@@ -1,0 +1,22 @@
+{
+  "source": "https://ai.google.dev/api/generate-content#FunctionResponse",
+  "google_genai_version": "2.30.1",
+  "needs_approval": {
+    "willContinue": true,
+    "scheduling": "WHEN_IDLE",
+    "id": "same-id",
+    "name": "invoke_tool",
+    "response": {
+      "status": "needs_approval"
+    }
+  },
+  "denied": {
+    "willContinue": false,
+    "scheduling": "WHEN_IDLE",
+    "id": "same-id",
+    "name": "invoke_tool",
+    "response": {
+      "status": "denied"
+    }
+  }
+}

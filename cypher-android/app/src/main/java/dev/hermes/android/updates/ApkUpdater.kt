@@ -1,0 +1,63 @@
+package dev.hermes.android.updates
+
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.provider.Settings
+import androidx.core.content.FileProvider
+import dev.hermes.android.core.*
+import dev.hermes.android.data.CypherClient
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import java.io.File
+
+class ApkUpdater(private val context: Context) {
+    private fun installed() = context.packageManager.getPackageInfo(context.packageName, PackageManager.GET_SIGNING_CERTIFICATES)
+    fun installedVersion(): Long = installed().longVersionCode
+    private fun signer(): String {
+        val certificate = installed().signingInfo?.apkContentsSigners?.singleOrNull()
+            ?: error("This installation has no supported single signing identity. Keep the installed app and contact its owner.")
+        return sha256(certificate.toByteArray())
+    }
+    suspend fun check(client: CypherClient): Release? {
+        val release = Release.from(client.nativeRequest("/api/plugins/cypher/mobile/releases/latest"))
+        return newerRelease(release, context.packageName, installed().longVersionCode, signer())
+    }
+    suspend fun download(client: CypherClient, release: Release): File = withContext(Dispatchers.IO) {
+        release.validate(context.packageName, installed().longVersionCode, signer())
+        val dir = File(context.filesDir, "updates").apply { mkdirs() }
+        val part = File(dir, "${client.scope.key}-${java.util.UUID.randomUUID()}.part")
+        try {
+            val size = part.outputStream().use { client.copyTo(safeArtifactPath(release.path), it, limit = release.size) }
+            require(size == release.size && sha256(part).equals(release.sha, true)) { "Update checksum or size failed. The installed app is unchanged." }
+            val parsed = context.packageManager.getPackageArchiveInfo(part.absolutePath, PackageManager.GET_SIGNING_CERTIFICATES) ?: error("Update is not a valid APK")
+            require(parsed.packageName == context.packageName && parsed.longVersionCode == release.version) { "APK package or version differs from the release manifest" }
+            val certificate = parsed.signingInfo?.apkContentsSigners?.singleOrNull()?.toByteArray() ?: error("APK signing identity is missing")
+            require(sha256(certificate).equals(release.signer, true) && sha256(certificate).equals(signer(), true)) { "APK signature differs from the installed app" }
+            val artifact = File(dir, "hermes-${client.scope.key}-${release.version}-${release.sha.take(16)}.apk")
+            currentCoroutineContext().ensureActive()
+            check(part.renameTo(artifact)) { "Could not retain verified update" }
+            dir.listFiles()?.filter { it.isFile && it.name.endsWith(".apk") && it != artifact }?.sortedByDescending { it.lastModified() }?.drop(2)?.forEach { it.delete() }
+            artifact
+        } finally { part.delete() }
+    }
+    internal fun validateInstall(file: File) {
+        require(file.canonicalFile.parentFile == File(context.filesDir, "updates").canonicalFile) { "Reopen the verified app update" }
+        val archive = context.packageManager.getPackageArchiveInfo(file.absolutePath, PackageManager.GET_SIGNING_CERTIFICATES) ?: error("The verified update is no longer available")
+        require(archive.packageName == context.packageName && archive.longVersionCode > installed().longVersionCode && archive.signingInfo?.apkContentsSigners?.singleOrNull()?.let { sha256(it.toByteArray()).equals(signer(), true) } == true) { "The APK no longer matches the installed package, newer version or signing identity" }
+    }
+    /** Call only after validating private bytes and rechecking local authorization. */
+    internal fun launchInstaller(file: File): Boolean {
+        if (!context.packageManager.canRequestPackageInstalls()) { context.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); return false }
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+        try {
+            context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (error: android.content.ActivityNotFoundException) {
+            throw IllegalStateException("Android's package installer is unavailable. The verified update is retained for a later retry.", error)
+        }
+        return true
+    }
+}

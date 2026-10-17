@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <queries>
+        <intent><action android:name="android.speech.action.RECOGNIZE_SPEECH" /></intent>
+        <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
+    </queries>
+    <application android:name=".CypherApplication" android:label="Cypher" android:icon="@drawable/ic_cypher" android:theme="@style/Theme.Cypher" android:allowBackup="false" android:fullBackupContent="@xml/backup_rules" android:dataExtractionRules="@xml/data_extraction_rules" android:usesCleartextTraffic="false" android:supportsRtl="true">
+        <activity android:name=".CypherActivity" android:exported="true" android:resizeableActivity="true" android:windowSoftInputMode="adjustResize">
+        </activity>
+        <!-- Installed launcher component remains a technical compatibility alias. -->
+        <activity-alias android:name=".MainActivity" android:targetActivity=".CypherActivity" android:exported="true">
+            <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
+        </activity-alias>
+        <service android:name=".voice.CypherCallService" android:exported="false" android:foregroundServiceType="microphone|phoneCall|camera|mediaProjection" />
+        <service android:name=".voice.IncomingRingtoneService" android:exported="false" android:foregroundServiceType="phoneCall" />
+        <receiver android:name=".voice.IncomingCallReceiver" android:exported="false" />
+        <receiver android:name=".push.DeviceRestartReceiver" android:exported="false">
+            <intent-filter><action android:name="android.intent.action.BOOT_COMPLETED" /><action android:name="android.intent.action.MY_PACKAGE_REPLACED" /></intent-filter>
+        </receiver>
+        <service android:name=".updates.UpdateCheckJob" android:exported="false" android:permission="android.permission.BIND_JOB_SERVICE" />
+        <receiver android:name=".push.NativeActivityReceiver" android:exported="false" />
+        <service android:name=".push.NativeActivityActionJob" android:exported="false" android:permission="android.permission.BIND_JOB_SERVICE" />
+        <service android:name=".push.NotificationPreviewJob" android:exported="false" android:permission="android.permission.BIND_JOB_SERVICE" />
+        <service android:name=".push.PushRegistrationJob" android:exported="false" android:permission="android.permission.BIND_JOB_SERVICE" />
+        <service android:name=".push.CypherMessagingService" android:exported="false">
+            <intent-filter><action android:name="com.google.firebase.MESSAGING_EVENT" /></intent-filter>
+        </service>
+        <provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.files" android:exported="false" android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>
