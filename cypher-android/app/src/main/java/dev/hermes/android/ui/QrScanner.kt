@@ -75,13 +75,17 @@ fun QrScanner(onResult: (String) -> Unit, onClose: () -> Unit) {
         } else {
             val options = remember { BarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build() }
             val scanner = remember(options) { BarcodeScanning.getClient(options) }
-            val providerState = remember { mutableStateOf<ProcessCameraProvider?>(null) }
+            val boundUseCases = remember { mutableStateOf<Pair<ProcessCameraProvider, Pair<Preview, ImageAnalysis>>?>(null) }
             val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
             val detected = remember { AtomicBoolean(false) }
+            val active = remember { AtomicBoolean(false) }
             val mainHandler = remember { Handler(Looper.getMainLooper()) }
             DisposableEffect(lifecycleOwner, scanner, cameraExecutor) {
+                active.set(true)
                 onDispose {
-                    providerState.value?.unbindAll()
+                    active.set(false)
+                    boundUseCases.value?.let { (provider, useCases) -> provider.unbind(useCases.first, useCases.second) }
+                    boundUseCases.value = null
                     scanner.close()
                     cameraExecutor.shutdown()
                 }
@@ -94,8 +98,10 @@ fun QrScanner(onResult: (String) -> Unit, onClose: () -> Unit) {
                         implementationMode = PreviewView.ImplementationMode.COMPATIBLE
                         val future = ProcessCameraProvider.getInstance(viewContext)
                         future.addListener({
+                            if (!active.get()) return@addListener
                             try {
                                 val provider = future.get()
+                                if (!active.get()) return@addListener
                                 val preview = Preview.Builder().build().also { it.setSurfaceProvider(surfaceProvider) }
                                 val analysis = ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
                                 analysis.setAnalyzer(cameraExecutor) { proxy ->
@@ -106,16 +112,15 @@ fun QrScanner(onResult: (String) -> Unit, onClose: () -> Unit) {
                                         scanner.process(InputImage.fromMediaImage(image, proxy.imageInfo.rotationDegrees))
                                             .addOnSuccessListener { codes ->
                                                 val value = codes.firstNotNullOfOrNull { it.rawValue?.takeIf(String::isNotBlank) }
-                                                if (value != null && detected.compareAndSet(false, true)) mainHandler.post { latestResult(value) }
+                                                if (value != null && active.get() && detected.compareAndSet(false, true)) mainHandler.post { if (active.get()) latestResult(value) }
                                             }
                                             .addOnCompleteListener { proxy.close() }
                                     } catch (_: Exception) { proxy.close() }
                                 }
-                                provider.unbindAll()
                                 provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
-                                providerState.value = provider
+                                boundUseCases.value = provider to (preview to analysis)
                             } catch (_: Exception) {
-                                mainHandler.post { cameraError = "Camera unavailable. Close the scanner and paste the link or address instead." }
+                                if (active.get()) mainHandler.post { if (active.get()) cameraError = "Camera unavailable. Close the scanner and paste the link or address instead." }
                             }
                         }, ContextCompat.getMainExecutor(viewContext))
                     }

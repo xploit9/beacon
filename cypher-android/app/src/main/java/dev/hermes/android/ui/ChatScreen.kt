@@ -25,6 +25,8 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
@@ -94,6 +96,11 @@ import org.json.JSONObject
     val chat = chatState.copy(messages = messages)
     val callMessagesById = remember(chatState.callMessages) { chatState.callMessages.associateBy { "call:${it.eventId}" } }
     val call by vm.app.calls.state.collectAsStateWithLifecycle()
+    var surfacedCallError by rememberSaveable { mutableStateOf("") }
+    LaunchedEffect(call.error) {
+        if (call.error.isBlank()) surfacedCallError = ""
+        else if (call.error != surfacedCallError) { surfacedCallError = call.error; vm.notice(call.error) }
+    }
     val handoff by vm.voiceHandoff.collectAsStateWithLifecycle()
     val pendingVoiceCall by vm.voiceCallRequest.collectAsStateWithLifecycle()
     if(handoff?.scope==vm.authenticatedScope()&&handoff?.targetCall?.isBlank()==true) AlertDialog(
@@ -119,6 +126,8 @@ import org.json.JSONObject
     if (projects) ChatProjectPicker(vm, onDismiss = { projects = false })
     var search by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf("") }
     var showSearch by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(false) }
+    val searchFocusRequester = remember { FocusRequester() }
+    LaunchedEffect(showSearch, canonical, chat.sessionId) { if (showSearch && canonical) searchFocusRequester.requestFocus() }
     val promptScope = vm.authenticatedScope()?.takeIf { it.copy(session = "") == vm.client?.scope }
     val questionId = chat.clarification?.let { it.string("clarify_id", it.string("id")) }.orEmpty()
     var questionAnswers by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId, questionId,
@@ -133,7 +142,7 @@ import org.json.JSONObject
     val sphereMotionEnabled = motionEnabled && settings.optBoolean("animate_background", true)
     val sphereStreaming = chat.streamId.isNotBlank()
     val sphereWaitingForFirstToken = sphereStreaming && chat.liveText.isBlank()
-    val sphereHasError = ui.error.isNotBlank() || chat.status.contains("error", ignoreCase = true) || chat.status.contains("failed", ignoreCase = true)
+    val sphereHasError = chat.status.contains("error", ignoreCase = true) || chat.status.contains("failed", ignoreCase = true)
     val rawSphereState = resolveSphereState(sphereHasError, sphereStreaming, sphereWaitingForFirstToken)
     var sphereState by remember(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(rawSphereState) }
     LaunchedEffect(ui.origin, ui.owner, ui.profile, chat.sessionId, rawSphereState) {
@@ -144,6 +153,7 @@ import org.json.JSONObject
     val activeSphereTool = sphereStreaming && chat.liveTools.any { toolOutcomeOf(it, streaming = true) == ToolOutcome.Running }
     val sphereToolCallBurst by animateFloatAsState(if (activeSphereTool) 1f else 0f, if (sphereMotionEnabled) tween(if (activeSphereTool) 200 else 1_200) else snap(), label = "chatSphereToolBurst")
     val avatarState = dev.hermes.android.ui.sphere.AvatarRenderState(sphereState, sphereIntensity, sphereToolCallBurst, paused = !sphereMotionEnabled)
+    val transcriptAvatarState = avatarState.copy(paused = !sphereMotionEnabled || (!sphereStreaming && !sphereHasError))
     var showCallHistory by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(false) }
     BackHandler(activeHere && showCallHistory) { showCallHistory = false }
     LaunchedEffect(call.active) { if (!call.active) showCallHistory = false }
@@ -176,9 +186,9 @@ import org.json.JSONObject
         } else { permissionClient=active.detached();permissionConversation=conversation;microphone.launch(Manifest.permission.RECORD_AUDIO) }
     }
     val callThisChat: () -> Unit = { vm.client?.let { requestCall(it,chat.sessionId) };Unit }
-    LaunchedEffect(pendingVoiceCall,ui.tab,chat.sessionId) {
+    LaunchedEffect(pendingVoiceCall,ui.tab,ui.morePage,permanentBotChat,chat.sessionId) {
         val pending=pendingVoiceCall?:return@LaunchedEffect
-        if(ui.tab !in setOf("Chat","Xara")) return@LaunchedEffect
+        if(ui.tab !in setOf("Chat","Xara") && !permanentBotChat) return@LaunchedEffect
         vm.consumeVoiceCallRequest(pending)
         val active=vm.client
         if(active==null||active.scope!=pending.scope||chat.sessionId!=pending.conversationId) vm.notice("The conversation changed. Start the call again.")
@@ -251,7 +261,7 @@ import org.json.JSONObject
                     }
                 }
             }
-            if (canonical && showSearch) OutlinedTextField(search, { search = it }, placeholder = { Text(uiText("Find in conversation")) }, singleLine = true, trailingIcon = { IconButton(onClick = { showSearch = false; search = "" }) { Icon(Icons.Rounded.Close, uiText("Close search")) } }, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp))
+            if (canonical && showSearch) OutlinedTextField(search, { search = it }, placeholder = { Text(uiText("Find in conversation")) }, singleLine = true, trailingIcon = { IconButton(onClick = { showSearch = false; search = "" }) { Icon(Icons.Rounded.Close, uiText("Close search")) } }, modifier = Modifier.fillMaxWidth().focusRequester(searchFocusRequester).padding(horizontal = 16.dp))
             if (xara && !ready) Box(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
                 EmptyState(if (ui.xaraOpening) "Opening Cypher’s conversation" else if (ui.profile != "default") "Cypher uses the default profile" else "Cypher’s conversation is unavailable", ui.xaraError.ifBlank { "Your conversation is opening. Your other chats and drafts are safely saved." }, action = if (ui.xaraOpening) "" else if (ui.profile != "default") "Switch to default profile" else "Retry Cypher", onAction = { if (ui.profile != "default") vm.switchProfile("default") else vm.openXara() })
             } else if (chat.sessionId.isBlank()) Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -263,7 +273,7 @@ import org.json.JSONObject
             }
             else Box(Modifier.weight(1f).fillMaxWidth().testTag("transcript-layer")) {
                 if (chat.messages.isNotEmpty() || chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank() || sphereStreaming)
-                    ChatSphere(Modifier.fillMaxSize().alpha(.65f).testTag("chat-sphere-background"), avatarState)
+                    ChatSphere(Modifier.fillMaxSize().alpha(if (sphereStreaming) .5f else .12f).testTag("chat-sphere-background"), transcriptAvatarState)
                 LazyColumn(Modifier.fillMaxSize().nestedScroll(ownerScroll).testTag("conversation-transcript"), state = list, contentPadding = PaddingValues(horizontal = 20.dp, vertical = 20.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) {
                 if (chat.messages.isEmpty() && chat.streamId.isBlank()) item("empty-state") {
                     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -315,7 +325,7 @@ import org.json.JSONObject
             Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 if (navigationBack != null) IconButton(onClick = navigationBack, modifier = Modifier.testTag("bot-chat-back")) { Icon(Icons.Rounded.ArrowBack, "Back to bots") }
                 else IconButton(onClick = LocalOpenNavigationMenu.current ?: { vm.toggleSessions(!ui.showSessions) }, modifier = Modifier.testTag("navigation-toggle")) { Icon(Icons.Rounded.Menu, uiText(if (LocalPersistentNavigation.current) "Hide navigation" else "Show navigation")) }
-                Column(Modifier.weight(1f).padding(vertical = 8.dp)) { Text(titleOverride ?: if (xara || activeHere) "Cypher" else chat.title, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis); Text(if (xara || activeHere) uiText(if (call.active) "Voice conversation" else "Text and voice, together") else chat.raw.string("model", "Choose a model"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
+                Column(Modifier.weight(1f).padding(vertical = 8.dp)) { Text(titleOverride ?: if (xara || activeHere) "Cypher" else chat.title, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis); Text(if (xara || activeHere) uiText(if (call.active) "Voice conversation" else "Text and voice, together") else if (!canonical) uiText("Loading model…") else chat.raw.string("model", "Choose a model"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
                 if (!xara && !permanentBotChat) IconButton(onClick = { vm.newChat() }) { Icon(Icons.Rounded.Edit, uiText("New conversation")) }
                 IconButton(onClick = { showSearch = !showSearch; if (activeHere && showSearch) showCallHistory = true }, enabled = canonical) { Icon(Icons.Rounded.Search, uiText("Search this conversation")) }
                 Box { IconButton(onClick = { menu = true }, enabled = ready) { Icon(Icons.Rounded.MoreVert, uiText("Conversation actions")) }; DropdownMenu(menu && ready, { menu = false }, modifier = Modifier.heightIn(max = actionMenuHeight).testTag("conversation-actions-menu")) {
@@ -323,7 +333,7 @@ import org.json.JSONObject
                         if (index > 0) HorizontalDivider()
                         Text(uiText(if (group == "Model and tools") "Tools" else group), Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         titles.filterNot { it in setOf("Model & provider", "Reasoning") || (permanentBotChat && it == "New conversation") }.forEach { title ->
-                            val label = conversationActionLabel(title, chat.raw.optBoolean("pinned"), chat.raw.optBoolean("archived"))
+                            val label = conversationActionLabel(title, chat.raw.optBoolean("pinned"), chat.raw.optBoolean("archived")).replaceFirstChar { it.uppercase() }
                             DropdownMenuItem({ Column { Text(uiText(label)); if (activeHere && title in setOf("Delete conversation", "Undo last turn", "Compress context")) Text("End this call to continue", style = MaterialTheme.typography.labelSmall) } }, onClick = { menu = false; chatAction(vm, title) }, enabled = nativeConversationAction(title) && (canonical || title == "New conversation") && !(activeHere && title in setOf("Delete conversation", "Undo last turn", "Compress context")), leadingIcon = { Icon(chatActionIcon(label), null) }, modifier = Modifier.testTag("conversation-action:$title"))
                         }
                     }
@@ -343,15 +353,27 @@ import org.json.JSONObject
                 conversationContent(Modifier.weight(1f).widthIn(max = 840.dp).fillMaxWidth().align(Alignment.CenterHorizontally))
             }
         }
-        if (ready && !activeHere && activity.active) Box(Modifier.fillMaxWidth().widthIn(max = 840.dp).align(Alignment.CenterHorizontally)) { ChatActivityStrip(activity) { activitySheet = true } }
-        if (ready && !activeHere) Box(Modifier.fillMaxWidth().onSizeChanged { onComposerHeight(it.height) }, contentAlignment = Alignment.Center) { Composer(vm, activeHere, !call.active, callThisChat, composerDetails, { composerDetails = it }) }
-        if (ready && !activeHere) ChatStatusStrip(ui, chat)
+        if (ready && !activeHere) Column(Modifier.fillMaxWidth().onSizeChanged { onComposerHeight(it.height) }) {
+            if (activity.active) Box(Modifier.fillMaxWidth().widthIn(max = 840.dp).align(Alignment.CenterHorizontally)) { ChatActivityStrip(activity) { activitySheet = true } }
+            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { Composer(vm, activeHere, !call.active, callThisChat, composerDetails, { composerDetails = it }) }
+            ChatStatusStrip(ui, chat)
+        }
     }
     }
     side?.takeIf { ready }?.let { question -> AlertDialog(onDismissRequest = vm::closeSideQuestion, title = { Text(uiText("Side question")) }, text = { Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) { Text(question.question, style = MaterialTheme.typography.titleMedium); Text(question.status, color = MaterialTheme.colorScheme.onSurfaceVariant); Markdown(question.text, vm, question.scope.session(question.sessionId), interactive = false) } }, confirmButton = { TextButton(onClick = vm::closeSideQuestion) { Text(uiText("Close")) } }, dismissButton = { TextButton(onClick = vm::resumeSideQuestion) { Text(uiText("Reconnect")) } }) }
     if (canonical) NativeCatalog(vm)
     if (activitySheet && ready) ChatActivitySheet(activity, chat.queued.map { it.text }, onRemoveQueued = { index -> vm.removeQueued(index) }, onDismiss = { activitySheet = false })
 }
+
+internal fun acceptsInitialConversationEdit(
+    inputScope: Scope?,
+    currentScope: Scope?,
+    ownerScope: Scope?,
+    newChatOpening: Boolean,
+    sameClient: Boolean,
+    callActive: Boolean,
+): Boolean = sameClient && newChatOpening && !callActive && inputScope?.session.isNullOrBlank() &&
+    ownerScope != null && currentScope?.copy(session = "") == ownerScope
 
 @Composable private fun Composer(vm: CypherViewModel, callActive: Boolean, callAvailable: Boolean, onCall: () -> Unit, details: Boolean, onDetails: (Boolean) -> Unit) {
     val ui by vm.ui.collectAsStateWithLifecycle()
@@ -360,7 +382,7 @@ import org.json.JSONObject
     val settings = LocalCypherSettings.current
     val readOnly = chat.raw.optBoolean("read_only") || chat.raw.optBoolean("is_read_only")
     val canonical = chat.sessionId.isNotBlank()
-    val editable = chat.projectionReady && (canonical || vm.canComposeInitialChat())
+    val editable = (chat.projectionReady || ui.newChatOpening) && (canonical || vm.canComposeInitialChat())
     val files by vm.attachments.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
     val preparing by vm.attachmentPreparation.collectAsStateWithLifecycle()
@@ -375,7 +397,10 @@ import org.json.JSONObject
         else if (chat.streamId.isNotBlank()) vm.queue() else vm.send()
     }
     val changeDraft: (TextFieldValue) -> Unit = { value ->
-        if (acceptsComposerEdit(inputClient, vm.client, inputScope, vm.authenticatedScope(), vm.app.calls.state.value.let { it.active && it.conversationScope == inputScope })) vm.composer(value, fromEditor = true)
+        val currentScope = vm.authenticatedScope()
+        val callActive = vm.app.calls.state.value.let { it.active && it.conversationScope == inputScope }
+        val initialCreation = acceptsInitialConversationEdit(inputScope, currentScope, inputClient?.scope, ui.newChatOpening, inputClient === vm.client, callActive)
+        if (acceptsComposerEdit(inputClient, vm.client, inputScope, currentScope, callActive) || initialCreation) vm.composer(value, fromEditor = true)
     }
     var attachmentRequest by remember { mutableStateOf<Pair<CypherClient, Scope?>?>(null) }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris -> val request = attachmentRequest; attachmentRequest = null; if (uris.isNotEmpty()) { if (request != null && vm.client === request.first && vm.authenticatedScope() == request.second) uris.distinct().forEach { vm.upload(it) } else vm.notice("Reopen attachments in the original account and conversation.") } }
@@ -407,9 +432,9 @@ import org.json.JSONObject
             // Relay-style composer surface: one pill with a hairline border.
             Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh, border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
                 Column(Modifier.padding(horizontal = 6.dp, vertical = 3.dp)) {
-                    if (chat.queued.isNotEmpty()) Column(Modifier.fillMaxWidth().testTag("composer-queue"), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Text(queuedHeading(chat.queued.size), Modifier.padding(horizontal = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        chat.queued.forEachIndexed { index, queued -> Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    if (chat.queued.isNotEmpty()) LazyColumn(Modifier.fillMaxWidth().heightIn(max = 144.dp).testTag("composer-queue"), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        item(key = "queue-heading") { Text(queuedHeading(chat.queued.size), Modifier.padding(horizontal = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                        itemsIndexed(chat.queued) { index, queued -> Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                             Text(queued.text.ifBlank { "Attachment" } + if (queued.attachments.isNotEmpty()) " · ${queued.attachments.size} files" else "", Modifier.weight(1f).padding(horizontal = 8.dp), style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                             IconButton(onClick = { vm.removeQueued(index) }, modifier = Modifier.size(48.dp)) { Icon(Icons.Rounded.Close, uiText("Remove queued message")) }
                         } }
@@ -598,7 +623,8 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
     val running = outcome == ToolOutcome.Running
     val preparing = outcome == ToolOutcome.Preparing
     // A running tool opens like Relay's; history and preparing tools start folded.
-    var expanded by rememberSaveable(tool.toolKey(0)) { mutableStateOf(running) }
+    val toolKey = tool.toolKey(0)
+    var expanded by rememberSaveable(toolKey) { mutableStateOf(running) }
     val finished = outcome == ToolOutcome.Completed || outcome == ToolOutcome.Failed || outcome == ToolOutcome.Dispatched
     val duration = toolDurationLabel(tool.durationSeconds())
     // Native tool events carry a duration but no clock time; like Relay, a finished call shows its message's recorded time.
@@ -639,22 +665,26 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
                 if (outcome == ToolOutcome.Dispatched) Text("The task was handed off. Its own completion isn’t recorded here.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 tool.string("description").takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                 // Full recorded text, newlines intact, in a bounded scroll area; plain text only.
-                argumentsText?.let { ToolDetailBlock("Arguments", it, "tool-card-arguments", MaterialTheme.colorScheme.onSurface) }
-                if (resultText.isNotBlank()) ToolDetailBlock(if (outcome == ToolOutcome.Failed) "Error" else "Result", resultText, "tool-card-result", if (outcome == ToolOutcome.Failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
+                argumentsText?.let { ToolDetailBlock("Arguments", it, "tool-card-arguments", MaterialTheme.colorScheme.onSurface, toolKey) }
+                if (resultText.isNotBlank()) ToolDetailBlock(if (outcome == ToolOutcome.Failed) "Error" else "Result", resultText, "tool-card-result", if (outcome == ToolOutcome.Failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface, toolKey)
                 else if (outcome == ToolOutcome.Completed || outcome == ToolOutcome.Failed) Text("The tool finished with an empty result.", Modifier.testTag("tool-card-empty-result"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 // Partial output is shown as such; it never marks the call finished.
-                previewText?.let { ToolDetailBlock("Preview (partial)", it, "tool-card-preview", MaterialTheme.colorScheme.onSurface) }
+                previewText?.let { ToolDetailBlock("Preview (partial)", it, "tool-card-preview", MaterialTheme.colorScheme.onSurface, toolKey) }
                 if (outcome == ToolOutcome.NoResult) Text("No completion was recorded for this tool.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } }
         }
     }
 }
 
-@Composable private fun ToolDetailBlock(title: String, text: String, tag: String, color: Color) {
+@Composable private fun ToolDetailBlock(title: String, text: String, tag: String, color: Color, toolKey: String) {
+    var detailLimit by rememberSaveable(toolKey, tag) { mutableStateOf(ToolDetailPageSize) }
+    val shownLimit = detailLimit.coerceAtMost(ToolDetailLimit)
     Text(title, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     Box(Modifier.fillMaxWidth().heightIn(max = 320.dp).clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.surfaceContainerLowest).verticalScroll(rememberScrollState()).padding(8.dp)) {
-        Text(boundedDetail(text), Modifier.testTag(tag), style = MaterialTheme.typography.bodySmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace), color = color)
+        Text(boundedDetail(text, shownLimit), Modifier.testTag(tag), style = MaterialTheme.typography.bodySmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace), color = color)
     }
+    if (text.length > shownLimit && shownLimit < ToolDetailLimit) TextButton(onClick = { detailLimit = nextToolDetailLimit(shownLimit) }, modifier = Modifier.testTag("$tag-show-more")) { Text(uiText("Show more")) }
+    if (shownLimit > ToolDetailPageSize) TextButton(onClick = { detailLimit = ToolDetailPageSize }, modifier = Modifier.testTag("$tag-show-less")) { Text(uiText("Show less")) }
 }
 
 /** Relay's assistant bubble: restrained surface, small tail corner, wide enough for rich content. */
