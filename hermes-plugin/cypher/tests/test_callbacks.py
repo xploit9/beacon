@@ -41,6 +41,17 @@ def test_owner_and_native_authority_fail_closed(env):
     n.verify=lambda *a: (_ for _ in ()).throw(LookupError())
     with pytest.raises(LookupError): cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
     assert jobs==[]
+
+
+def test_callback_script_is_not_published_when_atomic_replace_fails(env,monkeypatch):
+    cb,m,n,cfg,jobs,tmp=env
+    target=tmp/'scripts'/'cypher-callback-test.py'
+    monkeypatch.setattr(cb,'os',SimpleNamespace(replace=lambda *args:(_ for _ in ()).throw(OSError('fixture replace failure'))),raising=False)
+
+    with pytest.raises(OSError):cb.script_file(tmp,target.name,'callback source')
+
+    assert not target.exists()
+    assert list(target.parent.glob('.'+target.name+'.*.tmp'))==[]
 def test_deliver_once_and_expired_deferred(env):
     cb,m,n,cfg,jobs,tmp=env;cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
     with m.connect() as c: key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]

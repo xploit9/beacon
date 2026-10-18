@@ -59,27 +59,37 @@ def model_capabilities(profile, provider, model):
 
 
 def snapshot(profile):
-    from hermes_cli.config import load_config, require_readable_config_before_write
-    from hermes_cli.web_server_profiles import _config_profile_scope, _resolve_profile_dir
-    from hermes_cli.web_routers.profiles import _profile_to_dict
+    from hermes_cli.web_server_profiles import _config_profile_scope
     from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK
-    from hermes_cli import profiles
     with _config_profile_scope(profile), _CONFIG_MUTATION_LOCK:
-        model = load_config().get('model', {})
-        root = _resolve_profile_dir(profile)
-        soul = root / 'SOUL.md'
-        if soul.is_symlink() or getattr(soul, 'is_junction', lambda: False)():
-            raise HTTPException(409, 'Linked bot instructions cannot be read here')
+        return _snapshot_locked(profile)
+
+
+def _snapshot_locked(profile):
+    from hermes_cli.config import load_config
+    from hermes_cli.web_server_profiles import _resolve_profile_dir
+    from hermes_cli.web_routers.profiles import _profile_to_dict
+    from hermes_cli import profiles
+    model = load_config().get('model', {})
+    root = _resolve_profile_dir(profile)
+    soul = root / 'SOUL.md'
+    if soul.is_symlink() or getattr(soul, 'is_junction', lambda: False)():
+        raise HTTPException(409, 'Linked bot instructions cannot be read here')
+    try:
         if soul.exists() and soul.stat().st_size > 128 * 1024:
             raise HTTPException(413, 'Bot instructions are too large for the phone')
         content = soul.read_text(encoding='utf-8-sig') if soul.exists() else ''
-        info = next((p for p in profiles.list_profiles(lazy_skill_count=True) if p.name == profile), None)
-        if info is None:
-            raise HTTPException(404, 'Authorized bot profile not found')
-        row = _profile_to_dict(info)
-        return {'profile': profile, 'title': row.get('bot_title') or row.get('display_name') or profile,
-                'description': row['description'], 'soul': content, 'provider': row['provider'] or '',
-                'model': row['model'] or '', 'revision': revision(model)}
+    except UnicodeDecodeError:
+        raise HTTPException(409, 'Bot instructions have invalid text encoding; repair them on the computer') from None
+    except OSError:
+        raise HTTPException(503, 'Bot instructions could not be read; check them on the computer') from None
+    info = next((p for p in profiles.list_profiles(lazy_skill_count=True) if p.name == profile), None)
+    if info is None:
+        raise HTTPException(404, 'Authorized bot profile not found')
+    row = _profile_to_dict(info)
+    return {'profile': profile, 'title': row.get('bot_title') or row.get('display_name') or profile,
+            'description': row['description'], 'soul': content, 'provider': row['provider'] or '',
+            'model': row['model'] or '', 'revision': revision(model)}
 
 
 def save_model(profile, payload):
@@ -100,7 +110,7 @@ def save_model(profile, payload):
         if revision(load_config().get('model', {})) != expected:
             raise HTTPException(409, 'Bot model changed elsewhere. Reload and review before saving.')
         _write_profile_model(_resolve_profile_dir(profile), provider.strip(), model.strip())
-        return {'ok': True, 'bot': snapshot(profile)}
+        return {'ok': True, 'bot': _snapshot_locked(profile)}
 
 
 

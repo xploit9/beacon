@@ -223,8 +223,12 @@ async def calls(request:Request):
     elif selection['provider']=='openai':
         raise HTTPException(409,'OpenAI Realtime requires a phone-held key')
     if conversation: await asyncio.to_thread(safely,native.reserve_conversation,owner,provider,profile,conversation)
-    else: conversation=await asyncio.to_thread(safely,native.create,owner,provider,profile)
-    return safely(mobile.reserve,owner,profile,conversation,selection)
+    else:
+        with mobile.connect() as conn:
+            if conn.execute('SELECT COUNT(*) FROM calls WHERE owner=? AND closed=0 AND created>?',(owner,time.time()-4*3600)).fetchone()[0]>=mobile.MAX_ACTIVE_CALLS:
+                raise HTTPException(409,'Active call limit reached')
+        conversation=await asyncio.to_thread(safely,native.create,owner,provider,profile)
+    return safely(mobile.reserve,owner,profile,conversation,selection,client_key)
 @router.get('/mobile/calls/{call_id}')
 async def get_call(call_id:str,request:Request):
     owner,provider,row,cfg=call(request,call_id)
@@ -242,6 +246,8 @@ async def close_call(call_id:str,request:Request):
 async def token(call_id:str,request:Request):
     await body(request,1024);owner,provider,row,cfg=call(request,call_id,True)
     selection=safely(voice_models.bound,row,cfg)
+    if selection['provider']=='openai' or json.loads(row.get('voice_config') or '{}').get('client_key') is True:
+        raise HTTPException(409,'This voice call requires a phone-held key')
     if selection['provider']=='grok':
         try: return JSONResponse(await asyncio.to_thread(voice_models.mint_xai,cfg,selection),headers={'Cache-Control':'no-store'})
         except Exception: raise HTTPException(503,'Grok voice could not connect. Check the server key and account credit.') from None
@@ -326,7 +332,7 @@ def watch(owner,provider,profile):
     for job in rows:
         if job['status'] in ('watching','needs_input'):
             try:
-                history=native.verify(owner,provider,profile,job['stored'],job['runtime'])
+                native.verify(owner,provider,profile,job['stored'],job['runtime'],False)
                 from tui_gateway import server,event_replay
                 with server._sessions_lock:
                     record=server._sessions.get(job['runtime'],{})
@@ -345,20 +351,26 @@ def watch(owner,provider,profile):
                         pending=server_requests.open_requests(job['runtime']) if staged.get('_row_id')==job['seq'] else []
                     except (ImportError,AttributeError): pending=[]
                     with mobile.LOCK,mobile.connect() as conn:
-                        conn.execute('UPDATE jobs SET status=? WHERE id=?',('needs_input' if pending else 'watching',job['id']))
+                        conn.execute("UPDATE jobs SET status=? WHERE id=? AND status IN ('watching','needs_input')",('needs_input' if pending else 'watching',job['id']))
                         mobile.prune_notices(conn)
                     continue
                 terminal={'complete':'completed','error':'failed','interrupted':'cancelled','cancelled':'cancelled'}.get(proof.get('status'))
                 if not terminal: continue
                 receipt=proof.get('persisted_turn',{})
                 if terminal=='completed':
+                    history=native.verify(owner,provider,profile,job['stored'],job['runtime'],True)
                     final_id=receipt.get('final_assistant_row_id')
-                    final=next((m for m in history.get('messages',[]) if m.get('row_id')==final_id and m.get('role')=='assistant'),None)
+                    final=next((m for m in history.get('messages',[]) if m.get('row_id',m.get('_row_id'))==final_id and m.get('role')=='assistant'),None)
                     if type(final_id) is not int or final_id<=0 or not final: continue
                     text=final.get('text',final.get('content',''))
                 else: text=''
                 with mobile.LOCK,mobile.connect() as conn:
-                    conn.execute('UPDATE jobs SET status=?,result=?,error=? WHERE id=?',(terminal,text[:65536],('Native Hermes turn failed; review the native session.' if terminal=='failed' else ''),job['id']))
+                    updated=conn.execute("UPDATE jobs SET status=?,result=?,error=? WHERE id=? AND status IN ('watching','needs_input')",(terminal,text[:65536],('Native Hermes turn failed; review the native session.' if terminal=='failed' else ''),job['id']))
+                if not updated.rowcount: continue
+            except LookupError:
+                with mobile.LOCK,mobile.connect() as conn:
+                    conn.execute("UPDATE jobs SET status='failed',error='Native Hermes session no longer exists' WHERE id=? AND status IN ('watching','needs_input')",(job['id'],))
+                continue
             except Exception: continue
         with mobile.LOCK,mobile.connect() as conn:
             current=conn.execute('SELECT * FROM jobs WHERE id=?',(job['id'],)).fetchone()
@@ -614,10 +626,11 @@ async def answer(invitation_id:str,action:str,request:Request):
             if action=='decline':
                 conn.execute("UPDATE notices SET state='declined' WHERE id=?",(invitation_id,))
                 return {'declined':True,'state':'declined','callback_id':invitation_id,'kind':'incoming_call','profile':profile,**source}
-            if conn.execute('SELECT COUNT(*) FROM calls WHERE owner=? AND closed=0 AND created>?',(owner,time.time()-4*3600)).fetchone()[0]>=8: raise HTTPException(409,'Active call limit reached')
+            if conn.execute('SELECT COUNT(*) FROM calls WHERE owner=? AND closed=0 AND created>?',(owner,time.time()-4*3600)).fetchone()[0]>=mobile.MAX_ACTIVE_CALLS: raise HTTPException(409,'Active call limit reached')
             cid=uuid.uuid4().hex
             context={key:row[key] for key in ('id','reason','job_id','conversation')}
-            conn.execute('INSERT INTO calls(id,owner,profile,conversation,created,callback_context,voice_config) VALUES(?,?,?,?,?,?,?)',(cid,owner,profile,row['conversation'],time.time(),json.dumps(context),json.dumps(selection)))
+            voice_config={**selection,**({'client_key':True} if client_key else {})}
+            conn.execute('INSERT INTO calls(id,owner,profile,conversation,created,callback_context,voice_config) VALUES(?,?,?,?,?,?,?)',(cid,owner,profile,row['conversation'],time.time(),json.dumps(context),json.dumps(voice_config)))
             conn.execute("UPDATE notices SET state='answered',call_id=? WHERE id=?",(cid,invitation_id))
         return {'call_id':cid,'conversation_id':row['conversation'],'profile':profile,'recording_status':'disabled','transcript_status':'pending','callback_id':invitation_id,'kind':'incoming_call','state':'answered',**selection,**mobile.refs(owner,profile,row['conversation'])}
     result=await asyncio.to_thread(consume)
@@ -687,20 +700,29 @@ def _push_devices(owner,profile):
                 if not remaining and accepted: conn.execute("UPDATE notices SET push='sent' WHERE id=?",(row['id'],))
     except Exception: return
 
+_release_failures={}
 def announce_release(cfg):
     """A changed verified feed creates durable hints; clients still verify before installing."""
     owner=cfg.get('owner_id');profiles=cfg.get('profiles',[]);root=cfg.get('release_root')
     if not owner or not cfg.get('owner_provider') or not root or not profiles: return
     manifest=Path(root)/'latest.json'
-    if not manifest.is_file() or manifest.stat().st_size>16384: return
-    candidate=json.loads(manifest.read_text(encoding='utf-8-sig')).get('version_code')
+    if not manifest.is_file(): return
+    with manifest.open('rb') as stream: raw=stream.read(16385)
+    if len(raw)>16384: return
+    cache_key=str(manifest.resolve());fingerprint=hashlib.sha256(raw).hexdigest()
+    if _release_failures.get(cache_key)==fingerprint: return
+    candidate=json.loads(raw.decode('utf-8-sig')).get('version_code')
     if type(candidate) is not int or not 20<candidate<=2147483647: return
     def key(profile): return 'release-announced:'+hashlib.sha256((owner+'\0'+profile).encode()).hexdigest()
     with mobile.connect() as conn:
         wanted=[profile for profile in profiles if conn.execute('SELECT 1 FROM targets WHERE owner=? AND profile=? AND expires>?',(owner,profile,time.time())).fetchone()
                 and int((conn.execute('SELECT value FROM meta WHERE key=?',(key(profile),)).fetchone() or [0])[0])<candidate]
     if not wanted: return
-    verified=release(cfg)
+    try: verified=release(cfg)
+    except Exception:
+        _release_failures[cache_key]=fingerprint
+        raise
+    _release_failures.pop(cache_key,None)
     version=verified['version_code']
     with mobile.LOCK,mobile.connect() as conn:
         for profile in wanted:

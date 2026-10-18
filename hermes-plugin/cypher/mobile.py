@@ -20,6 +20,7 @@ _OWNER_SID=None
 _CALL_LOCKS=weakref.WeakValueDictionary()
 ID = re.compile(r"[A-Za-z0-9_-]{1,160}\Z")
 MAX_MS = 4 * 60 * 60 * 1000
+MAX_ACTIVE_CALLS = 8
 
 def settings():
     from copy import deepcopy
@@ -153,12 +154,13 @@ def owned(conn, call_id, owner, profile=None, writable=False):
         raise ValueError('Call is closed')
     return dict(row)
 
-def reserve(owner, profile, conversation, voice=None):
+def reserve(owner, profile, conversation, voice=None, client_key=False):
     call_id = uuid.uuid4().hex
     with LOCK, connect() as conn:
         active=conn.execute('SELECT COUNT(*) FROM calls WHERE owner=? AND closed=0 AND created>?',(owner,time.time()-4*3600)).fetchone()[0]
-        if active>=8: raise ValueError('Active call limit reached')
-        conn.execute('INSERT INTO calls(id,owner,profile,conversation,created,voice_config) VALUES(?,?,?,?,?,?)', (call_id,owner,profile,ident(conversation),time.time(),json.dumps(voice or {})))
+        if active>=MAX_ACTIVE_CALLS: raise ValueError('Active call limit reached')
+        config={**(voice or {}),**({'client_key':True} if client_key else {})}
+        conn.execute('INSERT INTO calls(id,owner,profile,conversation,created,voice_config) VALUES(?,?,?,?,?,?)', (call_id,owner,profile,ident(conversation),time.time(),json.dumps(config)))
     return {'call_id':call_id,'conversation_id':conversation,'profile':profile,'transport':'gemini_live_direct','recording_status':'disabled','transcript_status':'pending',**(voice or {})}
 
 def status(row):
@@ -180,7 +182,7 @@ def events(call_id,owner,body):
         ident(row.get('event_id')); ident(row.get('turn_id','none')); finite(row.get('at_ms'))
         if any(k in row for k in ('provider','attempt','close_code','cause_class')):
             if row['type']!='media_diagnostic': raise ValueError('Unexpected transport diagnostic')
-            if 'provider' in row and row['provider'] not in ('gemini','grok'): raise ValueError('Invalid diagnostic provider')
+            if 'provider' in row and row['provider'] not in ('gemini','grok','openai'): raise ValueError('Invalid diagnostic provider')
             if 'attempt' in row and (type(row['attempt']) is not int or not 0<=row['attempt']<=10): raise ValueError('Invalid diagnostic attempt')
             if 'close_code' in row and (type(row['close_code']) is not int or not 0<=row['close_code']<=4999): raise ValueError('Invalid diagnostic close code')
             if 'cause_class' in row and row['cause_class'] not in ('ssl_handshake','ssl_peer','ssl_protocol','ssl_transport','socket_timeout','dns','connect','eof','io','other'): raise ValueError('Invalid diagnostic cause')

@@ -95,6 +95,8 @@ def build_router(identity, read_body, native):
                 await asyncio.to_thread(native.reserve_conversation, owner, provider, profile, stored)
             except LookupError:
                 raise HTTPException(404, 'Conversation is not available to this account') from None
+            except (RuntimeError, OSError):
+                raise HTTPException(503, 'Native conversation store is unavailable; try again later') from None
         path = managed_path(request, payload.get('path'), write=True)
         return await asyncio.to_thread(create_file, path, payload.get('content', ''))
     return router

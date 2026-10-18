@@ -60,6 +60,23 @@ def test_invalid_signed_release_never_queues_or_advances_marker(harness,monkeypa
         assert db.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'release-announced:%'").fetchone()[0]==0
 
 
+def test_failed_release_verification_is_not_repeated_for_unchanged_manifest(harness,monkeypatch):
+    api,c,cfg,manifest,checks,sent,_=configured(harness,monkeypatch);register(c,'old')
+    attempts=[]
+    def invalid(cfg):
+        attempts.append(True)
+        raise ValueError('signature rejected')
+    monkeypatch.setattr(api,'release',invalid)
+
+    with pytest.raises(ValueError): api.announce_release(cfg)
+    api.announce_release(cfg)
+    assert len(attempts)==1
+
+    manifest.write_text(json.dumps({'version_code':29}))
+    with pytest.raises(ValueError): api.announce_release(cfg)
+    assert len(attempts)==2
+
+
 def test_new_version_and_profile_are_separate(harness,monkeypatch):
     api,c,cfg,manifest,checks,sent,_=configured(harness,monkeypatch)
     register(c,'legacy')

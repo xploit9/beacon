@@ -89,17 +89,22 @@ def test_mail_read_hides_native_error_payload_and_returns_bounded_failure(env,mo
     with m.connect() as c:assert c.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'mail-evidence:%'").fetchone()[0]==0
 
 def test_mail_read_bounds_schema_errors_and_incomplete_contract(env,monkeypatch):
+    import importlib.util
     import sys
     from types import SimpleNamespace
+    from pathlib import Path
     _,m,n,cfg,_,_=env;p=load('__init__');p.mobile=m;p.native=n
     monkeypatch.setattr(p,'current_profile',lambda c:'default');monkeypatch.setattr(p,'verify_mail_source',lambda *a:None)
     cfg.update(callback_tool_enabled=True,mailbox_evidence={'server':'mail','tool':'exact','account':'fixture'})
-    calls=[];tool={'name':'exact','_server':'mail','read_only':True,'parameters':{},'_handler':lambda *a,**kw:calls.append(a)}
-    backend=SimpleNamespace(NativeMcp=lambda:SimpleNamespace(catalog=lambda:[tool]),validate=lambda *a:None)
+    calls=[];tool={'name':'exact','_server':'mail','read_only':True,'parameters':{'type':'object','required':['query'],'properties':{'query':{'type':'string'}}},'_handler':lambda *a,**kw:calls.append(a)}
+    path=Path(__file__).resolve().parents[1]/'gateway_tools.py'
+    spec=importlib.util.spec_from_file_location('fixture_mail_gateway_tools',path)
+    gateway=importlib.util.module_from_spec(spec);spec.loader.exec_module(gateway)
+    backend=SimpleNamespace(NativeMcp=lambda:SimpleNamespace(catalog=lambda:[tool]),validate=gateway.validate)
     monkeypatch.setitem(sys.modules,'cypher_gateway_tools',backend)
-    backend.validate=lambda *a:(_ for _ in ()).throw(ValueError('Mailbox arguments are invalid'))
     result=json.loads(p.mail_read({'arguments':{}},session_id='scan'))
-    assert result=={'error':'Mailbox arguments are invalid'}
+    assert result=={'error':'Arguments do not match the configured tool schema'}
+    assert len(json.dumps(result))<200
     assert json.loads(p.mail_read({'arguments':[]},session_id='scan'))=={'error':'Mailbox arguments must be an object'}
     assert calls==[]
 

@@ -85,7 +85,9 @@ def file_client(tmp_path, monkeypatch):
         return 'owner', 'basic', 'default', {}
     async def body(request, limit): return await request.json()
     app = FastAPI()
-    app.include_router(api.build_router(identity, body, SimpleNamespace(reserve_conversation=lambda *args: None)))
+    native = SimpleNamespace(reserve_conversation=lambda *args: None)
+    app.state.native = native
+    app.include_router(api.build_router(identity, body, native))
     return TestClient(app, headers={'x-owner': 'owner'})
 
 
@@ -98,6 +100,19 @@ def test_pc_text_editor_requires_no_conversation_and_preserves_stale_draft(file_
     assert Path(path).read_text('utf-8') == 'Reviewed'
     assert file_client.post('/mobile/files/text', json={'path': path, 'expected_content': 'Original', 'content': 'Stale'}).status_code == 409
     assert Path(path).read_text('utf-8') == 'Reviewed'
+
+
+@pytest.mark.parametrize('failure', [OSError('native store unavailable'), RuntimeError('native store unavailable')])
+def test_native_conversation_store_errors_map_to_503(file_client, failure):
+    def fail(*args): raise failure
+    file_client.app.state.native.reserve_conversation = fail
+
+    response = file_client.post('/mobile/files/create', json={
+        'path': 'ignored.md', 'content': 'fixture', 'session_id': 'native-stored',
+    })
+
+    assert response.status_code == 503
+    assert 'native conversation store' in response.text.lower()
 
 
 def test_pc_editor_enforces_native_root_and_sensitive_file_policy(file_client, tmp_path):

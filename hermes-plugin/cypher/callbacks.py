@@ -3,7 +3,9 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import hashlib
 import json
+import os
 from pathlib import Path
+import tempfile
 
 ZONE = 'Asia/Dubai'
 
@@ -29,7 +31,19 @@ def script_file(home, name, source):
     target=folder/name
     if target.is_symlink() or getattr(target,'is_junction',lambda:False)(): raise ValueError('Unsafe callback script')
     if target.exists() and target.read_text('utf-8')!=source: raise ValueError('Callback script differs; inspect on host')
-    if not target.exists(): target.write_text(source,encoding='utf-8')
+    if not target.exists():
+        temporary=None
+        try:
+            with tempfile.NamedTemporaryFile('w',encoding='utf-8',dir=folder,prefix='.'+name+'.',suffix='.tmp',delete=False) as stream:
+                temporary=Path(stream.name)
+                stream.write(source)
+            if target.is_symlink() or getattr(target,'is_junction',lambda:False)(): raise ValueError('Unsafe callback script')
+            if target.exists():
+                if target.read_text('utf-8')!=source: raise ValueError('Callback script differs; inspect on host')
+            else:
+                os.replace(temporary,target)
+        finally:
+            if temporary: temporary.unlink(missing_ok=True)
     return name
 
 def schedule(mobile,native,owner,provider,row,cfg,value,now=None):

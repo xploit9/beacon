@@ -69,31 +69,33 @@
         }
       }
 
+      function renderBody() {
+        if (loadError) return h('p', { className: 'mt-3 text-sm text-destructive', role: 'alert' }, 'A secure public dashboard address is not configured.');
+        if (!info) return h('p', { className: 'mt-3 text-sm text-muted-foreground', role: 'status' }, 'Loading connection details…');
+        return h('div', { className: 'mt-4 space-y-4' },
+          h('p', { className: 'text-sm text-muted-foreground' }, info.session ? 'Scan with Cypher to connect instantly' : 'Install Cypher, tap Scan QR, sign in.'),
+          !qrError ? h('canvas', {
+            ref: canvas,
+            className: 'block h-auto max-w-full rounded-md bg-white p-2',
+            style: { width: '16rem', imageRendering: 'pixelated' },
+            'aria-label': 'Cypher phone connection QR code',
+          }) : h('p', { className: 'text-sm text-muted-foreground', role: 'status' }, 'QR unavailable; copy the connection link below.'),
+          h('div', { className: 'space-y-2' },
+            h('div', { className: 'break-all rounded-md bg-muted/40 p-3 font-mono text-xs', tabIndex: 0 }, link),
+            h('button', {
+              type: 'button',
+              className: 'rounded-md border border-border px-3 py-2 text-sm hover:bg-muted',
+              onClick: copyLink,
+            }, 'Copy connection link'),
+            copyStatus ? h('span', { className: 'ml-3 text-xs text-muted-foreground', role: 'status' }, copyStatus) : null,
+          ),
+        );
+      }
+
       return h('main', { className: 'space-y-4 p-4', 'aria-labelledby': 'cypher-connect-title' },
         h('section', { className: 'max-w-2xl rounded-lg border border-border bg-card p-5 shadow-sm' },
           h('h1', { id: 'cypher-connect-title', className: 'text-xl font-semibold' }, 'Connect phone'),
-          loadError
-            ? h('p', { className: 'mt-3 text-sm text-destructive', role: 'alert' }, 'A secure public dashboard address is not configured.')
-            : !info
-              ? h('p', { className: 'mt-3 text-sm text-muted-foreground', role: 'status' }, 'Loading connection details…')
-              : h('div', { className: 'mt-4 space-y-4' },
-                h('p', { className: 'text-sm text-muted-foreground' }, info.session ? 'Scan with Cypher to connect instantly' : 'Install Cypher, tap Scan QR, sign in.'),
-                !qrError ? h('canvas', {
-                  ref: canvas,
-                  className: 'block h-auto max-w-full rounded-md bg-white p-2',
-                  style: { width: '16rem', imageRendering: 'pixelated' },
-                  'aria-label': 'Cypher phone connection QR code',
-                }) : h('p', { className: 'text-sm text-muted-foreground', role: 'status' }, 'QR unavailable; copy the connection link below.'),
-                h('div', { className: 'space-y-2' },
-                  h('div', { className: 'break-all rounded-md bg-muted/40 p-3 font-mono text-xs', tabIndex: 0 }, link),
-                  h('button', {
-                    type: 'button',
-                    className: 'rounded-md border border-border px-3 py-2 text-sm hover:bg-muted',
-                    onClick: copyLink,
-                  }, 'Copy connection link'),
-                  copyStatus ? h('span', { className: 'ml-3 text-xs text-muted-foreground', role: 'status' }, copyStatus) : null,
-                ),
-              ),
+          renderBody(),
         ),
       );
     }
