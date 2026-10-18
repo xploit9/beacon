@@ -25,6 +25,24 @@ def test_unverified_stale_foreign_and_nonfinite_mail_cannot_authorize(env):
         o.mailbox_observed(m,cfg,'default','scan',tool,{'account':account,'message':{'id':'m','received_at':received,'unread':True}},status,verified)
     with m.connect() as c:assert c.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'mail-evidence:%'").fetchone()[0]==0
 
+
+def test_stale_observer_metadata_is_pruned(env,monkeypatch):
+    from types import SimpleNamespace
+    _,m,_,cfg,_,_=env;o=load('observers');now=time.time()
+    monkeypatch.setattr(o,'time',SimpleNamespace(time=lambda:now))
+    cfg.update(owner_id='owner',mailbox_evidence={'tool':'exact-read','account':'fixture'})
+    with m.connect() as c:
+        c.execute('INSERT INTO meta VALUES(?,?)',('mail-evidence:owner:default:old:m',json.dumps({'observed_at':now-301}).encode()))
+        c.execute('INSERT INTO meta VALUES(?,?)',('completion:owner:default:old:turn',str(now-86401).encode()))
+        c.execute('INSERT INTO meta VALUES(?,?)',('completion:owner:default:legacy:turn',b'notified'))
+    received=now-60
+    o.mailbox_observed(m,cfg,'default','scan','exact-read',{'account':'fixture','message':{'id':'m','received_at':received,'unread':True}},'ok',True)
+    with m.connect() as c:
+        assert c.execute("SELECT COUNT(*) FROM meta WHERE key='mail-evidence:owner:default:old:m'").fetchone()[0]==0
+        assert c.execute("SELECT COUNT(*) FROM meta WHERE key='completion:owner:default:old:turn'").fetchone()[0]==0
+        assert float(c.execute("SELECT value FROM meta WHERE key='completion:owner:default:legacy:turn'").fetchone()[0])==now
+        assert c.execute("SELECT COUNT(*) FROM meta WHERE key='mail-evidence:owner:default:scan:m'").fetchone()[0]==1
+
 def test_gmail_raw_metadata_is_source_fact_not_urgency():
     o=load('observers');cfg={'adapter':'gmail','account':'fixture'}
     result=o.mailbox_facts({'messages':[{'id':'m','internalDate':'1792137600000','labelIds':['INBOX','UNREAD'],'snippet':'Synthetic content'}]},cfg)

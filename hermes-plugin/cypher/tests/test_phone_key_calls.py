@@ -100,12 +100,13 @@ def test_openai_token_endpoint_never_mints_a_google_token(harness, monkeypatch):
     assert 'phone-held key' in result.text
 
 
-def test_openai_media_diagnostic_is_admitted(harness):
+@pytest.mark.parametrize('stage', ['provider_ready', 'provider_key_ready'])
+def test_openai_media_diagnostic_is_admitted(harness,stage):
     api, client, _, _, _ = harness
     call_id = client.post('/api/plugins/cypher/mobile/calls', json={'profile': 'default'}).json()['call_id']
     result = client.post(f'/api/plugins/cypher/mobile/calls/{call_id}/events', json={'events': [{
         'event_id': 'openai-ready', 'turn_id': 'connection', 'type': 'media_diagnostic',
-        'at_ms': 100, 'provider': 'openai', 'stage': 'provider_ready',
+        'at_ms': 100, 'provider': 'openai', 'stage': stage,
     }]})
 
     assert result.status_code == 200

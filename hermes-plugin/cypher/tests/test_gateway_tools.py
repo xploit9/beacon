@@ -256,6 +256,113 @@ def test_post_dispatch_http_exception_preserves_uncertainty_and_code(gateway):
     assert 'Secret account' not in json.dumps(result) and 'before execution' not in result['reason']
 
 
+def test_generic_pre_dispatch_failure_is_failed_not_uncertain(gateway):
+    api,backend,_=gateway;original=backend.catalog;calls=0
+    def fail_worker_catalog():
+        nonlocal calls
+        calls+=1
+        if calls>1: raise RuntimeError('Private catalog failure')
+        return original()
+    backend.catalog=fail_worker_catalog
+    invoke(api)
+    result=settled(api)
+    assert result['status']=='failed' and 'Private catalog failure' not in json.dumps(result)
+
+
+def test_generic_read_only_failure_is_failed_not_uncertain(gateway):
+    api,backend,_=gateway
+    def fail(*args): raise RuntimeError('Private read failure')
+    backend.execute=fail
+    invoke(api)
+    result=settled(api)
+    assert result['status']=='failed' and 'Private read failure' not in json.dumps(result)
+
+
+def test_executor_submission_failure_settles_receipt_and_releases_slot(gateway,monkeypatch):
+    api,_,_=gateway
+    def fail_submit(*args,**kwargs): raise RuntimeError('Private executor failure')
+    monkeypatch.setattr(g.POOL,'submit',fail_submit)
+    with pytest.raises(HTTPException) as error: invoke(api)
+    assert error.value.status_code==503
+    receipt=api.status(SCOPE,'r1')
+    assert receipt['status']=='failed' and 'Private executor failure' not in json.dumps(receipt)
+    assert g.SLOTS.acquire(blocking=False)
+    g.SLOTS.release()
+
+
+def test_global_receipt_cap_prunes_closed_call_history(gateway,monkeypatch):
+    api,_,mobile=gateway
+    monkeypatch.setattr(g,'MAX_RECEIPTS',1,raising=False)
+    now=time.time()
+    with mobile.connect() as conn:
+        conn.execute('CREATE TABLE calls(id TEXT PRIMARY KEY,owner TEXT,profile TEXT,created REAL,closed INTEGER)')
+        conn.execute('INSERT INTO calls VALUES(?,?,?,?,?)',('old-call','owner','profile',now-10,1))
+        conn.execute('INSERT INTO calls VALUES(?,?,?,?,?)',('call','owner','profile',now,0))
+        conn.execute('''CREATE TABLE IF NOT EXISTS tool_receipts (
+            owner TEXT,provider TEXT,profile TEXT,call_id TEXT,request_id TEXT,
+            signature TEXT NOT NULL,payload TEXT NOT NULL,updated REAL NOT NULL,
+            PRIMARY KEY(owner,provider,profile,call_id,request_id))''')
+        conn.execute('INSERT INTO tool_receipts VALUES(?,?,?,?,?,?,?,?)',
+                     ('owner','password','profile','old-call','old','sig',json.dumps({'status':'completed'}),now-10))
+    invoke(api)
+    assert settled(api)['status']=='completed'
+    with mobile.connect() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM tool_receipts').fetchone()[0]==1
+        assert conn.execute("SELECT COUNT(*) FROM tool_receipts WHERE call_id='old-call'").fetchone()[0]==0
+
+
+def test_global_receipt_cap_rejects_when_only_live_receipts_remain(gateway,monkeypatch):
+    api,backend,mobile=gateway
+    monkeypatch.setattr(g,'MAX_RECEIPTS',1)
+    now=time.time()
+    with mobile.connect() as conn:
+        conn.execute('CREATE TABLE calls(id TEXT PRIMARY KEY,owner TEXT,profile TEXT,created REAL,closed INTEGER)')
+        conn.execute('INSERT INTO calls VALUES(?,?,?,?,?)',('call','owner','profile',now,0))
+        conn.execute('''CREATE TABLE IF NOT EXISTS tool_receipts (
+            owner TEXT,provider TEXT,profile TEXT,call_id TEXT,request_id TEXT,
+            signature TEXT NOT NULL,payload TEXT NOT NULL,updated REAL NOT NULL,
+            PRIMARY KEY(owner,provider,profile,call_id,request_id))''')
+        conn.execute('INSERT INTO tool_receipts VALUES(?,?,?,?,?,?,?,?)',
+                     ('owner','password','profile','call','running','sig',json.dumps({'status':'running'}),now))
+    with pytest.raises(HTTPException) as error: invoke(api)
+    assert error.value.status_code==429 and backend.calls==[]
+    with mobile.connect() as conn: assert conn.execute('SELECT COUNT(*) FROM tool_receipts').fetchone()[0]==1
+
+
+def test_cancelled_lookup_retrieves_worker_exception(tmp_path):
+    import asyncio
+    import gc
+    from types import SimpleNamespace
+    started=threading.Event();release=threading.Event();finished=threading.Event()
+    class ExplodingGateway:
+        def __init__(self,*args): pass
+        def discover(self,*args):
+            started.set();release.wait(2);finished.set()
+            raise RuntimeError('Private detached lookup failure')
+    monkeypatcher=pytest.MonkeyPatch()
+    try:
+        monkeypatcher.setitem(sys.modules,'cypher_gateway_tools',SimpleNamespace(Gateway=ExplodingGateway))
+        module_spec=importlib.util.spec_from_file_location('cypher_gateway_api_cancel_test',ROOT/'gateway_api.py')
+        api=importlib.util.module_from_spec(module_spec);module_spec.loader.exec_module(api)
+        router=api.build_router(lambda *args,**kwargs:('owner','password',{'profile':'profile'},{}),
+                                lambda *args,**kwargs:{},lambda profile,fn:fn(tmp_path),Mobile(tmp_path/'api.sqlite'))
+        endpoint=next(route.endpoint for route in router.routes if route.path.endswith('/tools'))
+        async def exercise():
+            loop=asyncio.get_running_loop();errors=[]
+            loop.set_exception_handler(lambda _,context:errors.append(context))
+            request=asyncio.create_task(endpoint('call',None,''))
+            assert await asyncio.to_thread(started.wait,1)
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError): await request
+            release.set()
+            assert await asyncio.to_thread(finished.wait,1)
+            await asyncio.sleep(.05);gc.collect();await asyncio.sleep(0)
+            assert not any(context.get('message')=='Task exception was never retrieved' for context in errors)
+        asyncio.run(exercise())
+    finally:
+        release.set();monkeypatcher.undo()
+
+
 def test_http_failure_inside_scraper_payload_is_not_success(gateway):
     api,backend,_=gateway
     for code in (401,403,429,500,'502'):

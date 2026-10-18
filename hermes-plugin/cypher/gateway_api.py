@@ -28,9 +28,9 @@ def build_router(call, body, scoped, mobile):
             try: return fn(*args)
             finally: admissions.release()
         task=asyncio.create_task(asyncio.to_thread(run))
+        task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
         try: return await asyncio.wait_for(asyncio.shield(task),15)
         except asyncio.TimeoutError:
-            task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
             raise HTTPException(504,'Tool lookup still settling; inspect the same request identity') from None
 
     @router.get('/mobile/calls/{call_id}/tools')

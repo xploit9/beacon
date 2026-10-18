@@ -38,7 +38,13 @@ def tick(mobile,native,cfg,profile,now):
     return {'state':'pending','event_id':event}
 
 
-def run(plugin_root,profile):
+def run(plugin_root,profile,timezone_name=None,now=None):
+    if timezone_name is None and now is None:
+        import hermes_time
+        timezone_name=hermes_time.get_timezone_name();now=hermes_time.now()
+    elif timezone_name is None or now is None:
+        raise ValueError('Check-up clock must include the target profile timezone and time')
+    if timezone_name!='Asia/Dubai': raise ValueError('Profile clock must resolve to Asia/Dubai')
     import importlib.util
     from pathlib import Path
     import sys
@@ -48,8 +54,6 @@ def run(plugin_root,profile):
         if key not in sys.modules:
             spec=importlib.util.spec_from_file_location(key,root/(name+'.py'))
             module=importlib.util.module_from_spec(spec);sys.modules[key]=module;spec.loader.exec_module(module)
-    import hermes_time
     mobile=sys.modules['cypher_mobile']
-    if hermes_time.get_timezone_name()!='Asia/Dubai': raise ValueError('Profile clock must resolve to Asia/Dubai')
-    tick(mobile,sys.modules['cypher_native'],mobile.settings(),profile,hermes_time.now())
+    tick(mobile,sys.modules['cypher_native'],mobile.settings(),profile,now)
     # Empty stdout makes no_agent native runs silent. The owned durable outbox wakes the phone.
