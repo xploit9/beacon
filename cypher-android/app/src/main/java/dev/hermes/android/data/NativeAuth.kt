@@ -230,6 +230,7 @@ class NativeAuth internal constructor(
             .post(payload.toString().toRequestBody(JSON_MEDIA)).build()
         return try {
             client.newCall(request).execute().use { response ->
+                if (response.code == 401 && previous != null) throw NativeAuthException("Hermes sign-in expired. Sign in again.", sessionExpired = true)
                 val body = response.body?.source()?.let { source -> source.request(MAX_RESPONSE_BYTES + 1L); source.buffer.readByteArray(minOf(source.buffer.size, MAX_RESPONSE_BYTES + 1L)) } ?: ByteArray(0)
                 if (body.size > MAX_RESPONSE_BYTES) throw NativeAuthException(GENERIC_ERROR_MESSAGE)
                 val json = runCatching { JSONObject(String(body, StandardCharsets.UTF_8)) }
@@ -255,6 +256,7 @@ class NativeAuth internal constructor(
                     owner = owner,
                     profile = previous?.profile ?: "default",
                     provider = json.optString("provider", previous?.provider.orEmpty()),
+                    issuedAt = System.currentTimeMillis() / 1000,
                 )
             }
         } catch (error: NativeAuthException) {

@@ -200,10 +200,18 @@ class SetupWizardUiTest {
         fixture.installCustomTabSeam()
         try {
             val transport = fixture.client.http.newBuilder().cookieJar(CookieJar.NO_COOKIES).build()
-            val result = NativeAuth(fixture.scope.origin, transport).authorize(compose.activity)
+            val outcome = runCatching { NativeAuth(fixture.scope.origin, transport).authorize(compose.activity) }
+            fixture.callbackFailure?.let { throw AssertionError("Synthetic OAuth callback failed", it) }
+            val result = outcome.getOrThrow()
             assertEquals(fixture.scope.owner, result.owner)
             assertEquals(1, fixture.customTabLaunches)
-            assertTrue(fixture.requests.filter { it.string("path").startsWith("/auth/native/") }.all { !it.has("body") })
+            val authRequests = fixture.requests.filter { it.string("path").startsWith("/auth/native/") }
+            val tokenFields = authRequests.single { it.string("path") == "/auth/native/token" }.getJSONArray("body_fields")
+            assertTrue((0 until tokenFields.length()).any { tokenFields.optString(it) == "code_verifier" })
+            assertTrue(authRequests.all { request ->
+                val fields = request.optJSONArray("body_fields") ?: return@all false
+                (0 until fields.length()).none { fields.optString(it) in setOf("username", "password") }
+            })
         } finally {
             fixture.clearCustomTabSeam()
             fixture.client.closeNative()

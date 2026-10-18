@@ -20,6 +20,7 @@ import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -277,6 +278,7 @@ class NativeAuthTest {
 
         assertEquals(1, requests.size)
         assertTrue(result.all { it.accessToken == "fresh-access" && it.refreshToken == "fresh-refresh" })
+        assertTrue(result.all { it.issuedAt > 0 })
         val payload = Buffer().also { requests.single().body!!.writeTo(it) }.readUtf8()
         assertEquals("old-refresh", JSONObject(payload).getString("refresh_token"))
     }
@@ -304,6 +306,30 @@ class NativeAuthTest {
         assertEquals("Bearer old-access", requests[0].header("Authorization"))
         assertEquals("Bearer fresh-access", requests[2].header("Authorization"))
         client.closeNative()
+    }
+
+    @Test fun refreshUnauthorizedClearsRejectedBearerForJsonAndHtmlBodies() = runBlocking {
+        val origin = "https://native.example"
+        for ((body, mediaType) in listOf(
+            """{"detail":"Unauthorized"}""" to "application/json",
+            "<html>Unauthorized</html>" to "text/html",
+        )) {
+            val requests = CopyOnWriteArrayList<Request>()
+            val original = NativeBearerRecord("old-access", "old-refresh", 0, origin, "owner", "work", "fixture")
+            val client = CypherClient(AuthContext(origin, emptyList(), original.owner, original.profile, backend = "hermes-dashboard", bearer = original), null) { builder ->
+                builder.addInterceptor { chain ->
+                    val request = chain.request(); requests += request
+                    val refresh = request.url.encodedPath == "/auth/native/refresh"
+                    Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(401).message("Unauthorized")
+                        .body((if (refresh) body else """{"detail":"Unauthorized"}""").toResponseBody(mediaType.toMediaType())).build()
+                }
+            }
+
+            assertTrue(runCatching { client.get("/api/auth/me") }.exceptionOrNull() is NativeAuthExpiredException)
+            assertNull("A rejected refresh credential must be removed", client.auth.bearer)
+            assertEquals(listOf("/api/auth/me", "/auth/native/refresh"), requests.map { it.url.encodedPath })
+            client.closeNative()
+        }
     }
 
     @Test fun wsTicketAndPluginRequestsShareTheSameBearerWithoutSendingLegacyCookies() = runBlocking {

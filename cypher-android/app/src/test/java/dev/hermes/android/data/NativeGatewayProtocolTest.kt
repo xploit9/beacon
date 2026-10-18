@@ -19,6 +19,7 @@ class NativeGatewayProtocolTest {
         val sent = mutableListOf<JSONObject>()
         var approvalMode = "manual"
         var ignoreApprovalWrite = false
+        var ignoreYoloWrite = false
         var yoloAcknowledgement = "0"
         var sessionBypass: Boolean? = false
         var failPrompt = false
@@ -50,7 +51,13 @@ class NativeGatewayProtocolTest {
                         "session.steer" -> json("status" to "queued")
                         "session.list" -> json("sessions" to JSONArray().put(json("id" to "visible", "title" to "Visible title", "secret_metadata" to "not-searchable")).apply { if (call.getJSONObject("params").optBoolean("include_hidden")) { put(json("id" to "hidden", "title" to "Archived title")); put(json("id" to "hidden", "title" to "Archived title")) } })
                         "config.get" -> json("value" to approvalMode)
-                        "config.set" -> { val params = call.getJSONObject("params"); if (params.getString("key") == "approvals.mode" && !ignoreApprovalWrite) approvalMode = params.getString("value"); json("key" to params.getString("key"), "value" to if (params.getString("key") == "yolo") yoloAcknowledgement else params.getString("value")) }
+                        "config.set" -> {
+                            val params = call.getJSONObject("params"); val key = params.getString("key"); val value = params.getString("value")
+                            if (key == "approvals.mode" && !ignoreApprovalWrite) approvalMode = value
+                            val echo = if (key == "yolo") yoloAcknowledgement else value
+                            if (key == "yolo" && !ignoreYoloWrite && echo == (if (value in setOf("1", "on")) "1" else "0") && (value != "off" || sessionBypass != null)) sessionBypass = value in setOf("1", "on", "true")
+                            json("key" to key, "value" to echo)
+                        }
                         "commands.catalog" -> json("pairs" to JSONArray().put(JSONArray().put("/help").put("Help")))
                         else -> JSONObject()
                     }
@@ -92,7 +99,7 @@ class NativeGatewayProtocolTest {
         }
     }
     @Test fun approvalsUseNativeProfileModesAndRemoveOnlyTheSelectedSessionBypass() = runBlocking {
-        val wire = Wire(); val c = client(wire)
+        val wire = Wire().apply { sessionBypass = true }; val c = client(wire)
         for (mode in nativeApprovalModes) {
             val result = c.call("/api/approval/mode", method = "POST", data = json("session_id" to "stored-a", "mode" to mode, "scope_key" to c.scope.session("stored-a").key))
             assertEquals(mode, result.getString("value"))
@@ -117,11 +124,38 @@ class NativeGatewayProtocolTest {
         c.closeNative()
     }
     @Test fun profileManualModeDoesNotHideAConversationBypass() = runBlocking {
-        val wire = Wire().apply { sessionBypass = true }; val c = client(wire)
+        val wire = Wire().apply { sessionBypass = true; ignoreYoloWrite = true }; val c = client(wire)
         val result = c.get("/api/approval/mode", mapOf("session_id" to "stored-a"))
         assertEquals("off", result.getString("value")); assertEquals("manual", result.getString("profile_mode"))
         assertTrue(result.getBoolean("session_bypass")); assertEquals("stored-a", result.getString("session_id"))
         assertTrue(runCatching { c.call("/api/approval/mode", method="POST", data=json("session_id" to "stored-a", "mode" to "manual", "scope_key" to c.scope.session("stored-a").key)) }.isFailure)
+        c.closeNative()
+    }
+    @Test fun perChatYoloUsesRuntimeSessionAndRefreshesItsEffectiveState() = runBlocking {
+        val wire = Wire().apply { yoloAcknowledgement = "1" }; val c = client(wire)
+        val result = c.call("/api/approval/mode", method = "POST", data = json("session_id" to "stored-a", "yolo" to true, "scope_key" to c.scope.session("stored-a").key))
+        val write = wire.sent.single { it.getString("method") == "config.set" }.getJSONObject("params")
+        assertEquals("yolo", write.getString("key")); assertEquals("1", write.getString("value"))
+        assertEquals("session", write.getString("scope")); assertEquals("runtime-a", write.getString("session_id"))
+        assertTrue(result.getBoolean("session_bypass")); assertEquals("manual", result.getString("profile_mode"))
+        assertEquals("stored-a", result.getString("session_id"))
+        c.closeNative()
+    }
+    @Test fun perChatYoloRejectsAFalseEnableEcho() = runBlocking {
+        val wire = Wire().apply { yoloAcknowledgement = "0" }; val c = client(wire)
+        assertTrue(runCatching { c.call("/api/approval/mode", method = "POST", data = json("session_id" to "stored-a", "yolo" to true, "scope_key" to c.scope.session("stored-a").key)) }.isFailure)
+        val write = wire.sent.single { it.getString("method") == "config.set" }.getJSONObject("params")
+        assertEquals("yolo", write.getString("key")); assertEquals("1", write.getString("value"))
+        assertFalse(wire.sent.any { it.getString("method") == "config.set" && it.getJSONObject("params").getString("key") == "approvals.mode" })
+        c.closeNative()
+    }
+    @Test fun perChatYoloCanBeDisabledToRestoreProfilePolicy() = runBlocking {
+        val wire = Wire().apply { sessionBypass = true }; val c = client(wire)
+        val result = c.call("/api/approval/mode", method = "POST", data = json("session_id" to "stored-a", "yolo" to false, "scope_key" to c.scope.session("stored-a").key))
+        val write = wire.sent.single { it.getString("method") == "config.set" }.getJSONObject("params")
+        assertEquals("yolo", write.getString("key")); assertEquals("0", write.getString("value"))
+        assertEquals("runtime-a", write.getString("session_id")); assertEquals("session", write.getString("scope"))
+        assertFalse(result.getBoolean("session_bypass")); assertEquals("manual", result.getString("value"))
         c.closeNative()
     }
     @Test fun approvalModeNeverChangesIfNativeBypassWasNotDisabled() = runBlocking {

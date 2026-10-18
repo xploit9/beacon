@@ -19,6 +19,12 @@ private const val OPTIONAL_VOICE_HISTORY_TIMEOUT_MS = 1_500L
 
 internal class NativeOperations(private val c: CypherClient) {
     suspend fun call(path: String, q: Map<String, String>, method: String, body: JSONObject?, maxBytes: Int): JSONObject = try { dispatch(path, q, method, body, maxBytes) } finally { c.closeNative() }
+    /** Adapts Hermes Relay's session-scoped GatewayChatClient.setYolo wire contract. */
+    private suspend fun setSessionYolo(target: NativeSessionBinding, enabled: Boolean) {
+        val value = if (enabled) "1" else "0"
+        val result = c.nativeRpc("config.set", json("session_id" to target.runtimeSessionId, "key" to "yolo", "value" to value, "scope" to "session"))
+        require(result.string("value") == value) { "Hermes did not confirm the chat YOLO state. Refresh before trying again." }
+    }
     private suspend fun dispatch(path: String, q: Map<String, String>, method: String, body: JSONObject?, maxBytes: Int): JSONObject {
         require(q["profile"] == null || q["profile"] == c.auth.profile) { "Native request belongs to another profile" }
         require(body?.has("profile") != true || body.string("profile") == c.auth.profile) { "Native request belongs to another profile" }
@@ -101,27 +107,39 @@ internal class NativeOperations(private val c: CypherClient) {
             }
             "/api/approval/mode" -> {
                 require(method in setOf("GET", "POST")) { "Unsupported approval setting operation" }
+                val yoloWrite = method == "POST" && d.has("yolo")
                 if (method == "POST") {
-                    require(d.keys().asSequence().all { it in setOf("session_id", "mode", "scope_key") } && d.string("mode") in nativeApprovalModes) { "Choose a native approval mode" }
+                    val allowed = if (yoloWrite) setOf("session_id", "yolo", "scope_key") else setOf("session_id", "mode", "scope_key")
+                    require(d.keys().asSequence().all { it in allowed } && (if (yoloWrite) d.opt("yolo") is Boolean else d.string("mode") in nativeApprovalModes)) { "Choose a native approval mode or chat YOLO state" }
                     require(d.string("scope_key") == c.scope.session(sid()).key) { "Reopen Approvals in the original account and profile" }
-                    val selected = d.getString("mode")
                     val target = binding()
                     require(d.string("scope_key") == c.scope.session(target.storedSessionId).key) { "Refresh the resolved conversation before changing approvals" }
-                    // A deliberate mode choice makes this chat follow its profile instead of a session bypass.
-                    val bypass = c.nativeRpc("config.set", json("session_id" to target.runtimeSessionId, "key" to "yolo", "value" to "off", "scope" to "session"))
-                    require(bypass.string("value") == "0") { "The conversation still has an independent approval bypass. Refresh before trying again." }
-                    val applied = c.nativeRpc("config.set", json("key" to "approvals.mode", "value" to selected))
-                    require(applied.string("value") == selected) { "Hermes did not confirm the approval mode. Refresh before trying again." }
+                    if (yoloWrite) {
+                        if (d.getBoolean("yolo")) {
+                            val profileMode = c.nativeRpc("config.get", json("key" to "approvals.mode")).string("value")
+                            require(profileMode in nativeApprovalModes) { "Hermes returned an unrecognized approval mode" }
+                            require(profileMode != "off") { "Profile approvals are Off, so this chat already bypasses prompts. Choose Manual or Smart before using the per-chat override." }
+                        }
+                        setSessionYolo(target, d.getBoolean("yolo"))
+                    } else {
+                        val selected = d.getString("mode")
+                        // A deliberate mode choice makes this chat follow its profile instead of a session bypass.
+                        val bypass = c.nativeRpc("config.set", json("session_id" to target.runtimeSessionId, "key" to "yolo", "value" to "off", "scope" to "session"))
+                        require(bypass.string("value") == "0") { "The conversation still has an independent approval bypass. Refresh before trying again." }
+                        val applied = c.nativeRpc("config.set", json("key" to "approvals.mode", "value" to selected))
+                        require(applied.string("value") == selected) { "Hermes did not confirm the approval mode. Refresh before trying again." }
+                    }
                 }
                 val result = c.nativeRpc("config.get", json("key" to "approvals.mode"))
                 require(result.string("value") in nativeApprovalModes) { "Hermes returned an unrecognized approval mode" }
-                require(method == "GET" || result.string("value") == d.string("mode")) { "Hermes did not activate the selected approval mode. Refresh to check for an override or another change." }
+                if (!yoloWrite) require(method == "GET" || result.string("value") == d.string("mode")) { "Hermes did not activate the selected approval mode. Refresh to check for an override or another change." }
                 val target = binding()
                 val fresh = c.nativeRpc("session.resume", json("session_id" to target.storedSessionId, "omit_messages" to true, "close_on_disconnect" to false))
                 require(nativeSessionBinding(c.scope, fresh).storedSessionId == target.storedSessionId) { "Approval status belongs to another conversation" }
                 val bypass = fresh.optJSONObject("info")?.opt("yolo")
                 val profileMode = result.getString("value")
-                require(method == "GET" || d.string("mode") == "off" || bypass != true) { "A host approval bypass remains enabled. Check Hermes before continuing." }
+                if (yoloWrite) require((bypass == true) == d.getBoolean("yolo")) { "Hermes did not confirm the chat YOLO state. Refresh before trying again." }
+                else require(method == "GET" || d.string("mode") == "off" || bypass != true) { "A host approval bypass remains enabled. Check Hermes before continuing." }
                 return result.put("profile_mode", profileMode).put("value", if (bypass == true) "off" else profileMode).put("session_status_known", bypass is Boolean).put("session_bypass", bypass == true && profileMode != "off").put("session_id", target.storedSessionId).put("scope_key", c.scope.key)
             }
             "/api/approval/respond", "/api/clarify/respond" -> {
