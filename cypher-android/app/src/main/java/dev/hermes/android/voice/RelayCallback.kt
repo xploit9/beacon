@@ -146,7 +146,9 @@ class RelayCallbackProtocol {
     /** Call on sign-out, re-pairing, scope changes and opt-out, even without incoming traffic. */
     @Synchronized fun invalidate(binding: RelayCallbackBinding?, prefs: RelayCallbackPreferences?): RelayCallbackTransition? {
         val call = current?.takeUnless { it.phase == RelayCallbackPhase.Finished } ?: return null
-        if (authorized(call, binding, prefs)) return null
+        if (binding == null || !binding.valid || binding != call.binding) return finish(call, missed = call.phase == RelayCallbackPhase.Ringing)
+        if (prefs == null) return null
+        if (RelayCallbackPolicy.callsAllowed(prefs, binding.connectionId)) return null
         return finish(call, missed = call.phase == RelayCallbackPhase.Ringing)
     }
 
@@ -165,7 +167,7 @@ class RelayCallbackProtocol {
             return RelayCallbackTransition(call, action(call, "ringing"))
         }
         val call = current?.takeUnless { it.phase == RelayCallbackPhase.Finished } ?: return null
-        expire(now, elapsed)?.let { return it }
+        expire(now, elapsed, binding, prefs)?.let { return it }
         val payload = envelope.payload
         // State inherits the trusted invitation binding; supplied scope fields must also agree.
         if (payload.has("profile") && payload.opt("profile") != call.binding.profile ||
@@ -191,10 +193,18 @@ class RelayCallbackProtocol {
     @Synchronized fun answer(id: String?, token: String?, binding: RelayCallbackBinding?, prefs: RelayCallbackPreferences?,
         now: Long, elapsed: Long): RelayCallbackTransition? {
         val call = current ?: return null
-        if (id != call.callId || token != call.actionToken || !authorized(call, binding, prefs) ||
-            call.phase != RelayCallbackPhase.Ringing || call.remainingRingMillis(now, elapsed) == 0L ||
-            elapsed > Long.MAX_VALUE - RelayCallback.START_WINDOW_MS) return null
-        val answering = call.copy(phase = RelayCallbackPhase.Answering, startDeadlineElapsed = elapsed + RelayCallback.START_WINDOW_MS)
+        val retrying = call.phase == RelayCallbackPhase.Answering
+        val canAnswer = when (call.phase) {
+            RelayCallbackPhase.Ringing -> call.remainingRingMillis(now, elapsed) > 0L &&
+                elapsed <= Long.MAX_VALUE - RelayCallback.START_WINDOW_MS
+            RelayCallbackPhase.Answering -> now >= call.arrivedAt && elapsed >= call.arrivedElapsed &&
+                elapsed < call.startDeadlineElapsed
+            else -> false
+        }
+        if (id != call.callId || token != call.actionToken || !authorized(call, binding, prefs) || !canAnswer) return null
+        if (retrying) return RelayCallbackTransition(call)
+        val answering = call.copy(phase = RelayCallbackPhase.Answering,
+            startDeadlineElapsed = elapsed + RelayCallback.START_WINDOW_MS)
         current = answering
         val outgoing = action(answering, "answer")
         answerId = outgoing.getString("id")
@@ -204,16 +214,25 @@ class RelayCallbackProtocol {
     @Synchronized fun decline(id: String?, token: String?, binding: RelayCallbackBinding?, prefs: RelayCallbackPreferences?,
         now: Long, elapsed: Long): RelayCallbackTransition? {
         val call = current ?: return null
+        val canDecline = when (call.phase) {
+            RelayCallbackPhase.Ringing -> call.remainingRingMillis(now, elapsed) > 0L
+            RelayCallbackPhase.Answering -> now >= call.arrivedAt && elapsed >= call.arrivedElapsed && elapsed < call.startDeadlineElapsed
+            else -> false
+        }
         if (id != call.callId || token != call.actionToken || !authorized(call, binding, prefs) ||
-            call.phase != RelayCallbackPhase.Ringing || call.remainingRingMillis(now, elapsed) == 0L) return null
+            !canDecline) return null
         return finish(call, "decline")
     }
 
-    @Synchronized fun expire(now: Long, elapsed: Long): RelayCallbackTransition? {
+    @Synchronized fun expire(now: Long, elapsed: Long, binding: RelayCallbackBinding?,
+        prefs: RelayCallbackPreferences?): RelayCallbackTransition? {
+        invalidate(binding, prefs)?.let { return it }
         val call = current ?: return null
         if (call.phase == RelayCallbackPhase.Ringing && call.remainingRingMillis(now, elapsed) == 0L) return finish(call, missed = true)
         if (call.phase in setOf(RelayCallbackPhase.Answering, RelayCallbackPhase.Accepted, RelayCallbackPhase.Starting) &&
-            (now < call.arrivedAt || elapsed < call.arrivedElapsed || elapsed >= call.startDeadlineElapsed)) return finish(call, "failed")
+            (now < call.arrivedAt || elapsed < call.arrivedElapsed || elapsed >= call.startDeadlineElapsed)) {
+            return finish(call, if (authorized(call, binding, prefs)) "failed" else null)
+        }
         return null
     }
 

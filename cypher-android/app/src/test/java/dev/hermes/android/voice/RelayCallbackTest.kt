@@ -8,7 +8,7 @@ import org.junit.Test
 class RelayCallbackTest {
     private val id = "15be9220-e148-4c6b-8a42-6a749502ef36"
     private val binding = RelayCallbackBinding("connection", "phone", "work", "session", "https://native.example", "owner")
-    private val prefs = RelayCallbackPreferences("connection", false, true, true)
+    private val prefs = RelayCallbackPreferences("connection", calls = true, keepConnected = true)
     private fun payload(callId: String = id) = JSONObject().put("call_id", callId).put("device_id", "phone")
         .put("profile", "work").put("session_id", "session").put("title", "Hermes").put("reason", "Check in")
         .put("created_at", 1000L).put("expires_at", 21000L).put("status", "ringing")
@@ -113,7 +113,7 @@ class RelayCallbackTest {
 
     @Test fun `receive requires current connection bound calls consent and cannot start voice`() {
         for (snapshot in listOf(null, prefs.copy(connectionId = null), prefs.copy(connectionId = "foreign"),
-            prefs.copy(calls = false, messages = true), prefs.copy(keepConnected = false))) {
+            prefs.copy(calls = false), prefs.copy(keepConnected = false))) {
             val protocol = RelayCallbackProtocol()
             assertNull(protocol.receive(envelope(), binding, snapshot, 1000, 50))
             assertNull(protocol.current)
@@ -153,8 +153,41 @@ class RelayCallbackTest {
         assertFalse(effect.stopVoice)
         assertEquals(2, effect.outgoing!!.getJSONObject("payload").length())
         assertFalse(effect.outgoing.toString().contains(call.actionToken))
-        assertNull(protocol.answer(id, call.actionToken, binding, prefs, 1000, 50))
+        val retry = protocol.answer(id, call.actionToken, binding, prefs, 1000, 50)!!
+        assertEquals(effect.call.startDeadlineElapsed, retry.call.startDeadlineElapsed)
+        assertNull(retry.outgoing)
+        assertNull(protocol.answer(id, call.actionToken, binding, prefs, 1000, effect.call.startDeadlineElapsed))
         assertFalse(start(protocol))
+    }
+
+    @Test fun `answer can be retried after local setup without extending the start deadline`() {
+        val protocol = invite()
+        val first = answer(protocol)
+        val deadline = first.call.startDeadlineElapsed
+
+        val retry = protocol.answer(id, first.call.actionToken, binding, prefs, 2_000, 1_050)
+
+        assertNotNull(retry)
+        assertEquals(RelayCallbackPhase.Answering, retry!!.call.phase)
+        assertEquals(deadline, retry.call.startDeadlineElapsed)
+        assertNull(retry.outgoing)
+        val accepted = protocol.receive(
+            envelope("phone.call.state", payload().put("status", "accepted"), first.outgoing!!.getString("id")),
+            binding, prefs, 2_000, 1_050,
+        )
+        assertEquals(RelayCallbackPhase.Accepted, accepted!!.call.phase)
+    }
+
+    @Test fun `answering call can still be declined or ended before startup`() {
+        val declined = invite()
+        val token = answer(declined).call.actionToken
+        val decline = declined.decline(id, token, binding, prefs, 2_000, 1_050)
+        assertEquals("decline", verb(decline))
+        assertFalse(decline!!.stopVoice)
+
+        val ended = invite()
+        val answering = answer(ended).call
+        assertEquals("failed", verb(ended.end(id, answering.actionToken, binding, prefs)))
     }
 
     @Test fun `only correlated accepted acknowledgement advances an explicit answer`() {
@@ -210,12 +243,12 @@ class RelayCallbackTest {
         assertNull(protocol.receive(envelope("phone.call.state", payload().put("status", "accepted")), binding, prefs, 1000, 50))
         assertNull(protocol.decline(id, decline.call.actionToken, binding, prefs, 1000, 50))
         val expired = invite(now = 20000)
-        val missed = expired.expire(20000, 1050)!!
+        val missed = expired.expire(20000, 1050, binding, prefs)!!
         assertTrue(missed.missed)
         assertNull(missed.outgoing)
         assertFalse(missed.stopVoice)
         assertFalse(start(expired))
-        assertNull(expired.expire(21000, 1050))
+        assertNull(expired.expire(21000, 1050, binding, prefs))
     }
 
     @Test fun `startup deadline and clock reset retire answering accepted and starting states`() {
@@ -223,15 +256,25 @@ class RelayCallbackTest {
             val protocol = invite()
             if (stage == 0) answer(protocol) else accept(protocol)
             if (stage == 2) assertTrue(start(protocol))
-            assertNull(protocol.expire(1000, 30049))
-            val failed = protocol.expire(1000, 30050)!!
+            assertNull(protocol.expire(1000, 30049, binding, prefs))
+            val failed = protocol.expire(1000, 30050, binding, prefs)!!
             assertEquals("failed", verb(failed))
             assertEquals(stage == 2, failed.stopVoice)
             assertFalse(foreground(protocol))
             assertNull(capture(protocol))
         }
-        assertTrue(invite().expire(999, 51)!!.missed)
-        assertEquals("failed", verb(accept(invite()).expire(1000, 49)))
+        assertTrue(invite().expire(999, 51, binding, prefs)!!.missed)
+        assertEquals("failed", verb(accept(invite()).expire(1000, 49, binding, prefs)))
+    }
+
+    @Test fun `startup expiry does not emit an action without current connection authority`() {
+        val protocol = invite()
+        answer(protocol)
+
+        val expired = protocol.expire(1_000, 30_050, binding.copy(connectionId = "foreign"), prefs)
+
+        assertNotNull(expired)
+        assertNull(expired!!.outgoing)
     }
 
     @Test fun `only current action errors retire a call and terminal states stop owned voice once`() {
@@ -273,6 +316,20 @@ class RelayCallbackTest {
         assertTrue(effect.missed)
         assertFalse(effect.stopVoice)
         assertNull(effect.outgoing)
+    }
+
+    @Test fun `unknown preferences preserve active voice while lost binding still tears it down`() {
+        val protocol = accept(invite())
+        assertTrue(start(protocol))
+        assertTrue(foreground(protocol))
+        assertNotNull(capture(protocol))
+
+        assertNull(protocol.invalidate(binding, null))
+        assertEquals(RelayCallbackPhase.Connected, protocol.current!!.phase)
+
+        val invalidated = protocol.invalidate(null, null)!!
+        assertTrue(invalidated.stopVoice)
+        assertNull(invalidated.outgoing)
     }
 
     @Test fun `hangup is capability bound and delayed old actions cannot end next call`() {

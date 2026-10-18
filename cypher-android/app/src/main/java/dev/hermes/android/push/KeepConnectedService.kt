@@ -72,6 +72,10 @@ internal class KeepConnectedCursors(
 internal fun keepConnectedBackoffMs(failures: Int): Long =
     (1_000L * (1L shl (failures - 1).coerceIn(0, 6))).coerceAtMost(60_000L)
 
+internal const val KEEP_CONNECTED_MIN_CYCLE_MILLIS = 500L
+internal fun keepConnectedPollDelay(cycleDurationMillis: Long): Long =
+    (KEEP_CONNECTED_MIN_CYCLE_MILLIS - cycleDurationMillis.coerceAtLeast(0)).coerceAtLeast(0)
+
 /** One cursor and one admission callback per authorized Hermes profile. */
 internal class KeepConnectedPoller(
     private val origin: String,
@@ -151,7 +155,7 @@ internal fun prepareKeepConnectedCall(
 
     val connectionId = "${scope.origin}\u0000${scope.owner}\u0000${scope.profile}".digest()
     val binding = RelayCallbackBinding(connectionId, source, profile, session, scope.origin, scope.owner)
-    val preferences = RelayCallbackPreferences(connectionId, messages = false, calls = true, keepConnected = enabled)
+    val preferences = RelayCallbackPreferences(connectionId, calls = true, keepConnected = enabled)
     val payload = JSONObject()
         .put("call_id", eventId)
         .put("device_id", source)
@@ -291,8 +295,13 @@ class KeepConnectedService : Service() {
                     stopSelf()
                     return
                 }
+                val cycleStarted = SystemClock.elapsedRealtime()
                 when (val result = poller.pollOnce()) {
-                    KeepConnectedCycle.Connected -> setStatus(this, STATUS_CONNECTED)
+                    KeepConnectedCycle.Connected -> {
+                        setStatus(this, STATUS_CONNECTED)
+                        getSystemService(NotificationManager::class.java).cancel(SIGN_IN_NOTIFICATION_ID)
+                        delay(keepConnectedPollDelay(SystemClock.elapsedRealtime() - cycleStarted))
+                    }
                     is KeepConnectedCycle.Reconnecting -> {
                         setStatus(this, STATUS_RECONNECTING)
                         delay(result.delayMillis)
