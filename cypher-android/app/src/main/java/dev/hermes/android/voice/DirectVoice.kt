@@ -20,13 +20,22 @@ import kotlinx.coroutines.sync.withPermit
 
 internal data class DirectCallEnd(val notSent:Int=0,val submissionUnknown:Int=0)
 
-internal suspend fun testVoiceProvider(provider:String,apiKey:String,model:String):Boolean {
+internal enum class VoiceProviderTestResult { Success, KeyRejected, Unreachable, ProviderError }
+
+internal fun classifyVoiceProviderTestResponse(code:Int?):VoiceProviderTestResult = when(code) {
+    101 -> VoiceProviderTestResult.Success
+    401,403 -> VoiceProviderTestResult.KeyRejected
+    null -> VoiceProviderTestResult.Unreachable
+    else -> VoiceProviderTestResult.ProviderError
+}
+
+internal suspend fun testVoiceProvider(provider:String,apiKey:String,model:String):VoiceProviderTestResult {
     val request=runCatching { when(provider) {
         "gemini" -> GeminiWire.request(apiKey)
         "grok" -> GrokWire.request(apiKey,model)
         "openai" -> OpenAiWire.request(apiKey,model)
         else -> error("Unsupported voice provider")
-    } }.getOrNull()?:return false
+    } }.getOrNull()?:return VoiceProviderTestResult.ProviderError
     val http=OkHttpClient.Builder().cookieJar(CookieJar.NO_COOKIES).followRedirects(false).followSslRedirects(false).build()
     return try {
         withTimeoutOrNull(10000) {
@@ -34,17 +43,17 @@ internal suspend fun testVoiceProvider(provider:String,apiKey:String,model:Strin
                 val socket=http.newWebSocket(request.rawRequest(),object:WebSocketListener() {
                     override fun onOpen(webSocket:WebSocket,response:Response) {
                         webSocket.close(1000,"Credential test")
-                        if(continuation.isActive) continuation.resume(true)
+                        if(continuation.isActive) continuation.resume(classifyVoiceProviderTestResponse(response.code))
                     }
                     override fun onFailure(webSocket:WebSocket,error:Throwable,response:Response?) {
-                        if(continuation.isActive) continuation.resume(false)
+                        if(continuation.isActive) continuation.resume(classifyVoiceProviderTestResponse(response?.code))
                     }
                 })
                 continuation.invokeOnCancellation { socket.cancel() }
             }
-    }==true
+    } ?: VoiceProviderTestResult.Unreachable
     } catch(error:CancellationException) { throw error }
-    catch(_:Exception) { false
+    catch(_:Exception) { VoiceProviderTestResult.Unreachable
     } finally {
         http.dispatcher.cancelAll()
         http.connectionPool.evictAll()

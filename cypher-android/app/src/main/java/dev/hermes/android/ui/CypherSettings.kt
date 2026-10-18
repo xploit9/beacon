@@ -142,17 +142,21 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                     scope.launch {
                         val apiKey=entered.ifBlank { withContext(Dispatchers.IO) { store.key(provider).orEmpty() } }
                         if(apiKey.isBlank()) { status="Enter an API key first.";busy=false;return@launch }
-                        val connected=testVoiceProvider(provider,apiKey,model)
-                        if(connected) {
-                            val saved=runCatching { if(entered.isNotBlank()) withContext(Dispatchers.IO) { store.saveKey(provider,apiKey) };true }.getOrDefault(false)
-                            if(saved) {
-                                draft=""
-                                keyMask=withContext(Dispatchers.IO) { store.maskedKey(provider).orEmpty() }
-                                catalogRefresh++
-                                status="Connection succeeded. The key is stored on this phone."
-                                onKeySaved()
-                            } else status="Connection succeeded, but the key could not be saved."
-                        } else status="Connection failed. Check the key and provider access."
+                        when(testVoiceProvider(provider,apiKey,model)) {
+                            dev.hermes.android.voice.VoiceProviderTestResult.Success -> {
+                                val saved=runCatching { if(entered.isNotBlank()) withContext(Dispatchers.IO) { store.saveKey(provider,apiKey) };true }.getOrDefault(false)
+                                if(saved) {
+                                    draft=""
+                                    keyMask=withContext(Dispatchers.IO) { store.maskedKey(provider).orEmpty() }
+                                    catalogRefresh++
+                                    status="Connection succeeded. The key is stored on this phone."
+                                    onKeySaved()
+                                } else status="Connection succeeded, but the key could not be saved."
+                            }
+                            dev.hermes.android.voice.VoiceProviderTestResult.KeyRejected -> status="The provider rejected this key. Check the key and account access."
+                            dev.hermes.android.voice.VoiceProviderTestResult.Unreachable -> status="The provider could not be reached. Check your connection and try again."
+                            dev.hermes.android.voice.VoiceProviderTestResult.ProviderError -> status="The provider responded with an error. Check the selected model or try again."
+                        }
                         busy=false
                     }
                 },
