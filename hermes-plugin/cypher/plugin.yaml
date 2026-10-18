@@ -5,6 +5,7 @@ description: Native Cypher Android calls, text conversations and callbacks
 kind: standalone
 platforms: [windows, linux, macos]
 hooks: [on_session_end, post_tool_call, pre_llm_call]
+provides_hooks: [on_session_end, post_tool_call, pre_llm_call]
 provides_tools: [cypher_call_user, cypher_email_notice, cypher_mail_read]
 python_dependencies:
   - fastapi>=0.115,<1
