@@ -52,9 +52,9 @@ class RedesignKanbanTest {
         assertTrue(runCatching { boardTaskFields("Task", "x".repeat(16_001), "") }.isFailure)
         assertTrue(runCatching { boardTaskFields("Task", "", "evil\nprofile") }.isFailure)
         assertEquals("Task", boardTaskFields(" Task ", "Body", "work").getString("title"))
-        assertFalse(NativeOperationPolicy.direct("/api/plugins/kanban/tasks/t_1/force"))
-        assertFalse(NativeOperationPolicy.direct("/api/plugins/kanban/../settings"))
-        assertTrue(NativeOperationPolicy.direct("/api/plugins/kanban/tasks/t_1"))
+        assertFalse(NativeOperationPolicy.direct("/api/plugins/kanban/tasks/t_1/force", "GET"))
+        assertFalse(NativeOperationPolicy.direct("/api/plugins/kanban/../settings", "GET"))
+        assertTrue(NativeOperationPolicy.direct("/api/plugins/kanban/tasks/t_1", "GET"))
     }
     @Test fun boardParserPreservesRealStatusAndDeduplicates() {
         val rows = json("columns" to org.json.JSONArray().put(json("name" to "review", "tasks" to org.json.JSONArray().put(JSONObject(card)).put(JSONObject(card)))))

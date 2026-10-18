@@ -10,6 +10,7 @@ import dev.hermes.android.voice.CypherCallService
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.LocalActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -162,11 +163,24 @@ class CypherActivity : ComponentActivity() {
     }
 }
 
+internal fun historyTruncationMessage(raw: org.json.JSONObject): String? =
+    if (raw.optBoolean("history_truncated")) "Only the latest ${raw.optInt("history_limit", 500)} messages are loaded; older history may be incomplete." else null
+
+@Composable private fun HistoryTruncationNotice(vm: CypherViewModel) {
+    val chat by vm.chat.collectAsStateWithLifecycle()
+    historyTruncationMessage(chat.raw)?.let { message ->
+        Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth()) {
+            Text(message, Modifier.padding(horizontal = 16.dp, vertical = 10.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
 @Composable fun CypherTheme(dark: Boolean = isSystemInDarkTheme(), skin: String = "default", content: @Composable () -> Unit) {
     NativeSkinTheme(dark, skin, content)
 }
 
 @Composable internal fun CypherRoot(vm: CypherViewModel) {
+    val hostActivity = LocalActivity.current
     val ui by vm.ui.collectAsStateWithLifecycle()
     val botMode by vm.botMode.state.collectAsStateWithLifecycle()
     val botChatVisible = ui.tab == "More" && ui.morePage == "Bots" && botMode.activeBot != null && botMode.sessionId == vm.authenticatedScope()?.session
@@ -276,6 +290,7 @@ class CypherActivity : ComponentActivity() {
                                 TextButton(enabled = !ui.loading, onClick = { vm.connect(ui.origin) }) { Text(uiText("Reconnect")) }
                             }
                         }
+                        if (ui.tab in setOf("Chat", "Xara")) HistoryTruncationNotice(vm)
                         if (call.active && (ui.tab !in setOf("Chat","Xara") && !botChatVisible || call.conversationScope != vm.authenticatedScope())) Surface(color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.fillMaxWidth()) { Row(Modifier.padding(start = 16.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) { Text("Cypher · ${call.state}", Modifier.weight(1f)); TextButton(onClick = { vm.openCurrentCall() }) { Text(uiText("Open call")) }; IconButton(onClick = vm.app.calls::hangup) { Icon(Icons.Rounded.CallEnd, uiText("Hang up Cypher")) } } }
                         Box(Modifier.weight(1f).then(modeMotion)) {
                         if (vm.client == null && !ui.loading && ui.tab in setOf("Tasks", "Spaces", "Projects", "Kanban")) {
@@ -291,6 +306,9 @@ class CypherActivity : ComponentActivity() {
     // Register after destination Back handlers so an open drawer always closes first.
     BackHandler(!ui.showSessions && ui.tab == "More" && ui.morePage.isNotBlank() && ui.morePage !in setOf("Skills", "Memory", "Bots", "Profiles")) { vm.backFromSettings() }
     BackHandler(ui.showSessions) { vm.toggleSessions(false) }
+    BackHandler(ui.setupWizard && !ui.restoringSession) {
+        if (ui.authenticated) vm.cancelSetupWizard() else hostActivity?.finish()
+    }
     form?.let { NativeForm(vm, it) }
     val approval=call.toolApprovals.firstOrNull()?.takeIf { ui.authenticated && call.active && call.conversationScope?.let { s -> s.owner==ui.owner&&s.profile==ui.profile&&s.origin==ui.origin }==true }
     if(approval!=null&&form==null) {

@@ -30,13 +30,16 @@ class VoiceKeyStoreTest {
 
     @Test fun keysAreProviderBoundReplaceableAndRemovable() {
         store.saveKey("gemini", "fixture-google-key")
+        assertTrue(store.hasKey("gemini"))
         val original = storage.getValue("key.gemini")
         storage["key.grok"] = original
         assertNull(store.key("grok"))
+        assertFalse(store.hasKey("grok"))
         store.saveKey("gemini", "fixture-google-key-new")
         assertEquals("fixture-google-key-new", store.key("gemini"))
         store.removeKey("gemini")
         assertNull(store.key("gemini"))
+        assertFalse(store.hasKey("gemini"))
         assertFalse(storage.containsKey("key.gemini"))
     }
 

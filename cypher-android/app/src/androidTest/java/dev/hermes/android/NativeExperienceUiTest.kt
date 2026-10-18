@@ -2328,7 +2328,11 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Check sources before answering.").performScrollTo().assertExists()
         compose.onNodeWithText("Hide behavior instructions").performScrollTo().performClick()
         compose.onNodeWithText("Change default model").performScrollTo().performClick()
-        compose.onNodeWithText("Enter a configured model ID").performScrollTo().performClick()
+        await { vm.phoneSettings.bots.value.editing }
+        val modelList = compose.onAllNodes(hasScrollToNodeAction()).fetchSemanticsNodes().maxBy { it.boundsInRoot.right }
+        compose.onNode(SemanticsMatcher("Profile model settings list") { it.id == modelList.id })
+            .performScrollToNode(hasText("Enter a configured model ID"))
+        compose.onNodeWithText("Enter a configured model ID").performClick()
         compose.onNode(hasSetTextAction() and hasText("Model ID")).performScrollTo().performTextReplacement("next-model")
         androidx.test.espresso.Espresso.closeSoftKeyboard()
         compose.onNodeWithContentDescription("Back").performClick()
