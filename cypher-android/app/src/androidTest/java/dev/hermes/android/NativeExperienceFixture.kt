@@ -190,15 +190,17 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             }
             val buffer = okio.Buffer(); request.body?.writeTo(buffer)
             val body = buffer.readUtf8().takeIf(String::isNotBlank)?.let(::JSONObject) ?: JSONObject()
+            val profileQuery = if (request.url.encodedPath.startsWith("/api/plugins/cypher/")) "cypher_profile" else "profile"
+            val profile = request.url.queryParameter(profileQuery) ?: "default"
             requests += if (request.url.encodedPath.startsWith("/auth/native/")) json(
                 "path" to request.url.encodedPath,
                 "method" to request.method,
                 "body_fields" to JSONArray().apply { body.keys().forEach { put(it) } },
             )
-                else json("path" to request.url.encodedPath, "method" to request.method, "body" to body, "profile" to request.url.queryParameter("profile"))
+                else json("path" to request.url.encodedPath, "method" to request.method, "body" to body, "profile" to profile)
             val outage = pluginStatus?.takeIf { request.url.encodedPath.startsWith("/api/plugins/cypher/") }
             val (status, result) = if (outage != null) outage to json("detail" to "Synthetic optional plugin outage")
-                else http(request.url.encodedPath, request.method, body, request.url.queryParameter("profile") ?: "default", request.url.queryParameter("path").orEmpty(), request.url.queryParameter("include_archived") == "1" || request.url.queryParameter("archived") == "only", request.url)
+                else http(request.url.encodedPath, request.method, body, profile, request.url.queryParameter("path").orEmpty(), request.url.queryParameter("include_archived") == "1" || request.url.queryParameter("archived") == "only", request.url)
             Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(status).message("Synthetic fixture")
                 .body(result.toString().toResponseBody("application/json".toMediaType())).build()
         }
