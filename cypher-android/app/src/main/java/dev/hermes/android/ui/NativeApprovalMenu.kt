@@ -28,14 +28,20 @@ import kotlinx.coroutines.launch
     var confirmOff by remember(capturedClient, capturedScope) { mutableStateOf(false) }
     var confirmYolo by remember(capturedClient, capturedScope) { mutableStateOf(false) }
     var saving by remember(capturedClient, capturedScope) { mutableStateOf(false) }
+    var lastVerifiedYolo by remember(capturedClient, capturedScope) { mutableStateOf<Boolean?>(null) }
     val key = "picker:approvals"
     val path = "/api/approval/mode"
     val record = data[key]
     val scopedRecord = record?.takeIf { it.string("scope_key") == capturedClient?.scope?.key && it.string("session_id") == capturedScope?.session }
     val current = scopedRecord?.string("value").orEmpty()
     val profileMode = scopedRecord?.string("profile_mode").orEmpty()
-    val yolo = scopedRecord?.optBoolean("session_bypass") == true && profileMode != "off"
+    val yoloKnown = scopedRecord?.optBoolean("session_status_known") == true
+    val yolo = yoloKnown && scopedRecord?.optBoolean("session_bypass") == true && profileMode != "off"
+    val yoloUnknown = scopedRecord != null && current.isNotBlank() && !yoloKnown && profileMode != "off"
     val loading = key in refreshing
+    LaunchedEffect(scopedRecord) {
+        if (yoloKnown) lastVerifiedYolo = scopedRecord?.optBoolean("session_bypass")
+    }
     fun refresh() { vm.load(key, path, mapOf("session_id" to capturedScope?.session.orEmpty())) }
     fun apply(mode: String) {
         if (saving) return
@@ -61,7 +67,14 @@ import kotlinx.coroutines.launch
         }
         saving = true
         val job = vm.action(path, json("yolo" to turnOn, "session_id" to capturedScope.session, "scope_key" to capturedScope.key), refresh = false,
-            successNotice = if (turnOn) "YOLO enabled for this chat" else "YOLO disabled for this chat") { _, result -> vm.storeData(key, result) }
+            successNotice = if (turnOn) "YOLO enabled for this chat" else "YOLO disabled for this chat") { _, result ->
+                vm.storeData(key, result)
+                lastVerifiedYolo = when {
+                    turnOn -> true
+                    result.optBoolean("session_status_known") -> result.optBoolean("session_bypass")
+                    else -> null
+                }
+            }
         scope.launch {
             try {
                 job.join()
@@ -71,11 +84,19 @@ import kotlinx.coroutines.launch
     }
     Box {
         IconButton(onClick = { open = true; refresh() }, enabled = enabled && capturedClient != null && capturedScope != null && !saving, modifier = Modifier.testTag("composer-approvals")) {
-            Icon(Icons.Rounded.Shield, uiText(if (yolo) "Approvals · YOLO on" else "Approvals"), tint = if (yolo) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant)
+            val description = when {
+                yolo -> "Approvals · YOLO on"
+                yoloUnknown -> "Approvals · YOLO status unknown for this chat"
+                else -> "Approvals"
+            }
+            Icon(Icons.Rounded.Shield, uiText(description), tint = if (yolo) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant)
         }
         DropdownMenu(open, { open = false }, modifier = Modifier.heightIn(max = 360.dp).testTag("approvals-menu")) {
             DropdownMenuItem({ Text("Approvals · ${capturedClient?.scope?.profile.orEmpty()}") }, {}, enabled = false)
-            if (scopedRecord != null && current.isNotBlank() && !scopedRecord.optBoolean("session_status_known")) DropdownMenuItem({ Text("Chat is initializing. Showing profile defaults.", style = MaterialTheme.typography.bodySmall) }, {}, enabled = false)
+            if (yoloUnknown) DropdownMenuItem({
+                val last = lastVerifiedYolo?.let { ". Last verified YOLO: ${if (it) "on" else "off"}." }.orEmpty()
+                Text("YOLO status unknown for this chat$last", style = MaterialTheme.typography.bodySmall)
+            }, {}, enabled = false)
             if (scopedRecord?.optBoolean("session_bypass") == true && current.isNotBlank()) DropdownMenuItem({ Text("This chat bypasses approvals. Choose a mode to restore its profile policy.", style = MaterialTheme.typography.bodySmall) }, {}, enabled = false)
             if (loading || saving) DropdownMenuItem({ Text(if (saving) "Saving…" else "Refreshing…") }, {}, enabled = false)
             val error = recordError(record)
@@ -98,11 +119,14 @@ import kotlinx.coroutines.launch
                 {}, enabled = false,
             )
             DropdownMenuItem(
-                text = { Column { Text("YOLO"); Text("Bypass approval prompts for this chat only. Resets when the session changes.", style = MaterialTheme.typography.bodySmall, maxLines = 2) } },
+                text = { Column {
+                    Text(if (yoloUnknown) "Turn off YOLO for this chat" else "YOLO")
+                    Text(if (yoloUnknown) "Write a session-scoped disable while the current status is unknown." else "Bypass approval prompts for this chat only. Resets when the session changes.", style = MaterialTheme.typography.bodySmall, maxLines = 2)
+                } },
                 trailingIcon = { if (yolo) Icon(Icons.Rounded.Check, "YOLO enabled") },
                 enabled = enabled && !loading && !saving && current in nativeApprovalModes && error.isBlank() && profileMode != "off",
                 modifier = Modifier.testTag("approval-yolo"),
-                onClick = { if (yolo) applyYolo(false) else { open = false; confirmYolo = true } },
+                onClick = { if (yolo || yoloUnknown) applyYolo(false) else { open = false; confirmYolo = true } },
             )
             HorizontalDivider()
             DropdownMenuItem({ Text("Direct voice changes keep their separate confirmation.", style = MaterialTheme.typography.bodySmall) }, {}, enabled = false)

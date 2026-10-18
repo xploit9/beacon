@@ -22,6 +22,7 @@ class NativeGatewayProtocolTest {
         var ignoreYoloWrite = false
         var yoloAcknowledgement = "0"
         var sessionBypass: Boolean? = false
+        var resumeYoloPresent = true
         var failPrompt = false
         var silentPrompt = false
         var activeListFailure = false
@@ -44,7 +45,7 @@ class NativeGatewayProtocolTest {
                     }
                     if (silentPrompt && call.getString("method") == "prompt.submit") return true
                     val result = when(call.getString("method")) {
-                        "session.create", "session.resume" -> json("session_id" to "runtime-a", "stored_session_id" to "stored-a", "info" to json("yolo" to sessionBypass))
+                        "session.create", "session.resume" -> json("session_id" to "runtime-a", "stored_session_id" to "stored-a", "info" to if (resumeYoloPresent) json("yolo" to sessionBypass) else JSONObject())
                         "session.events.since" -> json("epoch" to "epoch-a", "latest_seq" to 2, "events" to replayEvents)
                         "session.active_list" -> { if (activeListFailure) throw IllegalArgumentException("Synthetic status failure"); json("sessions" to activeSessions) }
                         "prompt.submit" -> json("status" to "streaming", "user_row_id" to 42)
@@ -121,6 +122,28 @@ class NativeGatewayProtocolTest {
         assertEquals("manual", result.getString("value")); assertFalse(result.getBoolean("session_status_known"))
         val applied = c.call("/api/approval/mode", method="POST", data=json("session_id" to "stored-a", "mode" to "smart", "scope_key" to c.scope.session("stored-a").key))
         assertEquals("smart", applied.getString("value")); assertFalse(applied.getBoolean("session_status_known"))
+        c.closeNative()
+    }
+    @Test fun approvalReadDoesNotReportOffWhenResumeOmitsYolo() = runBlocking {
+        val wire = Wire().apply { resumeYoloPresent = false }; val c = client(wire)
+        val result = c.get("/api/approval/mode", mapOf("session_id" to "stored-a"))
+        assertFalse(result.getBoolean("session_status_known"))
+        assertTrue(result.isNull("session_bypass"))
+        c.closeNative()
+    }
+    @Test fun perChatYoloWriteAndFreshReadPreserveUnknownWhenResumeOmitsYolo() = runBlocking {
+        val wire = Wire().apply { resumeYoloPresent = false; yoloAcknowledgement = "1" }; val c = client(wire)
+        val written = c.call("/api/approval/mode", method = "POST", data = json("session_id" to "stored-a", "yolo" to true, "scope_key" to c.scope.session("stored-a").key))
+        assertFalse(written.getBoolean("session_status_known"))
+        assertTrue(written.isNull("session_bypass"))
+        val beforeRefresh = wire.requests.count { it.url.encodedPath == "/api/ws" }
+        val refreshed = c.get("/api/approval/mode", mapOf("session_id" to "stored-a"))
+        assertEquals(beforeRefresh + 1, wire.requests.count { it.url.encodedPath == "/api/ws" })
+        assertFalse(refreshed.getBoolean("session_status_known"))
+        assertTrue(refreshed.isNull("session_bypass"))
+        val write = wire.sent.single { it.getString("method") == "config.set" }.getJSONObject("params")
+        assertEquals("yolo", write.getString("key")); assertEquals("1", write.getString("value"))
+        assertEquals("session", write.getString("scope")); assertEquals("runtime-a", write.getString("session_id"))
         c.closeNative()
     }
     @Test fun profileManualModeDoesNotHideAConversationBypass() = runBlocking {
