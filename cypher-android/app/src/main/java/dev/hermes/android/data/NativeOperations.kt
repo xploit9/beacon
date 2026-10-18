@@ -42,6 +42,9 @@ internal class NativeOperations(private val c: CypherClient) {
             "/api/mobile/bootstrap" -> return c.bootstrap()
             "/api/commands", "/api/commands/catalog" -> { val result = c.nativeRpc("commands.catalog"); val pairs = result.optJSONArray("pairs") ?: JSONArray(); val commands = JSONArray(); for (i in 0 until pairs.length()) { val pair = pairs.optJSONArray(i) ?: continue; commands.put(json("name" to pair.optString(0).removePrefix("/"), "description" to pair.optString(1))) }; return json("commands" to commands, "available" to true, "warning" to result.string("warning")) }
             "/api/commands/exec" -> { val b = binding(); return c.nativeRpc("command.dispatch", json("session_id" to b.runtimeSessionId, "name" to d.getString("name"), "arg" to d.string("argument"))) }
+            // What Hermes starts a new chat with in this profile, for the composer of a chat with no messages yet.
+            "/api/profile/defaults" -> return json("profile" to c.auth.profile, "model" to c.nativeRpc("config.get", json("key" to "provider")).string("model"),
+                "reasoning_effort" to c.nativeRpc("config.get", json("key" to "reasoning")).string("value"))
             "/api/profile/switch" -> {
                 val name = d.getString("name")
                 val profiles = c.nativeGet("/api/profiles").rows("profiles")

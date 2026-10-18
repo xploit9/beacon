@@ -558,7 +558,8 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             "session.branch" -> { val key = "branch-${sequence.incrementAndGet()}"; val rows = sessions.getValue(id).getJSONArray("messages"); history(key, params.string("name", "Branch"), JSONArray((0 until params.optInt("count", rows.length()).coerceIn(0, rows.length())).map(rows::get))).also { sessions[key] = it } }
             "session.compress" -> json("status" to "aborted")
             "session.undo" -> { sessions.getValue(id).put("messages", JSONArray()); json("ok" to true) }
-            "config.get" -> json("value" to if (params.string("key") == "approvals.mode") approvalMode else reasoningEffort)
+            "config.get" -> if (params.string("key") == "provider") json("model" to profileModel, "provider" to "fixture")
+                else json("value" to if (params.string("key") == "approvals.mode") approvalMode else reasoningEffort)
             "config.set" -> {
                 val key = params.string("key")
                 val value = params.string("value")

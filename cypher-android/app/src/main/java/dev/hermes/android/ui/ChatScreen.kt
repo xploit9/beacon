@@ -431,6 +431,9 @@ internal fun acceptsInitialConversationEdit(
     var modelMenu by remember { mutableStateOf(false) }
     var attachMenu by remember { mutableStateOf(false) }
     LaunchedEffect(ui.origin, ui.owner, ui.profile) { vm.loadSlashCatalog() }
+    val unsent = chat.messages.isEmpty() && chat.raw.string("model").isBlank()
+    val defaults = data["profile-defaults"]?.takeIf { unsent && it.string("profile") == ui.profile && recordError(it).isBlank() }
+    LaunchedEffect(ui.origin, ui.owner, ui.profile, unsent) { if (unsent) vm.load("profile-defaults", "/api/profile/defaults") }
     BoxWithConstraints(Modifier.widthIn(max = 840.dp).fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
         // Reserve the action row before the editor grows. The editor scrolls its own long draft.
         val commandHeight = if (draft.text.startsWith("/")) (maxHeight - 160.dp).coerceIn(48.dp, 160.dp) else 0.dp
@@ -486,8 +489,8 @@ internal fun acceptsInitialConversationEdit(
                         Box(Modifier.weight(1f, fill = false).widthIn(max = 168.dp)) {
                             TextButton(onClick = { modelMenu = true }, enabled = canonical && !callActive && !readOnly, modifier = Modifier.heightIn(min = 48.dp).testTag("composer-model-effort"), contentPadding = PaddingValues(horizontal = 8.dp)) {
                                 Column(Modifier.weight(1f, fill = false), horizontalAlignment = Alignment.Start) {
-                                    Text(chat.raw.string("model", "Model"), maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, style = MaterialTheme.typography.labelMedium)
-                                    Text(chat.raw.string("reasoning_effort", chat.raw.string("reasoning", "Effort")), maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text(chat.raw.string("model").ifBlank { defaults?.string("model").orEmpty() }.ifBlank { "Model" }, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, style = MaterialTheme.typography.labelMedium)
+                                    Text(chat.raw.string("reasoning_effort", chat.raw.string("reasoning")).ifBlank { defaults?.string("reasoning_effort").orEmpty() }.ifBlank { "Effort" }, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                                 Icon(Icons.Rounded.ExpandMore, null, Modifier.size(16.dp))
                             }

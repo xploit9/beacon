@@ -914,6 +914,19 @@ class NativeExperienceUiTest {
         receipts += "Bot Mode visibly toggles, opens a different profile's permanent chat, preserves both unsent drafts, restores normal history search/profile/chat, and never auto-sends or creates a normal session."
     }
 
+    @Test fun unsentChatComposerShowsTheProfileModelAndEffort() = withFixture { vm, fixture ->
+        fixture.profileModel = "profile-default-model"; fixture.reasoningEffort = "high"
+        compose.runOnIdle {
+            field(vm, "sourceScope", null)
+            flow<ChatState>(vm, "_chat").value = ChatState()
+            flow<AppState>(vm, "_ui").value = vm.ui.value.copy(tab = "Chat", initialChatReady = true)
+        }
+        await { vm.data.value["profile-defaults"]?.string("model") == "profile-default-model" }
+        compose.onNodeWithTag("composer-model-effort").assert(hasAnyDescendant(hasText("profile-default-model")))
+        compose.onNodeWithTag("composer-model-effort").assert(hasAnyDescendant(hasText("high")))
+        receipts += "A chat with no messages shows the model and effort Hermes starts this profile's chats with, not placeholder labels."
+    }
+
     @Test fun botModeLeavesToAnUnsentNewChat() = withFixture { vm, fixture ->
         // Live 2026-10-19: entered from an empty new chat, Bot Mode could never be left because that chat has no history to load yet.
         var shellId = ""
