@@ -1390,6 +1390,8 @@ class NativeExperienceUiTest {
         val shells = CypherViewModel::class.java.getDeclaredField("initialShells").apply { isAccessible = true }.get(vm) as MutableMap<String, String>
         @Suppress("UNCHECKED_CAST")
         val attempts = CypherViewModel::class.java.getDeclaredField("initialCreateAttempts").apply { isAccessible = true }.get(vm) as MutableMap<String, String>
+        val staleScope = fixture.scope.session("deleted-shell")
+        runBlocking { app.cache.delete(staleScope, "client-created-shell"); app.cache.delete(staleScope, "session") }
         try {
             compose.runOnIdle {
                 field(vm, "sourceScope", null)
@@ -1413,7 +1415,10 @@ class NativeExperienceUiTest {
             assertTrue(vm.ui.value.newChatError.isBlank())
             receipts += "An unowned stale shell confirmed missing by passive history is cleared without discarding the draft; explicit New creates once."
         } finally {
-            runBlocking { app.cache.delete(fixture.scope, "new-chat-shell"); app.cache.delete(fixture.scope, "new-chat-attempt"); app.cache.delete(fixture.scope, "initial-draft") }
+            runBlocking {
+                app.cache.delete(fixture.scope, "new-chat-shell"); app.cache.delete(fixture.scope, "new-chat-attempt"); app.cache.delete(fixture.scope, "initial-draft")
+                app.cache.delete(staleScope, "client-created-shell"); app.cache.delete(staleScope, "session")
+            }
         }
     }
 
@@ -2038,6 +2043,9 @@ class NativeExperienceUiTest {
     }
 
     @Test fun newChatReplacesAConfirmedMissingInitialShellWithoutLosingTheDraft() = withFixture { vm, fixture ->
+        val staleScope = fixture.scope.session("removed-initial-shell")
+        // Older runs could leave a false phone-created marker for this never-created fixture id.
+        runBlocking { app.cache.delete(staleScope, "client-created-shell"); app.cache.delete(staleScope, "session") }
         compose.runOnIdle {
             field(vm, "sourceScope", null)
             flow<ChatState>(vm, "_chat").value = ChatState()

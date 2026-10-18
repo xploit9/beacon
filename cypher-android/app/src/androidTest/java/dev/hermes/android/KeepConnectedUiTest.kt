@@ -204,8 +204,11 @@ class KeepConnectedUiTest {
             compose.onNodeWithTag("xara-incoming-answer").assertIsDisplayed().performClick()
             compose.waitUntil(15_000) { vm.ui.value.tab == "Xara" && vm.chat.value.sessionId == "chat-b" }
             assertEquals("chat-b", vm.chat.value.sessionId)
+            val answerPath = "/api/plugins/cypher/mobile/callbacks/${answerEvent.getString("event_id")}/answer"
+            // This fixture host is hidden; the service posts the explicit receipt before refusing to start a live call.
+            compose.waitUntil(15_000) { fixture.requests.any { it.string("method") == "POST" && it.string("path") == answerPath } && !app.calls.state.value.active }
             assertFalse(app.calls.state.value.active)
-            assertTrue(fixture.requests.any { it.string("path") == "/api/plugins/cypher/mobile/callbacks/${answerEvent.getString("event_id")}/answer" })
+            assertTrue(fixture.requests.any { it.string("method") == "POST" && it.string("path") == answerPath })
 
             val declineEvent = fixture.emitIncomingCall(conversationId = "chat-a")
             testEvents += declineEvent
