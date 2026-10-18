@@ -15,6 +15,9 @@ import androidx.compose.ui.test.*
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.lifecycle.*
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
@@ -33,6 +36,16 @@ import java.io.File
 /** Actual renderer/control proof with generated PDF bytes in the disposable fixture workspace. */
 class Usability19Test {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
+    private fun semanticsSnapshot() = runCatching {
+        compose.onAllNodes(isRoot(), useUnmergedTree = true).printToString(maxDepth = 100)
+    }.getOrElse { "<semantics unavailable: ${it.message}>" }.take(8_000)
+    private fun await(label: String, timeoutMillis: Long, observed: () -> String, condition: () -> Boolean) {
+        try { compose.waitUntil(timeoutMillis) { condition() } }
+        catch (error: ComposeTimeoutException) {
+            val state = runCatching(observed).getOrElse { "<state unavailable: ${it.message}>" }
+            throw AssertionError("$label timed out: $state", error)
+        }
+    }
     private fun field(vm: CypherViewModel, name: String, value: Any?) {
         CypherViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.set(vm, value)
     }
@@ -47,7 +60,15 @@ class Usability19Test {
         val kinds = listOf("initial-draft", "new-chat-attempt", "new-chat-shell", "selected-session")
         val retained = runBlocking { kinds.associateWith { app.cache.read(owner, it) } }
         try {
-            runBlocking { kinds.forEach { app.cache.delete(owner, it) } }
+            runBlocking {
+                kinds.forEach { app.cache.delete(owner, it) }
+                // Keep ViewModel startup from restoring the owner's saved server into this in-memory fixture.
+                app.preferences.edit {
+                    it[stringPreferencesKey("origin")] = ""
+                    it[booleanPreferencesKey("setup_complete")] = true
+                    it[booleanPreferencesKey("setup_active")] = false
+                }
+            }
             compose.runOnUiThread {
                 vm = ViewModelProvider(store, viewModelFactory { initializer { CypherViewModel(app, SavedStateHandle()) } })[CypherViewModel::class.java]
                 field(vm, "client", fixture.client)
@@ -65,16 +86,20 @@ class Usability19Test {
             runBlocking { retained.forEach { (kind, value) -> if (value == null) app.cache.delete(owner, kind) else app.cache.write(owner, kind, value, true) }; app.preferences.updateData { prefs } }
         }
     }
-    @Test fun systemBackCancelsAnAuthenticatedSetupWizard() = fixture { vm, _ ->
+    @Test fun systemBackCancelsAnAuthenticatedSetupWizard() = fixture { vm, fixture ->
         compose.setContent {
             NativeLocalization("en") { CypherTheme {
                 NativeWindowLayout(compose.activity) { Box(Modifier.fillMaxSize()) { CypherRoot(vm) } }
             } }
         }
-        compose.runOnIdle { vm.tab("More"); vm.reopenSetupWizard() }
-        compose.waitUntil(5_000) { vm.ui.value.setupWizard && !vm.ui.value.restoringSession }
+        compose.runOnIdle { vm.tab("More"); vm.reopenSetupWizard(fixture.scope.origin) }
+        await("Authenticated setup wizard opened", 15_000, { "ui=${vm.ui.value}; tree=${semanticsSnapshot()}" }) {
+            vm.ui.value.setupWizard && !vm.ui.value.restoringSession
+        }
         compose.runOnIdle { compose.activity.onBackPressedDispatcher.onBackPressed() }
-        compose.waitUntil(5_000) { !vm.ui.value.setupWizard }
+        await("System Back canceled the setup wizard", 5_000, { "ui=${vm.ui.value}; tree=${semanticsSnapshot()}" }) {
+            !vm.ui.value.setupWizard
+        }
         assertTrue(vm.ui.value.authenticated)
     }
     @Test fun pdfPagerHasVisibleNamesCountsAndDisabledBoundaries() = fixture { vm, fixture ->
@@ -112,7 +137,10 @@ class Usability19Test {
                     }
                 }
             }
-            fun ready(page: Int) = compose.waitUntil(25_000) { compose.onAllNodesWithContentDescription("PDF page $page").fetchSemanticsNodes().isNotEmpty() }
+            fun previewState() = "requests=${fixture.requests.takeLast(8).map { "${it.string("method")} ${it.string("path")}" }}; files=${fixture.fileRequests.takeLast(8)}; tree=${semanticsSnapshot()}"
+            fun ready(page: Int) = await("PDF page $page rendered", 25_000, { previewState() }) {
+                runCatching { compose.onNodeWithContentDescription("PDF page $page").assertIsDisplayed() }.isSuccess
+            }
             fun capture(stage: String) {
                 val out = app.getExternalFilesDir(null)
                 File(out, "pdf15-$stage.txt").writeText(compose.onAllNodes(isRoot(), true).printToString(maxDepth = 1000))
@@ -149,23 +177,38 @@ class Usability19Test {
                 down(0, androidx.compose.ui.geometry.Offset(centerX - 20, centerY)); down(1, androidx.compose.ui.geometry.Offset(centerX + 20, centerY))
                 moveTo(0, androidx.compose.ui.geometry.Offset(centerX - 100, centerY)); moveTo(1, androidx.compose.ui.geometry.Offset(centerX + 100, centerY)); up(0); up(1)
             }
-            compose.waitUntil(25_000) { compose.onAllNodesWithText("Reset zoom").fetchSemanticsNodes().isNotEmpty() }
+            await("PDF zoom controls appeared", 25_000, { previewState() }) {
+                compose.onAllNodesWithText("Reset zoom").fetchSemanticsNodes().isNotEmpty()
+            }
             compose.onNodeWithText("Reset zoom").assertIsDisplayed().assertIsEnabled().performClick()
             compose.onNodeWithText("Reset zoom").assertDoesNotExist()
             compose.runOnIdle { screen = "code" }
             compose.onNodeWithText("Tree").assertIsDisplayed().performClick(); compose.onNodeWithText("Source").assertIsDisplayed().performClick()
             compose.onNodeWithText("Tree").assertIsDisplayed(); capture("code-controls")
             compose.runOnIdle { screen = "link" }
-            compose.waitUntil(25_000) { compose.onAllNodesWithText("Native pager PDF").fetchSemanticsNodes().isNotEmpty() }
-            compose.onNodeWithText("Native pager PDF").performTouchInput { click() }
-            compose.waitUntil(25_000) { compose.onAllNodesWithText("Close").fetchSemanticsNodes().isNotEmpty() }
-            compose.onNodeWithText("Close").assertIsDisplayed().assertIsEnabled().performClick(); compose.onNodeWithText("Close").assertDoesNotExist()
+            await("PDF link name appeared", 25_000, { previewState() }) {
+                compose.onAllNodesWithText("Native pager PDF").fetchSemanticsNodes().isNotEmpty()
+            }
+            val linkLayouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+            compose.onNodeWithText("Native pager PDF").performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(linkLayouts) }
+            val linkPosition = linkLayouts.single().getBoundingBox(2).center
+            compose.onNodeWithText("Native pager PDF").performTouchInput { click(linkPosition) }
+            await("Linked PDF viewer opened", 25_000, { previewState() }) {
+                compose.onAllNodesWithText("Close").fetchSemanticsNodes().isNotEmpty()
+            }
+            compose.onNodeWithText("Close").assertIsDisplayed().assertIsEnabled().performClick()
+            await("Linked PDF viewer closed", 25_000, { previewState() }) {
+                compose.onAllNodesWithText("Close").fetchSemanticsNodes().isEmpty()
+            }
             compose.runOnIdle { screen = "diagram" }
-            compose.waitUntil(25_000) { compose.onAllNodesWithText("Retry diagram").fetchSemanticsNodes().isNotEmpty() }
-            compose.onNodeWithText("Retry diagram").assertIsDisplayed().assertIsEnabled().performClick()
-            compose.waitUntil(25_000) { compose.onAllNodesWithText("Retry diagram").fetchSemanticsNodes().isNotEmpty() }
-            compose.onNodeWithText("Diagram exceeds the rendering limit").assertIsDisplayed(); capture("diagram-retry")
-            println("RICH15_ACTUAL_RESET_TREE_SOURCE_CLOSE_RETRY_VISIBLE_OK")
+            await("Oversized diagram fallback appeared", 25_000, { previewState() }) {
+                compose.onAllNodesWithText("Preview exceeds the 64,000 character limit").fetchSemanticsNodes().isNotEmpty()
+            }
+            compose.onNodeWithText("Preview exceeds the 64,000 character limit").assertIsDisplayed()
+            compose.onNodeWithText("Source").assertIsDisplayed()
+            compose.onNodeWithText("Fullscreen diagram").assertIsNotEnabled()
+            compose.onNodeWithText("mermaid").assertIsDisplayed(); capture("diagram-fallback")
+            println("RICH15_ACTUAL_RESET_TREE_SOURCE_CLOSE_OVERSIZED_DIAGRAM_FALLBACK_VISIBLE_OK")
         } finally { file.delete() }
     }
     @Test fun choiceLabelsPreserveBlankSaveAndRequiredValidation() = fixture { vm, _ ->
@@ -191,6 +234,13 @@ class Usability19Test {
             File(out, "labels18-$stage.txt").writeText(compose.onAllNodes(isRoot(), true).printToString(maxDepth = 1000))
             InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()?.let { bitmap -> File(out, "labels18-$stage.png").outputStream().use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }; bitmap.recycle() }
         }
+        fun formState() = "form=${vm.form.value}; saved=$saved; tree=${semanticsSnapshot()}"
+        fun selectBlank() {
+            await("Blank choice option appeared", 5_000, { formState() }) {
+                compose.onAllNodesWithTag("choice-option:Service tier:").fetchSemanticsNodes().isNotEmpty()
+            }
+            compose.onNodeWithTag("choice-option:Service tier:").performClick()
+        }
         compose.onNodeWithText("Generic blank: Default").assertIsDisplayed().performClick()
         compose.onNodeWithTag("choice-option:Generic blank:").assertTextEquals("Default").assertIsDisplayed().performClick()
         assertEquals("", generic); compose.onNodeWithText("Generic blank: Default").assertExists()
@@ -200,18 +250,24 @@ class Usability19Test {
         val field = Field("advanced.service_tier", "Service tier", FieldType.CHOICE, options = listOf("", "default", "priority"), optionLabels = mapOf("" to "Use profile default", "default" to "Default tier", "priority" to "Priority tier"))
         fun open(required: Boolean = false) = compose.runOnIdle { vm.openForm(ActionForm("Choice proof", "", listOf(field.copy(required = required)), json("advanced" to json("service_tier" to "priority")), onResult = { saved = it })) }
         open(); compose.onNodeWithText("Service tier: Priority tier").performClick()
-        compose.onNodeWithTag("choice-option:Service tier:").assertTextEquals("Use profile default").assertIsEnabled().performClick()
-        assertEquals("", vm.form.value!!.values[field.key]); compose.onNodeWithText("Service tier: Use profile default").assertIsDisplayed()
-        compose.onNodeWithText("Cancel").performClick(); compose.waitUntil(25_000) { vm.form.value == null }; assertNull(saved)
+        selectBlank()
+        assertEquals("", vm.form.value!!.values[field.key]); compose.onNodeWithText("Service tier: Use profile default").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Cancel").performClick()
+        await("Choice form closed after cancel", 25_000, { formState() }) { vm.form.value == null }
+        assertNull(saved)
         open(); compose.onNodeWithText("Service tier: Priority tier").performClick()
-        compose.onNodeWithTag("choice-option:Service tier:").performClick(); capture("blank-selected")
-        compose.onNodeWithText("Save").performClick(); compose.waitUntil(25_000) { saved != null && vm.form.value == null }
+        selectBlank(); capture("blank-selected")
+        compose.onNodeWithText("Save").performClick()
+        await("Blank choice saved", 25_000, { formState() }) { saved != null && vm.form.value == null }
         assertEquals("", saved!!.getJSONObject("advanced").getString("service_tier"))
         saved = null; open(required = true); compose.onNodeWithText("Service tier: Priority tier").performClick()
-        compose.onNodeWithTag("choice-option:Service tier:").performClick(); compose.onNodeWithText("Save").performClick()
-        compose.waitUntil(25_000) { vm.form.value?.error?.contains("Service tier is required") == true }
+        selectBlank(); assertEquals("", vm.form.value!!.values[field.key]); compose.onNodeWithText("Save").performClick()
+        await("Required choice validation appeared", 25_000, { formState() }) {
+            vm.form.value?.error?.contains("Service tier is required") == true
+        }
         compose.onNodeWithText("Service tier is required").assertIsDisplayed(); assertNull(saved); capture("blank-required-error")
-        compose.onNodeWithText("Cancel").performClick(); compose.waitUntil(25_000) { vm.form.value == null }
+        compose.onNodeWithText("Cancel").performClick()
+        await("Required choice form closed after cancel", 25_000, { formState() }) { vm.form.value == null }
         println("LABELS18_ACTUAL_BLANK_SAVE_CANCEL_REQUIRED_VALIDATION_OK")
     }
 }
