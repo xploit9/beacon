@@ -98,7 +98,7 @@ import kotlinx.coroutines.launch
             vm.phoneSettings::botDraft, vm.phoneSettings::saveBot, { leave { vm.phoneSettings.editBot(false) } },
             onSettings = { profile, page -> vm.viewModelScope.launch {
                 if (profile != vm.ui.value.profile) vm.switchProfile(profile).join()
-                if (vm.ui.value.profile == profile && vm.ui.value.tab == "More" && vm.ui.value.morePage in setOf("", "Profiles")) vm.more(if (page == "Models & tools") "category:$page" else page)
+                if (vm.ui.value.profile == profile && vm.ui.value.tab == "More" && vm.ui.value.morePage in setOf("", "Profiles")) vm.more(settingsRoute(page))
             } }, onRefresh = { state.selected?.let { vm.phoneSettings.openBot(it.profile) } ?: vm.phoneSettings.loadBots() }, models = models,
             renderBehavior = { Markdown(it, vm) })
     }

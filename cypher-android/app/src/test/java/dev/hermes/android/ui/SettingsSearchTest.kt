@@ -57,6 +57,12 @@ class SettingsSearchTest {
         assertEquals(listOf("Health", "Logs", "Server updates", "App updates", "Session checkpoints"), settingsCategories.getValue("Health, logs & updates"))
         assertTrue("A page name must never collide with a category name", settingsCategories.values.flatten().none { it in settingsCategories })
     }
+    @Test fun retiredModelsAndToolsRoutesResolveToTheCurrentCategory() {
+        assertEquals("category:Profiles & model", settingsRoute("Models & tools"))
+        assertEquals("category:Profiles & model", normalizeSettingsPage("Models & tools"))
+        assertEquals("category:Profiles & model", normalizeSettingsPage("category:Models & tools"))
+        assertEquals("category:Tools & MCP", settingsRoute("Tools & MCP"))
+    }
     @Test fun onlyPluginBackedPagesShowTheMissingPluginState() {
         assertFalse(settingsNeedsCypherPlugin("Skills", "absent"))
         assertFalse(settingsNeedsCypherPlugin("Memory", "absent"))
@@ -86,6 +92,7 @@ class SettingsSearchTest {
             connected = true, profile = "work", sendKey = "ctrl_enter", formatMessages = false, showThinking = true,
             theme = "dark", colorStyle = "graphite", fontSize = "xlarge", language = "Deutsch", reducedMotion = true,
             installedVersion = "0.4.14", voiceProviderId = "gemini", voiceKeySaved = true, autoFollow = true, animateBackground = false,
+            keepConnectedEnabled = true,
         )
         assertEquals("Connected privately · work", summary("Connection", known))
         assertEquals("Connection needs attention · work", summary("Connection", known.copy(connected = false)))
@@ -101,12 +108,24 @@ class SettingsSearchTest {
         assertEquals("Update available · 0.4.15", summary("App updates", known.copy(updateName = "0.4.15")))
         assertEquals("Update ready to install", summary("App updates", known.copy(updateName = "0.4.15", updateReady = true)))
         assertEquals("Gemini Live · Key saved", summary("Voice & calls", known))
+        assertEquals("Keep connected on", summary("Notifications & Keep connected", known))
+        assertEquals("Keep connected off", summary("Notifications & Keep connected", known.copy(keepConnectedEnabled = false)))
         assertEquals("Graphite · Extra large text", summary("Appearance", SettingsSnapshot(theme = "sepia", colorStyle = "graphite", fontSize = "xlarge")))
         assertEquals("Enter to send", summary("Chat", SettingsSnapshot(sendKey = "enter")))
         assertEquals("", summary("Chat", SettingsSnapshot(sendKey = "shift_enter")))
         for ((stored, label) in mapOf("enter" to "Enter to send", "ctrl_enter" to "Ctrl + Enter to send", "ctrl+enter" to "Ctrl + Enter to send", "shift+enter" to "Shift + Enter to send")) assertEquals(label, summary("Chat", SettingsSnapshot(sendKey = stored)))
         for (stored in listOf("", "shift_enter", "alt+enter", "Enter ")) assertNull("$stored is not a composer shortcut", settingsSendKeyLabel(stored))
-        for (route in settingsSearchRoutes - setOf("Connection", "Profiles", "Profiles & model", "Chat", "Appearance", "App updates", "Voice & calls", "Health, logs & updates", "About & licenses")) assertTrue("$route has no observable state to summarize", settingsSummary(route, known).isEmpty())
+        for (route in settingsSearchRoutes - setOf("Connection", "Profiles", "Profiles & model", "Chat", "Appearance", "App updates", "Voice & calls", "Notifications & Keep connected", "Health, logs & updates", "About & licenses")) assertTrue("$route has no observable state to summarize", settingsSummary(route, known).isEmpty())
+    }
+    @Test fun statusChipCopyMatchesTheAndroidVersion() {
+        assertEquals(
+            "Status chips aren't supported on this Android 16 build. Calls and requests use standard notifications.",
+            statusChipUnsupportedDescription("16", 36),
+        )
+        assertEquals(
+            "Status chips require Android 16 or later. Calls and requests use standard notifications.",
+            statusChipUnsupportedDescription("15", 35),
+        )
     }
     @Test fun userDataStaysVerbatimWhileFixedWordsTranslate() {
         val parts = settingsSummary("Profiles & model", SettingsSnapshot(profile = "Settings"))

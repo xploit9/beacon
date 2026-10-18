@@ -1,9 +1,10 @@
 package dev.hermes.android.ui
 
 
-/** Each settings column needs readable text after icons, padding and text scaling. */
-internal fun settingsUseColumns(contentWidthDp: Float, fontScale: Float): Boolean =
-    contentWidthDp >= 52f + 720f * fontScale.coerceAtLeast(1f)
+internal fun statusChipUnsupportedDescription(androidVersion: String, sdkInt: Int): String = when {
+    sdkInt >= 36 -> "Status chips aren't supported on this Android $androidVersion build. Calls and requests use standard notifications."
+    else -> "Status chips require Android 16 or later. Calls and requests use standard notifications."
+}
 
 internal fun choiceDisplayLabel(value: String, labels: Map<String, String>, offered: Boolean): String =
     labels[value]?.takeIf(String::isNotBlank) ?: value.ifBlank { if (offered) "Default" else "Choose" }

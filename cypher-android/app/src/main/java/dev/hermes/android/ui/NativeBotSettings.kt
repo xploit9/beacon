@@ -57,7 +57,7 @@ import dev.hermes.android.data.NativeBotsState
                 }
             } else item { OutlinedButton(onClick = onEditModel, enabled = !state.loading) { Text("Change default model") } }
             item { Text("Behavior instructions", style = MaterialTheme.typography.titleMedium); TextButton(onClick = { showBehavior = !showBehavior }) { Text(if (showBehavior) "Hide behavior instructions" else "Read behavior instructions") }; if (showBehavior) { renderBehavior(bot.soul.ifBlank { "No SOUL.md instructions are stored for this profile." }); Text("Read-only here. These are this profile’s authored SOUL.md instructions.", style = MaterialTheme.typography.bodyMedium) } }
-            item { TextButton(onClick = { onSettings(bot.profile, "Skills") }, enabled = !state.editing) { Text("Skills for this profile") }; TextButton(onClick = { onSettings(bot.profile, "Memory") }, enabled = !state.editing) { Text("Memory for this profile") }; TextButton(onClick = { onSettings(bot.profile, "Models & tools") }, enabled = !state.editing) { Text("Models & tools for this profile") } }
+            item { TextButton(onClick = { onSettings(bot.profile, "Skills") }, enabled = !state.editing) { Text("Skills for this profile") }; TextButton(onClick = { onSettings(bot.profile, "Memory") }, enabled = !state.editing) { Text("Memory for this profile") }; TextButton(onClick = { onSettings(bot.profile, "Profiles & model") }, enabled = !state.editing) { Text("Profiles & model for this profile") } }
         }
         item { TextButton(onClick = onRefresh, enabled = !state.loading && !state.saving && !state.editing) { Text("Refresh profiles") } }
     }

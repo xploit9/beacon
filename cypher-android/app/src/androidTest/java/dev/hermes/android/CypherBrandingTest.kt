@@ -16,8 +16,8 @@ class CypherBrandingTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
     @Test fun launcherAndArabicAssistantUseCipherWithStablePackageAndPrivateFilesAuthority() {
         val app = ApplicationProvider.getApplicationContext<CypherApplication>()
-        assertEquals("Cypher", app.packageManager.getApplicationLabel(app.applicationInfo).toString())
         assertTrue(app.packageName == "dev.hermes.android" || app.packageName == "dev.hermes.android.debug")
+        assertEquals(if (app.packageName.endsWith(".debug")) "Cypher Preview" else "Cypher", app.packageManager.getApplicationLabel(app.applicationInfo).toString())
         assertNotNull(app.packageManager.resolveContentProvider("${app.packageName}.files", 0))
         compose.setContent { NativeLocalization("ar") { Text(uiText("Call Cypher")) } }
         compose.onNode(hasText("Cypher", substring = true)).assertIsDisplayed()

@@ -63,7 +63,14 @@ internal fun settingsRoute(name: String): String = when (name) {
     "Voice & calls" -> "Cypher"
     "Notifications & Keep connected" -> "Notifications"
     "About & licenses" -> "Licenses"
+    "Models & tools" -> "category:Profiles & model"
     else -> if (name in settingsCategories) "category:$name" else name
+}
+
+/** Old category names can remain in the per-owner navigation history after a settings rename. */
+internal fun normalizeSettingsPage(page: String): String = when (page) {
+    "Models & tools", "category:Models & tools" -> "category:Profiles & model"
+    else -> page
 }
 
 internal val settingsThemeLabels = mapOf("system" to "Follow device", "dark" to "Dark", "light" to "Light")
@@ -85,6 +92,7 @@ internal data class SettingsSnapshot(
     val installedVersion: String = "", val updateName: String = "", val updateReady: Boolean = false,
     val voiceProviderId: String = "", val voiceKeySaved: Boolean? = null,
     val autoFollow: Boolean? = null, val animateBackground: Boolean? = null,
+    val keepConnectedEnabled: Boolean? = null,
 )
 /**
  * Mirrors the composer's key handling (`ChatScreen.kt` `onPreviewKeyEvent`): it recognises `ctrl_enter`/`ctrl+enter` and
@@ -137,6 +145,9 @@ internal fun settingsSummary(route: String, s: SettingsSnapshot): List<SettingsS
             voiceProviderLabels[s.voiceProviderId]?.let { provider ->
                 listOf(SettingsSummaryPart(provider, translate = false), SettingsSummaryPart(if (keySaved) "Key saved" else "Add key"))
             }
+        }.orEmpty()
+        "Notifications & Keep connected" -> s.keepConnectedEnabled?.let {
+            listOf(SettingsSummaryPart(if (it) "Keep connected on" else "Keep connected off"))
         }.orEmpty()
         else -> emptyList()
     }

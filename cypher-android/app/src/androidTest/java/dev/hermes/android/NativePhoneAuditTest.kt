@@ -114,7 +114,7 @@ class NativePhoneAuditTest {
             steps.add("Profile purpose/model reader, configured search and cancel")
 
             navigate("Settings")
-            click("Models & tools"); click("Tools & commands")
+            click("Tools & MCP"); click("Tools & commands")
             waitFor { vm.data.value["native-tools"] != null }
             assertEquals("", recordError(vm.data.value["native-tools"]))
             capture("tools")

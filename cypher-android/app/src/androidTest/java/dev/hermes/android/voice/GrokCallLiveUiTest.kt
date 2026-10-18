@@ -31,10 +31,12 @@ class GrokCallLiveUiTest {
         val app=ApplicationProvider.getApplicationContext<CypherApplication>()
         require(app.packageName.endsWith(".debug")&&!app.calls.state.value.active)
         val auth=JSONObject(File(app.filesDir,"live-auth.json").readText(Charsets.UTF_8))
+        val voiceStore=VoiceKeyStore(app)
+        val previousProvider=voiceStore.settings().provider
+        val previousSelections=listOf("gemini","grok","openai").map(voiceStore::settings)
         lateinit var vm:CypherViewModel
         rule.runOnIdle { vm=ViewModelProvider(rule.activity)[CypherViewModel::class.java] }
-        var reader:CypherClient?=null;var previous="";var session="";var runtime="";var call=""
-        var previousSettings:JSONObject?=null
+        var reader:CypherClient?=null;var session="";var runtime="";var call=""
         val admittedStyles=ConcurrentLinkedQueue<JSONObject>()
         val requests=ConcurrentLinkedQueue<String>();var started=0L
         val rejectGemini=java.util.concurrent.atomic.AtomicBoolean(false)
@@ -47,7 +49,7 @@ class GrokCallLiveUiTest {
                 if(condition()) { rule.mainClock.advanceTimeBy(32);rule.waitForIdle();break }
                 delay(100)
             } } }
-            catch(error:TimeoutCancellationException) { throw AssertionError("Grok QA phase=$phase authenticated=${vm.ui.value.authenticated} connected=${vm.ui.value.connected} loading=${vm.ui.value.loading} page=${vm.ui.value.morePage} call=${app.calls.state.value.state}/${app.calls.state.value.active}/${app.calls.state.value.voiceProvider} visible=${app.calls.uiVisible} bound=${app.calls.state.value.conversationScope==vm.authenticatedScope()} service=${app.calls.service!=null} handoff=${vm.voiceHandoff.value?.media}/${vm.voiceHandoff.value?.targetCall?.isNotBlank()} notice=${vm.ui.value.error} voice=${vm.data.value["voice-settings"]}",error) }
+            catch(error:TimeoutCancellationException) { throw AssertionError("Grok QA phase=$phase authenticated=${vm.ui.value.authenticated} connected=${vm.ui.value.connected} loading=${vm.ui.value.loading} page=${vm.ui.value.morePage} call=${app.calls.state.value.state}/${app.calls.state.value.active}/${app.calls.state.value.voiceProvider} visible=${app.calls.uiVisible} bound=${app.calls.state.value.conversationScope==vm.authenticatedScope()} service=${app.calls.service!=null} handoff=${vm.voiceHandoff.value?.media}/${vm.voiceHandoff.value?.targetCall?.isNotBlank()} notice=${vm.ui.value.error} voice=${voiceStore.settings()}",error) }
         }
         try {
             await { !vm.ui.value.restoringSession }
@@ -57,25 +59,22 @@ class GrokCallLiveUiTest {
             await { vm.ui.value.authenticated&&vm.ui.value.connected&&!vm.ui.value.loading }
             (CypherViewModel::class.java.getDeclaredField("selectionJob").apply { isAccessible=true }.get(vm) as? Job)?.join()
             reader=requireNotNull(vm.client).detached()
-            previousSettings=reader!!.nativeRequest("/api/plugins/cypher/mobile/voice-settings")
-            previous=previousSettings!!.getString("selected_provider")
             phase="settings-load"
             withContext(Dispatchers.Main.immediate) { vm.tab("More");vm.more("Cypher") }
             rule.waitForIdle()
-            await { vm.data.value["voice-settings"]?.rows("providers")?.size==2 }
             rule.onNodeWithTag("voice-model-grok").performScrollTo().performClick()
             phase="settings-save"
-            await { vm.data.value["voice-settings"]?.string("selected_provider")=="grok" }
+            await { voiceStore.settings().provider=="grok" }
             rule.onNodeWithTag("voice-model-grok").assertIsSelected()
-            val grokBefore=previousSettings!!.rows("providers").single { it.string("id")=="grok" }
-            val targetVoice=if(grokBefore.string("voice")=="ara") "eve" else "ara"
-            val targetPersonality=if(grokBefore.string("personality")=="warm") "balanced" else "warm"
-            rule.onNodeWithText("Voice: ${grokBefore.string("voice")}").performScrollTo().performClick()
+            val grokBefore=voiceStore.settings("grok")
+            val targetVoice=if(grokBefore.voice=="ara") "eve" else "ara"
+            val targetPersonality=if(grokBefore.personality=="warm") "balanced" else "warm"
+            rule.onNodeWithText("Voice: ${grokBefore.voice}").performScrollTo().performClick()
             rule.onNodeWithText(targetVoice).performClick()
-            await { vm.data.value["voice-settings"]?.rows("providers")?.single { it.string("id")=="grok" }?.string("voice")==targetVoice }
-            rule.onAllNodesWithText("Personality: ${grokBefore.string("personality").replaceFirstChar { it.uppercase() }}").onLast().performScrollTo().performClick()
+            await { voiceStore.settings("grok").voice==targetVoice }
+            rule.onNodeWithText("Personality: ${grokBefore.personality.replaceFirstChar { it.uppercase() }}").performScrollTo().performClick()
             rule.onNodeWithText(targetPersonality.replaceFirstChar { it.uppercase() }).performClick()
-            await { vm.data.value["voice-settings"]?.rows("providers")?.single { it.string("id")=="grok" }?.string("personality")==targetPersonality }
+            await { voiceStore.settings("grok").personality==targetPersonality }
             phase="create-chat"
             withContext(Dispatchers.Main.immediate) { vm.newChat(json("title" to "Grok call verification")) }.join()
             await { vm.chat.value.sessionId.isNotBlank()&&!vm.ui.value.newChatOpening }
@@ -136,7 +135,7 @@ class GrokCallLiveUiTest {
             val toolMs=(System.nanoTime()-started)/1000000
             phase="spoken-tool-result"
             await(30000) { app.calls.state.value.transcripts.any { it.role=="assistant"&&it.final&&it.text.contains("documentation",true) } }
-            reader!!.nativeRequest("/api/plugins/cypher/mobile/voice-settings","PUT",json("provider" to "gemini"))
+            voiceStore.setSelection(voiceStore.settings("gemini"))
             assertEquals("grok",app.calls.state.value.voiceProvider)
             InstrumentationRegistry.getInstrumentation().uiAutomation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_HOME)
             phase="background"
@@ -169,7 +168,7 @@ class GrokCallLiveUiTest {
             val handoffs=JSONArray()
             for(media in listOf("camera","screen","failure")) {
                 phase="handoff-$media-start"
-                reader!!.nativeRequest("/api/plugins/cypher/mobile/voice-settings","PUT",json("provider" to "grok"))
+                voiceStore.setSelection(voiceStore.settings("grok"))
                 withContext(Dispatchers.Main.immediate) { vm.tab("Chat");app.calls.start(requireNotNull(vm.client),session) }
                 await(45000) { app.calls.state.value.active&&app.calls.state.value.voiceProvider=="grok"&&app.calls.state.value.state in setOf("listening","speaking") }
                 val oldId=app.calls.state.value.callId;val oldService=requireNotNull(app.calls.service)
@@ -200,7 +199,7 @@ class GrokCallLiveUiTest {
                 assertTrue(oldHttp.dispatcher.executorService.isShutdown)
                 assertEquals(0,oldHttp.dispatcher.runningCallsCount());assertEquals(0,oldHttp.connectionPool.connectionCount())
                 assertTrue(reader!!.nativeRequest("/api/plugins/cypher/mobile/calls/$oldId").optBoolean("closed"))
-                assertEquals("grok",reader!!.nativeRequest("/api/plugins/cypher/mobile/voice-settings").string("selected_provider"))
+                assertEquals("grok",voiceStore.settings().provider)
                 handoffs.put(json("media" to media,"old_closed" to true,"old_socket_closed" to true,"same_conversation" to true,"gemini_capture_sent" to true,"default_unchanged" to true))
                 rule.onNodeWithTag("xara-hang-up").performClick()
                 await(45000) { !app.calls.state.value.active&&app.calls.service==null }
@@ -212,8 +211,8 @@ class GrokCallLiveUiTest {
             val cleanup=mutableListOf<Throwable>()
             suspend fun attempt(block:suspend ()->Unit) { try { block() } catch(error:Throwable) { cleanup+=error } }
             attempt { withContext(Dispatchers.Main.immediate) { app.calls.hangup() };withTimeout(45000) { while(app.calls.service!=null) delay(100) } }
-            previousSettings?.rows("providers")?.filter { it.optBoolean("available") }?.forEach { provider -> attempt { reader?.nativeRequest("/api/plugins/cypher/mobile/voice-settings","PUT",json("provider" to provider.string("id"),"voice" to provider.string("voice"),"personality" to provider.string("personality"))) } }
-            attempt { if(previous.isNotBlank()) reader?.nativeRequest("/api/plugins/cypher/mobile/voice-settings","PUT",json("provider" to previous)) }
+            previousSelections.forEach { selection -> attempt { voiceStore.setSelection(selection) } }
+            previousSelections.firstOrNull { it.provider==previousProvider }?.let { selection -> attempt { voiceStore.setSelection(selection) } }
             attempt { if(call.isNotBlank()) reader?.nativeRequest("/api/plugins/cypher/mobile/calls/$call","DELETE") }
             attempt { if(runtime.isNotBlank()) reader?.nativeRpc("session.close",json("session_id" to runtime)) }
             attempt { if(session.isNotBlank()) reader?.nativeRpc("session.set_hidden",json("session_id" to session,"hidden" to true)) }

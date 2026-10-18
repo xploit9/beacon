@@ -9,6 +9,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -17,6 +18,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.CypherViewModel
 import dev.hermes.android.data.*
 import dev.hermes.android.voice.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -52,7 +54,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
     var models by remember(selection.provider) { mutableStateOf(listOf(defaultVoiceModel(selection.provider))) }
     var voices by remember(selection.provider) { mutableStateOf(defaultVoiceChoices(selection.provider)) }
     var catalogLoading by remember(selection.provider) { mutableStateOf(false) }
-    var liveVoices by remember(selection.provider) { mutableStateOf(false) }
+    var catalogRefresh by remember(selection.provider) { mutableIntStateOf(0) }
     var busy by remember { mutableStateOf(false) }
     var modelMenu by remember(selection.provider) { mutableStateOf(false) }
     var voiceMenu by remember(selection.provider) { mutableStateOf(false) }
@@ -64,20 +66,27 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
         keyMask=withContext(Dispatchers.IO) { store.maskedKey(selection.provider).orEmpty() }
     }
 
-    LaunchedEffect(selection.provider,keyMask) {
+    LaunchedEffect(selection.provider,catalogRefresh) {
         val apiKey=withContext(Dispatchers.IO) { store.key(selection.provider) }
         if(apiKey==null) {
             models=listOf(defaultVoiceModel(selection.provider))
             voices=defaultVoiceChoices(selection.provider)
-            liveVoices=false
+            catalogLoading=false
             return@LaunchedEffect
         }
         catalogLoading=true
-        val catalog=runCatching { loadVoiceCatalog(selection.provider,apiKey) }.getOrDefault(VoiceCatalog())
-        models=(listOf(selection.model)+catalog.models).distinct()
-        voices=(listOf(selection.voice)+catalog.voices).distinct().ifEmpty { defaultVoiceChoices(selection.provider) }
-        liveVoices=catalog.voices.isNotEmpty()
-        catalogLoading=false
+        try {
+            val catalog=loadVoiceCatalog(selection.provider,apiKey)
+            models=(listOf(selection.model)+catalog.models).distinct()
+            voices=(catalog.voices.ifEmpty { defaultVoiceChoices(selection.provider) }+selection.voice).distinct()
+        } catch (cancelled:CancellationException) {
+            throw cancelled
+        } catch (_:Exception) {
+            models=listOf(selection.model)
+            voices=(defaultVoiceChoices(selection.provider)+selection.voice).distinct()
+        } finally {
+            catalogLoading=false
+        }
     }
 
     fun saveSelection(next:VoicePreferences) {
@@ -99,7 +108,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                     headlineContent={Text(label)},
                     supportingContent={Text(if(selection.provider==id) "Selected for new calls" else "Use for new calls")},
                     leadingContent={RadioButton(selected=selection.provider==id,onClick=null)},
-                    modifier=Modifier.fillMaxWidth().selectable(selected=selection.provider==id,role=Role.RadioButton,onClick={
+                    modifier=Modifier.fillMaxWidth().testTag("voice-model-$id").selectable(selected=selection.provider==id,role=Role.RadioButton,onClick={
                         if(selection.provider!=id&&!busy) {
                             val next=store.settings(id)
                             draft=""
@@ -115,7 +124,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
         OutlinedTextField(
             value=draft,
             onValueChange={draft=it.take(8192);status=""},
-            modifier=Modifier.fillMaxWidth(),
+            modifier=Modifier.fillMaxWidth().testTag("voice-provider-key"),
             label={Text("Provider API key")},
             placeholder={Text(if(keyMask.isBlank()) "Enter an API key" else "Saved key ••••" + keyMask.takeLast(4))},
             visualTransformation=PasswordVisualTransformation(),
@@ -139,6 +148,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                             if(saved) {
                                 draft=""
                                 keyMask=withContext(Dispatchers.IO) { store.maskedKey(provider).orEmpty() }
+                                catalogRefresh++
                                 status="Connection succeeded. The key is stored on this phone."
                                 onKeySaved()
                             } else status="Connection succeeded, but the key could not be saved."
@@ -153,7 +163,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                 busy=true
                 scope.launch {
                     val removed=runCatching { withContext(Dispatchers.IO) { store.removeKey(provider) } }.isSuccess
-                    if(removed) { keyMask="";draft="";status="Key removed from this phone." }
+                    if(removed) { keyMask="";draft="";catalogRefresh++;status="Key removed from this phone." }
                     else status="The key could not be removed."
                     busy=false
                 }
@@ -182,14 +192,6 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                 }
             }
         }
-        if(selection.provider=="openai"||!liveVoices) {
-            val source=when(selection.provider) {
-                "openai" -> "OpenAI voices per docs (2026-10-18)"
-                "grok" -> "Grok voices per provider API (2026-10-18)"
-                else -> "Gemini prebuilt voices per docs (2026-10-18)"
-            }
-            Text(source,style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
-        }
         Box {
             TextButton(onClick={personalityMenu=true},enabled=!busy) { Text("Personality: " + selection.personality.replaceFirstChar { it.uppercase() }) }
             DropdownMenu(expanded=personalityMenu,onDismissRequest={personalityMenu=false}) {
@@ -215,14 +217,18 @@ private fun defaultVoiceChoices(provider:String):List<String> = when(provider) {
 private suspend fun loadVoiceCatalog(provider:String,apiKey:String):VoiceCatalog = withContext(Dispatchers.IO) {
     val client=OkHttpClient.Builder().cookieJar(CookieJar.NO_COOKIES).followRedirects(false).followSslRedirects(false)
         .callTimeout(15,TimeUnit.SECONDS).build()
-    fun get(request:VoiceProviderRequest):JSONObject? = runCatching {
+    fun get(request:VoiceProviderRequest):JSONObject? = try {
         client.newCall(request.rawRequest()).execute().use { response ->
             if(!response.isSuccessful) return@use null
             val body=response.body?:return@use null
             if(body.contentLength()>1_000_000) return@use null
             JSONObject(body.string())
         }
-    }.getOrNull()
+    } catch (cancelled:CancellationException) {
+        throw cancelled
+    } catch (_:Exception) {
+        null
+    }
     try {
         when(provider) {
             "gemini" -> VoiceCatalog(

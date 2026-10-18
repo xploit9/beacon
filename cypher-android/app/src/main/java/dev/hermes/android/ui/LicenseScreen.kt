@@ -28,7 +28,7 @@ internal val licenseDocuments = listOf(
         Text("jsoup 1.23.2 · MIT. Source: https://jsoup.org. Parses offline HTML before isolated previews.", style = MaterialTheme.typography.bodySmall)
         Text("core-js 3.50.0 · MIT. Source: https://github.com/zloirock/core-js. Selected compatibility functions for the isolated diagram renderer.", style = MaterialTheme.typography.bodySmall)
         Text("Reference design: omarqaterge/hermes-mobile-app · MIT. Source: https://github.com/omarqaterge/hermes-mobile-app, revision 2d5c5881764c218c4393567f8698db670fb9ad7e. Profile selector, navigation and rich content ideas are implemented in native Compose.", style = MaterialTheme.typography.bodySmall)
-        Text("Hermes Relay sphere rendering · MIT. Adapted from Hermes Relay ui/components/MorphingSphere.kt and related sphere components.", style = MaterialTheme.typography.bodySmall)
+        Text("Hermes Relay · MIT. Adapted code includes chat presentation, NativeAuth, NativeOperations, OpenAiWire, RelayCallback, RelayCallbackPolicy and sphere rendering. SettingsSearch follows Relay’s search pattern. See the source headers and retained Hermes Relay MIT notice.", style = MaterialTheme.typography.bodySmall)
         Text(uiText("JLaTeXMath Android 0.2.0"), style = MaterialTheme.typography.titleMedium)
         Text(uiText("Copyright 2017 Dimitry Ivanov and upstream contributors. GPL-2.0-or-later with the independent module linking exception. JLaTeXMath COPYING and font notices are retained with the corresponding source package."))
         Text(uiText("Source: https://github.com/noties/jlatexmath-android\nPinned commit: cc2a83dcf695028b5588f91a90734d94eb5bd02b"), style = MaterialTheme.typography.bodySmall)

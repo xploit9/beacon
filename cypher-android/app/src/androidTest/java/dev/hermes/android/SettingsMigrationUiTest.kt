@@ -175,7 +175,7 @@ class SettingsMigrationUiTest {
         val host = show(widthDp = PhoneWidthDp, snapshot = null)
         shown("Appearance").assertTextContains("Theme, text size and language")
         shown("Chat").assertTextContains("Chat preferences for sending and display")
-        shown("Connection").assertTextContains("Connection")
+        shown("Connection").assertTextContains("Server and signed-in account")
         compose.runOnIdle { host.snapshot = known }
         shown("Appearance").assertTextContains("Dark · Graphite · Large text · English")
         shown("Chat").assertTextContains("Ctrl + Enter to send · Plain messages · Thinking shown · Auto-follow on · Background animation on")
