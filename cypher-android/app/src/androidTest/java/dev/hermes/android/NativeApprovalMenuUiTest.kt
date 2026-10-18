@@ -85,6 +85,27 @@ class NativeApprovalMenuUiTest {
         await { vm.data.value["picker:approvals"] != null && "picker:approvals" !in vm.refreshing.value }
     }
 
+    private fun omitSessionYoloReadback(vm: CypherViewModel) {
+        compose.runOnIdle {
+            val result = vm.data.value.getValue("picker:approvals").copy().apply {
+                put("session_status_known", false)
+                remove("session_bypass")
+            }
+            vm.storeData("picker:approvals", result)
+        }
+    }
+
+    private fun switchConversation(vm: CypherViewModel, fixture: NativeExperienceFixture, session: String) {
+        compose.runOnIdle {
+            field(vm, "sourceScope", fixture.scope.session(session))
+            val snapshot = fixture.snapshot(session)
+            flow<ChatState>(vm, "_chat").value = ChatState(
+                sessionId = session, title = snapshot.optString("title"), raw = snapshot,
+                messages = snapshot.rows("messages").mapIndexed { index, row -> Message.from(row, index, session) },
+            )
+        }
+    }
+
     @Test fun yoloRequiresConfirmationAndCanBeTurnedOffForTheSession() = withFixture { vm, fixture ->
         open(vm)
         compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
@@ -117,17 +138,78 @@ class NativeApprovalMenuUiTest {
         assertTrue(fixture.requests.none { it.string("method") == "config.set" && it.optJSONObject("params")?.string("key") == "yolo" })
     }
 
+    @Test fun unknownYoloStatusCanBeEnabledAfterConfirmation() = withFixture { vm, fixture ->
+        fixture.sessions.getValue("chat-a").getJSONObject("info").remove("yolo")
+        open(vm)
+        compose.onNodeWithContentDescription("Approvals · YOLO status unknown for this chat").assertIsDisplayed()
+        compose.onNodeWithTag("approval-yolo").performScrollTo()
+        compose.onNodeWithText("Turn on YOLO for this chat…").assertIsDisplayed()
+        compose.onNodeWithTag("approval-yolo-off").performScrollTo()
+        compose.onNodeWithText("Turn off YOLO for this chat").assertIsDisplayed()
+
+        compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
+        compose.onNodeWithText("Enable YOLO for this chat?").assertIsDisplayed()
+        assertTrue(fixture.requests.none { it.string("method") == "config.set" && it.optJSONObject("params")?.string("key") == "yolo" })
+        compose.onNodeWithText("Cancel").performClick()
+
+        open(vm)
+        compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
+        compose.onNodeWithText("Enable YOLO").performClick()
+        await { vm.data.value["picker:approvals"]?.let { it.optBoolean("session_status_known") && it.optBoolean("session_bypass") } == true }
+        val write = fixture.requests.single { it.string("method") == "config.set" && it.optJSONObject("params")?.string("key") == "yolo" }.getJSONObject("params")
+        assertEquals("1", write.string("value")); assertEquals("session", write.string("scope"))
+        assertEquals("runtime-chat-a", write.string("session_id"))
+        compose.onNodeWithContentDescription("Approvals · YOLO on").assertIsDisplayed()
+        omitSessionYoloReadback(vm)
+        compose.onNodeWithContentDescription("Approvals · YOLO on").assertIsDisplayed()
+    }
+
     @Test fun unknownYoloStatusOffersSessionScopedDisable() = withFixture { vm, fixture ->
         fixture.sessions.getValue("chat-a").getJSONObject("info").remove("yolo")
         open(vm)
         compose.onNodeWithContentDescription("Approvals · YOLO status unknown for this chat").assertIsDisplayed()
         compose.onNodeWithText("YOLO status unknown for this chat").assertIsDisplayed()
-        compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
-        await { vm.data.value["picker:approvals"]?.optBoolean("session_status_known") == true }
+        compose.onNodeWithTag("approval-yolo").performScrollTo()
+        compose.onNodeWithText("Turn on YOLO for this chat…").assertIsDisplayed()
+        compose.onNodeWithTag("approval-yolo-off").performScrollTo().performClick()
+        await { vm.data.value["picker:approvals"]?.let { it.optBoolean("session_status_known") && !it.optBoolean("session_bypass") } == true }
         val write = fixture.requests.single { it.string("method") == "config.set" && it.optJSONObject("params")?.string("key") == "yolo" }.getJSONObject("params")
         assertEquals("0", write.string("value")); assertEquals("session", write.string("scope"))
         assertEquals("runtime-chat-a", write.string("session_id"))
+        omitSessionYoloReadback(vm)
         compose.onNodeWithContentDescription("Approvals").assertIsDisplayed()
+    }
+
+    @Test fun knownYoloReadOverridesTheLastVerifiedValue() = withFixture { vm, fixture ->
+        fixture.sessions.getValue("chat-a").getJSONObject("info").remove("yolo")
+        open(vm)
+        compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
+        compose.onNodeWithText("Enable YOLO").performClick()
+        await { vm.data.value["picker:approvals"]?.let { it.optBoolean("session_status_known") && it.optBoolean("session_bypass") } == true }
+        compose.onNodeWithContentDescription("Approvals · YOLO on").assertIsDisplayed()
+
+        omitSessionYoloReadback(vm)
+        compose.onNodeWithContentDescription("Approvals · YOLO on").assertIsDisplayed()
+        fixture.sessions.getValue("chat-a").getJSONObject("info").put("yolo", false)
+        open(vm)
+        await { vm.data.value["picker:approvals"]?.let { it.optBoolean("session_status_known") && !it.optBoolean("session_bypass") } == true }
+        compose.onNodeWithContentDescription("Approvals").assertIsDisplayed()
+    }
+
+    @Test fun changingConversationClearsThePreviousLastVerifiedYoloValue() = withFixture { vm, fixture ->
+        fixture.sessions.getValue("chat-a").getJSONObject("info").remove("yolo")
+        open(vm)
+        compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
+        compose.onNodeWithText("Enable YOLO").performClick()
+        await { vm.data.value["picker:approvals"]?.let { it.optBoolean("session_status_known") && it.optBoolean("session_bypass") } == true }
+        compose.onNodeWithContentDescription("Approvals · YOLO on").assertIsDisplayed()
+
+        fixture.sessions.getValue("chat-b").getJSONObject("info").remove("yolo")
+        switchConversation(vm, fixture, "chat-b")
+        compose.onNodeWithContentDescription("Approvals").assertIsDisplayed()
+        open(vm)
+        compose.onNodeWithContentDescription("Approvals · YOLO status unknown for this chat").assertIsDisplayed()
+        compose.onNodeWithText("YOLO status unknown for this chat").assertIsDisplayed()
     }
 
     @Test fun freshRefreshKeepsTheLastVerifiedYoloStateWhenHermesOmitsIt() = withFixture { vm, fixture ->
@@ -141,8 +223,11 @@ class NativeApprovalMenuUiTest {
         val beforeRefresh = fixture.requests.count { it.string("path") == "/api/auth/ws-ticket" }
         compose.onNodeWithTag("composer-approvals").performClick()
         await { fixture.requests.count { it.string("path") == "/api/auth/ws-ticket" } == beforeRefresh + 1 && "picker:approvals" !in vm.refreshing.value }
-        compose.onNodeWithContentDescription("Approvals · YOLO status unknown for this chat").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals · YOLO on · last verified").assertIsDisplayed()
         compose.onNodeWithText("YOLO status unknown for this chat. Last verified YOLO: on.").assertIsDisplayed()
+        compose.onNodeWithTag("approval-yolo").performScrollTo()
+        compose.onNodeWithText("Turn on YOLO for this chat…").assertIsDisplayed()
+        compose.onNodeWithTag("approval-yolo-off").performScrollTo()
         compose.onNodeWithText("Turn off YOLO for this chat").assertIsDisplayed()
     }
 
