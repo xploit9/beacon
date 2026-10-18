@@ -1,6 +1,9 @@
 // Adapted from Hermes Relay (MIT) app/src/main/kotlin/com/hermesandroid/relay/ui/components/MorphingSphere.kt
 package dev.hermes.android.ui.sphere
 
+import android.graphics.Canvas as AndroidCanvas
+import android.graphics.Paint as AndroidPaint
+import android.graphics.Typeface
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
@@ -20,13 +23,9 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawWithCache
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.TextLayoutResult
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.drawText
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 
@@ -47,7 +46,7 @@ import androidx.compose.ui.unit.dp
 
 // Continuous-drift speeds, matched to the legacy infinite-transition tweens so
 // the orb moves at exactly the same pace as before:
-//   time:  0..1000 over the old 1_000_000ms loop == 1.0 unit/sec
+//   time:  1.0 unit/sec, matching the old 0..1000 over 1_000_000ms loop
 //   color: 0..2π   over the old 8_000ms loop      == 0.7854 rad/sec
 private const val SPHERE_TIME_UNITS_PER_SEC = 1f
 private const val SPHERE_TWO_PI = 6.2832f
@@ -132,8 +131,7 @@ fun MorphingSphere(
                 val now = withFrameNanos { it }
                 val dtSec = (now - lastNanos).coerceAtLeast(0L) / 1_000_000_000f
                 lastNanos = now
-                animatedTime.floatValue =
-                    (animatedTime.floatValue + dtSec * SPHERE_TIME_UNITS_PER_SEC) % 1000f
+                animatedTime.floatValue = advanceSphereTime(animatedTime.floatValue, dtSec * SPHERE_TIME_UNITS_PER_SEC)
                 animatedColorPhase.floatValue =
                     (animatedColorPhase.floatValue + dtSec * SPHERE_COLOR_RADIANS_PER_SEC) %
                     SPHERE_TWO_PI
@@ -144,48 +142,58 @@ fun MorphingSphere(
     val cols = 58
     val rows = 34
 
-    // Cache covers the ~25 distinct glyphs across charSets/dataChars/debrisChars.
-    val textMeasurer = rememberTextMeasurer(cacheSize = 64)
-
     Canvas(modifier = modifier.fillMaxSize().clipToBounds().drawWithCache {
         val cellW = size.width / cols
         val cellH = size.height / rows
         val charSize = (cellW * 1.3f).coerceAtMost(cellH * 1.1f)
-        val style = TextStyle(fontSize = charSize.toSp(), fontFamily = FontFamily.Monospace)
-        val layouts = HashMap<Char, TextLayoutResult>(32)
+        val frame = SphereFrame(
+            cols = cols, rows = rows, charAspect = cellW / cellH,
+            state = state, time = 0f, colorPhase = 0f,
+            breatheSpeed = breatheSpeed, breatheAmp = breatheAmp,
+            lightSpeedX = lightSpeedX, lightSpeedY = lightSpeedY,
+            lightInfluence = lightInfluence, coreTightness = coreTightness,
+            turbulenceAmp = turbulenceAmp, rippleScale = rippleScale,
+            heartbeatSpeed = heartbeatSpeed, radialFlowSpeed = radialFlowSpeed,
+            cr1 = cr1, cg1 = cg1, cb1 = cb1,
+            cr2 = cr2, cg2 = cg2, cb2 = cb2,
+            intensity = effIntensity, toolCallBurst = effToolBurst,
+            voiceAmplitude = amp, voiceMode = effVoiceMode,
+            voiceRadiusScale = voiceRadiusScale
+        )
+        val paint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+            typeface = Typeface.MONOSPACE
+            textSize = charSize
+        }
+        // Reuse the renderer and its one-character storage throughout the draw loop.
+        val renderer = SphereCanvasRenderer(paint, SphereGlyphBuffer(), cellW, cellH)
 
         onDrawBehind {
-            val frame = SphereFrame(
-                cols = cols, rows = rows, charAspect = cellW / cellH,
-                state = state, time = fixedTime ?: animatedTime.floatValue,
-                colorPhase = fixedColorPhase ?: animatedColorPhase.floatValue,
-                breatheSpeed = breatheSpeed, breatheAmp = breatheAmp,
-                lightSpeedX = lightSpeedX, lightSpeedY = lightSpeedY,
-                lightInfluence = lightInfluence, coreTightness = coreTightness,
-                turbulenceAmp = turbulenceAmp, rippleScale = rippleScale,
-                heartbeatSpeed = heartbeatSpeed, radialFlowSpeed = radialFlowSpeed,
-                cr1 = cr1, cg1 = cg1, cb1 = cb1,
-                cr2 = cr2, cg2 = cg2, cb2 = cb2,
-                intensity = effIntensity, toolCallBurst = effToolBurst,
-                voiceAmplitude = amp, voiceMode = effVoiceMode,
-                voiceRadiusScale = voiceRadiusScale
+            renderer.canvas = drawContext.canvas.nativeCanvas
+            forEachSphereCell(
+                frame,
+                fixedTime ?: animatedTime.floatValue,
+                fixedColorPhase ?: animatedColorPhase.floatValue,
+                renderer,
             )
-
-            forEachSphereCell(frame) { col, row, char, red, green, blue, alpha ->
-                val layout = layouts.getOrPut(char) { textMeasurer.measure(char.toString(), style) }
-                // Legacy Paint used y as baseline (`row*cellH + cellH*0.8f`).
-                // Compose `drawText` uses top-left, offset by firstBaseline to match.
-                val px = col * cellW
-                val py = row * cellH + cellH * 0.8f - layout.firstBaseline
-                drawText(
-                    textLayoutResult = layout,
-                    color = Color(red, green, blue, alpha),
-                    topLeft = Offset(px, py)
-                )
-            }
         }
     }) {}
 
+}
+
+private class SphereCanvasRenderer(
+    private val paint: AndroidPaint,
+    private val glyphs: SphereGlyphBuffer,
+    private val cellW: Float,
+    private val cellH: Float,
+) : SphereCellRenderer {
+    var canvas: AndroidCanvas? = null
+
+    override fun draw(col: Int, row: Int, char: Char, r: Float, g: Float, b: Float, alpha: Float) {
+        val target = canvas ?: return
+        glyphs.set(char)
+        paint.color = Color(r, g, b, alpha).toArgb()
+        target.drawText(glyphs.characters, 0, 1, col * cellW, row * cellH + cellH * 0.8f, paint)
+    }
 }
 
 // ── Previews ─────────────────────────────────────────────────────────
@@ -232,7 +240,7 @@ private fun PreviewCompact() {
 
 @Preview(name = "Listening", showBackground = true, backgroundColor = 0xFF0A0A0A, widthDp = 360, heightDp = 640)
 @Composable
-fun MorphingSphereListeningPreview() {
+private fun MorphingSphereListeningPreview() {
     Box(Modifier.fillMaxSize().background(Color(0xFF0A0A0A))) {
         MorphingSphere(
             modifier = Modifier.fillMaxSize(),
@@ -247,7 +255,7 @@ fun MorphingSphereListeningPreview() {
 
 @Preview(name = "Speaking (low)", showBackground = true, backgroundColor = 0xFF0A0A0A, widthDp = 360, heightDp = 640)
 @Composable
-fun MorphingSphereSpeakingLowPreview() {
+private fun MorphingSphereSpeakingLowPreview() {
     Box(Modifier.fillMaxSize().background(Color(0xFF0A0A0A))) {
         MorphingSphere(
             modifier = Modifier.fillMaxSize(),
@@ -262,7 +270,7 @@ fun MorphingSphereSpeakingLowPreview() {
 
 @Preview(name = "Speaking (peak)", showBackground = true, backgroundColor = 0xFF0A0A0A, widthDp = 360, heightDp = 640)
 @Composable
-fun MorphingSphereSpeakingPeakPreview() {
+private fun MorphingSphereSpeakingPeakPreview() {
     Box(Modifier.fillMaxSize().background(Color(0xFF0A0A0A))) {
         MorphingSphere(
             modifier = Modifier.fillMaxSize(),
