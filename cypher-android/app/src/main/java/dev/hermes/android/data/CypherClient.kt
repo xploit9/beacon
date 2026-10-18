@@ -24,7 +24,12 @@ class ApiFailure(val status: Int, override val message: String) : IOException(me
 internal class LoopbackSessionRefreshFailed : IOException("Hermes restarted. Scan the Connect QR again.")
 internal const val HERMES_LOOPBACK_SESSION_HEADER = "X-Hermes-Session-Token"
 private const val MAX_LOOPBACK_ROOT_BYTES = 256L * 1024L
+private const val CYPHER_PLUGIN_PATH = "/api/plugins/cypher/"
 private val LOOPBACK_SESSION_ASSIGNMENT = Regex("""window\.__HERMES_SESSION_TOKEN__\s*=\s*("(?:\\.|[^"\\])*")\s*;""")
+
+// Hermes reserves `profile` for plugin routing; Cypher uses its own key for the selected data profile.
+private fun cypherPluginProfileQuery(query: Map<String, String>, profile: String) =
+    (query - "profile" - "cypher_profile") + ("cypher_profile" to profile)
 
 internal fun parseLoopbackSessionToken(html: String): String {
     val literal = LOOPBACK_SESSION_ASSIGNMENT.find(html)?.groupValues?.getOrNull(1) ?: throw LoopbackSessionRefreshFailed()
@@ -109,7 +114,8 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
     suspend fun nativeRequest(path: String, method: String = "GET", body: JSONObject? = null): JSONObject {
         require(NativeOperationPolicy.direct(path, method)) { "Unsupported native endpoint" }
         if (body?.has("profile") == true) require(body.string("profile") == auth.profile) { "Native request belongs to another profile" }
-        return rawCall(path, query = if (path.startsWith("/api/plugins/cypher/")) mapOf("profile" to auth.profile) else emptyMap(), method = method, data = body)
+        val query = if (path.startsWith(CYPHER_PLUGIN_PATH)) cypherPluginProfileQuery(emptyMap(), auth.profile) else emptyMap()
+        return rawCall(path, query = query, method = method, data = body)
     }
     suspend fun nativeCallContext(callId: String): JSONObject = kotlinx.coroutines.withTimeout(20_000) {
         val path = "/api/plugins/cypher/mobile/calls/$callId/context"
@@ -259,7 +265,7 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
         require(NativeOperationPolicy.direct(path, method)) { "This capability is unavailable in native Hermes" }
         if (query.containsKey("profile")) require(query["profile"] == auth.profile) { "Native request belongs to another profile" }
         if (data?.has("profile") == true) require(data.string("profile") == auth.profile) { "Native request belongs to another profile" }
-        val scoped = if (path.startsWith("/api/plugins/cypher/")) query + ("profile" to auth.profile) else query
+        val scoped = if (path.startsWith(CYPHER_PLUGIN_PATH)) cypherPluginProfileQuery(query, auth.profile) else query
         return rawCall(path, scoped, method, data, maxBytes, persistAuth)
     }
     internal suspend fun nativeAuthorizedProfiles(): List<String> = nativeProfileCatalog() ?: listOf(auth.profile)
@@ -273,7 +279,9 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
         require(NativeOperationPolicy.direct(path, "GET") && validNativeProfile(profile) && profile in authorizedProfiles) {
             "Native request belongs to an unauthorized profile"
         }
-        return rawCall(path, query + ("profile" to profile), maxBytes = maxBytes, persistAuth = false)
+        val scoped = if (path.startsWith(CYPHER_PLUGIN_PATH)) cypherPluginProfileQuery(query, profile)
+        else (query - "cypher_profile") + ("profile" to profile)
+        return rawCall(path, scoped, maxBytes = maxBytes, persistAuth = false)
     }
     /** Retained for existing direct native-protocol callers; the app's sign-in UI uses NativeAuth OAuth. */
     @Deprecated("The app's sign-in flow uses Hermes OAuth")
@@ -353,7 +361,7 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
     private suspend fun optionalExtension(profile: String): OptionalExtension {
         val payload = try {
             withTimeoutOrNull(OPTIONAL_EXTENSION_TIMEOUT_MS) {
-                nativeGet("/api/plugins/cypher/mobile/bootstrap", mapOf("profile" to profile), persistAuth = false)
+                nativeGet("/api/plugins/cypher/mobile/bootstrap", mapOf("cypher_profile" to profile), persistAuth = false)
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
@@ -463,7 +471,9 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
         require(NativeOperationPolicy.direct(mapped, if (data == null) "GET" else "POST")) { "This download capability is unavailable in native Hermes" }
         if (query.containsKey("profile")) require(query["profile"] == auth.profile) { "Native download belongs to another profile" }
         if (data?.has("profile") == true) require(data.string("profile") == auth.profile) { "Native download belongs to another profile" }
-        val scopedQuery = (query - "session_id").let { if (mapped.startsWith("/api/plugins/cypher/")) it + ("profile" to auth.profile) else it }
+        val scopedQuery = (query - "session_id").let {
+            if (mapped.startsWith(CYPHER_PLUGIN_PATH)) cypherPluginProfileQuery(it, auth.profile) else it
+        }
         execute(request(mapped, scopedQuery, if (data == null) "GET" else "POST", data?.toString()?.toRequestBody("application/json".toMediaType())).build()) { response ->
             if (!response.isSuccessful) throw ApiFailure(response.code, "Download failed (${response.code})")
             val body = response.body ?: error("Missing file")

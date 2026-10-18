@@ -60,7 +60,9 @@ class NativeSkillsTest {
         assertTrue(skills.read("mail").content.contains("Sign in first."))
         skills.toggle("mail", true)
         skills.save("mail", "# Setup\nUse the work inbox.", "a".repeat(64))
-        assertTrue(requests.take(2).all { it.url.queryParameter("profile") == "work" })
+        assertTrue(requests.take(2).all {
+            it.url.queryParameter("cypher_profile") == "work" && it.url.queryParameter("profile") == null
+        })
         requests.filter { it.method == "PUT" }.forEach { request ->
             assertEquals("PUT", request.method)
             val buffer = okio.Buffer(); request.body!!.writeTo(buffer)

@@ -192,7 +192,7 @@ class NativeBotModeTest {
         val c = CypherClient(AuthContext("https://native.example", emptyList(), "owner", "default"), null) { builder ->
             builder.addInterceptor { chain ->
                 val request = chain.request()
-                assertEquals("default", request.url.queryParameter("profile"))
+                assertEquals("default", request.url.queryParameter("cypher_profile"))
                 var status = 200
                 val result = when {
                     request.url.encodedPath.endsWith("/messages") -> {
@@ -236,7 +236,8 @@ class NativeBotModeTest {
         fun account(owner: String, profile: String) = CypherClient(AuthContext("https://native.example", emptyList(), owner, profile), null) { builder ->
             builder.addInterceptor { chain ->
                 val request = chain.request()
-                profiles += request.url.queryParameter("profile").orEmpty()
+                val profileKey = if (request.url.encodedPath.startsWith("/api/plugins/cypher/")) "cypher_profile" else "profile"
+                profiles += request.url.queryParameter(profileKey).orEmpty()
                 val result = if (request.url.encodedPath.endsWith("/space/room"))
                     JSONObject("""{"room":{"room_id":"room"},"events":[{"event_id":"1","kind":"message.user","payload":{"text":"Private history"}}]}""")
                 else JSONObject(if (roomsVisible) """{"bots":[],"spaces":[{"room_id":"room","name":"Team"}]}""" else """{"bots":[],"spaces":[]}""")

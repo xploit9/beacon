@@ -208,7 +208,8 @@ class KeepConnectedTest {
                 assertFalse(reason.contains("private response token"))
                 val request = server.takeRequest()
                 assertEquals("/api/plugins/cypher/mobile/notifications/events", request.requestUrl!!.encodedPath)
-                assertEquals("academic", request.requestUrl!!.queryParameter("profile"))
+                assertEquals("academic", request.requestUrl!!.queryParameter("cypher_profile"))
+                assertNull(request.requestUrl!!.queryParameter("profile"))
             }
         } finally {
             client.closeNative()
@@ -220,7 +221,7 @@ class KeepConnectedTest {
         val server = MockWebServer().apply { start() }
         server.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
             override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse =
-                if (request.requestUrl?.queryParameter("profile") == "academic") {
+                if (request.requestUrl?.queryParameter("cypher_profile") == "academic") {
                     MockResponse().setResponseCode(403).setBody("""{"detail":"private profile policy"}""")
                 } else {
                     val after = request.requestUrl?.queryParameter("after")?.toLongOrNull() ?: 0L

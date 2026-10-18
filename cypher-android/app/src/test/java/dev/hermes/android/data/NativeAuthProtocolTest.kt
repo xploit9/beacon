@@ -39,7 +39,7 @@ class NativeAuthProtocolTest {
                         else response(200, JSONObject().put("profiles", JSONArray(profiles.map { json("name" to it) })).toString())
                     "/api/profiles/active" -> response(200, json("active" to activeProfile, "current" to activeProfile).toString())
                     "/api/plugins/cypher/mobile/bootstrap" -> {
-                        val profile = request.url.queryParameter("profile").orEmpty()
+                        val profile = request.url.queryParameter("cypher_profile").orEmpty()
                         when (plugin) {
                             "absent" -> response(404, """{"detail":"Not Found"}""")
                             "error" -> response(500, """{"detail":"plugin failed"}""")
@@ -84,7 +84,7 @@ class NativeAuthProtocolTest {
         val optional = client.probeOptionalFeatures()
         assertEquals("available", optional.getString("plugin"))
         assertTrue(optional.getJSONObject("voice").getBoolean("available"))
-        assertEquals("work", pluginCalls(requests).single().url.queryParameter("profile"))
+        assertEquals("work", pluginCalls(requests).single().url.queryParameter("cypher_profile"))
         assertTrue(requests.none { it.url.encodedPath in setOf("/api/auth/providers", "/auth/password-login") })
         assertTrue(requests.none { it.header("X-Hermes-CSRF-Token") != null })
     }
@@ -114,7 +114,7 @@ class NativeAuthProtocolTest {
         assertEquals("absent", optional.getString("plugin"))
         assertFalse(optional.getJSONObject("voice").getBoolean("available"))
         assertEquals(before, client.auth)
-        assertEquals("work", pluginCalls(requests).single().url.queryParameter("profile"))
+        assertEquals("work", pluginCalls(requests).single().url.queryParameter("cypher_profile"))
         assertEquals("native-owner", boot.getString("owner_id"))
     }
 
@@ -188,18 +188,18 @@ class NativeAuthProtocolTest {
         val (work, workRequests) = fixture()
         assertEquals("work", work.bootstrap().getString("profile"))
         work.probeOptionalFeatures()
-        assertEquals("work", pluginCalls(workRequests).single().url.queryParameter("profile"))
+        assertEquals("work", pluginCalls(workRequests).single().url.queryParameter("cypher_profile"))
 
         val (fallback, fallbackRequests) = fixture(profiles = listOf("default", "ops"), activeProfile = "ops")
         assertEquals("ops", fallback.bootstrap().getString("profile"))
         fallback.probeOptionalFeatures()
-        assertEquals("ops", pluginCalls(fallbackRequests).single().url.queryParameter("profile"))
+        assertEquals("ops", pluginCalls(fallbackRequests).single().url.queryParameter("cypher_profile"))
 
         val (defaultOnly, defaultRequests) = fixture(profiles = listOf("default"), activeProfile = "default")
         assertEquals("default", defaultOnly.bootstrap().getString("profile"))
         assertEquals("default", defaultOnly.auth.profile)
         defaultOnly.probeOptionalFeatures()
-        assertEquals("default", pluginCalls(defaultRequests).single().url.queryParameter("profile"))
+        assertEquals("default", pluginCalls(defaultRequests).single().url.queryParameter("cypher_profile"))
 
         val (older, _) = fixture(profiles = null)
         assertEquals("work", older.bootstrap().getString("profile"))
@@ -320,7 +320,7 @@ class NativeAuthProtocolTest {
         }
         val path = "/api/plugins/cypher/mobile/releases/fixture/download"
         assertArrayEquals(byteArrayOf(1, 2, 3), c.bytes(path, mapOf("session_id" to "stored-a")))
-        assertEquals("work", requests.single().url.queryParameter("profile"))
+        assertEquals("work", requests.single().url.queryParameter("cypher_profile"))
         assertNull(requests.single().url.queryParameter("session_id"))
         assertEquals(path, requests.single().url.encodedPath)
         assertTrue(runCatching { c.bytes(path, mapOf("profile" to "foreign")) }.isFailure)
