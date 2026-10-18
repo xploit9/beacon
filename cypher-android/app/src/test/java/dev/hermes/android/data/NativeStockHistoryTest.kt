@@ -18,7 +18,7 @@ import java.util.concurrent.CopyOnWriteArrayList
  *
  * Every response below is a SYNTHETIC FIXTURE served by an interceptor. It stands in for the stock dashboard routes
  * the Hermes Relay reference uses (DashboardApiClient.listSessions / getSessionMessages):
- *  - GET /api/sessions?profile=&archived=exclude|only|include&limit<=100&offset=   (Cypher keeps a 200-row window: 2x100)
+ *  - GET /api/sessions?profile=&archived=exclude|only|include&exclude_sources=cron&limit<=100&offset=   (Cypher keeps a 200-row window: 2x100)
  *  - GET /api/sessions/{id}?profile=                                                (metadata)
  *  - GET /api/sessions/{id}/messages?profile=&limit<=500&offset=&order=latest|oldest
  *    -> {session_id (the resolved compression descendant), profile, messages (chronological, ancestors included),
@@ -150,6 +150,7 @@ class NativeStockHistoryTest {
         assertEquals("Newest 200 conversation titles and identities", result.getString("search_scope"))
         assertTrue(stock.pluginHistory().isEmpty())
         assertTrue(stock.listPages().all { it.url.queryParameter("archived") in setOf(null, "exclude") })
+        assertTrue("Cron runs are excluded from active recents", stock.listPages().all { it.url.queryParameter("exclude_sources") == "cron" })
         assertTrue(stock.listPages().all { (it.url.queryParameter("limit")?.toInt() ?: 0) in 1..100 })
         assertProfiled(stock)
         assertTrue(probe.opened.isEmpty())
@@ -161,6 +162,7 @@ class NativeStockHistoryTest {
         assertEquals(listOf("archived-0", "archived-1"), ids(result))
         for (i in 0 until 2) assertTrue(result.getJSONArray("sessions").getJSONObject(i).getBoolean("archived"))
         assertTrue(stock.listPages().isNotEmpty() && stock.listPages().all { it.url.queryParameter("archived") == "only" })
+        assertTrue("Cron runs are excluded from archived recents", stock.listPages().all { it.url.queryParameter("exclude_sources") == "cron" })
         assertProfiled(stock)
     }
 
@@ -195,6 +197,7 @@ class NativeStockHistoryTest {
         assertEquals(listOf("archived-0"), ids(list(c, archived = true, query = "archived-0")))
         assertTrue(stock.pluginHistory().isEmpty())
         assertTrue(stock.listPages().all { (it.url.queryParameter("limit")?.toInt() ?: 0) in 1..100 })
+        assertTrue("List and local-search requests both exclude cron runs", stock.listPages().all { it.url.queryParameter("exclude_sources") == "cron" })
         assertProfiled(stock)
     }
 

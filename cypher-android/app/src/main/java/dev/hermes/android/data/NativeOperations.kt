@@ -18,7 +18,12 @@ private const val MAX_COMPRESSION_CHAIN = 512
 private const val OPTIONAL_VOICE_HISTORY_TIMEOUT_MS = 1_500L
 
 internal class NativeOperations(private val c: CypherClient) {
-    suspend fun call(path: String, q: Map<String, String>, method: String, body: JSONObject?, maxBytes: Int): JSONObject = try { dispatch(path, q, method, body, maxBytes) } finally { c.closeNative() }
+    suspend fun call(path: String, q: Map<String, String>, method: String, body: JSONObject?, maxBytes: Int): JSONObject {
+        var keepCreatedSessionLive = false
+        return try {
+            dispatch(path, q, method, body, maxBytes).also { keepCreatedSessionLive = path == "/api/session/new" || path == "/api/xara/open" }
+        } finally { if (!keepCreatedSessionLive) c.closeNative() }
+    }
     /** Adapts Hermes Relay's session-scoped GatewayChatClient.setYolo wire contract. */
     private suspend fun setSessionYolo(target: NativeSessionBinding, enabled: Boolean) {
         val value = if (enabled) "1" else "0"
@@ -279,7 +284,7 @@ internal class NativeOperations(private val c: CypherClient) {
         var offset = 0
         while (offset < SESSION_INDEX_WINDOW) {
             val limit = minOf(SESSION_PAGE_LIMIT, SESSION_INDEX_WINDOW - offset)
-            val page = c.nativeGet("/api/sessions", mapOf("profile" to c.auth.profile, "archived" to if (archived) "only" else "exclude", "limit" to "$limit", "offset" to "$offset"))
+            val page = c.nativeGet("/api/sessions", mapOf("profile" to c.auth.profile, "archived" to if (archived) "only" else "exclude", "exclude_sources" to "cron", "limit" to "$limit", "offset" to "$offset"))
             val items = listOf("sessions", "items", "data").firstNotNullOfOrNull { page.opt(it) as? JSONArray } ?: error("Hermes returned an unreadable conversation list")
             for (index in 0 until items.length()) {
                 val row = items.opt(index) as? JSONObject ?: error("Hermes returned an unreadable conversation list")

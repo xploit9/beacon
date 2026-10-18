@@ -94,7 +94,9 @@ internal class NativeGateway(private val client: CypherClient, private val socke
         mine.pending[id] = result
         try {
             mine.failure?.let { throw unknown(it) }
-            if (mine.socket?.send(json("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to params.copy().put("profile", client.auth.profile)).toString()) != true) throw unknown(IOException("Native connection unavailable"))
+            val wireParams = params.copy().put("profile", client.auth.profile)
+            if (method == "session.resume") wireParams.put("source", "android")
+            if (mine.socket?.send(json("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to wireParams).toString()) != true) throw unknown(IOException("Native connection unavailable"))
             val response = try { withTimeout(rpcTimeoutMs) { result.await() } } catch (e: TimeoutCancellationException) { currentCoroutineContext().ensureActive(); throw unknown(e) }
             response.optJSONObject("error")?.let { throw ApiFailure(it.optInt("code", 500), it.optString("message", "Native operation failed")) }
             return response.optJSONObject("result") ?: JSONObject().put("value", response.opt("result"))

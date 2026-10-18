@@ -151,6 +151,15 @@ def safely(fn,*args):
     except ValueError as exc: raise HTTPException(409,str(exc)) from None
     except (OSError,TypeError): raise HTTPException(503,'Configured resource unavailable') from None
     except RuntimeError: raise HTTPException(503,'Native service unavailable') from None
+_NOT_OWNED_CONVERSATION='This chat is not linked to your Hermes sign-in, so Cypher cannot start a call from it. Start a new chat in Cypher.'
+def reject_unowned_conversation(owner,provider,profile,stored):
+    try:
+        from tui_gateway import server
+        with server._profile_db({'profile':profile}) as db: row=db.get_session(stored) if db else None
+    except Exception:
+        return
+    if row is not None and row.get('user_id')!=provider+':'+owner:
+        raise HTTPException(404,_NOT_OWNED_CONVERSATION) from None
 def call(request,call_id,writable=False):
     # First authorize owner, then select the call's recorded profile rather than trust input.
     owner,provider,profile,cfg=identity(request,owner_only=True)
@@ -159,6 +168,7 @@ def call(request,call_id,writable=False):
     selected=request.query_params.get('cypher_profile') or request.query_params.get('profile')
     if selected and selected!=row['profile']: raise HTTPException(403,'Call profile mismatch')
     identity(request,row['profile'])
+    reject_unowned_conversation(owner,provider,row['profile'],row['conversation'])
     return owner,provider,row,cfg
 router.include_router(sys.modules['cypher_gateway_api'].build_router(call,body,voice_context.scoped,mobile))
 
@@ -236,7 +246,9 @@ async def calls(request:Request):
         raise HTTPException(400,'Choose a voice provider for a phone-key call')
     elif selection['provider']=='openai':
         raise HTTPException(409,'OpenAI Realtime requires a phone-held key')
-    if conversation: await asyncio.to_thread(safely,native.reserve_conversation,owner,provider,profile,conversation)
+    if conversation:
+        reject_unowned_conversation(owner,provider,profile,conversation)
+        await asyncio.to_thread(safely,native.reserve_conversation,owner,provider,profile,conversation)
     else:
         with mobile.connect() as conn:
             if conn.execute('SELECT COUNT(*) FROM calls WHERE owner=? AND closed=0 AND created>?',(owner,time.time()-4*3600)).fetchone()[0]>=mobile.MAX_ACTIVE_CALLS:
@@ -619,7 +631,9 @@ async def answer(invitation_id:str,action:str,request:Request):
         if row['state']!='pending' or row['expires']<=time.time(): raise HTTPException(409,'Invitation consumed or expired')
         return dict(row)
     initial=await asyncio.to_thread(peek)
-    if action=='answer': await asyncio.to_thread(safely,native.verify,owner,provider,profile,initial['conversation'])
+    if action=='answer':
+        reject_unowned_conversation(owner,provider,profile,initial['conversation'])
+        await asyncio.to_thread(safely,native.verify,owner,provider,profile,initial['conversation'])
     source=await asyncio.to_thread(mobile.refs,owner,profile)
     selection=voice_models.selected(mobile,owner,profile,cfg)
     if action=='answer' and 'voice_provider' in value:
