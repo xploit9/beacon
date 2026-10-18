@@ -241,6 +241,10 @@ class NativeGatewayProtocolTest {
         assertTrue(wire.sent.none { it.getString("method") == "session.interrupt" })
         gateway.close()
     }
+    @Test fun connectionTicketCannotInjectAnotherWebSocketSubprotocol() {
+        assertEquals("fixture-single-use-ticket", nativeConnectionTicket("fixture-single-use-ticket"))
+        assertTrue(runCatching { nativeConnectionTicket("ticket,another-protocol") }.isFailure)
+    }
     @Test fun acceptedPromptMetadataIsPreservedAndLostAckIsNeverRetried() = runBlocking<Unit> {
         val wire = Wire(); val gateway = NativeGateway(client(), wire)
         assertEquals(42, gateway.rpc("prompt.submit", json("session_id" to "runtime-a", "text" to "fixture")).getInt("user_row_id"))

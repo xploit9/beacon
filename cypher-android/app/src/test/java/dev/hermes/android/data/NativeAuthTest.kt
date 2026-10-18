@@ -35,11 +35,11 @@ import java.util.concurrent.TimeUnit
 
 class NativeAuthTest {
     @Test fun nativeOAuthRoutesAreAllowed() {
-        assertTrue(NativeOperationPolicy.direct("/auth/native/authorize"))
-        assertTrue(NativeOperationPolicy.direct("/auth/native/token"))
-        assertTrue(NativeOperationPolicy.direct("/auth/native/refresh"))
-        assertTrue(NativeOperationPolicy.direct("/auth/logout"))
-        assertTrue(NativeOperationPolicy.direct("/api/status"))
+        assertTrue(NativeOperationPolicy.direct("/auth/native/authorize", "GET"))
+        assertTrue(NativeOperationPolicy.direct("/auth/native/token", "GET"))
+        assertTrue(NativeOperationPolicy.direct("/auth/native/refresh", "GET"))
+        assertTrue(NativeOperationPolicy.direct("/auth/logout", "GET"))
+        assertTrue(NativeOperationPolicy.direct("/api/status", "GET"))
     }
 
     @Test fun pkceS256MatchesTheRfc7636Vector() {

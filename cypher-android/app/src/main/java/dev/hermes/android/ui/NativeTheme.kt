@@ -3,9 +3,10 @@ package dev.hermes.android.ui
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
@@ -37,16 +38,25 @@ fun nativeAmbientColors(scheme: ColorScheme): List<Color> = listOf(
 
 // Dotted chat background and metadata style adapted from Hermes Relay ui/theme/RelayRefresh.kt
 // (RelayDottedOverlay, relayMetadataStyle) — MIT, see licenses/Hermes-Relay-MIT.txt. Colors come from the active Cypher scheme.
+internal fun forEachNativeDot(width: Float, height: Float, step: Float, draw: (Rect) -> Unit) {
+    require(width.isFinite() && height.isFinite() && step.isFinite() && width >= 0f && height >= 0f && step > 0f)
+    var y = 0f
+    while (y <= height) {
+        var x = 0f
+        while (x <= width) {
+            draw(Rect(x - .1f, y - .1f, x + 2.1f, y + 2.1f))
+            x += step
+        }
+        y += step
+    }
+}
+
 @Composable fun Modifier.chatDottedBackground(alpha: Float = .14f): Modifier {
     val dot = MaterialTheme.colorScheme.primary.copy(alpha = alpha)
-    return drawBehind {
-        val step = 12.dp.toPx()
-        var y = 0f
-        while (y <= size.height) {
-            var x = 0f
-            while (x <= size.width) { drawCircle(dot, radius = 1.1f, center = Offset(x + 1f, y + 1f)); x += step }
-            y += step
-        }
+    return drawWithCache {
+        val dots = Path()
+        forEachNativeDot(size.width, size.height, 12.dp.toPx()) { dots.addOval(it) }
+        onDrawBehind { drawPath(dots, dot) }
     }
 }
 

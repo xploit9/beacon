@@ -10,6 +10,7 @@ import android.graphics.Bitmap
 import android.os.ParcelFileDescriptor
 import java.io.FileOutputStream
 import org.junit.Assert.*
+import org.junit.After
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -28,6 +29,11 @@ class LiveCallInterfaceTest {
         fun wakeUp() { executeShellCommand("input keyevent 224") }
     }
     private fun shell(command: String) { device.executeShellCommand(command) }
+    @After fun restoreDeviceDisplay() {
+        shell("wm size reset")
+        shell("wm density reset")
+        shell("settings put system font_scale 1.0")
+    }
     private fun capture(name: String) {
         val dir=File(rule.activity.getExternalFilesDir(null),"ui-evidence").apply{mkdirs()}
         assertTrue(device.takeScreenshot(File(dir,"$name.png")))

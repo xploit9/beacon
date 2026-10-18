@@ -25,7 +25,7 @@ internal fun nativeSessionBinding(scope: Scope, result: JSONObject): NativeSessi
 
 /** The ticket rides in a Sec-WebSocket-Protocol header value, so refuse anything but a bounded single token. */
 internal fun nativeConnectionTicket(value: String): String {
-    require(value.length in 1..1024 && value.none { it <= ' ' || it == '\u007f' }) { "Native server did not return a usable connection ticket" }
+    require(value.length in 1..1024 && value.none { it <= ' ' || it == '\u007f' || it == ',' }) { "Native server did not return a usable connection ticket" }
     return value
 }
 
