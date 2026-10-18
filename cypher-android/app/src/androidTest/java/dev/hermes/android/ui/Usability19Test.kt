@@ -189,7 +189,10 @@ class Usability19Test {
             await("PDF link name appeared", 25_000, { previewState() }) {
                 compose.onAllNodesWithText("Native pager PDF").fetchSemanticsNodes().isNotEmpty()
             }
-            compose.onNodeWithText("Native pager PDF").performTouchInput { click() }
+            val linkLayouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+            compose.onNodeWithText("Native pager PDF").performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(linkLayouts) }
+            val linkPosition = linkLayouts.single().getBoundingBox(2).center
+            compose.onNodeWithText("Native pager PDF").performTouchInput { click(linkPosition) }
             await("Linked PDF viewer opened", 25_000, { previewState() }) {
                 compose.onAllNodesWithText("Close").fetchSemanticsNodes().isNotEmpty()
             }
