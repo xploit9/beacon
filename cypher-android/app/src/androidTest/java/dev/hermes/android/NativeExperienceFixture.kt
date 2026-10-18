@@ -22,6 +22,7 @@ internal suspend fun loginLiveTest(app: CypherApplication, origin: String, crede
 internal class NativeExperienceFixture : WebSocket.Factory {
     val requests = CopyOnWriteArrayList<JSONObject>()
     val sessions = ConcurrentHashMap<String, JSONObject>()
+    private val unpromptedShells = ConcurrentHashMap<String, JSONObject>()
     val jobs = ConcurrentHashMap<String, JSONObject>()
     val boardTasks = ConcurrentHashMap<String, JSONObject>()
     val projects = ConcurrentHashMap<String, JSONObject>()
@@ -68,6 +69,9 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var notificationProfiles = listOf("default", "coder")
     @Volatile var incomingNotification: JSONObject? = null
     val notificationWaits = CopyOnWriteArrayList<Long>()
+    fun markUnpromptedShell(id: String) {
+        unpromptedShells[id] = sessions.remove(id) ?: error("Synthetic session missing")
+    }
     fun emitIncomingCall(profile: String = "default", conversationId: String = "chat-a", expiresInSeconds: Long = 120): JSONObject {
         require(profile in notificationProfiles)
         val id = java.util.UUID.randomUUID().toString().replace("-", "")
@@ -186,15 +190,17 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             }
             val buffer = okio.Buffer(); request.body?.writeTo(buffer)
             val body = buffer.readUtf8().takeIf(String::isNotBlank)?.let(::JSONObject) ?: JSONObject()
+            val profileQuery = if (request.url.encodedPath.startsWith("/api/plugins/cypher/")) "cypher_profile" else "profile"
+            val profile = request.url.queryParameter(profileQuery) ?: "default"
             requests += if (request.url.encodedPath.startsWith("/auth/native/")) json(
                 "path" to request.url.encodedPath,
                 "method" to request.method,
                 "body_fields" to JSONArray().apply { body.keys().forEach { put(it) } },
             )
-                else json("path" to request.url.encodedPath, "method" to request.method, "body" to body, "profile" to request.url.queryParameter("profile"))
+                else json("path" to request.url.encodedPath, "method" to request.method, "body" to body, "profile" to profile)
             val outage = pluginStatus?.takeIf { request.url.encodedPath.startsWith("/api/plugins/cypher/") }
             val (status, result) = if (outage != null) outage to json("detail" to "Synthetic optional plugin outage")
-                else http(request.url.encodedPath, request.method, body, request.url.queryParameter("profile") ?: "default", request.url.queryParameter("path").orEmpty(), request.url.queryParameter("include_archived") == "1" || request.url.queryParameter("archived") == "only", request.url)
+                else http(request.url.encodedPath, request.method, body, profile, request.url.queryParameter("path").orEmpty(), request.url.queryParameter("include_archived") == "1" || request.url.queryParameter("archived") == "only", request.url)
             Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(status).message("Synthetic fixture")
                 .body(result.toString().toResponseBody("application/json".toMediaType())).build()
         }
@@ -518,7 +524,13 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             "session.cwd.set" -> { sessions.getValue(id).getJSONObject("info").put("cwd", params.getString("cwd")); json("cwd" to params.getString("cwd")) }
             "projects.tree" -> json("projects" to JSONArray().put(json("id" to "p_project_a", "label" to "Travel", "path" to "C:/synthetic-workspace", "sessionCount" to 2)), "scoped_session_ids" to JSONArray().put("chat-a").put("chat-b"))
             "projects.project_sessions" -> json("project" to json("id" to params.getString("project_id"), "label" to "Travel", "sessionIds" to JSONArray().put("chat-a").put("chat-b"), "previewSessions" to JSONArray().put(json("id" to "chat-a", "title" to "Travel planning", "profile" to scope.profile))))
-            "session.resume", "session.history" -> { require(!historyFailure) { "Synthetic history unavailable" }; sessions[id]?.copy()?.apply { put("session_key", id); remove("stored_session_id"); getJSONObject("info").put("stored_session_id", id) } ?: throw IllegalArgumentException("Synthetic session missing") }
+            "session.resume" -> {
+                require(!historyFailure) { "Synthetic history unavailable" }
+                val row = sessions[id] ?: unpromptedShells.remove(id)?.also { sessions[id] = it }
+                row?.copy()?.apply { put("session_key", id); remove("stored_session_id"); getJSONObject("info").put("stored_session_id", id) }
+                    ?: throw IllegalArgumentException("Synthetic session missing")
+            }
+            "session.history" -> { require(!historyFailure) { "Synthetic history unavailable" }; sessions[id]?.copy()?.apply { put("session_key", id); remove("stored_session_id"); getJSONObject("info").put("stored_session_id", id) } ?: throw IllegalArgumentException("Synthetic session missing") }
             "session.create" -> { val key = "new-${sequence.incrementAndGet()}"; history(key, params.string("title", "New conversation"), JSONArray()).also { sessions[key] = it } }
             "session.events.since" -> json("epoch" to "synthetic", "latest_seq" to nativeEventSequence.get(), "events" to JSONArray(nativeEvents.filter { it.optLong("seq") > params.optLong("last_seen", 0) }))
             "session.active_list" -> {

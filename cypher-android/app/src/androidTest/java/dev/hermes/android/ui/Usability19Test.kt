@@ -15,8 +15,6 @@ import androidx.compose.ui.test.*
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
-import androidx.datastore.preferences.core.edit
-import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.lifecycle.*
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
@@ -24,8 +22,7 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.hermes.android.*
 import dev.hermes.android.core.*
-import dev.hermes.android.data.AuthContext
-import dev.hermes.android.data.CypherClient
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
@@ -36,36 +33,36 @@ import java.io.File
 /** Actual renderer/control proof with generated PDF bytes in the disposable fixture workspace. */
 class Usability19Test {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
-    @Suppress("DEPRECATION")
-    private fun fixture(block: (CypherViewModel, CypherClient) -> Unit) {
-        val args = InstrumentationRegistry.getArguments()
-        check(args.getString("controls_probe") == "1")
-        val origin = args.getString("rc8Fixture", "https://localhost:8798")
-        require(origin.matches(Regex("https://localhost:[0-9]+")))
+    private fun field(vm: CypherViewModel, name: String, value: Any?) {
+        CypherViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.set(vm, value)
+    }
+    @Suppress("UNCHECKED_CAST")
+    private fun <T> flow(vm: CypherViewModel, name: String) = CypherViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.get(vm) as MutableStateFlow<T>
+    private fun fixture(block: (CypherViewModel, NativeExperienceFixture) -> Unit) {
         val app = ApplicationProvider.getApplicationContext<CypherApplication>()
-        val prefs = runBlocking { app.preferences.data.first() }; val auth = app.auth.read(origin)
+        val prefs = runBlocking { app.preferences.data.first() }
         val store = ViewModelStore(); lateinit var vm: CypherViewModel
-        val control = CypherClient(AuthContext(origin, emptyList()), app.auth)
+        val fixture = NativeExperienceFixture()
+        val owner = fixture.scope
         val kinds = listOf("initial-draft", "new-chat-attempt", "new-chat-shell", "selected-session")
-        var owner: Scope? = null
-        var retained: Map<String, String?> = emptyMap()
+        val retained = runBlocking { kinds.associateWith { app.cache.read(owner, it) } }
         try {
-            runBlocking { control.login("fixture-only", username = "fixture-user"); control.post("/api/profile/switch", json("name" to "default")); control.bootstrap() }
-            val scope = control.scope
-            owner = scope
-            retained = runBlocking { kinds.associateWith { app.cache.read(scope, it) } }
-            runBlocking { kinds.forEach { app.cache.delete(scope, it) }; app.preferences.edit { it[stringPreferencesKey("origin")] = "" } }
-            compose.runOnUiThread { vm = ViewModelProvider(store, viewModelFactory { initializer { CypherViewModel(app, SavedStateHandle()) } })[CypherViewModel::class.java] }
-            compose.runOnIdle { vm.connect(origin) }
-            compose.waitUntil(25_000) { vm.ui.value.authenticated && !vm.ui.value.loading && vm.ui.value.initialChatReady }
-            val sid = runBlocking { control.post("/api/session/import", json("title" to "Native PDF pager", "messages" to org.json.JSONArray(listOf(json("role" to "user", "content" to "Synthetic PDF pager"))))) }.getString("session_id")
-            compose.runOnIdle { vm.selectSession(sid) }
-            compose.waitUntil(25_000) { vm.authenticatedScope()?.session == sid && vm.chat.value.sessionId == sid }
-            block(vm, control)
+            runBlocking { kinds.forEach { app.cache.delete(owner, it) } }
+            compose.runOnUiThread {
+                vm = ViewModelProvider(store, viewModelFactory { initializer { CypherViewModel(app, SavedStateHandle()) } })[CypherViewModel::class.java]
+                field(vm, "client", fixture.client)
+                field(vm, "sourceScope", owner.session("chat-a"))
+                app.calls.ownerScope = owner
+                val snapshot = fixture.snapshot("chat-a")
+                flow<AppState>(vm, "_ui").value = AppState(origin = owner.origin, authenticated = true, connected = true, owner = owner.owner, profile = owner.profile, setupComplete = true,
+                    initialChatReady = true, restoringSession = false, bootstrap = json("voice" to json("available" to false)), sessions = fixture.sessions.keys.sorted().map(fixture::snapshot))
+                flow<ChatState>(vm, "_chat").value = ChatState(sessionId = "chat-a", title = "Travel planning", raw = snapshot,
+                    messages = snapshot.rows("messages").mapIndexed { index, row -> Message.from(row, index, "chat-a") })
+            }
+            block(vm, fixture)
         } finally {
-            compose.runOnUiThread { store.clear() }
-            owner?.let { scope -> runBlocking { retained.forEach { (kind, value) -> if (value == null) app.cache.delete(scope, kind) else app.cache.write(scope, kind, value, true) } } }
-            runBlocking { if (auth.owner.isBlank()) app.auth.clear(origin) else app.auth.write(auth); app.preferences.updateData { prefs } }
+            compose.runOnUiThread { store.clear(); fixture.client.closeNative(); app.calls.ownerScope = null }
+            runBlocking { retained.forEach { (kind, value) -> if (value == null) app.cache.delete(owner, kind) else app.cache.write(owner, kind, value, true) }; app.preferences.updateData { prefs } }
         }
     }
     @Test fun systemBackCancelsAnAuthenticatedSetupWizard() = fixture { vm, _ ->
@@ -80,7 +77,7 @@ class Usability19Test {
         compose.waitUntil(5_000) { !vm.ui.value.setupWizard }
         assertTrue(vm.ui.value.authenticated)
     }
-    @Test fun pdfPagerHasVisibleNamesCountsAndDisabledBoundaries() = fixture { vm, control ->
+    @Test fun pdfPagerHasVisibleNamesCountsAndDisabledBoundaries() = fixture { vm, fixture ->
         val app = ApplicationProvider.getApplicationContext<CypherApplication>()
         val args = InstrumentationRegistry.getArguments()
         val sid = requireNotNull(vm.authenticatedScope()).session
@@ -96,7 +93,7 @@ class Usability19Test {
                 }
                 file.outputStream().use(pdf::writeTo)
             } finally { pdf.close() }
-            runBlocking { control.upload("/api/workspace/upload", file, name, "application/pdf", sid) }
+            fixture.downloads[name] = file.readBytes()
             var screen by mutableStateOf("pdf")
             compose.setContent {
                 val density = LocalDensity.current
