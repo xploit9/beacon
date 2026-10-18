@@ -63,6 +63,7 @@ import org.json.JSONObject
     var deviceAllowed by remember { mutableStateOf(androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled()) }
     var keepConnectedEnabled by remember(context) { mutableStateOf(KeepConnectedService.isEnabled(context)) }
     var keepConnectedStatus by remember(context) { mutableStateOf(KeepConnectedService.status(context)) }
+    var keepConnectedReason by remember(context) { mutableStateOf(KeepConnectedService.failureReason(context)) }
     var pendingKeepConnectedChoice by remember { mutableStateOf<Boolean?>(null) }
     val keepConnectedPermissionRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
         deviceAllowed = allowed || androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled()
@@ -79,12 +80,13 @@ import org.json.JSONObject
     var restricted by remember { mutableStateOf(backgroundRestricted()) }
     var optimized by remember { mutableStateOf(batteryOptimized()) }
     val liveUpdatesSettings = remember(context) { Intent("android.settings.MANAGE_APP_PROMOTED_NOTIFICATIONS").putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName).takeIf { android.os.Build.VERSION.SDK_INT >= 36 && it.resolveActivity(context.packageManager) != null } }
-    androidx.lifecycle.compose.LifecycleResumeEffect(ownerScope) { target = vm.client?.scope?.let { vm.app.push.registeredTarget(it) }; deviceAllowed = androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled(); keepConnectedEnabled = KeepConnectedService.isEnabled(context); keepConnectedStatus = KeepConnectedService.status(context); liveUpdatesAllowed = liveAllowed();restricted=backgroundRestricted();optimized=batteryOptimized(); if (vm.app.firebaseConfigured) vm.load("push-status", "/api/plugins/cypher/mobile/notifications/status"); onPauseOrDispose { } }
+    androidx.lifecycle.compose.LifecycleResumeEffect(ownerScope) { target = vm.client?.scope?.let { vm.app.push.registeredTarget(it) }; deviceAllowed = androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled(); keepConnectedEnabled = KeepConnectedService.isEnabled(context); keepConnectedStatus = KeepConnectedService.status(context); keepConnectedReason = KeepConnectedService.failureReason(context); liveUpdatesAllowed = liveAllowed();restricted=backgroundRestricted();optimized=batteryOptimized(); if (vm.app.firebaseConfigured) vm.load("push-status", "/api/plugins/cypher/mobile/notifications/status"); onPauseOrDispose { } }
     DisposableEffect(context) {
         val prefs = context.getSharedPreferences(KeepConnectedService.PREFS, android.content.Context.MODE_PRIVATE)
         val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
             if (key == KeepConnectedService.KEY_ENABLED) keepConnectedEnabled = KeepConnectedService.isEnabled(context)
             if (key == KeepConnectedService.KEY_STATUS) keepConnectedStatus = KeepConnectedService.status(context)
+            if (key == KeepConnectedService.KEY_REASON) keepConnectedReason = KeepConnectedService.failureReason(context)
         }
         prefs.registerOnSharedPreferenceChangeListener(listener)
         onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
@@ -172,6 +174,12 @@ import org.json.JSONObject
                 keepConnectedStatus == KeepConnectedService.STATUS_SIGNED_OUT -> "Signed out · sign in again to receive calls"
                 else -> "Starting…"
             }, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.testTag("keep-connected-status"))
+            if (keepConnectedEnabled && keepConnectedReason.isNotBlank()) Text(
+                keepConnectedReason,
+                color = if (keepConnectedStatus == KeepConnectedService.STATUS_RECONNECTING || keepConnectedStatus == KeepConnectedService.STATUS_SIGNED_OUT) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.testTag("keep-connected-reason"),
+            )
             if (keepConnectedEnabled && !deviceAllowed) Text("Android notifications are off; incoming call alerts may be hidden.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
         } }
         if (vm.app.firebaseConfigured) {

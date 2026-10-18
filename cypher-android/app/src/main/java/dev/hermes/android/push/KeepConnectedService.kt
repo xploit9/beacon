@@ -14,6 +14,7 @@ import android.os.IBinder
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import dev.hermes.android.BuildConfig
 import dev.hermes.android.CypherActivity
 import dev.hermes.android.CypherApplication
 import dev.hermes.android.R
@@ -21,6 +22,7 @@ import dev.hermes.android.core.Scope
 import dev.hermes.android.core.digest
 import dev.hermes.android.data.AuthContext
 import dev.hermes.android.data.AuthStore
+import dev.hermes.android.data.ApiFailure
 import dev.hermes.android.data.CypherClient
 import dev.hermes.android.data.NativeAuthExpiredException
 import dev.hermes.android.data.authorizesPushSource
@@ -43,9 +45,50 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.util.UUID
 
 internal data class KeepConnectedPage(val events: List<JSONObject>, val nextCursor: Long)
+internal class KeepConnectedPageException : IOException()
+private class KeepConnectedProfilesException : IOException()
+
+internal const val KEEP_CONNECTED_LONG_POLL_SECONDS = 25
+
+internal fun parseKeepConnectedPage(response: JSONObject, after: Long): KeepConnectedPage {
+    val rows = response.optJSONArray("events") ?: throw KeepConnectedPageException()
+    val next = when (val value = response.opt("next_cursor")) {
+        is Int -> value.toLong()
+        is Long -> value
+        else -> throw KeepConnectedPageException()
+    }
+    if (after < 0 || next < after || rows.length() > 100) throw KeepConnectedPageException()
+    val events = (0 until rows.length()).map { rows.optJSONObject(it) ?: throw KeepConnectedPageException() }
+    return KeepConnectedPage(events, next)
+}
+
+internal fun keepConnectedFailureReason(profile: String, error: Throwable): String = when (error) {
+    is NativeAuthExpiredException -> "Hermes sign-in expired"
+    is KeepConnectedPageException -> "Hermes returned an invalid notification page"
+    is KeepConnectedProfilesException -> "Hermes returned no authorized profiles"
+    is InterruptedIOException -> "Hermes did not answer in time"
+    is ApiFailure -> when {
+        error.status == 401 -> "Hermes rejected the connection (401)"
+        error.status == 403 -> "Hermes refused profile ${profile.takeIf(::validNativeProfile)?.take(32) ?: "current"} (403)"
+        error.status == 404 -> "Cypher plugin route missing (404)"
+        error.status == 409 -> "Hermes refused the notification request (409)"
+        error.status in 500..599 -> "Hermes server error (${error.status})"
+        else -> "Hermes request failed (${error.status})"
+    }
+    is IOException -> "Could not reach Hermes"
+    else -> "Could not process Hermes notifications"
+}
+
+private fun logKeepConnectedFailure(error: Throwable) {
+    if (BuildConfig.DEBUG) {
+        val status = (error as? ApiFailure)?.status?.toString() ?: "-"
+        android.util.Log.d("KeepConnected", "notification poll failed type=${error.javaClass.simpleName} status=$status")
+    }
+}
 
 internal sealed interface KeepConnectedCycle {
     data object Connected : KeepConnectedCycle
@@ -82,37 +125,105 @@ internal class KeepConnectedPoller(
     private val owner: String,
     private val cursors: KeepConnectedCursors,
     private val profiles: suspend () -> List<String>,
+    private val signedInProfile: suspend () -> String = { "" },
+    private val nowMillis: () -> Long = { System.nanoTime() / 1_000_000L },
     private val poll: suspend (String, Long) -> KeepConnectedPage,
     private val onEvent: suspend (String, JSONObject) -> Unit,
 ) {
-    private var failures = 0
+    private data class ProfileFailure(val attempts: Int, val retryAtMillis: Long, val reason: String)
+
+    private val profileFailures = linkedMapOf<String, ProfileFailure>()
+    private var primaryProfile = ""
+    private var discoveryFailures = 0
+    private var discoveryRetryAtMillis = 0L
+    private var discoveryFailureReason = ""
     private var stopped = false
+    val lastFailureReason: String
+        get() = if (discoveryFailureReason.isNotBlank()) discoveryFailureReason
+        else profileFailures[primaryProfile]?.reason ?: profileFailures.values.lastOrNull()?.reason.orEmpty()
 
     suspend fun pollOnce(): KeepConnectedCycle {
         if (stopped) return KeepConnectedCycle.SignedOut
-        return try {
-            val authorized = profiles().filter(::validNativeProfile).distinct().take(256)
-            if (authorized.isEmpty()) throw IOException("Hermes returned no authorized profiles")
-            coroutineScope {
-                authorized.map { profile -> async {
-                    val after = cursors.read(origin, owner, profile)
-                    val page = poll(profile, after)
-                    require(page.nextCursor >= after && page.events.size <= 100) { "Invalid Hermes event page" }
-                    page.events.forEach { onEvent(profile, it) }
-                    cursors.advance(origin, owner, profile, page.nextCursor)
-                } }.forEach { it.await() }
-            }
-            failures = 0
-            KeepConnectedCycle.Connected
-        } catch (_: NativeAuthExpiredException) {
+        val now = nowMillis()
+        if (discoveryRetryAtMillis > now) return KeepConnectedCycle.Reconnecting(discoveryRetryAtMillis - now)
+        val authorized = try {
+            profiles().filter(::validNativeProfile).distinct().take(256)
+        } catch (error: NativeAuthExpiredException) {
             stopped = true
-            KeepConnectedCycle.SignedOut
+            discoveryFailureReason = keepConnectedFailureReason("", error)
+            return KeepConnectedCycle.SignedOut
         } catch (error: CancellationException) {
             throw error
-        } catch (_: Exception) {
-            failures += 1
-            KeepConnectedCycle.Reconnecting(keepConnectedBackoffMs(failures))
+        } catch (error: Exception) {
+            recordDiscoveryFailure(error)
+            return KeepConnectedCycle.Reconnecting(discoveryRetryAtMillis - nowMillis())
         }
+        if (authorized.isEmpty()) {
+            recordDiscoveryFailure(KeepConnectedProfilesException())
+            return KeepConnectedCycle.Reconnecting(discoveryRetryAtMillis - nowMillis())
+        }
+        discoveryFailures = 0
+        discoveryRetryAtMillis = 0L
+        discoveryFailureReason = ""
+        profileFailures.keys.retainAll(authorized.toSet())
+        primaryProfile = signedInProfile().takeIf { it in authorized } ?: authorized.first()
+
+        val cycleNow = nowMillis()
+        val due = authorized.filter { profile -> profileFailures[profile]?.retryAtMillis?.let { cycleNow >= it } ?: true }
+        if (due.isEmpty()) {
+            val retryAt = profileFailures[primaryProfile]?.retryAtMillis ?: cycleNow
+            return KeepConnectedCycle.Reconnecting((retryAt - cycleNow).coerceAtLeast(1L))
+        }
+        val results = try {
+            coroutineScope {
+                due.map { profile -> async {
+                    val failure = try {
+                        val after = cursors.read(origin, owner, profile)
+                        val page = poll(profile, after)
+                        if (page.nextCursor < after || page.events.size > 100) throw KeepConnectedPageException()
+                        page.events.forEach { onEvent(profile, it) }
+                        cursors.advance(origin, owner, profile, page.nextCursor)
+                        null
+                    } catch (error: NativeAuthExpiredException) {
+                        throw error
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        logKeepConnectedFailure(error)
+                        error
+                    }
+                    Triple(profile, failure, nowMillis())
+                } }.map { it.await() }
+            }
+        } catch (_: NativeAuthExpiredException) {
+            stopped = true
+            discoveryFailureReason = keepConnectedFailureReason(primaryProfile, NativeAuthExpiredException())
+            return KeepConnectedCycle.SignedOut
+        } catch (error: CancellationException) {
+            throw error
+        }
+        results.forEach { (profile, error, failedAt) ->
+            if (error == null) profileFailures.remove(profile)
+            else {
+                val attempts = (profileFailures[profile]?.attempts ?: 0) + 1
+                profileFailures.remove(profile)
+                profileFailures[profile] = ProfileFailure(
+                    attempts,
+                    failedAt + keepConnectedBackoffMs(attempts),
+                    keepConnectedFailureReason(profile, error),
+                )
+            }
+        }
+        val primaryFailure = profileFailures[primaryProfile]
+        return if (primaryFailure == null) KeepConnectedCycle.Connected
+        else KeepConnectedCycle.Reconnecting((primaryFailure.retryAtMillis - nowMillis()).coerceAtLeast(1L))
+    }
+
+    private fun recordDiscoveryFailure(error: Exception) {
+        discoveryFailures += 1
+        discoveryFailureReason = keepConnectedFailureReason("", error)
+        discoveryRetryAtMillis = nowMillis() + keepConnectedBackoffMs(discoveryFailures)
+        logKeepConnectedFailure(error)
     }
 }
 
@@ -267,25 +378,19 @@ class KeepConnectedService : Service() {
                 authorizedProfiles = requireNotNull(client).nativeAuthorizedProfiles()
                 authorizedProfiles
             },
-            poll = { profile, after ->
-                val response = requireNotNull(client).nativeGetForProfile(
-                    "/api/plugins/cypher/mobile/notifications/events",
-                    profile,
-                    authorizedProfiles,
-                    query = mapOf("after" to after.toString(), "wait" to "25"),
-                    maxBytes = 1_048_576,
-                )
-                val rows = response.optJSONArray("events") ?: throw IOException("Hermes returned an invalid event page")
-                if (rows.length() > 100) throw IOException("Hermes returned too many events")
-                val next = when (val value = response.opt("next_cursor")) {
-                    is Int -> value.toLong()
-                    is Long -> value
-                    else -> throw IOException("Hermes returned an invalid event cursor")
-                }
-                KeepConnectedPage((0 until rows.length()).map { rows.getJSONObject(it) }, next)
-            },
-            onEvent = { profile, event -> deliverIncomingCall(app, origin, owner, profile, event) },
-        )
+                poll = { profile, after ->
+                    val response = requireNotNull(client).nativeGetForProfile(
+                        "/api/plugins/cypher/mobile/notifications/events",
+                        profile,
+                        authorizedProfiles,
+                        query = mapOf("after" to after.toString(), "wait" to KEEP_CONNECTED_LONG_POLL_SECONDS.toString()),
+                        maxBytes = 1_048_576,
+                    )
+                    parseKeepConnectedPage(response, after)
+                },
+                signedInProfile = { client?.auth?.profile.orEmpty() },
+                onEvent = { profile, event -> deliverIncomingCall(app, origin, owner, profile, event) },
+            )
         try {
             while (currentCoroutineContext().isActive && isEnabledFor(this, Scope(origin, owner, "default"))) {
                 val current = app.auth.read(origin)
@@ -298,16 +403,16 @@ class KeepConnectedService : Service() {
                 val cycleStarted = SystemClock.elapsedRealtime()
                 when (val result = poller.pollOnce()) {
                     KeepConnectedCycle.Connected -> {
-                        setStatus(this, STATUS_CONNECTED)
+                        setStatus(this, STATUS_CONNECTED, poller.lastFailureReason)
                         getSystemService(NotificationManager::class.java).cancel(SIGN_IN_NOTIFICATION_ID)
                         delay(keepConnectedPollDelay(SystemClock.elapsedRealtime() - cycleStarted))
                     }
                     is KeepConnectedCycle.Reconnecting -> {
-                        setStatus(this, STATUS_RECONNECTING)
+                        setStatus(this, STATUS_RECONNECTING, poller.lastFailureReason)
                         delay(result.delayMillis)
                     }
                     KeepConnectedCycle.SignedOut -> {
-                        setStatus(this, STATUS_SIGNED_OUT)
+                        setStatus(this, STATUS_SIGNED_OUT, poller.lastFailureReason)
                         app.push.invalidateKeepConnectedInvitations()
                         postSignInNotification()
                         stopSelf()
@@ -406,6 +511,7 @@ class KeepConnectedService : Service() {
         const val KEY_ORIGIN = "origin"
         const val KEY_OWNER = "owner"
         const val KEY_STATUS = "status"
+        const val KEY_REASON = "reason"
         private const val KEY_STOP_TOKEN = "stop_token"
         const val STATUS_OFF = "off"
         const val STATUS_STARTING = "starting"
@@ -425,6 +531,7 @@ class KeepConnectedService : Service() {
         private fun preferences(context: Context) = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         fun isEnabled(context: Context): Boolean = preferences(context).getBoolean(KEY_ENABLED, false)
         fun status(context: Context): String = preferences(context).getString(KEY_STATUS, STATUS_OFF) ?: STATUS_OFF
+        fun failureReason(context: Context): String = preferences(context).getString(KEY_REASON, "").orEmpty()
         fun isEnabledFor(context: Context, scope: Scope): Boolean {
             val prefs = preferences(context)
             return prefs.getBoolean(KEY_ENABLED, false) && prefs.getString(KEY_ORIGIN, null) == scope.origin &&
@@ -443,7 +550,7 @@ class KeepConnectedService : Service() {
             require(authorized != null && authorized.owner == current.owner) { "Sign in with Hermes before enabling Keep connected" }
             val prefs = preferences(context)
             check(prefs.edit().putBoolean(KEY_ENABLED, true).putString(KEY_ORIGIN, current.origin)
-                .putString(KEY_OWNER, current.owner).putString(KEY_STATUS, STATUS_STARTING)
+                .putString(KEY_OWNER, current.owner).putString(KEY_STATUS, STATUS_STARTING).putString(KEY_REASON, "")
                 .putString(KEY_STOP_TOKEN, UUID.randomUUID().toString()).commit()) { "Could not enable Keep connected" }
             start(context)
         }
@@ -486,14 +593,14 @@ class KeepConnectedService : Service() {
             }
         }
 
-        private fun setStatus(context: Context, status: String) {
-            preferences(context).edit().putString(KEY_STATUS, status).apply()
+        private fun setStatus(context: Context, status: String, reason: String = "") {
+            preferences(context).edit().putString(KEY_STATUS, status).putString(KEY_REASON, reason).apply()
             activeInstance?.updateNotification()
         }
 
         private fun disablePreference(context: Context) {
             val prefs = preferences(context)
-            check(prefs.edit().putBoolean(KEY_ENABLED, false).putString(KEY_STATUS, STATUS_OFF).commit()) { "Could not stop Keep connected" }
+            check(prefs.edit().putBoolean(KEY_ENABLED, false).putString(KEY_STATUS, STATUS_OFF).putString(KEY_REASON, "").commit()) { "Could not stop Keep connected" }
         }
 
         private fun stopToken(context: Context): String = ensureStopToken(context)

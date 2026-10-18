@@ -1,18 +1,46 @@
 package dev.hermes.android.push
 
 import dev.hermes.android.core.Scope
+import dev.hermes.android.data.ApiFailure
+import dev.hermes.android.data.AuthContext
+import dev.hermes.android.data.CypherClient
 import dev.hermes.android.data.NativeAuthExpiredException
 import dev.hermes.android.voice.RelayCallbackPhase
 import dev.hermes.android.voice.RelayCallbackPolicy
 import kotlinx.coroutines.test.runTest
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.SocketPolicy
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.IOException
+import java.net.SocketTimeoutException
+import java.util.concurrent.TimeUnit
 
 class KeepConnectedTest {
+    private fun client(server: MockWebServer, readTimeoutMillis: Long = 60_000): CypherClient =
+        CypherClient(AuthContext("https://native.example", emptyList(), owner = "owner", profile = "default", backend = "hermes-dashboard"), null, persistContext = false) { builder ->
+            builder.readTimeout(readTimeoutMillis, TimeUnit.MILLISECONDS)
+            builder.addInterceptor { chain ->
+                val request = chain.request()
+                val local = server.url(request.url.encodedPath).newBuilder().encodedQuery(request.url.encodedQuery).build()
+                chain.proceed(request.newBuilder().url(local).build())
+            }
+        }
+
+    private suspend fun eventPage(client: CypherClient, profile: String, after: Long, profiles: List<String>) =
+        parseKeepConnectedPage(
+            client.nativeGetForProfile(
+                "/api/plugins/cypher/mobile/notifications/events", profile, profiles,
+                query = mapOf("after" to after.toString(), "wait" to KEEP_CONNECTED_LONG_POLL_SECONDS.toString()),
+            ),
+            after,
+        )
+
     private fun callEvent(
         owner: String = "owner",
         profile: String = "default",
@@ -126,12 +154,16 @@ class KeepConnectedTest {
 
     @Test fun networkFailureBacksOffAndSuccessfulPollResetsIt() = runTest {
         var fail = true
+        var now = 0L
+        var requests = 0
         val poller = KeepConnectedPoller(
             origin = "https://hermes.example",
             owner = "owner",
             cursors = cursors(),
             profiles = { listOf("default") },
+            nowMillis = { now },
             poll = { _, after ->
+                requests += 1
                 if (fail) { fail = false; throw IOException("offline") }
                 KeepConnectedPage(emptyList(), after)
             },
@@ -139,7 +171,156 @@ class KeepConnectedTest {
         )
 
         assertEquals(KeepConnectedCycle.Reconnecting(1_000L), poller.pollOnce())
+        assertEquals(KeepConnectedCycle.Reconnecting(1_000L), poller.pollOnce())
+        assertEquals(1, requests)
+        now = 1_000L
         assertEquals(KeepConnectedCycle.Connected, poller.pollOnce())
+        assertEquals(2, requests)
+        fail = true
+        assertEquals(KeepConnectedCycle.Reconnecting(1_000L), poller.pollOnce())
+        assertEquals(3, requests)
+    }
+
+    @Test fun eventHttpFailuresHaveShortSecretFreeReasons() = runTest {
+        val server = MockWebServer().apply { start() }
+        val client = client(server)
+        try {
+            val failures = listOf(
+                401 to "Hermes rejected the connection (401)",
+                403 to "Hermes refused profile academic (403)",
+                404 to "Cypher plugin route missing (404)",
+                409 to "Hermes refused the notification request (409)",
+                500 to "Hermes server error (500)",
+                503 to "Hermes server error (503)",
+            )
+            failures.forEach { (status, expected) ->
+                server.enqueue(MockResponse().setResponseCode(status).setBody("""{"detail":"private response token"}"""))
+                val error = runCatching {
+                    client.nativeGetForProfile(
+                        "/api/plugins/cypher/mobile/notifications/events", "academic", listOf("academic"),
+                        query = mapOf("after" to "0", "wait" to "25"),
+                    )
+                }.exceptionOrNull()
+                assertTrue("expected ApiFailure for HTTP $status, got $error", error is ApiFailure)
+                assertEquals(status, (error as ApiFailure).status)
+                val reason = keepConnectedFailureReason("academic", error)
+                assertEquals(expected, reason)
+                assertFalse(reason.contains("private response token"))
+                val request = server.takeRequest()
+                assertEquals("/api/plugins/cypher/mobile/notifications/events", request.requestUrl!!.encodedPath)
+                assertEquals("academic", request.requestUrl!!.queryParameter("profile"))
+            }
+        } finally {
+            client.closeNative()
+            server.shutdown()
+        }
+    }
+
+    @Test fun pluginUnauthorizedProfileDoesNotBlockSignedInProfileAndRetriesOnBackoff() = runTest {
+        val server = MockWebServer().apply { start() }
+        server.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse =
+                if (request.requestUrl?.queryParameter("profile") == "academic") {
+                    MockResponse().setResponseCode(403).setBody("""{"detail":"private profile policy"}""")
+                } else {
+                    val after = request.requestUrl?.queryParameter("after")?.toLongOrNull() ?: 0L
+                    MockResponse().setBody(if (after == 0L) """{"events":[{"event_id":"default-call"}],"next_cursor":1}""" else """{"events":[],"next_cursor":1}""")
+                }
+        }
+        val client = client(server)
+        try {
+            val profiles = listOf("default", "academic")
+            val attempts = mutableMapOf<String, Int>()
+            val delivered = mutableSetOf<String>()
+            var now = 0L
+            val poller = KeepConnectedPoller(
+                origin = "https://hermes.example",
+                owner = "owner",
+                cursors = cursors(),
+                profiles = { profiles },
+                signedInProfile = { "default" },
+                nowMillis = { now },
+                poll = { profile, after ->
+                    attempts[profile] = attempts.getOrDefault(profile, 0) + 1
+                    eventPage(client, profile, after, profiles)
+                },
+                onEvent = { profile, event -> delivered += "$profile:${event.getString("event_id")}" },
+            )
+
+            assertEquals(KeepConnectedCycle.Connected, poller.pollOnce())
+            assertEquals("Hermes refused profile academic (403)", poller.lastFailureReason)
+            assertEquals(mapOf("default" to 1, "academic" to 1), attempts)
+            assertEquals(setOf("default:default-call"), delivered)
+
+            assertEquals(KeepConnectedCycle.Connected, poller.pollOnce())
+            assertEquals(1, attempts["academic"])
+            now = 999
+            poller.pollOnce()
+            assertEquals(1, attempts["academic"])
+            now = 1_000
+            poller.pollOnce()
+            assertEquals(2, attempts["academic"])
+        } finally {
+            client.closeNative()
+            server.shutdown()
+        }
+    }
+
+    @Test fun invalidEventPageShapesGetASecretFreeReason() = runTest {
+        val server = MockWebServer().apply { start() }
+        val client = client(server)
+        try {
+            val invalidPages = listOf(
+                """{"events":"private body","next_cursor":0}""" to 0L,
+                """{"events":["private body"],"next_cursor":0}""" to 0L,
+                """{"events":[],"next_cursor":"private cursor"}""" to 0L,
+                """{"events":[],"next_cursor":3}""" to 4L,
+                """{"events":[],"next_cursor":-1}""" to 0L,
+            )
+            invalidPages.forEach { (body, after) ->
+                server.enqueue(MockResponse().setBody(body))
+                val response = client.nativeGetForProfile(
+                    "/api/plugins/cypher/mobile/notifications/events", "default", listOf("default"),
+                    query = mapOf("after" to after.toString(), "wait" to "25"),
+                )
+                val error = runCatching { parseKeepConnectedPage(response, after) }.exceptionOrNull()
+                assertTrue("expected invalid page error, got $error", error is KeepConnectedPageException)
+                val reason = keepConnectedFailureReason("default", error!!)
+                assertEquals("Hermes returned an invalid notification page", reason)
+                assertFalse(reason.contains("private"))
+            }
+        } finally {
+            client.closeNative()
+            server.shutdown()
+        }
+    }
+
+    @Test fun readTimeoutIsReportedAndTheDefaultClientAllowsTheTwentyFiveSecondLongPoll() = runTest {
+        val server = MockWebServer().apply { start() }
+        val defaultClient = client(server)
+        try {
+            assertEquals(60_000, defaultClient.http.readTimeoutMillis)
+            assertEquals(0, defaultClient.http.callTimeoutMillis)
+            assertTrue(defaultClient.http.readTimeoutMillis > KEEP_CONNECTED_LONG_POLL_SECONDS * 1_000)
+        } finally {
+            defaultClient.closeNative()
+        }
+
+        server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+        val shortTimeoutClient = client(server, readTimeoutMillis = 150)
+        try {
+            val error = runCatching {
+                shortTimeoutClient.nativeGetForProfile(
+                    "/api/plugins/cypher/mobile/notifications/events", "default", listOf("default"),
+                    query = mapOf("after" to "0", "wait" to KEEP_CONNECTED_LONG_POLL_SECONDS.toString()),
+                )
+            }.exceptionOrNull()
+            assertTrue("expected read timeout, got $error", error is SocketTimeoutException)
+            assertEquals("Hermes did not answer in time", keepConnectedFailureReason("default", error!!))
+        } finally {
+            shortTimeoutClient.closeNative()
+            server.shutdown()
+        }
     }
 
     @Test fun cypherCallEventAdaptsToTheFailClosedRelayBindingAndKeepsTheTwentySecondRing() {
