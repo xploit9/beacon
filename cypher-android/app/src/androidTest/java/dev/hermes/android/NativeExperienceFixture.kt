@@ -59,6 +59,9 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     val holdNextRoomRead = java.util.concurrent.atomic.AtomicBoolean(false)
     val roomReadCaptured = java.util.concurrent.CountDownLatch(1)
     val releaseRoomRead = java.util.concurrent.CountDownLatch(1)
+    val holdNextSessionList = java.util.concurrent.atomic.AtomicBoolean(false)
+    val sessionListCaptured = java.util.concurrent.CountDownLatch(1)
+    val releaseSessionList = java.util.concurrent.CountDownLatch(1)
     @Volatile var approvalMode = "manual"
     @Volatile var rejectApprovalWrite = false
     /** Hermes's lazy session.resume can omit info.yolo even after a session-scoped yolo write. */
@@ -250,6 +253,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     }
     private fun http(path: String, method: String, body: JSONObject, profile: String, directory: String, archived: Boolean = false, url: HttpUrl? = null): Pair<Int, JSONObject> {
         if (path == "/api/plugins/cypher/mobile/bot-mode/space/fixture-room" && holdNextRoomRead.getAndSet(false)) { roomReadCaptured.countDown(); check(releaseRoomRead.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
+        if (path == "/api/sessions" && holdNextSessionList.getAndSet(false)) { sessionListCaptured.countDown(); check(releaseSessionList.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
         return when {
         path == "/api/profiles" -> 200 to json("profiles" to JSONArray(notificationProfiles.map { json("name" to it) }))
         path == "/api/profiles/active" -> 200 to json("current" to profile, "active" to profile)

@@ -914,6 +914,21 @@ class NativeExperienceUiTest {
         receipts += "Bot Mode visibly toggles, opens a different profile's permanent chat, preserves both unsent drafts, restores normal history search/profile/chat, and never auto-sends or creates a normal session."
     }
 
+    @Test fun historyShowsLoadingInsteadOfEmptyWhileTheListIsFetched() = withFixture { vm, fixture ->
+        // Live 2026-10-19: over a slow link the drawer said "No conversations here" for seconds before the list arrived.
+        compose.runOnIdle { flow<AppState>(vm, "_ui").value = vm.ui.value.copy(sessions = emptyList()) }
+        fixture.holdNextSessionList.set(true)
+        try {
+            compose.runOnIdle { vm.refreshSessions(""); vm.toggleSessions(true) }
+            assertTrue(fixture.sessionListCaptured.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            compose.onNodeWithTag("history-loading").performScrollTo().assertIsDisplayed()
+            compose.onNodeWithText("No conversations here").assertDoesNotExist()
+        } finally { fixture.releaseSessionList.countDown() }
+        await { !vm.ui.value.historyLoading && vm.ui.value.sessions.isNotEmpty() }
+        compose.onNodeWithTag("history-loading").assertDoesNotExist()
+        receipts += "While the conversation list is being fetched the drawer shows a loading row, never a false empty state."
+    }
+
     @Test fun unsentChatComposerShowsTheProfileModelAndEffort() = withFixture { vm, fixture ->
         fixture.profileModel = "profile-default-model"; fixture.reasoningEffort = "high"
         compose.runOnIdle {

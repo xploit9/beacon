@@ -94,7 +94,11 @@ internal fun toolCallResultId(tool: JSONObject): String = tool.string("tool_call
         groups.forEach { (label, indices) ->
             if (indices.isNotEmpty()) item("history:$label") { Text(uiText(label), Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             val rows = indices.map { ui.sessions[it] }
-        if (ui.sessions.isEmpty() && label == "Recent") item("empty-history") { EmptyState("No conversations here", "Start a conversation or try another search.", action = "New conversation", onAction = { vm.toggleSessions(false); vm.newChat() }) }
+        if (ui.sessions.isEmpty() && label == "Recent") item("empty-history") {
+            // An empty list is only "empty" once the fetch has answered.
+            if (ui.historyLoading) ListItem(headlineContent = { Text(uiText("Loading conversations…")) }, leadingContent = { CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) }, colors = ListItemDefaults.colors(containerColor = Color.Transparent), modifier = Modifier.testTag("history-loading"))
+            else EmptyState("No conversations here", "Start a conversation or try another search.", action = "New conversation", onAction = { vm.toggleSessions(false); vm.newChat() })
+        }
         items(rows, key = { "session:" + sessionRowId(it) }) { row ->
             val id = sessionRowId(row)
             ListItem(headlineContent = { Text(row.string("title").ifBlank { "Untitled conversation" }, maxLines = 2) }, leadingContent = { Icon(if (row.optBoolean("pinned")) Icons.Rounded.PushPin else Icons.Rounded.ChatBubbleOutline, null) }, trailingContent = { if (row.string("active_stream_id").isNotBlank()) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp) }, colors = ListItemDefaults.colors(containerColor = if (id == chat.sessionId) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent), modifier = Modifier.semantics { selected = id == chat.sessionId }.clickable { vm.tab("Chat"); vm.openConversation(row) }.heightIn(min = 56.dp))

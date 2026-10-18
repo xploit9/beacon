@@ -52,7 +52,7 @@ internal fun releaseTerminalChat(chat: ChatState, stream: String, replyConfirmed
 data class EditorState(val scope: Scope? = null, val path: String = "", val text: TextFieldValue = TextFieldValue(), val serverText: String = "", val metadata: JSONObject = JSONObject(), val loading: Boolean = false, val saving: Boolean = false, val error: String = "", val reviewRequired: Boolean = false) { val dirty get() = text.text != serverText }
 data class SideQuestion(val scope: Scope, val question: String, val sessionId: String, val streamId: String, val text: String = "", val status: String = "Responding", val cursor: String = "", val error: String = "")
 data class AppUpdateState(val release: Release? = null, val busy: Boolean = false, val ready: Boolean = false, val status: String = "Cypher checks for updates automatically while connected.")
-data class AppState(val origin: String = BuildConfig.DEFAULT_ORIGIN, val authenticated: Boolean = false, val profile: String = "default", val owner: String = "", val tab: String = "Chat", val connected: Boolean = false, val loading: Boolean = false, val error: String = "", val notice: String = "", val bootstrap: JSONObject = JSONObject(), val sessions: List<JSONObject> = emptyList(), val query: String = "", val showSessions: Boolean = false, val morePage: String = "", val xaraOpening: Boolean = false, val xaraError: String = "", val newChatOpening: Boolean = false, val newChatError: String = "", val initialChatReady: Boolean = false, val restoringSession: Boolean = true, val botModeEnabled: Boolean = false, val botModeSwitching: Boolean = false, val setupWizard: Boolean = false, val setupComplete: Boolean = false, val setupStep: String = "connect", val setupPluginMessage: String = "", val setupOrigin: String = "")
+data class AppState(val origin: String = BuildConfig.DEFAULT_ORIGIN, val authenticated: Boolean = false, val profile: String = "default", val owner: String = "", val tab: String = "Chat", val connected: Boolean = false, val loading: Boolean = false, val error: String = "", val notice: String = "", val bootstrap: JSONObject = JSONObject(), val sessions: List<JSONObject> = emptyList(), val query: String = "", val showSessions: Boolean = false, val morePage: String = "", val xaraOpening: Boolean = false, val xaraError: String = "", val newChatOpening: Boolean = false, val newChatError: String = "", val initialChatReady: Boolean = false, val restoringSession: Boolean = true, val botModeEnabled: Boolean = false, val botModeSwitching: Boolean = false, val setupWizard: Boolean = false, val setupComplete: Boolean = false, val setupStep: String = "connect", val setupPluginMessage: String = "", val setupOrigin: String = "", val historyLoading: Boolean = false)
 internal fun voiceKeySetupPageIfMissing(hasKey:Boolean):String? = if(hasKey) null else "Cypher"
 internal data class VoiceCallRequest(val scope:Scope,val conversationId:String)
 
@@ -1346,7 +1346,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val request = ++sessionIndexRequest
         val revision = sessionIndexRevision
         sessionIndexArchived = archived
-        _ui.update { it.copy(query = query) }
+        _ui.update { it.copy(query = query, historyLoading = true) }
         fun current() = client === active && generation == originGeneration && _ui.value.authenticated && sessionIndexCurrent(request, sessionIndexRequest, revision, sessionIndexRevision)
         return viewModelScope.launch {
           try { supervisorScope {
@@ -1369,6 +1369,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             }
 
           } } catch (e: Throwable) { if (e is CancellationException) throw e; if (current()) fail(e) }
+          finally { if (request == sessionIndexRequest) _ui.update { it.copy(historyLoading = false) } }
         }.also { indexFetch = it }
     }
     private fun publishConfirmedSession(owner: Scope, id: String, response: JSONObject, accepted: Boolean = false) {
