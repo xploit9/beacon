@@ -1190,9 +1190,9 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                         val selection = selectionJob
                         val selectedNavigation = navigationGeneration
                         try { kotlinx.coroutines.selects.select<Unit> { hydrated.onAwait { }; selection?.onJoin { } } } catch (error: CancellationException) { selection?.cancel(); throw error }
+                        // Leaving Bot Mode must always succeed: an unsent new chat has no history yet, and a load failure stays in the chat with its retry.
                         require(client === restored && originGeneration == restoredGeneration && navigationGeneration == selectedNavigation &&
-                            sourceScope == restored.scope.session(id) && _chat.value.sessionId == id &&
-                            (_chat.value.raw.length() > 0 || _chat.value.status == "Conversation unavailable · draft retained")) {
+                            sourceScope == restored.scope.session(id) && _chat.value.sessionId == id) {
                             "Your original conversation could not be restored. Its draft is kept; try switching back again."
                         }
                     }

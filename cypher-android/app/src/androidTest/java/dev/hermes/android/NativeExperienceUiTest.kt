@@ -914,6 +914,30 @@ class NativeExperienceUiTest {
         receipts += "Bot Mode visibly toggles, opens a different profile's permanent chat, preserves both unsent drafts, restores normal history search/profile/chat, and never auto-sends or creates a normal session."
     }
 
+    @Test fun botModeLeavesToAnUnsentNewChat() = withFixture { vm, fixture ->
+        // Live 2026-10-19: entered from an empty new chat, Bot Mode could never be left because that chat has no history to load yet.
+        var shellId = ""
+        try {
+            compose.runOnIdle { vm.newChat() }
+            await { vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.newChatOpening && vm.chat.value.projectionReady }
+            shellId = vm.chat.value.sessionId
+            fixture.markUnpromptedShell(shellId)
+            runBlocking { app.cache.delete(fixture.scope.session(shellId), "session") }
+            compose.runOnIdle { vm.composer(TextFieldValue("Unsent first message")) }
+            compose.runOnIdle { vm.toggleBotMode() }
+            await { vm.ui.value.botModeEnabled && !vm.ui.value.botModeSwitching }
+            compose.runOnIdle { vm.toggleBotMode() }
+            await { !vm.ui.value.botModeEnabled && !vm.ui.value.botModeSwitching }
+            assertEquals(shellId, vm.chat.value.sessionId)
+            assertEquals("Chat", vm.ui.value.tab)
+            assertEquals("Unsent first message", vm.composer.value.text)
+            assertEquals(0, fixture.requests.count { it.string("method") == "prompt.submit" })
+            receipts += "Leaving Bot Mode returns to an unsent new chat with its draft, without sending or recreating it."
+        } finally {
+            if (shellId.isNotBlank()) runBlocking { listOf("client-created-shell", "session", "draft").forEach { app.cache.delete(fixture.scope.session(shellId), it) } }
+        }
+    }
+
     @Test fun referenceNavigationAndNativeBoardControls() = withFixture { vm, fixture ->
         runBlocking { app.cache.delete(fixture.scope, "kanban-draft:default") }
         compose.runOnIdle { vm.toggleSessions(true) }
