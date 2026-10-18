@@ -203,8 +203,11 @@ def events(call_id,owner,body):
             if not isinstance(row.get('tool_name'),str) or not 1<=len(row['tool_name'])<=200: raise ValueError('Invalid tool name')
             if row.get('status') not in ('ready','running','needs_approval','completed','failed','denied','expired','uncertain','cancelled','unavailable','not_sent','submission_unconfirmed'): raise ValueError('Invalid tool receipt status')
         elif any(k in row for k in ('request_id','tool_name','status')): raise ValueError('Unexpected tool evidence')
-        if 'stage' in row and row['stage'] not in ('capture_started','capture_stopped','playout_started','playout_stopped','capture_error','playout_error','media_timeout','timestamp_overlap_corrected','voice_connecting','context_ready','token_ready','token_error','provider_ready','provider_error','voice_error'): raise ValueError('Invalid stage')
-        if 'error_code' in row and (row['type'] not in ('tool_receipt','media_diagnostic') or not isinstance(row['error_code'],str) or not re.fullmatch(r'http_[45][0-9]{2}|timeout|dns|tls|network|invalid_response',row['error_code'])): raise ValueError('Invalid diagnostic code')
+        if 'stage' in row and row['stage'] not in ('capture_started','capture_stopped','playout_started','playout_stopped','capture_error','playout_error','media_timeout','timestamp_overlap_corrected','voice_connecting','context_ready','token_ready','token_error','provider_key_ready','provider_ready','provider_error','voice_error'): raise ValueError('Invalid stage')
+        if 'error_code' in row:
+            codes=r'http_[45][0-9]{2}|timeout|dns|tls|network|invalid_response'
+            if row['type']=='tool_receipt': codes+='|tool_http_failure|admission_rejected'
+            if row['type'] not in ('tool_receipt','media_diagnostic') or not isinstance(row['error_code'],str) or not re.fullmatch(codes,row['error_code']): raise ValueError('Invalid diagnostic code')
         if 'elapsed_ms' in row: finite(row['elapsed_ms'])
         for field,limit in (('count',1000000),('total_corrected_ms',9007199254740991)):
             if field in row and (row['type']!='media_diagnostic' or row.get('stage')!='timestamp_overlap_corrected' or type(row[field]) is not int or not 0<=row[field]<=limit): raise ValueError('Invalid clock diagnostic aggregate')

@@ -49,6 +49,24 @@ def test_save_empty_unicode_and_other_document_untouched(native_home):
     assert user.read_text(encoding='utf-8') == 'User preferences'
 
 
+def test_first_save_creates_missing_memories_directory(native_home):
+    root=native_home;directory=root/'memories';directory.rmdir()
+    before=api.documents(root)['documents'][0]
+    saved=api.update(root,{'target':'memory','content':'First note','revision':before['revision']})
+    assert saved['document']['content']=='First note'
+
+
+def test_read_only_memory_write_maps_permission_error_to_forbidden(native_home,monkeypatch):
+    import utils
+    before=api.documents(native_home)['documents'][0]
+    def fail(*args,**kwargs): raise PermissionError('private filesystem detail')
+    monkeypatch.setattr(utils,'atomic_write_text',fail)
+    with pytest.raises(HTTPException) as error:
+        api.update(native_home,{'target':'memory','content':'New note','revision':before['revision']})
+    assert error.value.status_code==403
+    assert 'private filesystem detail' not in str(error.value.detail)
+
+
 def test_limits_invalid_encoding_and_traversal_preserve_bytes(native_home):
     root = native_home
     before = api.documents(root)['documents'][0]

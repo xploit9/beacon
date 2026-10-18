@@ -16,6 +16,8 @@ from fastapi import HTTPException
 MAX_ARGUMENTS = 16384
 MAX_RESULT = 24576
 MAX_TOOLS = 12
+# Eight active calls at 128 receipts each; old closed or expired receipts make room.
+MAX_RECEIPTS = 1024
 DEADLINE = 90
 BOOT = uuid.uuid4().hex
 POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix='cypher-mcp')
@@ -320,6 +322,18 @@ class Gateway:
                 return self.status(scope,request)
             if conn.execute('SELECT COUNT(*) FROM tool_receipts WHERE owner=? AND profile=? AND call_id=?', (scope[0],scope[2],scope[3])).fetchone()[0]>=128:
                 raise HTTPException(429,'Call tool request capacity reached')
+            total=conn.execute('SELECT COUNT(*) FROM tool_receipts').fetchone()[0]
+            if total>=MAX_RECEIPTS:
+                expired=conn.execute('''SELECT r.rowid FROM tool_receipts r
+                    LEFT JOIN calls c ON c.id=r.call_id AND c.owner=r.owner AND c.profile=r.profile
+                    WHERE (c.id IS NULL OR c.closed=1 OR c.created<?)
+                    AND json_extract(r.payload,'$.status')!='running'
+                    ORDER BY r.updated LIMIT ?''',(time.time()-4*3600,total-MAX_RECEIPTS+1)).fetchall()
+                conn.executemany('DELETE FROM tool_receipts WHERE rowid=?',expired)
+                remaining=conn.execute('SELECT COUNT(*) FROM tool_receipts').fetchone()[0]
+                if remaining>=MAX_RECEIPTS:
+                    if expired: conn.commit()
+                    raise HTTPException(429,'Tool receipt capacity reached')
             conn.execute('INSERT INTO tool_receipts VALUES(?,?,?,?,?,?,?,?)',(*scope,request,signature,encoded(result),time.time()))
         if tool['read_only']: self._start(scope,request,tool,False)
         return self.status(scope,request)
@@ -377,7 +391,17 @@ class Gateway:
                 value.update(status='running',_started=time.time(),_boot=BOOT)
                 self._save(conn,scope,request,value)
             context=contextvars.copy_context()
-            POOL.submit(context.run,self._run,scope,request,tool,value['_arguments'],approved)
+            try:
+                POOL.submit(context.run,self._run,scope,request,tool,value['_arguments'],approved)
+            except Exception:
+                with self.db() as conn:
+                    row=self._row(conn,scope,request)
+                    if row:
+                        value=json.loads(row['payload'])
+                        if value['status']=='running':
+                            value.update(status='failed',reason='Tool execution could not be started')
+                            self._save(conn,scope,request,value)
+                raise HTTPException(503,'Tool execution could not be started') from None
             submitted = True
         finally:
             if not submitted: SLOTS.release()
@@ -414,7 +438,10 @@ class Gateway:
                     'reason':'Tool returned an HTTP failure after dispatch' if dispatched else 'Call authority or tool configuration changed before execution',
                     'error_code':'tool_http_failure' if dispatched else 'admission_rejected','http_status':error.status_code}
         except Exception:
-            update={'status':'uncertain','reason':'Tool outcome unavailable; inspect external state before retrying'}
+            uncertain=dispatched and not tool['read_only']
+            update={'status':'uncertain' if uncertain else 'failed',
+                    'reason':'Tool outcome unavailable; inspect external state before retrying' if uncertain else
+                            'Read-only tool failed' if dispatched else 'Tool failed before execution'}
         finally:
             try:
                 with self.db() as conn:

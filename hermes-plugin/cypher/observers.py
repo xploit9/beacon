@@ -5,6 +5,23 @@ import time
 import uuid
 
 
+def prune_meta(conn,now):
+    for key,value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'mail-evidence:%'").fetchall():
+        try: observed=json.loads(value).get('observed_at')
+        except (AttributeError,TypeError,ValueError): observed=None
+        try: fresh=type(observed) in (int,float) and math.isfinite(observed) and now-observed<=300
+        except (OverflowError,TypeError): fresh=False
+        if not fresh:
+            conn.execute('DELETE FROM meta WHERE key=?',(key,))
+    for key,value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'completion:%'").fetchall():
+        try: created=float(value)
+        except (TypeError,ValueError,OverflowError):
+            if value==b'notified': conn.execute('UPDATE meta SET value=? WHERE key=?',(str(now).encode(),key))
+            else: conn.execute('DELETE FROM meta WHERE key=?',(key,))
+        else:
+            if not math.isfinite(created) or now-created>86400: conn.execute('DELETE FROM meta WHERE key=?',(key,))
+
+
 def completion(mobile,native,cfg,profile,session_id,turn_id,completed=False,failed=False,interrupted=False,**kwargs):
     if (completed is not True and failed is not True) or interrupted or not session_id or not turn_id: return
     owner=cfg.get('owner_id');provider=cfg.get('owner_provider')
@@ -12,11 +29,13 @@ def completion(mobile,native,cfg,profile,session_id,turn_id,completed=False,fail
     row=native.verify(owner,provider,profile,session_id)
     kind='failure' if failed is True else ('task_result' if row.get('source')=='cron' else 'completion')
     key='completion:'+owner+':'+profile+':'+session_id+':'+str(turn_id)
+    now=time.time()
     with mobile.LOCK,mobile.connect() as conn:
+        prune_meta(conn,now)
         if conn.execute('SELECT 1 FROM meta WHERE key=?',(key,)).fetchone(): return
         if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: raise ValueError('Notification capacity reached')
-        conn.execute('INSERT INTO meta VALUES(?,?)',(key,b'notified'))
-        conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires) VALUES(?,?,?,?,?,?,?)',(uuid.uuid4().hex,owner,profile,kind,session_id,time.time(),time.time()+86400))
+        conn.execute('INSERT INTO meta VALUES(?,?)',(key,str(now).encode()))
+        conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires) VALUES(?,?,?,?,?,?,?)',(uuid.uuid4().hex,owner,profile,kind,session_id,now,now+86400))
 
 
 def mailbox_facts(value,contract):
@@ -62,9 +81,12 @@ def mailbox_observed(mobile,cfg,profile,session_id,tool_name,result,status,read_
     if not 0<=time.time()-received<=86400 or message.get('unread') is not True: return
     owner=cfg.get('owner_id')
     if not owner: return
-    evidence={'account':account,'message_id':mid,'received_at':received,'unread':True,'action_required':message.get('action_required'),'urgent':message.get('urgent'),'important':message.get('important'),'content_observed':any(isinstance(message.get(k),str) and bool(message[k].strip()) for k in ('subject','snippet','body','text')),'observed_at':time.time()}
+    evidence={'account':account,'message_id':mid,'received_at':received,'unread':True,'action_required':message.get('action_required'),'urgent':message.get('urgent'),'important':message.get('important'),'content_observed':any(isinstance(message.get(k),str) and bool(message[k].strip()) for k in ('subject','snippet','body','text'))}
     key='mail-evidence:'+owner+':'+profile+':'+session_id+':'+mid
+    now=time.time()
     with mobile.LOCK,mobile.connect() as conn:
+        prune_meta(conn,now)
+        evidence['observed_at']=now
         conn.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(key,json.dumps(evidence).encode()))
 
 
@@ -92,6 +114,7 @@ def email_notice(mobile,native,cfg,profile,session_id,args,now):
     key='mail-evidence:'+owner+':'+profile+':'+session_id+':'+mid
     dedupe='mail-notified:'+owner+':'+profile+':'+account+':'+mid
     with mobile.LOCK,mobile.connect() as conn:
+        prune_meta(conn,time.time())
         row=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
         if not row: raise ValueError('Read the actual message using the verified read-only native mailbox tool first')
         proof=json.loads(row[0])

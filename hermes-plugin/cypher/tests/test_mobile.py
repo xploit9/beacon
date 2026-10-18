@@ -66,6 +66,19 @@ def test_visual_tool_and_aggregated_clock_evidence_is_scoped_and_validated(harne
     c.headers['x-fixture-owner']='foreign'
     assert c.post(url,json={'events':rows}).status_code==403
 
+
+@pytest.mark.parametrize('code,status',[('tool_http_failure','uncertain'),('admission_rejected','failed')])
+def test_gateway_tool_error_codes_are_admitted(harness,code,status):
+    _,c,_,_,_=harness
+    call_id=reserve(c);url=f'/api/plugins/cypher/mobile/calls/{call_id}/events'
+    result=c.post(url,json={'events':[{'event_id':'gateway-error','turn_id':'tools','type':'tool_receipt',
+        'at_ms':100,'request_id':'request-1','tool_name':'MCP tool request','status':status,'error_code':code}]})
+    assert result.status_code==200
+    if code=='tool_http_failure':
+        rejected=c.post(url,json={'events':[{'event_id':'bad-gateway-diagnostic','turn_id':'tools','type':'media_diagnostic',
+            'at_ms':200,'stage':'provider_error','error_code':code}]})
+        assert rejected.status_code==409
+
 def test_auth_insecure_owner_and_profiles(harness):
     api,c,cfg,tmp,app=harness
     assert c.get('/api/plugins/cypher/mobile/bootstrap').json()['voice']['available'] is False
@@ -631,7 +644,9 @@ def test_native_completion_is_owned_completed_and_deduplicated(harness,monkeypat
     with api.mobile.connect() as conn: assert conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==0
     observer.completion(api.mobile,api.native,cfg,'default','owned-chat','turn',completed=True)
     observer.completion(api.mobile,api.native,cfg,'default','owned-chat','turn',completed=True)
-    with api.mobile.connect() as conn: assert conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==1
+    with api.mobile.connect() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==1
+        assert float(conn.execute("SELECT value FROM meta WHERE key LIKE 'completion:%'").fetchone()[0])>0
     monkeypatch.setattr(api.native,'verify',lambda *args:(_ for _ in ()).throw(LookupError('Unowned')))
     with pytest.raises(LookupError): observer.completion(api.mobile,api.native,cfg,'default','foreign-chat','turn2',completed=True)
     with api.mobile.connect() as conn: assert conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==1
@@ -691,7 +706,15 @@ def test_native_task_presets_use_native_cron_contract_and_script_only_fixture_ho
     first=api.install_checkup_task('default')
     assert first['job']['schedule']=='every 1m' and first['job']['no_agent'] is True
     assert first['job']['script']=='cypher-checkups.py'
-    ast.parse((tmp/'scripts'/'cypher-checkups.py').read_text())
+    source=(tmp/'scripts'/'cypher-checkups.py').read_text()
+    ast.parse(source)
+    assert source.index('hermes_time.get_timezone_name()') < source.index("os.environ['HERMES_HOME']")
+    assert "os.environ['HERMES_HOME']="+repr(str(api.mobile.home())) in source
+    assert 'module.run('+repr(str(api.ROOT))+",'default',hermes_timezone,hermes_now)" in source
+    legacy=("import importlib.util\nfrom pathlib import Path\nspec=importlib.util.spec_from_file_location('cypher_checkups',"+repr(str(api.ROOT/'checkups.py'))+")\nmodule=importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\nmodule.run("+repr(str(api.ROOT))+",'default')\n")
+    (tmp/'scripts'/'cypher-checkups.py').write_text(legacy)
+    assert api.install_checkup_task('default')['existing'] is True
+    assert "os.environ['HERMES_HOME']=" in (tmp/'scripts'/'cypher-checkups.py').read_text()
     assert api.install_checkup_task('default')['existing'] is True
     assert len(jobs)==1
     result=api.install_mail_task('default',{'tool':'mcp__mail__get','account':'synthetic@example.invalid','toolset':'mcp-mail'})

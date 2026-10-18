@@ -457,15 +457,17 @@ def _install_checkup_task(profile):
     name='Cypher check-ups · 3–4 daily · Dubai 10–22'
     existing=_call_cron_for_profile(profile,'list_jobs',True)
     matches=[job for job in existing if job.get('name')==name and job.get('script')=='cypher-checkups.py']
-    if matches: return {'job':matches[0],'existing':True}
     scripts=Path(home)/'scripts'
     scripts.mkdir(parents=True,exist_ok=True)
     if scripts.is_symlink() or getattr(scripts,'is_junction',lambda:False)() or scripts.resolve().parent!=Path(home).resolve(): raise ValueError('Unsafe scripts directory')
     target=scripts/'cypher-checkups.py'
     if target.is_symlink() or getattr(target,'is_junction',lambda:False)(): raise ValueError('Unsafe check-up script')
-    source="import importlib.util\nfrom pathlib import Path\nspec=importlib.util.spec_from_file_location('cypher_checkups',"+repr(str(ROOT/'checkups.py'))+")\nmodule=importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\nmodule.run("+repr(str(ROOT))+","+repr(profile)+")\n"
-    if target.exists() and target.read_text(encoding='utf-8')!=source: raise ValueError('Existing check-up script differs; review it on the host')
+    source=("import hermes_time\nhermes_timezone=hermes_time.get_timezone_name()\nhermes_now=hermes_time.now()\nimport os\nos.environ['HERMES_HOME']="+repr(str(mobile.home()))+
+            "\nimport importlib.util\nfrom pathlib import Path\nspec=importlib.util.spec_from_file_location('cypher_checkups',"+repr(str(ROOT/'checkups.py'))+")\nmodule=importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\nmodule.run("+repr(str(ROOT))+","+repr(profile)+",hermes_timezone,hermes_now)\n")
+    legacy=("import importlib.util\nfrom pathlib import Path\nspec=importlib.util.spec_from_file_location('cypher_checkups',"+repr(str(ROOT/'checkups.py'))+")\nmodule=importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\nmodule.run("+repr(str(ROOT))+","+repr(profile)+")\n")
+    if target.exists() and target.read_text(encoding='utf-8') not in (source,legacy): raise ValueError('Existing check-up script differs; review it on the host')
     target.write_text(source,encoding='utf-8')
+    if matches: return {'job':matches[0],'existing':True}
     return {'job':_create_cron_job_sync(CronJobCreate(name=name,schedule='every 1m',prompt='Owner-requested check-ups: 3–4 random opportunities in Asia/Dubai, 10:00–22:00; missed/busy opportunities skipped.',deliver='local',script='cypher-checkups.py',no_agent=True),profile),'existing':False}
 @router.get('/mobile/notifications/targets')
 async def targets(request:Request):

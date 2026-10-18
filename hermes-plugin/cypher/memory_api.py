@@ -57,14 +57,19 @@ def update(root, payload):
     if _scan_memory_content(content):
         raise HTTPException(400, 'Hermes rejected unsafe memory content')
     # Share the native writer lock: a stale phone edit must not replace newer agent notes.
-    with MemoryStore._file_lock(path):
-        current = document(root, target, load_config())
-        if current['revision'] != revision:
-            raise HTTPException(409, 'Notes changed elsewhere. Keep your draft, reload and merge before saving.')
-        if len(content) > current['limit']:
-            raise HTTPException(400, f"Notes exceed the {current['limit']} character limit")
-        atomic_write_text(path, content, tmp_prefix='.mem_')
-        return {'ok': True, 'document': document(root, target, load_config())}
+    try:
+        with MemoryStore._file_lock(path):
+            current = document(root, target, load_config())
+            if current['revision'] != revision:
+                raise HTTPException(409, 'Notes changed elsewhere. Keep your draft, reload and merge before saving.')
+            if len(content) > current['limit']:
+                raise HTTPException(400, f"Notes exceed the {current['limit']} character limit")
+            atomic_write_text(path, content, tmp_prefix='.mem_')
+            return {'ok': True, 'document': document(root, target, load_config())}
+    except PermissionError:
+        raise HTTPException(403, 'Profile memory notes are not writable') from None
+    except OSError:
+        raise HTTPException(400, 'Could not save notes in this profile') from None
 
 
 def build_router(identity, read_body, scoped):
