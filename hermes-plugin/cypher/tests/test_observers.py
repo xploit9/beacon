@@ -1,6 +1,7 @@
 from test_callbacks import load,env,ROW,NOW
 import json,time
 from datetime import datetime
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 import pytest
 
@@ -17,6 +18,9 @@ def test_factual_mail_receipt_and_model_assessment_are_separate(env):
     model={**args,'classification':'model'}
     assert o.email_notice(m,n,cfg,'default','scan',model,now)['status']=='pending'
     assert o.email_notice(m,n,cfg,'default','scan',model,now)['status']=='duplicate'
+    with m.connect() as c:
+        marker=c.execute("SELECT value FROM meta WHERE key='mail-notified:owner:default:fixture:m'").fetchone()[0]
+        assert float(marker)>time.time()-10
 
 def test_unverified_stale_foreign_and_nonfinite_mail_cannot_authorize(env):
     _,m,n,cfg,_,_=env;o=load('observers')
@@ -27,7 +31,6 @@ def test_unverified_stale_foreign_and_nonfinite_mail_cannot_authorize(env):
 
 
 def test_stale_observer_metadata_is_pruned(env,monkeypatch):
-    from types import SimpleNamespace
     _,m,_,cfg,_,_=env;o=load('observers');now=time.time()
     monkeypatch.setattr(o,'time',SimpleNamespace(time=lambda:now))
     cfg.update(owner_id='owner',mailbox_evidence={'tool':'exact-read','account':'fixture'})
@@ -35,13 +38,44 @@ def test_stale_observer_metadata_is_pruned(env,monkeypatch):
         c.execute('INSERT INTO meta VALUES(?,?)',('mail-evidence:owner:default:old:m',json.dumps({'observed_at':now-301}).encode()))
         c.execute('INSERT INTO meta VALUES(?,?)',('completion:owner:default:old:turn',str(now-86401).encode()))
         c.execute('INSERT INTO meta VALUES(?,?)',('completion:owner:default:legacy:turn',b'notified'))
+        c.execute('INSERT INTO meta VALUES(?,?)',('mail-notified:owner:default:legacy:message',b'notified'))
     received=now-60
     o.mailbox_observed(m,cfg,'default','scan','exact-read',{'account':'fixture','message':{'id':'m','received_at':received,'unread':True}},'ok',True)
     with m.connect() as c:
         assert c.execute("SELECT COUNT(*) FROM meta WHERE key='mail-evidence:owner:default:old:m'").fetchone()[0]==0
         assert c.execute("SELECT COUNT(*) FROM meta WHERE key='completion:owner:default:old:turn'").fetchone()[0]==0
         assert float(c.execute("SELECT value FROM meta WHERE key='completion:owner:default:legacy:turn'").fetchone()[0])==now
+        assert float(c.execute("SELECT value FROM meta WHERE key='mail-notified:owner:default:legacy:message'").fetchone()[0])==now
         assert c.execute("SELECT COUNT(*) FROM meta WHERE key='mail-evidence:owner:default:scan:m'").fetchone()[0]==1
+
+def test_mail_marker_retention_is_one_day_lookback_plus_two_day_margin(env,monkeypatch):
+    _,m,_,_,_,_=env;o=load('observers');now=time.time()
+    assert o.MAIL_LOOKBACK_SECONDS==86400
+    assert o.MAIL_MARKER_RETENTION_SECONDS==3*86400
+    monkeypatch.setattr(o,'time',SimpleNamespace(time=lambda:now))
+    with m.connect() as c:
+        c.execute('INSERT INTO meta VALUES(?,?)',('mail-notified:owner:default:fixture:old',str(now-3*86400-1).encode()))
+        c.execute('INSERT INTO meta VALUES(?,?)',('mail-notified:owner:default:fixture:recent',str(now-3*86400+1).encode()))
+        o.prune_meta(c,now)
+        assert c.execute("SELECT 1 FROM meta WHERE key='mail-notified:owner:default:fixture:old'").fetchone() is None
+        assert c.execute("SELECT 1 FROM meta WHERE key='mail-notified:owner:default:fixture:recent'").fetchone()
+
+def test_old_unread_mail_cannot_be_notified_after_marker_expires(env,monkeypatch):
+    _,m,n,cfg,_,_=env;o=load('observers');now=time.time();received=now-2*86400
+    monkeypatch.setattr(o,'time',SimpleNamespace(time=lambda:now))
+    cfg.update(scheduled_callback_conversation_id='owned',mailbox_evidence={'tool':'exact-read','account':'fixture'})
+    marker='mail-notified:owner:default:fixture:old-message'
+    with m.connect() as c:c.execute('INSERT INTO meta VALUES(?,?)',(marker,str(now-4*86400).encode()))
+    with m.connect() as c:o.prune_meta(c,now)
+    o.mailbox_observed(m,cfg,'default','scan','exact-read',
+        {'account':'fixture','message':{'id':'old-message','received_at':received,'unread':True,'urgent':True,'action_required':True}},'ok',True)
+    args={'account':'fixture','message_id':'old-message','received_at':received,'unread':True,
+          'urgent':True,'important':True,'action_required':True,'reason':'Synthetic old unread message'}
+    with pytest.raises(ValueError):o.email_notice(m,n,cfg,'default','scan',args,datetime.fromtimestamp(now,ZoneInfo('Asia/Dubai')))
+    with m.connect() as c:
+        assert c.execute('SELECT 1 FROM meta WHERE key=?',(marker,)).fetchone() is None
+        assert c.execute("SELECT 1 FROM meta WHERE key LIKE 'mail-evidence:%' AND key LIKE '%old-message'").fetchone() is None
+        assert c.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==0
 
 def test_gmail_raw_metadata_is_source_fact_not_urgency():
     o=load('observers');cfg={'adapter':'gmail','account':'fixture'}

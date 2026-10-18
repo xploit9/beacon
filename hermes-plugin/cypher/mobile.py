@@ -21,6 +21,9 @@ _CALL_LOCKS=weakref.WeakValueDictionary()
 ID = re.compile(r"[A-Za-z0-9_-]{1,160}\Z")
 MAX_MS = 4 * 60 * 60 * 1000
 MAX_ACTIVE_CALLS = 8
+HISTORY_RETENTION_DAYS = (0,30,90,365)
+HISTORY_RETENTION_EVENTS_PER_BATCH = 1000
+HISTORY_RETENTION_CALLS_PER_BATCH = 100
 
 def settings():
     from copy import deepcopy
@@ -104,6 +107,10 @@ def _connect():
     columns={r[1] for r in conn.execute('PRAGMA table_info(jobs)')}
     for name in ('result','error'):
         if name not in columns: conn.execute('ALTER TABLE jobs ADD COLUMN '+name+" TEXT DEFAULT ''")
+    if 'history_updated' not in columns:
+        conn.execute('ALTER TABLE jobs ADD COLUMN history_updated REAL NOT NULL DEFAULT 0')
+        # Legacy jobs have no change time; preserve them until their age is known.
+        conn.execute('UPDATE jobs SET history_updated=?',(time.time(),))
     notice_columns={r[1] for r in conn.execute('PRAGMA table_info(notices)')}
     if 'release_version' not in notice_columns: conn.execute('ALTER TABLE notices ADD COLUMN release_version INTEGER NOT NULL DEFAULT 0')
     if 'reason' not in notice_columns: conn.execute("ALTER TABLE notices ADD COLUMN reason TEXT DEFAULT ''")
@@ -117,6 +124,82 @@ def _connect():
 def connect():
     with LOCK: return _connect()
 
+def _history_key(owner):
+    if not isinstance(owner,str) or not owner: raise ValueError('Owner required')
+    digest=hashlib.sha256(owner.encode('utf-8')).hexdigest()
+    return 'history_retention_days:'+digest
+
+def _history_days(conn,owner):
+    row=conn.execute('SELECT value FROM meta WHERE key=?',(_history_key(owner),)).fetchone()
+    if not row: return 0
+    raw=row[0]
+    try: days=int(raw.decode() if isinstance(raw,bytes) else raw)
+    except (TypeError,ValueError,OverflowError): return 0
+    return days if days in HISTORY_RETENTION_DAYS else 0
+
+def history_retention_days(owner):
+    with LOCK,connect() as conn: return _history_days(conn,owner)
+
+def _active_history_notice(conn,call_id,owner,profile,now):
+    return conn.execute("""SELECT 1 FROM notices n
+        WHERE n.owner=? AND n.profile=? AND n.kind='incoming_call' AND n.state='pending' AND n.expires>?
+          AND (n.call_id=? OR n.job_id IN (SELECT id FROM jobs WHERE call_id=? AND owner=? AND profile=?))
+        LIMIT 1""",(owner,profile,now,call_id,call_id,owner,profile)).fetchone()
+
+def _prune_history(conn,owner,days,now):
+    if days<=0: return 0
+    cutoff=now-days*86400
+    removed_events=removed_calls=0
+    while removed_events<HISTORY_RETENTION_EVENTS_PER_BATCH and removed_calls<HISTORY_RETENTION_CALLS_PER_BATCH:
+        call=conn.execute("""SELECT c.id,c.profile FROM calls c
+            WHERE c.owner=? AND c.closed=1 AND c.created<?
+              AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.call_id=c.id AND j.owner=c.owner AND j.profile=c.profile
+                AND (j.status IS NULL OR j.status NOT IN ('completed','callback_pending','failed','cancelled') OR j.history_updated>=?))
+              AND NOT EXISTS (SELECT 1 FROM notices n WHERE n.owner=c.owner AND n.profile=c.profile
+                AND n.kind='incoming_call' AND n.state='pending' AND n.expires>?
+                AND (n.call_id=c.id OR n.job_id IN (SELECT id FROM jobs WHERE call_id=c.id AND owner=c.owner AND profile=c.profile)))
+            ORDER BY c.created,c.id LIMIT 1""",(owner,cutoff,cutoff,now)).fetchone()
+        if not call: break
+        call_id,profile=call['id'],call['profile']
+        budget=HISTORY_RETENTION_EVENTS_PER_BATCH-removed_events
+        deleted=conn.execute('DELETE FROM timeline WHERE rowid IN (SELECT rowid FROM timeline WHERE call_id=? LIMIT ?)',(call_id,budget)).rowcount
+        removed_events+=deleted
+        if conn.execute('SELECT 1 FROM timeline WHERE call_id=? LIMIT 1',(call_id,)).fetchone(): break
+        conn.execute("DELETE FROM jobs WHERE call_id=? AND owner=? AND profile=? AND history_updated<? AND status IN ('completed','callback_pending','failed','cancelled')",
+                     (call_id,owner,profile,cutoff))
+        if _active_history_notice(conn,call_id,owner,profile,now): break
+        deleted=conn.execute("""DELETE FROM calls WHERE id=? AND owner=? AND profile=? AND closed=1 AND created<?
+            AND NOT EXISTS (SELECT 1 FROM jobs WHERE call_id=?)""",(call_id,owner,profile,cutoff,call_id)).rowcount
+        if not deleted: break
+        removed_calls+=deleted
+    return removed_events+removed_calls
+
+def prune_history(owner):
+    now=time.time()
+    with LOCK,connect() as conn:
+        days=_history_days(conn,owner)
+        if not days: return 0
+        key='history_retention_last_run:'+hashlib.sha256(owner.encode('utf-8')).hexdigest()
+        row=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
+        try: last=float(row[0].decode() if isinstance(row[0],bytes) else row[0]) if row else None
+        except (TypeError,ValueError,OverflowError): last=None
+        if last is not None and math.isfinite(last) and now-last<3600: return 0
+        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(key,str(now).encode()))
+        return _prune_history(conn,owner,days,now)
+
+def set_history_retention_days(owner,days):
+    if type(days) is not int or days not in HISTORY_RETENTION_DAYS: raise ValueError('Invalid history retention period')
+    now=time.time()
+    with LOCK,connect() as conn:
+        previous=_history_days(conn,owner)
+        key=_history_key(owner)
+        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(key,str(days).encode()))
+        if days and (previous==0 or days<previous):
+            _prune_history(conn,owner,days,now)
+            last_key='history_retention_last_run:'+hashlib.sha256(owner.encode('utf-8')).hexdigest()
+            conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(last_key,str(now).encode()))
+    return days
+
 def call_lock(call_id):
     with LOCK:
         lock=_CALL_LOCKS.get(call_id)
@@ -126,7 +209,7 @@ def call_lock(call_id):
 
 def prune_notices(conn):
     # Move legacy answered invitation metadata into its owned call before pruning
-    # the delivery outbox. Text transcripts and call/job history are preserved.
+    # the delivery outbox; call, timeline and job history use separate retention.
     rows=conn.execute("SELECT n.* FROM notices n JOIN calls c ON c.id=n.call_id AND c.owner=n.owner AND c.profile=n.profile WHERE n.state='answered' AND n.expires<? AND c.callback_context='{}'",(time.time(),)).fetchall()
     for row in rows:
         context={key:row[key] for key in ('id','reason','job_id','conversation')}

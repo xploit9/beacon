@@ -3,11 +3,38 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import re
 import tempfile
 
 ZONE = 'Asia/Dubai'
+CALLBACK_WINDOW_SECONDS=120
+CALLBACK_MARKER_RETENTION_SECONDS=CALLBACK_WINDOW_SECONDS+7*24*60*60
+CALLBACK_MARKER_PRUNE_BATCH=256
+_CALLBACK_EVENT=re.compile(r'[0-9a-f]{64}\Z')
+
+def _prune_expired(conn,now,owner):
+    cutoff=now-CALLBACK_MARKER_RETENTION_SECONDS-1
+    keys=conn.execute("""SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'
+        AND CASE WHEN json_valid(CAST(value AS TEXT)) THEN
+          CASE WHEN json_extract(CAST(value AS TEXT),'$.owner')=? THEN
+            CAST(strftime('%s',json_extract(CAST(value AS TEXT),'$.scheduled_at')) AS REAL)
+          END
+        END<=? ORDER BY rowid LIMIT ?""",(owner,cutoff,CALLBACK_MARKER_PRUNE_BATCH)).fetchall()
+    conn.executemany('DELETE FROM meta WHERE key=?',keys)
+
+def prune_expired(mobile,owner,now=None):
+    now=now if now is not None else datetime.now(ZoneInfo(ZONE)).timestamp()
+    key='scheduled-callback-prune:'+hashlib.sha256(owner.encode('utf-8')).hexdigest()
+    with mobile.LOCK,mobile.connect() as conn:
+        row=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
+        try: last=float(row[0].decode() if isinstance(row[0],bytes) else row[0]) if row else None
+        except (TypeError,ValueError,OverflowError): last=None
+        if last is not None and math.isfinite(last) and now-last<3600: return 0
+        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(key,str(now).encode()))
+        return _prune_expired(conn,now,owner)
 
 def target_time(value, now):
     if set(value) - {'request_id','reason','delay_seconds','at'}: raise ValueError('Unknown callback field')
@@ -60,9 +87,13 @@ def schedule(mobile,native,owner,provider,row,cfg,value,now=None):
     fingerprint=hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()
     key='scheduled-callback:'+hashlib.sha256((owner+'\0'+profile+'\0'+request).encode()).hexdigest()
     with mobile.LOCK:
-        with mobile.connect() as conn: existing=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
+        with mobile.connect() as conn:
+            _prune_expired(conn,now.timestamp(),owner)
+            existing=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
         if existing:
             record=json.loads(existing[0])
+            if (now-datetime.fromisoformat(record['scheduled_at'])).total_seconds()>=CALLBACK_WINDOW_SECONDS:
+                raise ValueError('Callback request expired')
             if record['fingerprint']!=fingerprint or record['conversation']!=stored: raise ValueError('Callback request_id already used for another request')
         else:
             if row.get('closed'): raise ValueError('Call ended before callback request was accepted')
@@ -102,12 +133,13 @@ def schedule(mobile,native,owner,provider,row,cfg,value,now=None):
 def deliver(mobile,native,key,now):
     cfg=mobile.settings()
     with mobile.LOCK,mobile.connect() as conn:
+        _prune_expired(conn,now.timestamp(),cfg.get('owner_id'))
         found=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
         if not found: raise ValueError('Callback intent unavailable')
         row=json.loads(found[0]);target=datetime.fromisoformat(row['scheduled_at'])
+        if not 0<=(now-target).total_seconds()<CALLBACK_WINDOW_SECONDS: return {'status':'skipped_expired'}
         if row.get('delivered'): return {'status':'duplicate'}
         if cfg.get('scheduled_callbacks_enabled') is not True or cfg.get('owner_id')!=row['owner'] or cfg.get('owner_provider')!=row['provider'] or row['profile'] not in cfg.get('profiles',[]): raise ValueError('Callback authority changed')
-        if not 0<=(now-target).total_seconds()<120: return {'status':'skipped_expired'}
         native.verify(row['owner'],row['provider'],row['profile'],row['conversation'])
         # Exact deterministic notice id makes retry atomic with its delivery marker.
         event=key.split(':')[1]
@@ -117,18 +149,22 @@ def deliver(mobile,native,key,now):
             conn.execute('INSERT INTO deferred(id,owner,profile,conversation,created,reason) VALUES(?,?,?,?,?,?)',(event,row['owner'],row['profile'],row['conversation'],now.timestamp(),row['reason']))
         else:
             if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: raise RuntimeError('Notification capacity reached')
-            conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason) VALUES(?,?,?,?,?,?,?,?)',(event,row['owner'],row['profile'],'incoming_call',row['conversation'],now.timestamp(),now.timestamp()+120,row['reason']))
+            conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason) VALUES(?,?,?,?,?,?,?,?)',(event,row['owner'],row['profile'],'incoming_call',row['conversation'],now.timestamp(),now.timestamp()+CALLBACK_WINDOW_SECONDS,row['reason']))
         row['delivered']=event
         conn.execute('UPDATE meta SET value=? WHERE key=?',(json.dumps(row).encode(),key))
     return {'status':'pending','event_id':event}
 
-def deferred_allowed(mobile,event,now):
-    # None denotes a different producer; an explicit timed request expires at due+120s.
+def deferred_allowed(mobile,event,now,owner=None):
+    # None denotes a different producer; scheduled IDs remain rejectable after marker pruning.
     key='scheduled-callback:'+event
-    with mobile.connect() as conn: found=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
-    if not found: return None
-    row=json.loads(found[0]);target=datetime.fromisoformat(row['scheduled_at'])
-    return row.get('delivered')==event and 0<=(now-target).total_seconds()<120
+    with mobile.LOCK,mobile.connect() as conn:
+        if isinstance(owner,str) and owner: _prune_expired(conn,now.timestamp(),owner)
+        found=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
+    if not found: return False if isinstance(event,str) and _CALLBACK_EVENT.fullmatch(event) else None
+    try:
+        row=json.loads(found[0]);target=datetime.fromisoformat(row['scheduled_at'])
+    except (TypeError,ValueError,KeyError): return False
+    return row.get('delivered')==event and 0<=(now-target).total_seconds()<CALLBACK_WINDOW_SECONDS
 
 def run(key):
     import importlib.util,sys

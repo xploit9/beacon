@@ -25,8 +25,9 @@ VALUE={'request_id':'stable','reason':'Requested reminder','delay_seconds':60}
 def test_schedule_native_one_shot_replay_after_call_end(env):
     cb,m,n,cfg,jobs,tmp=env
     first=cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
-    second=cb.schedule(m,n,'owner','basic',{**ROW,'closed':1},cfg,VALUE,NOW+timedelta(hours=1))
-    assert first==second and first['scheduled_at']=='2026-10-16T23:01:00+04:00'
+    with pytest.raises(ValueError,match='expired'):
+        cb.schedule(m,n,'owner','basic',{**ROW,'closed':1},cfg,VALUE,NOW+timedelta(hours=1))
+    assert first['scheduled_at']=='2026-10-16T23:01:00+04:00'
     assert len(jobs)==1 and jobs[0]['no_agent'] is True and jobs[0]['schedule']==first['scheduled_at']
     assert (tmp/'scripts'/jobs[0]['script']).exists()
     with pytest.raises(ValueError): cb.schedule(m,n,'owner','basic',ROW,cfg,{**VALUE,'reason':'different'},NOW)
@@ -69,6 +70,27 @@ def test_stale_or_changed_authority_does_not_ring(env):
     cfg['scheduled_callbacks_enabled']=False
     with pytest.raises(ValueError):cb.deliver(m,n,key,NOW+timedelta(seconds=60))
     with m.connect() as c:assert c.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==0
+
+def test_expired_callback_replay_is_rejected_before_and_after_marker_pruning(env):
+    cb,m,n,cfg,jobs,tmp=env
+    first=cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
+    with m.connect() as c:key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]
+    event=key.split(':')[1]
+    expiry=datetime.fromisoformat(first['scheduled_at'])+timedelta(seconds=120)
+    with m.connect() as c:
+        record=json.loads(c.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()[0])
+        record['delivered']=event
+        c.execute('UPDATE meta SET value=? WHERE key=?',(json.dumps(record).encode(),key))
+    assert cb.deliver(m,n,key,expiry)['status']=='skipped_expired'
+    assert cb.deferred_allowed(m,event,expiry) is False
+    with pytest.raises(ValueError):cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,expiry)
+    margin=expiry+timedelta(days=7)
+    cb.schedule(m,n,'owner','basic',ROW,cfg,{**VALUE,'request_id':'before-prune'},margin-timedelta(seconds=1))
+    with m.connect() as c:assert c.execute('SELECT 1 FROM meta WHERE key=?',(key,)).fetchone()
+    cb.schedule(m,n,'owner','basic',ROW,cfg,{**VALUE,'request_id':'after-prune'},margin+timedelta(seconds=1))
+    with m.connect() as c:assert c.execute('SELECT 1 FROM meta WHERE key=?',(key,)).fetchone() is None
+    assert cb.deferred_allowed(m,event,margin+timedelta(seconds=1)) is False
+    with pytest.raises(ValueError):cb.deliver(m,n,key,margin+timedelta(seconds=1))
 
 def test_native_timeout_reconciles_exact_job_without_replay(env,monkeypatch):
     cb,m,n,cfg,jobs,tmp=env;module=sys.modules['hermes_cli.web_server_cron'];original=module._create_cron_job_sync
