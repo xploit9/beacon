@@ -15,6 +15,8 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.unit.Density
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
@@ -23,14 +25,16 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.test.core.app.ApplicationProvider
 import dev.hermes.android.core.json
 import dev.hermes.android.ui.*
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
 
 /**
- * Local-fixture proof for the Settings overview: no network, no ViewModel. The overview is stateless, so these tests
- * drive it with fixed summaries and record the exact route each tap emits for `CypherViewModel.more`.
+ * Local-fixture proof for the Settings overview. The stateless overview checks use fixed summaries; the navigation check
+ * uses a real ViewModel with a blank origin, so it exercises routes without contacting Hermes.
  * Phone and tablet widths come from a density override, so the layout rule is exercised on any device.
  * A node only counts once it has been scrolled into the viewport and asserted displayed: a lazy list can compose
  * nodes that are off screen, and existing there proves nothing about the user seeing or reaching them.
@@ -218,23 +222,30 @@ class SettingsMigrationUiTest {
 
     @Test fun everyHubRowNavigatesAndBackReturnsToTheHub() {
         val app = ApplicationProvider.getApplicationContext<CypherApplication>()
+        val priorPreferences = runBlocking { app.preferences.data.first() }
         val store = ViewModelStore()
-        val vm = ViewModelProvider(store, viewModelFactory { initializer { CypherViewModel(app, SavedStateHandle()) } })[CypherViewModel::class.java]
-        compose.setContent {
-            CypherTheme(dark = true) {
-                Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { MoreScreen(vm) }
+        try {
+            runBlocking { app.preferences.edit { it[stringPreferencesKey("origin")] = "" } }
+            val vm = ViewModelProvider(store, viewModelFactory { initializer { CypherViewModel(app, SavedStateHandle()) } })[CypherViewModel::class.java]
+            compose.setContent {
+                CypherTheme(dark = true) {
+                    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { MoreScreen(vm) }
+                }
             }
+            compose.waitUntil(5_000) { vm.ui.value.origin.isBlank() && !vm.ui.value.restoringSession }
+            compose.runOnIdle { vm.tab("More") }
+            for (name in settingsHubRoutes) {
+                shown(name).performClick()
+                val route = settingsRoute(name)
+                compose.waitUntil(5_000) { vm.ui.value.tab == "More" && vm.ui.value.morePage == route }
+                compose.runOnIdle { vm.backFromSettings() }
+                compose.waitUntil(5_000) { vm.ui.value.tab == "More" && vm.ui.value.morePage.isBlank() }
+                compose.onNodeWithTag("settings-overview").assertExists()
+            }
+        } finally {
+            compose.runOnUiThread { store.clear() }
+            runBlocking { app.preferences.updateData { priorPreferences } }
         }
-        compose.runOnIdle { vm.tab("More") }
-        for (name in settingsHubRoutes) {
-            shown(name).performClick()
-            val route = settingsRoute(name)
-            compose.waitUntil(5_000) { vm.ui.value.tab == "More" && vm.ui.value.morePage == route }
-            compose.runOnIdle { vm.backFromSettings() }
-            compose.waitUntil(5_000) { vm.ui.value.tab == "More" && vm.ui.value.morePage.isBlank() }
-            compose.onNodeWithTag("settings-overview").assertExists()
-        }
-        compose.runOnUiThread { store.clear() }
     }
 
     private companion object {
