@@ -20,7 +20,6 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
@@ -33,8 +32,6 @@ import androidx.compose.animation.core.tween
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.LayoutDirection
@@ -46,6 +43,7 @@ import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.hermes.android.data.NativeAuth
 import dev.hermes.android.ui.*
 import kotlinx.coroutines.flow.collect
 
@@ -53,6 +51,7 @@ class CypherActivity : ComponentActivity() {
     private var vm: CypherViewModel? = null
     private var initialPush by mutableStateOf<Triple<String, String, String>?>(null)
     private var updateToken by mutableStateOf<String?>(null)
+    private var pendingConnectionLink by mutableStateOf<String?>(null)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -63,6 +62,9 @@ class CypherActivity : ComponentActivity() {
             val preferences by model.preferences.collectAsStateWithLifecycle()
             val data by model.data.collectAsStateWithLifecycle()
             val ui by model.ui.collectAsStateWithLifecycle()
+            LaunchedEffect(model, pendingConnectionLink) {
+                pendingConnectionLink?.let { model.openSetupLink(it); pendingConnectionLink = null }
+            }
             var permissionSource by rememberSaveable { mutableStateOf("") }
             var permissionEvent by rememberSaveable { mutableStateOf("") }
             var permissionAction by rememberSaveable { mutableStateOf("answer") }
@@ -111,10 +113,11 @@ class CypherActivity : ComponentActivity() {
         catch (_: RuntimeException) { vm?.notice("Floating calls are unavailable. Your call continues; return using its notification.") }
     }
     override fun onStart() { super.onStart(); (application as CypherApplication).calls.let { it.uiVisible = true; if (it.state.value.active) it.resumeWindow() }; vm?.foreground(true) }
-    override fun onResume() { super.onResume(); vm?.resumeAppUpdate(); (application as CypherApplication).calls.refreshOverlayPermission() }
+    override fun onResume() { super.onResume(); NativeAuth.onActivityResumed(); vm?.resumeAppUpdate(); (application as CypherApplication).calls.refreshOverlayPermission() }
     override fun onStop() { (application as CypherApplication).calls.uiVisible = false; vm?.foreground(false); super.onStop() }
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); setIntent(intent); push(intent) }
     private fun push(intent: Intent?) {
+        intent?.data?.takeIf { it.scheme.equals("cypher", true) && it.host.equals("connect", true) }?.let { pendingConnectionLink = it.toString(); intent?.data = null }
         intent?.getStringExtra(CypherCallService.EXTRA_CALL_ID)?.let { pendingReturn=it;intent.removeExtra(CypherCallService.EXTRA_CALL_ID) }
         intent?.getStringExtra(dev.hermes.android.updates.UpdateManager.EXTRA_TOKEN)?.takeIf(dev.hermes.android.updates.UpdateManager::validToken)?.let { updateToken = it }
         val source = intent?.getStringExtra("push_source") ?: intent?.getStringExtra("source_ref").orEmpty()
@@ -129,7 +132,6 @@ class CypherActivity : ComponentActivity() {
         }
     }
 }
-
 @Composable internal fun IncomingCallSheet(vm: CypherViewModel, requestingPermission: Boolean, onAnswer: (String, String) -> Unit) {
     val invite by vm.app.push.incoming.collectAsStateWithLifecycle()
     val ui by vm.ui.collectAsStateWithLifecycle()
@@ -195,7 +197,7 @@ class CypherActivity : ComponentActivity() {
     BackHandler(ui.authenticated && !ui.showSessions && ui.tab !in setOf("Chat", "Xara") && (ui.tab != "More" || ui.morePage.isBlank())) {
         if (ui.tab == "More") vm.backFromSettings() else if (ui.tab == "Spaces" && vm.editor.value.path.isNotBlank()) vm.closeEditor() else if (ui.botModeEnabled) vm.showBotMode() else vm.tab("Chat")
     }
-    LaunchedEffect(ui.error, ui.notice) { val text = ui.error.ifBlank { ui.notice }; if (text.isNotBlank()) { snackbar.showSnackbar(text, withDismissAction = true); vm.clearMessage() } }
+    LaunchedEffect(ui.error, ui.notice, ui.setupWizard) { if (!ui.setupWizard) { val text = ui.error.ifBlank { ui.notice }; if (text.isNotBlank()) { snackbar.showSnackbar(text, withDismissAction = true); vm.clearMessage() } } }
     if (ui.restoringSession) {
         Surface(Modifier.fillMaxSize().testTag("session-restore-logo"), color = MaterialTheme.colorScheme.background) {
             Column(Modifier.safeDrawingPadding(), verticalArrangement = Arrangement.Center, horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally) {
@@ -204,9 +206,8 @@ class CypherActivity : ComponentActivity() {
                 Text("Cypher", style = MaterialTheme.typography.displaySmall)
             }
         }
-    } else if (!ui.authenticated) {
-        val feedbackReserve = with(LocalDensity.current) { feedbackHeightPx.toDp() }
-        Scaffold(modifier = Modifier.imePadding(), contentWindowInsets = WindowInsets.safeDrawing, snackbarHost = feedbackHost) { padding -> SignIn(vm, Modifier.padding(padding).padding(bottom = feedbackReserve).consumeWindowInsets(padding)) }
+    } else if (!ui.authenticated || ui.setupWizard) {
+        SetupWizard(vm, Modifier.fillMaxSize().safeDrawingPadding())
     } else {
         val keyboard = LocalSoftwareKeyboardController.current
         val openMenu = { keyboard?.hide(); vm.toggleSessions(!ui.showSessions) }
@@ -307,26 +308,5 @@ class CypherActivity : ComponentActivity() {
             confirmButton={TextButton(onClick={decide(true)},enabled=!approval.busy,modifier=Modifier.testTag("cypher-tool-allow")) {Text("Allow once")}},
             dismissButton={TextButton(onClick={decide(false)},enabled=!approval.busy,modifier=Modifier.testTag("cypher-tool-deny")) {Text("Deny")}},
             modifier=Modifier.testTag("cypher-tool-approval"))
-    }
-}
-
-@Composable private fun SignIn(vm: CypherViewModel, modifier: Modifier = Modifier) {
-    val ui by vm.ui.collectAsStateWithLifecycle()
-    var origin by rememberSaveable(ui.origin) { mutableStateOf(ui.origin) }
-    var username by rememberSaveable { mutableStateOf(BuildConfig.DEFAULT_USERNAME) }
-    var password by remember { mutableStateOf("") }
-    Column(modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 24.dp), verticalArrangement = Arrangement.Center, horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally) {
-        Text(uiText("Cypher"), style = MaterialTheme.typography.displayMedium)
-        Spacer(Modifier.height(12.dp))
-        Text(uiText("Your conversations, work and Cypher.\nConnected privately to Hermes."), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Spacer(Modifier.height(32.dp))
-        Glass(Modifier.widthIn(max = 560.dp).fillMaxWidth()) { Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            OutlinedTextField(origin, { origin = it }, label = { Text(uiText("Private Cypher HTTPS origin")) }, placeholder = { Text(uiText("https://your-device.ts.net")) }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), singleLine = true, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(username, { username = it }, label = { Text(uiText("Hermes username")) }, singleLine = true, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(password, { password = it }, label = { Text(uiText("Cypher password")) }, visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password), singleLine = true, modifier = Modifier.fillMaxWidth())
-            if (ui.error.isNotBlank()) Text(ui.error, color = MaterialTheme.colorScheme.error)
-            Button(onClick = { vm.connect(origin, password, username = username); password = "" }, enabled = !ui.loading && origin.isNotBlank() && username.isNotBlank(), modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { if (ui.loading) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) else Text(uiText("Connect securely")) }
-            Text(uiText("Keep Tailscale connected. Credentials are stored with Android Keystore."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        } }
     }
 }

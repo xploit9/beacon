@@ -3,6 +3,22 @@ package dev.hermes.android.core
 import org.json.JSONObject
 import org.json.JSONArray
 
+// Timestamp normalization follows Hermes Relay's FlexibleTimestampSerializer and
+// ChatHandler history projection (MIT; see licenses/Hermes-Relay-MIT.txt). Missing/invalid times stay unknown.
+internal fun recordedMessageTime(value: Any?): Long {
+    val raw = when (value) {
+        is Number -> value.toString()
+        is String -> value.trim()
+        else -> return 0L
+    }
+    val numeric = raw.toDoubleOrNull()
+    if (numeric != null) {
+        val millis = if (numeric < 100_000_000_000.0) numeric * 1000.0 else numeric
+        return if (millis.isFinite() && millis > 0 && millis < Long.MAX_VALUE.toDouble()) millis.toLong() else 0L
+    }
+    return runCatching { java.time.Instant.parse(raw).toEpochMilli() }.getOrNull()?.takeIf { it > 0 } ?: 0L
+}
+
 data class ChatPresentation(val activity: Boolean, val text: String, val summary: String)
 
 data class LiveAssistantBody(val text: String, val reasoning: String)

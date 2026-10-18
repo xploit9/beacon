@@ -79,7 +79,8 @@ class NativeCallLiveUiTest {
         val transport=ConcurrentLinkedQueue<JSONObject>()
         var primary:Throwable?=null
         try {
-            withContext(Dispatchers.Main.immediate) { vm.connect(BuildConfig.DEFAULT_ORIGIN,credentials.getString("password"),username=credentials.getString("username")) }.join()
+            loginLiveTest(app, BuildConfig.DEFAULT_ORIGIN, credentials)
+            withContext(Dispatchers.Main.immediate) { vm.connect(BuildConfig.DEFAULT_ORIGIN) }.join()
             phase="connected-auth"
             await { vm.ui.value.authenticated&&vm.ui.value.connected&&!vm.ui.value.loading }
             // Authentication returns before the cached conversation selection settles.

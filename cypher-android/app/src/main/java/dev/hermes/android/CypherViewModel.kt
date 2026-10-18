@@ -1,11 +1,17 @@
 package dev.hermes.android
 
 import android.app.Application
+import android.Manifest
+import android.app.NotificationManager
+import android.content.Context
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.provider.OpenableColumns
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.SavedStateHandle
@@ -24,14 +30,14 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
-data class Message(val id: String, val role: String, val text: String, val reasoning: String = "", val tools: List<JSONObject> = emptyList(), val attachments: List<JSONObject> = emptyList(), val mediaSnapshots: Map<String, String> = emptyMap(), val sessionId: String = "", val interrupted: Boolean = false, val voice: Boolean = false) {
+data class Message(val id: String, val role: String, val text: String, val reasoning: String = "", val tools: List<JSONObject> = emptyList(), val attachments: List<JSONObject> = emptyList(), val mediaSnapshots: Map<String, String> = emptyMap(), val sessionId: String = "", val interrupted: Boolean = false, val voice: Boolean = false, val recordedAt: Long = 0L) {
     companion object {
         fun from(o: JSONObject, index: Int, sessionId: String = ""): Message {
             val content = when { o.has("display_content") && !o.isNull("display_content") -> o.opt("display_content"); o.has("display_text") && !o.isNull("display_text") -> o.opt("display_text"); o.has("text") && !o.isNull("text") -> o.opt("text"); else -> o.opt("content") }
             val parts = (content as? JSONArray)?.objects().orEmpty()
             val text = messageContentText(o.string("role", "assistant"), content)
             val snapshots = o.optJSONObject("_media_snapshots")?.let { values -> values.keys().asSequence().take(256).mapNotNull { path -> values.optString(path).takeIf(::validMediaSnapshot)?.takeIf { path.length in 1..8192 && path.none { it.code < 32 || it.code == 127 } }?.let { path to it.lowercase() } }.toMap() }.orEmpty()
-            return Message(o.string("id", o.string("message_id", o.string("row_id", o.string("_row_id", o.string("tool_call_id", "${o.string("role")}:$index"))))), o.string("role", "assistant"), text, o.string("reasoning", o.string("reasoning_content")), o.rows("tool_calls"), o.rows("attachments") + parts.filter { it.string("type").contains("image") }, snapshots, sessionId, o.optBoolean("interrupted") || o.optJSONObject("display_metadata")?.optBoolean("interrupted") == true || o.string("finish_reason") == "cancelled", o.optJSONObject("display_metadata")?.optString("channel") == "voice")
+            return Message(o.string("id", o.string("message_id", o.string("row_id", o.string("_row_id", o.string("tool_call_id", "${o.string("role")}:$index"))))), o.string("role", "assistant"), text, o.string("reasoning", o.string("reasoning_content")), o.rows("tool_calls"), o.rows("attachments") + parts.filter { it.string("type").contains("image") }, snapshots, sessionId, o.optBoolean("interrupted") || o.optJSONObject("display_metadata")?.optBoolean("interrupted") == true || o.string("finish_reason") == "cancelled", o.optJSONObject("display_metadata")?.optString("channel") == "voice", recordedAt = recordedMessageTime(o.opt("timestamp")))
         }
     }
 }
@@ -39,7 +45,16 @@ data class ChatState(val sessionId: String = "", val title: String = "New conver
 data class EditorState(val scope: Scope? = null, val path: String = "", val text: TextFieldValue = TextFieldValue(), val serverText: String = "", val metadata: JSONObject = JSONObject(), val loading: Boolean = false, val saving: Boolean = false, val error: String = "", val reviewRequired: Boolean = false) { val dirty get() = text.text != serverText }
 data class SideQuestion(val scope: Scope, val question: String, val sessionId: String, val streamId: String, val text: String = "", val status: String = "Responding", val cursor: String = "", val error: String = "")
 data class AppUpdateState(val release: Release? = null, val busy: Boolean = false, val ready: Boolean = false, val status: String = "Cypher checks for updates automatically while connected.")
-data class AppState(val origin: String = BuildConfig.DEFAULT_ORIGIN, val authenticated: Boolean = false, val profile: String = "default", val owner: String = "", val tab: String = "Chat", val connected: Boolean = false, val loading: Boolean = false, val error: String = "", val notice: String = "", val bootstrap: JSONObject = JSONObject(), val sessions: List<JSONObject> = emptyList(), val query: String = "", val showSessions: Boolean = false, val morePage: String = "", val xaraOpening: Boolean = false, val xaraError: String = "", val newChatOpening: Boolean = false, val newChatError: String = "", val initialChatReady: Boolean = false, val restoringSession: Boolean = true, val botModeEnabled: Boolean = false, val botModeSwitching: Boolean = false)
+data class AppState(val origin: String = BuildConfig.DEFAULT_ORIGIN, val authenticated: Boolean = false, val profile: String = "default", val owner: String = "", val tab: String = "Chat", val connected: Boolean = false, val loading: Boolean = false, val error: String = "", val notice: String = "", val bootstrap: JSONObject = JSONObject(), val sessions: List<JSONObject> = emptyList(), val query: String = "", val showSessions: Boolean = false, val morePage: String = "", val xaraOpening: Boolean = false, val xaraError: String = "", val newChatOpening: Boolean = false, val newChatError: String = "", val initialChatReady: Boolean = false, val restoringSession: Boolean = true, val botModeEnabled: Boolean = false, val botModeSwitching: Boolean = false, val setupWizard: Boolean = false, val setupComplete: Boolean = false, val setupStep: String = "connect", val setupPluginMessage: String = "", val setupOrigin: String = "")
+internal fun voiceKeySetupPageIfMissing(hasKey:Boolean):String? = if(hasKey) null else "Cypher"
+internal data class VoiceCallRequest(val scope:Scope,val conversationId:String)
+
+internal enum class NativeSetupAuthMode { Loopback, NativePkce, Unsupported }
+internal fun nativeSetupAuthMode(status: JSONObject): NativeSetupAuthMode = when (status.opt("auth_required")) {
+    false -> NativeSetupAuthMode.Loopback
+    true -> if ((status.optJSONArray("auth_flows") ?: JSONArray()).let { flows -> (0 until flows.length()).any { flows.optString(it) == "native_pkce" } }) NativeSetupAuthMode.NativePkce else NativeSetupAuthMode.Unsupported
+    else -> NativeSetupAuthMode.Unsupported
+}
 
 data class VoiceHandoff(val scope:Scope,val media:String,val targetCall:String="")
 
@@ -83,6 +98,10 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private var normalModeReturn: JSONObject? = null
     private var modeTransition: Job? = null
     val ui = _ui.asStateFlow()
+    private val _voiceCallRequest = MutableStateFlow<VoiceCallRequest?>(null)
+    internal val voiceCallRequest = _voiceCallRequest.asStateFlow()
+    private var pendingVoiceCallAfterKey:VoiceCallRequest?=null
+    private var pendingIncomingAfterKey:Triple<String,String,String>?=null
     private val _appUpdate = MutableStateFlow(AppUpdateState())
     val appUpdate = _appUpdate.asStateFlow()
     private var updateJob: Job? = null
@@ -139,6 +158,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private var startupJob: Job? = null
     private var startupIndex: Job? = null
     private var startupSettings: Job? = null
+    private var optionalProbe: Job? = null
     private var preparedXara: Pair<Scope, String>? = null
     private val xaraResolveLock = Mutex()
     private var recoveryJob: Job? = null
@@ -177,6 +197,9 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     val readingAloud = _readingAloud.asStateFlow()
     private var pasteJob: Job? = null
     @Volatile private var foreground = true
+    private var setupProbeJob: Job? = null
+    private var setupProbeGeneration = 0L
+    private var pendingSetupLink: dev.hermes.android.ui.CypherConnectInput? = null
 
     init {
         viewModelScope.launch {
@@ -192,10 +215,25 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         viewModelScope.launch {
             val generation = originGeneration
             try {
-                val origin = app.preferences.data.first()[stringPreferencesKey("origin")] ?: BuildConfig.DEFAULT_ORIGIN
+                val prefs = app.preferences.data.first()
+                val origin = prefs[stringPreferencesKey("origin")] ?: BuildConfig.DEFAULT_ORIGIN
                 if (generation != originGeneration) return@launch
-                _ui.update { it.copy(origin = origin) }
-                if (origin.isNotBlank()) connect(origin) else _ui.update { it.copy(restoringSession = false) }
+                val auth = if (origin.isBlank()) AuthContext(origin, emptyList()) else withContext(Dispatchers.IO) { app.auth.read(origin) }
+                val cached = origin.isNotBlank() && auth.cachedScopeFor(origin, replacingAccount = false) != null
+                val complete = prefs[booleanPreferencesKey("setup_complete")] == true
+                val activeSetup = prefs[booleanPreferencesKey("setup_active")] == true
+                val setupOrigin = prefs[stringPreferencesKey("setup_origin")].orEmpty()
+                val knownSteps = setOf("connect", "probe", "signin", "unsupported", "permission-microphone", "permission-notifications", "permission-full-screen", "done")
+                val savedStep = prefs[stringPreferencesKey("setup_step")].orEmpty().takeIf { it in knownSteps } ?: if (complete) "done" else "connect"
+                val step = when {
+                    origin.isBlank() -> "connect"
+                    !cached && (complete || savedStep.startsWith("permission-") || savedStep == "done") -> "signin"
+                    cached && !complete && !activeSetup && savedStep == "connect" -> firstIncompleteSetupPermission()
+                    savedStep == "done" && !complete && !activeSetup -> "connect"
+                    else -> savedStep
+                }
+                _ui.update { it.copy(origin = origin, setupOrigin = setupOrigin, setupWizard = activeSetup || !complete || !cached, setupComplete = complete, setupStep = step) }
+                if (cached) connect(origin) else _ui.update { it.copy(restoringSession = false, setupWizard = true) }
             } catch (e: Throwable) {
                 if (generation == originGeneration) { _ui.update { it.copy(restoringSession = false) }; fail(e) }
             }
@@ -267,6 +305,36 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         } catch (e: Throwable) { _submittingForm.value = ""; _form.update { if (it?.id == form.id) it.copy(error = e.message ?: "Check the fields and try again.") else it }; fail(e) }
     }
     fun notice(value: String) { _ui.update { it.copy(error = if (value.isNotBlank()) "" else it.error, notice = value) } }
+    fun prepareVoiceCall(active:CypherClient,conversationId:String):Boolean {
+        val keyStore=VoiceKeyStore(app)
+        if(keyStore.hasKey(keyStore.settings().provider)) return true
+        openVoiceKeySettingsForCall(active,conversationId)
+        return false
+    }
+    fun openVoiceKeySettingsForCall(active:CypherClient,conversationId:String) {
+        val page=voiceKeySetupPageIfMissing(false)?:return
+        pendingVoiceCallAfterKey=VoiceCallRequest(active.scope,conversationId)
+        more(page)
+    }
+    internal fun consumeVoiceCallRequest(request:VoiceCallRequest) {
+        if(_voiceCallRequest.value==request) _voiceCallRequest.value=null
+    }
+    fun voiceKeyConfigured() {
+        viewModelScope.launch {
+            if(withContext(Dispatchers.IO) { VoiceKeyStore(app).session()==null }) return@launch
+            pendingIncomingAfterKey?.let { (source,event,action) ->
+                pendingIncomingAfterKey=null
+                backFromSettings()
+                handlePush(source,event,action)
+                return@launch
+            }
+            val pending=pendingVoiceCallAfterKey?:return@launch
+            pendingVoiceCallAfterKey=null
+            if(client?.scope!=pending.scope) { notice("The conversation changed. Start the call again.");return@launch }
+            backFromSettings()
+            _voiceCallRequest.value=pending
+        }
+    }
     private val checklistWrites = Mutex()
     fun saveChecklistReading(scope: Scope, documentKey: String, values: Map<String, Boolean>) = viewModelScope.launch {
         try { checklistWrites.withLock { app.cache.write(scope, "reading-checklist:$documentKey", JSONObject(values).toString()) } }
@@ -280,7 +348,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val owner = client?.scope ?: cachedOwnerScope ?: return@launch
         try { nativePreferencesLock.withLock {
         val chat = app.cache.read(owner, "chat-preferences")?.let(::JSONObject) ?: json("render_user_markdown" to true, "send_key" to "enter")
-        for (key in setOf("render_user_markdown", "show_thinking", "send_key")) if (values.has(key)) {
+        for (key in setOf("render_user_markdown", "show_thinking", "send_key", "auto_scroll_follow", "animate_background")) if (values.has(key)) {
             if (key != "send_key") chat.put(key, values.getBoolean(key))
             else { require(values.getString(key) in setOf("enter", "ctrl_enter")) { "Choose Enter or Ctrl+Enter" }; chat.put(key, values.getString(key)) }
         }
@@ -300,7 +368,18 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         }
     }
     fun storeData(key: String, value: JSONObject) { _data.update { it + (key to value) } }
+    fun setKeepConnectedEnabled(enabled: Boolean) {
+        runCatching { dev.hermes.android.push.KeepConnectedService.setEnabled(app, client?.auth, enabled) }
+            .onFailure { notice(it.message ?: "Could not change Keep connected") }
+    }
+    private fun savedNativeSessionValid(): Boolean = client?.auth?.let { auth ->
+        if (auth.bearer == null) true else app.auth.read(auth.origin).let { it.owner == auth.owner && it.bearer != null }
+    } ?: true
     fun foreground(active: Boolean) {
+        if (active && _ui.value.authenticated && !savedNativeSessionValid()) {
+            fail(NativeAuthExpiredException())
+            return
+        }
         if (foreground == active) return
         foreground = active
         if (active) resumeAppUpdate()
@@ -374,6 +453,10 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         }
     }
     fun resumeAppUpdate() {
+        if (_ui.value.authenticated && !savedNativeSessionValid()) {
+            fail(NativeAuthExpiredException())
+            return
+        }
         if (app.updates.shouldContinueInstall() || waitingInstallPermission || app.updates.awaitingInstallPermission()) {
             val awaitingPermission = waitingInstallPermission || app.updates.awaitingInstallPermission()
             waitingInstallPermission = false
@@ -468,7 +551,33 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     }
     private fun fail(error: Throwable) {
         if (error is CancellationException) return
-        if (error is ApiFailure && error.status == 401 || error is CachedIdentityMismatch) {
+        if (error is NativeAuthExpiredException) {
+            val owner = client?.scope ?: cachedOwnerScope
+            dev.hermes.android.push.KeepConnectedService.onUserSignedOut(app, owner?.origin ?: _ui.value.origin)
+            val draftScope = draftScope()
+            val retainedDraft = draft()
+            val retainedEditor = _editor.value
+            checkpointJob?.cancel(); editorCheckpoint?.cancel()
+            val invalidation = ++originGeneration
+            cancelStartup(); resetAppUpdate(); app.updates.clearAuthorization(); ++sessionGeneration
+            if (draftScope != null) {
+                drafts[draftScope.key] = retainedDraft
+                viewModelScope.launch {
+                    runCatching {
+                        app.cache.write(draftScope, draftKind(draftScope), retainedDraft.encode(), retainedDraft.text.isNotBlank() || retainedDraft.attachments.isNotEmpty() || retainedDraft.queued.isNotEmpty())
+                        if (retainedEditor.scope != null && retainedEditor.path.isNotBlank()) app.cache.write(retainedEditor.scope, "editor:${retainedEditor.path}", json("text" to retainedEditor.text.text, "start" to retainedEditor.text.selection.start, "end" to retainedEditor.text.selection.end).toString(), retainedEditor.dirty || retainedEditor.saving)
+                    }.onFailure { if (originGeneration == invalidation) notice("The latest local checkpoint could not be saved: ${it.message.orEmpty()}") }
+                }
+            }
+            cancelNewChatWork(); app.calls.hangup(); sessionWatch?.cancel(); selectionJob?.cancel()
+            streams.values.toList().forEach(Job::cancel); loads.values.toList().forEach(Job::cancel)
+            client = null; cachedOwnerScope = owner
+            _ui.update { it.copy(origin = owner?.origin ?: it.origin, owner = owner?.owner ?: it.owner, profile = owner?.profile ?: it.profile, authenticated = false, connected = false, loading = false, restoringSession = false, setupWizard = true, setupComplete = false, setupStep = "signin", error = error.message ?: "Sign-in expired. Sign in again.") }
+            saveSetupProgress("signin", complete = false)
+            return
+        }
+        if (error is LoopbackSessionRefreshFailed || error is ApiFailure && error.status == 401 || error is CachedIdentityMismatch) {
+            val loopbackRestart = error is LoopbackSessionRefreshFailed
             val origin = client?.auth?.origin ?: cachedOwnerScope?.origin ?: runCatching { trustedOrigin(_ui.value.origin) }.getOrNull()
             val draftScope = draftScope()
             val retainedDraft = draft()
@@ -490,9 +599,10 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             cancelNewChatWork(); app.calls.hangup(); sessionWatch?.cancel(); selectionJob?.cancel()
             streams.values.toList().forEach(Job::cancel); loads.values.toList().forEach(Job::cancel)
             client = null; cachedOwnerScope = null; sourceScope = null
-            var message = "Sign in again. Your local draft is retained."
+            val message = if (loopbackRestart) error.message.orEmpty() else "Sign in again. Your local draft is retained."
             origin?.let { revoked -> val version = app.auth.authorityEpoch.readVersion(); viewModelScope.launch { runCatching { app.auth.removeIfUnchanged(revoked, version) }.onFailure { if (originGeneration == invalidation) notice("Local credential removal failed: ${it.message.orEmpty()}") } } }
-            _ui.update { it.copy(authenticated = false, connected = false, loading = false, restoringSession = false, xaraOpening = false, xaraError = "", newChatOpening = false, newChatError = "", initialChatReady = false, owner = "", query = "", sessions = emptyList(), bootstrap = JSONObject(), error = message) }
+            _ui.update { it.copy(authenticated = false, connected = false, loading = false, restoringSession = false, setupWizard = true, setupComplete = false, setupStep = if (loopbackRestart) "connect" else "signin", setupOrigin = if (loopbackRestart) origin ?: it.setupOrigin else it.setupOrigin, xaraOpening = false, xaraError = "", newChatOpening = false, newChatError = "", initialChatReady = false, owner = "", query = "", sessions = emptyList(), bootstrap = JSONObject(), error = message) }
+            saveSetupProgress(if (loopbackRestart) "connect" else "signin", complete = false, setupOrigin = if (loopbackRestart) origin else null)
             _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList(); _data.value = emptyMap(); clearDetails()
         } else {
             _ui.update { it.copy(error = error.message ?: "The operation failed. Try again.") }
@@ -508,7 +618,9 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             }
         }
     }
-    fun connect(input: String, password: String? = null, provider: String = "", username: String = "") = viewModelScope.launch {
+    fun connect(input: String) = connect(input, null)
+    private fun connect(input: String, initialAuth: AuthContext?) = viewModelScope.launch {
+        val setupFlow = _ui.value.setupWizard
         modeTransition?.cancelAndJoin()
         val generation = ++originGeneration
         cancelStartup()
@@ -516,47 +628,44 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         cancelNewChatWork()
         try { checkpointVisible() } catch (e: Throwable) { _ui.update { it.copy(restoringSession = false) }; fail(e); return@launch }
         if (generation != originGeneration) return@launch
-        if (password != null) app.calls.hangup()
         sessionWatch?.cancel(); selectionJob?.cancel(); ++sessionGeneration
         streams.values.forEach(Job::cancel); streams.clear()
-        _ui.update { it.copy(loading = true, restoringSession = password == null, error = "", xaraOpening = false, xaraError = "", newChatOpening = false, newChatError = "", initialChatReady = false, authenticated = false, connected = false, owner = "", query = "", sessions = emptyList(), bootstrap = JSONObject()) }
+        _ui.update { it.copy(loading = true, restoringSession = true, error = "", xaraOpening = false, xaraError = "", newChatOpening = false, newChatError = "", initialChatReady = false, authenticated = false, connected = false, owner = "", query = "", sessions = emptyList(), bootstrap = JSONObject()) }
         _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList(); _data.value = emptyMap(); clearDetails(); sourceScope = null; cachedOwnerScope = null; client = null
         var restoringClient: CypherClient? = null
         var restoringScope: Scope? = null
         val credentialVersion = app.auth.authorityEpoch.readVersion()
         try {
             val origin = trustedOrigin(input)
-            if (password != null || origin != (app.preferences.data.first()[stringPreferencesKey("origin")] ?: BuildConfig.DEFAULT_ORIGIN)) app.updates.clearAuthorization()
+            if (origin != (app.preferences.data.first()[stringPreferencesKey("origin")] ?: BuildConfig.DEFAULT_ORIGIN)) app.updates.clearAuthorization()
             _ui.update { it.copy(origin = origin) }
-            val auth = withContext(Dispatchers.IO) {
-                if (password != null) { AuthContext(origin, emptyList()) }
-                else app.auth.read(origin)
-            }
+            val auth = initialAuth?.also { require(it.origin == origin) } ?: withContext(Dispatchers.IO) { app.auth.read(origin) }
             if (generation != originGeneration) return@launch
-            val next = CypherClient(auth)
-            val trustedCache = auth.cachedScopeFor(origin, replacingAccount = password != null)
-            if (!keepsRestoredCall(app.calls.state.value.conversationScope, trustedCache, password != null)) app.calls.hangup()
+            val next = CypherClient(auth, app.auth, persistContext = false)
+            val trustedCache = auth.cachedScopeFor(origin, replacingAccount = false)
+            if (!keepsRestoredCall(app.calls.state.value.conversationScope, trustedCache, false)) app.calls.hangup()
             restoringClient = next.takeIf { trustedCache != null }
             restoringScope = trustedCache
             if (trustedCache != null) restoreCachedOwner(trustedCache, generation)
             if (generation != originGeneration) return@launch
             // Local encrypted recovery settles the splash; the network may still be offline.
             _ui.update { it.copy(restoringSession = false) }
-            val bootstrap = if (password == null) next.bootstrap() else next.login(password, provider, username)
+            val bootstrap = next.bootstrap()
             if (generation != originGeneration) return@launch
             trustedCache?.let(next.auth::requireCachedIdentity)
             val xara = app.cache.read(next.scope, "xara-session")
             if (generation != originGeneration) return@launch
             xara?.let { saved["xara:${next.scope.key}"] = it }
-            app.preferences.edit { it[stringPreferencesKey("origin")] = origin }
-            if (generation != originGeneration) return@launch
-            if (!app.auth.persistIfUnchanged(next.auth, credentialVersion)) {
+            if (!persistAuthIfCurrent(next.auth, credentialVersion)) {
                 if (generation == originGeneration) {
                     app.calls.hangup(); cachedOwnerScope = null; sourceScope = null
                     _ui.update { it.copy(authenticated = false, loading = false, owner = "", error = "Sign-in changed while reconnecting. Reconnect to use the current account.") }
                 }
                 return@launch
             }
+            next.markLoopbackSessionPersisted()
+            if (generation != originGeneration) return@launch
+            app.preferences.edit { it[stringPreferencesKey("origin")] = origin }
             if (generation != originGeneration) return@launch
             client = next; cachedOwnerScope = null; retireSavedDrafts(null)
             restoreBotMode(next.scope)
@@ -567,7 +676,16 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             }
             app.updates.authorize(next)
             restoreAppUpdate()
-            _ui.update { it.copy(origin = origin, owner = next.auth.owner, profile = next.auth.profile, authenticated = true, connected = true, bootstrap = bootstrap, loading = false) }
+            val previousSetupStep = _ui.value.setupStep
+            val wizardStep = when {
+                !setupFlow -> previousSetupStep
+                previousSetupStep in setOf("connect", "probe") && initialAuth == null -> previousSetupStep
+                previousSetupStep in setOf("signin", "voice-provider") -> "voice-provider"
+                else -> firstIncompleteSetupPermission()
+            }
+            if (setupFlow) saveSetupProgress(wizardStep, setupOrigin = origin)
+            _ui.update { it.copy(origin = origin, owner = next.auth.owner, profile = next.auth.profile, authenticated = true, connected = true, bootstrap = bootstrap, loading = false, setupWizard = setupFlow || it.setupWizard, setupStep = if (setupFlow) wizardStep else it.setupStep) }
+            dev.hermes.android.push.KeepConnectedService.startIfEnabled(app)
             checkForAppUpdate(quiet = true)
             prepareStartup()
             if (_ui.value.tab == "Xara") openXara() else {
@@ -587,7 +705,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                     if (retained != null && owner != null) {
                         try {
                             retained.auth.requireCachedIdentity(owner)
-                            app.auth.persistIfUnchanged(retained.auth.copy(cookies = retained.jar.snapshot()), credentialVersion)
+                            persistAuthIfCurrent(retained.auth.copy(cookies = retained.jar.snapshot()), credentialVersion)
                         } catch (saveError: Throwable) {
                             if (saveError is CancellationException) throw saveError
                             if (generation == originGeneration) notice("The refreshed sign-in could not be retained. Reconnect before leaving Cypher.")
@@ -602,6 +720,167 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         } finally {
             if (generation == originGeneration) _ui.update { it.copy(restoringSession = false) }
         }
+    }
+    fun reopenSetupWizard(address: String = _ui.value.origin) {
+        setupProbeJob?.cancel(); ++setupProbeGeneration
+        pendingSetupLink = null
+        _ui.update { it.copy(setupOrigin = address, setupWizard = true, setupStep = "connect", setupPluginMessage = "", error = "") }
+        saveSetupProgress("connect", active = true, setupOrigin = address)
+    }
+    fun openSetupLink(value: String) {
+        setupProbeJob?.cancel(); ++setupProbeGeneration
+        pendingSetupLink = null
+        val parsed = try { dev.hermes.android.ui.parseCypherConnectLink(value) }
+        catch (error: Exception) {
+            _ui.update { it.copy(setupOrigin = "", setupWizard = true, setupStep = "connect", error = error.message ?: "Enter an HTTPS Hermes address or scan its QR code.") }
+            saveSetupProgress("connect", active = true, setupOrigin = "")
+            return
+        }
+        pendingSetupLink = parsed.takeIf { it.sessionToken != null }
+        _ui.update { it.copy(setupOrigin = parsed.origin, setupWizard = true, setupStep = "connect", setupPluginMessage = "", error = "") }
+        saveSetupProgress("connect", active = true, setupOrigin = parsed.origin)
+    }
+    fun cancelSetupWizard() {
+        pendingSetupLink = null
+        if (_ui.value.authenticated) {
+            setupProbeJob?.cancel(); ++setupProbeGeneration
+            val complete = _ui.value.setupComplete
+            val connectedClient = client
+            val previousOrigin = connectedClient?.auth?.origin ?: _ui.value.origin
+            _ui.update { it.copy(origin = previousOrigin, setupOrigin = "", connected = connectedClient != null, setupWizard = false, setupStep = if (complete) "done" else it.setupStep, error = "") }
+            if (connectedClient != null) viewModelScope.launch { app.preferences.edit { it[stringPreferencesKey("origin")] = previousOrigin } }
+            saveSetupProgress(if (complete) "done" else _ui.value.setupStep, complete = complete, active = false)
+            client?.let { prepareStartup(); recoverForeground() }
+        }
+    }
+    fun finishSetupWizard(keepConnected: Boolean = true) {
+        if (!_ui.value.authenticated) return
+        pendingSetupLink = null
+        setKeepConnectedEnabled(keepConnected)
+        _ui.update { it.copy(setupWizard = false, setupComplete = true, setupStep = "done", setupOrigin = "", error = "") }
+        saveSetupProgress("done", complete = true, active = false)
+    }
+    private suspend fun persistAuthIfCurrent(auth: AuthContext, version: Long?): Boolean {
+        if (app.auth.persistIfUnchanged(auth, version)) return true
+        val session = auth.loopbackSession?.takeIf { it.verified } ?: return false
+        return withContext(Dispatchers.IO) {
+            app.auth.read(auth.origin).let { current ->
+                current.origin == auth.origin && current.owner == auth.owner && current.profile == auth.profile &&
+                    current.backend == auth.backend && current.loopbackSession?.copy(persisted = false) == session.copy(persisted = false)
+            }
+        }
+    }
+    private fun saveSetupProgress(step: String, complete: Boolean? = null, active: Boolean? = true, setupOrigin: String? = null) {
+        viewModelScope.launch {
+            app.preferences.edit { values ->
+                values[stringPreferencesKey("setup_step")] = step
+                complete?.let { values[booleanPreferencesKey("setup_complete")] = it }
+                active?.let { values[booleanPreferencesKey("setup_active")] = it }
+                setupOrigin?.let { values[stringPreferencesKey("setup_origin")] = it }
+                if (active == false) values.remove(stringPreferencesKey("setup_origin"))
+            }
+        }
+    }
+    private fun firstIncompleteSetupPermission(): String = when {
+        androidx.core.content.ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED -> "permission-microphone"
+        Build.VERSION.SDK_INT >= 33 && androidx.core.content.ContextCompat.checkSelfPermission(app, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED -> "permission-notifications"
+        Build.VERSION.SDK_INT >= 34 && app.getSystemService(NotificationManager::class.java)?.canUseFullScreenIntent() != true -> "permission-full-screen"
+        else -> "done"
+    }
+    fun advanceSetupPermission() {
+        val next = when (_ui.value.setupStep) {
+            "voice-provider" -> firstIncompleteSetupPermission()
+            "permission-microphone" -> when {
+                Build.VERSION.SDK_INT >= 33 && androidx.core.content.ContextCompat.checkSelfPermission(app, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED -> "permission-notifications"
+                Build.VERSION.SDK_INT >= 34 && app.getSystemService(NotificationManager::class.java)?.canUseFullScreenIntent() != true -> "permission-full-screen"
+                else -> "done"
+            }
+            "permission-notifications" -> if (Build.VERSION.SDK_INT >= 34 && app.getSystemService(NotificationManager::class.java)?.canUseFullScreenIntent() != true) "permission-full-screen" else "done"
+            "permission-full-screen" -> "done"
+            else -> return
+        }
+        _ui.update { it.copy(setupStep = next, error = "") }
+        saveSetupProgress(next)
+    }
+    fun probeSetupAddress(value: String) {
+        setupProbeJob?.cancel()
+        val parsed = try { dev.hermes.android.ui.parseCypherConnectLink(value) }
+        catch (error: Exception) {
+            pendingSetupLink = null
+            val safeAddress = if (value.trim().startsWith("cypher://", ignoreCase = true)) "" else value
+            _ui.update { it.copy(setupOrigin = safeAddress, setupWizard = true, setupStep = "connect", error = error.message ?: "Enter an HTTPS Hermes address or scan its QR code.") }
+            saveSetupProgress("connect", active = true, setupOrigin = safeAddress)
+            return
+        }
+        val origin = parsed.origin
+        val linkedToken = parsed.sessionToken ?: pendingSetupLink?.takeIf { it.origin == origin }?.sessionToken
+        pendingSetupLink = null
+        val generation = ++setupProbeGeneration
+        _ui.update { it.copy(setupOrigin = origin, setupWizard = true, setupStep = "probe", loading = true, error = "") }
+        saveSetupProgress("probe", active = true, setupOrigin = origin)
+        setupProbeJob = viewModelScope.launch {
+            var probe: CypherClient? = null
+            try {
+                val statusClient = CypherClient(AuthContext(origin, emptyList()))
+                probe = statusClient
+                val status = withTimeoutOrNull(45_000) { statusClient.get("/api/status") }
+                    ?: throw java.io.IOException("Hermes server probe timed out")
+                require(status.string("version").isNotBlank() && status.has("gateway_state") && status.optJSONObject("components") != null) {
+                    "This address doesn't look like a Hermes server. Check the address, then Retry."
+                }
+                if (generation != setupProbeGeneration) return@launch
+                when (nativeSetupAuthMode(status)) {
+                    NativeSetupAuthMode.Loopback -> {
+                        val session = linkedToken?.let { LoopbackSessionRecord(it, origin, "local") }
+                            ?: withTimeoutOrNull(30_000) { statusClient.readLoopbackSessionToken() }
+                            ?: throw LoopbackSessionRefreshFailed()
+                        if (session.origin != origin || session.owner != "local") throw LoopbackSessionRefreshFailed()
+                        val profile = _ui.value.profile.takeIf(::validNativeProfile) ?: "default"
+                        val signedIn = AuthContext(origin, emptyList(), "local", profile, backend = "hermes-dashboard", loopbackSession = session)
+                        connect(origin, signedIn).join()
+                    }
+                    NativeSetupAuthMode.NativePkce -> {
+                        saveSetupProgress("signin", active = true, setupOrigin = origin)
+                        _ui.update { it.copy(setupOrigin = origin, loading = false, setupStep = "signin", error = "") }
+                    }
+                    NativeSetupAuthMode.Unsupported -> {
+                        saveSetupProgress("unsupported", active = true, setupOrigin = origin)
+                        _ui.update { it.copy(setupOrigin = origin, loading = false, setupStep = "unsupported", error = "") }
+                    }
+                }
+            } catch (error: CancellationException) { throw error }
+            catch (error: Throwable) {
+                if (generation != setupProbeGeneration) return@launch
+                val loopbackRestart = error is LoopbackSessionRefreshFailed
+                val message = when {
+                    loopbackRestart -> error.message.orEmpty()
+                    generateSequence(error as Throwable?) { it.cause }.any { it is javax.net.ssl.SSLException } -> "Can't make a secure HTTPS connection. Check the address and TLS certificate, then Retry."
+                    error.message?.startsWith("This address doesn't look like a Hermes") == true -> "This address doesn't look like a Hermes server. Check the address, then Retry."
+                    error is ApiFailure -> "This address doesn't look like a Hermes server. Check the address, then Retry."
+                    else -> "Can't reach Hermes. Check Tailscale/VPN is on, then Retry."
+                }
+                val step = if (loopbackRestart) "connect" else "probe"
+                _ui.update { it.copy(loading = false, setupOrigin = origin, setupStep = step, error = message) }
+                saveSetupProgress(step, active = true, setupOrigin = origin)
+            } finally {
+                probe?.closeNative()
+                if (generation == setupProbeGeneration) setupProbeJob = null
+            }
+        }
+    }
+    fun signIn(context: Context) = viewModelScope.launch {
+        if (_ui.value.loading) return@launch
+        val origin = try { trustedOrigin(_ui.value.setupOrigin.ifBlank { _ui.value.origin }) }
+        catch (error: Exception) { _ui.update { it.copy(setupStep = "connect", loading = false, error = error.message.orEmpty()) }; return@launch }
+        _ui.update { it.copy(setupWizard = true, setupStep = "signin", loading = true, error = "") }
+        try {
+            val bearer = NativeAuth(origin).authorize(context)
+            val profile = _ui.value.profile.takeIf(::validNativeProfile) ?: "default"
+            val signedIn = AuthContext(origin, emptyList(), bearer.owner, profile, bearer = bearer.copy(profile = profile))
+            app.preferences.edit { it[stringPreferencesKey("setup_origin")] = origin; it[booleanPreferencesKey("setup_active")] = true; it[stringPreferencesKey("setup_step")] = "signin" }
+            connect(origin, signedIn).join()
+        } catch (error: CancellationException) { throw error }
+        catch (error: Throwable) { _ui.update { it.copy(loading = false, error = error.message ?: "Hermes sign-in didn't finish. Retry.") } }
     }
     private suspend fun restoreCachedOwner(scope: Scope, generation: Int) {
         val index = app.cache.read(scope, "conversation-index")?.let(::JSONObject)
@@ -643,6 +922,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         if (current()) _ui.update { it.copy(newChatError = if (initialCreateAttempts.containsKey(owner.key)) initialCreateError else "", initialChatReady = true) }
     }
     fun logout() = viewModelScope.launch {
+        pendingSetupLink = null
         val generation = ++originGeneration
         cancelStartup()
         resetAppUpdate()
@@ -650,11 +930,13 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         cancelNewChatWork()
         val cached = cachedOwnerScope
         val current = client?.detached() ?: cached?.let { owner ->
-            withContext(Dispatchers.IO) { runCatching { CypherClient(app.auth.read(owner.origin).also { it.requireCachedIdentity(owner) }) }.getOrNull() }
+            withContext(Dispatchers.IO) { runCatching { CypherClient(app.auth.read(owner.origin).also { it.requireCachedIdentity(owner) }, app.auth, persistContext = false) }.getOrNull() }
         }
+        val loopback = current?.auth?.loopbackSession != null
         try { checkpointVisible() } catch (e: Throwable) { fail(e); return@launch }
         if (generation != originGeneration) return@launch
         val origin = current?.auth?.origin ?: cached?.origin
+        origin?.let { dev.hermes.android.push.KeepConnectedService.onUserSignedOut(app, it) }
         try { origin?.let { app.auth.remove(it) } } catch (e: Throwable) { fail(e); return@launch }
         modeTransition?.cancelAndJoin()
         (current?.scope ?: cached)?.let { optionalLocalSave { app.cache.delete(modeCacheScope(it), "bot-mode-return") } }
@@ -666,11 +948,13 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             // Runs local push revocation before its first network suspension.
             viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
                 runCatching { try { app.push.revokeOwner(frozen) } finally { frozen.logout() } }
-                    .onFailure { if (generation == originGeneration) notice("Signed out locally. Server cleanup is not confirmed: ${it.message.orEmpty()}") }
+                    .onFailure { if (generation == originGeneration) notice("Signed out on this phone. Push notification cleanup could not be confirmed: ${it.message.orEmpty()}") }
             }
         }
         client = null; cachedOwnerScope = null; sourceScope = null; retireSavedDrafts(null); _chat.value = ChatState(); _composer.value = TextFieldValue(); _data.value = emptyMap(); _attachments.value = emptyList(); clearDetails()
-        _ui.update { it.copy(authenticated = false, connected = false, loading = false, restoringSession = false, xaraOpening = false, xaraError = "", newChatOpening = false, newChatError = "", initialChatReady = false, sessions = emptyList(), query = "", owner = "", bootstrap = JSONObject()) }
+        val setupStep = if (loopback) "connect" else "signin"
+        _ui.update { it.copy(authenticated = false, connected = false, loading = false, restoringSession = false, setupWizard = true, setupComplete = false, setupStep = setupStep, setupOrigin = if (loopback) origin.orEmpty() else it.setupOrigin, xaraOpening = false, xaraError = "", newChatOpening = false, newChatError = "", initialChatReady = false, sessions = emptyList(), query = "", owner = "", bootstrap = JSONObject()) }
+        saveSetupProgress(setupStep, complete = false, setupOrigin = if (loopback) origin else null)
     }
     fun tab(value: String) { if (_ui.value.botModeSwitching) return; botMode.back(); tab(value, resumeDraft = true) }
     private fun tab(value: String, resumeDraft: Boolean) {
@@ -907,7 +1191,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         botMode.selectSpace(id)
     }
     private fun cancelStartup() {
-        startupJob?.cancel(); startupIndex?.cancel(); startupSettings?.cancel()
+        startupJob?.cancel(); startupIndex?.cancel(); startupSettings?.cancel(); optionalProbe?.cancel()
         preloadJobs.toList().forEach(Job::cancel); preloadJobs.clear()
         loads.values.toList().forEach(Job::cancel)
         ++sessionIndexRequest
@@ -921,6 +1205,13 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val generation = originGeneration
         fun current() = generation == originGeneration && client === active && _ui.value.authenticated && foreground
         if (!current()) return
+        // Native chat/history are already established; the optional plugin probe only adds features.
+        if (optionalFeaturesPending(_ui.value.bootstrap, owner)) optionalProbe = viewModelScope.launch {
+            val optional = try { c.probeOptionalFeatures() } catch (e: Exception) { if (e is CancellationException) throw e; return@launch }
+            if (!current() || active.scope != owner) return@launch
+            val pluginMessage = if (optional.string("plugin") == "absent") "Cypher plugin not installed on this Hermes — chat works; calls need the plugin." else ""
+            _ui.update { state -> mergeOptionalFeaturesFor(state.bootstrap, owner, optional)?.let { state.copy(bootstrap = it, setupPluginMessage = pluginMessage) } ?: state }
+        }
         viewModelScope.launch { try { val prefs = app.cache.read(owner, "chat-preferences")?.let(::JSONObject) ?: json("render_user_markdown" to true, "send_key" to "enter"); if (current()) storeData("profile-settings", prefs) } catch (e: Exception) { if (e is CancellationException) throw e; if (current()) fail(e) } }
         phoneSettings.loadSkills(force = false)
         phoneSettings.loadMemory(force = false)
@@ -1332,17 +1623,24 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         renderedServerProjection = scope to response.toString()
         _chat.update { old ->
             val rows = o.rows("messages")
-            val active = o.string("active_stream_id")
+            val active = (o.opt("active_stream_id") as? String)?.takeIf { it.matches(Regex("[A-Za-z0-9_.:-]{1,256}")) }
             val turn = currentTurnMessages(rows)
             val owned = historyToolIdentities(turn)
             val boundary = liveBoundaries["${scope.key}:${old.streamId}"] ?: LiveAssistantBoundary()
             val proof = persistedTurns["${scope.key}:${old.streamId}"]
             val finalRow = proof?.string("final_assistant_row_id").orEmpty()
-            val clearLive = active.isBlank() || active != old.streamId || finalRow.isNotBlank() && rows.any { it.string("row_id", it.string("_row_id")) == finalRow } || historyOwnsLiveBoundary(turn, old.liveTools, boundary.closed, boundary.toolIds)
+            val historyOwnsLive = (finalRow.isNotBlank() && rows.any { it.string("row_id", it.string("_row_id")) == finalRow }) ||
+                historyOwnsLiveBoundary(turn, old.liveTools, boundary.closed, boundary.toolIds)
+            val streamEnded = historyOwnsLive || (!active.isNullOrBlank() && active != old.streamId)
             old.copy(projectionReady = true,
                 approval = if (o.has("pending_approval")) o.optJSONObject("pending_approval") else old.approval,
                 clarification = if (o.has("pending_clarification")) o.optJSONObject("pending_clarification") else old.clarification,
-                sessionId = scope.session, title = o.string("title").ifBlank { "New conversation" }, messages = rows.mapIndexed { i, m -> Message.from(m, i, scope.session) }, raw = o, status = "", streamId = active, liveText = if (clearLive) "" else old.liveText, liveReasoning = if (clearLive) "" else old.liveReasoning, liveTools = if (active.isBlank() || active != old.streamId) emptyList() else old.liveTools.filterNot { toolIdentity(it).isNotBlank() && toolIdentity(it) in owned })
+                sessionId = scope.session, title = o.string("title").ifBlank { "New conversation" }, messages = rows.mapIndexed { i, m -> Message.from(m, i, scope.session) }, raw = o,
+                status = if (streamEnded) "" else if (active.isNullOrBlank() && old.streamId.isNotBlank()) old.status.ifBlank { "Turn status unknown" } else "",
+                streamId = active?.takeIf { it.isNotBlank() } ?: if (streamEnded) "" else old.streamId,
+                liveText = if (streamEnded) "" else old.liveText,
+                liveReasoning = if (streamEnded) "" else old.liveReasoning,
+                liveTools = if (streamEnded) emptyList() else old.liveTools.filterNot { toolIdentity(it).isNotBlank() && toolIdentity(it) in owned })
         }
         projectCallTranscripts()
     }
@@ -1515,12 +1813,15 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             var lastCheckpoint = 0L
             var retry = 0
             var terminalError = frame?.string("error").orEmpty()
+            var terminalObserved = false
+            var terminalReplyVisible = false
             if (terminalError.isNotBlank() && sourceScope == scope) _ui.update { it.copy(error = terminalError) }
             try {
                 while (isActive) {
                     try {
                         c.stream("/api/chat/stream", mapOf("stream_id" to stream, "session_id" to scope.session, "replay" to "1"), cursor.lastId) { event ->
                             if (cursor.accept(event)) {
+                                if (event.type in setOf("done", "error")) terminalObserved = true
                                 if (event.type == "done" && event.payload().string("status") == "interrupted") terminalError = "Interrupted"
                                 if (event.type in setOf("apperror", "error")) terminalError = event.payload().string("message", event.payload().string("error", "Server reported a problem"))
                                 retry = 0
@@ -1543,28 +1844,60 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                         if (e is CancellationException || e is ApiFailure && e.status in setOf(401, 403)) throw e
                         if (sourceScope == scope) _chat.update { it.copy(status = "Connection interrupted · reconnecting") }
                     }
+                    if (terminalObserved) break
+                    var active: String? = null
                     try {
                         val revision = chatHistoryRevision
                         val response = c.get("/api/session", mapOf("session_id" to scope.session))
                         if (sourceScope == scope && revision != chatHistoryRevision) continue
                         app.cache.write(scope, "session", response.toString()); renderSession(response, scope, revision)
-                        val active = (response.optJSONObject("session") ?: response).string("active_stream_id")
-                        if (active.isBlank()) break
-                        if (active != stream) {
+                        active = ((response.optJSONObject("session") ?: response).opt("active_stream_id") as? String)
+                            ?.takeIf { it.matches(Regex("[A-Za-z0-9_.:-]{1,256}")) }
+                        if (!active.isNullOrBlank() && active != stream) {
                             liveFrames.remove(frameKey); liveBoundaries.remove(frameKey); persistedTurns.remove(frameKey); app.cache.delete(scope, "live:$stream")
                             if (sourceScope == scope) _chat.update { it.copy(streamId = active, liveText = "", liveReasoning = "", liveTools = emptyList(), status = "Working") }
                             attachStream(c, scope, active)
                             return@launch
                         }
-                        if (sourceScope == scope) _chat.update { it.copy(status = terminalError.ifBlank { "Reconnecting" }) }
                     } catch (e: Throwable) {
                         if (e is CancellationException || e is ApiFailure && e.status in setOf(401, 403)) throw e
-                        if (sourceScope == scope) _chat.update { it.copy(status = terminalError.ifBlank { "Connection interrupted · reconnecting" }) }
                     }
+                    val liveStatus = try { c.nativeSessionStatus(scope.session, stream) }
+                    catch (e: Throwable) {
+                        if (e is CancellationException || e is ApiFailure && e.status in setOf(401, 403)) throw e
+                        null
+                    }
+                    if (liveStatus == "idle") { terminalObserved = true; break }
+                    if (sourceScope == scope) _chat.update { it.copy(status = when (liveStatus) {
+                        "working" -> "Connection interrupted · turn still running · reconnecting"
+                        "waiting" -> "Connection interrupted · turn waiting · reconnecting"
+                        else -> "Turn status unknown · draft and queued messages are kept"
+                    }) }
                     delay((500L shl retry.coerceAtMost(4)).coerceAtMost(8000)); retry++
                 }
-                liveFrames.remove(frameKey); liveBoundaries.remove(frameKey); persistedTurns.remove(frameKey); app.cache.delete(scope, "live:$stream")
-                if (sourceScope == scope) { pollPrompts(c, scope); refreshSessions(); _chat.update { it.copy(streamId = "", liveText = "", liveReasoning = "", liveTools = emptyList(), status = terminalError) }; val q = _chat.value.queued.firstOrNull(); if (q != null && _composer.value.text.isBlank() && _attachments.value.isEmpty()) { removeQueued(0); _attachments.value = q.attachments; composer(TextFieldValue(q.text)); send(q) } }
+                // Both a terminal event and a validated idle read need the final saved projection.
+                if (terminalObserved) {
+                    val revision = chatHistoryRevision
+                    try {
+                        val response = c.get("/api/session", mapOf("session_id" to scope.session))
+                        if (sourceScope == scope && client?.scope == c.scope && revision == chatHistoryRevision) {
+                            app.cache.write(scope, "session", response.toString())
+                            renderSession(response, scope, revision)
+                            val snapshot = response.optJSONObject("session") ?: response
+                            terminalReplyVisible = currentTurnMessages(snapshot.rows("messages")).any { it.string("role") == "assistant" }
+                            if (!terminalReplyVisible) _chat.update { it.copy(status = terminalError.ifBlank { "Reply ended" } + " · final reply not confirmed; live output retained") }
+                        } else if (sourceScope == scope && client?.scope == c.scope) {
+                            _chat.update { it.copy(status = terminalError.ifBlank { "Reply ended" } + " · history changed during refresh; live output retained") }
+                        }
+                    } catch (e: Throwable) {
+                        if (e is CancellationException || e is ApiFailure && e.status in setOf(401, 403)) throw e
+                        if (sourceScope == scope && client?.scope == c.scope) _chat.update { it.copy(status = terminalError.ifBlank { "Reply ended" } + " · final history refresh failed; live output retained") }
+                    }
+                }
+                if (terminalObserved && terminalReplyVisible) {
+                    liveFrames.remove(frameKey); liveBoundaries.remove(frameKey); persistedTurns.remove(frameKey); app.cache.delete(scope, "live:$stream")
+                    if (sourceScope == scope) { pollPrompts(c, scope); refreshSessions(); _chat.update { it.copy(streamId = "", liveText = "", liveReasoning = "", liveTools = emptyList(), status = terminalError) }; val q = _chat.value.queued.firstOrNull(); if (q != null && _composer.value.text.isBlank() && _attachments.value.isEmpty()) { removeQueued(0); _attachments.value = q.attachments; composer(TextFieldValue(q.text)); send(q) } }
+                }
             } catch (e: Throwable) { if (e is CancellationException) throw e; if (sourceScope == scope) fail(e) } finally { if (streams[scope.key] == currentCoroutineContext()[Job]) streams.remove(scope.key) }
         }
     }
@@ -1656,19 +1989,32 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         if (!current) notice("This request changed. Refresh it before responding.")
         return current
     }
+    private fun retirePrompt(scope: Scope, idKey: String, id: String) {
+        if (id.isBlank() || sourceScope != scope || _chat.value.sessionId != scope.session || scope.copy(session = "") != client?.scope) return
+        _chat.update { state ->
+            if (state.sessionId != scope.session) state else when (idKey) {
+                "approval_id" -> state.approval?.takeIf { it.string(idKey, it.string("id")) == id }?.let { state.copy(approval = null) } ?: state
+                "clarify_id" -> state.clarification?.takeIf { it.string(idKey, it.string("id")) == id }?.let { state.copy(clarification = null) } ?: state
+                else -> state
+            }
+        }
+    }
     fun approval(choice: String, shown: JSONObject, scope: Scope) {
         val pending = _chat.value.approval
         if (!acceptsPrompt(shown, pending, scope, "approval_id")) return
         if (choice !in pending?.optJSONArray("choices")?.strings().orEmpty()) { notice("This approval choice was not offered by Hermes"); return }
-        action("/api/approval/respond", json("session_id" to scope.session, "scope_key" to scope.key, "choice" to choice, "approval_id" to shown.string("approval_id", shown.string("id"))), successNotice = "")
+        val id = shown.string("approval_id", shown.string("id"))
+        action("/api/approval/respond", json("session_id" to scope.session, "scope_key" to scope.key, "choice" to choice, "approval_id" to id), successNotice = "", onSuccess = { _, _ -> retirePrompt(scope, "approval_id", id) })
     }
     fun clarify(answer: String, shown: JSONObject, scope: Scope) {
         if (!acceptsPrompt(shown, _chat.value.clarification, scope, "clarify_id")) return
-        action("/api/clarify/respond", json("session_id" to scope.session, "scope_key" to scope.key, "response" to answer, "clarify_id" to shown.string("clarify_id", shown.string("id"))), successNotice = "")
+        val id = shown.string("clarify_id", shown.string("id"))
+        action("/api/clarify/respond", json("session_id" to scope.session, "scope_key" to scope.key, "response" to answer, "clarify_id" to id), successNotice = "", onSuccess = { _, _ -> retirePrompt(scope, "clarify_id", id) })
     }
     fun clarifyBatch(answers: JSONObject, shown: JSONObject, scope: Scope) {
         if (!acceptsPrompt(shown, _chat.value.clarification, scope, "clarify_id")) return
-        action("/api/clarify/respond", json("session_id" to scope.session, "scope_key" to scope.key, "answers" to answers, "clarify_id" to shown.string("clarify_id", shown.string("id"))), successNotice = "")
+        val id = shown.string("clarify_id", shown.string("id"))
+        action("/api/clarify/respond", json("session_id" to scope.session, "scope_key" to scope.key, "answers" to answers, "clarify_id" to id), successNotice = "", onSuccess = { _, _ -> retirePrompt(scope, "clarify_id", id) })
     }
     fun sessionAction(path: String, body: JSONObject = JSONObject(), callback: (suspend (JSONObject) -> Unit)? = null) { if (!admitConversation()) return; if (app.calls.state.value.active && app.calls.state.value.conversationScope == sourceScope && path in setOf("/api/session/delete", "/api/session/undo", "/api/session/compress")) { notice("End this call before changing its conversation."); return }; body.put("session_id", _chat.value.sessionId); action(path, body) { _, o -> callback?.invoke(o) } }
     private suspend fun retainSideQuestion() { val side = _side.value ?: return; app.cache.write(side.scope, "side-question", json("question" to side.question, "session_id" to side.sessionId, "stream_id" to side.streamId, "text" to side.text, "status" to side.status, "cursor" to side.cursor, "error" to side.error).toString(), side.status !in setOf("Complete", "Stopped")) }
@@ -2058,9 +2404,9 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             if (generation != originGeneration) return@launch
             clearDetails(); retireSavedDrafts(null); sessionWatch?.cancel(); selectionJob?.cancel(); sourceScope = null; ++sessionGeneration
             if (app.calls.state.value.active && !keepsRestoredCall(app.calls.state.value.conversationScope,c.scope,false)) app.calls.hangup()
-            require(app.auth.persistIfUnchanged(c.auth,credentialVersion)) { "Sign-in changed while opening this notification" }
+            require(persistAuthIfCurrent(c.auth, credentialVersion)) { "Sign-in changed while opening this notification" }
             if (generation != originGeneration) return@launch
-            client = CypherClient(c.auth); cachedOwnerScope = null
+            client = c.detached(); cachedOwnerScope = null
             val restoredClient = requireNotNull(client)
             restoreBotMode(restoredClient.scope)
             if (generation != originGeneration || client !== restoredClient) return@launch
@@ -2079,6 +2425,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 openXara()
                 if (action == "answer" && generation == originGeneration) {
                     stopReadAloud()
+                    require(app.push.authorizeKeepConnectedAction(source, event, "answer")) { "This Cypher invitation has ended" }
                     app.calls.answer(source, event)
                 }
                 if (action == "callback" && generation == originGeneration) {
@@ -2095,7 +2442,9 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             }
         } catch (e: Throwable) {
             if (action == "answer" && (dev.hermes.android.voice.incomingFailureTerminal(e) || !app.push.permitsIncoming(source))) app.push.discardInvitation(source, event)
-            if (e !is CancellationException && (generation == -1 || generation == originGeneration)) _ui.update { it.copy(loading = false, restoringSession = false, error = if (e is ApiFailure && e.status == 401) "Sign in to the notification's owner account to open this activity" else e.message.orEmpty()) }
+            val needsVoiceKey=e is MissingVoiceKeyException&&startsCall&&generation==originGeneration
+            if(needsVoiceKey) { pendingIncomingAfterKey=Triple(source,event,action);more(voiceKeySetupPageIfMissing(false)!!) }
+            if (e !is CancellationException && !needsVoiceKey && (generation == -1 || generation == originGeneration)) _ui.update { it.copy(loading = false, restoringSession = false, error = if (e is ApiFailure && e.status == 401) "Sign in to the notification's owner account to open this activity" else e.message.orEmpty()) }
         }
         finally { if (startsCall) _incomingBusy.value = false }
     }

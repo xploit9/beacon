@@ -52,7 +52,8 @@ class GrokCallLiveUiTest {
         try {
             await { !vm.ui.value.restoringSession }
             phase="login"
-            withContext(Dispatchers.Main.immediate) { vm.connect(BuildConfig.DEFAULT_ORIGIN,auth.getString("password"),username=auth.getString("username")) }.join()
+            loginLiveTest(app, BuildConfig.DEFAULT_ORIGIN, auth)
+            withContext(Dispatchers.Main.immediate) { vm.connect(BuildConfig.DEFAULT_ORIGIN) }.join()
             await { vm.ui.value.authenticated&&vm.ui.value.connected&&!vm.ui.value.loading }
             (CypherViewModel::class.java.getDeclaredField("selectionJob").apply { isAccessible=true }.get(vm) as? Job)?.join()
             reader=requireNotNull(vm.client).detached()

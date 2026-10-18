@@ -55,8 +55,10 @@ class NativePhoneAuditTest {
         assumeTrue(args.getString("cypherLiveUi") == "1")
         require(compose.activity.packageName.endsWith(".debug"))
         val credentials = JSONObject(File(compose.activity.filesDir, "live-auth.json").readText(Charsets.UTF_8).removePrefix("\uFEFF"))
+        val app = compose.activity.application as CypherApplication
         compose.runOnIdle { vm = ViewModelProvider(compose.activity)[CypherViewModel::class.java] }
-        compose.runOnIdle { vm.connect(BuildConfig.DEFAULT_ORIGIN, credentials.getString("password"), username = credentials.getString("username")) }
+        runBlocking { loginLiveTest(app, BuildConfig.DEFAULT_ORIGIN, credentials) }
+        compose.runOnIdle { vm.connect(BuildConfig.DEFAULT_ORIGIN) }
         waitFor { vm.ui.value.authenticated && vm.client != null && !vm.ui.value.loading }
         assertEquals("default", vm.ui.value.profile)
         args.getString("auditTheme")?.let { theme ->

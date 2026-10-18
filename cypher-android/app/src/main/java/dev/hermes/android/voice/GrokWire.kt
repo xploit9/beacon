@@ -6,9 +6,11 @@ import org.json.JSONObject
 import java.net.URI
 
 /** Only the provider protocol differs; ownership, tool authority and queues live in DirectVoice. */
-internal class GrokWire {
+internal class GrokWire(private val providerName: String = "Grok") {
     private val calls=linkedMapOf<String,String>()
     private val inputSnapshots=linkedMapOf<String,String>()
+    private val argumentDeltas=linkedMapOf<String,String>()
+    private val emittedCalls=linkedSetOf<String>()
     private val delivered=linkedMapOf<String,String>()
     // DirectVoice admits at most 64 mutations; unfinished receipts outlive the recent read cache.
     private val pendingDelivered=mutableMapOf<String,String>()
@@ -21,31 +23,73 @@ internal class GrokWire {
             require(uri.scheme=="wss"&&uri.host=="api.x.ai"&&uri.port in setOf(-1,443)&&uri.path=="/v1/realtime"&&uri.userInfo==null&&uri.rawQuery==null&&uri.fragment==null)
             return value
         }
-        fun request(grant:JSONObject):Request {
-            require(grant.getString("provider")=="grok"&&grant.getString("model")=="grok-voice-latest")
-            val secret=grant.getString("token")
-            require(secret.isNotBlank()&&secret.length<=8192&&secret.none { it=='\r'||it=='\n' })
-            return Request.Builder().url(endpoint(grant.getString("websocket_url"))+"?model=grok-voice-latest").header("Authorization","Bearer $secret").build()
+        private const val REALTIME_URL = "wss://api.x.ai/v1/realtime"
+        private fun validProviderKey(value: String) = value.isNotBlank() && value.length <= 8192 && value.none { it.isWhitespace() || it.isISOControl() }
+        private fun safeModel(value: String) = value.matches(Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,199}"))
+        private fun safeCatalogValue(value: String) = value.length in 1..200 && value.all { it.isLetterOrDigit() || it in "._/-" }
+
+        fun request(apiKey: String, model: String): VoiceProviderRequest {
+            require(validProviderKey(apiKey)) { "Invalid provider key" }
+            require(safeModel(model)) { "Invalid voice model" }
+            val url = Request.Builder().url(endpoint(REALTIME_URL)).build().url.newBuilder().addQueryParameter("model", model).build()
+            return VoiceProviderRequest(Request.Builder().url(url).header("Authorization", "Bearer $apiKey").build(),"grok")
+        }
+
+        fun modelRequest(apiKey: String): VoiceProviderRequest {
+            require(validProviderKey(apiKey)) { "Invalid provider key" }
+            return VoiceProviderRequest(Request.Builder().url("https://api.x.ai/v1/models").header("Authorization", "Bearer $apiKey").build(),"grok")
+        }
+
+        fun voiceRequest(apiKey: String): VoiceProviderRequest {
+            require(validProviderKey(apiKey)) { "Invalid provider key" }
+            return VoiceProviderRequest(Request.Builder().url("https://api.x.ai/v1/tts/voices").header("Authorization", "Bearer $apiKey").build(),"grok")
+        }
+
+        fun models(value: JSONObject): List<String> {
+            val rows = value.optJSONArray("data") ?: value.optJSONArray("models") ?: return emptyList()
+            return buildList {
+                for (i in 0 until rows.length()) {
+                    val row = rows.optJSONObject(i) ?: continue
+                    val id = row.optString("id")
+                    if (id.startsWith("grok-voice") && safeCatalogValue(id)) add(id)
+                    val aliases = row.optJSONArray("aliases") ?: continue
+                    for (j in 0 until aliases.length()) {
+                        val alias = aliases.optString(j)
+                        if (alias.startsWith("grok-voice") && safeCatalogValue(alias)) add(alias)
+                    }
+                }
+            }.distinct()
+        }
+
+        fun voices(value: JSONObject): List<String> {
+            val rows = value.optJSONArray("voices") ?: return emptyList()
+            return (0 until rows.length()).mapNotNull { i ->
+                rows.optJSONObject(i)?.optString("voice_id")?.takeIf(::safeCatalogValue)
+            }.distinct()
         }
         private fun schema(value:Any?):Any? = when(value) {
             is JSONObject -> JSONObject().apply { value.keys().forEach { key -> val child=value.get(key);put(key,if(key=="type"&&child is String) child.lowercase() else schema(child)) } }
             is JSONArray -> JSONArray().apply { for(i in 0 until value.length()) put(schema(value.get(i))) }
             else -> value
         }
-        fun setup(gemini:JSONObject,voice:String):JSONObject {
+        fun functionTools(gemini: JSONObject): JSONArray {
             val tools=gemini.getJSONArray("tools").getJSONObject(0).getJSONArray("functionDeclarations")
-            val functions=JSONArray()
-            for(i in 0 until tools.length()) {
-                val tool=tools.getJSONObject(i)
-                functions.put(JSONObject().put("type","function").put("name",tool.getString("name")).put("description",tool.getString("description")).put("parameters",schema(tool.getJSONObject("parameters"))))
+            return JSONArray().also { functions ->
+                for(i in 0 until tools.length()) {
+                    val tool=tools.getJSONObject(i)
+                    functions.put(JSONObject().put("type","function").put("name",tool.getString("name"))
+                        .put("description",tool.getString("description")).put("parameters",schema(tool.getJSONObject("parameters"))))
+                }
             }
+        }
+        fun setup(gemini:JSONObject,voice:String):JSONObject {
             val instruction=gemini.getJSONObject("systemInstruction").getJSONArray("parts").getJSONObject(0).getString("text")
             return JSONObject().put("type","session.update").put("session",JSONObject().put("voice",voice.ifBlank { "eve" })
                 .put("instructions",instruction+"\nThis Grok voice session has no camera or screen input. Current visual access is unavailable.")
                 .put("turn_detection",JSONObject().put("type","server_vad"))
                 .put("audio",JSONObject().put("input",JSONObject().put("format",JSONObject().put("type","audio/pcm").put("rate",16000)).put("transcription",JSONObject().put("model","grok-transcribe")))
                     .put("output",JSONObject().put("format",JSONObject().put("type","audio/pcm").put("rate",24000))))
-                .put("tools",functions))
+                .put("tools",functionTools(gemini)))
         }
         fun text(value:String)=JSONObject().put("type","conversation.item.create").put("item",JSONObject().put("type","message").put("role","user")
             .put("content",JSONArray().put(JSONObject().put("type","input_text").put("text",value))))
@@ -98,6 +142,7 @@ internal class GrokWire {
     /** Normalise provider events to the existing media/transcript/tool lifecycle. */
     @Synchronized fun inbound(frame:JSONObject):JSONObject? {
         val content=JSONObject()
+        val functionCalls=JSONArray()
         when(frame.optString("type")) {
             "session.updated" -> return JSONObject().put("setupComplete",JSONObject())
             "response.created" -> { responding=true;return null }
@@ -113,28 +158,71 @@ internal class GrokWire {
                     .put("item_id",item).put("content_index",frame.optInt("content_index",0)).put("final",true))
             }
             "response.output_audio_transcript.delta","response.audio_transcript.delta" -> content.put("outputTranscription",JSONObject().put("text",frame.getString("delta")))
-            "response.function_call_arguments.done" -> {
-                val id=frame.getString("call_id");require(id.isNotBlank()&&id.length<=200)
-                calls[id]=frame.getString("name")
-                if(calls.size>128) {
-                    val oldestRead=calls.entries.firstOrNull { directToolIsReadOnly(it.value) }?.key
-                    // This is protocol matching only; DirectVoice retains mutation authority and receipts.
-                    calls.remove(oldestRead?:calls.keys.first())
+            "response.output_audio_transcript.done","response.audio_transcript.done" -> content.put("outputTranscription",JSONObject().put("text",frame.optString("transcript")).put("final",true)
+                .apply { frame.optString("item_id").takeIf(String::isNotBlank)?.let { put("item_id",it).put("content_index",frame.optInt("content_index",0)) } })
+            "response.output_item.added" -> {
+                val item=frame.optJSONObject("item")
+                if(item?.optString("type")=="function_call") {
+                    val id=item.optString("call_id")
+                    if(id.isNotBlank()) calls[id]=item.optString("name")
                 }
-                val arguments=frame.getString("arguments");require(arguments.length<=20000)
-                return JSONObject().put("toolCall",JSONObject().put("functionCalls",JSONArray().put(JSONObject().put("id",id).put("name",frame.getString("name")).put("args",JSONObject(arguments)))))
+                return null
+            }
+            "response.function_call_arguments.delta" -> {
+                val item=frame.getString("item_id")
+                require(item.isNotBlank()&&item.length<=200)
+                val accumulated=argumentDeltas.getOrDefault(item,"")+frame.getString("delta")
+                require(accumulated.length<=20000)
+                argumentDeltas[item]=accumulated
+                if(argumentDeltas.size>128) argumentDeltas.remove(argumentDeltas.keys.first())
+                frame.optString("call_id").takeIf(String::isNotBlank)?.let { id ->
+                    frame.optString("name").takeIf(String::isNotBlank)?.let { name -> calls[id]=name }
+                }
+                return null
+            }
+            "response.function_call_arguments.done" -> {
+                decodeCall(frame)?.let(functionCalls::put)
             }
             "response.done" -> {
                 responding=false
-                val status=frame.optJSONObject("response")?.optString("status")
-                if(status=="failed") error("Grok response failed")
+                val response=frame.optJSONObject("response")
+                val status=response?.optString("status")
+                if(status=="failed") error("$providerName response failed")
+                val output=response?.optJSONArray("output")
+                if(output!=null) for(i in 0 until output.length()) {
+                    val item=output.optJSONObject(i)?:continue
+                    if(item.optString("type")=="function_call") decodeCall(item)?.let(functionCalls::put)
+                }
                 content.put("turnComplete",true)
                 if(status=="cancelled") content.put("interrupted",true)
             }
-            "error" -> error("Grok voice protocol error") // Provider messages may echo secrets or private payloads.
+            "error" -> error("$providerName voice protocol error") // Provider messages may echo secrets or private payloads.
             else -> return null
         }
-        return JSONObject().put("serverContent",content)
+        return JSONObject().put("serverContent",content).apply {
+            if(functionCalls.length()>0) put("toolCall",JSONObject().put("functionCalls",functionCalls))
+        }
+    }
+
+    private fun decodeCall(frame:JSONObject):JSONObject? {
+        val id=frame.optString("call_id")
+        val name=frame.optString("name")
+        require(id.isNotBlank()&&id.length<=200&&name.isNotBlank()&&name.length<=128)
+        if(!emittedCalls.add(id)) return null
+        val arguments=frame.optString("arguments").takeIf(String::isNotBlank)
+            ?:argumentDeltas[frame.optString("item_id")].orEmpty()
+        require(arguments.isNotBlank()&&arguments.length<=20000)
+        val args=JSONObject(arguments)
+        calls[id]=name
+        if(calls.size>128) {
+            val oldestRead=calls.entries.firstOrNull { directToolIsReadOnly(it.value) }?.key
+            // This is protocol matching only; DirectVoice retains mutation authority and receipts.
+            val remove=oldestRead?:calls.keys.first()
+            calls.remove(remove);emittedCalls.remove(remove)
+        }
+        if(emittedCalls.size>128) emittedCalls.remove(emittedCalls.first())
+        frame.optString("item_id").takeIf(String::isNotBlank)?.let(argumentDeltas::remove)
+        return JSONObject().put("id",id).put("name",name).put("args",args)
     }
     @Synchronized fun continueResponse():JSONObject? = if(responsePending&&!responding) {
         responsePending=false;responding=true;JSONObject().put("type","response.create")

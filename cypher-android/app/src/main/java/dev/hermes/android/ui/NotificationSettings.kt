@@ -34,6 +34,7 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.contentDescription
@@ -44,6 +45,7 @@ import dev.hermes.android.BuildConfig
 import dev.hermes.android.CypherViewModel
 import dev.hermes.android.core.*
 import dev.hermes.android.data.CypherClient
+import dev.hermes.android.push.KeepConnectedService
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.json.JSONArray
@@ -59,6 +61,14 @@ import org.json.JSONObject
     var busy by remember(ownerScope) { mutableStateOf(false) }
     var operationError by remember(ownerScope) { mutableStateOf("") }
     var deviceAllowed by remember { mutableStateOf(androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled()) }
+    var keepConnectedEnabled by remember(context) { mutableStateOf(KeepConnectedService.isEnabled(context)) }
+    var keepConnectedStatus by remember(context) { mutableStateOf(KeepConnectedService.status(context)) }
+    var pendingKeepConnectedChoice by remember { mutableStateOf<Boolean?>(null) }
+    val keepConnectedPermissionRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
+        deviceAllowed = allowed || androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled()
+        pendingKeepConnectedChoice?.let(vm::setKeepConnectedEnabled)
+        pendingKeepConnectedChoice = null
+    }
     fun liveAllowed() = android.os.Build.VERSION.SDK_INT >= 36 && context.getSystemService(android.app.NotificationManager::class.java).canPostPromotedNotifications()
     var liveUpdatesAllowed by remember { mutableStateOf(liveAllowed()) }
     fun backgroundRestricted()=context.getSystemService(android.app.ActivityManager::class.java).isBackgroundRestricted
@@ -66,7 +76,16 @@ import org.json.JSONObject
     var restricted by remember { mutableStateOf(backgroundRestricted()) }
     var optimized by remember { mutableStateOf(batteryOptimized()) }
     val liveUpdatesSettings = remember(context) { Intent("android.settings.MANAGE_APP_PROMOTED_NOTIFICATIONS").putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName).takeIf { android.os.Build.VERSION.SDK_INT >= 36 && it.resolveActivity(context.packageManager) != null } }
-    androidx.lifecycle.compose.LifecycleResumeEffect(ownerScope) { target = vm.client?.scope?.let { vm.app.push.registeredTarget(it) }; deviceAllowed = androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled(); liveUpdatesAllowed = liveAllowed();restricted=backgroundRestricted();optimized=batteryOptimized(); vm.load("push-status", "/api/plugins/cypher/mobile/notifications/status"); onPauseOrDispose { } }
+    androidx.lifecycle.compose.LifecycleResumeEffect(ownerScope) { target = vm.client?.scope?.let { vm.app.push.registeredTarget(it) }; deviceAllowed = androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled(); keepConnectedEnabled = KeepConnectedService.isEnabled(context); keepConnectedStatus = KeepConnectedService.status(context); liveUpdatesAllowed = liveAllowed();restricted=backgroundRestricted();optimized=batteryOptimized(); vm.load("push-status", "/api/plugins/cypher/mobile/notifications/status"); onPauseOrDispose { } }
+    DisposableEffect(context) {
+        val prefs = context.getSharedPreferences(KeepConnectedService.PREFS, android.content.Context.MODE_PRIVATE)
+        val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == KeepConnectedService.KEY_ENABLED) keepConnectedEnabled = KeepConnectedService.isEnabled(context)
+            if (key == KeepConnectedService.KEY_STATUS) keepConnectedStatus = KeepConnectedService.status(context)
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
     fun register(captured: CypherClient) {
         busy = true; operationError = ""
         scope.launch {
@@ -116,10 +135,34 @@ import org.json.JSONObject
                 if (vm.client?.scope == captured.scope) { target = vm.app.push.registeredTarget(captured.scope); busy = false; vm.load("push-status", "/api/plugins/cypher/mobile/notifications/status") }
             }
         }
+        fun setKeepConnected(enabled: Boolean) {
+            if (!enabled) { vm.setKeepConnectedEnabled(false); return }
+            if (android.os.Build.VERSION.SDK_INT >= 33 && !deviceAllowed) {
+                pendingKeepConnectedChoice = true
+                keepConnectedPermissionRequest.launch(Manifest.permission.POST_NOTIFICATIONS)
+            } else vm.setKeepConnectedEnabled(true)
+        }
         Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
             LabeledToggle("Notifications for this profile", target != null, { enabled -> if (enabled) enable() else disable() },
                 description = if (target != null) "On for this profile" else "Off · you can still check activity in Cypher",
                 enabled = !busy && requestingClient == null && (target != null || (vm.app.firebaseConfigured && serverReady && pushStatus?.has("_error") != true)))
+        } }
+        Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(horizontal = 20.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Keep connected", style = MaterialTheme.typography.titleMedium)
+                    Text("Let Hermes reach this phone for incoming calls while Cypher is closed.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Switch(checked = keepConnectedEnabled, enabled = ownerScope != null, onCheckedChange = ::setKeepConnected, modifier = Modifier.testTag("keep-connected-toggle"))
+            }
+            Text(when {
+                !keepConnectedEnabled -> "Off"
+                keepConnectedStatus == KeepConnectedService.STATUS_CONNECTED -> "Connected"
+                keepConnectedStatus == KeepConnectedService.STATUS_RECONNECTING -> "Reconnecting"
+                keepConnectedStatus == KeepConnectedService.STATUS_SIGNED_OUT -> "Signed out · sign in again to receive calls"
+                else -> "Starting…"
+            }, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.testTag("keep-connected-status"))
+            if (keepConnectedEnabled && !deviceAllowed) Text("Android notifications are off; incoming call alerts may be hidden.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
         } }
         if (pushStatus?.has("_error") == true) TextButton(enabled = !busy, onClick = { vm.load("push-status", "/api/plugins/cypher/mobile/notifications/status") }) { Text("Retry notification status") }
         else if (target != null && !registered && vm.app.firebaseConfigured && serverReady && deviceAllowed) TextButton(enabled = !busy, onClick = { enable() }) { Text("Retry registration") }
@@ -138,6 +181,7 @@ import org.json.JSONObject
         TextButton(onClick = { context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)) }) { Text(uiText("Android notification settings")) }
         Text("Background delivery",style=MaterialTheme.typography.titleMedium)
         Text(when { restricted -> "Android is restricting Cypher in the background. Open app settings and allow background activity."; optimized -> "Battery optimization is on. If alerts arrive late, allow background activity in your phone’s app or battery settings."; else -> "Android battery optimization is off for Cypher." },color=if(restricted) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("Keep connected uses a persistent low-importance notification and may use more battery. Allow background activity and keep Tailscale connected for reliable calls.", style=MaterialTheme.typography.bodySmall, color=MaterialTheme.colorScheme.onSurfaceVariant)
         Text("Keep Tailscale connected to answer private requests. Do Not Disturb and notification settings can silence popups. On Honor, also check App launch → Manage manually → Run in background.",style=MaterialTheme.typography.bodySmall)
         Text("After Force stop in Android settings, reopen Cypher once to receive notifications again. Hiding the call bubble keeps your call available in the notification and supported status chip.",style=MaterialTheme.typography.bodySmall)
         TextButton(onClick={runCatching { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:${context.packageName}"))) }.onFailure { vm.notice("Open Cypher’s app settings in Android") }}) { Text("Open background app settings") }

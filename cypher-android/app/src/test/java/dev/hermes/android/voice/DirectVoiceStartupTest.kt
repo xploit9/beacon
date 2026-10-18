@@ -3,6 +3,9 @@ package dev.hermes.android.voice
 import dev.hermes.android.data.AuthContext
 import dev.hermes.android.core.json
 import dev.hermes.android.data.CypherClient
+import dev.hermes.android.data.VoiceSessionCredentials
+import dev.hermes.android.data.defaultVoiceModel
+import dev.hermes.android.data.defaultVoiceName
 import kotlinx.coroutines.*
 import okhttp3.Protocol
 import okhttp3.Response
@@ -25,6 +28,15 @@ import org.junit.Test
 import java.util.concurrent.atomic.AtomicInteger
 
 class DirectVoiceStartupTest {
+    @Test fun directVoiceAcceptsOpenAiAsASelectedProvider() {
+        val client=CypherClient(AuthContext("https://voice-fixture.invalid",emptyList(),"owner","default",backend="hermes-dashboard"),null)
+        val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
+        val voice=DirectVoice(client,"call","stored",scope,{}, {}, {},credentials=credentials("openai"))
+        try {
+            assertEquals("openai",DirectVoice::class.java.getDeclaredField("provider").apply { isAccessible=true }.get(voice))
+        } finally { voice.close();scope.cancel();client.closeNative() }
+    }
+
     @Test(timeout=25000) fun delegatedReadinessTimeoutReturnsNotSentWithoutCancellingTheCall() = runBlocking {
         val submitted=AtomicInteger()
         val factory=WebSocket.Factory { request,listener ->
@@ -51,7 +63,7 @@ class DirectVoiceStartupTest {
                 .body(json("ticket" to "fixture-ticket").toString().toResponseBody("application/json".toMediaType())).build() }
         }
         val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
-        val voice=DirectVoice(client,"call","stored",scope,{}, {}, {})
+        val voice=DirectVoice(client,"call","stored",scope,{}, {}, {},credentials=credentials())
         try {
             val method=DirectVoice::class.java.getDeclaredMethod("tool",JSONObject::class.java,java.lang.Long.TYPE,Continuation::class.java).apply { isAccessible=true }
             val result=runCatching { suspendCoroutineUninterceptedOrReturn<Unit> { continuation ->
@@ -66,14 +78,12 @@ class DirectVoiceStartupTest {
         } finally { voice.close();scope.cancel();client.closeNative() }
     }
 
-    @Test(timeout=30000) fun retriesShareOneInitialConnectionDeadline() = runBlocking {
-        val server=MockWebServer()
-        repeat(4) { server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE)) }
-        server.start()
+    @Test(timeout=30000) fun phoneKeyReconnectsShareOneInitialConnectionDeadlineWithoutTokenFetches() = runBlocking {
+        val connections=AtomicInteger()
         val failed=CompletableDeferred<String>()
         val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
-        val client=client("stored",server.url("/token")) {}
-        val voice=DirectVoice(client,"call","stored",scope,{}, {}, { failed.complete(it) })
+        val client=client("stored")
+        val voice=DirectVoice(client,"call","stored",scope,{}, {}, { failed.complete(it) },credentials=credentials(),providerSocketFactory=providerFactory(false) { connections.incrementAndGet() })
         val start=System.nanoTime()
         try {
             voice.start()
@@ -81,35 +91,34 @@ class DirectVoiceStartupTest {
             val elapsed=(System.nanoTime()-start)/1_000_000
             assertTrue(message,message.contains("20 seconds"))
             assertTrue("Elapsed $elapsed ms",elapsed in 19000..24000)
-            assertTrue(server.requestCount in 1..3)
-        } finally { voice.close();scope.cancel();client.closeNative();server.shutdown() }
+            assertTrue(connections.get() in 1..3)
+        } finally { voice.close();scope.cancel();client.closeNative() }
     }
 
-    @Test fun providerAdmissionDoesNotWaitForUnrelatedNativeModel() = runBlocking {
-        val token = CompletableDeferred<Unit>()
+    @Test fun providerAdmissionUsesThePhoneKeyAfterOneScopedContextRead() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        val contexts=AtomicInteger();val nativeTickets=AtomicInteger();val firstTokenContextCount=CompletableDeferred<Int>()
-        val client = client("stored",contextRead={contexts.incrementAndGet()},nativeAdmission={nativeTickets.incrementAndGet()}) { firstTokenContextCount.complete(contexts.get());token.complete(Unit) }
-        val voice = DirectVoice(client, "call", "stored", scope, {}, {}, {})
+        val contexts=AtomicInteger();val nativeTickets=AtomicInteger();val connections=AtomicInteger();val firstContext=CompletableDeferred<Int>()
+        val client = client("stored",contextRead={contexts.incrementAndGet()},nativeAdmission={nativeTickets.incrementAndGet()})
+        val voice = DirectVoice(client, "call", "stored", scope, {}, {}, {},credentials=credentials(),providerSocketFactory=providerFactory(true) { connections.incrementAndGet();firstContext.complete(contexts.get()) })
         try {
             voice.start()
-            assertEquals("An unavailable Hermes agent must not block direct voice admission", true,
-                withTimeoutOrNull(3000) { token.await(); true })
-            assertEquals("First admission must not repeat the context roundtrip",1,firstTokenContextCount.await())
+            assertEquals("Provider admission must not wait for an unrelated Hermes model", true,withTimeoutOrNull(3000) { firstContext.await();true })
+            assertEquals("The scoped context is read before opening the direct provider socket",1,firstContext.await())
+            assertEquals(1,connections.get())
             delay(100);assertEquals("Direct voice must not open a native events socket without delegated jobs",0,nativeTickets.get())
         } finally { voice.close(); scope.cancel(); client.closeNative() }
     }
 
     @Test fun mismatchedConversationCannotRequestProviderCredentials() = runBlocking {
-        val requests = AtomicInteger()
+        val connections = AtomicInteger()
         val failed = CompletableDeferred<Unit>()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        val client = client("someone-else") { requests.incrementAndGet() }
-        val voice = DirectVoice(client, "call", "stored", scope, {}, {}, { failed.complete(Unit) })
+        val client = client("someone-else")
+        val voice = DirectVoice(client, "call", "stored", scope, {}, {}, { failed.complete(Unit) },credentials=credentials(),providerSocketFactory=providerFactory(true) { connections.incrementAndGet() })
         try {
             voice.start()
             withTimeout(3000) { failed.await() }
-            assertEquals(0, requests.get())
+            assertEquals(0, connections.get())
         } finally { voice.close(); scope.cancel(); client.closeNative() }
     }
 
@@ -124,7 +133,7 @@ class DirectVoiceStartupTest {
             }
         }
         val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
-        val voice=DirectVoice(client,"call","stored",scope,{}, {}, {})
+        val voice=DirectVoice(client,"call","stored",scope,{}, {}, {},credentials=credentials())
         val method=DirectVoice::class.java.getDeclaredMethod("refreshContext",java.lang.Long.TYPE,Continuation::class.java).apply { isAccessible=true }
         suspend fun refresh()=suspendCoroutineUninterceptedOrReturn<Unit> { continuation -> method.invoke(voice,3000L,continuation) }
         val context=DirectVoice::class.java.getDeclaredField("context").apply { isAccessible=true }
@@ -155,7 +164,7 @@ class DirectVoiceStartupTest {
             }
         }
         val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
-        val voice=DirectVoice(client,"call","stored",scope,{}, {}, {})
+        val voice=DirectVoice(client,"call","stored",scope,{}, {}, {},credentials=credentials())
         val method=DirectVoice::class.java.getDeclaredMethod("tool",JSONObject::class.java,java.lang.Long.TYPE,Continuation::class.java).apply { isAccessible=true }
         suspend fun invoke(id:String)=suspendCoroutineUninterceptedOrReturn<Unit> { continuation ->
             method.invoke(voice,json("id" to id,"name" to "schedule_callback","args" to json("reason" to "Check back","delay_seconds" to 300)),0L,continuation)
@@ -176,7 +185,28 @@ class DirectVoiceStartupTest {
         } finally { voice.close();scope.cancel();client.closeNative() }
     }
 
-    private fun client(session: String, stalledToken: HttpUrl? = null, contextRead: () -> Unit = {}, nativeAdmission: () -> Unit = {}, token: () -> Unit): CypherClient =
+    private fun credentials(provider:String="gemini")=VoiceSessionCredentials(provider,"fixture-provider-key",defaultVoiceModel(provider),defaultVoiceName(provider),"balanced")
+
+    private fun providerFactory(open:Boolean,onRequest:()->Unit={}):WebSocket.Factory = WebSocket.Factory { request,listener ->
+        onRequest()
+        val socket=object:WebSocket {
+            override fun request()=request
+            override fun queueSize()=0L
+            override fun send(bytes:ByteString)=false
+            override fun close(code:Int,reason:String?)=true
+            override fun cancel()=Unit
+            override fun send(text:String):Boolean {
+                val frame=JSONObject(text)
+                if(frame.has("setup")) listener.onMessage(this,JSONObject().put("setupComplete",JSONObject()).toString())
+                else if(frame.optString("type")=="session.update") listener.onMessage(this,JSONObject().put("type","session.updated").toString())
+                return true
+            }
+        }
+        if(open) listener.onOpen(socket,Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Fixture").build())
+        socket
+    }
+
+    private fun client(session: String, contextRead: () -> Unit = {}, nativeAdmission: () -> Unit = {}): CypherClient =
         CypherClient(AuthContext("https://voice-fixture.invalid", emptyList(), "owner", "default", backend = "hermes-dashboard"), null) { builder ->
             builder.addInterceptor { chain ->
                 val request = chain.request()
@@ -184,10 +214,7 @@ class DirectVoiceStartupTest {
                 val context = request.url.encodedPath.endsWith("/context")
                 if(context) contextRead()
                 if(request.url.encodedPath.endsWith("/ws-ticket")) nativeAdmission()
-                if (request.url.encodedPath.endsWith("/token")) {
-                    token()
-                    if(stalledToken!=null) return@addInterceptor chain.proceed(request.newBuilder().url(stalledToken).build())
-                }
+                check(!request.url.encodedPath.endsWith("/token")) { "Phone-held provider keys must not request a Hermes token" }
                 val body = if (context) json("profile" to "default", "selected_session_id" to session) else json("detail" to "Synthetic native runtime unavailable")
                 Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if (context) 200 else 503)
                     .message("Fixture").body(body.toString().toResponseBody("application/json".toMediaType())).build()

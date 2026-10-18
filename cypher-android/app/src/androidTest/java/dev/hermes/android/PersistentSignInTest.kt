@@ -46,4 +46,24 @@ class PersistentSignInTest {
             assertTrue(AuthStore(context, AppCipher()).read(origin).cookies.isEmpty())
         } finally { first.remove(origin) }
     }
+
+    @Test fun encryptedBearerRoundTripsWithoutCookieAndKeepsItsAccountBinding() = runBlocking<Unit> {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val origin = "https://bearer-${java.util.UUID.randomUUID()}.example"
+        val bearer = dev.hermes.android.data.NativeBearerRecord("access-fixture-secret", "refresh-fixture-secret", 1L, origin, "fixture-owner", "work", "fixture")
+        val auth = AuthContext(origin, emptyList(), bearer.owner, bearer.profile, backend = "hermes-dashboard", bearer = bearer)
+        val first = AuthStore(context, AppCipher())
+        try {
+            first.persist(auth)
+            val encrypted = context.getSharedPreferences("auth-private", Context.MODE_PRIVATE).getString(origin.digest(), "")!!
+            assertFalse(encrypted.contains(bearer.accessToken))
+            assertFalse(encrypted.contains(bearer.refreshToken))
+            val restored = AuthStore(context, AppCipher()).read(origin)
+            assertEquals(bearer, restored.bearer)
+            assertEquals("fixture-owner", restored.owner)
+            assertEquals("work", restored.profile)
+            assertNotNull(restored.cachedScopeFor(origin, replacingAccount = false))
+            assertNull(restored.copy(bearer = bearer.copy(profile = "other")).cachedScopeFor(origin, replacingAccount = false))
+        } finally { first.remove(origin) }
+    }
 }

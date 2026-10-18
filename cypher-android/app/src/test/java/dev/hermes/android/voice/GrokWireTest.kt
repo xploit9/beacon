@@ -9,8 +9,11 @@ class GrokWireTest {
     @Test fun endpointPinsProviderAndNeverAcceptsEmbeddedCredentials() {
         assertEquals("wss://api.x.ai/v1/realtime",GrokWire.endpoint("wss://api.x.ai/v1/realtime"))
         for(url in listOf("ws://api.x.ai/v1/realtime","wss://api.x.ai.evil/v1/realtime","wss://secret@api.x.ai/v1/realtime","wss://api.x.ai/v1/realtime?token=secret","wss://api.x.ai/v1/realtime#secret","wss://api.x.ai:444/v1/realtime","wss://api.x.ai/v1/other")) assertTrue(url,runCatching { GrokWire.endpoint(url) }.isFailure)
-        val request=GrokWire.request(JSONObject().put("provider","grok").put("model","grok-voice-latest").put("token","ephemeral").put("websocket_url","wss://api.x.ai/v1/realtime"))
-        assertEquals("Bearer ephemeral",request.header("Authorization"));assertNull(request.header("Cookie"));assertFalse(request.url.toString().contains("ephemeral"))
+        val key="xai-fixture-secret"
+        val request=GrokWire.request(key,"grok-voice-think-fast-2.0")
+        assertEquals("Bearer $key",request.rawRequest().header("Authorization"));assertNull(request.rawRequest().header("Cookie"))
+        assertEquals("grok-voice-think-fast-2.0",request.rawRequest().url.queryParameter("model"));assertFalse(request.rawRequest().url.toString().contains(key))
+        assertFalse(request.toString().contains(key))
     }
     @Test fun setupReusesExactConsentInstructionsAndToolsWithCompatiblePcm() {
         val setup=GrokWire().outbound(GeminiWire.setup("grok-voice-latest","eve",null)).single().getJSONObject("session")

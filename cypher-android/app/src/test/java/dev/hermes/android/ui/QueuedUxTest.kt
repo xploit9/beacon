@@ -13,6 +13,6 @@ class QueuedUxTest {
     @Test fun profilesAndBotsHaveDistinctRoutes() {
         assertEquals(NavigationRoute("More", "Bots"), navigationRoute("Bots"))
         assertEquals(NavigationRoute("More"), navigationRoute("Settings"))
-        assertEquals("", settingsParent("Profiles"))
+        assertEquals("category:Profiles & model", settingsParent("Profiles"))
     }
 }

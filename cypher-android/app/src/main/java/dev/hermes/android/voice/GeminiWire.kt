@@ -1,6 +1,7 @@
 package dev.hermes.android.voice
 
 import kotlinx.coroutines.ensureActive
+import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
@@ -9,6 +10,45 @@ import java.net.URI
 internal object GeminiWire {
     const val INPUT_RATE = 16000
     const val OUTPUT_RATE = 24000
+    private const val LIVE_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+    private const val API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+    fun request(apiKey: String): VoiceProviderRequest {
+        require(validProviderKey(apiKey)) { "Invalid provider key" }
+        return VoiceProviderRequest(Request.Builder().url(LIVE_URL).header("x-goog-api-key", apiKey).build(),"gemini")
+    }
+
+    fun modelRequest(apiKey: String): VoiceProviderRequest {
+        require(validProviderKey(apiKey)) { "Invalid provider key" }
+        return VoiceProviderRequest(Request.Builder().url("$API_BASE/models?pageSize=1000").header("x-goog-api-key", apiKey).build(),"gemini")
+    }
+
+    fun voiceRequest(apiKey: String): VoiceProviderRequest {
+        require(validProviderKey(apiKey)) { "Invalid provider key" }
+        return VoiceProviderRequest(Request.Builder().url("$API_BASE/voices?type=prebuilt&page_size=1000").header("x-goog-api-key", apiKey).build(),"gemini")
+    }
+
+    fun models(value: JSONObject): List<String> {
+        val rows = value.optJSONArray("models") ?: return emptyList()
+        return (0 until rows.length()).mapNotNull { index ->
+            val row = rows.optJSONObject(index) ?: return@mapNotNull null
+            val methods = row.optJSONArray("supportedGenerationMethods") ?: return@mapNotNull null
+            val supportsLive = (0 until methods.length()).any { methods.optString(it) == "bidiGenerateContent" }
+            row.optString("name").takeIf { supportsLive && safeCatalogValue(it) && it.startsWith("models/") }
+        }.distinct()
+    }
+
+    fun voices(value: JSONObject): List<String> {
+        val rows = value.optJSONArray("voices") ?: return emptyList()
+        return (0 until rows.length()).mapNotNull { index ->
+            val row = rows.optJSONObject(index) ?: return@mapNotNull null
+            row.optString("id").takeIf { row.optString("type") == "prebuilt" && safeCatalogValue(it) }
+        }.distinct()
+    }
+
+    private fun validProviderKey(value: String) = value.isNotBlank() && value.length <= 8192 && value.none { it.isWhitespace() || it.isISOControl() }
+    private fun safeCatalogValue(value: String) = value.length in 1..200 && value.all { it.isLetterOrDigit() || it in "._/-" }
+
     fun visualMayQueue(bytes:Int,backlog:Long,pending:Boolean):Boolean {
         val encoded=(bytes.toLong()+2)/3*4+200
         return bytes in 1..128000&&backlog in 0 until 64000&&!pending&&encoded+backlog<=160000
@@ -46,12 +86,6 @@ internal object GeminiWire {
                 NativeVoiceRead(if(name=="hermes_search") "web_search" else "memory_recall",if(name=="hermes_search") "search" else "memory",JSONObject().put("query",query))
             }
         }
-    }
-    fun endpoint(value: String): String {
-        val uri = URI(value)
-        require(uri.scheme == "wss" && uri.host == "generativelanguage.googleapis.com" && uri.port in listOf(-1,443) && uri.userInfo == null && uri.fragment == null && uri.rawQuery == null)
-        require(uri.path == "/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained")
-        return value
     }
     fun setup(model: String, voice: String, resume: String?,context:JSONObject=JSONObject()) = JSONObject().put("setup", JSONObject().apply {
         put("model", if(model.startsWith("models/")) model else "models/$model")

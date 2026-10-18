@@ -82,6 +82,7 @@ fun requireIncomingRoute(route: JSONObject, source: String, profile: String, now
 }
 
 suspend fun declineIncoming(app: CypherApplication, source: String, event: String) = withTimeout(8000) {
+    require(app.push.authorizeKeepConnectedAction(source, event, "decline")) { "This Cypher invitation has ended" }
     require(app.push.claimInvitation(source, event)) { "This Cypher invitation has ended" }
     val (client, _) = resolveIncoming(app, source, event)
     try {

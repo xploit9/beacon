@@ -59,18 +59,28 @@ class NativePhoneSettingsTest {
         val worker = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
         try {
             val controller = NativePhoneSettings(worker, SavedStateHandle()) { client }
-            controller.bind(); controller.restoreDraft(draftFixture(client.scope.key)); controller.editMemory("")
-            controller.loadMemory()
+            // No document is visible yet: the first read is in flight with no known base.
+            controller.bind(); controller.loadMemory()
             assertTrue(withContext(Dispatchers.IO) { entered.await(3, java.util.concurrent.TimeUnit.SECONDS) })
+            assertTrue(controller.memory.value.loading && controller.memory.value.documents.isEmpty())
             controller.editMemory("memory")
-            assertTrue("Do not enter an editor from a refresh in flight", controller.memory.value.editing.isBlank())
+            // Editing a visible, known base during a refresh is allowed (see editingVisibleMemoryWhileRefreshing...);
+            // an editor without any base is not.
+            assertTrue("Do not enter a blank-base editor from a refresh in flight", controller.memory.value.editing.isBlank())
+            assertEquals("", controller.memory.value.draft)
             controller.restoreDraft(draftFixture(client.scope.key))
+            assertEquals("memory", controller.memory.value.editing)
             release.countDown()
             worker.coroutineContext[Job]!!.children.toList().forEach { it.join() }
+            // The released read (new content, revision d) must not replace the recovered draft or its original revision.
             assertEquals("memory", controller.memory.value.editing)
             assertEquals("edited notes", controller.memory.value.draft)
             assertEquals("original notes", controller.memory.value.documents.single().content)
             assertEquals("b".repeat(64), controller.memory.value.documents.single().revision)
+            assertEquals("b".repeat(64), controller.memory.value.documents.single().saveBody(controller.memory.value.draft).getString("revision"))
+            // A newer edit also survives a repeated recovery.
+            controller.memoryDraft("newer notes"); controller.restoreDraft(draftFixture(client.scope.key))
+            assertEquals("newer notes", controller.memory.value.draft)
         } finally { release.countDown(); worker.cancel(); client.closeNative() }
     }
 

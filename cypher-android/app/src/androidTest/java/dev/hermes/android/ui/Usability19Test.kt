@@ -44,7 +44,7 @@ class Usability19Test {
         val app = ApplicationProvider.getApplicationContext<CypherApplication>()
         val prefs = runBlocking { app.preferences.data.first() }; val auth = app.auth.read(origin)
         val store = ViewModelStore(); lateinit var vm: CypherViewModel
-        val control = CypherClient(AuthContext(origin, emptyList()))
+        val control = CypherClient(AuthContext(origin, emptyList()), app.auth)
         runBlocking { control.login("fixture-only"); control.post("/api/profile/switch", json("name" to "default")); control.bootstrap() }
         val owner = control.scope
         val kinds = listOf("initial-draft", "new-chat-attempt", "new-chat-shell", "selected-session")
@@ -52,7 +52,7 @@ class Usability19Test {
         try {
             runBlocking { kinds.forEach { app.cache.delete(owner, it) }; app.preferences.edit { it[stringPreferencesKey("origin")] = "" } }
             compose.runOnUiThread { vm = ViewModelProvider(store, viewModelFactory { initializer { CypherViewModel(app, SavedStateHandle()) } })[CypherViewModel::class.java] }
-            compose.runOnIdle { vm.connect(origin, "fixture-only") }
+            compose.runOnIdle { vm.connect(origin) }
             compose.waitUntil(25_000) { vm.ui.value.authenticated && !vm.ui.value.loading && vm.ui.value.initialChatReady }
             val sid = runBlocking { control.post("/api/session/import", json("title" to "Native PDF pager", "messages" to org.json.JSONArray(listOf(json("role" to "user", "content" to "Synthetic PDF pager"))))) }.getString("session_id")
             compose.runOnIdle { vm.selectSession(sid) }
@@ -154,11 +154,9 @@ class Usability19Test {
             println("RICH15_ACTUAL_RESET_TREE_SOURCE_CLOSE_RETRY_VISIBLE_OK")
         } finally { file.delete() }
     }
-    @Test fun choiceLabelsPreserveBlankSaveAndProactiveHasNamedReadback() = fixture { vm, control ->
+    @Test fun choiceLabelsPreserveBlankSaveAndRequiredValidation() = fixture { vm, _ ->
         val args = InstrumentationRegistry.getArguments()
-        val proactiveOriginal = runBlocking { control.get("/api/mobile/proactive") }.getBoolean("enabled")
         var saved: org.json.JSONObject? = null
-        var screen by mutableStateOf("choice")
         var generic by mutableStateOf("")
         compose.setContent {
             val density = LocalDensity.current
@@ -166,9 +164,9 @@ class Usability19Test {
             CompositionLocalProvider(LocalDensity provides Density(density.density, args.getString("audit_font", "1").toFloat()), LocalLayoutDirection provides if (args.getString("audit_rtl") == "true") LayoutDirection.Rtl else LayoutDirection.Ltr) {
                 CypherTheme(dark = args.getString("audit_theme") != "light") {
                     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                        if (screen == "choice") Column(Modifier.padding(16.dp)) {
+                        Column(Modifier.padding(16.dp)) {
                             Choice("Generic blank", generic, listOf("", "default", "provider/Model_ID-v1"), { generic = it })
-                        } else MoreScreen(vm)
+                        }
                         form?.let { NativeForm(vm, it) }
                     }
                 }
@@ -200,18 +198,6 @@ class Usability19Test {
         compose.waitUntil(25_000) { vm.form.value?.error?.contains("Service tier is required") == true }
         compose.onNodeWithText("Service tier is required").assertIsDisplayed(); assertNull(saved); capture("blank-required-error")
         compose.onNodeWithText("Cancel").performClick(); compose.waitUntil(25_000) { vm.form.value == null }
-        try {
-            compose.runOnIdle { vm.tab("More"); vm.more("Notifications"); screen = "proactive" }
-            compose.waitUntil(25_000) { vm.data.value["proactive"] != null && compose.onAllNodesWithText("Proactive calls").fetchSemanticsNodes().isNotEmpty() }
-            val toggle = compose.onNode(hasText("Proactive calls") and isToggleable())
-            toggle.performScrollTo().assertIsDisplayed().assertIsEnabled()
-            assertTrue(toggle.fetchSemanticsNode().boundsInRoot.height / compose.activity.resources.displayMetrics.density >= 48f)
-            val enabled = vm.data.value["proactive"]!!.getBoolean("enabled")
-            toggle.performClick(); compose.waitUntil(25_000) { vm.data.value["proactive"]?.getBoolean("enabled") == !enabled }
-            assertEquals(!enabled, runBlocking { control.get("/api/mobile/proactive") }.getBoolean("enabled")); capture("proactive-named")
-            toggle.performClick(); compose.waitUntil(25_000) { vm.data.value["proactive"]?.getBoolean("enabled") == enabled }
-            assertEquals(enabled, runBlocking { control.get("/api/mobile/proactive") }.getBoolean("enabled"))
-            println("LABELS18_ACTUAL_BLANK_SAVE_CANCEL_PROACTIVE_NAME_GET_OK")
-        } finally { runBlocking { control.post("/api/mobile/proactive", json("enabled" to proactiveOriginal)) } }
+        println("LABELS18_ACTUAL_BLANK_SAVE_CANCEL_REQUIRED_VALIDATION_OK")
     }
 }

@@ -1,5 +1,6 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <application android:networkSecurityConfig="@xml/fixture_network_security">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+    <!-- Debug-only preview label; the release manifest keeps "Cypher". -->
+    <application android:label="Cypher Preview" android:networkSecurityConfig="@xml/fixture_network_security" tools:replace="android:label">
         <activity android:name="dev.hermes.android.ui.LiveCallShowcaseActivity" android:exported="false" />
     </application>
 </manifest>

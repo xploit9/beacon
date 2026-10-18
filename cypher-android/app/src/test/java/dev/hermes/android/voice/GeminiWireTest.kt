@@ -26,10 +26,14 @@ class GeminiWireTest {
         val unsafe=org.json.JSONObject(evidence.toString());unsafe.getJSONArray("sources").getJSONObject(0).put("url","https://secret@example.com/fact")
         assertTrue(runCatching { GeminiWire.evidence(unsafe,true) }.isFailure)
     }
-    @Test fun ephemeralSocketRejectsAlternateHostCredentialsAndQuery() {
-        val path="/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained"
-        assertEquals("wss://generativelanguage.googleapis.com$path",GeminiWire.endpoint("wss://generativelanguage.googleapis.com$path"))
-        for(url in listOf("ws://generativelanguage.googleapis.com$path","wss://evil.example$path","wss://generativelanguage.googleapis.com.evil.example$path","wss://secret@generativelanguage.googleapis.com$path","wss://generativelanguage.googleapis.com$path?key=secret","wss://generativelanguage.googleapis.com:444$path")) assertTrue(url,runCatching { GeminiWire.endpoint(url) }.isFailure)
+    @Test fun socketUsesV1betaAndKeepsTheKeyOutOfTheUrl() {
+        val key="google-fixture-secret"
+        val request=GeminiWire.request(key)
+        assertEquals("https",request.rawRequest().url.scheme)
+        assertEquals("generativelanguage.googleapis.com",request.rawRequest().url.host)
+        assertEquals("/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",request.rawRequest().url.encodedPath)
+        assertEquals(key,request.rawRequest().header("x-goog-api-key"));assertNull(request.rawRequest().url.queryParameter("key"))
+        assertFalse(request.toString().contains(key))
     }
     @Test fun setupCarriesResumeTranscriptionAndNonblockingNativeWork() {
         val setup=GeminiWire.setup("test-model","Aoede","resume").getJSONObject("setup")

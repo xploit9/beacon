@@ -19,6 +19,10 @@ import dev.hermes.android.R
 import dev.hermes.android.core.*
 import dev.hermes.android.data.CypherClient
 import dev.hermes.android.data.ApiFailure
+import dev.hermes.android.data.MissingVoiceKeyException
+import dev.hermes.android.data.VoiceKeyStore
+import dev.hermes.android.data.VoiceSessionCredentials
+import dev.hermes.android.data.voiceProviderSupported
 import dev.hermes.android.data.authorizesPushSource
 import dev.hermes.android.data.cachedScopeFor
 import kotlinx.coroutines.*
@@ -70,7 +74,18 @@ internal fun cameraMayShare(requested: Boolean, visible: Boolean, held: Boolean,
 
 internal fun cameraStopRequested(event: JSONObject): Boolean = event.string("type") == "camera_state" && event.opt("enabled") == false
 
-data class CallSpec(val client: CypherClient, val grant: JSONObject, val incoming: Boolean = false)
+internal data class CallSpec(val client: CypherClient, val grant: JSONObject, val incoming: Boolean = false, val credentials: VoiceSessionCredentials? = null)
+
+internal fun phoneKeyCallBody(provider:String,profile:String,conversationId:String?):JSONObject {
+    require(voiceProviderSupported(provider))
+    return JSONObject().put("profile",profile).put("voice_provider",provider).put("client_key",true).apply {
+        conversationId?.let { put("conversation_id",it) }
+    }
+}
+internal fun phoneKeyAnswerBody(provider:String):JSONObject {
+    require(voiceProviderSupported(provider))
+    return JSONObject().put("voice_provider",provider).put("client_key",true)
+}
 
 class CallController(private val app: CypherApplication) {
     private val _state = MutableStateFlow(CallState())
@@ -109,11 +124,14 @@ class CallController(private val app: CypherApplication) {
     private val epoch = java.util.concurrent.atomic.AtomicLong()
     suspend fun start(client: CypherClient, conversationId: String? = null) {
         check(!switching.get()) { "Wait for the voice model switch to finish" }
-        start(client, null, conversationId)
+        val keyStore=VoiceKeyStore(app)
+        val credentials=withContext(Dispatchers.IO) { keyStore.session() }?:throw MissingVoiceKeyException(keyStore.settings().provider)
+        start(client, null, conversationId,credentials)
     }
     suspend fun switchToGemini(expectedId:String):String {
         val before=state.value
         require(before.active&&before.callId==expectedId&&before.voiceProvider=="grok"&&before.conversationScope!=null) { "This Grok call has ended" }
+        val credentials=withContext(Dispatchers.IO) { VoiceKeyStore(app).session("gemini") }?:throw MissingVoiceKeyException("gemini")
         check(switching.compareAndSet(false,true)) { "A voice switch is already in progress" }
         var replacement=""
         try {
@@ -123,7 +141,7 @@ class CallController(private val app: CypherApplication) {
             val generation=epoch.incrementAndGet()
             previous.hangup()
             awaitCallTeardown(previous.destroyed) { epoch.get()==generation&&uiVisible&&ownerScope==client.scope }
-            start(client,null,before.conversationScope.session,"gemini")
+            start(client,null,before.conversationScope.session,credentials)
             replacement=state.value.callId
             withTimeout(45000) {
                 state.first {
@@ -140,12 +158,14 @@ class CallController(private val app: CypherApplication) {
     }
     suspend fun answer(source: String, event: String) {
         check(!switching.get()) { "Wait for the voice model switch to finish" }
+        val keyStore=VoiceKeyStore(app)
+        val credentials=withContext(Dispatchers.IO) { keyStore.session() }?:throw MissingVoiceKeyException(keyStore.settings().provider)
         check(ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) { "Allow microphone access to answer Cypher" }
         require(app.push.claimInvitation(source, event)) { "This Cypher invitation has ended" }
         val (client, route) = withTimeout(15000) { resolveIncoming(app, source, event) }
-        start(client, IncomingCall(source, event, route.getLong("expires_at")))
+        start(client, IncomingCall(source, event, route.getLong("expires_at")),voiceSettings=credentials)
     }
-    private suspend fun start(client: CypherClient, incoming: IncomingCall?, conversationId: String? = null, voiceProvider:String?=null) {
+    private suspend fun start(client: CypherClient, incoming: IncomingCall?, conversationId: String? = null, voiceSettings:VoiceSessionCredentials) {
         requireCameraReleasedForNewCall(_state.value)
         check(!_state.value.audioStopPending) { "Microphone release is unconfirmed. Use Android’s Stop app control before another call." }
         check(!_state.value.active) { "Cypher already has a call" }
@@ -160,8 +180,11 @@ class CallController(private val app: CypherApplication) {
             // Saved-auth restoration must recognize an already admitted local owner during reservation.
             _state.value = CallState(true, "connecting", startedAt = System.currentTimeMillis(), conversationScope = conversationId?.let { frozen.scope.session(it) })
             if (incoming != null) require(app.push.invitation(incoming.source, incoming.event) != null) { "This Cypher invitation has already ended" }
-            grant = if (incoming == null) frozen.nativeRequest("/api/plugins/cypher/mobile/calls", "POST", JSONObject().apply { put("profile", frozen.auth.profile); conversationId?.let { put("conversation_id", it) };voiceProvider?.let { put("voice_provider",it) } }) else frozen.nativeRequest("/api/plugins/cypher/mobile/callbacks/${incoming.event}/answer", "POST", JSONObject())
-            require(grant.string("transport") in setOf("gemini_live_direct", "grok_live_direct") && grant.string("transport") == grant.optString("provider", "gemini") + "_live_direct") { "Unsupported voice transport" }
+            grant = if (incoming == null) frozen.nativeRequest("/api/plugins/cypher/mobile/calls", "POST",
+                phoneKeyCallBody(voiceSettings.provider,frozen.auth.profile,conversationId))
+                else frozen.nativeRequest("/api/plugins/cypher/mobile/callbacks/" + incoming.event + "/answer", "POST", phoneKeyAnswerBody(voiceSettings.provider))
+            require(grant.string("provider")==voiceSettings.provider&&voiceProviderSupported(voiceSettings.provider)&&
+                grant.string("transport")==voiceSettings.provider+"_live_direct") { "Unsupported voice transport" }
             require(grant.string("profile") == frozen.auth.profile && grant.string("call_id").isNotBlank() && grant.string("conversation_id").isNotBlank()) { "Invalid call authorization" }
             if (incoming != null) app.push.discardInvitation(incoming.source, incoming.event)
             if (generation != epoch.get()) { release(CallSpec(frozen, grant)); return }
@@ -169,8 +192,8 @@ class CallController(private val app: CypherApplication) {
                 require(app.push.permitsIncoming(incoming.source)) { "The invitation's owner signed out" }
                 require(uiVisible) { "Open Cypher to finish answering Cypher" }
             }
-            spec = CallSpec(frozen, grant, incoming != null)
-            _state.update { it.copy(conversationScope = frozen.scope.session(grant.getString("conversation_id")), callId = grant.getString("call_id"), voiceProvider = grant.optString("provider", "gemini"), visionAvailable = grant.optString("provider", "gemini") == "gemini").withOverlayPermission(android.provider.Settings.canDrawOverlays(app)) }
+            spec = CallSpec(frozen, grant, incoming != null,voiceSettings)
+            _state.update { it.copy(conversationScope = frozen.scope.session(grant.getString("conversation_id")), callId = grant.getString("call_id"), voiceProvider = voiceSettings.provider, visionAvailable = voiceSettings.provider == "gemini").withOverlayPermission(android.provider.Settings.canDrawOverlays(app)) }
             ContextCompat.startForegroundService(app, Intent(app, CypherCallService::class.java).setAction(CypherCallService.START))
         } catch (e: Throwable) {
             if (generation == epoch.get()) { spec = null; _state.value = CallState(error = e.message.orEmpty()) }
@@ -340,10 +363,11 @@ class CypherCallService : Service() {
             admitCallTransport(mediaLock,closed,{app.calls.service===this@CypherCallService}) {
             try {
                 transcriptSync = NativeCallTranscriptSync(spec.client::nativeRequest,spec.grant.getString("call_id"),scope) { status -> app.calls.updateFrom(this@CypherCallService) { it.copy(transcriptStatus=status) } }
+                val voiceSettings=checkNotNull(spec.credentials)
                 val audio = NativePcm(scope,{ bytes,at ->
                     val intent=microphoneGate.snapshot()
                     if(directVoice?.pcm(bytes) { microphoneGate.current(intent)&&intent.enabled&&!closed.get() }!=true) app.calls.updateFrom(this@CypherCallService) { it.copy(state="connecting") }
-                },{_,_ -> },::failure,::audioLevel,PcmQueue())
+                },{_,_ -> },::failure,::audioLevel,PcmQueue(),captureRate=if(voiceSettings.provider=="openai")48000 else 16000)
                 pcm=audio;audio.start(this@CypherCallService);audio.mute(muted||held||closed.get())
                 if(closed.get()) return@admitCallTransport
                 visual=NativeVisual(this@CypherCallService,Handler(mediaThread.looper),{
@@ -361,7 +385,7 @@ class CypherCallService : Service() {
                 },{ stopScreen() })
                 directVoice=DirectVoice(spec.client,spec.grant.getString("call_id"),spec.grant.getString("conversation_id"),scope,{bytes ->
                     if(!held&&!closed.get()) { if(!audio.enqueue(bytes)&&!closed.get()) { audio.interrupt();app.calls.updateFrom(this@CypherCallService) { it.copy(error="Playback queue overflow; current speech was interrupted") } } }
-                },::directEvent,::failure,{ app.calls.state.value.transcripts.takeLast(10).joinToString("\n") { "${it.role}: ${it.text}" }.takeLast(6000) },provider=spec.grant.optString("provider","gemini")).also { it.start() }
+                },::directEvent,::failure,{ app.calls.state.value.transcripts.takeLast(10).joinToString("\n") { "${it.role}: ${it.text}" }.takeLast(6000) },voiceSettings).also { it.start() }
             } catch(e:Exception) { if(!closed.get()) failure("Native audio initialization failed") }
             }
         }

@@ -43,7 +43,8 @@ class VoiceLookupLiveTest {
         val mailTools=java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         val phases=JSONObject().put("provider",provider)
         try {
-            withContext(Dispatchers.Main.immediate) { vm.connect(auth.getString("origin"),auth.getString("password"),username=auth.getString("username")) }.join()
+            loginLiveTest(app, auth.getString("origin"), auth)
+            withContext(Dispatchers.Main.immediate) { vm.connect(auth.getString("origin")) }.join()
             await { vm.ui.value.connected&&vm.client!=null }
             client=vm.client!!.detached()
             previous=client!!.nativeRequest("/api/plugins/cypher/mobile/voice-settings").getString("selected_provider")

@@ -98,7 +98,13 @@ class NativeGatewayTest {
                 } else if (path.endsWith("/voice-history")) {
                     archivePaths += path
                     json("session_id" to stored, "profile" to "default", "events" to JSONArray())
-                } else if (path == "/api/plugins/cypher/mobile/sessions/$stored") json("session_id" to stored, "profile" to "default", "runtime_session_id" to "android-runtime", "active_stream_id" to if(resumeStatus in setOf("working", "waiting")) "android-runtime" else "", "messages" to JSONArray())
+                } else if (path == "/api/sessions/$stored") {
+                    assertEquals("default", chain.request().url.queryParameter("profile"))
+                    json("id" to stored, "profile" to "default", "title" to "Synthetic", "message_count" to 0)
+                } else if (path == "/api/sessions/$stored/messages") {
+                    assertEquals("default", chain.request().url.queryParameter("profile"))
+                    json("session_id" to stored, "profile" to "default", "messages" to JSONArray(), "pagination" to json("limit" to 500, "offset" to 0, "order" to "latest", "returned" to 0))
+                } else if (path.startsWith("/api/plugins/cypher/mobile/sessions/$stored") && !path.endsWith("/voice-history")) error("Passive history must not use the optional plugin")
                 else json("ticket" to "test-ticket")
                 Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(status).message("Native").body(body.toString().toResponseBody("application/json".toMediaType())).build()
             }
@@ -108,7 +114,9 @@ class NativeGatewayTest {
         repeat(2) {
             val resumed = client.get("/api/session", mapOf("session_id" to stored))
             assertEquals(stored, resumed.getString("session_id"))
-            assertEquals("android-runtime", resumed.getString("runtime_session_id"))
+            assertEquals(stored, resumed.getString("stored_session_id"))
+            // Passive stock history has no live agent, so it never reports a runtime identity it did not open.
+            assertTrue(resumed.optString("runtime_session_id").isBlank())
             assertTrue(resumed.getBoolean("voice_transcripts_available"))
         }
         assertEquals(0, resumes)
@@ -121,11 +129,14 @@ class NativeGatewayTest {
 
         assertEquals(2, archivePaths.size)
         assertTrue(archivePaths.all { it.endsWith("/$stored/voice-history") })
+        val resumesBeforePassiveStatusReads = resumes
         for (status in listOf("starting", "resuming", "idle", "working", "waiting")) {
             resumeStatus = status
             val snapshot = client.get("/api/session", mapOf("session_id" to stored))
-            assertEquals(status, status in setOf("working", "waiting"), snapshot.optString("active_stream_id").isNotBlank())
+            // Stock history cannot observe a running turn without resuming; it must not claim one.
+            assertTrue(status, snapshot.optString("active_stream_id").isBlank())
         }
+        assertEquals("Reading history in any agent state never adds a resume", resumesBeforePassiveStatusReads, resumes)
         resumeStatus = "idle"
         val saved=client.post("/api/file/save",json("session_id" to stored,"path" to "C:/test/file.txt","content" to "after\r\n","expected_content" to "before\r\n"))
         assertEquals("after\n",savedText)

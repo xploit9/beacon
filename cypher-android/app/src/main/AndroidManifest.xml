@@ -13,6 +13,7 @@
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -25,6 +26,20 @@
     </queries>
     <application android:name=".CypherApplication" android:label="Cypher" android:icon="@drawable/ic_cypher" android:theme="@style/Theme.Cypher" android:allowBackup="false" android:fullBackupContent="@xml/backup_rules" android:dataExtractionRules="@xml/data_extraction_rules" android:usesCleartextTraffic="false" android:supportsRtl="true">
         <activity android:name=".CypherActivity" android:exported="true" android:resizeableActivity="true" android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="cypher" android:host="connect" />
+            </intent-filter>
+        </activity>
+        <activity android:name=".AuthReturnActivity" android:excludeFromRecents="true" android:exported="true" android:noHistory="true" android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="cypher" android:host="auth" android:path="/complete" />
+            </intent-filter>
         </activity>
         <!-- Installed launcher component remains a technical compatibility alias. -->
         <activity-alias android:name=".MainActivity" android:targetActivity=".CypherActivity" android:exported="true">
@@ -32,6 +47,9 @@
         </activity-alias>
         <service android:name=".voice.CypherCallService" android:exported="false" android:foregroundServiceType="microphone|phoneCall|camera|mediaProjection" />
         <service android:name=".voice.IncomingRingtoneService" android:exported="false" android:foregroundServiceType="phoneCall" />
+        <service android:name=".push.KeepConnectedService" android:exported="false" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Maintains an HTTPS notification event connection to the signed-in Hermes account so incoming Cypher calls can reach the phone while the user enables Keep connected." />
+        </service>
         <receiver android:name=".voice.IncomingCallReceiver" android:exported="false" />
         <receiver android:name=".push.DeviceRestartReceiver" android:exported="false">
             <intent-filter><action android:name="android.intent.action.BOOT_COMPLETED" /><action android:name="android.intent.action.MY_PACKAGE_REPLACED" /></intent-filter>

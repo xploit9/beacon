@@ -35,6 +35,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.hermes.android.core.*
+import dev.hermes.android.data.VoiceKeyStore
 import dev.hermes.android.data.startupReads
 import dev.hermes.android.ui.*
 import dev.hermes.android.voice.*
@@ -132,7 +133,7 @@ class NativeExperienceUiTest {
             if (restoration == null) compose.setContent(content) else restoration.setContent(content)
             block(vm, fixture)
         } finally {
-            compose.runOnUiThread { store.clear(); fixture.client.closeNative(); app.calls.ownerScope = null }
+            compose.runOnUiThread { store.clear(); fixture.client.closeNative(); fixture.clearCustomTabSeam(); app.calls.ownerScope = null }
             runBlocking { app.preferences.edit {
                 prior[originKey]?.let { value -> it[originKey] = value } ?: it.remove(originKey)
                 prior[motionKey]?.let { value -> it[motionKey] = value } ?: it.remove(motionKey)
@@ -149,6 +150,18 @@ class NativeExperienceUiTest {
     }
     private fun clickText(text: String) = compose.onNodeWithText(text, useUnmergedTree = true).performScrollTo().performClick()
     private fun await(condition: () -> Boolean) = compose.waitUntil(15_000, condition)
+    /** Menus and sheets are checked with the IME away, so neither a keyboard nor a stale focus can cover them. */
+    private fun closeKeyboard() {
+        compose.runOnIdle { compose.activity.getSystemService(android.view.inputmethod.InputMethodManager::class.java).hideSoftInputFromWindow(compose.activity.window.decorView.windowToken, 0) }
+        await { androidx.core.view.ViewCompat.getRootWindowInsets(compose.activity.window.decorView)?.isVisible(androidx.core.view.WindowInsetsCompat.Type.ime()) != true }
+    }
+
+    /** A modal sheet taller than half the window opens half-expanded, with its lower rows off screen. Use the sheet's own Expand action when it offers one. */
+    private fun expandModalSheet() {
+        val expand = compose.onAllNodes(SemanticsMatcher.keyIsDefined(androidx.compose.ui.semantics.SemanticsActions.Expand), useUnmergedTree = true)
+        if (expand.fetchSemanticsNodes().isNotEmpty()) expand.onFirst().performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.Expand) { it() }
+        compose.waitForIdle()
+    }
 
     private class PickerRegistry(private val context: Context) : ActivityResultRegistry() {
         var code = -1
@@ -312,6 +325,7 @@ class NativeExperienceUiTest {
 
     @Test fun stalePromptButtonsCannotApproveOrAnswerTheNextRequest() = withFixture { vm, fixture ->
         fun approval(id: String) = json("approval_id" to id, "command" to "Synthetic $id", "choices" to JSONArray().put("once").put("deny"))
+        fun question(id: String) = json("clarify_id" to id, "question" to "Synthetic $id", "choices" to JSONArray().put("Choose this"))
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = approval("old-approval")) }
         val staleApproval = requireNotNull(compose.onNodeWithText("Allow once").performScrollTo().fetchSemanticsNode().config[androidx.compose.ui.semantics.SemanticsActions.OnClick].action)
         compose.runOnIdle {
@@ -326,10 +340,30 @@ class NativeExperienceUiTest {
         await { compose.onAllNodesWithText("Synthetic new-approval").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("Allow once").performScrollTo().performClick()
         await { fixture.requests.any { it.string("method") == "approval.respond" } }
-        assertEquals("new-approval", fixture.requests.single { it.string("method") == "approval.respond" }.getJSONObject("params").string("request_id"))
+        assertEquals("new-approval", fixture.requests.last { it.string("method") == "approval.respond" }.getJSONObject("params").string("request_id"))
         await { vm.chat.value.approval == null }
-        fun question(id: String) = json("clarify_id" to id, "question" to "Synthetic $id", "choices" to JSONArray().put("Choose this"))
-        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = null, clarification = question("old-question")) }
+
+        compose.runOnIdle {
+            flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = approval("racing-approval"))
+            fixture.onPromptResponse = { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = approval("replacement-approval")) }
+        }
+        compose.onNodeWithText("Allow once").performScrollTo().performClick()
+        await { fixture.requests.count { it.string("method") == "approval.respond" } == 2 }
+        assertEquals("racing-approval", fixture.requests.last { it.string("method") == "approval.respond" }.getJSONObject("params").string("request_id"))
+        await { vm.chat.value.approval?.string("approval_id") == "replacement-approval" }
+
+        compose.runOnIdle {
+            flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = approval("failed-approval"))
+            fixture.rejectPromptResponse = true
+        }
+        compose.onNodeWithText("Allow once").performScrollTo().performClick()
+        await { fixture.requests.count { it.string("method") == "approval.respond" } == 3 }
+        await { vm.ui.value.error.contains("Synthetic prompt response rejected") }
+        assertEquals("A failed acknowledgement retains the displayed prompt", "failed-approval", vm.chat.value.approval?.string("approval_id"))
+        compose.runOnIdle {
+            vm.clearMessage()
+            flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = null, clarification = question("old-question"))
+        }
         val staleAnswer = requireNotNull(compose.onNodeWithText("Choose this").performScrollTo().fetchSemanticsNode().config[androidx.compose.ui.semantics.SemanticsActions.OnClick].action)
         compose.runOnIdle {
             flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(clarification = question("new-question"))
@@ -344,6 +378,7 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Choose this").performScrollTo().performClick()
         await { fixture.requests.any { it.string("method") == "request.answer" } }
         assertEquals("new-question", fixture.requests.single { it.string("method") == "request.answer" }.getJSONObject("params").string("id"))
+        await { vm.chat.value.clarification == null }
         receipts += "A retained click from a replaced approval/question sends nothing; fresh actions carry only their displayed request ID."
         capture("audit-prompt-identity")
     }
@@ -452,7 +487,8 @@ class NativeExperienceUiTest {
         fixture.rejectRoomSend = false
         compose.onNodeWithText("Send").performClick()
         await { vm.botMode.state.value.draft.isBlank() && !vm.botMode.state.value.loading }
-        val sends = fixture.requests.filter { it.string("path").endsWith("/messages") }
+        // Only shared-space sends: stock history reads also end in /messages.
+        val sends = fixture.requests.filter { it.string("path").endsWith("/space/fixture-room/messages") }
         assertEquals(2, sends.size)
         assertEquals(sends[0].getJSONObject("body").string("event_id"), sends[1].getJSONObject("body").string("event_id"))
         assertEquals(1, fixture.roomEvents.size)
@@ -593,10 +629,30 @@ class NativeExperienceUiTest {
             val one = File(directory, "picker-first.txt").apply { writeText("First selected file") }
             val two = File(directory, "picker-second.txt").apply { writeText("Second selected file") }
             fun uri(file: File) = androidx.core.content.FileProvider.getUriForFile(app, app.packageName + ".files", file)
+            // Attach opens a Photos/Files menu; only the chosen entry launches the system picker.
+            fun openPicker(entry: String) {
+                compose.onNodeWithTag("composer-attach").performClick()
+                compose.onNodeWithTag("attach-menu").assertIsDisplayed()
+                compose.onNodeWithTag(entry).performClick()
+                await { compose.onAllNodesWithTag("attach-menu").fetchSemanticsNodes().isEmpty() }
+            }
+            fun openFiles() = openPicker("attach-files")
             try {
                 compose.onNodeWithTag("composer-attach").performClick()
+                compose.onNodeWithTag("attach-photos").assertIsDisplayed()
+                compose.onNodeWithTag("attach-files").assertIsDisplayed()
+                assertNull("Opening the menu alone launches nothing", picker.intent)
+                compose.onNodeWithTag("attach-photos").performClick()
+                await { compose.onAllNodesWithTag("attach-menu").fetchSemanticsNodes().isEmpty() }
                 assertEquals(Intent.ACTION_OPEN_DOCUMENT, picker.intent?.action)
                 assertTrue(picker.intent!!.getBooleanExtra(Intent.EXTRA_ALLOW_MULTIPLE, false))
+                assertArrayEquals("Photos asks the system picker for images only", arrayOf("image/*"), picker.intent!!.getStringArrayExtra(Intent.EXTRA_MIME_TYPES))
+                compose.runOnUiThread { picker.deliver(emptyList()) }
+                assertTrue(vm.attachments.value.isEmpty())
+                openFiles()
+                assertEquals(Intent.ACTION_OPEN_DOCUMENT, picker.intent?.action)
+                assertTrue(picker.intent!!.getBooleanExtra(Intent.EXTRA_ALLOW_MULTIPLE, false))
+                assertArrayEquals("Files asks the system picker for any document", arrayOf("*/*"), picker.intent!!.getStringArrayExtra(Intent.EXTRA_MIME_TYPES))
                 compose.runOnUiThread { picker.deliver(listOf(uri(one), uri(two), uri(one))) }
                 await { vm.attachments.value.size == 2 && vm.attachmentPreparation.value.isEmpty() }
                 assertEquals(setOf(one.name, two.name), vm.attachments.value.map { it.string("name") }.toSet())
@@ -606,15 +662,15 @@ class NativeExperienceUiTest {
                 compose.onNodeWithContentDescription("Remove ${one.name}").performScrollTo().performClick()
                 await { vm.attachments.value.size == 1 }
                 assertEquals(two.name, vm.attachments.value.single().string("name"))
-                compose.onNodeWithTag("composer-attach").performClick()
+                openFiles()
                 compose.runOnUiThread { picker.deliver(emptyList()) }
                 assertEquals(1, vm.attachments.value.size)
-                compose.onNodeWithTag("composer-attach").performClick()
+                openFiles()
                 compose.runOnUiThread { picker.deliver(listOf(uri(one), Uri.parse("content://missing-fixture/not-found"))) }
                 await { vm.attachments.value.size == 2 && vm.attachmentPreparation.value.any { it.string("status") == "error" } }
                 assertTrue(vm.attachmentPreparation.value.single().string("error").isNotBlank())
                 compose.runOnIdle { vm.dismissAttachmentPreparation(vm.attachmentPreparation.value.single().string("id")) }
-                compose.onNodeWithTag("composer-attach").performClick()
+                openFiles()
                 compose.runOnIdle { vm.selectSession("chat-b") }
                 await { vm.chat.value.sessionId == "chat-b" }
                 compose.runOnUiThread { picker.deliver(listOf(uri(one), uri(two))) }
@@ -622,7 +678,7 @@ class NativeExperienceUiTest {
                 assertTrue(vm.attachments.value.isEmpty())
                 assertTrue(vm.attachmentPreparation.value.isEmpty())
                 assertFalse(fixture.requests.any { it.string("method") == "prompt.submit" })
-                receipts += "System multi-document result preserves each file, deduplicates selection, supports removal/cancel/failure and rejects stale conversation results. No prompt sent."
+                receipts += "Attach opens Photos/Files; Photos requests image/* and Files */*. System multi-document result preserves each file, deduplicates selection, supports removal/cancel/failure and rejects stale conversation results. No prompt sent."
             } finally { one.delete(); two.delete() }
         }
     }
@@ -1005,21 +1061,33 @@ class NativeExperienceUiTest {
             input.showSoftInput(compose.activity.currentFocus, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
         }
         await { androidx.core.view.ViewCompat.getRootWindowInsets(compose.activity.window.decorView)?.isVisible(androidx.core.view.WindowInsetsCompat.Type.ime()) == true }
-        await {
+        fun keyboardTop(): Int {
             val decor = compose.activity.window.decorView
             val bottom = androidx.core.view.ViewCompat.getRootWindowInsets(decor)?.getInsets(androidx.core.view.WindowInsetsCompat.Type.ime())?.bottom ?: 0
-            val keyboardTop = decor.height - bottom
-            compose.onNodeWithTag("message-input").fetchSemanticsNode().boundsInWindow.bottom <= keyboardTop + 2 &&
-                compose.onNodeWithTag("message-send").fetchSemanticsNode().boundsInWindow.bottom <= keyboardTop + 2
+            return decor.height - bottom
+        }
+        await {
+            compose.onNodeWithTag("message-input").fetchSemanticsNode().boundsInWindow.bottom <= keyboardTop() + 2 &&
+                compose.onNodeWithTag("message-send").fetchSemanticsNode().boundsInWindow.bottom <= keyboardTop() + 2
         }
         receipts += "Android reports the software keyboard visible while the composer stays reachable."
         val inputBounds = compose.onNodeWithTag("message-input").fetchSemanticsNode().boundsInWindow
         val sendBounds = compose.onNodeWithTag("message-send").fetchSemanticsNode().boundsInWindow
-        assertTrue("Primary action is oval and below the text area", sendBounds.width > sendBounds.height && sendBounds.top >= inputBounds.bottom)
+        // The v3 primary action is a fixed 48dp circle that sits in the control row below the editor, never wider than tall.
+        val sendFootprint = compose.onNodeWithTag("message-send").getUnclippedBoundsInRoot()
+        assertEquals("Primary action is 48dp wide", 48f, (sendFootprint.right - sendFootprint.left).value, .75f)
+        assertEquals("Primary action is 48dp tall", 48f, (sendFootprint.bottom - sendFootprint.top).value, .75f)
+        assertTrue("Primary action is below the text area and above the keyboard", sendBounds.top >= inputBounds.bottom && sendBounds.bottom <= keyboardTop() + 2)
         val attachBounds = compose.onNodeWithTag("composer-attach").fetchSemanticsNode().boundsInWindow
         val permissionBounds = compose.onNodeWithTag("composer-approvals").fetchSemanticsNode().boundsInWindow
         val modelBounds = compose.onNodeWithTag("composer-model-effort").fetchSemanticsNode().boundsInWindow
-        assertTrue("Composer controls retain their requested reading order", attachBounds.right <= permissionBounds.left && permissionBounds.right <= modelBounds.left && modelBounds.right <= sendBounds.left)
+        val dictateBounds = compose.onNodeWithTag("composer-dictate").fetchSemanticsNode().boundsInWindow
+        assertTrue("Composer controls retain their requested reading order", attachBounds.right <= permissionBounds.left && permissionBounds.right <= modelBounds.left && modelBounds.right <= dictateBounds.left && dictateBounds.right <= sendBounds.left)
+        val composerViewport = compose.onNodeWithTag("experience-viewport").fetchSemanticsNode().boundsInRoot
+        listOf("composer-attach", "composer-approvals", "composer-model-effort", "composer-dictate", "message-send").forEach { tag ->
+            val control = compose.onNodeWithTag(tag).fetchSemanticsNode().boundsInRoot
+            assertTrue("$tag stays inside the usable window", control.left >= composerViewport.left && control.right <= composerViewport.right && control.bottom <= composerViewport.bottom)
+        }
         capture("composer-keyboard")
         compose.onNodeWithContentDescription("Conversation actions").performClick()
         compose.onNodeWithTag("conversation-actions-menu").assertIsDisplayed()
@@ -1033,7 +1101,7 @@ class NativeExperienceUiTest {
         assertEquals("Keep this draft during navigation", vm.composer.value.text)
         receipts += "Navigation open/close preserves draft and selected session."
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "runtime-chat-a", liveText = "Preparing the comparison.") }
-        compose.onNodeWithTag("message-send").assertIsEnabled().assertIsDisplayed()
+        compose.onNodeWithTag("message-send").assertIsEnabled().assertIsDisplayed().assertContentDescriptionEquals("Queue")
         val viewport = compose.onNodeWithTag("experience-viewport").fetchSemanticsNode().boundsInRoot
         val send = compose.onNodeWithTag("message-send").fetchSemanticsNode().boundsInRoot
         assertTrue("Queue must stay inside the usable window", send.left >= viewport.left && send.right <= viewport.right && send.bottom <= viewport.bottom)
@@ -1042,7 +1110,21 @@ class NativeExperienceUiTest {
         assertTrue(vm.composer.value.text.isBlank())
         assertTrue("Queue must not dispatch another prompt", fixture.requests.none { it.string("method") == "prompt.submit" })
         receipts += "Busy primary queues locally; no prompt dispatched."
+        // With the draft now empty and the turn still streaming, the trailing voice slot becomes Stop, in the same 48dp footprint.
+        compose.onNodeWithTag("message-stop").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag("message-send").assertDoesNotExist()
+        compose.onNodeWithTag("chat-call-xara").assertDoesNotExist()
+        val stopFootprint = compose.onNodeWithTag("message-stop").getUnclippedBoundsInRoot()
+        assertEquals("Stop is 48dp wide", 48f, (stopFootprint.right - stopFootprint.left).value, .75f)
+        assertEquals("Stop is 48dp tall", 48f, (stopFootprint.bottom - stopFootprint.top).value, .75f)
         capture("busy-composer")
+        compose.onNodeWithTag("message-stop").performClick()
+        await { fixture.requests.any { it.string("method") == "session.interrupt" } }
+        assertEquals("Stop sends one native interrupt for the displayed runtime stream", listOf("runtime-chat-a"), fixture.requests.filter { it.string("method") == "session.interrupt" }.map { it.getJSONObject("params").string("session_id") })
+        assertEquals("Stop is not a send: the queue is untouched", 1, vm.chat.value.queued.size)
+        assertTrue("Stop never submits or creates a conversation", fixture.requests.none { it.string("method") in setOf("prompt.submit", "session.create") })
+        compose.runOnIdle { vm.clearMessage() }
+        receipts += "Stop replaces voice when an empty composer streams, keeps the 48dp footprint, and its existing callback sends exactly one native session.interrupt for the runtime id without touching the queue."
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "", liveText = ""); vm.composer(TextFieldValue("/")) }
         await { vm.data.value["slash:catalog"] != null }
         compose.onNodeWithTag("message-input").performClick()
@@ -1065,6 +1147,218 @@ class NativeExperienceUiTest {
         assertTrue(vm.ui.value.xaraError.isBlank())
         receipts += "Fifty repeated Cypher opens while create ACK is delayed resolve one durable conversation."
         capture("stable-cypher")
+    }
+
+    /** Combined root wiring for the chat reference states: recorded time, tool outcomes, live work and the unchanged Cypher shell. */
+    @Test fun migrationChatReferenceStates() = withFixture { vm, fixture ->
+        // One fixed instant. The expected label comes from this device's zone and locale, never a hard-coded local clock.
+        val known = java.time.Instant.parse("2026-10-14T09:41:00Z").toEpochMilli()
+        val zone = java.util.TimeZone.getDefault()
+        val locale = java.util.Locale.getDefault()
+        val shown = java.text.SimpleDateFormat("h:mm a", locale).apply { timeZone = zone }.format(java.util.Date(known))
+        assertEquals(shown, messageTimeLabel(known, zone, locale))
+        assertEquals("Native seconds and milliseconds name the same instant", shown, messageTimeLabel(known / 1000, zone, locale))
+        assertEquals("9:41 AM", messageTimeLabel(known, java.util.TimeZone.getTimeZone("UTC"), java.util.Locale.US))
+        assertNull("An unrecorded time stays unknown", messageTimeLabel(0))
+        val passedArguments = "gradle test\n--tests dev.hermes.ChatTest\n--info"
+        val passedResult = "> Task :app:test\nBUILD SUCCESSFUL in 4s\n12 tests passed"
+        val failedArguments = "path=C:/synthetic-workspace/missing.txt\nencoding=utf-8"
+        val failedResult = "Error: file not found\nChecked 2 locations"
+        val silentArguments = "query=synthetic release notes\nlimit=3"
+        val passed = json("tool_call_id" to "ref-tool-passed", "name" to "run_tests", "args" to passedArguments, "result" to passedResult, "duration_s" to 1.2)
+        val failed = json("tool_call_id" to "ref-tool-failed", "name" to "read_file", "args" to failedArguments, "result" to failedResult, "is_error" to true, "duration_s" to 0.4)
+        val silent = json("tool_call_id" to "ref-tool-silent", "name" to "web_search", "args" to silentArguments)
+        // Tool lifecycle: a stored call that only ever said "running" has no terminal evidence. Its live sibling below has the same payload.
+        val stale = json("tool_call_id" to "ref-tool-stale", "name" to "sync_notes", "args" to "target=notes.md", "status" to "running")
+        // The native row key is `timestamp`; a row that has none must stay unrecorded.
+        fun row(id: String, role: String, text: String, timestamp: Long? = null, vararg tools: JSONObject) =
+            json("row_id" to id, "role" to role, "text" to text, "tool_calls" to JSONArray().apply { tools.forEach { put(it) } }).apply { timestamp?.let { put("timestamp", it) } }
+        val messages = listOf(
+            Message.from(row("ref-user-known", "user", "Summarize the build log.", known), 0, "chat-a"),
+            Message.from(row("ref-assistant-known", "assistant", "The build finished with one failed step.", known / 1000, passed, failed), 1, "chat-a"),
+            Message.from(row("ref-user-unknown", "user", "Try the follow-up search."), 2, "chat-a"),
+            Message.from(row("ref-assistant-unknown", "assistant", "No search completion was recorded.", null, silent, stale), 3, "chat-a"),
+        )
+        // Parser wiring, not a test-side copy: native milliseconds and seconds both reach the same instant, and no timestamp stays 0.
+        assertTrue(messages[0].recordedAt > 0 && messages[1].recordedAt > 0)
+        assertEquals(shown, messageTimeLabel(messages[0].recordedAt, zone, locale))
+        assertEquals(shown, messageTimeLabel(messages[1].recordedAt, zone, locale))
+        assertEquals(0L, messages[2].recordedAt)
+        assertEquals(0L, messages[3].recordedAt)
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(messages = messages) }
+        fun card(description: String): SemanticsMatcher = hasTestTag("tool-card") and hasContentDescription(description)
+        fun part(card: SemanticsMatcher, tag: String) = compose.onNode(hasTestTag(tag) and hasAnyAncestor(card), useUnmergedTree = true)
+        fun toggle(card: SemanticsMatcher) = compose.onNode(hasTestTag("tool-card-toggle") and hasAnyAncestor(card), useUnmergedTree = true).performScrollTo().performClick()
+        // Click the real toggle only when the card is folded, so a card that starts open (a running tool) is never closed by the test.
+        fun ensureExpanded(card: SemanticsMatcher) {
+            if (compose.onAllNodes(hasTestTag("tool-card-details") and hasAnyAncestor(card), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()) toggle(card)
+            part(card, "tool-card-details").assertExists()
+        }
+        fun reveal(matcher: SemanticsMatcher) = compose.onNodeWithTag("conversation-transcript").performScrollToNode(matcher)
+        val passedCard = card("run tests, Completed, 1.2s · $shown")
+        val failedCard = card("read file, Failed, 0.4s · $shown")
+        val silentCard = card("web search, No result recorded")
+        val staleCard = card("sync notes, No result recorded")
+        await { compose.onAllNodes(silentCard, useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+
+        // The tail is the unrecorded exchange: no time anywhere, and a tool without a completion is never successful.
+        compose.onNodeWithTag("message-row:ref-assistant-unknown", useUnmergedTree = true).assertExists()
+        compose.onAllNodesWithTag("message-time:ref-assistant-unknown", useUnmergedTree = true).assertCountEquals(0)
+        part(silentCard, "tool-card-meta").assertTextEquals("No result")
+        ensureExpanded(silentCard)
+        part(silentCard, "tool-card-status").assertTextEquals("Status: No result recorded")
+        part(silentCard, "tool-card-arguments").assertTextEquals(silentArguments)
+        compose.onAllNodes(hasTestTag("tool-card-result") and hasAnyAncestor(silentCard), useUnmergedTree = true).assertCountEquals(0)
+        compose.onAllNodes(hasTestTag("tool-card-empty-result") and hasAnyAncestor(silentCard), useUnmergedTree = true).assertCountEquals(0)
+        compose.onAllNodes((hasText("Completed", substring = true) or hasContentDescription("Completed", substring = true)) and hasAnyAncestor(silentCard), useUnmergedTree = true).assertCountEquals(0)
+        compose.onNode(hasText("No completion was recorded for this tool.") and hasAnyAncestor(silentCard), useUnmergedTree = true).assertExists()
+        // The stored "running" sibling is also No result: no spinner, no Running label, no Completed.
+        part(staleCard, "tool-card-meta").assertTextEquals("No result")
+        compose.onAllNodes(hasProgressBarRangeInfo(androidx.compose.ui.semantics.ProgressBarRangeInfo.Indeterminate) and hasAnyAncestor(staleCard), useUnmergedTree = true).assertCountEquals(0)
+        ensureExpanded(staleCard)
+        part(staleCard, "tool-card-status").assertTextEquals("Status: No result recorded")
+        part(staleCard, "tool-card-arguments").assertTextEquals("target=notes.md")
+        compose.onAllNodes((hasText("Running", substring = true) or hasText("Completed", substring = true) or hasContentDescription("Running", substring = true) or hasContentDescription("Completed", substring = true)) and hasAnyAncestor(staleCard), useUnmergedTree = true).assertCountEquals(0)
+        compose.onNode(hasText("No completion was recorded for this tool.") and hasAnyAncestor(staleCard), useUnmergedTree = true).assertExists()
+        part(staleCard, "tool-card-details").performScrollTo()
+        // Cards keep to the 840dp transcript column on every width and font scale; long text wraps or scrolls inside the card.
+        val transcriptBounds = compose.onNodeWithTag("conversation-transcript").getUnclippedBoundsInRoot()
+        val silentBounds = compose.onNode(silentCard, useUnmergedTree = true).getUnclippedBoundsInRoot()
+        assertTrue("Tool cards stay inside the transcript column", silentBounds.left >= transcriptBounds.left && silentBounds.right <= transcriptBounds.right && silentBounds.right - silentBounds.left <= 840.dp)
+        receipts += "A stored tool whose only status is running has no terminal evidence, so it reads No result with no spinner; its live twin below stays Running."
+        capture("migration-tool-no-result")
+
+        // Expanding a tool stops tail-following, so explicit scrolling to older rows holds.
+        reveal(hasTestTag("message-row:ref-user-unknown"))
+        compose.onNodeWithTag("message-row:ref-user-unknown", useUnmergedTree = true).assertExists()
+        compose.onAllNodesWithTag("message-time:ref-user-unknown", useUnmergedTree = true).assertCountEquals(0)
+        reveal(hasTestTag("message-row:ref-user-known"))
+        compose.onNodeWithTag("message-time:ref-user-known", useUnmergedTree = true).performScrollTo().assertIsDisplayed().assertTextEquals(shown)
+        reveal(hasTestTag("message-row:ref-assistant-known"))
+        compose.onNodeWithTag("message-time:ref-assistant-known", useUnmergedTree = true).performScrollTo().assertIsDisplayed().assertTextEquals(shown)
+        part(passedCard, "tool-card-meta").assertTextEquals("1.2s · $shown")
+        part(failedCard, "tool-card-meta").assertTextEquals("0.4s · $shown")
+        receipts += "A recorded time shows in the device zone and locale on the bubble and on finished tools; an unrecorded message shows none, and a tool with no recorded completion says so and is never Completed."
+        capture("migration-chat-recorded-times")
+
+        ensureExpanded(passedCard)
+        part(passedCard, "tool-card-status").assertTextEquals("Status: Completed")
+        compose.onNode(hasText("Result") and hasAnyAncestor(passedCard), useUnmergedTree = true).assertExists()
+        part(passedCard, "tool-card-arguments").assertTextEquals(passedArguments)
+        part(passedCard, "tool-card-result").assertTextEquals(passedResult)
+        compose.onAllNodes(hasTestTag("tool-card-empty-result") and hasAnyAncestor(passedCard), useUnmergedTree = true).assertCountEquals(0)
+        part(passedCard, "tool-card-details").performScrollTo()
+        capture("migration-tool-completed")
+        ensureExpanded(failedCard)
+        part(failedCard, "tool-card-status").assertTextEquals("Status: Failed")
+        compose.onNode(hasContentDescription("Failed") and hasAnyAncestor(failedCard), useUnmergedTree = true).assertExists()
+        compose.onNode(hasText("Error") and hasAnyAncestor(failedCard), useUnmergedTree = true).assertExists()
+        part(failedCard, "tool-card-arguments").assertTextEquals(failedArguments)
+        part(failedCard, "tool-card-result").assertTextEquals(failedResult)
+        part(failedCard, "tool-card-details").performScrollTo()
+        receipts += "Expanded tools show their full multi-line arguments and result with the recorded status; a failed call is labelled Error, not Result."
+        capture("migration-tool-failed")
+
+        // Live work through the real composer and root state: an unfinished tool, a queued message and then a prompt.
+        // Same payload as the stored `stale` call, but live: it stays Running. The finished sibling's result beats its stale status.
+        val running = json("tool_call_id" to "ref-live-build", "name" to "build_project", "args" to "gradle assembleDebug\n--console=plain", "status" to "running")
+        val listed = json("tool_call_id" to "ref-live-list", "name" to "list_files", "args" to "path=C:/synthetic-workspace", "status" to "running", "result" to "notes.md\nresearch", "duration_s" to 0.3)
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "runtime-chat-a", liveText = "Checking the build log.", liveTools = listOf(running, listed)) }
+        // Under an open modal the strip is covered, so its state is read without requiring it to be displayed.
+        fun stripState(status: String) = compose.onNodeWithTag("chat-activity-strip", useUnmergedTree = true).assertExists()
+            .assertContentDescriptionEquals("Current chat activity, $status")
+            .assert(SemanticsMatcher.expectValue(androidx.compose.ui.semantics.SemanticsProperties.StateDescription, status))
+        fun stripShows(status: String) { stripState(status); compose.onNodeWithTag("chat-activity-strip", useUnmergedTree = true).assertIsDisplayed() }
+        await { compose.onAllNodesWithTag("chat-activity-strip", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+        stripShows("1 running")
+        val stripBounds = compose.onNodeWithTag("chat-activity-strip", useUnmergedTree = true).getUnclippedBoundsInRoot()
+        assertTrue("The activity strip keeps to the content column and is a comfortable touch target", stripBounds.right - stripBounds.left <= 840.dp && stripBounds.bottom - stripBounds.top >= 47.5.dp)
+        reveal(hasTestTag("message-activity-status"))
+        compose.onNodeWithTag("message-activity-status", useUnmergedTree = true).assertTextEquals("Working")
+        val buildCard = card("build project, Running")
+        // The running tool opens like Relay's (ChatScreen starts a Running card expanded); a folded card is opened with its real toggle.
+        ensureExpanded(buildCard)
+        part(buildCard, "tool-card-status").assertTextEquals("Status: Running")
+        part(buildCard, "tool-card-arguments").assertTextEquals("gradle assembleDebug\n--console=plain")
+        compose.onAllNodes(hasProgressBarRangeInfo(androidx.compose.ui.semantics.ProgressBarRangeInfo.Indeterminate) and hasAnyAncestor(buildCard), useUnmergedTree = true).assertCountEquals(1)
+        // Live tool events carry no clock time, so none is invented for them. A terminal result beats the sibling's stale running status.
+        compose.onNode(card("list files, Completed, 0.3s"), useUnmergedTree = true).assertExists()
+        receipts += "A live running preview keeps its spinner and Status: Running, while a live tool with a result is Completed even if its status still says running."
+        compose.runOnIdle { vm.composer(TextFieldValue("Then update the notes.")) }
+        compose.onNodeWithTag("message-send").assertIsEnabled().assertContentDescriptionEquals("Queue").performClick()
+        await { vm.chat.value.queued.size == 1 }
+        compose.onNodeWithText(queuedHeading(1), useUnmergedTree = true).assertExists()
+        compose.onNodeWithTag("message-stop").assertIsDisplayed().assertIsEnabled()
+        stripShows("1 running · 1 queued")
+        compose.runOnIdle {
+            flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = json("approval_id" to "ref-approval", "description" to "Run the synthetic build task", "command" to "gradle assembleDebug", "choices" to JSONArray().put("once").put("deny")))
+        }
+        stripShows("1 running · 1 queued · Waiting for you")
+        reveal(hasText("Approval needed"))
+        compose.onNodeWithText("Allow once").performScrollTo().assertIsDisplayed()
+        capture("migration-chat-pending")
+
+        // The unchanged Cypher shell stays functional with work pending: top-right actions, then the left navigation.
+        closeKeyboard()
+        compose.onNodeWithContentDescription("Conversation actions").performClick()
+        compose.onNodeWithTag("conversation-actions-menu").assertIsDisplayed()
+        compose.onNodeWithText("Message queue", useUnmergedTree = true).assertExists()
+        compose.onNodeWithText("Delete conversation").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Reasoning", useUnmergedTree = true).assertDoesNotExist()
+        capture("migration-chat-actions-menu")
+        androidx.test.espresso.Espresso.pressBack()
+        await { compose.onAllNodesWithTag("conversation-actions-menu").fetchSemanticsNodes().isEmpty() }
+        compose.onNodeWithTag("navigation-toggle").performClick()
+        compose.onNodeWithTag("navigation-menu").assertIsDisplayed()
+        capture("migration-chat-navigation")
+        compose.onNodeWithTag("navigation-menu").performTouchInput { swipeLeft() }
+        await { !vm.ui.value.showSessions }
+        assertEquals("chat-a", vm.chat.value.sessionId)
+
+        // Strip and sheet report only what this chat really holds, and offer no process stop.
+        compose.onNodeWithTag("chat-activity-strip", useUnmergedTree = true).performClick()
+        await { compose.onAllNodesWithTag("chat-activity-sheet", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+        // The sheet is scrollable and, when tall (or under large text), opens half-expanded. Expand it, then bring every row into its
+        // scroll viewport before asserting that it is displayed or touching it; existence alone would not prove it can be reached.
+        expandModalSheet()
+        val inSheet = hasAnyAncestor(hasTestTag("chat-activity-sheet"))
+        fun sheet(text: String) = compose.onNode(hasText(text) and inSheet, useUnmergedTree = true)
+        sheet("Current chat activity").performScrollTo().assertIsDisplayed()
+        capture("migration-activity-sheet")
+        listOf("Running · 1", "Build project", "Running", "Waiting for you · 1", "Approval needed", "Answer it in the conversation", "Queued · 1", "Then update the notes.",
+            "Recent tools · 1", "List files", "Completed · 0.3s").forEach { sheet(it).performScrollTo().assertIsDisplayed() }
+        compose.onNodeWithTag("activity-process-unavailable", useUnmergedTree = true).performScrollTo().assertIsDisplayed().assertTextEquals(ProcessControlUnavailable)
+        capture("migration-activity-sheet-lower")
+        listOf("Stop", "Kill", "Terminate").forEach { word ->
+            compose.onAllNodes(hasClickAction() and inSheet and (hasContentDescription(word, substring = true, ignoreCase = true) or hasText(word, substring = true, ignoreCase = true))).assertCountEquals(0)
+        }
+        compose.onNode(hasClickAction() and hasContentDescription("Remove queued message") and inSheet).performScrollTo().assertIsDisplayed().performClick()
+        await { vm.chat.value.queued.isEmpty() }
+        compose.onAllNodes(hasText("Queued", substring = true) and inSheet, useUnmergedTree = true).assertCountEquals(0)
+        stripState("1 running · Waiting for you")
+        compose.onNodeWithTag("chat-activity-close", useUnmergedTree = true).performScrollTo().assertIsDisplayed().performClick()
+        await { compose.onAllNodesWithTag("chat-activity-sheet", useUnmergedTree = true).fetchSemanticsNodes().isEmpty() }
+        stripShows("1 running · Waiting for you")
+
+        // A clarification replaces the approval; the strip still waits for the user and nothing was answered.
+        compose.runOnIdle {
+            flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = null, clarification = json("clarify_id" to "ref-question", "question" to "Which notes file should be updated?", "choices" to JSONArray().put("notes.md")))
+        }
+        reveal(hasText("Which notes file should be updated?"))
+        compose.onNodeWithText("notes.md").performScrollTo().assertIsDisplayed()
+        compose.onAllNodesWithText("Approval needed").assertCountEquals(0)
+        stripShows("1 running · Waiting for you")
+        capture("migration-chat-question")
+
+        // When the turn ends the strip leaves with it and the voice slot returns, unavailable here because the fixture has no voice.
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(clarification = null, streamId = "", liveText = "", liveTools = emptyList()) }
+        compose.onAllNodesWithTag("chat-activity-strip", useUnmergedTree = true).assertCountEquals(0)
+        compose.onNodeWithTag("message-stop").assertDoesNotExist()
+        compose.onNodeWithTag("chat-call-xara").assertIsNotEnabled()
+        assertTrue(vm.chat.value.queued.isEmpty())
+        assertTrue("Reference states never send, stop, approve or answer anything", fixture.requests.none { it.string("method") in setOf("prompt.submit", "session.create", "session.interrupt", "approval.respond", "request.answer") })
+        receipts += "Live running/queued/approval/question work appears in the activity strip and read-only sheet from real chat state; the sheet has no stop control, queue removal is the only mutation, and the Cypher shell menus keep working. Nothing was sent."
+        capture("migration-chat-settled")
     }
 
     @Test fun deletedInitialConversationKeepsDraftAndNewChatRecovers() = withFixture { vm, fixture ->
@@ -1133,7 +1427,56 @@ class NativeExperienceUiTest {
 
     @Test fun settingsAndMenusExposeHonestState() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.tab("More"); vm.more("") }
+        fun summary(route: String, text: String, substring: Boolean = false) =
+            compose.onNode(hasText(text, substring = substring) and hasAnyAncestor(hasTestTag("settings-row:$route")), useUnmergedTree = true)
+        // The overview reports only local state it actually holds; the Cypher left menu is still the way into navigation.
+        compose.onNodeWithTag("settings-overview").assertIsDisplayed()
+        compose.onNodeWithTag("navigation-toggle").assertIsDisplayed()
+        compose.onNode(hasText("Connected privately · default") and hasAnyAncestor(hasTestTag("settings-connection")), useUnmergedTree = true).assertExists()
+        summary("Settings", "Enter to send · Messages formatted · Thinking shown").assertExists()
+        summary("Profiles", "Active profile · default").assertExists()
+        summary("Appearance", "Reduced motion", substring = true).assertExists()
+        val voiceStore = VoiceKeyStore(app)
+        val localProvider = voiceStore.settings().provider
+        val localProviderLabel = when (localProvider) {
+            "gemini" -> "Gemini Live"
+            "grok" -> "Grok"
+            "openai" -> "OpenAI Realtime"
+            else -> error("Unsupported phone voice provider")
+        }
+        val localKeyStatus = if (voiceStore.maskedKey(localProvider) != null) "Key saved" else "Add key"
+        val localVoiceSummary = "$localProviderLabel · $localKeyStatus"
+        await { compose.onAllNodes(hasText(localVoiceSummary) and hasAnyAncestor(hasTestTag("settings-row:Cypher")), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
         capture("settings")
+        compose.runOnIdle { vm.load("voice-settings", "/api/plugins/cypher/mobile/voice-settings") }
+        await { vm.data.value["voice-settings"]?.has("providers") == true }
+        // Loading server voice capabilities must leave the phone-local provider and key summary unchanged.
+        summary("Cypher", localVoiceSummary).assertExists()
+        // A real preference write moves its summary, the row opens the page that holds the saved value, and Back returns to the overview.
+        compose.runOnIdle { vm.nativePreferences(json("send_key" to "ctrl_enter", "show_thinking" to false)) }
+        await { vm.data.value["profile-settings"]?.let { it.string("send_key") == "ctrl_enter" && !it.optBoolean("show_thinking", true) } == true }
+        await { compose.onAllNodes(hasText("Ctrl + Enter to send · Messages formatted · Thinking hidden") and hasAnyAncestor(hasTestTag("settings-row:Settings")), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+        capture("settings-summaries-updated")
+        compose.onNodeWithTag("settings-row:Settings").performScrollTo().performClick()
+        await { vm.ui.value.tab == "More" && vm.ui.value.morePage == "Settings" }
+        compose.onNodeWithText("Send shortcut: Ctrl + Enter").assertExists()
+        compose.onNode(hasText("Show thinking") and isToggleable()).performScrollTo().assertIsOff()
+        compose.onNode(hasText("Format your messages") and isToggleable()).performScrollTo().assertIsOn()
+        compose.onNodeWithText("Send shortcut: Ctrl + Enter").performScrollTo()
+        capture("settings-detail-saved")
+        compose.onNodeWithContentDescription("Back").performClick()
+        await { vm.ui.value.tab == "More" && vm.ui.value.morePage.isBlank() }
+        summary("Settings", "Ctrl + Enter to send · Messages formatted · Thinking hidden").assertExists()
+        compose.onNodeWithTag("navigation-toggle").performClick()
+        compose.onNodeWithTag("navigation-menu").assertIsDisplayed()
+        capture("settings-navigation-open")
+        compose.onNodeWithTag("navigation-menu").performTouchInput { swipeLeft() }
+        await { !vm.ui.value.showSessions }
+        // Restore the fixture's own values, so the page captures below keep showing the defaults.
+        compose.runOnIdle { vm.nativePreferences(json("send_key" to "enter", "show_thinking" to true)) }
+        await { vm.data.value["profile-settings"]?.let { it.string("send_key") == "enter" && it.optBoolean("show_thinking", false) } == true }
+        summary("Settings", "Enter to send · Messages formatted · Thinking shown").assertExists()
+        receipts += "Settings overview summarizes local state, including the phone-selected voice provider and key presence; loading server voice capabilities leaves that summary unchanged; native chat preference writes update their row, the row opens the saved page, Back returns to the overview, and the left navigation still opens and closes."
         compose.runOnIdle { vm.more("Settings") }
         compose.onNodeWithText("Unavailable in native Hermes").assertDoesNotExist()
         capture("chat-preferences")
@@ -1901,6 +2244,71 @@ class NativeExperienceUiTest {
         assertFalse(fixture.requests.drop(count).any { it.string("method") == "prompt.submit" })
         receipts += "Initial native history is measured at the tail and returning from settings preserves it; reads never resume/create a Hermes agent."
         capture("flow-passive-history-tail")
+    }
+
+    @Test fun optionalPluginOutageKeepsStockHistoryBrowsingAndNativeSend() = withFixture { vm, fixture ->
+        val passive = setOf("session.resume", "session.history", "session.create", "prompt.submit")
+        for ((status, id) in listOf(404 to "chat-b", 500 to "chat-a")) {
+            fixture.pluginStatus = status
+            fixture.sessions.getValue(id).put("messages", JSONArray((1..3).map { json("id" to it, "role" to "user", "text" to "Stock saved $id $it during plugin $status") }))
+            val before = fixture.requests.size
+            compose.runOnIdle { vm.selectSession(id) }
+            await { vm.chat.value.sessionId == id && vm.chat.value.projectionReady && vm.chat.value.messages.any { it.text == "Stock saved $id 3 during plugin $status" } }
+            compose.onNodeWithText("Stock saved $id 3 during plugin $status").assertIsDisplayed()
+            val reads = fixture.requests.drop(before)
+            assertTrue("History came from the stock route", reads.any { it.string("path") == "/api/sessions/$id/messages" && it.string("profile") == fixture.scope.profile })
+            assertTrue("Plugin history routes are not used", reads.none { it.string("path").startsWith("/api/plugins/cypher/mobile/sessions") && !it.string("path").endsWith("/voice-history") })
+            assertTrue("Browsing never resumes, creates or sends", reads.none { it.string("method") in passive })
+            assertFalse(vm.chat.value.raw.optBoolean("voice_transcripts_available"))
+            assertFalse(vm.chat.value.status.contains("Could not load"))
+        }
+        compose.onNodeWithTag("message-input").performClick().performTextInput("Native send while the plugin is down")
+        compose.onNodeWithTag("message-send").assertIsEnabled().performClick()
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } }
+        val submit = fixture.requests.single { it.string("method") == "prompt.submit" }.getJSONObject("params")
+        assertEquals("The native send resumes only the selected conversation", "runtime-chat-a", submit.string("session_id"))
+        assertTrue(submit.string("text").contains("Native send while the plugin is down"))
+        receipts += "With the optional plugin returning 404/500, saved history loads from stock /api/sessions routes without resuming an agent, and a native send still resumes and submits to the selected conversation."
+        capture("flow-stock-history-plugin-outage")
+    }
+
+    @Test fun interruptedTurnKeepsLiveProgressAndQueuedDraftUntilTerminalReplay() = withFixture { vm, fixture ->
+        kotlinx.coroutines.runBlocking { app.cache.delete(fixture.scope.session("chat-a"), "live:runtime-chat-a") }
+        val subscriptionsBeforeSend = fixture.streamSubscriptions.get()
+        compose.runOnIdle { fixture.persistTerminalMessages = true; vm.composer(TextFieldValue("First prompt")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId == "runtime-chat-a" }
+        await { fixture.streamSubscriptions.get() > subscriptionsBeforeSend }
+        fixture.emitNativeEvent("message.delta", json("text" to "Partial answer"))
+        await { vm.chat.value.liveText == "Partial answer" }
+
+        compose.runOnIdle { vm.composer(TextFieldValue("Queued follow-up")); vm.queue() }
+        await { vm.chat.value.queued.singleOrNull()?.text == "Queued follow-up" }
+        val subscriptionsBeforeReconnect = fixture.streamSubscriptions.get()
+        fixture.nativeStatusFailure = true
+        fixture.interruptActiveNativeStream()
+        await { fixture.requests.any { it.string("method") == "session.active_list" } }
+        await { fixture.streamSubscriptions.get() > subscriptionsBeforeReconnect }
+
+        assertEquals("The interrupted runtime remains selected", "runtime-chat-a", vm.chat.value.streamId)
+        assertEquals("Live text survives passive history without active_stream_id", "Partial answer", vm.chat.value.liveText)
+        assertEquals("The queued draft is retained", "Queued follow-up", vm.chat.value.queued.single().text)
+        assertTrue("The UI keeps explicit recovery uncertainty", vm.chat.value.status.contains("unknown", ignoreCase = true))
+        assertFalse("An unproven outcome is not shown as complete", vm.chat.value.status.contains("complete", ignoreCase = true))
+        assertEquals("No queued prompt is submitted on an unproven outcome", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
+        val activeList = fixture.requests.last { it.string("method") == "session.active_list" }.getJSONObject("params")
+        assertEquals("runtime-chat-a", activeList.getString("current_session_id"))
+        assertEquals(fixture.scope.profile, activeList.getString("profile"))
+
+        fixture.nativeStatusFailure = false
+        val historyReadsBeforeCompletion = fixture.requests.count { it.string("path") == "/api/sessions/chat-a/messages" }
+        fixture.terminalOnActiveList = json("text" to "Completed answer")
+        fixture.interruptActiveNativeStream()
+        await { fixture.requests.count { it.string("method") == "prompt.submit" } == 2 }
+        assertTrue("The terminal snapshot reloads stock history before advancing the queue", fixture.requests.count { it.string("path") == "/api/sessions/chat-a/messages" } >= historyReadsBeforeCompletion + 2)
+        assertTrue("The final assistant reply is visible before another history poll", vm.chat.value.messages.any { it.text == "Completed answer" })
+        compose.onNodeWithText("Completed answer", useUnmergedTree = true).assertIsDisplayed()
+        await { vm.chat.value.queued.isEmpty() }
+        receipts += "A real synthetic WebSocket failure preserves partial progress and the queued follow-up while native status is unknown; a replayed terminal event persists the final assistant row, refreshes history immediately, and only then advances the queue."
     }
 
 }

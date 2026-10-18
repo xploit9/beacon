@@ -4,10 +4,13 @@ import android.util.Base64
 import dev.hermes.android.data.CypherClient
 import dev.hermes.android.data.ApiFailure
 import dev.hermes.android.data.NativeToolGateway
+import dev.hermes.android.data.VoiceSessionCredentials
+import dev.hermes.android.data.voiceProviderSupported
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import okhttp3.*
 import org.json.JSONObject
+import kotlin.coroutines.resume
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.sync.Mutex
@@ -17,10 +20,44 @@ import kotlinx.coroutines.sync.withPermit
 
 internal data class DirectCallEnd(val notSent:Int=0,val submissionUnknown:Int=0)
 
+internal suspend fun testVoiceProvider(provider:String,apiKey:String,model:String):Boolean {
+    val request=runCatching { when(provider) {
+        "gemini" -> GeminiWire.request(apiKey)
+        "grok" -> GrokWire.request(apiKey,model)
+        "openai" -> OpenAiWire.request(apiKey,model)
+        else -> error("Unsupported voice provider")
+    } }.getOrNull()?:return false
+    val http=OkHttpClient.Builder().cookieJar(CookieJar.NO_COOKIES).followRedirects(false).followSslRedirects(false).build()
+    return try {
+        withTimeoutOrNull(10000) {
+            suspendCancellableCoroutine { continuation ->
+                val socket=http.newWebSocket(request.rawRequest(),object:WebSocketListener() {
+                    override fun onOpen(webSocket:WebSocket,response:Response) {
+                        webSocket.close(1000,"Credential test")
+                        if(continuation.isActive) continuation.resume(true)
+                    }
+                    override fun onFailure(webSocket:WebSocket,error:Throwable,response:Response?) {
+                        if(continuation.isActive) continuation.resume(false)
+                    }
+                })
+                continuation.invokeOnCancellation { socket.cancel() }
+            }
+    }==true
+    } catch(error:CancellationException) { throw error }
+    catch(_:Exception) { false
+    } finally {
+        http.dispatcher.cancelAll()
+        http.connectionPool.evictAll()
+        http.dispatcher.executorService.shutdown()
+    }
+}
+
 internal class DirectVoice(private val client:CypherClient,private val callId:String,private val selectedSession:String,private val scope:CoroutineScope,
-    private val audio:(ByteArray)->Unit,private val event:(JSONObject)->Unit,private val failure:(String)->Unit,private val recentSpeech:()->String={""},private val provider:String="gemini") {
+    private val audio:(ByteArray)->Unit,private val event:(JSONObject)->Unit,private val failure:(String)->Unit,private val recentSpeech:()->String={""},
+    private val credentials:VoiceSessionCredentials,private val providerSocketFactory:WebSocket.Factory?=null) {
     // Deliberately separate from authenticated Hermes HTTP: no cookie jar, interceptors, or copied headers.
-    private val providerHttp=OkHttpClient.Builder().cookieJar(CookieJar.NO_COOKIES).pingInterval(20,TimeUnit.SECONDS).build()
+    private val provider=credentials.provider
+    private val providerHttp=OkHttpClient.Builder().cookieJar(CookieJar.NO_COOKIES).followRedirects(false).followSslRedirects(false).pingInterval(20,TimeUnit.SECONDS).build()
     private val epoch=AtomicLong();@Volatile private var socket:WebSocket?=null;@Volatile private var resume:String?=null
     private data class Outbound(val json:String,val permitted:()->Boolean,val visualBytes:Int=0,val control:Boolean=false,val onSent:()->Unit={},val onDropped:()->Unit={})
     private var run:Job?=null;private val microphone=Channel<Outbound>(20)
@@ -70,7 +107,14 @@ internal class DirectVoice(private val client:CypherClient,private val callId:St
                 closeCode?.takeIf { it in 1000..4999 }?.let { put("close_code",it) }
             })
     }
-    init { require(provider in setOf("gemini","grok")) }
+    init { require(voiceProviderSupported(provider)&&credentials.apiKey.isNotBlank()) }
+    private fun providerRequest():VoiceProviderRequest = when(provider) {
+        "gemini" -> GeminiWire.request(credentials.apiKey)
+        "grok" -> GrokWire.request(credentials.apiKey,credentials.model)
+        else -> OpenAiWire.request(credentials.apiKey,credentials.model)
+    }
+    private fun newProviderSocket(request:VoiceProviderRequest,listener:WebSocketListener):WebSocket =
+        providerSocketFactory?.newWebSocket(request.rawRequest(),listener)?:providerHttp.newWebSocket(request.rawRequest(),listener)
     private suspend fun refreshContext(timeout:Long) {
         contextReady=false
         val fresh=withTimeout(timeout) { client.nativeCallContext(callId) }
@@ -144,20 +188,27 @@ internal class DirectVoice(private val client:CypherClient,private val callId:St
                 val generation=epoch.incrementAndGet();ready=false
                 while(microphone.tryReceive().isSuccess) {}
                 while(true) { val dropped=visualFrames.tryReceive().getOrNull()?:break;dropped.onDropped() };visualPending.set(false)
-                val grant=directAdmissionAttempt(admissionBudget(10000),{ it is ApiFailure&&it.status==401 || it is SecurityException }) {
-                    try { client.nativeRequest("/api/plugins/cypher/mobile/calls/$callId/token","POST",JSONObject()) }
-                    catch(error:Exception) { if(error is CancellationException) throw error;diagnostic("token_error",error);throw error }
-                }
-                if(grant==null) { reconnects.failed();continue }
-                diagnostic("token_ready")
-                require(grant.optString("provider","gemini")==provider) { "Call provider binding changed" }
+                diagnostic("provider_key_ready")
                 val grok=if(provider=="grok") GrokWire() else null
-                val request=if(grok!=null) GrokWire.request(grant) else Request.Builder().url(GeminiWire.endpoint(grant.getString("websocket_url"))+"?access_token="+java.net.URLEncoder.encode(grant.getString("token"),"UTF-8")).build()
-                fun sendFrames(ws:WebSocket,json:String):Boolean = (grok?.outbound(JSONObject(json))?:listOf(JSONObject(json))).all { ws.send(it.toString()) }
+                val openAi=if(provider=="openai") OpenAiWire() else null
+                val request=providerRequest()
+                fun sendFrames(ws:WebSocket,json:String):Boolean {
+                    val frame=JSONObject(json)
+                    val frames=when {
+                        grok!=null -> grok.outbound(frame)
+                        openAi!=null -> openAi.outbound(frame)
+                        else -> listOf(frame)
+                    }
+                    return frames.all { ws.send(it.toString()) }
+                }
                 val admitted=CompletableDeferred<Unit>();val ended=CompletableDeferred<Unit>()
                 val resumption=resume
-                val setup=GeminiWire.setup(grant.getString("model"),grant.optString("voice"),resumption,JSONObject(context.toString()).apply { put("personality_instruction",grant.optString("personality_instruction")); if(resumption==null) put("live_context_summary",recentSpeech().takeLast(6000)) }).toString()
-                val ws=providerHttp.newWebSocket(request,object:WebSocketListener() {
+                val geminiSetup=GeminiWire.setup(credentials.model,credentials.voice,resumption,JSONObject(context.toString()).apply {
+                    put("personality_instruction",credentials.personalityInstruction)
+                    if(resumption==null) put("live_context_summary",recentSpeech().takeLast(6000))
+                })
+                val setup=(if(openAi!=null) OpenAiWire.setup(geminiSetup) else geminiSetup).toString()
+                val ws=newProviderSocket(request,object:WebSocketListener() {
                     fun current()=voiceProviderCurrent(generation,epoch.get(),stopped,ended.isCompleted)
                     override fun onOpen(ws:WebSocket,response:Response) {
                         if(!current()) ws.cancel() else if(!sendFrames(ws,setup)) { ended.complete(Unit);ws.cancel() }
@@ -166,9 +217,14 @@ internal class DirectVoice(private val client:CypherClient,private val callId:St
                         if(!current()) return
                         if(text.length>1_000_000) { ended.complete(Unit);ws.cancel();return }
                         try {
-                            val frame=grok?.inbound(JSONObject(text))?:if(grok==null) JSONObject(text) else return
+                            val raw=JSONObject(text)
+                            val frame=when {
+                                grok!=null -> grok.inbound(raw)?:return
+                                openAi!=null -> openAi.inbound(raw)?:return
+                                else -> raw
+                            }
                             if(!current()) return
-                            grok?.continueResponse()?.let { if(!ws.send(it.toString())) { ended.complete(Unit);ws.cancel();return } }
+                            (grok?.continueResponse()?:openAi?.continueResponse())?.let { if(!ws.send(it.toString())) { ended.complete(Unit);ws.cancel();return } }
                             if(frame.has("setupComplete")) {
                                 if(!greeted) {
                                     val opening=JSONObject().put("clientContent",JSONObject().put("turns",org.json.JSONArray().put(JSONObject().put("role","user").put("parts",org.json.JSONArray().put(JSONObject().put("text","Begin this call naturally using the trusted opening guidance and any verified callback reason/result. Prior conversation is context, not a new action request."))))).put("turnComplete",true))
@@ -237,7 +293,7 @@ internal class DirectVoice(private val client:CypherClient,private val callId:St
                     } }
                     ended.await();writer.cancelAndJoin()
                 } catch(e:CancellationException) { throw e }
-                catch(e:Exception) { /* Fresh ephemeral admission on the next bounded attempt. */ }
+                catch(e:Exception) { /* Reconnect with the same phone-held key and refreshed Hermes context. */ }
                 finally { epoch.compareAndSet(generation,generation+1);ready=false;ws.cancel();if(!stopped) { event(JSONObject().put("type","interrupted"));event(JSONObject().put("type","state").put("state","reconnecting")) } }
                 reconnects.failed()
             }
@@ -252,13 +308,21 @@ internal class DirectVoice(private val client:CypherClient,private val callId:St
     }
     private fun callOwned() = !stopped&&client.scope==callScope
     private suspend fun selectAdmission(admitted:Deferred<Unit>,ended:Deferred<Unit>) = kotlinx.coroutines.selects.select<Unit> {
-        admitted.onAwait { };ended.onAwait { error("Gemini ended before setup") }
+        admitted.onAwait { };ended.onAwait { error("$provider ended before setup") }
     }
     fun send(value:JSONObject):Boolean = ready&&!stopped&&controls.trySend(Outbound(value.toString(),{ true },control=true)).isSuccess
-    fun pcm(bytes:ByteArray,permitted:()->Boolean):Boolean=ready&&!stopped&&permitted()&&microphone.trySend(Outbound(GeminiWire.audio(Base64.encodeToString(bytes,Base64.NO_WRAP)).toString(),permitted)).isSuccess
-    fun setVisualState(source:String,state:String,reason:String="") { visualEvidence.update(source,if(provider=="grok"&&state!="off") "failed" else state,if(provider=="grok"&&state!="off") "Grok voice does not support live vision" else reason)?.let(event) }
+    fun pcm(bytes:ByteArray,permitted:()->Boolean):Boolean {
+        if(!ready||stopped||!permitted()) return false
+        val encoded=Base64.encodeToString(bytes,Base64.NO_WRAP)
+        val frame=if(provider=="openai") OpenAiWire.audio(encoded) else GeminiWire.audio(encoded)
+        return microphone.trySend(Outbound(frame.toString(),permitted)).isSuccess
+    }
+    fun setVisualState(source:String,state:String,reason:String="") {
+        val unsupported=provider!="gemini"&&state!="off"
+        visualEvidence.update(source,if(unsupported) "failed" else state,if(unsupported) "$provider voice does not support live vision" else reason)?.let(event)
+    }
     fun image(bytes:ByteArray,permitted:()->Boolean,onSent:()->Unit={},onDropped:()->Unit={}):Boolean {
-        if(provider=="grok") return false
+        if(provider!="gemini") return false
         val ticket=visualEvidence.ticket()?:return false
         if(!ready||stopped||!permitted()||!GeminiWire.visualMayQueue(bytes.size,socket?.queueSize()?:Long.MAX_VALUE,visualPending.get())||!visualPending.compareAndSet(false,true)) return false
         val accepted=visualFrames.trySend(Outbound(GeminiWire.image(Base64.encodeToString(bytes,Base64.NO_WRAP)).toString(),{permitted()&&visualEvidence.permits(ticket)},bytes.size,

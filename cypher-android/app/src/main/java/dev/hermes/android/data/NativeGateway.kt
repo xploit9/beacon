@@ -23,6 +23,12 @@ internal fun nativeSessionBinding(scope: Scope, result: JSONObject): NativeSessi
     return NativeSessionBinding(scope, identities.single(), runtime)
 }
 
+/** The ticket rides in a Sec-WebSocket-Protocol header value, so refuse anything but a bounded single token. */
+internal fun nativeConnectionTicket(value: String): String {
+    require(value.length in 1..1024 && value.none { it <= ' ' || it == '\u007f' }) { "Native server did not return a usable connection ticket" }
+    return value
+}
+
 internal class NativeGateway(private val client: CypherClient, private val socketFactory: WebSocket.Factory = client.http, private val rpcTimeoutMs: Long = 60000) {
     private class Connection {
         val frames = Channel<JSONObject>(256)
@@ -44,7 +50,7 @@ internal class NativeGateway(private val client: CypherClient, private val socke
         connection?.takeIf { it.failure == null && it.ready.isCompleted }?.let { return@withLock it }
         require(client.auth.backend == "hermes-dashboard" && client.auth.owner.isNotBlank() && client.auth.profile.isNotBlank()) { "Verify native dashboard identity before connecting" }
         val attempt = generation.get()
-        val ticket = client.nativeRequest("/api/auth/ws-ticket", "POST", JSONObject()).getString("ticket")
+        val ticket = nativeConnectionTicket(client.nativeRequest("/api/auth/ws-ticket", "POST", JSONObject()).getString("ticket"))
         val mine = Connection()
         synchronized(lifecycle) { check(attempt == generation.get()) { "Native client closed during ticket admission" }; connection = mine }
         try {

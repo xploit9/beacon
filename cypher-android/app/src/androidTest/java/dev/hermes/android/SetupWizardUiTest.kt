@@ -1,0 +1,320 @@
+package dev.hermes.android
+
+import android.content.Intent
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.collectAsState
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertTextEquals
+import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performTextInput
+import androidx.activity.ComponentActivity
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
+import androidx.test.core.app.ApplicationProvider
+import androidx.test.platform.app.InstrumentationRegistry
+import dev.hermes.android.core.Scope
+import dev.hermes.android.core.string
+import dev.hermes.android.data.AuthContext
+import dev.hermes.android.data.CypherClient
+import dev.hermes.android.data.NativeAuthExpiredException
+import dev.hermes.android.data.NativeAuth
+import okhttp3.CookieJar
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.flow.first
+import dev.hermes.android.ui.NativeLocalization
+import dev.hermes.android.ui.SetupWizardScreen
+import dev.hermes.android.ui.parseCypherConnectInput
+import android.net.Uri
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
+import org.junit.Rule
+import org.junit.Test
+import android.content.pm.PackageManager
+import java.net.ConnectException
+import java.net.InetSocketAddress
+import java.net.Socket
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
+import java.util.concurrent.atomic.AtomicReference
+
+class SetupWizardUiTest {
+    @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
+
+    @Suppress("UNCHECKED_CAST") private fun <T> flow(vm: CypherViewModel, name: String) =
+        CypherViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.get(vm) as MutableStateFlow<T>
+    private fun field(vm: CypherViewModel, name: String, value: Any?) {
+        CypherViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.set(vm, value)
+    }
+
+    @Test fun authReturnDeepLinkReturnsToCypher() {
+        val app = ApplicationProvider.getApplicationContext<CypherApplication>()
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("cypher://auth/complete")).setPackage(app.packageName)
+        val target = app.packageManager.resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)
+        assertEquals("dev.hermes.android.AuthReturnActivity", target?.activityInfo?.name)
+        val unrelated = Intent(Intent.ACTION_VIEW, Uri.parse("cypher://auth/other")).setPackage(app.packageName)
+        assertTrue(app.packageManager.resolveActivity(unrelated, PackageManager.MATCH_DEFAULT_ONLY)?.activityInfo?.name != "dev.hermes.android.AuthReturnActivity")
+        val monitor = instrumentation.addMonitor(CypherActivity::class.java.name, null, false)
+        try {
+            app.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            val activity = monitor.waitForActivityWithTimeout(5_000)
+            assertNotNull("Auth return trampoline should bring Cypher to the foreground", activity)
+            assertTrue(activity is CypherActivity)
+            assertTrue(activity?.intent?.data == null)
+            instrumentation.runOnMainSync { activity?.finish() }
+        } finally {
+            instrumentation.removeMonitor(monitor)
+        }
+    }
+
+    @Test fun connectionLinkContinuesThroughSignInPermissionsAndChat() {
+        var state by mutableStateOf(AppState(origin = "", setupWizard = true, setupStep = "connect", restoringSession = false))
+        var reachedOrigin = ""
+        var finished = false
+        compose.setContent {
+            NativeLocalization("en") { CypherTheme(dark = true) {
+                SetupWizardScreen(
+                    state = state,
+                    onProbe = { raw -> reachedOrigin = parseCypherConnectInput(raw); state = state.copy(origin = reachedOrigin, setupStep = "signin", error = "") },
+                    onSignIn = { state = state.copy(authenticated = true, setupStep = "permission-microphone", setupPluginMessage = "Cypher plugin not installed on this Hermes — chat works; calls need the plugin.") },
+                    onAdvancePermission = { state = state.copy(setupStep = when (state.setupStep) { "permission-microphone" -> "permission-notifications"; "permission-notifications" -> "permission-full-screen"; else -> "done" }) },
+                    onFinish = { finished = true; state = state.copy(setupWizard = false, setupStep = "done") },
+                    onReopen = { state = state.copy(origin = it, setupStep = "connect") },
+                    onCancel = {},
+                )
+            } }
+        }
+
+        compose.onNodeWithTag("setup-address").performTextInput("cypher://connect?url=https%3A%2F%2Fhermes.example&name=Hermes")
+        compose.onNodeWithText("Cypher password").assertDoesNotExist()
+        compose.onNodeWithText("Hermes username").assertDoesNotExist()
+        compose.onNodeWithTag("setup-connect").performClick()
+        assertEquals("https://hermes.example", reachedOrigin)
+        compose.onNodeWithTag("setup-signin").performClick()
+        compose.onNodeWithText("Microphone").assertIsDisplayed()
+        compose.onNodeWithText("Skip for now").performClick()
+        compose.onNodeWithText("Notifications").assertIsDisplayed()
+        compose.onNodeWithText("Skip for now").performClick()
+        compose.onNodeWithText("Full-screen call alerts").assertIsDisplayed()
+        compose.onNodeWithText("Skip for now").performClick()
+        compose.onNodeWithTag("setup-finish").performClick()
+        assertTrue(finished)
+    }
+
+    @Test fun externalConnectionLinkPrefillsButWaitsForContinueAndCancelKeepsActiveOrigin() {
+        val activeOrigin = "https://current.example"
+        val pendingOrigin = "https://next.example"
+        var probes = 0
+        var probedOrigin = ""
+        var cancelled = false
+        var state by mutableStateOf(AppState(origin = activeOrigin, setupOrigin = pendingOrigin, authenticated = true, setupWizard = true, setupStep = "connect", restoringSession = false))
+        compose.setContent { NativeLocalization("en") { CypherTheme(dark = true) {
+            SetupWizardScreen(
+                state = state,
+                onProbe = { raw -> probes++; probedOrigin = parseCypherConnectInput(raw) },
+                onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {},
+                onCancel = { cancelled = true; state = state.copy(setupWizard = false) },
+            )
+        } } }
+
+        compose.onNodeWithTag("setup-address").assertTextEquals("Paste link or address", pendingOrigin)
+        assertEquals(0, probes)
+        compose.onNodeWithTag("setup-connect").performClick()
+        assertEquals(1, probes)
+        assertEquals(pendingOrigin, probedOrigin)
+        assertEquals(activeOrigin, state.origin)
+        compose.onNodeWithText("Close setup").performClick()
+        assertTrue(cancelled)
+        assertEquals(activeOrigin, state.origin)
+    }
+
+    @Test fun openingExternalLinkStoresPendingOriginAndCancelKeepsTheActiveAccount() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<CypherApplication>()
+        val originKey = stringPreferencesKey("origin")
+        val setupOriginKey = stringPreferencesKey("setup_origin")
+        val setupStepKey = stringPreferencesKey("setup_step")
+        val setupCompleteKey = booleanPreferencesKey("setup_complete")
+        val setupActiveKey = booleanPreferencesKey("setup_active")
+        val before = app.preferences.data.first()
+        val activeOrigin = "https://active-${java.util.UUID.randomUUID()}.example"
+        val pendingOrigin = "https://pending-${java.util.UUID.randomUUID()}.example"
+        val store = ViewModelStore()
+        lateinit var vm: CypherViewModel
+        try {
+            app.preferences.edit { values ->
+                values[originKey] = activeOrigin
+                values[setupCompleteKey] = true
+                values[setupActiveKey] = false
+                values.remove(setupOriginKey)
+            }
+            compose.runOnUiThread {
+                vm = ViewModelProvider(store, viewModelFactory { initializer { CypherViewModel(app, SavedStateHandle()) } })[CypherViewModel::class.java]
+            }
+            compose.waitUntil(5_000) { !vm.ui.value.restoringSession }
+            val link = "cypher://connect?url=${Uri.encode(pendingOrigin)}&name=Hermes"
+            compose.runOnUiThread { vm.openSetupLink(link) }
+            compose.waitUntil(5_000) { vm.ui.value.setupWizard && vm.ui.value.setupStep == "connect" && vm.ui.value.setupOrigin == pendingOrigin }
+
+            assertEquals(activeOrigin, vm.ui.value.origin)
+            assertEquals(activeOrigin, app.preferences.data.first()[originKey])
+            compose.runOnUiThread {
+                flow<AppState>(vm, "_ui").value = vm.ui.value.copy(authenticated = true, setupComplete = true)
+                vm.cancelSetupWizard()
+            }
+            compose.waitUntil(5_000) { !vm.ui.value.setupWizard }
+            withTimeout(5_000) { while (app.preferences.data.first()[setupOriginKey] != null) delay(10) }
+            assertTrue(vm.ui.value.authenticated)
+            assertEquals(activeOrigin, vm.ui.value.origin)
+            assertEquals(activeOrigin, app.preferences.data.first()[originKey])
+        } finally {
+            compose.runOnUiThread { store.clear() }
+            app.preferences.edit { values ->
+                before[originKey]?.let { values[originKey] = it } ?: values.remove(originKey)
+                before[setupOriginKey]?.let { values[setupOriginKey] = it } ?: values.remove(setupOriginKey)
+                before[setupStepKey]?.let { values[setupStepKey] = it } ?: values.remove(setupStepKey)
+                before[setupCompleteKey]?.let { values[setupCompleteKey] = it } ?: values.remove(setupCompleteKey)
+                before[setupActiveKey]?.let { values[setupActiveKey] = it } ?: values.remove(setupActiveKey)
+            }
+        }
+    }
+
+    @Test fun fixtureReplacesTheCustomTabAndReturnsToTheLoopbackCallback() = runBlocking {
+        val fixture = NativeExperienceFixture()
+        fixture.installCustomTabSeam()
+        try {
+            val transport = fixture.client.http.newBuilder().cookieJar(CookieJar.NO_COOKIES).build()
+            val result = NativeAuth(fixture.scope.origin, transport).authorize(compose.activity)
+            assertEquals(fixture.scope.owner, result.owner)
+            assertEquals(1, fixture.customTabLaunches)
+            assertTrue(fixture.requests.filter { it.string("path").startsWith("/auth/native/") }.all { !it.has("body") })
+        } finally {
+            fixture.clearCustomTabSeam()
+            fixture.client.closeNative()
+        }
+    }
+
+    @Test fun cancellingNativeSignInClosesItsLoopbackListener() = runBlocking {
+        val callback = AtomicReference<Uri?>()
+        NativeAuth.customTabLauncher = { _, authorization ->
+            callback.set(Uri.parse(authorization.getQueryParameter("redirect_uri") ?: error("Missing loopback redirect")))
+        }
+        val signIn = launch(Dispatchers.Main) { runCatching { NativeAuth("https://hermes.example").authorize(compose.activity) } }
+        try {
+            withTimeout(5_000) { while (callback.get() == null) delay(10) }
+            val redirect = callback.get() ?: error("Native sign-in did not create its loopback listener")
+            signIn.cancelAndJoin()
+            Socket().use { socket ->
+                val failure = runCatching { socket.connect(InetSocketAddress("127.0.0.1", redirect.port), 500) }.exceptionOrNull()
+                assertTrue("The callback port should be closed after sign-in is cancelled", failure is ConnectException)
+            }
+        } finally {
+            signIn.cancelAndJoin()
+            NativeAuth.customTabLauncher = null
+        }
+    }
+
+    @Test fun unreachableServerShowsRetry() {
+        var retries = 0
+        val state = AppState(origin = "https://hermes.example", setupWizard = true, setupStep = "probe", restoringSession = false, error = "Can't reach Hermes. Check Tailscale/VPN is on, then Retry.")
+        compose.setContent { NativeLocalization("en") { CypherTheme(dark = true) {
+            SetupWizardScreen(state, onProbe = { retries++ }, onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {})
+        } } }
+        compose.onNodeWithText("Can't reach Hermes. Check Tailscale/VPN is on, then Retry.").assertIsDisplayed()
+        compose.onNodeWithTag("setup-probe-retry").performClick()
+        assertEquals(1, retries)
+    }
+
+    @Test fun missingPluginMessageIsShownWithoutBlockingSignIn() {
+        val message = "Cypher plugin not installed on this Hermes — chat works; calls need the plugin."
+        val state = AppState(origin = "https://hermes.example", authenticated = true, setupWizard = true, setupStep = "done", restoringSession = false, setupPluginMessage = message)
+        compose.setContent { NativeLocalization("en") { CypherTheme(dark = true) {
+            SetupWizardScreen(state, onProbe = {}, onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {})
+        } } }
+        compose.onNodeWithText(message).assertIsDisplayed()
+        compose.onNodeWithTag("setup-finish").assertIsDisplayed()
+    }
+
+    @Test fun anInterruptedSetupResumesAtItsIncompletePermissionStep() {
+        val state = AppState(origin = "https://hermes.example", authenticated = true, setupWizard = true, setupStep = "permission-notifications", restoringSession = false)
+        compose.setContent { NativeLocalization("en") { CypherTheme(dark = true) {
+            SetupWizardScreen(state, onProbe = {}, onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {})
+        } } }
+        compose.onNodeWithText("Notifications").assertIsDisplayed()
+        compose.onNodeWithTag("setup-permission-primary").assertIsDisplayed()
+    }
+
+    @Test fun expiredRefreshOffersOneTapSignInAndRetainsTheComposerAndChat() {
+        check(!ApplicationProvider.getApplicationContext<CypherApplication>().calls.state.value.active)
+        val app = ApplicationProvider.getApplicationContext<CypherApplication>()
+        val originKey = stringPreferencesKey("origin")
+        val setupStepKey = stringPreferencesKey("setup_step")
+        val setupCompleteKey = androidx.datastore.preferences.core.booleanPreferencesKey("setup_complete")
+        val setupActiveKey = androidx.datastore.preferences.core.booleanPreferencesKey("setup_active")
+        val priorPreferences = runBlocking { app.preferences.data.first() }
+        runBlocking { app.preferences.edit { it[originKey] = "" } }
+        val store = ViewModelStore()
+        val origin = "https://expired-${java.util.UUID.randomUUID()}.example"
+        val scope = Scope(origin, "fixture-owner", "work")
+        val client = CypherClient(AuthContext(origin, emptyList(), scope.owner, scope.profile, backend = "hermes-dashboard"))
+        lateinit var vm: CypherViewModel
+        try {
+            compose.runOnUiThread {
+                vm = ViewModelProvider(store, viewModelFactory { initializer { CypherViewModel(app, SavedStateHandle()) } })[CypherViewModel::class.java]
+            }
+            compose.waitUntil(5_000) { !vm.ui.value.restoringSession }
+            compose.runOnIdle {
+                field(vm, "originGeneration", 100)
+                field(vm, "client", client)
+                field(vm, "sourceScope", scope.session("chat-a"))
+                app.calls.ownerScope = scope
+                flow<AppState>(vm, "_ui").value = AppState(origin = origin, authenticated = true, owner = scope.owner, profile = scope.profile, connected = true, restoringSession = false, setupComplete = true)
+                flow<ChatState>(vm, "_chat").value = ChatState(sessionId = "chat-a", messages = listOf(Message("saved", "assistant", "Earlier answer")))
+                flow<TextFieldValue>(vm, "_composer").value = TextFieldValue("Keep this unfinished answer")
+            }
+            val fail = CypherViewModel::class.java.getDeclaredMethod("fail", Throwable::class.java).apply { isAccessible = true }
+            compose.runOnIdle { fail.invoke(vm, NativeAuthExpiredException()) }
+            compose.waitUntil(5_000) { vm.ui.value.setupWizard && vm.ui.value.setupStep == "signin" }
+            assertEquals("Keep this unfinished answer", vm.composer.value.text)
+            assertEquals("Earlier answer", vm.chat.value.messages.single().text)
+
+            var signInTaps = 0
+            compose.setContent { val state by vm.ui.collectAsState(); NativeLocalization("en") { CypherTheme(dark = true) {
+                SetupWizardScreen(state, onProbe = {}, onSignIn = { signInTaps++ }, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {})
+            } } }
+            compose.onNodeWithTag("setup-signin").performClick()
+            assertEquals(1, signInTaps)
+            assertEquals("Keep this unfinished answer", vm.composer.value.text)
+            assertEquals("Earlier answer", vm.chat.value.messages.single().text)
+            compose.waitUntil(5_000) { runBlocking { app.cache.read(scope.session("chat-a"), "draft") != null } }
+        } finally {
+            compose.runOnUiThread { store.clear(); client.closeNative(); app.calls.ownerScope = null }
+            runBlocking {
+                app.cache.delete(scope.session("chat-a"), "draft")
+                app.auth.remove(origin)
+                app.preferences.edit { values ->
+                    priorPreferences[originKey]?.let { values[originKey] = it } ?: values.remove(originKey)
+                    priorPreferences[setupStepKey]?.let { values[setupStepKey] = it } ?: values.remove(setupStepKey)
+                    priorPreferences[setupCompleteKey]?.let { values[setupCompleteKey] = it } ?: values.remove(setupCompleteKey)
+                    priorPreferences[setupActiveKey]?.let { values[setupActiveKey] = it } ?: values.remove(setupActiveKey)
+                }
+            }
+        }
+    }
+}

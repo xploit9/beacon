@@ -28,7 +28,6 @@ android {
         versionName = "0.4.15"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "DEFAULT_ORIGIN", quoted(owner.getProperty("native.origin", "")))
-        buildConfigField("String", "DEFAULT_USERNAME", quoted(owner.getProperty("native.username", "hermes")))
         buildConfigField("String", "FIREBASE_APP_ID", quoted(owner.getProperty("firebase.appId", "")))
         buildConfigField("String", "FIREBASE_API_KEY", quoted(owner.getProperty("firebase.apiKey", "")))
         buildConfigField("String", "FIREBASE_PROJECT_ID", quoted(owner.getProperty("firebase.projectId", "")))
@@ -44,7 +43,7 @@ android {
         }
     }
     buildTypes {
-        debug { applicationIdSuffix = ".debug"; versionNameSuffix = "-debug" }
+        debug { applicationIdSuffix = ".debug"; versionNameSuffix = "-preview" }
         release {
             isMinifyEnabled = true
             if (signing.isNotEmpty()) signingConfig = signingConfigs.getByName("owner")
@@ -80,6 +79,12 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.7")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("androidx.browser:browser:1.10.0")
+    implementation("com.google.mlkit:barcode-scanning:17.3.0")
+    implementation("androidx.camera:camera-core:1.6.1")
+    implementation("androidx.camera:camera-camera2:1.6.1")
+    implementation("androidx.camera:camera-lifecycle:1.6.1")
+    implementation("androidx.camera:camera-view:1.6.1")
     implementation("org.commonmark:commonmark:0.25.1")
     implementation("org.commonmark:commonmark-ext-gfm-tables:0.25.1")
     implementation("org.jsoup:jsoup:1.23.2")

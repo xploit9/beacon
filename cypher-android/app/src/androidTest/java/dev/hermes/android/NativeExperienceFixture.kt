@@ -1,5 +1,6 @@
 package dev.hermes.android
 
+import android.net.Uri
 import dev.hermes.android.core.*
 import dev.hermes.android.data.*
 import okhttp3.*
@@ -11,6 +12,11 @@ import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
+
+@Suppress("DEPRECATION")
+internal suspend fun loginLiveTest(app: CypherApplication, origin: String, credentials: JSONObject) {
+    CypherClient(AuthContext(origin, emptyList()), app.auth).login(credentials.getString("password"), username = credentials.getString("username"))
+}
 
 /** Synthetic in-process native protocol fixture. No socket, service, model, mailbox or sensor. */
 internal class NativeExperienceFixture : WebSocket.Factory {
@@ -53,20 +59,104 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     val releaseRoomRead = java.util.concurrent.CountDownLatch(1)
     @Volatile var approvalMode = "manual"
     @Volatile var rejectApprovalWrite = false
+    @Volatile var rejectPromptResponse = false
+    @Volatile var onPromptResponse: (() -> Unit)? = null
     @Volatile var commandCatalogFailure = false
     @Volatile var commandDistractors = 0
     private val sequence = AtomicInteger(1)
+    private val notificationSequence = AtomicInteger()
+    @Volatile var notificationProfiles = listOf("default", "coder")
+    @Volatile var incomingNotification: JSONObject? = null
+    val notificationWaits = CopyOnWriteArrayList<Long>()
+    fun emitIncomingCall(profile: String = "default", conversationId: String = "chat-a", expiresInSeconds: Long = 120): JSONObject {
+        require(profile in notificationProfiles)
+        val id = java.util.UUID.randomUUID().toString().replace("-", "")
+        val sequence = notificationSequence.incrementAndGet()
+        val source = "source-$profile-${id.take(12)}"
+        val event = json(
+            "seq" to sequence,
+            "event_id" to id,
+            "callback_id" to id,
+            "owner_id" to scope.owner,
+            "profile" to profile,
+            "kind" to "incoming_call",
+            "state" to "pending",
+            "source_ref" to source,
+            "conversation_ref" to "conversation-$profile-${id.take(12)}-$conversationId",
+            "conversation_id" to conversationId,
+            "session_id" to conversationId,
+            "expires_at" to (System.currentTimeMillis() / 1000 + expiresInSeconds),
+        )
+        incomingNotification = event
+        return event
+    }
     @Volatile var cronFailure: String? = null
     @Volatile var historyFailure = false
+    /** When set, every optional `/api/plugins/cypher/` route answers with this status. */
+    @Volatile var pluginStatus: Int? = null
+    /** Requested stored id -> compression descendant served by the stock /messages route. */
+    val descendants = ConcurrentHashMap<String, String>()
     @Volatile var boardFailure = false
     @Volatile var preferredBoard = "default"
     @Volatile var fileText = "# Travel notes\nCheck the weather."
     @Volatile var fileWrites = 0
     @Volatile var holdCreateAcknowledgement = false
     private val delayedCreates = CopyOnWriteArrayList<() -> Unit>()
+    @Volatile private var activeNativeListener: WebSocketListener? = null
+    @Volatile private var activeNativeSocket: WebSocket? = null
+    private val replayReads = ConcurrentHashMap<WebSocket, AtomicInteger>()
+    val streamSubscriptions = AtomicInteger()
+    @Volatile var nativeTurnStatus = "idle"
+    @Volatile var nativeStatusFailure = false
+    @Volatile var persistTerminalMessages = false
+    @Volatile var terminalOnActiveList: JSONObject? = null
+    @Volatile var customTabLaunches = 0
+    private val nativeEvents = CopyOnWriteArrayList<JSONObject>()
+    private val nativeEventSequence = AtomicInteger()
     fun releaseCreateAcknowledgement() {
         val queued = synchronized(delayedCreates) { holdCreateAcknowledgement = false; delayedCreates.toList().also { delayedCreates.clear() } }
         queued.forEach { it() }
+    }
+    fun installCustomTabSeam() {
+        NativeAuth.customTabLauncher = { _, authorizeUrl ->
+            customTabLaunches += 1
+            val state = authorizeUrl.getQueryParameter("state").orEmpty()
+            val redirect = Uri.parse(authorizeUrl.getQueryParameter("redirect_uri") ?: error("Missing loopback redirect"))
+                .buildUpon().appendQueryParameter("code", "synthetic-code").appendQueryParameter("state", state).build()
+            Thread {
+                runCatching {
+                    client.http.newCall(Request.Builder().url(authorizeUrl.toString()).get().build()).execute().close()
+                    val port = redirect.port
+                    java.net.Socket("127.0.0.1", port).use { socket ->
+                        socket.soTimeout = 5_000
+                        val path = redirect.encodedPath + "?" + redirect.encodedQuery
+                        socket.getOutputStream().write("GET $path HTTP/1.1\r\nHost: 127.0.0.1:$port\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                        socket.getOutputStream().flush()
+                        socket.getInputStream().bufferedReader().use { reader -> while (reader.readLine() != null) { } }
+                    }
+                }
+            }.apply { name = "cypher-oauth-test-callback"; isDaemon = true; start() }
+        }
+    }
+    fun clearCustomTabSeam() { NativeAuth.customTabLauncher = null }
+    fun retainNativeEvent(type: String, payload: JSONObject): JSONObject {
+        val event = json("session_id" to "runtime-chat-a", "seq" to nativeEventSequence.incrementAndGet(), "type" to type, "payload" to payload.copy())
+        if (persistTerminalMessages && type == "message.complete") {
+            sessions["chat-a"]?.optJSONArray("messages")?.put(json("role" to "assistant", "text" to payload.string("text"), "row_id" to "terminal-${event.optInt("seq")}"))
+        }
+        nativeEvents.add(event)
+        return event
+    }
+    fun emitNativeEvent(type: String, payload: JSONObject) {
+        val event = retainNativeEvent(type, payload)
+        val listener = activeNativeListener ?: error("No native socket is open")
+        val socket = activeNativeSocket ?: error("No native socket is open")
+        listener.onMessage(socket, json("method" to "event", "params" to event).toString())
+    }
+    fun interruptActiveNativeStream() {
+        val listener = activeNativeListener ?: error("No native socket is open")
+        val socket = activeNativeSocket ?: error("No native socket is open")
+        listener.onFailure(socket, java.io.IOException("Synthetic native WebSocket interruption"), null)
     }
     val scope = Scope("https://ui-fixture.invalid", "synthetic-owner", "default")
     val client = CypherClient(AuthContext(scope.origin, emptyList(), scope.owner, scope.profile, backend = "hermes-dashboard"), null, this) { builder ->
@@ -80,12 +170,23 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             }
             val buffer = okio.Buffer(); request.body?.writeTo(buffer)
             val body = buffer.readUtf8().takeIf(String::isNotBlank)?.let(::JSONObject) ?: JSONObject()
-            requests += json("path" to request.url.encodedPath, "method" to request.method, "body" to body)
-            val (status, result) = http(request.url.encodedPath, request.method, body, request.url.queryParameter("profile") ?: "default", request.url.queryParameter("path").orEmpty(), request.url.queryParameter("include_archived") == "1")
+            requests += if (request.url.encodedPath.startsWith("/auth/native/")) json("path" to request.url.encodedPath, "method" to request.method)
+                else json("path" to request.url.encodedPath, "method" to request.method, "body" to body, "profile" to request.url.queryParameter("profile"))
+            val outage = pluginStatus?.takeIf { request.url.encodedPath.startsWith("/api/plugins/cypher/") }
+            val (status, result) = if (outage != null) outage to json("detail" to "Synthetic optional plugin outage")
+                else http(request.url.encodedPath, request.method, body, request.url.queryParameter("profile") ?: "default", request.url.queryParameter("path").orEmpty(), request.url.queryParameter("include_archived") == "1" || request.url.queryParameter("archived") == "only", request.url)
             Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(status).message("Synthetic fixture")
                 .body(result.toString().toResponseBody("application/json".toMediaType())).build()
         }
     }
+    fun clientFor(auth: AuthContext, authStore: AuthStore? = null) = CypherClient(
+        initial = auth,
+        authStore = authStore,
+        socketFactory = this,
+        sharedHttp = client.http,
+        persistContext = false,
+        configureHttp = {},
+    )
     init {
         projects["p_project_a"] = json("id" to "p_project_a", "name" to "Travel", "primary_path" to "C:/synthetic-workspace", "folders" to JSONArray().put(json("path" to "C:/synthetic-workspace", "is_primary" to true)))
         sessions["chat-a"] = history("chat-a", "Travel planning", JSONArray().put(json("role" to "user", "text" to "Compare the two plans.", "row_id" to 10)).put(json("role" to "assistant", "text" to "A clear comparison follows.\n\n| Plan | Duration | Status |\n|---|---:|---|\n| City | 3 days | Ready |\n| Mountains and the surrounding national park | 5 days | Needs dates |\n\n```kotlin\nval ready = true\n```", "row_id" to 11)))
@@ -99,9 +200,61 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         val info = getJSONObject("info"); info.keys().forEach { put(it, info.opt(it)) }
         put("runtime_session_id", getString("session_id")); put("session_id", id)
     }
-    private fun http(path: String, method: String, body: JSONObject, profile: String, directory: String, archived: Boolean = false): Pair<Int, JSONObject> {
+    /** Synthetic stock dashboard history: metadata, newest-window messages and the compression chain. */
+    private fun stockSession(path: String, profile: String): Pair<Int, JSONObject> {
+        val parts = path.removePrefix("/api/sessions/").split('/')
+        val id = parts.first()
+        val row = sessions[id]
+        if (historyFailure || row == null) return 404 to json("detail" to "Session not found")
+        val messages = row.getJSONArray("messages")
+        val tip = descendants[id]
+        return when (parts.getOrNull(1)) {
+            null -> 200 to row.getJSONObject("info").copy().put("id", id).put("profile", profile).put("message_count", messages.length())
+            "messages" -> {
+                val window = JSONArray((maxOf(0, messages.length() - 500) until messages.length()).map(messages::get))
+                200 to json("session_id" to (tip ?: id), "profile" to profile, "messages" to window, "pagination" to json("limit" to 500, "offset" to 0, "order" to "latest", "returned" to window.length()))
+            }
+            "latest-descendant" -> 200 to (if (tip == null) json("requested_session_id" to id, "session_id" to id, "path" to JSONArray().put(id), "changed" to false)
+                else json("requested_session_id" to id, "session_id" to tip, "path" to JSONArray().put(id).put(tip), "changed" to true))
+            else -> 404 to json("detail" to "Not Found")
+        }
+    }
+    private fun http(path: String, method: String, body: JSONObject, profile: String, directory: String, archived: Boolean = false, url: HttpUrl? = null): Pair<Int, JSONObject> {
         if (path == "/api/plugins/cypher/mobile/bot-mode/space/fixture-room" && holdNextRoomRead.getAndSet(false)) { roomReadCaptured.countDown(); check(releaseRoomRead.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
         return when {
+        path == "/api/profiles" -> 200 to json("profiles" to JSONArray(notificationProfiles.map { json("name" to it) }))
+        path == "/api/profiles/active" -> 200 to json("current" to profile, "active" to profile)
+        path == "/api/plugins/cypher/mobile/notifications/events" -> {
+            val after = url?.queryParameter("after")?.toLongOrNull() ?: 0L
+            val wait = url?.queryParameter("wait")?.toLongOrNull() ?: 0L
+            notificationWaits += wait
+            var event = incomingNotification?.takeIf { it.optLong("seq") > after && it.string("profile") == profile }
+            if (event == null && wait > 0) {
+                Thread.sleep(minOf(wait * 1000, 50))
+                event = incomingNotification?.takeIf { it.optLong("seq") > after && it.string("profile") == profile }
+            }
+            200 to json("events" to JSONArray().apply { event?.let { put(JSONObject(it.toString())) } }, "next_cursor" to (event?.optLong("seq") ?: after))
+        }
+        path.startsWith("/api/plugins/cypher/mobile/notifications/events/") -> {
+            val id = path.substringAfterLast('/')
+            val event = incomingNotification?.takeIf { it.string("event_id") == id && it.string("profile") == profile }
+            if (event == null) 404 to json("detail" to "Notification missing") else 200 to JSONObject(event.toString())
+        }
+        path.startsWith("/api/plugins/cypher/mobile/callbacks/") -> {
+            val rest = path.removePrefix("/api/plugins/cypher/mobile/callbacks/")
+            val id = rest.substringBefore('/')
+            val action = rest.substringAfterLast('/')
+            val event = incomingNotification?.takeIf { it.string("event_id") == id && it.string("profile") == profile }
+            if (event == null) 404 to json("detail" to "Invitation missing")
+            else if (action == "decline" && method == "POST") {
+                event.put("state", "declined")
+                200 to json("declined" to true, "state" to "declined", "callback_id" to id, "kind" to "incoming_call", "profile" to profile)
+            } else if (action == "answer" && method == "POST") {
+                event.put("state", "answered")
+                200 to json("call_id" to "fixture-call", "conversation_id" to event.string("session_id"), "profile" to profile,
+                    "transport" to "gemini_live_direct", "provider" to "gemini", "callback_id" to id, "kind" to "incoming_call", "state" to "answered")
+            } else 404 to json("detail" to "Unknown callback action")
+        }
         path == "/api/plugins/cypher/mobile/voice-settings" -> {
             if (method == "PUT") {
                 voiceProvider = body.getString("provider"); check(voices.containsKey(voiceProvider))
@@ -142,19 +295,22 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         }
         path == "/api/plugins/cypher/mobile/bot-mode/space/fixture-room/rename" -> { roomName = body.getString("name"); 200 to json("room" to json("room_id" to "fixture-room", "name" to roomName)) }
         path == "/api/plugins/cypher/mobile/bot-mode/space/fixture-room" -> 200 to json("room" to json("room_id" to "fixture-room", "name" to roomName, "members" to JSONArray(roomMembers.map { json("profile" to it) })), "events" to JSONArray(roomEvents.toList()), "driver_status" to json("running" to true, "pending_actions" to JSONArray(roomActions.toList())))
-        path == "/api/plugins/cypher/mobile/sessions" -> {
-            200 to json("sessions" to JSONArray(sessions.values.filter { it.getJSONObject("info").optBoolean("hidden") == archived }.map { row -> row.getJSONObject("info").copy().put("id", row.string("stored_session_id")).put("stored_session_id", row.string("stored_session_id")) }))
+        path == "/api/sessions" -> {
+            // Stock dashboard index: profile-scoped pages of at most 100, archived=exclude|only.
+            val limit = url?.queryParameter("limit")?.toIntOrNull() ?: 20
+            val offset = url?.queryParameter("offset")?.toIntOrNull() ?: 0
+            if (limit !in 1..100) 422 to json("detail" to "limit must be at most 100")
+            else 200 to json("sessions" to JSONArray(sessions.values.filter { it.getJSONObject("info").optBoolean("hidden") == archived }
+                .map { row -> row.getJSONObject("info").copy().put("id", row.string("stored_session_id")).put("profile", profile).put("message_count", row.getJSONArray("messages").length()) }
+                .drop(offset).take(limit)))
         }
-        path.startsWith("/api/plugins/cypher/mobile/sessions/") && !path.endsWith("/reserve") && !path.endsWith("/voice-history") -> {
-            val id = path.substringAfterLast('/')
-            val row = sessions[id]
-            if (historyFailure || row == null) 404 to json("detail" to "Owned native conversation unavailable")
-            else 200 to row.getJSONObject("info").copy().put("workspace", row.getJSONObject("info").string("cwd")).put("session_id", id).put("stored_session_id", id).put("profile", profile).put("messages", row.getJSONArray("messages")).put("runtime_session_id", row.getString("session_id")).put("active_stream_id", if (row.optBoolean("running")) row.getString("session_id") else "")
-        }
+        path.startsWith("/api/sessions/") -> stockSession(path, profile)
         path == "/api/auth/ws-ticket" -> 200 to json("ticket" to "synthetic-once")
+        path == "/auth/native/authorize" -> 200 to json("ready" to true)
+        path == "/auth/native/token" -> if (body.string("code").isBlank() || body.string("code_verifier").isBlank()) 400 to json("detail" to "Invalid code or verifier") else 200 to json("access_token" to "synthetic-access", "refresh_token" to "synthetic-refresh", "expires_at" to 2_000_000_000L, "token_type" to "Bearer", "provider" to "fixture", "user_id" to scope.owner)
+        path == "/auth/native/refresh" -> if (body.string("refresh_token").isBlank()) 401 to json("error" to "session_expired") else 200 to json("access_token" to "synthetic-access-refreshed", "refresh_token" to "synthetic-refresh-refreshed", "expires_at" to 2_000_000_000L, "token_type" to "Bearer", "provider" to "fixture", "user_id" to scope.owner)
         path == "/api/auth/me" -> 200 to json("user_id" to scope.owner)
         path == "/auth/logout" -> 200 to json("ok" to true)
-        path == "/api/profiles" -> 200 to json("profiles" to JSONArray().put(json("name" to "default")).put(json("name" to "coder")))
         path == "/api/model/options" -> 200 to json("providers" to JSONArray().put(json("slug" to "fixture", "name" to "Configured provider", "models" to JSONArray(listOf("synthetic-model", "other-model", "confirm-model")))))
         path == "/api/plugins/cypher/admin/model-capabilities" -> 200 to json("reasoning_known" to true, "reasoning_options" to JSONArray(listOf("low", "medium", "high")))
         path == "/api/tools/toolsets" -> 200 to json("items" to JSONArray().put(json("name" to "web", "label" to "Web research", "description" to "Read public pages", "enabled" to toolEnabled, "configured" to true, "tools" to JSONArray().put("web_search"))))
@@ -290,12 +446,18 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             override fun send(text: String): Boolean {
                 val frame = JSONObject(text); requests += frame.copy()
                 try {
-                    val result = rpc(frame.getString("method"), frame.optJSONObject("params") ?: JSONObject())
+                    val method = frame.getString("method")
+                    val result = rpc(method, frame.optJSONObject("params") ?: JSONObject())
                     val response = json("jsonrpc" to "2.0", "id" to frame.getString("id"), "result" to result).toString()
                     val deferred = synchronized(delayedCreates) {
-                        if (holdCreateAcknowledgement && frame.string("method") == "session.create") { delayedCreates += { listener.onMessage(this, response) }; true } else false
+                        if (holdCreateAcknowledgement && method == "session.create") { delayedCreates += { listener.onMessage(this, response) }; true } else false
                     }
                     if (!deferred) listener.onMessage(this, response)
+                    if (!deferred && method == "session.events.since" && replayReads.computeIfAbsent(this) { AtomicInteger() }.incrementAndGet() == 2) {
+                        activeNativeListener = listener
+                        activeNativeSocket = this
+                        streamSubscriptions.incrementAndGet()
+                    }
                 } catch (error: IllegalArgumentException) {
                     val missing = error.message == "Synthetic session missing"
                     listener.onMessage(this, json("jsonrpc" to "2.0", "id" to frame.getString("id"), "error" to json("code" to if (missing) 4007 else 404, "message" to if (missing) "session not found" else error.message)).toString())
@@ -331,7 +493,19 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             "projects.project_sessions" -> json("project" to json("id" to params.getString("project_id"), "label" to "Travel", "sessionIds" to JSONArray().put("chat-a").put("chat-b"), "previewSessions" to JSONArray().put(json("id" to "chat-a", "title" to "Travel planning", "profile" to scope.profile))))
             "session.resume", "session.history" -> { require(!historyFailure) { "Synthetic history unavailable" }; sessions[id]?.copy()?.apply { put("session_key", id); remove("stored_session_id"); getJSONObject("info").put("stored_session_id", id) } ?: throw IllegalArgumentException("Synthetic session missing") }
             "session.create" -> { val key = "new-${sequence.incrementAndGet()}"; history(key, params.string("title", "New conversation"), JSONArray()).also { sessions[key] = it } }
-            "session.events.since" -> json("epoch" to "synthetic", "latest_seq" to 0, "events" to JSONArray())
+            "session.events.since" -> json("epoch" to "synthetic", "latest_seq" to nativeEventSequence.get(), "events" to JSONArray(nativeEvents.filter { it.optLong("seq") > params.optLong("last_seen", 0) }))
+            "session.active_list" -> {
+                if (nativeStatusFailure) throw IllegalArgumentException("Synthetic active status unavailable")
+                terminalOnActiveList?.let { payload ->
+                    terminalOnActiveList = null
+                    retainNativeEvent("message.complete", payload)
+                }
+                val runtime = params.opt("current_session_id") as? String
+                val stored = runtime?.takeIf { it.startsWith("runtime-") }?.removePrefix("runtime-")
+                val rows = JSONArray()
+                if (stored != null && sessions.containsKey(stored)) rows.put(json("id" to runtime, "session_key" to stored, "status" to nativeTurnStatus))
+                json("sessions" to rows)
+            }
             "session.usage" -> json("input_tokens" to 100, "output_tokens" to 20, "context_window" to 32000)
             "session.title" -> { sessions.getValue(id).getJSONObject("info").put("title", params.getString("title")); json("ok" to true) }
             "session.set_hidden" -> { val hidden = params.getBoolean("hidden"); sessions.getValue(id).getJSONObject("info").put("hidden", hidden); json("hidden" to hidden, "session_key" to id) }
@@ -358,13 +532,22 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 }
                 json("ok" to true, "key" to params.string("key"), "value" to if (params.string("key") == "yolo") "0" else params.string("value"))
             }
-            "approval.respond", "request.answer" -> json("ok" to true)
+            "approval.respond", "request.answer" -> {
+                if (rejectPromptResponse) { rejectPromptResponse = false; throw IllegalArgumentException("Synthetic prompt response rejected") }
+                onPromptResponse?.also { onPromptResponse = null }?.invoke()
+                json("ok" to true)
+            }
             "approval.pending" -> json("approvals" to JSONArray())
             "commands.catalog" -> {
                 require(!commandCatalogFailure) { "Synthetic command catalog unavailable" }
                 json("pairs" to JSONArray().apply { repeat(commandDistractors) { put(JSONArray().put("/candidate$it").put("The help text describes another command")) } }.put(JSONArray().put("/help").put("Show available commands")).put(JSONArray().put("/model").put("Choose a model")))
             }
-            "prompt.submit" -> json("status" to "streaming", "user_row_id" to sequence.incrementAndGet())
+            "prompt.submit" -> {
+                nativeTurnStatus = "working"
+                val rowId = sequence.incrementAndGet()
+                if (persistTerminalMessages) sessions[id]?.optJSONArray("messages")?.put(json("role" to "user", "text" to params.string("text"), "row_id" to rowId))
+                json("status" to "streaming", "user_row_id" to rowId)
+            }
             "session.steer" -> json("status" to "steered", "accepted" to true)
             "session.interrupt" -> json("ok" to true)
             else -> throw IllegalArgumentException("Synthetic fixture has no response for $method")

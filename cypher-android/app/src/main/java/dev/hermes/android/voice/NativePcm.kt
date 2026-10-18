@@ -14,7 +14,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 internal class NativePcm(private val scope:CoroutineScope,private val input:(ByteArray,Long)->Unit,
     private val played:(ByteArray,Long)->Unit,private val failure:(String)->Unit,private val level:(Float,Boolean)->Unit,
-    private val queue:PcmQueue=PcmQueue()) {
+    private val queue:PcmQueue=PcmQueue(),private val captureRate:Int=16000) {
+    private val downsampler=if(captureRate==48000) Pcm48To24() else null
     private val capture=AtomicBoolean(false)
     private val closed=AtomicBoolean(false)
     private val output=Channel<Unit>(Channel.CONFLATED)
@@ -36,13 +37,14 @@ internal class NativePcm(private val scope:CoroutineScope,private val input:(Byt
 
     fun start(context:Context) {
         if(context.checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED) throw SecurityException("Microphone permission unavailable")
-        val inputSize=AudioRecord.getMinBufferSize(16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT)
+        require(captureRate==16000||captureRate==48000)
+        val inputSize=AudioRecord.getMinBufferSize(captureRate,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT)
         val outputSize=AudioTrack.getMinBufferSize(24000,AudioFormat.CHANNEL_OUT_MONO,AudioFormat.ENCODING_PCM_16BIT)
         require(inputSize>0&&outputSize>0)
         lateinit var rec:AudioRecord
         lateinit var track:AudioTrack
         try {
-        rec=AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION,16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT,maxOf(inputSize,6400))
+        rec=AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION,captureRate,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT,maxOf(inputSize,captureRate*2/5))
         recorder=rec;check(rec.state==AudioRecord.STATE_INITIALIZED)
         if(AcousticEchoCanceler.isAvailable()) echo=AcousticEchoCanceler.create(rec.audioSessionId)?.apply { enabled=true }
         if(NoiseSuppressor.isAvailable()) noise=NoiseSuppressor.create(rec.audioSessionId)?.apply { enabled=true }
@@ -62,7 +64,7 @@ internal class NativePcm(private val scope:CoroutineScope,private val input:(Byt
         val captureEpochNs=System.nanoTime()
         captureJob=scope.launch(Dispatchers.IO) {
             try {
-                val bytes=ByteArray(640);var readFrames=0L
+                val bytes=ByteArray(captureRate*2/50);var readFrames=0L
                 while(isActive&&!closed.get()) {
                     val count=rec.read(bytes,0,bytes.size,AudioRecord.READ_BLOCKING)
                     check(count>=0&&count%2==0) { "Microphone read failed" }
@@ -70,9 +72,13 @@ internal class NativePcm(private val scope:CoroutineScope,private val input:(Byt
                     val firstFrame=readFrames;readFrames+=count/2;captureObserved.set(true)
                     val stamp=AudioTimestamp()
                     val at=if(rec.getTimestamp(stamp,AudioTimestamp.TIMEBASE_MONOTONIC)==AudioRecord.SUCCESS&&stamp.nanoTime>=captureEpochNs)
-                        (stamp.nanoTime-startedNs)/1_000_000-(stamp.framePosition-firstFrame)*1000/16000
-                    else clock()-count*1000L/32000
-                    synchronized(lock) { if(capture.get()&&!closed.get()) { val copy=bytes.copyOf(count);input(copy,at);level(amplitude(copy),true) } }
+                        (stamp.nanoTime-startedNs)/1_000_000-(stamp.framePosition-firstFrame)*1000/captureRate
+                    else clock()-count*1000L/(captureRate*2)
+                    synchronized(lock) { if(capture.get()&&!closed.get()) {
+                        val copy=bytes.copyOf(count)
+                        val pcm=downsampler?.convert(copy)?:copy
+                        if(pcm.isNotEmpty()) { input(pcm,at);level(amplitude(pcm),true) }
+                    } }
                 }
             } catch(error:CancellationException) { throw error }
             catch(error:Exception) { if(!closed.get()) failure("Microphone capture failed") }
@@ -160,5 +166,30 @@ internal class NativePcm(private val scope:CoroutineScope,private val input:(Byt
         var peak=0
         for(i in 0 until bytes.size-1 step 2) { val sample=((bytes[i].toInt() and 255) or (bytes[i+1].toInt() shl 8)).toShort().toInt();peak=maxOf(peak,kotlin.math.abs(sample)) }
         return peak/32768f
+    }
+}
+
+/** Pair averaging gives OpenAI's 24 kHz input a simple low-pass before decimation. */
+internal class Pcm48To24 {
+    private var pending: Short? = null
+
+    fun convert(input: ByteArray): ByteArray {
+        require(input.size % 2 == 0)
+        val samples=input.size/2
+        val output=ByteArray(((samples+(if(pending==null) 0 else 1))/2)*2)
+        var first=pending
+        pending=null
+        var offset=0
+        for(index in 0 until samples) {
+            val sample=((input[index*2].toInt() and 255) or (input[index*2+1].toInt() shl 8)).toShort()
+            if(first==null) first=sample else {
+                val average=((first.toInt()+sample.toInt())/2).toShort()
+                output[offset++]=average.toInt().toByte()
+                output[offset++]=(average.toInt() shr 8).toByte()
+                first=null
+            }
+        }
+        pending=first
+        return if(offset==output.size) output else output.copyOf(offset)
     }
 }

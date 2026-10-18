@@ -18,7 +18,10 @@ class DeviceRestartReceiver : BroadcastReceiver() {
         val app=context.applicationContext as? CypherApplication ?: return
         val pending=goAsync()
         CoroutineScope(SupervisorJob()+Dispatchers.IO).launch {
-            try { restoreAfterRestart({ app.push.reconcileIncomingDeadlines() }, { app.updates.schedule() }, { PushRegistrationJob.schedule(app) }) }
+            try {
+                restoreAfterRestart({ app.push.reconcileIncomingDeadlines() }, { app.updates.schedule() }, { PushRegistrationJob.schedule(app) })
+                runCatching { KeepConnectedService.startIfEnabled(app) }
+            }
             finally { pending.finish();cancel() }
         }
     }

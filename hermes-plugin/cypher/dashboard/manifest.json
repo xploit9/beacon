@@ -1,0 +1,11 @@
+{
+  "name": "cypher",
+  "label": "Cypher",
+  "version": "2.0.0",
+  "description": "Native authenticated mobile API",
+  "api": "plugin_api.py",
+  "tab": {
+    "path": "/cypher"
+  },
+  "entry": "entry.js"
+}

@@ -2,7 +2,11 @@ package dev.hermes.android.ui
 
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.compositeOver
@@ -31,6 +35,26 @@ fun nativeAmbientColors(scheme: ColorScheme): List<Color> = listOf(
     lerp(scheme.background, scheme.onSurfaceVariant, .04f),
 )
 
+// Dotted chat background and metadata style adapted from Hermes Relay ui/theme/RelayRefresh.kt
+// (RelayDottedOverlay, relayMetadataStyle) — MIT, see licenses/Hermes-Relay-MIT.txt. Colors come from the active Cypher scheme.
+@Composable fun Modifier.chatDottedBackground(alpha: Float = .14f): Modifier {
+    val dot = MaterialTheme.colorScheme.primary.copy(alpha = alpha)
+    return drawBehind {
+        val step = 12.dp.toPx()
+        var y = 0f
+        while (y <= size.height) {
+            var x = 0f
+            while (x <= size.width) { drawCircle(dot, radius = 1.1f, center = Offset(x + 1f, y + 1f)); x += step }
+            y += step
+        }
+    }
+}
+
+@Composable fun nativeMetadataStyle(): TextStyle = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Medium, letterSpacing = 0.sp)
+
+internal fun nativeMotionAllowed(reducedMotion: Boolean, systemAnimationsEnabled: Boolean, lifecycleStarted: Boolean): Boolean =
+    systemAnimationsEnabled && !reducedMotion && lifecycleStarted
+
 @Composable fun rememberNativeMotionEnabled(reducedMotion: Boolean): Boolean {
     val resolver = LocalContext.current.contentResolver
     val lifecycle by LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsState()
@@ -43,7 +67,7 @@ fun nativeAmbientColors(scheme: ColorScheme): List<Color> = listOf(
         resolver.registerContentObserver(android.provider.Settings.Global.getUriFor(android.provider.Settings.Global.ANIMATOR_DURATION_SCALE), false, observer)
         onDispose { resolver.unregisterContentObserver(observer) }
     }
-    return systemEnabled && !reducedMotion && lifecycle.isAtLeast(Lifecycle.State.STARTED)
+    return nativeMotionAllowed(reducedMotion, systemEnabled, lifecycle.isAtLeast(Lifecycle.State.STARTED))
 }
 fun nativeContrast(a: Color, b: Color): Float = (maxOf(a.luminance(), b.luminance()) + .05f) / (minOf(a.luminance(), b.luminance()) + .05f)
 fun nativeRoleBackgrounds(scheme: ColorScheme): List<Color> {

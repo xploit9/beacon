@@ -21,6 +21,9 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import org.json.JSONObject
 import dev.hermes.android.voice.IncomingCall
 import dev.hermes.android.voice.IncomingCallReceiver
+import dev.hermes.android.voice.RelayCallbackPolicy
+import dev.hermes.android.voice.RelayCallbackPreferences
+import dev.hermes.android.core.Scope
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 private val opaquePattern=Regex("[A-Za-z0-9_.:-]+")
@@ -43,6 +46,8 @@ class PushManager(private val app: CypherApplication) {
     private val privatePrefs = app.getSharedPreferences("push-binding", Context.MODE_PRIVATE)
     private val lock = Any()
     private val registration=Mutex()
+    private data class KeepConnectedReceipt(val source: String, val event: String, val prepared: PreparedKeepConnectedCall)
+    private val keepConnectedReceipts = mutableMapOf<String, KeepConnectedReceipt>()
     @Volatile private var newestToken:String?=null
     private val _incoming = kotlinx.coroutines.flow.MutableStateFlow<IncomingCall?>(null)
     val incoming = _incoming.asStateFlow()
@@ -110,6 +115,7 @@ class PushManager(private val app: CypherApplication) {
             sources.forEach { edit.remove("source:${it.digest()}") }
             val removed=removeIncoming(sources,edit)
             check(edit.commit()) { "Could not remove local notification authorization" }
+            keepConnectedReceipts.entries.removeAll { it.value.source in sources }
             sources.forEach { cancelNativeActivities(app,it) }
             removed.forEach { (source,event) -> dismissInvitation(source,event) }
             (owned.map { it.string("target") }+active?.string("target").orEmpty()).filter(::validOpaque).distinct()
@@ -117,12 +123,81 @@ class PushManager(private val app: CypherApplication) {
         targets.forEach { target -> client.nativeRequest("/api/plugins/cypher/mobile/notifications/targets/$target","DELETE") }
     } }
     fun binding(source: String): JSONObject? { if (!validOpaque(source)) return null; return synchronized(lock) { runCatching { read("source:${source.digest()}") }.getOrNull() } }
-    fun permitsIncoming(source: String): Boolean = binding(source)?.let { b -> runCatching { nativePushBindingAuthorized(b, app.auth.read(b.getString("origin"))) }.getOrDefault(false) } == true
+    fun permitsIncoming(source: String): Boolean = binding(source)?.let { b -> runCatching {
+        nativePushBindingAuthorized(b, app.auth.read(b.getString("origin"))) &&
+            (!b.optBoolean("keep_connected") || KeepConnectedService.isEnabledFor(app, Scope(b.getString("origin"), b.getString("owner"), b.getString("profile"))))
+    }.getOrDefault(false) } == true
     fun clientFor(binding: JSONObject): CypherClient {
         val origin = trustedOrigin(binding.getString("origin"))
         val current = app.auth.read(origin)
         require(nativePushBindingAuthorized(binding, current)) { "Sign in to the invitation's native Hermes account" }
-        return CypherClient(current.copy(profile = binding.getString("profile")))
+        return KeepConnectedService.createClient(app, current).forAuthorizedProfile(binding.getString("profile"))
+    }
+    fun bindKeepConnectedSource(scope: Scope, source: String): Boolean {
+        if (!validOpaque(source) || !app.auth.read(scope.origin).authorizesPushSource(scope)) return false
+        return synchronized(lock) {
+            val key = "source:${source.digest()}"
+            val existing = runCatching { read(key) }.getOrNull()
+            if (existing != null) {
+                return@synchronized existing.string("source") == source && existing.string("origin") == scope.origin &&
+                    existing.string("owner") == scope.owner && existing.string("profile") == scope.profile &&
+                    nativePushBindingAuthorized(existing, app.auth.read(scope.origin))
+            }
+            val value = json("source" to source, "origin" to scope.origin, "owner" to scope.owner,
+                "profile" to scope.profile, "backend" to "hermes-dashboard", "target" to "", "keep_connected" to true)
+            persistPushBindings(privatePrefs, mapOf(key to encoded(key, value)))
+            true
+        }
+    }
+    fun prepareKeepConnectedCall(scope: Scope, event: JSONObject, now: Long, elapsed: Long): String? {
+        if (!KeepConnectedService.isEnabledFor(app, scope) || !app.auth.read(scope.origin).authorizesPushSource(scope)) return null
+        val source = event.optString("source_ref")
+        val eventId = event.optString("event_id")
+        if (!validOpaque(source) || !validOpaque(eventId) || deadlineInvitation(source, eventId) != null) return null
+        val prepared = dev.hermes.android.push.prepareKeepConnectedCall(scope, event, enabled = true, now = now, elapsed = elapsed) ?: return null
+        if (!bindKeepConnectedSource(scope, source)) return null
+        return synchronized(lock) {
+            if (storedInvitation(source, eventId) != null) return@synchronized null
+            keepConnectedReceipts["$source\u0000$eventId".digest()] = KeepConnectedReceipt(source, eventId, prepared)
+            prepared.call.actionToken
+        }
+    }
+    fun hasKeepConnectedInvitation(source: String, event: String, token: String): Boolean = synchronized(lock) {
+        storedInvitation(source, event)?.actionToken == token
+    }
+    fun removeKeepConnectedCallback(source: String, event: String, token: String? = null): Unit = synchronized(lock) {
+        val key = "$source\u0000$event".digest()
+        keepConnectedReceipts[key]?.takeIf { token == null || it.prepared.call.actionToken == token }?.let { keepConnectedReceipts.remove(key) }
+        Unit
+    }
+    fun authorizeKeepConnectedAction(source: String, event: String, action: String): Boolean {
+        val invite = deadlineInvitation(source, event) ?: return false
+        val binding = binding(source) ?: return false
+        if (!binding.optBoolean("keep_connected")) return true
+        val receipt = synchronized(lock) { keepConnectedReceipts["$source\u0000$event".digest()] } ?: return false
+        val call = receipt.prepared
+        val scope = Scope(call.binding.origin, call.binding.owner, call.binding.profile)
+        val currentPreferences = call.preferences.copy(keepConnected = KeepConnectedService.isEnabledFor(app, scope))
+        if (!app.auth.read(scope.origin).authorizesPushSource(scope) || !RelayCallbackPolicy.callsAllowed(currentPreferences, call.binding.connectionId)) {
+            call.protocol.invalidate(call.binding, currentPreferences)
+            return false
+        }
+        val now = System.currentTimeMillis()
+        val elapsed = android.os.SystemClock.elapsedRealtime()
+        return when (action) {
+            "answer" -> call.protocol.answer(event, invite.actionToken, call.binding, currentPreferences, now, elapsed) != null
+            "decline" -> call.protocol.decline(event, invite.actionToken, call.binding, currentPreferences, now, elapsed) != null
+            else -> false
+        }
+    }
+    fun invalidateKeepConnectedInvitations() {
+        val receipts = synchronized(lock) { keepConnectedReceipts.values.toList().also { keepConnectedReceipts.clear() } }
+        receipts.forEach { receipt ->
+            if (binding(receipt.source)?.optBoolean("keep_connected") == true) {
+                receipt.prepared.protocol.invalidate(receipt.prepared.binding, receipt.prepared.preferences.copy(keepConnected = false))
+                discardInvitation(receipt.source, receipt.event)
+            }
+        }
     }
     private fun bootCount() = android.provider.Settings.Global.getInt(app.contentResolver, android.provider.Settings.Global.BOOT_COUNT, -1)
     private fun storedInvitation(source: String, event: String): IncomingCall? = runCatching {
@@ -189,6 +264,8 @@ class PushManager(private val app: CypherApplication) {
         val invite = storedInvitation(source, event) ?: return
         if (invite.state != "ringing") return
         if (invite.ringDurationMillis(currentBoot = bootCount()) > 0) return
+        val key = "$source\u0000$event".digest()
+        keepConnectedReceipts.remove(key)?.prepared?.protocol?.expire(System.currentTimeMillis(), android.os.SystemClock.elapsedRealtime())
         persistInvitation(invite.copy(state = "missed"))
         clearIncomingPresentation(source, event)
         if (!permitsIncoming(source)) return
@@ -207,6 +284,7 @@ class PushManager(private val app: CypherApplication) {
         if (!validOpaque(source) || !validOpaque(event)) return false
         val key = "incoming:${"$source\u0000$event".digest()}"
         val stored = privatePrefs.contains(key)
+        keepConnectedReceipts.remove("$source\u0000$event".digest())
         storedInvitation(source, event)?.let { persistInvitation(it.copy(state = "ended")) }
         dismissInvitation(source, event)
         stored
@@ -216,12 +294,13 @@ class PushManager(private val app: CypherApplication) {
             runCatching { read(key) }.getOrNull()?.takeIf { it.string("source") in sources }?.let { invite -> edit.remove(key); invite.string("source") to invite.string("event") }
         }
     private fun bindings(): List<JSONObject> = synchronized(lock) { privatePrefs.all.keys.filter { it.startsWith("source:") }.mapNotNull { runCatching { read(it) }.getOrNull() } }
+    private fun fcmBindings() = bindings().filter { validOpaque(it.string("target")) }
     fun tokenChanged(token:String) {
         newestToken=token
         PushRegistrationJob.schedule(app,replace=true)
     }
     suspend fun refreshRegistrations() {
-        if(!app.firebaseConfigured || bindings().isEmpty()) return
+        if(!app.firebaseConfigured || fcmBindings().isEmpty()) return
         val token=suspendCancellableCoroutine<String> { c -> FirebaseMessaging.getInstance().token.addOnSuccessListener { if(c.isActive) c.resume(it) }.addOnFailureListener { if(c.isActive) c.resumeWithException(it) } }
         newestToken=token
         rotate(token)
@@ -229,7 +308,7 @@ class PushManager(private val app: CypherApplication) {
     suspend fun rotate(token: String) = withTimeout(30000) { registration.withLock {
         if(!app.firebaseConfigured||newestToken?.let { it!=token }==true) return@withLock
         var failed=false
-        bindings().forEach { binding ->
+        fcmBindings().forEach { binding ->
             if(newestToken?.let { it!=token }==true) return@withLock
             // A new token never invents a source: authenticate every previously registered scope.
             runCatching {
@@ -247,17 +326,20 @@ class PushManager(private val app: CypherApplication) {
     } }
     suspend fun revokeOwner(client: CypherClient) {
         val owned = bindings().filter { it.string("origin") == client.auth.origin && it.string("owner") == client.auth.owner }
+        val ownedSources = owned.map { it.string("source") }.toSet()
+        val remotelyOwned = owned.filter { validOpaque(it.string("target")) }
         // Local revocation precedes network IO, so an offline sign-out cannot be revived by a tap.
         synchronized(lock) {
             val edit = privatePrefs.edit()
-            val removed = removeIncoming(owned.map { it.string("source") }.toSet(), edit)
+            val removed = removeIncoming(ownedSources, edit)
             owned.forEach { binding -> edit.remove("source:${binding.string("source").digest()}").remove("active:${Scope(client.auth.origin, client.auth.owner, binding.string("profile")).key}") }
             check(edit.commit()) { "Could not remove local notification authorization" }
+            keepConnectedReceipts.entries.removeAll { it.value.source in ownedSources }
             owned.forEach { cancelNativeActivities(app, it.string("source")) }
             removed.forEach { (source, event) -> dismissInvitation(source, event) }
         }
         var failure: Throwable? = null
-        owned.forEach { binding ->
+        remotelyOwned.forEach { binding ->
             runCatching {
                 require(binding.string("backend")=="hermes-dashboard"&&binding.string("profile").isNotBlank()&&validOpaque(binding.string("target")))
                 // Logout already erased AuthStore; this frozen snapshot is used only to revoke the verified prior scope.
@@ -289,13 +371,18 @@ class CypherMessagingService : FirebaseMessagingService() {
     override fun onNewToken(token: String) {
         app.push.tokenChanged(token)
     }
-    override fun onMessageReceived(message: RemoteMessage) {
-        receivePush(this, message.data)
-    }
+    override fun onMessageReceived(message: RemoteMessage) { receivePush(this, message.data) }
     companion object { const val CHANNEL = "hermes-activity"; const val INCOMING_CHANNEL = "xara-incoming-call-v2" }
 }
 /** Same entry point for FCM and isolated native delivery checks. */
-fun receivePush(context: Context, data: Map<String, String>) {
+fun receivePush(context: Context, data: Map<String, String>) = receivePush(context, data, null)
+
+internal fun receiveKeepConnectedCall(context: Context, data: Map<String, String>, actionToken: String) {
+    require(validOpaque(actionToken)) { "Invalid local call action token" }
+    receivePush(context, data, actionToken)
+}
+
+private fun receivePush(context: Context, data: Map<String, String>, localActionToken: String?) {
         val app = context.applicationContext as CypherApplication
         val source = data["source_ref"].orEmpty()
         val event = data["event_id"].orEmpty()
@@ -315,7 +402,11 @@ fun receivePush(context: Context, data: Map<String, String>) {
         }
         if (data["kind"] !in setOf("failure", "completion", "approval", "clarify", "task_result", "test", "incoming_call")) return
         val incoming = data["kind"] == "incoming_call"
-        var invite = if (incoming) IncomingCall(source, event, data["expires_at"]?.toLongOrNull() ?: 0, conversation = data["conversation_ref"].orEmpty()) else null
+        var invite = if (incoming) IncomingCall(
+            source, event, data["expires_at"]?.toLongOrNull() ?: 0,
+            actionToken = localActionToken ?: java.util.UUID.randomUUID().toString(),
+            conversation = data["conversation_ref"].orEmpty(),
+        ) else null
         if (incoming && (invite == null || !invite.valid() || !validOpaque(data["conversation_ref"].orEmpty()) || !app.push.permitsIncoming(source))) return
         if (!incoming && !app.push.firstArrival(source, event)) return
         val ring = invite != null && app.push.saveInvitation(invite!!)

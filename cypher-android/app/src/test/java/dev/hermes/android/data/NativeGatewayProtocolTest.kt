@@ -1,6 +1,7 @@
 package dev.hermes.android.data
 
 import dev.hermes.android.core.json
+import dev.hermes.android.core.string
 import kotlinx.coroutines.*
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
@@ -22,6 +23,8 @@ class NativeGatewayProtocolTest {
         var sessionBypass: Boolean? = false
         var failPrompt = false
         var silentPrompt = false
+        var activeListFailure = false
+        var activeSessions = JSONArray().put(json("id" to "runtime-a", "session_key" to "stored-a", "status" to "working"))
         var replayEvents = JSONArray().put(json("session_id" to "runtime-a", "seq" to 1, "type" to "message.delta", "payload" to json("text" to "hello")))
         lateinit var listener: WebSocketListener
         lateinit var ws: WebSocket
@@ -42,6 +45,7 @@ class NativeGatewayProtocolTest {
                     val result = when(call.getString("method")) {
                         "session.create", "session.resume" -> json("session_id" to "runtime-a", "stored_session_id" to "stored-a", "info" to json("yolo" to sessionBypass))
                         "session.events.since" -> json("epoch" to "epoch-a", "latest_seq" to 2, "events" to replayEvents)
+                        "session.active_list" -> { if (activeListFailure) throw IllegalArgumentException("Synthetic status failure"); json("sessions" to activeSessions) }
                         "prompt.submit" -> json("status" to "streaming", "user_row_id" to 42)
                         "session.steer" -> json("status" to "queued")
                         "session.list" -> json("sessions" to JSONArray().put(json("id" to "visible", "title" to "Visible title", "secret_metadata" to "not-searchable")).apply { if (call.getJSONObject("params").optBoolean("include_hidden")) { put(json("id" to "hidden", "title" to "Archived title")); put(json("id" to "hidden", "title" to "Archived title")) } })
@@ -59,17 +63,32 @@ class NativeGatewayProtocolTest {
         }
         fun event(session: String, seq: Int) = listener.onMessage(ws, json("method" to "event", "params" to json("session_id" to session, "seq" to seq, "type" to "message.delta", "payload" to json("text" to "x"))).toString())
     }
-    private fun client(wire: Wire? = null, voiceStatus: Int = 404): CypherClient = CypherClient(AuthContext("https://native.example", emptyList(), "owner", "work", backend = "hermes-dashboard"), null, wire) { builder ->
+    /** Synthetic stock dashboard history routes; [historyStatus] fails the native transcript read itself. */
+    private fun client(wire: Wire? = null, voiceStatus: Int = 404, historyStatus: Int = 200, authCookies: List<String> = emptyList(), voiceSetCookie: String? = null, requestCookies: MutableList<Pair<String, String?>>? = null): CypherClient = CypherClient(AuthContext("https://native.example", authCookies, "owner", "work", backend = "hermes-dashboard"), null, wire) { builder ->
         builder.addInterceptor { chain ->
             val voice = chain.request().url.encodedPath.endsWith("/voice-history")
             val path = chain.request().url.encodedPath
+            // This application-interceptor fixture skips OkHttp's BridgeInterceptor. Replay its cookie
+            // steps against the actual call's client, so a detached request exercises its own jar.
+            val jar = (chain.call().javaClass.getMethod("getClient").invoke(chain.call()) as OkHttpClient).cookieJar
+            val cookieHeader = jar.loadForRequest(chain.request().url).joinToString("; ") { "${it.name}=${it.value}" }.ifBlank { null }
+            requestCookies?.add(path to cookieHeader)
+            val history = path == "/api/sessions/stored-a/messages"
             val payload = when {
                 voice -> json("session_id" to "stored-a", "profile" to "work", "events" to JSONArray())
-                path == "/api/plugins/cypher/mobile/sessions/stored-a" -> json("session_id" to "stored-a", "profile" to "work", "messages" to JSONArray(), "runtime_session_id" to "runtime-a")
-                path == "/api/plugins/cypher/mobile/sessions" -> json("sessions" to JSONArray().put(if (chain.request().url.queryParameter("include_archived") == "1") json("id" to "hidden", "title" to "Archived title") else json("id" to "visible", "title" to "Visible title", "secret_metadata" to "not-searchable")))
+                path == "/api/sessions/stored-a" -> json("id" to "stored-a", "profile" to "work", "title" to "Fixture title", "message_count" to 0)
+                history -> json("session_id" to "stored-a", "profile" to "work", "messages" to JSONArray(), "pagination" to json("limit" to 500, "offset" to 0, "order" to "latest", "returned" to 0))
+                path == "/api/sessions" -> json("sessions" to JSONArray().put(if (chain.request().url.queryParameter("archived") == "only") json("id" to "hidden", "title" to "Archived title", "profile" to "work") else json("id" to "visible", "title" to "Visible title", "profile" to "work", "secret_metadata" to "not-searchable")))
+                path.startsWith("/api/plugins/cypher/mobile/sessions") -> error("Native history must not use the optional plugin: $path")
                 else -> json("ticket" to "fixture-single-use-ticket")
             }
-            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(if (voice) voiceStatus else 200).message("Fixture").body(payload.toString().toResponseBody("application/json".toMediaType())).build()
+            val status = if (voice) voiceStatus else if (history) historyStatus else 200
+            val response = Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(status).message("Fixture").apply {
+                if (voice && voiceSetCookie != null) addHeader("Set-Cookie", voiceSetCookie)
+            }.body((if (status == 200) payload else json("detail" to "Fixture failure")).toString().toResponseBody("application/json".toMediaType())).build()
+            val received = Cookie.parseAll(chain.request().url, response.headers)
+            if (received.isNotEmpty()) jar.saveFromResponse(chain.request().url, received)
+            response
         }
     }
     @Test fun approvalsUseNativeProfileModesAndRemoveOnlyTheSelectedSessionBypass() = runBlocking {
@@ -282,16 +301,78 @@ class NativeGatewayProtocolTest {
         assertEquals(1, wire.sent.size)
     }
 
-    @Test fun missingVoiceArchiveDoesNotBlockNativeHistoryButAuthFailurePropagates() = runBlocking<Unit> {
-        for (status in listOf(403, 404)) {
+    @Test fun missingVoiceArchiveDoesNotBlockNativeHistoryButNativeAuthFailurePropagates() = runBlocking<Unit> {
+        // The voice archive is an optional plugin read: even its own 401 is not a native sign-in decision.
+        for (status in listOf(401, 403, 404, 500)) {
             val c = client(Wire(), status)
             val snapshot = c.get("/api/session", mapOf("session_id" to "stored-a"))
             assertEquals("stored-a", snapshot.getString("session_id"))
             assertFalse(snapshot.getBoolean("voice_transcripts_available"))
         }
-        val error = runCatching { client(Wire(), 401).get("/api/session", mapOf("session_id" to "stored-a")) }.exceptionOrNull()
-        assertTrue(error is ApiFailure && error.status == 401)
+        val error = runCatching { client(Wire(), voiceStatus = 200, historyStatus = 401).get("/api/session", mapOf("session_id" to "stored-a")) }.exceptionOrNull()
+        assertTrue("A native history 401 stays fatal: $error", error is ApiFailure && error.status == 401)
     }
+
+    @Test fun optionalVoiceHistoryCannotRotateOrDeleteNativeCookies() = runBlocking<Unit> {
+        val cookie = Cookie.Builder().name("hermes_session").value("verified").domain("native.example").path("/").secure().httpOnly().build().toString()
+        for ((status, setCookie) in listOf(
+            200 to "hermes_session=rotated; Path=/; Secure; HttpOnly",
+            401 to "hermes_session=; Max-Age=0; Path=/; Secure; HttpOnly",
+        )) {
+            val requests = mutableListOf<Pair<String, String?>>()
+            val c = client(voiceStatus = status, authCookies = listOf(cookie), voiceSetCookie = setCookie, requestCookies = requests)
+            val authBefore = c.auth
+            val cookiesBefore = c.jar.snapshot()
+
+            val history = c.get("/api/session", mapOf("session_id" to "stored-a"))
+            assertEquals(status == 200, history.getBoolean("voice_transcripts_available"))
+            assertEquals("Optional Set-Cookie cannot mutate native auth", authBefore, c.auth)
+            assertEquals("Optional Set-Cookie cannot mutate the parent's jar", cookiesBefore, c.jar.snapshot())
+
+            c.nativeGet("/api/sessions")
+            assertEquals("hermes_session=verified", requests.last { it.first == "/api/sessions" }.second)
+            assertEquals(authBefore, c.auth)
+            c.closeNative()
+        }
+    }
+
+    @Test fun activeSessionStatusRequiresExactRuntimeAndStoredIdentity() = runBlocking<Unit> {
+        val wire = Wire(); val c = client(wire)
+        assertEquals("working", c.nativeSessionStatus("stored-a", "runtime-a"))
+        val request = wire.sent.last { it.string("method") == "session.active_list" }
+        assertEquals("runtime-a", request.getJSONObject("params").getString("current_session_id"))
+        assertEquals("work", request.getJSONObject("params").getString("profile"))
+
+        for (status in listOf("idle", "working", "waiting")) {
+            wire.activeSessions = JSONArray().put(json("id" to "runtime-a", "session_key" to "stored-a", "status" to status))
+            assertEquals(status, c.nativeSessionStatus("stored-a", "runtime-a"))
+        }
+        for (row in listOf(
+            json("id" to "runtime-other", "session_key" to "stored-a", "status" to "idle"),
+            json("id" to "runtime-a", "session_key" to "stored-other", "status" to "idle"),
+            json("id" to "runtime-a", "session_key" to "stored-a", "status" to "starting"),
+            json("id" to "runtime-a", "session_key" to "stored-a", "status" to "resuming"),
+            json("id" to "runtime-a", "session_key" to "stored-a", "status" to 1),
+        )) {
+            wire.activeSessions = JSONArray().put(row)
+            assertNull(c.nativeSessionStatus("stored-a", "runtime-a"))
+        }
+        wire.activeSessions = JSONArray()
+        assertNull(c.nativeSessionStatus("stored-a", "runtime-a"))
+        wire.activeSessions = JSONArray().put(json("id" to "runtime-a", "session_key" to "stored-a", "status" to "idle"))
+            .put(json("id" to "runtime-a", "session_key" to "stored-a", "status" to "idle"))
+        assertNull(c.nativeSessionStatus("stored-a", "runtime-a"))
+        wire.activeSessions = JSONArray().put(json("id" to "runtime-a", "session_key" to "stored-a", "status" to "idle"))
+            .put(json("id" to "runtime-a", "session_key" to "stored-other", "status" to "working"))
+        assertNull(c.nativeSessionStatus("stored-a", "runtime-a"))
+        wire.activeSessions = JSONArray().put(json("id" to "runtime-a", "session_key" to "stored-a", "status" to "idle"))
+            .put(json("id" to "runtime-other", "session_key" to "stored-a", "status" to "working"))
+        assertNull(c.nativeSessionStatus("stored-a", "runtime-a"))
+        wire.activeListFailure = true
+        assertTrue(runCatching { c.nativeSessionStatus("stored-a", "runtime-a") }.isFailure)
+        c.closeNative()
+    }
+
     @Test fun methodOnlyCompletionClosesLogicalChatStream() = runBlocking<Unit> {
         val wire = Wire(); val c = client(wire)
         val types = mutableListOf<String>()
@@ -300,6 +381,61 @@ class NativeGatewayProtocolTest {
         wire.listener.onMessage(wire.ws, json("method" to "message.complete", "params" to json("text" to "complete")).toString())
         withTimeout(2000) { collector.await() }
         assertEquals("done", types.last())
+    }
+
+    @Test fun bootstrapWithoutPluginStillMintsATicket() = runBlocking<Unit> {
+        val wire = Wire()
+        val httpRequests = mutableListOf<Request>()
+        val c = CypherClient(AuthContext("https://native.example", emptyList(), profile = "work"), null, wire) { builder ->
+            builder.addInterceptor { chain ->
+                httpRequests += chain.request()
+                val path = chain.request().url.encodedPath
+                val payload = when (path) {
+                    "/api/auth/me" -> json("user_id" to "owner")
+                    "/api/profiles" -> json("profiles" to JSONArray().put(json("name" to "work")))
+                    "/api/auth/ws-ticket" -> json("ticket" to "fixture-single-use-ticket")
+                    else -> null
+                }
+                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1)
+                    .code(if (payload == null) 404 else 200).message("Fixture")
+                    .body((payload ?: json("detail" to "Not Found")).toString().toResponseBody("application/json".toMediaType())).build()
+            }
+        }
+        val boot = c.bootstrap()
+        assertEquals("not_probed", boot.getJSONObject("optional_features").getString("plugin"))
+        assertEquals("hermes-dashboard", c.auth.backend)
+        assertEquals("owner", c.auth.owner)
+        assertTrue(httpRequests.none { it.url.encodedPath.startsWith("/api/plugins/") })
+        val binding = c.nativeSession("stored-a")
+        assertEquals("stored-a", binding.storedSessionId)
+        assertEquals("hermes-gateway-v1, hermes-gateway-ticket.fixture-single-use-ticket", wire.requests.single().header("Sec-WebSocket-Protocol"))
+        assertNull(wire.requests.single().header("Authorization"))
+        assertEquals("native.example", wire.requests.single().url.host)
+        assertEquals("work", wire.sent.single().getJSONObject("params").getString("profile"))
+        c.closeNative()
+    }
+
+    @Test fun redirectedOrBlankTicketNeverOpensASocket() = runBlocking<Unit> {
+        val redirected = Wire()
+        val redirectClient = CypherClient(AuthContext("https://native.example", emptyList(), "owner", "work", backend = "hermes-dashboard"), null, redirected) { builder ->
+            builder.addInterceptor { chain ->
+                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(302).message("Found")
+                    .addHeader("Location", "https://other.example/api/auth/ws-ticket")
+                    .body(json("detail" to "Redirect").toString().toResponseBody("application/json".toMediaType())).build()
+            }
+        }
+        assertTrue(runCatching { NativeGateway(redirectClient, redirected).rpc("session.create", JSONObject()) }.isFailure)
+        assertTrue(redirected.requests.isEmpty())
+
+        val injected = Wire()
+        val blankTicket = CypherClient(AuthContext("https://native.example", emptyList(), "owner", "work", backend = "hermes-dashboard"), null, injected) { builder ->
+            builder.addInterceptor { chain ->
+                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
+                    .body(json("ticket" to "bad ticket").toString().toResponseBody("application/json".toMediaType())).build()
+            }
+        }
+        assertTrue(runCatching { NativeGateway(blankTicket, injected).rpc("session.create", JSONObject()) }.isFailure)
+        assertTrue(injected.requests.isEmpty())
     }
 
 }

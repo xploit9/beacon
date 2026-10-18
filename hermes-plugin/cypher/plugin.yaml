@@ -1,0 +1,16 @@
+name: cypher
+manifest_version: 1
+version: 2.1.0
+description: Native Cypher Android calls, text conversations and callbacks
+kind: standalone
+platforms: [windows, linux, macos]
+hooks: [on_session_end, post_tool_call, pre_llm_call]
+provides_tools: [cypher_call_user, cypher_email_notice, cypher_mail_read]
+python_dependencies:
+  - fastapi>=0.115,<1
+  - PyYAML>=6,<7
+  - google-genai==1.67.0
+  - firebase-admin==7.7.0
+  - httpx>=0.28,<1
+  - python-dotenv>=1.2,<2
+  - jsonschema>=4,<5

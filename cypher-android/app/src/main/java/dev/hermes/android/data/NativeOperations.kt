@@ -8,6 +8,14 @@ import org.json.JSONObject
 private class NativeTurnEnded : Exception()
 internal class NativeModelConfirmation(message: String) : IllegalStateException(message)
 internal val nativeApprovalModes = listOf("manual", "smart", "off")
+private val storedSessionId = Regex("[A-Za-z0-9_.:-]{1,256}")
+// Stock dashboard bounds: /api/sessions pages reject limit > 100; Cypher keeps its 200-row drawer window.
+private const val SESSION_PAGE_LIMIT = 100
+private const val SESSION_INDEX_WINDOW = 200
+// /api/sessions/{id}/messages allows limit <= 500; passive browsing reads one newest window.
+private const val HISTORY_WINDOW = 500
+private const val MAX_COMPRESSION_CHAIN = 512
+private const val OPTIONAL_VOICE_HISTORY_TIMEOUT_MS = 1_500L
 
 internal class NativeOperations(private val c: CypherClient) {
     suspend fun call(path: String, q: Map<String, String>, method: String, body: JSONObject?, maxBytes: Int): JSONObject = try { dispatch(path, q, method, body, maxBytes) } finally { c.closeNative() }
@@ -30,12 +38,7 @@ internal class NativeOperations(private val c: CypherClient) {
                 c.bindProfile(name)
                 return json("ok" to true, "profile" to name)
             }
-            "/api/sessions", "/api/sessions/search" -> {
-                val result = c.nativeGet("/api/plugins/cypher/mobile/sessions", mapOf("include_archived" to q["include_archived"].orEmpty()))
-                val rows = result.rows("sessions").ifEmpty { result.rows("items") }
-                val query = q["q"].orEmpty()
-                return json("sessions" to JSONArray(rows.filter { query.isBlank() || it.string("title").contains(query, true) || it.string("id").contains(query, true) }.distinctBy { it.string("stored_session_id", it.string("session_id", it.string("id"))) }.map { it.copy().put("archived", q["include_archived"] == "1").put("session_id", it.string("stored_session_id", it.string("session_id", it.string("id")))) }), "search_scope" to "Newest 200 conversation titles and identities", "limit" to 200)
-            }
+            "/api/sessions", "/api/sessions/search" -> return sessionIndex(archived = q["include_archived"] == "1", query = q["q"].orEmpty())
             "/api/session/new", "/api/xara/open" -> {
                 val params = JSONObject()
                 for (key in setOf("title", "model")) if (d.has(key) && !d.isNull(key)) params.put(key, d.opt(key))
@@ -46,10 +49,8 @@ internal class NativeOperations(private val c: CypherClient) {
                 return sessionProjection(c.nativeSessionSnapshot().put("messages", JSONArray()).put("acknowledged_shell", true), b).put("profile", c.auth.profile)
             }
             "/api/session" -> {
-                require(sid().matches(Regex("[A-Za-z0-9_.:-]{1,256}"))) { "Choose a native conversation first" }
-                val result = c.nativeRequest("/api/plugins/cypher/mobile/sessions/${sid()}")
-                require(result.string("session_id") == sid() && result.string("profile") == c.scope.profile) { "Conversation scope changed" }
-                return withVoiceHistory(result, NativeSessionBinding(c.scope, sid(), result.string("runtime_session_id")))
+                require(sid().matches(storedSessionId)) { "Choose a native conversation first" }
+                return passiveHistory(sid())
             }
             "/api/chat/start", "/api/chat/steer" -> {
                 require(path != "/api/chat/steer" || d.rows("attachments").isEmpty()) { "Guide accepts text only" }
@@ -169,7 +170,7 @@ internal class NativeOperations(private val c: CypherClient) {
                     val fresh = c.nativeRpc("session.resume", json("session_id" to b.storedSessionId, "close_on_disconnect" to false, "omit_messages" to false))
                     val updated = nativeSessionBinding(c.scope, fresh)
                     require(updated.scope == b.scope && updated.storedSessionId == b.storedSessionId) { "Model change returned another conversation. Refresh before sending." }
-                    return json("session" to withVoiceHistory(sessionProjection(fresh, updated), updated), "deferred" to result.optBoolean("deferred"))
+                    return json("session" to withVoiceHistory(sessionProjection(fresh, updated), updated.storedSessionId), "deferred" to result.optBoolean("deferred"))
                 }
                 if (d.has("workspace")) return c.nativeRpc("session.cwd.set", json("session_id" to b.runtimeSessionId, "cwd" to d.getString("workspace")))
                 throw ApiFailure(501, "These conversation settings are unavailable in native Hermes")
@@ -229,16 +230,91 @@ internal class NativeOperations(private val c: CypherClient) {
         if (NativeOperationPolicy.direct(path)) return c.nativeGet(path, q + ("profile" to c.auth.profile), method, body, maxBytes)
         throw ApiFailure(501, "This operation is unavailable in native Hermes: ${path.removePrefix("/api/")}")
     }
-    private suspend fun withVoiceHistory(snapshot: JSONObject, b: NativeSessionBinding): JSONObject {
-        val id = b.storedSessionId
-        require(id.matches(Regex("[A-Za-z0-9_.:-]{1,256}"))) { "Invalid native stored session identity" }
+    /** The optional plugin's voice archive. Any failure, including its own 401, only marks voice history unavailable. */
+    private suspend fun withVoiceHistory(snapshot: JSONObject, id: String): JSONObject {
+        require(id.matches(storedSessionId)) { "Invalid native stored session identity" }
         try {
-            val archive = c.nativeRequest("/api/plugins/cypher/mobile/sessions/$id/voice-history")
-            archivedVoiceTranscripts(c.scope.session(id), archive)
-            snapshot.put("voice_transcripts", archive.optJSONArray("events") ?: JSONArray()).put("voice_transcripts_available", true).put("voice_transcripts_truncated", archive.optBoolean("truncated"))
+            // Only this local timeout yields null; an external cancellation still propagates below.
+            val archive = kotlinx.coroutines.withTimeoutOrNull(OPTIONAL_VOICE_HISTORY_TIMEOUT_MS) {
+                c.detached().nativeGet("/api/plugins/cypher/mobile/sessions/$id/voice-history", mapOf("profile" to c.auth.profile), persistAuth = false)
+            }
+            if (archive == null) unavailableVoiceHistory(snapshot) else {
+                archivedVoiceTranscripts(c.scope.session(id), archive)
+                snapshot.put("voice_transcripts", archive.optJSONArray("events") ?: JSONArray()).put("voice_transcripts_available", true).put("voice_transcripts_truncated", archive.optBoolean("truncated"))
+            }
         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
-        catch (e: Exception) { if (e is ApiFailure && e.status == 401) throw e; snapshot.put("voice_transcripts_available", false).put("voice_transcripts", JSONArray()) }
+        catch (_: Exception) { unavailableVoiceHistory(snapshot) }
         return snapshot.put("profile", c.auth.profile)
+    }
+    private fun unavailableVoiceHistory(snapshot: JSONObject) = snapshot.put("voice_transcripts_available", false).put("voice_transcripts", JSONArray())
+
+    private fun ownedByProfile(row: JSONObject) = row.string("profile").let { it.isBlank() || it == c.auth.profile }
+
+    /**
+     * Stock dashboard conversation index, as Hermes Relay's DashboardApiClient.listSessions reads it (MIT; see
+     * licenses/Hermes-Relay-MIT.txt): the newest [SESSION_INDEX_WINDOW] rows in profile-scoped pages of at most
+     * [SESSION_PAGE_LIMIT], stopping at a short page. Search covers only titles and identities within that window.
+     */
+    private suspend fun sessionIndex(archived: Boolean, query: String): JSONObject {
+        val rows = LinkedHashMap<String, JSONObject>()
+        var offset = 0
+        while (offset < SESSION_INDEX_WINDOW) {
+            val limit = minOf(SESSION_PAGE_LIMIT, SESSION_INDEX_WINDOW - offset)
+            val page = c.nativeGet("/api/sessions", mapOf("profile" to c.auth.profile, "archived" to if (archived) "only" else "exclude", "limit" to "$limit", "offset" to "$offset"))
+            val items = listOf("sessions", "items", "data").firstNotNullOfOrNull { page.opt(it) as? JSONArray } ?: error("Hermes returned an unreadable conversation list")
+            for (index in 0 until items.length()) {
+                val row = items.opt(index) as? JSONObject ?: error("Hermes returned an unreadable conversation list")
+                val id = row.string("id", row.string("session_id"))
+                require(id.matches(storedSessionId)) { "Hermes returned a conversation without a valid identity" }
+                require(ownedByProfile(row)) { "The conversation list belongs to another profile" }
+                rows.putIfAbsent(id, row)
+            }
+            if (items.length() < limit) break
+            offset += limit
+        }
+        val listed = rows.filter { (id, row) -> query.isBlank() || row.string("title").contains(query, true) || id.contains(query, true) }
+        return json("sessions" to JSONArray(listed.map { (id, row) -> row.copy().put("session_id", id).put("profile", c.auth.profile).put("archived", archived) }),
+            "search_scope" to "Newest 200 conversation titles and identities", "limit" to SESSION_INDEX_WINDOW)
+    }
+
+    /**
+     * Read-only transcript: stock metadata plus the newest [HISTORY_WINDOW] messages (Relay getSessionMessages, LATEST).
+     * No socket, resume or live identity: `runtime_session_id` and `active_stream_id` stay blank. The UI keeps the
+     * requested id; a compressed history is accepted only with a verified descendant chain to the returned id.
+     */
+    private suspend fun passiveHistory(requested: String): JSONObject {
+        val scoped = mapOf("profile" to c.auth.profile)
+        val meta = c.nativeGet("/api/sessions/$requested", scoped)
+        require(meta.string("id", meta.string("session_id")) == requested && ownedByProfile(meta)) { "Conversation scope changed" }
+        val page = c.nativeGet("/api/sessions/$requested/messages", scoped + mapOf("order" to "latest", "limit" to "$HISTORY_WINDOW", "offset" to "0"))
+        val messages = page.opt("messages") as? JSONArray ?: error("Hermes returned an unreadable conversation history")
+        require(ownedByProfile(page)) { "Conversation scope changed" }
+        val resolved = page.string("session_id")
+        require(resolved.matches(storedSessionId)) { "Hermes returned a conversation without a valid identity" }
+        if (resolved != requested) requireDescendant(requested, resolved, scoped)
+        val rows = JSONArray()
+        for (index in 0 until messages.length()) {
+            val row = (messages.opt(index) as? JSONObject)?.copy() ?: error("Hermes returned an unreadable conversation history")
+            // Dashboard rows carry the SQLite row id as numeric `id`; gateway rows name it `row_id` (Relay MessageItem.resolvedRowId).
+            val rowId = row.opt("id")
+            if (!row.has("row_id") && (rowId is Number || rowId is String && rowId.toLongOrNull() != null)) row.put("row_id", rowId)
+            rows.put(row)
+        }
+        val returned = page.optJSONObject("pagination")?.optInt("returned", messages.length()) ?: messages.length()
+        val projection = meta.copy().apply { remove("id"); remove("runtime_session_id"); remove("active_stream_id"); if (has("provider")) put("model_provider", opt("provider")); if (has("cwd")) put("workspace", opt("cwd")) }
+            .put("session_id", requested).put("stored_session_id", resolved).put("profile", c.auth.profile)
+            .put("messages", rows).put("history_limit", HISTORY_WINDOW).put("history_truncated", returned >= HISTORY_WINDOW)
+        return withVoiceHistory(projection, requested)
+    }
+
+    /** A different returned id is a compression descendant only if the native chain runs from [requested] to [resolved]. */
+    private suspend fun requireDescendant(requested: String, resolved: String, scoped: Map<String, String>) {
+        val chain = c.nativeGet("/api/sessions/$requested/latest-descendant", scoped)
+        val path = chain.opt("path") as? JSONArray
+        val ids = path?.let { values -> (0 until values.length()).map { values.opt(it) as? String ?: "" } }.orEmpty()
+        require(chain.string("requested_session_id") == requested && chain.string("session_id") == resolved && chain.opt("changed") == true &&
+            ids.size in 2..MAX_COMPRESSION_CHAIN && ids.first() == requested && ids.last() == resolved &&
+            ids.all { it.matches(storedSessionId) } && ids.distinct().size == ids.size && ownedByProfile(chain)) { "Conversation history belongs to another conversation" }
     }
     internal suspend fun workspacePath(stored: String, path: String): String {
         if (path.startsWith('/') || path.matches(Regex("^[A-Za-z]:[/\\\\].*"))) return path
