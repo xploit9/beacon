@@ -123,6 +123,13 @@ class PushManager(private val app: CypherApplication) {
         targets.forEach { target -> client.nativeRequest("/api/plugins/cypher/mobile/notifications/targets/$target","DELETE") }
     } }
     fun binding(source: String): JSONObject? { if (!validOpaque(source)) return null; return synchronized(lock) { runCatching { read("source:${source.digest()}") }.getOrNull() } }
+    private fun receiptStillAuthorized(source: String, call: PreparedKeepConnectedCall): Boolean {
+        val stored = binding(source) ?: return false
+        val scope = Scope(call.binding.origin, call.binding.owner, call.binding.profile)
+        return stored.string("source") == source && stored.string("origin") == scope.origin &&
+            stored.string("owner") == scope.owner && stored.string("profile") == scope.profile &&
+            nativePushBindingAuthorized(stored, app.auth.read(scope.origin))
+    }
     fun permitsIncoming(source: String): Boolean = binding(source)?.let { b -> runCatching {
         nativePushBindingAuthorized(b, app.auth.read(b.getString("origin"))) &&
             (!b.optBoolean("keep_connected") || KeepConnectedService.isEnabledFor(app, Scope(b.getString("origin"), b.getString("owner"), b.getString("profile"))))
@@ -172,14 +179,18 @@ class PushManager(private val app: CypherApplication) {
     }
     fun authorizeKeepConnectedAction(source: String, event: String, action: String): Boolean {
         val invite = deadlineInvitation(source, event) ?: return false
-        val binding = binding(source) ?: return false
-        if (!binding.optBoolean("keep_connected")) return true
         val receipt = synchronized(lock) { keepConnectedReceipts["$source\u0000$event".digest()] } ?: return false
         val call = receipt.prepared
         val scope = Scope(call.binding.origin, call.binding.owner, call.binding.profile)
+        if (receipt.source != source || !receiptStillAuthorized(source, call)) {
+            call.protocol.invalidate(null, null)
+            discardInvitation(source, event)
+            return false
+        }
         val currentPreferences = call.preferences.copy(keepConnected = KeepConnectedService.isEnabledFor(app, scope))
-        if (!app.auth.read(scope.origin).authorizesPushSource(scope) || !RelayCallbackPolicy.callsAllowed(currentPreferences, call.binding.connectionId)) {
+        if (!RelayCallbackPolicy.callsAllowed(currentPreferences, call.binding.connectionId)) {
             call.protocol.invalidate(call.binding, currentPreferences)
+            discardInvitation(source, event)
             return false
         }
         val now = System.currentTimeMillis()
@@ -193,10 +204,8 @@ class PushManager(private val app: CypherApplication) {
     fun invalidateKeepConnectedInvitations() {
         val receipts = synchronized(lock) { keepConnectedReceipts.values.toList().also { keepConnectedReceipts.clear() } }
         receipts.forEach { receipt ->
-            if (binding(receipt.source)?.optBoolean("keep_connected") == true) {
-                receipt.prepared.protocol.invalidate(receipt.prepared.binding, receipt.prepared.preferences.copy(keepConnected = false))
-                discardInvitation(receipt.source, receipt.event)
-            }
+            receipt.prepared.protocol.invalidate(receipt.prepared.binding, receipt.prepared.preferences.copy(keepConnected = false))
+            discardInvitation(receipt.source, receipt.event)
         }
     }
     private fun bootCount() = android.provider.Settings.Global.getInt(app.contentResolver, android.provider.Settings.Global.BOOT_COUNT, -1)
@@ -265,7 +274,12 @@ class PushManager(private val app: CypherApplication) {
         if (invite.state != "ringing") return
         if (invite.ringDurationMillis(currentBoot = bootCount()) > 0) return
         val key = "$source\u0000$event".digest()
-        keepConnectedReceipts.remove(key)?.prepared?.protocol?.expire(System.currentTimeMillis(), android.os.SystemClock.elapsedRealtime())
+        keepConnectedReceipts.remove(key)?.prepared?.let { call ->
+            val scope = Scope(call.binding.origin, call.binding.owner, call.binding.profile)
+            val authorizedBinding = call.binding.takeIf { receiptStillAuthorized(source, call) }
+            val prefs = call.preferences.copy(keepConnected = KeepConnectedService.isEnabledFor(app, scope))
+            call.protocol.expire(System.currentTimeMillis(), android.os.SystemClock.elapsedRealtime(), authorizedBinding, prefs)
+        }
         persistInvitation(invite.copy(state = "missed"))
         clearIncomingPresentation(source, event)
         if (!permitsIncoming(source)) return

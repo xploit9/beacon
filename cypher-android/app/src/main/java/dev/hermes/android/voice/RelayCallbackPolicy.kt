@@ -1,14 +1,13 @@
 package dev.hermes.android.voice
 
 import dev.hermes.android.core.trustedOrigin
-import org.json.JSONObject
 
 // Adapted from Hermes Relay ProactiveSubscription.kt / data/ProactivePrefs.kt.
 // Copyright (c) 2026 Axiom Labs, MIT; full notice in RelayCallback.kt.
 
 /** A hydrated preference snapshot. Null means storage has not loaded, never consent. */
 data class RelayCallbackPreferences(
-    val connectionId: String?, val messages: Boolean, val calls: Boolean, val keepConnected: Boolean,
+    val connectionId: String?, val calls: Boolean, val keepConnected: Boolean,
 )
 
 /**
@@ -30,21 +29,6 @@ object RelayCallbackPolicy {
     private fun bound(prefs: RelayCallbackPreferences?, connectionId: String?): RelayCallbackPreferences? =
         prefs?.takeIf { !connectionId.isNullOrBlank() && it.connectionId == connectionId }
 
-    fun messagesAllowed(prefs: RelayCallbackPreferences?, connectionId: String?): Boolean =
-        bound(prefs, connectionId)?.messages == true
-
     fun callsAllowed(prefs: RelayCallbackPreferences?, connectionId: String?): Boolean =
         bound(prefs, connectionId)?.let { it.calls && it.keepConnected } == true
-
-    /** Unknown/unbound storage must not change the subscription on a different connection. */
-    fun subscriptionEnvelope(prefs: RelayCallbackPreferences?, connectionId: String?): JSONObject? {
-        val snapshot = bound(prefs, connectionId) ?: return null
-        val calls = snapshot.calls && snapshot.keepConnected
-        return if (!snapshot.messages && !calls) RelayCallbackWire.envelope("proactive.unsubscribe", JSONObject())
-        else RelayCallbackWire.envelope("proactive.subscribe", JSONObject()
-            .put("messages", snapshot.messages).put("voice_calls", calls))
-    }
-
-    fun canSetCallsConsent(enabled: Boolean, paired: Boolean, keepConnected: Boolean): Boolean =
-        !enabled || paired && keepConnected
 }

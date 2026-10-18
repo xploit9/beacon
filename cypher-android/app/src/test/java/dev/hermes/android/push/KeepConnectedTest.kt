@@ -56,6 +56,14 @@ class KeepConnectedTest {
         assertEquals(60_000L, keepConnectedBackoffMs(100))
     }
 
+    @Test fun successfulPollPacingEnforcesAMinimumCycleWithoutStackingAfterLongPoll() {
+        assertEquals(500L, keepConnectedPollDelay(0))
+        assertEquals(300L, keepConnectedPollDelay(200))
+        assertEquals(0L, keepConnectedPollDelay(500))
+        assertEquals(0L, keepConnectedPollDelay(1_500))
+        assertEquals(500L, keepConnectedPollDelay(-1))
+    }
+
     @Test fun eachAuthorizedProfileIsPolledAndGetsItsOwnCursor() = runTest {
         val store = cursors().apply {
             advance("https://hermes.example", "owner", "default", 4)

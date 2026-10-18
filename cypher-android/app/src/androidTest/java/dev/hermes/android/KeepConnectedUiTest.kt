@@ -3,7 +3,9 @@ package dev.hermes.android
 import android.Manifest
 import android.app.NotificationManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.media.AudioManager
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.assertIsOn
@@ -25,7 +27,9 @@ import dev.hermes.android.core.digest
 import dev.hermes.android.core.string
 import dev.hermes.android.data.AuthContext
 import dev.hermes.android.data.NativeBearerRecord
+import dev.hermes.android.data.VoiceKeyStore
 import dev.hermes.android.push.KeepConnectedService
+import dev.hermes.android.push.persistPushBindings
 import dev.hermes.android.ui.NativeLocalization
 import dev.hermes.android.ui.NotificationSettings
 import dev.hermes.android.ui.SetupWizardScreen
@@ -35,9 +39,11 @@ import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
+import org.json.JSONObject
 
 class KeepConnectedUiTest {
     @get:Rule val compose = createAndroidComposeRule<androidx.activity.ComponentActivity>()
@@ -82,8 +88,8 @@ class KeepConnectedUiTest {
     @Test fun enablingPollsFixtureCallsAndReusesTheCypherIncomingCallPath() = runBlocking {
         val app = ApplicationProvider.getApplicationContext<CypherApplication>()
         val uiAutomation = InstrumentationRegistry.getInstrumentation().uiAutomation
-        if (android.os.Build.VERSION.SDK_INT >= 33) uiAutomation.grantRuntimePermission(app.packageName, Manifest.permission.POST_NOTIFICATIONS)
-        uiAutomation.grantRuntimePermission(app.packageName, Manifest.permission.RECORD_AUDIO)
+        val hadNotifications = android.os.Build.VERSION.SDK_INT < 33 || app.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        val hadRecordAudio = app.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         val fixture = NativeExperienceFixture()
         val scope = fixture.scope
         val oldAuth = app.auth.read(scope.origin)
@@ -91,7 +97,19 @@ class KeepConnectedUiTest {
         val keepPrefs = app.getSharedPreferences(KeepConnectedService.PREFS, Context.MODE_PRIVATE)
         val keepBefore = keepPrefs.all.toMap()
         val pushPrefs = app.getSharedPreferences("push-binding", Context.MODE_PRIVATE)
+        val voicePrefs = app.getSharedPreferences("voice-private", Context.MODE_PRIVATE)
+        val voiceBefore = voicePrefs.all.toMap()
         val priorSources = mutableMapOf<String, String?>()
+        fun seedExistingFcmBinding(source: String) {
+            val key = "source:${source.digest()}"
+            priorSources[key] = pushPrefs.getString(key, null)
+            val value = JSONObject().put("source", source).put("origin", scope.origin).put("owner", scope.owner)
+                .put("profile", scope.profile).put("backend", "hermes-dashboard").put("target", "fixture-target")
+            val encoded = android.util.Base64.encodeToString(
+                app.cipher.encrypt(value.toString().toByteArray(), key), android.util.Base64.NO_WRAP,
+            )
+            persistPushBindings(pushPrefs, mapOf(key to encoded))
+        }
         val originKey = stringPreferencesKey("origin")
         val setupCompleteKey = booleanPreferencesKey("setup_complete")
         val setupActiveKey = booleanPreferencesKey("setup_active")
@@ -99,6 +117,7 @@ class KeepConnectedUiTest {
         val beforeVolume = app.getSystemService(AudioManager::class.java).getStreamVolume(AudioManager.STREAM_RING)
         val audio = app.getSystemService(AudioManager::class.java)
         val manager = app.getSystemService(NotificationManager::class.java)
+        val previousSignInNotification = runCatching { manager.activeNotifications.firstOrNull { it.id == 4083 } }.getOrNull()
         val store = ViewModelStore()
         var vmClient: dev.hermes.android.data.CypherClient? = null
         val auth = AuthContext(
@@ -107,17 +126,21 @@ class KeepConnectedUiTest {
         )
         val testEvents = mutableListOf<org.json.JSONObject>()
         lateinit var vm: CypherViewModel
-        KeepConnectedService.setEnabled(app, null, false)
-        KeepConnectedService.clientFactoryForTest = { current, authStore -> fixture.clientFor(current, authStore) }
-        audio.setStreamVolume(AudioManager.STREAM_RING, 0, 0)
-        app.auth.write(auth)
-        app.preferences.edit { values ->
-            values[originKey] = ""
-            values[setupCompleteKey] = true
-            values[setupActiveKey] = false
-            values[setupStepKey] = "done"
-        }
         try {
+            if (android.os.Build.VERSION.SDK_INT >= 33) uiAutomation.grantRuntimePermission(app.packageName, Manifest.permission.POST_NOTIFICATIONS)
+            uiAutomation.grantRuntimePermission(app.packageName, Manifest.permission.RECORD_AUDIO)
+            KeepConnectedService.setEnabled(app, null, false)
+            KeepConnectedService.clientFactoryForTest = { current, authStore -> fixture.clientFor(current, authStore) }
+            audio.setStreamVolume(AudioManager.STREAM_RING, 0, 0)
+            app.auth.write(auth)
+            app.preferences.edit { values ->
+                values[originKey] = ""
+                values[setupCompleteKey] = true
+                values[setupActiveKey] = false
+                values[setupStepKey] = "done"
+            }
+            val voiceStore = VoiceKeyStore(app)
+            voiceStore.saveKey(voiceStore.settings().provider, "fixture-voice-key")
             compose.runOnUiThread {
                 vm = ViewModelProvider(store, viewModelFactory { initializer { CypherViewModel(app, SavedStateHandle()) } })[CypherViewModel::class.java]
             }
@@ -130,24 +153,35 @@ class KeepConnectedUiTest {
                 app.calls.ownerScope = scope
                 app.calls.uiVisible = false
             }
-            compose.setContent { NativeLocalization("en") { CypherTheme(dark = true) { NotificationSettings(vm) } } }
+            val showIncomingCall = mutableStateOf(false)
+            compose.setContent { NativeLocalization("en") { CypherTheme(dark = true) {
+                if (showIncomingCall.value) IncomingCallSheet(vm, requestingPermission = false) { source, event -> vm.handlePush(source, event, "answer") }
+                else NotificationSettings(vm)
+            } } }
+
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                manager.createNotificationChannel(android.app.NotificationChannel("cypher_keep_connected", "Keep connected", NotificationManager.IMPORTANCE_LOW))
+            }
+            val signInPrompt = if (android.os.Build.VERSION.SDK_INT >= 26) {
+                android.app.Notification.Builder(app, "cypher_keep_connected")
+            } else android.app.Notification.Builder(app)
+            manager.notify(4083, signInPrompt.setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle("Sign in again").build())
 
             val answerEvent = fixture.emitIncomingCall(conversationId = "chat-b")
             testEvents += answerEvent
             val answerSource = answerEvent.getString("source_ref")
-            priorSources["source:${answerSource.digest()}"] = pushPrefs.getString("source:${answerSource.digest()}", null)
+            seedExistingFcmBinding(answerSource)
             compose.onNodeWithTag("keep-connected-toggle").performClick()
             compose.waitUntil(15_000) {
                 KeepConnectedService.status(app) == KeepConnectedService.STATUS_CONNECTED &&
                     app.push.ringingInvitation(answerSource, answerEvent.getString("event_id")) != null
             }
+            assertFalse(manager.activeNotifications.any { it.id == 4083 })
             assertTrue(fixture.notificationWaits.contains(25L))
             val answerInvite = app.push.ringingInvitation(answerSource, answerEvent.getString("event_id"))!!
             assertTrue(manager.activeNotifications.any { it.tag == answerInvite.key && it.id == 2 })
 
-            compose.setContent { NativeLocalization("en") { CypherTheme(dark = true) {
-                IncomingCallSheet(vm, requestingPermission = false) { source, event -> vm.handlePush(source, event, "answer") }
-            } } }
+            compose.runOnIdle { showIncomingCall.value = true }
             compose.onNodeWithTag("xara-incoming-answer").assertIsDisplayed().performClick()
             compose.waitUntil(15_000) { vm.ui.value.tab == "Xara" && vm.chat.value.sessionId == "chat-b" }
             assertEquals("chat-b", vm.chat.value.sessionId)
@@ -157,7 +191,7 @@ class KeepConnectedUiTest {
             val declineEvent = fixture.emitIncomingCall(conversationId = "chat-a")
             testEvents += declineEvent
             val declineSource = declineEvent.getString("source_ref")
-            priorSources["source:${declineSource.digest()}"] = pushPrefs.getString("source:${declineSource.digest()}", null)
+            seedExistingFcmBinding(declineSource)
             compose.waitUntil(10_000) { app.push.ringingInvitation(declineSource, declineEvent.getString("event_id")) != null }
             compose.onNodeWithTag("xara-incoming-decline").performClick()
             compose.waitUntil(10_000) { fixture.incomingNotification?.optString("event_id") == declineEvent.getString("event_id") && fixture.incomingNotification?.optString("state") == "declined" }
@@ -165,10 +199,22 @@ class KeepConnectedUiTest {
             val expiryEvent = fixture.emitIncomingCall(conversationId = "chat-a", expiresInSeconds = 3)
             testEvents += expiryEvent
             val expirySource = expiryEvent.getString("source_ref")
-            priorSources["source:${expirySource.digest()}"] = pushPrefs.getString("source:${expirySource.digest()}", null)
+            seedExistingFcmBinding(expirySource)
             compose.waitUntil(10_000) { app.push.missedInvitation(expirySource, expiryEvent.getString("event_id")) != null }
+
+            val optOutEvent = fixture.emitIncomingCall(conversationId = "chat-a")
+            testEvents += optOutEvent
+            val optOutSource = optOutEvent.getString("source_ref")
+            seedExistingFcmBinding(optOutSource)
+            compose.waitUntil(10_000) { app.push.ringingInvitation(optOutSource, optOutEvent.getString("event_id")) != null }
+            assertFalse(app.push.binding(optOutSource)!!.optBoolean("keep_connected"))
+            KeepConnectedService.setEnabled(app, null, false)
+            assertNull(app.push.ringingInvitation(optOutSource, optOutEvent.getString("event_id")))
+            assertFalse(app.push.authorizeKeepConnectedAction(optOutSource, optOutEvent.getString("event_id"), "answer"))
         } finally {
             KeepConnectedService.setEnabled(app, null, false)
+            if (previousSignInNotification == null) manager.cancel(4083)
+            else manager.notify(previousSignInNotification.tag, previousSignInNotification.id, previousSignInNotification.notification)
             runCatching { compose.waitUntil(5_000) { manager.activeNotifications.none { it.id == 4082 } } }
             testEvents.forEach { event ->
                 val source = event.optString("source_ref")
@@ -191,8 +237,11 @@ class KeepConnectedUiTest {
                 dataBefore[setupStepKey]?.let { values[setupStepKey] = it } ?: values.remove(setupStepKey)
             }
             restoreSharedPreferences(keepPrefs, keepBefore)
+            restoreSharedPreferences(voicePrefs, voiceBefore)
             audio.setStreamVolume(AudioManager.STREAM_RING, beforeVolume, 0)
             if (keepBefore[KeepConnectedService.KEY_ENABLED] == true) KeepConnectedService.startIfEnabled(app)
+            if (android.os.Build.VERSION.SDK_INT >= 33 && !hadNotifications) runCatching { uiAutomation.revokeRuntimePermission(app.packageName, Manifest.permission.POST_NOTIFICATIONS) }
+            if (!hadRecordAudio) runCatching { uiAutomation.revokeRuntimePermission(app.packageName, Manifest.permission.RECORD_AUDIO) }
         }
     }
 }
