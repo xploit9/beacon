@@ -29,6 +29,8 @@ import kotlinx.coroutines.launch
     var confirmYolo by remember(capturedClient, capturedScope) { mutableStateOf(false) }
     var saving by remember(capturedClient, capturedScope) { mutableStateOf(false) }
     var lastVerifiedYolo by remember(capturedClient, capturedScope) { mutableStateOf<Boolean?>(null) }
+    var yoloReadRequested by remember(capturedClient, capturedScope) { mutableStateOf(false) }
+    var yoloUnknownAfterRead by remember(capturedClient, capturedScope) { mutableStateOf(false) }
     val key = "picker:approvals"
     val path = "/api/approval/mode"
     val record = data[key]
@@ -36,13 +38,17 @@ import kotlinx.coroutines.launch
     val current = scopedRecord?.string("value").orEmpty()
     val profileMode = scopedRecord?.string("profile_mode").orEmpty()
     val yoloKnown = scopedRecord?.optBoolean("session_status_known") == true
-    val yolo = yoloKnown && scopedRecord?.optBoolean("session_bypass") == true && profileMode != "off"
+    val yolo = (if (yoloKnown) scopedRecord?.optBoolean("session_bypass") == true else lastVerifiedYolo == true) && profileMode != "off"
     val yoloUnknown = scopedRecord != null && current.isNotBlank() && !yoloKnown && profileMode != "off"
     val loading = key in refreshing
     LaunchedEffect(scopedRecord) {
-        if (yoloKnown) lastVerifiedYolo = scopedRecord?.optBoolean("session_bypass")
+        if (yoloKnown) {
+            lastVerifiedYolo = scopedRecord?.optBoolean("session_bypass")
+            yoloUnknownAfterRead = false
+        } else if (yoloReadRequested && lastVerifiedYolo != null) yoloUnknownAfterRead = true
+        yoloReadRequested = false
     }
-    fun refresh() { vm.load(key, path, mapOf("session_id" to capturedScope?.session.orEmpty())) }
+    fun refresh() { yoloReadRequested = true; vm.load(key, path, mapOf("session_id" to capturedScope?.session.orEmpty())) }
     fun apply(mode: String) {
         if (saving) return
         if (!enabled || capturedClient == null || capturedScope == null || vm.client !== capturedClient || vm.authenticatedScope() != capturedScope) {
@@ -68,12 +74,10 @@ import kotlinx.coroutines.launch
         saving = true
         val job = vm.action(path, json("yolo" to turnOn, "session_id" to capturedScope.session, "scope_key" to capturedScope.key), refresh = false,
             successNotice = if (turnOn) "YOLO enabled for this chat" else "YOLO disabled for this chat") { _, result ->
+                lastVerifiedYolo = turnOn
+                yoloUnknownAfterRead = false
+                yoloReadRequested = false
                 vm.storeData(key, result)
-                lastVerifiedYolo = when {
-                    turnOn -> true
-                    result.optBoolean("session_status_known") -> result.optBoolean("session_bypass")
-                    else -> null
-                }
             }
         scope.launch {
             try {
@@ -85,7 +89,10 @@ import kotlinx.coroutines.launch
     Box {
         IconButton(onClick = { open = true; refresh() }, enabled = enabled && capturedClient != null && capturedScope != null && !saving, modifier = Modifier.testTag("composer-approvals")) {
             val description = when {
+                yolo && yoloUnknownAfterRead -> "Approvals · YOLO on · last verified"
                 yolo -> "Approvals · YOLO on"
+                yoloUnknown && yoloUnknownAfterRead && lastVerifiedYolo == false -> "Approvals · YOLO off · last verified"
+                yoloUnknown && lastVerifiedYolo == false -> "Approvals"
                 yoloUnknown -> "Approvals · YOLO status unknown for this chat"
                 else -> "Approvals"
             }
@@ -108,7 +115,8 @@ import kotlinx.coroutines.launch
                     else -> "No Hermes approval prompts"
                 }
                 DropdownMenuItem(text = { Column { Text(mode.replaceFirstChar { it.uppercase() }); Text(description, style = MaterialTheme.typography.bodySmall, maxLines = 2) } },
-                    trailingIcon = { if (current == mode) Icon(Icons.Rounded.Check, "Selected") },
+                    // Tick the profile's own mode: a per-chat YOLO bypass reports value "off" but has its own YOLO tick.
+                    trailingIcon = { if (profileMode.ifBlank { current } == mode) Icon(Icons.Rounded.Check, "Selected") },
                     enabled = enabled && !loading && !saving && current in nativeApprovalModes && error.isBlank(),
                     modifier = Modifier.testTag("approval-mode-$mode"), onClick = {
                         if (mode == "off" && profileMode != "off") { open = false; confirmOff = true } else apply(mode)
@@ -118,15 +126,35 @@ import kotlinx.coroutines.launch
                 { Text("Profile approvals are Off, so this chat already bypasses prompts. Choose Manual or Smart before using the per-chat override.", style = MaterialTheme.typography.bodySmall) },
                 {}, enabled = false,
             )
-            DropdownMenuItem(
+            val yoloActionEnabled = enabled && !loading && !saving && current in nativeApprovalModes && error.isBlank() && profileMode != "off"
+            if (yoloUnknown) {
+                DropdownMenuItem(
+                    text = { Column {
+                        Text("Turn on YOLO for this chat…")
+                        Text("Confirm to bypass approval prompts for this chat only.", style = MaterialTheme.typography.bodySmall, maxLines = 2)
+                    } },
+                    enabled = yoloActionEnabled,
+                    modifier = Modifier.testTag("approval-yolo"),
+                    onClick = { open = false; confirmYolo = true },
+                )
+                DropdownMenuItem(
+                    text = { Column {
+                        Text("Turn off YOLO for this chat")
+                        Text("Write a session-scoped disable while the current status is unknown.", style = MaterialTheme.typography.bodySmall, maxLines = 2)
+                    } },
+                    enabled = yoloActionEnabled,
+                    modifier = Modifier.testTag("approval-yolo-off"),
+                    onClick = { applyYolo(false) },
+                )
+            } else DropdownMenuItem(
                 text = { Column {
-                    Text(if (yoloUnknown) "Turn off YOLO for this chat" else "YOLO")
-                    Text(if (yoloUnknown) "Write a session-scoped disable while the current status is unknown." else "Bypass approval prompts for this chat only. Resets when the session changes.", style = MaterialTheme.typography.bodySmall, maxLines = 2)
+                    Text("YOLO")
+                    Text("Bypass approval prompts for this chat only. Resets when the session changes.", style = MaterialTheme.typography.bodySmall, maxLines = 2)
                 } },
                 trailingIcon = { if (yolo) Icon(Icons.Rounded.Check, "YOLO enabled") },
-                enabled = enabled && !loading && !saving && current in nativeApprovalModes && error.isBlank() && profileMode != "off",
+                enabled = yoloActionEnabled,
                 modifier = Modifier.testTag("approval-yolo"),
-                onClick = { if (yolo || yoloUnknown) applyYolo(false) else { open = false; confirmYolo = true } },
+                onClick = { if (yolo) applyYolo(false) else { open = false; confirmYolo = true } },
             )
             HorizontalDivider()
             DropdownMenuItem({ Text("Direct voice changes keep their separate confirmation.", style = MaterialTheme.typography.bodySmall) }, {}, enabled = false)
