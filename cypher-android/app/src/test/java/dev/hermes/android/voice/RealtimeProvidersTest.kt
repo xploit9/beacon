@@ -168,4 +168,26 @@ class RealtimeProvidersTest {
         assertEquals(listOf(50), read(first))
         assertEquals(listOf(250), read(second))
     }
+
+    @Test fun openAiMicrophoneFramesReachTheSocketAsAppendEvents() {
+        val microphoneFrame = JSONObject(OpenAiWire.audio("AQIDBA==").toString())
+        val sent = OpenAiWire().outbound(microphoneFrame)
+        assertEquals(1, sent.size)
+        assertEquals("input_audio_buffer.append", sent.single().getString("type"))
+        assertEquals("AQIDBA==", sent.single().getString("audio"))
+    }
+
+    @Test fun openAiSessionEnablesInputTranscription() {
+        val setup = OpenAiWire.setup(GeminiWire.setup("gpt-realtime-2.1", "marin", null))
+        val input = setup.getJSONObject("session").getJSONObject("audio").getJSONObject("input")
+        assertEquals("gpt-4o-transcribe", input.getJSONObject("transcription").getString("model"))
+    }
+
+    @Test fun providerCheckDistinguishesSuccessRejectionUnreachableAndProviderErrors() {
+        assertEquals(VoiceProviderTestResult.Success, classifyVoiceProviderTestResponse(101))
+        assertEquals(VoiceProviderTestResult.KeyRejected, classifyVoiceProviderTestResponse(401))
+        assertEquals(VoiceProviderTestResult.KeyRejected, classifyVoiceProviderTestResponse(403))
+        assertEquals(VoiceProviderTestResult.Unreachable, classifyVoiceProviderTestResponse(null))
+        assertEquals(VoiceProviderTestResult.ProviderError, classifyVoiceProviderTestResponse(503))
+    }
 }

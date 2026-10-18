@@ -9,6 +9,7 @@ import java.net.URI
 internal class GrokWire(private val providerName: String = "Grok") {
     private val calls=linkedMapOf<String,String>()
     private val inputSnapshots=linkedMapOf<String,String>()
+    private val outputTranscriptItems=linkedSetOf<String>()
     private val argumentDeltas=linkedMapOf<String,String>()
     private val emittedCalls=linkedSetOf<String>()
     private val delivered=linkedMapOf<String,String>()
@@ -157,9 +158,16 @@ internal class GrokWire(private val providerName: String = "Grok") {
                 content.put("inputTranscription",JSONObject().put("text",text)
                     .put("item_id",item).put("content_index",frame.optInt("content_index",0)).put("final",true))
             }
-            "response.output_audio_transcript.delta","response.audio_transcript.delta" -> content.put("outputTranscription",JSONObject().put("text",frame.getString("delta")))
-            "response.output_audio_transcript.done","response.audio_transcript.done" -> content.put("outputTranscription",JSONObject().put("text",frame.optString("transcript")).put("final",true)
-                .apply { frame.optString("item_id").takeIf(String::isNotBlank)?.let { put("item_id",it).put("content_index",frame.optInt("content_index",0)) } })
+            "response.output_audio_transcript.delta","response.audio_transcript.delta" -> {
+                frame.optString("item_id").takeIf(String::isNotBlank)?.let(::rememberOutputTranscript)
+                content.put("outputTranscription",JSONObject().put("text",frame.getString("delta")))
+            }
+            "response.output_audio_transcript.done","response.audio_transcript.done" -> {
+                val item=frame.optString("item_id")
+                if(item.isNotBlank()&&!rememberOutputTranscript(item)) return null
+                content.put("outputTranscription",JSONObject().put("text",frame.optString("transcript")).put("final",true)
+                    .apply { item.takeIf(String::isNotBlank)?.let { put("item_id",it).put("content_index",frame.optInt("content_index",0)) } })
+            }
             "response.output_item.added" -> {
                 val item=frame.optJSONObject("item")
                 if(item?.optString("type")=="function_call") {
@@ -223,6 +231,13 @@ internal class GrokWire(private val providerName: String = "Grok") {
         if(emittedCalls.size>128) emittedCalls.remove(emittedCalls.first())
         frame.optString("item_id").takeIf(String::isNotBlank)?.let(argumentDeltas::remove)
         return JSONObject().put("id",id).put("name",name).put("args",args)
+    }
+
+    private fun rememberOutputTranscript(item:String):Boolean {
+        require(item.isNotBlank()&&item.length<=200)
+        val fresh=outputTranscriptItems.add(item)
+        if(outputTranscriptItems.size>128) outputTranscriptItems.remove(outputTranscriptItems.first())
+        return fresh
     }
     @Synchronized fun continueResponse():JSONObject? = if(responsePending&&!responding) {
         responsePending=false;responding=true;JSONObject().put("type","response.create")

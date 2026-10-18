@@ -173,16 +173,10 @@ data class SphereFrame(
     val shadowStrength: Float = 0f
 )
 
-/** What to draw at one grid cell. RGB + alpha in 0..1. */
-data class SphereCell(
-    val col: Int,
-    val row: Int,
-    val char: Char,
-    val r: Float,
-    val g: Float,
-    val b: Float,
-    val alpha: Float
-)
+/** Draw callback keeps per-cell scalar values unboxed and avoids a frame object per glyph. */
+fun interface SphereCellRenderer {
+    fun draw(col: Int, row: Int, char: Char, r: Float, g: Float, b: Float, alpha: Float)
+}
 
 private val charSets = arrayOf(
     " ·:;=+*#%@",
@@ -197,8 +191,8 @@ private const val dataChars = "01<>[]{}|/\\~^"
  * cell that should be drawn. Cells outside the drawable region (or excluded by
  * sparsity) are silently skipped — the callback sees only visible glyphs.
  */
-fun forEachSphereCell(frame: SphereFrame, onCell: (SphereCell) -> Unit) {
-    val amp = frame.voiceAmplitude.coerceIn(0f, 1f)
+fun forEachSphereCell(frame: SphereFrame, onCell: SphereCellRenderer) {
+    val amp = if (frame.voiceMode) frame.voiceAmplitude.coerceIn(0f, 1f) else 0f
 
     // ── Voice modulation of animated base params ─────────────────
     val breatheSpeed = when (frame.state) {
@@ -350,13 +344,12 @@ fun forEachSphereCell(frame: SphereFrame, onCell: (SphereCell) -> Unit) {
                 val warmth = (1f - normDist * normDist) * (coreWarmth * 0.40f)
                 val lightBoost = directionalLight * 0.08f
 
-                onCell(SphereCell(
-                    col = col, row = row, char = ch,
-                    r = (colR + lightBoost + warmth).coerceIn(0f, 1f),
-                    g = (colG + lightBoost * 0.5f + warmth).coerceIn(0f, 1f),
-                    b = (colB + lightBoost + warmth).coerceIn(0f, 1f),
-                    alpha = alpha
-                ))
+                onCell.draw(
+                    col, row, ch,
+                    (colR + lightBoost + warmth).coerceIn(0f, 1f),
+                    (colG + lightBoost * 0.5f + warmth).coerceIn(0f, 1f),
+                    (colB + lightBoost + warmth).coerceIn(0f, 1f), alpha
+                )
             } else if (dist <= glowRadius) {
                 // ── GLOW / DEBRIS ZONE ───────────────────────
                 val glowT = (dist - distortedRadius) / (glowRadius - distortedRadius)
@@ -377,13 +370,7 @@ fun forEachSphereCell(frame: SphereFrame, onCell: (SphereCell) -> Unit) {
                 if (ch == ' ') continue
 
                 val alpha = glowFalloff * 0.85f
-                onCell(SphereCell(
-                    col = col, row = row, char = ch,
-                    r = colR.coerceIn(0f, 1f),
-                    g = colG.coerceIn(0f, 1f),
-                    b = colB.coerceIn(0f, 1f),
-                    alpha = alpha
-                ))
+                onCell.draw(col, row, ch, colR.coerceIn(0f, 1f), colG.coerceIn(0f, 1f), colB.coerceIn(0f, 1f), alpha)
             } else if (dist >= dataRingInner) {
                 // ── DATA RING ────────────────────────────────
                 val ringT = (dist - dataRingInner) / (dataRingOuter - dataRingInner)
@@ -401,13 +388,12 @@ fun forEachSphereCell(frame: SphereFrame, onCell: (SphereCell) -> Unit) {
 
                 val ringFade = (1f - ringT).coerceIn(0f, 1f)
                 val alpha = ringFade * 0.65f
-                onCell(SphereCell(
-                    col = col, row = row, char = ch,
-                    r = (colR * 0.85f).coerceIn(0f, 1f),
-                    g = (colG * 0.85f).coerceIn(0f, 1f),
-                    b = (colB * 0.85f).coerceIn(0f, 1f),
-                    alpha = alpha
-                ))
+                onCell.draw(
+                    col, row, ch,
+                    (colR * 0.85f).coerceIn(0f, 1f),
+                    (colG * 0.85f).coerceIn(0f, 1f),
+                    (colB * 0.85f).coerceIn(0f, 1f), alpha
+                )
             }
         }
     }

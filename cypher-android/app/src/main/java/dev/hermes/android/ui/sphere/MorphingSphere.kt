@@ -19,8 +19,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontFamily
@@ -41,11 +43,6 @@ import androidx.compose.ui.unit.dp
  * (`animateFloatAsState` for state transitions, a throttled per-frame loop for
  * the continuous drift) and text drawing.
  *
- * As of the avatar seam (WP-C2) this is the renderer behind the default
- * [com.hermesandroid.relay.ui.components.avatar.SphereAvatar]; app surfaces no
- * longer call it directly but go through `LocalAgentAvatar.current.Render(...)`.
- * It stays a public composable (previews + onboarding still call it directly),
- * and its rendering is intentionally unchanged.
  */
 
 // Continuous-drift speeds, matched to the legacy infinite-transition tweens so
@@ -66,7 +63,7 @@ internal fun sphereMotionMode(
     fixedTime: Float?,
     fixedColorPhase: Float?,
 ): SphereMotionMode {
-    if (!motionVisible || fixedTime != null || fixedColorPhase != null) {
+    if (!motionVisible || (fixedTime != null && fixedColorPhase != null)) {
         return SphereMotionMode.Still
     }
     return SphereMotionMode.Procedural
@@ -80,23 +77,18 @@ fun MorphingSphere(
     toolCallBurst: Float = 0f,
     voiceAmplitude: Float = 0f,
     voiceMode: Boolean = false,
-    skin: SphereSkin = LocalSphereSkin.current,
     fixedTime: Float? = null,
     fixedColorPhase: Float? = null,
     motionVisible: Boolean = true,
 ) {
     val colorScheme = MaterialTheme.colorScheme
-    // Gate reactive inputs on what the skin declares it honors — this is the
-    // "optional + detectable" reactivity contract. A skin that opts out of an
-    // input renders as if that input were neutral, and the same flags drive the
-    // capability badges in the picker.
-    val effIntensity = if (skin.reactivity.intensity) intensity else 0f
-    val effToolBurst = if (skin.reactivity.tools) toolCallBurst else 0f
-    val effVoiceMode = voiceMode && skin.reactivity.voice
-    val amp = (if (skin.reactivity.voice) voiceAmplitude else 0f).coerceIn(0f, 1f)
+    val effIntensity = intensity
+    val effToolBurst = toolCallBurst
+    val effVoiceMode = voiceMode
+    val amp = voiceAmplitude.coerceIn(0f, 1f)
 
-    val targetP = remember(state, skin) { skin.paramsForState(state) }
-    val targetC = remember(state, skin, colorScheme) { skin.colorsFor(state, colorScheme) }
+    val targetP = remember(state) { paramsFor(state) }
+    val targetC = remember(state, colorScheme) { adaptiveColors(state, colorScheme) }
     val spec = if (motionVisible) tween<Float>(800, easing = FastOutSlowInEasing) else snap()
 
     val voiceRadiusScale by animateFloatAsState(
@@ -149,58 +141,51 @@ fun MorphingSphere(
         }
     }
 
-    val time = fixedTime ?: animatedTime.floatValue
-    val colorPhase = fixedColorPhase ?: animatedColorPhase.floatValue
-
     val cols = 58
     val rows = 34
 
     // Cache covers the ~25 distinct glyphs across charSets/dataChars/debrisChars.
     val textMeasurer = rememberTextMeasurer(cacheSize = 64)
-    val glyphStrings = remember { HashMap<Char, String>(32) }
 
-    Canvas(modifier = modifier.fillMaxSize().clipToBounds()) {
-        val canvasW = size.width
-        val canvasH = size.height
-        val cellW = canvasW / cols
-        val cellH = canvasH / rows
+    Canvas(modifier = modifier.fillMaxSize().clipToBounds().drawWithCache {
+        val cellW = size.width / cols
+        val cellH = size.height / rows
         val charSize = (cellW * 1.3f).coerceAtMost(cellH * 1.1f)
-        val charAspect = cellW / cellH
+        val style = TextStyle(fontSize = charSize.toSp(), fontFamily = FontFamily.Monospace)
+        val layouts = HashMap<Char, TextLayoutResult>(32)
 
-        val style = TextStyle(
-            fontSize = charSize.toSp(),
-            fontFamily = FontFamily.Monospace
-        )
-
-        val frame = SphereFrame(
-            cols = cols, rows = rows, charAspect = charAspect,
-            state = state, time = time, colorPhase = colorPhase,
-            breatheSpeed = breatheSpeed, breatheAmp = breatheAmp,
-            lightSpeedX = lightSpeedX, lightSpeedY = lightSpeedY,
-            lightInfluence = lightInfluence, coreTightness = coreTightness,
-            turbulenceAmp = turbulenceAmp, rippleScale = rippleScale,
-            heartbeatSpeed = heartbeatSpeed, radialFlowSpeed = radialFlowSpeed,
-            cr1 = cr1, cg1 = cg1, cb1 = cb1,
-            cr2 = cr2, cg2 = cg2, cb2 = cb2,
-            intensity = effIntensity, toolCallBurst = effToolBurst,
-            voiceAmplitude = amp, voiceMode = effVoiceMode,
-            voiceRadiusScale = voiceRadiusScale
-        )
-
-        forEachSphereCell(frame) { cell ->
-            val glyph = glyphStrings.getOrPut(cell.char) { cell.char.toString() }
-            val layout = textMeasurer.measure(glyph, style)
-            // Legacy Paint used y as baseline (`row*cellH + cellH*0.8f`).
-            // Compose `drawText` uses top-left — offset by firstBaseline to match.
-            val px = cell.col * cellW
-            val py = cell.row * cellH + cellH * 0.8f - layout.firstBaseline
-            drawText(
-                textLayoutResult = layout,
-                color = Color(cell.r, cell.g, cell.b, cell.alpha),
-                topLeft = Offset(px, py)
+        onDrawBehind {
+            val frame = SphereFrame(
+                cols = cols, rows = rows, charAspect = cellW / cellH,
+                state = state, time = fixedTime ?: animatedTime.floatValue,
+                colorPhase = fixedColorPhase ?: animatedColorPhase.floatValue,
+                breatheSpeed = breatheSpeed, breatheAmp = breatheAmp,
+                lightSpeedX = lightSpeedX, lightSpeedY = lightSpeedY,
+                lightInfluence = lightInfluence, coreTightness = coreTightness,
+                turbulenceAmp = turbulenceAmp, rippleScale = rippleScale,
+                heartbeatSpeed = heartbeatSpeed, radialFlowSpeed = radialFlowSpeed,
+                cr1 = cr1, cg1 = cg1, cb1 = cb1,
+                cr2 = cr2, cg2 = cg2, cb2 = cb2,
+                intensity = effIntensity, toolCallBurst = effToolBurst,
+                voiceAmplitude = amp, voiceMode = effVoiceMode,
+                voiceRadiusScale = voiceRadiusScale
             )
+
+            forEachSphereCell(frame) { col, row, char, red, green, blue, alpha ->
+                val layout = layouts.getOrPut(char) { textMeasurer.measure(char.toString(), style) }
+                // Legacy Paint used y as baseline (`row*cellH + cellH*0.8f`).
+                // Compose `drawText` uses top-left, offset by firstBaseline to match.
+                val px = col * cellW
+                val py = row * cellH + cellH * 0.8f - layout.firstBaseline
+                drawText(
+                    textLayoutResult = layout,
+                    color = Color(red, green, blue, alpha),
+                    topLeft = Offset(px, py)
+                )
+            }
         }
-    }
+    }) {}
+
 }
 
 // ── Previews ─────────────────────────────────────────────────────────

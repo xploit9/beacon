@@ -15,7 +15,6 @@ internal class OpenAiWire {
     private val bridge = GrokWire("OpenAI")
 
     companion object {
-        const val DEFAULT_MODEL = "gpt-realtime-2.1"
         const val DEFAULT_VOICE = "marin"
         private const val REALTIME_URL = "wss://api.openai.com/v1/realtime"
         val VOICES = listOf("alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar")
@@ -60,6 +59,7 @@ internal class OpenAiWire {
                 .put("audio", JSONObject()
                     .put("input", JSONObject()
                         .put("format", JSONObject().put("type", "audio/pcm").put("rate", 24000))
+                        .put("transcription", JSONObject().put("model", "gpt-4o-transcribe"))
                         .put("turn_detection", JSONObject().put("type", "semantic_vad")))
                     .put("output", JSONObject()
                         .put("format", JSONObject().put("type", "audio/pcm").put("rate", 24000))
@@ -74,7 +74,8 @@ internal class OpenAiWire {
     fun inbound(frame: JSONObject): JSONObject? = bridge.inbound(frame)
 
     fun outbound(frame: JSONObject): List<JSONObject> =
-        if (frame.optString("type") == "session.update") listOf(frame) else bridge.outbound(frame)
+        if (frame.optString("type") == "session.update" || frame.optString("type").startsWith("input_audio_buffer.")) listOf(frame)
+        else bridge.outbound(frame)
 
     fun continueResponse(): JSONObject? = bridge.continueResponse()
 }

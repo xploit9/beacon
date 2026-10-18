@@ -36,6 +36,16 @@ class GrokWireTest {
         assertEquals("call-1",tool.getString("id"));assertEquals("invoke_tool",tool.getString("name"));assertEquals("opaque",tool.getJSONObject("args").getString("tool_id"))
         assertTrue(runCatching { wire.inbound(JSONObject().put("type","error").put("error",JSONObject().put("message","private token"))) }.exceptionOrNull()!!.message!!.let { !it.contains("private token") })
     }
+    @Test fun assistantTranscriptDoneDoesNotRepeatTextAlreadyStreamedForTheItem() {
+        val wire=GrokWire()
+        val delta=JSONObject().put("type","response.output_audio_transcript.delta").put("item_id","item-1").put("delta","Hello ")
+        val done=JSONObject().put("type","response.output_audio_transcript.done").put("item_id","item-1").put("transcript","Hello world")
+        assertEquals("Hello ",wire.inbound(delta)!!.getJSONObject("serverContent").getJSONObject("outputTranscription").getString("text"))
+        assertNull("The cumulative done snapshot must not be appended after its deltas",wire.inbound(done))
+
+        val snapshot=JSONObject().put("type","response.output_audio_transcript.done").put("item_id","item-2").put("transcript","A complete reply")
+        assertEquals("A complete reply",wire.inbound(snapshot)!!.getJSONObject("serverContent").getJSONObject("outputTranscription").getString("text"))
+    }
     @Test fun pendingAndFinalReceiptsProduceOneFunctionOutputAndDeferredSpokenUpdate() {
         val wire=GrokWire();wire.inbound(function());wire.inbound(JSONObject().put("type","response.created"))
         val pending=GeminiWire.tool("call-1","invoke_tool",JSONObject().put("status","needs_approval"))
