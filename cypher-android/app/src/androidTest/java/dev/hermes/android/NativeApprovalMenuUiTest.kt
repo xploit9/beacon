@@ -116,4 +116,22 @@ class NativeApprovalMenuUiTest {
         compose.onNodeWithTag("approval-yolo").assertIsNotEnabled()
         assertTrue(fixture.requests.none { it.string("method") == "config.set" && it.optJSONObject("params")?.string("key") == "yolo" })
     }
+
+    @Test fun fixtureRetainsTerminalEventsOnTheMatchingConversation() {
+        val fixture = NativeExperienceFixture()
+        fixture.persistTerminalMessages = true
+        try {
+            val chatA = fixture.sessions.getValue("chat-a").getJSONArray("messages")
+            val chatB = fixture.sessions.getValue("chat-b").getJSONArray("messages")
+            val beforeA = chatA.length()
+            val beforeB = chatB.length()
+            val event = fixture.retainNativeEvent("runtime-chat-b", "message.complete", json("text" to "Only chat B finished"))
+            assertEquals("runtime-chat-b", event.getString("session_id"))
+            assertEquals(beforeA, chatA.length())
+            assertEquals(beforeB + 1, chatB.length())
+            assertEquals("Only chat B finished", chatB.getJSONObject(beforeB).getString("text"))
+        } finally {
+            fixture.client.closeNative()
+        }
+    }
 }
