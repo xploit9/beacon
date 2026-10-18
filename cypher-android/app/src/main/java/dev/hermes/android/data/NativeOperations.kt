@@ -138,9 +138,10 @@ internal class NativeOperations(private val c: CypherClient) {
                 require(nativeSessionBinding(c.scope, fresh).storedSessionId == target.storedSessionId) { "Approval status belongs to another conversation" }
                 val bypass = fresh.optJSONObject("info")?.opt("yolo")
                 val profileMode = result.getString("value")
-                if (yoloWrite) require((bypass == true) == d.getBoolean("yolo")) { "Hermes did not confirm the chat YOLO state. Refresh before trying again." }
+                if (yoloWrite && bypass is Boolean) require(bypass == d.getBoolean("yolo")) { "Hermes did not confirm the chat YOLO state. Refresh before trying again." }
                 else require(method == "GET" || d.string("mode") == "off" || bypass != true) { "A host approval bypass remains enabled. Check Hermes before continuing." }
-                return result.put("profile_mode", profileMode).put("value", if (bypass == true) "off" else profileMode).put("session_status_known", bypass is Boolean).put("session_bypass", bypass == true && profileMode != "off").put("session_id", target.storedSessionId).put("scope_key", c.scope.key)
+                val sessionBypass = if (bypass is Boolean) bypass == true && profileMode != "off" else JSONObject.NULL
+                return result.put("profile_mode", profileMode).put("value", if (bypass == true) "off" else profileMode).put("session_status_known", bypass is Boolean).put("session_bypass", sessionBypass).put("session_id", target.storedSessionId).put("scope_key", c.scope.key)
             }
             "/api/approval/respond", "/api/clarify/respond" -> {
                 require(d.string("scope_key") == c.scope.session(sid()).key) { "Reopen this request in its original conversation." }
