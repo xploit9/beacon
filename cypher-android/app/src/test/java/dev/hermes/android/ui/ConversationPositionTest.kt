@@ -159,6 +159,11 @@ class ConversationPositionTest {
         assertTrue(shown.endsWith("25 more characters not shown"))
         assertEquals(ToolDetailLimit, shown.takeWhile { it == 'y' }.length)
     }
+    @Test fun largeToolDetailsRevealInBoundedPages() {
+        assertEquals(ToolDetailPageSize * 2, nextToolDetailLimit(ToolDetailPageSize))
+        assertEquals(ToolDetailLimit, nextToolDetailLimit(ToolDetailLimit - 1))
+        assertEquals(ToolDetailLimit, nextToolDetailLimit(ToolDetailLimit))
+    }
 
     private fun snap(name: String, outcome: ToolOutcome) = ToolSnapshot(name, name, outcome)
 

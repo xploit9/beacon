@@ -25,7 +25,7 @@
         <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
     </queries>
     <application android:name=".CypherApplication" android:label="Cypher" android:icon="@drawable/ic_cypher" android:theme="@style/Theme.Cypher" android:allowBackup="false" android:fullBackupContent="@xml/backup_rules" android:dataExtractionRules="@xml/data_extraction_rules" android:usesCleartextTraffic="false" android:supportsRtl="true">
-        <activity android:name=".CypherActivity" android:exported="true" android:resizeableActivity="true" android:windowSoftInputMode="adjustResize">
+        <activity android:name=".CypherActivity" android:exported="true" android:launchMode="singleTop" android:resizeableActivity="true" android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />

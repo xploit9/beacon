@@ -42,6 +42,8 @@ data class Message(val id: String, val role: String, val text: String, val reaso
     }
 }
 data class ChatState(val sessionId: String = "", val title: String = "New conversation", val messages: List<Message> = emptyList(), val raw: JSONObject = JSONObject(), val streamId: String = "", val liveText: String = "", val liveReasoning: String = "", val liveTools: List<JSONObject> = emptyList(), val status: String = "", val approval: JSONObject? = null, val clarification: JSONObject? = null, val uncertain: String = "", val queued: List<QueuedMessage> = emptyList(), val anchor: Int = 0, val anchorOffset: Int = 0, val anchorId: String = "", val callMessages: List<CallTranscript> = emptyList(), val projectionReady: Boolean = true)
+internal fun sessionCanStillBeUnpersisted(clientCreated: Boolean, chat: ChatState): Boolean =
+    clientCreated && chat.messages.isEmpty() && chat.callMessages.isEmpty() && chat.liveText.isBlank() && chat.streamId.isBlank() && chat.raw.optInt("message_count") == 0
 data class EditorState(val scope: Scope? = null, val path: String = "", val text: TextFieldValue = TextFieldValue(), val serverText: String = "", val metadata: JSONObject = JSONObject(), val loading: Boolean = false, val saving: Boolean = false, val error: String = "", val reviewRequired: Boolean = false) { val dirty get() = text.text != serverText }
 data class SideQuestion(val scope: Scope, val question: String, val sessionId: String, val streamId: String, val text: String = "", val status: String = "Responding", val cursor: String = "", val error: String = "")
 data class AppUpdateState(val release: Release? = null, val busy: Boolean = false, val ready: Boolean = false, val status: String = "Cypher checks for updates automatically while connected.")
@@ -57,6 +59,7 @@ internal fun nativeSetupAuthMode(status: JSONObject): NativeSetupAuthMode = when
 }
 
 data class VoiceHandoff(val scope:Scope,val media:String,val targetCall:String="")
+private data class PendingVisionSwitch(val scope: Scope, val callId: String, val media: String)
 
 class CypherViewModel(application: Application, private val saved: SavedStateHandle) : AndroidViewModel(application) {
     private val _voiceHandoff=MutableStateFlow<VoiceHandoff?>(null)
@@ -77,7 +80,11 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             } catch(error:Throwable) {
                 _voiceHandoff.value=null
                 if(error is CancellationException) throw error
-                notice(error.message ?: "Could not switch to Gemini. Start a new call to try again.")
+                if (error is MissingVoiceKeyException) {
+                    pendingVisionSwitchAfterKey = PendingVisionSwitch(owner, callId, media)
+                    more(voiceKeySetupPageIfMissing(false) ?: "Cypher")
+                    notice("Add a Gemini key in Voice & calls to continue this call's screen sharing.")
+                } else notice(error.message ?: "Could not switch to Gemini. Start a new call to try again.")
             }
         }
     }
@@ -102,6 +109,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     internal val voiceCallRequest = _voiceCallRequest.asStateFlow()
     private var pendingVoiceCallAfterKey:VoiceCallRequest?=null
     private var pendingIncomingAfterKey:Triple<String,String,String>?=null
+    private var pendingVisionSwitchAfterKey: PendingVisionSwitch? = null
     private val _appUpdate = MutableStateFlow(AppUpdateState())
     val appUpdate = _appUpdate.asStateFlow()
     private var updateJob: Job? = null
@@ -170,6 +178,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private val drafts = mutableMapOf<String, Draft>()
     private val persistedDrafts = mutableMapOf<String, String>()
     private val initialShells = mutableMapOf<String, String>()
+    private val clientCreatedSessions = mutableSetOf<String>()
     private val initialCreateAttempts = mutableMapOf<String, String>()
     private val newChatJobs = mutableMapOf<String, Job>()
     private val initialCreateError = "Conversation opening failed or was not confirmed. Your draft is safe. Retry to open an empty conversation."
@@ -219,11 +228,20 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 val origin = prefs[stringPreferencesKey("origin")] ?: BuildConfig.DEFAULT_ORIGIN
                 if (generation != originGeneration) return@launch
                 val auth = if (origin.isBlank()) AuthContext(origin, emptyList()) else withContext(Dispatchers.IO) { app.auth.read(origin) }
+                if (generation != originGeneration) return@launch
                 val cached = origin.isNotBlank() && auth.cachedScopeFor(origin, replacingAccount = false) != null
                 val complete = prefs[booleanPreferencesKey("setup_complete")] == true
                 val activeSetup = prefs[booleanPreferencesKey("setup_active")] == true
-                val setupOrigin = prefs[stringPreferencesKey("setup_origin")].orEmpty()
-                val knownSteps = setOf("connect", "probe", "signin", "unsupported", "permission-microphone", "permission-notifications", "permission-full-screen", "done")
+                val setupOriginKey = stringPreferencesKey("setup_origin")
+                val storedSetupOrigin = prefs[setupOriginKey].orEmpty()
+                val setupOrigin = runCatching { dev.hermes.android.ui.parseCypherConnectInput(storedSetupOrigin) }.getOrDefault("")
+                if (setupOrigin != storedSetupOrigin) app.preferences.edit { values ->
+                    if (values[setupOriginKey] == storedSetupOrigin) {
+                        if (setupOrigin.isBlank()) values.remove(setupOriginKey) else values[setupOriginKey] = setupOrigin
+                    }
+                }
+                if (generation != originGeneration) return@launch
+                val knownSteps = setOf("connect", "probe", "signin", "unsupported", "voice-provider", "permission-microphone", "permission-notifications", "permission-full-screen", "done")
                 val savedStep = prefs[stringPreferencesKey("setup_step")].orEmpty().takeIf { it in knownSteps } ?: if (complete) "done" else "connect"
                 val step = when {
                     origin.isBlank() -> "connect"
@@ -321,6 +339,23 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     }
     fun voiceKeyConfigured() {
         viewModelScope.launch {
+            val vision = pendingVisionSwitchAfterKey
+            if (vision != null) {
+                if (withContext(Dispatchers.IO) { VoiceKeyStore(app).session("gemini") == null }) {
+                    notice("Save a Gemini key in Voice & calls to continue this call's screen sharing.")
+                    return@launch
+                }
+                pendingVisionSwitchAfterKey = null
+                val call = app.calls.state.value
+                if (!call.active || call.callId != vision.callId || call.voiceProvider != "grok" || call.conversationScope != vision.scope || authenticatedScope() != vision.scope) {
+                    backFromSettings()
+                    notice("The call changed before Gemini was ready. Start screen sharing again.")
+                    return@launch
+                }
+                backFromSettings()
+                switchCallForVision(vision.callId, vision.media)
+                return@launch
+            }
             if(withContext(Dispatchers.IO) { VoiceKeyStore(app).session()==null }) return@launch
             pendingIncomingAfterKey?.let { (source,event,action) ->
                 pendingIncomingAfterKey=null
@@ -376,12 +411,13 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         if (auth.bearer == null) true else app.auth.read(auth.origin).let { it.owner == auth.owner && it.bearer != null }
     } ?: true
     fun foreground(active: Boolean) {
+        val changed = foreground != active
+        foreground = active
         if (active && _ui.value.authenticated && !savedNativeSessionValid()) {
             fail(NativeAuthExpiredException())
             return
         }
-        if (foreground == active) return
-        foreground = active
+        if (!changed) return
         if (active) resumeAppUpdate()
         if (!active) { cancelStartup(); recoveryJob?.cancel(); sessionWatch?.cancel(); sideJob?.cancel(); streams.values.toList().forEach(Job::cancel); viewModelScope.launch { runCatching { checkpointVisible() }.onFailure(::fail) } }
         else if (_ui.value.authenticated && client == null && !_ui.value.loading) connect(_ui.value.origin)
@@ -722,22 +758,25 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         }
     }
     fun reopenSetupWizard(address: String = _ui.value.origin) {
+        ++originGeneration
         setupProbeJob?.cancel(); ++setupProbeGeneration
         pendingSetupLink = null
-        _ui.update { it.copy(setupOrigin = address, setupWizard = true, setupStep = "connect", setupPluginMessage = "", error = "") }
-        saveSetupProgress("connect", active = true, setupOrigin = address)
+        val safeAddress = runCatching { dev.hermes.android.ui.parseCypherConnectInput(address) }.getOrDefault("")
+        _ui.update { it.copy(setupOrigin = safeAddress, setupWizard = true, setupStep = "connect", loading = false, restoringSession = false, setupPluginMessage = "", error = "", notice = "") }
+        saveSetupProgress("connect", active = true, setupOrigin = safeAddress)
     }
     fun openSetupLink(value: String) {
+        ++originGeneration
         setupProbeJob?.cancel(); ++setupProbeGeneration
         pendingSetupLink = null
         val parsed = try { dev.hermes.android.ui.parseCypherConnectLink(value) }
         catch (error: Exception) {
-            _ui.update { it.copy(setupOrigin = "", setupWizard = true, setupStep = "connect", error = error.message ?: "Enter an HTTPS Hermes address or scan its QR code.") }
+            _ui.update { it.copy(setupOrigin = "", setupWizard = true, setupStep = "connect", loading = false, restoringSession = false, error = error.message ?: "Enter an HTTPS Hermes address or scan its QR code.", notice = "") }
             saveSetupProgress("connect", active = true, setupOrigin = "")
             return
         }
         pendingSetupLink = parsed.takeIf { it.sessionToken != null }
-        _ui.update { it.copy(setupOrigin = parsed.origin, setupWizard = true, setupStep = "connect", setupPluginMessage = "", error = "") }
+        _ui.update { it.copy(setupOrigin = parsed.origin, setupWizard = true, setupStep = "connect", loading = false, restoringSession = false, setupPluginMessage = "", error = "", notice = "") }
         saveSetupProgress("connect", active = true, setupOrigin = parsed.origin)
     }
     fun cancelSetupWizard() {
@@ -776,7 +815,11 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 values[stringPreferencesKey("setup_step")] = step
                 complete?.let { values[booleanPreferencesKey("setup_complete")] = it }
                 active?.let { values[booleanPreferencesKey("setup_active")] = it }
-                setupOrigin?.let { values[stringPreferencesKey("setup_origin")] = it }
+                setupOrigin?.let { address ->
+                    val safeAddress = runCatching { dev.hermes.android.ui.parseCypherConnectInput(address) }.getOrDefault("")
+                    if (safeAddress.isBlank()) values.remove(stringPreferencesKey("setup_origin"))
+                    else values[stringPreferencesKey("setup_origin")] = safeAddress
+                }
                 if (active == false) values.remove(stringPreferencesKey("setup_origin"))
             }
         }
@@ -807,8 +850,8 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val parsed = try { dev.hermes.android.ui.parseCypherConnectLink(value) }
         catch (error: Exception) {
             pendingSetupLink = null
-            val safeAddress = if (value.trim().startsWith("cypher://", ignoreCase = true)) "" else value
-            _ui.update { it.copy(setupOrigin = safeAddress, setupWizard = true, setupStep = "connect", error = error.message ?: "Enter an HTTPS Hermes address or scan its QR code.") }
+            val safeAddress = runCatching { dev.hermes.android.ui.parseCypherConnectInput(value) }.getOrDefault("")
+            _ui.update { it.copy(setupOrigin = safeAddress, setupWizard = true, setupStep = "connect", loading = false, error = error.message ?: "Enter an HTTPS Hermes address or scan its QR code.") }
             saveSetupProgress("connect", active = true, setupOrigin = safeAddress)
             return
         }
@@ -877,7 +920,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             val bearer = NativeAuth(origin).authorize(context)
             val profile = _ui.value.profile.takeIf(::validNativeProfile) ?: "default"
             val signedIn = AuthContext(origin, emptyList(), bearer.owner, profile, bearer = bearer.copy(profile = profile))
-            app.preferences.edit { it[stringPreferencesKey("setup_origin")] = origin; it[booleanPreferencesKey("setup_active")] = true; it[stringPreferencesKey("setup_step")] = "signin" }
+            app.preferences.edit { it[stringPreferencesKey("setup_origin")] = dev.hermes.android.ui.parseCypherConnectInput(origin); it[booleanPreferencesKey("setup_active")] = true; it[stringPreferencesKey("setup_step")] = "signin" }
             connect(origin, signedIn).join()
         } catch (error: CancellationException) { throw error }
         catch (error: Throwable) { _ui.update { it.copy(loading = false, error = error.message ?: "Hermes sign-in didn't finish. Retry.") } }
@@ -1273,10 +1316,12 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val result = c.post("/api/xara/open")
         val id = result.string("session_id", result.string("conversation_id", result.optJSONObject("session")?.string("session_id").orEmpty()))
         require(id.isNotBlank()) { "Cypher did not return a conversation" }
+        val sessionScope = c.scope.session(id)
+        clientCreatedSessions.add(sessionScope.key)
         // The owned creation already happened; a newer navigation must not discard its identity.
         saved["xara:${c.scope.key}"] = id
         if (client?.scope == c.scope) preparedXara = c.scope to id
-        runCatching { app.cache.write(c.scope, "xara-session", id, protected = true); app.cache.delete(c.scope, "xara-opening") }.onFailure { if (it is CancellationException) throw it; if (client?.scope == c.scope) notice("Cypher opened; recovery checkpoint failed") }
+        runCatching { app.cache.write(c.scope, "xara-session", id, protected = true); app.cache.delete(c.scope, "xara-opening"); app.cache.write(sessionScope, "client-created-shell", "1", protected = true) }.onFailure { if (it is CancellationException) throw it; if (client?.scope == c.scope) notice("Cypher opened; recovery checkpoint failed") }
         id
     }
     private var indexFetch: Job? = null
@@ -1399,6 +1444,9 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 val response = c.post("/api/session/new", request)
                 val id = (response.optJSONObject("session") ?: response).getString("session_id")
                 require(id.isNotBlank()) { "The server did not return a conversation ID" }
+                val createdScope = owner.session(id)
+                clientCreatedSessions.add(createdScope.key)
+                optionalLocalSave { app.cache.write(createdScope, "client-created-shell", "1", protected = true) }
                 if (client === active && originGeneration == origin) publishConfirmedSession(owner, id, response)
                 if (initial) {
                     initialShells[owner.key] = id
@@ -1440,7 +1488,6 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         fun current() = client === active && active.scope == owner && originGeneration == origin && sessionGeneration == selection && navigationGeneration == navigation && canComposeInitialChat()
         val job = viewModelScope.launch {
             val running = currentCoroutineContext()[Job]
-            var replaceMissing = false
             if (current()) _ui.update { it.copy(newChatOpening = true) }
             try {
                 val response = c.get("/api/session", mapOf("session_id" to id))
@@ -1455,10 +1502,13 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             } catch (e: Throwable) {
                 if (e !is CancellationException) {
                     if (missingNativeConversation(e) && initialShells[owner.key] == id) {
-                        initialShells.remove(owner.key); initialCreateAttempts.remove(owner.key)
-                        app.cache.delete(owner, "new-chat-shell"); app.cache.delete(owner, "new-chat-attempt")
-                        replaceMissing = true
-                        if (current()) _ui.update { it.copy(newChatError = "", error = "", notice = "The saved conversation was removed. Your draft is kept.") }
+                        val scope = owner.session(id)
+                        clientCreatedSessions.add(scope.key)
+                        optionalLocalSave { app.cache.write(scope, "client-created-shell", "1", protected = true) }
+                        if (current()) {
+                            selectSession(id, preserveInitialDraft = true, closeMenu = false)
+                            selectionJob?.join()
+                        }
                         return@launch
                     }
                     val attempt = java.util.UUID.randomUUID().toString()
@@ -1471,7 +1521,6 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 }
             } finally {
                 if (newChatJobs[owner.key] === running) { newChatJobs.remove(owner.key); if (client === active && originGeneration == origin) _ui.update { it.copy(newChatOpening = false) } }
-                if (replaceMissing && current()) createNewChat(json("worktree" to false), initial = true).join()
             }
         }
         newChatJobs[owner.key] = job
@@ -1540,6 +1589,8 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             if (generation != sessionGeneration || client !== active || (client?.scope ?: cachedOwnerScope) != ownerScope || preserveInitialDraft && navigationGeneration != navigation) return@launch
             sessionWatch?.cancel()
             val scope = ownerScope.session(id)
+            clientCreatedSessions.removeAll { it != scope.key }
+            var clientCreated = initialShells[ownerScope.key] == id || clientCreatedSessions.contains(scope.key)
             val initialDraft = if (preserveInitialDraft) draft() else null
             initialDraft?.let { drafts[scope.key] = it }
             sourceScope = scope; clearDetails()
@@ -1550,6 +1601,12 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             else initialDraft?.let { restoreDraft(it, preserveActiveInput = true) }
             initialResponse?.let { renderSession(it, scope) }
             try {
+                clientCreated = clientCreated || app.cache.read(scope, "client-created-shell") == "1" ||
+                    (saved.get<String>("xara:${ownerScope.key}") == id && app.cache.read(scope, "session") == null)
+                if (clientCreated) {
+                    clientCreatedSessions.add(scope.key)
+                    optionalLocalSave { app.cache.write(scope, "client-created-shell", "1", protected = true) }
+                }
                 if (preserveInitialDraft) checkpointNow()
                 app.cache.write(ownerScope, "selected-session", id, protected = true)
                 if (!restoreCachedConversation(scope, generation, preserveActiveInput = preserveInitialDraft)) return@launch
@@ -1564,6 +1621,12 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 if (generation != sessionGeneration || sourceScope != scope || client !== active) return@launch
                 renderSession(response, scope)
                 app.cache.write(scope, "session", response.toString())
+                val session = response.optJSONObject("session") ?: response
+                if (session.rows("messages").isNotEmpty() || session.optInt("message_count") > 0 || session.string("active_stream_id").isNotBlank()) {
+                    clientCreated = false
+                    clientCreatedSessions.remove(scope.key)
+                    optionalLocalSave { app.cache.delete(scope, "client-created-shell") }
+                }
                 if (_chat.value.streamId.isNotBlank()) pollPrompts(c.detached(), scope)
                 if (pending.containsKey(scope.key)) reconcile(scope, c.detached())
                 val active = (response.optJSONObject("session") ?: response).string("active_stream_id")
@@ -1573,8 +1636,9 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 if (e is CancellationException) throw e
                 if (sourceScope == scope && generation == sessionGeneration && client === active) {
                     val cached = _chat.value.raw.length() > 0
-                    _chat.update { it.copy(projectionReady = true, status = when { missingNativeConversation(e) -> "Conversation unavailable · draft retained"; e is ApiFailure && e.status in setOf(401, 403) -> "Access denied · draft retained"; cached -> "Cached · refresh failed"; else -> "Could not load conversation · retry" }) }
-                    fail(e)
+                    val pendingFirstTurn = missingNativeConversation(e) && sessionCanStillBeUnpersisted(clientCreated, _chat.value)
+                    _chat.update { it.copy(projectionReady = true, status = if (pendingFirstTurn) "" else when { missingNativeConversation(e) -> "Conversation unavailable · draft retained"; e is ApiFailure && e.status in setOf(401, 403) -> "Access denied · draft retained"; cached -> "Cached · refresh failed"; else -> "Could not load conversation · retry" }) }
+                    if (!pendingFirstTurn) fail(e)
                 }
             }
         }
@@ -1744,6 +1808,8 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             optionalLocalSave { app.cache.write(scope, "attachments:${result.optLong("user_row_id")}", json("attachments" to result.optJSONArray("attachment_receipts"), "display_text" to sent.text).toString(), true) }
         }
         val owner = scope.copy(session = "")
+        clientCreatedSessions.remove(scope.key)
+        optionalLocalSave { app.cache.delete(scope, "client-created-shell") }
         publishConfirmedSession(owner, scope.session, result, accepted = true)
         if (client?.scope == owner) refreshSessions()
         if (initialShells[owner.key] == scope.session) { initialShells.remove(owner.key); optionalLocalSave { app.cache.delete(owner, "new-chat-shell") } }
@@ -1963,6 +2029,11 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                         renderSession(response, scope, revision)
                         app.cache.write(scope, "session", response.toString())
                     }
+                    val session = response.optJSONObject("session") ?: response
+                    if (session.rows("messages").isNotEmpty() || session.optInt("message_count") > 0 || session.string("active_stream_id").isNotBlank()) {
+                        clientCreatedSessions.remove(scope.key)
+                        optionalLocalSave { app.cache.delete(scope, "client-created-shell") }
+                    }
                     val running = response.string("active_stream_id")
                     if (running.isNotBlank() && streams[scope.key]?.isActive != true) {
                         pollPrompts(c.detached(), scope)
@@ -1970,6 +2041,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                     }
                 } catch (e: Throwable) {
                     if (e is CancellationException) throw e
+                    if (missingNativeConversation(e) && sessionCanStillBeUnpersisted(clientCreatedSessions.contains(scope.key), _chat.value)) continue
                     if (e is ApiFailure && e.status in setOf(401, 403) || missingNativeConversation(e)) {
                         if (foreground && request.current()) {
                             if (e is ApiFailure && e.status == 401) fail(e)
@@ -2116,6 +2188,10 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             val result = c.call(path, method = method, data = body)
             if (result.has("ok") && !result.optBoolean("ok")) error(result.string("message", result.string("status", "Operation was not accepted")))
             committed = true
+            if (removing && selected != null) {
+                clientCreatedSessions.remove(selected.key)
+                optionalLocalSave { app.cache.delete(selected, "client-created-shell") }
+            }
             if (current()) {
                 if (path == "/api/session/archive" && selected != null) {
                     val archived = result.getBoolean("hidden")

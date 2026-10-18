@@ -34,6 +34,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.Switch
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -49,9 +50,12 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.AppState
 import dev.hermes.android.CypherViewModel
+import dev.hermes.android.data.VoiceKeyStore
 import dev.hermes.android.push.KeepConnectedService
 import dev.hermes.android.core.trustedOrigin
 import dev.hermes.android.data.validLoopbackSessionToken
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 internal data class CypherConnectInput(val origin: String, val sessionToken: String? = null) {
     override fun toString() = "CypherConnectInput(origin=$origin, sessionToken=<redacted>)"
@@ -75,6 +79,14 @@ internal fun parseCypherConnectLink(value: String): CypherConnectInput {
 
 internal fun parseCypherConnectInput(value: String): String = parseCypherConnectLink(value).origin
 
+internal fun setupAddressForDisplay(value: String): String {
+    val input = value.trim()
+    val uri = Uri.parse(input)
+    if (!uri.scheme.equals("cypher", ignoreCase = true)) return value
+    if (!uri.host.equals("connect", ignoreCase = true)) return ""
+    return runCatching { trustedOrigin(uri.getQueryParameter("url").orEmpty()) }.getOrDefault("")
+}
+
 @Composable
 fun SetupWizard(vm: CypherViewModel, modifier: Modifier = Modifier) {
     val state by vm.ui.collectAsStateWithLifecycle()
@@ -89,6 +101,7 @@ fun SetupWizard(vm: CypherViewModel, modifier: Modifier = Modifier) {
         onFinish = { vm.finishSetupWizard(it) },
         onReopen = vm::reopenSetupWizard,
         onCancel = vm::cancelSetupWizard,
+        onStageLink = vm::openSetupLink,
     )
 }
 
@@ -103,9 +116,11 @@ internal fun SetupWizardScreen(
     onReopen: (String) -> Unit,
     onCancel: () -> Unit,
     onVoiceKeySaved: () -> Unit = {},
+    onStageLink: (String) -> Unit = {},
 ) {
     val context = LocalContext.current
-    val initialAddress = state.setupOrigin.ifBlank { state.origin }
+    val initialAddress = setupAddressForDisplay(state.setupOrigin.ifBlank { state.origin })
+    val visibleOrigin = setupAddressForDisplay(state.setupOrigin.ifBlank { state.origin })
     var address by rememberSaveable(initialAddress) { mutableStateOf(initialAddress) }
     var scanning by rememberSaveable { mutableStateOf(false) }
     val permissionRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { onAdvancePermission() }
@@ -113,8 +128,15 @@ internal fun SetupWizardScreen(
     var keepConnected by rememberSaveable(state.setupComplete, state.setupOrigin) {
         mutableStateOf(if (state.setupComplete) KeepConnectedService.isEnabled(context) else true)
     }
-    var notificationAllowed by remember(context) {
+    var notificationAllowed by remember(context, state.setupStep) {
         mutableStateOf(Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED)
+    }
+    var voiceKeySaved by remember(context) { mutableStateOf(false) }
+    LaunchedEffect(context, state.setupStep) {
+        if (state.setupStep == "voice-provider") {
+            val store = VoiceKeyStore(context.applicationContext)
+            voiceKeySaved = withContext(Dispatchers.IO) { listOf("gemini", "grok", "openai").any(store::hasKey) }
+        }
     }
     var notificationPermissionRequested by rememberSaveable { mutableStateOf(false) }
     val keepConnectedPermissionRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
@@ -131,7 +153,7 @@ internal fun SetupWizardScreen(
 
     if (scanning) {
         QrScanner(
-            onResult = { value -> scanning = false; address = runCatching { parseCypherConnectLink(value).origin }.getOrDefault(""); onProbe(value) },
+            onResult = { value -> scanning = false; address = setupAddressForDisplay(value); onStageLink(value) },
             onClose = { scanning = false },
         )
         return
@@ -151,41 +173,41 @@ internal fun SetupWizardScreen(
                 when (state.setupStep) {
                     "probe" -> {
                         Text("Check the server", style = MaterialTheme.typography.headlineSmall)
-                        Text(address, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(visibleOrigin, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         if (state.loading) {
                             CircularProgressIndicator(Modifier.align(Alignment.CenterHorizontally))
                             Text("Checking the secure connection…", style = MaterialTheme.typography.bodyMedium)
                         } else {
                             state.error.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                             state.notice.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                            Button(onClick = { onProbe(address) }, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-probe-retry")) { Text("Retry") }
-                            TextButton(onClick = { onReopen(address) }, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text("Change address") }
+                            Button(onClick = { onProbe(visibleOrigin) }, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-probe-retry")) { Text("Retry") }
+                            TextButton(onClick = { onReopen(visibleOrigin) }, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text("Change address") }
                             if (state.authenticated) TextButton(onClick = onCancel, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text("Close setup") }
                         }
                     }
                     "signin" -> {
                         Text("Sign in with Hermes", style = MaterialTheme.typography.headlineSmall)
                         Text("Use your Hermes account for chat, history, plugin pages, and calls.", style = MaterialTheme.typography.bodyLarge)
-                        Text(address, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(visibleOrigin, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         state.setupPluginMessage.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                         state.error.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                         state.notice.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                         Button(onClick = { onSignIn(context) }, enabled = !state.loading, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-signin")) {
                             if (state.loading) CircularProgressIndicator(Modifier.height(20.dp), strokeWidth = 2.dp) else Text("Sign in with Hermes")
                         }
-                        TextButton(onClick = { onReopen(address) }, enabled = !state.loading, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text("Use another server") }
+                        TextButton(onClick = { onReopen(visibleOrigin) }, enabled = !state.loading, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text("Use another server") }
                         if (state.authenticated && !state.loading) TextButton(onClick = onCancel, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text("Close setup") }
                     }
                     "unsupported" -> {
                         Text("This Hermes needs an update before phones can sign in.", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        TextButton(onClick = { onReopen(address) }, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text("Use another server") }
+                        TextButton(onClick = { onReopen(visibleOrigin) }, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text("Use another server") }
                         if (state.authenticated) TextButton(onClick = onCancel, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text("Close setup") }
                     }
                     "voice-provider" -> {
                         Text("Voice & calls", style = MaterialTheme.typography.headlineSmall)
                         Text("Add a provider key for one-tap realtime calls. You can skip this and add it later in Settings.", style = MaterialTheme.typography.bodyLarge)
-                        VoiceKeySetupPanel(onKeySaved = onVoiceKeySaved, showTitle = false)
-                        Button(onClick = onAdvancePermission, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-voice-continue")) { Text("Continue") }
+                        VoiceKeySetupPanel(onKeySaved = { voiceKeySaved = true; onVoiceKeySaved() }, showTitle = false)
+                        if (voiceKeySaved) Button(onClick = onAdvancePermission, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-voice-continue")) { Text("Continue") }
                         TextButton(onClick = onAdvancePermission, modifier = Modifier.align(Alignment.CenterHorizontally).testTag("setup-voice-skip")) { Text("Skip for now") }
                         if (state.authenticated) TextButton(onClick = onCancel, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text("Close setup") }
                     }
@@ -247,7 +269,18 @@ internal fun SetupWizardScreen(
                         Text("Scan the Cypher QR on your Hermes dashboard, or paste its link or HTTPS server address.", style = MaterialTheme.typography.bodyLarge)
                         OutlinedTextField(
                             value = address,
-                            onValueChange = { address = it },
+                            onValueChange = { value ->
+                                val input = value.trim()
+                                val uri = Uri.parse(input)
+                                if (uri.scheme.equals("cypher", ignoreCase = true) && uri.host.equals("connect", ignoreCase = true)) {
+                                    val parsed = runCatching { parseCypherConnectLink(value) }.getOrNull()
+                                    val hasSession = runCatching { uri.getQueryParameters("session").isNotEmpty() }.getOrDefault(false) || input.contains("session=", ignoreCase = true)
+                                    if (parsed != null || hasSession) {
+                                        address = setupAddressForDisplay(value)
+                                        onStageLink(value)
+                                    } else address = value
+                                } else address = value
+                            },
                             label = { Text("Paste link or address") },
                             placeholder = { Text("https://your-device.ts.net") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),

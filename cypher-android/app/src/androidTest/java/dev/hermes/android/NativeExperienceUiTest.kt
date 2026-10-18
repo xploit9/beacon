@@ -514,21 +514,35 @@ class NativeExperienceUiTest {
     @Test fun messageCopyShareAndBothBranchActionsUseTheSelectedMessage() = withFixture { vm, fixture ->
         val original = vm.chat.value.messages.first()
         fun action(label: String) = compose.onNode(hasContentDescription(label) and hasAnyAncestor(hasTestTag("message-actions:${original.id}")))
+        fun revealAction(label: String) {
+            val target = action(label)
+            val transcript = compose.onNodeWithTag("conversation-transcript")
+            repeat(8) {
+                if (runCatching { target.assertIsDisplayed() }.isSuccess) return
+                transcript.performTouchInput { swipeDown() }
+                compose.waitForIdle()
+            }
+            target.assertIsDisplayed()
+        }
+        revealAction("More message actions")
         action("More message actions").performScrollTo().performClick()
         compose.onNodeWithText("Copy source").performClick()
         val clipboard = app.getSystemService(android.content.ClipboardManager::class.java)
         assertEquals(original.text, clipboard.primaryClip!!.getItemAt(0).text.toString())
+        revealAction("Share text")
         action("Share text").performScrollTo().performClick()
         val automation = InstrumentationRegistry.getInstrumentation().uiAutomation
         await { automation.rootInActiveWindow?.packageName?.toString()?.let { it != app.packageName } == true }
         assertTrue(automation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK))
         compose.waitForIdle()
+        revealAction("More message actions")
         action("More message actions").performScrollTo().performClick()
         compose.onNodeWithText("Branch from here").performClick()
         await { vm.chat.value.sessionId.startsWith("branch-") }
         assertEquals(1, fixture.requests.last { it.string("method") == "session.branch" }.getJSONObject("params").getInt("count"))
         compose.runOnIdle { vm.selectSession("chat-a") }
         await { vm.chat.value.sessionId == "chat-a" && vm.chat.value.messages.isNotEmpty() }
+        revealAction("More message actions")
         action("More message actions").performScrollTo().performClick()
         compose.onNodeWithText("Edit and branch").performClick()
         await { vm.chat.value.sessionId.startsWith("branch-") && vm.composer.value.text == original.text }
@@ -1194,7 +1208,16 @@ class NativeExperienceUiTest {
             if (compose.onAllNodes(hasTestTag("tool-card-details") and hasAnyAncestor(card), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()) toggle(card)
             part(card, "tool-card-details").assertExists()
         }
-        fun reveal(matcher: SemanticsMatcher) = compose.onNodeWithTag("conversation-transcript").performScrollToNode(matcher)
+        fun reveal(matcher: SemanticsMatcher, towardOlder: Boolean) {
+            val target = compose.onNode(matcher, useUnmergedTree = true)
+            val transcript = compose.onNodeWithTag("conversation-transcript")
+            repeat(8) {
+                if (runCatching { target.assertIsDisplayed() }.isSuccess) return
+                transcript.performTouchInput { if (towardOlder) swipeDown() else swipeUp() }
+                compose.waitForIdle()
+            }
+            target.assertIsDisplayed()
+        }
         val passedCard = card("run tests, Completed, 1.2s · $shown")
         val failedCard = card("read file, Failed, 0.4s · $shown")
         val silentCard = card("web search, No result recorded")
@@ -1229,13 +1252,13 @@ class NativeExperienceUiTest {
         capture("migration-tool-no-result")
 
         // Expanding a tool stops tail-following, so explicit scrolling to older rows holds.
-        reveal(hasTestTag("message-row:ref-user-unknown"))
+        reveal(hasTestTag("message-row:ref-user-unknown"), towardOlder = true)
         compose.onNodeWithTag("message-row:ref-user-unknown", useUnmergedTree = true).assertExists()
         compose.onAllNodesWithTag("message-time:ref-user-unknown", useUnmergedTree = true).assertCountEquals(0)
-        reveal(hasTestTag("message-row:ref-user-known"))
-        compose.onNodeWithTag("message-time:ref-user-known", useUnmergedTree = true).performScrollTo().assertIsDisplayed().assertTextEquals(shown)
-        reveal(hasTestTag("message-row:ref-assistant-known"))
-        compose.onNodeWithTag("message-time:ref-assistant-known", useUnmergedTree = true).performScrollTo().assertIsDisplayed().assertTextEquals(shown)
+        reveal(hasTestTag("message-row:ref-user-known"), towardOlder = true)
+        compose.onNodeWithTag("message-time:ref-user-known", useUnmergedTree = true).assertIsDisplayed().assertTextEquals(shown)
+        reveal(hasTestTag("message-time:ref-assistant-known"), towardOlder = false)
+        compose.onNodeWithTag("message-time:ref-assistant-known", useUnmergedTree = true).assertIsDisplayed().assertTextEquals(shown)
         part(passedCard, "tool-card-meta").assertTextEquals("1.2s · $shown")
         part(failedCard, "tool-card-meta").assertTextEquals("0.4s · $shown")
         receipts += "A recorded time shows in the device zone and locale on the bubble and on finished tools; an unrecorded message shows none, and a tool with no recorded completion says so and is never Completed."
@@ -1273,7 +1296,7 @@ class NativeExperienceUiTest {
         stripShows("1 running")
         val stripBounds = compose.onNodeWithTag("chat-activity-strip", useUnmergedTree = true).getUnclippedBoundsInRoot()
         assertTrue("The activity strip keeps to the content column and is a comfortable touch target", stripBounds.right - stripBounds.left <= 840.dp && stripBounds.bottom - stripBounds.top >= 47.5.dp)
-        reveal(hasTestTag("message-activity-status"))
+        reveal(hasTestTag("message-activity-status"), towardOlder = false)
         compose.onNodeWithTag("message-activity-status", useUnmergedTree = true).assertTextEquals("Working")
         val buildCard = card("build project, Running")
         // The running tool opens like Relay's (ChatScreen starts a Running card expanded); a folded card is opened with its real toggle.
@@ -1294,7 +1317,7 @@ class NativeExperienceUiTest {
             flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = json("approval_id" to "ref-approval", "description" to "Run the synthetic build task", "command" to "gradle assembleDebug", "choices" to JSONArray().put("once").put("deny")))
         }
         stripShows("1 running · 1 queued · Waiting for you")
-        reveal(hasText("Approval needed"))
+        reveal(hasText("Approval needed"), towardOlder = false)
         compose.onNodeWithText("Allow once").performScrollTo().assertIsDisplayed()
         capture("migration-chat-pending")
 
@@ -1344,7 +1367,7 @@ class NativeExperienceUiTest {
         compose.runOnIdle {
             flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = null, clarification = json("clarify_id" to "ref-question", "question" to "Which notes file should be updated?", "choices" to JSONArray().put("notes.md")))
         }
-        reveal(hasText("Which notes file should be updated?"))
+        reveal(hasText("Which notes file should be updated?"), towardOlder = false)
         compose.onNodeWithText("notes.md").performScrollTo().assertIsDisplayed()
         compose.onAllNodesWithText("Approval needed").assertCountEquals(0)
         stripShows("1 running · Waiting for you")

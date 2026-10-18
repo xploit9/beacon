@@ -96,6 +96,11 @@ internal fun compactToolDetail(value: String, maxChars: Int = 700): String {
 }
 
 internal const val ToolDetailLimit = 200_000
+internal const val ToolDetailPageSize = 4_000
+
+/** Reveal large details in bounded Compose layouts instead of measuring the full output on the first tap. */
+internal fun nextToolDetailLimit(currentLimit: Int): Int =
+    (currentLimit + ToolDetailPageSize).coerceAtMost(ToolDetailLimit)
 
 /** Full recorded text with newlines intact; only a pathological size is cut, and the omitted count is stated. */
 internal fun boundedDetail(value: String, limit: Int = ToolDetailLimit): String {
