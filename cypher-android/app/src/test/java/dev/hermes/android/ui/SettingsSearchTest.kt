@@ -61,6 +61,8 @@ class SettingsSearchTest {
         assertEquals("category:Profiles & model", settingsRoute("Models & tools"))
         assertEquals("category:Profiles & model", normalizeSettingsPage("Models & tools"))
         assertEquals("category:Profiles & model", normalizeSettingsPage("category:Models & tools"))
+        assertEquals("category:Health, logs & updates", normalizeSettingsPage("category:Server & support"))
+        assertTrue(normalizeSettingsPage("category:Server & support").removePrefix("category:") in settingsCategories.keys)
         assertEquals("category:Tools & MCP", settingsRoute("Tools & MCP"))
     }
     @Test fun onlyPluginBackedPagesShowTheMissingPluginState() {

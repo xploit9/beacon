@@ -70,6 +70,7 @@ internal fun settingsRoute(name: String): String = when (name) {
 /** Old category names can remain in the per-owner navigation history after a settings rename. */
 internal fun normalizeSettingsPage(page: String): String = when (page) {
     "Models & tools", "category:Models & tools" -> "category:Profiles & model"
+    "Server & support", "category:Server & support" -> "category:Health, logs & updates"
     else -> page
 }
 
