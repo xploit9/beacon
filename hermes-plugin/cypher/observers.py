@@ -4,6 +4,10 @@ import math
 import time
 import uuid
 
+MAIL_LOOKBACK_SECONDS=24*60*60
+MAIL_MARKER_RETENTION_SECONDS=MAIL_LOOKBACK_SECONDS+2*24*60*60
+MAIL_MARKER_PRUNE_BATCH=256
+
 
 def prune_meta(conn,now):
     for key,value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'mail-evidence:%'").fetchall():
@@ -12,6 +16,14 @@ def prune_meta(conn,now):
         try: fresh=type(observed) in (int,float) and math.isfinite(observed) and now-observed<=300
         except (OverflowError,TypeError): fresh=False
         if not fresh:
+            conn.execute('DELETE FROM meta WHERE key=?',(key,))
+    for key,value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'mail-notified:%' ORDER BY CAST(value AS REAL),key LIMIT ?",(MAIL_MARKER_PRUNE_BATCH,)).fetchall():
+        try: created=float(value.decode() if isinstance(value,bytes) else value)
+        except (TypeError,ValueError,OverflowError): created=None
+        if created is None or not math.isfinite(created) or created>now:
+            # Legacy markers had no timestamp; retain them from migration time to avoid a duplicate.
+            conn.execute('UPDATE meta SET value=? WHERE key=?',(str(now).encode(),key))
+        elif now-created>MAIL_MARKER_RETENTION_SECONDS:
             conn.execute('DELETE FROM meta WHERE key=?',(key,))
     for key,value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'completion:%'").fetchall():
         try: created=float(value)
@@ -78,7 +90,7 @@ def mailbox_observed(mobile,cfg,profile,session_id,tool_name,result,status,read_
     if account!=contract.get('account') or not isinstance(message,dict): return
     mid=message.get('id');received=message.get('received_at')
     if not isinstance(mid,str) or not 1<=len(mid)<=256 or type(received) not in (int,float) or not math.isfinite(received): return
-    if not 0<=time.time()-received<=86400 or message.get('unread') is not True: return
+    if not 0<=time.time()-received<=MAIL_LOOKBACK_SECONDS or message.get('unread') is not True: return
     owner=cfg.get('owner_id')
     if not owner: return
     evidence={'account':account,'message_id':mid,'received_at':received,'unread':True,'action_required':message.get('action_required'),'urgent':message.get('urgent'),'important':message.get('important'),'content_observed':any(isinstance(message.get(k),str) and bool(message[k].strip()) for k in ('subject','snippet','body','text'))}
@@ -118,7 +130,7 @@ def email_notice(mobile,native,cfg,profile,session_id,args,now):
         row=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
         if not row: raise ValueError('Read the actual message using the verified read-only native mailbox tool first')
         proof=json.loads(row[0])
-        if time.time()-proof['observed_at']>300 or not 0<=time.time()-proof['received_at']<=86400 or args.get('received_at')!=proof['received_at']: raise ValueError('Mailbox evidence is stale or does not match the message')
+        if time.time()-proof['observed_at']>300 or not 0<=time.time()-proof['received_at']<=MAIL_LOOKBACK_SECONDS or args.get('received_at')!=proof['received_at']: raise ValueError('Mailbox evidence is stale or does not match the message')
         if not urgent and time.time()-proof['received_at']<900: raise ValueError('Nonurgent important mail must be missed for at least15 minutes')
         if classification=='source' and (proof.get('action_required') is not True or (urgent and proof.get('urgent') is not True) or (not urgent and proof.get('important') is not True)): raise ValueError('Source importance flags unavailable; explicitly classify the untrusted message instead')
         if classification=='model' and proof.get('content_observed') is not True: raise ValueError('Read actual message content before an importance assessment')
@@ -127,6 +139,6 @@ def email_notice(mobile,native,cfg,profile,session_id,args,now):
         if conn.execute('SELECT 1 FROM calls WHERE owner=? AND closed=0 AND created>?',(owner,time.time()-4*3600)).fetchone(): return {'status':'skipped_busy'}
         if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: raise ValueError('Notification capacity reached')
         event=uuid.uuid4().hex
-        conn.execute('INSERT INTO meta VALUES(?,?)',(dedupe,b'notified'))
+        conn.execute('INSERT INTO meta VALUES(?,?)',(dedupe,str(time.time()).encode()))
         conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason) VALUES(?,?,?,?,?,?,?,?)',(event,owner,profile,'incoming_call',stored,time.time(),time.time()+120,'Verified unread actionable email needs your attention'))
     return {'status':'pending','event_id':event,'conversation_id':stored}

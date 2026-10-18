@@ -60,6 +60,29 @@ import org.json.JSONObject
     var target by remember(ownerScope) { mutableStateOf(vm.client?.scope?.let { vm.app.push.registeredTarget(it) }) }
     var busy by remember(ownerScope) { mutableStateOf(false) }
     var operationError by remember(ownerScope) { mutableStateOf("") }
+    var historyRetentionDays by remember(ownerScope) { mutableStateOf<Int?>(null) }
+    var historyRetentionSaving by remember(ownerScope) { mutableStateOf(false) }
+    var historyRetentionError by remember(ownerScope) { mutableStateOf("") }
+    val historyRetentionKey = "$HISTORY_RETENTION_KEY:${ownerScope.orEmpty()}"
+    val historyRetentionRecord = data[historyRetentionKey]
+    LaunchedEffect(ownerScope, historyRetentionRecord) {
+        when {
+            historyRetentionRecord?.has("_error") == true -> {
+                historyRetentionDays = null
+                historyRetentionError = historyRetentionRecord.optString("_error").ifBlank { "Couldn’t load history retention from Hermes." }
+            }
+            historyRetentionRecord?.has("history_retention_days") == true -> {
+                val days = historyRetentionRecord.optInt("history_retention_days", -1)
+                if (historyRetentionChoices.any { it.first == days }) {
+                    historyRetentionDays = days
+                    historyRetentionError = ""
+                } else {
+                    historyRetentionDays = null
+                    historyRetentionError = "Hermes returned an unsupported history retention period."
+                }
+            }
+        }
+    }
     var deviceAllowed by remember { mutableStateOf(androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled()) }
     var keepConnectedEnabled by remember(context) { mutableStateOf(KeepConnectedService.isEnabled(context)) }
     var keepConnectedStatus by remember(context) { mutableStateOf(KeepConnectedService.status(context)) }
@@ -80,7 +103,19 @@ import org.json.JSONObject
     var restricted by remember { mutableStateOf(backgroundRestricted()) }
     var optimized by remember { mutableStateOf(batteryOptimized()) }
     val liveUpdatesSettings = remember(context) { Intent("android.settings.MANAGE_APP_PROMOTED_NOTIFICATIONS").putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName).takeIf { android.os.Build.VERSION.SDK_INT >= 36 && it.resolveActivity(context.packageManager) != null } }
-    androidx.lifecycle.compose.LifecycleResumeEffect(ownerScope) { target = vm.client?.scope?.let { vm.app.push.registeredTarget(it) }; deviceAllowed = androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled(); keepConnectedEnabled = KeepConnectedService.isEnabled(context); keepConnectedStatus = KeepConnectedService.status(context); keepConnectedReason = KeepConnectedService.failureReason(context); liveUpdatesAllowed = liveAllowed();restricted=backgroundRestricted();optimized=batteryOptimized(); if (vm.app.firebaseConfigured) vm.load("push-status", "/api/plugins/cypher/mobile/notifications/status"); onPauseOrDispose { } }
+    androidx.lifecycle.compose.LifecycleResumeEffect(ownerScope) {
+        target = vm.client?.scope?.let { vm.app.push.registeredTarget(it) }
+        deviceAllowed = androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled()
+        keepConnectedEnabled = KeepConnectedService.isEnabled(context)
+        keepConnectedStatus = KeepConnectedService.status(context)
+        keepConnectedReason = KeepConnectedService.failureReason(context)
+        liveUpdatesAllowed = liveAllowed()
+        restricted = backgroundRestricted()
+        optimized = batteryOptimized()
+        if (vm.app.firebaseConfigured) vm.load("push-status", "/api/plugins/cypher/mobile/notifications/status")
+        vm.load(historyRetentionKey, HISTORY_RETENTION_PATH)
+        onPauseOrDispose { }
+    }
     DisposableEffect(context) {
         val prefs = context.getSharedPreferences(KeepConnectedService.PREFS, android.content.Context.MODE_PRIVATE)
         val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
@@ -102,6 +137,29 @@ import org.json.JSONObject
                     vm.notice(operationError)
                 } }
             if (vm.client?.scope == captured.scope) { target = vm.app.push.registeredTarget(captured.scope); busy = false; deviceAllowed = androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled() }
+        }
+    }
+    fun saveHistoryRetention(days: Int) {
+        val capturedScope = vm.client?.scope ?: return
+        historyRetentionSaving = true
+        historyRetentionError = ""
+        scope.launch {
+            var savedDays: Int? = null
+            vm.action(
+                HISTORY_RETENTION_PATH,
+                json("history_retention_days" to days),
+                method = "PUT",
+                refresh = false,
+                successNotice = "History retention saved",
+            ) { _, response ->
+                val value = response.optInt("history_retention_days", -1)
+                if (historyRetentionChoices.any { it.first == value }) savedDays = value
+            }.join()
+            if (vm.client?.scope == capturedScope) {
+                historyRetentionSaving = false
+                if (savedDays == null) historyRetentionError = vm.ui.value.error.ifBlank { "Couldn’t save history retention. Try again." }
+                else historyRetentionDays = savedDays
+            }
         }
     }
     val request = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
@@ -187,6 +245,13 @@ import org.json.JSONObject
             else if (target != null && !registered && serverReady && deviceAllowed) TextButton(enabled = !busy, onClick = { enable() }) { Text("Retry registration") }
             OutlinedButton(onClick = { busy = true; operationError = ""; val owner = vm.client?.scope; scope.launch { var accepted = false; vm.action("/api/plugins/cypher/mobile/notifications/test", json("kind" to "fcm"), refresh = false) { _, _ -> accepted = true; vm.notice("Test queued. Delivery is confirmed only when the notification arrives on this phone.") }.join(); if (vm.client?.scope == owner) { if (!accepted) operationError = vm.ui.value.error.ifBlank { "Couldn’t queue a test. Try again." }; busy = false; vm.load("push-status", "/api/plugins/cypher/mobile/notifications/status") } } }, enabled = !busy && serverReady && registered && deviceAllowed) { Text(uiText("Send a test notification")) }
         }
+        Glass(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                key(ownerScope) {
+                    HistoryRetentionControl(historyRetentionDays, historyRetentionSaving, historyRetentionError, ::saveHistoryRetention)
+                }
+            }
+        }
         TextButton(onClick = { vm.tab("Tasks") }) { Text("Manage check-up calls and email alerts") }
         Text("Live Updates", style = MaterialTheme.typography.titleMedium)
         Text(when { liveUpdatesAllowed -> "Calls, ongoing work and requests can appear in your phone’s status chip. Tap to return or respond."; liveUpdatesSettings != null -> "Enable Live Updates in Android to keep calls, work and requests in the status bar."; else -> statusChipUnsupportedDescription(android.os.Build.VERSION.RELEASE, android.os.Build.VERSION.SDK_INT) }, style = MaterialTheme.typography.bodyMedium)
@@ -205,5 +270,77 @@ import org.json.JSONObject
         Text("Keep Tailscale connected to answer private requests. Do Not Disturb and notification settings can silence popups. On Honor, also check App launch → Manage manually → Run in background.",style=MaterialTheme.typography.bodySmall)
         Text("After Force stop in Android settings, reopen Cypher once to receive notifications again. Hiding the call bubble keeps your call available in the notification and supported status chip.",style=MaterialTheme.typography.bodySmall)
         TextButton(onClick={runCatching { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:${context.packageName}"))) }.onFailure { vm.notice("Open Cypher’s app settings in Android") }}) { Text("Open background app settings") }
+    }
+}
+
+private const val HISTORY_RETENTION_KEY = "history-retention"
+private const val HISTORY_RETENTION_PATH = "/api/plugins/cypher/mobile/history-retention"
+internal val historyRetentionChoices = listOf(0 to "Forever", 365 to "1 year", 90 to "90 days", 30 to "30 days")
+internal fun historyRetentionLabel(days: Int): String = historyRetentionChoices.firstOrNull { it.first == days }?.second ?: "Unavailable"
+internal fun historyRetentionNeedsConfirmation(currentDays: Int, selectedDays: Int): Boolean =
+    selectedDays != currentDays && selectedDays > 0 && (currentDays == 0 || selectedDays < currentDays)
+
+@Composable internal fun HistoryRetentionControl(
+    currentDays: Int?,
+    saving: Boolean,
+    error: String,
+    onSave: (Int) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    var pendingDays by remember { mutableStateOf<Int?>(null) }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Keep call and task history", style = MaterialTheme.typography.titleMedium)
+        Text("Applies to call transcripts and linked task history across your Hermes profiles.", style = MaterialTheme.typography.bodySmall)
+        Text(
+            currentDays?.let { "Current server setting: ${historyRetentionLabel(it)}" }
+                ?: if (error.isBlank()) "Checking the current server setting…" else "Current server setting unavailable",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.testTag("history-retention-current"),
+        )
+        Box {
+            OutlinedButton(
+                onClick = { expanded = true },
+                enabled = currentDays != null && !saving,
+                modifier = Modifier
+                    .semantics {
+                        contentDescription = "History retention choice"
+                        stateDescription = currentDays?.let { "Current server setting: ${historyRetentionLabel(it)}" } ?: "Unavailable"
+                    }
+                    .testTag("history-retention-choice"),
+            ) {
+                Text(currentDays?.let(::historyRetentionLabel) ?: "Unavailable")
+            }
+            DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                historyRetentionChoices.forEach { (days, label) ->
+                    DropdownMenuItem(
+                        text = { Text(label) },
+                        enabled = currentDays != null && !saving,
+                        onClick = {
+                            expanded = false
+                            val current = currentDays
+                            if (current != null && days != current) {
+                                if (historyRetentionNeedsConfirmation(current, days)) pendingDays = days
+                                else onSave(days)
+                            }
+                        },
+                    )
+                }
+            }
+        }
+        if (saving) LinearProgressIndicator(Modifier.fillMaxWidth().testTag("history-retention-saving"))
+        if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error, modifier = Modifier.testTag("history-retention-error"))
+    }
+    pendingDays?.let { days ->
+        AlertDialog(
+            onDismissRequest = { if (!saving) pendingDays = null },
+            title = { Text("Shorten history retention?") },
+            text = { Text("Older call transcripts and task history on Hermes will be deleted") },
+            confirmButton = {
+                TextButton(onClick = { pendingDays = null; onSave(days) }, enabled = !saving) { Text("Delete older history") }
+            },
+            dismissButton = { TextButton(onClick = { pendingDays = null }, enabled = !saving) { Text("Cancel") } },
+            modifier = Modifier.testTag("history-retention-confirmation"),
+        )
     }
 }

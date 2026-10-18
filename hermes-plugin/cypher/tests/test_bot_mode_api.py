@@ -235,6 +235,31 @@ def test_create_retry_finds_renamed_room_beyond_first_page(harness):
     assert not any(c[2] == 'groups.create' for c in calls)
     assert [c[3]['offset'] for c in calls if c[2] == 'groups.list'] == [0,100]
 
+def test_create_reuses_a_matching_room_on_page_three(harness):
+    client,calls,results=harness
+    request_id='third-page'
+    room=dict(results['groups.state']['room'],room_id=api.space_id('owner','password','default',request_id))
+    pages={0:{'rooms':[],'next_offset':250},250:{'rooms':[],'next_offset':700},700:{'rooms':[room],'next_offset':900}}
+    results['groups.list']=lambda params:pages[params['offset']]
+    response=client.post('/mobile/bot-mode/space',json={'profiles':['default','writer'],'request_id':request_id})
+    assert response.status_code==200 and response.json()['room']==room
+    assert [c[3]['offset'] for c in calls if c[2]=='groups.list']==[0,250,700]
+    assert not any(c[2]=='groups.create' for c in calls)
+
+def test_room_scan_ceiling_fails_closed_before_creation(harness):
+    client,calls,results=harness
+    def page(params):
+        if params['offset']>=1000: raise RuntimeError('page ceiling was exceeded')
+        return {'rooms':[],'next_offset':params['offset']+100}
+    results['groups.list']=page
+    response=client.post('/mobile/bot-mode/space',json={'profiles':['default','writer'],'request_id':'bounded-scan'})
+    assert response.status_code==409
+    assert response.json()['detail']=='Cypher checked 1,000 group rooms and stopped before creating a duplicate. Archive unused rooms in Hermes, then try again.'
+    pages=[c[3] for c in calls if c[2]=='groups.list']
+    assert len(pages)==10 and all(page['limit']==100 for page in pages)
+    assert [page['offset'] for page in pages]==list(range(0,1000,100))
+    assert not any(c[2]=='groups.create' for c in calls)
+
 
 def test_create_rejects_nonadvancing_native_page(harness):
     client, _, results = harness

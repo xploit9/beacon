@@ -188,6 +188,20 @@ async def voice_settings(request:Request):
     owner,_,profile,cfg=identity(request)
     return {'selected_provider':voice_models.selected(mobile,owner,profile,cfg)['provider'],
             'providers':voice_models.choices(cfg,secret,mobile,owner,profile),'applies_to':'next_call'}
+@router.get('/mobile/history-retention')
+async def history_retention(request:Request):
+    owner,_,_,_=identity(request)
+    days=await asyncio.to_thread(mobile.history_retention_days,owner)
+    return JSONResponse({'history_retention_days':days},headers={'Cache-Control':'no-store'})
+@router.put('/mobile/history-retention')
+async def save_history_retention(request:Request):
+    owner,_,_,_=identity(request)
+    value=await body(request,1024)
+    days=value.get('history_retention_days')
+    if set(value)!={'history_retention_days'} or type(days) is not int or days not in mobile.HISTORY_RETENTION_DAYS:
+        raise HTTPException(400,'Choose Forever, 1 year, 90 days, or 30 days')
+    days=await asyncio.to_thread(mobile.set_history_retention_days,owner,days)
+    return JSONResponse({'history_retention_days':days},headers={'Cache-Control':'no-store'})
 @router.put('/mobile/voice-settings')
 async def save_voice_settings(request:Request):
     owner,_,profile,cfg=identity(request);value=await body(request,1024)
@@ -300,8 +314,8 @@ async def jobs(call_id:str,request:Request):
         if conn.execute("SELECT COUNT(*) FROM jobs WHERE owner=? AND profile=? AND status IN ('watching','needs_input')",(owner,row['profile'])).fetchone()[0]>=512: raise HTTPException(409,'Native watch capacity reached')
         if conn.execute('SELECT COUNT(*) FROM jobs WHERE call_id=?',(call_id,)).fetchone()[0]>=64: raise HTTPException(409,'Job linkage capacity reached')
         if conn.execute("SELECT 1 FROM jobs WHERE (runtime=? AND status IN ('watching','needs_input')) OR (owner=? AND profile=? AND stored=? AND seq=?)",(value['runtime_session_id'],owner,row['profile'],value['stored_session_id'],user_row_id)).fetchone(): raise HTTPException(409,'One watched prompt per runtime session')
-        conn.execute('INSERT INTO jobs(id,call_id,owner,profile,stored,runtime,request,title,callback,epoch,seq,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-            (jid,call_id,owner,row['profile'],value['stored_session_id'],value['runtime_session_id'],value['request_id'],title,int(value.get('callback') is True),event_replay.replay_epoch(),user_row_id,'watching'))
+        conn.execute('INSERT INTO jobs(id,call_id,owner,profile,stored,runtime,request,title,callback,epoch,seq,status,history_updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            (jid,call_id,owner,row['profile'],value['stored_session_id'],value['runtime_session_id'],value['request_id'],title,int(value.get('callback') is True),event_replay.replay_epoch(),user_row_id,'watching',time.time()))
     return {'job_id':jid,'status':'working','user_row_id':user_row_id,'request_id':value['request_id'],'stored_session_id':value['stored_session_id'],'runtime_session_id':value['runtime_session_id']}
 @router.post('/mobile/calls/{call_id}/callback')
 async def callback(call_id:str,request:Request):
@@ -312,7 +326,7 @@ async def callback(call_id:str,request:Request):
         if value.get('job_id'): rows=[r for r in rows if r['id']==value['job_id']]
         elif value.get('scope','latest')=='latest': rows=rows[:1]
         if not rows: raise HTTPException(404,'Owned native job unavailable')
-        for r in rows: conn.execute('UPDATE jobs SET callback=1 WHERE id=?',(r['id'],))
+        for r in rows: conn.execute('UPDATE jobs SET callback=1,history_updated=? WHERE id=?',(time.time(),r['id']))
     await asyncio.to_thread(watch,owner,provider,row['profile'])
     return {'subscribed':True,'job_ids':[r['id'] for r in rows]}
 def job_status(job):
@@ -351,7 +365,7 @@ def watch(owner,provider,profile):
                         pending=server_requests.open_requests(job['runtime']) if staged.get('_row_id')==job['seq'] else []
                     except (ImportError,AttributeError): pending=[]
                     with mobile.LOCK,mobile.connect() as conn:
-                        conn.execute("UPDATE jobs SET status=? WHERE id=? AND status IN ('watching','needs_input')",('needs_input' if pending else 'watching',job['id']))
+                        conn.execute("UPDATE jobs SET status=?,history_updated=? WHERE id=? AND status IN ('watching','needs_input')",('needs_input' if pending else 'watching',time.time(),job['id']))
                         mobile.prune_notices(conn)
                     continue
                 terminal={'complete':'completed','error':'failed','interrupted':'cancelled','cancelled':'cancelled'}.get(proof.get('status'))
@@ -365,11 +379,11 @@ def watch(owner,provider,profile):
                     text=final.get('text',final.get('content',''))
                 else: text=''
                 with mobile.LOCK,mobile.connect() as conn:
-                    updated=conn.execute("UPDATE jobs SET status=?,result=?,error=? WHERE id=? AND status IN ('watching','needs_input')",(terminal,text[:65536],('Native Hermes turn failed; review the native session.' if terminal=='failed' else ''),job['id']))
+                    updated=conn.execute("UPDATE jobs SET status=?,result=?,error=?,history_updated=? WHERE id=? AND status IN ('watching','needs_input')",(terminal,text[:65536],('Native Hermes turn failed; review the native session.' if terminal=='failed' else ''),time.time(),job['id']))
                 if not updated.rowcount: continue
             except LookupError:
                 with mobile.LOCK,mobile.connect() as conn:
-                    conn.execute("UPDATE jobs SET status='failed',error='Native Hermes session no longer exists' WHERE id=? AND status IN ('watching','needs_input')",(job['id'],))
+                    conn.execute("UPDATE jobs SET status='failed',error='Native Hermes session no longer exists',history_updated=? WHERE id=? AND status IN ('watching','needs_input')",(time.time(),job['id']))
                 continue
             except Exception: continue
         with mobile.LOCK,mobile.connect() as conn:
@@ -381,7 +395,7 @@ def watch(owner,provider,profile):
             if current['status']=='completed' and current['callback'] and ended and ended[0] and not active and capacity:
                 nid=uuid.uuid4().hex
                 conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,job_id,reason) VALUES(?,?,?,?,?,?,?,?,?)',(nid,owner,profile,'incoming_call',job['stored'],time.time(),time.time()+120,job['id'],job['title']))
-                conn.execute("UPDATE jobs SET status='callback_pending' WHERE id=?",(job['id'],))
+                conn.execute("UPDATE jobs SET status='callback_pending',history_updated=? WHERE id=?",(time.time(),job['id']))
     activate(owner,profile)
 def task_clock(profile):
     from hermes_cli.web_server_profiles import _config_profile_scope
@@ -539,6 +553,8 @@ async def notices(request:Request,after:int=0,wait:float=0):
     if after<0: raise HTTPException(400,'Invalid cursor')
     duration=_bounded_event_wait(wait)
     async def snapshot():
+        await asyncio.to_thread(mobile.prune_history,owner)
+        await asyncio.to_thread(sys.modules['cypher_callbacks'].prune_expired,mobile,owner)
         await asyncio.to_thread(watch,owner,provider,profile)
         return await asyncio.to_thread(_notices_after,owner,profile,after)
     rows=await snapshot()
@@ -648,7 +664,7 @@ def activate(owner,profile):
         deferred=conn.execute('SELECT * FROM deferred WHERE owner=? AND profile=? ORDER BY created LIMIT 32',(owner,profile)).fetchall()
         for row in deferred:
             now=datetime.now(timezone.utc)
-            explicit=sys.modules['cypher_callbacks'].deferred_allowed(mobile,row['id'],now)
+            explicit=sys.modules['cypher_callbacks'].deferred_allowed(mobile,row['id'],now,owner)
             if explicit is False:
                 conn.execute('DELETE FROM deferred WHERE id=?',(row['id'],));continue
             # Unscheduled legacy callbacks are owner requests; proactive producers enforce their own quiet window.

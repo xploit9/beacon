@@ -1,9 +1,12 @@
 import base64
 import importlib.util
 import json
+import os
+import subprocess
 from pathlib import Path
 import sys
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -42,6 +45,172 @@ def reserve(client):
     result=client.post('/api/plugins/cypher/mobile/calls',json={'profile':'default'})
     assert result.status_code==200,result.text
     return result.json()['call_id']
+
+def test_history_retention_setting_is_owner_and_profile_scoped(harness):
+    api,client,cfg,tmp,_=harness
+    path='/api/plugins/cypher/mobile/history-retention'
+    assert client.get(path).json()=={'history_retention_days':0}
+    assert client.put(path,json={'history_retention_days':30}).json()=={'history_retention_days':30}
+    assert client.get(path).json()=={'history_retention_days':30}
+    assert client.put(path,json={'history_retention_days':7}).status_code==400
+    assert client.put(path,json={'history_retention_days':True}).status_code==400
+    assert client.put(path,content=b'{"history_retention_days":'+b'9'*2048+b'}',headers={'content-type':'application/json'}).status_code==413
+    client.headers['x-fixture-owner']='foreign'
+    assert client.get(path).status_code==403
+    client.headers['x-fixture-owner']='owner'
+    cfg['profiles']=['default','work']
+    assert client.get(path).status_code==403
+    assert client.get(path+'?profile=work').json()=={'history_retention_days':30}
+    for days in (90,365,0):
+        saved=client.put(path+'?profile=work',json={'history_retention_days':days})
+        assert saved.status_code==200 and saved.json()=={'history_retention_days':days}
+    assert client.put(path+'?profile=foreign',json={'history_retention_days':30}).status_code==403
+    assert not (tmp/'config.yaml').exists()
+
+def test_history_retention_zero_preserves_old_closed_call_history(harness):
+    api,client,_,_,_=harness
+    call_id=reserve(client)
+    with api.mobile.connect() as conn:
+        conn.execute('UPDATE calls SET created=?,closed=1,status=\'saved\' WHERE id=?',(time.time()-400*86400,call_id))
+        conn.execute('INSERT INTO timeline(call_id,event_id,digest,payload) VALUES(?,?,?,?)',
+                     (call_id,'old-transcript','digest',json.dumps({'type':'transcript','role':'user','text':'old'})))
+    response=client.put('/api/plugins/cypher/mobile/history-retention',json={'history_retention_days':0})
+    assert response.status_code==200,response.text
+    with api.mobile.connect() as conn:
+        assert conn.execute('SELECT 1 FROM calls WHERE id=?',(call_id,)).fetchone()
+        assert conn.execute('SELECT 1 FROM timeline WHERE call_id=?',(call_id,)).fetchone()
+
+def test_legacy_jobs_without_a_change_time_are_preserved_on_migration(harness):
+    api,client,_,tmp,_=harness
+    root=tmp/'plugin-data'/'cypher'
+    root.mkdir(parents=True)
+    legacy=api.mobile.sqlite3.connect(root/'mobile.sqlite')
+    legacy.executescript('''
+        CREATE TABLE meta(key TEXT PRIMARY KEY,value BLOB);
+        CREATE TABLE calls(id TEXT PRIMARY KEY,owner TEXT,profile TEXT,conversation TEXT,created REAL,closed INTEGER DEFAULT 0,status TEXT DEFAULT 'pending',receipt TEXT DEFAULT '{}');
+        CREATE TABLE jobs(id TEXT PRIMARY KEY,call_id TEXT,owner TEXT,profile TEXT,stored TEXT,runtime TEXT,request TEXT,title TEXT,callback INTEGER,epoch TEXT,seq INTEGER,status TEXT DEFAULT 'watching',UNIQUE(owner,profile,request));
+    ''')
+    old=time.time()-400*86400
+    legacy.execute("INSERT INTO calls(id,owner,profile,conversation,created,closed,status) VALUES('legacy-call','owner','default','stored',?,1,'failed')",(old,))
+    legacy.execute("INSERT INTO jobs(id,call_id,owner,profile,stored,runtime,request,title,callback,epoch,seq,status) VALUES('legacy-job','legacy-call','owner','default','stored','runtime','request','fixture',0,'epoch',1,'failed')")
+    legacy.commit();legacy.close()
+    saved=client.put('/api/plugins/cypher/mobile/history-retention',json={'history_retention_days':30})
+    assert saved.status_code==200,saved.text
+    with api.mobile.connect() as conn:
+        assert conn.execute('SELECT 1 FROM calls WHERE id=\'legacy-call\'').fetchone()
+        assert conn.execute('SELECT history_updated FROM jobs WHERE id=\'legacy-job\'').fetchone()[0]>=time.time()-60
+
+def test_shortened_history_retention_prunes_only_expired_closed_owner_history(harness):
+    api,client,cfg,_,_=harness
+    assert client.put('/api/plugins/cypher/mobile/history-retention',json={'history_retention_days':7}).status_code==400
+    cfg['profiles']=['default','work']
+    now=time.time()
+    def call(owner,profile,age_days,closed=True):
+        call_id=api.mobile.reserve(owner,profile,'session-'+profile+'-'+str(age_days))['call_id']
+        with api.mobile.connect() as conn:
+            conn.execute('UPDATE calls SET created=?,closed=?,status=? WHERE id=?',
+                         (now-age_days*86400,int(closed),'saved' if closed else 'pending',call_id))
+            conn.execute('INSERT INTO timeline(call_id,event_id,digest,payload) VALUES(?,?,?,?)',
+                         (call_id,'transcript','digest',json.dumps({'type':'transcript','role':'user','text':'fixture'})))
+        return call_id
+    expired=call('owner','default',31)
+    recent=call('owner','default',29)
+    active=call('owner','work',31,closed=False)
+    running=call('owner','work',31)
+    recently_updated=call('owner','work',31)
+    ringing=call('owner','work',31)
+    unknown_job=call('owner','work',31)
+    foreign=call('foreign','default',31)
+    with api.mobile.connect() as conn:
+        for call_id,profile,job_id,status,updated in (
+            (expired,'default','old-job','failed',now-31*86400),
+            (running,'work','running-job','watching',now-31*86400),
+            (recently_updated,'work','recent-job','failed',now-86400),
+            (ringing,'work','ringing-job','callback_pending',now-31*86400),
+            (unknown_job,'work','unknown-job',None,now-31*86400),
+        ):
+            conn.execute('INSERT INTO jobs(id,call_id,owner,profile,stored,runtime,request,title,callback,epoch,seq,status,history_updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                         (job_id,call_id,'owner',profile,'stored','runtime',job_id,'fixture',0,'epoch',1,status,updated))
+        conn.execute("INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,job_id,reason) VALUES('ringing-notice','owner','work','incoming_call','stored',?,?,?,'fixture')",
+                     (now,now+120,'ringing-job'))
+    saved=client.put('/api/plugins/cypher/mobile/history-retention?profile=default',json={'history_retention_days':30})
+    assert saved.status_code==200,saved.text
+    with api.mobile.connect() as conn:
+        remaining={row[0] for row in conn.execute('SELECT id FROM calls')}
+        assert expired not in remaining and recent in remaining and active in remaining
+        assert running in remaining and recently_updated in remaining and ringing in remaining and unknown_job in remaining and foreign in remaining
+        assert conn.execute('SELECT 1 FROM timeline WHERE call_id=?',(expired,)).fetchone() is None
+        assert conn.execute('SELECT 1 FROM jobs WHERE id=\'old-job\'').fetchone() is None
+        assert conn.execute('SELECT 1 FROM jobs WHERE id=\'running-job\'').fetchone()
+        assert conn.execute('SELECT 1 FROM jobs WHERE id=\'recent-job\'').fetchone()
+        assert conn.execute('SELECT 1 FROM jobs WHERE id=\'ringing-job\'').fetchone()
+        assert conn.execute('SELECT 1 FROM jobs WHERE id=\'unknown-job\'').fetchone()
+
+def test_history_retention_notice_poll_prunes_bounded_batches_at_most_hourly(harness,monkeypatch):
+    api,client,_,_,_=harness
+    now=time.time()
+    call_id=reserve(client)
+    payload=json.dumps({'type':'transcript','role':'user','text':'fixture'})
+    with api.mobile.connect() as conn:
+        conn.execute('UPDATE calls SET created=?,closed=1,status=\'saved\' WHERE id=?',(now-31*86400,call_id))
+        conn.executemany('INSERT INTO timeline(call_id,event_id,digest,payload) VALUES(?,?,?,?)',
+                         ((call_id,'transcript-'+str(i),'digest',payload) for i in range(1001)))
+    assert client.put('/api/plugins/cypher/mobile/history-retention',json={'history_retention_days':30}).status_code==200
+    with api.mobile.connect() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM timeline WHERE call_id=?',(call_id,)).fetchone()[0]==1
+    monkeypatch.setattr(api,'watch',lambda *args:None)
+    assert client.get('/api/plugins/cypher/mobile/notifications/events').status_code==200
+    with api.mobile.connect() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM timeline WHERE call_id=?',(call_id,)).fetchone()[0]==1
+    monkeypatch.setattr(api.mobile,'time',SimpleNamespace(time=lambda:now+3601))
+    assert client.get('/api/plugins/cypher/mobile/notifications/events').status_code==200
+    with api.mobile.connect() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM timeline WHERE call_id=?',(call_id,)).fetchone()[0]==0
+        assert conn.execute('SELECT 1 FROM calls WHERE id=?',(call_id,)).fetchone() is None
+
+def test_history_retention_limits_closed_call_deletions_per_batch(harness):
+    api,client,_,_,_=harness
+    old=time.time()-31*86400
+    with api.mobile.connect() as conn:
+        conn.executemany('INSERT INTO calls(id,owner,profile,conversation,created,closed,status) VALUES(?,?,?,?,?,1,\'saved\')',
+                         ((f'batch-call-{i:03d}','owner','default',f'session-{i}',old) for i in range(101)))
+    response=client.put('/api/plugins/cypher/mobile/history-retention',json={'history_retention_days':30})
+    assert response.status_code==200,response.text
+    with api.mobile.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM calls WHERE id LIKE 'batch-call-%'").fetchone()[0]==1
+
+def test_history_retention_never_follows_configured_archive_links(harness):
+    api,client,cfg,tmp,_=harness
+    call_id=reserve(client)
+    archive=Path(cfg['archive_root']);archive.mkdir()
+    external=tmp/'external-archive';external.mkdir()
+    sentinel=external/'transcript.json';sentinel.write_text('unowned fixture',encoding='utf-8')
+    link=archive/call_id
+    if os.name=='nt':
+        quote=lambda value:"'"+str(value).replace("'","''")+"'"
+        command=f'New-Item -ItemType Junction -Path {quote(link)} -Target {quote(external)} | Out-Null'
+        result=subprocess.run(['powershell.exe','-NoProfile','-Command',command],capture_output=True,text=True)
+        if result.returncode: pytest.skip(f'directory junctions are unavailable: {result.stderr}')
+    else:
+        link.symlink_to(external,target_is_directory=True)
+    with api.mobile.connect() as conn:
+        conn.execute('UPDATE calls SET created=?,closed=1,status=\'saved\' WHERE id=?',(time.time()-31*86400,call_id))
+    response=client.put('/api/plugins/cypher/mobile/history-retention',json={'history_retention_days':30})
+    assert response.status_code==200,response.text
+    assert sentinel.read_text(encoding='utf-8')=='unowned fixture'
+
+def test_mail_monitor_prompt_uses_existing_24_hour_lookback(harness,monkeypatch):
+    api,_,_,_,_=harness
+    jobs=[]
+    monkeypatch.setitem(sys.modules,'hermes_cli.web_server_cron',SimpleNamespace(
+        _call_cron_for_profile=lambda *args:[],
+        _create_cron_job_sync=lambda model,profile:jobs.append((model,profile)) or model))
+    monkeypatch.setitem(sys.modules,'hermes_cli.web_models',SimpleNamespace(CronJobCreate=lambda **kwargs:SimpleNamespace(**kwargs)))
+    installed=api._install_mail_task('default',{'account':'fixture'})
+    assert installed['existing'] is False
+    assert 'received in the last24 hours' in installed['job'].prompt
+    assert installed['job'].schedule=='0,15,30,45 10-21 * * *'
+    assert installed['job'].enabled_toolsets==['cypher-mailbox','no_mcp']
 
 def audio(seq=0,stream='user',at=0,pcm=None):
     rate=16000 if stream=='user' else 24000
@@ -773,9 +942,11 @@ def test_phone_clock_correction_diagnostic_is_admitted_and_preserved(harness):
     assert c.post(url,json={'events':[{**event,'event_id':'unknown','stage':'unknown-stage'}]}).status_code==409
 
 
-def test_cached_plugin_authority_tracks_replacement_and_never_exposes_mutable_cache(harness,monkeypatch):
+def test_plugin_settings_copy_authority_and_track_replacement(harness,monkeypatch):
     api,c,cfg,tmp,app=harness
     module=load_private('mobile');monkeypatch.setattr(module,'home',lambda:tmp)
+    # This fixture writes JSON, so it does not depend on Hermes' optional YAML adapter.
+    monkeypatch.setitem(sys.modules,'utils',SimpleNamespace(load_yaml_file_readonly=lambda path:json.loads(Path(path).read_text(encoding='utf-8'))))
     path=tmp/'config.yaml'
     def replace(owner,enabled=True):
         text=json.dumps({'plugins':{'enabled':['cypher'] if enabled else [],'entries':{'cypher':{'settings':{'owner_id':owner,'profiles':['default']}}}},'other_secret':'fixture-private-value'})

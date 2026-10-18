@@ -6,6 +6,9 @@ from fastapi import APIRouter, HTTPException, Request
 
 CANONICAL_TITLE = 'Bot Chat'
 CHAT_LOCK = asyncio.Lock()
+SPACE_PAGE_SIZE = 100
+SPACE_SCAN_PAGES = 10
+SPACE_SCAN_LIMIT = SPACE_PAGE_SIZE * SPACE_SCAN_PAGES
 
 
 def space_id(owner, provider, profile, request_id=None):
@@ -104,9 +107,12 @@ def build_router(identity, body, native):
         # Older clients have no request identity; keep their retry behavior and existing room.
         rid = space_id(owner, provider, profile, request_id or 'members:' + ','.join(chosen))
         offset = 0
-        while True:
-            rooms = await rpc(owner, provider, profile, 'groups.list', limit=100, offset=offset)
-            for existing in rooms.get('rooms', []):
+        for _ in range(SPACE_SCAN_PAGES):
+            rooms = await rpc(owner, provider, profile, 'groups.list', limit=SPACE_PAGE_SIZE, offset=offset)
+            page = rooms.get('rooms') if isinstance(rooms,dict) else None
+            if not isinstance(page,list) or len(page)>SPACE_PAGE_SIZE:
+                raise HTTPException(503, 'Shared-space list could not be refreshed; try again')
+            for existing in page:
                 members = existing.get('members') or []
                 if (existing.get('room_id') in ({rid} if request_id else {rid, space_id(owner, provider, profile)})
                         and authorized_members(members, allowed)
@@ -118,6 +124,8 @@ def build_router(identity, body, native):
             if not isinstance(following, int) or isinstance(following, bool) or following <= offset:
                 raise HTTPException(503, 'Shared-space list could not be refreshed; try again')
             offset = following
+        else:
+            raise HTTPException(409, f'Cypher checked {SPACE_SCAN_LIMIT:,} group rooms and stopped before creating a duplicate. Archive unused rooms in Hermes, then try again.')
         members = [{'member_id': p, 'profile': p, 'handle': 'hermes' if p == 'default' else p,
                     'target': {'kind': 'local', 'profile': p}} for p in chosen]
         return await rpc(owner, provider, profile, 'groups.create', room_id=rid, name='Shared space', members=members)
