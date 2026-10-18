@@ -1493,12 +1493,29 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         newChatJobs[owner.key]?.takeIf { !it.isCompleted }?.let { return it }
         val origin = originGeneration; val selection = sessionGeneration; val navigation = navigationGeneration
         val c = active.detached()
+        val scope = owner.session(id)
         fun current() = client === active && active.scope == owner && originGeneration == origin && sessionGeneration == selection && navigationGeneration == navigation && canComposeInitialChat()
+        suspend fun clientCreatedShell() = clientCreatedSessions.contains(scope.key) || try {
+            app.cache.read(scope, "client-created-shell") == "1"
+        } catch (lookupError: Exception) {
+            if (lookupError is CancellationException) throw lookupError
+            if (current()) notice("The draft recovery marker could not be checked; your draft is kept")
+            true
+        }
+        suspend fun readInitialSession() = try {
+            c.get("/api/session", mapOf("session_id" to id))
+        } catch (readError: Throwable) {
+            if (readError is CancellationException) throw readError
+            if (readError !is ApiFailure || readError.status != 404 || !current() || !clientCreatedShell()) throw readError
+            val resumed = c.nativeSession(id)
+            require(resumed.storedSessionId == id) { "The resumed conversation changed identity" }
+            c.get("/api/session", mapOf("session_id" to id))
+        }
         val job = viewModelScope.launch {
             val running = currentCoroutineContext()[Job]
             if (current()) _ui.update { it.copy(newChatOpening = true) }
             try {
-                val response = c.get("/api/session", mapOf("session_id" to id))
+                val response = readInitialSession()
                 val session = response.optJSONObject("session") ?: response
                 require(session.string("session_id") == id) { "The conversation response changed identity" }
                 require(session.rows("messages").isEmpty() && session.optInt("message_count") == 0 && session.string("active_stream_id").isBlank() && !session.optBoolean("has_pending_user_message") && session.opt("pending_user_message") in listOf(null, JSONObject.NULL, "") && session.string("profile", "default") == owner.profile) { "The saved conversation is no longer an empty draft. Open it from history or retry a new conversation." }
@@ -1511,14 +1528,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 if (e !is CancellationException) {
                     fun ownsMissingShell() = client === active && originGeneration == origin && initialShells[owner.key] == id
                     if (missingNativeConversation(e) && ownsMissingShell()) {
-                        val scope = owner.session(id)
-                        val clientCreated = clientCreatedSessions.contains(scope.key) || try {
-                            app.cache.read(scope, "client-created-shell") == "1"
-                        } catch (lookupError: Exception) {
-                            if (lookupError is CancellationException) throw lookupError
-                            if (current()) notice("The draft recovery marker could not be checked; your draft is kept")
-                            true
-                        }
+                        val clientCreated = clientCreatedShell()
                         val confirmedNativeMissing = e is ApiFailure && e.status == 4007 && e.message == "session not found"
                         // Hermes can keep a minted shell out of REST history until its first native resume.
                         if (clientCreated && !confirmedNativeMissing) {

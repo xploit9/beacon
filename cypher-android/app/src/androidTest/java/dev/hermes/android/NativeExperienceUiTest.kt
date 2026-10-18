@@ -1392,6 +1392,8 @@ class NativeExperienceUiTest {
         val attempts = CypherViewModel::class.java.getDeclaredField("initialCreateAttempts").apply { isAccessible = true }.get(vm) as MutableMap<String, String>
         val staleScope = fixture.scope.session("deleted-shell")
         runBlocking { app.cache.delete(staleScope, "client-created-shell"); app.cache.delete(staleScope, "session") }
+        runBlocking { app.cache.write(staleScope, "client-created-shell", "1", protected = true) }
+        var createdId = ""
         try {
             compose.runOnIdle {
                 field(vm, "sourceScope", null)
@@ -1408,16 +1410,23 @@ class NativeExperienceUiTest {
                 throw AssertionError("Deleted-shell recovery: tab=${vm.ui.value.tab} ready=${vm.ui.value.initialChatReady} opening=${vm.ui.value.newChatOpening} id=${vm.chat.value.sessionId} error=${vm.ui.value.error} newChatError=${vm.ui.value.newChatError} notice=${vm.ui.value.notice} requests=$calls", error)
             }
             assertEquals("Retain my unfinished draft", vm.composer.value.text)
+            createdId = vm.chat.value.sessionId
             val calls = recentCalls(fixture)
             assertEquals("Expected one native session.create; requests=$calls", 1, fixture.requests.count { it.string("method") == "session.create" })
             assertEquals(vm.chat.value.sessionId, shells[fixture.scope.key])
             assertFalse(attempts.containsKey(fixture.scope.key))
+            assertNull(runBlocking { app.cache.read(staleScope, "client-created-shell") })
             assertTrue(vm.ui.value.newChatError.isBlank())
-            receipts += "An unowned stale shell confirmed missing by passive history is cleared without discarding the draft; explicit New creates once."
+            receipts += "A legacy client-created marker is cleared only after native resume confirms the shell is missing; explicit New retains the draft and creates once."
         } finally {
             runBlocking {
                 app.cache.delete(fixture.scope, "new-chat-shell"); app.cache.delete(fixture.scope, "new-chat-attempt"); app.cache.delete(fixture.scope, "initial-draft")
+                app.cache.delete(fixture.scope, "selected-session"); app.cache.delete(fixture.scope, "conversation-index")
                 app.cache.delete(staleScope, "client-created-shell"); app.cache.delete(staleScope, "session")
+                if (createdId.isNotBlank()) {
+                    val createdScope = fixture.scope.session(createdId)
+                    app.cache.delete(createdScope, "client-created-shell"); app.cache.delete(createdScope, "session"); app.cache.delete(createdScope, "draft")
+                }
             }
         }
     }
@@ -2003,6 +2012,7 @@ class NativeExperienceUiTest {
                 val shells = CypherViewModel::class.java.getDeclaredField("initialShells").apply { isAccessible = true }.get(restarted) as MutableMap<String, String>
                 shells[owner.key] = cachedShell
             }
+            val resumesBefore = fixture.requests.count { it.string("method") == "session.resume" }
             compose.runOnIdle {
                 restarted.composer(TextFieldValue("Keep this draft after restart"))
                 restarted.newChat()
@@ -2015,9 +2025,6 @@ class NativeExperienceUiTest {
             assertEquals("Keep this draft after restart", restarted.composer.value.text)
             assertEquals(createsBefore + 1, fixture.requests.count { it.string("method") == "session.create" })
             assertTrue(fixture.requests.any { it.string("method") == "GET" && it.string("path") == "/api/sessions/$shellId" })
-            val resumesBefore = fixture.requests.count { it.string("method") == "session.resume" }
-            val binding = runBlocking { newClient.nativeSession(shellId) }
-            assertEquals(shellId, binding.storedSessionId)
             assertEquals(resumesBefore + 1, fixture.requests.count { it.string("method") == "session.resume" })
             assertTrue(fixture.sessions.containsKey(shellId))
             receipts += "After a fresh ViewModel restores the owner-bound shell, passive history may be absent until Hermes resumes the minted key; the same shell resumes without another create and the draft survives."
@@ -2046,28 +2053,42 @@ class NativeExperienceUiTest {
         val staleScope = fixture.scope.session("removed-initial-shell")
         // Older runs could leave a false phone-created marker for this never-created fixture id.
         runBlocking { app.cache.delete(staleScope, "client-created-shell"); app.cache.delete(staleScope, "session") }
-        compose.runOnIdle {
-            field(vm, "sourceScope", null)
-            flow<ChatState>(vm, "_chat").value = ChatState()
-            flow<AppState>(vm, "_ui").value = vm.ui.value.copy(tab = "Chat", initialChatReady = true)
+        var createdId = ""
+        try {
+            compose.runOnIdle {
+                field(vm, "sourceScope", null)
+                flow<ChatState>(vm, "_chat").value = ChatState()
+                flow<AppState>(vm, "_ui").value = vm.ui.value.copy(tab = "Chat", initialChatReady = true)
+                @Suppress("UNCHECKED_CAST")
+                val shells = CypherViewModel::class.java.getDeclaredField("initialShells").apply { isAccessible = true }.get(vm) as MutableMap<String, String>
+                shells[fixture.scope.key] = "removed-initial-shell"
+                vm.composer(TextFieldValue("Keep this unsent thought"))
+                vm.newChat()
+            }
+            try { await { vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.newChatOpening } }
+            catch (error: Throwable) {
+                val calls = recentCalls(fixture)
+                throw AssertionError("Initial recovery: tab=${vm.ui.value.tab} ready=${vm.ui.value.initialChatReady} opening=${vm.ui.value.newChatOpening} id=${vm.chat.value.sessionId} error=${vm.ui.value.error} newChatError=${vm.ui.value.newChatError} notice=${vm.ui.value.notice} requests=$calls", error)
+            }
+            assertEquals("Keep this unsent thought", vm.composer.value.text)
+            createdId = vm.chat.value.sessionId
+            val calls = recentCalls(fixture)
+            assertEquals("Expected one native session.create; requests=$calls", 1, fixture.requests.count { it.string("method") == "session.create" })
+            assertTrue(fixture.sessions.containsKey(vm.chat.value.sessionId))
             @Suppress("UNCHECKED_CAST")
             val shells = CypherViewModel::class.java.getDeclaredField("initialShells").apply { isAccessible = true }.get(vm) as MutableMap<String, String>
-            shells[fixture.scope.key] = "removed-initial-shell"
-            vm.composer(TextFieldValue("Keep this unsent thought"))
-            vm.newChat()
+            assertEquals(vm.chat.value.sessionId, shells[fixture.scope.key])
+        } finally {
+            runBlocking {
+                app.cache.delete(fixture.scope, "new-chat-shell"); app.cache.delete(fixture.scope, "new-chat-attempt"); app.cache.delete(fixture.scope, "initial-draft")
+                app.cache.delete(fixture.scope, "selected-session"); app.cache.delete(fixture.scope, "conversation-index")
+                app.cache.delete(staleScope, "client-created-shell"); app.cache.delete(staleScope, "session")
+                if (createdId.isNotBlank()) {
+                    val createdScope = fixture.scope.session(createdId)
+                    app.cache.delete(createdScope, "client-created-shell"); app.cache.delete(createdScope, "session"); app.cache.delete(createdScope, "draft")
+                }
+            }
         }
-        try { await { vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.newChatOpening } }
-        catch (error: Throwable) {
-            val calls = recentCalls(fixture)
-            throw AssertionError("Initial recovery: tab=${vm.ui.value.tab} ready=${vm.ui.value.initialChatReady} opening=${vm.ui.value.newChatOpening} id=${vm.chat.value.sessionId} error=${vm.ui.value.error} newChatError=${vm.ui.value.newChatError} notice=${vm.ui.value.notice} requests=$calls", error)
-        }
-        assertEquals("Keep this unsent thought", vm.composer.value.text)
-        val calls = recentCalls(fixture)
-        assertEquals("Expected one native session.create; requests=$calls", 1, fixture.requests.count { it.string("method") == "session.create" })
-        assertTrue(fixture.sessions.containsKey(vm.chat.value.sessionId))
-        @Suppress("UNCHECKED_CAST")
-        val shells = CypherViewModel::class.java.getDeclaredField("initialShells").apply { isAccessible = true }.get(vm) as MutableMap<String, String>
-        assertEquals(vm.chat.value.sessionId, shells[fixture.scope.key])
     }
 
     @Test fun selectingTheCurrentSettingsDestinationClosesTheDrawerWithoutAddingBackHistory() = withFixture { vm, _ ->
