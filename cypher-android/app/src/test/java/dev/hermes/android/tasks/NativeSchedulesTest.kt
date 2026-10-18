@@ -32,4 +32,14 @@ class NativeSchedulesTest {
         assertEquals("Failed",scheduleState(JSONObject().put("last_status","error")))
         assertEquals("Paused",scheduleState(JSONObject().put("paused",true)))
     }
+    @Test fun pausedFollowsHermesEnabledAndStateOverAStaleLegacyFlag() {
+        // Live 2026-10-19: enabled, state "scheduled", still running every 5 min, but a stale "paused": true.
+        val running = JSONObject().put("paused",true).put("enabled",true).put("state","scheduled").put("next_run_at","2026-10-19T00:40:00+04:00")
+        assertFalse(schedulePaused(running)); assertEquals("Waiting",scheduleState(running))
+        assertEquals("Failed",scheduleState(JSONObject(running.toString()).put("last_status","error")))
+        assertTrue(schedulePaused(JSONObject().put("enabled",false).put("state","paused")))
+        assertTrue(schedulePaused(JSONObject().put("enabled",true).put("state","paused")))
+        assertEquals("Paused",scheduleState(JSONObject().put("enabled",false).put("state","scheduled")))
+        assertFalse(schedulePaused(JSONObject().put("enabled",false).put("state","completed")))
+    }
 }

@@ -26,12 +26,18 @@ internal fun nativeScheduleInput(job: JSONObject): String {
         else -> schedule.string("expr", schedule.string("expression", schedule.string("display")))
     }
 }
+// Hermes's own rule (hermes_cli/web_routers/cron.py): disabled or state "paused" means paused. The legacy "paused"
+// flag can stay true on a job that is enabled and still running, so it is read only when Hermes sends neither field.
+internal fun schedulePaused(job: JSONObject): Boolean = when {
+    job.string("state") in setOf("completed", "finished") -> false
+    job.has("enabled") || job.has("state") -> job.string("state") == "paused" || (job.has("enabled") && !job.optBoolean("enabled"))
+    else -> job.optBoolean("paused")
+}
 internal fun scheduleState(job: JSONObject): String = when {
-    job.optBoolean("paused") -> "Paused"
+    schedulePaused(job) -> "Paused"
     job.string("state") in setOf("completed", "finished") -> "Completed"
     job.string("state") in setOf("running", "claimed") -> "Running"
     job.string("last_status") in setOf("error", "failed") || job.string("state") == "error" -> "Failed"
-    job.has("enabled") && !job.optBoolean("enabled") -> "Execution unavailable"
     job.optDouble("scheduler_heartbeat_age_s", 0.0) > 120 -> "Scheduler needs attention"
     job.string("next_run_at").isNotBlank() -> "Waiting"
     else -> "Execution unconfirmed"
