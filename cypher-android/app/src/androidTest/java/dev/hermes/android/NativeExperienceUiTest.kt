@@ -922,8 +922,8 @@ class NativeExperienceUiTest {
             flow<AppState>(vm, "_ui").value = vm.ui.value.copy(tab = "Chat", initialChatReady = true)
         }
         await { vm.data.value["profile-defaults"]?.string("model") == "profile-default-model" }
-        compose.onNodeWithTag("composer-model-effort").assert(hasAnyDescendant(hasText("profile-default-model")))
-        compose.onNodeWithTag("composer-model-effort").assert(hasAnyDescendant(hasText("high")))
+        // The chip merges its labels into one Text list.
+        compose.onNodeWithTag("composer-model-effort").assert(hasText("profile-default-model")).assert(hasText("high"))
         receipts += "A chat with no messages shows the model and effort Hermes starts this profile's chats with, not placeholder labels."
     }
 

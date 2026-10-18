@@ -450,8 +450,9 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                     check(!updates.has("id") && !updates.has("next_run_at") && !updates.has("last_status")) { "Immutable/runtime fields leaked into a task edit" }
                     updates.keys().forEach { job.put(it, updates.opt(it)) }; 200 to json("job" to job, "ok" to true)
                 }
-                path.endsWith("/pause") -> { job.put("paused", true); 200 to json("job" to job, "ok" to true) }
-                path.endsWith("/resume") -> { job.put("paused", false); 200 to json("job" to job, "ok" to true) }
+                // Hermes cron/jobs.py pause_job/resume_job write enabled + state; the legacy flag is kept for older readers.
+                path.endsWith("/pause") -> { job.put("paused", true).put("enabled", false).put("state", "paused"); 200 to json("job" to job, "ok" to true) }
+                path.endsWith("/resume") -> { job.put("paused", false).put("enabled", true).put("state", "scheduled"); 200 to json("job" to job, "ok" to true) }
                 path.endsWith("/trigger") -> 200 to json("ok" to true, "status" to "queued")
                 method == "DELETE" -> { jobs.remove(id); 200 to json("ok" to true) }
                 else -> 200 to json("job" to job)
