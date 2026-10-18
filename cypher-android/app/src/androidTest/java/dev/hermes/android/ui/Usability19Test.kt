@@ -202,14 +202,13 @@ class Usability19Test {
             }
             compose.runOnIdle { screen = "diagram" }
             await("Oversized diagram fallback appeared", 25_000, { previewState() }) {
-                compose.onAllNodesWithText("Retry diagram").fetchSemanticsNodes().isNotEmpty()
+                compose.onAllNodesWithText("Preview exceeds the 64,000 character limit").fetchSemanticsNodes().isNotEmpty()
             }
-            compose.onNodeWithText("Retry diagram").assertIsDisplayed().assertIsEnabled().performClick()
-            await("Oversized diagram fallback remained after retry", 25_000, { previewState() }) {
-                compose.onAllNodesWithText("Retry diagram").fetchSemanticsNodes().isNotEmpty()
-            }
-            compose.onNodeWithText("Diagram exceeds the rendering limit").assertIsDisplayed(); capture("diagram-retry")
-            println("RICH15_ACTUAL_RESET_TREE_SOURCE_CLOSE_RETRY_VISIBLE_OK")
+            compose.onNodeWithText("Preview exceeds the 64,000 character limit").assertIsDisplayed()
+            compose.onNodeWithText("Source").assertIsDisplayed()
+            compose.onNodeWithText("Fullscreen diagram").assertIsNotEnabled()
+            compose.onNodeWithText("mermaid").assertIsDisplayed(); capture("diagram-fallback")
+            println("RICH15_ACTUAL_RESET_TREE_SOURCE_CLOSE_OVERSIZED_DIAGRAM_FALLBACK_VISIBLE_OK")
         } finally { file.delete() }
     }
     @Test fun choiceLabelsPreserveBlankSaveAndRequiredValidation() = fixture { vm, _ ->
