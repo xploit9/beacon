@@ -177,7 +177,8 @@ class KeepConnectedUiTest {
                 KeepConnectedService.status(app) == KeepConnectedService.STATUS_CONNECTED &&
                     app.push.ringingInvitation(answerSource, answerEvent.getString("event_id")) != null
             }
-            assertFalse(manager.activeNotifications.any { it.id == 4083 })
+            // The system applies notification cancels asynchronously.
+            compose.waitUntil(5_000) { manager.activeNotifications.none { it.id == 4083 } }
             assertTrue(fixture.notificationWaits.contains(25L))
             val answerInvite = app.push.ringingInvitation(answerSource, answerEvent.getString("event_id"))!!
             val answerEventId = answerEvent.getString("event_id")

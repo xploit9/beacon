@@ -421,8 +421,9 @@ class KeepConnectedService : Service() {
                 val cycleStarted = SystemClock.elapsedRealtime()
                 when (val result = poller.pollOnce()) {
                     KeepConnectedCycle.Connected -> {
-                        setStatus(this, STATUS_CONNECTED, poller.lastFailureReason)
+                        // Clear the stale sign-in prompt before anything can observe "Connected".
                         getSystemService(NotificationManager::class.java).cancel(SIGN_IN_NOTIFICATION_ID)
+                        setStatus(this, STATUS_CONNECTED, poller.lastFailureReason)
                         delay(keepConnectedPollDelay(SystemClock.elapsedRealtime() - cycleStarted))
                     }
                     is KeepConnectedCycle.Reconnecting -> {
