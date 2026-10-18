@@ -61,6 +61,8 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     val releaseRoomRead = java.util.concurrent.CountDownLatch(1)
     @Volatile var approvalMode = "manual"
     @Volatile var rejectApprovalWrite = false
+    /** Hermes's lazy session.resume can omit info.yolo even after a session-scoped yolo write. */
+    @Volatile var omitResumeYolo = false
     @Volatile var rejectPromptResponse = false
     @Volatile var onPromptResponse: (() -> Unit)? = null
     @Volatile var commandCatalogFailure = false
@@ -530,7 +532,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             "session.resume" -> {
                 require(!historyFailure) { "Synthetic history unavailable" }
                 val row = sessions[id] ?: unpromptedShells.remove(id)?.also { sessions[id] = it }
-                row?.copy()?.apply { put("session_key", id); remove("stored_session_id"); getJSONObject("info").put("stored_session_id", id) }
+                row?.copy()?.apply { put("session_key", id); remove("stored_session_id"); getJSONObject("info").put("stored_session_id", id); if (omitResumeYolo) getJSONObject("info").remove("yolo") }
                     ?: throw IllegalArgumentException("Synthetic session missing")
             }
             "session.history" -> { require(!historyFailure) { "Synthetic history unavailable" }; sessions[id]?.copy()?.apply { put("session_key", id); remove("stored_session_id"); getJSONObject("info").put("stored_session_id", id) } ?: throw IllegalArgumentException("Synthetic session missing") }

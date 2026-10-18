@@ -219,6 +219,24 @@ class NativeApprovalMenuUiTest {
         compose.onNodeWithText("YOLO status unknown for this chat").assertIsDisplayed()
     }
 
+    @Test fun choosingAModeClearsLastVerifiedYoloWhenTheReadbackOmitsIt() = withFixture { vm, fixture ->
+        open(vm)
+        compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
+        compose.onNodeWithText("Enable YOLO").performClick()
+        await { vm.data.value["picker:approvals"]?.let { it.optBoolean("session_status_known") && it.optBoolean("session_bypass") } == true }
+        compose.onNodeWithContentDescription("Approvals · YOLO on").assertIsDisplayed()
+
+        // The mode write's verified "0" echo clears this chat's bypass even when the follow-up resume omits info.yolo.
+        fixture.omitResumeYolo = true
+        open(vm)
+        compose.onNodeWithContentDescription("Approvals · YOLO on · last verified").assertIsDisplayed()
+        compose.onNodeWithTag("approval-mode-smart").performScrollTo().performClick()
+        await { vm.data.value["picker:approvals"]?.let { it.string("value") == "smart" && !it.optBoolean("session_status_known") } == true }
+        val clear = fixture.requests.filter { it.string("method") == "config.set" && it.optJSONObject("params")?.string("key") == "yolo" }.last().getJSONObject("params")
+        assertEquals("off", clear.string("value")); assertEquals("session", clear.string("scope"))
+        compose.onNodeWithContentDescription("Approvals").assertIsDisplayed()
+    }
+
     @Test fun freshRefreshKeepsTheLastVerifiedYoloStateWhenHermesOmitsIt() = withFixture { vm, fixture ->
         open(vm)
         compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
