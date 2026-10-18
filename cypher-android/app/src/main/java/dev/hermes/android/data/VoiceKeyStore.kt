@@ -91,10 +91,7 @@ internal class VoiceKeyStore private constructor(
         }.getOrNull()
     }
 
-    fun hasKey(provider: String): Boolean {
-        require(voiceProviderSupported(provider)) { "Unsupported voice provider" }
-        return !read("key.$provider").isNullOrBlank()
-    }
+    fun hasKey(provider: String): Boolean = key(provider) != null
 
     fun maskedKey(provider: String): String? = key(provider)?.takeLast(4)?.let { "••••$it" }
 

@@ -77,7 +77,7 @@ class LoopbackSessionTest {
             assertNull(ticket.header("Authorization"))
             assertNull(ticket.url.queryParameter("session"))
             assertNull(client.request("/api/ws").build().header(HERMES_LOOPBACK_SESSION_HEADER))
-            assertTrue(NativeOperationPolicy.direct("/"))
+            assertTrue(NativeOperationPolicy.direct("/", "GET"))
             assertTrue(runCatching { client.request("/", method = "POST").build() }.isFailure)
             assertTrue(requests.all { it.url.host == "hermes.example" && it.url.scheme == "https" })
         } finally { client.closeNative() }

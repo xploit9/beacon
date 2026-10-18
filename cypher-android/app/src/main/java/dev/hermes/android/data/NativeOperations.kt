@@ -245,7 +245,7 @@ internal class NativeOperations(private val c: CypherClient) {
             }
         }
         if (path.startsWith("/api/mobile/receipts/")) throw ApiFailure(501, "Native Hermes has no prompt receipt lookup. Refresh conversation history before deciding whether to resend; your draft is retained.")
-        if (NativeOperationPolicy.direct(path)) return c.nativeGet(path, q + ("profile" to c.auth.profile), method, body, maxBytes)
+        if (NativeOperationPolicy.direct(path, method)) return c.nativeGet(path, q + ("profile" to c.auth.profile), method, body, maxBytes)
         throw ApiFailure(501, "This operation is unavailable in native Hermes: ${path.removePrefix("/api/")}")
     }
     /** The optional plugin's voice archive. Any failure, including its own 401, only marks voice history unavailable. */

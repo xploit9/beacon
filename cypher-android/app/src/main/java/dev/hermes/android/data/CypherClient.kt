@@ -83,7 +83,7 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
         return auth.copy(bearer = source.bearer?.copy(profile = auth.profile), loopbackSession = source.loopbackSession, cookies = jar.snapshot())
     }
     fun request(path: String, query: Map<String, String> = emptyMap(), method: String = "GET", body: RequestBody? = null): Request.Builder = Request.Builder().url(url(path, query)).apply {
-        require(NativeOperationPolicy.direct(path)) { "Unsupported native endpoint" }
+        require(NativeOperationPolicy.direct(path, method)) { "Unsupported native endpoint" }
         require(path != "/" || method == "GET" && body == null && query.isEmpty()) { "Unsupported native endpoint" }
     }.header("Accept", "application/json").apply {
         val session = requestAuth()
@@ -107,7 +107,7 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
     private val native = NativeGateway(this, socketFactory ?: http)
     suspend fun nativeRpc(method: String, params: JSONObject = JSONObject()): JSONObject = native.rpc(method, params)
     suspend fun nativeRequest(path: String, method: String = "GET", body: JSONObject? = null): JSONObject {
-        require(NativeOperationPolicy.direct(path)) { "Unsupported native endpoint" }
+        require(NativeOperationPolicy.direct(path, method)) { "Unsupported native endpoint" }
         if (body?.has("profile") == true) require(body.string("profile") == auth.profile) { "Native request belongs to another profile" }
         return rawCall(path, query = if (path.startsWith("/api/plugins/cypher/")) mapOf("profile" to auth.profile) else emptyMap(), method = method, data = body)
     }
@@ -256,7 +256,7 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
     }
     suspend fun call(path: String, query: Map<String, String> = emptyMap(), method: String = "GET", data: JSONObject? = null, maxBytes: Int = 32 * 1024 * 1024): JSONObject = operationLock.withLock { NativeOperations(this).call(path, query, method, data, maxBytes) }
     internal suspend fun nativeGet(path: String, query: Map<String, String> = emptyMap(), method: String = "GET", data: JSONObject? = null, maxBytes: Int = 32 * 1024 * 1024, persistAuth: Boolean = true): JSONObject {
-        require(NativeOperationPolicy.direct(path)) { "This capability is unavailable in native Hermes" }
+        require(NativeOperationPolicy.direct(path, method)) { "This capability is unavailable in native Hermes" }
         if (query.containsKey("profile")) require(query["profile"] == auth.profile) { "Native request belongs to another profile" }
         if (data?.has("profile") == true) require(data.string("profile") == auth.profile) { "Native request belongs to another profile" }
         val scoped = if (path.startsWith("/api/plugins/cypher/")) query + ("profile" to auth.profile) else query
@@ -270,7 +270,7 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
         query: Map<String, String> = emptyMap(),
         maxBytes: Int = 32 * 1024 * 1024,
     ): JSONObject {
-        require(NativeOperationPolicy.direct(path) && validNativeProfile(profile) && profile in authorizedProfiles) {
+        require(NativeOperationPolicy.direct(path, "GET") && validNativeProfile(profile) && profile in authorizedProfiles) {
             "Native request belongs to an unauthorized profile"
         }
         return rawCall(path, query + ("profile" to profile), maxBytes = maxBytes, persistAuth = false)
@@ -460,7 +460,7 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
     }
     suspend fun copyTo(path: String, output: OutputStream, query: Map<String, String> = emptyMap(), data: JSONObject? = null, limit: Long = 32L * 1024 * 1024): Long = withContext(Dispatchers.IO) {
         val mapped = if (path == "/api/file/raw") "/api/fs/download" else path
-        require(NativeOperationPolicy.direct(mapped)) { "This download capability is unavailable in native Hermes" }
+        require(NativeOperationPolicy.direct(mapped, if (data == null) "GET" else "POST")) { "This download capability is unavailable in native Hermes" }
         if (query.containsKey("profile")) require(query["profile"] == auth.profile) { "Native download belongs to another profile" }
         if (data?.has("profile") == true) require(data.string("profile") == auth.profile) { "Native download belongs to another profile" }
         val scopedQuery = (query - "session_id").let { if (mapped.startsWith("/api/plugins/cypher/")) it + ("profile" to auth.profile) else it }
