@@ -48,8 +48,10 @@ data class NativeBearerRecord(
     val owner: String,
     val profile: String,
     val provider: String = "",
+    /** Unix seconds; zero identifies a pre-issue-time stored record. */
+    val issuedAt: Long = 0,
 ) {
-    override fun toString() = "NativeBearerRecord(origin=$origin, owner=$owner, profile=$profile, expiresAt=$expiresAt, provider=$provider, accessToken=<redacted>, refreshToken=<redacted>)"
+    override fun toString() = "NativeBearerRecord(origin=$origin, owner=$owner, profile=$profile, expiresAt=$expiresAt, issuedAt=$issuedAt, provider=$provider, accessToken=<redacted>, refreshToken=<redacted>)"
 }
 
 data class LoopbackSessionRecord(val token: String, val origin: String, val owner: String, val verified: Boolean = false, val persisted: Boolean = false) {
@@ -109,7 +111,7 @@ class AuthStore(context: Context, private val cipher: AppCipher) {
             val profile = o.optString("profile", "default")
             val backend = o.optString("backend")
             val bearer = o.optJSONObject("bearer")?.let {
-                NativeBearerRecord(it.optString("access_token"), it.optString("refresh_token"), it.optLong("expires_at"), it.optString("origin"), it.optString("owner"), it.optString("profile"), it.optString("provider"))
+                NativeBearerRecord(it.optString("access_token"), it.optString("refresh_token"), it.optLong("expires_at"), it.optString("origin"), it.optString("owner"), it.optString("profile"), it.optString("provider"), it.optLong("issued_at"))
             }?.takeIf { token ->
                 token.accessToken.isNotBlank() && token.accessToken.none { it.isWhitespace() || it.isISOControl() } &&
                     token.refreshToken.isNotBlank() && token.origin == origin && token.owner == o.optString("owner") &&
@@ -129,7 +131,17 @@ class AuthStore(context: Context, private val cipher: AppCipher) {
         synchronized(this@AuthStore) {
             if (version != null && authorityEpoch.current(version)) {
                 val current = read(auth.origin)
-                val newestBearer = if (auth.loopbackSession == null) current.bearer?.takeIf { it.origin == auth.origin && it.owner == auth.owner && it.profile == auth.profile } else null
+                val storedBearer = if (auth.loopbackSession == null) current.bearer?.takeIf { it.origin == auth.origin && it.owner == auth.owner && it.profile == auth.profile } else null
+                // Use issuance time for current records and expiry as the legacy fallback; ties prefer incoming auth.
+                val newestBearer = when {
+                    storedBearer == null -> auth.bearer
+                    auth.bearer == null -> storedBearer
+                    storedBearer.issuedAt > 0 && auth.bearer.issuedAt > 0 -> if (storedBearer.issuedAt > auth.bearer.issuedAt) storedBearer else auth.bearer
+                    storedBearer.issuedAt > 0 -> storedBearer
+                    auth.bearer.issuedAt > 0 -> auth.bearer
+                    storedBearer.expiresAt > auth.bearer.expiresAt -> storedBearer
+                    else -> auth.bearer
+                }
                 write(auth.copy(
                     bearer = newestBearer ?: auth.bearer,
                     loopbackSession = if (newestBearer != null || auth.bearer != null) null else auth.loopbackSession,
@@ -150,7 +162,9 @@ class AuthStore(context: Context, private val cipher: AppCipher) {
         auth.bearer?.let { token ->
             require(token.accessToken.isNotBlank() && token.accessToken.none { it.isWhitespace() || it.isISOControl() } && token.refreshToken.isNotBlank()) { "Bearer credentials are incomplete" }
             require(token.origin == auth.origin && token.owner == auth.owner && token.profile == auth.profile) { "Bearer authority does not match the saved account" }
-            o.put("bearer", JSONObject().put("access_token", token.accessToken).put("refresh_token", token.refreshToken).put("expires_at", token.expiresAt).put("origin", token.origin).put("owner", token.owner).put("profile", token.profile).put("provider", token.provider))
+            val stored = JSONObject().put("access_token", token.accessToken).put("refresh_token", token.refreshToken).put("expires_at", token.expiresAt).put("origin", token.origin).put("owner", token.owner).put("profile", token.profile).put("provider", token.provider)
+            if (token.issuedAt > 0) stored.put("issued_at", token.issuedAt)
+            o.put("bearer", stored)
         }
         auth.loopbackSession?.let { session ->
             require(validLoopbackSessionToken(session.token)) { "Loopback session is invalid" }

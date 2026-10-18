@@ -14,12 +14,15 @@ import dev.hermes.android.data.AppCipher
 import dev.hermes.android.data.cachedScopeFor
 import dev.hermes.android.data.AuthContext
 import dev.hermes.android.data.AuthStore
+import dev.hermes.android.data.CypherClient
 import dev.hermes.android.data.LoopbackSessionRecord
+import dev.hermes.android.data.NativeBearerRecord
 import dev.hermes.android.ui.NativeLocalization
 import dev.hermes.android.ui.SetupWizardScreen
 import dev.hermes.android.ui.parseCypherConnectLink
 import java.security.MessageDigest
 import java.util.UUID
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -120,9 +123,97 @@ class LoopbackSetupUiTest {
             assertTrue(restoredSession.verified && restoredSession.persisted)
             assertTrue(restored.cachedScopeFor(origin, replacingAccount = false) != null)
             assertFalse(restored.toString().contains(secret))
-            val encrypted = context.getSharedPreferences("auth-private", Context.MODE_PRIVATE).getString(origin.digest(), "")
-            assertFalse(encrypted.orEmpty().contains(secret))
+            val encrypted = context.getSharedPreferences("auth-private", Context.MODE_PRIVATE).getString(origin.digest(), null)
+            assertTrue("Encrypted auth record is missing", !encrypted.isNullOrBlank())
+            assertFalse(requireNotNull(encrypted).contains(secret))
         } finally {
+            store.clear(origin)
+        }
+    }
+
+    @Test fun authPersistenceKeepsFreshSignInAndNewestRestoredBearer() = runBlocking {
+        val origin = "https://auth-${UUID.randomUUID()}.example"
+        val owner = "native-owner"
+        val profile = "default"
+        val context = ApplicationProvider.getApplicationContext<Context>().createDeviceProtectedStorageContext()
+        val store = AuthStore(context, AppCipher())
+        fun bearer(access: String, expiry: Long, issuedAt: Long = 0) = NativeBearerRecord(access, "refresh-$access", expiry, origin, owner, profile, "fixture", issuedAt)
+        val saved = AuthContext(origin, emptyList(), owner, profile, backend = "hermes-dashboard", bearer = bearer("stored", 100))
+        try {
+            store.write(saved)
+            val fresh = saved.copy(bearer = bearer("fresh", 0, 200))
+            assertTrue(store.persistIfUnchanged(fresh, store.authorityEpoch.readVersion()))
+            assertEquals("fresh", store.read(origin).bearer?.accessToken)
+            assertEquals(200L, requireNotNull(store.read(origin).bearer).issuedAt)
+
+            val newestStored = saved.copy(bearer = bearer("newest-stored", 0, 300))
+            store.write(newestStored)
+            assertTrue(store.persistIfUnchanged(fresh, store.authorityEpoch.readVersion()))
+            assertEquals("newest-stored", store.read(origin).bearer?.accessToken)
+
+            val tiedIncoming = saved.copy(bearer = bearer("tied-incoming", 0, 300))
+            assertTrue(store.persistIfUnchanged(tiedIncoming, store.authorityEpoch.readVersion()))
+            assertEquals("tied-incoming", store.read(origin).bearer?.accessToken)
+
+            store.write(saved.copy(bearer = bearer("legacy-newest", 250)))
+            val legacyRestore = saved.copy(bearer = bearer("legacy-restore", 200))
+            assertTrue(store.persistIfUnchanged(legacyRestore, store.authorityEpoch.readVersion()))
+            assertEquals("legacy-newest", store.read(origin).bearer?.accessToken)
+        } finally {
+            store.clear(origin)
+        }
+    }
+
+    @Test fun detachedProfileViewsNeverPersistOrRecreateAuth() = runBlocking {
+        val origin = "https://detached-${UUID.randomUUID()}.example"
+        val secret = token()
+        val context = ApplicationProvider.getApplicationContext<Context>().createDeviceProtectedStorageContext()
+        val store = AuthStore(context, AppCipher())
+        val auth = AuthContext(origin, emptyList(), "local", "default", backend = "hermes-dashboard", loopbackSession = LoopbackSessionRecord(secret, origin, "local", verified = true))
+        val client = CypherClient(auth, store)
+        try {
+            store.write(auth)
+            val foreignProfile = client.detached()
+            try { foreignProfile.bindProfile("coder") } finally { foreignProfile.closeNative() }
+            assertEquals("default", store.read(origin).profile)
+
+            store.clear(origin)
+            val signedOutView = client.detached()
+            try { signedOutView.bindProfile("coder") } finally { signedOutView.closeNative() }
+            val restored = store.read(origin)
+            assertTrue(restored.owner.isBlank())
+            assertNull(restored.loopbackSession)
+        } finally {
+            client.closeNative()
+            store.clear(origin)
+        }
+    }
+
+    @Test fun detachedBootstrapDoesNotRecreateClearedAuth() = runBlocking {
+        val fixture = NativeExperienceFixture()
+        val origin = fixture.scope.origin
+        val context = ApplicationProvider.getApplicationContext<Context>().createDeviceProtectedStorageContext()
+        val store = AuthStore(context, AppCipher())
+        val bearer = NativeBearerRecord("access", "refresh", 200, origin, fixture.scope.owner, fixture.scope.profile, "fixture")
+        val auth = AuthContext(origin, emptyList(), fixture.scope.owner, fixture.scope.profile, backend = "hermes-dashboard", bearer = bearer)
+        val client = CypherClient(
+            initial = auth,
+            authStore = store,
+            socketFactory = fixture,
+            sharedHttp = fixture.client.http,
+            persistContext = true,
+            configureHttp = {},
+        )
+        try {
+            store.clear(origin)
+            val detached = client.detached()
+            try { detached.bootstrap() } finally { detached.closeNative() }
+            val restored = store.read(origin)
+            assertTrue(restored.owner.isBlank())
+            assertNull(restored.bearer)
+        } finally {
+            client.closeNative()
+            fixture.client.closeNative()
             store.clear(origin)
         }
     }

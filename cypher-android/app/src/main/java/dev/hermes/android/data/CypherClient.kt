@@ -52,7 +52,7 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
     private val operationLock = kotlinx.coroutines.sync.Mutex()
     internal suspend fun bindProfile(profile: String) {
         closeNative(); auth = auth.copy(profile = profile, bearer = auth.bearer?.copy(profile = profile))
-        authStore?.let { it.persist(auth); markLoopbackSessionPersisted() }
+        authStore?.takeIf { !detachedView }?.let { it.persist(auth); markLoopbackSessionPersisted() }
     }
     internal fun markLoopbackSessionPersisted() {
         auth.loopbackSession?.takeIf { it.verified }?.let { auth = auth.copy(loopbackSession = it.copy(persisted = true)) }
@@ -299,7 +299,7 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
         val profile = resolveNativeProfile(nativeProfileCatalog())
         // Keep the /api/auth/me cookie rotation in the verified native context.
         auth = auth.copy(owner = owner, profile = profile, csrf = "", cookies = jar.snapshot(), backend = "hermes-dashboard", bearer = auth.bearer?.copy(owner = owner, profile = profile), loopbackSession = auth.loopbackSession?.copy(verified = true))
-        if (persistContext && authStore != null) {
+        if (persistContext && !detachedView && authStore != null) {
             authStore.persist(auth)
             markLoopbackSessionPersisted()
         }

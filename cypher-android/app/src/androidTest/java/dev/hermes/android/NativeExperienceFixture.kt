@@ -94,8 +94,6 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var historyFailure = false
     /** When set, every optional `/api/plugins/cypher/` route answers with this status. */
     @Volatile var pluginStatus: Int? = null
-    /** Requested stored id -> compression descendant served by the stock /messages route. */
-    val descendants = ConcurrentHashMap<String, String>()
     @Volatile var boardFailure = false
     @Volatile var preferredBoard = "default"
     @Volatile var fileText = "# Travel notes\nCheck the weather."
@@ -104,13 +102,15 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     private val delayedCreates = CopyOnWriteArrayList<() -> Unit>()
     @Volatile private var activeNativeListener: WebSocketListener? = null
     @Volatile private var activeNativeSocket: WebSocket? = null
-    private val replayReads = ConcurrentHashMap<WebSocket, AtomicInteger>()
+    @Volatile private var activeNativeSessionId: String? = null
+    private val pendingNativeStreams = ConcurrentHashMap.newKeySet<String>()
     val streamSubscriptions = AtomicInteger()
     @Volatile var nativeTurnStatus = "idle"
     @Volatile var nativeStatusFailure = false
     @Volatile var persistTerminalMessages = false
     @Volatile var terminalOnActiveList: JSONObject? = null
     @Volatile var customTabLaunches = 0
+    @Volatile var callbackFailure: Throwable? = null
     private val nativeEvents = CopyOnWriteArrayList<JSONObject>()
     private val nativeEventSequence = AtomicInteger()
     fun releaseCreateAcknowledgement() {
@@ -118,6 +118,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         queued.forEach { it() }
     }
     fun installCustomTabSeam() {
+        callbackFailure = null
         NativeAuth.customTabLauncher = { _, authorizeUrl ->
             customTabLaunches += 1
             val state = authorizeUrl.getQueryParameter("state").orEmpty()
@@ -134,28 +135,43 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                         socket.getOutputStream().flush()
                         socket.getInputStream().bufferedReader().use { reader -> while (reader.readLine() != null) { } }
                     }
-                }
+                }.onFailure { callbackFailure = it }
             }.apply { name = "cypher-oauth-test-callback"; isDaemon = true; start() }
         }
     }
     fun clearCustomTabSeam() { NativeAuth.customTabLauncher = null }
-    fun retainNativeEvent(type: String, payload: JSONObject): JSONObject {
-        val event = json("session_id" to "runtime-chat-a", "seq" to nativeEventSequence.incrementAndGet(), "type" to type, "payload" to payload.copy())
+    fun retainNativeEvent(runtimeSessionId: String, type: String, payload: JSONObject): JSONObject {
+        val storedSessionId = sessions.entries.firstOrNull { it.value.optString("session_id") == runtimeSessionId }?.key
+            ?: error("Synthetic runtime session missing: $runtimeSessionId")
+        val event = json("session_id" to runtimeSessionId, "seq" to nativeEventSequence.incrementAndGet(), "type" to type, "payload" to payload.copy())
         if (persistTerminalMessages && type == "message.complete") {
-            sessions["chat-a"]?.optJSONArray("messages")?.put(json("role" to "assistant", "text" to payload.string("text"), "row_id" to "terminal-${event.optInt("seq")}"))
+            sessions[storedSessionId]?.optJSONArray("messages")?.put(json("role" to "assistant", "text" to payload.string("text"), "row_id" to "terminal-${event.optInt("seq")}"))
         }
         nativeEvents.add(event)
         return event
     }
+    fun awaitActiveNativeSocket(timeoutMs: Long = 15_000L): Pair<WebSocketListener, WebSocket> {
+        require(timeoutMs >= 0)
+        val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        while (true) {
+            val listener = activeNativeListener
+            val socket = activeNativeSocket
+            if (listener != null && socket != null) return listener to socket
+            if (System.nanoTime() >= deadline) error("No active native socket for ${activeNativeSessionId ?: "the pending conversation"} after ${timeoutMs}ms")
+            Thread.sleep(10)
+        }
+    }
     fun emitNativeEvent(type: String, payload: JSONObject) {
-        val event = retainNativeEvent(type, payload)
-        val listener = activeNativeListener ?: error("No native socket is open")
-        val socket = activeNativeSocket ?: error("No native socket is open")
+        val runtime = activeNativeSessionId ?: error("No active native conversation is selected")
+        val event = retainNativeEvent(runtime, type, payload)
+        val (listener, socket) = awaitActiveNativeSocket(0)
         listener.onMessage(socket, json("method" to "event", "params" to event).toString())
     }
     fun interruptActiveNativeStream() {
-        val listener = activeNativeListener ?: error("No native socket is open")
-        val socket = activeNativeSocket ?: error("No native socket is open")
+        val (listener, socket) = awaitActiveNativeSocket(0)
+        activeNativeListener = null
+        activeNativeSocket = null
+        activeNativeSessionId = null
         listener.onFailure(socket, java.io.IOException("Synthetic native WebSocket interruption"), null)
     }
     val scope = Scope("https://ui-fixture.invalid", "synthetic-owner", "default")
@@ -170,7 +186,11 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             }
             val buffer = okio.Buffer(); request.body?.writeTo(buffer)
             val body = buffer.readUtf8().takeIf(String::isNotBlank)?.let(::JSONObject) ?: JSONObject()
-            requests += if (request.url.encodedPath.startsWith("/auth/native/")) json("path" to request.url.encodedPath, "method" to request.method)
+            requests += if (request.url.encodedPath.startsWith("/auth/native/")) json(
+                "path" to request.url.encodedPath,
+                "method" to request.method,
+                "body_fields" to JSONArray().apply { body.keys().forEach { put(it) } },
+            )
                 else json("path" to request.url.encodedPath, "method" to request.method, "body" to body, "profile" to request.url.queryParameter("profile"))
             val outage = pluginStatus?.takeIf { request.url.encodedPath.startsWith("/api/plugins/cypher/") }
             val (status, result) = if (outage != null) outage to json("detail" to "Synthetic optional plugin outage")
@@ -200,22 +220,20 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         val info = getJSONObject("info"); info.keys().forEach { put(it, info.opt(it)) }
         put("runtime_session_id", getString("session_id")); put("session_id", id)
     }
-    /** Synthetic stock dashboard history: metadata, newest-window messages and the compression chain. */
+    /** Synthetic stock dashboard history: metadata and the newest message window. */
     private fun stockSession(path: String, profile: String): Pair<Int, JSONObject> {
         val parts = path.removePrefix("/api/sessions/").split('/')
         val id = parts.first()
         val row = sessions[id]
         if (historyFailure || row == null) return 404 to json("detail" to "Session not found")
         val messages = row.getJSONArray("messages")
-        val tip = descendants[id]
         return when (parts.getOrNull(1)) {
             null -> 200 to row.getJSONObject("info").copy().put("id", id).put("profile", profile).put("message_count", messages.length())
             "messages" -> {
                 val window = JSONArray((maxOf(0, messages.length() - 500) until messages.length()).map(messages::get))
-                200 to json("session_id" to (tip ?: id), "profile" to profile, "messages" to window, "pagination" to json("limit" to 500, "offset" to 0, "order" to "latest", "returned" to window.length()))
+                200 to json("session_id" to id, "profile" to profile, "messages" to window, "pagination" to json("limit" to 500, "offset" to 0, "order" to "latest", "returned" to window.length()))
             }
-            "latest-descendant" -> 200 to (if (tip == null) json("requested_session_id" to id, "session_id" to id, "path" to JSONArray().put(id), "changed" to false)
-                else json("requested_session_id" to id, "session_id" to tip, "path" to JSONArray().put(id).put(tip), "changed" to true))
+            "latest-descendant" -> 200 to json("requested_session_id" to id, "session_id" to id, "path" to JSONArray().put(id), "changed" to false)
             else -> 404 to json("detail" to "Not Found")
         }
     }
@@ -447,16 +465,25 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 val frame = JSONObject(text); requests += frame.copy()
                 try {
                     val method = frame.getString("method")
-                    val result = rpc(method, frame.optJSONObject("params") ?: JSONObject())
+                    val params = frame.optJSONObject("params") ?: JSONObject()
+                    when (method) {
+                        "prompt.submit", "session.steer" -> params.string("session_id").takeIf(String::isNotBlank)?.let(pendingNativeStreams::add)
+                        "session.active_list" -> params.string("current_session_id").takeIf(String::isNotBlank)?.let(pendingNativeStreams::add)
+                    }
+                    val result = rpc(method, params)
                     val response = json("jsonrpc" to "2.0", "id" to frame.getString("id"), "result" to result).toString()
                     val deferred = synchronized(delayedCreates) {
                         if (holdCreateAcknowledgement && method == "session.create") { delayedCreates += { listener.onMessage(this, response) }; true } else false
                     }
                     if (!deferred) listener.onMessage(this, response)
-                    if (!deferred && method == "session.events.since" && replayReads.computeIfAbsent(this) { AtomicInteger() }.incrementAndGet() == 2) {
-                        activeNativeListener = listener
-                        activeNativeSocket = this
-                        streamSubscriptions.incrementAndGet()
+                    if (!deferred && method == "session.events.since") {
+                        val runtimeSessionId = params.string("session_id")
+                        if (pendingNativeStreams.remove(runtimeSessionId)) {
+                            activeNativeListener = listener
+                            activeNativeSocket = this
+                            activeNativeSessionId = runtimeSessionId
+                            streamSubscriptions.incrementAndGet()
+                        }
                     }
                 } catch (error: IllegalArgumentException) {
                     val missing = error.message == "Synthetic session missing"
@@ -496,12 +523,12 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             "session.events.since" -> json("epoch" to "synthetic", "latest_seq" to nativeEventSequence.get(), "events" to JSONArray(nativeEvents.filter { it.optLong("seq") > params.optLong("last_seen", 0) }))
             "session.active_list" -> {
                 if (nativeStatusFailure) throw IllegalArgumentException("Synthetic active status unavailable")
-                terminalOnActiveList?.let { payload ->
+                val runtime = params.optString("current_session_id")
+                terminalOnActiveList?.takeIf { runtime.isNotBlank() }?.let { payload ->
                     terminalOnActiveList = null
-                    retainNativeEvent("message.complete", payload)
+                    retainNativeEvent(runtime, "message.complete", payload)
                 }
-                val runtime = params.opt("current_session_id") as? String
-                val stored = runtime?.takeIf { it.startsWith("runtime-") }?.removePrefix("runtime-")
+                val stored = runtime.takeIf { it.startsWith("runtime-") }?.removePrefix("runtime-")
                 val rows = JSONArray()
                 if (stored != null && sessions.containsKey(stored)) rows.put(json("id" to runtime, "session_key" to stored, "status" to nativeTurnStatus))
                 json("sessions" to rows)
@@ -516,21 +543,24 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             "session.undo" -> { sessions.getValue(id).put("messages", JSONArray()); json("ok" to true) }
             "config.get" -> json("value" to if (params.string("key") == "approvals.mode") approvalMode else reasoningEffort)
             "config.set" -> {
-                if (params.string("key") == "model") {
-                    val requested = params.getString("value")
+                val key = params.string("key")
+                val value = params.string("value")
+                if (key == "model") {
+                    val requested = value
                     val model = requested.substringBefore(" --provider ")
                     if (model == "confirm-model" && !params.optBoolean("confirm_expensive_model")) return json("key" to "model", "value" to model, "confirm_required" to true, "confirm_message" to "This selected model requires your confirmation.")
                     sessions.getValue(id).getJSONObject("info").put("model", model).put("provider", requested.substringAfter(" --provider ", "fixture"))
                     return json("key" to "model", "value" to model, "confirm_required" to false)
                 }
-                if (params.string("key") == "reasoning") reasoningEffort = params.getString("value")
-                check(params.string("value") !in setOf("show", "hide"))
-                if (params.string("key") == "approvals.mode") {
+                if (key == "reasoning") reasoningEffort = value
+                check(value !in setOf("show", "hide"))
+                if (key == "approvals.mode") {
                     require(!rejectApprovalWrite) { "Synthetic approval write refused" }
-                    require(params.string("value") in nativeApprovalModes)
-                    approvalMode = params.string("value")
+                    require(value in nativeApprovalModes)
+                    approvalMode = value
                 }
-                json("ok" to true, "key" to params.string("key"), "value" to if (params.string("key") == "yolo") "0" else params.string("value"))
+                if (key == "yolo") sessions.getValue(id).getJSONObject("info").put("yolo", value in setOf("1", "on", "true"))
+                json("ok" to true, "key" to key, "value" to if (key == "yolo") if (value in setOf("1", "on", "true")) "1" else "0" else value)
             }
             "approval.respond", "request.answer" -> {
                 if (rejectPromptResponse) { rejectPromptResponse = false; throw IllegalArgumentException("Synthetic prompt response rejected") }
