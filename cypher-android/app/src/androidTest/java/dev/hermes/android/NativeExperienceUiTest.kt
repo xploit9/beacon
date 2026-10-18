@@ -935,11 +935,21 @@ class NativeExperienceUiTest {
             field(vm, "sourceScope", null)
             flow<ChatState>(vm, "_chat").value = ChatState()
             flow<AppState>(vm, "_ui").value = vm.ui.value.copy(tab = "Chat", initialChatReady = true)
+            // chat-a already loaded the defaults on first composition; read the changed profile again.
+            vm.load("profile-defaults", "/api/profile/defaults")
         }
         await { vm.data.value["profile-defaults"]?.string("model") == "profile-default-model" }
         // The chip merges its labels into one Text list.
         compose.onNodeWithTag("composer-model-effort").assert(hasText("profile-default-model")).assert(hasText("high"))
         receipts += "A chat with no messages shows the model and effort Hermes starts this profile's chats with, not placeholder labels."
+    }
+
+    @Test fun chatFollowingItsProfileShowsTheProfileEffort() = withFixture { vm, fixture ->
+        // The defaults load on first composition, so the fixture's own profile effort is expected.
+        assertTrue(vm.chat.value.messages.isNotEmpty() && vm.chat.value.raw.string("reasoning_effort").isBlank())
+        await { vm.data.value["profile-defaults"]?.string("reasoning_effort") == fixture.reasoningEffort }
+        compose.onNodeWithTag("composer-model-effort").assert(hasText("synthetic-model")).assert(hasText(fixture.reasoningEffort))
+        receipts += "A chat whose effort Hermes reports blank (it follows the profile) shows the profile's effort."
     }
 
     @Test fun botModeLeavesToAnUnsentNewChat() = withFixture { vm, fixture ->

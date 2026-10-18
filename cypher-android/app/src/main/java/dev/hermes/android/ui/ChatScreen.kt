@@ -435,9 +435,12 @@ internal fun acceptsInitialConversationEdit(
     var modelMenu by remember { mutableStateOf(false) }
     var attachMenu by remember { mutableStateOf(false) }
     LaunchedEffect(ui.origin, ui.owner, ui.profile) { vm.loadSlashCatalog() }
-    val unsent = chat.messages.isEmpty() && chat.raw.string("model").isBlank()
-    val defaults = data["profile-defaults"]?.takeIf { unsent && it.string("profile") == ui.profile && recordError(it).isBlank() }
-    LaunchedEffect(ui.origin, ui.owner, ui.profile, unsent) { if (unsent) vm.load("profile-defaults", "/api/profile/defaults") }
+    // Hermes reports a blank model/effort when the chat follows its profile (tui_gateway _session_info, _cfg_get_reasoning),
+    // so the profile's own values are the chat's effective ones.
+    val effort = chat.raw.string("reasoning_effort", chat.raw.string("reasoning"))
+    val followsProfile = chat.raw.string("model").isBlank() || effort.isBlank()
+    val defaults = data["profile-defaults"]?.takeIf { followsProfile && it.string("profile") == ui.profile && recordError(it).isBlank() }
+    LaunchedEffect(ui.origin, ui.owner, ui.profile, followsProfile) { if (followsProfile) vm.load("profile-defaults", "/api/profile/defaults") }
     BoxWithConstraints(Modifier.widthIn(max = 840.dp).fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
         // Reserve the action row before the editor grows. The editor scrolls its own long draft.
         val commandHeight = if (draft.text.startsWith("/")) (maxHeight - 160.dp).coerceIn(48.dp, 160.dp) else 0.dp
@@ -494,7 +497,7 @@ internal fun acceptsInitialConversationEdit(
                             TextButton(onClick = { modelMenu = true }, enabled = canonical && !callActive && !readOnly, modifier = Modifier.heightIn(min = 48.dp).testTag("composer-model-effort"), contentPadding = PaddingValues(horizontal = 8.dp)) {
                                 Column(Modifier.weight(1f, fill = false), horizontalAlignment = Alignment.Start) {
                                     Text(chat.raw.string("model").ifBlank { defaults?.string("model").orEmpty() }.ifBlank { "Model" }, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, style = MaterialTheme.typography.labelMedium)
-                                    Text(chat.raw.string("reasoning_effort", chat.raw.string("reasoning")).ifBlank { defaults?.string("reasoning_effort").orEmpty() }.ifBlank { "Effort" }, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text(effort.ifBlank { defaults?.string("reasoning_effort").orEmpty() }.ifBlank { "Effort" }, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                                 Icon(Icons.Rounded.ExpandMore, null, Modifier.size(16.dp))
                             }
