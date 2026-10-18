@@ -1,7 +1,10 @@
 package dev.hermes.android
 
 import androidx.activity.ComponentActivity
+import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasAnyDescendant
+import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
@@ -123,6 +126,10 @@ class NativeApprovalMenuUiTest {
         compose.onNodeWithContentDescription("Approvals · YOLO on").assertIsDisplayed()
 
         open(vm)
+        // The profile keeps Manual; only the YOLO row is ticked for this chat's bypass.
+        compose.onNodeWithTag("approval-mode-manual", useUnmergedTree = true).performScrollTo().assert(hasAnyDescendant(hasContentDescription("Selected")))
+        compose.onNodeWithTag("approval-mode-off", useUnmergedTree = true).assert(!hasAnyDescendant(hasContentDescription("Selected")))
+        compose.onNodeWithTag("approval-yolo", useUnmergedTree = true).assert(hasAnyDescendant(hasContentDescription("YOLO enabled")))
         compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
         await { vm.data.value["picker:approvals"]?.optBoolean("session_bypass") == false }
         val writes = fixture.requests.filter { it.string("method") == "config.set" && it.optJSONObject("params")?.string("key") == "yolo" }

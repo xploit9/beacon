@@ -115,7 +115,8 @@ import kotlinx.coroutines.launch
                     else -> "No Hermes approval prompts"
                 }
                 DropdownMenuItem(text = { Column { Text(mode.replaceFirstChar { it.uppercase() }); Text(description, style = MaterialTheme.typography.bodySmall, maxLines = 2) } },
-                    trailingIcon = { if (current == mode) Icon(Icons.Rounded.Check, "Selected") },
+                    // Tick the profile's own mode: a per-chat YOLO bypass reports value "off" but has its own YOLO tick.
+                    trailingIcon = { if (profileMode.ifBlank { current } == mode) Icon(Icons.Rounded.Check, "Selected") },
                     enabled = enabled && !loading && !saving && current in nativeApprovalModes && error.isBlank(),
                     modifier = Modifier.testTag("approval-mode-$mode"), onClick = {
                         if (mode == "off" && profileMode != "off") { open = false; confirmOff = true } else apply(mode)
