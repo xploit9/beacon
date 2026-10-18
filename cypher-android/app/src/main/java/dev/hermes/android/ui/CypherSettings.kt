@@ -27,6 +27,16 @@ import okhttp3.OkHttpClient
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
+internal fun voiceOptionsWithSelected(options: List<String>, selected: String): List<String> = (listOf(selected) + options).distinct()
+
+internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<T> = try {
+    Result.success(block())
+} catch (cancelled: CancellationException) {
+    throw cancelled
+} catch (error: Throwable) {
+    Result.failure(error)
+}
+
 private data class VoiceCatalog(val models: List<String> = emptyList(), val voices: List<String> = emptyList())
 
 @Composable internal fun CypherSettings(vm: CypherViewModel, pluginAbsent: Boolean) {
@@ -59,7 +69,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
     var modelMenu by remember(selection.provider) { mutableStateOf(false) }
     var voiceMenu by remember(selection.provider) { mutableStateOf(false) }
     var personalityMenu by remember(selection.provider) { mutableStateOf(false) }
-    var status by remember(selection.provider) { mutableStateOf("") }
+    var status by remember { mutableStateOf("") }
     val scope=rememberCoroutineScope()
 
     LaunchedEffect(selection.provider) {
@@ -69,21 +79,21 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
     LaunchedEffect(selection.provider,catalogRefresh) {
         val apiKey=withContext(Dispatchers.IO) { store.key(selection.provider) }
         if(apiKey==null) {
-            models=listOf(defaultVoiceModel(selection.provider))
-            voices=defaultVoiceChoices(selection.provider)
+            models=voiceOptionsWithSelected(emptyList(),selection.model)
+            voices=voiceOptionsWithSelected(defaultVoiceChoices(selection.provider),selection.voice)
             catalogLoading=false
             return@LaunchedEffect
         }
         catalogLoading=true
         try {
             val catalog=loadVoiceCatalog(selection.provider,apiKey)
-            models=(listOf(selection.model)+catalog.models).distinct()
-            voices=(catalog.voices.ifEmpty { defaultVoiceChoices(selection.provider) }+selection.voice).distinct()
+            models=voiceOptionsWithSelected(catalog.models,selection.model)
+            voices=voiceOptionsWithSelected(catalog.voices.ifEmpty { defaultVoiceChoices(selection.provider) },selection.voice)
         } catch (cancelled:CancellationException) {
             throw cancelled
         } catch (_:Exception) {
-            models=listOf(selection.model)
-            voices=(defaultVoiceChoices(selection.provider)+selection.voice).distinct()
+            models=voiceOptionsWithSelected(emptyList(),selection.model)
+            voices=voiceOptionsWithSelected(defaultVoiceChoices(selection.provider),selection.voice)
         } finally {
             catalogLoading=false
         }
@@ -93,7 +103,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
         if(busy) return
         busy=true
         scope.launch {
-            val saved=runCatching { withContext(Dispatchers.IO) { store.setSelection(next) } }.isSuccess
+            val saved=runCatchingCancellable { withContext(Dispatchers.IO) { store.setSelection(next) } }.isSuccess
             if(saved) { selection=next;status="Saved for the next call." }
             else status="Voice preferences could not be saved."
             busy=false
@@ -144,7 +154,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                         if(apiKey.isBlank()) { status="Enter an API key first.";busy=false;return@launch }
                         when(testVoiceProvider(provider,apiKey,model)) {
                             dev.hermes.android.voice.VoiceProviderTestResult.Success -> {
-                                val saved=runCatching { if(entered.isNotBlank()) withContext(Dispatchers.IO) { store.saveKey(provider,apiKey) };true }.getOrDefault(false)
+                                val saved=runCatchingCancellable { if(entered.isNotBlank()) withContext(Dispatchers.IO) { store.saveKey(provider,apiKey) };true }.getOrDefault(false)
                                 if(saved) {
                                     draft=""
                                     keyMask=withContext(Dispatchers.IO) { store.maskedKey(provider).orEmpty() }
@@ -166,7 +176,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                 val provider=selection.provider
                 busy=true
                 scope.launch {
-                    val removed=runCatching { withContext(Dispatchers.IO) { store.removeKey(provider) } }.isSuccess
+                    val removed=runCatchingCancellable { withContext(Dispatchers.IO) { store.removeKey(provider) } }.isSuccess
                     if(removed) { keyMask="";draft="";catalogRefresh++;status="Key removed from this phone." }
                     else status="The key could not be removed."
                     busy=false

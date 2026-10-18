@@ -55,7 +55,12 @@ import kotlinx.coroutines.launch
             vm.notice("Reopen Approvals in the original conversation."); return
         }
         saving = true
-        val job = vm.action(path, json("mode" to mode, "session_id" to capturedScope.session, "scope_key" to capturedScope.key), refresh = false, successNotice = "Hermes approvals updated") { _, result -> vm.storeData(key, result) }
+        val job = vm.action(path, json("mode" to mode, "session_id" to capturedScope.session, "scope_key" to capturedScope.key), refresh = false, successNotice = "Hermes approvals updated") { _, result ->
+            lastVerifiedYolo = false
+            yoloUnknownAfterRead = false
+            yoloReadRequested = false
+            vm.storeData(key, result)
+        }
         scope.launch {
             try {
                 job.join()

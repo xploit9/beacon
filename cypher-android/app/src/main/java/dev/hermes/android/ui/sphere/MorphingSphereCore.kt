@@ -103,33 +103,6 @@ fun paramsFor(state: SphereState): SphereParams = when (state) {
     )
 }
 
-fun colorsFor(state: SphereState): SphereColors = when (state) {
-    SphereState.Idle -> SphereColors(
-        0.25f, 0.85f, 0.40f,
-        0.61f, 0.42f, 0.94f
-    )
-    SphereState.Thinking -> SphereColors(
-        0.30f, 0.55f, 0.95f,
-        0.55f, 0.35f, 0.90f
-    )
-    SphereState.Streaming -> SphereColors(
-        0.20f, 0.90f, 0.50f,
-        0.25f, 0.80f, 0.85f
-    )
-    SphereState.Listening -> SphereColors(
-        0.35f, 0.55f, 0.95f,
-        0.65f, 0.45f, 0.95f
-    )
-    SphereState.Speaking -> SphereColors(
-        0.25f, 0.92f, 0.55f,
-        0.30f, 0.85f, 0.88f
-    )
-    SphereState.Error -> SphereColors(
-        0.90f, 0.30f, 0.25f,
-        0.85f, 0.50f, 0.20f
-    )
-}
-
 /** All inputs needed to render one frame — populated by the caller from animation state. */
 data class SphereFrame(
     val cols: Int,
@@ -178,6 +151,13 @@ fun interface SphereCellRenderer {
     fun draw(col: Int, row: Int, char: Char, r: Float, g: Float, b: Float, alpha: Float)
 }
 
+internal class SphereGlyphBuffer {
+    val characters = charArrayOf('\u0000')
+    fun set(char: Char) { characters[0] = char }
+}
+
+internal fun advanceSphereTime(time: Float, frameSeconds: Float): Float = time + frameSeconds
+
 private val charSets = arrayOf(
     " ·:;=+*#%@",
     " .:;=+*#%@",
@@ -191,7 +171,10 @@ private const val dataChars = "01<>[]{}|/\\~^"
  * cell that should be drawn. Cells outside the drawable region (or excluded by
  * sparsity) are silently skipped — the callback sees only visible glyphs.
  */
-fun forEachSphereCell(frame: SphereFrame, onCell: SphereCellRenderer) {
+fun forEachSphereCell(frame: SphereFrame, onCell: SphereCellRenderer) =
+    forEachSphereCell(frame, frame.time, frame.colorPhase, onCell)
+
+internal fun forEachSphereCell(frame: SphereFrame, time: Float, colorPhase: Float, onCell: SphereCellRenderer) {
     val amp = if (frame.voiceMode) frame.voiceAmplitude.coerceIn(0f, 1f) else 0f
 
     // ── Voice modulation of animated base params ─────────────────
@@ -227,7 +210,7 @@ fun forEachSphereCell(frame: SphereFrame, onCell: SphereCellRenderer) {
     val maxRadiusFromRows = (frame.rows / 2f) * 0.60f
     val maxRadiusFromCols = (frame.cols / 2f) * charAspect * 0.60f
     val baseRadius = minOf(maxRadiusFromRows, maxRadiusFromCols) * frame.voiceRadiusScale
-    val t = frame.time
+    val t = time
 
     val breathe = sin(t * breatheSpeed) * frame.breatheAmp
     val breathingRadius = baseRadius * (1f + breathe)
@@ -245,7 +228,7 @@ fun forEachSphereCell(frame: SphereFrame, onCell: SphereCellRenderer) {
 
     val heartbeat = sin(t * frame.heartbeatSpeed) * 0.5f + 0.5f
 
-    val pulse = sin(frame.colorPhase) * 0.5f + 0.5f
+    val pulse = sin(colorPhase) * 0.5f + 0.5f
     val colR = lerp(frame.cr1, frame.cr2, pulse)
     val colG = lerp(frame.cg1, frame.cg2, pulse)
     val colB = lerp(frame.cb1, frame.cb2, pulse)

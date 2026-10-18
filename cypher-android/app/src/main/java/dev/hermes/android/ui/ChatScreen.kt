@@ -51,14 +51,30 @@ import dev.hermes.android.*
 import dev.hermes.android.core.*
 import dev.hermes.android.data.CypherClient
 import dev.hermes.android.data.MissingVoiceKeyException
+import dev.hermes.android.data.VoiceKeyStore
 import dev.hermes.android.voice.transcriptLabel
 import dev.hermes.android.voice.CallState
 import dev.hermes.android.voice.CallTranscript
 import dev.hermes.android.ui.sphere.resolveSphereState
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
+
+internal suspend fun voiceKeyConfiguredOnIo(store: () -> VoiceKeyStore): Boolean = withContext(Dispatchers.IO) {
+    val keyStore = store()
+    keyStore.hasKey(keyStore.settings().provider)
+}
+
+internal fun separateToolResultIds(messages: List<JSONObject>): Set<String> = messages.asSequence()
+    .filter { it.string("role") == "tool" || it.string("role") == "function" }
+    .map { it.string("tool_call_id") }
+    .filter(String::isNotBlank)
+    .toSet()
+
+internal fun toolCallResultId(tool: JSONObject): String = tool.string("tool_call_id").ifBlank { toolIdentity(tool) }
 
 @Composable fun SessionList(vm: CypherViewModel, modifier: Modifier = Modifier, beforeHistory: @Composable () -> Unit = {}) {
     val ui by vm.ui.collectAsStateWithLifecycle()
@@ -95,6 +111,7 @@ import org.json.JSONObject
     val messages = remember(chatState.messages, chatState.callMessages, chatState.sessionId) { chatState.messages + chatState.callMessages.map { Message("call:${it.eventId}", it.role, it.text, sessionId = chatState.sessionId) } }
     val chat = chatState.copy(messages = messages)
     val callMessagesById = remember(chatState.callMessages) { chatState.callMessages.associateBy { "call:${it.eventId}" } }
+    val separateToolResults = remember(chat.raw) { separateToolResultIds(chat.raw.rows("messages")) }
     val call by vm.app.calls.state.collectAsStateWithLifecycle()
     var surfacedCallError by rememberSaveable { mutableStateOf("") }
     LaunchedEffect(call.error) {
@@ -178,12 +195,17 @@ import org.json.JSONObject
         } else vm.notice(if(allowed) "Open the conversation again before calling" else "Allow microphone permission to call Cypher")
     }
     fun requestCall(active:CypherClient,conversation:String) {
-        if(!vm.prepareVoiceCall(active,conversation)) return
-        if(androidx.core.content.ContextCompat.checkSelfPermission(vm.app,Manifest.permission.RECORD_AUDIO)==android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            scope.launch { runCatching { vm.stopReadAloud();vm.app.calls.start(active.detached(),conversation) }.onFailure { error ->
+        scope.launch {
+            if(!voiceKeyConfiguredOnIo { VoiceKeyStore(vm.app) }) {
+                vm.openVoiceKeySettingsForCall(active,conversation)
+                return@launch
+            }
+            if(androidx.core.content.ContextCompat.checkSelfPermission(vm.app,Manifest.permission.RECORD_AUDIO)==android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                runCatching { vm.stopReadAloud();vm.app.calls.start(active.detached(),conversation) }.onFailure { error ->
                 if(error is MissingVoiceKeyException) vm.openVoiceKeySettingsForCall(active,conversation) else vm.notice(error.message.orEmpty())
-            } }
-        } else { permissionClient=active.detached();permissionConversation=conversation;microphone.launch(Manifest.permission.RECORD_AUDIO) }
+                }
+            } else { permissionClient=active.detached();permissionConversation=conversation;microphone.launch(Manifest.permission.RECORD_AUDIO) }
+        }
     }
     val callThisChat: () -> Unit = { vm.client?.let { requestCall(it,chat.sessionId) };Unit }
     LaunchedEffect(pendingVoiceCall,ui.tab,ui.morePage,permanentBotChat,chat.sessionId) {
@@ -282,7 +304,7 @@ import org.json.JSONObject
                     }
                 }
                 if (search.isNotBlank() && visibleMessages.isEmpty()) item { Text("No messages match your search.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                items(visibleMessages, key = { it.value.id }) { (index, message) -> MessageRow(vm, message, index, callMessagesById[message.id], onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }) }
+                items(visibleMessages, key = { it.value.id }) { (index, message) -> MessageRow(vm, message, index, callMessagesById[message.id], separateToolResults, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }) }
                 if (chat.streamId.isNotBlank() || chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank()) item("live") {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         if (chat.liveText.isNotBlank()) AssistantSurface { Markdown(chat.liveText, vm, vm.authenticatedScope(), interactive = false) }
@@ -514,7 +536,7 @@ internal fun acceptsInitialConversationEdit(
 }
 
 
-@Composable private fun MessageRow(vm: CypherViewModel, message: Message, index: Int, callTranscript: CallTranscript? = null, onToolExpanded: (Boolean) -> Unit = {}) {
+@Composable private fun MessageRow(vm: CypherViewModel, message: Message, index: Int, callTranscript: CallTranscript? = null, separateToolResults: Set<String> = emptySet(), onToolExpanded: (Boolean) -> Unit = {}) {
     val context = LocalContext.current
     val origin = vm.authenticatedScope()?.session(message.sessionId.ifBlank { vm.chat.value.sessionId })
     val settings = LocalCypherSettings.current
@@ -545,7 +567,7 @@ internal fun acceptsInitialConversationEdit(
             Disclosure(presentation.summary, message.text, renderActions)
         } else {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = if (message.role == "user") Arrangement.End else Arrangement.Start) {
-                Text(if (message.role == "user") uiText("You") else if (vm.isCypherConversation() || callTranscript != null || message.voice) "Cypher" else assistantDisplayName("Cypher"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(if (message.role == "user") uiText("You") else "Cypher", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 if (callTranscript != null) { Spacer(Modifier.weight(1f)); Text(archivedCallLabel(callTranscript.final, callTranscript.interrupted, currentCall.active && currentCall.conversationScope == origin), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             }
             if (message.role == "user") BoxWithConstraints(Modifier.fillMaxWidth()) {
@@ -555,7 +577,7 @@ internal fun acceptsInitialConversationEdit(
             } else if (presentation.text.isNotBlank()) AssistantSurface { Markdown(presentation.text, vm, origin, message.mediaSnapshots, documentKey = message.id); BubbleTime(message) }
             renderActions()
         }
-        MessageActivity(message.reasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), message.tools, messageTime = message.recordedAt, onToolExpanded = onToolExpanded)
+        MessageActivity(message.reasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), message.tools, messageTime = message.recordedAt, separateToolResults = separateToolResults, onToolExpanded = onToolExpanded)
         message.attachments.forEach { attachment -> SecureAttachment(vm, attachment, origin, message.mediaSnapshots) }
     }
 }
@@ -580,12 +602,12 @@ internal fun acceptsInitialConversationEdit(
 // Only presentation is adapted; Cypher's own ChatState and callbacks supply every value.
 
 /** Each tool is its own collapsed card; reasoning and live status sit above them. */
-@Composable internal fun MessageActivity(reasoning: String, tools: List<JSONObject>, status: String = "", streaming: Boolean = status.isNotBlank(), messageTime: Long = 0L, onToolExpanded: (Boolean) -> Unit = {}) {
+@Composable internal fun MessageActivity(reasoning: String, tools: List<JSONObject>, status: String = "", streaming: Boolean = status.isNotBlank(), messageTime: Long = 0L, separateToolResults: Set<String> = emptySet(), onToolExpanded: (Boolean) -> Unit = {}) {
     if (reasoning.isBlank() && tools.isEmpty() && status.isBlank()) return
     Column(Modifier.fillMaxWidth().testTag("message-activity"), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (status.isNotBlank()) Text(status, Modifier.testTag("message-activity-status"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         if (reasoning.isNotBlank()) Disclosure("Reasoning", reasoning)
-        tools.forEachIndexed { index, tool -> key(tool.toolKey(index)) { ToolCard(tool, streaming, messageTime, onToolExpanded) } }
+        tools.forEachIndexed { index, tool -> key(tool.toolKey(index)) { ToolCard(tool, streaming, messageTime, onToolExpanded, toolCallResultId(tool) in separateToolResults) } }
     }
 }
 
@@ -617,9 +639,10 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
     else -> Icons.Rounded.Build
 }
 
-@Composable fun ToolCard(tool: JSONObject, streaming: Boolean = false, messageTime: Long = 0L, onExpandedChange: (Boolean) -> Unit = {}) {
+@Composable fun ToolCard(tool: JSONObject, streaming: Boolean = false, messageTime: Long = 0L, onExpandedChange: (Boolean) -> Unit = {}, hasSeparateResult: Boolean = false) {
     val rawName = tool.rawToolName()
     val outcome = toolOutcomeOf(tool, streaming)
+    val separateResult = hasSeparateResult && outcome == ToolOutcome.NoResult
     val running = outcome == ToolOutcome.Running
     val preparing = outcome == ToolOutcome.Preparing
     // A running tool opens like Relay's; history and preparing tools start folded.
@@ -633,12 +656,12 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
     val resultText = tool.recordedValue("result", "output")?.detailText().orEmpty()
     val previewText = tool.recordedValue("preview")?.detailText().orEmpty().takeIf { resultText.isBlank() && it.isNotBlank() }
     val statusTitle = uiText("Status")
-    val meta = when (outcome) {
+    val meta = if (separateResult) "See transcript" else when (outcome) {
         ToolOutcome.Dispatched -> toolOutcomeLabel(outcome)
         ToolOutcome.NoResult -> "No result"
         else -> listOfNotNull(duration, time).joinToString(" · ")
     }
-    val (statusIcon, statusColor) = when (outcome) {
+    val (statusIcon, statusColor) = if (separateResult) Icons.Rounded.Description to MaterialTheme.colorScheme.primary else when (outcome) {
         ToolOutcome.Completed -> Icons.Rounded.Check to MaterialTheme.colorScheme.primary
         ToolOutcome.Failed -> Icons.Rounded.Close to MaterialTheme.colorScheme.error
         ToolOutcome.Preparing -> Icons.Rounded.MoreHoriz to MaterialTheme.colorScheme.onSurfaceVariant
@@ -646,7 +669,7 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
         ToolOutcome.Dispatched -> Icons.Rounded.Send to MaterialTheme.colorScheme.secondary
         ToolOutcome.NoResult -> Icons.Rounded.HelpOutline to MaterialTheme.colorScheme.onSurfaceVariant
     }
-    val label = toolOutcomeLabel(outcome)
+    val label = if (separateResult) "Result in transcript" else toolOutcomeLabel(outcome)
     Surface(Modifier.fillMaxWidth().testTag("tool-card").semantics { contentDescription = "${toolDisplayName(tool)}, $label" + (if (meta.isNotBlank() && outcome != ToolOutcome.Dispatched && outcome != ToolOutcome.NoResult) ", $meta" else "") }, shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
         Column(Modifier.padding(horizontal = 12.dp)) {
             Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(onClickLabel = uiText(if (expanded) "Hide details" else "Details")) { expanded = !expanded; onExpandedChange(expanded) }.testTag("tool-card-toggle"), verticalAlignment = Alignment.CenterVertically) {
@@ -670,7 +693,8 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
                 else if (outcome == ToolOutcome.Completed || outcome == ToolOutcome.Failed) Text("The tool finished with an empty result.", Modifier.testTag("tool-card-empty-result"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 // Partial output is shown as such; it never marks the call finished.
                 previewText?.let { ToolDetailBlock("Preview (partial)", it, "tool-card-preview", MaterialTheme.colorScheme.onSurface, toolKey) }
-                if (outcome == ToolOutcome.NoResult) Text("No completion was recorded for this tool.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (separateResult) Text("The result is shown in a separate transcript row.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                else if (outcome == ToolOutcome.NoResult) Text("No completion was recorded for this tool.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } }
         }
     }
