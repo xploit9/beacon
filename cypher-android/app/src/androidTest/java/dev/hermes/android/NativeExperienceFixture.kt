@@ -49,6 +49,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     val roomActions = CopyOnWriteArrayList<JSONObject>()
     val workspaceFiles = ConcurrentHashMap<String, String>()
     val downloads = ConcurrentHashMap<String, ByteArray>()
+    val fileRequests = CopyOnWriteArrayList<String>()
     val holdNextFileList = java.util.concurrent.atomic.AtomicBoolean(false)
     val fileListCaptured = java.util.concurrent.CountDownLatch(1)
     val releaseFileList = java.util.concurrent.CountDownLatch(1)
@@ -183,8 +184,10 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         builder.addInterceptor { chain ->
             val request = chain.request()
             check(request.url.host == "ui-fixture.invalid") { "UI fixture may not access a real host" }
-            if (request.url.encodedPath in setOf("/api/fs/download", "/api/files/download")) {
-                val bytes = downloads[request.url.queryParameter("path")]
+            if (request.url.encodedPath in setOf("/api/fs/download", "/api/files/download", "/api/file/raw")) {
+                val path = request.url.queryParameter("path").orEmpty()
+                fileRequests += "${request.method} ${request.url.encodedPath}?path=$path"
+                val bytes = downloads[path]
                 return@addInterceptor Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if (bytes == null) 404 else 200).message("Synthetic download")
                     .body((bytes ?: ByteArray(0)).toResponseBody("application/octet-stream".toMediaType())).build()
             }
