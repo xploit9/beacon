@@ -247,7 +247,7 @@ async def calls(request:Request):
     elif selection['provider']=='openai':
         raise HTTPException(409,'OpenAI Realtime requires a phone-held key')
     if conversation:
-        reject_unowned_conversation(owner,provider,profile,conversation)
+        await asyncio.to_thread(reject_unowned_conversation,owner,provider,profile,conversation)
         await asyncio.to_thread(safely,native.reserve_conversation,owner,provider,profile,conversation)
     else:
         with mobile.connect() as conn:
@@ -632,7 +632,7 @@ async def answer(invitation_id:str,action:str,request:Request):
         return dict(row)
     initial=await asyncio.to_thread(peek)
     if action=='answer':
-        reject_unowned_conversation(owner,provider,profile,initial['conversation'])
+        await asyncio.to_thread(reject_unowned_conversation,owner,provider,profile,initial['conversation'])
         await asyncio.to_thread(safely,native.verify,owner,provider,profile,initial['conversation'])
     source=await asyncio.to_thread(mobile.refs,owner,profile)
     selection=voice_models.selected(mobile,owner,profile,cfg)
