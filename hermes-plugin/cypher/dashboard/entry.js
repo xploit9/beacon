@@ -27,15 +27,17 @@
       }, []);
 
       const query = info ? new URLSearchParams({ url: info.url, name: info.name }) : null;
-      if (query && info.session) query.set('session', info.session);
       const link = query ? `cypher://connect?${query.toString()}` : '';
+      const qrPayload = info && info.session
+        ? JSON.stringify({ type: 'cypher-connect', url: info.url, session: info.session })
+        : link;
 
       useEffect(() => {
-        if (!link || !canvas.current) return;
+        if (!qrPayload || !canvas.current) return;
         try {
           if (typeof window.qrcode !== 'function') throw new Error('QR encoder unavailable');
           const qr = window.qrcode(0, 'M');
-          qr.addData(link);
+          qr.addData(qrPayload);
           qr.make();
           const modules = qr.getModuleCount();
           const border = 4;
@@ -58,7 +60,7 @@
         } catch (_) {
           setQrError(true);
         }
-      }, [link]);
+      }, [qrPayload]);
 
       async function copyLink() {
         try {

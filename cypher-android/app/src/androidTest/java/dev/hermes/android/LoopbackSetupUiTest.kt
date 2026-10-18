@@ -20,6 +20,7 @@ import dev.hermes.android.data.NativeBearerRecord
 import dev.hermes.android.ui.NativeLocalization
 import dev.hermes.android.ui.SetupWizardScreen
 import dev.hermes.android.ui.parseCypherConnectLink
+import dev.hermes.android.ui.setupAddressForDisplay
 import java.security.MessageDigest
 import java.util.UUID
 import kotlinx.coroutines.runBlocking
@@ -46,6 +47,14 @@ class LoopbackSetupUiTest {
         assertEquals("https://hermes.example", parsed.origin)
         assertToken(secret, parsed.sessionToken)
         assertFalse(parsed.toString().contains(secret))
+        assertEquals("https://hermes.example", parseCypherConnectLink("cypher://CONNECT?url=${Uri.encode("https://hermes.example")}").origin)
+        val scannerQr = org.json.JSONObject()
+            .put("type", "cypher-connect")
+            .put("url", "https://hermes.example")
+            .put("session", secret)
+            .toString()
+        assertToken(secret, parseCypherConnectLink(scannerQr).sessionToken)
+        assertEquals("https://hermes.example", setupAddressForDisplay(scannerQr))
 
         val state = AppState(setupOrigin = parsed.origin, setupWizard = true, setupStep = "connect", restoringSession = false)
         var submitted: String? = null

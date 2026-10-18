@@ -234,6 +234,14 @@ internal data class PreparedKeepConnectedCall(
     val protocol: RelayCallbackProtocol,
 )
 
+internal fun keepConnectedLoopNeedsRestart(
+    jobActive: Boolean,
+    runningOrigin: String?,
+    runningOwner: String?,
+    requestedOrigin: String,
+    requestedOwner: String,
+): Boolean = !jobActive || runningOrigin != requestedOrigin || runningOwner != requestedOwner
+
 /** Translate only the plugin's event fields into the reviewed local Relay reducer envelope. */
 internal fun prepareKeepConnectedCall(
     scope: Scope,
@@ -292,6 +300,8 @@ internal fun prepareKeepConnectedCall(
 class KeepConnectedService : Service() {
     private val serviceScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO)
     private var pollJob: kotlinx.coroutines.Job? = null
+    private var pollOrigin: String? = null
+    private var pollOwner: String? = null
     private var promoted = false
 
     override fun onCreate() {
@@ -320,12 +330,22 @@ class KeepConnectedService : Service() {
             stopSelfResult(startId)
             return START_NOT_STICKY
         }
-        if (pollJob?.isActive != true) pollJob = serviceScope.launch { runLoop() }
+        val prefs = preferences(this)
+        val origin = prefs.getString(KEY_ORIGIN, "").orEmpty()
+        val owner = prefs.getString(KEY_OWNER, "").orEmpty()
+        if (keepConnectedLoopNeedsRestart(pollJob?.isActive == true, pollOrigin, pollOwner, origin, owner)) {
+            pollJob?.cancel()
+            pollOrigin = origin
+            pollOwner = owner
+            pollJob = serviceScope.launch { runLoop(origin, owner) }
+        }
         return START_STICKY
     }
 
     override fun onDestroy() {
         pollJob?.cancel()
+        pollOrigin = null
+        pollOwner = null
         serviceScope.cancel()
         if (activeInstance === this) activeInstance = null
         super.onDestroy()
@@ -346,11 +366,9 @@ class KeepConnectedService : Service() {
         false
     }
 
-    private suspend fun runLoop() {
+    private suspend fun runLoop(origin: String, owner: String) {
         val app = application as CypherApplication
         val prefs = preferences(this)
-        val origin = prefs.getString(KEY_ORIGIN, "").orEmpty()
-        val owner = prefs.getString(KEY_OWNER, "").orEmpty()
         if (origin.isBlank() || owner.isBlank()) {
             setStatus(this, STATUS_SIGNED_OUT)
             stopSelf()

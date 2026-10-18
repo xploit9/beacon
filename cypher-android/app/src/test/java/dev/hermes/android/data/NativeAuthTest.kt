@@ -506,4 +506,38 @@ class NativeAuthTest {
         assertTrue(requests.isEmpty())
         client.closeNative()
     }
+
+    @Test fun transientRefreshFailurePreservesBearerAndAllowsTheNextRequestToRetry() = runBlocking {
+        val requests = CopyOnWriteArrayList<Request>()
+        var refreshAttempts = 0
+        val bearer = NativeBearerRecord("old-access", "old-refresh", 0, "https://native.example", "owner", "work", "fixture")
+        val client = CypherClient(AuthContext(bearer.origin, emptyList(), bearer.owner, bearer.profile, backend = "hermes-dashboard", bearer = bearer), null) { builder ->
+            builder.addInterceptor { chain ->
+                val request = chain.request()
+                requests += request
+                val status = when {
+                    request.url.encodedPath == "/auth/native/refresh" -> if (++refreshAttempts == 1) 503 else 200
+                    request.header("Authorization") == "Bearer fresh-access" -> 200
+                    else -> 401
+                }
+                val body = when {
+                    request.url.encodedPath == "/auth/native/refresh" && status == 200 -> """{"access_token":"fresh-access","refresh_token":"fresh-refresh","token_type":"Bearer","expires_at":1900000000,"provider":"fixture","user_id":"owner"}"""
+                    status == 200 -> """{"user_id":"owner"}"""
+                    else -> """{"detail":"Unauthorized"}"""
+                }
+                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(status).message("Fixture")
+                    .body(body.toResponseBody("application/json".toMediaType())).build()
+            }
+        }
+
+        val firstFailure = runCatching { client.get("/api/auth/me") }.exceptionOrNull()
+
+        assertTrue(firstFailure is NativeAuthException)
+        assertFalse(firstFailure is NativeAuthExpiredException)
+        assertEquals(bearer, client.auth.bearer)
+        assertEquals("owner", client.get("/api/auth/me").getString("user_id"))
+        assertEquals(2, requests.count { it.url.encodedPath == "/auth/native/refresh" })
+        assertEquals("fresh-access", client.auth.bearer?.accessToken)
+        client.closeNative()
+    }
 }

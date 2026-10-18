@@ -47,12 +47,29 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.data.NativeAuth
 import dev.hermes.android.ui.*
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+
+internal data class SafeExternalConnectLink(val link: String, val sessionRemoved: Boolean)
+
+internal fun sanitizeExternalConnectLink(uri: Uri): SafeExternalConnectLink {
+    val parameters = uri.queryParameterNames
+    val sessionRemoved = parameters.any { name ->
+        name.equals("session", ignoreCase = true) && uri.getQueryParameters(name).any(String::isNotBlank)
+    }
+    val safeUri = uri.buildUpon().clearQuery()
+    parameters.filterNot { it.equals("session", ignoreCase = true) }.forEach { name ->
+        uri.getQueryParameters(name).forEach { value -> safeUri.appendQueryParameter(name, value) }
+    }
+    return SafeExternalConnectLink(safeUri.build().toString(), sessionRemoved)
+}
 
 class CypherActivity : ComponentActivity() {
     private var vm: CypherViewModel? = null
     private var initialPush by mutableStateOf<Triple<String, String, String>?>(null)
     private var updateToken by mutableStateOf<String?>(null)
     private var pendingConnectionLink by mutableStateOf<String?>(null)
+    private var pendingConnectionSessionNotice by mutableStateOf(false)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -63,8 +80,13 @@ class CypherActivity : ComponentActivity() {
             val preferences by model.preferences.collectAsStateWithLifecycle()
             val data by model.data.collectAsStateWithLifecycle()
             val ui by model.ui.collectAsStateWithLifecycle()
-            LaunchedEffect(model, pendingConnectionLink) {
-                pendingConnectionLink?.let { model.openSetupLink(it); pendingConnectionLink = null }
+            LaunchedEffect(model, pendingConnectionLink, pendingConnectionSessionNotice) {
+                pendingConnectionLink?.let { link ->
+                    model.openSetupLink(link)
+                    if (pendingConnectionSessionNotice) model.notice("For this dashboard, scan the QR code with Cypher's scanner to sign in.")
+                    pendingConnectionLink = null
+                    pendingConnectionSessionNotice = false
+                }
             }
             var permissionSource by rememberSaveable { mutableStateOf("") }
             var permissionEvent by rememberSaveable { mutableStateOf("") }
@@ -118,7 +140,12 @@ class CypherActivity : ComponentActivity() {
     override fun onStop() { (application as CypherApplication).calls.uiVisible = false; vm?.foreground(false); super.onStop() }
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); setIntent(intent); push(intent) }
     private fun push(intent: Intent?) {
-        intent?.data?.takeIf { it.scheme.equals("cypher", true) && it.host.equals("connect", true) }?.let { pendingConnectionLink = it.toString(); intent?.data = null }
+        intent?.data?.takeIf { it.scheme.equals("cypher", true) && it.host.equals("connect", true) }?.let {
+            val safe = sanitizeExternalConnectLink(it)
+            pendingConnectionLink = safe.link
+            pendingConnectionSessionNotice = safe.sessionRemoved
+            intent?.data = null
+        }
         intent?.getStringExtra(CypherCallService.EXTRA_CALL_ID)?.let { pendingReturn=it;intent.removeExtra(CypherCallService.EXTRA_CALL_ID) }
         intent?.getStringExtra(dev.hermes.android.updates.UpdateManager.EXTRA_TOKEN)?.takeIf(dev.hermes.android.updates.UpdateManager::validToken)?.let { updateToken = it }
         val source = intent?.getStringExtra("push_source") ?: intent?.getStringExtra("source_ref").orEmpty()
@@ -133,6 +160,26 @@ class CypherActivity : ComponentActivity() {
         }
     }
 }
+@Composable
+internal fun NativeFeedbackEffect(
+    error: String,
+    notice: String,
+    setupWizard: Boolean,
+    snackbar: SnackbarHostState,
+    clearMessage: () -> Unit,
+) {
+    val message = rememberUpdatedState(if (setupWizard) "" else error.ifBlank { notice })
+    val clear = rememberUpdatedState(clearMessage)
+    LaunchedEffect(snackbar) {
+        snapshotFlow { message.value }.distinctUntilChanged().collectLatest { text ->
+            if (text.isNotBlank()) {
+                snackbar.showSnackbar(text, withDismissAction = true, duration = SnackbarDuration.Long)
+                clear.value()
+            }
+        }
+    }
+}
+
 @Composable internal fun IncomingCallSheet(vm: CypherViewModel, requestingPermission: Boolean, onAnswer: (String, String) -> Unit) {
     val invite by vm.app.push.incoming.collectAsStateWithLifecycle()
     val ui by vm.ui.collectAsStateWithLifecycle()
@@ -211,7 +258,7 @@ internal fun historyTruncationMessage(raw: org.json.JSONObject): String? =
     BackHandler(ui.authenticated && !ui.showSessions && ui.tab !in setOf("Chat", "Xara") && (ui.tab != "More" || ui.morePage.isBlank())) {
         if (ui.tab == "More") vm.backFromSettings() else if (ui.tab == "Spaces" && vm.editor.value.path.isNotBlank()) vm.closeEditor() else if (ui.botModeEnabled) vm.showBotMode() else vm.tab("Chat")
     }
-    LaunchedEffect(ui.error, ui.notice, ui.setupWizard) { if (!ui.setupWizard) { val text = ui.error.ifBlank { ui.notice }; if (text.isNotBlank()) { snackbar.showSnackbar(text, withDismissAction = true); vm.clearMessage() } } }
+    NativeFeedbackEffect(ui.error, ui.notice, ui.setupWizard, snackbar, vm::clearMessage)
     if (ui.restoringSession) {
         Surface(Modifier.fillMaxSize().testTag("session-restore-logo"), color = MaterialTheme.colorScheme.background) {
             Column(Modifier.safeDrawingPadding(), verticalArrangement = Arrangement.Center, horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally) {

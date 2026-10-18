@@ -58,6 +58,13 @@ class KeepConnectedTest {
         .put("state", "pending")
         .put("expires_at", expiresAt)
 
+    @Test fun pollLoopRestartsWhenItsAuthorizedOriginOrOwnerChanges() {
+        assertFalse(keepConnectedLoopNeedsRestart(true, "https://one.example", "owner", "https://one.example", "owner"))
+        assertTrue(keepConnectedLoopNeedsRestart(true, "https://one.example", "owner", "https://two.example", "owner"))
+        assertTrue(keepConnectedLoopNeedsRestart(true, "https://one.example", "owner", "https://one.example", "other"))
+        assertTrue(keepConnectedLoopNeedsRestart(false, null, null, "https://one.example", "owner"))
+    }
+
     private fun cursors(values: MutableMap<String, String> = mutableMapOf()) = KeepConnectedCursors(
         read = values::get,
         write = { key, value -> values[key] = value; true },
