@@ -225,7 +225,8 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
             }
         } catch (error: NativeAuthException) {
             response.close()
-            if (error.sessionExpired && (authStore?.removeIfBearerUnchanged(bearer) != false)) auth = auth.copy(bearer = null, cookies = emptyList())
+            if (!error.sessionExpired) throw error
+            if (authStore?.removeIfBearerUnchanged(bearer) != false) auth = auth.copy(bearer = null, cookies = emptyList())
             throw NativeAuthExpiredException()
         }
         response.close()

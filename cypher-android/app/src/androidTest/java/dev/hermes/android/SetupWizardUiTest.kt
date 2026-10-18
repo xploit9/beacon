@@ -1,16 +1,20 @@
 package dev.hermes.android
 
 import android.content.Intent
+import android.Manifest
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.collectAsState
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
 import androidx.activity.ComponentActivity
 import androidx.compose.ui.text.input.TextFieldValue
@@ -36,10 +40,14 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.flow.first
 import dev.hermes.android.ui.NativeLocalization
 import dev.hermes.android.ui.SetupWizardScreen
+import dev.hermes.android.ui.QrScanner
 import dev.hermes.android.ui.parseCypherConnectInput
 import android.net.Uri
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -145,6 +153,51 @@ class SetupWizardUiTest {
         assertEquals(activeOrigin, state.origin)
     }
 
+    @Test fun externalConnectIntentDropsSessionButKeepsTheServerAddress() {
+        val token = "private-loopback-session-token"
+        val input = Uri.parse("cypher://connect?url=https%3A%2F%2Fhermes.example&name=Hermes&session=$token&session=duplicate&SESSION=uppercase")
+
+        val external = sanitizeExternalConnectLink(input)
+        val safeUri = Uri.parse(external.link)
+
+        assertTrue(external.sessionRemoved)
+        assertEquals("https://hermes.example", safeUri.getQueryParameter("url"))
+        assertNull(safeUri.getQueryParameter("session"))
+        assertFalse(external.link.contains(token))
+        assertFalse(external.link.contains("duplicate"))
+        assertFalse(external.link.contains("uppercase"))
+
+        val plain = sanitizeExternalConnectLink(Uri.parse("cypher://connect?url=https%3A%2F%2Fhermes.example"))
+        assertFalse(plain.sessionRemoved)
+        assertEquals("https://hermes.example", Uri.parse(plain.link).getQueryParameter("url"))
+    }
+
+    @Test fun malformedAndTypedConnectLinksStayVisibleUntilContinue() {
+        var staged = ""
+        var probed = ""
+        val state = AppState(setupWizard = true, setupStep = "connect", restoringSession = false)
+        compose.setContent { NativeLocalization("en") { CypherTheme(dark = true) {
+            SetupWizardScreen(
+                state = state,
+                onProbe = { probed = it }, onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {},
+                onStageLink = { staged = it },
+            )
+        } } }
+
+        val malformed = "cypher://connect?session=private-token"
+        compose.onNodeWithTag("setup-address").performTextInput(malformed)
+        compose.onNodeWithTag("setup-address").assertTextEquals("Paste link or address", malformed)
+        assertEquals("", staged)
+
+        compose.onNodeWithTag("setup-address").performTextClearance()
+        compose.onNodeWithTag("setup-address").performTextInput("cypher://connect?url=https%3A%2F%2Fhermes.example&name=Hermes")
+        val typed = "cypher://connect?url=https%3A%2F%2Fhermes.example&name=Hermes"
+        compose.onNodeWithTag("setup-address").assertTextEquals("Paste link or address", typed)
+        assertEquals("", staged)
+        compose.onNodeWithTag("setup-connect").performClick()
+        assertEquals(typed, probed)
+    }
+
     @Test fun openingExternalLinkStoresPendingOriginAndCancelKeepsTheActiveAccount() = runBlocking {
         val app = ApplicationProvider.getApplicationContext<CypherApplication>()
         val originKey = stringPreferencesKey("origin")
@@ -247,6 +300,46 @@ class SetupWizardUiTest {
         compose.onNodeWithText("Can't reach Hermes. Check Tailscale/VPN is on, then Retry.").assertIsDisplayed()
         compose.onNodeWithTag("setup-probe-retry").performClick()
         assertEquals(1, retries)
+    }
+
+    @Test fun errorSnackbarSurvivesNoticeRecompositionAndUsesLongDuration() {
+        val snackbar = SnackbarHostState()
+        var notice by mutableStateOf("")
+        val error = "Owned resource unavailable"
+        compose.setContent { CypherTheme(dark = true) {
+            NativeFeedbackEffect(error = error, notice = notice, setupWizard = false, snackbar = snackbar) {}
+            SnackbarHost(snackbar)
+        } }
+
+        compose.waitUntil(5_000) { snackbar.currentSnackbarData != null }
+        val original = snackbar.currentSnackbarData
+        compose.runOnIdle { notice = "An unrelated status update" }
+        compose.waitForIdle()
+        assertSame(original, snackbar.currentSnackbarData)
+        compose.mainClock.advanceTimeBy(4_500)
+        compose.onNodeWithText(error).assertIsDisplayed()
+    }
+
+    @Test fun qrScannerRefreshesCameraPermissionAfterResume() {
+        val app = ApplicationProvider.getApplicationContext<CypherApplication>()
+        val uiAutomation = InstrumentationRegistry.getInstrumentation().uiAutomation
+        val hadCamera = app.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        try {
+            runCatching { uiAutomation.revokeRuntimePermission(app.packageName, Manifest.permission.CAMERA) }
+            compose.setContent { QrScanner(onResult = {}, onClose = {}) }
+            compose.onNodeWithTag("setup-camera-permission").assertIsDisplayed()
+
+            uiAutomation.grantRuntimePermission(app.packageName, Manifest.permission.CAMERA)
+            compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.CREATED)
+            compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.RESUMED)
+            compose.waitUntil(5_000) {
+                runCatching { compose.onNodeWithTag("setup-camera-permission").assertDoesNotExist() }.isSuccess
+            }
+            compose.onNodeWithTag("setup-camera-permission").assertDoesNotExist()
+        } finally {
+            if (hadCamera) runCatching { uiAutomation.grantRuntimePermission(app.packageName, Manifest.permission.CAMERA) }
+            else runCatching { uiAutomation.revokeRuntimePermission(app.packageName, Manifest.permission.CAMERA) }
+        }
     }
 
     @Test fun missingPluginMessageIsShownWithoutBlockingSignIn() {

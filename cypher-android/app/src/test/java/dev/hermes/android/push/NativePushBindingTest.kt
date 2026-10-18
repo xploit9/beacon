@@ -19,4 +19,15 @@ class NativePushBindingTest {
         assertFalse(nativePushBindingAuthorized(binding().put("profile", ""), auth))
         assertFalse(nativePushBindingAuthorized(binding(), auth.copy(owner = "")))
     }
+
+    @Test fun onlyKeepConnectedInvitationsRequireAnInMemoryReceipt() {
+        val keepConnected = requiresLocalKeepConnectedReceipt("local-action-token")
+        val fcm = requiresLocalKeepConnectedReceipt(null)
+
+        assertFalse(canAuthorizeWithoutKeepConnectedReceipt(keepConnected, "answer"))
+        assertFalse(canAuthorizeWithoutKeepConnectedReceipt(keepConnected, "decline"))
+        assertTrue(canAuthorizeWithoutKeepConnectedReceipt(fcm, "answer"))
+        assertTrue(canAuthorizeWithoutKeepConnectedReceipt(fcm, "decline"))
+        assertFalse(canAuthorizeWithoutKeepConnectedReceipt(fcm, "other"))
+    }
 }

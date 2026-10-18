@@ -5,6 +5,7 @@ import dev.hermes.android.core.Scope
 import dev.hermes.android.sessionCanStillBeUnpersisted
 import org.json.JSONObject
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -31,5 +32,20 @@ class CypherF1RegressionTest {
     @Test fun connectInputDiagnosticsNeverPrintTheSessionToken() {
         val token = "private-loopback-session-token"
         assertFalse(CypherConnectInput("https://hermes.example", token).toString().contains(token))
+    }
+
+    @Test fun deniedSetupPermissionStaysOnTheCurrentStep() {
+        var advanced = 0
+        var denied = 0
+
+        handleSetupPermissionResult(false, { advanced++ }, { denied++ })
+
+        assertEquals(0, advanced)
+        assertEquals(1, denied)
+        handleSetupPermissionResult(true, { advanced++ }, { denied++ })
+        assertEquals(1, advanced)
+        assertFalse(setupPermissionRequiresSettings(false, false))
+        assertFalse(setupPermissionRequiresSettings(true, true))
+        assertTrue(setupPermissionRequiresSettings(true, false))
     }
 }

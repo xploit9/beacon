@@ -30,6 +30,7 @@ import dev.hermes.android.data.NativeBearerRecord
 import dev.hermes.android.data.VoiceKeyStore
 import dev.hermes.android.push.KeepConnectedService
 import dev.hermes.android.push.persistPushBindings
+import dev.hermes.android.push.receivePush
 import dev.hermes.android.ui.NativeLocalization
 import dev.hermes.android.ui.NotificationSettings
 import dev.hermes.android.ui.SetupWizardScreen
@@ -233,6 +234,35 @@ class KeepConnectedUiTest {
             KeepConnectedService.setEnabled(app, null, false)
             assertNull(app.push.ringingInvitation(optOutSource, optOutEvent.getString("event_id")))
             assertFalse(app.push.authorizeKeepConnectedAction(optOutSource, optOutEvent.getString("event_id"), "answer"))
+
+            val fcmEvent = fixture.emitIncomingCall(conversationId = "chat-a")
+            testEvents += fcmEvent
+            val fcmSource = fcmEvent.getString("source_ref")
+            val fcmEventId = fcmEvent.getString("event_id")
+            seedExistingFcmBinding(fcmSource)
+            receivePush(app, mapOf(
+                "source_ref" to fcmSource,
+                "event_id" to fcmEventId,
+                "conversation_ref" to fcmEvent.getString("conversation_ref"),
+                "kind" to "incoming_call",
+                "expires_at" to fcmEvent.getString("expires_at"),
+            ))
+            assertTrue(app.push.authorizeKeepConnectedAction(fcmSource, fcmEventId, "answer"))
+            assertTrue(app.push.authorizeKeepConnectedAction(fcmSource, fcmEventId, "decline"))
+
+            val receiptlessEvent = fixture.emitIncomingCall(conversationId = "chat-a")
+            testEvents += receiptlessEvent
+            val receiptlessSource = receiptlessEvent.getString("source_ref")
+            val receiptlessEventId = receiptlessEvent.getString("event_id")
+            seedExistingFcmBinding(receiptlessSource)
+            assertTrue(app.push.saveInvitation(dev.hermes.android.voice.IncomingCall(
+                receiptlessSource,
+                receiptlessEventId,
+                receiptlessEvent.getString("expires_at").toLong(),
+                java.util.UUID.randomUUID().toString(),
+                conversation = receiptlessEvent.getString("conversation_ref"),
+            )))
+            assertFalse(app.push.authorizeKeepConnectedAction(receiptlessSource, receiptlessEventId, "answer"))
         } finally {
             KeepConnectedService.setEnabled(app, null, false)
             if (previousSignInNotification == null) manager.cancel(4083)

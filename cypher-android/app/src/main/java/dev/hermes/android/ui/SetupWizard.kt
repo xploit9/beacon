@@ -3,6 +3,7 @@ package dev.hermes.android.ui
 import android.Manifest
 import android.app.NotificationManager
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -47,6 +48,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.core.app.ActivityCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.AppState
 import dev.hermes.android.CypherViewModel
@@ -57,6 +59,18 @@ import dev.hermes.android.data.validLoopbackSessionToken
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
+internal fun handleSetupPermissionResult(granted: Boolean, advance: () -> Unit, denied: () -> Unit) {
+    if (granted) advance() else denied()
+}
+
+internal fun setupPermissionRequiresSettings(denied: Boolean, showRationale: Boolean): Boolean = denied && !showRationale
+
+private tailrec fun Context.findActivity(): android.app.Activity? = when (this) {
+    is android.app.Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
 internal data class CypherConnectInput(val origin: String, val sessionToken: String? = null) {
     override fun toString() = "CypherConnectInput(origin=$origin, sessionToken=<redacted>)"
 }
@@ -64,13 +78,25 @@ internal data class CypherConnectInput(val origin: String, val sessionToken: Str
 internal fun parseCypherConnectLink(value: String): CypherConnectInput {
     val input = value.trim()
     val uri = Uri.parse(input)
+    val scannerPayload = runCatching { org.json.JSONObject(input) }.getOrNull()
+        ?.takeIf { it.optString("type") == "cypher-connect" }
     val link = uri.scheme.equals("cypher", ignoreCase = true)
-    val address = if (link) {
-        require(uri.host == "connect" && uri.path.isNullOrEmpty()) { "Scan a Cypher connection QR or paste an HTTPS Hermes address." }
-        uri.getQueryParameter("url")?.takeIf(String::isNotBlank)
-            ?: throw IllegalArgumentException("This Cypher link has no server address. Scan the QR again or paste the HTTPS address.")
-    } else input
-    val sessions = if (link) uri.getQueryParameters("session") else emptyList()
+    val address = when {
+        scannerPayload != null -> scannerPayload.opt("url") as? String
+            ?: throw IllegalArgumentException("This Cypher QR has no server address. Scan it again or paste the HTTPS address.")
+        link -> {
+            require(uri.host.equals("connect", ignoreCase = true) && uri.path.isNullOrEmpty()) { "Scan a Cypher connection QR or paste an HTTPS Hermes address." }
+            uri.getQueryParameter("url")?.takeIf(String::isNotBlank)
+                ?: throw IllegalArgumentException("This Cypher link has no server address. Scan the QR again or paste the HTTPS address.")
+        }
+        else -> input
+    }
+    val sessions = when {
+        scannerPayload != null -> listOf((scannerPayload.opt("session") as? String)?.takeIf(String::isNotBlank)
+            ?: throw IllegalArgumentException("This Cypher QR has an invalid session. Scan it again."))
+        link -> uri.getQueryParameters("session")
+        else -> emptyList()
+    }
     require(sessions.size <= 1) { "This Cypher link has an invalid session. Scan the Connect QR again." }
     val session = sessions.singleOrNull()?.takeIf(String::isNotBlank)
     require(session == null || validLoopbackSessionToken(session)) { "This Cypher link has an invalid session. Scan the Connect QR again." }
@@ -81,6 +107,9 @@ internal fun parseCypherConnectInput(value: String): String = parseCypherConnect
 
 internal fun setupAddressForDisplay(value: String): String {
     val input = value.trim()
+    val scannerPayload = runCatching { org.json.JSONObject(input) }.getOrNull()
+        ?.takeIf { it.optString("type") == "cypher-connect" }
+    if (scannerPayload != null) return runCatching { trustedOrigin(scannerPayload.optString("url")) }.getOrDefault("")
     val uri = Uri.parse(input)
     if (!uri.scheme.equals("cypher", ignoreCase = true)) return value
     if (!uri.host.equals("connect", ignoreCase = true)) return ""
@@ -123,8 +152,49 @@ internal fun SetupWizardScreen(
     val visibleOrigin = setupAddressForDisplay(state.setupOrigin.ifBlank { state.origin })
     var address by rememberSaveable(initialAddress) { mutableStateOf(initialAddress) }
     var scanning by rememberSaveable { mutableStateOf(false) }
-    val permissionRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { onAdvancePermission() }
-    val settingsRequest = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { onAdvancePermission() }
+    var permissionDenied by rememberSaveable(state.setupStep) { mutableStateOf(false) }
+    var permissionNotice by rememberSaveable(state.setupStep) { mutableStateOf("") }
+
+    fun permissionAllowed(step: String): Boolean = when (step) {
+        "permission-microphone" -> ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        "permission-notifications" -> Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        "permission-full-screen" -> Build.VERSION.SDK_INT < 34 || context.getSystemService(NotificationManager::class.java)?.canUseFullScreenIntent() == true
+        else -> false
+    }
+
+    fun showRationale(permission: String): Boolean =
+        context.findActivity()?.let { ActivityCompat.shouldShowRequestPermissionRationale(it, permission) } ?: true
+
+    fun reportPermissionResult(granted: Boolean, step: String) {
+        handleSetupPermissionResult(granted,
+            advance = { permissionDenied = false; permissionNotice = ""; onAdvancePermission() },
+            denied = {
+                permissionDenied = true
+                val title = when (step) {
+                    "permission-microphone" -> "Microphone"
+                    "permission-notifications" -> "Notifications"
+                    else -> "Full-screen call alerts"
+                }
+                val permanent = when (step) {
+                    "permission-microphone" -> setupPermissionRequiresSettings(true, showRationale(Manifest.permission.RECORD_AUDIO))
+                    "permission-notifications" -> setupPermissionRequiresSettings(true, showRationale(Manifest.permission.POST_NOTIFICATIONS))
+                    else -> true
+                }
+                permissionNotice = when {
+                    step == "permission-full-screen" -> "Full-screen call alerts are still off. Open settings again or skip for now."
+                    permanent -> "$title permission is blocked. Open app settings or skip for now."
+                    else -> "$title permission wasn't granted. You can try again or skip for now."
+                }
+            },
+        )
+    }
+
+    val permissionRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        reportPermissionResult(granted, state.setupStep)
+    }
+    val settingsRequest = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        reportPermissionResult(permissionAllowed(state.setupStep), state.setupStep)
+    }
     var keepConnected by rememberSaveable(state.setupComplete, state.setupOrigin) {
         mutableStateOf(if (state.setupComplete) KeepConnectedService.isEnabled(context) else true)
     }
@@ -214,37 +284,50 @@ internal fun SetupWizardScreen(
                     // KEEP_CONNECTED_STEP_EXTENSION_POINT; kept empty until the connection-service leaf adds its step.
                     "permission-microphone", "permission-notifications", "permission-full-screen" -> {
                         val permission = state.setupStep
-                        val (title, reason, allowed) = when (permission) {
-                            "permission-microphone" -> Triple(
+                        val (title, reason) = when (permission) {
+                            "permission-microphone" -> Pair(
                                 "Microphone",
                                 "Allow the microphone when you choose to start a call.",
-                                ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED,
                             )
-                            "permission-notifications" -> Triple(
+                            "permission-notifications" -> Pair(
                                 "Notifications",
                                 "Allow notifications so call and connection updates can reach you.",
-                                Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED,
                             )
                             else -> {
-                                val fullScreenAllowed = Build.VERSION.SDK_INT < 34 || context.getSystemService(NotificationManager::class.java)?.canUseFullScreenIntent() == true
-                                Triple(
+                                Pair(
                                     "Full-screen call alerts",
                                     "Allow full-screen alerts so an incoming call can get your attention.",
-                                    fullScreenAllowed,
                                 )
                             }
                         }
-                        val action: () -> Unit = when (permission) {
-                            "permission-microphone" -> { { permissionRequest.launch(Manifest.permission.RECORD_AUDIO) } }
-                            "permission-notifications" -> { { permissionRequest.launch(Manifest.permission.POST_NOTIFICATIONS) } }
-                            else -> { { settingsRequest.launch(Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT).setData(Uri.parse("package:${context.packageName}"))) } }
+                        val allowed = permissionAllowed(permission)
+                        val permanentDenial = when (permission) {
+                            "permission-microphone" -> setupPermissionRequiresSettings(permissionDenied, showRationale(Manifest.permission.RECORD_AUDIO))
+                            "permission-notifications" -> setupPermissionRequiresSettings(permissionDenied, showRationale(Manifest.permission.POST_NOTIFICATIONS))
+                            else -> false
+                        }
+                        val openAppSettings = {
+                            settingsRequest.launch(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).setData(Uri.parse("package:${context.packageName}")))
+                        }
+                        val action: () -> Unit = {
+                            when (permission) {
+                                "permission-microphone" -> if (permanentDenial) openAppSettings() else permissionRequest.launch(Manifest.permission.RECORD_AUDIO)
+                                "permission-notifications" -> if (permanentDenial) openAppSettings() else permissionRequest.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                else -> settingsRequest.launch(Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT).setData(Uri.parse("package:${context.packageName}")))
+                            }
                         }
                         Text(title, style = MaterialTheme.typography.headlineSmall)
                         Text(reason, style = MaterialTheme.typography.bodyLarge)
+                        permissionNotice.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
                         state.notice.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                         state.setupPluginMessage.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                        Button(onClick = if (allowed) onAdvancePermission else action, enabled = !state.loading, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-permission-primary")) {
-                            Text(if (allowed) "Continue" else "Allow $title")
+                        Button(onClick = { if (allowed) reportPermissionResult(true, permission) else action() }, enabled = !state.loading, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-permission-primary")) {
+                            Text(when {
+                                allowed -> "Continue"
+                                permission == "permission-full-screen" -> "Open settings"
+                                permanentDenial -> "Open app settings"
+                                else -> "Allow $title"
+                            })
                         }
                         TextButton(onClick = onAdvancePermission, modifier = Modifier.align(Alignment.CenterHorizontally).testTag("setup-permission-skip")) { Text("Skip for now") }
                         if (state.authenticated) TextButton(onClick = onCancel, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text("Close setup") }
@@ -269,18 +352,7 @@ internal fun SetupWizardScreen(
                         Text("Scan the Cypher QR on your Hermes dashboard, or paste its link or HTTPS server address.", style = MaterialTheme.typography.bodyLarge)
                         OutlinedTextField(
                             value = address,
-                            onValueChange = { value ->
-                                val input = value.trim()
-                                val uri = Uri.parse(input)
-                                if (uri.scheme.equals("cypher", ignoreCase = true) && uri.host.equals("connect", ignoreCase = true)) {
-                                    val parsed = runCatching { parseCypherConnectLink(value) }.getOrNull()
-                                    val hasSession = runCatching { uri.getQueryParameters("session").isNotEmpty() }.getOrDefault(false) || input.contains("session=", ignoreCase = true)
-                                    if (parsed != null || hasSession) {
-                                        address = setupAddressForDisplay(value)
-                                        onStageLink(value)
-                                    } else address = value
-                                } else address = value
-                            },
+                            onValueChange = { address = it },
                             label = { Text("Paste link or address") },
                             placeholder = { Text("https://your-device.ts.net") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),

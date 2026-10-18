@@ -28,6 +28,9 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 private val opaquePattern=Regex("[A-Za-z0-9_.:-]+")
 fun validOpaque(value: String): Boolean = value.length in 1..200 && value != "." && value != ".." && value.matches(opaquePattern)
+internal fun requiresLocalKeepConnectedReceipt(localActionToken: String?): Boolean = localActionToken != null
+internal fun canAuthorizeWithoutKeepConnectedReceipt(receiptRequired: Boolean, action: String): Boolean =
+    !receiptRequired && (action == "answer" || action == "decline")
 internal fun nativePushBindingAuthorized(binding: JSONObject, auth: dev.hermes.android.data.AuthContext): Boolean =
     binding.string("backend") == "hermes-dashboard" && binding.string("profile").isNotBlank() &&
         auth.authorizesPushSource(Scope(binding.string("origin"), binding.string("owner"), binding.string("profile")))
@@ -179,7 +182,9 @@ class PushManager(private val app: CypherApplication) {
     }
     fun authorizeKeepConnectedAction(source: String, event: String, action: String): Boolean {
         val invite = deadlineInvitation(source, event) ?: return false
-        val receipt = synchronized(lock) { keepConnectedReceipts["$source\u0000$event".digest()] } ?: return false
+        val receipt = synchronized(lock) { keepConnectedReceipts["$source\u0000$event".digest()] }
+            ?: return canAuthorizeWithoutKeepConnectedReceipt(invitationRequiresKeepConnectedReceipt(source, event), action) &&
+                invitation(source, event) != null
         val call = receipt.prepared
         val scope = Scope(call.binding.origin, call.binding.owner, call.binding.profile)
         if (receipt.source != source || !receiptStillAuthorized(source, call)) {
@@ -215,16 +220,21 @@ class PushManager(private val app: CypherApplication) {
                 it.optLong("arrived_at"), it.optLong("arrived_elapsed"), it.optInt("boot", -2), it.optString("state", "missed"), it.optString("conversation"))
         }?.takeIf { it.source == source && it.event == event }
     }.getOrNull()
-    private fun persistInvitation(invite: IncomingCall) = save("incoming:${invite.key}", json("source" to invite.source, "event" to invite.event,
+    private fun invitationRequiresKeepConnectedReceipt(source: String, event: String): Boolean = runCatching {
+        val stored = read("incoming:${"$source\u0000$event".digest()}") ?: return@runCatching true
+        !stored.has("keep_connected_receipt_required") || stored.optBoolean("keep_connected_receipt_required")
+    }.getOrDefault(true)
+    private fun persistInvitation(invite: IncomingCall, receiptRequired: Boolean = invitationRequiresKeepConnectedReceipt(invite.source, invite.event)) = save("incoming:${invite.key}", json("source" to invite.source, "event" to invite.event,
         "expires_at" to invite.expiresAt, "action_token" to invite.actionToken, "arrived_at" to invite.arrivedAt,
-        "arrived_elapsed" to invite.arrivedElapsed, "boot" to invite.boot, "state" to invite.state, "conversation" to invite.conversation))
+        "arrived_elapsed" to invite.arrivedElapsed, "boot" to invite.boot, "state" to invite.state, "conversation" to invite.conversation,
+        "keep_connected_receipt_required" to receiptRequired))
     private fun deadlineIntent(invite: IncomingCall) = PendingIntent.getBroadcast(app, 0,
         Intent(app, IncomingCallReceiver::class.java).setAction(invite.deadlineAction).setData(android.net.Uri.parse("hermes://incoming/${invite.key}/deadline"))
             .putExtra("push_source", invite.source).putExtra("push_event", invite.event), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-    fun saveInvitation(invite: IncomingCall): Boolean = synchronized(lock) {
+    fun saveInvitation(invite: IncomingCall, receiptRequired: Boolean = true): Boolean = synchronized(lock) {
         if (!invite.valid() || !permitsIncoming(invite.source) || storedInvitation(invite.source, invite.event) != null) return false
         val saved = invite.copy(arrivedAt = System.currentTimeMillis(), arrivedElapsed = android.os.SystemClock.elapsedRealtime(), boot = bootCount())
-        persistInvitation(saved)
+        persistInvitation(saved, receiptRequired)
         _incoming.value = saved
         val alarm = app.getSystemService(AlarmManager::class.java)
         // Exact alarm access is optional; the active service independently enforces the audio deadline.
@@ -423,7 +433,7 @@ private fun receivePush(context: Context, data: Map<String, String>, localAction
         ) else null
         if (incoming && (invite == null || !invite.valid() || !validOpaque(data["conversation_ref"].orEmpty()) || !app.push.permitsIncoming(source))) return
         if (!incoming && !app.push.firstArrival(source, event)) return
-        val ring = invite != null && app.push.saveInvitation(invite!!)
+        val ring = invite != null && app.push.saveInvitation(invite!!, requiresLocalKeepConnectedReceipt(localActionToken))
         if (incoming && !ring) return
         if (ring) invite = app.push.ringingInvitation(source, event)
         if (android.os.Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
