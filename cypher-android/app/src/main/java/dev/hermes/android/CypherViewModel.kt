@@ -44,6 +44,11 @@ data class Message(val id: String, val role: String, val text: String, val reaso
 data class ChatState(val sessionId: String = "", val title: String = "New conversation", val messages: List<Message> = emptyList(), val raw: JSONObject = JSONObject(), val streamId: String = "", val liveText: String = "", val liveReasoning: String = "", val liveTools: List<JSONObject> = emptyList(), val status: String = "", val approval: JSONObject? = null, val clarification: JSONObject? = null, val uncertain: String = "", val queued: List<QueuedMessage> = emptyList(), val anchor: Int = 0, val anchorOffset: Int = 0, val anchorId: String = "", val callMessages: List<CallTranscript> = emptyList(), val projectionReady: Boolean = true)
 internal fun sessionCanStillBeUnpersisted(clientCreated: Boolean, chat: ChatState): Boolean =
     clientCreated && chat.messages.isEmpty() && chat.callMessages.isEmpty() && chat.liveText.isBlank() && chat.streamId.isBlank() && chat.raw.optInt("message_count") == 0
+internal fun releaseTerminalChat(chat: ChatState, stream: String, replyConfirmed: Boolean, terminalStatus: String): ChatState {
+    if (chat.streamId != stream) return chat
+    return if (replyConfirmed) chat.copy(streamId = "", liveText = "", liveReasoning = "", liveTools = emptyList(), status = terminalStatus)
+    else chat.copy(streamId = "", liveTools = emptyList())
+}
 data class EditorState(val scope: Scope? = null, val path: String = "", val text: TextFieldValue = TextFieldValue(), val serverText: String = "", val metadata: JSONObject = JSONObject(), val loading: Boolean = false, val saving: Boolean = false, val error: String = "", val reviewRequired: Boolean = false) { val dirty get() = text.text != serverText }
 data class SideQuestion(val scope: Scope, val question: String, val sessionId: String, val streamId: String, val text: String = "", val status: String = "Responding", val cursor: String = "", val error: String = "")
 data class AppUpdateState(val release: Release? = null, val busy: Boolean = false, val ready: Boolean = false, val status: String = "Cypher checks for updates automatically while connected.")
@@ -1436,7 +1441,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val selection = sessionGeneration
         val navigation = navigationGeneration
         val tab = _ui.value.tab
-        val c = active.detached()
+        val c = active
         fun current() = client === active && active.scope == owner && originGeneration == origin && sessionGeneration == selection && navigationGeneration == navigation && sourceScope == selected && _ui.value.tab == tab
         val request = JSONObject(body.toString()).apply { put("profile", owner.profile); selected?.session?.let { put("prev_session_id", it) } }
         val attempt = if (initial) java.util.UUID.randomUUID().toString().also { initialCreateAttempts[owner.key] = it } else null
@@ -1492,7 +1497,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val id = initialShells[owner.key] ?: return viewModelScope.launch {}
         newChatJobs[owner.key]?.takeIf { !it.isCompleted }?.let { return it }
         val origin = originGeneration; val selection = sessionGeneration; val navigation = navigationGeneration
-        val c = active.detached()
+        val c = active
         val scope = owner.session(id)
         fun current() = client === active && active.scope == owner && originGeneration == origin && sessionGeneration == selection && navigationGeneration == navigation && canComposeInitialChat()
         suspend fun clientCreatedShell() = clientCreatedSessions.contains(scope.key) || try {
@@ -1519,6 +1524,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 val session = response.optJSONObject("session") ?: response
                 require(session.string("session_id") == id) { "The conversation response changed identity" }
                 require(session.rows("messages").isEmpty() && session.optInt("message_count") == 0 && session.string("active_stream_id").isBlank() && !session.optBoolean("has_pending_user_message") && session.opt("pending_user_message") in listOf(null, JSONObject.NULL, "") && session.string("profile", "default") == owner.profile) { "The saved conversation is no longer an empty draft. Open it from history or retry a new conversation." }
+                if (clientCreatedShell()) clientCreatedSessions.add(scope.key)
                 if (!current()) return@launch
                 app.cache.delete(owner, "new-chat-attempt"); initialCreateAttempts.remove(owner.key)
                 if (!current()) return@launch
@@ -1594,7 +1600,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val owner = active?.scope ?: cachedOwnerScope
         val generation = ++xaraGeneration
         val connection = originGeneration
-        val c = active?.detached()
+        val c = active
         fun current() = generation == xaraGeneration && connection == originGeneration && _ui.value.tab == "Xara" && client === active && (client?.scope ?: cachedOwnerScope) == owner
         return viewModelScope.launch {
             if (!current()) return@launch
@@ -1822,8 +1828,9 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     fun send(queued: QueuedMessage? = null) = viewModelScope.launch {
         if (_attachmentPreparation.value.isNotEmpty()) { notice("Finish or remove attachments before sending"); return@launch }
         if (!admitConversation()) return@launch
-        val c = client?.detached() ?: run { notice("Reconnect before sending. Your draft is retained."); return@launch }
+        val active = client ?: run { notice("Reconnect before sending. Your draft is retained."); return@launch }
         val scope = sourceScope ?: return@launch
+        val c = if (clientCreatedSessions.contains(scope.key)) active else active.detached()
         val d = draft()
         if (_chat.value.raw.length() == 0) { notice("Wait for this conversation to load before sending"); return@launch }
         if (app.calls.state.value.active || _chat.value.approval != null || _chat.value.clarification != null) { notice("Finish the call or pending request before sending"); return@launch }
@@ -2005,11 +2012,21 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                         if (sourceScope == scope && client?.scope == c.scope) _chat.update { it.copy(status = terminalError.ifBlank { "Reply ended" } + " · final history refresh failed; live output retained") }
                     }
                 }
-                if (terminalObserved && terminalReplyVisible) {
-                    liveFrames.remove(frameKey); liveBoundaries.remove(frameKey); persistedTurns.remove(frameKey); app.cache.delete(scope, "live:$stream")
-                    if (sourceScope == scope) { pollPrompts(c, scope); refreshSessions(); _chat.update { it.copy(streamId = "", liveText = "", liveReasoning = "", liveTools = emptyList(), status = terminalError) }; val q = _chat.value.queued.firstOrNull(); if (q != null && _composer.value.text.isBlank() && _attachments.value.isEmpty()) { removeQueued(0); _attachments.value = q.attachments; composer(TextFieldValue(q.text)); send(q) } }
+                if (terminalObserved) {
+                    if (terminalReplyVisible) { liveFrames.remove(frameKey); liveBoundaries.remove(frameKey); persistedTurns.remove(frameKey); app.cache.delete(scope, "live:$stream") }
+                    if (sourceScope == scope) {
+                        _chat.update { releaseTerminalChat(it, stream, terminalReplyVisible, terminalError) }
+                        pollPrompts(c, scope); refreshSessions()
+                        if (terminalReplyVisible) {
+                            val q = _chat.value.queued.firstOrNull()
+                            if (q != null && _composer.value.text.isBlank() && _attachments.value.isEmpty()) { removeQueued(0); _attachments.value = q.attachments; composer(TextFieldValue(q.text)); send(q) }
+                        }
+                    }
                 }
-            } catch (e: Throwable) { if (e is CancellationException) throw e; if (sourceScope == scope) fail(e) } finally { if (streams[scope.key] == currentCoroutineContext()[Job]) streams.remove(scope.key) }
+            } catch (e: Throwable) { if (e is CancellationException) throw e; if (sourceScope == scope) fail(e) } finally {
+                if (terminalObserved && sourceScope == scope) _chat.update { releaseTerminalChat(it, stream, terminalReplyVisible, terminalError) }
+                if (streams[scope.key] == currentCoroutineContext()[Job]) streams.remove(scope.key)
+            }
         }
     }
     private fun applyEvent(scope: Scope, event: SseEvent) {

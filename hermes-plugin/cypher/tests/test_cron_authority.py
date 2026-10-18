@@ -104,11 +104,18 @@ def test_call_user_rejects_foreign_owned_cron_and_allows_unowned_cron(harness, m
         'cron-foreign': {'user_id': 'basic:intruder', 'source': 'cron', 'title': 'Foreign cron'},
         'cron-unowned': {'user_id': None, 'source': 'cron', 'title': 'Owner callback'},
         'cron-owner': {'user_id': 'cron-owner', 'source': 'cron', 'title': 'Owner check-up'},
+        'phone-unowned': {'user_id': None, 'source': 'android', 'title': 'Unowned phone chat'},
     })
     monkeypatch.setattr(api.native, 'verify', lambda *args: {})
+    not_owned = {
+        'error': 'This chat is not linked to your Hermes sign-in, so Cypher cannot ring from it. Start a new chat in Cypher and ask again.',
+        'reason': 'conversation_not_owned',
+    }
 
     denied = json.loads(plugin.call_user({'reason': 'ring the owner'}, session_id='cron-foreign'))
-    assert 'error' in denied
+    assert denied == not_owned
+    assert json.loads(plugin.call_user({'reason': 'ring the owner'}, session_id='phone-unowned')) == not_owned
+    assert json.loads(plugin.call_user({'reason': 'ring the owner'}, session_id='missing')) == {'error': 'Owned native callback context unavailable'}
     with api.mobile.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM notices WHERE kind='incoming_call'").fetchone()[0] == 0
 

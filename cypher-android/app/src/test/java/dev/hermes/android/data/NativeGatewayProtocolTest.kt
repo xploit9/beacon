@@ -284,7 +284,7 @@ class NativeGatewayProtocolTest {
         val stop = IOException("fixture-stop")
         try { gateway.events { frame -> val seq = frame.getJSONObject("params").getLong("seq"); received.add(seq); if (seq == 2L) throw stop } } catch (e: IOException) { assertSame(stop, e) }
         assertEquals(listOf(1L, 2L), received)
-        assertFalse(wire.sent.first().getJSONObject("params").has("source"))
+        assertEquals("android", wire.sent.first().getJSONObject("params").getString("source"))
         gateway.close()
     }
     @Test fun currentTurnReplayDoesNotTerminateOnAnOlderCompletion() = runBlocking<Unit> {

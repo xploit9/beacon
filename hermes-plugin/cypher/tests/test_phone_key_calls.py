@@ -1,10 +1,17 @@
 import json
 import sys
+from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from test_mobile import harness
+
+
+def bind_conversation_rows(monkeypatch, rows):
+    db = SimpleNamespace(get_session=rows.get)
+    server = SimpleNamespace(_profile_db=lambda scope: nullcontext(db))
+    monkeypatch.setitem(sys.modules, 'tui_gateway', SimpleNamespace(server=server))
 
 
 def stub_google_token(monkeypatch):
@@ -43,6 +50,38 @@ def test_phone_key_calls_record_provider_and_keep_context_without_server_secrets
 
     context = client.get(f"/api/plugins/cypher/mobile/calls/{call['call_id']}/context")
     assert context.status_code == 200 and context.json()['context_summary'] == 'owned native context'
+
+
+def test_unowned_existing_chat_call_error_is_actionable_but_other_lookup_errors_stay_generic(harness, monkeypatch):
+    api, client, _, _, _ = harness
+    rows = {'phone-unowned': {'id': 'phone-unowned', 'user_id': None, 'source': 'android'}}
+    bind_conversation_rows(monkeypatch, rows)
+    monkeypatch.setattr(api.native, 'reserve_conversation', lambda *args: (_ for _ in ()).throw(LookupError('not owned')))
+
+    response = client.post('/api/plugins/cypher/mobile/calls', json={'profile': 'default', 'conversation_id': 'phone-unowned'})
+
+    assert response.status_code == 404
+    assert response.json()['detail'] == 'This chat is not linked to your Hermes sign-in, so Cypher cannot start a call from it. Start a new chat in Cypher.'
+    rows.clear()
+    missing = client.post('/api/plugins/cypher/mobile/calls', json={'profile': 'default', 'conversation_id': 'missing'})
+    assert missing.status_code == 404 and missing.json()['detail'] == 'Owned resource unavailable'
+
+
+def test_unowned_existing_callback_answer_keeps_404_and_gives_actionable_error(harness, monkeypatch):
+    api, client, _, _, _ = harness
+    rows = {'phone-unowned': {'id': 'phone-unowned', 'user_id': None, 'source': 'android'}}
+    bind_conversation_rows(monkeypatch, rows)
+    verified = []
+    monkeypatch.setattr(api.native, 'verify', lambda *args: verified.append(args))
+    invitation = api.mobile.invitation('owner', 'default', 'phone-unowned')
+
+    response = client.post(f'/api/plugins/cypher/mobile/callbacks/{invitation}/answer', json={})
+
+    assert response.status_code == 404
+    assert response.json()['detail'] == 'This chat is not linked to your Hermes sign-in, so Cypher cannot start a call from it. Start a new chat in Cypher.'
+    assert verified == []
+    with api.mobile.connect() as conn:
+        assert conn.execute('SELECT state FROM notices WHERE id=?', (invitation,)).fetchone()['state'] == 'pending'
 
 
 @pytest.mark.parametrize('field', ['api_key', 'key', 'token'])

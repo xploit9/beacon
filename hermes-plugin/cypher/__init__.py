@@ -46,7 +46,7 @@ def call_user(args,session_id=None,**kwargs):
         if not row: raise LookupError('Native session unavailable')
         if row.get('user_id')!=provider+':'+owner:
             if not _cron_fallback_allowed(cfg,row):
-                raise LookupError('Native session owner mismatch')
+                return json.dumps({'error':'This chat is not linked to your Hermes sign-in, so Cypher cannot ring from it. Start a new chat in Cypher and ask again.','reason':'conversation_not_owned'})
             stored=cfg.get('scheduled_callback_conversation_id')
         native.verify(owner,provider,profile,stored)
         reason=args.get('reason',row.get('title','')) if isinstance(args,dict) else row.get('title','')

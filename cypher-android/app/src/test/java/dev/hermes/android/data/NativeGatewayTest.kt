@@ -12,6 +12,65 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class NativeGatewayTest {
+    private class GatewayFixture {
+        val calls = mutableListOf<Pair<String, JSONObject>>()
+        var socketCount = 0
+        val client = CypherClient(AuthContext("https://native.example", emptyList(), "owner", "default", backend = "hermes-dashboard"), null,
+            WebSocket.Factory { request, listener ->
+                socketCount++
+                val socket = object : WebSocket {
+                    override fun request() = request
+                    override fun queueSize() = 0L
+                    override fun cancel() = Unit
+                    override fun close(code: Int, reason: String?) = true
+                    override fun send(bytes: ByteString) = false
+                    override fun send(text: String): Boolean {
+                        val frame = JSONObject(text)
+                        val method = frame.getString("method")
+                        val params = frame.getJSONObject("params").copy()
+                        calls += method to params
+                        val result = when (method) {
+                            "session.create" -> json("session_id" to "phone-runtime", "stored_session_id" to "20261019_001507_a4cbef", "messages" to JSONArray(), "info" to json("lazy" to true))
+                            "session.resume" -> json("session_id" to "phone-runtime", "session_key" to "20261019_001507_a4cbef", "messages" to JSONArray(), "info" to json("lazy" to true))
+                            "session.events.since" -> json("events" to JSONArray(), "latest_seq" to 0, "epoch" to "fixture-epoch")
+                            "prompt.submit" -> json("status" to "streaming", "user_row_id" to 1)
+                            else -> JSONObject()
+                        }
+                        listener.onMessage(this, json("jsonrpc" to "2.0", "id" to frame.getString("id"), "result" to result).toString())
+                        return true
+                    }
+                }
+                listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Fixture").build())
+                socket
+            }) { builder ->
+                builder.addInterceptor { chain -> Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
+                    .body(json("ticket" to "fixture-ticket").toString().toResponseBody("application/json".toMediaType())).build() }
+            }
+    }
+
+    @Test fun newChatFirstPromptUsesTheLiveRuntimeCreatedForThatChat() = runBlocking<Unit> {
+        val fixture = GatewayFixture()
+        val stored = "20261019_001507_a4cbef"
+
+        val created = fixture.client.post("/api/session/new")
+        val accepted = fixture.client.post("/api/chat/start", json("session_id" to stored, "message" to "Hello", "attachments" to JSONArray()))
+
+        assertEquals(stored, created.getString("session_id"))
+        assertTrue(accepted.getBoolean("accepted"))
+        assertEquals("The creating client keeps one live socket through the first prompt", 1, fixture.socketCount)
+        assertEquals(listOf("session.create", "session.events.since", "prompt.submit"), fixture.calls.map { it.first })
+        assertEquals("phone-runtime", fixture.calls.last().second.getString("session_id"))
+        fixture.client.closeNative()
+    }
+
+    @Test fun everyStoredSessionResumeCarriesAndroidSource() = runBlocking<Unit> {
+        val fixture = GatewayFixture()
+        fixture.client.nativeSession("20261019_001507_a4cbef")
+
+        assertEquals("android", fixture.calls.single { it.first == "session.resume" }.second.getString("source"))
+        fixture.client.closeNative()
+    }
+
     @Test fun synchronousSocketFailureDoesNotRetainAConnection() = runBlocking<Unit> {
         val client = CypherClient(AuthContext("https://native.example", emptyList(), "owner", "default", backend = "hermes-dashboard"), null) { builder ->
             builder.addInterceptor { chain -> Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
