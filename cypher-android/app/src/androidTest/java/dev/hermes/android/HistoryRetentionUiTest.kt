@@ -32,7 +32,7 @@ class HistoryRetentionUiTest {
         compose.onNodeWithText("Current server setting: Forever").assertIsDisplayed()
         compose.onNodeWithContentDescription("History retention choice").performClick()
         compose.onNodeWithText("30 days").performClick()
-        compose.onNodeWithText("Older call transcripts and task history on Hermes will be deleted").assertIsDisplayed()
+        compose.onNodeWithText("Call transcripts and task history older than 30 days will be deleted from Hermes. This can’t be undone.").assertIsDisplayed()
         compose.onNodeWithText("Cancel").performClick()
         assertEquals(-1, saved)
 

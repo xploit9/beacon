@@ -335,7 +335,7 @@ internal fun historyRetentionNeedsConfirmation(currentDays: Int, selectedDays: I
         AlertDialog(
             onDismissRequest = { if (!saving) pendingDays = null },
             title = { Text("Shorten history retention?") },
-            text = { Text("Older call transcripts and task history on Hermes will be deleted") },
+            text = { Text("Call transcripts and task history older than ${historyRetentionLabel(days)} will be deleted from Hermes. This can’t be undone.") },
             confirmButton = {
                 TextButton(onClick = { pendingDays = null; onSave(days) }, enabled = !saving) { Text("Delete older history") }
             },
