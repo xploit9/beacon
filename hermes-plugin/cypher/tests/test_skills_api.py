@@ -69,6 +69,24 @@ def test_skill_search_contracts_keep_project_quarantine(native_home, monkeypatch
     assert calls == [project, project]
 
 
+def test_alias_lookup_skips_unreadable_skill(native_home, monkeypatch):
+    from tools import skill_manager_tool, skills_tool
+    broken = native_home / 'skills' / 'broken' / 'SKILL.md'
+    alias_dir = native_home / 'skills' / 'alias'
+    alias_file = alias_dir / 'SKILL.md'
+    broken.parent.mkdir();alias_dir.mkdir()
+    alias_file.write_text('---\nname: mail-alias\n---\nAlias body\n', encoding='utf-8')
+    monkeypatch.setattr(skill_manager_tool, '_find_skill', lambda name: None)
+    monkeypatch.setattr(skill_manager_tool, '_validate_name', lambda name: None)
+    monkeypatch.setattr(api, 'skill_files', lambda native: [broken, alias_file])
+    monkeypatch.setattr(skills_tool, '_read_skill_text', lambda path: (_ for _ in ()).throw(OSError()) if path == broken else '---\nname: mail-alias\n---\nAlias body')
+    monkeypatch.setattr(skills_tool, '_parse_frontmatter', lambda text: ({'name': 'mail-alias'}, 'Alias body'))
+
+    result = api.document(native_home, 'mail-alias')
+
+    assert result['name'] == 'mail-alias' and result['content'].endswith('Alias body\n')
+
+
 def test_native_edit_validates_and_revision_preserves_concurrent_write(native_home):
     path = create(native_home)
     before = api.document(native_home, 'mail')

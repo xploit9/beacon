@@ -78,7 +78,10 @@ def document(root, name):
     found = _find_skill(name)
     if not found:
         for candidate in skill_files(native):
-            frontmatter, _ = native._parse_frontmatter(native._read_skill_text(candidate)[:4000])
+            try:
+                frontmatter, _ = native._parse_frontmatter(native._read_skill_text(candidate)[:4000])
+            except Exception:
+                continue
             if frontmatter.get('name', candidate.parent.name) == name:
                 found = {'path': candidate.parent}
                 break

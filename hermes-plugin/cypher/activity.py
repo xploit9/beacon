@@ -103,13 +103,15 @@ def answer(mobile, native, owner, provider, profile, event, value):
             raise ValueError('Open Cypher to review the full request')
         params = frame.get('params', {})
         choices = request_actions(frame)
-        if params.get('choices') is not None and value not in [c['value'] for c in choices]: raise ValueError('Answer was not offered')
+        if params.get('choices') and value not in [c['value'] for c in choices]: raise ValueError('Answer was not offered')
         if frame['method'] == 'approval' and not choices: raise ValueError('No approval choice offered')
         if frame['method'] == 'clarify' and (params.get('questions') or params.get('multi_select')):
             raise ValueError('Review this question in the app')
-        result = {'choice': value} if frame['method'] == 'approval' else {'answer': value}
-        receipt = native.rpc(owner, provider, 'request.answer', {'id': frame['id'], 'result': result})
-        if receipt.get('status') != 'ok': raise ValueError('Native request already settled')
+        if frame['method'] == 'approval':
+            receipt = native.rpc(owner, provider, 'approval.respond', {'session_id': row['runtime'], 'request_id': frame['id'], 'choice': value})
+        else:
+            receipt = native.rpc(owner, provider, 'request.answer', {'id': frame['id'], 'result': {'answer': value}})
+        if not isinstance(receipt,dict) or receipt.get('ok') is not True: raise ValueError('Native request already settled')
         with mobile.LOCK, mobile.connect() as conn:
             conn.execute("UPDATE notices SET state='answered' WHERE id=? AND owner=? AND profile=?", (event,owner,profile))
         return {'status': 'answered', 'event_id': event}

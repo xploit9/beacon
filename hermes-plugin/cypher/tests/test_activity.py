@@ -13,7 +13,7 @@ def activity_harness(harness,monkeypatch):
     monkeypatch.setattr(api.activity,'snapshot',lambda *args:work)
     monkeypatch.setitem(sys.modules,'tui_gateway',SimpleNamespace(server_requests=SimpleNamespace(open_requests=lambda sid:frames)))
     answers=[]
-    monkeypatch.setattr(api.native,'rpc',lambda *args:answers.append(args) or {'status':'ok'})
+    monkeypatch.setattr(api.native,'rpc',lambda *args:answers.append(args) or {'ok':True})
     api.activity.sync(api.mobile,api.native,'owner','basic','default')
     return api,client,frames,work,answers
 
@@ -27,7 +27,7 @@ def test_authenticated_offered_action_and_replay(activity_harness):
     assert c.post(BASE+'/native-srq-fixture/answer',json={'answer':'always'}).status_code==409
     assert not answers
     assert c.post(BASE+'/native-srq-fixture/answer',json={'answer':'once'}).status_code==200
-    assert answers[0][-2:] == ('request.answer',{'id':'srq-fixture','result':{'choice':'once'}})
+    assert answers[0][-2:] == ('approval.respond',{'session_id':'runtime','request_id':'srq-fixture','choice':'once'})
     assert c.post(BASE+'/native-srq-fixture/answer',json={'answer':'once'}).status_code==409
     assert len(answers)==1
 
@@ -52,7 +52,7 @@ def test_incomplete_permission_preview_cannot_authorize_a_hidden_command(activit
     assert c.post(BASE+'/native-srq-fixture/answer',json={'answer':'once'}).status_code==409
     assert not answers
     assert c.post(BASE+'/native-srq-fixture/answer',json={'answer':'deny'}).status_code==200
-    assert answers[0][-1]['result']=={'choice':'deny'}
+    assert answers[0][-2:] == ('approval.respond',{'session_id':'runtime','request_id':'srq-fixture','choice':'deny'})
 
 def test_redaction_is_forced_and_android_utf16_preview_limit_is_respected(activity_harness,monkeypatch):
     api,c,frames,work,answers=activity_harness
@@ -101,6 +101,15 @@ def test_single_question_text_and_complex_question_open_app(activity_harness):
     frames[0]['params']={'question':'Fixture question'}
     assert c.post(BASE+'/native-srq-fixture/answer',json={'answer':'text'}).status_code==200
     assert answers[-1][-1]['result']=={'answer':'text'}
+
+
+def test_empty_clarify_choices_allow_free_text(activity_harness):
+    api,c,frames,work,answers=activity_harness
+    frames[0]['method']='clarify';frames[0]['params']={'question':'Fixture question','choices':[]}
+    with api.mobile.connect() as conn:conn.execute("UPDATE notices SET kind='clarify'")
+
+    assert c.post(BASE+'/native-srq-fixture/answer',json={'answer':'free text'}).status_code==200
+    assert answers[-1][-2:] == ('request.answer',{'id':'srq-fixture','result':{'answer':'free text'}})
 
 def test_work_and_end_cursor_outbox(activity_harness):
     api,c,frames,work,answers=activity_harness

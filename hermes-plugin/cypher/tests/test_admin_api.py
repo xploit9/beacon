@@ -10,6 +10,31 @@ api = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(api)
 
 
+def install_snapshot_sources(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    from types import ModuleType, SimpleNamespace
+    import threading
+    hermes_cli = ModuleType('hermes_cli'); hermes_cli.__path__ = []
+    profiles_api = ModuleType('hermes_cli.profiles')
+    profiles_api.list_profiles = lambda **kwargs: [SimpleNamespace(name='default')]
+    hermes_cli.profiles = profiles_api
+    routers = ModuleType('hermes_cli.web_routers'); routers.__path__ = []
+    config_api = ModuleType('hermes_cli.config')
+    config_api.load_config = lambda: {'model': {}}
+    scopes = ModuleType('hermes_cli.web_server_profiles')
+    scopes._config_profile_scope = lambda profile: nullcontext()
+    scopes._resolve_profile_dir = lambda profile: tmp_path
+    common = ModuleType('hermes_cli.web_routers._common')
+    common._CONFIG_MUTATION_LOCK = threading.RLock()
+    profile_api = ModuleType('hermes_cli.web_routers.profiles')
+    profile_api._profile_to_dict = lambda info: {'description': '', 'provider': '', 'model': ''}
+    for name, module in (('hermes_cli', hermes_cli), ('hermes_cli.profiles', profiles_api),
+                         ('hermes_cli.web_routers', routers), ('hermes_cli.config', config_api),
+                         ('hermes_cli.web_server_profiles', scopes), ('hermes_cli.web_routers._common', common),
+                         ('hermes_cli.web_routers.profiles', profile_api)):
+        monkeypatch.setitem(sys.modules, name, module)
+
+
 def test_reasoning_choices_use_published_metadata_and_no_invented_levels():
     assert api.reasoning_options({'reasoning_efforts': [{'value': 'low'}, {'value': 'max'}, {'value': 'future'}]}) == ['low', 'max']
     assert api.reasoning_options({'capabilities': {'reasoning_effort': ['high', 'low']}}) == ['low', 'high']
@@ -81,14 +106,15 @@ def test_model_revision_rejects_stale_write_and_preserves_unrelated_config(tmp_p
     scopes._config_profile_scope = lambda profile: nullcontext()
     scopes._resolve_profile_dir = lambda profile: tmp_path
     common = ModuleType('hermes_cli.web_routers._common')
-    common._CONFIG_MUTATION_LOCK = threading.RLock()
+    common._CONFIG_MUTATION_LOCK = threading.Lock()
     profiles = ModuleType('hermes_cli.web_routers.profiles')
     profiles._write_profile_model = write_model
     for name, module in (('hermes_cli', hermes_cli), ('hermes_cli.web_routers', routers),
                          ('hermes_cli.config', config_api), ('hermes_cli.web_server_profiles', scopes),
                          ('hermes_cli.web_routers._common', common), ('hermes_cli.web_routers.profiles', profiles)):
         monkeypatch.setitem(sys.modules, name, module)
-    monkeypatch.setattr(api, 'snapshot', lambda profile: {'profile': profile})
+    monkeypatch.setattr(api, 'snapshot', lambda profile: pytest.fail('save_model re-entered snapshot under the native config lock'))
+    monkeypatch.setattr(api, '_snapshot_locked', lambda profile: {'profile': profile}, raising=False)
     with pytest.raises(HTTPException) as error:
         api.save_model('default', {'provider': 'custom', 'model': 'phone-model', 'revision': '0' * 64})
     assert error.value.status_code == 409
@@ -97,6 +123,20 @@ def test_model_revision_rejects_stale_write_and_preserves_unrelated_config(tmp_p
     assert api.save_model('default', {'provider': 'custom', 'model': 'phone-model', 'revision': current})['ok']
     assert writes == [(tmp_path, 'custom', 'phone-model')]
     assert config['model']['default'] == 'phone-model' and config['voice']['enabled'] is True
+
+
+@pytest.mark.parametrize(('kind', 'status', 'detail'), [('invalid', 409, 'encoding'), ('directory', 503, 'read')])
+def test_bot_instruction_read_errors_are_actionable(tmp_path, monkeypatch, kind, status, detail):
+    soul = tmp_path / 'SOUL.md'
+    if kind == 'invalid': soul.write_bytes(b'\xff')
+    else: soul.mkdir()
+    install_snapshot_sources(tmp_path, monkeypatch)
+
+    with pytest.raises(HTTPException) as error:
+        api.snapshot('default')
+
+    assert error.value.status_code == status
+    assert detail in error.value.detail.lower()
 
 
 def test_bot_list_only_exposes_configured_profiles(harness, monkeypatch):
