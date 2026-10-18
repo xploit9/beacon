@@ -12,6 +12,14 @@ for name in ('mobile','native','observers'):
         module=importlib.util.module_from_spec(spec);sys.modules[key]=module;spec.loader.exec_module(module)
 mobile=sys.modules['cypher_mobile'];native=sys.modules['cypher_native'];observers=sys.modules['cypher_observers']
 
+def _cron_fallback_allowed(cfg,row):
+    if row.get('source')!='cron' or cfg.get('scheduled_callbacks_enabled') is not True: return False
+    try:
+        from hermes_state_keys import CRON_PRINCIPAL_ID
+    except ImportError:
+        CRON_PRINCIPAL_ID='cron-owner'  # Hermes's stable scheduler principal remains known without this helper module.
+    return row.get('user_id') in (None,'',CRON_PRINCIPAL_ID)
+
 def call_user(args,session_id=None,**kwargs):
     cfg=mobile.settings()
     if cfg.get('callback_tool_enabled') is not True:
@@ -37,7 +45,7 @@ def call_user(args,session_id=None,**kwargs):
             row=db.get_session(stored) if db else None
         if not row: raise LookupError('Native session unavailable')
         if row.get('user_id')!=provider+':'+owner:
-            if row.get('source')!='cron' or row.get('user_id') not in (None,'') or cfg.get('scheduled_callbacks_enabled') is not True:
+            if not _cron_fallback_allowed(cfg,row):
                 raise LookupError('Native session owner mismatch')
             stored=cfg.get('scheduled_callback_conversation_id')
         native.verify(owner,provider,profile,stored)
@@ -67,7 +75,7 @@ def verify_mail_source(cfg,profile,session_id):
     with server._profile_db({'profile':profile}) as db: row=db.get_session(session_id) if db else None
     if not row: raise LookupError('Native mailbox scan session unavailable')
     if row.get('user_id')==provider+':'+owner: return
-    if row.get('source')!='cron' or row.get('user_id') not in (None,'') or cfg.get('scheduled_callbacks_enabled') is not True: raise LookupError('Mailbox scan session is not authorized')
+    if not _cron_fallback_allowed(cfg,row): raise LookupError('Mailbox scan session is not authorized')
     native.verify(owner,provider,profile,cfg.get('scheduled_callback_conversation_id'))
 
 def native_completion(**kwargs):
