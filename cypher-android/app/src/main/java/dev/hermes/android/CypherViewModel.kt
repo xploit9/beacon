@@ -1386,25 +1386,33 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val owner = initialDraftOwner()
         if (owner != null) {
             if (_ui.value.tab != "Chat") tab("Chat", resumeDraft = false)
-            newChatJobs[owner.key]?.takeIf { !it.isCompleted }?.let { return it }
             val active = client
             val origin = originGeneration
-            val navigation = ++navigationGeneration
             val options = JSONObject(body.toString())
+            newChatJobs[owner.key]?.takeIf { !it.isCompleted }?.let { opening ->
+                val shell = initialShells[owner.key] ?: return opening
+                return viewModelScope.launch {
+                    opening.join()
+                    if (client === active && originGeneration == origin && initialDraftOwner() == owner && canComposeInitialChat() &&
+                        !initialCreateAttempts.containsKey(owner.key) &&
+                        (initialShells[owner.key] == null || options.length() > 0 && initialShells[owner.key] == shell)
+                    ) newChat(options).join()
+                }
+            }
+            val navigation = ++navigationGeneration
             return viewModelScope.launch {
                 fun current() = client === active && originGeneration == origin && navigationGeneration == navigation && initialDraftOwner() == owner && canComposeInitialChat()
                 try {
                     if (!_ui.value.initialChatReady) restoreInitialDraft(owner, origin)
                     if (!current()) return@launch
-                    if (initialCreateAttempts.containsKey(owner.key) && initialShells.containsKey(owner.key)) {
+                    if (initialShells.containsKey(owner.key) && (initialCreateAttempts.containsKey(owner.key) || options.length() == 0)) {
                         resumeInitialChat().join()
                         if (!current()) return@launch
                     }
                     if (initialCreateAttempts.containsKey(owner.key)) { _ui.update { it.copy(newChatError = initialCreateError) }; notice("Use Retry to open a conversation after the unconfirmed attempt. Your draft is retained."); return@launch }
                     // A legitimate New intent from Tasks/Spaces keeps the owner's unsent
                     // draft; explicit workspace/worktree/model options pass through intact.
-                    if (options.length() == 0 && initialShells.containsKey(owner.key)) resumeInitialChat().join()
-                    else createNewChat(options, initial = true).join()
+                    if (options.length() > 0 || !initialShells.containsKey(owner.key)) createNewChat(options, initial = true).join()
                 } catch (e: Throwable) { if (client === active && originGeneration == origin && navigationGeneration == navigation && initialDraftOwner() == owner) fail(e) }
             }
         }
@@ -1501,13 +1509,40 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 selectionJob?.join()
             } catch (e: Throwable) {
                 if (e !is CancellationException) {
-                    if (missingNativeConversation(e) && initialShells[owner.key] == id) {
+                    fun ownsMissingShell() = client === active && originGeneration == origin && initialShells[owner.key] == id
+                    if (missingNativeConversation(e) && ownsMissingShell()) {
                         val scope = owner.session(id)
-                        clientCreatedSessions.add(scope.key)
-                        optionalLocalSave { app.cache.write(scope, "client-created-shell", "1", protected = true) }
-                        if (current()) {
-                            selectSession(id, preserveInitialDraft = true, closeMenu = false)
-                            selectionJob?.join()
+                        val clientCreated = clientCreatedSessions.contains(scope.key) || try {
+                            app.cache.read(scope, "client-created-shell") == "1"
+                        } catch (lookupError: Exception) {
+                            if (lookupError is CancellationException) throw lookupError
+                            if (current()) notice("The draft recovery marker could not be checked; your draft is kept")
+                            true
+                        }
+                        val confirmedNativeMissing = e is ApiFailure && e.status == 4007 && e.message == "session not found"
+                        // Hermes can keep a minted shell out of REST history until its first native resume.
+                        if (clientCreated && !confirmedNativeMissing) {
+                            clientCreatedSessions.add(scope.key)
+                            optionalLocalSave { app.cache.write(scope, "client-created-shell", "1", protected = true) }
+                            if (current()) {
+                                selectSession(id, preserveInitialDraft = true, closeMenu = false)
+                                selectionJob?.join()
+                            }
+                            return@launch
+                        }
+                        val attempt = initialCreateAttempts[owner.key]
+                        runCatching {
+                            if (app.cache.read(owner, "new-chat-shell") == id && ownsMissingShell()) app.cache.delete(owner, "new-chat-shell")
+                            if (app.cache.read(owner, "new-chat-attempt") != null && initialCreateAttempts[owner.key] == attempt && ownsMissingShell()) app.cache.delete(owner, "new-chat-attempt")
+                            if (ownsMissingShell()) app.cache.delete(scope, "client-created-shell")
+                        }.onFailure {
+                            if (it is CancellationException) throw it
+                            if (current()) notice("The missing conversation recovery pointers could not be cleared")
+                        }
+                        if (ownsMissingShell() && initialCreateAttempts[owner.key] == attempt) {
+                            initialShells.remove(owner.key)
+                            initialCreateAttempts.remove(owner.key)
+                            clientCreatedSessions.remove(scope.key)
                         }
                         return@launch
                     }
@@ -1636,7 +1671,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 if (e is CancellationException) throw e
                 if (sourceScope == scope && generation == sessionGeneration && client === active) {
                     val cached = _chat.value.raw.length() > 0
-                    val pendingFirstTurn = missingNativeConversation(e) && sessionCanStillBeUnpersisted(clientCreated, _chat.value)
+                    val pendingFirstTurn = e is ApiFailure && e.status == 404 && sessionCanStillBeUnpersisted(clientCreated, _chat.value)
                     _chat.update { it.copy(projectionReady = true, status = if (pendingFirstTurn) "" else when { missingNativeConversation(e) -> "Conversation unavailable · draft retained"; e is ApiFailure && e.status in setOf(401, 403) -> "Access denied · draft retained"; cached -> "Cached · refresh failed"; else -> "Could not load conversation · retry" }) }
                     if (!pendingFirstTurn) fail(e)
                 }
@@ -2041,7 +2076,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                     }
                 } catch (e: Throwable) {
                     if (e is CancellationException) throw e
-                    if (missingNativeConversation(e) && sessionCanStillBeUnpersisted(clientCreatedSessions.contains(scope.key), _chat.value)) continue
+                    if (e is ApiFailure && e.status == 404 && sessionCanStillBeUnpersisted(clientCreatedSessions.contains(scope.key), _chat.value)) continue
                     if (e is ApiFailure && e.status in setOf(401, 403) || missingNativeConversation(e)) {
                         if (foreground && request.current()) {
                             if (e is ApiFailure && e.status == 401) fail(e)

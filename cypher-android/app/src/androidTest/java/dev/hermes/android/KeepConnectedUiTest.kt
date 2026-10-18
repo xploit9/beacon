@@ -179,7 +179,26 @@ class KeepConnectedUiTest {
             assertFalse(manager.activeNotifications.any { it.id == 4083 })
             assertTrue(fixture.notificationWaits.contains(25L))
             val answerInvite = app.push.ringingInvitation(answerSource, answerEvent.getString("event_id"))!!
-            assertTrue(manager.activeNotifications.any { it.tag == answerInvite.key && it.id == 2 })
+            val answerEventId = answerEvent.getString("event_id")
+            fun ringingCards() = manager.activeNotifications.filter { card ->
+                val inviteRoute = android.app.PendingIntent.getActivity(
+                    app,
+                    "$answerSource:$answerEventId".hashCode(),
+                    android.content.Intent(app, CypherActivity::class.java)
+                        .setData(android.net.Uri.parse("hermes://activity/${answerInvite.key}"))
+                        .addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                        .putExtra("push_source", answerSource)
+                        .putExtra("push_event", answerEventId),
+                    android.app.PendingIntent.FLAG_NO_CREATE or android.app.PendingIntent.FLAG_IMMUTABLE,
+                )
+                inviteRoute != null && card.notification.category == android.app.Notification.CATEGORY_CALL && card.notification.contentIntent == inviteRoute
+            }
+            fun isRingingSlot(card: android.service.notification.StatusBarNotification) =
+                (card.tag == answerInvite.key && card.id == 2) || (card.tag == null && card.id == 42)
+            compose.waitUntil(10_000) { ringingCards().let { it.size == 1 && isRingingSlot(it.single()) } }
+            val cards = ringingCards()
+            assertEquals("Expected one active call card for this invite; found ${cards.map { "${it.tag}:${it.id}" }}", 1, cards.size)
+            assertTrue("The invite card must use its notification or ringtone foreground slot", isRingingSlot(cards.single()))
 
             compose.runOnIdle { showIncomingCall.value = true }
             compose.onNodeWithTag("xara-incoming-answer").assertIsDisplayed().performClick()

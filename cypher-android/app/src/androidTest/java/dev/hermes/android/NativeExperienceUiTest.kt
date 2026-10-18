@@ -150,6 +150,7 @@ class NativeExperienceUiTest {
     }
     private fun clickText(text: String) = compose.onNodeWithText(text, useUnmergedTree = true).performScrollTo().performClick()
     private fun await(condition: () -> Boolean) = compose.waitUntil(15_000, condition)
+    private fun recentCalls(fixture: NativeExperienceFixture) = fixture.requests.takeLast(10).map { "${it.string("method")} ${it.string("path")}".trim() }
     /** Menus and sheets are checked with the IME away, so neither a keyboard nor a stale focus can cover them. */
     private fun closeKeyboard() {
         compose.runOnIdle { compose.activity.getSystemService(android.view.inputmethod.InputMethodManager::class.java).hideSoftInputFromWindow(compose.activity.window.decorView.windowToken, 0) }
@@ -1399,12 +1400,18 @@ class NativeExperienceUiTest {
                 attempts[fixture.scope.key] = "prior-read-failure"
                 vm.newChat(json("title" to "Recovered draft"))
             }
-            await { vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.newChatOpening }
+            try { await { vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.newChatOpening } }
+            catch (error: Throwable) {
+                val calls = recentCalls(fixture)
+                throw AssertionError("Deleted-shell recovery: tab=${vm.ui.value.tab} ready=${vm.ui.value.initialChatReady} opening=${vm.ui.value.newChatOpening} id=${vm.chat.value.sessionId} error=${vm.ui.value.error} newChatError=${vm.ui.value.newChatError} notice=${vm.ui.value.notice} requests=$calls", error)
+            }
             assertEquals("Retain my unfinished draft", vm.composer.value.text)
-            assertEquals(1, fixture.requests.count { it.string("method") == "session.create" })
+            val calls = recentCalls(fixture)
+            assertEquals("Expected one native session.create; requests=$calls", 1, fixture.requests.count { it.string("method") == "session.create" })
+            assertEquals(vm.chat.value.sessionId, shells[fixture.scope.key])
             assertFalse(attempts.containsKey(fixture.scope.key))
             assertTrue(vm.ui.value.newChatError.isBlank())
-            receipts += "Missing native shell code 4007 clears only stale pointers; explicit New chat keeps the draft and creates once."
+            receipts += "An unowned stale shell confirmed missing by passive history is cleared without discarding the draft; explicit New creates once."
         } finally {
             runBlocking { app.cache.delete(fixture.scope, "new-chat-shell"); app.cache.delete(fixture.scope, "new-chat-attempt"); app.cache.delete(fixture.scope, "initial-draft") }
         }
@@ -1944,6 +1951,92 @@ class NativeExperienceUiTest {
         }
     }
 
+    @Test fun clientCreatedUnpromptedShellResumesFromCacheAfterViewModelRestart() = withFixture { vm, fixture ->
+        val owner = fixture.scope
+        val initialShellBefore = runBlocking { app.cache.read(owner, "new-chat-shell") }
+        val initialAttemptBefore = runBlocking { app.cache.read(owner, "new-chat-attempt") }
+        val initialDraftBefore = runBlocking { app.cache.read(owner, "initial-draft") }
+        val selectedBefore = runBlocking { app.cache.read(owner, "selected-session") }
+        val indexBefore = runBlocking { app.cache.read(owner, "conversation-index") }
+        val likelyShell = owner.session("new-2")
+        val clientCreatedBefore = runBlocking { app.cache.read(likelyShell, "client-created-shell") }
+        val projectionBefore = runBlocking { app.cache.read(likelyShell, "session") }
+        val draftBefore = runBlocking { app.cache.read(likelyShell, "draft") }
+        runBlocking { app.cache.delete(likelyShell, "client-created-shell"); app.cache.delete(likelyShell, "session") }
+        val createsBefore = fixture.requests.count { it.string("method") == "session.create" }
+        var shellId = ""
+        var restartedClient: dev.hermes.android.data.CypherClient? = null
+        val restartedStore = ViewModelStore()
+        try {
+            compose.runOnIdle {
+                field(vm, "sourceScope", null)
+                flow<ChatState>(vm, "_chat").value = ChatState()
+                flow<AppState>(vm, "_ui").value = vm.ui.value.copy(tab = "Chat", initialChatReady = true)
+                vm.newChat()
+            }
+            await { vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.newChatOpening }
+            shellId = vm.chat.value.sessionId
+            assertEquals(createsBefore + 1, fixture.requests.count { it.string("method") == "session.create" })
+            fixture.markUnpromptedShell(shellId)
+            assertFalse(fixture.sessions.containsKey(shellId))
+            val cachedShell = requireNotNull(runBlocking { app.cache.read(owner, "new-chat-shell") })
+            assertEquals(shellId, cachedShell)
+            assertEquals("1", runBlocking { app.cache.read(owner.session(shellId), "client-created-shell") })
+
+            val auth = requireNotNull(vm.client).auth
+            val newClient = fixture.clientFor(auth, app.auth)
+            restartedClient = newClient
+            lateinit var restarted: CypherViewModel
+            compose.runOnUiThread {
+                restarted = ViewModelProvider(restartedStore, viewModelFactory { initializer { CypherViewModel(app, SavedStateHandle()) } })[CypherViewModel::class.java]
+                field(restarted, "client", newClient)
+                field(restarted, "cachedOwnerScope", owner)
+                field(restarted, "sourceScope", null)
+                flow<AppState>(restarted, "_ui").value = vm.ui.value.copy(tab = "Chat", initialChatReady = true, newChatOpening = false, newChatError = "", restoringSession = false)
+                flow<ChatState>(restarted, "_chat").value = ChatState()
+                @Suppress("UNCHECKED_CAST")
+                val shells = CypherViewModel::class.java.getDeclaredField("initialShells").apply { isAccessible = true }.get(restarted) as MutableMap<String, String>
+                shells[owner.key] = cachedShell
+            }
+            compose.runOnIdle {
+                restarted.composer(TextFieldValue("Keep this draft after restart"))
+                restarted.newChat()
+            }
+            try { await { restarted.chat.value.sessionId == shellId && !restarted.ui.value.newChatOpening } }
+            catch (error: Throwable) {
+                val calls = recentCalls(fixture)
+                throw AssertionError("Restarted unprompted shell: id=${restarted.chat.value.sessionId} opening=${restarted.ui.value.newChatOpening} error=${restarted.ui.value.error} notice=${restarted.ui.value.notice} requests=$calls", error)
+            }
+            assertEquals("Keep this draft after restart", restarted.composer.value.text)
+            assertEquals(createsBefore + 1, fixture.requests.count { it.string("method") == "session.create" })
+            assertTrue(fixture.requests.any { it.string("method") == "GET" && it.string("path") == "/api/sessions/$shellId" })
+            val resumesBefore = fixture.requests.count { it.string("method") == "session.resume" }
+            val binding = runBlocking { newClient.nativeSession(shellId) }
+            assertEquals(shellId, binding.storedSessionId)
+            assertEquals(resumesBefore + 1, fixture.requests.count { it.string("method") == "session.resume" })
+            assertTrue(fixture.sessions.containsKey(shellId))
+            receipts += "After a fresh ViewModel restores the owner-bound shell, passive history may be absent until Hermes resumes the minted key; the same shell resumes without another create and the draft survives."
+        } finally {
+            compose.runOnUiThread { restartedStore.clear(); restartedClient?.closeNative() }
+            runBlocking {
+                if (initialShellBefore == null) app.cache.delete(owner, "new-chat-shell") else app.cache.write(owner, "new-chat-shell", initialShellBefore, true)
+                if (initialAttemptBefore == null) app.cache.delete(owner, "new-chat-attempt") else app.cache.write(owner, "new-chat-attempt", initialAttemptBefore, true)
+                if (initialDraftBefore == null) app.cache.delete(owner, "initial-draft") else app.cache.write(owner, "initial-draft", initialDraftBefore, true)
+                if (selectedBefore == null) app.cache.delete(owner, "selected-session") else app.cache.write(owner, "selected-session", selectedBefore, true)
+                if (indexBefore == null) app.cache.delete(owner, "conversation-index") else app.cache.write(owner, "conversation-index", indexBefore, true)
+                if (shellId.isNotBlank() && shellId != likelyShell.session) {
+                    val session = owner.session(shellId)
+                    app.cache.delete(session, "client-created-shell")
+                    app.cache.delete(session, "session")
+                    app.cache.delete(session, "draft")
+                }
+                if (clientCreatedBefore == null) app.cache.delete(likelyShell, "client-created-shell") else app.cache.write(likelyShell, "client-created-shell", clientCreatedBefore, true)
+                if (projectionBefore == null) app.cache.delete(likelyShell, "session") else app.cache.write(likelyShell, "session", projectionBefore, true)
+                if (draftBefore == null) app.cache.delete(likelyShell, "draft") else app.cache.write(likelyShell, "draft", draftBefore, true)
+            }
+        }
+    }
+
     @Test fun newChatReplacesAConfirmedMissingInitialShellWithoutLosingTheDraft() = withFixture { vm, fixture ->
         compose.runOnIdle {
             field(vm, "sourceScope", null)
@@ -1955,14 +2048,18 @@ class NativeExperienceUiTest {
             vm.composer(TextFieldValue("Keep this unsent thought"))
             vm.newChat()
         }
-        try { await { vm.chat.value.sessionId.isNotBlank() && !vm.ui.value.newChatOpening } }
+        try { await { vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.newChatOpening } }
         catch (error: Throwable) {
-            val calls = fixture.requests.map { it.string("method", it.string("path")) }.takeLast(10)
-            throw AssertionError("Initial recovery: tab=${vm.ui.value.tab} ready=${vm.ui.value.initialChatReady} opening=${vm.ui.value.newChatOpening} id=${vm.chat.value.sessionId} error=${vm.ui.value.error} notice=${vm.ui.value.notice} requests=$calls", error)
+            val calls = recentCalls(fixture)
+            throw AssertionError("Initial recovery: tab=${vm.ui.value.tab} ready=${vm.ui.value.initialChatReady} opening=${vm.ui.value.newChatOpening} id=${vm.chat.value.sessionId} error=${vm.ui.value.error} newChatError=${vm.ui.value.newChatError} notice=${vm.ui.value.notice} requests=$calls", error)
         }
         assertEquals("Keep this unsent thought", vm.composer.value.text)
-        assertEquals(1, fixture.requests.count { it.string("method") == "session.create" })
+        val calls = recentCalls(fixture)
+        assertEquals("Expected one native session.create; requests=$calls", 1, fixture.requests.count { it.string("method") == "session.create" })
         assertTrue(fixture.sessions.containsKey(vm.chat.value.sessionId))
+        @Suppress("UNCHECKED_CAST")
+        val shells = CypherViewModel::class.java.getDeclaredField("initialShells").apply { isAccessible = true }.get(vm) as MutableMap<String, String>
+        assertEquals(vm.chat.value.sessionId, shells[fixture.scope.key])
     }
 
     @Test fun selectingTheCurrentSettingsDestinationClosesTheDrawerWithoutAddingBackHistory() = withFixture { vm, _ ->
@@ -1975,10 +2072,10 @@ class NativeExperienceUiTest {
         assertEquals("Keep this draft", vm.composer.value.text)
     }
 
-    @Test fun connectionSummaryAndSignOutRequireTheExplicitConfirmation() = withFixture { vm, _ ->
+    @Test fun connectionSummaryAndSignOutRequireTheExplicitConfirmation() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.more("Connection") }
         compose.onNodeWithText("Signed-in account · synthetic-owner").assertExists()
-        compose.onNodeWithText("Profile · work").assertExists()
+        compose.onNodeWithText("Profile · ${fixture.scope.profile}").assertExists()
         compose.onNodeWithText("Technical details").assertDoesNotExist()
         compose.onNodeWithText("Account identifier").assertDoesNotExist()
         compose.onNodeWithText("Sign out", ignoreCase = true).performScrollTo().performClick()
