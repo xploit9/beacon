@@ -55,19 +55,21 @@ import com.google.mlkit.vision.common.InputImage
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
+internal fun cameraGranted(context: android.content.Context) = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+
 @Composable
-fun QrScanner(onResult: (String) -> Unit, onClose: () -> Unit) {
+fun QrScanner(onResult: (String) -> Unit, onClose: () -> Unit, hasCamera: (android.content.Context) -> Boolean = ::cameraGranted) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val latestResult by rememberUpdatedState(onResult)
-    var permitted by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
+    var permitted by remember { mutableStateOf(hasCamera(context)) }
     var cameraError by remember { mutableStateOf("") }
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { permitted = it }
     BackHandler(onBack = onClose)
     DisposableEffect(context, lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                permitted = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+                permitted = hasCamera(context)
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)

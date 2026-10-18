@@ -321,25 +321,19 @@ class SetupWizardUiTest {
     }
 
     @Test fun qrScannerRefreshesCameraPermissionAfterResume() {
-        val app = ApplicationProvider.getApplicationContext<CypherApplication>()
-        val uiAutomation = InstrumentationRegistry.getInstrumentation().uiAutomation
-        val hadCamera = app.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
-        try {
-            runCatching { uiAutomation.revokeRuntimePermission(app.packageName, Manifest.permission.CAMERA) }
-            compose.setContent { QrScanner(onResult = {}, onClose = {}) }
-            compose.onNodeWithTag("setup-camera-permission").assertIsDisplayed()
+        // Revoking a granted runtime permission kills the app process (and this test), so the check is simulated:
+        // the user grants camera access in system Settings while the scanner is in the background.
+        var granted = false
+        compose.setContent { QrScanner(onResult = {}, onClose = {}, hasCamera = { granted }) }
+        compose.onNodeWithTag("setup-camera-permission").assertIsDisplayed()
 
-            uiAutomation.grantRuntimePermission(app.packageName, Manifest.permission.CAMERA)
-            compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.CREATED)
-            compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.RESUMED)
-            compose.waitUntil(5_000) {
-                runCatching { compose.onNodeWithTag("setup-camera-permission").assertDoesNotExist() }.isSuccess
-            }
-            compose.onNodeWithTag("setup-camera-permission").assertDoesNotExist()
-        } finally {
-            if (hadCamera) runCatching { uiAutomation.grantRuntimePermission(app.packageName, Manifest.permission.CAMERA) }
-            else runCatching { uiAutomation.revokeRuntimePermission(app.packageName, Manifest.permission.CAMERA) }
+        granted = true
+        compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.CREATED)
+        compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.RESUMED)
+        compose.waitUntil(5_000) {
+            runCatching { compose.onNodeWithTag("setup-camera-permission").assertDoesNotExist() }.isSuccess
         }
+        compose.onNodeWithTag("setup-camera-permission").assertDoesNotExist()
     }
 
     @Test fun missingPluginMessageIsShownWithoutBlockingSignIn() {
