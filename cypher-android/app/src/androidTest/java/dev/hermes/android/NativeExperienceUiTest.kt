@@ -1447,6 +1447,10 @@ class NativeExperienceUiTest {
         val localKeyStatus = if (voiceStore.maskedKey(localProvider) != null) "Key saved" else "Add key"
         val localVoiceSummary = "$localProviderLabel · $localKeyStatus"
         await { compose.onAllNodes(hasText(localVoiceSummary) and hasAnyAncestor(hasTestTag("settings-row:Cypher")), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+        val keepConnectedEnabled = dev.hermes.android.push.KeepConnectedService.isEnabled(app)
+        val keepConnectedSummary = if (keepConnectedEnabled) "Keep connected on" else "Keep connected off"
+        val keepConnectedStatus = if (keepConnectedEnabled) "Keep connected is on" else "Keep connected is off"
+        await { compose.onAllNodes(hasText(keepConnectedSummary) and hasAnyAncestor(hasTestTag("settings-row:Notifications")), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
         capture("settings")
         compose.runOnIdle { vm.load("voice-settings", "/api/plugins/cypher/mobile/voice-settings") }
         await { vm.data.value["voice-settings"]?.has("providers") == true }
@@ -1481,12 +1485,16 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Unavailable in native Hermes").assertDoesNotExist()
         capture("chat-preferences")
         compose.runOnIdle { vm.more("Notifications") }
-        await { vm.data.value["push-status"] != null }
+        assertFalse("The preview build does not configure Firebase push", app.firebaseConfigured)
+        compose.onNodeWithText(keepConnectedStatus).assertIsDisplayed()
+        compose.onNodeWithText("Firebase push notifications are not part of this build. Keep connected is available on this phone.").assertIsDisplayed()
+        compose.onNodeWithText("Notifications for this profile").assertDoesNotExist()
+        compose.onNodeWithText("Send a test notification").assertDoesNotExist()
         compose.onNodeWithText("Proactive calls").assertDoesNotExist()
         val notifications = app.getSystemService(android.app.NotificationManager::class.java)
         listOf("hermes-messages", "hermes-tasks", "hermes-approvals", "hermes-updates").forEach { assertNotNull("Advertised notification category exists: $it", notifications.getNotificationChannel(it)) }
         assertTrue(fixture.requests.none { it.string("path") == "/api/mobile/proactive" })
-        receipts += "Local chat preferences are reachable; notification settings do not schedule proactive calls."
+        receipts += "Local chat preferences are reachable; Keep connected state leads Notifications, Firebase-only controls stay hidden in this build, and no proactive calls are scheduled."
         capture("notification-categories")
     }
 
@@ -1556,11 +1564,11 @@ class NativeExperienceUiTest {
     @Test fun settingsSearchUsesVisibleNamesAndDirtyNotesRecoverFromEncryptedCache() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.navigate("Settings") }
         compose.onNodeWithText("Search settings").performTextInput("Chat preferences")
-        compose.onNode(hasText("Chat preferences") and hasClickAction() and !hasSetTextAction()).assertExists()
-        compose.onNode(hasSetTextAction() and hasText("Chat preferences")).performTextReplacement("Models & tools")
+        compose.onNodeWithTag("settings-row:Chat").assertExists()
+        compose.onNode(hasSetTextAction() and hasText("Chat preferences")).performTextReplacement("Tools & MCP")
         androidx.test.espresso.Espresso.closeSoftKeyboard()
-        compose.onNode(hasText("Models & tools") and hasClickAction() and !hasSetTextAction()).performClick()
-        await { vm.ui.value.morePage == "category:Models & tools" }
+        compose.onNodeWithTag("settings-row:Tools & MCP").performClick()
+        await { vm.ui.value.morePage == "category:Tools & MCP" }
         capture("settings-category-search")
         compose.onNodeWithText("MCP servers",ignoreCase=true).assertIsDisplayed()
         compose.runOnIdle { vm.navigate("Memory") }
@@ -1605,6 +1613,20 @@ class NativeExperienceUiTest {
         await { vm.editor.value.path.isBlank() }
         compose.onNodeWithText("notes.md").assertExists()
         compose.runOnIdle { field(vm, "client", null); flow<AppState>(vm,"_ui").value=vm.ui.value.copy(connected=false,loading=false) }
+        assertTrue(app.packageName.endsWith(".debug"))
+        val voiceStore = VoiceKeyStore(app)
+        val provider = voiceStore.settings().provider
+        val previousKey = voiceStore.key(provider)
+        voiceStore.removeKey(provider)
+        try {
+            compose.runOnIdle { vm.more("Cypher") }
+            compose.onNodeWithTag("voice-provider-key").performTextInput("not-a-real-provider-key")
+            compose.onNodeWithText("Test").assertIsEnabled()
+            compose.runOnIdle { vm.more("App updates") }
+            compose.onNodeWithText("Preview builds are installed manually.").assertIsDisplayed()
+            compose.onNodeWithText("Check for updates").assertDoesNotExist()
+            compose.onNodeWithText("Reconnect to Hermes").assertDoesNotExist()
+        } finally { previousKey?.let { voiceStore.saveKey(provider, it) } ?: voiceStore.removeKey(provider) }
         for (page in listOf("Skills", "Memory", "Bots", "Files", "Cron", "Projects", "Kanban")) {
             compose.runOnIdle { vm.navigate(page) }
             compose.onNodeWithText("Reconnect to Hermes").assertIsDisplayed()
@@ -1930,11 +1952,11 @@ class NativeExperienceUiTest {
         assertEquals("Keep this draft", vm.composer.value.text)
     }
 
-    @Test fun connectionDetailsAndSignOutRequireTheExplicitConfirmation() = withFixture { vm, _ ->
+    @Test fun connectionSummaryAndSignOutRequireTheExplicitConfirmation() = withFixture { vm, _ ->
         compose.runOnIdle { vm.more("Connection") }
-        compose.onNodeWithText("Technical details").performScrollTo().performClick()
-        compose.onNodeWithText("synthetic-owner").assertExists()
-        compose.onNodeWithText("Hide technical details").performScrollTo().performClick()
+        compose.onNodeWithText("Signed-in account · synthetic-owner").assertExists()
+        compose.onNodeWithText("Profile · work").assertExists()
+        compose.onNodeWithText("Technical details").assertDoesNotExist()
         compose.onNodeWithText("Account identifier").assertDoesNotExist()
         compose.onNodeWithText("Sign out", ignoreCase = true).performScrollTo().performClick()
         compose.onNodeWithText("Sign out of Cypher").assertExists()
@@ -1982,25 +2004,42 @@ class NativeExperienceUiTest {
         capture("audit-licenses")
     }
 
-    @Test fun bothVoiceSettingsProvidersPersistVoicesAndPersonalityWithoutStartingACall() = withFixture { vm, fixture ->
-        compose.runOnIdle { vm.more("Cypher") }
-        await { vm.data.value["voice-settings"] != null }
-        for (provider in listOf("grok", "gemini")) {
-            compose.onNodeWithTag("voice-model-$provider").performScrollTo().performClick()
-            await { fixture.voiceProvider == provider && "voice-settings" !in vm.refreshing.value }
-            compose.onNodeWithText("Voice: ${fixture.voices[provider]}").performScrollTo().performClick()
-            val voice = if (provider == "grok") "eve" else "Puck"
-            compose.onNodeWithText(voice).performClick()
-            await { fixture.voices[provider] == voice && "voice-settings" !in vm.refreshing.value }
-            val label = "Personality: ${fixture.personalities[provider]!!.replaceFirstChar(Char::titlecase)}"
-            val nodes = compose.onAllNodesWithText(label)
-            (if (provider == "grok") nodes.onLast() else nodes.onFirst()).performScrollTo().performClick()
-            compose.onNodeWithText("Concise").performClick()
-            await { fixture.personalities[provider] == "concise" && "voice-settings" !in vm.refreshing.value }
+    @Test fun voiceSettingsPersistOnThePhoneWithoutStartingACall() = withFixture { vm, fixture ->
+        val store = VoiceKeyStore(app)
+        val providers = listOf("gemini", "grok", "openai")
+        val previousProvider = store.settings().provider
+        val previousSelections = providers.associateWith { store.settings(it) }
+        val previousKeys = providers.associateWith { store.key(it) }
+        try {
+            providers.forEach(store::removeKey)
+            compose.runOnIdle { vm.more("Cypher") }
+            compose.onNodeWithText("Gemini prebuilt voices per docs (2026-10-18)").assertDoesNotExist()
+            compose.onNodeWithText("Grok voices per provider API (2026-10-18)").assertDoesNotExist()
+            compose.onNodeWithText("OpenAI voices per docs (2026-10-18)").assertDoesNotExist()
+            for (provider in listOf("grok", "gemini")) {
+                compose.onNodeWithTag("voice-model-$provider").performScrollTo().performClick()
+                await { store.settings().provider == provider }
+                val before = store.settings(provider)
+                compose.onNodeWithText("Voice: ${before.voice}").performScrollTo().performClick()
+                val choices = if (provider == "grok") listOf("eve", "ara", "rex", "sal", "leo") else listOf("Puck", "Charon", "Kore", "Fenrir", "Aoede", "Leda", "Orus", "Zephyr")
+                val voice = choices.first { it != before.voice }
+                compose.onNodeWithText(voice).performClick()
+                await { store.settings(provider).voice == voice }
+                val currentPersonality = store.settings(provider).personality
+                val personality = if (currentPersonality == "concise") "warm" else "concise"
+                compose.onNodeWithText("Personality: ${currentPersonality.replaceFirstChar(Char::titlecase)}").performScrollTo().performClick()
+                compose.onNodeWithText(personality.replaceFirstChar(Char::titlecase)).performClick()
+                await { store.settings(provider).personality == personality }
+            }
+            assertFalse(fixture.requests.any { it.string("path").endsWith("/voice-settings") && it.string("method") != "GET" })
+        } finally {
+            providers.forEach { provider -> previousKeys[provider]?.let { store.saveKey(provider, it) } ?: store.removeKey(provider) }
+            previousSelections.values.forEach(store::setSelection)
+            store.setSelection(previousSelections.getValue(previousProvider))
         }
         assertFalse(app.calls.state.value.active)
         assertNull(app.calls.service)
-        receipts += "Gemini/Grok model, voice and personality settings save through the native endpoint; settings changes do not start recording or a call."
+        receipts += "Gemini/Grok voice and personality choices persist in phone storage without server voice-settings writes or starting a call."
         capture("audit-voice-settings")
     }
 
@@ -2300,11 +2339,12 @@ class NativeExperienceUiTest {
         assertEquals(fixture.scope.profile, activeList.getString("profile"))
 
         fixture.nativeStatusFailure = false
-        val historyReadsBeforeCompletion = fixture.requests.count { it.string("path") == "/api/sessions/chat-a/messages" }
+        val requestsBeforeCompletion = fixture.requests.size
         fixture.terminalOnActiveList = json("text" to "Completed answer")
         fixture.interruptActiveNativeStream()
         await { fixture.requests.count { it.string("method") == "prompt.submit" } == 2 }
-        assertTrue("The terminal snapshot reloads stock history before advancing the queue", fixture.requests.count { it.string("path") == "/api/sessions/chat-a/messages" } >= historyReadsBeforeCompletion + 2)
+        val queuedSubmitIndex = fixture.requests.indexOfLast { it.string("method") == "prompt.submit" }
+        assertTrue("The terminal history refresh happens before the queued prompt", fixture.requests.subList(requestsBeforeCompletion, queuedSubmitIndex).any { it.string("path") == "/api/sessions/chat-a/messages" })
         assertTrue("The final assistant reply is visible before another history poll", vm.chat.value.messages.any { it.text == "Completed answer" })
         compose.onNodeWithText("Completed answer", useUnmergedTree = true).assertIsDisplayed()
         await { vm.chat.value.queued.isEmpty() }

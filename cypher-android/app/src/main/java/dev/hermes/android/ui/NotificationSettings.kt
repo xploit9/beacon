@@ -66,7 +66,10 @@ import org.json.JSONObject
     var pendingKeepConnectedChoice by remember { mutableStateOf<Boolean?>(null) }
     val keepConnectedPermissionRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
         deviceAllowed = allowed || androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled()
-        pendingKeepConnectedChoice?.let(vm::setKeepConnectedEnabled)
+        pendingKeepConnectedChoice?.let { enabled ->
+            if (!enabled || deviceAllowed) vm.setKeepConnectedEnabled(enabled)
+            else { operationError = "Notification permission is off. Keep connected was not enabled."; vm.notice(operationError) }
+        }
         pendingKeepConnectedChoice = null
     }
     fun liveAllowed() = android.os.Build.VERSION.SDK_INT >= 36 && context.getSystemService(android.app.NotificationManager::class.java).canPostPromotedNotifications()
@@ -76,7 +79,7 @@ import org.json.JSONObject
     var restricted by remember { mutableStateOf(backgroundRestricted()) }
     var optimized by remember { mutableStateOf(batteryOptimized()) }
     val liveUpdatesSettings = remember(context) { Intent("android.settings.MANAGE_APP_PROMOTED_NOTIFICATIONS").putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName).takeIf { android.os.Build.VERSION.SDK_INT >= 36 && it.resolveActivity(context.packageManager) != null } }
-    androidx.lifecycle.compose.LifecycleResumeEffect(ownerScope) { target = vm.client?.scope?.let { vm.app.push.registeredTarget(it) }; deviceAllowed = androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled(); keepConnectedEnabled = KeepConnectedService.isEnabled(context); keepConnectedStatus = KeepConnectedService.status(context); liveUpdatesAllowed = liveAllowed();restricted=backgroundRestricted();optimized=batteryOptimized(); vm.load("push-status", "/api/plugins/cypher/mobile/notifications/status"); onPauseOrDispose { } }
+    androidx.lifecycle.compose.LifecycleResumeEffect(ownerScope) { target = vm.client?.scope?.let { vm.app.push.registeredTarget(it) }; deviceAllowed = androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled(); keepConnectedEnabled = KeepConnectedService.isEnabled(context); keepConnectedStatus = KeepConnectedService.status(context); liveUpdatesAllowed = liveAllowed();restricted=backgroundRestricted();optimized=batteryOptimized(); if (vm.app.firebaseConfigured) vm.load("push-status", "/api/plugins/cypher/mobile/notifications/status"); onPauseOrDispose { } }
     DisposableEffect(context) {
         val prefs = context.getSharedPreferences(KeepConnectedService.PREFS, android.content.Context.MODE_PRIVATE)
         val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
@@ -112,15 +115,22 @@ import org.json.JSONObject
         val serverReady = pushStatus?.optBoolean("android_configured") == true
         val registered = target != null && pushStatus?.rows("targets")?.any { it.string("target_id") == target && it.string("kind") == "fcm" && !it.optBoolean("revoked") } == true
         val delivery = pushStatus?.optJSONObject("delivery")
-        Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text(when { pushStatus == null -> "Checking notification status…"; pushStatus.has("_error") -> "Couldn’t reach Cypher"; !vm.app.firebaseConfigured -> "Notifications unavailable in this build"; !serverReady -> "Server setup needed"; !deviceAllowed -> "Notifications are off on this phone"; !registered -> if (target == null) "Notifications are off for this profile" else "Registration needs attention"; else -> "Ready for notifications" }, style = MaterialTheme.typography.titleLarge)
-            Text(when { pushStatus == null -> "Connecting to your private server."; pushStatus.has("_error") -> "Reconnect to Tailscale, then retry below."; !vm.app.firebaseConfigured -> "This app build needs its owner Firebase configuration before it can register this phone."; !serverReady -> "This phone can receive notifications, but your Cypher server still needs its notification sender configured."; !deviceAllowed -> "Allow Cypher notifications in Android settings."; !registered -> if (target == null) "Turn on notifications for native calls and approval requests." else "This profile has a saved registration, but the server has not confirmed it. Retry registration or turn it off."; else -> "Calls and approval requests can reach you while the app is closed. Send a test to check delivery on this phone." }, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if ((delivery?.optInt("pending") ?: 0) > 0) Text("${delivery?.optInt("pending")} notifications waiting to be delivered", style = MaterialTheme.typography.labelMedium)
-            if (!delivery?.string("last_error").isNullOrBlank() && serverReady) Text("The last delivery needs attention. Try a test notification.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-        } }
-        recordError(pushStatus).takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+        if (!vm.app.firebaseConfigured) {
+            Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(if (keepConnectedEnabled) "Keep connected is on" else "Keep connected is off", style = MaterialTheme.typography.titleLarge)
+                Text("Firebase push notifications are not part of this build. Keep connected is available on this phone.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } }
+        } else {
+            Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(when { pushStatus == null -> "Checking notification status…"; pushStatus.has("_error") -> "Couldn’t reach Cypher"; !serverReady -> "Server setup needed"; !deviceAllowed -> "Notifications are off on this phone"; !registered -> if (target == null) "Notifications are off for this profile" else "Registration needs attention"; else -> "Ready for notifications" }, style = MaterialTheme.typography.titleLarge)
+                Text(when { pushStatus == null -> "Connecting to your private server."; pushStatus.has("_error") -> "Reconnect to Tailscale, then retry below."; !serverReady -> "This phone can receive notifications, but your Cypher server still needs its notification sender configured."; !deviceAllowed -> "Allow Cypher notifications in Android settings."; !registered -> if (target == null) "Turn on notifications for native calls and approval requests." else "This profile has a saved registration, but the server has not confirmed it. Retry registration or turn it off."; else -> "Calls and approval requests can reach you while the app is closed. Send a test to check delivery on this phone." }, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if ((delivery?.optInt("pending") ?: 0) > 0) Text("${delivery?.optInt("pending")} notifications waiting to be delivered", style = MaterialTheme.typography.labelMedium)
+                if (!delivery?.string("last_error").isNullOrBlank() && serverReady) Text("The last delivery needs attention. Try a test notification.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            } }
+            recordError(pushStatus).takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+        }
         if (operationError.isNotBlank()) Text(operationError, color = MaterialTheme.colorScheme.error)
-        if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
         fun enable() {
             val captured = vm.client?.detached() ?: return
             busy = true; operationError = ""
@@ -142,10 +152,10 @@ import org.json.JSONObject
                 keepConnectedPermissionRequest.launch(Manifest.permission.POST_NOTIFICATIONS)
             } else vm.setKeepConnectedEnabled(true)
         }
-        Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
+        if (vm.app.firebaseConfigured) Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
             LabeledToggle("Notifications for this profile", target != null, { enabled -> if (enabled) enable() else disable() },
                 description = if (target != null) "On for this profile" else "Off · you can still check activity in Cypher",
-                enabled = !busy && requestingClient == null && (target != null || (vm.app.firebaseConfigured && serverReady && pushStatus?.has("_error") != true)))
+                enabled = !busy && requestingClient == null && (target != null || (serverReady && pushStatus?.has("_error") != true)))
         } }
         Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(horizontal = 20.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -164,12 +174,14 @@ import org.json.JSONObject
             }, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.testTag("keep-connected-status"))
             if (keepConnectedEnabled && !deviceAllowed) Text("Android notifications are off; incoming call alerts may be hidden.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
         } }
-        if (pushStatus?.has("_error") == true) TextButton(enabled = !busy, onClick = { vm.load("push-status", "/api/plugins/cypher/mobile/notifications/status") }) { Text("Retry notification status") }
-        else if (target != null && !registered && vm.app.firebaseConfigured && serverReady && deviceAllowed) TextButton(enabled = !busy, onClick = { enable() }) { Text("Retry registration") }
-        OutlinedButton(onClick = { busy = true; operationError = ""; val owner = vm.client?.scope; scope.launch { var accepted = false; vm.action("/api/plugins/cypher/mobile/notifications/test", json("kind" to "fcm"), refresh = false) { _, _ -> accepted = true; vm.notice("Test queued. Delivery is confirmed only when the notification arrives on this phone.") }.join(); if (vm.client?.scope == owner) { if (!accepted) operationError = vm.ui.value.error.ifBlank { "Couldn’t queue a test. Try again." }; busy = false; vm.load("push-status", "/api/plugins/cypher/mobile/notifications/status") } } }, enabled = !busy && vm.app.firebaseConfigured && serverReady && registered && deviceAllowed) { Text(uiText("Send a test notification")) }
+        if (vm.app.firebaseConfigured) {
+            if (pushStatus?.has("_error") == true) TextButton(enabled = !busy, onClick = { vm.load("push-status", "/api/plugins/cypher/mobile/notifications/status") }) { Text("Retry notification status") }
+            else if (target != null && !registered && serverReady && deviceAllowed) TextButton(enabled = !busy, onClick = { enable() }) { Text("Retry registration") }
+            OutlinedButton(onClick = { busy = true; operationError = ""; val owner = vm.client?.scope; scope.launch { var accepted = false; vm.action("/api/plugins/cypher/mobile/notifications/test", json("kind" to "fcm"), refresh = false) { _, _ -> accepted = true; vm.notice("Test queued. Delivery is confirmed only when the notification arrives on this phone.") }.join(); if (vm.client?.scope == owner) { if (!accepted) operationError = vm.ui.value.error.ifBlank { "Couldn’t queue a test. Try again." }; busy = false; vm.load("push-status", "/api/plugins/cypher/mobile/notifications/status") } } }, enabled = !busy && serverReady && registered && deviceAllowed) { Text(uiText("Send a test notification")) }
+        }
         TextButton(onClick = { vm.tab("Tasks") }) { Text("Manage check-up calls and email alerts") }
         Text("Live Updates", style = MaterialTheme.typography.titleMedium)
-        Text(when { liveUpdatesAllowed -> "Calls, ongoing work and requests can appear in your phone’s status chip. Tap to return or respond."; liveUpdatesSettings != null -> "Enable Live Updates in Android to keep calls, work and requests in the status bar."; else -> "Calls and requests use standard notifications on this Android version. Status chips need a supported Android 16 update." }, style = MaterialTheme.typography.bodyMedium)
+        Text(when { liveUpdatesAllowed -> "Calls, ongoing work and requests can appear in your phone’s status chip. Tap to return or respond."; liveUpdatesSettings != null -> "Enable Live Updates in Android to keep calls, work and requests in the status bar."; else -> statusChipUnsupportedDescription(android.os.Build.VERSION.RELEASE, android.os.Build.VERSION.SDK_INT) }, style = MaterialTheme.typography.bodyMedium)
         if (liveUpdatesSettings != null) TextButton(onClick = { runCatching { context.startActivity(liveUpdatesSettings) }.onFailure { vm.notice("Open Android notification settings to manage Live Updates") } }) { Text("Manage Live Updates") }
         val manager = context.getSystemService(android.app.NotificationManager::class.java)
         dev.hermes.android.push.ensureActivityChannels(manager)

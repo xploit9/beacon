@@ -30,6 +30,7 @@ import dev.hermes.android.BuildConfig
 import dev.hermes.android.CypherViewModel
 import dev.hermes.android.core.*
 import dev.hermes.android.data.VoiceKeyStore
+import dev.hermes.android.push.KeepConnectedService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -140,6 +141,15 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
     val data by vm.data.collectAsStateWithLifecycle()
     val update by vm.appUpdate.collectAsStateWithLifecycle()
     val context = LocalContext.current.applicationContext
+    var keepConnectedEnabled by remember(context) { mutableStateOf(KeepConnectedService.isEnabled(context)) }
+    DisposableEffect(context) {
+        val preferences = context.getSharedPreferences(KeepConnectedService.PREFS, android.content.Context.MODE_PRIVATE)
+        val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == KeepConnectedService.KEY_ENABLED) keepConnectedEnabled = KeepConnectedService.isEnabled(context)
+        }
+        preferences.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { preferences.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
     val phoneVoice by produceState<Pair<String, Boolean>?>(null, context) {
         value = withContext(Dispatchers.IO) {
             runCatching {
@@ -155,6 +165,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         reducedMotion = prefs.reducedMotion, rtl = prefs.rtl,
         installedVersion = BuildConfig.VERSION_NAME, updateName = update.release?.name.orEmpty(), updateReady = update.ready,
         voiceProviderId = phoneVoice?.first.orEmpty(), voiceKeySaved = phoneVoice?.second,
+        keepConnectedEnabled = keepConnectedEnabled,
     ).withLoaded(data["profile-settings"])
     val summaries = localizedSettingsSummaries(snapshot)
     SettingsOverview(summaries, { vm.more(it) }, category)
@@ -162,7 +173,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
 
 @Composable fun MoreScreen(vm: CypherViewModel) {
     val ui by vm.ui.collectAsStateWithLifecycle()
-    val page = ui.morePage
+    val page = normalizeSettingsPage(ui.morePage)
     val pluginStatus = ui.bootstrap.optJSONObject("optional_features")?.optString("plugin").orEmpty()
     if (settingsNeedsCypherPlugin(page, pluginStatus)) {
         androidx.activity.compose.BackHandler { vm.backFromSettings() }
@@ -175,7 +186,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         }
         return
     }
-    val remotePage = page in (settingsCategories.values.flatten() + listOf("Skills", "Memory", "Cypher", "Notifications", "Bots", "Profiles", "Commands", "Session usage"))
+    val remotePage = page in (settingsCategories.values.flatten() + listOf("Skills", "Memory", "Cypher", "Notifications", "Bots", "Profiles", "Commands", "Session usage")) && page !in setOf("Cypher", "App updates")
     if (remotePage && vm.client == null && !ui.loading) {
         androidx.activity.compose.BackHandler { vm.backFromSettings() }
         Column(Modifier.fillMaxSize()) {
@@ -285,6 +296,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
     val incoming by vm.incomingBusy.collectAsStateWithLifecycle()
     val callBusy = call.active || incoming || call.state == "ending"
     val context = LocalContext.current
+    val previewBuild = BuildConfig.APPLICATION_ID.endsWith(".debug")
     fun alertsEnabled(): Boolean = androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled() &&
         context.getSystemService(android.app.NotificationManager::class.java).getNotificationChannel(dev.hermes.android.updates.UpdateManager.CHANNEL)?.importance != android.app.NotificationManager.IMPORTANCE_NONE
     var alertsAllowed by remember { mutableStateOf(alertsEnabled()) }
@@ -301,20 +313,24 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
             Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 Icon(Icons.Rounded.SystemUpdate, null, Modifier.size(36.dp), tint = MaterialTheme.colorScheme.primary)
                 Text(update.release?.let { "Cypher ${it.name}" } ?: "Keep Cypher up to date", style = MaterialTheme.typography.headlineSmall)
-                Text(update.status, style = MaterialTheme.typography.bodyLarge)
-                if (update.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-                Button(onClick = { if (update.release == null && !update.ready) vm.checkForAppUpdate() else vm.downloadAppUpdate() }, enabled = !update.busy && !(callBusy && (update.release != null || update.ready)), modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
-                    Text(when { update.busy -> "Updating…"; update.ready -> "Install update"; update.release != null -> "Update"; else -> "Check for updates" })
+                Text(if (previewBuild) "Preview builds are installed manually." else update.status, style = MaterialTheme.typography.bodyLarge)
+                if (!previewBuild) {
+                    if (update.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                    Button(onClick = { if (update.release == null && !update.ready) vm.checkForAppUpdate() else vm.downloadAppUpdate() }, enabled = !update.busy && !(callBusy && (update.release != null || update.ready)), modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
+                        Text(when { update.busy -> "Updating…"; update.ready -> "Install update"; update.release != null -> "Update"; else -> "Check for updates" })
+                    }
+                    if (callBusy && (update.release != null || update.ready)) Text(if(call.state=="ending") "Call cleanup is finishing. The update will be available shortly." else "Finish your call before installing the update.", style = MaterialTheme.typography.bodyMedium)
                 }
-                if (callBusy && (update.release != null || update.ready)) Text(if(call.state=="ending") "Call cleanup is finishing. The update will be available shortly." else "Finish your call before installing the update.", style = MaterialTheme.typography.bodyMedium)
                 Text("Installed · ${BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
-        Text("Cypher checks, downloads and verifies the release. Confirm installation in Android to finish.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        if (!alertsAllowed) OutlinedButton(onClick = {
-            context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
-        }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Allow update notifications") }
-        Text("Keep Tailscale connected for background checks. Android may delay checks to save battery.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (!previewBuild) {
+            Text("Cypher checks, downloads and verifies the release. Confirm installation in Android to finish.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (!alertsAllowed) OutlinedButton(onClick = {
+                context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
+            }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Allow update notifications") }
+            Text("Keep Tailscale connected for background checks. Android may delay checks to save battery.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
     }
     }
 }

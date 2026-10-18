@@ -91,7 +91,7 @@ fun formBody(form: ActionForm): JSONObject {
 }
 @Composable fun LabeledToggle(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit, description: String = "", checkbox: Boolean = false, enabled: Boolean = true) {
     Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).semantics(mergeDescendants = true) {}.toggleable(checked, enabled = enabled, role = if (checkbox) Role.Checkbox else Role.Switch, onValueChange = onCheckedChange), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-        Column(Modifier.weight(1f)) { Text(label, style = MaterialTheme.typography.bodyLarge); if (description.isNotBlank()) Text(description, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        Column(Modifier.weight(1f).padding(end = 12.dp)) { Text(label, style = MaterialTheme.typography.bodyLarge); if (description.isNotBlank()) Text(description, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         if (checkbox) Checkbox(checked, onCheckedChange = null, enabled = enabled) else Switch(checked, onCheckedChange = null, enabled = enabled)
     }
 }
