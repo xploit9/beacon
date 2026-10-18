@@ -134,13 +134,8 @@ class NativeExperienceUiTest {
             block(vm, fixture)
         } finally {
             compose.runOnUiThread { store.clear(); fixture.client.closeNative(); fixture.clearCustomTabSeam(); app.calls.ownerScope = null }
-            runBlocking { app.preferences.edit {
-                prior[originKey]?.let { value -> it[originKey] = value } ?: it.remove(originKey)
-                prior[motionKey]?.let { value -> it[motionKey] = value } ?: it.remove(motionKey)
-                for (name in listOf("theme", "skin", "font_size", "language", "rtl")) {
-                    val key = stringPreferencesKey(name); prior[key]?.let { value -> it[key] = value } ?: it.remove(key)
-                }
-            } }
+            // Restore every preference, including setup_* written by wizard and sign-out cases, so the real app never reopens on the wizard.
+            runBlocking { app.preferences.updateData { prior } }
             runBlocking {
                 app.auth.remove(fixture.scope.origin)
                 if (priorChatPreferences == null) app.cache.delete(fixture.scope, "chat-preferences") else app.cache.write(fixture.scope, "chat-preferences", priorChatPreferences, true)
