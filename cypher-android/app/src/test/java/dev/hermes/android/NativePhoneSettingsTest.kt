@@ -192,7 +192,13 @@ class NativePhoneSettingsTest {
             assertEquals("my changed notes", controller.memory.value.documents.single().content)
             assertEquals(confirmedRevision, controller.memory.value.documents.single().revision)
             assertEquals("", controller.memory.value.editing)
-            assertTrue(requests.all { it.url.queryParameter("profile") == "default" })
+            assertTrue(requests.all {
+                if (it.url.encodedPath.startsWith("/api/plugins/cypher/")) {
+                    it.url.queryParameter("cypher_profile") == "default" && it.url.queryParameter("profile") == null
+                } else {
+                    it.url.queryParameter("profile") == "default" && it.url.queryParameter("cypher_profile") == null
+                }
+            })
         } finally { worker.cancel(); client.closeNative() }
     }
     @Test fun unresolvedHostUpdateSurvivesProfileSwitchAndBlocksAnotherApply() {

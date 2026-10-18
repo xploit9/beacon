@@ -32,7 +32,7 @@ class NativeGatewayTest {
                 builder.addInterceptor { chain ->
                     assertEquals("GET", chain.request().method)
                     assertEquals("/api/plugins/cypher/mobile/calls/owned-call/context", chain.request().url.encodedPath)
-                    assertEquals("default", chain.request().url.queryParameter("profile"))
+                    assertEquals("default", chain.request().url.queryParameter("cypher_profile"))
                     val status = if (requests++ == 0) first else second
                     Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(status).message("Native")
                         .body(json((if (status == 200) "profile" else "detail") to (if (status == 200) "default" else "Native lookup failed")).toString().toResponseBody("application/json".toMediaType())).build()
