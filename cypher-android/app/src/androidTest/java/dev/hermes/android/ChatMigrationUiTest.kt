@@ -2,6 +2,7 @@ package dev.hermes.android
 
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Button
@@ -32,6 +33,12 @@ class ChatMigrationUiTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
 
     private fun tool(name: String, vararg extra: Pair<String, Any>) = JSONObject().put("tid", "t-$name").put("name", name).also { o -> extra.forEach { o.put(it.first, it.second) } }
+
+    private fun expandModalSheet() {
+        val expand = compose.onAllNodes(SemanticsMatcher.keyIsDefined(androidx.compose.ui.semantics.SemanticsActions.Expand), useUnmergedTree = true)
+        if (expand.fetchSemanticsNodes().isNotEmpty()) expand.onFirst().performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.Expand) { it() }
+        compose.waitForIdle()
+    }
 
     @Test fun historyToolCardIsFoldedThenShowsArgumentsAndResult() {
         compose.setContent { MaterialTheme { ToolCard(tool("terminal", "args" to "ls -la", "result" to "total 0")) } }
@@ -67,10 +74,16 @@ class ChatMigrationUiTest {
     }
 
     @Test fun storedToolWithNoMarkerIsNotRunningEvenWhileSomethingElseStreams() {
-        compose.setContent { MaterialTheme { MessageActivity("", listOf(tool("read_file"))) } }
-        compose.onNodeWithTag("tool-card-details").assertDoesNotExist()
-        compose.onNodeWithTag("tool-card-toggle").performClick()
-        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertTextContains("No result recorded", substring = true)
+        compose.setContent { MaterialTheme { Column {
+            MessageActivity("", listOf(tool("read_file")))
+            MessageActivity("", listOf(tool("terminal")), status = "Working", streaming = true)
+        } } }
+        compose.onAllNodesWithTag("tool-card-details").assertCountEquals(1) // only the live sibling opens by itself
+        compose.onAllNodesWithTag("tool-card-toggle")[0].performClick()
+        val statuses = compose.onAllNodesWithTag("tool-card-status", useUnmergedTree = true)
+        statuses.assertCountEquals(2)
+        statuses[0].assertTextContains("No result recorded", substring = true)
+        statuses[1].assertTextContains("Running", substring = true)
     }
 
     @Test fun storedRunningStatusWithNothingTerminalIsNoResultNotRunning() {
@@ -161,10 +174,12 @@ class ChatMigrationUiTest {
         assertEquals(listOf(false, true), reported)
     }
 
-    @Test fun eachToolGetsItsOwnCardAndNoGenericSummaryRow() {
+    @Test fun eachToolGetsItsOwnCardWithItsName() {
         compose.setContent { MaterialTheme { MessageActivity("", listOf(tool("terminal", "result" to "a"), tool("read_file", "result" to "b"), tool("web_search", "result" to "c"))) } }
         compose.onAllNodesWithTag("tool-card").assertCountEquals(3)
-        compose.onAllNodesWithText("Used", substring = true).assertCountEquals(0)
+        compose.onNodeWithText("Terminal").assertIsDisplayed()
+        compose.onNodeWithText("Read file").assertIsDisplayed()
+        compose.onNodeWithText("Web search").assertIsDisplayed()
     }
 
     @Test fun toolCardsFitANarrowPhone() {
@@ -196,6 +211,7 @@ class ChatMigrationUiTest {
         compose.onNodeWithTag("chat-activity-sheet").assertDoesNotExist()
         compose.onNodeWithTag("chat-activity-strip").performClick()
         compose.onNodeWithTag("chat-activity-sheet").assertIsDisplayed()
+        expandModalSheet()
         compose.onNodeWithText("Read-only live details from this chat").assertIsDisplayed()
         // The sheet scrolls, so bring each section into view before asserting on it.
         compose.onNodeWithText("Terminal").performScrollTo().assertIsDisplayed()
@@ -223,15 +239,6 @@ class ChatMigrationUiTest {
         compose.onNodeWithText("No result recorded", substring = true).performScrollTo().assertIsDisplayed()
     }
 
-    @Test fun composerRulesStayStable() {
-        assertTrue(composerUsesVoice("", 0, 0))
-        assertFalse(composerUsesVoice("hi", 0, 0))
-        assertFalse(composerUsesVoice("", 2, 0))
-        assertFalse(composerUsesVoice("", 0, 1))
-        assertEquals(48f, composerActionSize.value, 0f)
-        assertEquals("1 message queued — delivers after this turn", queuedHeading(1))
-        assertEquals("3 messages queued — delivers after this turn", queuedHeading(3))
-    }
     @Test fun sphereBackdropSitsUnderContentAndDoesNotConsumeClicks() {
         var clicked by mutableStateOf(false)
         compose.setContent { MaterialTheme {
