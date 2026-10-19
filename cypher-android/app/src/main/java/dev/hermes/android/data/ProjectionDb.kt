@@ -51,7 +51,7 @@ class ProjectionCache internal constructor(private val db: ProjectionDb, private
                         rows.put(Projection(target, row.scope, migrated, row.updated, row.protected, migrated.size.toLong()))
                         rows.delete(row.key)
                     }
-                    String(clear, Charsets.UTF_8)
+                    return String(clear, Charsets.UTF_8)
                 }
                 val current = (rows.get(newKey) ?: rows.get(legacyKey(scope, kind)))?.let { read(it, newKey) }
                 if (current != null) {
