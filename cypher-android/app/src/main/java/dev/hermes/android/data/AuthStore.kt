@@ -74,20 +74,25 @@ data class AuthContext(
     override fun toString() = "AuthContext(origin=$origin, cookies=${cookies.size}, owner=$owner, profile=$profile, csrf=<redacted>, backend=$backend, bearer=$bearer, loopbackSession=$loopbackSession)"
 }
 
-// Issue time wins for current records; expiry is the legacy fallback and ties prefer incoming.
-internal fun chooseNewestBearer(incoming: NativeBearerRecord?, stored: NativeBearerRecord?): NativeBearerRecord? = when {
+// Issued-time ties keep stored on ordinary writes but incoming on epoch-checked persistence; legacy expiry ties still prefer incoming.
+internal fun chooseNewestBearer(incoming: NativeBearerRecord?, stored: NativeBearerRecord?, preferIncomingOnIssueTimeTie: Boolean): NativeBearerRecord? = when {
     stored == null -> incoming
     incoming == null -> stored
-    stored.issuedAt > 0 && incoming.issuedAt > 0 -> if (stored.issuedAt > incoming.issuedAt) stored else incoming
+    stored.issuedAt > 0 && incoming.issuedAt > 0 -> when {
+        stored.issuedAt > incoming.issuedAt -> stored
+        stored.issuedAt < incoming.issuedAt -> incoming
+        preferIncomingOnIssueTimeTie -> incoming
+        else -> stored
+    }
     stored.issuedAt > 0 -> stored
     incoming.issuedAt > 0 -> incoming
     stored.expiresAt > incoming.expiresAt -> stored
     else -> incoming
 }
 
-internal fun AuthContext.withNewestBearer(stored: NativeBearerRecord?): AuthContext {
+internal fun AuthContext.withNewestBearer(stored: NativeBearerRecord?, preferIncomingOnIssueTimeTie: Boolean = false): AuthContext {
     val sameOwner = stored?.takeIf { loopbackSession == null && it.origin == origin && it.owner == owner }
-    return copy(bearer = chooseNewestBearer(bearer, sameOwner)?.copy(profile = profile))
+    return copy(bearer = chooseNewestBearer(bearer, sameOwner, preferIncomingOnIssueTimeTie)?.copy(profile = profile))
 }
 
 internal fun AuthContext.compareAndSetBearer(expected: NativeBearerRecord, replacement: NativeBearerRecord): AuthContext? {
@@ -151,7 +156,7 @@ class AuthStore(context: Context, private val cipher: AppCipher) {
     internal suspend fun persistIfUnchanged(auth: AuthContext, version: Long?) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
         synchronized(this@AuthStore) {
             if (version != null && authorityEpoch.current(version)) {
-                write(auth.copy(loopbackSession = auth.loopbackSession?.takeIf { auth.bearer == null }))
+                write(auth.copy(loopbackSession = auth.loopbackSession?.takeIf { auth.bearer == null }), preferIncomingOnIssueTimeTie = true)
                 true
             } else false
         }
@@ -162,7 +167,8 @@ class AuthStore(context: Context, private val cipher: AppCipher) {
         }
     }
     suspend fun remove(origin: String) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { clear(origin) }
-    fun write(auth: AuthContext) = authorityEpoch.mutate { synchronized(this) { writeRecord(auth.withNewestBearer(read(auth.origin).bearer)) } }
+    fun write(auth: AuthContext) = write(auth, preferIncomingOnIssueTimeTie = false)
+    private fun write(auth: AuthContext, preferIncomingOnIssueTimeTie: Boolean) = authorityEpoch.mutate { synchronized(this) { writeRecord(auth.withNewestBearer(read(auth.origin).bearer, preferIncomingOnIssueTimeTie)) } }
     private fun writeRecord(auth: AuthContext) {
         val o = JSONObject().put("cookies", JSONArray(auth.cookies)).put("owner", auth.owner).put("profile", auth.profile).put("csrf", auth.csrf).put("backend", auth.backend)
         auth.bearer?.let { token ->

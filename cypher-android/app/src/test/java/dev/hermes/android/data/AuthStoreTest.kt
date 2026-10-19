@@ -18,6 +18,16 @@ class AuthStoreTest {
         assertEquals("work", saved.bearer?.profile)
     }
 
+    @Test fun sameIssuedAtKeepsStoredOnWriteButLetsCheckedPersistChooseIncoming() {
+        val origin = "https://native.example"
+        val stale = NativeBearerRecord("stale-access", "stale-refresh", 4000, origin, "owner", "work", issuedAt = 300)
+        val refreshed = NativeBearerRecord("refreshed-access", "refreshed-refresh", 2000, origin, "owner", "work", issuedAt = 300)
+        val auth = AuthContext(origin, emptyList(), "owner", "work", backend = "hermes-dashboard", bearer = stale)
+
+        assertEquals(refreshed, auth.withNewestBearer(refreshed).bearer)
+        assertEquals(stale, auth.withNewestBearer(refreshed, preferIncomingOnIssueTimeTie = true).bearer)
+    }
+
     @Test fun compareAndSetBearerKeepsRefreshWrittenWhenClockMovesBack() {
         val origin = "https://native.example"
         val expected = NativeBearerRecord("expected-access", "expected-refresh", 3000, origin, "owner", "work", issuedAt = 200)
