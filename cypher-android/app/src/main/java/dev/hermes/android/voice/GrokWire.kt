@@ -177,10 +177,11 @@ internal class GrokWire(private val providerName: String = "Grok") {
                 return null
             }
             "response.function_call_arguments.delta" -> {
-                val item=frame.getString("item_id")
-                require(item.isNotBlank()&&item.length<=200)
-                val accumulated=argumentDeltas.getOrDefault(item,"")+frame.getString("delta")
-                require(accumulated.length<=20000)
+                val item=frame.opt("item_id") as? String ?: return null
+                val delta=frame.opt("delta") as? String ?: return null
+                if(item.isBlank()||item.length>200||delta.isBlank()) return null
+                val accumulated=argumentDeltas.getOrDefault(item,"")+delta
+                if(accumulated.length>20000) return null
                 argumentDeltas[item]=accumulated
                 if(argumentDeltas.size>128) argumentDeltas.remove(argumentDeltas.keys.first())
                 frame.optString("call_id").takeIf(String::isNotBlank)?.let { id ->
@@ -196,10 +197,12 @@ internal class GrokWire(private val providerName: String = "Grok") {
                 val response=frame.optJSONObject("response")
                 val status=response?.optString("status")
                 if(status=="failed") error("$providerName response failed")
-                val output=response?.optJSONArray("output")
+                val output=response?.takeIf { status=="completed" }?.optJSONArray("output")
                 if(output!=null) for(i in 0 until output.length()) {
                     val item=output.optJSONObject(i)?:continue
-                    if(item.optString("type")=="function_call") decodeCall(item)?.let(functionCalls::put)
+                    if(item.optString("type")=="function_call") try {
+                        decodeCall(item)?.let(functionCalls::put)
+                    } catch (_: Exception) { }
                 }
                 content.put("turnComplete",true)
                 if(status=="cancelled") content.put("interrupted",true)
@@ -216,11 +219,12 @@ internal class GrokWire(private val providerName: String = "Grok") {
         val id=frame.optString("call_id")
         val name=frame.optString("name")
         require(id.isNotBlank()&&id.length<=200&&name.isNotBlank()&&name.length<=128)
-        if(!emittedCalls.add(id)) return null
+        if(id in emittedCalls) return null
         val arguments=frame.optString("arguments").takeIf(String::isNotBlank)
             ?:argumentDeltas[frame.optString("item_id")].orEmpty()
         require(arguments.isNotBlank()&&arguments.length<=20000)
         val args=JSONObject(arguments)
+        if(!emittedCalls.add(id)) return null
         calls[id]=name
         if(calls.size>128) {
             val oldestRead=calls.entries.firstOrNull { directToolIsReadOnly(it.value) }?.key

@@ -169,9 +169,17 @@ internal fun NativeFeedbackEffect(
     clearMessage: () -> Unit,
 ) {
     val message = rememberUpdatedState(if (setupWizard) "" else error.ifBlank { notice })
+    val wizardOpen = rememberUpdatedState(setupWizard)
     val clear = rememberUpdatedState(clearMessage)
     LaunchedEffect(snackbar) {
-        snapshotFlow { message.value }.distinctUntilChanged().collectLatest { text ->
+        var wasWizardOpen = wizardOpen.value
+        snapshotFlow { wizardOpen.value to message.value }.distinctUntilChanged().collectLatest { (inWizard, text) ->
+            if (wasWizardOpen && !inWizard) {
+                wasWizardOpen = false
+                clear.value()
+                return@collectLatest
+            }
+            if (inWizard) wasWizardOpen = true
             if (text.isNotBlank()) {
                 snackbar.showSnackbar(text, withDismissAction = true, duration = SnackbarDuration.Long)
                 clear.value()

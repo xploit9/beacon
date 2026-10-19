@@ -33,28 +33,34 @@ class VoiceLookupLiveTest {
         val app=ApplicationProvider.getApplicationContext<CypherApplication>()
         require(app.packageName.endsWith(".debug")&&!app.calls.state.value.active)
         val auth=JSONObject(File(app.filesDir,"live-auth.json").readText(Charsets.UTF_8))
+        val voiceStore=VoiceKeyStore(app)
+        val previousVoiceSettings=voiceStore.settings()
+        val providerSelection=voiceStore.settings(provider)
         lateinit var vm:CypherViewModel
         rule.runOnIdle { vm=ViewModelProvider(rule.activity)[CypherViewModel::class.java] }
         suspend fun await(ms:Long=45_000,condition:()->Boolean) { withTimeout(ms) { while(!condition()) delay(75) } }
-        var client:CypherClient?=null;var session="";var previous="";var call=""
+        var client:CypherClient?=null;var session="";var call=""
         val web=AtomicInteger();val mail=AtomicInteger();val skills=AtomicInteger();val memory=AtomicInteger();val completedAfter=AtomicInteger()
         val tools=ConcurrentLinkedQueue<String>();val discoveries=ConcurrentLinkedQueue<String>()
+        val callAdmissions=ConcurrentLinkedQueue<JSONObject>()
         val seenReceipts=java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         val mailTools=java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         val phases=JSONObject().put("provider",provider)
         try {
+            voiceStore.setSelection(providerSelection)
             loginLiveTest(app, auth.getString("origin"), auth)
             withContext(Dispatchers.Main.immediate) { vm.connect(auth.getString("origin")) }.join()
             await { vm.ui.value.connected&&vm.client!=null }
             client=vm.client!!.detached()
-            previous=client!!.nativeRequest("/api/plugins/cypher/mobile/voice-settings").getString("selected_provider")
-            client!!.nativeRequest("/api/plugins/cypher/mobile/voice-settings","PUT",json("provider" to provider))
             withContext(Dispatchers.Main.immediate) { vm.newChat(json("title" to "Voice lookup verification")) }.join()
             await { vm.chat.value.sessionId.isNotBlank()&&!vm.ui.value.newChatOpening }
             session=vm.chat.value.sessionId
             val original=requireNotNull(vm.client)
             val observed=original.http.newBuilder().addNetworkInterceptor { chain ->
                 val request=chain.request()
+                if(request.url.encodedPath=="/api/plugins/cypher/mobile/calls"&&request.method=="POST") {
+                    val buffer=okio.Buffer();request.body?.writeTo(buffer);callAdmissions.add(JSONObject(buffer.readUtf8()))
+                }
                 check(request.url.pathSegments.last() !in setOf("jobs","callback","decision")) { "Read-only verification does not authorize delegated work or writes" }
                 chain.proceed(request).also { response ->
                     if(response.isSuccessful) {
@@ -94,10 +100,16 @@ class VoiceLookupLiveTest {
             phases.put("ready_ms",(System.nanoTime()-start)/1_000_000)
             call=app.calls.state.value.callId
             assertEquals(provider,app.calls.state.value.voiceProvider)
-            // Provider binding is immutable now; immediately restore the owner's saved preference.
-            client!!.nativeRequest("/api/plugins/cypher/mobile/voice-settings","PUT",json("provider" to previous));previous=""
+            val admission=callAdmissions.single()
+            assertEquals(provider,admission.getString("voice_provider"));assertTrue(admission.optBoolean("client_key"))
+            assertFalse(admission.has("api_key")||admission.has("token"))
             await { app.calls.state.value.transcripts.any { it.role=="assistant"&&it.final } }
             val direct=CypherCallService::class.java.getDeclaredField("directVoice").apply { isAccessible=true }.get(requireNotNull(app.calls.service)) as DirectVoice
+            val callCredentials=DirectVoice::class.java.getDeclaredField("credentials").apply { isAccessible=true }.get(direct) as dev.hermes.android.data.VoiceSessionCredentials
+            assertEquals(providerSelection.provider,callCredentials.provider)
+            assertEquals(providerSelection.voice,callCredentials.voice)
+            assertEquals(providerSelection.personality,callCredentials.personality)
+            phases.put("phone_key_admission",true).put("client_key",true).put("provider_voice",callCredentials.voice).put("provider_personality",callCredentials.personality)
             suspend fun drainSpeech() {
                 val audio=CypherCallService::class.java.getDeclaredField("pcm").apply { isAccessible=true }.get(requireNotNull(app.calls.service)) as NativePcm
                 val audioLock=NativePcm::class.java.getDeclaredField("lock").apply { isAccessible=true }.get(audio)
@@ -141,7 +153,7 @@ class VoiceLookupLiveTest {
             phases.put("call_id",call).put("session_id",session).put("version_code",BuildConfig.VERSION_CODE)
             phases.put("call_error",app.calls.state.value.error.take(300))
             app.calls.hangup();withTimeoutOrNull(45000) { while(app.calls.service!=null) delay(100) }
-            if(previous.isNotBlank()) client?.nativeRequest("/api/plugins/cypher/mobile/voice-settings","PUT",json("provider" to previous))
+            voiceStore.setSelection(previousVoiceSettings)
             if(call.isNotBlank()) client?.nativeRequest("/api/plugins/cypher/mobile/calls/$call","DELETE")
             if(session.isNotBlank()) client?.nativeRpc("session.set_hidden",json("session_id" to session,"hidden" to true))
             File(app.filesDir,"voice-lookup-$provider-last-phase.json").writeText(phases.toString(),Charsets.UTF_8)

@@ -12,10 +12,11 @@ import androidx.test.platform.app.InstrumentationRegistry
 import dev.hermes.android.*
 import dev.hermes.android.core.*
 import dev.hermes.android.data.CypherClient
+import dev.hermes.android.data.VoiceKeyStore
+import dev.hermes.android.data.VoicePreferences
+import dev.hermes.android.data.VoiceSessionCredentials
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collect
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -55,6 +56,9 @@ class NativeCallLiveUiTest {
         require(app.resources.configuration.locales[0].language=="en") { "Consent driver requires English system UI" }
         require(app.checkSelfPermission(Manifest.permission.RECORD_AUDIO)==PackageManager.PERMISSION_GRANTED)
         require(!app.calls.state.value.active) { "Do not disturb an existing call" }
+        val voiceStore=VoiceKeyStore(app)
+        val previousVoiceSettings=voiceStore.settings()
+        val geminiSettings=voiceStore.settings("gemini")
         val credentials=JSONObject(File(app.filesDir,"live-auth.json").readText(Charsets.UTF_8).removePrefix("\uFEFF"))
         require(BuildConfig.DEFAULT_ORIGIN.startsWith("https://"))
         if(credentials.has("origin")) require(credentials.getString("origin")==BuildConfig.DEFAULT_ORIGIN)
@@ -77,8 +81,10 @@ class NativeCallLiveUiTest {
         cameraManager.registerAvailabilityCallback(cameraObserver,android.os.Handler(android.os.Looper.getMainLooper()))
         val collector=launch { app.calls.state.collect { if(stored.isNotBlank()&&it.conversationScope?.session==stored&&it.error.isNotBlank()) failures.add("Owned call reported error") } }
         val transport=ConcurrentLinkedQueue<JSONObject>()
+        val callAdmissions=ConcurrentLinkedQueue<JSONObject>()
         var primary:Throwable?=null
         try {
+            voiceStore.setSelection(geminiSettings)
             loginLiveTest(app, BuildConfig.DEFAULT_ORIGIN, credentials)
             withContext(Dispatchers.Main.immediate) { vm.connect(BuildConfig.DEFAULT_ORIGIN) }.join()
             phase="connected-auth"
@@ -119,12 +125,13 @@ class NativeCallLiveUiTest {
             val allowedDecisions=java.util.concurrent.ConcurrentHashMap<String,Pair<String,String>>()
             val traced=original.http.newBuilder().addInterceptor { chain ->
                 var request=chain.request();val started=System.nanoTime()
+                val trace=json("route" to request.url.pathSegments.last(),"method" to request.method)
                 if(request.url.encodedPath=="/api/plugins/cypher/mobile/calls" && request.method=="POST") {
                     val buffer=okio.Buffer();request.body?.writeTo(buffer)
-                    val body=JSONObject(buffer.readUtf8()).put("voice_provider","gemini")
-                    request=request.newBuilder().post(body.toString().toRequestBody("application/json".toMediaType())).build()
+                    val body=JSONObject(buffer.readUtf8())
+                    callAdmissions.add(body)
+                    trace.put("voice_provider",body.optString("voice_provider")).put("client_key",body.optBoolean("client_key"))
                 }
-                val trace=json("route" to request.url.pathSegments.last(),"method" to request.method)
                 check(request.url.pathSegments.last()!="audio") { "Call audio must never be uploaded" }
                 if(request.url.pathSegments.last()=="invoke") {
                     val buffer=okio.Buffer();request.body?.writeTo(buffer)
@@ -158,6 +165,7 @@ class NativeCallLiveUiTest {
             assertTrue("Actual CoreTelecom/native service reported a failure",failures.isEmpty())
             callId=app.calls.state.value.callId
             assertEquals(stored,app.calls.state.value.conversationScope?.session)
+            assertPhoneKeyCall(app,callAdmissions,geminiSettings)
             rule.onNodeWithTag("cypher-live-call-surface").assertExists()
             rule.onNodeWithTag("cypher-minimize-call").assertDoesNotExist()
             rule.onNodeWithTag("cypher-share-screen").assertIsEnabled().performClick()
@@ -427,10 +435,16 @@ class NativeCallLiveUiTest {
         }
         finally {
             val cleanup=cleanupOwnedCall(stored,callId,runtime,reader)
+            var settingsRestore:Throwable?=null
+            try { voiceStore.setSelection(previousVoiceSettings) } catch(error:Throwable) { settingsRestore=error }
             File(app.filesDir,"live-service-http.json").writeText(JSONArray(transport.toList()).toString(),Charsets.UTF_8)
             cameraManager.unregisterAvailabilityCallback(cameraObserver)
             collector.cancel();reader?.closeNative()
-            if(cleanup!=null) { val error=AssertionError("Verification call/runtime cleanup incomplete");if(primary!=null) primary!!.addSuppressed(error) else throw error }
+            if(cleanup!=null||settingsRestore!=null) {
+                val error=AssertionError("Verification call/runtime cleanup incomplete")
+                cleanup?.let(error::addSuppressed);settingsRestore?.let(error::addSuppressed)
+                if(primary!=null) primary!!.addSuppressed(error) else throw error
+            }
         }
     }
     private suspend fun cleanupOwnedCall(stored:String,callId:String,runtime:String,reader:CypherClient?):Throwable? = try {
@@ -448,5 +462,15 @@ class NativeCallLiveUiTest {
         } }
         null
     } catch(error:Throwable) { error }
+    private fun assertPhoneKeyCall(app:CypherApplication,admissions:Collection<JSONObject>,settings:VoicePreferences) {
+        val admission=admissions.firstOrNull()?:throw AssertionError("Phone-key call admission was not captured")
+        assertEquals("gemini",admission.getString("voice_provider"));assertTrue(admission.optBoolean("client_key"))
+        assertFalse(admission.has("api_key")||admission.has("token"))
+        val direct=CypherCallService::class.java.getDeclaredField("directVoice").apply { isAccessible=true }.get(requireNotNull(app.calls.service)) as DirectVoice
+        val credentials=DirectVoice::class.java.getDeclaredField("credentials").apply { isAccessible=true }.get(direct) as VoiceSessionCredentials
+        assertEquals("gemini",credentials.provider)
+        assertEquals(settings.voice,credentials.voice)
+        assertEquals(settings.personality,credentials.personality)
+    }
     private fun contextIsEmulator()=Build.FINGERPRINT.contains("generic")||Build.FINGERPRINT.contains("emulator")||Build.MODEL.contains("sdk_gphone")
 }

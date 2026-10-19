@@ -36,6 +36,36 @@ class GrokWireTest {
         assertEquals("call-1",tool.getString("id"));assertEquals("invoke_tool",tool.getString("name"));assertEquals("opaque",tool.getJSONObject("args").getString("tool_id"))
         assertTrue(runCatching { wire.inbound(JSONObject().put("type","error").put("error",JSONObject().put("message","private token"))) }.exceptionOrNull()!!.message!!.let { !it.contains("private token") })
     }
+    @Test fun incompleteResponsesSkipCallsAndMalformedCompletedItemsDoNotPoisonCallIds() {
+        val wire=GrokWire()
+        val malformed=JSONObject().put("type","function_call").put("call_id","call-1").put("name","invoke_tool").put("arguments","{")
+        val incomplete=wire.inbound(JSONObject().put("type","response.done").put("response",JSONObject()
+            .put("status","cancelled").put("output",JSONArray().put(malformed))))
+        assertTrue(incomplete!!.getJSONObject("serverContent").getBoolean("interrupted"))
+        assertFalse(incomplete.has("toolCall"))
+
+        val malformedComplete=wire.inbound(JSONObject().put("type","response.done").put("response",JSONObject()
+            .put("status","completed").put("output",JSONArray().put(malformed))))
+        assertNotNull(malformedComplete)
+        assertFalse(malformedComplete!!.has("toolCall"))
+
+        val valid=malformed.put("arguments",JSONObject().put("tool_id","opaque").toString())
+        val recovered=wire.inbound(JSONObject().put("type","response.done").put("response",JSONObject()
+            .put("status","completed").put("output",JSONArray().put(valid))))
+        assertEquals("call-1",recovered!!.getJSONObject("toolCall").getJSONArray("functionCalls").getJSONObject(0).getString("id"))
+    }
+    @Test fun malformedFunctionArgumentDeltasAreSkippedAndAValidItemStillCompletes() {
+        val wire=GrokWire()
+        assertNull(wire.inbound(JSONObject().put("type","response.function_call_arguments.delta")))
+        assertNull(wire.inbound(JSONObject().put("type","response.function_call_arguments.delta").put("item_id","item-1")))
+        assertNull(wire.inbound(JSONObject().put("type","response.function_call_arguments.delta").put("item_id",1).put("delta","ignored")))
+        assertNull(wire.inbound(JSONObject().put("type","response.function_call_arguments.delta").put("item_id","item-1").put("delta","{")))
+        assertNull(wire.inbound(JSONObject().put("type","response.function_call_arguments.delta").put("item_id","item-1").put("delta","\"tool_id\":\"opaque\"}")))
+
+        val call=wire.inbound(JSONObject().put("type","response.function_call_arguments.done").put("item_id","item-1")
+            .put("call_id","call-1").put("name","invoke_tool"))!!.getJSONObject("toolCall").getJSONArray("functionCalls").getJSONObject(0)
+        assertEquals("opaque",call.getJSONObject("args").getString("tool_id"))
+    }
     @Test fun assistantTranscriptDoneDoesNotRepeatTextAlreadyStreamedForTheItem() {
         val wire=GrokWire()
         val delta=JSONObject().put("type","response.output_audio_transcript.delta").put("item_id","item-1").put("delta","Hello ")

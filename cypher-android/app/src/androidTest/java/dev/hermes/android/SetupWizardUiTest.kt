@@ -8,6 +8,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.collectAsState
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -68,6 +69,36 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class SetupWizardUiTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
+
+    @Test fun setupWizardSuppressedNoticeAndErrorAreClearedWhenItCloses() {
+        var setupWizard by mutableStateOf(true)
+        var error by mutableStateOf("")
+        var notice by mutableStateOf("For this dashboard, scan the QR code with Cypher's scanner to sign in.")
+        var cleared = 0
+        val snackbar = SnackbarHostState()
+        compose.setContent { MaterialTheme {
+            NativeFeedbackEffect(error, notice, setupWizard, snackbar) {
+                cleared++
+                error = ""
+                notice = ""
+            }
+            SnackbarHost(snackbar)
+        } }
+        compose.waitForIdle()
+        assertNull(snackbar.currentSnackbarData)
+
+        compose.runOnIdle { setupWizard = false }
+        compose.waitUntil(5_000) { cleared == 1 || snackbar.currentSnackbarData != null }
+        assertEquals(1, cleared)
+        assertNull(snackbar.currentSnackbarData)
+
+        compose.runOnIdle { setupWizard = true; error = "Setup step failed" }
+        compose.waitForIdle()
+        compose.runOnIdle { setupWizard = false }
+        compose.waitUntil(5_000) { cleared == 2 || snackbar.currentSnackbarData != null }
+        assertEquals(2, cleared)
+        assertNull(snackbar.currentSnackbarData)
+    }
 
     @Suppress("UNCHECKED_CAST") private fun <T> flow(vm: CypherViewModel, name: String) =
         CypherViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.get(vm) as MutableStateFlow<T>

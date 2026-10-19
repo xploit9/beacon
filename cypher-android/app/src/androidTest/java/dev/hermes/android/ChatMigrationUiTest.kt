@@ -151,6 +151,33 @@ class ChatMigrationUiTest {
         assertTrue(shown.contains("line 80"))
     }
 
+    @Test fun largeToolResultShowsMoreAndShowLessRestoresTheFirstPage() {
+        val long = "x".repeat(ToolDetailPageSize + 500)
+        compose.setContent { MaterialTheme { ToolCard(tool("terminal", "result" to long)) } }
+        compose.onNodeWithTag("tool-card-toggle").performClick()
+        val shown = { compose.onNodeWithTag("tool-card-result", useUnmergedTree = true).fetchSemanticsNode().config[androidx.compose.ui.semantics.SemanticsProperties.Text].joinToString("") { it.text } }
+        val firstPage = shown()
+        assertTrue(firstPage.startsWith(long.take(ToolDetailPageSize)))
+        assertTrue(firstPage.endsWith("500 more characters not shown"))
+        compose.onNodeWithTag("tool-card-result-show-more").assertExists().performClick()
+        assertEquals(long, shown())
+        compose.onNodeWithTag("tool-card-result-show-less").assertExists().performClick()
+        assertEquals(firstPage, shown())
+    }
+
+    @Test fun separateToolResultRowNamesItsCallAndMarksTheToolCardAsTranscriptResult() {
+        val call = tool("terminal", "tool_call_id" to "call-1")
+        val result = JSONObject().put("id", "tool-result-1").put("role", "tool").put("tool_call_id", "call-1").put("tool_name", "terminal")
+        val messages = listOf(result)
+        val separateResults = separateToolResultIds(messages)
+        assertEquals(setOf("call-1"), separateResults)
+        assertEquals("Terminal result", toolResultTitles(messages)["tool-result-1"])
+
+        compose.setContent { MaterialTheme { MessageActivity("", listOf(call), separateToolResults = separateResults) } }
+        compose.onNodeWithTag("tool-card-toggle").performClick()
+        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertTextContains("Result in transcript", substring = true)
+    }
+
     @Test fun dispatchedDelegationReadsAsDispatchedNotCompleted() {
         compose.setContent { MaterialTheme { ToolCard(tool("delegate_task", "status" to "completed", "result" to """{"status":"dispatched"}""")) } }
         compose.onNodeWithTag("tool-card-meta", useUnmergedTree = true).assertTextEquals("Dispatched")

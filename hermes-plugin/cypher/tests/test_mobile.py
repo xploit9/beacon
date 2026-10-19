@@ -1035,20 +1035,17 @@ def test_voice_skill_reads_are_current_enabled_scoped_and_bounded(harness, monke
     assert set(seen) == {'coder'}
 
 
-def test_voice_memory_uses_native_provider_without_llm_and_never_silently_falls_back(harness, monkeypatch):
+def test_voice_memory_does_not_initialize_a_missing_external_provider(harness, monkeypatch):
     api, _, _, tmp, _ = harness
     (tmp / 'config.yaml').write_text('memory:\n  provider: hindsight\n', encoding='utf-8')
     calls = []
     monkeypatch.setattr(api.voice_context, 'scoped', lambda profile, fn: fn(tmp))
     monkeypatch.setattr(api.voice_context, 'external_provider', lambda *args: (None, 'hindsight'))
-    monkeypatch.setitem(sys.modules, 'agent.memory_manager', SimpleNamespace(sanitize_context=lambda text: text))
-    monkeypatch.setattr(api.voice_context, 'lookup_provider', lambda *args: (SimpleNamespace(_prefetch_provider=lambda provider, query, session_id: calls.append((query, session_id)) or 'Verified native memory'), SimpleNamespace(shutdown=lambda: calls.append('closed'))))
-    monkeypatch.setattr(api.voice_context, 'builtin_memory', lambda *args: pytest.fail('Configured external recall must not silently become builtin recall'))
-    result = api.voice_context.recall('owner', 'basic', 'default', 'native-stored', 'current question')
-    assert result['sources'][0]['ref'] == 'native-memory:hindsight'
-    assert calls == [('current question', 'native-stored'), 'closed']
-    monkeypatch.setattr(api.voice_context, 'lookup_provider', lambda *args: (_ for _ in ()).throw(LookupError('Provider unavailable')))
-    with pytest.raises(LookupError): api.voice_context.recall('owner', 'basic', 'default', 'native-stored', 'current question')
+    monkeypatch.setattr(api.voice_context, 'lookup_provider', lambda *args: calls.append(args) or pytest.fail('A missing provider must not be initialized'), raising=False)
+    monkeypatch.setattr(api.voice_context, 'builtin_memory', lambda *args: '')
+    with pytest.raises(LookupError, match='Native memory recall unavailable'):
+        api.voice_context.recall('owner', 'basic', 'default', 'native-stored', 'current question')
+    assert calls == []
 
 
 def test_project_assignment_can_reserve_only_an_owned_existing_draft(harness, monkeypatch):
