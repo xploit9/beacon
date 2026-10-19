@@ -8,6 +8,7 @@ import java.io.IOException
 import dev.hermes.android.core.Scope
 import dev.hermes.android.data.AuthContext
 import dev.hermes.android.data.authorizesPushSource
+import kotlinx.coroutines.test.runTest
 
 class IncomingCallTest {
     private fun route() = JSONObject("""{"source_ref":"source-1","profile":"default","kind":"incoming_call","state":"pending","callback_id":"callback-1","expires_at":1120}""")
@@ -41,6 +42,31 @@ class IncomingCallTest {
         assertThrows(IllegalArgumentException::class.java) { requireIncomingRoute(route(), "source-2", "default", 1000) }
         assertThrows(IllegalArgumentException::class.java) { requireIncomingRoute(route(), "source-1", "other", 1000) }
     }
+
+    @Test fun declineAuthorizationRunsAfterPreflightAndImmediatelyBeforeTheRequest() = runTest {
+        val order = mutableListOf<String>()
+        val preflightFailure = runCatching {
+            performIncomingDeclineRequest(
+                pending = { order += "pending"; false },
+                authorize = { order += "authorize"; true },
+                request = { order += "request" },
+            )
+        }.exceptionOrNull()
+        assertTrue(preflightFailure is IllegalArgumentException)
+        assertEquals(listOf("pending"), order)
+
+        order.clear()
+        val requestFailure = runCatching {
+            performIncomingDeclineRequest(
+                pending = { order += "pending"; true },
+                authorize = { order += "authorize"; true },
+                request = { order += "request"; throw IOException("response lost") },
+            )
+        }.exceptionOrNull()
+        assertTrue(requestFailure is IOException)
+        assertEquals(listOf("pending", "authorize", "request"), order)
+    }
+
     @Test fun serverTwoMinuteInvitationAcceptsSevenSecondSkewAndThirtySecondBoundary() {
         val serverNow = 1000L
         val expiry = serverNow + 120

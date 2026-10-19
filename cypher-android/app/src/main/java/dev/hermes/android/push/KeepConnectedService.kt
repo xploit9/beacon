@@ -35,14 +35,20 @@ import dev.hermes.android.voice.RelayCallbackPreferences
 import dev.hermes.android.voice.RelayCallbackProtocol
 import dev.hermes.android.voice.RelayCallbackTransition
 import dev.hermes.android.voice.RelayCallbackWire
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.async
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.IOException
 import java.io.InterruptedIOException
@@ -53,6 +59,7 @@ internal class KeepConnectedPageException : IOException()
 private class KeepConnectedProfilesException : IOException()
 
 internal const val KEEP_CONNECTED_LONG_POLL_SECONDS = 25
+internal const val KEEP_CONNECTED_MAX_PROFILE_POLLS = 8
 
 internal fun parseKeepConnectedPage(response: JSONObject, after: Long): KeepConnectedPage {
     val rows = response.optJSONArray("events") ?: throw KeepConnectedPageException()
@@ -131,6 +138,7 @@ internal class KeepConnectedPoller(
     private val onEvent: suspend (String, JSONObject) -> Unit,
 ) {
     private data class ProfileFailure(val attempts: Int, val retryAtMillis: Long, val reason: String)
+    private data class ProfilePollResult(val profile: String, val failure: Exception?, val completedAtMillis: Long)
 
     private val profileFailures = linkedMapOf<String, ProfileFailure>()
     private var primaryProfile = ""
@@ -174,26 +182,43 @@ internal class KeepConnectedPoller(
             val retryAt = profileFailures[primaryProfile]?.retryAtMillis ?: cycleNow
             return KeepConnectedCycle.Reconnecting((retryAt - cycleNow).coerceAtLeast(1L))
         }
-        val results = try {
+        try {
             coroutineScope {
-                due.map { profile -> async {
-                    val failure = try {
-                        val after = cursors.read(origin, owner, profile)
-                        val page = poll(profile, after)
-                        if (page.nextCursor < after || page.events.size > 100) throw KeepConnectedPageException()
-                        page.events.forEach { onEvent(profile, it) }
-                        cursors.advance(origin, owner, profile, page.nextCursor)
-                        null
-                    } catch (error: NativeAuthExpiredException) {
-                        throw error
-                    } catch (error: CancellationException) {
-                        throw error
-                    } catch (error: Exception) {
-                        logKeepConnectedFailure(error)
-                        error
+                // Eight keeps the normal five-profile owner concurrent while bounding larger accounts.
+                val permits = Semaphore(KEEP_CONNECTED_MAX_PROFILE_POLLS)
+                val channel = Channel<ProfilePollResult>(KEEP_CONNECTED_MAX_PROFILE_POLLS)
+                val firstPollAcks = due.associateWith { CompletableDeferred<Unit>() }
+                val workers = due.map { profile -> launch {
+                    var firstPoll = true
+                    // Let each fast profile resume as soon as its first result is recorded, without waiting for peers.
+                    while (currentCoroutineContext().isActive) {
+                        val result = pollProfile(profile, permits)
+                        channel.send(result)
+                        if (result.failure != null) break
+                        if (firstPoll) {
+                            firstPoll = false
+                            firstPollAcks.getValue(profile).await()
+                        }
                     }
-                    Triple(profile, failure, nowMillis())
-                } }.map { it.await() }
+                } }
+                val completedProfiles = mutableSetOf<String>()
+                try {
+                    while (completedProfiles.size < due.size) {
+                        val result = channel.receive()
+                        recordProfileResult(result)
+                        if (completedProfiles.add(result.profile) && result.failure == null && completedProfiles.size < due.size) {
+                            firstPollAcks.getValue(result.profile).complete(Unit)
+                        }
+                    }
+                } finally {
+                    workers.forEach { it.cancel() }
+                    withContext(NonCancellable) { workers.joinAll() }
+                    while (true) {
+                        val queued = channel.tryReceive().getOrNull() ?: break
+                        recordProfileResult(queued)
+                    }
+                    channel.close()
+                }
             }
         } catch (_: NativeAuthExpiredException) {
             stopped = true
@@ -202,21 +227,49 @@ internal class KeepConnectedPoller(
         } catch (error: CancellationException) {
             throw error
         }
-        results.forEach { (profile, error, failedAt) ->
-            if (error == null) profileFailures.remove(profile)
-            else {
-                val attempts = (profileFailures[profile]?.attempts ?: 0) + 1
-                profileFailures.remove(profile)
-                profileFailures[profile] = ProfileFailure(
-                    attempts,
-                    failedAt + keepConnectedBackoffMs(attempts),
-                    keepConnectedFailureReason(profile, error),
-                )
-            }
-        }
         val primaryFailure = profileFailures[primaryProfile]
         return if (primaryFailure == null) KeepConnectedCycle.Connected
         else KeepConnectedCycle.Reconnecting((primaryFailure.retryAtMillis - nowMillis()).coerceAtLeast(1L))
+    }
+
+    private suspend fun pollProfile(profile: String, permits: Semaphore): ProfilePollResult {
+        val startedAt = nowMillis()
+        return try {
+            val after = cursors.read(origin, owner, profile)
+            val page = permits.withPermit {
+                val result = poll(profile, after)
+                if (result.nextCursor < after || result.events.size > 100) throw KeepConnectedPageException()
+                result.events.forEach { onEvent(profile, it) }
+                cursors.advance(origin, owner, profile, result.nextCursor)
+                result
+            }
+            if (page.events.isEmpty() || page.nextCursor == after) {
+                // Avoid spinning if an empty or non-advancing long poll returns before the 500 ms minimum cycle.
+                keepConnectedPollDelay(nowMillis() - startedAt).takeIf { it > 0 }?.let { delay(it) }
+            }
+            ProfilePollResult(profile, null, nowMillis())
+        } catch (error: NativeAuthExpiredException) {
+            throw error
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            logKeepConnectedFailure(error)
+            ProfilePollResult(profile, error, nowMillis())
+        }
+    }
+
+    private fun recordProfileResult(result: ProfilePollResult) {
+        val error = result.failure
+        if (error == null) profileFailures.remove(result.profile)
+        else {
+            val attempts = (profileFailures[result.profile]?.attempts ?: 0) + 1
+            profileFailures.remove(result.profile)
+            profileFailures[result.profile] = ProfileFailure(
+                attempts,
+                result.completedAtMillis + keepConnectedBackoffMs(attempts),
+                keepConnectedFailureReason(result.profile, error),
+            )
+        }
     }
 
     private fun recordDiscoveryFailure(error: Exception) {
@@ -585,6 +638,7 @@ class KeepConnectedService : Service() {
             if (origin.isBlank() || owner.isBlank() || scope?.owner != owner) {
                 setStatus(context, STATUS_SIGNED_OUT)
                 app.push.invalidateKeepConnectedInvitations()
+                cancelSignInNotification(context)
                 context.applicationContext.stopService(Intent(context.applicationContext, KeepConnectedService::class.java))
                 return
             }
@@ -598,6 +652,7 @@ class KeepConnectedService : Service() {
             if (prefs.getString(KEY_ORIGIN, null) != origin) return
             setStatus(context, STATUS_SIGNED_OUT)
             (context.applicationContext as? CypherApplication)?.push?.invalidateKeepConnectedInvitations()
+            cancelSignInNotification(context)
             context.applicationContext.stopService(Intent(context.applicationContext, KeepConnectedService::class.java))
         }
 
@@ -620,6 +675,11 @@ class KeepConnectedService : Service() {
         private fun disablePreference(context: Context) {
             val prefs = preferences(context)
             check(prefs.edit().putBoolean(KEY_ENABLED, false).putString(KEY_STATUS, STATUS_OFF).putString(KEY_REASON, "").commit()) { "Could not stop Keep connected" }
+            cancelSignInNotification(context)
+        }
+
+        private fun cancelSignInNotification(context: Context) {
+            context.applicationContext.getSystemService(NotificationManager::class.java).cancel(SIGN_IN_NOTIFICATION_ID)
         }
 
         private fun stopToken(context: Context): String = ensureStopToken(context)
