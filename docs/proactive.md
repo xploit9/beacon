@@ -1,6 +1,6 @@
 # Proactive assistant
 
-When enabled, Cypher adds four fixed jobs to the selected Hermes profile: a morning brief (08:00), a calendar watch every 30 minutes from 07:00 to 22:00, an evening follow-up sweep (19:00), and nightly memory upkeep (02:00). Times use the profile's Hermes timezone. Routine checks stay quiet; useful results appear as task notices in the owner's assistant conversation.
+When enabled, Cypher adds four fixed jobs to the selected Hermes profile: a morning brief (08:00), a calendar watch every 30 minutes from 07:00 to 22:00, an evening follow-up sweep (19:00), and nightly memory upkeep (02:00). Times use the profile's Hermes timezone. Routine checks stay quiet; useful results send a short task notice to the phone, and opening it in Cypher shows the full text in the owner's assistant conversation.
 
 ## Enable and check status
 

@@ -981,7 +981,16 @@ async def proactive_enabled(request:Request):
     value=await body(request,1024)
     if set(value)!={'enabled'} or type(value['enabled']) is not bool:
         raise HTTPException(400,'Expected only an enabled boolean')
-    owner,_,profile,_=identity(request)
+    owner,provider,profile,cfg=identity(request)
+    if value['enabled']:
+        stored=cfg.get('scheduled_callback_conversation_id')
+        if not isinstance(stored,str) or not stored.strip():
+            raise HTTPException(409,'Choose an owned assistant conversation before enabling Proactive')
+        try: await feature(native.verify,owner,provider,profile,stored,timeout=8)
+        except HTTPException as exc:
+            if exc.status_code==404:
+                raise HTTPException(409,'Choose an owned assistant conversation before enabling Proactive') from None
+            raise
     return await feature(proactive.set_enabled,mobile,owner,profile,value['enabled'],timeout=30)
 
 router.include_router(sys.modules['cypher_callback_api'].build_router(call,body,feature,mobile,native,sys.modules['cypher_callbacks']))

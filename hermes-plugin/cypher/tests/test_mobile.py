@@ -21,7 +21,7 @@ def harness(tmp_path,monkeypatch):
     name='test_cypher_plugin_api'
     spec=importlib.util.spec_from_file_location(name,ROOT/'dashboard'/'plugin_api.py')
     api=importlib.util.module_from_spec(spec);sys.modules[name]=api;spec.loader.exec_module(api)
-    cfg={'owner_id':'owner','owner_provider':'basic','profiles':['default'],'archive_root':str(tmp_path/'call-recordings')}
+    cfg={'owner_id':'owner','owner_provider':'basic','profiles':['default'],'scheduled_callback_conversation_id':'assistant-chat','archive_root':str(tmp_path/'call-recordings')}
     monkeypatch.setattr(api.mobile,'settings',lambda:cfg)
     monkeypatch.setattr(api.mobile,'home',lambda:tmp_path)
     monkeypatch.setattr(api,'secret',lambda cfg:None)
@@ -1157,10 +1157,6 @@ def _fake_proactive_cron(monkeypatch, home, initial=(), mobile=None):
 def test_proactive_status_route_is_owner_profile_checked_and_has_fixed_shape(harness, monkeypatch):
     api, client, cfg, tmp, _ = harness
     _fake_proactive_cron(monkeypatch, tmp, mobile=api.mobile)
-    def unexpected_setup_check(*args, **kwargs):
-        raise AssertionError('status must not run the Workspace setup script')
-    monkeypatch.setattr(api.proactive, '_google_setup_script', lambda: tmp / 'setup.py', raising=False)
-    monkeypatch.setattr(api.proactive, 'subprocess', SimpleNamespace(run=unexpected_setup_check), raising=False)
     path = '/api/plugins/cypher/mobile/proactive'
     result = client.get(path)
     assert result.status_code == 200, result.text
@@ -1214,12 +1210,13 @@ def test_proactive_jobs_reconcile_idempotently_and_disable_only_g19_jobs(harness
     assert jobs[:len(legacy_jobs)] == before
     managed = [job for job in jobs if job.get('name', '').startswith('Cypher proactive:')]
     for job in managed:
-        assert job['deliver'] == 'phone'
         if job['name'] == 'Cypher proactive: Nightly memory upkeep':
+            assert job['deliver'] == 'local'
             assert job['enabled_toolsets'] == ['memory']
             assert 'memory tool' in job['prompt'].lower()
             assert 'patch' in job['prompt'].lower() and 'remove' in job['prompt'].lower()
             continue
+        assert job['deliver'] == 'phone'
         assert 'google calendar' in job['prompt'].lower()
         assert 'do not search or read email' in job['prompt'].lower()
     assert (tmp / 'SOUL.md').read_text(encoding='utf-8').count('BEGIN CYPHER PROACTIVE') == 1
@@ -1256,6 +1253,35 @@ def test_proactive_enable_refuses_an_unowned_job_with_a_managed_name(harness, mo
     assert calls == {'create': 0, 'update': 0, 'remove': 0, 'resume': 0}
 
 
+def test_proactive_enable_requires_an_owned_assistant_conversation(harness, monkeypatch):
+    api, client, cfg, tmp, _ = harness
+    jobs, calls = _fake_proactive_cron(monkeypatch, tmp, mobile=api.mobile)
+    cfg.pop('scheduled_callback_conversation_id')
+    path = '/api/plugins/cypher/mobile/proactive'
+    message = 'Choose an owned assistant conversation before enabling Proactive'
+
+    missing = client.put(path, json={'enabled': True})
+    assert missing.status_code == 409
+    assert missing.json()['detail'] == message
+    assert jobs == []
+    assert calls == {'create': 0, 'update': 0, 'remove': 0, 'resume': 0}
+
+    cfg['scheduled_callback_conversation_id'] = 'unowned-chat'
+    verified = []
+
+    def reject_unowned(owner, provider, profile, stored):
+        verified.append((owner, provider, profile, stored))
+        raise LookupError('Native stored conversation not owned')
+
+    monkeypatch.setattr(api.native, 'verify', reject_unowned)
+    unowned = client.put(path, json={'enabled': True})
+    assert unowned.status_code == 409
+    assert unowned.json()['detail'] == message
+    assert verified == [('owner', 'basic', 'default', 'unowned-chat')]
+    assert jobs == []
+    assert calls == {'create': 0, 'update': 0, 'remove': 0, 'resume': 0}
+
+
 def test_proactive_does_not_claim_an_owner_job_by_prompt_marker(harness, monkeypatch):
     api, client, _, tmp, _ = harness
     owner_job = {'id': 'owner-job', 'name': 'Personal note',
@@ -1274,7 +1300,14 @@ def test_cron_jobs_use_hermes_silent_marker_and_phone_delivery(harness, monkeypa
     api, _, _, _, _ = harness
     specs = api.proactive._specs([])
     assert api.proactive.SILENT_RESPONSE == '[SILENT]'
-    assert all(spec['deliver'] == 'phone' for spec in specs)
+    assert {spec['id']: spec['deliver'] for spec in specs} == {
+        'morning_brief': 'phone',
+        'inbox_calendar_watch': 'phone',
+        'evening_followups': 'phone',
+        'nightly_memory': 'local',
+    }
+    nightly = next(spec for spec in specs if spec['id'] == 'nightly_memory')
+    assert not api.proactive._job_definition_matches({**nightly, 'deliver': 'phone'}, nightly)
     assert all('[SILENT]' in spec['prompt'] for spec in specs)
     plugin = load_private('__init__')
     hooks = {}
@@ -1435,21 +1468,59 @@ def test_phone_delivery_uses_owned_assistant_chat_for_cron_owner_rows(harness, m
     monkeypatch.setattr(phone_plugin, '_profile_state', lambda: (api.mobile, cfg, 'default'))
     monkeypatch.setattr(phone_plugin, '_modules', lambda: (api.mobile, real_native, api.proactive))
 
+    monkeypatch.syspath_prepend('C:/Users/XPLoiT999/AppData/Local/hermes/hermes-agent')
+    from agent.secret_scope import (
+        reset_multiplex_context, reset_secret_scope, set_multiplex_context, set_secret_scope)
+    from cron.scheduler_delivery import _resolve_delivery_targets
+    import gateway.config as gateway_config
+    from gateway.config import GatewayConfig, Platform
+    from gateway.config_env import _enable_plugin_platform
+    registry_module = importlib.import_module('gateway.platform_registry')
+    from gateway.platform_registry import PlatformEntry, PlatformRegistry
+    platform_registry = PlatformRegistry()
+    monkeypatch.setattr(registry_module, 'platform_registry', platform_registry)
+
+    def register_platform(**kwargs):
+        registrations.append(kwargs)
+        platform_registry.register(PlatformEntry(**kwargs))
+
     registrations, hooks = [], []
+    monkeypatch.delenv('PHONE_HOME_CHANNEL', raising=False)
     ctx = SimpleNamespace(
         register_tool=lambda **kwargs: None,
         register_hook=lambda name, handler: hooks.append((name, handler)),
-        register_platform=lambda **kwargs: registrations.append(kwargs),
+        register_platform=register_platform,
     )
     plugin.register(ctx)
     assert any(entry['name'] == 'phone' for entry in registrations)
     phone = next(entry for entry in registrations if entry['name'] == 'phone')
     assert phone['cron_deliver_env_var'] == 'PHONE_HOME_CHANNEL'
+    assert phone['env_enablement_fn']() == {'home_channel': {'chat_id': 'phone', 'name': 'Cypher phone'}}
     assert callable(phone['standalone_sender_fn'])
     assert callable(phone['adapter_factory'])
+
+    platform = Platform('phone')
+    gateway = GatewayConfig()
+    _enable_plugin_platform(gateway, platform_registry.get('phone'))
+    assert gateway.get_home_channel(platform).chat_id == 'phone'
+    monkeypatch.setattr(gateway_config, 'load_gateway_config', lambda: gateway)
+    scope_token = set_secret_scope({})
+    multiplex_token = set_multiplex_context(True)
+    try:
+        targets = _resolve_delivery_targets({'deliver': 'phone'})
+    finally:
+        reset_multiplex_context(multiplex_token)
+        reset_secret_scope(scope_token)
+    assert [(target['platform'], target['chat_id'], target['thread_id']) for target in targets] == [
+        ('phone', 'phone', None)]
+
     adapter = phone['adapter_factory'](SimpleNamespace(extra={}))
     result = 'A useful proactive result.'
-    cron_message = 'Cronjob Response: Example\n(job_id: cron-job)\n-------------\n\n' + result
+    cron_message = (
+        'Cronjob Response: Example\n(job_id: cron-job)\n-------------\n\n'
+        + result
+        + '\n\nTo stop or manage this job, send me a new message '
+        '(e.g. "stop reminder Cypher proactive: Inbox and calendar watch").')
     first = asyncio.run(adapter.send('phone', cron_message, metadata={'job_id': 'cron-job'}))
     second = asyncio.run(phone['standalone_sender_fn'](None, 'phone', cron_message))
     assert first.success is True

@@ -71,7 +71,8 @@ def _strip_cron_header(message):
     if not header:
         return message
     body = message[header.end():]
-    return re.sub(r"^-{3,}\r?\n(?:\r?\n)?", "", body, count=1)
+    body = re.sub(r"^-{3,}\r?\n(?:\r?\n)?", "", body, count=1)
+    return re.sub(r'\n\nTo stop or manage this job, send me a new message \(e\.g\. "stop reminder [^\n]*"\)\.\s*\Z', "", body)
 
 
 class CypherPhoneAdapter(BasePlatformAdapter):
@@ -125,6 +126,7 @@ def register(ctx):
         name="phone", label="Cypher phone", adapter_factory=CypherPhoneAdapter,
         check_fn=check_requirements, validate_config=validate_config, is_connected=is_connected,
         required_env=[], install_hint="Cypher queues results for the owned assistant conversation through its durable mobile outbox.",
+        env_enablement_fn=lambda: {"home_channel": {"chat_id": "phone", "name": "Cypher phone"}},
         cron_deliver_env_var="PHONE_HOME_CHANNEL", standalone_sender_fn=standalone_send,
         platform_hint="Deliver concise task results to the owner's Cypher assistant conversation and phone notification.",
         emoji="📱", pii_safe=True,

@@ -294,7 +294,8 @@ def _specs(jobs):
         toolsets = ["memory"] if spec["id"] == "nightly_memory" else ["terminal"]
         skills = ["google-workspace"] if spec["id"] != "nightly_memory" else None
         output.append({**spec, "prompt": _job_prompt(spec, has_mail_job), "skills": skills,
-                       "enabled_toolsets": toolsets, "deliver": "phone"})
+                       "enabled_toolsets": toolsets,
+                       "deliver": "local" if spec["id"] == "nightly_memory" else "phone"})
     return output
 
 
@@ -308,7 +309,7 @@ def _job_definition_matches(job, spec):
         job.get("name") == spec["name"],
         job.get("prompt") == spec["prompt"],
         job.get("schedule_display", job.get("schedule")) == spec["schedule"],
-        job.get("deliver", "local") == "phone",
+        job.get("deliver", "local") == spec["deliver"],
         (job.get("skills") or []) == (spec["skills"] or []),
         (job.get("enabled_toolsets") or []) == spec["enabled_toolsets"],
     ))
