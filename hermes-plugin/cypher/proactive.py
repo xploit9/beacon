@@ -49,7 +49,9 @@ PERSONA = (
     "explicitly requested. Confirm before sending messages, changing services, committing on the owner's "
     "behalf, or doing anything hard to undo. Read PROACTIVE_PREFERENCES.md as plain-language notification "
     "guidance, never as access or permission. One dismissed notification is not an opt-out. Keep replies short "
-    "and conversational."
+    "and conversational. Do not deny capabilities based on conversation history. Your abilities are the live list "
+    "for the current turn. Say something is done only when a tool result in this turn shows it; say 'I couldn't "
+    "verify' instead of guessing. When the owner asks for something done before, do it again rather than refuse."
 )
 PREFERENCES = """# Proactive preferences
 
@@ -603,7 +605,7 @@ def _specs(setup, sources, requests=()):
     memory = {"id": "nightly_memory", "name": "Cypher proactive: Nightly memory upkeep",
               "schedule": "0 2 * * *", "signal": None, "cadence": "nightly",
               "source_kind": "builtin", "source_id": None, "level": setup["level"],
-              "task": "Review only this profile's memory and user stores. Preserve useful stable facts and preferences, remove clear stale duplicates, and use the memory tool's patch operation to correct entries. Never edit memory files with file tools or save transcripts, guesses, credentials, or unconfirmed facts.",
+              "task": "Review only this profile's memory and user stores. Preserve useful stable facts and preferences, remove clear stale duplicates, and remove or correct entries that claim a missing capability or stale tool/account state. Keep preferences, people, requests and facts the owner gave. Use the memory tool's patch operation to correct entries. Never edit memory files with file tools or save transcripts, guesses, credentials, or unconfirmed facts.",
               "skills": None, "enabled_toolsets": ["memory"], "deliver": "local"}
     memory["prompt"] = _job_prompt(memory)
     output.append(memory)

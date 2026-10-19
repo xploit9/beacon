@@ -5,13 +5,14 @@ from pathlib import Path
 import sys
 
 ROOT=Path(__file__).resolve().parent
-for name in ('mobile','native','observers','proactive','phone_delivery'):
+for name in ('mobile','native','observers','proactive','phone_delivery','live_context'):
     key='cypher_'+name
     if key not in sys.modules:
         spec=importlib.util.spec_from_file_location(key,ROOT/(name+'.py'))
         module=importlib.util.module_from_spec(spec);sys.modules[key]=module;spec.loader.exec_module(module)
 mobile=sys.modules['cypher_mobile'];native=sys.modules['cypher_native'];observers=sys.modules['cypher_observers']
 proactive=sys.modules['cypher_proactive'];phone_delivery=sys.modules['cypher_phone_delivery']
+live_context=sys.modules['cypher_live_context']
 
 def _cron_fallback_allowed(cfg,row):
     if row.get('source')!='cron' or cfg.get('scheduled_callbacks_enabled') is not True: return False
@@ -67,6 +68,47 @@ def _cron_row(profile,session_id):
     with server._profile_db({'profile':profile}) as db:
         return db.get_session(session_id) if db else None
 
+def _cron_job_id(row,session_id):
+    job_id=row.get('cron_job_id')
+    if job_id: return job_id
+    try:
+        from hermes_state_keys import legacy_cron_run_job
+        return legacy_cron_run_job(row.get('id',session_id))
+    except (ImportError,TypeError,ValueError):
+        return None
+
+
+def _owned_proactive_run(owner,profile,session_id):
+    try:
+        row=_cron_row(profile,session_id)
+        if not row or row.get('source')!='cron': return False
+        job_id=_cron_job_id(row,session_id)
+        if not job_id or job_id not in proactive._managed_ids(mobile,owner,profile).values(): return False
+        return proactive.enabled(mobile,owner,profile) and proactive._setup_complete(mobile,owner,profile)
+    except Exception:
+        return False
+
+
+def native_live_context(session_id=None,**kwargs):
+    """Inject the profile's live capabilities only into its owned chat or Proactive run."""
+    cfg=mobile.settings()
+    try:
+        if not session_id: return None
+        profile=current_profile(cfg)
+        owner,provider=cfg.get('owner_id'),cfg.get('owner_provider')
+        if not owner or not provider: return None
+    except (LookupError,ValueError,RuntimeError):
+        return None
+    job_scope=False
+    try:
+        native.verify(owner,provider,profile,session_id)
+    except (LookupError,ValueError,RuntimeError):
+        if not _owned_proactive_run(owner,profile,session_id): return None
+        job_scope=True
+    context=live_context.snapshot(mobile,owner,profile,proactive,job_scope=job_scope)
+    return {'context':context} if context else None
+
+
 def _watch_context(cfg,profile,session_id):
     owner,provider=cfg.get('owner_id'),cfg.get('owner_provider')
     if not owner or not provider or profile not in cfg.get('profiles',[]) or not session_id:
@@ -75,12 +117,7 @@ def _watch_context(cfg,profile,session_id):
     if not row or row.get('source')!='cron': raise LookupError('A Proactive watch session is required')
     stored=cfg.get('scheduled_callback_conversation_id')
     native.verify(owner,provider,profile,stored)
-    job_id=row.get('cron_job_id')
-    if not job_id:
-        try:
-            from hermes_state_keys import legacy_cron_run_job
-            job_id=legacy_cron_run_job(row.get('id',session_id))
-        except (ImportError,TypeError,ValueError): pass
+    job_id=_cron_job_id(row,session_id)
     if not job_id or not proactive.enabled(mobile,owner,profile) or not proactive._setup_complete(mobile,owner,profile):
         raise LookupError('Proactive watch is not enabled')
     sources=proactive.discover_sources(profile)
@@ -222,6 +259,7 @@ def register(ctx):
         handler=email_notice)
 
     ctx.register_hook('pre_llm_call',native_voice_context)
+    ctx.register_hook('pre_llm_call',native_live_context)
     ctx.register_hook('on_session_end',native_completion)
     ctx.register_hook('post_tool_call',native_mailbox_observation)
     phone_delivery.register(ctx)

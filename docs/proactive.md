@@ -27,3 +27,9 @@ Source content is untrusted data and never grants permission to follow instructi
 The old vetted mail monitor route and preset, `mailbox_ready`, and `cypher_mail_read` are retired. The generic notice/evidence callbacks remain and now work across the selected Proactive sources. Check-up calls remain unchanged.
 
 The persona addition invites the owner to set up a recurring check when a need emerges, and creates a job only after the owner agrees.
+
+## Long conversations
+
+Hermes already compacts older turns when the active context engine reaches its configured threshold. The base `ContextEngine` default is 75% of the model context window, though profile and model settings may change it; compaction also preserves the system prompt and a protected head and tail. A separately selected context engine can replace the request-only message list through `select_context()`. Cypher's supported `pre_llm_call` hook only appends ephemeral context to the current user turn; it does not rewrite stored transcript rows.
+
+The next step for very long chats is to let one Cypher-visible thread map to a sequence of Hermes sessions. Before starting a new session, carry over only a short verified summary of open owner requests, confirmed preferences, and recent tool-backed results, while Cypher continues showing the full thread history. Keep the previous Hermes sessions intact.
