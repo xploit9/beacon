@@ -134,3 +134,88 @@ def test_options_reject_wrong_provider_and_malformed_values(harness,monkeypatch)
     for value in ({'voice':'Aoede'}, {'voice':[]}, {'personality':[]}, {'personality':'invented'}, {'pitch':1}):
         result=c.put('/api/plugins/cypher/mobile/voice-settings',json={'provider':'grok',**value})
         assert result.status_code in (400,409),result.text
+
+def test_malformed_voice_preference_does_not_break_provider_listing(harness,monkeypatch):
+    api,c,_,_,_=harness;ready(api,monkeypatch)
+    key=api.voice_models.options_key('owner','default','grok')
+    with api.mobile.connect() as conn:conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(key,b'{'))
+    response=c.get('/api/plugins/cypher/mobile/voice-settings')
+    assert response.status_code==200
+    grok=next(item for item in response.json()['providers'] if item['id']=='grok')
+    assert grok['voice']=='eve' and grok['personality']=='balanced'
+
+def test_voice_preference_only_overrides_valid_voice_and_personality(harness):
+    api,c,cfg,_,_=harness
+    key=api.voice_models.options_key('owner','default','grok')
+    saved={'voice':'ara','personality':'warm','provider':'gemini','model':'attacker-model',
+           'personality_instruction':'attacker','transport':'attacker','capabilities':{'vision':True}}
+    with api.mobile.connect() as conn:
+        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(key,json.dumps(saved)))
+    selection=api.voice_models.provider_selection(api.mobile,'owner','default',cfg,'grok')
+    assert selection['provider']=='grok' and selection['model']=='grok-voice-latest'
+    assert selection['voice']=='ara' and selection['personality']=='warm'
+    assert selection['personality_instruction']==api.voice_models.PERSONALITIES['warm']
+    assert selection['transport']=='grok_live_direct' and selection['capabilities']=={'vision':False}
+
+def test_invalid_stored_voice_options_fall_back_to_provider_defaults(harness):
+    api,_,cfg,_,_=harness
+    key=api.voice_models.options_key('owner','default','grok')
+    saved={'voice':'Aoede','personality':'unknown'}
+    with api.mobile.connect() as conn:
+        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(key,json.dumps(saved)))
+    selection=api.voice_models.provider_selection(api.mobile,'owner','default',cfg,'grok')
+    assert selection['voice']=='eve' and selection['personality']=='balanced'
+
+def test_validate_options_rejects_unknown_provider(harness):
+    api,_,_,_,_=harness
+    with pytest.raises(ValueError,match='Unknown voice model'):
+        api.voice_models.validate_options('unknown',{'voice':'arbitrary'})
+
+def test_bound_validates_shape_memberships_and_rebuilds_server_fields(harness):
+    api,_,cfg,_,_=harness
+    for raw in ('[]','null','{'):
+        with pytest.raises(ValueError,match='Invalid voice admission'):
+            api.voice_models.bound({'voice_config':raw},cfg)
+    for value in (
+        {'provider':'unknown','model':'x','voice':'Aoede','personality':'balanced'},
+        {'provider':'grok','model':'grok-voice-latest','voice':'unknown','personality':'balanced'},
+        {'provider':'grok','model':'grok-voice-latest','voice':'ara','personality':'unknown'},
+    ):
+        with pytest.raises(ValueError,match='Invalid voice admission'):
+            api.voice_models.bound({'voice_config':json.dumps(value)},cfg)
+    saved={'provider':'grok','model':'grok-voice-latest','voice':'ara','personality':'warm',
+           'personality_instruction':'attacker','transport':'attacker','capabilities':{'vision':True}}
+    result=api.voice_models.bound({'voice_config':json.dumps(saved)},cfg)
+    assert result=={
+        'provider':'grok','model':'grok-voice-latest','voice':'ara','personality':'warm',
+        'personality_instruction':api.voice_models.PERSONALITIES['warm'],
+        'transport':'grok_live_direct','capabilities':{'vision':False},
+    }
+
+def test_choices_reports_expected_xai_credential_errors_without_secrets(harness,monkeypatch):
+    api,c,cfg,tmp,_=harness
+    monkeypatch.setattr(api,'secret',lambda cfg:'google-private-fixture')
+    monkeypatch.setattr(api.voice_models.importlib.util,'find_spec',lambda name:SimpleNamespace())
+    path=tmp/'missing-xai-credentials.txt';cfg['xai_credentials_file']=str(path)
+    def grok_choice():return next(item for item in api.voice_models.choices(cfg,api.secret) if item['id']=='grok')
+    missing=grok_choice()
+    assert missing['configured'] is False and missing['available'] is False
+    assert missing['configuration_error']=='Configured xAI credentials file is missing'
+    private='not-an-xAI-credential-'+'s'*32
+    path.write_text(private,encoding='utf-8')
+    invalid=grok_choice()
+    assert invalid['configured'] is False and invalid['available'] is False
+    assert invalid['configuration_error']=='Configured xAI credentials are invalid'
+    assert private not in repr(api.voice_models.choices(cfg,api.secret))
+    def unavailable(_):raise ModuleNotFoundError('credential store details')
+    monkeypatch.setattr(api.voice_models,'xai_secret',unavailable)
+    store_error=grok_choice()
+    assert store_error['configuration_error']=='xAI credential store is unavailable'
+    assert 'credential store details' not in repr(store_error)
+
+def test_choices_does_not_hide_unexpected_xai_credential_errors(harness,monkeypatch):
+    api,c,cfg,_,_=harness;ready(api,monkeypatch)
+    def broken(_):raise RuntimeError('unexpected credential resolver failure')
+    monkeypatch.setattr(api.voice_models,'xai_secret',broken)
+    with pytest.raises(RuntimeError,match='unexpected credential resolver failure'):
+        api.voice_models.choices(cfg,api.secret)
