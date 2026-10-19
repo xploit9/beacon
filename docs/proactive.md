@@ -8,6 +8,10 @@ The authenticated owner and profile can read `GET /api/plugins/cypher/mobile/pro
 
 Disabling removes only Cypher's managed jobs and persona section. The plain-language `PROACTIVE_PREFERENCES.md` file is kept.
 
+## Safety
+
+The morning, calendar-watch and evening jobs run unattended with the Google Workspace skill, which needs Hermes's terminal tool. Mail and calendar text is untrusted: anyone can put text in the inbox or calendar. The job prompts treat it as data, never instructions, and Hermes's default `approvals.cron_mode: deny` refuses commands it classifies as dangerous, but other terminal commands can still run without the owner present. Keep `cron_mode` at `deny`, grant the skill only the scopes it needs, and leave Proactive off on a profile whose terminal can reach anything you would not let an email trigger.
+
 ## Connect services
 
 The status response lists Gmail, Google Calendar, Drive, Contacts, Sheets, and Docs, with an instruction for each service the bundled Google Workspace skill supports. Setup happens on the Hermes host using that profile's Google Workspace skill; grant only the scopes needed. No direct OAuth link is available through this API.
