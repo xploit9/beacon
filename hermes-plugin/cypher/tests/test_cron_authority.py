@@ -30,6 +30,22 @@ def install_cron_context(api, cfg, tmp_path, monkeypatch, sessions):
     return plugin
 
 
+def test_current_profile_distinguishes_launch_and_named_profiles(harness, monkeypatch, tmp_path):
+    api, _, cfg, _, _ = harness
+    launch_home = tmp_path / 'launch'
+    work_home = tmp_path / 'work'
+    active_home = [launch_home]
+    server = SimpleNamespace(_profile_home=lambda profile: None if profile == 'default' else work_home)
+    monkeypatch.setitem(sys.modules, 'hermes_constants', SimpleNamespace(
+        get_hermes_home=lambda: active_home[0], get_process_hermes_home=lambda: launch_home))
+    monkeypatch.setitem(sys.modules, 'tui_gateway', SimpleNamespace(server=server))
+    cfg['profiles'] = ['default', 'work']
+
+    assert api.proactive.current_profile(cfg) == 'default'
+    active_home[0] = work_home
+    assert api.proactive.current_profile(cfg) == 'work'
+
+
 def test_mail_authority_rejects_foreign_cron_but_allows_unowned_cron(harness, monkeypatch):
     api, _, cfg, tmp_path, _ = harness
     plugin = install_cron_context(api, cfg, tmp_path, monkeypatch, {

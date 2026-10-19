@@ -957,7 +957,7 @@ def test_registered_native_completion_and_mailbox_hooks_are_real(harness):
     tools=[];hooks=[]
     ctx=SimpleNamespace(register_tool=lambda **kwargs:tools.append(kwargs),register_hook=lambda name,handler:hooks.append((name,handler)))
     plugin.register(ctx)
-    assert {name for name,handler in hooks}=={'on_session_end','post_tool_call','pre_llm_call','post_llm_call'}
+    assert {name for name,handler in hooks}=={'on_session_end','post_tool_call','pre_llm_call'}
     assert {tool['name'] for tool in tools}=={'cypher_call_user','cypher_email_notice','cypher_mail_read'}
     assert all(tool['toolset']=='cypher-mailbox' for tool in tools if tool['name'].endswith('email_notice'))
     assert all(callable(handler) for name,handler in hooks)
@@ -1157,8 +1157,10 @@ def _fake_proactive_cron(monkeypatch, home, initial=(), mobile=None):
 def test_proactive_status_route_is_owner_profile_checked_and_has_fixed_shape(harness, monkeypatch):
     api, client, cfg, tmp, _ = harness
     _fake_proactive_cron(monkeypatch, tmp, mobile=api.mobile)
-    monkeypatch.setattr(api.proactive.subprocess, 'run', lambda *args, **kwargs: SimpleNamespace(
-        returncode=0, stdout='AUTHENTICATED: Token valid', stderr=''))
+    def unexpected_setup_check(*args, **kwargs):
+        raise AssertionError('status must not run the Workspace setup script')
+    monkeypatch.setattr(api.proactive, '_google_setup_script', lambda: tmp / 'setup.py', raising=False)
+    monkeypatch.setattr(api.proactive, 'subprocess', SimpleNamespace(run=unexpected_setup_check), raising=False)
     path = '/api/plugins/cypher/mobile/proactive'
     result = client.get(path)
     assert result.status_code == 200, result.text
@@ -1212,7 +1214,11 @@ def test_proactive_jobs_reconcile_idempotently_and_disable_only_g19_jobs(harness
     assert jobs[:len(legacy_jobs)] == before
     managed = [job for job in jobs if job.get('name', '').startswith('Cypher proactive:')]
     for job in managed:
+        assert job['deliver'] == 'phone'
         if job['name'] == 'Cypher proactive: Nightly memory upkeep':
+            assert job['enabled_toolsets'] == ['memory']
+            assert 'memory tool' in job['prompt'].lower()
+            assert 'patch' in job['prompt'].lower() and 'remove' in job['prompt'].lower()
             continue
         assert 'google calendar' in job['prompt'].lower()
         assert 'do not search or read email' in job['prompt'].lower()
@@ -1264,13 +1270,12 @@ def test_proactive_does_not_claim_an_owner_job_by_prompt_marker(harness, monkeyp
     assert calls == {'create': 4, 'update': 0, 'remove': 4, 'resume': 0}
 
 
-def test_native_noop_proactive_run_is_silent_but_meaningful_run_uses_outbox(harness, monkeypatch):
-    api, client, _, tmp, _ = harness
-    _fake_proactive_cron(monkeypatch, tmp, mobile=api.mobile)
-    enabled = client.put('/api/plugins/cypher/mobile/proactive', json={'enabled': True})
-    assert enabled.status_code == 200, enabled.text
-    job_id = next(job['job_id'] for job in enabled.json()['jobs'] if job['id'] == 'morning_brief')
-
+def test_cron_jobs_use_hermes_silent_marker_and_phone_delivery(harness, monkeypatch):
+    api, _, _, _, _ = harness
+    specs = api.proactive._specs([])
+    assert api.proactive.SILENT_RESPONSE == '[SILENT]'
+    assert all(spec['deliver'] == 'phone' for spec in specs)
+    assert all('[SILENT]' in spec['prompt'] for spec in specs)
     plugin = load_private('__init__')
     hooks = {}
     ctx = SimpleNamespace(
@@ -1279,46 +1284,157 @@ def test_native_noop_proactive_run_is_silent_but_meaningful_run_uses_outbox(harn
         register_platform=lambda **kwargs: None,
     )
     plugin.register(ctx)
-    assert 'post_llm_call' in hooks
-    monkeypatch.setattr(plugin, 'current_profile', lambda cfg: 'default')
-    monkeypatch.setattr(plugin.native, 'verify', lambda *args: {'source': 'cron'})
-
-    hooks['post_llm_call'](
-        task_id=f'cron:{job_id}:run-noop', session_id='cron-noop', turn_id='turn-noop',
-        user_message='scheduled proactive check', assistant_response='[[CYPHER_PROACTIVE_SILENT]]')
-    hooks['on_session_end'](
-        task_id=f'cron:{job_id}:run-noop', session_id='cron-noop', turn_id='turn-noop', completed=True, failed=False, interrupted=False)
-    with api.mobile.connect() as conn:
-        assert conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0] == 0
-
-    hooks['post_llm_call'](
-        task_id=f'cron:{job_id}:run-result', session_id='cron-result', turn_id='turn-result',
-        user_message='scheduled proactive check', assistant_response='A useful calendar change needs your attention.')
-    hooks['on_session_end'](
-        task_id=f'cron:{job_id}:run-result', session_id='cron-result', turn_id='turn-result', completed=True, failed=False, interrupted=False)
-    with api.mobile.connect() as conn:
-        notice = conn.execute('SELECT * FROM notices').fetchone()
-        assert notice['kind'] == 'task_result'
-        assert notice['conversation'] == 'cron-result'
-        assert notice['job_id'] == job_id
+    assert 'post_llm_call' not in hooks
 
 
-def test_cypher_registers_phone_delivery_and_outbox_dedupes_job_results(harness, monkeypatch):
-    import asyncio
-
+def test_proactive_persona_does_not_draft_or_schedule_its_own_jobs(harness):
     api, _, _, _, _ = harness
+    persona = api.proactive.PERSONA.lower()
+    assert 'drafting' not in persona
+    assert 'scheduling your own checks' not in persona
+    assert 'offer a reminder' in persona
+
+
+def test_morning_prompts_use_todays_calendar_with_or_without_legacy_mail_jobs(harness):
+    api, _, _, _, _ = harness
+    for jobs in ([], [{'name': 'Cypher vetted urgent-mail scan'}]):
+        morning = next(spec for spec in api.proactive._specs(jobs) if spec['id'] == 'morning_brief')
+        assert "today's Google Calendar" in morning['prompt']
+
+
+def test_proactive_soul_section_is_blank_line_idempotent(harness, monkeypatch):
+    api, _, _, tmp, _ = harness
+    monkeypatch.setitem(sys.modules, 'hermes_cli.profile_distribution', SimpleNamespace(read_manifest=lambda home: None))
+    original = 'Owner profile instructions\n\n'
+    soul = tmp / 'SOUL.md'
+    soul.write_text(original, encoding='utf-8')
+    for _ in range(3):
+        api.proactive._write_profile_instructions(tmp, True)
+        api.proactive._write_profile_instructions(tmp, False)
+    assert soul.read_text(encoding='utf-8') == original
+
+
+def test_disabling_removes_jobs_before_malformed_soul_cleanup(harness, monkeypatch):
+    api, client, cfg, tmp, _ = harness
+    jobs, _ = _fake_proactive_cron(monkeypatch, tmp, mobile=api.mobile)
+    (tmp / 'SOUL.md').write_text('Owner profile instructions\n\n', encoding='utf-8')
+    enabled = client.put('/api/plugins/cypher/mobile/proactive', json={'enabled': True})
+    assert enabled.status_code == 200, enabled.text
+
+    (tmp / 'SOUL.md').write_text(api.proactive.SOUL_BEGIN + '\nowner text\n', encoding='utf-8')
+    disabled = client.put('/api/plugins/cypher/mobile/proactive', json={'enabled': False})
+    assert disabled.status_code == 409
+    assert jobs == []
+    assert api.proactive.enabled(api.mobile, cfg['owner_id'], 'default') is False
+
+
+def test_concurrent_proactive_enable_does_not_create_duplicate_jobs(harness, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    api, _, cfg, tmp, _ = harness
     monkeypatch.setattr(api.mobile, 'protect', lambda path: path.mkdir(parents=True, exist_ok=True))
-    stale_key = api.proactive._session_meta_key('owner', 'default', 'old-phone-job')
-    with api.mobile.connect() as conn:
-        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',
-                     (stale_key, json.dumps({'session': 'old-session', 'at': time.time() - 86401}).encode()))
-    api.proactive.record_cron_turn(api.mobile, 'owner', 'default', 'phone-job', 'cron-result', 'turn-1',
-                                   'A useful proactive result.')
-    with api.mobile.connect() as conn:
-        assert conn.execute('SELECT 1 FROM meta WHERE key=?', (stale_key,)).fetchone() is None
-    monkeypatch.setattr(api.native, 'verify', lambda *args: {'source': 'cron'})
+    (tmp / 'SOUL.md').write_text('Owner profile instructions\n\n', encoding='utf-8')
+    jobs = []
+    calls = {'create': 0, 'update': 0, 'remove': 0, 'resume': 0}
+    guard = threading.Lock()
+    reconcile = threading.Barrier(2, timeout=0.4)
+    local = threading.local()
+
+    def call(profile, name, *args, **kwargs):
+        if name != 'list_jobs':
+            raise AssertionError(f'unexpected cron read: {name}')
+        count = getattr(local, 'list_calls', 0) + 1
+        local.list_calls = count
+        if count == 2:
+            try:
+                reconcile.wait()
+            except threading.BrokenBarrierError:
+                pass
+        return list(jobs)
+
+    def create(model, profile):
+        with guard:
+            calls['create'] += 1
+            job = dict(model.__dict__, id=f'g19-{calls["create"]}', schedule_display=model.schedule)
+            jobs.append(job)
+            return job
+
+    def mutate(profile, name, *args):
+        job_id = args[0]
+        job = next((row for row in jobs if row['id'] == job_id), None)
+        if name == 'update_job':
+            calls['update'] += 1
+            job.update(args[1])
+            return job
+        if name == 'remove_job':
+            calls['remove'] += 1
+            if job is None:
+                return False
+            jobs.remove(job)
+            return True
+        if name == 'resume_job':
+            calls['resume'] += 1
+            job['enabled'] = True
+            return job
+        raise AssertionError(f'unexpected cron mutation: {name}')
+
+    monkeypatch.setitem(sys.modules, 'hermes_cli.web_server_cron', SimpleNamespace(
+        _cron_profile_home=lambda profile: (profile, tmp),
+        _call_cron_for_profile=call,
+        _create_cron_job_sync=create,
+        _mutate_cron_for_profile=mutate,
+    ))
+    monkeypatch.setitem(sys.modules, 'hermes_cli.web_models', SimpleNamespace(
+        CronJobCreate=lambda **kwargs: SimpleNamespace(**kwargs)))
+    monkeypatch.setitem(sys.modules, 'hermes_cli.profile_distribution', SimpleNamespace(read_manifest=lambda home: None))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: api.proactive.set_enabled(
+            api.mobile, cfg['owner_id'], 'default', True), range(2)))
+
+    assert all(result['enabled'] for result in results)
+    assert calls['create'] == 4
+    assert len(jobs) == 4
+
+
+def test_phone_delivery_uses_owned_assistant_chat_for_cron_owner_rows(harness, monkeypatch):
+    import asyncio
+    from contextlib import nullcontext
+
+    api, _, cfg, tmp, _ = harness
+    monkeypatch.setattr(api.mobile, 'protect', lambda path: path.mkdir(parents=True, exist_ok=True))
+    cfg['scheduled_callback_conversation_id'] = 'assistant-chat'
+    hermes_db_path = tmp / 'sessions.db'
+    with api.mobile.sqlite3.connect(hermes_db_path) as db:
+        db.execute('CREATE TABLE sessions(id TEXT PRIMARY KEY, user_id TEXT, source TEXT)')
+        db.executemany('INSERT INTO sessions(id,user_id,source) VALUES(?,?,?)', (
+            ('cron-run', 'cron-owner', 'cron'),
+            ('assistant-chat', 'basic:owner', 'android'),
+        ))
+
+    reads = []
+
+    class ProfileDb:
+        def get_session(self, session_id):
+            reads.append(session_id)
+            with api.mobile.sqlite3.connect(hermes_db_path) as db:
+                db.row_factory = api.mobile.sqlite3.Row
+                row = db.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
+            return dict(row) if row else None
+
+    server = SimpleNamespace(_profile_db=lambda scope: nullcontext(ProfileDb()))
+    monkeypatch.setitem(sys.modules, 'tui_gateway', SimpleNamespace(server=server))
     monkeypatch.setattr(api.proactive, 'current_profile', lambda cfg: 'default')
     plugin = load_private('__init__')
+    phone_plugin = plugin.phone_delivery
+    real_native = load_private('native')
+    with pytest.raises(LookupError, match='Native stored conversation not owned'):
+        real_native.verify('owner', 'basic', 'default', 'cron-run')
+    assert reads == ['cron-run']
+    reads.clear()
+    monkeypatch.setattr(phone_plugin, '_profile_state', lambda: (api.mobile, cfg, 'default'))
+    monkeypatch.setattr(phone_plugin, '_modules', lambda: (api.mobile, real_native, api.proactive))
+
     registrations, hooks = [], []
     ctx = SimpleNamespace(
         register_tool=lambda **kwargs: None,
@@ -1332,16 +1448,18 @@ def test_cypher_registers_phone_delivery_and_outbox_dedupes_job_results(harness,
     assert callable(phone['standalone_sender_fn'])
     assert callable(phone['adapter_factory'])
     adapter = phone['adapter_factory'](SimpleNamespace(extra={}))
-    first = asyncio.run(adapter.send('phone', 'A useful proactive result.', metadata={'job_id': 'phone-job'}))
-    second = asyncio.run(adapter.send('phone', 'A useful proactive result.', metadata={'job_id': 'phone-job'}))
-    assert first.success is True and second.message_id == first.message_id
-    fallback = asyncio.run(phone['standalone_sender_fn'](
-        None, 'phone', 'Cronjob Response: Example\n(job_id: phone-job)\n-------------\n\nA useful proactive result.'))
-    assert fallback['success'] is True and fallback['message_id'] == first.message_id
+    result = 'A useful proactive result.'
+    cron_message = 'Cronjob Response: Example\n(job_id: cron-job)\n-------------\n\n' + result
+    first = asyncio.run(adapter.send('phone', cron_message, metadata={'job_id': 'cron-job'}))
+    second = asyncio.run(phone['standalone_sender_fn'](None, 'phone', cron_message))
+    assert first.success is True
+    assert second['success'] is True and second['message_id'] == first.message_id
+    assert reads == ['assistant-chat', 'assistant-chat', 'assistant-chat', 'assistant-chat']
     with api.mobile.connect() as conn:
-        row = conn.execute("SELECT * FROM notices WHERE job_id='phone-job'").fetchone()
-        assert row['conversation'] == 'cron-result' and row['kind'] == 'task_result'
-        assert conn.execute("SELECT COUNT(*) FROM notices WHERE job_id='phone-job'").fetchone()[0] == 1
+        row = conn.execute('SELECT * FROM notices').fetchone()
+        assert row['conversation'] == 'assistant-chat' and row['kind'] == 'task_result'
+        assert row['reason'] == result
+        assert conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0] == 1
 
 
 def test_release_verification_cache_hits_unchanged_files_and_misses_stat_changes(harness, monkeypatch):

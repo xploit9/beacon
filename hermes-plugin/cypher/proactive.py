@@ -1,24 +1,21 @@
 """Owner-controlled proactive jobs for a single Hermes profile."""
-import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import re
 import stat
-import subprocess
-import sys
 import tempfile
-import time
+import threading
 
 
-SILENT_RESPONSE = "[[CYPHER_PROACTIVE_SILENT]]"
+SILENT_RESPONSE = "[SILENT]"
 SOUL_BEGIN = "<!-- BEGIN CYPHER PROACTIVE -->"
 SOUL_END = "<!-- END CYPHER PROACTIVE -->"
 PREFERENCES_NAME = "PROACTIVE_PREFERENCES.md"
 LEGACY_MAIL_JOBS = {"Cypher vetted urgent-mail scan", "Cypher — important missed emails", "Cypher important missed emails"}
 MAIL_CALENDAR_ONLY_TASKS = {
-    "morning_brief": "Prepare a short start-of-day brief from the next day's Google Calendar. Include only meetings, deadlines, or conflicts that change what the owner should do. The existing Cypher urgent-mail monitor owns Gmail; do not search or read email.",
+    "morning_brief": "Prepare a short start-of-day brief from today's Google Calendar. Include only meetings, deadlines, or conflicts that change what the owner should do. The existing Cypher urgent-mail monitor owns Gmail; do not search or read email.",
     "inbox_calendar_watch": "Check Google Calendar only for genuinely new important event changes in the next 24 hours. The existing Cypher urgent-mail monitor owns Gmail; do not search or read email.",
     "evening_followups": "Review today's Google Calendar for dropped threads, explicit deadlines, and preparation the owner needs. Ignore routine items and anything already reported. The existing Cypher urgent-mail monitor owns Gmail; do not search or read email.",
 }
@@ -34,8 +31,8 @@ PROFILE_PROMPT = (
 )
 PERSONA = (
     "Take initiative. When the owner asks for something, do it end to end with the tools you have instead of "
-    "describing how; carry out reversible steps (reading, searching, drafting, organising, scheduling your own "
-    "checks) straight away and say what you did. Finish with the most useful next step and offer to do it. "
+    "describing how; carry out reversible steps (reading and searching) straight away and say what you did. "
+    "Finish with the most useful next step and offer to do it. "
     "Notice commitments, dates and loose ends the owner mentions and offer a reminder or a follow-up check. "
     "Pick up unfinished threads from earlier conversations when they become relevant. Ask one short question "
     "only when a choice is truly the owner's. Speak first only when something is meaningfully new or the owner "
@@ -53,7 +50,7 @@ These preferences do not grant access or permission. Dismissing one alert does n
 
 JOBS = (
     {"id": "morning_brief", "name": "Cypher proactive: Morning briefing", "schedule": "0 8 * * *",
-     "task": "Prepare a short start-of-day brief from the next day's Google Calendar and relevant unread Gmail. "
+     "task": "Prepare a short start-of-day brief from today's Google Calendar and relevant unread Gmail. "
              "Include only meetings, deadlines, conflicts, or messages that change what the owner should do."},
     {"id": "inbox_calendar_watch", "name": "Cypher proactive: Inbox and calendar watch", "schedule": "*/30 7-22 * * *",
      "task": "Check for genuinely new actionable unread Gmail and important Google Calendar changes in the next 24 hours. "
@@ -62,9 +59,10 @@ JOBS = (
      "task": "Review today's relevant unread Gmail and upcoming Google Calendar for dropped threads, explicit deadlines, "
              "and preparation the owner needs. Ignore routine items and anything already reported."},
     {"id": "nightly_memory", "name": "Cypher proactive: Nightly memory upkeep", "schedule": "0 2 * * *",
-     "task": "Review only this profile's MEMORY.md and USER.md. Preserve explicit stable preferences and facts that are "
-             "useful later; remove stale duplicates only when clear. Never save transcripts, guesses, credentials, or "
-             "unconfirmed facts. Make no unrelated file changes."},
+     "task": "Review only this profile's `memory` and `user` stores using the memory tool. Preserve explicit stable "
+             "preferences and facts that are useful later; remove stale duplicates only when clear, and use patch to "
+             "correct an existing entry. Never edit memory files with file tools. Never save transcripts, guesses, "
+             "credentials, or unconfirmed facts. Make no unrelated file changes."},
 )
 
 
@@ -105,74 +103,14 @@ def _delete_managed_id(mobile, owner, profile, job_key):
     _meta_set(mobile, _key(owner, profile, "job:" + job_key), None)
 
 
-def parse_cron_task_id(task_id):
-    match = re.fullmatch(r"cron:([A-Za-z0-9_-]{1,160}):([A-Za-z0-9_-]{1,160})", str(task_id or ""))
-    return match.group(1) if match else None
-
-
-def _session_meta_key(owner, profile, job_id):
-    return _key(owner, profile, "cron-session:" + job_id)
-
-
-def record_cron_turn(mobile, owner, profile, job_id, session_id, turn_id, response):
-    """Bind Hermes's public cron task/session IDs for phone delivery and no-op filtering."""
-    if not all(isinstance(value, str) and value and len(value) <= 160 for value in (owner, profile, job_id, session_id, turn_id)):
-        return
-    now = time.time()
-    with mobile.LOCK, mobile.connect() as conn:
-        for row in conn.execute("SELECT key,value FROM meta WHERE key LIKE ?", (_key(owner, profile, "cron-session:%"),)).fetchall():
-            try:
-                if now - float(json.loads(row[1])["at"]) > 86400:
-                    conn.execute("DELETE FROM meta WHERE key=?", (row[0],))
-            except (TypeError, ValueError, KeyError, json.JSONDecodeError, OverflowError):
-                conn.execute("DELETE FROM meta WHERE key=?", (row[0],))
-        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
-                     (_session_meta_key(owner, profile, job_id), json.dumps({"session": session_id, "at": now}).encode("utf-8")))
-        for row in conn.execute("SELECT key,value FROM meta WHERE key LIKE ?", (_key(owner, profile, "silent:%"),)).fetchall():
-            try:
-                if now - float(row[1]) > 86400:
-                    conn.execute("DELETE FROM meta WHERE key=?", (row[0],))
-            except (TypeError, ValueError, OverflowError):
-                conn.execute("DELETE FROM meta WHERE key=?", (row[0],))
-        if response is None or not str(response).strip() or str(response).strip() == SILENT_RESPONSE:
-            job_key = next((spec["id"] for spec in JOBS if _managed_id(mobile, owner, profile, spec["id"]) == job_id), None)
-            if job_key:
-                marker = _key(owner, profile, f"silent:{job_id}:{session_id}:{turn_id}")
-                conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (marker, str(now).encode("utf-8")))
-
-
-def cron_session(mobile, owner, profile, job_id):
-    raw = _meta_get(mobile, _session_meta_key(owner, profile, job_id))
-    try:
-        value = json.loads(raw)
-        if time.time() - float(value["at"]) > 86400:
-            return None
-        return value["session"] if isinstance(value.get("session"), str) else None
-    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
-        return None
-
-
-def consume_silent(mobile, owner, profile, job_id, session_id, turn_id):
-    key = _key(owner, profile, f"silent:{job_id}:{session_id}:{turn_id}")
-    with mobile.LOCK, mobile.connect() as conn:
-        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-        if not row:
-            return False
-        conn.execute("DELETE FROM meta WHERE key=?", (key,))
-        try:
-            return time.time() - float(row[0]) <= 86400
-        except (TypeError, ValueError, OverflowError):
-            return False
-
-
 def current_profile(cfg):
-    from hermes_constants import get_hermes_home
+    from hermes_constants import get_hermes_home, get_process_hermes_home
     from tui_gateway import server
 
     matches = []
     for profile in cfg.get("profiles", []):
         requested = server._profile_home(profile)
-        target = Path(requested) if requested else Path(get_hermes_home())
+        target = Path(requested) if requested else Path(get_process_hermes_home())
         if target.resolve() == Path(get_hermes_home()).resolve():
             matches.append(profile)
     if len(matches) != 1:
@@ -243,7 +181,7 @@ def _soul_content(path, active):
     prefix = content
     if prefix and not prefix.endswith(("\n", "\r")):
         prefix += newline
-    if prefix:
+    if prefix and not prefix.endswith(newline * 2):
         prefix += newline
     return prefix + SOUL_BEGIN + newline + PERSONA + newline + SOUL_END + newline
 
@@ -292,26 +230,10 @@ def _google_skill(home):
     return None
 
 
-def _google_setup_script():
-    try:
-        spec = importlib.util.find_spec("hermes_cli")
-        if spec and spec.origin:
-            setup = Path(spec.origin).resolve().parent.parent / "skills" / "productivity" / "google-workspace" / "scripts" / "setup.py"
-            if setup.is_file():
-                return setup
-    except (ImportError, ValueError, OSError):
-        pass
-    return None
-
-
-def _service_status(home, scopes, authentication):
+def _service_status(home, scopes):
     token = home / "google_token.json"
     if not token.exists():
         return "missing"
-    if authentication == "missing":
-        return "missing"
-    if authentication != "connected":
-        return "unknown"
     try:
         if token.stat().st_size > 65536:
             return "unknown"
@@ -334,27 +256,6 @@ def _service_status(home, scopes, authentication):
 def _services(home):
     skill = _google_skill(home)
     supported = skill is not None
-    authentication = "missing"
-    if supported and (home / "google_token.json").exists():
-        setup = _google_setup_script()
-        if setup is None:
-            authentication = "unknown"
-        else:
-            try:
-                env = os.environ.copy()
-                env["HERMES_HOME"] = str(home)
-                flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-                checked = subprocess.run([sys.executable, str(setup), "--check"], cwd=str(home), env=env,
-                                         capture_output=True, text=True, timeout=8, creationflags=flags)
-                output = (checked.stdout or "") + (checked.stderr or "")
-                if checked.returncode == 0 and "AUTHENTICATED" in output:
-                    authentication = "connected"
-                elif any(status in output for status in ("NOT_AUTHENTICATED", "TOKEN_INVALID", "TOKEN_REVOKED", "TOKEN_CORRUPT")):
-                    authentication = "missing"
-                else:
-                    authentication = "unknown"
-            except (OSError, subprocess.SubprocessError):
-                authentication = "unknown"
     instructions = (
         "On this Hermes profile, follow the Google Workspace skill's First-Time Setup. Run setup.py --check; "
         "if needed, configure the OAuth client on the Hermes host, run setup.py --auth-url, and finish OAuth there. "
@@ -369,7 +270,7 @@ def _services(home):
         ("google_docs", "Google Docs", {"https://www.googleapis.com/auth/documents"}),
     )
     return [{"id": key, "name": name, "supported": supported,
-             "status": _service_status(home, scopes, authentication) if supported else "unsupported",
+             "status": _service_status(home, scopes) if supported else "unsupported",
              "connect_url": None, "instructions": instructions if supported else "This Hermes installation does not include the Google Workspace skill."}
             for key, name, scopes in definitions]
 
@@ -390,10 +291,10 @@ def _specs(jobs):
     has_mail_job = any(job.get("name") in LEGACY_MAIL_JOBS and job.get("enabled", True) is not False for job in jobs)
     output = []
     for spec in JOBS:
-        toolsets = ["file"] if spec["id"] == "nightly_memory" else ["terminal"]
+        toolsets = ["memory"] if spec["id"] == "nightly_memory" else ["terminal"]
         skills = ["google-workspace"] if spec["id"] != "nightly_memory" else None
         output.append({**spec, "prompt": _job_prompt(spec, has_mail_job), "skills": skills,
-                       "enabled_toolsets": toolsets, "deliver": "local"})
+                       "enabled_toolsets": toolsets, "deliver": "phone"})
     return output
 
 
@@ -407,7 +308,7 @@ def _job_definition_matches(job, spec):
         job.get("name") == spec["name"],
         job.get("prompt") == spec["prompt"],
         job.get("schedule_display", job.get("schedule")) == spec["schedule"],
-        job.get("deliver", "local") == "local",
+        job.get("deliver", "local") == "phone",
         (job.get("skills") or []) == (spec["skills"] or []),
         (job.get("enabled_toolsets") or []) == spec["enabled_toolsets"],
     ))
@@ -427,13 +328,8 @@ def _reconcile_jobs(mobile, owner, profile):
             _set_managed_id(mobile, owner, profile, spec["id"], job["id"])
             jobs.append(job)
             continue
-        job = next((item for item in owned if item.get("id") == _managed_id(mobile, owner, profile, spec["id"])), owned[0])
+        job = owned[0]
         _set_managed_id(mobile, owner, profile, spec["id"], job["id"])
-        for duplicate in owned:
-            if duplicate is not job:
-                mutate(profile, "remove_job", duplicate["id"])
-                if duplicate in jobs:
-                    jobs.remove(duplicate)
         if not _job_definition_matches(job, spec):
             job = mutate(profile, "update_job", job["id"], {key: spec[key] for key in (
                 "name", "schedule", "prompt", "deliver", "skills", "enabled_toolsets")})
@@ -450,16 +346,14 @@ def _job_status(mobile, owner, profile, jobs):
     output = []
     for spec in JOBS:
         owned = _owned_jobs(mobile, owner, profile, spec, jobs)
-        job = next((item for item in owned if item.get("id") == _managed_id(mobile, owner, profile, spec["id"])), None)
-        if job is None and owned:
-            job = owned[0]
+        job = owned[0] if owned else None
         output.append({"id": spec["id"], "name": spec["name"], "schedule": spec["schedule"],
                        "installed": job is not None, "job_id": job.get("id") if job else None,
                        "active": bool(job and job.get("enabled", True))})
     return output
 
 
-def status(mobile, owner, provider, profile, cfg):
+def status(mobile, owner, profile):
     call, _, _, _ = _cron_helpers()
     jobs = call(profile, "list_jobs", True)
     return {"enabled": enabled(mobile, owner, profile),
@@ -467,7 +361,15 @@ def status(mobile, owner, provider, profile, cfg):
             "services": _services(_home(profile))}
 
 
-def set_enabled(mobile, owner, provider, profile, cfg, value):
+_SET_ENABLED_LOCK = threading.Lock()
+
+
+def set_enabled(mobile, owner, profile, value):
+    with _SET_ENABLED_LOCK:
+        return _set_enabled_locked(mobile, owner, profile, value)
+
+
+def _set_enabled_locked(mobile, owner, profile, value):
     if type(value) is not bool:
         raise ValueError("enabled must be a boolean")
     home = _home(profile)
@@ -482,12 +384,12 @@ def set_enabled(mobile, owner, provider, profile, cfg, value):
         _write_profile_instructions(home, True)
         _meta_set(mobile, _key(owner, profile, "enabled"), "1")
     else:
-        _validate_profile_instructions(home, False)
         for spec in JOBS:
-            for job in _owned_jobs(mobile, owner, profile, spec, jobs):
-                if not mutate(profile, "remove_job", job["id"]):
-                    raise RuntimeError(f"Could not remove Cypher proactive job {spec['id']}")
+            owned = _owned_jobs(mobile, owner, profile, spec, jobs)
+            job = owned[0] if owned else None
+            if job and not mutate(profile, "remove_job", job["id"]):
+                raise RuntimeError(f"Could not remove Cypher proactive job {spec['id']}")
             _delete_managed_id(mobile, owner, profile, spec["id"])
-        _write_profile_instructions(home, False)
         _meta_set(mobile, _key(owner, profile, "enabled"), None)
-    return status(mobile, owner, provider, profile, cfg)
+        _write_profile_instructions(home, False)
+    return status(mobile, owner, profile)

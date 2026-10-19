@@ -52,34 +52,6 @@ def is_connected(config):
         return False
 
 
-def _queue_cron_result(job_id, content):
-    mobile, cfg, profile = _profile_state()
-    _, native, proactive = _modules()
-    owner, provider = cfg.get("owner_id"), cfg.get("owner_provider")
-    if not owner or not provider or not isinstance(job_id, str) or not mobile.ID.fullmatch(job_id):
-        raise ValueError("Owned cron job identity unavailable")
-
-    with mobile.connect() as conn:
-        row = conn.execute(
-            "SELECT id,conversation FROM notices WHERE owner=? AND profile=? AND job_id=? "
-            "AND kind IN ('task_result','failure','completion') ORDER BY created DESC LIMIT 1",
-            (owner, profile, job_id),
-        ).fetchone()
-    if row:
-        native_row = native.verify(owner, provider, profile, row["conversation"])
-        if native_row.get("source") != "cron":
-            raise LookupError("Cron result conversation is not owned")
-        return row["id"]
-
-    session = proactive.cron_session(mobile, owner, profile, job_id)
-    if not session:
-        raise LookupError("Cron result conversation is unavailable")
-    native_row = native.verify(owner, provider, profile, session)
-    if native_row.get("source") != "cron":
-        raise LookupError("Cron result conversation is not owned")
-    return mobile.enqueue_task_result(owner, profile, session, job_id)
-
-
 def _queue_standalone_result(message):
     mobile, cfg, profile = _profile_state()
     _, native, _ = _modules()
@@ -92,6 +64,14 @@ def _queue_standalone_result(message):
     digest = hashlib.sha256((str(message) + ":" + str(bucket)).encode("utf-8")).hexdigest()[:32]
     job_id = "phone-" + digest
     return mobile.enqueue_task_result(owner, profile, conversation, job_id, str(message)[:4000])
+
+
+def _strip_cron_header(message):
+    header = re.match(r"(?s)^Cronjob Response: [^\r\n]{1,240}\r?\n\(job_id: [A-Za-z0-9_-]{1,160}\)\r?\n", message)
+    if not header:
+        return message
+    body = message[header.end():]
+    return re.sub(r"^-{3,}\r?\n(?:\r?\n)?", "", body, count=1)
 
 
 class CypherPhoneAdapter(BasePlatformAdapter):
@@ -116,8 +96,7 @@ class CypherPhoneAdapter(BasePlatformAdapter):
         if not isinstance(content, str) or not content.strip():
             return SendResult(success=False, error="Refusing to queue an empty phone result")
         try:
-            job_id = (metadata or {}).get("job_id")
-            event = _queue_cron_result(job_id, content) if job_id else _queue_standalone_result(content)
+            event = _queue_standalone_result(_strip_cron_header(content))
             return SendResult(success=True, message_id=event)
         except Exception as exc:
             return SendResult(success=False, error=str(exc)[:240], retryable=True)
@@ -130,8 +109,7 @@ async def standalone_send(pconfig, chat_id, message, *, thread_id=None, media_fi
     if not isinstance(message, str) or not message.strip():
         return {"error": "Refusing to queue an empty phone result"}
     try:
-        cron_header = re.match(r"(?s)^Cronjob Response: [^\r\n]{1,240}\r?\n\(job_id: ([A-Za-z0-9_-]{1,160})\)\r?\n", message)
-        event = _queue_cron_result(cron_header.group(1), message) if cron_header else _queue_standalone_result(message)
+        event = _queue_standalone_result(_strip_cron_header(message))
         return {"success": True, "platform": "phone", "chat_id": chat_id or "phone", "message_id": event}
     except Exception as exc:
         return {"error": str(exc)[:240]}

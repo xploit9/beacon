@@ -973,16 +973,16 @@ async def get_voice_history(stored_id:str,request:Request):
 
 @router.get('/mobile/proactive')
 async def proactive_status(request:Request):
-    owner,provider,profile,cfg=identity(request)
-    return await feature(proactive.status,mobile,owner,provider,profile,cfg,timeout=12)
+    owner,_,profile,_=identity(request)
+    return await feature(proactive.status,mobile,owner,profile,timeout=12)
 
 @router.put('/mobile/proactive')
 async def proactive_enabled(request:Request):
     value=await body(request,1024)
     if set(value)!={'enabled'} or type(value['enabled']) is not bool:
         raise HTTPException(400,'Expected only an enabled boolean')
-    owner,provider,profile,cfg=identity(request)
-    return await feature(proactive.set_enabled,mobile,owner,provider,profile,cfg,value['enabled'],timeout=30)
+    owner,_,profile,_=identity(request)
+    return await feature(proactive.set_enabled,mobile,owner,profile,value['enabled'],timeout=30)
 
 router.include_router(sys.modules['cypher_callback_api'].build_router(call,body,feature,mobile,native,sys.modules['cypher_callbacks']))
 
