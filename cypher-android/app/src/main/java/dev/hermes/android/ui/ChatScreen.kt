@@ -155,7 +155,6 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
     var search by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf("") }
     var showSearch by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(false) }
     val searchFocusRequester = remember { FocusRequester() }
-    LaunchedEffect(showSearch, canonical, chat.sessionId) { if (showSearch && canonical) searchFocusRequester.requestFocus() }
     val promptScope = vm.authenticatedScope()?.takeIf { it.copy(session = "") == vm.client?.scope }
     val questionId = chat.clarification?.let { it.string("clarify_id", it.string("id")) }.orEmpty()
     var questionAnswers by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId, questionId,
@@ -294,6 +293,8 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                     }
                 }
             }
+            // Focus only while the field (and its requester) is composed; a hidden panel or rotation must not request focus.
+            if (canonical && showSearch) LaunchedEffect(chat.sessionId) { searchFocusRequester.requestFocus() }
             if (canonical && showSearch) OutlinedTextField(search, { search = it }, placeholder = { Text(uiText("Find in conversation")) }, singleLine = true, trailingIcon = { IconButton(onClick = { showSearch = false; search = "" }) { Icon(Icons.Rounded.Close, uiText("Close search")) } }, modifier = Modifier.fillMaxWidth().focusRequester(searchFocusRequester).padding(horizontal = 16.dp))
             if (xara && !ready) Box(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
                 EmptyState(if (ui.xaraOpening) "Opening Cypher’s conversation" else if (ui.profile != "default") "Cypher uses the default profile" else "Cypher’s conversation is unavailable", ui.xaraError.ifBlank { "Your conversation is opening. Your other chats and drafts are safely saved." }, action = if (ui.xaraOpening) "" else if (ui.profile != "default") "Switch to default profile" else "Retry Cypher", onAction = { if (ui.profile != "default") vm.switchProfile("default") else vm.openXara() })
@@ -619,7 +620,7 @@ internal fun acceptsInitialConversationEdit(
 // Only presentation is adapted; Cypher's own ChatState and callbacks supply every value.
 
 /** Each tool is its own collapsed card; reasoning and live status sit above them. */
-@Composable internal fun MessageActivity(reasoning: String, tools: List<JSONObject>, status: String = "", streaming: Boolean = status.isNotBlank(), messageTime: Long = 0L, separateToolResults: Set<String> = emptySet(), onToolExpanded: (Boolean) -> Unit = {}) {
+@Composable internal fun MessageActivity(reasoning: String, tools: List<JSONObject>, status: String = "", streaming: Boolean = false, messageTime: Long = 0L, separateToolResults: Set<String> = emptySet(), onToolExpanded: (Boolean) -> Unit = {}) {
     if (reasoning.isBlank() && tools.isEmpty() && status.isBlank()) return
     Column(Modifier.fillMaxWidth().testTag("message-activity"), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (status.isNotBlank()) Text(status, Modifier.testTag("message-activity-status"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

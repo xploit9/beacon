@@ -4,9 +4,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.platform.LocalContext
 import org.json.JSONObject
 
-/** Preserve custom names and stored preferences; only retired default branding is displayed anew. */
-internal fun assistantDisplayName(value: String): String = if (value.isBlank() || value.equals("Hermes", true) || value.equals("Xara", true) || value.equals("Cipher", true) || value.equals("Cypher", true)) "Cypher" else value
-
 val LocalCypherSettings = staticCompositionLocalOf { JSONObject() }
 val NativeLanguages = linkedMapOf("en" to "English", "ar" to "العربية", "it" to "Italiano", "ja" to "日本語", "ru" to "Русский", "es" to "Español", "de" to "Deutsch", "zh" to "简体中文", "zh-Hant" to "繁體中文", "pt" to "Português", "ko" to "한국어", "fr" to "Français", "cs" to "Čeština", "tr" to "Türkçe", "pl" to "Polski", "vi" to "Tiếng Việt")
 private val LocalUiStrings = staticCompositionLocalOf { JSONObject() }

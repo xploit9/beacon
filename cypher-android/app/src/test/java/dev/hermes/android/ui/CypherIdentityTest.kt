@@ -7,10 +7,6 @@ import dev.hermes.android.push.CypherMessagingService
 import dev.hermes.android.updates.UpdateManager
 
 class CypherIdentityTest {
-    @Test fun retiredDefaultNamesDisplayCypherWithoutRewritingCustomNames() {
-        for (name in listOf("", "Hermes", "hermes", "Xara", "xara", "Cipher", "cipher", "Cypher")) assertEquals("Cypher", assistantDisplayName(name))
-        assertEquals("My research assistant", assistantDisplayName("My research assistant"))
-    }
     @Test fun notificationIdsRemainCompatibleWithInstalledPreferences() {
         assertEquals("xara-calls", CypherCallService.CHANNEL)
         assertEquals("hermes-activity", CypherMessagingService.CHANNEL)
