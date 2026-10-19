@@ -95,7 +95,7 @@ import org.json.JSONObject
             "Tools & commands" -> NativeToolSettings(vm)
             "MCP servers" -> NativeToolSettings(vm, mcp = true)
             "Providers & models" -> Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                Text("Choose the model for this conversation, or manage a profile’s default for new chats.")
+                Text("Model for this chat.")
                 Text(chat.title, style = MaterialTheme.typography.titleMedium)
                 Text(chat.raw.string("model").ifBlank { "Uses the profile default" })
                 Button(onClick = { vm.openCatalog("Model & provider") }, enabled = chat.sessionId.isNotBlank()) { Text("Change conversation model") }

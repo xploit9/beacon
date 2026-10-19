@@ -20,7 +20,7 @@ internal fun acceptsComposerEdit(client: Any?, currentClient: Any?, scope: Any?,
     client === currentClient && scope == currentScope && !callActiveHere
 
 internal val conversationActionGroups = linkedMapOf(
-    "Conversation" to listOf("New conversation", "Rename", "Archive", "Branch"),
+    "Conversation" to listOf("New conversation", "Rename", "Pin", "Archive", "Branch"),
     "Model and tools" to listOf("Model & provider", "Reasoning", "Toolsets"),
     "Context and replies" to listOf("Compress context", "Undo last turn", "Usage"),
     "Manage" to listOf("Delete conversation"),

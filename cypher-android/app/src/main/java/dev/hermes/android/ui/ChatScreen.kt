@@ -1,4 +1,4 @@
-@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
 package dev.hermes.android.ui
 
 
@@ -23,6 +23,7 @@ import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -93,6 +94,11 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
     var view by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf(HistoryView.All) }
     var naming by rememberSaveable { mutableStateOf(false) }
     var filtersOpen by remember { mutableStateOf(false) }
+    // Long-press menu and the dialogs it opens, for one history row at a time.
+    var menuFor by remember { mutableStateOf<String?>(null) }
+    var renaming by remember { mutableStateOf<JSONObject?>(null) }
+    var deleting by remember { mutableStateOf<JSONObject?>(null) }
+    var projectFor by remember { mutableStateOf<String?>(null) }
     val order = HistoryOrder.of(preferences.historyOrder)
     val hidden = preferences.historyHiddenSources
     LaunchedEffect(search, archived, view, hidden, order) { kotlinx.coroutines.delay(250); vm.refreshSessions(search, archived, force = false, threads = view == HistoryView.Threads) }
@@ -155,14 +161,21 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
             val source = row.string("source")
             val thread = isThreadSource(source)
             val external = source.isNotBlank() && source != "android" && !thread
-            ListItem(headlineContent = { Text(row.string("title").ifBlank { "Untitled conversation" }, maxLines = 2) },
+            Box { ListItem(headlineContent = { Text(row.string("title").ifBlank { "Untitled conversation" }, maxLines = 2) },
                 supportingContent = if (external) ({ Text(uiText(historySourceLabel(source)), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }) else null,
                 leadingContent = { if (thread && !row.optBoolean("pinned")) ThreadSpoolGlyph(Modifier.size(24.dp), tint = LocalContentColor.current) else Icon(if (row.optBoolean("pinned")) Icons.Rounded.PushPin else Icons.Rounded.ChatBubbleOutline, null) },
-                trailingContent = { if (row.string("active_stream_id").isNotBlank()) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp) }, colors = ListItemDefaults.colors(containerColor = if (id == chat.sessionId) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent), modifier = Modifier.semantics { selected = id == chat.sessionId }.clickable { vm.tab("Chat"); vm.openConversation(row) }.heightIn(min = 56.dp))
+                trailingContent = { if (row.string("active_stream_id").isNotBlank()) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp) }, colors = ListItemDefaults.colors(containerColor = if (id == chat.sessionId) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent), modifier = Modifier.semantics { selected = id == chat.sessionId }.combinedClickable(onLongClickLabel = uiText("Conversation actions"), onLongClick = { menuFor = id }) { vm.tab("Chat"); vm.openConversation(row) }.heightIn(min = 56.dp).testTag("history-row:$id"))
+            DropdownMenu(menuFor == id, { menuFor = null }, modifier = Modifier.testTag("history-row-menu")) {
+                ConversationMenuItems(vm, row, onDone = { menuFor = null }, onRename = { renaming = row }, onProject = { projectFor = id },
+                    onDelete = { if (id == chat.sessionId) { vm.toggleSessions(false); chatAction(vm, "Delete conversation") } else deleting = row })
+            } }
         }
         }
 
     }
+    renaming?.let { row -> RenameConversationDialog(vm, sessionRowId(row), row.string("title"), onDismiss = { renaming = null }) }
+    deleting?.let { row -> DeleteConversationDialog(vm, sessionRowId(row), row.string("title"), onDismiss = { deleting = null }) }
+    projectFor?.let { id -> ChatProjectPicker(vm, id, onDismiss = { projectFor = null }) }
     if (naming) {
         var name by rememberSaveable { mutableStateOf("") }
         AlertDialog(onDismissRequest = { naming = false }, title = { Text(uiText("New thread")) },
@@ -193,7 +206,7 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
     if(handoff?.scope==vm.authenticatedScope()&&handoff?.targetCall?.isBlank()==true) AlertDialog(
         onDismissRequest=vm::cancelVoiceHandoff,
         title={Text("Switching to Gemini…")},
-        text={Column(verticalArrangement=Arrangement.spacedBy(12.dp)) { LinearProgressIndicator(Modifier.fillMaxWidth());Text("Closing Grok and reconnecting this conversation. Your dialogue stays in this chat.") }},
+        text={Column(verticalArrangement=Arrangement.spacedBy(12.dp)) { LinearProgressIndicator(Modifier.fillMaxWidth());Text("Reconnecting this chat…") }},
         confirmButton={TextButton(vm::cancelVoiceHandoff) { Text("Stop") }})
     val side by vm.side.collectAsStateWithLifecycle()
     val settings = LocalCypherSettings.current
@@ -209,7 +222,9 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
     }
     var composerDetails by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(false) }
     var projects by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(false) }
-    if (projects) ChatProjectPicker(vm, onDismiss = { projects = false })
+    if (projects) ChatProjectPicker(vm, chat.sessionId, onDismiss = { projects = false })
+    // The chat menu offers Add to or Remove from its project at once, without a loading step.
+    LaunchedEffect(chat.sessionId, ui.connected) { if (chat.sessionId.isNotBlank() && ui.connected) vm.loadConversationProject(chat.sessionId, force = false) }
     var search by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf("") }
     var showSearch by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(false) }
     val searchFocusRequester = remember { FocusRequester() }
@@ -218,6 +233,7 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
     var questionAnswers by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId, questionId,
         stateSaver = androidx.compose.runtime.saveable.mapSaver<Map<String, String>>(save = { it }, restore = { saved -> saved.mapValues { it.value as String } })) { mutableStateOf(emptyMap<String, String>()) }
     val visibleMessages = remember(messages, search) { messages.withIndex().filter { search.isBlank() || it.value.text.contains(search, true) } }
+    val dayStarts = remember(visibleMessages) { messageDayStarts(visibleMessages.map { it.value.id to it.value.recordedAt }) }
     val messageIds = remember(chat.messages) { chat.messages.map { it.id } }
     val list = key(ui.origin, ui.owner, ui.profile, chat.sessionId, chat.projectionReady) {
         val start = initialConversationPosition(messageIds, chat.anchorId, chat.anchor, chat.anchorOffset)
@@ -260,7 +276,7 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
             runCatching { vm.stopReadAloud();vm.app.calls.start(requested,conversation) }.onFailure { error ->
                 if(error is MissingVoiceKeyException) vm.openVoiceKeySettingsForCall(requested,conversation) else vm.notice(error.message.orEmpty())
             }
-        } else vm.notice(if(allowed) "Open the conversation again before calling" else "Allow microphone permission to call Cypher")
+        } else vm.notice(if(allowed) "Open the conversation again before calling" else "Allow microphone permission to call ${dev.hermes.android.data.currentAssistantName}")
     }
     fun requestCall(active:CypherClient,conversation:String) {
         scope.launch {
@@ -353,12 +369,13 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
             }
             // Focus only while the field (and its requester) is composed; a hidden panel or rotation must not request focus.
             if (canonical && showSearch) LaunchedEffect(chat.sessionId) { searchFocusRequester.requestFocus() }
-            if (canonical && showSearch) OutlinedTextField(search, { search = it }, placeholder = { Text(uiText("Find in conversation")) }, singleLine = true, trailingIcon = { IconButton(onClick = { showSearch = false; search = "" }) { Icon(Icons.Rounded.Close, uiText("Close search")) } }, modifier = Modifier.fillMaxWidth().focusRequester(searchFocusRequester).padding(horizontal = 16.dp))
+            if (canonical && showSearch) OutlinedTextField(search, { search = it }, placeholder = { Text(uiText("Find in conversation")) }, singleLine = true, suffix = if (search.isBlank()) null else ({ Text(visibleMessages.size.toString(), Modifier.testTag("search-count")) }), trailingIcon = { IconButton(onClick = { showSearch = false; search = "" }) { Icon(Icons.Rounded.Close, uiText("Close search")) } }, modifier = Modifier.fillMaxWidth().focusRequester(searchFocusRequester).padding(horizontal = 16.dp))
             if (xara && !ready) Box(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
-                EmptyState(if (ui.xaraOpening) "Opening Cypher’s conversation" else if (ui.profile != "default") "Cypher uses the default profile" else "Cypher’s conversation is unavailable", ui.xaraError.ifBlank { "Your conversation is opening. Your other chats and drafts are safely saved." }, action = if (ui.xaraOpening) "" else if (ui.profile != "default") "Switch to default profile" else "Retry Cypher", onAction = { if (ui.profile != "default") vm.switchProfile("default") else vm.openXara() })
+                EmptyState(assistantText(if (ui.xaraOpening) "Opening Cypher’s conversation" else "Cypher’s conversation is unavailable"), ui.xaraError.ifBlank { "Your conversation is opening. Your other chats and drafts are safely saved." }, action = if (ui.xaraOpening) "" else assistantText("Retry Cypher"), onAction = { vm.openXara() })
             } else if (chat.sessionId.isBlank()) Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
                 Box(Modifier.widthIn(max = 280.dp).fillMaxWidth(.9f).aspectRatio(1f).clipToBounds().testTag("chat-sphere-empty")) { ChatSphere(Modifier.fillMaxSize(), avatarState) }
                 EmptyState(if (ui.newChatOpening) "Opening your conversation" else "Make room for a thought", if (ui.newChatError.isNotBlank()) ui.newChatError else if (ui.newChatOpening) "Keep typing. Your draft stays here while the conversation opens." else "Ask, explore or turn an idea into working progress.", action = if (ui.newChatError.isNotBlank() && !ui.newChatOpening) "Retry" else "", onAction = { vm.retryInitialChat() })
+                if (!ui.newChatOpening && ui.newChatError.isBlank()) StarterPrompts { vm.composer(TextFieldValue(it, TextRange(it.length))) }
             }
             else if (!chat.projectionReady) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
@@ -370,15 +387,16 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                 if (chat.messages.isEmpty() && chat.streamId.isBlank() && !chatSendInFlight(chat)) item("empty-state") {
                     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
                         Box(Modifier.widthIn(max = 280.dp).fillMaxWidth(.9f).aspectRatio(1f).clipToBounds().testTag("chat-sphere-empty")) { ChatSphere(Modifier.fillMaxSize(), avatarState) }
-                        EmptyState("Where shall we begin?", if (xara) "Cypher keeps the same context across text, calls and completed tasks." else "Your work starts here. Choose a model and send your first message.")
+                        EmptyState("Where shall we begin?", if (xara) assistantText("Cypher keeps the same context across text, calls and completed tasks.") else "Your work starts here. Choose a model and send your first message.")
+                        StarterPrompts { vm.composer(TextFieldValue(it, TextRange(it.length))) }
                     }
                 }
                 if (search.isNotBlank() && visibleMessages.isEmpty()) item { Text("No messages match your search.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                items(visibleMessages, key = { it.value.id }) { (index, message) -> MessageRow(vm, message, index, callMessagesById[message.id], separateToolResults, toolResultTitles[message.id].orEmpty(), onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }) }
+                items(visibleMessages, key = { it.value.id }) { (index, message) -> dayStarts[message.id]?.let { DayDivider(uiText(it)) }; MessageRow(vm, message, index, callMessagesById[message.id], separateToolResults, toolResultTitles[message.id].orEmpty(), onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }) }
                 if (chat.streamId.isNotBlank() || chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank()) item("live") {
                     // Same header and spacing as the stored reply, so replacing this row does not move the text.
                     Column(Modifier.testTag("live-reply"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("Cypher", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(LocalAssistantName.current, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         // The blank meta line and the status row hold the places of the stored reply's time and action row.
                         if (chat.liveText.isNotBlank()) AssistantSurface { Markdown(chat.liveText, vm, vm.authenticatedScope(), interactive = false); Text(" ", Modifier.padding(top = 4.dp), style = nativeMetadataStyle()) }
                         Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("live-status"), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -424,7 +442,7 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
             Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 if (navigationBack != null) IconButton(onClick = navigationBack, modifier = Modifier.testTag("bot-chat-back")) { Icon(Icons.Rounded.ArrowBack, "Back to bots") }
                 else IconButton(onClick = LocalOpenNavigationMenu.current ?: { vm.toggleSessions(!ui.showSessions) }, modifier = Modifier.testTag("navigation-toggle")) { Icon(Icons.Rounded.Menu, uiText(if (LocalPersistentNavigation.current) "Hide navigation" else "Show navigation")) }
-                Column(Modifier.weight(1f).padding(vertical = 8.dp)) { Text(titleOverride ?: if (xara || activeHere) "Cypher" else chat.title, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis); Text(if (xara || activeHere) uiText(if (call.active) "Voice conversation" else "Text and voice, together") else if (!canonical) uiText("Loading model…") else chat.raw.string("model").ifBlank { profileDefaults["profile-defaults"]?.takeIf { it.string("profile") == ui.profile && recordError(it).isBlank() }?.string("model").orEmpty() }.ifBlank { "Choose a model" }, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
+                Column(Modifier.weight(1f).padding(vertical = 8.dp)) { Text(titleOverride ?: if (xara || activeHere) LocalAssistantName.current else chat.title, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis); Text(if (xara || activeHere) uiText(if (call.active) "Voice conversation" else "Text and voice, together") else if (!canonical) uiText("Loading model…") else chat.raw.string("model").ifBlank { profileDefaults["profile-defaults"]?.takeIf { it.string("profile") == ui.profile && recordError(it).isBlank() }?.string("model").orEmpty() }.ifBlank { "Choose a model" }, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
                 if (!xara && !permanentBotChat) IconButton(onClick = { vm.newChat() }) { Icon(Icons.Rounded.Edit, uiText("New conversation")) }
                 IconButton(onClick = { showSearch = !showSearch; if (activeHere && showSearch) showCallHistory = true }, enabled = canonical) { Icon(Icons.Rounded.Search, uiText("Search this conversation")) }
                 Box { IconButton(onClick = { menu = true }, enabled = ready) { Icon(Icons.Rounded.MoreVert, uiText("Conversation actions")) }; DropdownMenu(menu && ready, { menu = false }, modifier = Modifier.heightIn(max = actionMenuHeight).testTag("conversation-actions-menu")) {
@@ -439,7 +457,15 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                     HorizontalDivider()
                     if (chat.queued.isNotEmpty() || chat.uncertain.isNotBlank()) DropdownMenuItem({ Text("Message queue") }, { menu = false; composerDetails = true }, enabled = !activeHere)
                     if (composerDraft.text.startsWith("/")) DropdownMenuItem({ Text(if (chat.streamId.isNotBlank()) "Queue as text" else "Send as text") }, { menu = false; if (chat.streamId.isNotBlank()) vm.queue() else vm.send() }, enabled = canonical && !activeHere && chat.uncertain.isBlank())
-                    DropdownMenuItem({ Text("Projects") }, { menu = false; projects = true }, enabled = !activeHere && chat.streamId.isBlank() && chat.sessionId.isNotBlank())
+                    if (canonical && !activeHere && chat.streamId.isBlank()) ConversationProjectItem(vm, chat.sessionId, onAdd = { projects = true }, onDone = { menu = false })
+                    val assistantName = LocalAssistantName.current
+                    val context = LocalContext.current
+                    val shareTitle = uiText("Share conversation")
+                    if (canonical && chat.messages.isNotEmpty()) DropdownMenuItem({ Text(uiText("Share conversation")) }, { menu = false
+                        runCatching { context.startActivity(Intent.createChooser(formattedShareIntent(conversationShareText(chat.messages.map { it.role to it.text }, assistantName)), shareTitle)) }
+                            .onFailure { vm.notice(if (it is IllegalArgumentException) it.message.orEmpty() else "No app is available to share this conversation") } }, leadingIcon = { Icon(Icons.Rounded.Share, null) })
+                    if (canonical) DropdownMenuItem({ Text(uiText("Copy conversation ID")) }, { menu = false
+                        (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Conversation ID", chat.sessionId)); vm.notice("Conversation ID copied") }, leadingIcon = { Icon(Icons.Rounded.ContentCopy, null) })
                     DropdownMenuItem({ Text("Chat preferences") }, { menu = false; vm.more("Settings") })
                 } }
             }
@@ -502,9 +528,20 @@ internal fun acceptsInitialConversationEdit(
     }
     var attachmentRequest by remember { mutableStateOf<Pair<CypherClient, Scope?>?>(null) }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris -> val request = attachmentRequest; attachmentRequest = null; if (uris.isNotEmpty()) { if (request != null && vm.client === request.first && vm.authenticatedScope() == request.second) uris.distinct().forEach { vm.upload(it) } else vm.notice("Reopen attachments in the original account and conversation.") } }
+    // Camera photos go to a private cache folder the FileProvider shares with the camera app; stale ones are cleared at start.
+    var photo by rememberSaveable { mutableStateOf<String?>(null) }
+    val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { taken -> val request = attachmentRequest; attachmentRequest = null; val uri = photo?.let(android.net.Uri::parse); photo = null
+        if (taken && uri != null) { if (request != null && vm.client === request.first && vm.authenticatedScope() == request.second) vm.upload(uri) else vm.notice("Reopen attachments in the original account and conversation.") } }
+    val takePhoto = {
+        val file = java.io.File(context.cacheDir, "camera").apply { mkdirs() }.let { java.io.File(it, "photo-${System.currentTimeMillis()}.jpg") }
+        val uri = androidx.core.content.FileProvider.getUriForFile(context, context.packageName + ".files", file)
+        photo = uri.toString(); runCatching { camera.launch(uri) }.onFailure { attachmentRequest = null; vm.notice("No camera app is available") }
+    }
+    val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted -> if (granted) takePhoto() else { attachmentRequest = null; vm.notice("Allow camera access to take a photo.") } }
     var dictationRequest by remember { mutableStateOf<Pair<CypherClient, Scope?>?>(null) }
     val dictation = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r -> val request = dictationRequest; dictationRequest = null; val text = r.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull(); if (r.resultCode == android.app.Activity.RESULT_OK && text != null) { if (request != null && vm.client === request.first && vm.authenticatedScope() == request.second) vm.dictated(text) else vm.notice("Reopen dictation in the original account and conversation.") } }
     var modelMenu by remember { mutableStateOf(false) }
+    val assistantModelFixed = vm.preferences.collectAsStateWithLifecycle().value.assistantModel.isNotBlank()
     var attachMenu by remember { mutableStateOf(false) }
     LaunchedEffect(ui.origin, ui.owner, ui.profile) { vm.loadSlashCatalog() }
     // Hermes reports a blank model/effort when the chat follows its profile (tui_gateway _session_info, _cfg_get_reasoning),
@@ -548,7 +585,7 @@ internal fun acceptsInitialConversationEdit(
                     if (streaming && !voiceAction) Text(uiText("Queue next · delivers after this turn"), Modifier.padding(horizontal = 8.dp, vertical = 2.dp).clip(RoundedCornerShape(999.dp)).background(MaterialTheme.colorScheme.secondaryContainer).padding(horizontal = 8.dp, vertical = 3.dp).testTag("composer-queue-caption"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSecondaryContainer)
                     // In flight the transcript shows the message; the draft stays held (not shown twice) until Hermes accepts it.
                     // Edits are ignored rather than the field made read-only: read-only ends the input session and drops the keyboard.
-                    OutlinedTextField(if (sending) TextFieldValue("") else draft, if (sending) { _ -> } else changeDraft, placeholder = { Text(if (sending) uiText("Sending…") else if (callActive) "Finish your call to continue typing" else if (readOnly) "Branch this conversation to reply" else if (streaming) uiText("Correct the response...") else "Message Cypher") }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp.coerceAtMost(editorHeight), max = editorHeight).testTag("message-input").onPreviewKeyEvent { event -> val key = event.nativeKeyEvent; val sendKey = settings.string("send_key", "enter"); val matched = when (sendKey) { "ctrl_enter", "ctrl+enter" -> key.isCtrlPressed && !key.isShiftPressed; "shift+enter" -> key.isShiftPressed && !key.isCtrlPressed; else -> !key.isShiftPressed && !key.isCtrlPressed && !key.isAltPressed }; if (key.action == android.view.KeyEvent.ACTION_DOWN && key.keyCode == android.view.KeyEvent.KEYCODE_ENTER && matched && !callActive && !readOnly) { if (editable && chat.uncertain.isBlank()) submit(); true } else false }, minLines = 1, maxLines = 6, enabled = editable && !callActive && !readOnly, shape = RoundedCornerShape(18.dp), colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = .5f)))
+                    OutlinedTextField(if (sending) TextFieldValue("") else draft, if (sending) { _ -> } else changeDraft, placeholder = { Text(if (sending) uiText("Sending…") else if (callActive) "Finish your call to continue typing" else if (readOnly) "Branch this conversation to reply" else if (streaming) uiText("Correct the response...") else assistantText("Message Cypher")) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp.coerceAtMost(editorHeight), max = editorHeight).testTag("message-input").onPreviewKeyEvent { event -> val key = event.nativeKeyEvent; val sendKey = settings.string("send_key", "enter"); val matched = when (sendKey) { "ctrl_enter", "ctrl+enter" -> key.isCtrlPressed && !key.isShiftPressed; "shift+enter" -> key.isShiftPressed && !key.isCtrlPressed; else -> !key.isShiftPressed && !key.isCtrlPressed && !key.isAltPressed }; if (key.action == android.view.KeyEvent.ACTION_DOWN && key.keyCode == android.view.KeyEvent.KEYCODE_ENTER && matched && !callActive && !readOnly) { if (editable && chat.uncertain.isBlank()) submit(); true } else false }, minLines = 1, maxLines = 6, enabled = editable && !callActive && !readOnly, shape = RoundedCornerShape(18.dp), colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = .5f)))
                     if (streaming && !voiceAction) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                         TextButton(onClick = { vm.steer() }, enabled = canonical && preparing.isEmpty() && !readOnly && !callActive && draft.text.isNotBlank() && !draft.text.startsWith("/") && chat.uncertain.isBlank() && files.isEmpty(), modifier = Modifier.heightIn(min = 48.dp)) { Text("Guide") }
                         TextButton(onClick = { vm.cancel() }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Stop") }
@@ -559,6 +596,14 @@ internal fun acceptsInitialConversationEdit(
                             DropdownMenu(attachMenu, { attachMenu = false }, modifier = Modifier.testTag("attach-menu")) {
                                 DropdownMenuItem({ Text(uiText("Photos")) }, { attachMenu = false; vm.client?.let { attachmentRequest = it to vm.authenticatedScope(); picker.launch(arrayOf("image/*")) } }, leadingIcon = { Icon(Icons.Rounded.PhotoLibrary, null) }, modifier = Modifier.testTag("attach-photos"))
                                 DropdownMenuItem({ Text(uiText("Files")) }, { attachMenu = false; vm.client?.let { attachmentRequest = it to vm.authenticatedScope(); picker.launch(arrayOf("*/*")) } }, leadingIcon = { Icon(Icons.Rounded.AttachFile, null) }, modifier = Modifier.testTag("attach-files"))
+                                DropdownMenuItem({ Text(uiText("Camera")) }, { attachMenu = false; vm.client?.let { attachmentRequest = it to vm.authenticatedScope()
+                                    if (androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED) takePhoto() else cameraPermission.launch(android.Manifest.permission.CAMERA) } },
+                                    leadingIcon = { Icon(Icons.Rounded.PhotoCamera, null) }, modifier = Modifier.testTag("attach-camera"))
+                                DropdownMenuItem({ Text(uiText("Paste image")) }, { attachMenu = false
+                                    val clip = (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).primaryClip
+                                    val image = clip?.takeIf { it.description.hasMimeType("image/*") }?.getItemAt(0)?.uri
+                                    if (image == null) vm.notice("No image on the clipboard") else vm.upload(image) }, leadingIcon = { Icon(Icons.Rounded.ContentPaste, null) }, modifier = Modifier.testTag("attach-paste-image"))
+                                if (draft.text.isBlank()) DropdownMenuItem({ Text(uiText("Commands")) }, { attachMenu = false; changeDraft(TextFieldValue("/", TextRange(1))) }, leadingIcon = { Icon(Icons.Rounded.Terminal, null) }, modifier = Modifier.testTag("attach-commands"))
                             }
                         }
                         // Attach stays at the left; run controls sit together at the right edge.
@@ -573,7 +618,9 @@ internal fun acceptsInitialConversationEdit(
                                 Icon(Icons.Rounded.ExpandMore, null, Modifier.size(16.dp))
                             }
                             DropdownMenu(modelMenu, { modelMenu = false }) {
-                                DropdownMenuItem({ Text("Model & provider") }, { modelMenu = false; vm.openCatalog("Model & provider") })
+                                // The assistant's model is fixed in Settings › Assistant, so its chat changes it there.
+                                if (ui.tab == "Xara" && assistantModelFixed) DropdownMenuItem({ Text(uiText("Model · set in Settings")) }, { modelMenu = false; vm.more("Assistant") }, modifier = Modifier.testTag("assistant-model-settings"))
+                                else DropdownMenuItem({ Text("Model & provider") }, { modelMenu = false; vm.openCatalog("Model & provider") })
                                 DropdownMenuItem({ Text("Reasoning effort") }, { modelMenu = false; vm.openCatalog("Reasoning") })
                             }
                         }
@@ -587,7 +634,7 @@ internal fun acceptsInitialConversationEdit(
                             // The trailing slot morphs to Stop, so the bar never widens during a turn.
                             OutlinedIconButton(onClick = { vm.cancel() }, shape = CircleShape, border = BorderStroke(1.dp, MaterialTheme.colorScheme.error), modifier = Modifier.size(composerActionSize).testTag("message-stop")) { Icon(Icons.Rounded.Stop, uiText("Stop"), Modifier.size(24.dp), tint = MaterialTheme.colorScheme.error) }
                         } else if (voiceAction) {
-                            FilledIconButton(onClick = onCall, shape = CircleShape, modifier = Modifier.size(composerActionSize).testTag("chat-call-xara"), enabled = callAvailable && canonical && !callActive && !readOnly && chat.streamId.isBlank() && ui.bootstrap.optJSONObject("voice")?.optBoolean("available") == true) { Icon(Icons.Rounded.GraphicEq, uiText("Talk to Cypher in this conversation"), Modifier.size(24.dp)) }
+                            FilledIconButton(onClick = onCall, shape = CircleShape, modifier = Modifier.size(composerActionSize).testTag("chat-call-xara"), enabled = callAvailable && canonical && !callActive && !readOnly && chat.streamId.isBlank() && ui.bootstrap.optJSONObject("voice")?.optBoolean("available") == true) { Icon(Icons.Rounded.GraphicEq, assistantText("Talk to Cypher in this conversation"), Modifier.size(24.dp)) }
                         } else {
                             FilledIconButton(onClick = submit, shape = CircleShape, modifier = Modifier.size(composerActionSize).testTag("message-send"), enabled = editable && preparing.isEmpty() && chat.uncertain.isBlank() && !callActive && !readOnly) { Icon(Icons.Rounded.ArrowUpward, uiText(if (commandName != null) "Run command" else if (chat.streamId.isNotBlank()) "Queue" else "Send"), Modifier.size(24.dp)) }
                         }
@@ -602,7 +649,7 @@ internal fun acceptsInitialConversationEdit(
             if (readOnly) Text(uiText("This source is read-only. Branch into a new conversation to continue."))
             if (chat.status.isNotBlank()) Text(chat.status, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (chat.uncertain.isNotBlank()) {
-                Text("Delivery is unconfirmed. Compare the saved conversation before reviewing or deliberately resending your retained draft.")
+                Text("Not sure this message arrived. Check the chat, then resend or dismiss.")
                 TextButton(onClick = { vm.reconcileSend() }) { Text("Refresh saved conversation") }
                 TextButton(onClick = { vm.openForm(ActionForm("Mark message reviewed", "", emptyList(), explanation = "You have checked the saved conversation. Keep the draft and clear its unconfirmed delivery state.", actionLabel = "Mark reviewed", onResult = { vm.reviewPendingSend() })); onDetails(false) }) { Text("Mark reviewed") }
                 TextButton(onClick = { vm.openForm(ActionForm("Resend retained draft", "", emptyList(), explanation = "The earlier delivery is unconfirmed. Resending may create a duplicate if it already arrived.", actionLabel = "Resend", onResult = { vm.reviewPendingSend(resend = true) })); onDetails(false) }) { Text("Resend draft…") }
@@ -631,6 +678,7 @@ internal fun acceptsInitialConversationEdit(
             if (callTranscript == null && message.text.isNotBlank()) Row(Modifier.horizontalScroll(rememberScrollState()).testTag("message-actions:${message.id}"), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                 IconButton(onClick = { runCatching { val (text, html) = formattedClipboard(message.text); (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newHtmlText("Cypher message", text, html)) }.onSuccess { vm.notice("Formatted message copied") }.onFailure { vm.notice("Couldn’t copy the whole message. Select a smaller section.") } }) { Icon(Icons.Rounded.ContentCopy, uiText("Copy formatted message")) }
                 IconButton(onClick = share) { Icon(Icons.Rounded.Share, uiText("Share text")) }
+                IconButton(onClick = { vm.quoteInReply(presentation.text) }, modifier = Modifier.testTag("message-quote:${message.id}")) { Icon(Icons.Rounded.FormatQuote, uiText("Quote in reply")) }
                 IconButton(onClick = { if (reading) vm.stopReadAloud() else vm.readAloud(presentation.text) }) { Icon(if (reading) Icons.Rounded.Stop else Icons.Rounded.VolumeUp, uiText(if (reading) "Stop read aloud" else "Read aloud")) }
                 Box {
                     IconButton(onClick = { actions = true }) { Icon(Icons.Rounded.MoreHoriz, uiText("More message actions")) }
@@ -648,7 +696,7 @@ internal fun acceptsInitialConversationEdit(
             Disclosure(presentation.summary, message.text, renderActions)
         } else {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = if (message.role == "user") Arrangement.End else Arrangement.Start) {
-                Text(if (message.role == "user") uiText("You") else "Cypher", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(if (message.role == "user") uiText("You") else LocalAssistantName.current, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 if (callTranscript != null) { Spacer(Modifier.weight(1f)); Text(archivedCallLabel(callTranscript.final, callTranscript.interrupted, currentCall.active && currentCall.conversationScope == origin), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             }
             if (message.role == "user") BoxWithConstraints(Modifier.fillMaxWidth()) {
@@ -932,7 +980,7 @@ internal fun queuedHeading(count: Int): String = "$count ${if (count == 1) "mess
         val expected=permissionCall; permissionCall=""
         val current=vm.app.calls.state.value
         if(granted&&current.active&&current.callId==expected) vm.app.calls.camera(true)
-        else if(!granted) vm.notice("Allow camera access to share your camera with Cypher.")
+        else if(!granted) vm.notice("Allow camera access to share your camera with ${dev.hermes.android.data.currentAssistantName}.")
     }
     var screenCall by rememberSaveable { mutableStateOf("") }
     var screenToken by rememberSaveable { mutableLongStateOf(0L) }
@@ -1000,6 +1048,7 @@ private fun chatAction(vm: CypherViewModel, title: String) {
         "Rename" -> vm.openForm(ActionForm(title, "/api/session/rename", listOf(Field("title", "Conversation title", required = true)), seed.put("title", chat.title), onResult = result))
         "Model & provider", "Reasoning", "Toolsets" -> vm.openCatalog(title)
         "Archive" -> vm.sessionAction("/api/session/archive", json("archived" to !chat.raw.optBoolean("archived")))
+        "Pin" -> chat.raw.optBoolean("pinned").let { pinned -> vm.conversationAction(chat.sessionId, "/api/session/pin", json("pinned" to !pinned), if (pinned) "Unpinned" else "Pinned") }
         "Branch" -> vm.openForm(ActionForm(title, "/api/session/branch", listOf(Field("title", "Branch title"), Field("keep_count", "Messages to keep", FieldType.INTEGER)), seed.put("keep_count", chat.messages.size), onResult = result))
         "Compress context" -> vm.sessionAction("/api/session/compress") { response ->
             vm.notice(when (response.string("status")) { "compressed" -> "Context compressed"; "aborted" -> "Compression was not needed or was cancelled."; "pending", "lock_held" -> "Hermes is still working. Refresh the conversation to check progress."; else -> "Compression result is not confirmed. Refresh the conversation." })
@@ -1013,6 +1062,7 @@ private fun chatAction(vm: CypherViewModel, title: String) {
 private fun chatActionIcon(title: String): androidx.compose.ui.graphics.vector.ImageVector = when (title) {
     "New conversation" -> Icons.Rounded.Add
     "Rename" -> Icons.Rounded.Edit
+    "Pin", "Unpin" -> Icons.Rounded.PushPin
     "Archive" -> Icons.Rounded.Archive
     "Unarchive" -> Icons.Rounded.Unarchive
     "Branch" -> Icons.Rounded.CallSplit

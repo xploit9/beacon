@@ -21,16 +21,16 @@ import dev.hermes.android.data.NativeServerState
         if (state.notice.isNotBlank()) item { Text(state.notice) }
         when (page) {
             "Health" -> {
-                item { Text("Hermes ${state.version.ifBlank { "server" }}", style = MaterialTheme.typography.titleLarge); Text(if (state.overall == "ok") "Server components report healthy" else if (state.overall == "degraded") "Some server components need attention" else "Refresh to read server health"); Text("Gateway: ${state.gatewayState.ifBlank { "Not reported" }} · ${state.activeAgents} active agents"); Text("This checks server components. It does not test every tool or a live voice call.", style = MaterialTheme.typography.bodyMedium) }
+                item { Text("Hermes ${state.version.ifBlank { "server" }}", style = MaterialTheme.typography.titleLarge); Text(if (state.overall == "ok") "Server components report healthy" else if (state.overall == "degraded") "Some server components need attention" else "Refresh to read server health"); Text("Gateway: ${state.gatewayState.ifBlank { "Not reported" }} · ${state.activeAgents} active agents"); Text("Checks Hermes's components.", style = MaterialTheme.typography.bodyMedium) }
                 items(state.components, key = { it.name }) { component -> Column { Text(component.name.replaceFirstChar { it.uppercase() }, style = MaterialTheme.typography.titleMedium); Text("${component.status}${component.detail.takeIf { it.isNotBlank() }?.let { " · $it" }.orEmpty()}"); HorizontalDivider(Modifier.padding(top = 12.dp)) } }
             }
             "Logs" -> {
-                item { Text("Server logs", style = MaterialTheme.typography.titleLarge); Text("Recent entries for the selected profile. Logs can contain private operational details."); Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf("errors", "agent", "gateway", "gui", "desktop", "mcp").forEach { file -> FilterChip(selected = state.logFile == file, onClick = { onLogFile(file) }, enabled = !state.loading, label = { Text(file) }, modifier = Modifier.heightIn(min = 48.dp)) } }; OutlinedTextField(state.logSearch, onLogSearch, label = { Text("Search log entries") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
+                item { Text("Server logs", style = MaterialTheme.typography.titleLarge); Text("Recent entries for this profile."); Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf("errors", "agent", "gateway", "gui", "desktop", "mcp").forEach { file -> FilterChip(selected = state.logFile == file, onClick = { onLogFile(file) }, enabled = !state.loading, label = { Text(file) }, modifier = Modifier.heightIn(min = 48.dp)) } }; OutlinedTextField(state.logSearch, onLogSearch, label = { Text("Search log entries") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
                 if (!state.loading && state.logs.isEmpty()) item { Text("No matching log entries. The log may be empty or not created yet.") }
                 items(state.logs) { line -> SelectionContainer { Text(line, style = MaterialTheme.typography.bodyMedium) } }
             }
             "Server updates" -> {
-                item { Text("Update the Hermes server", style = MaterialTheme.typography.titleLarge); Text("Updates affect this host and may reconnect the dashboard and gateways. Finish active calls and work before applying."); Button(onClick = onCheckUpdate, enabled = !state.loading && !state.applying) { Text("Check now") } }
+                item { Text("Update the Hermes server", style = MaterialTheme.typography.titleLarge); Text("Hermes may reconnect while updating."); Button(onClick = onCheckUpdate, enabled = !state.loading && !state.applying) { Text("Check now") } }
                 state.update?.let { update ->
                     item { Text("Current version: ${update.string("current_version").ifBlank { "Not reported" }}"); Text(update.string("message").ifBlank { if (update.optBoolean("update_available")) "An update is available." else "No update result was reported." }); if (!update.optBoolean("can_apply")) Text(update.string("update_command").ifBlank { "This installation is updated outside the dashboard." }); if (update.optBoolean("can_apply") && update.optBoolean("update_available")) Button(onClick = onApplyUpdate, enabled = state.canApply) { Text("Apply server update") } }
 
@@ -50,7 +50,7 @@ import dev.hermes.android.data.NativeServerState
                 }
             }
             "Session checkpoints", "Rollback checkpoints" -> {
-                item { Text("Session file checkpoints", style = MaterialTheme.typography.titleLarge); Text("Hermes keeps file snapshots for conversation rollback. These are not server-version backups. Use /rollback in the owning conversation to review supported recovery."); Text("Stored: ${state.checkpointBytes} bytes") }
+                item { Text("Session file checkpoints", style = MaterialTheme.typography.titleLarge); Text("File snapshots for /rollback in each conversation."); Text("Stored: ${state.checkpointBytes} bytes") }
                 if (!state.loading && state.checkpoints.isEmpty()) item { Text("No session checkpoints are stored for this profile.") }
                 items(state.checkpoints, key = { it.session }) { checkpoint -> Column { Text(checkpoint.session, style = MaterialTheme.typography.titleMedium); Text("${checkpoint.files} stored files · ${checkpoint.bytes} bytes"); HorizontalDivider(Modifier.padding(top = 12.dp)) } }
             }

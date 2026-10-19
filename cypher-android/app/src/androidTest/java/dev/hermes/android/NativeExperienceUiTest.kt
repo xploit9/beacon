@@ -132,9 +132,10 @@ class NativeExperienceUiTest {
             }
             val content: @Composable () -> Unit = {
                 val settings by vm.data.collectAsState()
+                val prefs by vm.preferences.collectAsState()
                 val density = LocalDensity.current
                 val font = args.getString("native_ui_font", "1.0").orEmpty().toFloatOrNull() ?: 1f
-                CompositionLocalProvider(LocalDensity provides Density(density.density, font), LocalCypherSettings provides (settings["profile-settings"] ?: JSONObject()), LocalActivityResultRegistryOwner provides (pickerRegistry?.let { registry -> object : ActivityResultRegistryOwner { override val activityResultRegistry = registry } } ?: requireNotNull(LocalActivityResultRegistryOwner.current))) {
+                CompositionLocalProvider(LocalDensity provides Density(density.density, font), LocalCypherSettings provides (settings["profile-settings"] ?: JSONObject()), LocalAssistantName provides prefs.assistantName, LocalActivityResultRegistryOwner provides (pickerRegistry?.let { registry -> object : ActivityResultRegistryOwner { override val activityResultRegistry = registry } } ?: requireNotNull(LocalActivityResultRegistryOwner.current))) {
                     NativeLocalization("en") { CypherTheme(dark = args.getString("native_ui_theme") != "light") {
                         NativeWindowLayout(compose.activity) { Box(Modifier.fillMaxSize().testTag("experience-viewport")) { CypherRoot(vm) } }
                     } }
@@ -940,6 +941,26 @@ class NativeExperienceUiTest {
         receipts += "While the conversation list is being fetched the drawer shows a loading row, never a false empty state."
     }
 
+    @Test fun aThreadKeepsItsNameWhenAnotherConversationHoldsIt() = withFixture { vm, fixture ->
+        val taken = fixture.sessions.getValue("chat-b").getJSONObject("info").string("title")
+        fixture.dropCreateTitle = true
+        // The Threads lane lists only threads, so the clash is with a conversation the phone cannot see.
+        compose.runOnIdle { flow<AppState>(vm, "_ui").value = vm.ui.value.copy(sessions = emptyList()); vm.tab("Chat"); vm.newThread(taken) }
+        await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady }
+        val thread = vm.chat.value.sessionId
+        // Fixture ids repeat across runs; a stale stream cursor would skip this run's first event.
+        kotlinx.coroutines.runBlocking { app.cache.delete(fixture.scope.session(thread), "live:runtime-$thread") }
+        val subscriptionsBefore = fixture.streamSubscriptions.get()
+        compose.runOnIdle { fixture.persistTerminalMessages = true; vm.composer(TextFieldValue("First thread message")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId.isNotBlank() }
+        await { fixture.streamSubscriptions.get() > subscriptionsBefore }
+        fixture.nativeTurnStatus = "idle"
+        fixture.emitNativeEvent("message.complete", json("text" to "Thread reply"))
+        await { fixture.sessions.getValue(thread).getJSONObject("info").string("title") == "$taken 2" }
+        await { vm.chat.value.title == "$taken 2" }
+        receipts += "A thread whose name another conversation holds is renamed with the next free number instead of losing its name."
+    }
+
     @Test fun threadsLaneStartsANamedThreadAndDrawerFiltersRunInHermes() = withFixture { vm, fixture ->
         try {
             compose.runOnIdle { vm.toggleSessions(true) }
@@ -1061,6 +1082,95 @@ class NativeExperienceUiTest {
                 }
                 listOf("selected-session", "new-chat-shell", "new-chat-attempt", "initial-draft").forEach { app.cache.delete(fixture.scope, it) }
             }
+        }
+    }
+
+    @Test fun theAssistantTabUsesItsOwnProfileAndGivesTheChatsProfileBack() = withFixture { vm, fixture ->
+        val coder = fixture.scope.copy(profile = "coder")
+        runBlocking { app.preferences.edit { it[stringPreferencesKey("assistant_profile")] = "coder" } }
+        try {
+            await { vm.preferences.value.assistantProfile == "coder" && vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
+            compose.runOnIdle { vm.tab("Xara") }
+            await { vm.ui.value.tab == "Xara" && vm.ui.value.profile == "coder" && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady && vm.chat.value.sessionId.startsWith("new-") }
+            assertTrue("The assistant's conversation is created in its profile", fixture.requests.any { it.string("method") == "session.create" && it.optJSONObject("params")?.string("profile") == "coder" })
+            assertEquals("The drawer keeps the chats' profile", "default", vm.ui.value.chatProfile)
+
+            compose.runOnIdle { vm.tab("Chat") }
+            await { vm.ui.value.profile == "default" && vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
+            assertEquals("", vm.ui.value.chatProfile)
+            receipts += "The assistant tab always opens in its own profile; returning to Chat restores the chats' profile and the chat that was open."
+        } finally {
+            runBlocking {
+                app.preferences.edit { it.remove(stringPreferencesKey("assistant_profile")); it.remove(stringPreferencesKey("assistant_return")) }
+                listOf("xara-session", "xara-opening", "new-chat-shell", "selected-session").forEach { app.cache.delete(coder, it) }
+            }
+        }
+    }
+
+    @Test fun leavingTheAssistantTabNeverLeavesItsConversationInChat() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.newChat() }
+        await { vm.chat.value.sessionId.isBlank() || vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.newChatOpening }
+        val before = vm.chat.value.sessionId
+        compose.runOnIdle { vm.tab("Xara") }
+        await { vm.ui.value.tab == "Xara" && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady && vm.chat.value.sessionId.isNotBlank() && vm.chat.value.sessionId != before }
+        val assistant = vm.chat.value.sessionId
+        compose.runOnIdle { vm.tab("Chat") }
+        compose.waitUntil(5_000) { vm.chat.value.sessionId != assistant }
+        assertEquals("Chat returns to the new chat it had", before, vm.chat.value.sessionId)
+        receipts += "Leaving the assistant tab returns Chat to its own chat, even a new one, never the assistant's conversation."
+    }
+
+    @Test fun pickingAProfileOnTheAssistantTabIsForTheChats() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.tab("Xara") }
+        await { vm.ui.value.tab == "Xara" && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady }
+        try {
+            compose.runOnIdle { vm.chooseProfile("coder") }
+            await { vm.ui.value.tab == "Chat" && vm.ui.value.profile == "coder" }
+            receipts += "A profile picked while on the assistant tab applies to the chats and opens Chat, leaving the assistant's profile alone."
+        } finally {
+            runBlocking {
+                app.preferences.edit { it.remove(stringPreferencesKey("assistant_return")) }
+                listOf("xara-session", "new-chat-shell", "selected-session").forEach { app.cache.delete(fixture.scope.copy(profile = "coder"), it) }
+            }
+        }
+    }
+
+    @Test fun theAssistantsModelIsFixedInSettings() = withFixture { vm, fixture ->
+        try {
+            compose.runOnIdle { vm.more("Assistant") }
+            compose.waitUntil(10_000) { vm.data.value["picker:models"]?.rows("groups")?.isNotEmpty() == true }
+            compose.onNodeWithTag("assistant-model").performScrollTo().performClick()
+            compose.onNodeWithText("Configured provider · other-model").performClick()
+            await { vm.preferences.value.let { it.assistantModel == "other-model" && it.assistantProvider == "fixture" } }
+
+            compose.runOnIdle { vm.tab("Xara") }
+            await { vm.ui.value.tab == "Xara" && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady }
+            await { vm.chat.value.raw.string("model") == "other-model" }
+            compose.onNodeWithTag("composer-model-effort").performClick()
+            compose.onNodeWithTag("assistant-model-settings").performClick()
+            await { vm.ui.value.tab == "More" && vm.ui.value.morePage == "Assistant" }
+            receipts += "The assistant's chat runs on the model fixed in Settings › Assistant; its model menu leads there."
+        } finally {
+            runBlocking { app.preferences.edit { it.remove(stringPreferencesKey("assistant_model")); it.remove(stringPreferencesKey("assistant_provider")) } }
+        }
+    }
+
+    @Test fun theAssistantsNameShowsWhereverTheAssistantIsNamed() = withFixture { vm, fixture ->
+        try {
+            compose.runOnIdle { vm.more("Assistant") }
+            compose.onNodeWithTag("assistant-name").performTextReplacement("Nova")
+            compose.onNodeWithTag("assistant-name-save").performClick()
+            await { vm.preferences.value.assistantName == "Nova" }
+            assertEquals("Nova", dev.hermes.android.data.currentAssistantName)
+
+            compose.runOnIdle { vm.tab("Xara") }
+            await { vm.ui.value.tab == "Xara" && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady }
+            compose.waitUntil(5_000) { compose.onAllNodesWithText("Message Nova", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+            compose.runOnIdle { vm.toggleSessions(true) }
+            compose.waitUntil(5_000) { compose.onAllNodesWithText("Nova chat", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+            receipts += "Renaming the assistant in Settings shows the new name on its tab and composer."
+        } finally {
+            runBlocking { app.preferences.edit { it.remove(stringPreferencesKey("assistant_name")) } }
         }
     }
 
@@ -1709,7 +1819,7 @@ class NativeExperienceUiTest {
         compose.runOnIdle { vm.more("Notifications") }
         assertFalse("The preview build does not configure Firebase push", app.firebaseConfigured)
         compose.onNodeWithText(keepConnectedStatus).assertIsDisplayed()
-        compose.onNodeWithText("Firebase push notifications are not part of this build. Keep connected is available on this phone.").assertIsDisplayed()
+        compose.onNodeWithText("Calls and alerts arrive through Keep connected.").assertIsDisplayed()
         compose.onNodeWithText("Notifications for this profile").assertDoesNotExist()
         compose.onNodeWithText("Send a test notification").assertDoesNotExist()
         compose.onNodeWithText("Proactive calls").assertDoesNotExist()
@@ -1951,7 +2061,8 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Profiles", useUnmergedTree = true).assertDoesNotExist()
         compose.onNodeWithText("Spaces", useUnmergedTree = true).assertDoesNotExist()
         compose.onNodeWithText("Attachments, queue & status", useUnmergedTree = true).assertDoesNotExist()
-        compose.onNode(hasText("Projects") and hasAnyAncestor(hasTestTag("conversation-actions-menu")), useUnmergedTree = true).assertExists()
+        compose.waitUntil(5_000) { compose.onAllNodesWithTag("conversation-project-remove").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("conversation-project-move").assertExists()
         compose.onNodeWithText("Chat preferences", useUnmergedTree = true).performScrollTo().performClick()
         compose.onNodeWithContentDescription("Back").performClick()
         await { vm.ui.value.tab == "Chat" }
@@ -1988,6 +2099,92 @@ class NativeExperienceUiTest {
         capture("shared-space-renamed")
     }
 
+    @Test fun relayChatExtrasQuoteCommandsAndConversationId() = withFixture { vm, fixture ->
+        val message = vm.chat.value.messages.last { it.role == "assistant" && it.text.isNotBlank() }
+        compose.onNodeWithTag("message-quote:${message.id}", useUnmergedTree = true).performScrollTo().performClick()
+        await { vm.composer.value.text.startsWith("> " + dev.hermes.android.ui.quoteExcerpt(message.text).take(12)) && vm.composer.value.text.endsWith("\n\n") }
+
+        compose.runOnIdle { vm.composer(TextFieldValue("")) }
+        compose.onNodeWithContentDescription("Conversation actions").performClick()
+        compose.onNodeWithText("Copy conversation ID").performScrollTo().performClick()
+        compose.runOnIdle {
+            val clip = (app.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).primaryClip
+            assertEquals("chat-a", clip?.getItemAt(0)?.text?.toString())
+        }
+
+        compose.onNodeWithTag("composer-attach").performClick()
+        compose.onNodeWithTag("attach-camera").assertExists()
+        compose.onNodeWithTag("attach-paste-image").assertExists()
+        compose.onNodeWithTag("attach-commands").performClick()
+        await { vm.composer.value.text == "/" }
+        receipts += "Quote in reply, Copy conversation ID, Camera, Paste image and Commands work as in Relay."
+    }
+
+    @Test fun aNewChatOffersStarterPromptsThatFillTheComposer() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.newChat() }
+        compose.waitUntil(10_000) { compose.onAllNodesWithTag("starter-prompts").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("Plan my day").performClick()
+        await { vm.composer.value.text == "Plan my day" }
+        receipts += "A new chat offers starter prompts; a tap fills the composer for editing."
+    }
+
+    @Test fun historyRowsHaveALongPressMenuForAnyConversation() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.toggleSessions(true) }
+        await { vm.ui.value.sessions.any { sessionRowId(it) == "chat-b" } }
+        fun menu() {
+            compose.onNodeWithTag("history-row:chat-b").performScrollTo().performTouchInput { longClick() }
+            compose.waitUntil(5_000) { compose.onAllNodesWithTag("history-row-menu").fetchSemanticsNodes().isNotEmpty() }
+        }
+        menu()
+        // Project membership loads for the long-pressed chat, not only the open one (the fixture files it under Travel).
+        compose.waitUntil(5_000) { compose.onAllNodesWithTag("conversation-project-remove").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("conversation-project-remove").assertTextContains("Remove from Travel")
+        compose.onNodeWithTag("conversation-pin").performClick()
+        await { fixture.sessions.getValue("chat-b").getJSONObject("info").optBoolean("pinned") }
+        assertTrue("Pinning uses Hermes's sidebar PATCH", fixture.requests.any { it.string("method") == "PATCH" && it.string("path") == "/api/sessions/chat-b" })
+        await { vm.ui.value.sessions.single { sessionRowId(it) == "chat-b" }.optBoolean("pinned") }
+
+        menu()
+        compose.onNodeWithText("Unpin").assertExists()
+        compose.onNodeWithText("Rename").performClick()
+        compose.onNodeWithTag("conversation-rename-field").performTextReplacement("Renamed from history")
+        compose.onNodeWithText("Save").performClick()
+        await { fixture.sessions.getValue("chat-b").getJSONObject("info").string("title") == "Renamed from history" }
+        assertEquals("Acting on another conversation leaves the open chat in place", "chat-a", vm.chat.value.sessionId)
+
+        menu()
+        compose.onNodeWithTag("conversation-delete").performClick()
+        compose.onNodeWithTag("conversation-delete-confirm").performClick()
+        await { !fixture.sessions.containsKey("chat-b") }
+        assertEquals("chat-a", vm.chat.value.sessionId)
+        receipts += "Every history row has a long-press menu: pin, rename, project, archive and delete act on that conversation without opening it."
+    }
+
+    @Test fun theChatMenuRemovesTheChatFromItsProjectAndAddsItToAnother() = withFixture { vm, fixture ->
+        fixture.projects["p_research"] = json("id" to "p_research", "name" to "Research", "archived" to false, "primary_path" to "C:/synthetic-workspace/research",
+            "folders" to org.json.JSONArray().put(json("path" to "C:/synthetic-workspace/research", "label" to "research", "is_primary" to true)))
+        fun menuShows(tag: String) {
+            compose.onNodeWithContentDescription("Conversation actions").performClick()
+            compose.waitUntil(5_000) { compose.onAllNodesWithTag(tag).fetchSemanticsNodes().isNotEmpty() }
+        }
+        // The fixture files chat-a under Travel by its folder.
+        menuShows("conversation-project-remove")
+        compose.onNodeWithTag("conversation-project-remove").performScrollTo().assertTextContains("Remove from Travel").performClick()
+        await { fixture.sessions.getValue("chat-a").getJSONObject("info").string("cwd") == "C:/synthetic-home" }
+        await { vm.data.value["project-of:chat-a"]?.let { it.has("project") && it.optJSONObject("project") == null } == true }
+
+        menuShows("conversation-project-add")
+        compose.onNodeWithTag("conversation-project-add").performScrollTo().performClick()
+        compose.onNodeWithText("Add to project").assertExists()
+        // A project with one folder takes the chat at once.
+        compose.onNodeWithText("Research", useUnmergedTree = true).performClick()
+        await { fixture.sessions.getValue("chat-a").getJSONObject("info").string("cwd") == "C:/synthetic-workspace/research" }
+        await { vm.data.value["project-of:chat-a"]?.optJSONObject("project")?.string("id") == "p_research" }
+        menuShows("conversation-project-remove")
+        compose.onNodeWithTag("conversation-project-remove").assertTextContains("Remove from Research")
+        receipts += "The chat menu removes a chat from its project and adds it to another, from Hermes's own filing."
+    }
+
     @Test fun nativeProjectManagementAssignsFolderWithoutDeletingChatsOrFiles() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.navigate("Projects") }
         await { vm.data.value["native-projects"]?.rows("projects")?.isNotEmpty() == true }
@@ -2006,10 +2203,10 @@ class NativeExperienceUiTest {
         await { project.rows("folders").size == 1 }
         compose.runOnIdle { vm.tab("Chat"); vm.composer(TextFieldValue("Retain during project move")) }
         compose.onNodeWithContentDescription("Conversation actions").performClick()
-        compose.onNode(hasText("Projects") and hasAnyAncestor(hasTestTag("conversation-actions-menu")), useUnmergedTree = true).performScrollTo().performClick()
+        compose.waitUntil(5_000) { compose.onAllNodesWithTag("conversation-project-move").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("conversation-project-move").performScrollTo().performClick()
+        compose.onNodeWithText("Move to project").assertExists()
         compose.onNodeWithText("Research", useUnmergedTree = true).performClick()
-        compose.onNodeWithText("C:/synthetic-workspace/research", useUnmergedTree = true).performClick()
-        compose.onNodeWithText("Move chat", useUnmergedTree = true).performClick()
         await { vm.chat.value.raw.string("workspace") == "C:/synthetic-workspace/research" }
         assertEquals("Retain during project move", vm.composer.value.text)
         assertEquals("chat-a", vm.chat.value.sessionId)

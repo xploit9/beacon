@@ -35,6 +35,15 @@ internal class NativeOperations(private val c: CypherClient) {
             dispatch(path, q, method, body, maxBytes).also { keepCreatedSessionLive = path == "/api/session/new" || path == "/api/xara/open" }
         } finally { if (!keepCreatedSessionLive) c.closeNative() }
     }
+    /**
+     * The chat's saved YOLO flag. Hermes persists it in the conversation's model_config (`yolo_mode`) and restores it on
+     * resume (hermes_state_sessions.session_yolo_enabled), so it is the chat's state when a resume does not report one.
+     * Null when the conversation has no saved row yet.
+     */
+    private suspend fun storedYolo(id: String): Boolean? = try {
+        val config = c.nativeGet("/api/sessions/$id", mapOf("profile" to c.auth.profile)).opt("model_config")
+        ((config as? JSONObject) ?: (config as? String)?.takeIf(String::isNotBlank)?.let(::JSONObject) ?: JSONObject()).optBoolean("yolo_mode")
+    } catch (e: ApiFailure) { if (e.status == 404) null else throw e }
     /** Adapts Hermes Relay's session-scoped GatewayChatClient.setYolo wire contract. */
     private suspend fun setSessionYolo(target: NativeSessionBinding, enabled: Boolean) {
         val value = if (enabled) "1" else "0"
@@ -142,7 +151,7 @@ internal class NativeOperations(private val c: CypherClient) {
                         if (d.getBoolean("yolo")) {
                             val profileMode = c.nativeRpc("config.get", json("key" to "approvals.mode")).string("value")
                             require(profileMode in nativeApprovalModes) { "Hermes returned an unrecognized approval mode" }
-                            require(profileMode != "off") { "Profile approvals are Off, so this chat already bypasses prompts. Choose Manual or Smart before using the per-chat override." }
+                            require(profileMode != "off") { "Approvals are Off for this profile, so every chat already skips prompts." }
                         }
                         setSessionYolo(target, d.getBoolean("yolo"))
                     } else {
@@ -160,7 +169,7 @@ internal class NativeOperations(private val c: CypherClient) {
                 val target = binding()
                 val fresh = c.nativeRpc("session.resume", json("session_id" to target.storedSessionId, "omit_messages" to true, "close_on_disconnect" to false))
                 require(nativeSessionBinding(c.scope, fresh).storedSessionId == target.storedSessionId) { "Approval status belongs to another conversation" }
-                val bypass = fresh.optJSONObject("info")?.opt("yolo")
+                val bypass = fresh.optJSONObject("info")?.opt("yolo") as? Boolean ?: storedYolo(target.storedSessionId)
                 val profileMode = result.getString("value")
                 if (yoloWrite && bypass is Boolean) require(bypass == d.getBoolean("yolo")) { "Hermes did not confirm the chat YOLO state. Refresh before trying again." }
                 else require(method == "GET" || d.string("mode") == "off" || bypass != true) { "A host approval bypass remains enabled. Check Hermes before continuing." }
@@ -176,6 +185,10 @@ internal class NativeOperations(private val c: CypherClient) {
             "/api/session/branch" -> {
                 val result = c.nativeRpc("session.branch", json("session_id" to binding().runtimeSessionId, "name" to d.string("title").ifBlank { null }, "count" to if (d.has("keep_count")) d.getInt("keep_count") else null))
                 return sessionProjection(result, NativeSessionBinding(c.scope, result.getString("stored_session_id"), result.getString("session_id")))
+            }
+            "/api/session/pin" -> {
+                require(method == "POST" && sid().matches(storedSessionId) && d.opt("pinned") is Boolean) { "Choose a conversation to pin" }
+                return c.nativeRequest("/api/sessions/${sid()}", "PATCH", json("pinned" to d.getBoolean("pinned"), "profile" to c.auth.profile))
             }
             "/api/session/rename" -> return c.nativeRpc("session.title", json("session_id" to binding().runtimeSessionId, "title" to d.getString("title")))
             "/api/session/archive" -> {

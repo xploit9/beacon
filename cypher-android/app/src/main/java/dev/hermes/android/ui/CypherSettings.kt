@@ -16,6 +16,8 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.CypherViewModel
+import dev.hermes.android.core.rows
+import dev.hermes.android.core.string
 import dev.hermes.android.data.*
 import dev.hermes.android.voice.*
 import kotlinx.coroutines.CancellationException
@@ -39,11 +41,38 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
 
 private data class VoiceCatalog(val models: List<String> = emptyList(), val voices: List<String> = emptyList())
 
+/** The assistant's name (on this phone) and the profile its chat always uses. */
+@Composable internal fun AssistantSettings(vm: CypherViewModel) {
+    val prefs by vm.preferences.collectAsStateWithLifecycle()
+    val data by vm.data.collectAsStateWithLifecycle()
+    var name by remember(prefs.assistantName) { mutableStateOf(prefs.assistantName) }
+    LaunchedEffect(Unit) { vm.load("navigation-profiles", "/api/profiles", force = false); vm.load("picker:models", "/api/models", force = false) }
+    val profiles = data["navigation-profiles"]?.rows("profiles")?.map { it.string("name") }?.filter(String::isNotBlank).orEmpty()
+    // "provider\tmodel" keys; blank = the profile's default. The saved pick stays listed even before the list loads.
+    val models = data["picker:models"]?.rows("groups").orEmpty().flatMap { group -> group.rows("models").map { group.string("provider_id") + "\t" + it.string("id") to group.string("provider") + " · " + it.string("label", it.string("id")) } }.toMap()
+    val selectedModel = if (prefs.assistantModel.isBlank()) "" else prefs.assistantProvider + "\t" + prefs.assistantModel
+    LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        item {
+            OutlinedTextField(name, { name = it.take(ASSISTANT_NAME_MAX) }, label = { Text(uiText("Name")) }, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("assistant-name"),
+                trailingIcon = { if (assistantNameOf(name) != prefs.assistantName) TextButton({ vm.setAssistantName(name) }, Modifier.testTag("assistant-name-save")) { Text(uiText("Save")) } })
+        }
+        item {
+            // The saved choice stays listed even before the profile list loads or if it is gone, so it is never silently swapped.
+            Choice("Profile", prefs.assistantProfile, voiceOptionsWithSelected(profiles, prefs.assistantProfile), { vm.setAssistantProfile(it) }, Modifier.fillMaxWidth().testTag("assistant-profile"))
+            Text(uiText("Its chat always uses this profile. Your other chats keep theirs."), Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        item {
+            Choice("Model", selectedModel, voiceOptionsWithSelected(listOf("") + models.keys, selectedModel), { key -> vm.setAssistantModel(key.substringAfter('\t', ""), if (key.isBlank()) "" else key.substringBefore('\t')) },
+                Modifier.fillMaxWidth().testTag("assistant-model"), optionLabels = models + ("" to "Profile default") + (selectedModel to (models[selectedModel] ?: prefs.assistantModel)).takeIf { selectedModel.isNotBlank() }.let { listOfNotNull(it).toMap() })
+        }
+    }
+}
+
 @Composable internal fun CypherSettings(vm: CypherViewModel, pluginAbsent: Boolean) {
     LazyColumn(contentPadding=PaddingValues(16.dp),verticalArrangement=Arrangement.spacedBy(16.dp)) {
         item {
             Text("Voice & calls",style=MaterialTheme.typography.titleLarge)
-            Text("Choose the provider for one-tap calls. Provider keys stay on this phone and are never sent to Hermes.",
+            Text("Provider for one-tap calls. Keys stay on this phone.",
                 style=MaterialTheme.typography.bodyMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)
             VoiceSettingsPluginNote(pluginAbsent)
         }

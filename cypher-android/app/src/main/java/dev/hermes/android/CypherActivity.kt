@@ -96,7 +96,7 @@ class CypherActivity : ComponentActivity() {
                 val source = permissionSource; val event = permissionEvent
                 permissionSource = ""; permissionEvent = ""
                 if (allowed && source.isNotBlank() && event.isNotBlank()) model.handlePush(source, event, permissionAction)
-                else if (!allowed) model.notice("Allow microphone access to answer Cypher. The invitation stays available until it expires.")
+                else if (!allowed) model.notice("Allow the microphone to answer.")
             }
             val callFromNotification: (String, String, String) -> Unit = { source, event, action ->
                 if (permissionSource.isBlank()) {
@@ -124,7 +124,7 @@ class CypherActivity : ComponentActivity() {
                 )
             }
             val emptySettings = remember { org.json.JSONObject() }
-            CompositionLocalProvider(LocalCypherSettings provides (data["profile-settings"] ?: emptySettings)) { NativeLocalization(nativeLanguageFor(LocalConfiguration.current.locales[0])) { CypherTheme(dark, preferences.skin) { NativeWindowLayout(this@CypherActivity) { CypherRoot(model); IncomingCallSheet(model, permissionSource.isNotBlank(), answer) } } } }
+            CompositionLocalProvider(LocalCypherSettings provides (data["profile-settings"] ?: emptySettings), LocalAssistantName provides preferences.assistantName) { NativeLocalization(nativeLanguageFor(LocalConfiguration.current.locales[0])) { CypherTheme(dark, preferences.skin) { NativeWindowLayout(this@CypherActivity) { CypherRoot(model); IncomingCallSheet(model, permissionSource.isNotBlank(), answer) } } } }
         }
     }
     private var pendingReturn by mutableStateOf("")
@@ -132,7 +132,7 @@ class CypherActivity : ComponentActivity() {
         val calls=(application as CypherApplication).calls
         if (!calls.state.value.active || calls.state.value.callId != expectedId) return
         try { startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))) }
-        catch (_: RuntimeException) { vm?.notice("Floating calls are unavailable. Your call continues; return using its notification.") }
+        catch (_: RuntimeException) { vm?.notice("Floating calls aren't available; use the call notification.") }
     }
     override fun onStart() { super.onStart(); (application as CypherApplication).calls.let { it.uiVisible = true; if (it.state.value.active) it.resumeWindow() }; vm?.foreground(true) }
     override fun onResume() { super.onResume(); NativeAuth.onActivityResumed(); vm?.resumeAppUpdate(); (application as CypherApplication).calls.refreshOverlayPermission() }
@@ -206,26 +206,14 @@ internal fun NativeFeedbackEffect(
             Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Icon(Icons.Rounded.Call, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(32.dp))
-                    Text(uiText("Cypher is calling"), style = MaterialTheme.typography.headlineSmall)
+                    Text(assistantText("Cypher is calling"), style = MaterialTheme.typography.headlineSmall)
                 }
-                Text(uiText("Answer to start a private voice call. Your microphone stays off until you answer."), style = MaterialTheme.typography.bodyLarge)
+                Text(uiText("Your microphone stays off until you answer."), style = MaterialTheme.typography.bodyLarge)
                 Text(uiText("The result stays in Cypher history if you miss or decline this invitation."), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
                 ui.error.ifBlank { call.error }.takeIf { it.isNotBlank() }?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium) }
                 Button(onClick = { onAnswer(pending.source, pending.event) }, enabled = !requestingPermission && !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("xara-incoming-answer")) { Icon(Icons.Rounded.Call, null); Spacer(Modifier.width(8.dp)); Text(uiText(when { requestingPermission -> "Waiting for microphone permission"; busy -> "Please wait"; else -> "Answer" })) }
                 OutlinedButton(onClick = { vm.declineIncoming(pending.source, pending.event) }, enabled = !requestingPermission && !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("xara-incoming-decline")) { Icon(Icons.Rounded.CallEnd, null); Spacer(Modifier.width(8.dp)); Text(uiText("Decline")) }
             }
-        }
-    }
-}
-
-internal fun historyTruncationMessage(raw: org.json.JSONObject): String? =
-    if (raw.optBoolean("history_truncated")) "Only the latest ${raw.optInt("history_limit", 500)} messages are loaded; older history may be incomplete." else null
-
-@Composable private fun HistoryTruncationNotice(vm: CypherViewModel) {
-    val chat by vm.chat.collectAsStateWithLifecycle()
-    historyTruncationMessage(chat.raw)?.let { message ->
-        Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth()) {
-            Text(message, Modifier.padding(horizontal = 16.dp, vertical = 10.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -343,8 +331,7 @@ internal fun historyTruncationMessage(raw: org.json.JSONObject): String? =
                                 TextButton(enabled = !ui.loading, onClick = { vm.connect(ui.origin) }) { Text(uiText("Reconnect")) }
                             }
                         }
-                        if (ui.tab in setOf("Chat", "Xara")) HistoryTruncationNotice(vm)
-                        if (call.active && (ui.tab !in setOf("Chat","Xara") && !botChatVisible || call.conversationScope != vm.authenticatedScope())) Surface(color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.fillMaxWidth()) { Row(Modifier.padding(start = 16.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) { Text("Cypher · ${call.state}", Modifier.weight(1f)); TextButton(onClick = { vm.openCurrentCall() }) { Text(uiText("Open call")) }; IconButton(onClick = vm.app.calls::hangup) { Icon(Icons.Rounded.CallEnd, uiText("Hang up Cypher")) } } }
+                        if (call.active && (ui.tab !in setOf("Chat","Xara") && !botChatVisible || call.conversationScope != vm.authenticatedScope())) Surface(color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.fillMaxWidth()) { Row(Modifier.padding(start = 16.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) { Text("${LocalAssistantName.current} · ${call.state}", Modifier.weight(1f)); TextButton(onClick = { vm.openCurrentCall() }) { Text(uiText("Open call")) }; IconButton(onClick = vm.app.calls::hangup) { Icon(Icons.Rounded.CallEnd, assistantText("Hang up Cypher")) } } }
                         Box(Modifier.weight(1f).then(modeMotion)) {
                         if (vm.client == null && !ui.loading && ui.tab in setOf("Tasks", "Spaces", "Projects", "Kanban")) {
                             Header(when(ui.tab) { "Tasks" -> "Cron"; "Spaces" -> "Files"; else -> ui.tab }, menu = openMenu)
@@ -371,7 +358,7 @@ internal fun historyTruncationMessage(raw: org.json.JSONObject): String? =
             text={Column(Modifier.heightIn(max=420.dp).verticalScroll(rememberScrollState()),verticalArrangement=Arrangement.spacedBy(12.dp)) {
                 Text(approval.toolName.substringAfterLast("__").replace('_',' ').replaceFirstChar { it.titlecase() },style=MaterialTheme.typography.titleMedium)
                 if(approval.toolName.startsWith("mcp__")) Text("Connection: "+approval.toolName.removePrefix("mcp__").substringBefore("__").replace('_',' '),style=MaterialTheme.typography.bodySmall)
-                Text("Review the details before Cypher runs this action.")
+                Text(assistantText("Review the details before Cypher runs this action."))
                 androidx.compose.foundation.text.selection.SelectionContainer { Text(approval.arguments,style=MaterialTheme.typography.bodySmall.copy(fontFamily=androidx.compose.ui.text.font.FontFamily.Monospace)) }
                 if(approval.error.isNotBlank()) Text(approval.error,color=MaterialTheme.colorScheme.error)
                 if(approval.busy) LinearProgressIndicator(Modifier.fillMaxWidth())

@@ -52,7 +52,15 @@ Threads and filters (drawer, under Search; native Hermes, no plugin needed):
 
 Display: Cypher follows the phone for text size, language, text direction and animations (Android's font size, app language and "Remove animations" settings). Settings → Appearance keeps only Theme and Color style.
 
-Approvals (composer shield, native Hermes): Manual, Smart and Off set the profile's approval mode. **YOLO** bypasses approval prompts for the current chat only and always asks for confirmation before turning on. Hermes does not report a reopened chat's YOLO state, so the menu may say "YOLO status unknown for this chat"; it then offers both "Turn on YOLO for this chat…" and "Turn off YOLO for this chat". The shield shows the last state Hermes confirmed ("Approvals · YOLO on").
+Approvals (composer shield, native Hermes): Manual, Smart and Off set the profile's approval mode. **YOLO for this chat** is a switch: turning it on asks for confirmation, and it stays on for that chat until you turn it off (Hermes saves it with the conversation). While the profile's approvals are Off, the switch shows on and is locked.
+
+Conversation actions: long-press any conversation in History (or use the chat's ⋮ menu) to pin or unpin, rename, add it to a project or remove it from its project, archive or delete it. Removing a chat from a project moves it to the profile's own folder; its messages stay.
+
+Assistant (Settings › Assistant): set the assistant's name, profile and model. Its chat always opens in that profile on that model; your other chats keep the profile you picked, and leaving its tab returns you to the chat you had open. The name shows in the app and its calls; the app itself stays Cypher.
+
+Settings are grouped: Assistant (name, profile and model; voice and calls; notifications), Hermes (chat, profiles and models, skills, memory, tools, server) and App (appearance, updates, about).
+
+Chat extras from Relay: quote a message into your reply, attach from the camera or paste an image, open the command list from the attach menu, start a new chat from a suggested prompt, share the whole conversation or copy its ID from the ⋮ menu. Messages are grouped under Today, Yesterday or their date, and in-chat search shows how many messages match.
 
 With the Cypher plugin installed:
 - **Voice & calls.** One-tap realtime calls with Gemini Live, Grok or OpenAI Realtime. The provider key is entered in Cypher, stored encrypted on the phone and sent only to that provider, never to Hermes. Call audio is never stored.

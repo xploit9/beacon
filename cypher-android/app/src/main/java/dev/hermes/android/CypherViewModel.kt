@@ -43,6 +43,13 @@ data class Message(val id: String, val role: String, val text: String, val reaso
         }
     }
 }
+/** Status after a history render. A refresh during an in-flight send keeps it in flight (otherwise the unknown-outcome banner would flash). */
+internal fun renderedChatStatus(old: ChatState, active: String?, streamEnded: Boolean): String = when {
+    old.uncertain.isNotBlank() && old.status == "Sending" -> old.status
+    streamEnded -> ""
+    active.isNullOrBlank() && old.streamId.isNotBlank() -> old.status.ifBlank { "Turn status unknown" }
+    else -> ""
+}
 data class ChatState(val sessionId: String = "", val title: String = "New conversation", val messages: List<Message> = emptyList(), val raw: JSONObject = JSONObject(), val streamId: String = "", val liveText: String = "", val liveReasoning: String = "", val liveTools: List<JSONObject> = emptyList(), val status: String = "", val approval: JSONObject? = null, val clarification: JSONObject? = null, val uncertain: String = "", val queued: List<QueuedMessage> = emptyList(), val anchor: Int = 0, val anchorOffset: Int = 0, val anchorId: String = "", val callMessages: List<CallTranscript> = emptyList(), val projectionReady: Boolean = true)
 internal fun sessionCanStillBeUnpersisted(clientCreated: Boolean, chat: ChatState): Boolean =
     clientCreated && chat.messages.isEmpty() && chat.callMessages.isEmpty() && chat.liveText.isBlank() && chat.streamId.isBlank() && chat.raw.optInt("message_count") == 0
@@ -54,7 +61,7 @@ internal fun releaseTerminalChat(chat: ChatState, stream: String, replyConfirmed
 data class EditorState(val scope: Scope? = null, val path: String = "", val text: TextFieldValue = TextFieldValue(), val serverText: String = "", val metadata: JSONObject = JSONObject(), val loading: Boolean = false, val saving: Boolean = false, val error: String = "", val reviewRequired: Boolean = false) { val dirty get() = text.text != serverText }
 data class SideQuestion(val scope: Scope, val question: String, val sessionId: String, val streamId: String, val text: String = "", val status: String = "Responding", val cursor: String = "", val error: String = "")
 data class AppUpdateState(val release: Release? = null, val busy: Boolean = false, val ready: Boolean = false, val status: String = "Cypher checks for updates automatically while connected.")
-data class AppState(val origin: String = BuildConfig.DEFAULT_ORIGIN, val authenticated: Boolean = false, val profile: String = "default", val owner: String = "", val tab: String = "Chat", val connected: Boolean = false, val loading: Boolean = false, val error: String = "", val notice: String = "", val bootstrap: JSONObject = JSONObject(), val sessions: List<JSONObject> = emptyList(), val query: String = "", val showSessions: Boolean = false, val morePage: String = "", val xaraOpening: Boolean = false, val xaraError: String = "", val newChatOpening: Boolean = false, val newChatError: String = "", val initialChatReady: Boolean = false, val restoringSession: Boolean = true, val botModeEnabled: Boolean = false, val botModeSwitching: Boolean = false, val setupWizard: Boolean = false, val setupComplete: Boolean = false, val setupStep: String = "connect", val setupPluginMessage: String = "", val setupOrigin: String = "", val historyLoading: Boolean = false)
+data class AppState(val origin: String = BuildConfig.DEFAULT_ORIGIN, val authenticated: Boolean = false, val profile: String = "default", val chatProfile: String = "", val owner: String = "", val tab: String = "Chat", val connected: Boolean = false, val loading: Boolean = false, val error: String = "", val notice: String = "", val bootstrap: JSONObject = JSONObject(), val sessions: List<JSONObject> = emptyList(), val query: String = "", val showSessions: Boolean = false, val morePage: String = "", val xaraOpening: Boolean = false, val xaraError: String = "", val newChatOpening: Boolean = false, val newChatError: String = "", val initialChatReady: Boolean = false, val restoringSession: Boolean = true, val botModeEnabled: Boolean = false, val botModeSwitching: Boolean = false, val setupWizard: Boolean = false, val setupComplete: Boolean = false, val setupStep: String = "connect", val setupPluginMessage: String = "", val setupOrigin: String = "", val historyLoading: Boolean = false)
 internal fun voiceKeySetupPage(): String = "Cypher"
 internal data class VoiceCallRequest(val scope:Scope,val conversationId:String)
 
@@ -202,6 +209,8 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private var sessionIndexRevision = 0L
     private var sessionIndexArchived = false
     private var sessionIndexThreads = false
+    /** Thread names awaiting Hermes's first-turn title (scope key → name). shortcut: in memory only; a restart before the first reply leaves Hermes's own title. */
+    private val pendingThreadTitles = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val liveBoundaries = java.util.concurrent.ConcurrentHashMap<String, LiveAssistantBoundary>()
     private var chatHistoryRevision = 0L
     @Volatile private var originGeneration = 0
@@ -269,7 +278,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     }
     fun clearMessage() { _ui.update { it.copy(error = "", notice = "") } }
     private suspend fun optionalLocalSave(block: suspend () -> Unit) {
-        try { block() } catch (e: Exception) { if (e is CancellationException) throw e; notice("Local recovery checkpoint failed. The displayed result remains current; refresh before leaving this conversation.") }
+        try { block() } catch (e: Exception) { if (e is CancellationException) throw e; notice("Couldn't save a local copy. Refresh before leaving.") }
     }
     private val scheduleDraftLock = Mutex()
     private fun scheduleDraftKey(form: dev.hermes.android.ui.ActionForm) = "schedule-form:${form.path}:${form.seed.string("job_id", "new")}"
@@ -564,7 +573,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     }
     private fun checkpointPhoneSettings() {
         val owner = client?.scope ?: return
-        val snapshot = runCatching { phoneSettings.snapshotDraft() }.getOrElse { notice("This settings draft is too large to keep on the device. Shorten it before leaving."); return }
+        val snapshot = runCatching { phoneSettings.snapshotDraft() }.getOrElse { notice("This draft is too large to keep. Shorten it."); return }
         if (snapshot.string("scope") != owner.key) return
         phoneCheckpoint?.cancel()
         phoneCheckpoint = viewModelScope.launch {
@@ -583,7 +592,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         phoneCheckpoint?.cancelAndJoin()
         // Like the debounced path: an oversized settings draft must not abort connecting, signing out or switching chats.
         try { retainPhoneSettings(owner, phoneSettings.snapshotDraft()) }
-        catch (e: Throwable) { if (e is CancellationException) throw e; notice("This settings draft is too large to keep on the device. Shorten it before leaving.") }
+        catch (e: Throwable) { if (e is CancellationException) throw e; notice("This draft is too large to keep. Shorten it.") }
     }
     internal suspend fun restorePhoneSettings(active: CypherClient) {
         phoneSettings.bind()
@@ -762,7 +771,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             dev.hermes.android.push.KeepConnectedService.startIfEnabled(app)
             checkForAppUpdate(quiet = true)
             prepareStartup()
-            if (_ui.value.tab == "Xara") openXara() else {
+            if (_ui.value.tab == "Xara") openXara() else if (assistantReturn() != null) returnFromAssistant() else {
                 val selected = saved.get<String>("session:${next.scope.key}") ?: sourceScope?.takeIf { it.copy(session = "") == next.scope }?.session
                 val shell = app.cache.read(next.scope, "new-chat-shell")
                 if (generation != originGeneration || client !== next) return@launch
@@ -1017,7 +1026,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             saved.remove<String>("xara:${owner.key}")
             if (preparedXara?.second == id) preparedXara = null
             try { app.cache.delete(owner, "xara-session"); app.cache.delete(scope, "client-created-shell"); app.cache.delete(scope, "session") }
-            catch (error: Throwable) { if (error is CancellationException) throw error; notice("The draft is safe, but some pointers to the missing conversation could not be cleared.") }
+            catch (error: Throwable) { if (error is CancellationException) throw error; notice("Your draft is safe. Refresh to finish.") }
             if (!current()) return
             if (_ui.value.tab == "Xara") {
                 sessionWatch?.cancel(); ++sessionGeneration; sourceScope = null; clearDetails(); _chat.value = ChatState()
@@ -1066,7 +1075,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         saved.remove<String>("settings-navigation")
         saved["tab"] = "Chat"; saved["more"] = ""
         _ui.update { it.copy(tab = "Chat", morePage = "", showSessions = false, initialChatReady = false, newChatOpening = false, newChatError = "", botModeEnabled = if (botReturn != null) false else it.botModeEnabled, botModeSwitching = if (botReturn != null) false else it.botModeSwitching, xaraOpening = false, xaraError = "") }
-        if (cleanupFailed) notice("The draft is safe, but some pointers to the missing conversation could not be cleared.")
+        if (cleanupFailed) notice("Your draft is safe. Refresh to finish.")
         if (client !== active || originGeneration != origin) return
         restoreInitialDraft(owner, origin)
         if (client === active && originGeneration == origin && canComposeInitialChat() && newChatJobs[owner.key]?.isActive != true) createNewChat(json("worktree" to false), initial = true)
@@ -1110,6 +1119,8 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     }
     fun tab(value: String) { if (_ui.value.botModeSwitching) return; botMode.back(); tab(value, resumeDraft = true) }
     private fun tab(value: String, resumeDraft: Boolean) {
+        val previous = _ui.value.tab
+        if (value == "Xara" && previous != "Xara") noteAssistantReturn(previous)
         saved.remove<String>("settings-navigation")
         ++navigationGeneration
         clearPendingVoiceKeyRequestsIfLeavingVoiceKeyPage(value, "")
@@ -1117,6 +1128,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         if (value == "Xara" && _ui.value.authenticated) openXara()
         else if (value != "Xara") {
             ++xaraGeneration; _ui.update { it.copy(xaraOpening = false, xaraError = "") }
+            if (previous == "Xara") returnFromAssistant()
             if (value == "Chat" && resumeDraft && canComposeInitialChat()) {
                 val active = client
                 val owner = active?.scope ?: cachedOwnerScope
@@ -1187,6 +1199,43 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         saved["tab"] = targetTab; saved["more"] = targetPage
     }
     fun toggleSessions(show: Boolean = !_ui.value.showSessions) { _ui.update { it.copy(showSessions = show) } }
+    /** The drawer's profile choice is for chats; on the assistant tab it applies when the Chat tab opens. */
+    fun chooseProfile(name: String): Job = viewModelScope.launch {
+        if (_ui.value.tab != "Xara") { switchProfile(name).join(); return@launch }
+        setAssistantReturn(json("profile" to name)); _ui.update { it.copy(chatProfile = name) }
+        tab("Chat")
+    }
+    /** Where the chats were when the assistant tab took over: their profile and open conversation. */
+    private suspend fun assistantReturn(): JSONObject? = app.preferences.data.first()[stringPreferencesKey("assistant_return")]?.let { runCatching { JSONObject(it) }.getOrNull() }
+    private suspend fun setAssistantReturn(value: JSONObject?) = app.preferences.edit { if (value == null) it.remove(stringPreferencesKey("assistant_return")) else it[stringPreferencesKey("assistant_return")] = value.toString() }
+    private fun noteAssistantReturn(previousTab: String) {
+        val profile = (client?.scope ?: cachedOwnerScope)?.profile ?: return
+        val session = _chat.value.sessionId.takeIf { previousTab == "Chat" && it.isNotBlank() && it != saved.get<String>("xara:${(client?.scope ?: cachedOwnerScope)?.key}") }.orEmpty()
+        _ui.update { it.copy(chatProfile = profile) }
+        viewModelScope.launch { if (assistantReturn() == null) setAssistantReturn(json("profile" to profile, "session" to session)) }
+    }
+    private fun returnFromAssistant(): Job = viewModelScope.launch {
+        val back = assistantReturn() ?: return@launch
+        setAssistantReturn(null); _ui.update { it.copy(chatProfile = "") }
+        val profile = back.string("profile")
+        if (profile.isNotBlank() && (client?.scope ?: cachedOwnerScope)?.profile != profile) switchProfile(profile, false).join()
+        val session = back.string("session")
+        if (session.isNotBlank() && _ui.value.tab == "Chat" && (client?.scope ?: cachedOwnerScope)?.profile == profile) selectSession(session)
+    }
+    /** Settings › Assistant fixes the assistant chat's model; a chat that drifted from it is moved back when it opens. */
+    private fun keepAssistantModel() {
+        val fixed = preferences.value
+        val raw = _chat.value.raw
+        if (fixed.assistantModel.isBlank() || raw.string("model") == fixed.assistantModel && (fixed.assistantProvider.isBlank() || raw.string("model_provider") == fixed.assistantProvider)) return
+        val scope = sourceScope ?: return
+        sessionAction("/api/session/update", json("model" to fixed.assistantModel, "model_provider" to fixed.assistantProvider.ifBlank { null })) { saved["model_pick:${scope.key}"] = true }
+    }
+    fun setAssistantModel(model: String, provider: String) = viewModelScope.launch {
+        app.preferences.edit { it[stringPreferencesKey("assistant_model")] = model; it[stringPreferencesKey("assistant_provider")] = provider }
+        if (_ui.value.tab == "Xara") keepAssistantModel()
+    }
+    fun setAssistantName(name: String) = viewModelScope.launch { app.preferences.edit { it[stringPreferencesKey("assistant_name")] = dev.hermes.android.data.assistantNameOf(name) } }
+    fun setAssistantProfile(profile: String) = viewModelScope.launch { app.preferences.edit { it[stringPreferencesKey("assistant_profile")] = profile } }
     fun switchProfile(name: String): Job = viewModelScope.launch {
         if (_ui.value.botModeEnabled) { toggleBotMode().join(); if (_ui.value.botModeEnabled) return@launch }
         switchProfile(name, false).join()
@@ -1394,7 +1443,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             // Extra history work is sequential and expires; navigation owns its own live requests.
             withTimeoutOrNull(8_000) {
                 var xara = ""
-                if (owner.profile == "default") {
+                if (owner.profile == preferences.value.assistantProfile) {
                     try {
                         xara = preparedXara?.takeIf { it.first == owner }?.second
                             ?: saved.get<String>("xara:${owner.key}")
@@ -1427,7 +1476,8 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         currentCoroutineContext().ensureActive()
         require(current()) { "Account changed while preparing Cypher" }
         app.cache.write(c.scope, "xara-opening", "unknown", true)
-        val result = c.post("/api/xara/open")
+        val fixed = preferences.value
+        val result = c.post("/api/xara/open", JSONObject().apply { if (fixed.assistantModel.isNotBlank()) { put("model", fixed.assistantModel); if (fixed.assistantProvider.isNotBlank()) put("model_provider", fixed.assistantProvider) } })
         val id = result.string("session_id", result.string("conversation_id", result.optJSONObject("session")?.string("session_id").orEmpty()))
         require(id.isNotBlank()) { "Cypher did not return a conversation" }
         val sessionScope = c.scope.session(id)
@@ -1529,7 +1579,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                         resumeInitialChat().join()
                         if (!current()) return@launch
                     }
-                    if (initialCreateAttempts.containsKey(owner.key)) { _ui.update { it.copy(newChatError = initialCreateError) }; notice("Use Retry to open a conversation after the unconfirmed attempt. Your draft is retained."); return@launch }
+                    if (initialCreateAttempts.containsKey(owner.key)) { _ui.update { it.copy(newChatError = initialCreateError) }; notice("Tap Retry to open the chat. Your draft is kept."); return@launch }
                     // A legitimate New intent from Tasks/Spaces keeps the owner's unsent
                     // draft; explicit workspace/worktree/model options pass through intact.
                     if (options.length() > 0 || !initialShells.containsKey(owner.key)) createNewChat(options, initial = true).join()
@@ -1545,6 +1595,48 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val title = dev.hermes.android.ui.uniqueThreadTitle(name, _ui.value.sessions.map { it.string("title") })
         if (title.isBlank()) return viewModelScope.launch { notice("Name the thread first") }
         return newChat(json("title" to title, "thread" to true))
+    }
+    /** Hermes drops a first-turn title another conversation already holds (titles are unique per profile); keep the thread named. */
+    private suspend fun keepThreadTitle(c: CypherClient, scope: Scope, wanted: String, actual: String) {
+        pendingThreadTitles.remove(scope.key)
+        if (actual == wanted) return
+        for (candidate in listOf(wanted) + (2..9).map { "$wanted $it" }) {
+            try {
+                c.post("/api/session/rename", json("session_id" to scope.session, "title" to candidate))
+                if (sourceScope == scope) _chat.update { it.copy(title = candidate) }
+                refreshSessions()
+                return
+            } catch (e: Throwable) { if (e is CancellationException || e is ApiFailure && e.status in setOf(401, 403)) throw e }
+        }
+    }
+    /** Which project (if any) holds a conversation, as Hermes files it; read when a conversation menu opens. */
+    // Keyed by its chat, so it is not tied to the open chat like session_id page reads are.
+    fun loadConversationProject(id: String, force: Boolean = true) = load("project-of:$id", "/api/projects/for-session", mapOf("chat" to id), force = force)
+    /** Pin, rename, archive, project and delete for any listed conversation; the open chat follows the change. */
+    fun conversationAction(id: String, path: String, body: JSONObject = JSONObject(), done: String = "Saved"): Job = viewModelScope.launch {
+        val active = client ?: run { notice("Reconnect before changing this conversation."); return@launch }
+        val c = active.detached()
+        val target = c.scope.session(id)
+        try {
+            val result = c.call(path, method = "POST", data = body.copy().put("session_id", id).put("scope_key", target.key))
+            if (client !== active) return@launch
+            if (sourceScope == target) _chat.update { chat ->
+                when (path) {
+                    "/api/session/rename" -> chat.copy(title = body.string("title"), raw = chat.raw.copy().put("title", body.string("title")))
+                    "/api/session/pin" -> chat.copy(raw = chat.raw.copy().put("pinned", body.getBoolean("pinned")))
+                    "/api/session/archive" -> chat.copy(raw = chat.raw.copy().put("archived", result.optBoolean("hidden", body.optBoolean("archived"))))
+                    else -> chat
+                }
+            }
+            if (path.startsWith("/api/projects/")) {
+                loadConversationProject(id)
+                // The open chat's working folder changed with its project; show the new one.
+                if (sourceScope == target) c.get("/api/session", mapOf("session_id" to id)).let { if (sourceScope == target && client === active) renderSession(it, target) }
+            }
+            if (path == "/api/session/delete") { confirmedSessions.remove(target.key); optionalLocalSave { app.cache.delete(target, "client-created-shell") } }
+            notice(done)
+            refreshSessions()
+        } catch (e: Throwable) { if (e is CancellationException) throw e; if (client === active) fail(e) } finally { c.closeNative() }
     }
     fun setHistoryFilters(hidden: Set<String>, order: String) = viewModelScope.launch {
         app.preferences.edit { it[stringPreferencesKey("history_hidden_sources")] = hidden.sorted().joinToString(","); it[stringPreferencesKey("history_order")] = order }
@@ -1582,6 +1674,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 val id = (response.optJSONObject("session") ?: response).getString("session_id")
                 require(id.isNotBlank()) { "The server did not return a conversation ID" }
                 val createdScope = owner.session(id)
+                if (request.optBoolean("thread")) request.string("title").takeIf(String::isNotBlank)?.let { pendingThreadTitles[createdScope.key] = it }
                 clientCreatedSessions.add(createdScope.key)
                 optionalLocalSave { app.cache.write(createdScope, "client-created-shell", "1", protected = true) }
                 if (client === active && originGeneration == origin) publishConfirmedSession(owner, id, response)
@@ -1721,7 +1814,14 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         return viewModelScope.launch {
             if (!current()) return@launch
             if (owner == null || !_ui.value.authenticated) { _ui.update { it.copy(xaraOpening = false, xaraError = "Sign in again to open Cypher's conversation.") }; return@launch }
-            if (owner.profile != "default") { _ui.update { it.copy(xaraOpening = false, xaraError = "Cypher belongs to the default profile. Switch profiles to continue.") }; return@launch }
+            val wanted = preferences.value.assistantProfile
+            if (owner.profile != wanted) {
+                // The assistant keeps its own profile; switching reopens this tab there, and leaving gives the chats' profile back.
+                _ui.update { it.copy(xaraOpening = true, xaraError = "") }
+                switchProfile(wanted, false).join()
+                if (_ui.value.tab == "Xara" && (client?.scope ?: cachedOwnerScope)?.profile != wanted) _ui.update { it.copy(xaraOpening = false, xaraError = "The $wanted profile could not be opened. Choose another in Settings › Assistant.") }
+                return@launch
+            }
             _ui.update { it.copy(xaraOpening = true, xaraError = "") }
             try {
                 val id = if (c == null) (saved.get<String>("xara:${owner.key}") ?: app.cache.read(owner, "xara-session")).orEmpty()
@@ -1730,7 +1830,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 if (!current()) return@launch
                 selectSession(id, editorDraft = editorDraft, onCachedReady = { if (current()) _ui.update { it.copy(xaraOpening = false) } })
                 selectionJob?.join()
-                if (current()) _ui.update { it.copy(xaraOpening = false) }
+                if (current()) { _ui.update { it.copy(xaraOpening = false) }; keepAssistantModel() }
             } catch (e: Throwable) { if (current() && e !is CancellationException) { _ui.update { it.copy(xaraOpening = false, xaraError = e.message ?: "Cypher's conversation could not be opened. Retry to continue.") }; fail(e) } }
         }
     }
@@ -1904,7 +2004,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 approval = if (o.has("pending_approval")) o.optJSONObject("pending_approval") else old.approval,
                 clarification = if (o.has("pending_clarification")) o.optJSONObject("pending_clarification") else old.clarification,
                 sessionId = scope.session, title = o.string("title").ifBlank { old.title.takeIf { old.sessionId == scope.session } ?: "New conversation" }, messages = rows.mapIndexed { i, m -> Message.from(m, i, scope.session) }, raw = o,
-                status = if (streamEnded) "" else if (active.isNullOrBlank() && old.streamId.isNotBlank()) old.status.ifBlank { "Turn status unknown" } else "",
+                status = renderedChatStatus(old, active, streamEnded),
                 streamId = active?.takeIf { it.isNotBlank() } ?: if (streamEnded) "" else old.streamId,
                 liveText = if (streamEnded) "" else old.liveText,
                 liveReasoning = if (streamEnded) "" else old.liveReasoning,
@@ -1939,6 +2039,12 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         }
     }
     private fun restoreDraft(d: Draft, preserveActiveInput: Boolean = false) { if (!preserveActiveInput) { _composer.value = TextFieldValue(d.text, TextRange(d.selectionStart, d.selectionEnd)); _attachments.value = d.attachments }; _chat.update { it.copy(queued = d.queued, anchor = d.anchor, anchorOffset = d.anchorOffset, anchorId = d.anchorId) } }
+    /** Relay's "Quote in reply": the message's excerpt goes above the draft as a Markdown quote, cursor at the end. */
+    fun quoteInReply(text: String) {
+        val excerpt = dev.hermes.android.ui.quoteExcerpt(text).takeIf(String::isNotBlank) ?: return
+        val quoted = dev.hermes.android.ui.quotedDraft(excerpt, _composer.value.text)
+        composer(TextFieldValue(quoted, TextRange(quoted.length)))
+    }
     fun composer(value: TextFieldValue, fromEditor: Boolean = false) {
         if (value.text.length > 50_000) { notice("Draft is limited to 50,000 characters"); return }
         val previous = _composer.value.text
@@ -2048,7 +2154,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         if (sourceScope != scope || client?.scope != c.scope || pending[scope.key]?.id != send.id) return
         renderSession(result, scope)
         _chat.update { it.copy(uncertain = send.id, status = "Send outcome unknown · review history") }
-        notice("History refreshed. Review whether your message arrived, then explicitly mark reviewed or resend. Your draft is retained.")
+        notice("Check whether your message arrived, then resend or dismiss.")
     }
     fun reviewPendingSend(resend: Boolean = false) = viewModelScope.launch {
         val scope = sourceScope ?: return@launch
@@ -2160,6 +2266,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                             renderSession(response, scope, revision)
                             val snapshot = response.optJSONObject("session") ?: response
                             terminalReplyVisible = currentTurnMessages(snapshot.rows("messages")).any { it.string("role") == "assistant" }
+                            pendingThreadTitles[scope.key]?.let { wanted -> keepThreadTitle(c, scope, wanted, snapshot.string("title")) }
                             if (!terminalReplyVisible) _chat.update { it.copy(status = terminalError.ifBlank { "Reply ended" } + " · final reply not confirmed; live output retained") }
                         } else if (sourceScope == scope && client?.scope == c.scope) {
                             _chat.update { it.copy(status = terminalError.ifBlank { "Reply ended" } + " · history changed during refresh; live output retained") }

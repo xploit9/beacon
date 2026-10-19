@@ -60,7 +60,7 @@ import dev.hermes.android.data.NativeMemoryState
             TextButton(onClick = { explanation = !explanation }) { Text(if (explanation) "Hide how memory works" else "How memory works") }
             if (explanation) {
                 if (state.provider.isNotBlank()) Text("${state.activeLabel} stores additional recall separately. These profile notes are not its full knowledge, and editing them does not erase its stored recall.", style = MaterialTheme.typography.bodyMedium)
-                Text("Profile notes are read when a new chat starts. Existing chats keep their starting memory.", style = MaterialTheme.typography.bodyMedium)
+                Text("Used by new chats.", style = MaterialTheme.typography.bodyMedium)
             }
         }
     }

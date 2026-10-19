@@ -178,7 +178,7 @@ import org.json.JSONObject
         if (!vm.app.firebaseConfigured) {
             Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(if (keepConnectedEnabled) "Keep connected is on" else "Keep connected is off", style = MaterialTheme.typography.titleLarge)
-                Text("Firebase push notifications are not part of this build. Keep connected is available on this phone.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Calls and alerts arrive through Keep connected.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             } }
         } else {
             Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -243,7 +243,7 @@ import org.json.JSONObject
         if (vm.app.firebaseConfigured) {
             if (pushStatus?.has("_error") == true) TextButton(enabled = !busy, onClick = { vm.load("push-status", "/api/plugins/cypher/mobile/notifications/status") }) { Text("Retry notification status") }
             else if (target != null && !registered && serverReady && deviceAllowed) TextButton(enabled = !busy, onClick = { enable() }) { Text("Retry registration") }
-            OutlinedButton(onClick = { busy = true; operationError = ""; val owner = vm.client?.scope; scope.launch { var accepted = false; vm.action("/api/plugins/cypher/mobile/notifications/test", json("kind" to "fcm"), refresh = false) { _, _ -> accepted = true; vm.notice("Test queued. Delivery is confirmed only when the notification arrives on this phone.") }.join(); if (vm.client?.scope == owner) { if (!accepted) operationError = vm.ui.value.error.ifBlank { "Couldn’t queue a test. Try again." }; busy = false; vm.load("push-status", "/api/plugins/cypher/mobile/notifications/status") } } }, enabled = !busy && serverReady && registered && deviceAllowed) { Text(uiText("Send a test notification")) }
+            OutlinedButton(onClick = { busy = true; operationError = ""; val owner = vm.client?.scope; scope.launch { var accepted = false; vm.action("/api/plugins/cypher/mobile/notifications/test", json("kind" to "fcm"), refresh = false) { _, _ -> accepted = true; vm.notice("Test sent.") }.join(); if (vm.client?.scope == owner) { if (!accepted) operationError = vm.ui.value.error.ifBlank { "Couldn’t queue a test. Try again." }; busy = false; vm.load("push-status", "/api/plugins/cypher/mobile/notifications/status") } } }, enabled = !busy && serverReady && registered && deviceAllowed) { Text(uiText("Send a test notification")) }
         }
         Glass(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -266,9 +266,9 @@ import org.json.JSONObject
         TextButton(onClick = { context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)) }) { Text(uiText("Android notification settings")) }
         Text("Background delivery",style=MaterialTheme.typography.titleMedium)
         Text(when { restricted -> "Android is restricting Cypher in the background. Open app settings and allow background activity."; optimized -> "Battery optimization is on. If alerts arrive late, allow background activity in your phone’s app or battery settings."; else -> "Android battery optimization is off for Cypher." },color=if(restricted) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
-        Text("Keep connected uses a persistent low-importance notification and may use more battery. Allow background activity and keep Tailscale connected for reliable calls.", style=MaterialTheme.typography.bodySmall, color=MaterialTheme.colorScheme.onSurfaceVariant)
-        Text("Keep Tailscale connected to answer private requests. Do Not Disturb and notification settings can silence popups. On Honor, also check App launch → Manage manually → Run in background.",style=MaterialTheme.typography.bodySmall)
-        Text("After Force stop in Android settings, reopen Cypher once to receive notifications again. Hiding the call bubble keeps your call available in the notification and supported status chip.",style=MaterialTheme.typography.bodySmall)
+        Text("Shows a quiet notification and uses some battery.", style=MaterialTheme.typography.bodySmall, color=MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("Keep Tailscale on. On Honor phones, allow Cypher to run in the background.",style=MaterialTheme.typography.bodySmall)
+        Text("After a force stop, open Cypher once to receive calls again.",style=MaterialTheme.typography.bodySmall)
         TextButton(onClick={runCatching { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:${context.packageName}"))) }.onFailure { vm.notice("Open Cypher’s app settings in Android") }}) { Text("Open background app settings") }
     }
 }
@@ -290,7 +290,7 @@ internal fun historyRetentionNeedsConfirmation(currentDays: Int, selectedDays: I
     var pendingDays by remember { mutableStateOf<Int?>(null) }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("Keep call and task history", style = MaterialTheme.typography.titleMedium)
-        Text("Applies to call transcripts and linked task history across your Hermes profiles.", style = MaterialTheme.typography.bodySmall)
+        Text("Call transcripts and task history, all profiles.", style = MaterialTheme.typography.bodySmall)
         Text(
             currentDays?.let { "Current server setting: ${historyRetentionLabel(it)}" }
                 ?: if (error.isBlank()) "Checking the current server setting…" else "Current server setting unavailable",

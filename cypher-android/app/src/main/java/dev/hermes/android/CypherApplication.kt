@@ -29,8 +29,10 @@ class CypherApplication : Application() {
         val staleBefore = System.currentTimeMillis()
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             launch { readTranslations() }
+            launch { preferences.data.collect { dev.hermes.android.data.currentAssistantName = dev.hermes.android.data.AppPreferences.read(it).assistantName } }
             runCatching { push.reconcileIncomingDeadlines() }
             runCatching { cache.trim() }
+            runCatching { java.io.File(cacheDir, "camera").listFiles()?.filter { it.isFile && it.lastModified() < staleBefore }?.forEach { it.delete() } }
             // Only temporary content created by this client, within its private cache directory.
             runCatching { cacheDir.listFiles()?.filter { it.isFile && it.lastModified() < staleBefore && it.name.startsWithAny("preview", "read-aloud", "upload", "pasted", "recorded", "hermes-export-") }?.forEach { it.delete() } }
                 .onFailure { android.util.Log.w("CypherCache", "Temporary cache cleanup failed", it) }

@@ -118,7 +118,7 @@ import dev.hermes.android.data.CypherClient
         if (editor.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
         if (editor.metadata.string("edit_blocked_reason").isNotBlank()) Text(editor.metadata.string("edit_blocked_reason"), Modifier.padding(16.dp), style = MaterialTheme.typography.bodySmall)
         if (editor.reviewRequired) {
-            Text("The saved version changed, or this older draft has no version history. Review both copies before saving.", Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.bodyMedium)
+            Text("The file changed since your draft. Compare before saving.", Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.bodyMedium)
             TextButton(onClick = { review = true }, enabled = !editor.saving) { Text("Review changes") }
         }
         if (editor.dirty || editor.reviewRequired) TextButton(enabled = !editor.saving && !editor.loading, onClick = { vm.openForm(ActionForm("Discard local changes", "", emptyList(), explanation = "Discard the retained edits and reload the last confirmed server content.", actionLabel = "Discard", onResult = { vm.discardEditor() })) }) { Text(uiText("Discard changes")) }
@@ -130,7 +130,7 @@ import dev.hermes.android.data.CypherClient
     }
     if (review && editor.reviewRequired) AlertDialog(onDismissRequest = { review = false }, title = { Text("Review file versions") },
         text = { LazyColumn(Modifier.heightIn(max = 440.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            item { Text("Compare both copies. Using your draft prepares it to replace this saved version when you press Save.") }
+            item { Text("Use your draft, then Save to replace the file.") }
             item { Text("Saved on computer", style = MaterialTheme.typography.titleSmall); CodeBlock("text", editor.metadata.string("content", editor.serverText)) }
             item { Text("Your draft", style = MaterialTheme.typography.titleSmall); CodeBlock("text", editor.text.text) }
         } }, confirmButton = { TextButton(onClick = { review = false; vm.acceptEditorBase() }) { Text("Use my draft") } },

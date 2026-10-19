@@ -2,7 +2,7 @@ package dev.hermes.android.ui
 
 /** The native adapter is closed: identity alone never enables a retired WebUI action. */
 internal fun nativeConversationAction(action: String): Boolean = action in setOf(
-    "New conversation", "Rename", "Archive", "Branch", "Model & provider", "Reasoning", "Toolsets", "Compress context", "Undo last turn", "Usage", "Delete conversation"
+    "New conversation", "Rename", "Pin", "Archive", "Branch", "Model & provider", "Reasoning", "Toolsets", "Compress context", "Undo last turn", "Usage", "Delete conversation"
 )
 
 internal fun tableColumnWidths(rows: List<List<String>>): List<Int> =

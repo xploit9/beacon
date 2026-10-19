@@ -284,7 +284,7 @@ internal fun SetupWizardScreen(
                     }
                     "voice-provider" -> {
                         Text("Voice & calls", style = MaterialTheme.typography.headlineSmall)
-                        Text("Add a provider key for one-tap realtime calls. You can skip this and add it later in Settings.", style = MaterialTheme.typography.bodyLarge)
+                        Text("Add a voice key for calls, or skip for now.", style = MaterialTheme.typography.bodyLarge)
                         VoiceKeySetupPanel(onKeySaved = { voiceKeySaved = true; onVoiceKeySaved() }, showTitle = false)
                         if (voiceKeySaved) Button(onClick = onAdvancePermission, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-voice-continue")) { Text("Continue") }
                         TextButton(onClick = onAdvancePermission, modifier = Modifier.align(Alignment.CenterHorizontally).testTag("setup-voice-skip")) { Text("Skip for now") }
@@ -353,12 +353,12 @@ internal fun SetupWizardScreen(
                             Switch(checked = keepConnected, onCheckedChange = { keepConnected = it; if (it) requestKeepConnectedNotifications() }, modifier = Modifier.testTag("setup-keep-connected"))
                         }
                         if (keepConnected && !notificationAllowed) Text("Allow notifications so incoming call alerts can appear.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                        Text("Android battery settings may delay background calls. Allow Cypher to run in the background and keep Tailscale connected.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+                        Text("Allow Cypher to run in the background so calls reach you.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                         Button(onClick = { onFinish(keepConnected) }, enabled = state.authenticated, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-finish")) { Text("Open chat") }
                     }
                     else -> {
                         Text("Connect to Hermes", style = MaterialTheme.typography.headlineSmall)
-                        Text("Scan the Cypher QR on your Hermes dashboard, or paste its link or HTTPS server address.", style = MaterialTheme.typography.bodyLarge)
+                        Text("Scan the QR on your Hermes dashboard, or paste its address.", style = MaterialTheme.typography.bodyLarge)
                         OutlinedTextField(
                             value = address,
                             onValueChange = { address = it },

@@ -159,7 +159,7 @@ class CallController(private val app: CypherApplication) {
         check(!switching.get()) { "Wait for the voice model switch to finish" }
         val keyStore=VoiceKeyStore(app)
         val credentials=withContext(Dispatchers.IO) { keyStore.session() }?:throw MissingVoiceKeyException(keyStore.settings().provider)
-        check(ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) { "Allow microphone access to answer Cypher" }
+        check(ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) { "Allow microphone access to answer ${dev.hermes.android.data.currentAssistantName}" }
         require(app.push.claimInvitation(source, event)) { "This Cypher invitation has ended" }
         val (client, route) = withTimeout(15000) { resolveIncoming(app, source, event) }
         start(client, IncomingCall(source, event, route.getLong("expires_at")),voiceSettings=credentials)
@@ -168,7 +168,7 @@ class CallController(private val app: CypherApplication) {
         requireCameraReleasedForNewCall(_state.value)
         check(!_state.value.audioStopPending) { "Microphone release is unconfirmed. Use Android’s Stop app control before another call." }
         check(!_state.value.active) { "Cypher already has a call" }
-        check(ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) { "Allow microphone access to call Cypher" }
+        check(ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) { "Allow microphone access to call ${dev.hermes.android.data.currentAssistantName}" }
         check(starting.compareAndSet(false, true)) { "Cypher is already connecting" }
         val generation = epoch.get()
         val frozen = client.detached()
@@ -189,7 +189,7 @@ class CallController(private val app: CypherApplication) {
             if (generation != epoch.get()) { release(CallSpec(frozen, grant)); return }
             if (incoming != null) {
                 require(app.push.permitsIncoming(incoming.source)) { "The invitation's owner signed out" }
-                require(uiVisible) { "Open Cypher to finish answering Cypher" }
+                require(uiVisible) { "Open Cypher to finish answering ${dev.hermes.android.data.currentAssistantName}" }
             }
             spec = CallSpec(frozen, grant, incoming != null,voiceSettings)
             _state.update { it.copy(conversationScope = frozen.scope.session(grant.getString("conversation_id")), callId = grant.getString("call_id"), voiceProvider = voiceSettings.provider, visionAvailable = voiceSettings.provider == "gemini").withOverlayPermission(android.provider.Settings.canDrawOverlays(app)) }
@@ -295,7 +295,7 @@ class CypherCallService : Service() {
         }
         val pending = app.calls.spec ?: run { stopSelf(); return START_NOT_STICKY }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED || !app.auth.read(pending.client.auth.origin).authorizesPushSource(pending.client.scope)) {
-            app.calls.rejectPendingStart("Sign in and allow microphone access before calling Cypher"); stopSelf(); return START_NOT_STICKY
+            app.calls.rejectPendingStart("Sign in and allow microphone access before calling ${dev.hermes.android.data.currentAssistantName}"); stopSelf(); return START_NOT_STICKY
         }
         spec = pending; app.calls.spec = null; app.calls.service = this
         scope.launch {
@@ -326,7 +326,7 @@ class CypherCallService : Service() {
                 manager.registerAppWithTelecom(CallsManager.CAPABILITY_BASELINE)
                 currentCoroutineContext().ensureActive()
                 if(closed.get()||app.calls.service!==this@CypherCallService) return@launch
-                val attributes = CallAttributesCompat(displayName = "Cypher", address = Uri.parse("hermes:xara"), direction = if (pending.incoming) CallAttributesCompat.DIRECTION_INCOMING else CallAttributesCompat.DIRECTION_OUTGOING, callType = CallAttributesCompat.CALL_TYPE_AUDIO_CALL)
+                val attributes = CallAttributesCompat(displayName = dev.hermes.android.data.currentAssistantName, address = Uri.parse("hermes:xara"), direction = if (pending.incoming) CallAttributesCompat.DIRECTION_INCOMING else CallAttributesCompat.DIRECTION_OUTGOING, callType = CallAttributesCompat.CALL_TYPE_AUDIO_CALL)
                 manager.addCall(attributes, onAnswer = { _ -> hold(false) }, onDisconnect = { _ -> hangup() }, onSetActive = { hold(false) }, onSetInactive = { hold(true) }) {
                     control = this
                     launch { availableEndpoints.collect { values -> endpoints = values; app.calls.updateFrom(this@CypherCallService) { it.copy(routes = values.map { e -> AudioRoute(e.identifier.toString(), e.name.toString()) }) } } }
@@ -605,7 +605,7 @@ class CypherCallService : Service() {
                     if (closed.get()) call else call.copy(state = state, transcript = "", transcripts = call.transcripts.map { event -> if (!event.final && event.role == "assistant") event.copy(interrupted = true) else event })
                 }
             }
-            "error" -> failure(value.string("message", value.string("error", "Cypher call failed")))
+            "error" -> failure(value.string("message", value.string("error", "${dev.hermes.android.data.currentAssistantName} call failed")))
             "ended" -> hangup()
         }
     }
@@ -689,18 +689,18 @@ class CypherCallService : Service() {
             return PendingIntent.getService(this, code, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         }
         val builder = NotificationCompat.Builder(this, CHANNEL).setSmallIcon(R.drawable.ic_cypher_voice)
-            .setContentTitle(if (retainedCameraWarning) "Cypher call cleanup warning" else "Cypher call")
-            .setContentText(if (starting) { if(app.calls.state.value.active) "Connecting to Cypher" else "Call cancelled" } else if (retainedCameraWarning) "Call or capture shutdown unconfirmed; media delivery blocked. Use Android’s Stop app control."
+            .setContentTitle(if (retainedCameraWarning) "Cypher call cleanup warning" else "${dev.hermes.android.data.currentAssistantName} call")
+            .setContentText(if (starting) { if(app.calls.state.value.active) "Connecting to ${dev.hermes.android.data.currentAssistantName}" else "Call cancelled" } else if (retainedCameraWarning) "Call or capture shutdown unconfirmed; media delivery blocked. Use Android’s Stop app control."
                 else if (app.calls.state.value.toolApprovals.isNotEmpty()) "Action needs approval. Open Cypher to review."
                 else if (app.calls.state.value.screenStopPending) "Screen stop unconfirmed; visual delivery blocked. Tap to retry."
-                else if (app.calls.state.value.screenSharing) "Screen sharing with Cypher"
+                else if (app.calls.state.value.screenSharing) "Screen sharing with ${dev.hermes.android.data.currentAssistantName}"
                 else if (app.calls.state.value.cameraStopPending) "Camera stop unconfirmed; video blocked. Tap to retry."
-                else if (muted) "Microphone muted" else if (state.remoteSpeaking || state.state == "speaking") "Cypher is speaking" else "Listening to you")
+                else if (muted) "Microphone muted" else if (state.remoteSpeaking || state.state == "speaking") "${dev.hermes.android.data.currentAssistantName} is speaking" else "Listening to you")
             .setContentIntent(open).setOngoing(true).setCategory(if (retainedCameraWarning) NotificationCompat.CATEGORY_ERROR else NotificationCompat.CATEGORY_CALL)
             .setOnlyAlertOnce(true).setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-            .setPublicVersion(NotificationCompat.Builder(this,CHANNEL).setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle("Cypher call").setContentText("Tap to return to your call").build())
+            .setPublicVersion(NotificationCompat.Builder(this,CHANNEL).setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle("${dev.hermes.android.data.currentAssistantName} call").setContentText("Tap to return to your call").build())
         if (!retainedCameraWarning && !starting) {
-            builder.setStyle(NotificationCompat.CallStyle.forOngoingCall(androidx.core.app.Person.Builder().setName("Cypher").setImportant(true).build(),action(HANGUP,23)))
+            builder.setStyle(NotificationCompat.CallStyle.forOngoingCall(androidx.core.app.Person.Builder().setName(dev.hermes.android.data.currentAssistantName).setImportant(true).build(),action(HANGUP,23)))
                 .addAction(0, if (muted) "Unmute" else "Mute", action(MUTE, 22))
             builder.setShowWhen(false)
             if(android.os.Build.VERSION.SDK_INT>=36) builder.setRequestPromotedOngoing(true).setShortCriticalText(state.chipLabel())

@@ -108,7 +108,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
     if (choosingMembers && shared) AlertDialog(onDismissRequest = { if (!state.loading) choosingMembers = false },
         title = { Text("Choose bots") },
         text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Choose two to six bots. Changing the team stops its current work; previous messages stay in this space.")
+            Text("Choose 2–6 bots. Changing the team stops its current work.")
             state.bots.forEach { bot ->
                 Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).toggleable(bot.profile in members, enabled = !state.loading, role = androidx.compose.ui.semantics.Role.Checkbox) {
                     members = if (bot.profile in members) members - bot.profile else if (members.size < 6) members + bot.profile else members
@@ -157,7 +157,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
         }
         LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             if (!shared && !creating) {
-                item { Text("Pick a bot for an ongoing conversation, or bring several bots together in a shared space.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                item { Text("Chat with one bot, or bring several into a shared space.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
                 item { Text("Bots", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(top = 8.dp)) }
                 items(state.bots, key = { "overview-bot:${it.profile}" }) { bot ->
                     ActionRow(bot.title, bot.description, Icons.Rounded.SmartToy) { vm.openBot(bot) }

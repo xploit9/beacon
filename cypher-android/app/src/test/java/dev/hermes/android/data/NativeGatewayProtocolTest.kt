@@ -23,6 +23,9 @@ class NativeGatewayProtocolTest {
         var yoloAcknowledgement = "0"
         var sessionBypass: Boolean? = false
         var resumeYoloPresent = true
+        /** Hermes saves a chat's YOLO in model_config (null: same as the live flag); [savedRow] false = not saved yet (404). */
+        var savedYolo: Boolean? = null
+        var savedRow = true
         var failPrompt = false
         var silentPrompt = false
         var activeListFailure = false
@@ -57,6 +60,7 @@ class NativeGatewayProtocolTest {
                             if (key == "approvals.mode" && !ignoreApprovalWrite) approvalMode = value
                             val echo = if (key == "yolo") yoloAcknowledgement else value
                             if (key == "yolo" && !ignoreYoloWrite && echo == (if (value in setOf("1", "on")) "1" else "0") && (value != "off" || sessionBypass != null)) sessionBypass = value in setOf("1", "on", "true")
+                            if (key == "yolo" && !ignoreYoloWrite && echo == (if (value in setOf("1", "on")) "1" else "0")) savedYolo = value in setOf("1", "on", "true")
                             json("key" to key, "value" to echo)
                         }
                         "commands.catalog" -> json("pairs" to JSONArray().put(JSONArray().put("/help").put("Help")))
@@ -84,13 +88,14 @@ class NativeGatewayProtocolTest {
             val history = path == "/api/sessions/stored-a/messages"
             val payload = when {
                 voice -> json("session_id" to "stored-a", "profile" to "work", "events" to JSONArray())
-                path == "/api/sessions/stored-a" -> json("id" to "stored-a", "profile" to "work", "title" to "Fixture title", "message_count" to 0)
+                path == "/api/sessions/stored-a" -> json("id" to "stored-a", "profile" to "work", "title" to "Fixture title", "message_count" to 0,
+                    "model_config" to json("yolo_mode" to (wire?.savedYolo ?: (wire?.sessionBypass == true))).toString())
                 history -> json("session_id" to "stored-a", "profile" to "work", "messages" to JSONArray(), "pagination" to json("limit" to 500, "offset" to 0, "order" to "latest", "returned" to 0))
                 path == "/api/sessions" -> json("sessions" to JSONArray().put(if (chain.request().url.queryParameter("archived") == "only") json("id" to "hidden", "title" to "Archived title", "profile" to "work") else json("id" to "visible", "title" to "Visible title", "profile" to "work", "secret_metadata" to "not-searchable")))
                 path.startsWith("/api/plugins/cypher/mobile/sessions") -> error("Native history must not use the optional plugin: $path")
                 else -> json("ticket" to "fixture-single-use-ticket")
             }
-            val status = if (voice) voiceStatus else if (history) historyStatus else 200
+            val status = if (voice) voiceStatus else if (history) historyStatus else if (path == "/api/sessions/stored-a" && wire?.savedRow == false) 404 else 200
             val response = Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(status).message("Fixture").apply {
                 if (voice && voiceSetCookie != null) addHeader("Set-Cookie", voiceSetCookie)
             }.body((if (status == 200) payload else json("detail" to "Fixture failure")).toString().toResponseBody("application/json".toMediaType())).build()
@@ -117,30 +122,35 @@ class NativeGatewayProtocolTest {
         c.closeNative()
     }
     @Test fun aLazyChatCanChooseItsProfilePolicyBeforeAgentInfoArrives() = runBlocking {
-        val wire = Wire().apply { sessionBypass = null }; val c = client(wire)
+        // A chat Hermes has not saved yet has no stored flag either, so its YOLO stays unknown.
+        val wire = Wire().apply { sessionBypass = null; savedRow = false }; val c = client(wire)
         val result = c.get("/api/approval/mode", mapOf("session_id" to "stored-a"))
         assertEquals("manual", result.getString("value")); assertFalse(result.getBoolean("session_status_known"))
         val applied = c.call("/api/approval/mode", method="POST", data=json("session_id" to "stored-a", "mode" to "smart", "scope_key" to c.scope.session("stored-a").key))
         assertEquals("smart", applied.getString("value")); assertFalse(applied.getBoolean("session_status_known"))
         c.closeNative()
     }
-    @Test fun approvalReadDoesNotReportOffWhenResumeOmitsYolo() = runBlocking {
-        val wire = Wire().apply { resumeYoloPresent = false }; val c = client(wire)
+    @Test fun approvalReadUsesTheSavedYoloWhenResumeOmitsIt() = runBlocking {
+        val wire = Wire().apply { resumeYoloPresent = false; savedYolo = true }; val c = client(wire)
         val result = c.get("/api/approval/mode", mapOf("session_id" to "stored-a"))
-        assertFalse(result.getBoolean("session_status_known"))
-        assertTrue(result.isNull("session_bypass"))
+        assertTrue(result.getBoolean("session_status_known"))
+        assertTrue(result.getBoolean("session_bypass"))
+        wire.savedRow = false
+        val unsaved = c.get("/api/approval/mode", mapOf("session_id" to "stored-a"))
+        assertFalse("Only a chat with no saved row is unknown", unsaved.getBoolean("session_status_known"))
+        assertTrue(unsaved.isNull("session_bypass"))
         c.closeNative()
     }
-    @Test fun perChatYoloWriteAndFreshReadPreserveUnknownWhenResumeOmitsYolo() = runBlocking {
+    @Test fun perChatYoloWriteIsConfirmedByTheSavedFlagWhenResumeOmitsIt() = runBlocking {
         val wire = Wire().apply { resumeYoloPresent = false; yoloAcknowledgement = "1" }; val c = client(wire)
         val written = c.call("/api/approval/mode", method = "POST", data = json("session_id" to "stored-a", "yolo" to true, "scope_key" to c.scope.session("stored-a").key))
-        assertFalse(written.getBoolean("session_status_known"))
-        assertTrue(written.isNull("session_bypass"))
+        assertTrue(written.getBoolean("session_status_known"))
+        assertTrue(written.getBoolean("session_bypass"))
         val beforeRefresh = wire.requests.count { it.url.encodedPath == "/api/ws" }
         val refreshed = c.get("/api/approval/mode", mapOf("session_id" to "stored-a"))
         assertEquals(beforeRefresh + 1, wire.requests.count { it.url.encodedPath == "/api/ws" })
-        assertFalse(refreshed.getBoolean("session_status_known"))
-        assertTrue(refreshed.isNull("session_bypass"))
+        assertTrue(refreshed.getBoolean("session_status_known"))
+        assertTrue(refreshed.getBoolean("session_bypass"))
         val write = wire.sent.single { it.getString("method") == "config.set" }.getJSONObject("params")
         assertEquals("yolo", write.getString("key")); assertEquals("1", write.getString("value"))
         assertEquals("session", write.getString("scope")); assertEquals("runtime-a", write.getString("session_id"))

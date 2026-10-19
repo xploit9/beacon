@@ -193,4 +193,26 @@ class ConversationPositionTest {
         assertTrue(ProcessControlUnavailable.contains("aren’t available"))
         assertFalse(ProcessControlUnavailable.contains("0 "))
     }
+
+    @Test fun quotingKeepsOneBoundedLineAboveTheDraft() {
+        assertEquals("first line second", quoteExcerpt("  first line\n\n  second "))
+        val long = quoteExcerpt("word ".repeat(100))
+        assertEquals(240, long.length); assertTrue(long.endsWith("…"))
+        assertEquals("", quoteExcerpt(" \n "))
+        assertEquals("> said this\n\nmy reply", quotedDraft("said this", "my reply"))
+    }
+
+    @Test fun dayDividersMarkTheFirstMessageOfEachDay() {
+        val now = 1_760_000_000_000L // 2025-10-09 08:53 UTC
+        val day = 86_400L
+        val times = listOf("old" to now / 1000 - 400 * day, "a" to now / 1000 - 2 * day, "b" to now / 1000 - 2 * day + 60, "untimed" to 0L,
+            "y" to now / 1000 - day, "t1" to now / 1000 - 30, "t2" to now / 1000)
+        assertEquals(mapOf("old" to "Sep 4, 2024", "a" to "Tue, Oct 7", "y" to "Yesterday", "t1" to "Today"), messageDayStarts(times, now, utc, Locale.US))
+        assertTrue(messageDayStarts(listOf("x" to 0L), now, utc, Locale.US).isEmpty())
+    }
+
+    @Test fun aSharedConversationNamesBothSidesAndSkipsToolRows() {
+        val text = conversationShareText(listOf("user" to "Hi", "tool" to "{}", "assistant" to " Hello ", "assistant" to " ", "system" to "x"), "Nova")
+        assertEquals("You: Hi\n\nNova: Hello", text)
+    }
 }

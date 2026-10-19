@@ -101,7 +101,7 @@ val LocalPersistentNavigation = staticCompositionLocalOf { false }
 
     Canvas(modifier.clip(shape).background(Color(0xff0a1225)).testTag("cypher-blue-wave")
 
-        .semantics { contentDescription="Cypher voice activity"; stateDescription=if(call.held) "Call on hold" else call.state }) {
+        .semantics { contentDescription="${dev.hermes.android.data.currentAssistantName} voice activity"; stateDescription=if(call.held) "Call on hold" else call.state }) {
 
         drawRect(Brush.verticalGradient(listOf(Color(0xff102142),Color(0xff16315b),Color(0xff4c86db))))
 
@@ -185,7 +185,7 @@ internal data class CallUiActions(val mute: () -> Unit, val camera: () -> Unit, 
 
         Text(uiText(if(call.held) "Call on hold" else if(call.state=="connecting") "Connecting your call…" else if(call.userSpeaking) "Listening" else call.state.replaceFirstChar{it.titlecase()}),style=MaterialTheme.typography.labelLarge,color=Color(0xffdce8fc),modifier=Modifier.padding(bottom=8.dp))
         if(call.overlayPermissionMissing) {
-            Text(uiText("To keep the call bubble visible over other apps, allow floating calls. Your call continues without it."),
+            Text(uiText("Allow floating calls to keep the call bubble over other apps."),
                 style=MaterialTheme.typography.bodySmall,color=Color(0xffc3cbd8),modifier=Modifier.widthIn(max=480.dp).padding(horizontal=12.dp).testTag("cypher-overlay-permission-notice"))
             TextButton(actions.allowBubble,modifier=Modifier.heightIn(min=48.dp).testTag("cypher-allow-bubble")) { Text(uiText("Allow floating call bubble")) }
         }
@@ -224,9 +224,9 @@ internal data class CallUiActions(val mute: () -> Unit, val camera: () -> Unit, 
 
                 LiveCallCaptions(call,Modifier.padding(bottom=14.dp))
 
-                if(call.cameraSharing) Text(uiText(if(call.cameraRear) "Back camera shared with Cypher" else "Front camera shared with Cypher"),color=Color.White,style=MaterialTheme.typography.labelLarge,modifier=Modifier.padding(bottom=10.dp).background(Color(0xff080d15),RoundedCornerShape(12.dp)).padding(horizontal=12.dp,vertical=6.dp))
+                if(call.cameraSharing) Text(assistantText(if(call.cameraRear) "Back camera shared with Cypher" else "Front camera shared with Cypher"),color=Color.White,style=MaterialTheme.typography.labelLarge,modifier=Modifier.padding(bottom=10.dp).background(Color(0xff080d15),RoundedCornerShape(12.dp)).padding(horizontal=12.dp,vertical=6.dp))
 
-                if(call.screenSharing) Text(uiText("Screen shared with Cypher"),color=Color.White,style=MaterialTheme.typography.labelLarge,modifier=Modifier.padding(bottom=10.dp))
+                if(call.screenSharing) Text(assistantText("Screen shared with Cypher"),color=Color.White,style=MaterialTheme.typography.labelLarge,modifier=Modifier.padding(bottom=10.dp))
 
                 if(call.screenBusy) Text(uiText("Waiting for screen-sharing consent or first frame…"),color=Color.White,style=MaterialTheme.typography.labelLarge,modifier=Modifier.padding(bottom=10.dp))
 

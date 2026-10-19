@@ -61,10 +61,18 @@ class NativeOperationPolicyTest {
         )) {
             assertTrue("GET $path", NativeOperationPolicy.direct(path, "GET"))
             for (method in listOf("POST", "PUT", "PATCH", "DELETE", "get")) {
+                if (method == "PATCH" && path == "/api/sessions/session-a") continue
                 assertFalse("$method $path", NativeOperationPolicy.direct(path, method))
             }
         }
         assertTrue("Other allowlisted routes retain their methods", NativeOperationPolicy.direct("/api/model/set", "POST"))
+    }
+
+    @Test fun onlyAConversationsOwnSidebarPatchIsAllowed() {
+        // Hermes sets a pin only through PATCH /api/sessions/{id}; nothing else on those routes may change data.
+        assertTrue(NativeOperationPolicy.direct("/api/sessions/session-a", "PATCH"))
+        for (path in listOf("/api/sessions", "/api/sessions/search", "/api/sessions/owner-backfill", "/api/sessions/session-a/messages", "/api/sessions/session-a/timeline"))
+            assertFalse("PATCH " + path, NativeOperationPolicy.direct(path, "PATCH"))
     }
 
     @Test fun clientBoundariesRejectSessionMutationsBeforeTransport() = runBlocking<Unit> {

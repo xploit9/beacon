@@ -130,3 +130,40 @@ internal fun chatActivityStatus(activity: ChatActivity): String = listOfNotNull(
 
 /** The native connection exposes no process registry yet; say so instead of showing an empty list as truth. */
 internal const val ProcessControlUnavailable = "Background process list and stop controls aren’t available from this connection yet. Only this chat’s own tools, queue and prompts are shown."
+
+/** One-line excerpt for "Quote in reply" (Relay's bounded excerpt): whitespace collapsed, at most [max] characters. */
+internal fun quoteExcerpt(text: String, max: Int = 240): String {
+    val line = text.replace(whitespaceRun, " ").trim()
+    return if (line.length <= max) line else line.take(max - 1).trimEnd() + "…"
+}
+/** The composer after quoting: a plain Markdown quote above the draft, readable by every Hermes client. */
+internal fun quotedDraft(excerpt: String, draft: String): String = "> $excerpt\n\n$draft"
+
+private fun dayNumber(millis: Long, zone: java.util.TimeZone): Int =
+    java.util.Calendar.getInstance(zone).apply { timeInMillis = millis }.let { it.get(java.util.Calendar.YEAR) * 1000 + it.get(java.util.Calendar.DAY_OF_YEAR) }
+
+/** Divider labels for the first message of each day (Today, Yesterday or the date); a message without a time starts no day. */
+internal fun messageDayStarts(times: List<Pair<String, Long>>, now: Long = System.currentTimeMillis(), zone: java.util.TimeZone = java.util.TimeZone.getDefault(), locale: java.util.Locale = java.util.Locale.getDefault()): Map<String, String> {
+    val today = dayNumber(now, zone)
+    val yesterday = dayNumber(java.util.Calendar.getInstance(zone).apply { timeInMillis = now; add(java.util.Calendar.DAY_OF_YEAR, -1) }.timeInMillis, zone)
+    val year = today / 1000
+    var last = -1
+    val starts = linkedMapOf<String, String>()
+    for ((id, epoch) in times) {
+        val millis = epochMillis(epoch).takeIf { it > 0 } ?: continue
+        val day = dayNumber(millis, zone)
+        if (day == last) continue
+        last = day
+        starts[id] = when (day) {
+            today -> "Today"
+            yesterday -> "Yesterday"
+            else -> java.text.SimpleDateFormat(if (day / 1000 == year) "EEE, MMM d" else "MMM d, yyyy", locale).also { it.timeZone = zone }.format(java.util.Date(millis))
+        }
+    }
+    return starts
+}
+
+/** The whole conversation as plain text for sharing: who said what, tool and system rows left out. */
+internal fun conversationShareText(messages: List<Pair<String, String>>, assistant: String): String =
+    messages.filter { (role, text) -> role in setOf("user", "assistant") && text.isNotBlank() }
+        .joinToString("\n\n") { (role, text) -> (if (role == "user") "You" else assistant) + ": " + text.trim() }

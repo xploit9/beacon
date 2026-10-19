@@ -114,6 +114,8 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var fileWrites = 0
     @Volatile var holdCreateAcknowledgement = false
     @Volatile var holdPromptAcknowledgement = false
+    /** Like Hermes when another conversation already holds the requested title: the create-time title is dropped. */
+    @Volatile var dropCreateTitle = false
     private val delayedCreates = CopyOnWriteArrayList<() -> Unit>()
     @Volatile private var activeNativeListener: WebSocketListener? = null
     @Volatile private var activeNativeSocket: WebSocket? = null
@@ -254,7 +256,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         if (historyFailure || row == null) return 404 to json("detail" to "Session not found")
         val messages = row.getJSONArray("messages")
         return when (parts.getOrNull(1)) {
-            null -> 200 to row.getJSONObject("info").copy().put("id", id).put("profile", profile).put("message_count", messages.length())
+            null -> 200 to row.getJSONObject("info").copy().put("id", id).put("profile", profile).put("message_count", messages.length()).put("model_config", row.optString("model_config").ifBlank { "{}" })
             "messages" -> {
                 val window = JSONArray((maxOf(0, messages.length() - 500) until messages.length()).map(messages::get))
                 200 to json("session_id" to id, "profile" to profile, "messages" to window, "pagination" to json("limit" to 500, "offset" to 0, "order" to "latest", "returned" to window.length()))
@@ -354,6 +356,8 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 .map { row -> row.getJSONObject("info").copy().put("id", row.string("stored_session_id")).put("profile", profile).put("message_count", row.getJSONArray("messages").length()) }
                 .drop(offset).take(limit)))
         }
+        // Hermes's sidebar PATCH: the only REST mutation Cypher uses (pin).
+        path.startsWith("/api/sessions/") && method == "PATCH" -> path.removePrefix("/api/sessions/").let { id -> sessions.getValue(id).getJSONObject("info").put("pinned", body.getBoolean("pinned")); 200 to json("ok" to true, "session_id" to id) }
         path.startsWith("/api/sessions/") -> stockSession(path, profile)
         path == "/api/auth/ws-ticket" -> 200 to json("ticket" to "synthetic-once")
         path == "/auth/native/authorize" -> 200 to json("ready" to true)
@@ -538,7 +542,9 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         return when (method) {
             "session.list" -> json("sessions" to JSONArray(sessions.values.filter { params.optBoolean("include_hidden") || !it.getJSONObject("info").optBoolean("hidden") }.map { row -> row.getJSONObject("info").copy().put("id", row.string("stored_session_id")).put("stored_session_id", row.string("stored_session_id")) }))
             "projects.list" -> json("projects" to JSONArray(projects.values.toList()))
-            "projects.for_cwd" -> json("project" to projects.values.filter { project -> project.rows("folders").any { params.getString("cwd").startsWith(it.string("path")) } }.maxByOrNull { project -> project.rows("folders").maxOfOrNull { it.string("path").length } ?: 0 })
+            // Like Hermes: the project owning a folder; no cwd means the profile's own (project-free) folder.
+            "projects.for_cwd" -> params.string("cwd").ifBlank { "C:/synthetic-home" }.let { cwd -> json("cwd" to cwd, "project" to (projects.values.filter { project -> project.rows("folders").any { cwd.startsWith(it.string("path")) } }.maxByOrNull { project -> project.rows("folders").maxOfOrNull { it.string("path").length } ?: 0 } ?: JSONObject.NULL)) }
+            "session.workspace.move" -> params.getString("session_key").let { key -> sessions.getValue(key).getJSONObject("info").put("cwd", params.getString("cwd")); json("session_key" to key, "cwd" to params.getString("cwd")) }
             "projects.get" -> json("project" to projects.getValue(params.getString("id")))
             "projects.create" -> {
                 val key = "p_new_${sequence.incrementAndGet()}"
@@ -568,7 +574,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                     ?: throw IllegalArgumentException("Synthetic session missing")
             }
             "session.history" -> { require(!historyFailure) { "Synthetic history unavailable" }; sessions[id]?.copy()?.apply { put("session_key", id); remove("stored_session_id"); getJSONObject("info").put("stored_session_id", id) } ?: throw IllegalArgumentException("Synthetic session missing") }
-            "session.create" -> { val key = "new-${sequence.incrementAndGet()}"; history(key, params.string("title", "New conversation"), JSONArray()).also { row ->
+            "session.create" -> { val key = "new-${sequence.incrementAndGet()}"; history(key, if (dropCreateTitle) "" else params.string("title", "New conversation"), JSONArray()).also { row ->
                 row.getJSONObject("info").put("source", params.string("source"))
                 runtimeStoredSessionIds[row.string("session_id")] = key
                 currentRuntimeSessionIds[key] = row.string("session_id")
@@ -588,7 +594,11 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 json("sessions" to rows)
             }
             "session.usage" -> json("input_tokens" to 100, "output_tokens" to 20, "context_window" to 32000)
-            "session.title" -> { sessions.getValue(id).getJSONObject("info").put("title", params.getString("title")); json("ok" to true) }
+            "session.title" -> {
+                // Hermes titles are unique per profile (idx_sessions_title_unique).
+                require(sessions.none { (key, row) -> key != id && row.getJSONObject("info").string("title") == params.getString("title") }) { "Title already in use" }
+                sessions.getValue(id).getJSONObject("info").put("title", params.getString("title")); json("ok" to true)
+            }
             "session.set_hidden" -> { val hidden = params.getBoolean("hidden"); sessions.getValue(id).getJSONObject("info").put("hidden", hidden); json("hidden" to hidden, "session_key" to id) }
             "session.close" -> { closedSessions.add(id); json("closed" to true) }
             "session.delete" -> { require(id in closedSessions) { "cannot delete an active session" }; sessions.remove(id); json("deleted" to id) }
@@ -614,7 +624,13 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                     require(value in nativeApprovalModes)
                     approvalMode = value
                 }
-                if (key == "yolo") sessions.getValue(id).getJSONObject("info").put("yolo", value in setOf("1", "on", "true"))
+                if (key == "yolo") {
+                    // Like Hermes: the live flag and the saved model_config.yolo_mode change together.
+                    val on = value in setOf("1", "on", "true")
+                    val row = sessions.getValue(id)
+                    row.getJSONObject("info").put("yolo", on)
+                    row.put("model_config", JSONObject(row.optString("model_config").ifBlank { "{}" }).put("yolo_mode", on).toString())
+                }
                 json("ok" to true, "key" to key, "value" to if (key == "yolo") if (value in setOf("1", "on", "true")) "1" else "0" else value)
             }
             "approval.respond", "request.answer" -> {

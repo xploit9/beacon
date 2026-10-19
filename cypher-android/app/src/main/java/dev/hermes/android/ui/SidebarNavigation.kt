@@ -76,7 +76,8 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
                         Icon(Icons.Rounded.AccountCircle, null, Modifier.size(28.dp))
                         Spacer(Modifier.width(8.dp))
                         Column(Modifier.weight(1f), horizontalAlignment = Alignment.Start) {
-                            Text(ui.profile, style = MaterialTheme.typography.titleMedium)
+                            // The chats' profile, even while the assistant tab uses its own.
+                            Text(ui.chatProfile.ifBlank { ui.profile }, style = MaterialTheme.typography.titleMedium)
                             Text(uiText("Switch profile"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         Icon(Icons.Rounded.ExpandMore, null)
@@ -88,7 +89,7 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
                             record.string("_error").isNotBlank() -> DropdownMenuItem(text = { Text(uiText("Retry profiles")) }, onClick = { vm.load("navigation-profiles", "/api/profiles") })
                             else -> record.rows("profiles").forEach { profile ->
                                 val name = profile.string("name")
-                                if (name.isNotBlank()) DropdownMenuItem(text = { Text(name) }, leadingIcon = { if (name == ui.profile) Icon(Icons.Rounded.Check, null) }, onClick = { profilesOpen = false; if (name != ui.profile) vm.switchProfile(name) })
+                                if (name.isNotBlank()) DropdownMenuItem(text = { Text(name) }, leadingIcon = { if (name == ui.chatProfile.ifBlank { ui.profile }) Icon(Icons.Rounded.Check, null) }, onClick = { profilesOpen = false; if (name != ui.chatProfile.ifBlank { ui.profile }) vm.chooseProfile(name) })
                             }
                         }
                         DropdownMenuItem(text = { Text(uiText("Manage profiles")) }, onClick = { profilesOpen = false; vm.more("Profiles") })
@@ -120,7 +121,7 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
                 }
             }
         }
-        NavigationDrawerItem(label = { Text(uiText("Cypher chat")) }, selected = ui.tab == "Xara", onClick = { vm.navigate("Cypher") }, icon = { Icon(Icons.Rounded.GraphicEq, null) }, modifier = Modifier.testTag("navigation-cypher"))
+        NavigationDrawerItem(label = { Text(assistantText("Cypher chat")) }, selected = ui.tab == "Xara", onClick = { vm.navigate("Cypher") }, icon = { Icon(Icons.Rounded.GraphicEq, null) }, modifier = Modifier.testTag("navigation-cypher"))
         HorizontalDivider()
     }
 }

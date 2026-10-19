@@ -9,6 +9,12 @@ internal class NativeProjects(private val client: CypherClient) {
         require(path.isNotBlank() && path.length <= 4096 && path.none { it.isISOControl() }) { "Choose an existing PC folder" }
         return client.nativeGet("/api/files", mapOf("path" to path), maxBytes = 4 * 1024 * 1024).getString("path")
     }
+    /** The project that owns the chat's folder, as Hermes files it (projects.for_cwd); null when none does. */
+    private suspend fun projectOf(stored: String): JSONObject? {
+        require(stored.matches(Regex("[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}"))) { "Choose a conversation" }
+        val cwd = client.nativeGet("/api/sessions/$stored", mapOf("profile" to client.auth.profile)).string("cwd")
+        return if (cwd.isBlank()) null else client.nativeRpc("projects.for_cwd", json("cwd" to cwd)).optJSONObject("project")
+    }
     suspend fun call(path: String, method: String, data: JSONObject): JSONObject {
         val id = data.string("id")
         fun identity(): JSONObject { require(id.matches(Regex("p_[A-Za-z0-9_-]{1,100}"))) { "Choose a saved project" }; return json("id" to id) }
@@ -50,13 +56,22 @@ internal class NativeProjects(private val client: CypherClient) {
                 if (operation != "add") require(project.rows("folders").any { it.string("path") == selected }) { "This folder is no longer linked. Refresh the project." }
                 return client.nativeRpc("projects." + when (operation) { "add" -> "add_folder"; "remove" -> "remove_folder"; else -> "set_primary" }, params)
             }
+            "/api/projects/for-session" -> {
+                require(method == "GET")
+                val stored = data.string("chat")
+                return json("session_id" to stored, "project" to (projectOf(stored) ?: JSONObject.NULL))
+            }
             "/api/projects/detach" -> {
                 require(method == "POST")
                 val stored = data.string("session_id")
                 require(stored.isNotBlank() && data.string("scope_key") == client.scope.session(stored).key) { "Reopen Projects in the original conversation" }
-                val result = client.nativeRequest("/api/plugins/cypher/mobile/projects/detach", "POST", json("session_key" to stored, "expected_project_id" to id, "event_id" to data.getString("event_id")))
-                require(result.string("session_key") == stored && result.optBoolean("detached") && result.optBoolean("cwd_preserved")) { "Project removal was not confirmed. Refresh before retrying." }
-                return result
+                require(projectOf(stored)?.string("id") == identity().string("id")) { "This chat is no longer in that project. Refresh and try again." }
+                // Hermes files a chat under the project that owns its folder; moving it to the profile's own folder takes it out.
+                val home = client.nativeRpc("projects.for_cwd")
+                require(home.string("cwd").isNotBlank() && home.optJSONObject("project") == null) { "Hermes has no folder outside a project to move this chat to." }
+                val moved = client.nativeRpc("session.workspace.move", json("session_key" to stored, "cwd" to home.string("cwd")))
+                require(projectOf(stored)?.string("id") != id) { "Removing the chat from the project was not confirmed. Refresh before retrying." }
+                return moved.put("session_id", stored).put("detached", true)
             }
             "/api/projects/assign" -> {
                 require(method == "POST")

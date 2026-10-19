@@ -101,10 +101,11 @@ class SettingsMigrationUiTest {
         shown("Voice & calls").assertTextContains("Gemini Live · Key saved")
         shown("Appearance").assertTextContains("Dark · Graphite")
         shown("Profiles & model").assertTextContains("Active profile · work")
-        shown("Health, logs & updates").assertTextContains("Installed · 0.4.14")
+        shown("App updates").assertTextContains("Installed · 0.4.14")
         shown("About & licenses").assertTextContains("Installed · 0.4.14")
         val positions = settingsHubRoutes.map { shown(it).fetchSemanticsNode().positionInRoot }
         assertTrue("The hub uses one column", positions.all { it.x == positions.first().x })
+        for (section in listOf("Assistant", "Hermes", "App")) compose.onNodeWithTag("settings-group:$section").assertExists()
         compose.onNodeWithTag("settings-group:Preferences").assertDoesNotExist()
         compose.onNodeWithTag("settings-group:Assistant & server").assertDoesNotExist()
     }
@@ -185,7 +186,7 @@ class SettingsMigrationUiTest {
         shown("Chat").assertTextContains("Ctrl + Enter to send · Thinking shown")
         compose.runOnIdle { host.snapshot = known.copy(theme = "light", updateName = "0.4.15") }
         shown("Appearance").assertTextContains("Light · Graphite")
-        shown("Health, logs & updates").assertTextContains("Update available · 0.4.15")
+        shown("App updates").assertTextContains("Update available · 0.4.15")
         compose.runOnIdle { host.snapshot = known.copy(connected = false) }
         shown("Connection").assertTextContains("Connection needs attention · work")
         shown("Notifications & Keep connected").assertTextContains("Notification delivery")

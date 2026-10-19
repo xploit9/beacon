@@ -514,10 +514,10 @@ private fun receivePush(context: Context, data: Map<String, String>, localAction
             val answer = PendingIntent.getActivity(context, 0, answerIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
             val declineIntent = Intent(context, IncomingCallReceiver::class.java).setAction(invite.declineAction).setData(android.net.Uri.parse("hermes://incoming/$routeKey/decline")).putExtra("push_source", source).putExtra("push_event", event)
             val decline = PendingIntent.getBroadcast(context, 0, declineIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-            val person = androidx.core.app.Person.Builder().setName("Cypher").setImportant(true).build()
+            val person = androidx.core.app.Person.Builder().setName(dev.hermes.android.data.currentAssistantName).setImportant(true).build()
             fun notification(callStyle: Boolean = options.callStyle): Notification {
                 val card = options
-                val builder = NotificationCompat.Builder(context, incomingChannel).setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle("Cypher is calling").setContentText("Answer to start a private voice call").setContentIntent(pending).setDeleteIntent(decline).setCategory(card.category).setPriority(NotificationCompat.PRIORITY_HIGH).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).setPublicVersion(public).setTimeoutAfter(card.timeoutAfterMillis).setOnlyAlertOnce(card.onlyAlertOnce).setOngoing(true)
+                val builder = NotificationCompat.Builder(context, incomingChannel).setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle("${dev.hermes.android.data.currentAssistantName} is calling").setContentText("Answer to start a private voice call").setContentIntent(pending).setDeleteIntent(decline).setCategory(card.category).setPriority(NotificationCompat.PRIORITY_HIGH).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).setPublicVersion(public).setTimeoutAfter(card.timeoutAfterMillis).setOnlyAlertOnce(card.onlyAlertOnce).setOngoing(true)
                 if(android.os.Build.VERSION.SDK_INT>=36) builder.setRequestPromotedOngoing(true).setShortCriticalText("Calling")
                 // The alerting CallStyle falls back to heads-up when FSI is denied; ringing never starts the microphone.
                 if (card.fullScreenIntent) builder.setFullScreenIntent(pending, true)

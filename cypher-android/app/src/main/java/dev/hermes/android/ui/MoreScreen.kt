@@ -44,10 +44,11 @@ fun settingsParent(page: String): String = when {
 }
 private fun settingsIcon(name: String): ImageVector = when (name) {
     "Voice & calls", "Cypher" -> Icons.Rounded.GraphicEq
+    "Assistant" -> Icons.Rounded.Face
     "Appearance" -> Icons.Rounded.Palette
     "Chat", "Settings" -> Icons.Rounded.ChatBubbleOutline
     "Notifications & Keep connected", "Notifications" -> Icons.Rounded.NotificationsNone
-    "App updates", "Health, logs & updates", "Health", "Logs", "Server updates", "Session checkpoints" -> Icons.Rounded.SettingsSuggest
+    "App updates", "Server", "Health", "Logs", "Server updates", "Session checkpoints" -> Icons.Rounded.SettingsSuggest
     "Profiles & model", "Profiles", "Providers & models" -> Icons.Rounded.AutoAwesome
     "Tools & MCP", "Tools & commands", "MCP servers" -> Icons.Rounded.Build
     "About & licenses", "Licenses" -> Icons.Rounded.Info
@@ -76,12 +77,21 @@ internal val SettingsRowMinHeight = 78.dp
         modifier = Modifier.clickable(role = Role.Button, onClick = onClick).fillMaxWidth().heightIn(min = SettingsRowMinHeight).testTag(compatibilityTag ?: "settings-row:$name"),
     )
 }
+/** Tags older tests and saved routes rely on for renamed hub rows. */
+private fun hubCompatibilityTag(name: String): String? = when (name) {
+    "Connection" -> "settings-connection"
+    "Chat" -> "settings-row:Settings"
+    "Voice & calls" -> "settings-row:Cypher"
+    "Notifications & Keep connected" -> "settings-row:Notifications"
+    "Profiles & model" -> "settings-row:Profiles"
+    else -> null
+}
 @Composable private fun SettingsGroup(title: String, names: List<String>, summaries: Map<String, String>, modifier: Modifier = Modifier, onOpen: (String) -> Unit) {
     Column(modifier.testTag("settings-group:$title"), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text(uiText(title), Modifier.padding(start = 4.dp), style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (title.isNotBlank()) Text(uiText(title), Modifier.padding(start = 4.dp), style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Glass { Column { names.forEachIndexed { index, name ->
             if (index > 0) HorizontalDivider(Modifier.padding(start = 72.dp, end = 16.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f))
-            SettingsRow(name, summaries[name].orEmpty()) { onOpen(settingsRoute(name)) }
+            SettingsRow(name, summaries[name].orEmpty(), hubCompatibilityTag(name)) { onOpen(settingsRoute(name)) }
         } } }
     }
 }
@@ -101,18 +111,8 @@ internal val SettingsRowMinHeight = 78.dp
         } else if (category.isNotBlank()) {
             item { Glass { Column { settingsCategories[category].orEmpty().forEachIndexed { index, name -> if (index > 0) HorizontalDivider(Modifier.padding(start = 72.dp, end = 16.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f)); SettingsRow(name, summaries[name].orEmpty()) { onOpen(settingsRoute(name)) } } } } }
         } else {
-            item { Glass { Column { settingsHubRoutes.forEachIndexed { index, name ->
-                if (index > 0) HorizontalDivider(Modifier.padding(start = 72.dp, end = 16.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f))
-                val compatibilityTag = when (name) {
-                    "Connection" -> "settings-connection"
-                    "Chat" -> "settings-row:Settings"
-                    "Voice & calls" -> "settings-row:Cypher"
-                    "Notifications & Keep connected" -> "settings-row:Notifications"
-                    "Profiles & model" -> "settings-row:Profiles"
-                    else -> null
-                }
-                SettingsRow(name, summaries[name].orEmpty(), compatibilityTag) { onOpen(settingsRoute(name)) }
-            } } } }
+            // One item: every hub row stays composed, so scroll-to and screen readers reach all of them.
+            item { Column(verticalArrangement = Arrangement.spacedBy(20.dp)) { settingsHubSections.forEach { (title, names) -> SettingsGroup(title, names, summaries, onOpen = onOpen) } } }
         }
     }
 }
@@ -165,6 +165,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         installedVersion = BuildConfig.VERSION_NAME, updateName = update.release?.name.orEmpty(), updateReady = update.ready,
         voiceProviderId = phoneVoice?.first.orEmpty(), voiceKeySaved = phoneVoice?.second,
         keepConnectedEnabled = keepConnectedEnabled,
+        assistantName = prefs.assistantName, assistantProfile = prefs.assistantProfile,
     ).withLoaded(data["profile-settings"])
     val summaries = localizedSettingsSummaries(snapshot)
     SettingsOverview(summaries, { vm.more(it) }, category)
@@ -205,11 +206,12 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
             SettingsHome(vm, page.removePrefix("category:"))
         }
         page == "Settings" -> NativeChatPreferences(vm)
-        page in setOf("Appearance", "Connection", "Cypher", "Notifications", "App updates", "Licenses") -> Column(Modifier.fillMaxSize()) {
+        page in setOf("Appearance", "Assistant", "Connection", "Cypher", "Notifications", "App updates", "Licenses") -> Column(Modifier.fillMaxSize()) {
             // Fixed route names only reach this branch; Skills/Bots are handled above and keep their own headers.
             Header(uiText(settingsLabel(page)), back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current)
             when (page) {
                 "Cypher" -> CypherSettings(vm, pluginStatus == "absent")
+                "Assistant" -> AssistantSettings(vm)
                 "Appearance" -> AppearanceSettings(vm)
                 "Connection" -> ConnectionSettings(vm)
                 "Notifications" -> NotificationSettings(vm)
@@ -233,8 +235,8 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
             item { LabeledToggle("Format your messages", settings.optBoolean("render_user_markdown", true), { vm.nativePreferences(json("render_user_markdown" to it)) }, "Render Markdown while preserving the original source.") }
             item { LabeledToggle("Show thinking", settings.optBoolean("show_thinking", true), { vm.nativePreferences(json("show_thinking" to it)) }, "Show available reasoning disclosures. This does not change model reasoning effort.") }
             item { LabeledToggle("Auto-follow streaming", settings.optBoolean("auto_scroll_follow", true), { vm.nativePreferences(json("auto_scroll_follow" to it)) }, "Keep the latest streaming reply in view.") }
-            item { LabeledToggle("Background animation", settings.optBoolean("animate_background", true), { vm.nativePreferences(json("animate_background" to it)) }, "Turn it off to pause the Cypher sphere. Reduce motion can also pause it.") }
-            item { Text("Send starts a reply. Queue waits until the current reply finishes. Guide adds direction to the running reply.", style = MaterialTheme.typography.bodyMedium) }
+            item { LabeledToggle("Background animation", settings.optBoolean("animate_background", true), { vm.nativePreferences(json("animate_background" to it)) }, assistantText("Turn it off to pause the Cypher sphere. Reduce motion can also pause it.")) }
+            item { Text("While a reply runs, Queue waits for it and Guide steers it.", style = MaterialTheme.typography.bodyMedium) }
         }
     }
 }
@@ -324,11 +326,11 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
             }
         }
         if (!previewBuild) {
-            Text("Cypher checks, downloads and verifies the release. Confirm installation in Android to finish.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Cypher downloads and verifies the update; Android asks you to install it.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (!alertsAllowed) OutlinedButton(onClick = {
                 context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
             }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Allow update notifications") }
-            Text("Keep Tailscale connected for background checks. Android may delay checks to save battery.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Background checks need Tailscale.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
     }

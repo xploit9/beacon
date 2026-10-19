@@ -69,11 +69,11 @@ import kotlinx.coroutines.launch
             onLogFile = vm.phoneSettings::logFile, onLogSearch = vm.phoneSettings::logSearch, onReviewUnknown = { reviewUnknown = true })
     }
     if (confirm) AlertDialog(onDismissRequest = { confirm = false }, title = { Text("Update Hermes on your computer?") },
-        text = { Text("The dashboard and gateways may reconnect. Finish active work before applying the update.") },
+        text = { Text("Hermes may reconnect while updating.") },
         confirmButton = { TextButton(onClick = { confirm = false; if (!vm.app.calls.state.value.active) vm.phoneSettings.applyServerUpdate() else vm.notice("End the current call before updating Hermes.") }) { Text("Apply update") } },
         dismissButton = { TextButton(onClick = { confirm = false }) { Text("Cancel") } })
     if (reviewUnknown) AlertDialog(onDismissRequest = { reviewUnknown = false }, title = { Text("Check the server before retrying") },
-        text = { Text("Hermes reports that no update is running, but has not confirmed this attempt’s result. Clear the pending status and check the installed version. This does not undo server changes.") },
+        text = { Text("The update's result is unknown. Check the installed version.") },
         confirmButton = { TextButton(onClick = { reviewUnknown = false; vm.phoneSettings.clearReviewedUpdate() }) { Text("Check current version") } },
         dismissButton = { TextButton(onClick = { reviewUnknown = false }) { Text("Keep waiting") } })
 }

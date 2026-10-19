@@ -31,7 +31,7 @@ import dev.hermes.android.data.NativeBotsState
             val bot = state.selected
             item { Text(bot.title, style = MaterialTheme.typography.titleLarge); TextButton(onClick = onBack, enabled = !state.saving && !state.editing) { Text("All profiles") } }
             item { Text("Purpose", style = MaterialTheme.typography.titleMedium); SelectionContainer { Text(bot.description.ifBlank { "No purpose description has been written. Native Hermes uses this description to help route Kanban work." }) } }
-            item { Text("Default model", style = MaterialTheme.typography.titleMedium); Text("${bot.provider.ifBlank { "Provider not set" }} · ${bot.model.ifBlank { "Model not set" }}"); Text("Changes set this profile’s default for new chats. Existing conversation model overrides remain separate.", style = MaterialTheme.typography.bodyMedium) }
+            item { Text("Default model", style = MaterialTheme.typography.titleMedium); Text("${bot.provider.ifBlank { "Provider not set" }} · ${bot.model.ifBlank { "Model not set" }}"); Text("Default for new chats in this profile.", style = MaterialTheme.typography.bodyMedium) }
             if (state.editing) {
                 item {
                     Text("Choose a configured model", style = MaterialTheme.typography.titleMedium)

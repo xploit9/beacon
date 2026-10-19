@@ -22,17 +22,18 @@ internal fun modelSearchMatches(provider: String, id: String, label: String, que
 internal val settingsCategories = linkedMapOf(
     "Profiles & model" to listOf("Profiles", "Providers & models"),
     "Tools & MCP" to listOf("Tools & commands", "MCP servers"),
-    "Health, logs & updates" to listOf("Health", "Logs", "Server updates", "App updates", "Session checkpoints"),
+    "Server" to listOf("Health", "Logs", "Server updates", "Session checkpoints"),
 )
 internal val settingsDescriptions = mapOf(
     "Connection" to "Server and signed-in account",
+    "Assistant" to "Name and profile",
     "Chat" to "Sending and display",
     "Voice & calls" to "Voice provider and calls",
     "Notifications & Keep connected" to "Notification delivery",
     "Appearance" to "Theme and color style",
     "Profiles & model" to "Profiles and models",
     "Tools & MCP" to "Tool groups and MCP servers",
-    "Health, logs & updates" to "Hermes health, logs and updates",
+    "Server" to "Health, logs and updates",
     "About & licenses" to "Version and licenses",
     "Profiles" to "Profile defaults and behavior",
     "Settings" to "Sending and display",
@@ -46,11 +47,14 @@ internal val settingsDescriptions = mapOf(
     "Server updates" to "Check and update Hermes", "Session checkpoints" to "Saved file recovery points", "Licenses" to "Version and licenses",
 )
 
-/** Top-level list follows Relay's section order while every item remains a Cypher route. */
-internal val settingsHubRoutes = listOf(
-    "Connection", "Chat", "Voice & calls", "Notifications & Keep connected", "Appearance", "Profiles & model",
-    "Skills", "Memory", "Tools & MCP", "Health, logs & updates", "About & licenses",
+/** Hub sections in Relay's order (connection first, then Hermes, then the app), with the assistant's own section up front. */
+internal val settingsHubSections = linkedMapOf(
+    "" to listOf("Connection"),
+    "Assistant" to listOf("Assistant", "Voice & calls", "Notifications & Keep connected"),
+    "Hermes" to listOf("Chat", "Profiles & model", "Skills", "Memory", "Tools & MCP", "Server"),
+    "App" to listOf("Appearance", "App updates", "About & licenses"),
 )
+internal val settingsHubRoutes = settingsHubSections.values.flatten()
 /** Search includes both the hub and its focused destinations. */
 internal val settingsSearchRoutes = settingsHubRoutes + settingsCategories.values.flatten()
 // Skills, Memory and Server updates are native Hermes routes; only plugin-backed pages are gated.
@@ -70,7 +74,7 @@ internal fun settingsRoute(name: String): String = when (name) {
 /** Old category names can remain in the per-owner navigation history after a settings rename. */
 internal fun normalizeSettingsPage(page: String): String = when (page) {
     "Models & tools", "category:Models & tools" -> "category:Profiles & model"
-    "Server & support", "category:Server & support" -> "category:Health, logs & updates"
+    "Server & support", "category:Server & support", "Health, logs & updates", "category:Health, logs & updates" -> "category:Server"
     else -> page
 }
 
@@ -92,6 +96,7 @@ internal data class SettingsSnapshot(
     val voiceProviderId: String = "", val voiceKeySaved: Boolean? = null,
     val autoFollow: Boolean? = null, val animateBackground: Boolean? = null,
     val keepConnectedEnabled: Boolean? = null,
+    val assistantName: String = "", val assistantProfile: String = "",
 )
 /**
  * Mirrors the composer's key handling (`ChatScreen.kt` `onPreviewKeyEvent`): it recognises `ctrl_enter`/`ctrl+enter` and
@@ -131,7 +136,8 @@ internal fun settingsSummary(route: String, s: SettingsSnapshot): List<SettingsS
             // Same rule as the Appearance picker: a known skin label translates, an unknown stored key stays verbatim.
             skinLabels[s.colorStyle]?.let { SettingsSummaryPart(it) } ?: literal(s.colorStyle),
         )
-        "App updates", "Health, logs & updates" -> updateSummary()
+        "App updates" -> updateSummary()
+        "Assistant" -> listOfNotNull(literal(s.assistantName), literal(s.assistantProfile))
         "About & licenses" -> literal(s.installedVersion)?.let { listOf(SettingsSummaryPart("Installed"), it) }.orEmpty()
         "Cypher", "Voice & calls" -> s.voiceKeySaved?.let { keySaved ->
             voiceProviderLabels[s.voiceProviderId]?.let { provider ->

@@ -9,8 +9,8 @@ class NativeExperiencePresentationTest {
         assertTrue(runCatching { ensureClipboardFits("a".repeat(150_000), "b".repeat(100_000)) }.exceptionOrNull() is IllegalArgumentException)
     }
     @Test fun nativeMenuNeverAdmitsRetiredMutations() {
-        listOf("Pin", "Duplicate", "Retry last turn", "Approval mode", "Move to project", "Share snapshot", "Import", "Export").forEach { assertFalse(it, nativeConversationAction(it)) }
-        listOf("Rename", "Archive", "Branch", "Undo last turn", "Usage").forEach { assertTrue(it, nativeConversationAction(it)) }
+        listOf("Duplicate", "Retry last turn", "Approval mode", "Move to project", "Share snapshot", "Import", "Export").forEach { assertFalse(it, nativeConversationAction(it)) }
+        listOf("Rename", "Pin", "Archive", "Branch", "Undo last turn", "Usage").forEach { assertTrue(it, nativeConversationAction(it)) }
     }
     @Test fun sharedColumnsIncludeLongBodyCellsAndRaggedRows() {
         assertEquals(listOf(280, 100), tableColumnWidths(listOf(listOf("Name", "Value"), listOf("Long body ".repeat(50), "1"), listOf("Only one"))))

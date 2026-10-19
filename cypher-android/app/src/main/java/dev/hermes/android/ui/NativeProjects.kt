@@ -47,7 +47,7 @@ internal fun nativeProjectDetailCurrent(requestedId: String, returnedId: String)
         val owner = vm.client?.scope ?: return
         vm.openForm(ActionForm("Remove chat from project?", "/api/projects/detach", emptyList(),
             seed = json("id" to selected, "session_id" to id, "scope_key" to owner.session(id).key, "event_id" to java.util.UUID.randomUUID().toString()),
-            explanation = "The chat stays in your history. Its files and working folder are unchanged.", actionLabel = "Remove from project", onResult = { vm.loadNativeProjects(selected) }))
+            explanation = "The chat stays in your history.", actionLabel = "Remove from project", onResult = { vm.loadNativeProjects(selected) }))
     }
     if (folderPicker && project != null) PcFolderPicker(vm, "Link PC folder", onDismiss = { folderPicker = false }, onChoose = { path ->
         folderPicker = false
@@ -162,25 +162,28 @@ internal fun nativeProjectDetailCurrent(requestedId: String, returnedId: String)
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable internal fun ChatProjectPicker(vm: CypherViewModel, onDismiss: () -> Unit) {
+@Composable internal fun ChatProjectPicker(vm: CypherViewModel, sessionId: String, onDismiss: () -> Unit) {
     val ui by vm.ui.collectAsStateWithLifecycle()
-    val chat by vm.chat.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
-    val scope = vm.authenticatedScope()
-    var selected by remember(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf<JSONObject?>(null) }
+    val scope = vm.client?.scope?.session(sessionId)
+    var selected by remember(ui.origin, ui.owner, ui.profile, sessionId) { mutableStateOf<JSONObject?>(null) }
     LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, vm.client) { vm.loadNativeProjects() }
+    LaunchedEffect(sessionId) { vm.loadConversationProject(sessionId) }
+    fun assign(project: JSONObject, path: String) {
+        if (scope == null) vm.notice("Reconnect to choose a project.") else {
+            onDismiss()
+            vm.conversationAction(sessionId, "/api/projects/assign", json("id" to project.getString("id"), "path" to path), "Added to ${project.string("name")}")
+        }
+    }
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp).heightIn(max = 520.dp)) {
-            Text("Projects", style = MaterialTheme.typography.titleLarge)
-            Text("Choose the project folder this chat should work in.", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(vertical = 12.dp))
-            if (scope == null) Text("Reconnect and reopen this conversation before choosing a project.", color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(bottom = 12.dp))
-            val currentId = chat.raw.string("project_id")
-            if (scope != null && currentId.isNotBlank()) TextButton({
+            val current = data["project-of:$sessionId"]?.takeIf { it.string("session_id") == sessionId }?.optJSONObject("project")
+            Text(if (current != null) "Move to project" else "Add to project", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(bottom = 12.dp))
+            if (scope == null) Text("Reconnect to choose a project.", color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(bottom = 12.dp))
+            if (scope != null && current != null) TextButton({
                 onDismiss()
-                vm.openForm(ActionForm("Remove chat from project?", "/api/projects/detach", emptyList(),
-                    seed = json("id" to currentId, "session_id" to scope.session, "scope_key" to scope.key, "event_id" to java.util.UUID.randomUUID().toString()),
-                    explanation = "The chat stays in your history. Its files and working folder are unchanged.", actionLabel = "Remove from project"))
-            }) { Icon(Icons.Rounded.FolderOff, null); Text("Remove from current project", Modifier.padding(start = 8.dp)) }
+                vm.conversationAction(sessionId, "/api/projects/detach", json("id" to current.string("id")), "Removed from ${current.string("name")}")
+            }) { Icon(Icons.Rounded.FolderOff, null); Text("Remove from ${current.string("name")}", Modifier.padding(start = 8.dp)) }
             LazyColumn(Modifier.weight(1f, fill = false)) {
                 val record = data["native-projects"]
                 if (record == null || record.optBoolean("_loading")) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
@@ -188,19 +191,15 @@ internal fun nativeProjectDetailCurrent(requestedId: String, returnedId: String)
                 else if (selected == null) {
                     val projects = record.rows("projects").filterNot { it.optBoolean("archived") }
                     if (projects.isEmpty()) item { Text("Create a project and link a folder to get started.") }
-                    items(projects, key = { it.getString("id") }) { project -> ActionRow(project.string("name"), "${project.rows("folders").size} linked folder${if (project.rows("folders").size == 1) "" else "s"}") { selected = project } }
+                    items(projects, key = { it.getString("id") }) { project -> ActionRow(project.string("name"), "${project.rows("folders").size} linked folder${if (project.rows("folders").size == 1) "" else "s"}") {
+                        // One folder: nothing to choose, so the chat moves there at once.
+                        project.rows("folders").singleOrNull()?.let { assign(project, it.getString("path")) } ?: run { selected = project }
+                    } }
                 } else {
                     item { TextButton(onClick = { selected = null }) { Text("All projects") } }
                     if (selected!!.rows("folders").isEmpty()) item { Text("Link a PC folder to this project before moving a chat here.") }
                     items(if (scope == null) emptyList() else selected!!.rows("folders"), key = { it.getString("path") }) { folder ->
-                        ActionRow(folder.string("label").ifBlank { folder.getString("path") }, if (folder.optBoolean("is_primary")) "Main folder" else "") {
-                            if (scope == null) vm.notice("Reconnect and reopen this conversation before choosing a project.") else {
-                                val chosen = selected!!
-                                onDismiss()
-                                vm.openForm(ActionForm("Move chat to ${chosen.string("name")}?", "/api/projects/assign", emptyList(), seed = json("id" to chosen.getString("id"), "path" to folder.getString("path"), "session_id" to scope.session, "scope_key" to scope.key),
-                                    explanation = "Hermes will use ${folder.getString("path")} as this conversation’s working folder. Existing messages and your draft stay here.", actionLabel = "Move chat"))
-                            }
-                        }
+                        ActionRow(folder.string("label").ifBlank { folder.getString("path") }, if (folder.optBoolean("is_primary")) "Main folder" else "") { assign(selected!!, folder.getString("path")) }
                     }
                 }
             }

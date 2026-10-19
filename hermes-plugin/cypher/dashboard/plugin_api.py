@@ -947,11 +947,3 @@ async def get_voice_history(stored_id:str,request:Request):
 
 router.include_router(sys.modules['cypher_callback_api'].build_router(call,body,feature,mobile,native,sys.modules['cypher_callbacks']))
 
-@router.post('/mobile/projects/detach')
-async def detach_mobile_project(request:Request):
-    owner,provider,profile,cfg=identity(request)
-    value=await body(request,4096)
-    if set(value)!={'session_key','expected_project_id','event_id'} or any(not isinstance(v,str) or not v or len(v)>256 for v in value.values()):
-        raise HTTPException(400,'Choose a conversation and its current project')
-    await feature(native.verify,owner,provider,profile,value['session_key'],timeout=6)
-    return await feature(native.rpc,owner,provider,'sessions.project.clear',dict(value,profile=profile),timeout=8)
