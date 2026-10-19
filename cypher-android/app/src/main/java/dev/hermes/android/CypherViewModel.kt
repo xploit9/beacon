@@ -2098,6 +2098,17 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             state.copy(callMessages = mergeVoiceTranscripts(archive, live, state.messages.map { it.id }.toSet()))
         }
     }
+    internal fun firstCallTranscript(callId: String): CallTranscript? {
+        if (callId.isBlank()) return null
+        val scope = sourceScope ?: return null
+        val state = _chat.value
+        if (scope.copy(session = "") != client?.scope || state.sessionId != scope.session) return null
+        return archivedVoiceTranscripts(scope, json(
+            "session_id" to state.raw.string("session_id"),
+            "profile" to state.raw.string("profile"),
+            "events" to state.raw.optJSONArray("voice_transcripts"),
+        )).firstOrNull { it.eventId.startsWith("$callId:") && it.text.isNotBlank() }
+    }
     private fun reconcileCallConversation(call: CallState) {
         val scope = sourceScope ?: return
         val active = client ?: return

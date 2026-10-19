@@ -14,7 +14,6 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.hermes.android.core.*
 import dev.hermes.android.ui.*
-import dev.hermes.android.voice.CallTranscript
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -57,9 +56,13 @@ class CallHistoryUiTest {
             .put(json("id" to callId, "direction" to "outgoing", "state" to "completed", "started_at" to now,
                 "duration_s" to 83, "provider" to "gemini", "conversation_id" to "chat-a", "reason" to null, "has_transcript" to true))
             .put(json("id" to "call-history-missed", "direction" to "incoming", "state" to "missed", "started_at" to now - 60,
-                "duration_s" to null, "provider" to null, "conversation_id" to "chat-a", "reason" to "No answer", "has_transcript" to false)), "next" to null)
-        val messages = (1..45).map { Message("saved-$it", "user", "Saved history item $it", sessionId = "chat-a") }
-        val transcript = CallTranscript("$callId:user:turn-1", "user", "Transcript from completed call")
+                "duration_s" to null, "provider" to null, "conversation_id" to "chat-b", "reason" to "No answer", "has_transcript" to false)), "next" to null)
+        val messages = buildList {
+            (1..45).forEach { index ->
+                if (index == 23) add(Message("stored-call-row", "user", "Transcript from completed call", sessionId = "chat-a"))
+                add(Message("saved-$index", "user", "Saved history item $index", sessionId = "chat-a"))
+            }
+        }
         val store = ViewModelStore()
         lateinit var vm: CypherViewModel
         try {
@@ -71,6 +74,14 @@ class CallHistoryUiTest {
                 field(vm, "sourceScope", chatScope)
                 app.calls.ownerScope = ownerCache
                 val snapshot = fixture.snapshot("chat-a")
+                    .put("profile", ownerCache.profile)
+                    .put("session_id", "chat-a")
+                    .put("voice_transcripts", JSONArray().put(json(
+                        "call_id" to callId, "event_id" to "$callId:user:turn-1", "session_id" to "chat-a",
+                        "role" to "user", "text" to "Transcript from completed call", "message_id" to "stored-call-row",
+                        "final" to true,
+                    )))
+                fixture.snapshot("chat-b")
                 flow<AppState>(vm, "_ui").value = AppState(
                     origin = ownerCache.origin, authenticated = true, profile = ownerCache.profile, chatProfile = ownerCache.profile,
                     owner = ownerCache.owner, tab = "Cypher", connected = false, restoringSession = false,
@@ -79,7 +90,7 @@ class CallHistoryUiTest {
                 )
                 flow<ChatState>(vm, "_chat").value = ChatState(
                     sessionId = "chat-a", title = "Travel planning", raw = snapshot, messages = messages,
-                    callMessages = listOf(transcript), projectionReady = true,
+                    projectionReady = true,
                 )
             }
             compose.setContent {
@@ -90,7 +101,6 @@ class CallHistoryUiTest {
                 } }
             }
 
-            compose.onNodeWithText("Saved history item 1").performScrollTo()
             compose.onNodeWithText("Transcript from completed call").assertDoesNotExist()
             compose.onNodeWithContentDescription("Conversation actions").performClick()
             compose.onNodeWithTag("call-history-open").performClick()
@@ -100,9 +110,15 @@ class CallHistoryUiTest {
             }
             compose.onNodeWithText("Outgoing call").assertExists()
             compose.onNodeWithText("Missed call").assertExists()
+            compose.onNodeWithText("1:23").assertExists()
             compose.onNodeWithTag("call-history-row:$callId").performClick()
             compose.waitUntil(5_000) { compose.onAllNodesWithText("Transcript from completed call").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("Transcript from completed call").assertIsDisplayed()
+            compose.onNodeWithContentDescription("Conversation actions").performClick()
+            compose.onNodeWithTag("call-history-open").performClick()
+            compose.waitUntil(10_000) { compose.onAllNodesWithText("Missed call").fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithTag("call-history-row:call-history-missed").performClick()
+            compose.waitUntil(5_000) { vm.chat.value.sessionId == "chat-b" }
         } finally {
             compose.runOnUiThread { store.clear(); fixture.client.closeNative(); app.calls.ownerScope = priorCallOwnerScope }
             runBlocking {

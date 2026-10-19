@@ -87,7 +87,8 @@ def _initialize_schema(conn):
     conn.execute('PRAGMA journal_mode=WAL')
     conn.executescript('''
     CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value BLOB);
-    CREATE TABLE IF NOT EXISTS calls(id TEXT PRIMARY KEY, owner TEXT, profile TEXT, conversation TEXT, created REAL, closed INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', receipt TEXT DEFAULT '{}');
+    CREATE TABLE IF NOT EXISTS calls(id TEXT PRIMARY KEY, owner TEXT, profile TEXT, conversation TEXT, created REAL, ended REAL, closed INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', receipt TEXT DEFAULT '{}');
+    CREATE TABLE IF NOT EXISTS call_log(id TEXT PRIMARY KEY, owner TEXT, profile TEXT, conversation TEXT, created REAL, expires REAL, state TEXT DEFAULT 'pending', call_id TEXT, reason TEXT DEFAULT '');
     CREATE TABLE IF NOT EXISTS timeline(call_id TEXT,event_id TEXT,digest TEXT,payload TEXT,PRIMARY KEY(call_id,event_id));
     CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,call_id TEXT,owner TEXT,profile TEXT,stored TEXT,runtime TEXT,request TEXT,title TEXT,callback INTEGER,epoch TEXT,seq INTEGER,status TEXT DEFAULT 'watching',UNIQUE(owner,profile,request));
     CREATE TABLE IF NOT EXISTS targets(id TEXT PRIMARY KEY,owner TEXT,profile TEXT,token TEXT,expires REAL,payload TEXT);
@@ -96,10 +97,12 @@ def _initialize_schema(conn):
     CREATE TABLE IF NOT EXISTS notice_deliveries(event TEXT REFERENCES notices(id) ON DELETE CASCADE,target TEXT REFERENCES targets(id) ON DELETE CASCADE,accepted REAL DEFAULT 0,attempts INTEGER DEFAULT 0,next_attempt REAL DEFAULT 0,last_error TEXT DEFAULT '',PRIMARY KEY(event,target));
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS owned_voice_calls ON calls(owner,profile,conversation,created DESC)')
+    conn.execute('CREATE INDEX IF NOT EXISTS owned_call_log ON call_log(owner,profile,created DESC)')
     conn.execute("CREATE INDEX IF NOT EXISTS transcript_versions ON timeline(call_id,json_extract(payload,'$.type'),json_extract(payload,'$.role'),json_extract(payload,'$.turn_id'),json_extract(payload,'$.final'),json_extract(payload,'$.at_ms'))")
     call_columns={r[1] for r in conn.execute('PRAGMA table_info(calls)')}
     if 'voice_config' not in call_columns: conn.execute("ALTER TABLE calls ADD COLUMN voice_config TEXT NOT NULL DEFAULT '{}'")
     if 'callback_context' not in call_columns: conn.execute("ALTER TABLE calls ADD COLUMN callback_context TEXT NOT NULL DEFAULT '{}'")
+    if 'ended' not in call_columns: conn.execute('ALTER TABLE calls ADD COLUMN ended REAL')
     columns={r[1] for r in conn.execute('PRAGMA table_info(jobs)')}
     for name in ('result','error'):
         if name not in columns: conn.execute('ALTER TABLE jobs ADD COLUMN '+name+" TEXT DEFAULT ''")
@@ -113,6 +116,27 @@ def _initialize_schema(conn):
     if 'job_id' not in notice_columns: conn.execute("ALTER TABLE notices ADD COLUMN job_id TEXT DEFAULT ''")
     for name in ('activity_key','runtime','request_id'):
         if name not in notice_columns: conn.execute('ALTER TABLE notices ADD COLUMN '+name+" TEXT DEFAULT ''")
+    conn.execute('''
+    CREATE TRIGGER IF NOT EXISTS cypher_call_log_notice_insert AFTER INSERT ON notices
+    WHEN NEW.kind='incoming_call'
+    BEGIN
+        INSERT OR IGNORE INTO call_log(id,owner,profile,conversation,created,expires,state,call_id,reason)
+        VALUES(NEW.id,NEW.owner,NEW.profile,NEW.conversation,NEW.created,NEW.expires,NEW.state,NEW.call_id,NEW.reason);
+    END;
+    ''')
+    conn.execute('''
+    CREATE TRIGGER IF NOT EXISTS cypher_call_log_notice_update
+    AFTER UPDATE OF owner,profile,conversation,created,expires,state,call_id,reason ON notices
+    WHEN NEW.kind='incoming_call'
+    BEGIN
+        UPDATE call_log SET owner=NEW.owner,profile=NEW.profile,conversation=NEW.conversation,
+            created=NEW.created,expires=NEW.expires,state=NEW.state,call_id=NEW.call_id,reason=NEW.reason
+        WHERE id=NEW.id;
+    END;
+    ''')
+    if not conn.execute("SELECT 1 FROM meta WHERE key='incoming_call_log_migrated'").fetchone():
+        conn.execute("INSERT OR IGNORE INTO call_log(id,owner,profile,conversation,created,expires,state,call_id,reason) SELECT id,owner,profile,conversation,created,expires,state,call_id,reason FROM notices WHERE kind='incoming_call'")
+        conn.execute("INSERT INTO meta(key,value) VALUES('incoming_call_log_migrated','1')")
     deferred_columns={r[1] for r in conn.execute('PRAGMA table_info(deferred)')}
     if 'reason' not in deferred_columns: conn.execute("ALTER TABLE deferred ADD COLUMN reason TEXT DEFAULT ''")
 
@@ -184,6 +208,9 @@ def _prune_history(conn,owner,days,now):
     if days<=0: return 0
     cutoff=now-days*86400
     removed_events=removed_calls=0
+    removed_logs=conn.execute("""DELETE FROM call_log WHERE rowid IN
+        (SELECT rowid FROM call_log WHERE owner=? AND created<? ORDER BY created,id LIMIT ?)""",
+        (owner,cutoff,HISTORY_RETENTION_CALLS_PER_BATCH)).rowcount
     while removed_events<HISTORY_RETENTION_EVENTS_PER_BATCH and removed_calls<HISTORY_RETENTION_CALLS_PER_BATCH:
         call=conn.execute("""SELECT c.id,c.profile FROM calls c
             WHERE c.owner=? AND c.closed=1 AND c.created<?
@@ -206,7 +233,7 @@ def _prune_history(conn,owner,days,now):
             AND NOT EXISTS (SELECT 1 FROM jobs WHERE call_id=?)""",(call_id,owner,profile,cutoff,call_id)).rowcount
         if not deleted: break
         removed_calls+=deleted
-    return removed_events+removed_calls
+    return removed_events+removed_calls+removed_logs
 
 def prune_history(owner):
     now=time.time()
@@ -242,6 +269,7 @@ def call_lock(call_id):
         return lock
 
 def prune_notices(conn):
+    prune_call_history(conn)
     # Move legacy answered invitation metadata into its owned call before pruning
     # the delivery outbox; call, timeline and job history use separate retention.
     rows=conn.execute("SELECT n.* FROM notices n JOIN calls c ON c.id=n.call_id AND c.owner=n.owner AND c.profile=n.profile WHERE n.state='answered' AND n.expires<? AND c.callback_context='{}'",(time.time(),)).fetchall()
@@ -250,6 +278,11 @@ def prune_notices(conn):
         conn.execute('UPDATE calls SET callback_context=? WHERE id=?',(json.dumps(context),row['call_id']))
     # Keep expired native-request admission until it settles; polling must not renew an old action.
     conn.execute("DELETE FROM notices WHERE expires<? AND NOT(activity_key!='' AND state='pending' AND kind IN ('working','approval','clarify'))",(time.time(),))
+
+
+def prune_call_history(conn,now=None):
+    now=time.time() if now is None else now
+    return conn.execute("UPDATE call_log SET state='missed' WHERE state='pending' AND expires<=?",(now,)).rowcount
 
 
 def ident(value):
@@ -358,8 +391,9 @@ def finalize(call_id,owner,body):
         receipt['incomplete']=incomplete or any(r['type']=='upload_gap' for r in rows)
         receipt['complete']=not receipt['unfinalized_transcripts'] and not receipt['incomplete']
         state='saved' if receipt['complete'] else 'partial'
-        conn.execute('UPDATE calls SET status=?,closed=1,receipt=? WHERE id=?',(state,json.dumps(receipt),call_id))
-        call.update(status=state,closed=1,receipt=json.dumps(receipt))
+        ended=time.time()
+        conn.execute('UPDATE calls SET status=?,closed=1,ended=COALESCE(ended,?),receipt=? WHERE id=?',(state,ended,json.dumps(receipt),call_id))
+        call.update(status=state,closed=1,ended=call['ended'] or ended,receipt=json.dumps(receipt))
         return status(call)
 
 def invitation(owner,profile,conversation,reason=None):

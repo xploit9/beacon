@@ -59,9 +59,10 @@ def _page(mobile, owner, profile, limit, before):
         ).fetchall()
 
     with mobile.LOCK, mobile.connect() as conn:
+        mobile.prune_call_history(conn, now)
         calls = query(
             'calls c',
-            "c.id,c.conversation,c.created,c.closed,c.status,c.voice_config,"
+            "c.id,c.conversation,c.created,c.ended,c.closed,c.status,c.voice_config,"
             "COALESCE(NULLIF(c.callback_context,'{}'),(SELECT json_object('id',n.id,'reason',n.reason) "
             "FROM notices n WHERE n.call_id=c.id AND n.owner=c.owner AND n.profile=c.profile "
             "AND n.state='answered' ORDER BY n.created DESC LIMIT 1),'{}') AS callback_context,"
@@ -69,9 +70,10 @@ def _page(mobile, owner, profile, limit, before):
             "AND json_extract(t.payload,'$.type')='transcript') AS has_transcript",
             '', (),
         )
-        notices = query(
-            'notices n', 'n.id,n.conversation,n.created,n.expires,n.state,n.reason',
-            " AND n.kind='incoming_call' AND n.state IN ('pending','declined')", (),
+        call_logs = query(
+            'call_log l', 'l.id,l.call_id,l.conversation,l.created,l.expires,l.state,l.reason',
+            " AND (l.state!='answered' OR NOT EXISTS (SELECT 1 FROM calls c "
+            "WHERE c.id=l.call_id AND c.owner=l.owner AND c.profile=l.profile))", (),
         )
 
     rows = []
@@ -84,19 +86,24 @@ def _page(mobile, owner, profile, limit, before):
             continue
         callback = _stored_object(row['callback_context'])
         voice = _stored_object(row['voice_config'])
+        try:
+            ended = float(row['ended']) if row['ended'] is not None else None
+            duration = max(0, int(ended - created)) if ended is not None and math.isfinite(ended) else None
+        except (TypeError, ValueError, OverflowError):
+            duration = None
         rows.append({
             '_created': created,
             'id': row['id'],
             'direction': 'incoming' if callback.get('id') else 'outgoing',
             'state': 'active' if not row['closed'] else 'failed' if row['status'] == 'failed' else 'completed',
             'started_at': int(created),
-            'duration_s': None,
+            'duration_s': duration,
             'provider': voice.get('provider') if isinstance(voice.get('provider'), str) else None,
             'conversation_id': row['conversation'],
             'reason': (callback['reason'][:120] or None) if isinstance(callback.get('reason'), str) else None,
             'has_transcript': bool(row['has_transcript']),
         })
-    for row in notices:
+    for row in call_logs:
         try:
             created = float(row['created'])
             expires = float(row['expires'])
@@ -104,12 +111,14 @@ def _page(mobile, owner, profile, limit, before):
                 continue
         except (TypeError, ValueError):
             continue
-        state = 'missed' if row['state'] == 'pending' and expires <= now else 'active' if row['state'] == 'pending' else 'declined'
+        state = 'missed' if row['state'] == 'pending' and expires <= now else 'active' if row['state'] == 'pending' else row['state']
+        if state not in {'active', 'missed', 'declined', 'answered'}:
+            continue
         rows.append({
             '_created': created,
-            'id': row['id'],
+            'id': row['call_id'] or row['id'],
             'direction': 'incoming',
-            'state': state,
+            'state': 'completed' if state == 'answered' else state,
             'started_at': int(created),
             'duration_s': None,
             'provider': None,

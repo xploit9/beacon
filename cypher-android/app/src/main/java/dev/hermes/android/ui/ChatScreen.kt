@@ -391,12 +391,20 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
         }
         if (!position.third) ownerScrolling = false
     } }
-    LaunchedEffect(list, callHistoryTargetSession, callHistoryTargetId, chat.sessionId, chat.projectionReady, chat.callMessages) {
+    LaunchedEffect(list, callHistoryTargetSession, callHistoryTargetId, chat.sessionId, chat.projectionReady, chat.callMessages, chat.messages, chat.raw) {
         if (callHistoryTargetId.isBlank() || callHistoryTargetSession != chat.sessionId || !chat.projectionReady) return@LaunchedEffect
-        val event = chat.callMessages.firstOrNull {
+        val event = vm.firstCallTranscript(callHistoryTargetId) ?: chat.callMessages.firstOrNull {
             it.eventId.startsWith("$callHistoryTargetId:user:") || it.eventId.startsWith("$callHistoryTargetId:assistant:")
-        } ?: return@LaunchedEffect
-        val index = messages.indexOfFirst { it.id == "call:${event.eventId}" }
+        }
+        if (event == null) {
+            callHistoryTargetSession = ""
+            callHistoryTargetId = ""
+            return@LaunchedEffect
+        }
+        val rowId = chat.callMessages.firstOrNull { it.eventId == event.eventId }?.let { "call:${event.eventId}" }
+            ?: listOf(event.messageId, event.eventId).firstOrNull { id -> id.isNotBlank() && messages.any { it.id == id } }
+            ?: return@LaunchedEffect
+        val index = messages.indexOfFirst { it.id == rowId }
         if (index >= 0) {
             showSearch = false
             search = ""
@@ -629,6 +637,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
         showCallHistorySheet = false
         showSearch = false
         search = ""
+        follow = false
         callHistoryTargetSession = conversationId
         callHistoryTargetId = callId
         if (conversationId != chat.sessionId) vm.selectSession(conversationId)

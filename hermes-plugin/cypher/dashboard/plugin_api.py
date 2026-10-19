@@ -269,7 +269,8 @@ async def get_call(call_id:str,request:Request):
 @router.delete('/mobile/calls/{call_id}')
 async def close_call(call_id:str,request:Request):
     owner,provider,row,cfg=await call(request,call_id)
-    with mobile.LOCK,mobile.connect() as conn: conn.execute('UPDATE calls SET closed=1 WHERE id=?',(call_id,))
+    ended=time.time()
+    with mobile.LOCK,mobile.connect() as conn: conn.execute('UPDATE calls SET closed=1,ended=COALESCE(ended,?) WHERE id=? AND owner=? AND profile=?',(ended,call_id,owner,row['profile']))
     await asyncio.to_thread(watch,owner,provider,row['profile'])
     row['closed']=1
     clear_lookup_counts(call_id)

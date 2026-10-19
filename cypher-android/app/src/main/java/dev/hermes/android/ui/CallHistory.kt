@@ -38,7 +38,6 @@ private data class CallHistoryEntry(
     val provider: String?,
     val conversationId: String,
     val reason: String?,
-    val hasTranscript: Boolean,
 ) {
     companion object {
         fun from(value: JSONObject) = CallHistoryEntry(
@@ -50,7 +49,6 @@ private data class CallHistoryEntry(
             provider = value.string("provider").takeIf(String::isNotBlank),
             conversationId = value.string("conversation_id"),
             reason = value.string("reason").takeIf(String::isNotBlank),
-            hasTranscript = value.optBoolean("has_transcript"),
         ).takeIf { it.id.isNotBlank() && it.conversationId.isNotBlank() && it.startedAt > 0 }
     }
 }
@@ -150,7 +148,7 @@ private fun CallHistoryRow(call: CallHistoryEntry, onOpen: () -> Unit) {
     }.joinToString(" · ")
     Row(
         Modifier.fillMaxWidth()
-            .then(if (call.hasTranscript) Modifier.clickable(onClick = onOpen) else Modifier)
+            .clickable(onClick = onOpen)
             .testTag("call-history-row:${call.id}")
             .padding(vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,

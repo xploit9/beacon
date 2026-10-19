@@ -86,6 +86,58 @@ def test_call_history_distinguishes_missed_and_answered_incoming_calls(harness):
     assert answered_notice not in rows
 
 
+def test_incoming_outcomes_survive_notice_pruning(harness):
+    api, client, _, _, _ = harness
+    now = time.time()
+    missed = add_invitation(api, 'missed-chat', 'No answer', now - 180, expires=now - 60)
+    declined = add_invitation(api, 'declined-chat', 'Not now', now - 180, state='declined', expires=now - 60)
+    with api.mobile.connect() as conn:
+        api.mobile.prune_notices(conn)
+        assert conn.execute('SELECT COUNT(*) FROM notices WHERE id IN (?,?)', (missed, declined)).fetchone()[0] == 0
+        outcomes = {row['id']: row['state'] for row in conn.execute(
+            'SELECT id,state FROM call_log WHERE id IN (?,?)', (missed, declined))}
+
+    assert outcomes == {missed: 'missed', declined: 'declined'}
+    rows = {row['id']: row for row in history(client)['calls']}
+    assert rows[missed]['state'] == 'missed'
+    assert rows[declined]['state'] == 'declined'
+
+
+def test_missed_invitation_log_obeys_history_retention(harness):
+    api, client, _, _, _ = harness
+    now = time.time()
+    old = add_invitation(api, 'old-missed-chat', 'No answer', now - 31 * 86400,
+                         expires=now - 31 * 86400 + 120)
+    with api.mobile.connect() as conn:
+        api.mobile.prune_notices(conn)
+        assert conn.execute('SELECT state FROM call_log WHERE id=?', (old,)).fetchone()['state'] == 'missed'
+
+    assert api.mobile.set_history_retention_days('owner', 30) == 30
+    with api.mobile.connect() as conn:
+        assert conn.execute('SELECT 1 FROM call_log WHERE id=?', (old,)).fetchone() is None
+    assert old not in {row['id'] for row in history(client)['calls']}
+
+
+def test_call_history_duration_is_recorded_when_call_is_closed(harness):
+    api, client, _, _, _ = harness
+    call_id = add_call(api, created=time.time() - 4)
+
+    response = client.delete(f'{PATH}/{call_id}')
+    assert response.status_code == 200, response.text
+    row = next(row for row in history(client)['calls'] if row['id'] == call_id)
+    assert row['duration_s'] >= 3
+
+
+def test_call_history_duration_is_recorded_when_transcript_finalizes(harness):
+    api, client, _, _, _ = harness
+    call_id = add_call(api, created=time.time() - 4)
+
+    api.mobile.finalize(call_id, 'owner', {'incomplete': False})
+
+    row = next(row for row in history(client)['calls'] if row['id'] == call_id)
+    assert row['duration_s'] >= 3
+
+
 def test_call_history_pages_newest_first_with_a_stable_cursor(harness):
     api, client, _, _, _ = harness
     now = time.time()
