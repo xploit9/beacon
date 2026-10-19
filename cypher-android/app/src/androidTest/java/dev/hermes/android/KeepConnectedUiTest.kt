@@ -146,11 +146,11 @@ class KeepConnectedUiTest {
             }
             showSignInPrompt()
             KeepConnectedService.setEnabled(app, null, false)
-            assertTrue(manager.activeNotifications.none { it.id == 4083 })
+            compose.waitUntil(5_000) { manager.activeNotifications.none { it.id == 4083 } }
             assertTrue(keepPrefs.edit().putString(KeepConnectedService.KEY_ORIGIN, scope.origin).commit())
             showSignInPrompt()
             KeepConnectedService.onUserSignedOut(app, scope.origin)
-            assertTrue(manager.activeNotifications.none { it.id == 4083 })
+            compose.waitUntil(5_000) { manager.activeNotifications.none { it.id == 4083 } }
             app.preferences.edit { values ->
                 values[originKey] = ""
                 values[setupCompleteKey] = true

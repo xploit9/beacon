@@ -1035,15 +1035,14 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         catch (error: Throwable) { if (error is CancellationException) throw error; cleanupFailed = true }
         if (!current()) return
         if (initialShells[owner.key] == id) {
+            // Hermes confirmed this shell is gone, so the create attempt that produced it is settled even when only memory held the pointer.
             try {
-                if (app.cache.read(owner, "new-chat-shell") == id) {
-                    app.cache.delete(owner, "new-chat-shell")
-                    app.cache.delete(owner, "new-chat-attempt")
-                    initialCreateAttempts.remove(owner.key)
-                }
+                if (app.cache.read(owner, "new-chat-shell") == id) app.cache.delete(owner, "new-chat-shell")
+                app.cache.delete(owner, "new-chat-attempt")
             }
             catch (error: Throwable) { if (error is CancellationException) throw error; cleanupFailed = true }
             initialShells.remove(owner.key)
+            initialCreateAttempts.remove(owner.key)
         }
         try { app.cache.delete(scope, "client-created-shell"); app.cache.delete(scope, "session") }
         catch (error: Throwable) { if (error is CancellationException) throw error; cleanupFailed = true }

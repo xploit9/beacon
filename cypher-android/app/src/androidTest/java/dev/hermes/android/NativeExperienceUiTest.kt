@@ -960,7 +960,8 @@ class NativeExperienceUiTest {
             compose.runOnIdle { vm.newChat() }
             await { vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.newChatOpening && vm.chat.value.projectionReady }
             shellId = vm.chat.value.sessionId
-            val creatingRuntime = vm.chat.value.raw.string("runtime_session_id")
+            // The fixture names the runtime it creates for a chat runtime-<id>; the REST projection carries no runtime id.
+            val creatingRuntime = "runtime-" + shellId
             fixture.markUnpromptedShell(shellId)
             runBlocking { app.cache.delete(fixture.scope.session(shellId), "session") }
             compose.runOnIdle { vm.composer(TextFieldValue("Unsent first message")) }
@@ -1000,7 +1001,8 @@ class NativeExperienceUiTest {
 
             await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId != shellId && !vm.ui.value.newChatOpening && vm.chat.value.projectionReady }
             freshId = vm.chat.value.sessionId
-            val freshRuntime = vm.chat.value.raw.string("runtime_session_id")
+            // The fixture names the runtime it creates for a chat runtime-<id>; the REST projection carries no runtime id.
+            val freshRuntime = "runtime-" + freshId
             assertTrue(freshRuntime.isNotBlank())
             assertEquals("Send after the shell expired", vm.composer.value.text)
             assertTrue("The expired shell was resumed", fixture.requests.any {
@@ -2647,7 +2649,8 @@ class NativeExperienceUiTest {
         val subscriptionsBefore = fixture.streamSubscriptions.get()
         compose.runOnIdle { vm.newChat() }
         await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
-        val creatingRuntime = vm.chat.value.raw.string("runtime_session_id")
+        // The fixture names the runtime it creates for a chat runtime-<id>; the REST projection carries no runtime id.
+        val creatingRuntime = "runtime-" + vm.chat.value.sessionId
         fixture.persistTerminalMessages = true
         compose.runOnIdle { vm.composer(TextFieldValue("First prompt")); vm.send() }
         await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId.isNotBlank() }
