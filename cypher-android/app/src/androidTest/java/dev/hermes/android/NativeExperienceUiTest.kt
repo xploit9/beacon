@@ -960,6 +960,7 @@ class NativeExperienceUiTest {
             compose.runOnIdle { vm.newChat() }
             await { vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.newChatOpening && vm.chat.value.projectionReady }
             shellId = vm.chat.value.sessionId
+            val creatingRuntime = vm.chat.value.raw.string("runtime_session_id")
             fixture.markUnpromptedShell(shellId)
             runBlocking { app.cache.delete(fixture.scope.session(shellId), "session") }
             compose.runOnIdle { vm.composer(TextFieldValue("Unsent first message")) }
@@ -971,9 +972,56 @@ class NativeExperienceUiTest {
             assertEquals("Chat", vm.ui.value.tab)
             assertEquals("Unsent first message", vm.composer.value.text)
             assertEquals(0, fixture.requests.count { it.string("method") == "prompt.submit" })
-            receipts += "Leaving Bot Mode returns to an unsent new chat with its draft, without sending or recreating it."
+            compose.runOnIdle { vm.send() }
+            await { fixture.requests.count { it.string("method") == "prompt.submit" } == 1 }
+            val submit = fixture.requests.single { it.string("method") == "prompt.submit" }.getJSONObject("params")
+            assertEquals("Unsent first message", submit.string("text"))
+            assertEquals("The first prompt stays with the runtime that created this chat", creatingRuntime, submit.string("session_id"))
+            assertEquals(1, fixture.requests.count { it.string("method") == "prompt.submit" })
+            receipts += "Leaving Bot Mode returns to its unsent new chat, preserves the draft, and sends exactly one first prompt to the creating runtime."
         } finally {
             if (shellId.isNotBlank()) runBlocking { listOf("client-created-shell", "session", "draft").forEach { app.cache.delete(fixture.scope.session(shellId), it) } }
+        }
+    }
+
+    @Test fun missingUnsentShellFallsBackToFreshSendableChatWithDraft() = withFixture { vm, fixture ->
+        var shellId = ""
+        var freshId = ""
+        runBlocking { listOf("selected-session", "new-chat-shell", "new-chat-attempt", "initial-draft").forEach { app.cache.delete(fixture.scope, it) } }
+        try {
+            compose.runOnIdle { vm.newChat() }
+            await { vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.newChatOpening && vm.chat.value.projectionReady }
+            shellId = vm.chat.value.sessionId
+            fixture.markUnpromptedShell(shellId)
+            fixture.forgetUnpromptedShell(shellId)
+            fixture.client.closeNative()
+            runBlocking { app.cache.delete(fixture.scope.session(shellId), "session") }
+            compose.runOnIdle { vm.composer(TextFieldValue("Send after the shell expired")); vm.selectSession(shellId) }
+
+            await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId != shellId && !vm.ui.value.newChatOpening && vm.chat.value.projectionReady }
+            freshId = vm.chat.value.sessionId
+            val freshRuntime = vm.chat.value.raw.string("runtime_session_id")
+            assertTrue(freshRuntime.isNotBlank())
+            assertEquals("Send after the shell expired", vm.composer.value.text)
+            assertTrue("The expired shell was resumed", fixture.requests.any {
+                it.string("method") == "session.resume" && it.getJSONObject("params").string("session_id") == shellId
+            })
+            assertEquals(0, fixture.requests.count { it.string("method") == "prompt.submit" })
+
+            compose.runOnIdle { vm.send() }
+            await { fixture.requests.count { it.string("method") == "prompt.submit" } == 1 }
+            val submit = fixture.requests.single { it.string("method") == "prompt.submit" }.getJSONObject("params")
+            assertEquals("Send after the shell expired", submit.string("text"))
+            assertEquals(freshRuntime, submit.string("session_id"))
+            assertEquals(1, fixture.requests.count { it.string("method") == "prompt.submit" })
+            receipts += "When Hermes has forgotten an unsent shell, Cypher preserves its draft in a fresh sendable chat and submits once to the new creating runtime."
+        } finally {
+            runBlocking {
+                listOf(shellId, freshId).filter(String::isNotBlank).forEach { id ->
+                    listOf("client-created-shell", "session", "draft", "pending").forEach { app.cache.delete(fixture.scope.session(id), it) }
+                }
+                listOf("selected-session", "new-chat-shell", "new-chat-attempt", "initial-draft").forEach { app.cache.delete(fixture.scope, it) }
+            }
         }
     }
 

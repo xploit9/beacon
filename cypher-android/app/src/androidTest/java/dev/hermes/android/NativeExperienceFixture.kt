@@ -78,6 +78,9 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     fun markUnpromptedShell(id: String) {
         unpromptedShells[id] = sessions.remove(id) ?: error("Synthetic session missing")
     }
+    fun forgetUnpromptedShell(id: String) {
+        check(unpromptedShells.remove(id) != null) { "Synthetic unprompted shell missing" }
+    }
     fun emitIncomingCall(profile: String = "default", conversationId: String = "chat-a", expiresInSeconds: Long = 120): JSONObject {
         require(profile in notificationProfiles)
         val id = java.util.UUID.randomUUID().toString().replace("-", "")

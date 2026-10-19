@@ -1,6 +1,6 @@
 package dev.hermes.android.voice
 
-import dev.hermes.android.voiceKeySetupPageIfMissing
+import dev.hermes.android.voiceKeySetupPage
 import dev.hermes.android.data.voiceProviderSupported
 import org.json.JSONArray
 import org.json.JSONObject
@@ -144,8 +144,7 @@ class RealtimeProvidersTest {
         assertEquals("input_audio_buffer.append", OpenAiWire.audio("AA==").getString("type"))
         assertEquals("AA==", OpenAiWire.audio("AA==").getString("audio"))
         assertTrue(voiceProviderSupported("openai"))
-        assertEquals("Cypher", voiceKeySetupPageIfMissing(false))
-        assertNull(voiceKeySetupPageIfMissing(true))
+        assertEquals("Cypher", voiceKeySetupPage())
         val create = phoneKeyCallBody("openai", "default", "session-1")
         assertEquals("openai", create.getString("voice_provider"))
         assertTrue(create.getBoolean("client_key"))
