@@ -64,6 +64,7 @@ Chat extras from Relay: quote a message into your reply, attach from the camera 
 
 With the Cypher plugin installed:
 - **Voice & calls.** One-tap realtime calls with Gemini Live, Grok or OpenAI Realtime. The provider key is entered in Cypher, stored encrypted on the phone and sent only to that provider, never to Hermes. Call audio is never stored.
+- **Call history.** Open it from the Cypher chat menu to review call entries and jump to saved transcripts.
 - **Keep connected** (Settings → Notifications & Keep connected). A low-importance foreground service keeps a connection to Hermes for each signed-in profile, so Hermes can ring the phone while Cypher is closed. The page shows the connection state and, when it fails, the reason (for example "Hermes refused profile coder (403)").
 - **Keep call and task history** (same page): Forever (default), 1 year, 90 days or 30 days. This applies only to Cypher's own call transcripts and task history on Hermes. Shortening it asks for confirmation, then deletes older closed calls and finished tasks. Hermes conversations, messages, memories and files are never touched.
 

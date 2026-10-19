@@ -58,6 +58,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var rejectRoomSend = false
     val roomEvents = CopyOnWriteArrayList<JSONObject>()
     val roomActions = CopyOnWriteArrayList<JSONObject>()
+    @Volatile var callHistoryResponse = json("calls" to JSONArray(), "next" to "")
     val workspaceFiles = ConcurrentHashMap<String, String>()
     val downloads = ConcurrentHashMap<String, ByteArray>()
     val fileRequests = CopyOnWriteArrayList<String>()
@@ -320,6 +321,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             }
             200 to json("enabled" to (proactiveEnabled[profile] ?: false), "jobs" to JSONArray(), "services" to JSONArray(proactiveServices.map { it.copy() }))
         }
+        path == "/api/plugins/cypher/mobile/calls" -> 200 to callHistoryResponse.copy()
         path == "/api/plugins/cypher/mobile/notifications/events" -> {
             val after = url?.queryParameter("after")?.toLongOrNull() ?: 0L
             val wait = url?.queryParameter("wait")?.toLongOrNull() ?: 0L

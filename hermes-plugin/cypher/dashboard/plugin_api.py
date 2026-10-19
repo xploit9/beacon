@@ -26,7 +26,7 @@ ROOT=Path(__file__).resolve().parent.parent
 _RELEASE_CACHE_LOCK=threading.RLock()
 _RELEASE_CACHE_KEY=None
 _RELEASE_CACHE_VALUE=None
-for name in ('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_api','bot_mode_api','callbacks','callback_api','proactive'):
+for name in ('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_api','bot_mode_api','callbacks','callback_api','call_history_api','proactive'):
     key='cypher_'+name
     if key not in sys.modules:
         spec=importlib.util.spec_from_file_location(key,ROOT/(name+'.py'))
@@ -1002,4 +1002,5 @@ async def proactive_enabled(request:Request):
     return await feature(proactive.set_enabled,mobile,owner,profile,value['enabled'],timeout=30)
 
 router.include_router(sys.modules['cypher_callback_api'].build_router(call,body,feature,mobile,native,sys.modules['cypher_callbacks']))
+router.include_router(sys.modules['cypher_call_history_api'].build_router(identity,mobile))
 

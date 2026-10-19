@@ -309,6 +309,10 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
     val avatarState = dev.hermes.android.ui.sphere.AvatarRenderState(sphereState, sphereIntensity, sphereToolCallBurst, paused = !sphereMotionEnabled)
     val transcriptAvatarState = avatarState.copy(paused = !sphereMotionEnabled || (!sphereStreaming && !sphereHasError))
     var showCallHistory by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(false) }
+    var showCallHistorySheet by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf(false) }
+    var callHistoryTargetSession by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf("") }
+    var callHistoryTargetId by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf("") }
+    BackHandler(showCallHistorySheet) { showCallHistorySheet = false }
     BackHandler(activeHere && showCallHistory) { showCallHistory = false }
     LaunchedEffect(call.active) { if (!call.active) showCallHistory = false }
     LaunchedEffect(ready) { if (!ready) { menu = false; showSearch = false; search = "" } }
@@ -366,6 +370,23 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
         }
         if (!position.third) ownerScrolling = false
     } }
+    LaunchedEffect(list, callHistoryTargetSession, callHistoryTargetId, chat.sessionId, chat.projectionReady, chat.callMessages) {
+        if (callHistoryTargetId.isBlank() || callHistoryTargetSession != chat.sessionId || !chat.projectionReady) return@LaunchedEffect
+        val event = chat.callMessages.firstOrNull {
+            it.eventId.startsWith("$callHistoryTargetId:user:") || it.eventId.startsWith("$callHistoryTargetId:assistant:")
+        } ?: return@LaunchedEffect
+        val index = messages.indexOfFirst { it.id == "call:${event.eventId}" }
+        if (index >= 0) {
+            showSearch = false
+            search = ""
+            follow = false
+            withFrameNanos { }
+            snapshotFlow { list.layoutInfo.totalItemsCount }.first { it > index }
+            list.animateScrollToItem(index)
+            callHistoryTargetSession = ""
+            callHistoryTargetId = ""
+        }
+    }
     val conversationEntry = remember { Animatable(1f) }
     LaunchedEffect(chat.sessionId, cypher, motionEnabled) {
         if (motionEnabled) { conversationEntry.snapTo(.35f); conversationEntry.animateTo(1f, tween(180, easing = FastOutSlowInEasing)) }
@@ -534,6 +555,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
                 if (!cypher && !permanentBotChat) IconButton(onClick = { vm.newChat() }) { Icon(Icons.Rounded.Edit, uiText("New conversation")) }
                 IconButton(onClick = { showSearch = !showSearch; if (activeHere && showSearch) showCallHistory = true }, enabled = canonical) { Icon(Icons.Rounded.Search, uiText("Search this conversation")) }
                 Box { IconButton(onClick = { menu = true }, enabled = ready) { Icon(Icons.Rounded.MoreVert, uiText("Conversation actions")) }; DropdownMenu(menu && ready, { menu = false }, modifier = Modifier.heightIn(max = actionMenuHeight).testTag("conversation-actions-menu")) {
+                    if (cypher) DropdownMenuItem({ Text("Call history") }, { menu = false; showCallHistorySheet = true }, modifier = Modifier.testTag("call-history-open"))
                     conversationActionGroups.entries.forEachIndexed { index, (group, titles) ->
                         if (index > 0) HorizontalDivider()
                         Text(uiText(if (group == "Model and tools") "Tools" else group), Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -575,6 +597,14 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
     side?.takeIf { ready }?.let { question -> AlertDialog(onDismissRequest = vm::closeSideQuestion, title = { Text(uiText("Side question")) }, text = { Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) { Text(question.question, style = MaterialTheme.typography.titleMedium); Text(question.status, color = MaterialTheme.colorScheme.onSurfaceVariant); Markdown(question.text, vm, question.scope.session(question.sessionId), interactive = false) } }, confirmButton = { TextButton(onClick = vm::closeSideQuestion) { Text(uiText("Close")) } }, dismissButton = { TextButton(onClick = vm::resumeSideQuestion) { Text(uiText("Reconnect")) } }) }
     if (canonical) NativeCatalog(vm)
     if (activitySheet && ready) ChatActivitySheet(activity, chat.queued.map { it.text }, onRemoveQueued = { index -> vm.removeQueued(index) }, onDismiss = { activitySheet = false })
+    if (showCallHistorySheet && cypher) CallHistorySheet(vm, onOpenCall = { conversationId, callId ->
+        showCallHistorySheet = false
+        showSearch = false
+        search = ""
+        callHistoryTargetSession = conversationId
+        callHistoryTargetId = callId
+        if (conversationId != chat.sessionId) vm.selectSession(conversationId)
+    }, onDismiss = { showCallHistorySheet = false })
 }
 
 internal fun acceptsInitialConversationEdit(
