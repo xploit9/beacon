@@ -2684,7 +2684,10 @@ class NativeExperienceUiTest {
             await { fixture.streamSubscriptions.get() > subscriptionsBefore + 1 }
             fixture.nativeTurnStatus = "idle"
             fixture.emitNativeEvent("message.complete", json("text" to "Queued follow-up completed"))
-            await { vm.chat.value.messages.any { it.text == "Queued follow-up completed" } && vm.chat.value.streamId.isBlank() }
+            try { await { vm.chat.value.messages.any { it.text == "Queued follow-up completed" } && vm.chat.value.streamId.isBlank() } }
+            catch (error: Throwable) {
+                throw AssertionError("Queued follow-up: stream=${vm.chat.value.streamId} status=${vm.chat.value.status} texts=${vm.chat.value.messages.map { it.text.take(30) }} live=${vm.chat.value.liveText.take(40)} active=${fixture.activeRuntimeForTest()} requests=${recentCalls(fixture)}", error)
+            }
             compose.onNodeWithText("Queued follow-up completed", useUnmergedTree = true).assertIsDisplayed()
             compose.onNodeWithTag("message-input").performClick().performTextInput("Send after recovery")
             compose.onNodeWithTag("message-send").assertIsEnabled().performClick()

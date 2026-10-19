@@ -1657,7 +1657,8 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                             }
                             return@launch
                         }
-                        if (current()) { _ui.update { it.copy(newChatError = initialCreateError) }; fail(e) }
+                        // A shell this phone did not create has no first-prompt ownership to protect: REST 404 is authoritative (F11).
+                        recoverMissingInitialShell(owner, id) { current() && ownsMissingShell() }
                         return@launch
                     }
                     val attempt = java.util.UUID.randomUUID().toString()

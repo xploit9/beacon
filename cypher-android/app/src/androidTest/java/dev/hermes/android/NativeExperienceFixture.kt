@@ -177,6 +177,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             Thread.sleep(10)
         }
     }
+    fun activeRuntimeForTest(): String? = activeNativeSessionId
     fun emitNativeEvent(type: String, payload: JSONObject) {
         val runtime = activeNativeSessionId ?: error("No active native conversation is selected")
         val event = retainNativeEvent(runtime, type, payload)
