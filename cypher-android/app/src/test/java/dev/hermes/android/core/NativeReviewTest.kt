@@ -30,6 +30,9 @@ class NativeReviewTest {
         assertFalse(canonicalConversationReady(owner, xara, xara.session, true, xara.session, opening = true))
         assertFalse(canonicalConversationReady(owner, xara, xara.session, true, xara.session, resolutionError = true))
         assertFalse(canonicalConversationReady(owner.copy(profile = "research"), xara.copy(profile = "research"), xara.session, true, xara.session))
+        // The assistant tab may be bound to another profile in Settings › Assistant.
+        assertTrue(canonicalConversationReady(owner.copy(profile = "research"), xara.copy(profile = "research"), xara.session, true, xara.session, assistantProfile = "research"))
+        assertFalse(canonicalConversationReady(owner, xara, xara.session, true, xara.session, assistantProfile = "research"))
         assertFalse(canonicalConversationReady(null, null, xara.session, true, xara.session))
         assertFalse(canonicalConversationReady(owner, xara, scope.session, true, xara.session))
         assertTrue(canonicalConversationReady(owner, xara, xara.session, true, xara.session))

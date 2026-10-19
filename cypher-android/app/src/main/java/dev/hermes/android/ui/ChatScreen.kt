@@ -241,7 +241,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
         }
     }.collectAsStateWithLifecycle(initialValue = null as Pair<String, String>?)
     val promptText = when {
-        !proactiveLoaded || pluginStatus == "absent" -> ""
+        !proactiveLoaded || pluginStatus != "available" -> ""
         !proactiveEnabled -> assistantText("Let Cypher keep an eye on your day")
         gmailStatus == "missing" -> assistantText("Connect Gmail so Cypher can watch your inbox")
         calendarStatus == "missing" -> assistantText("Connect Google Calendar so Cypher can keep up with your day")
@@ -253,17 +253,17 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
         else -> "${Scope(ui.origin, ui.owner, preferences.assistantProfile).key}|on|gmail:$gmailStatus|google_calendar:$calendarStatus"
     }
     val promptDismissed = promptMemory?.let { it.first == promptSignature && it.second == promptSignature } == true
-    val showProactivePrompt = xara && ui.tab == "Xara" && pluginStatus != "absent" && promptMemory != null && promptText.isNotBlank() && !promptDismissed
+    val showProactivePrompt = xara && ui.tab == "Xara" && pluginStatus == "available" && promptMemory != null && promptText.isNotBlank() && !promptDismissed
     val canonical = ready && chat.sessionId.isNotBlank()
     val permanentBotChat = ui.botModeEnabled && ui.tab == "More" && ui.morePage == "Bots"
     val activeHere = call.active && call.conversationScope == vm.authenticatedScope()
     val scope = rememberCoroutineScope()
     LaunchedEffect(promptSignature, promptText, promptMemory) {
-        if (pluginStatus != "absent" && promptSignature.isNotBlank() && promptText.isBlank() && promptMemory?.let { it.first != promptSignature } == true)
+        if (pluginStatus == "available" && promptSignature.isNotBlank() && promptText.isBlank() && promptMemory?.let { it.first != promptSignature } == true)
             proactiveContext.preferences.edit { it[proactivePromptDismissedKey] = json("state" to promptSignature, "dismissed" to "").toString() }
     }
     LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, ui.tab, preferences.assistantProfile, pluginStatus) {
-        if (xara && ui.tab == "Xara" && ui.connected && ui.profile == preferences.assistantProfile && pluginStatus != "absent")
+        if (xara && ui.tab == "Xara" && ui.connected && ui.profile == preferences.assistantProfile && pluginStatus == "available")
             vm.load(proactiveKey, PROACTIVE_SETTINGS_PATH, mapOf("profile" to preferences.assistantProfile), force = false)
     }
     var menu by remember { mutableStateOf(false) }

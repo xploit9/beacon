@@ -1883,11 +1883,11 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     }
     fun isCypherConversation(): Boolean {
         val owner = client?.scope ?: cachedOwnerScope
-        return canonicalConversationReady(owner, sourceScope, _chat.value.sessionId, true, owner?.let { saved.get<String>("xara:${it.key}") }, _ui.value.xaraOpening, _ui.value.xaraError.isNotBlank())
+        return canonicalConversationReady(owner, sourceScope, _chat.value.sessionId, true, owner?.let { saved.get<String>("xara:${it.key}") }, _ui.value.xaraOpening, _ui.value.xaraError.isNotBlank(), preferences.value.assistantProfile)
     }
     private fun admitConversation(): Boolean {
         val owner = client?.scope ?: cachedOwnerScope
-        val ready = canonicalConversationReady(owner, sourceScope, _chat.value.sessionId, _ui.value.tab == "Xara", owner?.let { saved.get<String>("xara:${it.key}") }, _ui.value.xaraOpening, _ui.value.xaraError.isNotBlank())
+        val ready = canonicalConversationReady(owner, sourceScope, _chat.value.sessionId, _ui.value.tab == "Xara", owner?.let { saved.get<String>("xara:${it.key}") }, _ui.value.xaraOpening, _ui.value.xaraError.isNotBlank(), preferences.value.assistantProfile)
         if (!ready) notice(if (_ui.value.tab == "Xara") "Open Cypher's conversation before sending or changing it. Your scoped draft is retained." else "Open a conversation before continuing.")
         return ready
     }

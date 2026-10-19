@@ -1194,6 +1194,8 @@ class NativeExperienceUiTest {
             await { vm.ui.value.tab == "Xara" && vm.ui.value.profile == "coder" && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady && vm.chat.value.sessionId.startsWith("new-") }
             assertTrue("The assistant's conversation is created in its profile", fixture.requests.any { it.string("method") == "session.create" && it.optJSONObject("params")?.string("profile") == "coder" })
             assertEquals("The drawer keeps the chats' profile", "default", vm.ui.value.chatProfile)
+            assertTrue("The borrowed profile's assistant conversation is usable", vm.isCypherConversation())
+            compose.waitUntil(5_000) { compose.onAllNodesWithTag("composer-attach").fetchSemanticsNodes().isNotEmpty() }
 
             compose.runOnIdle { vm.tab("Chat") }
             await { vm.ui.value.profile == "default" && vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }

@@ -1,9 +1,10 @@
 package dev.hermes.android.core
 
 /** One admission rule serves the Xara presentation and every conversation write. */
-fun canonicalConversationReady(owner: Scope?, visible: Scope?, sessionId: String, xara: Boolean, canonicalXara: String?, opening: Boolean = false, resolutionError: Boolean = false): Boolean {
+/** [assistantProfile]: the profile Settings › Assistant binds the assistant tab to; its conversation lives only there. */
+fun canonicalConversationReady(owner: Scope?, visible: Scope?, sessionId: String, xara: Boolean, canonicalXara: String?, opening: Boolean = false, resolutionError: Boolean = false, assistantProfile: String = "default"): Boolean {
     if (owner == null || visible == null || owner != visible.copy(session = "") || sessionId.isBlank() || sessionId != visible.session) return false
-    return !xara || owner.profile == "default" && !opening && !resolutionError && !canonicalXara.isNullOrBlank() && sessionId == canonicalXara
+    return !xara || owner.profile == assistantProfile && !opening && !resolutionError && !canonicalXara.isNullOrBlank() && sessionId == canonicalXara
 }
 
 /** A detached request may finish on its original server, but only its live dispatch

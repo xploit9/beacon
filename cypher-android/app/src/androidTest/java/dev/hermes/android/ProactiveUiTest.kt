@@ -70,7 +70,7 @@ class ProactiveUiTest {
         compose.runOnIdle { vm.tab("Xara") }
         await { vm.ui.value.tab == "Xara" && vm.ui.value.profile == "coder" && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady && vm.chat.value.sessionId.startsWith("new-") }
         await { vm.data.value[proactiveKey(fixture)]?.has("enabled") == true }
-        compose.onNodeWithText("Let Cypher keep an eye on your day").assertExists()
+        compose.waitUntil(5_000) { compose.onAllNodesWithText("Let Cypher keep an eye on your day").fetchSemanticsNodes().isNotEmpty() }
 
         compose.onNodeWithTag("proactive-prompt-dismiss").performClick()
         await { compose.onAllNodesWithText("Let Cypher keep an eye on your day").fetchSemanticsNodes().isEmpty() }
@@ -110,8 +110,13 @@ class ProactiveUiTest {
         CypherViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.set(vm, value)
     }
 
-    private fun withFixture(pluginStatus: String = "present", block: (CypherViewModel, NativeExperienceFixture) -> Unit) {
+    private fun withFixture(pluginStatus: String = "available", block: (CypherViewModel, NativeExperienceFixture) -> Unit) {
         check(!app.calls.state.value.active && app.calls.service == null) { "Never replace an active real call" }
+        // Motion follows the phone's "Remove animations" setting; still frames let Compose go idle (as in NativeExperienceUiTest).
+        val shell = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().uiAutomation
+        fun shellRun(command: String): String = shell.executeShellCommand(command).use { java.io.FileInputStream(it.fileDescriptor).bufferedReader().readText().trim() }
+        val priorAnimatorScale = shellRun("settings get global animator_duration_scale")
+        shellRun("settings put global animator_duration_scale 0")
         val prior = runBlocking { app.preferences.data.first() }
         val dismissalKey = stringPreferencesKey("proactive_prompt_dismissed")
         runBlocking {
@@ -123,7 +128,7 @@ class ProactiveUiTest {
             }
         }
         val store = ViewModelStore()
-        val fixture = NativeExperienceFixture().apply { bootstrapPluginStatus = pluginStatus }
+        val fixture = NativeExperienceFixture().apply { bootstrapPluginStatus = pluginStatus; if (pluginStatus == "absent") this.pluginStatus = 404 }
         val profileScopes = listOf(fixture.scope, fixture.scope.copy(profile = "coder"))
         runBlocking {
             app.auth.remove(fixture.scope.origin)
@@ -176,6 +181,7 @@ class ProactiveUiTest {
             }
             block(vm, fixture)
         } finally {
+            shellRun(if (priorAnimatorScale == "null" || priorAnimatorScale.isBlank()) "settings delete global animator_duration_scale" else "settings put global animator_duration_scale $priorAnimatorScale")
             compose.runOnUiThread { store.clear(); fixture.client.closeNative(); app.calls.ownerScope = null }
             runBlocking {
                 app.auth.remove(fixture.scope.origin)
