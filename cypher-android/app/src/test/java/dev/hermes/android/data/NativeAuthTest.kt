@@ -127,7 +127,7 @@ class NativeAuthTest {
         assertFalse(error.message.orEmpty().contains("Broken pipe"))
     }
 
-    @Test fun resumeCancellationWaitsForGraceAndPreservesCapturedCallback() {
+    @Test fun activityResumeDoesNotCloseListenerBeforeCallbackOrTimeout() {
         var closed = false
         var delay = 0L
         var scheduled: (() -> Unit)? = null
@@ -139,18 +139,24 @@ class NativeAuthTest {
         assertEquals(1_500L, delay)
         assertFalse(closed)
         scheduled!!.invoke()
-        assertTrue(closed)
+        assertFalse("an unrelated resume must not close the callback listener", closed)
+        assertTrue(pending.cancelledOnResume)
         assertEquals("Sign-in wasn't finished. Tap Sign in with Hermes to try again.", NativeAuth.mapSignInFailure(IOException("Socket closed"), true).message)
+        pending.callbackCaptured()
+        assertTrue(closed)
+        assertFalse(pending.cancelledOnResume)
 
-        closed = false
+        var callbackListenerClosed = false
+        var callbackDecision: (() -> Unit)? = null
         val completed = PendingNativeAuthorization(
-            closeListener = { closed = true },
-            schedule = { _, action -> scheduled = action },
+            closeListener = { callbackListenerClosed = true },
+            schedule = { _, action -> callbackDecision = action },
         )
-        completed.callbackCaptured()
         completed.onActivityResumed()
-        scheduled!!.invoke()
-        assertFalse(closed)
+        completed.callbackCaptured()
+        callbackDecision!!.invoke()
+        assertTrue(callbackListenerClosed)
+        assertFalse("a callback that arrived during the grace period must win", completed.cancelledOnResume)
     }
 
     @Test fun tokenExchangeWaitsUntilCypherResumes() = runBlocking {

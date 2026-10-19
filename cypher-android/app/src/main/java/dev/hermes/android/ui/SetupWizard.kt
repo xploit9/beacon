@@ -126,19 +126,20 @@ internal fun setupAddressForDisplay(value: String): String {
 }
 
 @Composable
-fun SetupWizard(vm: CypherViewModel, modifier: Modifier = Modifier) {
+fun SetupWizard(vm: CypherViewModel, modifier: Modifier = Modifier, externalLinkOrigin: String? = null, onExternalLinkCleared: () -> Unit = {}) {
     val state by vm.ui.collectAsStateWithLifecycle()
     val context = LocalContext.current
     SetupWizardScreen(
         state = state,
         modifier = modifier,
+        externalLinkOrigin = externalLinkOrigin,
         onProbe = { vm.probeSetupAddress(it) },
         onSignIn = { vm.signIn(context) },
         onAdvancePermission = vm::advanceSetupPermission,
         onVoiceKeySaved = vm::voiceKeyConfigured,
-        onFinish = { vm.finishSetupWizard(it) },
+        onFinish = { vm.finishSetupWizard(it); onExternalLinkCleared() },
         onReopen = vm::reopenSetupWizard,
-        onCancel = vm::cancelSetupWizard,
+        onCancel = { vm.cancelSetupWizard(); onExternalLinkCleared() },
         onStageLink = vm::openSetupLink,
     )
 }
@@ -155,6 +156,7 @@ internal fun SetupWizardScreen(
     onCancel: () -> Unit,
     onVoiceKeySaved: () -> Unit = {},
     onStageLink: (String) -> Unit = {},
+    externalLinkOrigin: String? = null,
 ) {
     val context = LocalContext.current
     val initialAddress = setupAddressForDisplay(state.setupOrigin.ifBlank { state.origin })
@@ -359,6 +361,9 @@ internal fun SetupWizardScreen(
                     else -> {
                         Text("Connect to Hermes", style = MaterialTheme.typography.headlineSmall)
                         Text("Scan the QR on your Hermes dashboard, or paste its address.", style = MaterialTheme.typography.bodyLarge)
+                        externalLinkOrigin?.takeIf(String::isNotBlank)?.let {
+                            Text("Address from external link: $it", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+                        }
                         OutlinedTextField(
                             value = address,
                             onValueChange = { address = it },

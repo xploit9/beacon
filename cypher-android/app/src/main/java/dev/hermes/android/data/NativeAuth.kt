@@ -138,7 +138,7 @@ class NativeAuth internal constructor(
                 }
             }
         } catch (error: TimeoutCancellationException) {
-            throw NativeAuthException(TIMEOUT_MESSAGE, cause = error)
+            throw mapSignInFailure(error, pending?.cancelledOnResume == true)
         } catch (error: CancellationException) {
             throw error
         } catch (error: NativeAuthException) {
@@ -430,20 +430,20 @@ internal class PendingNativeAuthorization(
     }
 
     fun callbackCaptured() {
-        synchronized(lock) { codeCaptured = true }
+        synchronized(lock) {
+            codeCaptured = true
+            cancelledOnResume = false
+        }
+        runCatching(closeListener)
     }
 
     fun onActivityResumed() {
         foreground.value = true
         if (!resumeCheckScheduled.compareAndSet(false, true)) return
         schedule(RESUME_GRACE_MS) {
-            val shouldCancel = synchronized(lock) {
-                if (codeCaptured) false else {
-                    cancelledOnResume = true
-                    true
-                }
+            synchronized(lock) {
+                if (!codeCaptured) cancelledOnResume = true
             }
-            if (shouldCancel) runCatching(closeListener)
         }
     }
 
