@@ -16,7 +16,6 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -73,6 +72,8 @@ class CypherActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // The call-id extra is stripped once read, so a recreation before the call view opens must keep the pending return.
+        pendingReturn = savedInstanceState?.getString("pending_return").orEmpty()
         push(intent)
         setContent {
             val model: CypherViewModel = viewModel()
@@ -95,7 +96,7 @@ class CypherActivity : ComponentActivity() {
                 val source = permissionSource; val event = permissionEvent
                 permissionSource = ""; permissionEvent = ""
                 if (allowed && source.isNotBlank() && event.isNotBlank()) model.handlePush(source, event, permissionAction)
-                else model.notice("Allow microphone access to answer Cypher. The invitation stays available until it expires.")
+                else if (!allowed) model.notice("Allow microphone access to answer Cypher. The invitation stays available until it expires.")
             }
             val callFromNotification: (String, String, String) -> Unit = { source, event, action ->
                 if (permissionSource.isBlank()) {
@@ -138,6 +139,7 @@ class CypherActivity : ComponentActivity() {
     override fun onStart() { super.onStart(); (application as CypherApplication).calls.let { it.uiVisible = true; if (it.state.value.active) it.resumeWindow() }; vm?.foreground(true) }
     override fun onResume() { super.onResume(); NativeAuth.onActivityResumed(); vm?.resumeAppUpdate(); (application as CypherApplication).calls.refreshOverlayPermission() }
     override fun onStop() { (application as CypherApplication).calls.uiVisible = false; vm?.foreground(false); super.onStop() }
+    override fun onSaveInstanceState(outState: Bundle) { super.onSaveInstanceState(outState); outState.putString("pending_return", pendingReturn) }
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); setIntent(intent); push(intent) }
     private fun push(intent: Intent?) {
         intent?.data?.takeIf { it.scheme.equals("cypher", true) && it.host.equals("connect", true) }?.let {
