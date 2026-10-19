@@ -138,6 +138,13 @@ def validate(schema, arguments):
         raise HTTPException(400, 'Arguments do not match the configured tool schema') from None
 
 
+def readonly_methods(schema):
+    properties=schema.get('properties',{})
+    method=properties.get('method') if isinstance(properties,dict) else None
+    methods=method.get('enum') if isinstance(method,dict) else None
+    return tuple(methods) if isinstance(methods,list) and methods and all(value in ('GET','HEAD') for value in methods) else ()
+
+
 class NativeMcp:
     """Only native registrations whose exact connection still matches this profile's config."""
     def catalog(self):
@@ -172,14 +179,19 @@ class NativeMcp:
                 continue
             schema = json.loads(encoded(entry.schema.get('parameters', {})))
             generic_http=raw.replace('-', '_').endswith('make_request')
+            properties=schema.get('properties',{})
+            method=properties.get('method') if isinstance(properties,dict) else None
+            method_read_only=bool(readonly_methods(schema))
             if generic_http:
                 # Native recovery trusts the provider's erroneous read-only hint; prohibit writes.
-                method=schema.get('properties',{}).get('method')
                 if not isinstance(method,dict): continue
                 method['enum']=['GET']
                 method['default']='GET'
+                method_read_only=True
             # Generic HTTP request tools can POST despite a provider's read-only annotation.
-            readonly = _tool_is_read_only(server, raw) and not generic_http
+            has_method=isinstance(properties,dict) and 'method' in properties
+            readonly = (_tool_is_read_only(server, raw) and not generic_http
+                        and not (has_method and not method_read_only))
             version = digest([registry.current_scope_key(), server, raw, cfg, schema, readonly])
             output.append({'tool_id':version, 'name':entry.name,
                            'description':safe(entry.schema.get('description', ''), 1200),
@@ -301,12 +313,17 @@ class Gateway:
                 return self.status(scope,request)
         tools=self.catalog(scope[2]);tool=next((t for t in tools if t['tool_id']==value['tool_id']),None)
         if not tool: raise HTTPException(409, 'Tool changed or is no longer configured; rediscover it')
-        validate(tool['parameters'], value['arguments'])
+        arguments=value['arguments']
+        validate(tool['parameters'], arguments)
+        methods=readonly_methods(tool['parameters'])
+        if 'method' not in arguments and methods:
+            arguments={**arguments,'method':'GET' if 'GET' in methods else 'HEAD'}
+            validate(tool['parameters'],arguments)
         result={'request_id':request,'tool_id':tool['tool_id'],'tool_name':tool['name'],
                 'status':'ready' if tool['read_only'] else 'needs_approval',
-                '_arguments':value['arguments'], '_expires':time.time()+120}
+                '_arguments':arguments, '_expires':time.time()+120}
         if not tool['read_only']:
-            serialized=encoded(value['arguments'])
+            serialized=encoded(arguments)
             try:
                 displayed=json.loads(self.sanitize(serialized,MAX_ARGUMENTS))
                 if encoded(displayed)!=serialized:

@@ -131,6 +131,63 @@ def test_scope_isolation_and_argument_negative_controls(gateway):
     g.validate({'type':'object','properties':{'optional':{'type':'string','nullable':True}}},{'optional':None})
 
 
+def test_method_schema_requiring_post_is_write_capable(gateway,monkeypatch):
+    api,backend,_=gateway
+    def entry(name,method):
+        def handler(): return name
+        # Capture the values NativeMcp reads from the actual registered handler.
+        server_name='http';tool_name=name;tool_timeout=10
+        def registered(*args): return handler(),server_name,tool_name,tool_timeout
+        return SimpleNamespace(name=name,toolset='mcp-http',handler=registered,schema={
+            'description':name,'parameters':{'type':'object','properties':{
+                'url':{'type':'string'},'method':method},'required':['url'],'additionalProperties':False}})
+    cfg={'url':'https://example.invalid'}
+    registry=SimpleNamespace(current_scope_key=lambda:'scope',get_all_entries=lambda:[
+        entry('http_fetch',{'type':'string','enum':['GET','POST']}),
+        entry('make_request',{'type':'string','enum':['GET','POST']}),
+        entry('safe_fetch',{'type':'string','enum':['GET','HEAD']}),
+    ])
+    modules={
+        'tools':SimpleNamespace(mcp_tool=SimpleNamespace(_servers={},_lazy_server_configs={'http':cfg})),
+        'tools.mcp_tool_config':SimpleNamespace(_load_mcp_config=lambda:{'http':cfg}),
+        'tools.mcp_tool_common':SimpleNamespace(mcp_server_enabled=lambda cfg:True),
+        'tools.mcp_tool_discovery':SimpleNamespace(discover_mcp_tools=lambda:None),
+        'tools.mcp_tool_registration':SimpleNamespace(_same_server_route=lambda *a,**k:True,
+            _make_tool_filter=lambda *a:lambda raw:True,_normalize_server_trust=lambda trust:'trusted'),
+        'tools.mcp_tool_scope':SimpleNamespace(_resolve_server_key=lambda server:server),
+        'tools.mcp_tool_handlers':SimpleNamespace(_tool_is_read_only=lambda *args:True,
+            _make_tool_handler=lambda *args:lambda arguments,**kwargs:arguments),
+        'tools.registry':SimpleNamespace(registry=registry),
+    }
+    for name,module in modules.items(): monkeypatch.setitem(sys.modules,name,module)
+
+    tools={tool['_raw']:tool for tool in g.NativeMcp().catalog()}
+    assert tools['http_fetch']['read_only'] is False
+    assert tools['safe_fetch']['read_only'] is True
+    assert tools['make_request']['parameters']['properties']['method']['enum']==['GET']
+
+    backend.catalog=lambda:[tools['http_fetch']]
+    proposal=api.invoke(SCOPE,{'request_id':'post','tool_id':tools['http_fetch']['tool_id'],
+        'arguments':{'url':'https://example.invalid','method':'POST'}})
+    assert proposal['status']=='needs_approval' and not backend.calls
+
+
+def test_get_only_method_default_is_receipted_and_executed(gateway):
+    api,backend,_=gateway
+    tool={'tool_id':'c'*64,'name':'make_request','description':'HTTP request',
+        'parameters':{'type':'object','properties':{'url':{'type':'string'},
+            'method':{'type':'string','enum':['GET'],'default':'GET'}},
+            'required':['url'],'additionalProperties':False},'read_only':False}
+    backend.catalog=lambda:[tool]
+    proposal=api.invoke(SCOPE,{'request_id':'get-default','tool_id':tool['tool_id'],
+        'arguments':{'url':'https://example.invalid'}})
+    assert proposal['status']=='needs_approval'
+    assert proposal['proposal']['arguments']=={'url':'https://example.invalid','method':'GET'}
+    api.decide(SCOPE,'get-default',{'proposal_id':proposal['proposal']['id'],'decision':'approve'})
+    assert settled(api,'get-default')['status']=='completed'
+    assert backend.calls[0][0]['method']=='GET'
+
+
 def test_timeout_restart_and_late_return_are_uncertain_without_replay(gateway,monkeypatch):
     api,backend,_=gateway;backend.read_only=False;backend.wait=threading.Event()
     proposal=invoke(api);api.decide(SCOPE,'r1',{'proposal_id':proposal['proposal']['id'],'decision':'approve'})
@@ -344,8 +401,8 @@ def test_cancelled_lookup_retrieves_worker_exception(tmp_path):
         monkeypatcher.setitem(sys.modules,'cypher_gateway_tools',SimpleNamespace(Gateway=ExplodingGateway))
         module_spec=importlib.util.spec_from_file_location('cypher_gateway_api_cancel_test',ROOT/'gateway_api.py')
         api=importlib.util.module_from_spec(module_spec);module_spec.loader.exec_module(api)
-        router=api.build_router(lambda *args,**kwargs:('owner','password',{'profile':'profile'},{}),
-                                lambda *args,**kwargs:{},lambda profile,fn:fn(tmp_path),Mobile(tmp_path/'api.sqlite'))
+        async def call(*args,**kwargs): return 'owner','password',{'profile':'profile'},{}
+        router=api.build_router(call,lambda *args,**kwargs:{},lambda profile,fn:fn(tmp_path),Mobile(tmp_path/'api.sqlite'))
         endpoint=next(route.endpoint for route in router.routes if route.path.endswith('/tools'))
         async def exercise():
             loop=asyncio.get_running_loop();errors=[]

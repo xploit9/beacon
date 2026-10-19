@@ -17,8 +17,8 @@ def build_router(call, body, scoped, mobile):
     gateway=sys.modules[key].Gateway(mobile,scoped)
     admissions=threading.BoundedSemaphore(4)
 
-    def scope(request,call_id,writable=False):
-        owner,provider,row,_=call(request,call_id,writable)
+    async def scope(request,call_id,writable=False):
+        owner,provider,row,_=await call(request,call_id,writable)
         return owner,provider,row['profile'],call_id
 
     async def bounded(fn,*args):
@@ -35,29 +35,29 @@ def build_router(call, body, scoped, mobile):
 
     @router.get('/mobile/calls/{call_id}/tools')
     async def discover(call_id:str,request:Request,query:str=''):
-        binding=scope(request,call_id,True)
+        binding=await scope(request,call_id,True)
         return await bounded(gateway.discover,binding[2],query)
 
     @router.post('/mobile/calls/{call_id}/tools/invoke')
     async def invoke(call_id:str,request:Request):
-        binding=scope(request,call_id,True)
+        binding=await scope(request,call_id,True)
         value=await body(request,20000)
         return await bounded(gateway.invoke,binding,value)
 
     @router.get('/mobile/calls/{call_id}/tools/requests/{request_id}')
     async def status(call_id:str,request_id:str,request:Request):
-        binding=scope(request,call_id)
+        binding=await scope(request,call_id)
         return await bounded(gateway.status,binding,request_id)
 
     @router.post('/mobile/calls/{call_id}/tools/requests/{request_id}/decision')
     async def decision(call_id:str,request_id:str,request:Request):
-        binding=scope(request,call_id,True)
+        binding=await scope(request,call_id,True)
         value=await body(request,1024)
         return await bounded(gateway.decide,binding,request_id,value)
 
     @router.post('/mobile/calls/{call_id}/tools/requests/{request_id}/cancel')
     async def cancel(call_id:str,request_id:str,request:Request):
-        binding=scope(request,call_id)
+        binding=await scope(request,call_id)
         return await bounded(gateway.cancel,binding,request_id)
 
     return router

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 def test_route_binds_authority_and_allows_receipt_after_call_end():
     api=load('callback_api');seen=[]
-    def call(request,cid):
+    async def call(request,cid):
         if cid!='owned':raise HTTPException(404)
         return 'owner','basic',{'profile':'default','conversation':'original','closed':1},{'configured':True}
     async def body(request,limit):return await request.json()
