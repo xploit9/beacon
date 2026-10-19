@@ -110,7 +110,7 @@ class CallHistoryUiTest {
             }
             compose.onNodeWithText("Outgoing call").assertExists()
             compose.onNodeWithText("Missed call").assertExists()
-            compose.onNodeWithText("1:23").assertExists()
+            compose.onNodeWithText(" · 1:23 · Gemini", substring = true).assertExists()
             compose.onNodeWithTag("call-history-row:$callId").performClick()
             compose.waitUntil(5_000) { compose.onAllNodesWithText("Transcript from completed call").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("Transcript from completed call").assertIsDisplayed()

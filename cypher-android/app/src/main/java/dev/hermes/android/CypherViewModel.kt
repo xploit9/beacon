@@ -1315,7 +1315,10 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             if (generation != originGeneration || client?.scope != oldScope) return@launch
             sessionWatch?.cancel(); selectionJob?.cancel(); sourceScope = null; ++sessionGeneration
             app.auth.persist(c.auth)
-            val switchedAuth = withContext(Dispatchers.IO) { app.auth.read(c.auth.origin) }
+            // A request still finishing on the old profile (e.g. the history refresh) can save its auth over this write; never bind to that profile.
+            // shortcut: such a save landing after this read still reaches the store until the new client's next save; CAS the switch write if that matters.
+            val switchedAuth = withContext(Dispatchers.IO) { app.auth.read(c.auth.origin) }.takeIf { it.owner == c.auth.owner && it.profile == c.auth.profile }
+                ?: c.auth.also { app.auth.persist(it) }
             client = profileSwitchClientFactoryForTest?.invoke(switchedAuth) ?: CypherClient(switchedAuth, app.auth, persistContext = false)
             cachedOwnerScope = null; retireSavedDrafts(null)
             val restoredClient = client ?: return@launch

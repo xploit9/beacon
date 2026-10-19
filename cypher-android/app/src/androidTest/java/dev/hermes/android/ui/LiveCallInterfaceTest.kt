@@ -193,8 +193,8 @@ class LiveCallInterfaceTest {
         rule.activityRule.scenario.onActivity{it.startActivity(android.content.Intent(it,LiveCallShowcaseActivity::class.java).addFlags(android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP or android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))}
         Thread.sleep(400);device.executeShellCommand("input keyevent 3");Thread.sleep(500)
         rule.onNodeWithTag("cypher-call-bubble").assertExists()
-        device.sleep();Thread.sleep(300)
-        rule.onNodeWithTag("cypher-call-bubble").assertDoesNotExist()
+        // The bubble hides once Android reports the device non-interactive; a busy emulator can take longer than a fixed 300 ms.
+        device.sleep();rule.waitUntil(3000) { rule.onAllNodesWithTag("cypher-call-bubble").fetchSemanticsNodes(atLeastOneRootRequired = false).isEmpty() }
         assertTrue("Lock only hides presentation",LiveCallShowcaseActivity.source.value.active)
         device.wakeUp();device.executeShellCommand("wm dismiss-keyguard");Thread.sleep(500)
         rule.onNodeWithTag("cypher-call-bubble").performClick();rule.waitForIdle()
