@@ -66,6 +66,13 @@ class GrokWireTest {
             .put("call_id","call-1").put("name","invoke_tool"))!!.getJSONObject("toolCall").getJSONArray("functionCalls").getJSONObject(0)
         assertEquals("opaque",call.getJSONObject("args").getString("tool_id"))
     }
+    @Test fun whitespaceArgumentFragmentsAreKeptInTheCallArguments() {
+        val wire=GrokWire()
+        for(part in listOf("{\"query\":\"hello"," ","world\"}")) assertNull(wire.inbound(JSONObject().put("type","response.function_call_arguments.delta").put("item_id","item-1").put("delta",part)))
+        val call=wire.inbound(JSONObject().put("type","response.function_call_arguments.done").put("item_id","item-1")
+            .put("call_id","call-1").put("name","invoke_tool"))!!.getJSONObject("toolCall").getJSONArray("functionCalls").getJSONObject(0)
+        assertEquals("hello world",call.getJSONObject("args").getString("query"))
+    }
     @Test fun assistantTranscriptDoneDoesNotRepeatTextAlreadyStreamedForTheItem() {
         val wire=GrokWire()
         val delta=JSONObject().put("type","response.output_audio_transcript.delta").put("item_id","item-1").put("delta","Hello ")

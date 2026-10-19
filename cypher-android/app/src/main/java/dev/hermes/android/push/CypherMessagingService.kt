@@ -515,13 +515,13 @@ private fun receivePush(context: Context, data: Map<String, String>, localAction
             val declineIntent = Intent(context, IncomingCallReceiver::class.java).setAction(invite.declineAction).setData(android.net.Uri.parse("hermes://incoming/$routeKey/decline")).putExtra("push_source", source).putExtra("push_event", event)
             val decline = PendingIntent.getBroadcast(context, 0, declineIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
             val person = androidx.core.app.Person.Builder().setName("Cypher").setImportant(true).build()
-            fun notification(): Notification {
+            fun notification(callStyle: Boolean = options.callStyle): Notification {
                 val card = options
                 val builder = NotificationCompat.Builder(context, incomingChannel).setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle("Cypher is calling").setContentText("Answer to start a private voice call").setContentIntent(pending).setDeleteIntent(decline).setCategory(card.category).setPriority(NotificationCompat.PRIORITY_HIGH).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).setPublicVersion(public).setTimeoutAfter(card.timeoutAfterMillis).setOnlyAlertOnce(card.onlyAlertOnce).setOngoing(true)
                 if(android.os.Build.VERSION.SDK_INT>=36) builder.setRequestPromotedOngoing(true).setShortCriticalText("Calling")
                 // The alerting CallStyle falls back to heads-up when FSI is denied; ringing never starts the microphone.
                 if (card.fullScreenIntent) builder.setFullScreenIntent(pending, true)
-                if (card.callStyle) builder.setStyle(NotificationCompat.CallStyle.forIncomingCall(person, decline, answer))
+                if (callStyle) builder.setStyle(NotificationCompat.CallStyle.forIncomingCall(person, decline, answer))
                 else builder.addAction(R.drawable.ic_cypher, "Decline", decline).addAction(R.drawable.ic_cypher, "Answer", answer)
                 // A non-silent CallStyle card lets Android's existing user-configured channel own the single ringtone.
                 return builder.setSilent(card.silent).build().apply { if (card.insistent) flags = flags or Notification.FLAG_INSISTENT }
@@ -533,7 +533,8 @@ private fun receivePush(context: Context, data: Map<String, String>, localAction
                     .putExtra("push_source", source).putExtra("push_event", event).putExtra("notification", ringingNotification))
             } catch (error: RuntimeException) {
                 android.util.Log.w("CypherRinging", "Phone-call foreground service rejected; posting the deadline-bound call card", error)
-                try { manager.notify(routeKey, 2, ringingNotification) } catch (_: SecurityException) { return }
+                val fallback = if (options.fullScreenIntent) ringingNotification else notification(callStyle = false)
+                try { manager.notify(routeKey, 2, fallback) } catch (_: RuntimeException) { return }
             }
         }
         NotificationPreviewJob.enqueue(context, source, event, data["conversation_ref"].orEmpty(), data["kind"].orEmpty())

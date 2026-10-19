@@ -49,12 +49,13 @@ class VoiceReadinessTest {
             assertEquals(alerting, (firstCard.flags and Notification.FLAG_INSISTENT) != 0)
             assertNull("The user-configured call channel is the ringtone source", firstCard.sound)
             assertFalse("Ringing does not start an active microphone call", app.calls.state.value.active)
+            val postedAt = manager.activeNotifications.first { it.id == 42 }.postTime
             audio.setStreamVolume(AudioManager.STREAM_RING, 0, 0)
             assertFalse(dev.hermes.android.push.incomingCallMayAlert(false, audio.mode == AudioManager.MODE_NORMAL,
                 true, false, manager.areNotificationsEnabled(), channel?.importance ?: NotificationManager.IMPORTANCE_NONE,
                 channel?.sound != null, audio.ringerMode, audio.getStreamVolume(AudioManager.STREAM_RING)))
             audio.setStreamVolume(AudioManager.STREAM_RING, volume, 0)
-            waitFor { manager.activeNotifications.any { it.id == 42 } }
+            assertEquals("Muting and unmuting keeps the one ringing card; it is not posted again", postedAt, manager.activeNotifications.first { it.id == 42 }.postTime)
             val stops = List(8) { Thread { IncomingRingtoneService.silence(source, event) } }
             stops.forEach { it.start() }; stops.forEach { it.join() }
             waitFor { manager.activeNotifications.none { it.id == 42 } }

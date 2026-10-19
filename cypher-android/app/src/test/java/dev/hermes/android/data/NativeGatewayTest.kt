@@ -137,6 +137,13 @@ class NativeGatewayTest {
         other.client.closeNative()
     }
 
+    @Test fun statusProbeResumesLazilySoAGoneConversationIsNeverRecreated() = runBlocking<Unit> {
+        val fixture = GatewayFixture()
+        runCatching { withTimeout(3_000) { fixture.client.recoveredNativeSessionStatus("20261019_001507_a4cbef") } }
+        assertTrue("A probe of a gone conversation must get 4007, not a new ownerless row", fixture.calls.first { it.first == "session.resume" }.second.optBoolean("lazy"))
+        fixture.client.closeNative()
+    }
+
     @Test fun unsentShellRecoveryResumesLazilySoHermesNeverMaterializesAnOwnerlessRow() = runBlocking<Unit> {
         val fixture = GatewayFixture()
         fixture.client.nativeSession("20261019_001507_a4cbef", lazy = true)

@@ -69,7 +69,7 @@ internal val SettingsRowMinHeight = 78.dp
     // One clickable node: ListItem merges its own text, so a wrapping clickable would be an unlabeled button for TalkBack.
     ListItem(
         headlineContent = { Text(uiText(settingsLabel(name)), style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium) },
-        supportingContent = if (detail.isBlank()) null else ({ Text(detail, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }),
+        supportingContent = if (detail.isBlank()) null else ({ Text(detail, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }),
         leadingContent = { Surface(shape = RoundedCornerShape(13.dp), color = MaterialTheme.colorScheme.primary.copy(alpha = .09f)) { Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) { Icon(settingsIcon(name), null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(21.dp)) } } },
         trailingContent = { Icon(Icons.Rounded.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp)) },
         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
@@ -161,8 +161,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
     }
     val snapshot = SettingsSnapshot(
         connected = ui.connected, profile = ui.profile,
-        theme = prefs.theme, colorStyle = prefs.skin, fontSize = prefs.fontSize, language = NativeLanguages[prefs.language] ?: prefs.language,
-        reducedMotion = prefs.reducedMotion, rtl = prefs.rtl,
+        theme = prefs.theme, colorStyle = prefs.skin,
         installedVersion = BuildConfig.VERSION_NAME, updateName = update.release?.name.orEmpty(), updateReady = update.ready,
         voiceProviderId = phoneVoice?.first.orEmpty(), voiceKeySaved = phoneVoice?.second,
         keepConnectedEnabled = keepConnectedEnabled,
@@ -337,22 +336,11 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
 
 @Composable private fun AppearanceSettings(vm: CypherViewModel) {
     val prefs by vm.preferences.collectAsStateWithLifecycle()
+    // Text size, language, text direction and motion follow the phone's own settings.
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
-        item { Text("Appearance on this phone", style = MaterialTheme.typography.titleLarge); Text("These changes apply to this app. Your browser preferences stay separate.", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         item { Glass { Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text(uiText("Display"), style = MaterialTheme.typography.titleMedium)
             Choice("Theme", prefs.theme, listOf("system", "dark", "light"), { vm.nativePreferences(json("theme" to it)) }, optionLabels = settingsThemeLabels)
             Choice("Color style", prefs.skin, NativeSkins, { vm.nativePreferences(json("skin" to it)) }, optionLabels = skinLabels)
-        } } }
-        item { Glass { Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text(uiText("Reading"), style = MaterialTheme.typography.titleMedium)
-            Choice("Text size", prefs.fontSize, nativeFontSizes, { vm.nativePreferences(json("font_size" to it)) }, optionLabels = settingsFontSizeLabels)
-            Choice(uiText("Language"), NativeLanguages[prefs.language] ?: prefs.language, NativeLanguages.values.toList(), { label -> NativeLanguages.entries.firstOrNull { it.value == label }?.let { vm.nativePreferences(json("language" to it.key)) } })
-        } } }
-        item { Glass { Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(uiText("Comfort"), style = MaterialTheme.typography.titleMedium)
-            LabeledToggle(uiText("Reduce motion"), prefs.reducedMotion, { vm.nativePreferences(json("reduced_motion" to it)) }, "Keep transitions still")
-            LabeledToggle(uiText("Right-to-left layout"), prefs.rtl, { vm.nativePreferences(json("rtl" to it)) })
         } } }
     }
 }

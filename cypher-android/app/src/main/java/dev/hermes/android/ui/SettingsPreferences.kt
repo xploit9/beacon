@@ -11,7 +11,6 @@ internal fun privateStructuredKey(key: String): Boolean {
 }
 
 internal val skinLabels = NativeSkins.associateWith { key -> if (key == "default") "Cypher" else if (key == "github") "GitHub" else key.split('-').joinToString(" ") { it.replaceFirstChar(Char::titlecase) } }
-internal val nativeFontSizes = listOf("small", "default", "large", "xlarge")
 
 internal fun displayedBoolean(field: Field, stored: String) = if (field.inverse) !stored.toBoolean() else stored.toBoolean()
 internal fun storedBoolean(field: Field, displayed: Boolean) = (if (field.inverse) !displayed else displayed).toString()

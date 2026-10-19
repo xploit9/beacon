@@ -46,6 +46,12 @@ History bounds (stock Hermes routes, no plugin needed):
 
 Session deletion and project reservation still require the optional Cypher plugin. Standard sign-in, chat and bounded history do not.
 
+Threads and filters (drawer, under Search; native Hermes, no plugin needed):
+- **Threads** are named conversations you come back to, as in Hermes Relay. "New thread" asks for a name; the thread is an ordinary Hermes chat created with its own source (`android_thread`) and your title, which Hermes keeps instead of its automatic title. A repeated name gets a number, because Hermes does not allow two conversations with the same title. The Threads lane also lists your Hermes Relay threads.
+- **Filters**: All, Pinned and Archived, plus a Filter menu to sort by recent activity, newest first or A–Z and to show or hide conversations by where they came from (Web, Terminal, Telegram and so on). Hermes applies the source filters, so the 200-conversation window holds only what you choose to see. Choices are remembered on the phone.
+
+Display: Cypher follows the phone for text size, language, text direction and animations (Android's font size, app language and "Remove animations" settings). Settings → Appearance keeps only Theme and Color style.
+
 Approvals (composer shield, native Hermes): Manual, Smart and Off set the profile's approval mode. **YOLO** bypasses approval prompts for the current chat only and always asks for confirmation before turning on. Hermes does not report a reopened chat's YOLO state, so the menu may say "YOLO status unknown for this chat"; it then offers both "Turn on YOLO for this chat…" and "Turn off YOLO for this chat". The shield shows the last state Hermes confirmed ("Approvals · YOLO on").
 
 With the Cypher plugin installed:

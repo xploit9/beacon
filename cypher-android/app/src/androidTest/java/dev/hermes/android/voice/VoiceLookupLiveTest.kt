@@ -100,7 +100,7 @@ class VoiceLookupLiveTest {
             phases.put("ready_ms",(System.nanoTime()-start)/1_000_000)
             call=app.calls.state.value.callId
             assertEquals(provider,app.calls.state.value.voiceProvider)
-            val admission=callAdmissions.single()
+            val admission=callAdmissions.singleOrNull().also { assertNotNull("The phone-key call admission was captured exactly once",it) }!!
             assertEquals(provider,admission.getString("voice_provider"));assertTrue(admission.optBoolean("client_key"))
             assertFalse(admission.has("api_key")||admission.has("token"))
             await { app.calls.state.value.transcripts.any { it.role=="assistant"&&it.final } }
@@ -153,7 +153,7 @@ class VoiceLookupLiveTest {
             phases.put("call_id",call).put("session_id",session).put("version_code",BuildConfig.VERSION_CODE)
             phases.put("call_error",app.calls.state.value.error.take(300))
             app.calls.hangup();withTimeoutOrNull(45000) { while(app.calls.service!=null) delay(100) }
-            voiceStore.setSelection(previousVoiceSettings)
+            runCatching { voiceStore.setSelection(previousVoiceSettings) }.onFailure { phases.put("restore_error",it.javaClass.simpleName) }
             if(call.isNotBlank()) client?.nativeRequest("/api/plugins/cypher/mobile/calls/$call","DELETE")
             if(session.isNotBlank()) client?.nativeRpc("session.set_hidden",json("session_id" to session,"hidden" to true))
             File(app.filesDir,"voice-lookup-$provider-last-phase.json").writeText(phases.toString(),Charsets.UTF_8)

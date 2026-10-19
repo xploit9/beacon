@@ -60,7 +60,13 @@ class SettingsPreferencesTest {
         assertEquals(NativeSkins.toSet(), skinLabels.keys)
         assertTrue(skinLabels.values.all(String::isNotBlank))
         assertTrue(NativeLanguages.containsKey("ar"))
-        assertEquals(listOf("small", "default", "large", "xlarge"), nativeFontSizes)
+    }
+    @Test fun theAppReadsInThePhonesLanguage() {
+        assertEquals("ar", nativeLanguageFor(java.util.Locale.forLanguageTag("ar-AE")))
+        assertEquals("zh-Hant", nativeLanguageFor(java.util.Locale.forLanguageTag("zh-TW")))
+        assertEquals("zh-Hant", nativeLanguageFor(java.util.Locale.forLanguageTag("zh-Hant-HK")))
+        assertEquals("zh", nativeLanguageFor(java.util.Locale.forLanguageTag("zh-CN")))
+        assertEquals("A language without a translation reads English", "en", nativeLanguageFor(java.util.Locale.forLanguageTag("sw-KE")))
     }
     @Test fun errorPresentationDoesNotDisplayJsonNullAsAProblem() {
         assertEquals("", recordError(JSONObject().put("_error", JSONObject.NULL).put("error", JSONObject.NULL)))

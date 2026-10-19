@@ -123,7 +123,8 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     private val currentRuntimeSessionIds = ConcurrentHashMap<String, String>()
     val streamSubscriptions = AtomicInteger()
     @Volatile var nativeTurnStatus = "idle"
-    @Volatile var resumeRuntimeSessionId: String? = null
+    /** Stored id -> runtime id a later `session.resume` of that conversation binds (other conversations keep their own). */
+    val resumeRuntimeSessionIds = ConcurrentHashMap<String, String>()
     @Volatile var nativeStatusFailure = false
     @Volatile var persistTerminalMessages = false
     @Volatile var terminalOnActiveList: JSONObject? = null
@@ -558,7 +559,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 require(!historyFailure) { "Synthetic history unavailable" }
                 val row = sessions[id] ?: unpromptedShells.remove(id)?.also { sessions[id] = it }
                 row?.copy()?.apply {
-                    val runtime = resumeRuntimeSessionId ?: string("session_id")
+                    val runtime = resumeRuntimeSessionIds[id] ?: string("session_id")
                     put("session_id", runtime)
                     runtimeStoredSessionIds[runtime] = id
                     currentRuntimeSessionIds[id] = runtime

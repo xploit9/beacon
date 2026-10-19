@@ -343,7 +343,8 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         pendingVisionSwitchAfterKey = null
     }
     private fun clearPendingVoiceKeyRequestsIfLeavingVoiceKeyPage(tab: String, page: String) {
-        if (_ui.value.tab == "More" && _ui.value.morePage == "Cypher" && (tab != "More" || page != "Cypher")) clearPendingVoiceKeyRequests()
+        val keyPage = voiceKeySetupPage()
+        if (_ui.value.tab == "More" && _ui.value.morePage == keyPage && (tab != "More" || page != keyPage)) clearPendingVoiceKeyRequests()
     }
     internal fun consumeVoiceCallRequest(request:VoiceCallRequest) {
         if(_voiceCallRequest.value==request) _voiceCallRequest.value=null
@@ -400,7 +401,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         }
         app.cache.write(owner, "chat-preferences", chat.toString(), true)
         if ((client?.scope ?: cachedOwnerScope) == owner) storeData("profile-settings", chat)
-        app.preferences.edit { prefs -> values.keys().forEach { key -> if (key in setOf("theme", "skin", "font_size", "language", "rtl", "reduced_motion")) prefs[stringPreferencesKey(key)] = values.opt(key)?.toString().orEmpty() } }
+        app.preferences.edit { prefs -> values.keys().forEach { key -> if (key in setOf("theme", "skin")) prefs[stringPreferencesKey(key)] = values.opt(key)?.toString().orEmpty() } }
         } } catch (e: Exception) { if (e is CancellationException) throw e; if ((client?.scope ?: cachedOwnerScope) == owner) fail(e) }
     }
     fun loadSlashCatalog(force: Boolean = false) = load("slash:catalog", "/api/commands/catalog", force = force)
@@ -442,10 +443,8 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         }
         if (!changed) return
         if (!active) { cancelStartup(); recoveryJob?.cancel(); sessionWatch?.cancel(); sideJob?.cancel(); streams.values.toList().forEach(Job::cancel); viewModelScope.launch { runCatching { checkpointVisible() }.onFailure(::fail) } }
-        else {
-            resumeAppUpdate()
-            if (client == null && !_ui.value.loading) connect(_ui.value.origin)
-        }
+        // Signed out (setup, returning from sign-in): only the update check resumes; connecting is the user's step.
+        else resumeAppUpdate()
     }
     fun checkForAppUpdate(quiet: Boolean = false) {
         val captured = client?.detached() ?: run { if (!quiet) _appUpdate.update { it.copy(status = "Reconnect to Tailscale to check for updates.") }; return }
@@ -2175,7 +2174,8 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                     if (sourceScope == scope) {
                         _chat.update { releaseTerminalChat(it, stream, terminalReplyVisible, terminalError) }
                         pollPrompts(c, scope); refreshSessions()
-                        val q = _chat.value.queued.firstOrNull()
+                        // An unconfirmed reply after a live terminal event keeps the queue for review; a validated idle settled it.
+                        val q = _chat.value.queued.firstOrNull()?.takeIf { terminalReplyVisible || terminalAlreadyObserved && terminalError.isBlank() }
                         if (q != null && _composer.value.text.isBlank() && _attachments.value.isEmpty()) { removeQueued(0); _attachments.value = q.attachments; composer(TextFieldValue(q.text)); send(q) }
                     }
                 }
@@ -2643,7 +2643,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val sequence = readSequence
         val source = sourceScope
         _readingAloud.value = true
-        fun speak() { if (readSequence != sequence || sourceScope != source) return; speech?.language = java.util.Locale.forLanguageTag(preferences.value.language); if (speech?.speak(text.take(5000), android.speech.tts.TextToSpeech.QUEUE_FLUSH, null, sequence.toString()) == android.speech.tts.TextToSpeech.ERROR) { _readingAloud.value = false; notice("Android read aloud failed") } }
+        fun speak() { if (readSequence != sequence || sourceScope != source) return; speech?.language = java.util.Locale.getDefault(); if (speech?.speak(text.take(5000), android.speech.tts.TextToSpeech.QUEUE_FLUSH, null, sequence.toString()) == android.speech.tts.TextToSpeech.ERROR) { _readingAloud.value = false; notice("Android read aloud failed") } }
         if (speechReady) { speak(); return }
         speechPending = ::speak
         if (speech == null) speech = android.speech.tts.TextToSpeech(app) { status ->

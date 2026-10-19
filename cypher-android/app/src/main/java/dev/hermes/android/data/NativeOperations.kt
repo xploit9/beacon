@@ -22,7 +22,8 @@ private const val OPTIONAL_VOICE_HISTORY_TIMEOUT_MS = 1_500L
 internal suspend fun CypherClient.recoveredNativeSessionStatus(id: String): String? {
     if (!id.matches(storedSessionId)) return null
     // A resumed socket may bind a different runtime id than the stale ChatState stream id.
-    val binding = nativeSession(id)
+    // Lazy: a stored conversation resumes as usual; one Hermes no longer holds answers 4007 (unknown) instead of a new ownerless row.
+    val binding = nativeSession(id, lazy = true)
     if (binding.scope != scope || binding.storedSessionId != id) return null
     return nativeSessionStatus(id, binding.runtimeSessionId)
 }

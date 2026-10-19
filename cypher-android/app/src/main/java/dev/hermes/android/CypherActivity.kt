@@ -33,8 +33,8 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -123,10 +123,8 @@ class CypherActivity : ComponentActivity() {
                     navigationBarStyle = SystemBarStyle.auto(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT) { dark },
                 )
             }
-            val density = LocalDensity.current
-            val fontFactor = when (preferences.fontSize) { "small" -> .9f; "large" -> 1.12f; "xlarge" -> 1.25f; else -> 1f }
             val emptySettings = remember { org.json.JSONObject() }
-            CompositionLocalProvider(LocalCypherSettings provides (data["profile-settings"] ?: emptySettings), LocalDensity provides Density(density.density, density.fontScale * fontFactor), LocalLayoutDirection provides if (preferences.rtl || preferences.language in setOf("ar", "he", "fa", "ur")) LayoutDirection.Rtl else LocalLayoutDirection.current) { NativeLocalization(preferences.language) { CypherTheme(dark, preferences.skin) { NativeWindowLayout(this@CypherActivity) { CypherRoot(model); IncomingCallSheet(model, permissionSource.isNotBlank(), answer) } } } }
+            CompositionLocalProvider(LocalCypherSettings provides (data["profile-settings"] ?: emptySettings)) { NativeLocalization(nativeLanguageFor(LocalConfiguration.current.locales[0])) { CypherTheme(dark, preferences.skin) { NativeWindowLayout(this@CypherActivity) { CypherRoot(model); IncomingCallSheet(model, permissionSource.isNotBlank(), answer) } } } }
         }
     }
     private var pendingReturn by mutableStateOf("")
@@ -241,8 +239,7 @@ internal fun historyTruncationMessage(raw: org.json.JSONObject): String? =
     val ui by vm.ui.collectAsStateWithLifecycle()
     val botMode by vm.botMode.state.collectAsStateWithLifecycle()
     val botChatVisible = ui.tab == "More" && ui.morePage == "Bots" && botMode.activeBot != null && botMode.sessionId == vm.authenticatedScope()?.session
-    val preferences by vm.preferences.collectAsStateWithLifecycle()
-    val motionEnabled = rememberNativeMotionEnabled(preferences.reducedMotion)
+    val motionEnabled = rememberNativeMotionEnabled()
     val modeEntry = remember { Animatable(1f) }
     val sidebarState = rememberSaveableStateHolder()
     LaunchedEffect(ui.botModeEnabled, motionEnabled) {
@@ -250,7 +247,6 @@ internal fun historyTruncationMessage(raw: org.json.JSONObject): String? =
         else modeEntry.snapTo(1f)
     }
     val modeMotion = Modifier.graphicsLayer { alpha = modeEntry.value }
-    LaunchedEffect(preferences.reducedMotion) { vm.app.calls.reducedMotion=preferences.reducedMotion }
     val latestMotionEnabled by rememberUpdatedState(motionEnabled)
     val form by vm.form.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }

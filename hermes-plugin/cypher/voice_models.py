@@ -103,7 +103,16 @@ def choices(cfg, google_secret, mobile=None, owner=None, profile=None):
     result = []
     for provider in PROVIDERS:
         configuration_error=None
-        if provider=='gemini': configured=bool(google_secret(cfg))
+        if provider=='gemini':
+            try: configured=bool(google_secret(cfg))
+            except FileNotFoundError:
+                configured=False;configuration_error='Configured Google credentials file is missing'
+            except (OSError,UnicodeError,RuntimeError):
+                configured=False;configuration_error='Configured Google credentials file is unavailable'
+            except ImportError:
+                configured=False;configuration_error='Google credential store is unavailable'
+            except ValueError:
+                configured=False;configuration_error='Configured Google credentials are invalid'
         elif provider=='grok':
             try: configured=bool(xai_secret(cfg))
             except FileNotFoundError:

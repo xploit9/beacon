@@ -10,14 +10,14 @@ class SettingsSearchTest {
         assertEquals("Chat", settingsLabel("Settings"))
         assertEquals("Voice & calls", settingsLabel("Cypher"))
         val chatDescription = settingsDescriptions.getValue("Chat")
-        assertTrue(settingsSearchMatches(settingsLabel("Chat"), chatDescription, "chat preferences"))
+        assertTrue(settingsSearchMatches(settingsLabel("Chat"), chatDescription, "chat display"))
         assertTrue(settingsSearchMatches(settingsLabel("Chat"), chatDescription, "SEND"))
         assertTrue(settingsSearchMatches(settingsLabel("Chat"), chatDescription, "sending  display"))
         assertTrue(settingsSearchMatches("Tools & MCP", "Tool groups and MCP servers", "tools & mcp"))
         assertFalse(settingsSearchMatches(settingsLabel("Chat"), chatDescription, "camera"))
         assertFalse(settingsSearchMatches(settingsLabel("Chat"), chatDescription, "sending camera"))
-        assertTrue(settingsSearchMatches("Appearance", "Theme, text size and language", " "))
-        assertTrue(settingsSearchMatches("Appearance", "Theme, text size and language", " appearance "))
+        assertTrue(settingsSearchMatches("Appearance", "Theme and color style", " "))
+        assertTrue(settingsSearchMatches("Appearance", "Theme and color style", " appearance "))
         assertTrue(modelSearchMatches("provider", "model", "Configured model", " model "))
     }
     @Test fun unicodeWhitespaceSeparatesSearchTerms() {
@@ -92,17 +92,17 @@ class SettingsSearchTest {
         assertEquals("Connection needs attention", summary("Connection", unknown))
         val known = SettingsSnapshot(
             connected = true, profile = "work", sendKey = "ctrl_enter", formatMessages = false, showThinking = true,
-            theme = "dark", colorStyle = "graphite", fontSize = "xlarge", language = "Deutsch", reducedMotion = true,
+            theme = "dark", colorStyle = "graphite",
             installedVersion = "0.4.14", voiceProviderId = "gemini", voiceKeySaved = true, autoFollow = true, animateBackground = false,
             keepConnectedEnabled = true,
         )
         assertEquals("Connected privately · work", summary("Connection", known))
         assertEquals("Connection needs attention · work", summary("Connection", known.copy(connected = false)))
         assertEquals("Active profile · work", summary("Profiles & model", known))
-        assertEquals("Ctrl + Enter to send · Plain messages · Thinking shown · Auto-follow on · Background animation off", summary("Chat", known))
-        assertEquals("Background animation off", summary("Chat", SettingsSnapshot(reducedMotion = true, animateBackground = true)))
-        assertEquals("Dark · Graphite · Extra large text · Deutsch · Reduced motion", summary("Appearance", known))
-        assertEquals("Follow device · Cypher · Standard text · English · Right-to-left", summary("Appearance", SettingsSnapshot(theme = "system", colorStyle = "default", fontSize = "default", language = "English", rtl = true)))
+        // Two facts at most, so a hub row stays on one line.
+        assertEquals("Ctrl + Enter to send · Thinking shown", summary("Chat", known))
+        assertEquals("Dark · Graphite", summary("Appearance", known))
+        assertEquals("Follow device · Cypher", summary("Appearance", SettingsSnapshot(theme = "system", colorStyle = "default")))
         assertEquals("Installed · 0.4.14", summary("App updates", known))
         assertEquals("Installed · 0.4.14", summary("Health, logs & updates", known))
         assertEquals("Installed · 0.4.14", summary("About & licenses", known))
@@ -112,7 +112,7 @@ class SettingsSearchTest {
         assertEquals("Gemini Live · Key saved", summary("Voice & calls", known))
         assertEquals("Keep connected on", summary("Notifications & Keep connected", known))
         assertEquals("Keep connected off", summary("Notifications & Keep connected", known.copy(keepConnectedEnabled = false)))
-        assertEquals("Graphite · Extra large text", summary("Appearance", SettingsSnapshot(theme = "sepia", colorStyle = "graphite", fontSize = "xlarge")))
+        assertEquals("Graphite", summary("Appearance", SettingsSnapshot(theme = "sepia", colorStyle = "graphite")))
         assertEquals("Enter to send", summary("Chat", SettingsSnapshot(sendKey = "enter")))
         assertEquals("", summary("Chat", SettingsSnapshot(sendKey = "shift_enter")))
         for ((stored, label) in mapOf("enter" to "Enter to send", "ctrl_enter" to "Ctrl + Enter to send", "ctrl+enter" to "Ctrl + Enter to send", "shift+enter" to "Shift + Enter to send")) assertEquals(label, summary("Chat", SettingsSnapshot(sendKey = stored)))
@@ -133,9 +133,6 @@ class SettingsSearchTest {
         val parts = settingsSummary("Profiles & model", SettingsSnapshot(profile = "Settings"))
         assertEquals(listOf(SettingsSummaryPart("Active profile", true), SettingsSummaryPart("Settings", false)), parts)
         assertTrue(settingsSummary("App updates", SettingsSnapshot(installedVersion = "0.4.14")).last().let { !it.translate && it.text == "0.4.14" })
-        // Native language names are user-facing data in their own script and never pass through the catalog.
-        assertEquals(listOf(SettingsSummaryPart("العربية", false)), settingsSummary("Appearance", SettingsSnapshot(language = "العربية")))
-        assertEquals(listOf(SettingsSummaryPart("Deutsch", false)), settingsSummary("Appearance", SettingsSnapshot(language = "Deutsch")))
     }
     @Test fun colorStyleTranslatesLikeTheAppearancePicker() {
         // Known skins use the picker's label, which the picker passes through uiText.
@@ -156,7 +153,7 @@ class SettingsSearchTest {
             chat().put("_loading", true),
         )
         // The same values without the error/loading marker do produce summaries.
-        assertEquals("Ctrl + Enter to send · Plain messages · Thinking shown", summary("Chat", base.withLoaded(chat())))
+        assertEquals("Ctrl + Enter to send · Thinking shown", summary("Chat", base.withLoaded(chat())))
         assertEquals("Grok · Add key", summary("Voice & calls", base.copy(voiceProviderId = "grok", voiceKeySaved = false)))
         for (record in records) {
             val state = base.withLoaded(record)
@@ -174,7 +171,7 @@ class SettingsSearchTest {
         assertNull(onlySendKey.animateBackground)
         assertEquals("A loaded but empty record claims nothing", "", summary("Chat", base.withLoaded(JSONObject())))
         assertEquals("Enter to send", summary("Chat", base.withLoaded(json("send_key" to "enter", "render_user_markdown" to "false", "show_thinking" to JSONObject.NULL, "auto_scroll_follow" to "false", "animate_background" to JSONObject.NULL))))
-        assertEquals("Enter to send · Plain messages · Thinking shown · Auto-follow off · Background animation on", summary("Chat", base.withLoaded(json("send_key" to "enter", "render_user_markdown" to false, "show_thinking" to true, "auto_scroll_follow" to false, "animate_background" to true))))
+        assertEquals("Enter to send · Thinking shown", summary("Chat", base.withLoaded(json("send_key" to "enter", "render_user_markdown" to false, "show_thinking" to true, "auto_scroll_follow" to false, "animate_background" to true))))
     }
     @Test fun voiceSummaryNeedsKnownPhoneProviderAndKeyState() {
         assertEquals("Gemini Live · Key saved", summary("Voice & calls", base.copy(voiceProviderId = "gemini", voiceKeySaved = true)))
@@ -185,7 +182,7 @@ class SettingsSearchTest {
     }
     @Test fun overviewNeverAdvertisesRelayOnlyOrRemovedControls() {
         val forbidden = Regex("read.?aloud|insecure|http toggle|interrupt|plugin|relay", RegexOption.IGNORE_CASE)
-        val known = SettingsSnapshot(connected = true, profile = "work", sendKey = "enter", formatMessages = true, showThinking = true, theme = "light", colorStyle = "default", fontSize = "default", language = "English", installedVersion = "0.4.14", voiceProviderId = "gemini", voiceKeySaved = true)
+        val known = SettingsSnapshot(connected = true, profile = "work", sendKey = "enter", formatMessages = true, showThinking = true, theme = "light", colorStyle = "default", installedVersion = "0.4.14", voiceProviderId = "gemini", voiceKeySaved = true)
         for (route in settingsSearchRoutes) {
             val visible = "${settingsLabel(route)} ${settingsDescriptions[route].orEmpty()} ${summary(route, known)}"
             assertFalse("$route advertises unsupported capability: $visible", forbidden.containsMatchIn(visible))

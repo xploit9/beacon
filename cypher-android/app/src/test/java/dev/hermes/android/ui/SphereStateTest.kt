@@ -24,14 +24,12 @@ class SphereStateTest {
         assertEquals(SphereState.Idle, resolveSphereState(hasError = false, streaming = false, waitingForFirstToken = false))
     }
 
-    @Test fun reduceMotionAndDisabledSystemAnimationsPauseTheSphere() {
-        val reducedMotionEnabled = nativeMotionAllowed(reducedMotion = true, systemAnimationsEnabled = true, lifecycleStarted = true)
-        val systemAnimationsEnabled = nativeMotionAllowed(reducedMotion = false, systemAnimationsEnabled = false, lifecycleStarted = true)
-        assertFalse(reducedMotionEnabled)
+    @Test fun disabledSystemAnimationsPauseTheSphere() {
+        // The phone's "Remove animations" setting is the one motion switch.
+        val systemAnimationsEnabled = nativeMotionAllowed(systemAnimationsEnabled = false, lifecycleStarted = true)
         assertFalse(systemAnimationsEnabled)
-        assertFalse(nativeMotionAllowed(reducedMotion = false, systemAnimationsEnabled = true, lifecycleStarted = false))
-        assertTrue(nativeMotionAllowed(reducedMotion = false, systemAnimationsEnabled = true, lifecycleStarted = true))
-        assertEquals(SphereMotionMode.Still, sphereMotionMode(reducedMotionEnabled, fixedTime = null, fixedColorPhase = null))
+        assertFalse(nativeMotionAllowed(systemAnimationsEnabled = true, lifecycleStarted = false))
+        assertTrue(nativeMotionAllowed(systemAnimationsEnabled = true, lifecycleStarted = true))
         assertEquals(SphereMotionMode.Still, sphereMotionMode(systemAnimationsEnabled, fixedTime = null, fixedColorPhase = null))
     }
 

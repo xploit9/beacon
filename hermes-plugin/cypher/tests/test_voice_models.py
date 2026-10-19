@@ -213,6 +213,19 @@ def test_choices_reports_expected_xai_credential_errors_without_secrets(harness,
     assert store_error['configuration_error']=='xAI credential store is unavailable'
     assert 'credential store details' not in repr(store_error)
 
+def test_a_broken_google_credential_degrades_to_not_configured_instead_of_failing_bootstrap(harness,monkeypatch):
+    api,c,cfg,tmp,_=harness
+    monkeypatch.setattr(api.voice_models.importlib.util,'find_spec',lambda name:SimpleNamespace())
+    def gemini_choice(resolver):return next(item for item in api.voice_models.choices(cfg,resolver) if item['id']=='gemini')
+    for error,message in ((FileNotFoundError('/private/path'),'Configured Google credentials file is missing'),
+                          (RuntimeError('Invalid private credential file'),'Configured Google credentials file is unavailable'),
+                          (ModuleNotFoundError('dotenv'),'Google credential store is unavailable')):
+        def broken(_cfg,error=error):raise error
+        choice=gemini_choice(broken)
+        assert choice['configured'] is False and choice['available'] is False
+        assert choice['configuration_error']==message
+        assert '/private/path' not in repr(choice)
+
 def test_choices_does_not_hide_unexpected_xai_credential_errors(harness,monkeypatch):
     api,c,cfg,_,_=harness;ready(api,monkeypatch)
     def broken(_):raise RuntimeError('unexpected credential resolver failure')

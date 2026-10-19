@@ -53,7 +53,7 @@ class SettingsMigrationUiTest {
     private val known = SettingsSnapshot(
         connected = true, profile = "work", sendKey = "ctrl_enter", formatMessages = false, showThinking = true,
         autoFollow = true, animateBackground = true,
-        theme = "dark", colorStyle = "graphite", fontSize = "large", language = "English", installedVersion = "0.4.14", voiceProviderId = "gemini", voiceKeySaved = true,
+        theme = "dark", colorStyle = "graphite", installedVersion = "0.4.14", voiceProviderId = "gemini", voiceKeySaved = true,
     )
 
     private fun show(widthDp: Float, fontScale: Float = 1f, snapshot: SettingsSnapshot? = known): Host {
@@ -97,9 +97,9 @@ class SettingsMigrationUiTest {
     @Test fun phoneShowsRelayOrderedHubRowsAndLiveSummaries() {
         show(widthDp = PhoneWidthDp)
         shown("Connection").assertTextContains("Connected privately · work")
-        shown("Chat").assertTextContains("Ctrl + Enter to send · Plain messages · Thinking shown · Auto-follow on · Background animation on")
+        shown("Chat").assertTextContains("Ctrl + Enter to send · Thinking shown")
         shown("Voice & calls").assertTextContains("Gemini Live · Key saved")
-        shown("Appearance").assertTextContains("Dark · Graphite · Large text · English")
+        shown("Appearance").assertTextContains("Dark · Graphite")
         shown("Profiles & model").assertTextContains("Active profile · work")
         shown("Health, logs & updates").assertTextContains("Installed · 0.4.14")
         shown("About & licenses").assertTextContains("Installed · 0.4.14")
@@ -125,7 +125,7 @@ class SettingsMigrationUiTest {
             assertTrue("$name is shorter than its ${SettingsRowMinHeight.value}dp row floor", node.size.height / pxPerDp >= SettingsRowMinHeight.value - .5f)
             assertTrue("$name overflows the screen width", node.positionInRoot.x + node.size.width <= rootWidthPx + 1f)
         }
-        shown("Appearance").assertTextContains("Dark · Graphite · Large text · English")
+        shown("Appearance").assertTextContains("Dark · Graphite")
     }
 
     @Test fun everyHubRowEmitsItsRoute() {
@@ -149,7 +149,7 @@ class SettingsMigrationUiTest {
         compose.onNodeWithText("No matching settings").assertIsDisplayed()
         compose.onAllNodes(hasTestTag("settings-row:Settings")).assertCountEquals(0)
         search("appearance")
-        shown("Appearance").assertTextContains("Dark · Graphite · Large text · English")
+        shown("Appearance").assertTextContains("Dark · Graphite")
     }
 
     @Test fun searchFieldIsReachableAgainAfterAScrolledResultList() {
@@ -177,18 +177,18 @@ class SettingsMigrationUiTest {
 
     @Test fun summariesKeepUnknownsHonestAndExplainTheMissingPlugin() {
         val host = show(widthDp = PhoneWidthDp, snapshot = null)
-        shown("Appearance").assertTextContains("Theme, text size and language")
-        shown("Chat").assertTextContains("Chat preferences for sending and display")
+        shown("Appearance").assertTextContains("Theme and color style")
+        shown("Chat").assertTextContains("Sending and display")
         shown("Connection").assertTextContains("Server and signed-in account")
         compose.runOnIdle { host.snapshot = known }
-        shown("Appearance").assertTextContains("Dark · Graphite · Large text · English")
-        shown("Chat").assertTextContains("Ctrl + Enter to send · Plain messages · Thinking shown · Auto-follow on · Background animation on")
-        compose.runOnIdle { host.snapshot = known.copy(theme = "light", reducedMotion = true, updateName = "0.4.15") }
-        shown("Appearance").assertTextContains("Light · Graphite · Large text · English · Reduced motion")
+        shown("Appearance").assertTextContains("Dark · Graphite")
+        shown("Chat").assertTextContains("Ctrl + Enter to send · Thinking shown")
+        compose.runOnIdle { host.snapshot = known.copy(theme = "light", updateName = "0.4.15") }
+        shown("Appearance").assertTextContains("Light · Graphite")
         shown("Health, logs & updates").assertTextContains("Update available · 0.4.15")
         compose.runOnIdle { host.snapshot = known.copy(connected = false) }
         shown("Connection").assertTextContains("Connection needs attention · work")
-        shown("Notifications & Keep connected").assertTextContains("Manage notification delivery on this phone")
+        shown("Notifications & Keep connected").assertTextContains("Notification delivery")
         assertTrue("Reading a summary must not open a route", host.opened.isEmpty())
         compose.runOnIdle { host.pluginAbsent = true }
         compose.onNodeWithText("Calls need the Cypher plugin on your Hermes.").assertIsDisplayed()
@@ -207,9 +207,9 @@ class SettingsMigrationUiTest {
         )
         for (record in unavailable) {
             compose.runOnIdle { host.snapshot = known.withLoaded(record) }
-            shown("Chat").assertTextContains("Chat preferences for sending and display")
+            shown("Chat").assertTextContains("Sending and display")
             shown("Voice & calls").assertTextContains("Gemini Live · Key saved")
-            shown("Appearance").assertTextContains("Dark · Graphite · Large text · English")
+            shown("Appearance").assertTextContains("Dark · Graphite")
         }
         compose.runOnIdle { host.snapshot = known.withLoaded(json("send_key" to "shift+enter")) }
         shown("Chat").assertTextContains("Shift + Enter to send")

@@ -1,7 +1,6 @@
 package dev.hermes.android
 
 import android.content.Intent
-import android.Manifest
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -104,6 +103,28 @@ class SetupWizardUiTest {
         CypherViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.get(vm) as MutableStateFlow<T>
     private fun field(vm: CypherViewModel, name: String, value: Any?) {
         CypherViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.set(vm, value)
+    }
+
+    @Test fun returningToTheAppWhileSignedOutNeverStartsAConnection() {
+        val app = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext as CypherApplication
+        val store = ViewModelStore()
+        lateinit var vm: CypherViewModel
+        try {
+            compose.runOnUiThread { vm = ViewModelProvider(store, viewModelFactory { initializer { CypherViewModel(app, SavedStateHandle()) } })[CypherViewModel::class.java] }
+            compose.waitUntil(5_000) { !vm.ui.value.restoringSession }
+            val generation = CypherViewModel::class.java.getDeclaredField("originGeneration").apply { isAccessible = true }
+            compose.runOnUiThread {
+                field(vm, "client", null)
+                flow<AppState>(vm, "_ui").value = vm.ui.value.copy(authenticated = false, loading = false, error = "", setupWizard = true, setupStep = "connect")
+            }
+            val before = generation.getInt(vm)
+            compose.runOnUiThread { vm.foreground(false); vm.foreground(true) }
+            compose.waitForIdle()
+            assertEquals("A signed-out foreground (setup, sign-in return) must not connect and reset state", before, generation.getInt(vm))
+            assertFalse(vm.ui.value.loading)
+            assertEquals("", vm.ui.value.error)
+            assertTrue(vm.ui.value.setupWizard)
+        } finally { compose.runOnUiThread { store.clear() } }
     }
 
     @Test fun authReturnDeepLinkReturnsToCypher() {

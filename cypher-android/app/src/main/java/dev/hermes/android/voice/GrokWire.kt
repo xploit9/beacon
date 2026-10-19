@@ -179,7 +179,7 @@ internal class GrokWire(private val providerName: String = "Grok") {
             "response.function_call_arguments.delta" -> {
                 val item=frame.opt("item_id") as? String ?: return null
                 val delta=frame.opt("delta") as? String ?: return null
-                if(item.isBlank()||item.length>200||delta.isBlank()) return null
+                if(item.isBlank()||item.length>200||delta.isEmpty()) return null
                 val accumulated=argumentDeltas.getOrDefault(item,"")+delta
                 if(accumulated.length>20000) return null
                 argumentDeltas[item]=accumulated

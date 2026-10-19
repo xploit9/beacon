@@ -62,10 +62,11 @@ internal fun forEachNativeDot(width: Float, height: Float, step: Float, draw: (R
 
 @Composable fun nativeMetadataStyle(): TextStyle = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Medium, letterSpacing = 0.sp)
 
-internal fun nativeMotionAllowed(reducedMotion: Boolean, systemAnimationsEnabled: Boolean, lifecycleStarted: Boolean): Boolean =
-    systemAnimationsEnabled && !reducedMotion && lifecycleStarted
+/** Motion follows the phone's "Remove animations" setting and stops while the screen is not started. */
+internal fun nativeMotionAllowed(systemAnimationsEnabled: Boolean, lifecycleStarted: Boolean): Boolean =
+    systemAnimationsEnabled && lifecycleStarted
 
-@Composable fun rememberNativeMotionEnabled(reducedMotion: Boolean): Boolean {
+@Composable fun rememberNativeMotionEnabled(): Boolean {
     val resolver = LocalContext.current.contentResolver
     val lifecycle by LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsState()
     fun enabled() = android.provider.Settings.Global.getFloat(resolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f) > 0f
@@ -77,7 +78,7 @@ internal fun nativeMotionAllowed(reducedMotion: Boolean, systemAnimationsEnabled
         resolver.registerContentObserver(android.provider.Settings.Global.getUriFor(android.provider.Settings.Global.ANIMATOR_DURATION_SCALE), false, observer)
         onDispose { resolver.unregisterContentObserver(observer) }
     }
-    return nativeMotionAllowed(reducedMotion, systemEnabled, lifecycle.isAtLeast(Lifecycle.State.STARTED))
+    return nativeMotionAllowed(systemEnabled, lifecycle.isAtLeast(Lifecycle.State.STARTED))
 }
 fun nativeContrast(a: Color, b: Color): Float = (maxOf(a.luminance(), b.luminance()) + .05f) / (minOf(a.luminance(), b.luminance()) + .05f)
 fun nativeRoleBackgrounds(scheme: ColorScheme): List<Color> {

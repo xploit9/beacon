@@ -58,6 +58,10 @@ class IncomingDeadlineTest {
             val callChannel=manager.getNotificationChannel(original!!.channelId)
             val alerting=dev.hermes.android.push.incomingCallMayAlert(false,true,true,false,manager.areNotificationsEnabled(),
                 callChannel?.importance?:NotificationManager.IMPORTANCE_NONE,callChannel?.sound!=null,audio.ringerMode,audio.getStreamVolume(AudioManager.STREAM_RING))
+            if(audio.ringerMode==AudioManager.RINGER_MODE_NORMAL&&audio.getStreamVolume(AudioManager.STREAM_RING)>0) {
+                assertTrue("The call channel owns the ringtone",callChannel?.sound!=null)
+                assertTrue("Ringer on, volume up and notifications allowed: the card must alert",alerting)
+            }
             assertEquals(!alerting,original!!.group=="silent")
             assertEquals(alerting,(original!!.flags and Notification.FLAG_INSISTENT)!=0)
             assertEquals("Full-screen intent is only attached to an alerting card",alerting,original!!.fullScreenIntent!=null)

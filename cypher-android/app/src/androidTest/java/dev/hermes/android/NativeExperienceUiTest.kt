@@ -95,9 +95,13 @@ class NativeExperienceUiTest {
         check(!app.calls.state.value.active && app.calls.service == null) { "Never replace an active real call" }
         prepareWindow()
         val originKey = stringPreferencesKey("origin")
-        val motionKey = stringPreferencesKey("reduced_motion")
         val prior = runBlocking { app.preferences.data.first() }
-        runBlocking { app.preferences.edit { it[originKey] = ""; it[motionKey] = "true" } }
+        runBlocking { app.preferences.edit { it[originKey] = "" } }
+        // Motion follows the phone's "Remove animations" setting; still frames keep the synthetic UI deterministic.
+        val shell = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().uiAutomation
+        fun shellRun(command: String): String = shell.executeShellCommand(command).use { java.io.FileInputStream(it.fileDescriptor).bufferedReader().readText().trim() }
+        val priorAnimatorScale = shellRun("settings get global animator_duration_scale")
+        shellRun("settings put global animator_duration_scale 0")
         val store = ViewModelStore()
         val fixture = NativeExperienceFixture()
         runBlocking {
@@ -108,7 +112,8 @@ class NativeExperienceUiTest {
         // Each case starts without another case's initial-chat pointers (a shell id unknown to this fixture would block sends).
         runBlocking { listOf("new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session").forEach { app.cache.delete(fixture.scope, it) } }
         // Fixture chat ids (new-N) repeat across cases and runs; drop their per-chat receipts, drafts and projections too.
-        runBlocking { (1..8).forEach { n -> listOf("pending", "draft", "session", "client-created-shell", "side-question").forEach { app.cache.delete(fixture.scope.session("new-$n"), it) } } }
+        // shortcut: ids come from one counter shared with projects and branches; 24 covers every current case, widen it if one creates more.
+        runBlocking { (1..24).forEach { n -> listOf("pending", "draft", "session", "client-created-shell", "side-question").forEach { app.cache.delete(fixture.scope.session("new-$n"), it) } } }
         runBlocking { app.cache.delete(fixture.scope, "bot-mode-return"); app.cache.delete(fixture.scope, "xara-session"); app.cache.delete(fixture.scope, "xara-opening"); app.cache.delete(fixture.scope, "phone-editors"); app.cache.delete(fixture.scope, "editor:C:/synthetic-workspace/notes.md") }
         lateinit var vm: CypherViewModel
         try {
@@ -141,6 +146,7 @@ class NativeExperienceUiTest {
             compose.runOnUiThread { store.clear(); fixture.client.closeNative(); fixture.clearCustomTabSeam(); app.calls.ownerScope = null }
             // Restore every preference, including setup_* written by wizard and sign-out cases, so the real app never reopens on the wizard.
             runBlocking { app.preferences.updateData { prior } }
+            shellRun(if (priorAnimatorScale == "null" || priorAnimatorScale.isBlank()) "settings delete global animator_duration_scale" else "settings put global animator_duration_scale $priorAnimatorScale")
             runBlocking {
                 app.auth.remove(fixture.scope.origin)
                 if (priorChatPreferences == null) app.cache.delete(fixture.scope, "chat-preferences") else app.cache.write(fixture.scope, "chat-preferences", priorChatPreferences, true)
@@ -1035,7 +1041,6 @@ class NativeExperienceUiTest {
             freshId = vm.chat.value.sessionId
             // The fixture names the runtime it creates for a chat runtime-<id>; the REST projection carries no runtime id.
             val freshRuntime = "runtime-" + freshId
-            assertTrue(freshRuntime.isNotBlank())
             assertEquals("Send after the shell expired", vm.composer.value.text)
             assertTrue("The expired shell was resumed", fixture.requests.any {
                 it.string("method") == "session.resume" && it.getJSONObject("params").string("session_id") == shellId
@@ -1650,9 +1655,9 @@ class NativeExperienceUiTest {
         compose.onNodeWithTag("settings-overview").assertIsDisplayed()
         compose.onNodeWithTag("navigation-toggle").assertIsDisplayed()
         compose.onNode(hasText("Connected privately · default") and hasAnyAncestor(hasTestTag("settings-connection")), useUnmergedTree = true).assertExists()
-        summary("Settings", "Enter to send · Messages formatted · Thinking shown").assertExists()
+        summary("Settings", "Enter to send · Thinking shown").assertExists()
         summary("Profiles", "Active profile · default").assertExists()
-        summary("Appearance", "Reduced motion", substring = true).assertExists()
+        summary("Appearance", settingsThemeLabels.getValue(vm.preferences.value.theme), substring = true).assertExists()
         val voiceStore = VoiceKeyStore(app)
         val localProvider = voiceStore.settings().provider
         val localProviderLabel = when (localProvider) {
@@ -1676,7 +1681,7 @@ class NativeExperienceUiTest {
         // A real preference write moves its summary, the row opens the page that holds the saved value, and Back returns to the overview.
         compose.runOnIdle { vm.nativePreferences(json("send_key" to "ctrl_enter", "show_thinking" to false)) }
         await { vm.data.value["profile-settings"]?.let { it.string("send_key") == "ctrl_enter" && !it.optBoolean("show_thinking", true) } == true }
-        await { compose.onAllNodes(hasText("Ctrl + Enter to send · Messages formatted · Thinking hidden") and hasAnyAncestor(hasTestTag("settings-row:Settings")), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+        await { compose.onAllNodes(hasText("Ctrl + Enter to send · Thinking hidden") and hasAnyAncestor(hasTestTag("settings-row:Settings")), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
         capture("settings-summaries-updated")
         compose.onNodeWithTag("settings-row:Settings").performScrollTo().performClick()
         await { vm.ui.value.tab == "More" && vm.ui.value.morePage == "Settings" }
@@ -1687,7 +1692,7 @@ class NativeExperienceUiTest {
         capture("settings-detail-saved")
         compose.onNodeWithContentDescription("Back").performClick()
         await { vm.ui.value.tab == "More" && vm.ui.value.morePage.isBlank() }
-        summary("Settings", "Ctrl + Enter to send · Messages formatted · Thinking hidden").assertExists()
+        summary("Settings", "Ctrl + Enter to send · Thinking hidden").assertExists()
         compose.onNodeWithTag("navigation-toggle").performClick()
         compose.onNodeWithTag("navigation-menu").assertIsDisplayed()
         capture("settings-navigation-open")
@@ -1696,7 +1701,7 @@ class NativeExperienceUiTest {
         // Restore the fixture's own values, so the page captures below keep showing the defaults.
         compose.runOnIdle { vm.nativePreferences(json("send_key" to "enter", "show_thinking" to true)) }
         await { vm.data.value["profile-settings"]?.let { it.string("send_key") == "enter" && it.optBoolean("show_thinking", false) } == true }
-        summary("Settings", "Enter to send · Messages formatted · Thinking shown").assertExists()
+        summary("Settings", "Enter to send · Thinking shown").assertExists()
         receipts += "Settings overview summarizes local state, including the phone-selected voice provider and key presence; loading server voice capabilities leaves that summary unchanged; native chat preference writes update their row, the row opens the saved page, Back returns to the overview, and the left navigation still opens and closes."
         compose.runOnIdle { vm.more("Settings") }
         compose.onNodeWithText("Unavailable in native Hermes").assertDoesNotExist()
@@ -1780,9 +1785,9 @@ class NativeExperienceUiTest {
 
     @Test fun settingsSearchUsesVisibleNamesAndDirtyNotesRecoverFromEncryptedCache() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.navigate("Settings") }
-        compose.onNodeWithText("Search settings").performTextInput("Chat preferences")
+        compose.onNodeWithText("Search settings").performTextInput("Chat display")
         compose.onNodeWithTag("settings-row:Chat").assertExists()
-        compose.onNode(hasSetTextAction() and hasText("Chat preferences")).performTextReplacement("Tools & MCP")
+        compose.onNode(hasSetTextAction() and hasText("Chat display")).performTextReplacement("Tools & MCP")
         androidx.test.espresso.Espresso.closeSoftKeyboard()
         compose.onNodeWithTag("settings-row:Tools & MCP").performClick()
         await { vm.ui.value.morePage == "category:Tools & MCP" }
@@ -2299,17 +2304,8 @@ class NativeExperienceUiTest {
         }
         for (theme in listOf("light", "dark", "system")) { choice("Theme", theme); await { vm.preferences.value.theme == theme } }
         for (skin in NativeSkins) { choice("Color style", skin); await { vm.preferences.value.skin == skin } }
-        for (size in nativeFontSizes) { choice("Text size", size); await { vm.preferences.value.fontSize == size } }
-        for (language in listOf("日本語", "العربية", "English")) {
-            choice("Language", language)
-            await { NativeLanguages[vm.preferences.value.language] == language }
-        }
-        val motion = vm.preferences.value.reducedMotion
-        compose.onNode(hasText("Reduce motion") and isToggleable()).performScrollTo().performClick()
-        await { vm.preferences.value.reducedMotion != motion }
-        val rtl = vm.preferences.value.rtl
-        compose.onNode(hasText("Right-to-left layout") and isToggleable()).performScrollTo().performClick()
-        await { vm.preferences.value.rtl != rtl }
+        // Text size, language, text direction and motion belong to the phone's own settings.
+        for (removed in listOf("Text size", "Language", "Reduce motion", "Right-to-left layout")) compose.onAllNodesWithText(removed, substring = true).assertCountEquals(0)
         capture("audit-appearance")
         compose.runOnIdle { vm.more("Settings") }
         choice("Send shortcut", "ctrl_enter")
@@ -2322,7 +2318,7 @@ class NativeExperienceUiTest {
             val expected = app.assets.open(if (document.startsWith("rich/")) document else "licenses/$document").bufferedReader().use { it.readText().take(80) }
             await { compose.onAllNodes(hasText(expected, substring = true)).fetchSemanticsNodes().isNotEmpty() }
         }
-        receipts += "Appearance choices persist every shipped skin, themes, font sizes, representative languages, motion and RTL; chat preferences and every bundled license document control were executed."
+        receipts += "Appearance choices persist every shipped skin and theme (text size, language, direction and motion follow the phone); chat preferences and every bundled license document control were executed."
         capture("audit-licenses")
     }
 
@@ -2418,7 +2414,8 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Enabled", useUnmergedTree = true).performScrollTo().performClick()
         compose.onNodeWithText("Needs setup").performClick()
         compose.onNodeWithText("No skills match this filter and search.").assertExists()
-        compose.onNodeWithText("All", useUnmergedTree = true).performClick()
+        // The drawer's history "All" chip stays composed off-screen; pick the skills filter.
+        compose.onNode(hasText("All") and !hasAnyAncestor(hasTestTag("history-view-all")), useUnmergedTree = true).performClick()
         compose.onNodeWithText("Read & adjust").performScrollTo().performClick()
         await { vm.phoneSettings.skills.value.content != null }
         compose.onNodeWithText("Adjust instructions").performScrollTo().performClick()
@@ -2652,6 +2649,27 @@ class NativeExperienceUiTest {
         assertEquals("The accepted draft is cleared", "", vm.composer.value.text)
     }
 
+    @Test fun queuedPromptWaitsWhenAFinishedTurnsReplyIsNotInHistory() = withFixture { vm, fixture ->
+        kotlinx.coroutines.runBlocking { app.cache.delete(fixture.scope.session("chat-a"), "live:runtime-chat-a") }
+        val subscriptionsBeforeSend = fixture.streamSubscriptions.get()
+        // Hermes saves the prompt when the turn starts...
+        compose.runOnIdle { fixture.persistTerminalMessages = true; vm.composer(TextFieldValue("First prompt")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId == "runtime-chat-a" }
+        await { fixture.streamSubscriptions.get() > subscriptionsBeforeSend }
+        compose.runOnIdle { vm.composer(TextFieldValue("Queued follow-up")); vm.queue() }
+        await { vm.chat.value.queued.singleOrNull()?.text == "Queued follow-up" }
+        // ...but this reply never reaches the saved history.
+        fixture.persistTerminalMessages = false
+        fixture.emitNativeEvent("message.complete", json("text" to "A reply history never saved"))
+        // An unconfirmed reply keeps its live output; what matters is that the queue does not advance.
+        // Every unproven ending (reply not confirmed, history changed, refresh failed) keeps live output and says so.
+        try { await { vm.chat.value.status.contains("live output retained") } }
+        catch (error: Throwable) { throw AssertionError("Unproven ending not reported: status=${vm.chat.value.status} stream=${vm.chat.value.streamId} queued=${vm.chat.value.queued.map { it.text }} submits=${fixture.requests.count { it.string("method") == "prompt.submit" }}", error) }
+        runCatching { compose.waitUntil(3_000) { fixture.requests.count { it.string("method") == "prompt.submit" } > 1 } }
+        assertEquals("The queued prompt waits for review", "Queued follow-up", vm.chat.value.queued.single().text)
+        assertEquals("Nothing more is sent after an unconfirmed reply", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
+    }
+
     @Test fun interruptedTurnKeepsLiveProgressAndQueuedDraftUntilTerminalReplay() = withFixture { vm, fixture ->
         kotlinx.coroutines.runBlocking { app.cache.delete(fixture.scope.session("chat-a"), "live:runtime-chat-a") }
         val subscriptionsBeforeSend = fixture.streamSubscriptions.get()
@@ -2721,7 +2739,7 @@ class NativeExperienceUiTest {
         try {
             compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.CREATED)
             fixture.nativeTurnStatus = "idle"
-            fixture.resumeRuntimeSessionId = "$firstRuntime-resumed"
+            fixture.resumeRuntimeSessionIds[vm.chat.value.sessionId] = "$firstRuntime-resumed"
             fixture.retainNativeEvent(firstRuntime, "message.complete", json("text" to "Completed while backgrounded"))
             compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.RESUMED)
 

@@ -68,6 +68,8 @@ internal suspend fun voiceKeyConfiguredOnIo(store: () -> VoiceKeyStore): Boolean
     keyStore.hasKey(keyStore.settings().provider)
 }
 
+private val toolNamePattern = Regex("[A-Za-z0-9_.:-]{1,80}")
+
 internal fun separateToolResultIds(messages: List<JSONObject>): Set<String> = messages.asSequence()
     .filter { it.string("role") == "tool" || it.string("role") == "function" }
     .map { it.string("tool_call_id") }
@@ -79,7 +81,7 @@ internal fun toolCallResultId(tool: JSONObject): String = tool.string("tool_call
 /** Hermes stores the tool that produced a result row as `tool_name`; title the row after it. */
 internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> = messages.asSequence()
     .filter { (it.string("role") == "tool" || it.string("role") == "function") && it.string("id").isNotBlank() }
-    .mapNotNull { row -> row.string("tool_name").takeIf { it.matches(Regex("[A-Za-z0-9_.:-]{1,80}")) }?.let { row.string("id") to it.replace('_', ' ').replaceFirstChar(Char::titlecase) + " result" } }
+    .mapNotNull { row -> row.string("tool_name").takeIf { it.matches(toolNamePattern) }?.let { row.string("id") to it.replace('_', ' ').replaceFirstChar(Char::titlecase) + " result" } }
     .toMap()
 
 @Composable fun SessionList(vm: CypherViewModel, modifier: Modifier = Modifier, beforeHistory: @Composable () -> Unit = {}) {
@@ -194,7 +196,6 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
         text={Column(verticalArrangement=Arrangement.spacedBy(12.dp)) { LinearProgressIndicator(Modifier.fillMaxWidth());Text("Closing Grok and reconnecting this conversation. Your dialogue stays in this chat.") }},
         confirmButton={TextButton(vm::cancelVoiceHandoff) { Text("Stop") }})
     val side by vm.side.collectAsStateWithLifecycle()
-    val prefs by vm.preferences.collectAsStateWithLifecycle()
     val settings = LocalCypherSettings.current
     val ready = !xara || vm.isCypherConversation()
     val canonical = ready && chat.sessionId.isNotBlank()
@@ -222,7 +223,7 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
         val start = initialConversationPosition(messageIds, chat.anchorId, chat.anchor, chat.anchorOffset)
         rememberLazyListState(initialFirstVisibleItemIndex = start.first, initialFirstVisibleItemScrollOffset = start.second)
     }
-    val motionEnabled = rememberNativeMotionEnabled(prefs.reducedMotion)
+    val motionEnabled = rememberNativeMotionEnabled()
     val sphereMotionEnabled = motionEnabled && settings.optBoolean("animate_background", true)
     val sphereStreaming = chat.streamId.isNotBlank()
     val sphereWaitingForFirstToken = sphereStreaming && chat.liveText.isBlank()
@@ -696,7 +697,7 @@ private fun JSONObject.rawToolName(): String {
     // Hermes runs deferred tools through its `tool_call` meta-tool; name the tool it actually ran.
     if (name == "tool_call") {
         val inner = argumentsValue()?.let { it as? JSONObject ?: runCatching { JSONObject(it.toString()) }.getOrNull() }?.string("name").orEmpty()
-        if (inner.matches(Regex("[A-Za-z0-9_.:-]{1,80}"))) return inner
+        if (inner.matches(toolNamePattern)) return inner
     }
     return name.ifBlank { "tool" }
 }

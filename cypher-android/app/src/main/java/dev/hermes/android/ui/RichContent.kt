@@ -257,7 +257,6 @@ internal fun imagePanOffset(scale: Float, offset: androidx.compose.ui.geometry.O
     if (origin != null) NativeReferencePreview(vm, NativeReference.LocalMedia(path, origin.session, null, endpoint), name, origin)
 }
 @Composable private fun NativeReferencePreview(vm: CypherViewModel, reference: NativeReference, name: String, origin: Scope) {
-    val preferences by vm.preferences.collectAsStateWithLifecycle()
     val active = vm.client
     val resultClient = active.takeIf { reference is NativeReference.LocalMedia }
     val client = remember(origin.key, active) { active?.takeIf { it.scope == origin.copy(session = "") }?.detached() }
@@ -280,7 +279,7 @@ internal fun imagePanOffset(scale: Float, offset: androidx.compose.ui.geometry.O
     val extension = when (payload.mime.lowercase(java.util.Locale.ROOT)) { "image/svg+xml" -> "svg"; "image/gif" -> "gif"; "application/pdf" -> "pdf"; else -> filename.substringBefore('?').substringBefore('#').substringAfterLast('.', "").lowercase(java.util.Locale.ROOT) }
     when {
         extension == "svg" -> SvgPreview(data, name, origin.key)
-        extension == "gif" -> AnimatedPreview(data, name, preferences.reducedMotion, origin.key)
+        extension == "gif" -> AnimatedPreview(data, name, !rememberNativeMotionEnabled(), origin.key)
         extension == "pdf" || data.take(5).toByteArray().toString(Charsets.US_ASCII) == "%PDF-" -> PdfPreview(vm, data, origin.key, reference)
         payload.mime.startsWith("video/") || extension in setOf("mp4", "webm", "mkv", "mov") -> LocalMedia(vm, data, extension.ifBlank { "media" }, true, origin.key)
         payload.mime.startsWith("audio/") || extension in setOf("mp3", "wav", "m4a", "ogg", "flac", "aac") -> LocalMedia(vm, data, extension.ifBlank { "media" }, false, origin.key)

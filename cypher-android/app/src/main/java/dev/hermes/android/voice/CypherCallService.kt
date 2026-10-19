@@ -94,7 +94,6 @@ class CallController(private val app: CypherApplication) {
     @Volatile internal var service: CypherCallService? = null
     @Volatile var ownerScope: Scope? = null
         set(value) { field=value; service?.refreshOverlay() }
-    @Volatile var reducedMotion=false
     fun minimize(expectedId: String) { if(state.value.callId==expectedId) service?.minimize(expectedId) }
     fun resumeWindow() { service?.restoreWindow() }
     fun refreshOverlayPermission() { _state.update { it.withOverlayPermission(android.provider.Settings.canDrawOverlays(app)) } }
@@ -539,7 +538,7 @@ class CypherCallService : Service() {
                     !getSystemService(KeyguardManager::class.java).isDeviceLocked&&getSystemService(android.os.PowerManager::class.java).isInteractive,android.os.SystemClock.elapsedRealtime())
             },{if(app.calls.state.value.callId==expectedId) mute(!muted)},{if(app.calls.state.value.callId==expectedId) hangup()},{
                 if(app.calls.state.value.callId==expectedId) startActivity(Intent(this@CypherCallService,CypherActivity::class.java).setFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP).putExtra(EXTRA_CALL_ID,expectedId))
-            },{android.provider.Settings.Global.getFloat(contentResolver,android.provider.Settings.Global.ANIMATOR_DURATION_SCALE,1f)==0f||app.calls.reducedMotion})
+            },{android.provider.Settings.Global.getFloat(contentResolver,android.provider.Settings.Global.ANIMATOR_DURATION_SCALE,1f)==0f})
             if(overlayAuthorityJob?.isActive!=true) overlayAuthorityJob=scope.launch {
                 while(isActive&&!closed.get()) {
                     overlayAuthority.refresh()
