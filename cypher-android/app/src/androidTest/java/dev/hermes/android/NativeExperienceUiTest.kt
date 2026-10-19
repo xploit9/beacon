@@ -934,6 +934,33 @@ class NativeExperienceUiTest {
         receipts += "While the conversation list is being fetched the drawer shows a loading row, never a false empty state."
     }
 
+    @Test fun threadsLaneStartsANamedThreadAndDrawerFiltersRunInHermes() = withFixture { vm, fixture ->
+        try {
+            compose.runOnIdle { vm.toggleSessions(true) }
+            compose.onNodeWithTag("history-threads").performScrollTo().performClick()
+            compose.waitUntil(5_000) { fixture.sessionListQueries.any { it.string("sources") == "android_thread,phone" } }
+            compose.waitUntil(5_000) { compose.onAllNodesWithText("No threads yet").fetchSemanticsNodes().isNotEmpty() }
+
+            compose.onNodeWithTag("history-new-thread").performScrollTo().performClick()
+            compose.onNodeWithTag("new-thread-name").performTextInput("Trip planning")
+            compose.onNodeWithTag("new-thread-start").performClick()
+            await { fixture.requests.any { it.string("method") == "session.create" && it.getJSONObject("params").string("source") == "android_thread" } }
+            assertEquals("Trip planning", fixture.requests.last { it.string("method") == "session.create" }.getJSONObject("params").string("title"))
+            await { vm.chat.value.sessionId.isNotBlank() && vm.chat.value.title == "Trip planning" }
+
+            compose.runOnIdle { vm.setHistoryFilters(setOf("telegram"), "created") }
+            await { vm.preferences.value.historyOrder == "created" && vm.preferences.value.historyHiddenSources == setOf("telegram") }
+            compose.runOnIdle { vm.toggleSessions(true) }
+            compose.onNodeWithTag("history-view-all").performScrollTo().performClick()
+            compose.waitUntil(5_000) { fixture.sessionListQueries.any { it.string("exclude_sources") == "cron,telegram" && it.string("order") == "created" } }
+            compose.onNodeWithTag("history-filter").performScrollTo().assertIsSelected()
+        } finally {
+            compose.runOnIdle { vm.setHistoryFilters(emptySet(), "recent") }
+            await { vm.preferences.value.historyOrder == "recent" && vm.preferences.value.historyHiddenSources.isEmpty() }
+        }
+        receipts += "Threads sit under Search: the lane asks Hermes for Cypher and Relay threads only, a named thread is created natively with its own source and title, and source/order filters are applied by Hermes."
+    }
+
     @Test fun unsentChatComposerShowsTheProfileModelAndEffort() = withFixture { vm, fixture ->
         fixture.profileModel = "profile-default-model"; fixture.reasoningEffort = "high"
         compose.runOnIdle {
@@ -2608,6 +2635,21 @@ class NativeExperienceUiTest {
         assertTrue(submit.string("text").contains("Native send while the plugin is down"))
         receipts += "With the optional plugin returning 404/500, saved history loads from stock /api/sessions routes without resuming an agent, and a native send still resumes and submits to the selected conversation."
         capture("flow-stock-history-plugin-outage")
+    }
+
+    @Test fun sendInFlightShowsTheMessageOnceWithoutTheUnknownOutcomeBanner() = withFixture { vm, fixture ->
+        fixture.holdPromptAcknowledgement = true
+        try {
+            compose.runOnIdle { vm.composer(TextFieldValue("In flight message")); vm.send() }
+            await { fixture.requests.any { it.string("method") == "prompt.submit" } }
+            compose.waitUntil(5_000) { compose.onAllNodesWithTag("sending-message").fetchSemanticsNodes().isNotEmpty() }
+            assertEquals("The message shows once: in the transcript, not again in the composer", 1, compose.onAllNodesWithText("In flight message").fetchSemanticsNodes().size)
+            assertEquals("A send still in flight is not an unknown outcome", 0, compose.onAllNodesWithText("Checking whether your last message arrived. Your draft is saved.").fetchSemanticsNodes().size)
+            assertEquals("The draft stays held until Hermes accepts the turn", "In flight message", vm.composer.value.text)
+        } finally { fixture.releasePromptAcknowledgement() }
+        await { vm.chat.value.uncertain.isBlank() && vm.chat.value.streamId.isNotBlank() }
+        compose.waitUntil(5_000) { compose.onAllNodesWithTag("sending-message").fetchSemanticsNodes().isEmpty() && compose.onAllNodesWithTag("live-reply").fetchSemanticsNodes().isNotEmpty() }
+        assertEquals("The accepted draft is cleared", "", vm.composer.value.text)
     }
 
     @Test fun interruptedTurnKeepsLiveProgressAndQueuedDraftUntilTerminalReplay() = withFixture { vm, fixture ->

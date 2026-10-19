@@ -201,6 +201,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private var sessionIndexRequest = 0L
     private var sessionIndexRevision = 0L
     private var sessionIndexArchived = false
+    private var sessionIndexThreads = false
     private val liveBoundaries = java.util.concurrent.ConcurrentHashMap<String, LiveAssistantBoundary>()
     private var chatHistoryRevision = 0L
     @Volatile private var originGeneration = 0
@@ -1275,7 +1276,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                     val current = _ui.value
                     val target = json("origin" to owner.origin, "owner" to owner.owner, "profile" to owner.profile,
                         "session" to _chat.value.sessionId, "tab" to current.tab, "page" to current.morePage,
-                        "query" to current.query, "archived" to sessionIndexArchived)
+                        "query" to current.query, "archived" to sessionIndexArchived, "threads" to sessionIndexThreads)
                     app.cache.write(modeCacheScope(owner), "bot-mode-return", target.toString(), protected = true)
                     normalModeReturn = target
                     clearPendingVoiceKeyRequestsIfLeavingVoiceKeyPage("More", "Bots")
@@ -1319,7 +1320,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                     val page = target.string("page")
                     _ui.update { it.copy(botModeEnabled = false, tab = tab, morePage = page, query = target.string("query")) }
                     saved["tab"] = tab; saved["more"] = page
-                    refreshSessions(target.string("query"), target.optBoolean("archived"))
+                    refreshSessions(target.string("query"), target.optBoolean("archived"), threads = target.optBoolean("threads"))
                 }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
@@ -1441,12 +1442,15 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private var indexFetch: Job? = null
     private var indexFetchKey = ""
     private var indexReadAt = 0L
-    fun refreshSessions(query: String = _ui.value.query, archived: Boolean = false, force: Boolean = true): Job {
+    /** Defaults keep the drawer's current view (archived/threads), so a background refresh never swaps the list under it. */
+    fun refreshSessions(query: String = _ui.value.query, archived: Boolean = sessionIndexArchived, force: Boolean = true, threads: Boolean = sessionIndexThreads): Job {
         val active = client ?: return viewModelScope.launch {}
         val c = active.detached()
         val scope = c.scope
         val generation = originGeneration
-        val fetchKey = "${scope.key}:$generation:$query:$archived"
+        val hidden = preferences.value.historyHiddenSources.sorted().joinToString(",")
+        val order = preferences.value.historyOrder
+        val fetchKey = "${scope.key}:$generation:$query:$archived:$threads:$hidden:$order"
         if (indexFetchKey == fetchKey) {
             if (!force) indexFetch?.takeIf { it.isActive }?.let { return it }
             if (!force && startupReadFresh(indexReadAt, System.currentTimeMillis())) return viewModelScope.launch {}
@@ -1455,11 +1459,13 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val request = ++sessionIndexRequest
         val revision = sessionIndexRevision
         sessionIndexArchived = archived
+        sessionIndexThreads = threads
         _ui.update { it.copy(query = query, historyLoading = true) }
         fun current() = client === active && generation == originGeneration && _ui.value.authenticated && sessionIndexCurrent(request, sessionIndexRequest, revision, sessionIndexRevision)
         return viewModelScope.launch {
           try { supervisorScope {
-            val params = mutableMapOf("profile" to scope.profile, "include_archived" to if (archived) "1" else "0")
+            val params = mutableMapOf("profile" to scope.profile, "include_archived" to if (archived) "1" else "0", "hidden_sources" to hidden, "order" to order)
+            if (threads) params["view"] = "threads"
             val sessions = if (query.isBlank()) c.get("/api/sessions", params) else c.get("/api/sessions/search", params + ("q" to query))
             if (!current()) return@supervisorScope
             val serverRows = sessions.rows("sessions").ifEmpty { sessions.rows("results") }
@@ -1468,13 +1474,13 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 val local = confirmedSessions[key]
                 if (local != null && row.optInt("message_count") >= local.optInt("message_count")) confirmedSessions.remove(key)
             }
-            val confirmed = confirmedSessions.filterKeys { it.startsWith("${scope.key}:") }.values.toList().asReversed()
+            val confirmed = confirmedSessions.filterKeys { it.startsWith("${scope.key}:") }.values.toList().asReversed().filter { !threads || dev.hermes.android.ui.isThreadSource(it.string("source")) }
             val rows = visibleSessionRows(serverRows, confirmed, query, archived)
             indexReadAt = System.currentTimeMillis()
             _ui.update { it.copy(sessions = rows, connected = true) }
             if (current()) {
                 app.auth.persist(c.auth)
-                if (query.isBlank() && !archived) app.cache.write(scope, "conversation-index", json("sessions" to JSONArray(rows)).toString())
+                if (query.isBlank() && !archived && !threads) app.cache.write(scope, "conversation-index", json("sessions" to JSONArray(rows)).toString())
             }
 
           } } catch (e: Throwable) { if (e is CancellationException) throw e; if (current()) fail(e) }
@@ -1491,7 +1497,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         // Only server-confirmed IDs enter this temporary index overlay.
         confirmedSessions["${owner.key}:$id"] = row
         ++sessionIndexRevision
-        if (_ui.value.query.isBlank() && !sessionIndexArchived) _ui.update { it.copy(sessions = visibleSessionRows(it.sessions, listOf(row), "", false)) }
+        if (_ui.value.query.isBlank() && !sessionIndexArchived && (!sessionIndexThreads || dev.hermes.android.ui.isThreadSource(row.string("source")))) _ui.update { it.copy(sessions = visibleSessionRows(it.sessions, listOf(row), "", false)) }
     }
     private fun initialDraftOwner(): Scope? = (client?.scope ?: cachedOwnerScope)?.takeIf { _ui.value.authenticated && sourceScope == null && _chat.value.sessionId.isBlank() }
     fun canComposeInitialChat(): Boolean = _ui.value.initialChatReady && _ui.value.tab == "Chat" && initialDraftOwner() != null
@@ -1534,6 +1540,15 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         client?.scope?.key?.let { key -> newChatJobs[key]?.takeIf { !it.isCompleted }?.let { return it } }
         ++navigationGeneration
         return createNewChat(body, initial = false)
+    }
+    /** A named thread (Relay-style): a new native chat with its own source, titled by the user, not by Hermes's auto-title. */
+    fun newThread(name: String): Job {
+        val title = dev.hermes.android.ui.uniqueThreadTitle(name, _ui.value.sessions.map { it.string("title") })
+        if (title.isBlank()) return viewModelScope.launch { notice("Name the thread first") }
+        return newChat(json("title" to title, "thread" to true))
+    }
+    fun setHistoryFilters(hidden: Set<String>, order: String) = viewModelScope.launch {
+        app.preferences.edit { it[stringPreferencesKey("history_hidden_sources")] = hidden.sorted().joinToString(","); it[stringPreferencesKey("history_order")] = order }
     }
     fun retryInitialChat(): Job {
         if (!canComposeInitialChat()) return viewModelScope.launch {}
@@ -1986,7 +2001,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             val provider = queued?.provider ?: _chat.value.raw.string("model_provider")
             val o = c.post("/api/chat/start", json("session_id" to scope.session, "message" to d.text, "attachments" to JSONArray(d.attachments), "profile" to scope.profile, "client_request_id" to send.id, "model" to model.ifBlank { null }, "model_provider" to provider.ifBlank { null }, "explicit_model_pick" to (queued != null || saved.get<Boolean>("model_pick:${scope.key}") == true)))
             accepted(scope, c, o, send)
-        } catch (e: Throwable) { if (e is CancellationException) throw e; if (e is ApiFailure && e.status == 409) { try { reconcile(scope, c) } catch (receiptError: Throwable) { if (receiptError is CancellationException) throw receiptError; if (sourceScope == scope) fail(receiptError) }; return@launch }; if (e is ApiFailure && e.status in 400..499 && e.status !in setOf(408, 429)) { pending.remove(scope.key, send); optionalLocalSave { app.cache.delete(scope, "pending", send.encode()) }; if (sourceScope == scope && pending[scope.key] == null) _chat.update { it.copy(uncertain = "", status = "") } }; if (sourceScope == scope) fail(e) }
+        } catch (e: Throwable) { if (e is CancellationException) throw e; if (e is ApiFailure && e.status == 409) { try { reconcile(scope, c) } catch (receiptError: Throwable) { if (receiptError is CancellationException) throw receiptError; if (sourceScope == scope) fail(receiptError) }; return@launch }; if (e is ApiFailure && e.status in 400..499 && e.status !in setOf(408, 429)) { pending.remove(scope.key, send); optionalLocalSave { app.cache.delete(scope, "pending", send.encode()) }; if (sourceScope == scope && pending[scope.key] == null) _chat.update { it.copy(uncertain = "", status = "") } }; if (sourceScope == scope && _chat.value.uncertain == send.id) _chat.update { it.copy(status = "Send outcome unknown") }; if (sourceScope == scope) fail(e) }
     }
     private suspend fun accepted(scope: Scope, c: CypherClient, result: JSONObject, send: PendingSend) {
         val sent = send.draft

@@ -60,6 +60,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     val roomReadCaptured = java.util.concurrent.CountDownLatch(1)
     val releaseRoomRead = java.util.concurrent.CountDownLatch(1)
     val holdNextSessionList = java.util.concurrent.atomic.AtomicBoolean(false)
+    val sessionListQueries = CopyOnWriteArrayList<JSONObject>()
     val sessionListCaptured = java.util.concurrent.CountDownLatch(1)
     val releaseSessionList = java.util.concurrent.CountDownLatch(1)
     @Volatile var approvalMode = "manual"
@@ -112,6 +113,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var fileText = "# Travel notes\nCheck the weather."
     @Volatile var fileWrites = 0
     @Volatile var holdCreateAcknowledgement = false
+    @Volatile var holdPromptAcknowledgement = false
     private val delayedCreates = CopyOnWriteArrayList<() -> Unit>()
     @Volatile private var activeNativeListener: WebSocketListener? = null
     @Volatile private var activeNativeSocket: WebSocket? = null
@@ -129,8 +131,9 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var callbackFailure: Throwable? = null
     private val nativeEvents = CopyOnWriteArrayList<JSONObject>()
     private val nativeEventSequence = AtomicInteger()
+    fun releasePromptAcknowledgement() = releaseCreateAcknowledgement()
     fun releaseCreateAcknowledgement() {
-        val queued = synchronized(delayedCreates) { holdCreateAcknowledgement = false; delayedCreates.toList().also { delayedCreates.clear() } }
+        val queued = synchronized(delayedCreates) { holdCreateAcknowledgement = false; holdPromptAcknowledgement = false; delayedCreates.toList().also { delayedCreates.clear() } }
         queued.forEach { it() }
     }
     fun installCustomTabSeam() {
@@ -340,8 +343,13 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             // Stock dashboard index: profile-scoped pages of at most 100, archived=exclude|only.
             val limit = url?.queryParameter("limit")?.toIntOrNull() ?: 20
             val offset = url?.queryParameter("offset")?.toIntOrNull() ?: 0
+            // Like Hermes: `sources` keeps only those platforms, `exclude_sources` drops them.
+            val only = url?.queryParameter("sources")?.split(',')?.filter(String::isNotBlank)?.toSet()
+            val excluded = url?.queryParameter("exclude_sources").orEmpty().split(',').filter(String::isNotBlank).toSet()
+            sessionListQueries += json("sources" to url?.queryParameter("sources"), "exclude_sources" to url?.queryParameter("exclude_sources"), "order" to url?.queryParameter("order"))
             if (limit !in 1..100) 422 to json("detail" to "limit must be at most 100")
             else 200 to json("sessions" to JSONArray(sessions.values.filter { it.getJSONObject("info").optBoolean("hidden") == archived }
+                .filter { row -> val source = row.getJSONObject("info").string("source"); (only == null || source in only) && source !in excluded }
                 .map { row -> row.getJSONObject("info").copy().put("id", row.string("stored_session_id")).put("profile", profile).put("message_count", row.getJSONArray("messages").length()) }
                 .drop(offset).take(limit)))
         }
@@ -497,7 +505,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                     val result = rpc(method, params)
                     val response = json("jsonrpc" to "2.0", "id" to frame.getString("id"), "result" to result).toString()
                     val deferred = synchronized(delayedCreates) {
-                        if (holdCreateAcknowledgement && method == "session.create") { delayedCreates += { listener.onMessage(this, response) }; true } else false
+                        if (holdCreateAcknowledgement && method == "session.create" || holdPromptAcknowledgement && method == "prompt.submit") { delayedCreates += { listener.onMessage(this, response) }; true } else false
                     }
                     if (!deferred) listener.onMessage(this, response)
                     if (!deferred && method == "session.events.since") {
@@ -560,6 +568,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             }
             "session.history" -> { require(!historyFailure) { "Synthetic history unavailable" }; sessions[id]?.copy()?.apply { put("session_key", id); remove("stored_session_id"); getJSONObject("info").put("stored_session_id", id) } ?: throw IllegalArgumentException("Synthetic session missing") }
             "session.create" -> { val key = "new-${sequence.incrementAndGet()}"; history(key, params.string("title", "New conversation"), JSONArray()).also { row ->
+                row.getJSONObject("info").put("source", params.string("source"))
                 runtimeStoredSessionIds[row.string("session_id")] = key
                 currentRuntimeSessionIds[key] = row.string("session_id")
                 sessions[key] = row

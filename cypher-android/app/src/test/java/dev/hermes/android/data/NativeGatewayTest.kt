@@ -124,6 +124,19 @@ class NativeGatewayTest {
         fixture.client.closeNative()
     }
 
+    @Test fun aThreadIsCreatedWithItsOwnSourceAndOnlyThatSourceIsAccepted() = runBlocking<Unit> {
+        val fixture = GatewayFixture()
+        fixture.client.nativeCreate(json("title" to "Trip planning", "source" to CYPHER_THREAD_SOURCE))
+        val thread = fixture.calls.single { it.first == "session.create" }.second
+        assertEquals(CYPHER_THREAD_SOURCE, thread.getString("source"))
+        assertEquals("Trip planning", thread.getString("title"))
+        fixture.client.closeNative()
+        val other = GatewayFixture()
+        other.client.nativeCreate(json("source" to "telegram"))
+        assertEquals("A phone chat never claims another platform", "android", other.calls.single { it.first == "session.create" }.second.getString("source"))
+        other.client.closeNative()
+    }
+
     @Test fun unsentShellRecoveryResumesLazilySoHermesNeverMaterializesAnOwnerlessRow() = runBlocking<Unit> {
         val fixture = GatewayFixture()
         fixture.client.nativeSession("20261019_001507_a4cbef", lazy = true)

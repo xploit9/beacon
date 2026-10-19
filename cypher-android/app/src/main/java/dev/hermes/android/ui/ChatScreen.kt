@@ -85,32 +85,88 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
 @Composable fun SessionList(vm: CypherViewModel, modifier: Modifier = Modifier, beforeHistory: @Composable () -> Unit = {}) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val chat by vm.chat.collectAsStateWithLifecycle()
+    val preferences by vm.preferences.collectAsStateWithLifecycle()
     var search by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf(ui.query) }
     var archived by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf(false) }
-    LaunchedEffect(search, archived) { kotlinx.coroutines.delay(250); vm.refreshSessions(search, archived, force = false) }
+    var view by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf(HistoryView.All) }
+    var naming by rememberSaveable { mutableStateOf(false) }
+    var filtersOpen by remember { mutableStateOf(false) }
+    val order = HistoryOrder.of(preferences.historyOrder)
+    val hidden = preferences.historyHiddenSources
+    LaunchedEffect(search, archived, view, hidden, order) { kotlinx.coroutines.delay(250); vm.refreshSessions(search, archived, force = false, threads = view == HistoryView.Threads) }
     // One scroll owner keeps destinations, search, projects and history reachable with the IME.
     LazyColumn(modifier.background(MaterialTheme.colorScheme.surfaceContainer), contentPadding = PaddingValues(bottom = 16.dp)) {
         item("destinations") { beforeHistory() }
         item("history-header") { Text(uiText("History"), Modifier.padding(horizontal = 16.dp, vertical = 12.dp), style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         item("history-search") { OutlinedTextField(search, { search = it }, leadingIcon = { Icon(Icons.Rounded.Search, null) }, placeholder = { Text(uiText("Search conversations")) }, singleLine = true, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)) }
-        item("history-filters") { Row(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+        item("history-threads") {
+            val selected = view == HistoryView.Threads
+            Surface(onClick = { view = if (selected) HistoryView.All else HistoryView.Threads }, modifier = Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 10.dp).heightIn(min = 56.dp).semantics { this.selected = selected }.testTag("history-threads"),
+                shape = RoundedCornerShape(16.dp), color = if (selected) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
+                border = BorderStroke(1.dp, if (selected) MaterialTheme.colorScheme.primary.copy(alpha = .5f) else MaterialTheme.colorScheme.outlineVariant)) {
+                Row(Modifier.padding(start = 14.dp, end = 4.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    ThreadSpoolGlyph(Modifier.size(22.dp), tint = MaterialTheme.colorScheme.primary)
+                    Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                        Text(uiText("Threads"), style = MaterialTheme.typography.titleSmall)
+                        Text(uiText("Named conversations you come back to"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    IconButton(onClick = { naming = true }, modifier = Modifier.testTag("history-new-thread")) { Icon(Icons.Rounded.Add, uiText("New thread"), tint = MaterialTheme.colorScheme.primary) }
+                }
+            }
+        }
+        item("history-filters") { Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            FilterChip(view == HistoryView.All, { view = HistoryView.All }, { Text(uiText("All")) }, modifier = Modifier.testTag("history-view-all"))
+            FilterChip(view == HistoryView.Pinned, { view = if (view == HistoryView.Pinned) HistoryView.All else HistoryView.Pinned }, { Text(uiText("Pinned")) }, modifier = Modifier.testTag("history-view-pinned"))
             FilterChip(archived, { archived = !archived }, { Text(uiText("Archived")) })
+            Box {
+                val filtered = hidden.isNotEmpty() || order != HistoryOrder.Recent
+                FilterChip(filtered, { filtersOpen = true }, { Text(if (hidden.isEmpty()) uiText("Filter") else uiText("Filter") + " · " + hidden.size) }, leadingIcon = { Icon(Icons.Rounded.FilterList, null, Modifier.size(18.dp)) }, modifier = Modifier.testTag("history-filter"))
+                DropdownMenu(filtersOpen, { filtersOpen = false }) {
+                    Text(uiText("Sort by"), Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    HistoryOrder.entries.forEach { option -> DropdownMenuItem(text = { Text(uiText(option.label)) }, leadingIcon = { RadioButton(option == order, null) }, onClick = { vm.setHistoryFilters(hidden, option.key) }, modifier = Modifier.testTag("history-order:" + option.key)) }
+                    val sources = historySources(ui.sessions, hidden)
+                    if (view != HistoryView.Threads && sources.isNotEmpty()) {
+                        HorizontalDivider()
+                        Text(uiText("Show conversations from"), Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        sources.forEach { source -> DropdownMenuItem(text = { Text(uiText(historySourceLabel(source))) }, leadingIcon = { Checkbox(source !in hidden, null) }, onClick = { vm.setHistoryFilters(if (source in hidden) hidden - source else hidden + source, order.key) }, modifier = Modifier.testTag("history-source:" + source)) }
+                    }
+                    if (filtered) { HorizontalDivider(); DropdownMenuItem(text = { Text(uiText("Reset filters")) }, onClick = { filtersOpen = false; vm.setHistoryFilters(emptySet(), HistoryOrder.Recent.key) }) }
+                }
+            }
         } }
-        val groups = navigationHistoryGroups(ui.sessions.map { it.optBoolean("pinned") })
+        val rows = historyRows(ui.sessions, view, order)
+        val groups = if (view == HistoryView.Threads) listOf("Threads" to rows.indices.toList()) else navigationHistoryGroups(rows.map { it.optBoolean("pinned") })
         groups.forEach { (label, indices) ->
             if (indices.isNotEmpty()) item("history:$label") { Text(uiText(label), Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-            val rows = indices.map { ui.sessions[it] }
-        if (ui.sessions.isEmpty() && label == "Recent") item("empty-history") {
+            val groupRows = indices.map { rows[it] }
+        if (rows.isEmpty() && label == groups.last().first) item("empty-history") {
             // An empty list is only "empty" once the fetch has answered.
             if (ui.historyLoading) ListItem(headlineContent = { Text(uiText("Loading conversations…")) }, leadingContent = { CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) }, colors = ListItemDefaults.colors(containerColor = Color.Transparent), modifier = Modifier.testTag("history-loading"))
-            else EmptyState("No conversations here", "Start a conversation or try another search.", action = "New conversation", onAction = { vm.toggleSessions(false); vm.newChat() })
+            else when (view) {
+                HistoryView.Threads -> EmptyState("No threads yet", "Start a named thread for a topic you will come back to.", action = "New thread", onAction = { naming = true })
+                HistoryView.Pinned -> EmptyState("No pinned conversations", "Pin a conversation from its actions to keep it here.")
+                HistoryView.All -> EmptyState("No conversations here", "Start a conversation or try another search.", action = "New conversation", onAction = { vm.toggleSessions(false); vm.newChat() })
+            }
         }
-        items(rows, key = { "session:" + sessionRowId(it) }) { row ->
+        items(groupRows, key = { "session:" + sessionRowId(it) }) { row ->
             val id = sessionRowId(row)
-            ListItem(headlineContent = { Text(row.string("title").ifBlank { "Untitled conversation" }, maxLines = 2) }, leadingContent = { Icon(if (row.optBoolean("pinned")) Icons.Rounded.PushPin else Icons.Rounded.ChatBubbleOutline, null) }, trailingContent = { if (row.string("active_stream_id").isNotBlank()) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp) }, colors = ListItemDefaults.colors(containerColor = if (id == chat.sessionId) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent), modifier = Modifier.semantics { selected = id == chat.sessionId }.clickable { vm.tab("Chat"); vm.openConversation(row) }.heightIn(min = 56.dp))
+            val source = row.string("source")
+            val thread = isThreadSource(source)
+            val external = source.isNotBlank() && source != "android" && !thread
+            ListItem(headlineContent = { Text(row.string("title").ifBlank { "Untitled conversation" }, maxLines = 2) },
+                supportingContent = if (external) ({ Text(uiText(historySourceLabel(source)), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }) else null,
+                leadingContent = { if (thread && !row.optBoolean("pinned")) ThreadSpoolGlyph(Modifier.size(24.dp), tint = LocalContentColor.current) else Icon(if (row.optBoolean("pinned")) Icons.Rounded.PushPin else Icons.Rounded.ChatBubbleOutline, null) },
+                trailingContent = { if (row.string("active_stream_id").isNotBlank()) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp) }, colors = ListItemDefaults.colors(containerColor = if (id == chat.sessionId) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent), modifier = Modifier.semantics { selected = id == chat.sessionId }.clickable { vm.tab("Chat"); vm.openConversation(row) }.heightIn(min = 56.dp))
         }
         }
 
+    }
+    if (naming) {
+        var name by rememberSaveable { mutableStateOf("") }
+        AlertDialog(onDismissRequest = { naming = false }, title = { Text(uiText("New thread")) },
+            text = { OutlinedTextField(name, { name = it.take(100) }, label = { Text(uiText("Thread name")) }, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("new-thread-name")) },
+            confirmButton = { TextButton(onClick = { naming = false; view = HistoryView.Threads; vm.tab("Chat"); vm.newThread(name) }, enabled = name.isNotBlank(), modifier = Modifier.testTag("new-thread-start")) { Text(uiText("Start thread")) } },
+            dismissButton = { TextButton(onClick = { naming = false }) { Text(uiText("Cancel")) } })
     }
 }
 
@@ -319,7 +375,9 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                 if (search.isNotBlank() && visibleMessages.isEmpty()) item { Text("No messages match your search.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
                 items(visibleMessages, key = { it.value.id }) { (index, message) -> MessageRow(vm, message, index, callMessagesById[message.id], separateToolResults, toolResultTitles[message.id].orEmpty(), onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }) }
                 if (chat.streamId.isNotBlank() || chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank()) item("live") {
-                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    // Same header and spacing as the stored reply, so replacing this row does not move the text.
+                    Column(Modifier.testTag("live-reply"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Cypher", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         if (chat.liveText.isNotBlank()) AssistantSurface { Markdown(chat.liveText, vm, vm.authenticatedScope(), interactive = false) }
                         else LinearProgressIndicator(Modifier.width(120.dp))
                         MessageActivity(chat.liveReasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), chat.liveTools, chat.status.ifBlank { "Working" }, streaming = true, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) })
@@ -340,7 +398,8 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                     } }
                 } }
                 chat.clarification?.let { p -> item("clarify:$questionId") { Clarification(vm, p, promptScope, questionAnswers) { id, value -> questionAnswers = questionAnswers + (id to value) } } }
-                if (chat.status.isNotBlank() && chat.streamId.isBlank()) item { Text(chat.status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                if (chatSendInFlight(chat)) item("sending") { SendingMessage(composerDraft.text) }
+                else if (chat.status.isNotBlank() && chat.streamId.isBlank()) item { Text(chat.status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                 }
                 if (ready && !follow && list.canScrollForward) FloatingActionButton(
                     onClick = { follow = true; scope.launch { val last = (list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0); if (motionEnabled) list.animateScrollToItem(last) else list.scrollToItem(last) } },
@@ -350,7 +409,7 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                     contentColor = MaterialTheme.colorScheme.onPrimary,
                 ) { Icon(Icons.Rounded.ExpandMore, uiText("Scroll to latest"), Modifier.size(24.dp)) }
             }
-            if (ready && chat.uncertain.isNotBlank()) Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) { Text(uiText("Checking whether your last message arrived. Your draft is saved."), Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium); TextButton(onClick = { vm.reconcileSend() }) { Text(uiText("Check receipt")) } }
+            if (ready && chat.uncertain.isNotBlank() && !chatSendInFlight(chat)) Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) { Text(uiText("Checking whether your last message arrived. Your draft is saved."), Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium); TextButton(onClick = { vm.reconcileSend() }) { Text(uiText("Check receipt")) } }
         }
     }
     BoxWithConstraints(Modifier.fillMaxSize()) {
@@ -391,7 +450,6 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
         if (ready && !activeHere) Column(Modifier.fillMaxWidth().onSizeChanged { onComposerHeight(it.height) }) {
             if (activity.active) Box(Modifier.fillMaxWidth().widthIn(max = 840.dp).align(Alignment.CenterHorizontally)) { ChatActivityStrip(activity) { activitySheet = true } }
             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { Composer(vm, activeHere, !call.active, callThisChat, composerDetails, { composerDetails = it }) }
-            ChatStatusStrip(ui, chat)
         }
     }
     }
@@ -466,10 +524,7 @@ internal fun acceptsInitialConversationEdit(
             }
             val voiceAction = composerUsesVoice(draft.text, files.size, preparing.size)
             val streaming = chat.streamId.isNotBlank()
-            if (streaming) Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 2.dp).heightIn(min = 24.dp).testTag("composer-correct-caption"), verticalAlignment = Alignment.CenterVertically) {
-                Text(uiText("Correct now"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Icon(Icons.Rounded.ExpandLess, null, Modifier.padding(start = 4.dp).size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
+            val sending = chatSendInFlight(chat)
             // Relay-style composer surface: one pill with a hairline border.
             Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh, border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
                 Column(Modifier.padding(horizontal = 6.dp, vertical = 3.dp)) {
@@ -486,7 +541,9 @@ internal fun acceptsInitialConversationEdit(
                     }
                     // A visible state pill, so Queue vs. Guide does not depend on the trailing icon alone.
                     if (streaming && !voiceAction) Text(uiText("Queue next · delivers after this turn"), Modifier.padding(horizontal = 8.dp, vertical = 2.dp).clip(RoundedCornerShape(999.dp)).background(MaterialTheme.colorScheme.secondaryContainer).padding(horizontal = 8.dp, vertical = 3.dp).testTag("composer-queue-caption"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSecondaryContainer)
-                    OutlinedTextField(draft, changeDraft, placeholder = { Text(if (callActive) "Finish your call to continue typing" else if (readOnly) "Branch this conversation to reply" else if (streaming) uiText("Correct the response...") else "Message Cypher") }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp.coerceAtMost(editorHeight), max = editorHeight).testTag("message-input").onPreviewKeyEvent { event -> val key = event.nativeKeyEvent; val sendKey = settings.string("send_key", "enter"); val matched = when (sendKey) { "ctrl_enter", "ctrl+enter" -> key.isCtrlPressed && !key.isShiftPressed; "shift+enter" -> key.isShiftPressed && !key.isCtrlPressed; else -> !key.isShiftPressed && !key.isCtrlPressed && !key.isAltPressed }; if (key.action == android.view.KeyEvent.ACTION_DOWN && key.keyCode == android.view.KeyEvent.KEYCODE_ENTER && matched && !callActive && !readOnly) { if (editable && chat.uncertain.isBlank()) submit(); true } else false }, minLines = 1, maxLines = 6, enabled = editable && !callActive && !readOnly, shape = RoundedCornerShape(18.dp), colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = .5f)))
+                    // In flight the transcript shows the message; the draft stays held (not shown twice) until Hermes accepts it.
+                    // Read-only, not disabled, so the keyboard stays up.
+                    OutlinedTextField(if (sending) TextFieldValue("") else draft, if (sending) { _ -> } else changeDraft, readOnly = sending, placeholder = { Text(if (sending) uiText("Sending…") else if (callActive) "Finish your call to continue typing" else if (readOnly) "Branch this conversation to reply" else if (streaming) uiText("Correct the response...") else "Message Cypher") }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp.coerceAtMost(editorHeight), max = editorHeight).testTag("message-input").onPreviewKeyEvent { event -> val key = event.nativeKeyEvent; val sendKey = settings.string("send_key", "enter"); val matched = when (sendKey) { "ctrl_enter", "ctrl+enter" -> key.isCtrlPressed && !key.isShiftPressed; "shift+enter" -> key.isShiftPressed && !key.isCtrlPressed; else -> !key.isShiftPressed && !key.isCtrlPressed && !key.isAltPressed }; if (key.action == android.view.KeyEvent.ACTION_DOWN && key.keyCode == android.view.KeyEvent.KEYCODE_ENTER && matched && !callActive && !readOnly) { if (editable && chat.uncertain.isBlank()) submit(); true } else false }, minLines = 1, maxLines = 6, enabled = editable && !callActive && !readOnly, shape = RoundedCornerShape(18.dp), colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = .5f)))
                     if (streaming && !voiceAction) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                         TextButton(onClick = { vm.steer() }, enabled = canonical && preparing.isEmpty() && !readOnly && !callActive && draft.text.isNotBlank() && !draft.text.startsWith("/") && chat.uncertain.isBlank() && files.isEmpty(), modifier = Modifier.heightIn(min = 48.dp)) { Text("Guide") }
                         TextButton(onClick = { vm.cancel() }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Stop") }
@@ -739,6 +796,25 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
 }
 
 /** Relay's assistant bubble: restrained surface, small tail corner, wide enough for rich content. */
+/** A send Hermes has not answered yet; an unknown outcome is shown separately, once the request has failed or been interrupted. */
+internal fun chatSendInFlight(chat: ChatState): Boolean = chat.uncertain.isNotBlank() && chat.status == "Sending"
+
+/** The message being sent, laid out like the stored user row (label, bubble, action-row height) so its arrival does not shift the list. */
+@Composable private fun SendingMessage(text: String) {
+    Column(Modifier.fillMaxWidth().testTag("sending-message"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) { Text(uiText("You"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        BoxWithConstraints(Modifier.fillMaxWidth()) {
+            Surface(Modifier.widthIn(max = maxWidth * .9f).align(Alignment.CenterEnd).alpha(.7f), shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp, bottomStart = 22.dp, bottomEnd = 4.dp), color = MaterialTheme.colorScheme.primaryContainer) {
+                Text(text.ifBlank { uiText("Attachment") }, Modifier.padding(horizontal = 16.dp, vertical = 12.dp))
+            }
+        }
+        val sendingLabel = uiText("Sending…")
+        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).semantics { contentDescription = sendingLabel }, horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+            CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+        }
+    }
+}
+
 @Composable private fun AssistantSurface(content: @Composable ColumnScope.() -> Unit) {
     Surface(Modifier.fillMaxWidth(.96f).testTag("assistant-bubble"), shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomEnd = 16.dp, bottomStart = 4.dp), color = MaterialTheme.colorScheme.surfaceContainerLow) {
         Column(Modifier.padding(horizontal = 14.dp, vertical = 12.dp), content = content)
@@ -958,34 +1034,4 @@ internal fun composerUsesVoice(text: String, readyAttachments: Int, preparingAtt
         toolCallBurst = state.toolCallBurst,
         motionVisible = !state.paused,
     )
-}
-
-@Composable private fun ChatStatusStrip(ui: AppState, chat: ChatState) {
-    if (!ui.authenticated) return
-    val backend = ui.bootstrap.string("backend")
-    val gatewayKnown = backend.contains("hermes", ignoreCase = true)
-    val route = ui.origin.substringBefore("://", "").uppercase().takeIf { it == "HTTP" || it == "HTTPS" }
-    val model = chat.raw.string("model").trim().takeIf(String::isNotEmpty)
-    val profile = ui.profile.trim().takeIf(String::isNotEmpty)
-    val trailing = listOfNotNull(model, profile).joinToString(" / ")
-    if (!gatewayKnown && route == null && trailing.isBlank()) return
-    Surface(
-        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 3.dp).testTag("chat-status-strip"),
-        shape = RoundedCornerShape(16.dp),
-        color = MaterialTheme.colorScheme.surfaceContainerHigh,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .65f)),
-    ) {
-        Row(Modifier.fillMaxWidth().heightIn(min = 24.dp).padding(horizontal = 10.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-            if (gatewayKnown) {
-                Icon(Icons.Rounded.Bolt, null, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.primary)
-                Text("Gateway", Modifier.padding(start = 4.dp), style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.primary, maxLines = 1)
-            }
-            if (route == "HTTPS") Icon(Icons.Rounded.Lock, uiText("Secure connection"), Modifier.padding(start = 5.dp).size(12.dp), tint = MaterialTheme.colorScheme.primary)
-            route?.let { Text("\u00B7 $it", Modifier.padding(start = 4.dp), style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1) }
-            if (trailing.isNotBlank()) {
-                Spacer(Modifier.weight(1f))
-                Text(trailing, Modifier.testTag("chat-status-model-profile"), style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-            }
-        }
-    }
 }

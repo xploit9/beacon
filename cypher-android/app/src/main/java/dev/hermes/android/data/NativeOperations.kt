@@ -12,6 +12,8 @@ private val storedSessionId = Regex("[A-Za-z0-9_.:-]{1,256}")
 // Stock dashboard bounds: /api/sessions pages reject limit > 100; Cypher keeps its 200-row drawer window.
 private const val SESSION_PAGE_LIMIT = 100
 private const val SESSION_INDEX_WINDOW = 200
+/** A Hermes platform name (telegram, api_server, …); anything else is not sent as a source filter. */
+private val sourceName = Regex("[a-z][a-z0-9_]{0,39}")
 // /api/sessions/{id}/messages allows limit <= 500; passive browsing reads one newest window.
 private const val HISTORY_WINDOW = 500
 private const val MAX_COMPRESSION_CHAIN = 512
@@ -60,15 +62,20 @@ internal class NativeOperations(private val c: CypherClient) {
                 c.bindProfile(name)
                 return json("ok" to true, "profile" to name)
             }
-            "/api/sessions", "/api/sessions/search" -> return sessionIndex(archived = q["include_archived"] == "1", query = q["q"].orEmpty())
+            "/api/sessions", "/api/sessions/search" -> return sessionIndex(archived = q["include_archived"] == "1", query = q["q"].orEmpty(), threads = q["view"] == "threads", hidden = q["hidden_sources"].orEmpty(), order = q["order"].orEmpty())
             "/api/session/new", "/api/xara/open" -> {
                 val params = JSONObject()
                 for (key in setOf("title", "model")) if (d.has(key) && !d.isNull(key)) params.put(key, d.opt(key))
                 d.string("model_provider").takeIf { it.isNotBlank() }?.let { params.put("provider", it) }
                 d.string("workspace").takeIf { it.isNotBlank() }?.let { params.put("cwd", it) }
+                if (d.optBoolean("thread")) params.put("source", CYPHER_THREAD_SOURCE)
                 val b = c.nativeCreate(params)
                 require(b.storedSessionId.isNotBlank()) { "Native session has no durable identity yet; submit the first prompt before saving selection" }
-                return sessionProjection(c.nativeSessionSnapshot().put("messages", JSONArray()).put("acknowledged_shell", true), b).put("profile", c.auth.profile)
+                return sessionProjection(c.nativeSessionSnapshot().put("messages", JSONArray()).put("acknowledged_shell", true), b).put("profile", c.auth.profile).apply {
+                    // Hermes holds a create title until the first turn; show it (and the thread lane) from the start.
+                    if (string("title").isBlank() && params.string("title").isNotBlank()) put("title", params.string("title"))
+                    if (params.string("source") == CYPHER_THREAD_SOURCE) put("source", CYPHER_THREAD_SOURCE)
+                }
             }
             "/api/session" -> {
                 require(sid().matches(storedSessionId)) { "Choose a native conversation first" }
@@ -290,12 +297,15 @@ internal class NativeOperations(private val c: CypherClient) {
      * licenses/Hermes-Relay-MIT.txt): the newest [SESSION_INDEX_WINDOW] rows in profile-scoped pages of at most
      * [SESSION_PAGE_LIMIT], stopping at a short page. Search covers only titles and identities within that window.
      */
-    private suspend fun sessionIndex(archived: Boolean, query: String): JSONObject {
+    private suspend fun sessionIndex(archived: Boolean, query: String, threads: Boolean = false, hidden: String = "", order: String = ""): JSONObject {
+        // Filters run in Hermes, so the 200-row window holds only what the drawer shows.
+        val hiddenSources = hidden.split(',').map { it.trim().lowercase() }.filter { it.matches(sourceName) }
+        val scope = if (threads) mapOf("sources" to "$CYPHER_THREAD_SOURCE,phone") else mapOf("exclude_sources" to (listOf("cron") + hiddenSources).distinct().joinToString(","))
         val rows = LinkedHashMap<String, JSONObject>()
         var offset = 0
         while (offset < SESSION_INDEX_WINDOW) {
             val limit = minOf(SESSION_PAGE_LIMIT, SESSION_INDEX_WINDOW - offset)
-            val page = c.nativeGet("/api/sessions", mapOf("profile" to c.auth.profile, "archived" to if (archived) "only" else "exclude", "exclude_sources" to "cron", "min_messages" to "1", "limit" to "$limit", "offset" to "$offset"))
+            val page = c.nativeGet("/api/sessions", mapOf("profile" to c.auth.profile, "archived" to if (archived) "only" else "exclude", "order" to if (order == "created") "created" else "recent", "min_messages" to "1", "limit" to "$limit", "offset" to "$offset") + scope)
             val items = listOf("sessions", "items", "data").firstNotNullOfOrNull { page.opt(it) as? JSONArray } ?: error("Hermes returned an unreadable conversation list")
             for (index in 0 until items.length()) {
                 val row = items.opt(index) as? JSONObject ?: error("Hermes returned an unreadable conversation list")

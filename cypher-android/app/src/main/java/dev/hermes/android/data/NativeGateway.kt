@@ -12,6 +12,9 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
+/** Hermes `source` for a named Cypher thread (Relay tags its threads `phone`); every other phone chat is `android`. */
+internal const val CYPHER_THREAD_SOURCE = "android_thread"
+
 data class NativeSessionBinding(val scope: Scope, val storedSessionId: String, val runtimeSessionId: String)
 
 internal fun nativeSessionBinding(scope: Scope, result: JSONObject): NativeSessionBinding {
@@ -105,7 +108,7 @@ internal class NativeGateway(private val client: CypherClient, private val socke
     private var sessionState = JSONObject()
     internal fun sessionSnapshot(): JSONObject = synchronized(cursorLock) { sessionState.copy() }
     private fun bind(result: JSONObject): NativeSessionBinding = nativeSessionBinding(client.scope, result).also { synchronized(cursorLock) { sessionState = result.copy(); cursor = Cursor(it) } }
-    suspend fun create(params: JSONObject): NativeSessionBinding = sessionLock.withLock { bind(rpc("session.create", params.copy().put("source", "android").put("close_on_disconnect", false))) }
+    suspend fun create(params: JSONObject): NativeSessionBinding = sessionLock.withLock { bind(rpc("session.create", params.copy().put("source", if (params.string("source") == CYPHER_THREAD_SOURCE) CYPHER_THREAD_SOURCE else "android").put("close_on_disconnect", false))) }
     /** [lazy]: reattach a live unsent shell or answer 4007, never let Hermes materialize an ownerless row for a runtime that is gone. */
     suspend fun session(stored: String?, lazy: Boolean = false): NativeSessionBinding = sessionLock.withLock {
         synchronized(cursorLock) { cursor?.binding }?.takeIf { connection?.failure == null && connection?.ready?.isCompleted == true && it.scope == client.scope && (stored == it.storedSessionId || stored == it.runtimeSessionId) }?.let { return@withLock it }
