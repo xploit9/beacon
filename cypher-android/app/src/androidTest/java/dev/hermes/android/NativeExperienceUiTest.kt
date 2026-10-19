@@ -974,7 +974,8 @@ class NativeExperienceUiTest {
             assertEquals("Unsent first message", vm.composer.value.text)
             assertEquals(0, fixture.requests.count { it.string("method") == "prompt.submit" })
             compose.runOnIdle { vm.send() }
-            await { fixture.requests.count { it.string("method") == "prompt.submit" } == 1 }
+            try { await { fixture.requests.count { it.string("method") == "prompt.submit" } == 1 } }
+            catch (error: Throwable) { throw AssertionError("Send blocked: notice=${vm.ui.value.notice} error=${vm.ui.value.error} status=${vm.chat.value.status} raw=${vm.chat.value.raw.length()} ready=${vm.chat.value.projectionReady} stream=${vm.chat.value.streamId} id=${vm.chat.value.sessionId} requests=${recentCalls(fixture)}", error) }
             val submit = fixture.requests.single { it.string("method") == "prompt.submit" }.getJSONObject("params")
             assertEquals("Unsent first message", submit.string("text"))
             assertEquals("The first prompt stays with the runtime that created this chat", creatingRuntime, submit.string("session_id"))
@@ -2653,7 +2654,8 @@ class NativeExperienceUiTest {
         val creatingRuntime = "runtime-" + vm.chat.value.sessionId
         fixture.persistTerminalMessages = true
         compose.runOnIdle { vm.composer(TextFieldValue("First prompt")); vm.send() }
-        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId.isNotBlank() }
+        try { await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId.isNotBlank() } }
+        catch (error: Throwable) { throw AssertionError("Send blocked: notice=${vm.ui.value.notice} error=${vm.ui.value.error} status=${vm.chat.value.status} raw=${vm.chat.value.raw.length()} ready=${vm.chat.value.projectionReady} stream=${vm.chat.value.streamId} id=${vm.chat.value.sessionId} requests=${recentCalls(fixture)}", error) }
         val firstRuntime = vm.chat.value.streamId
         assertEquals("The first prompt stays on the runtime that created this chat", creatingRuntime,
             fixture.requests.last { it.string("method") == "prompt.submit" }.getJSONObject("params").string("session_id"))
