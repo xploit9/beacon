@@ -107,6 +107,8 @@ class NativeExperienceUiTest {
         runBlocking { app.cache.write(fixture.scope, "chat-preferences", json("render_user_markdown" to true, "show_thinking" to true, "send_key" to "enter").toString(), true) }
         // Each case starts without another case's initial-chat pointers (a shell id unknown to this fixture would block sends).
         runBlocking { listOf("new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session").forEach { app.cache.delete(fixture.scope, it) } }
+        // Fixture chat ids (new-N) repeat across cases and runs; drop their per-chat receipts, drafts and projections too.
+        runBlocking { (1..8).forEach { n -> listOf("pending", "draft", "session", "client-created-shell", "side-question").forEach { app.cache.delete(fixture.scope.session("new-$n"), it) } } }
         runBlocking { app.cache.delete(fixture.scope, "bot-mode-return"); app.cache.delete(fixture.scope, "xara-session"); app.cache.delete(fixture.scope, "xara-opening"); app.cache.delete(fixture.scope, "phone-editors"); app.cache.delete(fixture.scope, "editor:C:/synthetic-workspace/notes.md") }
         lateinit var vm: CypherViewModel
         try {
