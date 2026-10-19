@@ -94,9 +94,7 @@ class UpdateManager(private val app: CypherApplication) {
 
     private fun savedClient(expected: UpdateSource): CypherClient = synchronized(lock) {
         requireAuthorized(expected)
-        // Never give a detached background client AuthStore: its completion cannot
-        // overwrite a newer UI identity or resurrect credentials after sign-out.
-        CypherClient(app.auth.read(expected.origin))
+        CypherClient(app.auth.read(expected.origin), app.auth, persistContext = false)
     }
 
     private suspend fun checkAuthenticated(client: CypherClient, expected: UpdateSource, notify: Boolean): Release? {

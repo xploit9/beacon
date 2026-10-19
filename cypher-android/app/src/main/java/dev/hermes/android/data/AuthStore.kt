@@ -74,6 +74,22 @@ data class AuthContext(
     override fun toString() = "AuthContext(origin=$origin, cookies=${cookies.size}, owner=$owner, profile=$profile, csrf=<redacted>, backend=$backend, bearer=$bearer, loopbackSession=$loopbackSession)"
 }
 
+// Issue time wins for current records; expiry is the legacy fallback and ties prefer incoming.
+internal fun chooseNewestBearer(incoming: NativeBearerRecord?, stored: NativeBearerRecord?): NativeBearerRecord? = when {
+    stored == null -> incoming
+    incoming == null -> stored
+    stored.issuedAt > 0 && incoming.issuedAt > 0 -> if (stored.issuedAt > incoming.issuedAt) stored else incoming
+    stored.issuedAt > 0 -> stored
+    incoming.issuedAt > 0 -> incoming
+    stored.expiresAt > incoming.expiresAt -> stored
+    else -> incoming
+}
+
+internal fun AuthContext.withNewestBearer(stored: NativeBearerRecord?): AuthContext {
+    val sameOwner = stored?.takeIf { loopbackSession == null && it.origin == origin && it.owner == owner }
+    return copy(bearer = chooseNewestBearer(bearer, sameOwner)?.copy(profile = profile))
+}
+
 /** Only an encrypted context from a previous successful bootstrap may open its local vault.
  * A password replacement starts with an empty cookie jar and never previews that old owner. */
 fun AuthContext.cachedScopeFor(requestedOrigin: String, replacingAccount: Boolean, now: Long = System.currentTimeMillis()): Scope? {
@@ -132,16 +148,7 @@ class AuthStore(context: Context, private val cipher: AppCipher) {
             if (version != null && authorityEpoch.current(version)) {
                 val current = read(auth.origin)
                 val storedBearer = if (auth.loopbackSession == null) current.bearer?.takeIf { it.origin == auth.origin && it.owner == auth.owner && it.profile == auth.profile } else null
-                // Use issuance time for current records and expiry as the legacy fallback; ties prefer incoming auth.
-                val newestBearer = when {
-                    storedBearer == null -> auth.bearer
-                    auth.bearer == null -> storedBearer
-                    storedBearer.issuedAt > 0 && auth.bearer.issuedAt > 0 -> if (storedBearer.issuedAt > auth.bearer.issuedAt) storedBearer else auth.bearer
-                    storedBearer.issuedAt > 0 -> storedBearer
-                    auth.bearer.issuedAt > 0 -> auth.bearer
-                    storedBearer.expiresAt > auth.bearer.expiresAt -> storedBearer
-                    else -> auth.bearer
-                }
+                val newestBearer = chooseNewestBearer(auth.bearer, storedBearer)
                 write(auth.copy(
                     bearer = newestBearer ?: auth.bearer,
                     loopbackSession = if (newestBearer != null || auth.bearer != null) null else auth.loopbackSession,
@@ -157,7 +164,8 @@ class AuthStore(context: Context, private val cipher: AppCipher) {
     }
     suspend fun remove(origin: String) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { clear(origin) }
     fun write(auth: AuthContext) = authorityEpoch.mutate { synchronized(this) { writeRecord(auth) } }
-    private fun writeRecord(auth: AuthContext) {
+    private fun writeRecord(context: AuthContext) {
+        val auth = context.withNewestBearer(read(context.origin).bearer)
         val o = JSONObject().put("cookies", JSONArray(auth.cookies)).put("owner", auth.owner).put("profile", auth.profile).put("csrf", auth.csrf).put("backend", auth.backend)
         auth.bearer?.let { token ->
             require(token.accessToken.isNotBlank() && token.accessToken.none { it.isWhitespace() || it.isISOControl() } && token.refreshToken.isNotBlank()) { "Bearer credentials are incomplete" }
