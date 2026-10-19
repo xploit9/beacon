@@ -1,145 +1,299 @@
-"""Native lifecycle observers. Tool arguments are never mailbox evidence."""
+"""Native lifecycle and source-evidence observers."""
+import hashlib
 import json
 import math
+import re
 import time
 import uuid
 
-MAIL_LOOKBACK_SECONDS=24*60*60
-MAIL_MARKER_RETENTION_SECONDS=MAIL_LOOKBACK_SECONDS+2*24*60*60
-MAIL_MARKER_PRUNE_BATCH=256
+EVIDENCE_TTL = 300
+ALERT_RETENTION = 24 * 60 * 60
+CALL_WINDOW = 60 * 60
+CALL_LIMIT = 3
+PRUNE_BATCH = 256
+CLAIM_FIELDS = {"id", "message_id", "messageid", "event_id", "eventid", "task_id", "taskid",
+                "url", "uri", "link", "web_url", "subject", "title", "name", "summary"}
 
 
-def prune_meta(conn,now):
-    for key,value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'mail-evidence:%'").fetchall():
-        try: observed=json.loads(value).get('observed_at')
-        except (AttributeError,TypeError,ValueError): observed=None
-        try: fresh=type(observed) in (int,float) and math.isfinite(observed) and now-observed<=300
-        except (OverflowError,TypeError): fresh=False
-        if not fresh:
-            conn.execute('DELETE FROM meta WHERE key=?',(key,))
-    for key,value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'mail-notified:%' ORDER BY CAST(value AS REAL),key LIMIT ?",(MAIL_MARKER_PRUNE_BATCH,)).fetchall():
-        try: created=float(value.decode() if isinstance(value,bytes) else value)
-        except (TypeError,ValueError,OverflowError): created=None
-        if created is None or not math.isfinite(created) or created>now:
-            # Legacy markers had no timestamp; retain them from migration time to avoid a duplicate.
-            conn.execute('UPDATE meta SET value=? WHERE key=?',(str(now).encode(),key))
-        elif now-created>MAIL_MARKER_RETENTION_SECONDS:
-            conn.execute('DELETE FROM meta WHERE key=?',(key,))
-    for key,value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'completion:%'").fetchall():
-        try: created=float(value)
-        except (TypeError,ValueError,OverflowError):
-            if value==b'notified': conn.execute('UPDATE meta SET value=? WHERE key=?',(str(now).encode(),key))
-            else: conn.execute('DELETE FROM meta WHERE key=?',(key,))
-        else:
-            if not math.isfinite(created) or now-created>86400: conn.execute('DELETE FROM meta WHERE key=?',(key,))
+def _number(value):
+    try:
+        value = float(value.decode("utf-8") if isinstance(value, bytes) else value)
+        return value if math.isfinite(value) else None
+    except (TypeError, ValueError, UnicodeError, OverflowError):
+        return None
 
 
-def completion(mobile,native,cfg,profile,session_id,turn_id,completed=False,failed=False,interrupted=False,job_id=None,**kwargs):
-    if (completed is not True and failed is not True) or interrupted or not session_id or not turn_id: return
-    owner=cfg.get('owner_id');provider=cfg.get('owner_provider')
-    if not owner or not provider or profile not in cfg.get('profiles',[]): return
-    row=native.verify(owner,provider,profile,session_id)
-    kind='failure' if failed is True else ('task_result' if row.get('source')=='cron' else 'completion')
-    key='completion:'+owner+':'+profile+':'+session_id+':'+str(turn_id)
-    now=time.time()
-    with mobile.LOCK,mobile.connect() as conn:
-        prune_meta(conn,now)
-        if conn.execute('SELECT 1 FROM meta WHERE key=?',(key,)).fetchone(): return
-        if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: raise ValueError('Notification capacity reached')
-        conn.execute('INSERT INTO meta VALUES(?,?)',(key,str(now).encode()))
-        conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,job_id) VALUES(?,?,?,?,?,?,?,?)',
-                     (uuid.uuid4().hex,owner,profile,kind,session_id,now,now+86400,job_id if isinstance(job_id,str) and mobile.ID.fullmatch(job_id) else ''))
+def prune_meta(conn, now):
+    for key, value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'source-evidence:%' OR key LIKE 'mail-evidence:%' ORDER BY key LIMIT ?", (PRUNE_BATCH,)).fetchall():
+        try:
+            observed = json.loads(value).get("observed_at")
+        except (AttributeError, TypeError, ValueError):
+            observed = None
+        if type(observed) not in (int, float) or not math.isfinite(observed) or now - observed > EVIDENCE_TTL:
+            conn.execute("DELETE FROM meta WHERE key=?", (key,))
+    for key, value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'proactive-alert:%' OR key LIKE 'proactive-call:%' OR key LIKE 'mail-notified:%' ORDER BY key LIMIT ?", (PRUNE_BATCH,)).fetchall():
+        created = _number(value)
+        retention = CALL_WINDOW if key.startswith("proactive-call:") else ALERT_RETENTION
+        if created is None or created > now or now - created > retention:
+            conn.execute("DELETE FROM meta WHERE key=?", (key,))
+    for key, value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'completion:%'").fetchall():
+        created = _number(value)
+        if created is None:
+            if value == b"notified":
+                conn.execute("UPDATE meta SET value=? WHERE key=?", (str(now).encode(), key))
+            else:
+                conn.execute("DELETE FROM meta WHERE key=?", (key,))
+        elif now - created > 86400:
+            conn.execute("DELETE FROM meta WHERE key=?", (key,))
 
 
-def mailbox_facts(value,contract):
-    """Normalize source JSON only; never parse model prose into mailbox facts."""
-    if contract.get('adapter')=='gmail_metadata':
-        if isinstance(value,dict): value=value.get('result')
-        if not isinstance(value,str) or not value.startswith('Gmail Metadata: '): return None
-        first,_,content=value.partition('\n')
-        try: message=json.loads(first[len('Gmail Metadata: '):])
-        except ValueError: return None
-        if not isinstance(message,dict): return None
-        value={**message,'snippet':content}
-        contract={**contract,'adapter':'gmail'}
-    if not isinstance(value,dict) or value.get('isError') is True: return None
-    if contract.get('adapter','native')=='native': return value
-    if contract.get('adapter')!='gmail': return None
-    # Gmail API message fields. Account binding is checked before the exact read invocation.
-    rows=value.get('messages',[value])
-    if not isinstance(rows,list): return None
-    output=[]
-    for row in rows[:100]:
-        if not isinstance(row,dict): continue
-        labels=row.get('labelIds');stamp=row.get('internalDate');mid=row.get('id')
-        if not isinstance(labels,list) or any(not isinstance(x,str) for x in labels): continue
-        if not isinstance(stamp,str) or not stamp.isascii() or not stamp.isdigit(): continue
-        output.append({'account':contract['account'],'message':{'id':mid,'received_at':int(stamp)/1000,'unread':'UNREAD' in labels,'snippet':row.get('snippet','')}})
-    return output
+def completion(mobile, native, cfg, profile, session_id, turn_id, completed=False, failed=False,
+               interrupted=False, job_id=None, **kwargs):
+    if (completed is not True and failed is not True) or interrupted or not session_id or not turn_id:
+        return
+    owner, provider = cfg.get("owner_id"), cfg.get("owner_provider")
+    if not owner or not provider or profile not in cfg.get("profiles", []):
+        return
+    row = native.verify(owner, provider, profile, session_id)
+    kind = "failure" if failed is True else ("task_result" if row.get("source") == "cron" else "completion")
+    key = "completion:" + owner + ":" + profile + ":" + session_id + ":" + str(turn_id)
+    now = time.time()
+    with mobile.LOCK, mobile.connect() as conn:
+        prune_meta(conn, now)
+        if conn.execute("SELECT 1 FROM meta WHERE key=?", (key,)).fetchone():
+            return
+        if conn.execute("SELECT COUNT(*) FROM notices").fetchone()[0] >= 10000:
+            raise ValueError("Notification capacity reached")
+        conn.execute("INSERT INTO meta VALUES(?,?)", (key, str(now).encode()))
+        conn.execute("INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,job_id) VALUES(?,?,?,?,?,?,?,?)",
+                     (uuid.uuid4().hex, owner, profile, kind, session_id, now, now + 86400,
+                      job_id if isinstance(job_id, str) and mobile.ID.fullmatch(job_id) else ""))
 
 
-def mailbox_observed(mobile,cfg,profile,session_id,tool_name,result,status,read_only_verified):
-    contract=cfg.get('mailbox_evidence')
-    if not isinstance(contract,dict) or read_only_verified is not True or status!='ok' or tool_name!=contract.get('tool'): return
-    if profile not in cfg.get('profiles',[]) or not session_id: return
-    if isinstance(result,str):
-        try: result=json.loads(result)
-        except (TypeError,ValueError): return
-    if not isinstance(result,dict): return
-    # The source contract must return its account and immutable message metadata, not model claims.
-    account=result.get('account');message=result.get('message')
-    if account!=contract.get('account') or not isinstance(message,dict): return
-    mid=message.get('id');received=message.get('received_at')
-    if not isinstance(mid,str) or not 1<=len(mid)<=256 or type(received) not in (int,float) or not math.isfinite(received): return
-    if not 0<=time.time()-received<=MAIL_LOOKBACK_SECONDS or message.get('unread') is not True: return
-    owner=cfg.get('owner_id')
-    if not owner: return
-    evidence={'account':account,'message_id':mid,'received_at':received,'unread':True,'action_required':message.get('action_required'),'urgent':message.get('urgent'),'important':message.get('important'),'content_observed':any(isinstance(message.get(k),str) and bool(message[k].strip()) for k in ('subject','snippet','body','text'))}
-    key='mail-evidence:'+owner+':'+profile+':'+session_id+':'+mid
-    now=time.time()
-    with mobile.LOCK,mobile.connect() as conn:
-        prune_meta(conn,now)
-        evidence['observed_at']=now
-        conn.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(key,json.dumps(evidence).encode()))
+def _digest(value):
+    return hashlib.sha256(value.strip().casefold().encode("utf-8")).hexdigest()
 
 
-def email_notice(mobile,native,cfg,profile,session_id,args,now):
-    contract=cfg.get('mailbox_evidence')
-    if not isinstance(contract,dict): raise ValueError('No verified read-only mailbox evidence contract configured')
-    owner=cfg.get('owner_id');provider=cfg.get('owner_provider')
-    classification=args.get('classification','source')
-    if classification not in ('source','model'): raise ValueError('Invalid importance classification')
-    mid=args.get('message_id');account=args.get('account')
-    if not isinstance(mid,str) or not 1<=len(mid)<=256 or account!=contract.get('account'): raise ValueError('Mailbox identity does not match authorized account')
-    if getattr(now.tzinfo,'key',None)!='Asia/Dubai' or not 10<=now.hour<22: raise ValueError('Quiet hours: no urgent-mail night override authorized')
-    if args.get('unread') is not True or args.get('action_required') is not True: raise ValueError('Unread actionable evidence is required')
-    urgent=args.get('urgent') is True
-    important=args.get('important') is True
-    if not urgent and not important: raise ValueError('Message must be urgent or important')
-    # Legacy model-written reasons never become call context or grant urgency.
-    reason=args.get('reason','');summary=args.get('summary','')
-    if not isinstance(reason,str) or not isinstance(summary,str) or len(reason)>600 or len(summary)>8000: raise ValueError('Invalid legacy notice text')
-    suspect=('ignore previous','ignore all','system prompt','override policy','send email','mark as read','tool_call')
-    if any(term in (reason+' '+summary).lower() for term in suspect): raise ValueError('Instruction-like mailbox text cannot authorize a callback')
-    stored=cfg.get('scheduled_callback_conversation_id')
-    if cfg.get('scheduled_callbacks_enabled') is not True or not stored: raise ValueError('Configure the owned native callback conversation')
-    native.verify(owner,provider,profile,stored)
-    key='mail-evidence:'+owner+':'+profile+':'+session_id+':'+mid
-    dedupe='mail-notified:'+owner+':'+profile+':'+account+':'+mid
-    with mobile.LOCK,mobile.connect() as conn:
-        prune_meta(conn,time.time())
-        row=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
-        if not row: raise ValueError('Read the actual message using the verified read-only native mailbox tool first')
-        proof=json.loads(row[0])
-        if time.time()-proof['observed_at']>300 or not 0<=time.time()-proof['received_at']<=MAIL_LOOKBACK_SECONDS or args.get('received_at')!=proof['received_at']: raise ValueError('Mailbox evidence is stale or does not match the message')
-        if not urgent and time.time()-proof['received_at']<900: raise ValueError('Nonurgent important mail must be missed for at least 15 minutes')
-        if classification=='source' and (proof.get('action_required') is not True or (urgent and proof.get('urgent') is not True) or (not urgent and proof.get('important') is not True)): raise ValueError('Source importance flags unavailable; explicitly classify the untrusted message instead')
-        if classification=='model' and proof.get('content_observed') is not True: raise ValueError('Read actual message content before an importance assessment')
-        if classification=='model' and not reason.strip(): raise ValueError('Model importance assessment needs a reason')
-        if conn.execute('SELECT 1 FROM meta WHERE key=?',(dedupe,)).fetchone(): return {'status':'duplicate'}
-        if conn.execute('SELECT 1 FROM calls WHERE owner=? AND closed=0 AND created>?',(owner,time.time()-4*3600)).fetchone(): return {'status':'skipped_busy'}
-        if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: raise ValueError('Notification capacity reached')
-        event=uuid.uuid4().hex
-        conn.execute('INSERT INTO meta VALUES(?,?)',(dedupe,str(time.time()).encode()))
-        conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason) VALUES(?,?,?,?,?,?,?,?)',(event,owner,profile,'incoming_call',stored,time.time(),time.time()+120,'Verified unread actionable email needs your attention'))
-    return {'status':'pending','event_id':event,'conversation_id':stored}
+def _claims(value, depth=0, budget=None):
+    budget = [0] if budget is None else budget
+    budget[0] += 1
+    if depth > 5 or budget[0] > 512:
+        return set()
+    if isinstance(value, str):
+        if len(value) > 65536:
+            return set()
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            return _claims(parsed, depth + 1, budget)
+        output = set()
+        for line in value.splitlines()[:80]:
+            line = line.strip()
+            if 2 <= len(line) <= 256:
+                output.add(_digest(line))
+            output.update(_digest(url) for url in re.findall(r"https?://[^\s<>\"']+", line)[:8])
+        return output
+    if isinstance(value, dict):
+        output = set()
+        for key, child in list(value.items())[:100]:
+            if isinstance(child, str) and key.casefold() in CLAIM_FIELDS and 1 <= len(child.strip()) <= 256:
+                output.add(_digest(child))
+            output.update(_claims(child, depth + 1, budget))
+        return output
+    if isinstance(value, list):
+        output = set()
+        for child in value[:100]:
+            output.update(_claims(child, depth + 1, budget))
+        return output
+    return set()
+
+
+def _source_error(value, depth=0, budget=None):
+    budget = [0] if budget is None else budget
+    budget[0] += 1
+    if depth > 5 or budget[0] > 256:
+        return True
+    if isinstance(value, str):
+        if len(value) > 65536:
+            return True
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return False
+    if isinstance(value, list):
+        return any(_source_error(child, depth + 1, budget) for child in value[:64])
+    if not isinstance(value, dict):
+        return False
+    if value.get("isError") is True or value.get("is_error") is True or value.get("outcome_uncertain") is True:
+        return True
+    if value.get("error") not in (None, False, "", {}, []):
+        return True
+    for key in ("status_code", "http_status"):
+        code = value.get(key)
+        if (type(code) is int or isinstance(code, str) and code.isdecimal()) and 400 <= int(code) <= 599:
+            return True
+    children = [value[key] for key in ("result", "structuredContent", "structured_content") if key in value]
+    blocks = value.get("content", [])
+    if isinstance(blocks, list):
+        children.extend(block.get("text") for block in blocks[:64]
+                        if isinstance(block, dict) and block.get("type") == "text")
+    return any(_source_error(child, depth + 1, budget) for child in children[:64])
+
+
+def _evidence_key(owner, profile, session_id, source_id, signal):
+    source = hashlib.sha256((source_id + "\0" + signal).encode("utf-8")).hexdigest()[:24]
+    return f"source-evidence:{owner}:{profile}:{session_id}:{source}"
+
+
+def source_observed(mobile, cfg, profile, session_id, signal, source_id, tool_name, result,
+                    status, read_only_verified=None):
+    if (status not in ("ok", "success") or not session_id or not isinstance(source_id, str)
+            or profile not in cfg.get("profiles", [])):
+        return False
+    if source_id.startswith("mcp:") and read_only_verified is not True:
+        return False
+    if _source_error(result):
+        return False
+    owner = cfg.get("owner_id")
+    if not owner or not isinstance(tool_name, str) or not tool_name:
+        return False
+    try:
+        from cypher_proactive import SIGNALS, _setup, _setup_complete, enabled
+        if not enabled(mobile, owner, profile) or not _setup_complete(mobile, owner, profile):
+            return False
+        setup = _setup(mobile, owner, profile, {name: [] for name in SIGNALS})
+        if setup["signals"].get(signal) != source_id:
+            return False
+    except (ImportError, LookupError, RuntimeError, ValueError):
+        return False
+    claims = sorted(_claims(result))[:128]
+    if not claims:
+        return False
+    now = time.time()
+    key = _evidence_key(owner, profile, session_id, source_id, signal)
+    record = {"source_id": source_id, "signal": signal, "tool_name": tool_name,
+              "item_hashes": claims, "observed_at": now}
+    with mobile.LOCK, mobile.connect() as conn:
+        prune_meta(conn, now)
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+                     (key, json.dumps(record, separators=(",", ":")).encode()))
+    return True
+
+
+def mailbox_observed(mobile, cfg, profile, session_id, tool_name, result, status, read_only_verified,
+                     source_id=None, signal="email"):
+    """Compatibility entry point: old email evidence now follows the selected signal source."""
+    owner = cfg.get("owner_id")
+    if not source_id and owner:
+        try:
+            from cypher_proactive import SIGNALS, _setup
+            source_id = _setup(mobile, owner, profile, {name: [] for name in SIGNALS})["signals"].get(signal)
+        except (ImportError, LookupError, RuntimeError, ValueError):
+            return False
+    if not source_id:
+        return False
+    return source_observed(mobile, cfg, profile, session_id, signal, source_id, tool_name,
+                           result, status, read_only_verified)
+
+
+def _inside_quiet(now, setup):
+    start, end = setup["schedule"]["quiet_start"], setup["schedule"]["quiet_end"]
+    if start == end:
+        return False
+    minute = now.hour * 60 + now.minute
+    first = int(start[:2]) * 60 + int(start[3:])
+    last = int(end[:2]) * 60 + int(end[3:])
+    return first <= minute < last if first < last else minute >= first or minute < last
+
+
+def _notice(mobile, owner, profile, conversation, reason, alert_key, now):
+    with mobile.LOCK, mobile.connect() as conn:
+        prune_meta(conn, now.timestamp())
+        if conn.execute("SELECT 1 FROM meta WHERE key=?", (alert_key,)).fetchone():
+            return {"status": "duplicate"}
+        mobile.prune_notices(conn)
+        if conn.execute("SELECT COUNT(*) FROM notices").fetchone()[0] >= 10000:
+            raise ValueError("Notification capacity reached")
+        event = uuid.uuid4().hex
+        conn.execute("INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason) VALUES(?,?,?,?,?,?,?,?)",
+                     (event, owner, profile, "task_result", conversation, now.timestamp(),
+                      now.timestamp() + 86400, reason[:240]))
+        conn.execute("INSERT INTO meta(key,value) VALUES(?,?)", (alert_key, str(now.timestamp()).encode()))
+    return {"status": "notified", "event_id": event}
+
+
+def email_notice(mobile, native, cfg, profile, session_id, args, now):
+    from cypher_proactive import SIGNALS, _setup, _setup_complete, enabled, list_requests
+
+    owner, provider = cfg.get("owner_id"), cfg.get("owner_provider")
+    if not owner or not provider or profile not in cfg.get("profiles", []) or not session_id:
+        raise ValueError("Owned proactive session required")
+    if not isinstance(args, dict) or set(args) != {"request_id", "signal", "source_id", "item_id", "reason"}:
+        raise ValueError("Request id, signal, source id, item id, and reason are required")
+    request_id, signal, source_id, item_id, reason = (args.get("request_id"), args.get("signal"),
+                                                       args.get("source_id"), args.get("item_id"), args.get("reason"))
+    if not isinstance(request_id, str) or not mobile.ID.fullmatch(request_id):
+        raise ValueError("Invalid Proactive request id")
+    if not isinstance(source_id, str) or len(source_id) > 256:
+        raise ValueError("Invalid source id")
+    if signal not in ("email", "calendar", "tasks", "news"):
+        raise ValueError("Invalid Proactive signal")
+    if not isinstance(item_id, str) or not 1 <= len(item_id.strip()) <= 256:
+        raise ValueError("A source-returned item id, title, or URL is required")
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 240:
+        raise ValueError("A brief reason is required")
+    setup = _setup(mobile, owner, profile, {name: [] for name in SIGNALS})
+    if not enabled(mobile, owner, profile) or not _setup_complete(mobile, owner, profile):
+        raise ValueError("Proactive is not enabled")
+    if setup["signals"].get(signal) != source_id:
+        raise ValueError("Source is not selected for this profile")
+    request = next((row for row in list_requests(mobile, owner, profile)
+                    if row.get("id") == request_id and row.get("enabled") is True
+                    and row.get("signal") in (None, signal)), None)
+    if not request:
+        raise ValueError("No enabled request matches this selected signal")
+    evidence_key = _evidence_key(owner, profile, session_id, source_id, signal)
+    with mobile.connect() as conn:
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (evidence_key,)).fetchone()
+    try:
+        proof = json.loads(row[0]) if row else None
+        observed = proof.get("observed_at") if proof else None
+    except (AttributeError, TypeError, ValueError):
+        proof, observed = None, None
+    if (not proof or type(observed) not in (int, float) or not math.isfinite(observed)
+            or not 0 <= now.timestamp() - observed <= EVIDENCE_TTL
+            or proof.get("source_id") != source_id or proof.get("signal") != signal
+            or _digest(item_id) not in proof.get("item_hashes", [])):
+        raise ValueError("Fresh same-session evidence from the selected source is required")
+
+    stored = cfg.get("scheduled_callback_conversation_id")
+    if not isinstance(stored, str) or not stored.strip():
+        raise ValueError("Choose an owned assistant conversation before enabling Proactive")
+    native.verify(owner, provider, profile, stored)
+    request_label = f"Request {request_id}: {request['text'][:100]}"
+    reason_text = (request_label + "; " + reason.strip())[:240]
+    dedupe = "proactive-alert:" + owner + ":" + profile + ":" + request_id + ":" + _digest(source_id + "\0" + item_id)
+    if request["action"] == "call":
+        from cypher_mobile import invitation
+        with mobile.LOCK:
+            with mobile.connect() as conn:
+                prune_meta(conn, now.timestamp())
+                if conn.execute("SELECT 1 FROM meta WHERE key=?", (dedupe,)).fetchone():
+                    return {"status": "duplicate"}
+                prefix = f"proactive-call:{owner}:{profile}:"
+                count = sum((_number(row[0]) or 0) > now.timestamp() - CALL_WINDOW
+                            for row in conn.execute("SELECT value FROM meta WHERE substr(key,1,?)=?",
+                                                    (len(prefix), prefix)))
+            quiet_blocked = _inside_quiet(now, setup) and request.get("night") is not True
+            callbacks_ready = cfg.get("callback_tool_enabled") is True and cfg.get("scheduled_callbacks_enabled") is True
+            if not quiet_blocked and callbacks_ready and count < CALL_LIMIT:
+                event = invitation(owner, profile, stored, reason_text)
+                with mobile.connect() as conn:
+                    conn.execute("INSERT INTO meta(key,value) VALUES(?,?)",
+                                 ("proactive-call:" + owner + ":" + profile + ":" + uuid.uuid4().hex,
+                                  str(now.timestamp()).encode()))
+                    conn.execute("INSERT INTO meta(key,value) VALUES(?,?)", (dedupe, str(now.timestamp()).encode()))
+                return {"status": "pending", "event_id": event, "conversation_id": stored}
+    return _notice(mobile, owner, profile, stored, reason_text, dedupe, now)

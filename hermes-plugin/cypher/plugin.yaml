@@ -1,12 +1,12 @@
 name: cypher
 manifest_version: 1
-version: 2.3.0
+version: 2.4.0
 description: Native Cypher Android calls, text conversations and callbacks
 kind: standalone
 platforms: [windows, linux, macos]
-hooks: [on_session_end, post_tool_call, pre_llm_call]
-provides_hooks: [on_session_end, post_tool_call, pre_llm_call]
-provides_tools: [cypher_call_user, cypher_email_notice, cypher_mail_read]
+hooks: [on_session_end, pre_llm_call, post_tool_call]
+provides_hooks: [on_session_end, pre_llm_call, post_tool_call]
+provides_tools: [cypher_call_user, cypher_create_proactive_request, cypher_email_notice]
 python_dependencies:
   - fastapi>=0.115,<1
   - PyYAML>=6,<7
