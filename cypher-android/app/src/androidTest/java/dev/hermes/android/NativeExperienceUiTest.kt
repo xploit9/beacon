@@ -2690,7 +2690,14 @@ class NativeExperienceUiTest {
             await { fixture.streamSubscriptions.get() > subscriptionsBefore + 1 }
             fixture.nativeTurnStatus = "idle"
             fixture.emitNativeEvent("message.complete", json("text" to "Queued follow-up completed"))
-            try { await { vm.chat.value.messages.any { it.text == "Queued follow-up completed" } && vm.chat.value.streamId.isBlank() } }
+            fun followUpSettled() = vm.chat.value.messages.any { it.text == "Queued follow-up completed" } && vm.chat.value.streamId.isBlank()
+            // The fixture pushes a live event only to the socket subscribed at that instant; if the app was re-subscribing,
+            // the reply is still persisted, so foreground recovery (the behaviour under test above) must settle it.
+            if (!runCatching { compose.waitUntil(5_000) { followUpSettled() } }.isSuccess) {
+                compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.CREATED)
+                compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.RESUMED)
+            }
+            try { await { followUpSettled() } }
             catch (error: Throwable) {
                 throw AssertionError("Queued follow-up: stream=${vm.chat.value.streamId} status=${vm.chat.value.status} texts=${vm.chat.value.messages.map { it.text.take(30) }} live=${vm.chat.value.liveText.take(40)} active=${fixture.activeRuntimeForTest()} requests=${recentCalls(fixture)}", error)
             }
