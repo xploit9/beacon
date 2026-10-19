@@ -39,6 +39,15 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var reasoningEffort = "medium"
     @Volatile var updateApplied = false
     @Volatile var voiceProvider = "gemini"
+    val proactiveEnabled = ConcurrentHashMap(mapOf("default" to false, "coder" to false))
+    @Volatile var proactiveServices = listOf(
+        json("id" to "gmail", "name" to "Gmail", "supported" to true, "status" to "missing", "instructions" to "Connect Gmail with the Google Workspace skill on Hermes."),
+        json("id" to "google_calendar", "name" to "Google Calendar", "supported" to true, "status" to "connected", "instructions" to "Connect Google Calendar with the Google Workspace skill on Hermes."),
+        json("id" to "drive", "name" to "Drive", "supported" to true, "status" to "unknown", "instructions" to "Connect Drive with the Google Workspace skill on Hermes."),
+        json("id" to "contacts", "name" to "Contacts", "supported" to true, "status" to "unknown", "instructions" to "Connect Contacts with the Google Workspace skill on Hermes."),
+        json("id" to "sheets", "name" to "Sheets", "supported" to true, "status" to "unknown", "instructions" to "Connect Sheets with the Google Workspace skill on Hermes."),
+        json("id" to "docs", "name" to "Docs", "supported" to true, "status" to "unknown", "instructions" to "Connect Docs with the Google Workspace skill on Hermes."),
+    )
     val voices = ConcurrentHashMap(mapOf("gemini" to "Kore", "grok" to "ara"))
     val personalities = ConcurrentHashMap(mapOf("gemini" to "balanced", "grok" to "balanced"))
     @Volatile var roomName = "Shared workspace"
@@ -114,6 +123,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var historyFailure = false
     /** When set, every optional `/api/plugins/cypher/` route answers with this status. */
     @Volatile var pluginStatus: Int? = null
+    @Volatile var bootstrapPluginStatus: String? = null
     @Volatile var boardFailure = false
     @Volatile var preferredBoard = "default"
     @Volatile var fileText = "# Travel notes\nCheck the weather."
@@ -283,6 +293,13 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         return when {
         path == "/api/profiles" -> 200 to json("profiles" to JSONArray(notificationProfiles.map { json("name" to it) }))
         path == "/api/profiles/active" -> 200 to json("current" to profile, "active" to profile)
+        path == "/api/plugins/cypher/mobile/proactive" -> {
+            if (method == "PUT") {
+                require(body.length() == 1 && body.has("enabled"))
+                proactiveEnabled[profile] = body.getBoolean("enabled")
+            }
+            200 to json("enabled" to (proactiveEnabled[profile] ?: false), "jobs" to JSONArray(), "services" to JSONArray(proactiveServices.map { it.copy() }))
+        }
         path == "/api/plugins/cypher/mobile/notifications/events" -> {
             val after = url?.queryParameter("after")?.toLongOrNull() ?: 0L
             val wait = url?.queryParameter("wait")?.toLongOrNull() ?: 0L
@@ -510,7 +527,9 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         path.endsWith("/voice-history") -> 200 to json("session_id" to path.substringBeforeLast('/').substringAfterLast('/'), "profile" to scope.profile, "events" to JSONArray())
         path.endsWith("/notifications/status") -> 200 to json("android_configured" to false, "targets" to JSONArray(), "delivery" to json("pending" to 0), "available" to false)
         path.endsWith("/tasks/capabilities") -> 200 to json("timezone" to "Asia/Dubai", "random_checkups" to false)
-        path == "/api/plugins/cypher/mobile/bootstrap" -> 200 to json("contract_version" to 2, "backend" to "hermes-dashboard", "owner_id" to scope.owner, "profile" to profile, "voice" to json("available" to false))
+        path == "/api/plugins/cypher/mobile/bootstrap" -> 200 to json("contract_version" to 2, "backend" to "hermes-dashboard", "owner_id" to scope.owner, "profile" to profile, "voice" to json("available" to false)).apply {
+            bootstrapPluginStatus?.let { put("optional_features", json("plugin" to it)) }
+        }
         else -> 404 to json("detail" to "Synthetic fixture has no response for $path")
     } }
     override fun newWebSocket(request: Request, listener: WebSocketListener): WebSocket {

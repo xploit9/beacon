@@ -54,6 +54,8 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.stringPreferencesKey
 import dev.hermes.android.*
 import dev.hermes.android.core.*
 import dev.hermes.android.data.CypherClient
@@ -67,6 +69,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
@@ -191,9 +194,12 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
     }
 }
 
+private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt_dismissed")
+
 @Composable fun ChatScreen(vm: CypherViewModel, xara: Boolean = false, onComposerHeight: (Int) -> Unit = {}, navigationBack: (() -> Unit)? = null, titleOverride: String? = null) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val profileDefaults by vm.data.collectAsStateWithLifecycle()
+    val preferences by vm.preferences.collectAsStateWithLifecycle()
     val chatState by vm.chat.collectAsStateWithLifecycle()
     val composerDraft by vm.composer.collectAsStateWithLifecycle()
     val messages = remember(chatState.messages, chatState.callMessages, chatState.sessionId) { visibleTranscriptMessages(chatState.messages) + chatState.callMessages.map { Message("call:${it.eventId}", it.role, it.text, sessionId = chatState.sessionId) } }
@@ -220,10 +226,46 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
     val side by vm.side.collectAsStateWithLifecycle()
     val settings = LocalCypherSettings.current
     val ready = !xara || vm.isCypherConversation()
+    val proactiveKey = proactiveSettingsKey(Scope(ui.origin, ui.owner, preferences.assistantProfile))
+    val proactive = profileDefaults[proactiveKey]
+    val proactiveLoaded = proactive != null && proactive.has("enabled") && !proactive.has("_error")
+    val proactiveEnabled = proactiveLoaded && proactive?.optBoolean("enabled") == true
+    val gmailStatus = proactive?.rows("services")?.firstOrNull { it.string("id") == "gmail" }?.string("status").orEmpty()
+    val calendarStatus = proactive?.rows("services")?.firstOrNull { it.string("id") == "google_calendar" }?.string("status").orEmpty()
+    val pluginStatus = ui.bootstrap.optJSONObject("optional_features")?.optString("plugin").orEmpty()
+    val proactiveContext = LocalContext.current.applicationContext
+    val promptMemory by remember(proactiveContext) {
+        proactiveContext.preferences.data.map { values ->
+            val saved = values[proactivePromptDismissedKey]?.let { runCatching { JSONObject(it) }.getOrNull() }
+            saved?.string("state").orEmpty() to saved?.string("dismissed").orEmpty()
+        }
+    }.collectAsStateWithLifecycle(initialValue = null as Pair<String, String>?)
+    val promptText = when {
+        !proactiveLoaded || pluginStatus == "absent" -> ""
+        !proactiveEnabled -> assistantText("Let Cypher keep an eye on your day")
+        gmailStatus == "missing" -> assistantText("Connect Gmail so Cypher can watch your inbox")
+        calendarStatus == "missing" -> assistantText("Connect Google Calendar so Cypher can keep up with your day")
+        else -> ""
+    }
+    val promptSignature = when {
+        !proactiveLoaded -> ""
+        !proactiveEnabled -> "${Scope(ui.origin, ui.owner, preferences.assistantProfile).key}|off"
+        else -> "${Scope(ui.origin, ui.owner, preferences.assistantProfile).key}|on|gmail:$gmailStatus|google_calendar:$calendarStatus"
+    }
+    val promptDismissed = promptMemory?.let { it.first == promptSignature && it.second == promptSignature } == true
+    val showProactivePrompt = xara && ui.tab == "Xara" && pluginStatus != "absent" && promptMemory != null && promptText.isNotBlank() && !promptDismissed
     val canonical = ready && chat.sessionId.isNotBlank()
     val permanentBotChat = ui.botModeEnabled && ui.tab == "More" && ui.morePage == "Bots"
     val activeHere = call.active && call.conversationScope == vm.authenticatedScope()
     val scope = rememberCoroutineScope()
+    LaunchedEffect(promptSignature, promptText, promptMemory) {
+        if (pluginStatus != "absent" && promptSignature.isNotBlank() && promptText.isBlank() && promptMemory != null && promptMemory.first != promptSignature)
+            proactiveContext.preferences.edit { it[proactivePromptDismissedKey] = json("state" to promptSignature, "dismissed" to "").toString() }
+    }
+    LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, ui.tab, preferences.assistantProfile, pluginStatus) {
+        if (xara && ui.tab == "Xara" && ui.connected && ui.profile == preferences.assistantProfile && pluginStatus != "absent")
+            vm.load(proactiveKey, PROACTIVE_SETTINGS_PATH, mapOf("profile" to preferences.assistantProfile), force = false)
+    }
     var menu by remember { mutableStateOf(false) }
     var activitySheet by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(false) }
     val activity = remember(chat.liveTools, chat.queued.size, chat.approval, chat.clarification, chat.streamId) {
@@ -390,57 +432,74 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
             else if (!chat.projectionReady) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
             }
-            else Box(Modifier.weight(1f).fillMaxWidth().testTag("transcript-layer")) {
-                if (chat.messages.isNotEmpty() || chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank() || sphereStreaming)
-                    ChatSphere(Modifier.fillMaxSize().alpha(if (sphereStreaming) .5f else .12f).testTag("chat-sphere-background"), transcriptAvatarState)
-                LazyColumn(Modifier.fillMaxSize().nestedScroll(ownerScroll).testTag("conversation-transcript"), state = list, contentPadding = PaddingValues(horizontal = 20.dp, vertical = 20.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) {
-                if (chat.messages.isEmpty() && chat.streamId.isBlank() && !chatSendInFlight(chat)) item("empty-state") {
-                    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-                        Box(Modifier.widthIn(max = 280.dp).fillMaxWidth(.9f).aspectRatio(1f).clipToBounds().testTag("chat-sphere-empty")) { ChatSphere(Modifier.fillMaxSize(), avatarState) }
-                        EmptyState("Where shall we begin?", if (xara) assistantText("Cypher keeps the same context across text, calls and completed tasks.") else "Your work starts here. Choose a model and send your first message.")
-                        StarterPrompts { vm.composer(TextFieldValue(it, TextRange(it.length))) }
+            else Column(Modifier.weight(1f).fillMaxWidth()) {
+                if (showProactivePrompt) Card(
+                    Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp).testTag("proactive-prompt-card"),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .55f)),
+                ) {
+                    Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(promptText, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                            IconButton(onClick = { scope.launch { proactiveContext.preferences.edit { it[proactivePromptDismissedKey] = json("state" to promptSignature, "dismissed" to promptSignature).toString() } } }, modifier = Modifier.testTag("proactive-prompt-dismiss")) {
+                                Icon(Icons.Rounded.Close, contentDescription = uiText("Dismiss"))
+                            }
+                        }
+                        TextButton(onClick = { vm.more("Assistant") }, modifier = Modifier.testTag("proactive-prompt-settings")) { Text(uiText("Assistant settings")) }
                     }
                 }
-                if (search.isNotBlank() && visibleMessages.isEmpty()) item { Text("No messages match your search.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                items(visibleMessages, key = { it.value.id }) { (index, message) -> dayStarts[message.id]?.let { DayDivider(uiText(it)) }; MessageRow(vm, message, transcriptIndex[message.id] ?: index, callMessagesById[message.id], separateToolResults, toolResultTitles[message.id].orEmpty(), isLatestAssistant = message.id == latestAssistantMessageId, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }) }
-                if (chat.streamId.isNotBlank() || chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank()) item("live") {
-                    // Same header and spacing as the stored reply, so replacing this row does not move the text.
-                    Column(Modifier.testTag("live-reply"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text(LocalAssistantName.current, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        // The blank meta line and the status row hold the places of the stored reply's time and action row.
-                        if (chat.liveText.isNotBlank()) AssistantSurface { Markdown(chat.liveText, vm, vm.authenticatedScope(), interactive = false); Text(" ", Modifier.padding(top = 4.dp), style = nativeMetadataStyle()) }
-                        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("live-status"), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
-                            Text(chat.status.ifBlank { "Working" }, Modifier.testTag("message-activity-status"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Box(Modifier.weight(1f).fillMaxWidth().testTag("transcript-layer")) {
+                    if (chat.messages.isNotEmpty() || chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank() || sphereStreaming)
+                        ChatSphere(Modifier.fillMaxSize().alpha(if (sphereStreaming) .5f else .12f).testTag("chat-sphere-background"), transcriptAvatarState)
+                    LazyColumn(Modifier.fillMaxSize().nestedScroll(ownerScroll).testTag("conversation-transcript"), state = list, contentPadding = PaddingValues(horizontal = 20.dp, vertical = 20.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) {
+                    if (chat.messages.isEmpty() && chat.streamId.isBlank() && !chatSendInFlight(chat)) item("empty-state") {
+                        Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Box(Modifier.widthIn(max = 280.dp).fillMaxWidth(.9f).aspectRatio(1f).clipToBounds().testTag("chat-sphere-empty")) { ChatSphere(Modifier.fillMaxSize(), avatarState) }
+                            EmptyState("Where shall we begin?", if (xara) assistantText("Cypher keeps the same context across text, calls and completed tasks.") else "Your work starts here. Choose a model and send your first message.")
+                            StarterPrompts { vm.composer(TextFieldValue(it, TextRange(it.length))) }
                         }
-                        MessageActivity(chat.liveReasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), chat.liveTools, "", streaming = true, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) })
                     }
-                }
-                chat.approval?.let { p -> item("approval:${p.string("approval_id", p.string("id"))}") {
-                    val exactCypherAction = p.string("approval_id").startsWith("cypher-cf:")
-                    Glass { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text(uiText("Approval needed"), style = MaterialTheme.typography.titleMedium)
-                        Text(p.string("description", p.string("command", "The agent requests permission to continue.")))
-                        if (p.string("command").isNotBlank()) CodeBlock(if (exactCypherAction) "json" else "shell", p.string("command"))
-                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(onClick = { promptScope?.let { vm.approval("once", p, it) } }, enabled = promptScope != null && "once" in p.optJSONArray("choices")?.strings().orEmpty()) { Text(uiText("Allow once")) }
-                            if (!exactCypherAction && "session" in p.optJSONArray("choices")?.strings().orEmpty()) OutlinedButton(onClick = { promptScope?.let { vm.approval("session", p, it) } }, enabled = promptScope != null) { Text(uiText("This session")) }
-                            TextButton(onClick = { promptScope?.let { vm.approval("deny", p, it) } }, enabled = promptScope != null && "deny" in p.optJSONArray("choices")?.strings().orEmpty()) { Text(uiText("Deny")) }
-                            if (!exactCypherAction && "always" in p.optJSONArray("choices")?.strings().orEmpty()) TextButton(onClick = { promptScope?.let { vm.approval("always", p, it) } }, enabled = promptScope != null) { Text(uiText("Always allow")) }
+                    if (search.isNotBlank() && visibleMessages.isEmpty()) item { Text("No messages match your search.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    items(visibleMessages, key = { it.value.id }) { (index, message) -> dayStarts[message.id]?.let { DayDivider(uiText(it)) }; MessageRow(vm, message, transcriptIndex[message.id] ?: index, callMessagesById[message.id], separateToolResults, toolResultTitles[message.id].orEmpty(), isLatestAssistant = message.id == latestAssistantMessageId, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }) }
+                    if (chat.streamId.isNotBlank() || chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank()) item("live") {
+                        // Same header and spacing as the stored reply, so replacing this row does not move the text.
+                        Column(Modifier.testTag("live-reply"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(LocalAssistantName.current, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            // The blank meta line and the status row hold the places of the stored reply's time and action row.
+                            if (chat.liveText.isNotBlank()) AssistantSurface { Markdown(chat.liveText, vm, vm.authenticatedScope(), interactive = false); Text(" ", Modifier.padding(top = 4.dp), style = nativeMetadataStyle()) }
+                            Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("live-status"), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                                Text(chat.status.ifBlank { "Working" }, Modifier.testTag("message-activity-status"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            MessageActivity(chat.liveReasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), chat.liveTools, "", streaming = true, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) })
                         }
+                    }
+                    chat.approval?.let { p -> item("approval:${p.string("approval_id", p.string("id"))}") {
+                        val exactCypherAction = p.string("approval_id").startsWith("cypher-cf:")
+                        Glass { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Text(uiText("Approval needed"), style = MaterialTheme.typography.titleMedium)
+                            Text(p.string("description", p.string("command", "The agent requests permission to continue.")))
+                            if (p.string("command").isNotBlank()) CodeBlock(if (exactCypherAction) "json" else "shell", p.string("command"))
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(onClick = { promptScope?.let { vm.approval("once", p, it) } }, enabled = promptScope != null && "once" in p.optJSONArray("choices")?.strings().orEmpty()) { Text(uiText("Allow once")) }
+                                if (!exactCypherAction && "session" in p.optJSONArray("choices")?.strings().orEmpty()) OutlinedButton(onClick = { promptScope?.let { vm.approval("session", p, it) } }, enabled = promptScope != null) { Text(uiText("This session")) }
+                                TextButton(onClick = { promptScope?.let { vm.approval("deny", p, it) } }, enabled = promptScope != null && "deny" in p.optJSONArray("choices")?.strings().orEmpty()) { Text(uiText("Deny")) }
+                                if (!exactCypherAction && "always" in p.optJSONArray("choices")?.strings().orEmpty()) TextButton(onClick = { promptScope?.let { vm.approval("always", p, it) } }, enabled = promptScope != null) { Text(uiText("Always allow")) }
+                            }
+                        } }
                     } }
-                } }
-                chat.clarification?.let { p -> item("clarify:$questionId") { Clarification(vm, p, promptScope, questionAnswers) { id, value -> questionAnswers = questionAnswers + (id to value) } } }
-                if (chatSendInFlight(chat)) item("sending") { SendingMessage(composerDraft.text) }
-                else if (chat.status.isNotBlank() && chat.streamId.isBlank()) item { Text(chat.status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    chat.clarification?.let { p -> item("clarify:$questionId") { Clarification(vm, p, promptScope, questionAnswers) { id, value -> questionAnswers = questionAnswers + (id to value) } } }
+                    if (chatSendInFlight(chat)) item("sending") { SendingMessage(composerDraft.text) }
+                    else if (chat.status.isNotBlank() && chat.streamId.isBlank()) item { Text(chat.status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    }
+                    if (ready && !follow && list.canScrollForward) FloatingActionButton(
+                        onClick = { follow = true; scope.launch { val last = (list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0); if (motionEnabled) list.animateScrollToItem(last) else list.scrollToItem(last) } },
+                        modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp).testTag("scroll-to-latest"),
+                        shape = CircleShape,
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary,
+                    ) { Icon(Icons.Rounded.ExpandMore, uiText("Scroll to latest"), Modifier.size(24.dp)) }
                 }
-                if (ready && !follow && list.canScrollForward) FloatingActionButton(
-                    onClick = { follow = true; scope.launch { val last = (list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0); if (motionEnabled) list.animateScrollToItem(last) else list.scrollToItem(last) } },
-                    modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp).testTag("scroll-to-latest"),
-                    shape = CircleShape,
-                    containerColor = MaterialTheme.colorScheme.primary,
-                    contentColor = MaterialTheme.colorScheme.onPrimary,
-                ) { Icon(Icons.Rounded.ExpandMore, uiText("Scroll to latest"), Modifier.size(24.dp)) }
             }
             if (ready && chat.uncertain.isNotBlank() && !chatSendInFlight(chat)) Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) { Text(uiText("Checking whether your last message arrived. Your draft is saved."), Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium); TextButton(onClick = { vm.reconcileSend() }) { Text(uiText("Check receipt")) } }
         }
