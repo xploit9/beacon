@@ -56,7 +56,7 @@ Approvals (composer shield, native Hermes): Manual, Smart and Off set the profil
 
 Conversation actions: long-press any conversation in History (or use the chat's ⋮ menu) to pin or unpin, rename, add it to a project or remove it from its project, archive or delete it. Removing a chat from a project moves it to the profile's own folder; its messages stay.
 
-Assistant (Settings › Assistant): set the assistant's name, profile and model. Its chat always opens in that profile on that model; your other chats keep the profile you picked, and leaving its tab returns you to the chat you had open. The name shows in the app and its calls; the app itself stays Cypher. Turn on Proactive for briefings, follow-ups and alerts, then connect the services it needs.
+Assistant (Settings › Assistant): set the assistant's name, profile and model. Its chat always opens in that profile on that model; your other chats keep the profile you picked, and leaving its tab returns you to the chat you had open. The name shows in the app and its calls; the app itself stays Cypher. Turn on Proactive for briefings, follow-ups and alerts, then connect the services it needs. Task result notifications open their conversation with the full, selectable result in a dismissible card.
 
 Settings are grouped: Assistant (name, profile and model; voice and calls; notifications), Hermes (chat, profiles and models, skills, memory, tools, server) and App (appearance, updates, about).
 

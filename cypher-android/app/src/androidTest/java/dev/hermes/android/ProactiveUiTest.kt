@@ -22,6 +22,7 @@ import androidx.test.core.app.ApplicationProvider
 import dev.hermes.android.core.*
 import dev.hermes.android.data.AuthContext
 import dev.hermes.android.data.CypherClient
+import dev.hermes.android.push.KeepConnectedService
 import dev.hermes.android.ui.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
@@ -35,6 +36,51 @@ class ProactiveUiTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
     private val app get() = ApplicationProvider.getApplicationContext<CypherApplication>()
     private fun proactiveKey(fixture: NativeExperienceFixture) = proactiveSettingsKey(fixture.scope.copy(profile = "coder"))
+
+    @Test fun taskResultNotificationShowsFullReasonAndCanBeDismissed() = withFixture { vm, fixture ->
+        val source = "task-result-source-test"
+        val eventId = "task-result-event-test"
+        val reason = buildString {
+            append("Daily briefing: ")
+            repeat(40) { append("calendar follow-up item ${it + 1}; ") }
+            append("**FULL-REASON-END**")
+        }
+        runBlocking { app.auth.persist(fixture.client.auth) }
+        assertTrue(app.push.bindKeepConnectedSource(fixture.scope, source))
+        fixture.incomingNotification = json(
+            "seq" to 1,
+            "event_id" to eventId,
+            "owner_id" to fixture.scope.owner,
+            "profile" to fixture.scope.profile,
+            "kind" to "task_result",
+            "state" to "finished",
+            "source_ref" to source,
+            "session_id" to "chat-a",
+            "reason" to reason,
+            "preview" to json("body" to reason.take(240) + "…"),
+        )
+        val previousFactory = KeepConnectedService.clientFactoryForTest
+        val pushClients = mutableListOf<CypherClient>()
+        KeepConnectedService.clientFactoryForTest = { auth, store ->
+            fixture.freshClientFor(auth, store).also(pushClients::add)
+        }
+        try {
+            vm.handlePush(source, eventId)
+            await { vm.ui.value.tab == "Chat" && vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
+            await { compose.onAllNodesWithText("FULL-REASON-END", substring = true).fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithText("FULL-REASON-END", substring = true).performScrollTo().assertExists()
+            compose.onNodeWithTag("task-result-card").assertExists()
+            compose.onNodeWithTag("task-result-dismiss").performClick()
+            await { compose.onAllNodesWithTag("task-result-card").fetchSemanticsNodes().isEmpty() }
+        } finally {
+            vm.client?.closeNative()
+            pushClients.forEach(CypherClient::closeNative)
+            KeepConnectedService.clientFactoryForTest = previousFactory
+            app.getSharedPreferences("push-binding", android.content.Context.MODE_PRIVATE).edit()
+                .remove("source:${source.digest()}").commit()
+            runBlocking { app.auth.remove(fixture.scope.origin) }
+        }
+    }
 
     @Test fun switchUsesAssistantProfileAndOnlySendsEnabled() = withFixture { vm, fixture ->
         await { vm.preferences.value.assistantProfile == "coder" }

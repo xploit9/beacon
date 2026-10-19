@@ -64,12 +64,6 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
     LaunchedEffect(ui.origin, ui.owner, ui.profile, profile, ui.connected, pluginStatus, vm.client, proactiveRefresh) {
         if (!ui.connected || pluginStatus == "absent") return@LaunchedEffect
         val source = vm.client ?: return@LaunchedEffect
-        if (source.scope.profile == profile) {
-            vm.storeData(proactiveKey, JSONObject().put("_loading", true))
-            vm.load(proactiveKey, PROACTIVE_SETTINGS_PATH, mapOf("profile" to profile), force = false)
-            return@LaunchedEffect
-        }
-        // The shared read/action helpers bind to the active profile; this view keeps another assistant profile scoped safely.
         vm.storeData(proactiveKey, JSONObject().put("_loading", true))
         val client = try { source.forAuthorizedProfile(profile) } catch (_: Throwable) {
             vm.storeData(proactiveKey, JSONObject().put("_error", "Couldn’t load proactive settings."))
@@ -89,18 +83,6 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
         if (savingProactive) return
         val source = vm.client
         if (source == null || !ui.connected || pluginStatus == "absent") return
-        if (source.scope.profile == profile) {
-            savingProactive = true
-            scope.launch {
-                try {
-                    vm.action(PROACTIVE_SETTINGS_PATH, json("enabled" to enabled), method = "PUT", refresh = false, successNotice = "Proactive settings updated.") { _, response ->
-                        if (vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile)
-                            vm.storeData(proactiveKey, response)
-                    }.join()
-                } finally { savingProactive = false }
-            }
-            return
-        }
         val client = try { source.forAuthorizedProfile(profile) } catch (_: Throwable) {
             vm.notice("Couldn’t update proactive settings. Try again.")
             return

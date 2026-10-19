@@ -207,6 +207,8 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
     val transcriptIndex = remember(chatState.messages) { chatState.messages.withIndex().associate { it.value.id to it.index } }
     val latestAssistantMessageId = remember(chatState.messages) { chatState.messages.lastOrNull { it.role == "assistant" && it.text.isNotBlank() }?.id }
     val chat = chatState.copy(messages = messages)
+    val taskResultKey = "task-result:${Scope(ui.origin, ui.owner, ui.profile).session(chat.sessionId).key}"
+    val taskResult = profileDefaults[taskResultKey]?.string("reason").orEmpty()
     val callMessagesById = remember(chatState.callMessages) { chatState.callMessages.associateBy { "call:${it.eventId}" } }
     val separateToolResults = remember(chat.raw) { separateToolResultIds(chat.raw.rows("messages")) }
     val toolResultTitles = remember(chat.raw) { toolResultTitles(chat.raw.rows("messages")) }
@@ -433,6 +435,23 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
                 CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
             }
             else Column(Modifier.weight(1f).fillMaxWidth()) {
+                if (taskResult.isNotBlank()) Card(
+                    Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp).testTag("task-result-card"),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .55f)),
+                ) {
+                    Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(uiText("Task result"), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+                            IconButton(onClick = { vm.storeData(taskResultKey, JSONObject()) }, modifier = Modifier.testTag("task-result-dismiss")) {
+                                Icon(Icons.Rounded.Close, contentDescription = uiText("Dismiss"))
+                            }
+                        }
+                        Column(Modifier.heightIn(max = 240.dp).verticalScroll(rememberScrollState())) {
+                            Markdown(taskResult, vm, Scope(ui.origin, ui.owner, ui.profile).session(chat.sessionId), interactive = false)
+                        }
+                    }
+                }
                 if (showProactivePrompt) Card(
                     Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp).testTag("proactive-prompt-card"),
                     shape = RoundedCornerShape(16.dp),
