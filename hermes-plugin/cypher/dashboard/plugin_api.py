@@ -23,7 +23,10 @@ from fastapi.responses import StreamingResponse
 # Hermes loads this file by path rather than as a package. Load private sibling modules
 # under stable plugin-specific names so the native tool and dashboard share durable state.
 ROOT=Path(__file__).resolve().parent.parent
-for name in ('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_api','bot_mode_api','callbacks','callback_api'):
+_RELEASE_CACHE_LOCK=threading.RLock()
+_RELEASE_CACHE_KEY=None
+_RELEASE_CACHE_VALUE=None
+for name in ('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_api','bot_mode_api','callbacks','callback_api','proactive'):
     key='cypher_'+name
     if key not in sys.modules:
         spec=importlib.util.spec_from_file_location(key,ROOT/(name+'.py'))
@@ -31,6 +34,7 @@ for name in ('mobile','native','voice_context','voice_models','activity','memory
 mobile=sys.modules['cypher_mobile'];native=sys.modules['cypher_native'];voice_context=sys.modules['cypher_voice_context']
 activity=sys.modules['cypher_activity']
 voice_models=sys.modules['cypher_voice_models']
+proactive=sys.modules['cypher_proactive']
 @asynccontextmanager
 async def lifespan(app):
     await start_watcher()
@@ -599,7 +603,10 @@ def notice_preview(kind):
     return 'Cypher calling','Open Cypher to hear the saved result.'
 def notice_wire(row,owner):
     state='expired' if row['state']=='pending' and row['expires']<=time.time() else row['state']
-    return {**row,'event_id':row['id'],'callback_id':row['id'],'owner_id':owner,'conversation_id':row['conversation'],'session_id':row['conversation'] if row['kind']!='test' else '', 'expires_at':int(row['expires']),'state':state,'title':notice_preview(row['kind'])[0],'body':notice_preview(row['kind'])[1],'activity_ref':row.get('activity_key',''),'preview':{'title':notice_preview(row['kind'])[0],'body':notice_preview(row['kind'])[1]},**mobile.refs(owner,row['profile'],row['conversation'])}
+    title,body=notice_preview(row['kind'])
+    if row['kind']=='task_result' and row.get('reason'):
+        body=row['reason'][:240]+('…' if len(row['reason'])>240 else '')
+    return {**row,'event_id':row['id'],'callback_id':row['id'],'owner_id':owner,'conversation_id':row['conversation'],'session_id':row['conversation'] if row['kind']!='test' else '', 'expires_at':int(row['expires']),'state':state,'title':title,'body':body,'activity_ref':row.get('activity_key',''),'preview':{'title':title,'body':body},**mobile.refs(owner,row['profile'],row['conversation'])}
 @router.get('/mobile/notifications/events/{event_id}')
 async def notice_detail(event_id:str,request:Request):
     owner,provider,profile,_=identity(request)
@@ -770,6 +777,11 @@ def announce_release(cfg):
                          (event,owner,profile,'release','release-'+str(version),time.time(),time.time()+7*86400,version))
             conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(key(profile),version))
 def release(cfg,optional=False,digest=None):
+    with _RELEASE_CACHE_LOCK:
+        return _release(cfg,optional,digest)
+
+def _release(cfg,optional=False,digest=None):
+    global _RELEASE_CACHE_KEY,_RELEASE_CACHE_VALUE
     configured=cfg.get('release_root')
     if not configured:
         if optional: return {'available':False}
@@ -778,22 +790,34 @@ def release(cfg,optional=False,digest=None):
     if digest is not None and not re.fullmatch(r'[a-f0-9]{64}',digest): raise LookupError('Invalid immutable release')
     manifest=root/((digest+'.json') if digest else 'latest.json')
     if manifest.is_symlink() or getattr(manifest,'is_junction',lambda:False)(): raise ValueError('Unsafe release manifest')
-    if manifest.stat().st_size>16384: raise ValueError('Oversized release manifest')
+    manifest_stat=manifest.stat()
+    if manifest_stat.st_size>16384: raise ValueError('Oversized release manifest')
     data=json.loads(manifest.read_text(encoding='utf-8-sig'))
     filename=data.get('artifact_filename','')
     if not re.fullmatch(r'[A-Za-z0-9_.-]+\.apk',filename): raise ValueError('Invalid artifact name')
     path=root/filename
     if path.is_symlink() or getattr(path,'is_junction',lambda:False)() or path.resolve().parent!=root: raise ValueError('Unsafe artifact')
     if data.get('package_name')!='dev.hermes.android' or type(data.get('version_code')) is not int or data['version_code']<=20 or not re.fullmatch(r'[a-fA-F0-9]{64}',data.get('certificate_sha256','')): raise ValueError('Invalid release identity')
-    with path.open('rb') as stream: computed=hashlib.file_digest(stream,'sha256').hexdigest()
-    if digest is not None and digest!=computed: raise ValueError('Immutable manifest hash mismatch')
-    digest=computed
-    if not 1<=path.stat().st_size<=256*1024*1024: raise ValueError('APK size outside bounds')
-    if digest!=data.get('sha256') or path.stat().st_size!=data.get('size_bytes'): raise ValueError('Release artifact changed')
+    artifact_stat=path.stat()
+    if not 1<=artifact_stat.st_size<=256*1024*1024: raise ValueError('APK size outside bounds')
+    if artifact_stat.st_size!=data.get('size_bytes') or not re.fullmatch(r'[a-fA-F0-9]{64}',data.get('sha256','')): raise ValueError('Release artifact changed')
     expected=cfg.get('android_certificate_sha256')
     if not expected or expected.lower()!=data['certificate_sha256'].lower(): raise ValueError('Unexpected signing identity')
     aapt=cfg.get('aapt');signer=cfg.get('apksigner')
     if not aapt or not signer or not Path(aapt).is_file() or not Path(signer).is_file(): raise RuntimeError('APK verification tools unavailable')
+    tools=[]
+    for tool in (aapt,signer):
+        tool_path=Path(tool);tool_stat=tool_path.stat()
+        tools.append((str(tool_path.resolve()),tool_stat.st_size,tool_stat.st_mtime_ns))
+    cache_key=(str(manifest.resolve()),manifest_stat.st_size,manifest_stat.st_mtime_ns,
+               str(path.resolve()),artifact_stat.st_size,artifact_stat.st_mtime_ns,
+               digest,expected.lower(),tuple(tools))
+    if cache_key==_RELEASE_CACHE_KEY:
+        return dict(_RELEASE_CACHE_VALUE)
+    with path.open('rb') as stream: computed=hashlib.file_digest(stream,'sha256').hexdigest()
+    if digest is not None and digest!=computed: raise ValueError('Immutable manifest hash mismatch')
+    digest=computed
+    if digest!=data.get('sha256'): raise ValueError('Release artifact changed')
     flags=subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0
     try:
         badging=subprocess.run([aapt,'dump','badging',str(path)],capture_output=True,text=True,check=True,timeout=20,creationflags=flags).stdout
@@ -802,7 +826,9 @@ def release(cfg,optional=False,digest=None):
     package=re.search(r"package: name='([^']+)' versionCode='([0-9]+)' versionName='([^']+)'",badging)
     digests=re.findall(r'Signer #[0-9]+ certificate SHA-256 digest: ([a-fA-F0-9]{64})',certificates)
     if not package or package[1]!=data['package_name'] or int(package[2])!=data['version_code'] or package[3]!=data['version_name'] or len(digests)!=1 or digests[0].lower()!=expected.lower(): raise ValueError('APK metadata/signature mismatch')
-    return {k:data[k] for k in ('version_code','version_name','package_name','certificate_sha256','sha256','size_bytes')} | {'available':True,'download_url':'/api/plugins/cypher/mobile/releases/'+digest+'/download','artifact_path':'/api/plugins/cypher/mobile/releases/'+digest+'/download','min_contract_version':2,'max_contract_version':2}
+    result={k:data[k] for k in ('version_code','version_name','package_name','certificate_sha256','sha256','size_bytes')} | {'available':True,'download_url':'/api/plugins/cypher/mobile/releases/'+digest+'/download','artifact_path':'/api/plugins/cypher/mobile/releases/'+digest+'/download','min_contract_version':2,'max_contract_version':2}
+    _RELEASE_CACHE_KEY=cache_key;_RELEASE_CACHE_VALUE=dict(result)
+    return result
 @router.get('/mobile/releases/latest')
 async def latest(request:Request):
     _,_,_,cfg=identity(request);return await asyncio.to_thread(safely,release,cfg)
@@ -944,6 +970,19 @@ async def get_voice_history(stored_id:str,request:Request):
     await feature(native.verify,owner,provider,profile,stored_id,timeout=6)
     result=await feature(mobile.voice_history,owner,profile,stored_id,timeout=8)
     return JSONResponse(result,headers={'Cache-Control':'no-store'})
+
+@router.get('/mobile/proactive')
+async def proactive_status(request:Request):
+    owner,provider,profile,cfg=identity(request)
+    return await feature(proactive.status,mobile,owner,provider,profile,cfg,timeout=12)
+
+@router.put('/mobile/proactive')
+async def proactive_enabled(request:Request):
+    value=await body(request,1024)
+    if set(value)!={'enabled'} or type(value['enabled']) is not bool:
+        raise HTTPException(400,'Expected only an enabled boolean')
+    owner,provider,profile,cfg=identity(request)
+    return await feature(proactive.set_enabled,mobile,owner,provider,profile,cfg,value['enabled'],timeout=30)
 
 router.include_router(sys.modules['cypher_callback_api'].build_router(call,body,feature,mobile,native,sys.modules['cypher_callbacks']))
 

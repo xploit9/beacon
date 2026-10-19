@@ -34,7 +34,7 @@ def prune_meta(conn,now):
             if not math.isfinite(created) or now-created>86400: conn.execute('DELETE FROM meta WHERE key=?',(key,))
 
 
-def completion(mobile,native,cfg,profile,session_id,turn_id,completed=False,failed=False,interrupted=False,**kwargs):
+def completion(mobile,native,cfg,profile,session_id,turn_id,completed=False,failed=False,interrupted=False,job_id=None,**kwargs):
     if (completed is not True and failed is not True) or interrupted or not session_id or not turn_id: return
     owner=cfg.get('owner_id');provider=cfg.get('owner_provider')
     if not owner or not provider or profile not in cfg.get('profiles',[]): return
@@ -47,7 +47,8 @@ def completion(mobile,native,cfg,profile,session_id,turn_id,completed=False,fail
         if conn.execute('SELECT 1 FROM meta WHERE key=?',(key,)).fetchone(): return
         if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: raise ValueError('Notification capacity reached')
         conn.execute('INSERT INTO meta VALUES(?,?)',(key,str(now).encode()))
-        conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires) VALUES(?,?,?,?,?,?,?)',(uuid.uuid4().hex,owner,profile,kind,session_id,now,now+86400))
+        conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,job_id) VALUES(?,?,?,?,?,?,?,?)',
+                     (uuid.uuid4().hex,owner,profile,kind,session_id,now,now+86400,job_id if isinstance(job_id,str) and mobile.ID.fullmatch(job_id) else ''))
 
 
 def mailbox_facts(value,contract):

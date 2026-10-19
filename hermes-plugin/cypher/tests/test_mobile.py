@@ -957,7 +957,7 @@ def test_registered_native_completion_and_mailbox_hooks_are_real(harness):
     tools=[];hooks=[]
     ctx=SimpleNamespace(register_tool=lambda **kwargs:tools.append(kwargs),register_hook=lambda name,handler:hooks.append((name,handler)))
     plugin.register(ctx)
-    assert {name for name,handler in hooks}=={'on_session_end','post_tool_call','pre_llm_call'}
+    assert {name for name,handler in hooks}=={'on_session_end','post_tool_call','pre_llm_call','post_llm_call'}
     assert {tool['name'] for tool in tools}=={'cypher_call_user','cypher_email_notice','cypher_mail_read'}
     assert all(tool['toolset']=='cypher-mailbox' for tool in tools if tool['name'].endswith('email_notice'))
     assert all(callable(handler) for name,handler in hooks)
@@ -1106,3 +1106,333 @@ def test_project_creation_replays_one_native_intent_even_when_requests_overlap(h
     assert client.post(path, json={'request_id': intent, 'name': 'Research', 'profile': 'foreign'}).status_code == 400
     client.headers['x-fixture-owner'] = 'foreign'
     assert client.post(path, json={'request_id': intent, 'name': 'Research'}).status_code == 403
+
+
+def _fake_proactive_cron(monkeypatch, home, initial=(), mobile=None):
+    if mobile is not None:
+        monkeypatch.setattr(mobile, 'protect', lambda path: path.mkdir(parents=True, exist_ok=True))
+    jobs = [dict(job) for job in initial]
+    calls = {'create': 0, 'update': 0, 'remove': 0, 'resume': 0}
+
+    def create(model, profile):
+        calls['create'] += 1
+        job = dict(model.__dict__, id=f'g19-{calls["create"]}', schedule_display=model.schedule)
+        jobs.append(job)
+        return job
+
+    def mutate(profile, name, *args):
+        job_id = args[0]
+        job = next((row for row in jobs if row['id'] == job_id), None)
+        if name == 'update_job':
+            calls['update'] += 1
+            job.update(args[1])
+            if 'schedule' in args[1]:
+                job['schedule_display'] = args[1]['schedule']
+            return job
+        if name == 'remove_job':
+            calls['remove'] += 1
+            if job is None:
+                return False
+            jobs.remove(job)
+            return True
+        if name == 'resume_job':
+            calls['resume'] += 1
+            job['enabled'] = True
+            job['state'] = 'scheduled'
+            return job
+        raise AssertionError(f'unexpected cron mutation: {name}')
+
+    monkeypatch.setitem(sys.modules, 'hermes_cli.web_server_cron', SimpleNamespace(
+        _cron_profile_home=lambda profile: (profile, home),
+        _call_cron_for_profile=lambda profile, name, *args, **kwargs: list(jobs) if name == 'list_jobs' else None,
+        _create_cron_job_sync=create,
+        _mutate_cron_for_profile=mutate,
+    ))
+    monkeypatch.setitem(sys.modules, 'hermes_cli.web_models', SimpleNamespace(
+        CronJobCreate=lambda **kwargs: SimpleNamespace(**kwargs)))
+    monkeypatch.setitem(sys.modules, 'hermes_cli.profile_distribution', SimpleNamespace(read_manifest=lambda profile_home: None))
+    return jobs, calls
+
+
+def test_proactive_status_route_is_owner_profile_checked_and_has_fixed_shape(harness, monkeypatch):
+    api, client, cfg, tmp, _ = harness
+    _fake_proactive_cron(monkeypatch, tmp, mobile=api.mobile)
+    monkeypatch.setattr(api.proactive.subprocess, 'run', lambda *args, **kwargs: SimpleNamespace(
+        returncode=0, stdout='AUTHENTICATED: Token valid', stderr=''))
+    path = '/api/plugins/cypher/mobile/proactive'
+    result = client.get(path)
+    assert result.status_code == 200, result.text
+    body = result.json()
+    assert set(body) == {'enabled', 'jobs', 'services'}
+    assert body['enabled'] is False
+    assert {job['id'] for job in body['jobs']} == {
+        'morning_brief', 'inbox_calendar_watch', 'evening_followups', 'nightly_memory'}
+    assert {service['id'] for service in body['services']} == {
+        'gmail', 'google_calendar', 'google_drive', 'google_contacts', 'google_sheets', 'google_docs'}
+    assert all(service['status'] == 'missing' for service in body['services'])
+    (tmp / 'google_token.json').write_text(json.dumps({'token': 'synthetic-access-token'}), encoding='utf-8')
+    assert all(service['status'] == 'unknown' for service in client.get(path).json()['services'])
+    (tmp / 'google_token.json').write_text(json.dumps({
+        'token': 'synthetic-access-token',
+        'scopes': ['https://www.googleapis.com/auth/gmail.readonly'],
+    }), encoding='utf-8')
+    services = {service['id']: service for service in client.get(path).json()['services']}
+    assert services['gmail']['status'] == 'connected'
+    assert services['google_calendar']['status'] == 'missing'
+    assert 'synthetic-access-token' not in client.get(path).text
+    assert client.put(path, json={'enabled': 1}).status_code == 400
+    assert client.put(path, json={'enabled': True, 'profile': 'foreign'}).status_code == 400
+    assert client.get(path + '?profile=foreign').status_code == 403
+    client.headers['x-fixture-owner'] = 'foreign'
+    assert client.get(path).status_code == 403
+    client.headers['x-fixture-owner'] = 'owner'
+    cfg['profiles'] = ['default', 'work']
+    assert client.get(path).status_code == 403
+    assert client.get(path + '?profile=work').status_code == 200
+
+
+def test_proactive_jobs_reconcile_idempotently_and_disable_only_g19_jobs(harness, monkeypatch):
+    api, client, _, tmp, _ = harness
+    legacy_jobs = [
+        {'id': 'f1ab87f41d43', 'name': 'Daily Cybersecurity & AI Brief', 'deliver': 'phone', 'prompt': 'owner prompt'},
+        {'id': '5d44522ef791', 'name': 'Cypher — important missed emails', 'deliver': 'local', 'prompt': 'failing owner job'},
+        {'id': '4bfceb51e7e8', 'name': 'Cypher vetted urgent-mail scan', 'deliver': 'local', 'prompt': 'working owner job'},
+        {'id': '1aba9b0b6492', 'name': 'Cypher check-ups', 'enabled': False, 'state': 'paused', 'prompt': 'owner check-ups'},
+    ]
+    before = [dict(job) for job in legacy_jobs]
+    jobs, calls = _fake_proactive_cron(monkeypatch, tmp, legacy_jobs, mobile=api.mobile)
+    (tmp / 'SOUL.md').write_text('Owner profile instructions\n', encoding='utf-8')
+    path = '/api/plugins/cypher/mobile/proactive'
+
+    enabled = client.put(path, json={'enabled': True})
+    assert enabled.status_code == 200, enabled.text
+    assert enabled.json()['enabled'] is True
+    assert calls['create'] == 4
+    assert len(jobs) == len(legacy_jobs) + 4
+    assert jobs[:len(legacy_jobs)] == before
+    managed = [job for job in jobs if job.get('name', '').startswith('Cypher proactive:')]
+    for job in managed:
+        if job['name'] == 'Cypher proactive: Nightly memory upkeep':
+            continue
+        assert 'google calendar' in job['prompt'].lower()
+        assert 'do not search or read email' in job['prompt'].lower()
+    assert (tmp / 'SOUL.md').read_text(encoding='utf-8').count('BEGIN CYPHER PROACTIVE') == 1
+    assert (tmp / 'PROACTIVE_PREFERENCES.md').exists()
+
+    # A second enable repairs the managed definition instead of adding another job.
+    owned = next(job for job in jobs if job['id'].startswith('g19-'))
+    owned['prompt'] = 'stale plugin prompt'
+    owned['enabled'] = False
+    owned['state'] = 'paused'
+    repaired = client.put(path, json={'enabled': True})
+    assert repaired.status_code == 200, repaired.text
+    assert calls['create'] == 4 and calls['update'] == 1
+    assert calls['resume'] == 1
+    assert jobs[:len(legacy_jobs)] == before
+
+    disabled = client.put(path, json={'enabled': False})
+    assert disabled.status_code == 200, disabled.text
+    assert disabled.json()['enabled'] is False
+    assert jobs == before
+    assert calls['remove'] == 4
+    assert 'Owner profile instructions' in (tmp / 'SOUL.md').read_text(encoding='utf-8')
+    assert 'BEGIN CYPHER PROACTIVE' not in (tmp / 'SOUL.md').read_text(encoding='utf-8')
+    assert (tmp / 'PROACTIVE_PREFERENCES.md').exists()
+
+
+def test_proactive_enable_refuses_an_unowned_job_with_a_managed_name(harness, monkeypatch):
+    api, client, _, tmp, _ = harness
+    collision = {'id': 'owner-job', 'name': 'Cypher proactive: Morning briefing', 'prompt': 'owner-authored'}
+    jobs, calls = _fake_proactive_cron(monkeypatch, tmp, [collision], mobile=api.mobile)
+    result = client.put('/api/plugins/cypher/mobile/proactive', json={'enabled': True})
+    assert result.status_code == 409
+    assert jobs == [collision]
+    assert calls == {'create': 0, 'update': 0, 'remove': 0, 'resume': 0}
+
+
+def test_proactive_does_not_claim_an_owner_job_by_prompt_marker(harness, monkeypatch):
+    api, client, _, tmp, _ = harness
+    owner_job = {'id': 'owner-job', 'name': 'Personal note',
+                 'prompt': '<!-- CYPHER_PROACTIVE_JOB:morning_brief -->\nOwner-authored prompt'}
+    jobs, calls = _fake_proactive_cron(monkeypatch, tmp, [owner_job], mobile=api.mobile)
+    enabled = client.put('/api/plugins/cypher/mobile/proactive', json={'enabled': True})
+    assert enabled.status_code == 200, enabled.text
+    assert jobs[0] == owner_job
+    disabled = client.put('/api/plugins/cypher/mobile/proactive', json={'enabled': False})
+    assert disabled.status_code == 200, disabled.text
+    assert jobs == [owner_job]
+    assert calls == {'create': 4, 'update': 0, 'remove': 4, 'resume': 0}
+
+
+def test_native_noop_proactive_run_is_silent_but_meaningful_run_uses_outbox(harness, monkeypatch):
+    api, client, _, tmp, _ = harness
+    _fake_proactive_cron(monkeypatch, tmp, mobile=api.mobile)
+    enabled = client.put('/api/plugins/cypher/mobile/proactive', json={'enabled': True})
+    assert enabled.status_code == 200, enabled.text
+    job_id = next(job['job_id'] for job in enabled.json()['jobs'] if job['id'] == 'morning_brief')
+
+    plugin = load_private('__init__')
+    hooks = {}
+    ctx = SimpleNamespace(
+        register_tool=lambda **kwargs: None,
+        register_hook=lambda name, handler: hooks.setdefault(name, handler),
+        register_platform=lambda **kwargs: None,
+    )
+    plugin.register(ctx)
+    assert 'post_llm_call' in hooks
+    monkeypatch.setattr(plugin, 'current_profile', lambda cfg: 'default')
+    monkeypatch.setattr(plugin.native, 'verify', lambda *args: {'source': 'cron'})
+
+    hooks['post_llm_call'](
+        task_id=f'cron:{job_id}:run-noop', session_id='cron-noop', turn_id='turn-noop',
+        user_message='scheduled proactive check', assistant_response='[[CYPHER_PROACTIVE_SILENT]]')
+    hooks['on_session_end'](
+        task_id=f'cron:{job_id}:run-noop', session_id='cron-noop', turn_id='turn-noop', completed=True, failed=False, interrupted=False)
+    with api.mobile.connect() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0] == 0
+
+    hooks['post_llm_call'](
+        task_id=f'cron:{job_id}:run-result', session_id='cron-result', turn_id='turn-result',
+        user_message='scheduled proactive check', assistant_response='A useful calendar change needs your attention.')
+    hooks['on_session_end'](
+        task_id=f'cron:{job_id}:run-result', session_id='cron-result', turn_id='turn-result', completed=True, failed=False, interrupted=False)
+    with api.mobile.connect() as conn:
+        notice = conn.execute('SELECT * FROM notices').fetchone()
+        assert notice['kind'] == 'task_result'
+        assert notice['conversation'] == 'cron-result'
+        assert notice['job_id'] == job_id
+
+
+def test_cypher_registers_phone_delivery_and_outbox_dedupes_job_results(harness, monkeypatch):
+    import asyncio
+
+    api, _, _, _, _ = harness
+    monkeypatch.setattr(api.mobile, 'protect', lambda path: path.mkdir(parents=True, exist_ok=True))
+    stale_key = api.proactive._session_meta_key('owner', 'default', 'old-phone-job')
+    with api.mobile.connect() as conn:
+        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',
+                     (stale_key, json.dumps({'session': 'old-session', 'at': time.time() - 86401}).encode()))
+    api.proactive.record_cron_turn(api.mobile, 'owner', 'default', 'phone-job', 'cron-result', 'turn-1',
+                                   'A useful proactive result.')
+    with api.mobile.connect() as conn:
+        assert conn.execute('SELECT 1 FROM meta WHERE key=?', (stale_key,)).fetchone() is None
+    monkeypatch.setattr(api.native, 'verify', lambda *args: {'source': 'cron'})
+    monkeypatch.setattr(api.proactive, 'current_profile', lambda cfg: 'default')
+    plugin = load_private('__init__')
+    registrations, hooks = [], []
+    ctx = SimpleNamespace(
+        register_tool=lambda **kwargs: None,
+        register_hook=lambda name, handler: hooks.append((name, handler)),
+        register_platform=lambda **kwargs: registrations.append(kwargs),
+    )
+    plugin.register(ctx)
+    assert any(entry['name'] == 'phone' for entry in registrations)
+    phone = next(entry for entry in registrations if entry['name'] == 'phone')
+    assert phone['cron_deliver_env_var'] == 'PHONE_HOME_CHANNEL'
+    assert callable(phone['standalone_sender_fn'])
+    assert callable(phone['adapter_factory'])
+    adapter = phone['adapter_factory'](SimpleNamespace(extra={}))
+    first = asyncio.run(adapter.send('phone', 'A useful proactive result.', metadata={'job_id': 'phone-job'}))
+    second = asyncio.run(adapter.send('phone', 'A useful proactive result.', metadata={'job_id': 'phone-job'}))
+    assert first.success is True and second.message_id == first.message_id
+    fallback = asyncio.run(phone['standalone_sender_fn'](
+        None, 'phone', 'Cronjob Response: Example\n(job_id: phone-job)\n-------------\n\nA useful proactive result.'))
+    assert fallback['success'] is True and fallback['message_id'] == first.message_id
+    with api.mobile.connect() as conn:
+        row = conn.execute("SELECT * FROM notices WHERE job_id='phone-job'").fetchone()
+        assert row['conversation'] == 'cron-result' and row['kind'] == 'task_result'
+        assert conn.execute("SELECT COUNT(*) FROM notices WHERE job_id='phone-job'").fetchone()[0] == 1
+
+
+def test_release_verification_cache_hits_unchanged_files_and_misses_stat_changes(harness, monkeypatch):
+    import hashlib
+
+    api, _, cfg, tmp, _ = harness
+    root = tmp / 'release-cache'
+    root.mkdir()
+    apk = root / 'fixture.apk'
+    apk.write_bytes(b'fixture apk bytes')
+    certificate = 'a' * 64
+    digest = hashlib.sha256(apk.read_bytes()).hexdigest()
+    cfg.update(release_root=str(root), android_certificate_sha256=certificate,
+               aapt=str(tmp / 'aapt.exe'), apksigner=str(tmp / 'apksigner.exe'))
+    Path(cfg['aapt']).touch()
+    Path(cfg['apksigner']).touch()
+    manifest = root / 'latest.json'
+    manifest_data = {
+        'artifact_filename': apk.name, 'version_code': 21, 'version_name': '2.1',
+        'package_name': 'dev.hermes.android', 'certificate_sha256': certificate,
+        'sha256': digest, 'size_bytes': apk.stat().st_size,
+    }
+    manifest.write_text(json.dumps(manifest_data), encoding='utf-8')
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args[0])
+        output = ("package: name='dev.hermes.android' versionCode='21' versionName='2.1'"
+                  if args[0] == cfg['aapt'] else 'Signer #1 certificate SHA-256 digest: ' + certificate)
+        return SimpleNamespace(stdout=output)
+
+    monkeypatch.setattr(api.subprocess, 'run', run)
+    first = api.release(cfg)
+    assert api.release(cfg) == first
+    assert len(calls) == 2
+
+    manifest.write_text(manifest.read_text(encoding='utf-8') + ' ', encoding='utf-8')
+    assert api.release(cfg) == first
+    assert len(calls) == 4
+
+    apk.write_bytes(apk.read_bytes() + b' changed')
+    manifest_data.update(sha256=hashlib.sha256(apk.read_bytes()).hexdigest(), size_bytes=apk.stat().st_size)
+    manifest.write_text(json.dumps(manifest_data), encoding='utf-8')
+    changed = api.release(cfg)
+    assert changed['sha256'] == manifest_data['sha256']
+    assert changed['size_bytes'] == manifest_data['size_bytes']
+    assert len(calls) == 6
+
+
+def test_mobile_schema_initializes_once_per_database_in_process(harness, monkeypatch, tmp_path):
+    api, _, _, _, _ = harness
+    monkeypatch.setattr(api.mobile, 'protect', lambda path: path.mkdir(parents=True, exist_ok=True))
+    original_connect = api.mobile.sqlite3.connect
+    scripts = []
+
+    class CountingConnection:
+        def __init__(self, connection):
+            object.__setattr__(self, '_connection', connection)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+        def __setattr__(self, name, value):
+            setattr(self._connection, name, value)
+
+        def executescript(self, script):
+            scripts.append(script)
+            return self._connection.executescript(script)
+
+        def __enter__(self):
+            self._connection.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._connection.__exit__(*args)
+
+    monkeypatch.setattr(api.mobile.sqlite3, 'connect', lambda *args, **kwargs: CountingConnection(original_connect(*args, **kwargs)))
+    current_home = [tmp_path / 'first-profile']
+    current_home[0].mkdir()
+    monkeypatch.setattr(api.mobile, 'home', lambda: current_home[0])
+    with pytest.raises(RuntimeError):
+        with api.mobile.connect():
+            raise RuntimeError('simulate a caller failure on the first initialized connection')
+    with api.mobile.connect():
+        pass
+    with api.mobile.connect() as conn:
+        assert 'reason' in {row[1] for row in conn.execute('PRAGMA table_info(notices)')}
+    assert len(scripts) == 1
+
+    current_home[0] = tmp_path / 'second-profile'
+    current_home[0].mkdir()
+    with api.mobile.connect():
+        pass
+    assert len(scripts) == 2

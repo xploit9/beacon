@@ -18,6 +18,7 @@ PUSH_LOCK = threading.Lock()
 _PROTECTED={}
 _OWNER_SID=None
 _CALL_LOCKS=weakref.WeakValueDictionary()
+_SCHEMA_READY=set()
 ID = re.compile(r"[A-Za-z0-9_-]{1,160}\Z")
 MAX_MS = 4 * 60 * 60 * 1000
 MAX_ACTIVE_CALLS = 8
@@ -82,12 +83,7 @@ def protect(path):
         kernel.LocalFree(descriptor)
     _PROTECTED[str(path.resolve())]=identity
 
-def _connect():
-    root = home() / 'plugin-data' / 'cypher'
-    protect(root)
-    conn = sqlite3.connect(root / 'mobile.sqlite', timeout=15)
-    conn.row_factory = sqlite3.Row
-    conn.execute('PRAGMA foreign_keys=ON')
+def _initialize_schema(conn):
     conn.execute('PRAGMA journal_mode=WAL')
     conn.executescript('''
     CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value BLOB);
@@ -119,10 +115,48 @@ def _connect():
         if name not in notice_columns: conn.execute('ALTER TABLE notices ADD COLUMN '+name+" TEXT DEFAULT ''")
     deferred_columns={r[1] for r in conn.execute('PRAGMA table_info(deferred)')}
     if 'reason' not in deferred_columns: conn.execute("ALTER TABLE deferred ADD COLUMN reason TEXT DEFAULT ''")
+
+def _connect():
+    root = home() / 'plugin-data' / 'cypher'
+    protect(root)
+    database = root / 'mobile.sqlite'
+    conn = sqlite3.connect(database, timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA foreign_keys=ON')
+    try:
+        info=database.stat()
+        schema_key=(str(database.resolve()),info.st_dev,info.st_ino)
+        if schema_key not in _SCHEMA_READY:
+            _initialize_schema(conn)
+            conn.commit()
+            _SCHEMA_READY.add(schema_key)
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 def connect():
     with LOCK: return _connect()
+
+def enqueue_task_result(owner,profile,conversation,job_id,reason=''):
+    if (not isinstance(owner,str) or not owner or len(owner)>256 or any(ord(c)<32 for c in owner)
+            or not isinstance(profile,str) or not profile or len(profile)>80
+            or not isinstance(job_id,str) or not ID.fullmatch(job_id)
+            or not isinstance(reason,str) or len(reason)>8192 or '\x00' in reason):
+        raise ValueError('Invalid task notification')
+    conversation=ident(conversation)
+    with LOCK,connect() as conn:
+        prune_notices(conn)
+        existing=conn.execute("SELECT id FROM notices WHERE owner=? AND profile=? AND conversation=? AND job_id=? AND kind='task_result' AND expires>? ORDER BY created DESC LIMIT 1",
+                              (owner,profile,conversation,job_id,time.time())).fetchone()
+        if existing: return existing['id']
+        if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000:
+            raise RuntimeError('Notification outbox capacity reached')
+        event=uuid.uuid4().hex
+        now=time.time()
+        conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,job_id,reason) VALUES(?,?,?,?,?,?,?,?,?)',
+                     (event,owner,profile,'task_result',conversation,now,now+86400,job_id,reason))
+    return event
 
 def _history_key(owner):
     if not isinstance(owner,str) or not owner: raise ValueError('Owner required')
