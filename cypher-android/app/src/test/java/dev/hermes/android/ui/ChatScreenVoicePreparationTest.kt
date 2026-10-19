@@ -40,4 +40,13 @@ class ChatScreenVoicePreparationTest {
         val tool = JSONObject().put("id", "other-id").put("tool_call_id", "call-1")
         assertEquals("call-1", toolCallResultId(tool))
     }
+
+    @Test fun toolCallMetaToolShowsTheToolHermesRan() {
+        fun call(name: String, arguments: String) = JSONObject().put("type", "function").put("function", JSONObject().put("name", name).put("arguments", arguments))
+        assertEquals("cypher call user", toolDisplayName(call("tool_call", "{\"name\":\"cypher_call_user\",\"arguments\":{}}")))
+        assertEquals("tool describe", toolDisplayName(call("tool_describe", "{\"names\":[\"cypher_call_user\"]}")))
+        assertEquals("tool call", toolDisplayName(call("tool_call", "not json")))
+        assertEquals("tool call", toolDisplayName(call("tool_call", "{\"name\":\"<script>\"}")))
+        assertEquals("web search", toolDisplayName(JSONObject().put("name", "web_search")))
+    }
 }

@@ -621,8 +621,16 @@ internal fun acceptsInitialConversationEdit(
     }
 }
 
-private fun JSONObject.rawToolName(): String = string("name", optJSONObject("function")?.string("name") ?: "").ifBlank { "tool" }
-private fun toolDisplayName(tool: JSONObject): String = tool.rawToolName().replace('_', ' ')
+private fun JSONObject.rawToolName(): String {
+    val name = string("name", optJSONObject("function")?.string("name") ?: "")
+    // Hermes runs deferred tools through its `tool_call` meta-tool; name the tool it actually ran.
+    if (name == "tool_call") {
+        val inner = argumentsValue()?.let { it as? JSONObject ?: runCatching { JSONObject(it.toString()) }.getOrNull() }?.string("name").orEmpty()
+        if (inner.matches(Regex("[A-Za-z0-9_.:-]{1,80}"))) return inner
+    }
+    return name.ifBlank { "tool" }
+}
+internal fun toolDisplayName(tool: JSONObject): String = tool.rawToolName().replace('_', ' ')
 private fun JSONObject.toolKey(index: Int): String = toolIdentity(this).ifBlank { "${rawToolName()}:$index" }
 /** Native completion carries `result` (possibly empty) and `is_error`; a present key is a recorded fact even when empty. */
 private fun JSONObject.recordedValue(vararg keys: String): Any? = keys.firstNotNullOfOrNull { key -> if (has(key) && !isNull(key)) opt(key) else null }
