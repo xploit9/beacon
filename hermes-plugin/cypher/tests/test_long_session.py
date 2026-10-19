@@ -126,9 +126,6 @@ def test_live_snapshot_lists_current_sources_without_exposing_source_content(har
         {"_server": "calendar", "description": "Private event body"},
         {"_server": "private-token", "description": "Sensitive configuration"},
     ])
-    monkeypatch.setattr(api.proactive, "_skills_catalog", lambda: [
-        {"name": "calendar-check", "description": "Private skill content"},
-    ])
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles",
                         SimpleNamespace(_profile_scope=lambda profile: nullcontext()))
     monkeypatch.setitem(sys.modules, "agent.redact",
@@ -137,13 +134,12 @@ def test_live_snapshot_lists_current_sources_without_exposing_source_content(har
 
     context = live.snapshot(api.mobile, "owner", "default", api.proactive, job_scope=True)
 
-    assert "mail" in context and "calendar" in context and "calendar-check" in context
-    assert "unknown" in context and "abilities are this live list" in context
+    assert "mail" in context and "calendar" in context
+    assert "unknown" in context and "tools and skills available in this turn" in context
     assert "try it again once" in context
     assert "limited to its enabled toolset" in context
     assert "Private message body" not in context
     assert "Private event body" not in context
-    assert "Private skill content" not in context
     assert "private-token" not in context and "[redacted]" in context
     assert len(context) <= 600
 
@@ -202,7 +198,6 @@ def test_live_snapshot_preserves_proactive_error_state_and_check_time(harness, m
                      "health": {"state": "error", "checked_at": 1700000000}}],
     })
     monkeypatch.setattr(api.proactive, "_mcp_catalog", lambda: [])
-    monkeypatch.setattr(api.proactive, "_skills_catalog", lambda: [])
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles",
                         SimpleNamespace(_profile_scope=lambda profile: nullcontext()))
 
@@ -227,7 +222,6 @@ def test_live_snapshot_caps_large_catalogs_and_keeps_retry_rule(harness, monkeyp
     monkeypatch.setattr(api.proactive, "_mcp_catalog", lambda: [
         {"_server": f"source-{index}-" + "x" * 80} for index in range(30)
     ])
-    monkeypatch.setattr(api.proactive, "_skills_catalog", lambda: [])
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles",
                         SimpleNamespace(_profile_scope=lambda profile: nullcontext()))
 
@@ -256,7 +250,6 @@ def test_live_snapshot_shows_only_recent_successful_read_time_as_source_evidence
                      "health": {"state": "unknown", "checked_at": None}}],
     })
     monkeypatch.setattr(api.proactive, "_mcp_catalog", lambda: [{"_server": "mail"}])
-    monkeypatch.setattr(api.proactive, "_skills_catalog", lambda: [])
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles",
                         SimpleNamespace(_profile_scope=lambda profile: nullcontext()))
     with api.mobile.connect() as conn:

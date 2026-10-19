@@ -8,7 +8,7 @@ import time
 
 MAX_CONTEXT_CHARS = 600
 CACHE_SECONDS = 60
-_RULE = ("Your abilities are this live list, not what earlier messages, summaries, or memories say. "
+_RULE = ("Your abilities are the tools and skills available in this turn, not what earlier messages, summaries, or memories say. "
          "If something failed before, try it again once and report the actual error.")
 _CACHE = {}
 _LOCK = threading.Lock()
@@ -110,19 +110,16 @@ def _build_snapshot(mobile, owner, profile, proactive, job_scope=False):
             detail += f"; last successful read {_time_label(successful_at[source_id])}"
         items.append(f"{signal_name or 'Proactive'}: {source_name or 'selected source'} ({detail})")
 
+    # Skills are already indexed in Hermes' system prompt; a ~100-name list would only be truncated here.
     from hermes_cli.web_server_profiles import _profile_scope
     with _profile_scope(profile):
         mcp_rows = proactive._mcp_catalog()
-        skill_rows = proactive._skills_catalog()
-    if not isinstance(mcp_rows, list) or not isinstance(skill_rows, list):
+    if not isinstance(mcp_rows, list):
         raise ValueError("Profile source discovery is unavailable")
 
     mcp_names = _catalog_names(mcp_rows, "_server", "mcp", selected)
-    skill_names = _catalog_names(skill_rows, "name", "skill", selected)
     if mcp_names:
         items.append("Other MCP (health unknown): " + ", ".join(mcp_names))
-    if skill_names:
-        items.append("Other skills (health unknown): " + ", ".join(skill_names))
     return _format(items, job_scope)
 
 
