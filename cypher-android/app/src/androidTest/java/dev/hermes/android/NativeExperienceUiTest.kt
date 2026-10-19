@@ -105,6 +105,8 @@ class NativeExperienceUiTest {
         }
         val priorChatPreferences = runBlocking { app.cache.read(fixture.scope, "chat-preferences") }
         runBlocking { app.cache.write(fixture.scope, "chat-preferences", json("render_user_markdown" to true, "show_thinking" to true, "send_key" to "enter").toString(), true) }
+        // Each case starts without another case's initial-chat pointers (a shell id unknown to this fixture would block sends).
+        runBlocking { listOf("new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session").forEach { app.cache.delete(fixture.scope, it) } }
         runBlocking { app.cache.delete(fixture.scope, "bot-mode-return"); app.cache.delete(fixture.scope, "xara-session"); app.cache.delete(fixture.scope, "xara-opening"); app.cache.delete(fixture.scope, "phone-editors"); app.cache.delete(fixture.scope, "editor:C:/synthetic-workspace/notes.md") }
         lateinit var vm: CypherViewModel
         try {
