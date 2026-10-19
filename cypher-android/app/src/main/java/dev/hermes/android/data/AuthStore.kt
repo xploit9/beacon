@@ -90,6 +90,11 @@ internal fun AuthContext.withNewestBearer(stored: NativeBearerRecord?): AuthCont
     return copy(bearer = chooseNewestBearer(bearer, sameOwner)?.copy(profile = profile))
 }
 
+internal fun AuthContext.compareAndSetBearer(expected: NativeBearerRecord, replacement: NativeBearerRecord): AuthContext? {
+    if (replacement.origin != expected.origin || replacement.owner != expected.owner || replacement.profile != expected.profile || bearer != expected) return null
+    return copy(bearer = replacement)
+}
+
 /** Only an encrypted context from a previous successful bootstrap may open its local vault.
  * A password replacement starts with an empty cookie jar and never previews that old owner. */
 fun AuthContext.cachedScopeFor(requestedOrigin: String, replacingAccount: Boolean, now: Long = System.currentTimeMillis()): Scope? {
@@ -146,13 +151,7 @@ class AuthStore(context: Context, private val cipher: AppCipher) {
     internal suspend fun persistIfUnchanged(auth: AuthContext, version: Long?) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
         synchronized(this@AuthStore) {
             if (version != null && authorityEpoch.current(version)) {
-                val current = read(auth.origin)
-                val storedBearer = if (auth.loopbackSession == null) current.bearer?.takeIf { it.origin == auth.origin && it.owner == auth.owner && it.profile == auth.profile } else null
-                val newestBearer = chooseNewestBearer(auth.bearer, storedBearer)
-                write(auth.copy(
-                    bearer = newestBearer ?: auth.bearer,
-                    loopbackSession = if (newestBearer != null || auth.bearer != null) null else auth.loopbackSession,
-                ))
+                write(auth.copy(loopbackSession = auth.loopbackSession?.takeIf { auth.bearer == null }))
                 true
             } else false
         }
@@ -163,9 +162,8 @@ class AuthStore(context: Context, private val cipher: AppCipher) {
         }
     }
     suspend fun remove(origin: String) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { clear(origin) }
-    fun write(auth: AuthContext) = authorityEpoch.mutate { synchronized(this) { writeRecord(auth) } }
-    private fun writeRecord(context: AuthContext) {
-        val auth = context.withNewestBearer(read(context.origin).bearer)
+    fun write(auth: AuthContext) = authorityEpoch.mutate { synchronized(this) { writeRecord(auth.withNewestBearer(read(auth.origin).bearer)) } }
+    private fun writeRecord(auth: AuthContext) {
         val o = JSONObject().put("cookies", JSONArray(auth.cookies)).put("owner", auth.owner).put("profile", auth.profile).put("csrf", auth.csrf).put("backend", auth.backend)
         auth.bearer?.let { token ->
             require(token.accessToken.isNotBlank() && token.accessToken.none { it.isWhitespace() || it.isISOControl() } && token.refreshToken.isNotBlank()) { "Bearer credentials are incomplete" }
@@ -182,10 +180,8 @@ class AuthStore(context: Context, private val cipher: AppCipher) {
         check(prefs.edit().putString(auth.origin.digest(), Base64.encodeToString(cipher.encrypt(o.toString().toByteArray(), auth.origin), Base64.NO_WRAP)).commit()) { "Could not retain sign-in" }
     }
     internal fun replaceBearer(expected: NativeBearerRecord, replacement: NativeBearerRecord): Boolean = synchronized(this) {
-        if (replacement.origin != expected.origin || replacement.owner != expected.owner || replacement.profile != expected.profile) return@synchronized false
-        val current = read(expected.origin)
-        if (current.bearer != expected) return@synchronized false
-        writeRecord(current.copy(bearer = replacement))
+        val replacementContext = read(expected.origin).compareAndSetBearer(expected, replacement) ?: return@synchronized false
+        writeRecord(replacementContext)
         true
     }
     internal fun removeIfBearerUnchanged(expected: NativeBearerRecord): Boolean = synchronized(this) {

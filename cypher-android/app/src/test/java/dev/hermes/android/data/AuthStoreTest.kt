@@ -18,6 +18,15 @@ class AuthStoreTest {
         assertEquals("work", saved.bearer?.profile)
     }
 
+    @Test fun compareAndSetBearerKeepsRefreshWrittenWhenClockMovesBack() {
+        val origin = "https://native.example"
+        val expected = NativeBearerRecord("expected-access", "expected-refresh", 3000, origin, "owner", "work", issuedAt = 200)
+        val refreshed = expected.copy(accessToken = "refreshed-access", refreshToken = "refreshed-refresh", expiresAt = 4000, issuedAt = 100)
+        val current = AuthContext(origin, emptyList(), "owner", "work", backend = "hermes-dashboard", bearer = expected)
+
+        assertEquals(refreshed, current.compareAndSetBearer(expected, refreshed)?.bearer)
+    }
+
     @Test fun bearerFromAnotherOriginOrOwnerIsNotKept() {
         val origin = "https://native.example"
         val old = NativeBearerRecord("old-access", "old-refresh", 9000, origin, "owner", "work", issuedAt = 100)
