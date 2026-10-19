@@ -46,6 +46,9 @@ data class Message(val id: String, val role: String, val text: String, val reaso
     }
 }
 /** Status after a history render. A refresh during an in-flight send keeps it in flight (otherwise the unknown-outcome banner would flash). */
+/** Errors that end the native sign-in. A plugin's 401 is not one: a no-account loopback dashboard answers 401 to plugin routes. */
+internal fun endsSignIn(error: Throwable): Boolean =
+    error is LoopbackSessionRefreshFailed || error is ApiFailure && error.status == 401 && !error.plugin || error is CachedIdentityMismatch
 internal fun renderedChatStatus(old: ChatState, active: String?, streamEnded: Boolean): String = when {
     old.uncertain.isNotBlank() && old.status == "Sending" -> old.status
     streamEnded -> ""
@@ -676,7 +679,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             saveSetupProgress("signin", complete = false)
             return
         }
-        if (error is LoopbackSessionRefreshFailed || error is ApiFailure && error.status == 401 || error is CachedIdentityMismatch) {
+        if (endsSignIn(error)) {
             val loopbackRestart = error is LoopbackSessionRefreshFailed
             val origin = client?.auth?.origin ?: cachedOwnerScope?.origin ?: runCatching { trustedOrigin(_ui.value.origin) }.getOrNull()
             val draftScope = draftScope()

@@ -19,7 +19,7 @@ class CypherClientAuthTest {
         }
     }
 
-    @Test fun loopbackPluginUnauthorizedIsForbiddenWithoutDroppingTheSession() = runBlocking {
+    @Test fun loopbackPluginUnauthorizedNeverEndsSignInAndKeepsTheSession() = runBlocking {
         val origin = "https://native.example"
         val loopback = LoopbackSessionRecord("loopback-token", origin, "local", verified = true)
         val requests = mutableListOf<Request>()
@@ -32,7 +32,9 @@ class CypherClientAuthTest {
         val error = runCatching { client.nativeRequest("/api/plugins/cypher/mobile/bootstrap") }.exceptionOrNull()
 
         assertTrue(error is ApiFailure)
-        assertEquals(403, (error as ApiFailure).status)
+        assertEquals(401, (error as ApiFailure).status)
+        assertTrue(error.plugin)
+        assertTrue(!dev.hermes.android.endsSignIn(error))
         assertEquals("loopback-token", requests.single().header(HERMES_LOOPBACK_SESSION_HEADER))
         assertEquals(loopback, client.auth.loopbackSession)
         client.closeNative()
@@ -46,6 +48,7 @@ class CypherClientAuthTest {
 
         assertTrue(error is ApiFailure)
         assertEquals(401, (error as ApiFailure).status)
+        assertTrue(dev.hermes.android.endsSignIn(error))
         assertEquals("/api/auth/me", requests.single().url.encodedPath)
         client.closeNative()
     }

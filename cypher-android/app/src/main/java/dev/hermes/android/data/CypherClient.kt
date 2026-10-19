@@ -20,7 +20,8 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.util.concurrent.TimeUnit
 
-class ApiFailure(val status: Int, override val message: String) : IOException(message)
+/** [plugin]: the failure came from the optional Cypher plugin, whose 401 is a plugin answer, never a native sign-out. */
+class ApiFailure(val status: Int, override val message: String, val plugin: Boolean = false) : IOException(message)
 internal class LoopbackSessionRefreshFailed : IOException("Hermes restarted. Scan the Connect QR again.")
 internal const val HERMES_LOOPBACK_SESSION_HEADER = "X-Hermes-Session-Token"
 private const val MAX_LOOPBACK_ROOT_BYTES = 256L * 1024L
@@ -252,7 +253,7 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
             if (input != null) while (true) { currentCoroutineContext().ensureActive(); val n = input.read(chunk); if (n < 0) break; require(payload.size().toLong() + n <= maxBytes) { "Server response exceeds the size limit" }; payload.write(chunk, 0, n) }
             val raw = payload.toString("UTF-8")
             val result = runCatching { JSONObject(raw) }.getOrElse { if (raw.trim().startsWith('[')) json("items" to org.json.JSONArray(raw)) else json("message" to raw.take(2048)) }
-            if (!response.isSuccessful || result.has("error") && !result.isNull("error") && result.string("error").isNotBlank()) throw ApiFailure(if (response.code == 401 && path.startsWith(CYPHER_PLUGIN_PATH)) 403 else response.code, nativeErrorMessage(result, response.code))
+            if (!response.isSuccessful || result.has("error") && !result.isNull("error") && result.string("error").isNotBlank()) throw ApiFailure(response.code, nativeErrorMessage(result, response.code), plugin = path.startsWith(CYPHER_PLUGIN_PATH))
             // An optional probe must not rewrite the verified native auth context or its persisted cookies.
             if (persistAuth && !detachedView && auth.loopbackSession?.verified != false) {
                 auth = auth.copy(cookies = jar.snapshot())
