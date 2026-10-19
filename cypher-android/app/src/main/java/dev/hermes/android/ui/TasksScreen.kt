@@ -38,14 +38,12 @@ import kotlinx.coroutines.launch
         item {
             val capability = data["task-capabilities"]
             capability?.string("timezone")?.takeIf(String::isNotBlank)?.let { Text("Times in $it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-            TextButton(onClick = { showPresets = !showPresets }) { Text("Call and email tasks"); Icon(if (showPresets) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, null) }
+            TextButton(onClick = { showPresets = !showPresets }) { Text("Call tasks"); Icon(if (showPresets) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, null) }
             if (showPresets) {
             if (capability == null) LinearProgressIndicator(Modifier.fillMaxWidth())
             else if (recordError(capability).isNotBlank()) { Text(recordError(capability), color = MaterialTheme.colorScheme.error); TextButton(onClick = refresh) { Text("Retry task setup status") } }
 
             OutlinedButton(enabled = capability?.optBoolean("checkups_ready") == true, onClick = { vm.openForm(ActionForm("Create check-up task", "/api/plugins/cypher/mobile/tasks/checkups", emptyList(), explanation = "Create an ordinary native schedule. 3–4 random opportunities daily from 10:00 through before 22:00 Asia/Dubai; no missed-slot catch-up. Android call permission, quiet and DND policy still apply.", actionLabel = "Create task", onResult = { refresh() })) }) { Text("Create check-up task") }
-            OutlinedButton(enabled = capability?.optBoolean("mailbox_ready") == true && capability?.optBoolean("checkups_ready") == true, onClick = { vm.openForm(ActionForm("Create vetted mail task", "/api/plugins/cypher/mobile/tasks/mail-monitor", emptyList(), explanation = "Scan the configured read-only mailbox every 15 minutes in Dubai's 10:00-22:00 window. Only fresh unread, urgent, action-required source evidence may request one deduplicated callback. No mail is sent or marked read.", actionLabel = "Create task", onResult = { refresh() })) }) { Text("Create vetted mail task") }
-            if (capability != null && recordError(capability).isBlank() && !capability.optBoolean("mailbox_ready")) Text("Connect a supported read-only mailbox on your computer to enable email alerts.", style = MaterialTheme.typography.bodySmall)
             if (capability != null && recordError(capability).isBlank() && !capability.optBoolean("checkups_ready")) Text("Set up scheduled callbacks on your computer to enable check-up calls.", style = MaterialTheme.typography.bodySmall)
             }
         }

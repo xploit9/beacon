@@ -63,6 +63,7 @@ Settings are grouped: Assistant (name, profile and model; voice and calls; notif
 Chat extras from Relay: quote a message into your reply, attach from the camera or paste an image, open the command list from the attach menu, start a new chat from a suggested prompt, share the whole conversation or copy its ID from the ⋮ menu. Messages are grouped under Today, Yesterday or their date, and in-chat search shows how many messages match.
 
 With the Cypher plugin installed:
+- **Proactive.** Choose sources and watch intervals, set urgent delivery, and add requests for notifications or calls; preview results arrive as notifications.
 - **Voice & calls.** One-tap realtime calls with Gemini Live, Grok or OpenAI Realtime. The provider key is entered in Cypher, stored encrypted on the phone and sent only to that provider, never to Hermes. Call audio is never stored.
 - **Call history.** Open it from the Cypher chat menu to review call entries and jump to saved transcripts.
 - **Keep connected** (Settings → Notifications & Keep connected). A low-importance foreground service keeps a connection to Hermes for each signed-in profile, so Hermes can ring the phone while Cypher is closed. The page shows the connection state and, when it fails, the reason (for example "Hermes refused profile coder (403)").

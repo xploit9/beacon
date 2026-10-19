@@ -439,10 +439,10 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Save", useUnmergedTree = true).performClick()
         await { fixture.jobs.containsKey("task-new") && vm.form.value == null }
         assertEquals("Owned schedule fixture", fixture.jobs.getValue("task-new").string("name"))
-        clickText("Call and email tasks")
+        clickText("Call tasks")
         compose.onNodeWithText("Create check-up task").performScrollTo().assertIsNotEnabled()
-        compose.onNodeWithText("Create vetted mail task").performScrollTo().assertIsNotEnabled()
-        receipts += "Schedule create, pause, resume, run/cancel, history/result and delete use actual controls; unavailable call/mail prerequisites disable their actions."
+        compose.onNodeWithText("Create vetted mail task").assertDoesNotExist()
+        receipts += "Schedule create, pause, resume, run/cancel, history/result and delete use actual controls; check-up calls respect their prerequisites and the retired mail preset is absent."
         capture("audit-schedule-workflow")
     }
 

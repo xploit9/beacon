@@ -41,14 +41,19 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var updateApplied = false
     @Volatile var voiceProvider = "gemini"
     val proactiveEnabled = ConcurrentHashMap(mapOf("default" to false, "coder" to false))
-    @Volatile var proactiveServices = listOf(
-        json("id" to "gmail", "name" to "Gmail", "supported" to true, "status" to "missing", "instructions" to "Connect Gmail with the Google Workspace skill on Hermes."),
-        json("id" to "google_calendar", "name" to "Google Calendar", "supported" to true, "status" to "connected", "instructions" to "Connect Google Calendar with the Google Workspace skill on Hermes."),
-        json("id" to "drive", "name" to "Drive", "supported" to true, "status" to "unknown", "instructions" to "Connect Drive with the Google Workspace skill on Hermes."),
-        json("id" to "contacts", "name" to "Contacts", "supported" to true, "status" to "unknown", "instructions" to "Connect Contacts with the Google Workspace skill on Hermes."),
-        json("id" to "sheets", "name" to "Sheets", "supported" to true, "status" to "unknown", "instructions" to "Connect Sheets with the Google Workspace skill on Hermes."),
-        json("id" to "docs", "name" to "Docs", "supported" to true, "status" to "unknown", "instructions" to "Connect Docs with the Google Workspace skill on Hermes."),
+    val proactiveSetupComplete = ConcurrentHashMap(mapOf("default" to false, "coder" to false))
+    val proactiveSelections = ConcurrentHashMap<String, JSONObject>()
+    @Volatile var proactiveSchedule = json("brief" to "08:00", "wrap_up" to "19:00", "watch_minutes" to 30, "quiet_start" to "22:00", "quiet_end" to "07:00")
+    @Volatile var proactiveLevel = "useful"
+    @Volatile var proactiveUrgentDelivery = "notify"
+    val proactiveRequests = ConcurrentHashMap<String, CopyOnWriteArrayList<JSONObject>>()
+    @Volatile var proactiveSignals = listOf(
+        json("id" to "email", "label" to "Email", "source" to null, "sources" to JSONArray().put(json("id" to "mcp:mail", "label" to "Mail server", "kind" to "mcp", "detail" to "Email tools · read-only", "read_only" to true, "needs_terminal" to false)).put(json("id" to "skill:himalaya", "label" to "himalaya", "kind" to "skill", "detail" to "Local mail account", "read_only" to false, "needs_terminal" to true)), "health" to json("state" to "ok", "checked_at" to 1792400000, "message" to "")),
+        json("id" to "calendar", "label" to "Calendar", "source" to null, "sources" to JSONArray().put(json("id" to "mcp:calendar", "label" to "Calendar server", "kind" to "mcp", "detail" to "Calendar tools · read-only", "read_only" to true, "needs_terminal" to false)), "health" to json("state" to "ok", "checked_at" to 1792400000, "message" to "")),
+        json("id" to "tasks", "label" to "Tasks", "source" to null, "sources" to JSONArray().put(json("id" to "skill:notion", "label" to "notion", "kind" to "skill", "detail" to "Task tools", "read_only" to false, "needs_terminal" to true)), "health" to json("state" to "ok", "checked_at" to 1792400000, "message" to "")),
+        json("id" to "news", "label" to "News", "source" to null, "sources" to JSONArray().put(json("id" to "builtin:web", "label" to "Web", "kind" to "builtin", "detail" to "Hermes web search · read-only", "read_only" to true, "needs_terminal" to false)), "health" to json("state" to "ok", "checked_at" to 1792400000, "message" to "")),
     )
+    val proactivePreviews = CopyOnWriteArrayList<String>()
     val voices = ConcurrentHashMap(mapOf("gemini" to "Kore", "grok" to "ara"))
     val personalities = ConcurrentHashMap(mapOf("gemini" to "balanced", "grok" to "balanced"))
     @Volatile var roomName = "Shared workspace"
@@ -308,6 +313,22 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             else -> 404 to json("detail" to "Not Found")
         }
     }
+    private fun proactiveResponse(profile: String) = json(
+        "enabled" to (proactiveEnabled[profile] ?: false),
+        "setup_complete" to (proactiveSetupComplete[profile] ?: false),
+        "timezone" to "Asia/Dubai",
+        "signals" to JSONArray(proactiveSignals.map { signal ->
+            val id = signal.string("id")
+            val configured = proactiveSelections[profile]?.opt(id)
+            val defaultSource = signal.rows("sources").singleOrNull()?.takeIf { it.optBoolean("read_only") }?.string("id")
+            signal.copy().put("source", configured ?: defaultSource ?: JSONObject.NULL)
+        }),
+        "schedule" to proactiveSchedule.copy(),
+        "level" to proactiveLevel,
+        "urgent" to json("delivery" to proactiveUrgentDelivery),
+        "requests" to JSONArray(proactiveRequests[profile]?.map { it.copy() } ?: emptyList<JSONObject>()),
+        "jobs" to JSONArray(),
+    )
     private fun http(path: String, method: String, body: JSONObject, profile: String, directory: String, archived: Boolean = false, url: HttpUrl? = null): Pair<Int, JSONObject> {
         if (path == "/api/plugins/cypher/mobile/bot-mode/space/fixture-room" && holdNextRoomRead.getAndSet(false)) { roomReadCaptured.countDown(); check(releaseRoomRead.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
         if (path == "/api/sessions" && holdNextSessionList.getAndSet(false)) { sessionListCaptured.countDown(); check(releaseSessionList.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
@@ -316,10 +337,49 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         path == "/api/profiles/active" -> 200 to json("current" to profile, "active" to profile)
         path == "/api/plugins/cypher/mobile/proactive" -> {
             if (method == "PUT") {
-                require(body.length() == 1 && body.has("enabled"))
                 proactiveEnabled[profile] = body.getBoolean("enabled")
+                if (body.length() > 1) {
+                    proactiveSetupComplete[profile] = true
+                    proactiveSelections[profile] = body.getJSONObject("signals").copy()
+                    proactiveSchedule = body.getJSONObject("schedule").copy()
+                    proactiveLevel = body.getString("level")
+                    proactiveUrgentDelivery = body.optJSONObject("urgent")?.string("delivery") ?: "notify"
+                }
             }
-            200 to json("enabled" to (proactiveEnabled[profile] ?: false), "jobs" to JSONArray(), "services" to JSONArray(proactiveServices.map { it.copy() }))
+            200 to proactiveResponse(profile)
+        }
+        path == "/api/plugins/cypher/mobile/proactive/preview" && method == "POST" -> {
+            require(body.length() == 0)
+            proactivePreviews += profile
+            200 to json("queued" to true)
+        }
+        path == "/api/plugins/cypher/mobile/proactive/feedback" && method == "POST" -> {
+            val topic = body.getString("topic")
+            require(body.getString("verdict") in setOf("more", "less") && topic.codePointCount(0, topic.length) <= 200)
+            200 to json("ok" to true)
+        }
+        path == "/api/plugins/cypher/mobile/proactive/requests" && method == "POST" -> {
+            val requestText = body.getString("text")
+            require(requestText.isNotBlank() && requestText.codePointCount(0, requestText.length) <= 300 && body.getString("action") in setOf("notify", "call"))
+            val requests = proactiveRequests.computeIfAbsent(profile) { CopyOnWriteArrayList() }
+            require(requests.size < 20)
+            val request = json("id" to "request-${java.util.UUID.randomUUID()}", "text" to body.getString("text"), "action" to body.getString("action"),
+                "signal" to (body.opt("signal") ?: JSONObject.NULL), "night" to body.optBoolean("night"), "enabled" to true, "created_at" to 1792400000)
+            requests += request
+            200 to request.copy()
+        }
+        path.startsWith("/api/plugins/cypher/mobile/proactive/requests/") && method in setOf("PATCH", "DELETE") -> {
+            val id = path.substringAfterLast('/')
+            val requests = proactiveRequests[profile]
+            val request = requests?.firstOrNull { it.string("id") == id }
+            if (request == null) 404 to json("detail" to "Request not found")
+            else if (method == "DELETE") { requests!!.remove(request); 200 to json("ok" to true) }
+            else {
+                if (body.has("enabled")) request.put("enabled", body.getBoolean("enabled"))
+                if (body.has("night")) request.put("night", body.getBoolean("night"))
+                if (body.has("action")) { require(body.getString("action") in setOf("notify", "call")); request.put("action", body.getString("action")) }
+                200 to request.copy()
+            }
         }
         path == "/api/plugins/cypher/mobile/calls" -> 200 to callHistoryResponse.copy()
         path == "/api/plugins/cypher/mobile/notifications/events" -> {
