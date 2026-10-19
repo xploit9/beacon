@@ -507,6 +507,10 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                             activeNativeSocket = this
                             activeNativeSessionId = runtimeSessionId
                             streamSubscriptions.incrementAndGet()
+                        } else if (runtimeSessionId == activeNativeSessionId) {
+                            // Like Hermes, live events go to the latest subscriber of the runtime (a reconnect re-subscribes on a new socket).
+                            activeNativeListener = listener
+                            activeNativeSocket = this
                         }
                     }
                 } catch (error: IllegalArgumentException) {
