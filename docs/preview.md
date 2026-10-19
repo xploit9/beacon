@@ -38,7 +38,7 @@ adb install -r cypher-android/app/build/outputs/apk/debug/app-debug.apk
 Standard sign-in, chat and history use unmodified native Hermes (`/api/auth/me`, `/api/ws`). The optional Cypher plugin is probed only after sign-in, in the background with a bounded timeout. If it exists, it adds voice and capability information. If it is missing or fails, chat and history keep working and you stay signed in.
 
 History bounds (stock Hermes routes, no plugin needed):
-- The conversation list shows the newest 200 conversations of the signed-in profile (archived ones separately). Scheduled-task (cron) runs are left out, as in Hermes's desktop app, so a frequent schedule cannot push your chats out of the list. Search matches only titles and conversation IDs within those 200, not message text.
+- The conversation list shows the newest 200 conversations of the signed-in profile (archived ones separately). Scheduled-task (cron) runs and conversations without messages are left out, as in Hermes's desktop app, so a frequent schedule cannot push your chats out of the list. Search matches only titles and conversation IDs within those 200, not message text.
 - Opening a conversation loads its newest 500 messages, including messages from before a context compression. Older messages are not loaded. Browsing never starts or resumes a Hermes agent.
 - Stock read-only history does not report live status. Opening a conversation therefore cannot detect a reply running on another device; it polls for saved changes, which may not appear until Hermes writes messages.
 - After an in-app send, a dropped stream replays from its last event cursor. Partial output and queued prompts stay visible while the outcome is unknown. The queue advances only after a terminal event or a native `idle` status with matching runtime and stored session identities; missing, malformed or transitional status keeps the turn uncertain and reconnecting.
@@ -55,7 +55,7 @@ With the Cypher plugin installed:
 
 Verified on an Android 16 emulator against a live Hermes (19 October 2026):
 - One sign-in, chat, history, Bot Mode and settings; new phone chats are saved under the signed-in owner.
-- Incoming calls: with Keep connected on and Cypher closed, Hermes's `cypher_call_user` rings the phone for 20 seconds; Answer starts the call in that conversation, Decline settles it on Hermes, and an unanswered ring leaves a missed-call notification with Call back.
+- Incoming calls: with Keep connected on and Cypher closed, Hermes's `cypher_call_user` rings the phone for 20 seconds as a pop-up call card (full screen when the screen is off), and the caller opens by saying why it is calling; Answer starts the call in that conversation, Decline settles it on Hermes, and an unanswered ring leaves a missed-call notification with Call back.
 - One-tap calls with Gemini Live and Grok, with the key kept on the phone. The call transcript appears in the conversation afterwards.
 
 Not complete in this preview:
