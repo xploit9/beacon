@@ -13,7 +13,6 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.CypherViewModel
-import dev.hermes.android.core.Scope
 import dev.hermes.android.core.json
 import dev.hermes.android.core.copy
 import dev.hermes.android.core.rows
@@ -237,9 +236,14 @@ internal fun openProactiveRequestForm(vm: CypherViewModel, profile: String, sign
                     }
                     TextButton(onClick = {
                         openProactiveRequestForm(vm, profile, signals) {
-                            val ui = vm.ui.value
-                            val key = proactiveSettingsKey(Scope(ui.origin, ui.owner, profile))
-                            vm.load(key, PROACTIVE_SETTINGS_PATH, mapOf("profile" to profile), force = true)
+                            // The app's client can be another profile (Assistant settings), so refresh through this profile.
+                            coroutineScope.launch {
+                                val source = vm.client ?: return@launch
+                                runCatchingCancellable {
+                                    val client = source.forAuthorizedProfile(profile)
+                                    try { client.get(PROACTIVE_SETTINGS_PATH, mapOf("profile" to profile)) } finally { client.closeNative() }
+                                }.onSuccess(onSaved)
+                            }
                         }
                     }, enabled = initial.rows("requests").size < 20, modifier = Modifier.testTag("proactive-add-request-setup")) { Text("Add a request") }
                     if (initial.rows("requests").size >= 20) Text("Delete a request to add another.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

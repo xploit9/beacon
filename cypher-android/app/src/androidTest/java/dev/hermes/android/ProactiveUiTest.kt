@@ -176,7 +176,7 @@ class ProactiveUiTest {
         assertTrue(requestPost.getJSONObject("body").getBoolean("night"))
         await { vm.data.value[proactiveKey(fixture)]?.rows("requests")?.size == 1 }
 
-        compose.onNodeWithTag("proactive-brief-time").performTextClearance().performTextInput("09:15")
+        compose.onNodeWithTag("proactive-brief-time").performTextReplacement("09:15")
         compose.onNodeWithText("Wrap-up: Set time").performScrollTo().performClick()
         compose.onNodeWithTag("choice-option:Wrap-up:off").performClick()
         compose.onNodeWithText("Watch frequency: 30 min").performScrollTo().performClick()
@@ -187,8 +187,8 @@ class ProactiveUiTest {
         compose.onNodeWithTag("proactive-five-minute-cost-note").assertDoesNotExist()
         compose.onNodeWithText("Watch frequency: 15 min").performScrollTo().performClick()
         compose.onNodeWithTag("choice-option:Watch frequency:60").performClick()
-        compose.onNodeWithTag("proactive-quiet-start").performScrollTo().performTextClearance().performTextInput("21:30")
-        compose.onNodeWithTag("proactive-quiet-end").performScrollTo().performTextClearance().performTextInput("06:30")
+        compose.onNodeWithTag("proactive-quiet-start").performScrollTo().performTextReplacement("21:30")
+        compose.onNodeWithTag("proactive-quiet-end").performScrollTo().performTextReplacement("06:30")
         compose.onNodeWithText("How much should I interrupt you?: Useful").performScrollTo().performClick()
         compose.onNodeWithTag("choice-option:How much should I interrupt you?:urgent").performClick()
         compose.onNodeWithTag("proactive-setup-next").performScrollTo().performClick()
@@ -215,7 +215,7 @@ class ProactiveUiTest {
         assertEquals("notify", body.getJSONObject("urgent").string("delivery"))
         assertEquals("fixture-model", body.string("model"))
         assertEquals("fixture-provider", body.string("provider"))
-        compose.onNodeWithTag("proactive-health-email").performScrollTo().assertTextContains("Checked")
+        compose.onNodeWithTag("proactive-health-email").performScrollTo().assertTextContains("Checked", substring = true)
         compose.onNodeWithText("Call me when project deadlines change").performScrollTo().assertExists()
     }
 
@@ -259,8 +259,8 @@ class ProactiveUiTest {
         await { vm.preferences.value.assistantProfile == "coder" }
         compose.runOnIdle { vm.more("Assistant") }
         await { vm.data.value[proactiveKey(fixture)]?.optBoolean("setup_complete") == true }
-        compose.onNodeWithTag("proactive-health-email").performScrollTo().assertTextContains("Checked")
-        compose.onNodeWithTag("proactive-health-calendar").performScrollTo().assertTextContains("Reconnect")
+        compose.onNodeWithTag("proactive-health-email").performScrollTo().assertTextContains("Checked", substring = true)
+        compose.onNodeWithTag("proactive-health-calendar").performScrollTo().assertTextContains("Reconnect", substring = true)
         compose.onNodeWithText("For urgent things: Notify me").performScrollTo().performClick()
         compose.onNodeWithTag("choice-option:For urgent things:call").performClick()
         compose.onNodeWithText("Email: Don’t watch").performScrollTo().performClick()
@@ -286,7 +286,7 @@ class ProactiveUiTest {
         compose.onNodeWithText("Add request", useUnmergedTree = true).performClick()
         await { fixture.proactiveRequests["coder"]?.size == 1 && vm.data.value[proactiveKey(fixture)]?.rows("requests")?.size == 1 }
         val requestId = fixture.proactiveRequests.getValue("coder").single().string("id")
-        compose.onNodeWithTag("proactive-request-text-$requestId").performScrollTo().assertTextContains("calendar has a conflict")
+        compose.onNodeWithTag("proactive-request-text-$requestId").performScrollTo().assertTextContains("calendar has a conflict", substring = true)
         compose.onNodeWithText("Delivery: Notify").performScrollTo().performClick()
         compose.onNodeWithTag("choice-option:Delivery:call").performClick()
         await { fixture.proactiveRequests.getValue("coder").single().string("action") == "call" && vm.data.value[proactiveKey(fixture)]?.rows("requests")?.singleOrNull()?.string("action") == "call" }
