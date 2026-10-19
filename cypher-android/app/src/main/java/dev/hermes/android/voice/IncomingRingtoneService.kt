@@ -31,15 +31,15 @@ class IncomingRingtoneService : Service() {
         source = intent?.getStringExtra("push_source").orEmpty()
         event = intent?.getStringExtra("push_event").orEmpty()
         val app = application as CypherApplication
-        val invite = app.push.ringingInvitation(source, event) ?: run { stopSelf(); return START_NOT_STICKY }
+        val manager = getSystemService(NotificationManager::class.java)
+        val invite = app.push.ringingInvitation(source, event) ?: return stopWithoutRinging(manager, startId)
         val audio = getSystemService(AudioManager::class.java)
         if (!callbackMayAlert(app.calls.state.value.active, audio.mode == AudioManager.MODE_NORMAL) || suppressed(source, event)) {
-            stopSelf(); return START_NOT_STICKY
+            return stopWithoutRinging(manager, startId)
         }
-        val manager = getSystemService(NotificationManager::class.java)
-        val posted = intent?.getParcelableExtra<Notification>("notification") ?: run { stopSelf(); return START_NOT_STICKY }
+        val posted = intent?.getParcelableExtra<Notification>("notification") ?: return stopWithoutRinging(manager, startId)
         val duration = invite.ringDurationMillis()
-        if (duration <= 0) { app.push.expireInvitation(source, event); stopSelf(); return START_NOT_STICKY }
+        if (duration <= 0) { app.push.expireInvitation(source, event); return stopWithoutRinging(manager, startId) }
         val channel = manager.getNotificationChannel(incomingCallChannel(manager))
         val alert = posted.group != "silent" && incomingCallMayAlert(
             activeCall = app.calls.state.value.active,
@@ -102,6 +102,17 @@ class IncomingRingtoneService : Service() {
                 stopSelf(startId)
             }
         }
+        return START_NOT_STICKY
+    }
+
+    /** Every startForegroundService() start must reach startForeground() before the service stops, or Android crashes the app. */
+    private fun stopWithoutRinging(manager: NotificationManager, startId: Int): Int {
+        try {
+            startForeground(42, NotificationCompat.Builder(this, incomingCallChannel(manager)).setSmallIcon(dev.hermes.android.R.drawable.ic_cypher_notification)
+                .setSilent(true).build(), android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL)
+        } catch (error: RuntimeException) { android.util.Log.w("CypherRinging", "Phone-call foreground launch rejected while stopping", error) }
+        // A newer queued start keeps the service; it replaces or removes this silent placeholder.
+        stopSelf(startId)
         return START_NOT_STICKY
     }
 

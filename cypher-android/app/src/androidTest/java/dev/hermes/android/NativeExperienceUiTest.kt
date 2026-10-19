@@ -1389,7 +1389,8 @@ class NativeExperienceUiTest {
             compose.onNodeWithTag("assistant-name").performTextReplacement("Nova")
             compose.onNodeWithTag("assistant-name-save").performClick()
             await { vm.preferences.value.assistantName == "Nova" }
-            assertEquals("Nova", dev.hermes.android.data.currentAssistantName)
+            // The process-wide copy for services follows the saved setting asynchronously.
+            await { dev.hermes.android.data.currentAssistantName == "Nova" }
 
             compose.runOnIdle { vm.tab("Cypher") }
             await { vm.ui.value.tab == "Cypher" && !vm.ui.value.cypherOpening && vm.chat.value.projectionReady }

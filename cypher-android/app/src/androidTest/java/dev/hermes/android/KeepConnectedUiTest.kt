@@ -88,6 +88,23 @@ class KeepConnectedUiTest {
         assertEquals(false, selected)
     }
 
+    @Test fun disabledStartStopsWithoutCrashingTheApp() {
+        val app = ApplicationProvider.getApplicationContext<CypherApplication>()
+        val keepPrefs = app.getSharedPreferences(KeepConnectedService.PREFS, Context.MODE_PRIVATE)
+        val keepBefore = keepPrefs.all.toMap()
+        try {
+            check(keepPrefs.edit().putBoolean(KeepConnectedService.KEY_ENABLED, false).commit())
+            // Turning Keep connected off between the start request and onStartCommand must still promote; stopping first crashes the app.
+            androidx.core.content.ContextCompat.startForegroundService(app, android.content.Intent(app, KeepConnectedService::class.java))
+            // The crash, if any, lands right after onStartCommand; this wait lets it surface before the run reports.
+            Thread.sleep(1500)
+            assertTrue(app.getSystemService(NotificationManager::class.java).activeNotifications.none { it.id == 4082 })
+        } finally {
+            restoreSharedPreferences(keepPrefs, keepBefore)
+            if (keepBefore[KeepConnectedService.KEY_ENABLED] == true) KeepConnectedService.startIfEnabled(app)
+        }
+    }
+
     @Test fun enablingPollsFixtureCallsAndReusesTheCypherIncomingCallPath() = runBlocking {
         val app = ApplicationProvider.getApplicationContext<CypherApplication>()
         val uiAutomation = InstrumentationRegistry.getInstrumentation().uiAutomation
@@ -98,7 +115,9 @@ class KeepConnectedUiTest {
         val oldAuth = app.auth.read(scope.origin)
         val dataBefore = app.preferences.data.first()
         val keepPrefs = app.getSharedPreferences(KeepConnectedService.PREFS, Context.MODE_PRIVATE)
-        val keepBefore = keepPrefs.all.toMap()
+        // A killed run leaves its fixture cursor ahead of this fixture's first event, so the poll would never deliver it.
+        val fixtureCursors = fixture.notificationProfiles.map { "cursor:${"${scope.origin}\u0000${scope.owner}\u0000$it".digest()}" }
+        val keepBefore = keepPrefs.all.toMap() - fixtureCursors.toSet()
         val pushPrefs = app.getSharedPreferences("push-binding", Context.MODE_PRIVATE)
         val voicePrefs = app.getSharedPreferences("voice-private", Context.MODE_PRIVATE)
         val voiceBefore = voicePrefs.all.toMap()
@@ -133,6 +152,7 @@ class KeepConnectedUiTest {
             if (android.os.Build.VERSION.SDK_INT >= 33) uiAutomation.grantRuntimePermission(app.packageName, Manifest.permission.POST_NOTIFICATIONS)
             uiAutomation.grantRuntimePermission(app.packageName, Manifest.permission.RECORD_AUDIO)
             KeepConnectedService.setEnabled(app, null, false)
+            check(keepPrefs.edit().apply { fixtureCursors.forEach { remove(it) } }.commit())
             KeepConnectedService.clientFactoryForTest = { current, authStore -> fixture.clientFor(current, authStore) }
             audio.setStreamVolume(AudioManager.STREAM_RING, 0, 0)
             app.auth.write(auth)

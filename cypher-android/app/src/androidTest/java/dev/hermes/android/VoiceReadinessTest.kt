@@ -45,7 +45,8 @@ class VoiceReadinessTest {
                 true, false, manager.areNotificationsEnabled(), channel?.importance ?: NotificationManager.IMPORTANCE_NONE,
                 channel?.sound != null, audio.ringerMode, audio.getStreamVolume(AudioManager.STREAM_RING))
             assertEquals(Notification.CATEGORY_CALL, firstCard.category)
-            assertEquals(alerting, firstCard.group != "silent")
+            // setSilent() marks GROUP_ALERT_SUMMARY; Android 15+ swaps its "silent" group for a hidden flag on the posted card.
+            assertEquals(alerting, firstCard.groupAlertBehavior != Notification.GROUP_ALERT_SUMMARY)
             assertEquals(alerting, (firstCard.flags and Notification.FLAG_INSISTENT) != 0)
             assertNull("The user-configured call channel is the ringtone source", firstCard.sound)
             assertFalse("Ringing does not start an active microphone call", app.calls.state.value.active)
@@ -72,5 +73,15 @@ class VoiceReadinessTest {
             app.push.discardInvitation(source, event); app.push.discardInvitation(source, "$event-again")
             prefs.edit().remove(key).commit(); app.auth.write(old)
         }
+    }
+
+    @Test fun endedInvitationStartStopsWithoutCrashingTheApp() {
+        val app = ApplicationProvider.getApplicationContext<CypherApplication>()
+        // An invitation that ends before the service starts must still promote; stopping first crashes the app.
+        androidx.core.content.ContextCompat.startForegroundService(app, android.content.Intent(app, IncomingRingtoneService::class.java)
+            .putExtra("push_source", "ended-${UUID.randomUUID()}").putExtra("push_event", "ended-${UUID.randomUUID()}"))
+        // The crash, if any, lands right after onStartCommand; this wait lets it surface before the run reports.
+        Thread.sleep(1500)
+        assertTrue(app.getSystemService(NotificationManager::class.java).activeNotifications.none { it.id == 42 })
     }
 }

@@ -375,6 +375,8 @@ class KeepConnectedService : Service() {
             return START_STICKY
         }
         if (!isEnabled(this)) {
+            // A startForegroundService() start must promote before it stops, or Android crashes the app.
+            if (promote()) stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelfResult(startId)
             return START_NOT_STICKY
         }
