@@ -41,24 +41,12 @@ class ProjectionCache internal constructor(private val db: ProjectionDb, private
                 val rows = db.rows()
                 val newKey = key(scope, kind)
                 val oldKey = key(scope, legacyKind)
-                suspend fun read(row: ProjectionMetadata, target: String): String? {
-                    if (!row.protected && row.updated < System.currentTimeMillis() - MAX_AGE) { rows.delete(row.key); return null }
-                    require(row.scope == scope.key) { "Checkpoint belongs to another scope; saved state was retained" }
-                    val encrypted = readProjectionBlob(row) { start, count -> rows.encryptedChunk(row.key, start, count) }
-                    val clear = cipher.decrypt(encrypted, row.key)
-                    if (row.key != target) {
-                        val migrated = cipher.encrypt(clear, target)
-                        rows.put(Projection(target, row.scope, migrated, row.updated, row.protected, migrated.size.toLong()))
-                        rows.delete(row.key)
-                    }
-                    return String(clear, Charsets.UTF_8)
-                }
-                val current = (rows.get(newKey) ?: rows.get(legacyKey(scope, kind)))?.let { read(it, newKey) }
+                val current = (rows.get(newKey) ?: rows.get(legacyKey(scope, kind)))?.let { readRow(rows, scope, it, newKey) }
                 if (current != null) {
                     rows.delete(oldKey); rows.delete(legacyKey(scope, legacyKind))
                     current
                 } else {
-                    val old = (rows.get(oldKey) ?: rows.get(legacyKey(scope, legacyKind)))?.let { read(it, newKey) }
+                    val old = (rows.get(oldKey) ?: rows.get(legacyKey(scope, legacyKind)))?.let { readRow(rows, scope, it, newKey) }
                     rows.delete(oldKey); rows.delete(legacyKey(scope, legacyKind))
                     old
                 }
@@ -73,21 +61,25 @@ class ProjectionCache internal constructor(private val db: ProjectionDb, private
                     for (kind in kinds.distinct()) {
                         val id = key(scope, kind)
                         val row = rows.get(id) ?: rows.get(legacyKey(scope, kind)) ?: continue
-                        if (!row.protected && row.updated < System.currentTimeMillis() - MAX_AGE) { rows.delete(row.key); continue }
-                        require(row.scope == scope.key) { "Checkpoint belongs to another scope; saved state was retained" }
-                        val encryptedValue = readProjectionBlob(row) { start, count -> rows.encryptedChunk(row.key, start, count) }
-                        val clear = cipher.decrypt(encryptedValue, row.key)
-                        if (row.key != id) {
-                            // Preserve checkpoints and their age while removing path/kind metadata from old keys.
-                            val encrypted = cipher.encrypt(clear, id)
-                            rows.put(Projection(id, row.scope, encrypted, row.updated, row.protected, encrypted.size.toLong()))
-                            rows.delete(row.key)
-                        }
-                        put(kind, String(clear, Charsets.UTF_8))
+                        readRow(rows, scope, row, id)?.let { put(kind, it) }
                     }
                 }
             }
         }
+    }
+    /** Reads one row inside the caller's transaction, dropping it if expired and moving it to [target] if stored elsewhere. */
+    private suspend fun readRow(rows: ProjectionDao, scope: Scope, row: ProjectionMetadata, target: String): String? {
+        if (!row.protected && row.updated < System.currentTimeMillis() - MAX_AGE) { rows.delete(row.key); return null }
+        require(row.scope == scope.key) { "Checkpoint belongs to another scope; saved state was retained" }
+        val encryptedValue = readProjectionBlob(row) { start, count -> rows.encryptedChunk(row.key, start, count) }
+        val clear = cipher.decrypt(encryptedValue, row.key)
+        if (row.key != target) {
+            // Preserve checkpoints and their age while removing path/kind metadata from old keys.
+            val encrypted = cipher.encrypt(clear, target)
+            rows.put(Projection(target, row.scope, encrypted, row.updated, row.protected, encrypted.size.toLong()))
+            rows.delete(row.key)
+        }
+        return String(clear, Charsets.UTF_8)
     }
     suspend fun write(scope: Scope, kind: String, value: String, protected: Boolean = false) = withContext(Dispatchers.IO) {
         lock.withLock {

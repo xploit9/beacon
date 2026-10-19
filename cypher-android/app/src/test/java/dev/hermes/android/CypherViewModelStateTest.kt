@@ -5,6 +5,11 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CypherViewModelStateTest {
+    @Test fun releasedAssistantTabValueMigrates() {
+        assertEquals("Cypher", migratedTab("Xara"))
+        assertEquals("Chat", migratedTab("Chat"))
+    }
+
     @Test fun terminalCompletionReleasesStreamAndKeepsUnconfirmedOutputVisible() {
         val status = "Reply ended · final reply not confirmed; live output retained"
         val running = ChatState(

@@ -95,7 +95,8 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                     vm.storeData(proactiveKey, response)
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
-                vm.notice("Couldn’t update proactive settings. Try again.")
+                // A 409 names a host setup step that retrying cannot fix.
+                vm.notice((error as? ApiFailure)?.takeIf { it.status == 409 }?.message ?: "Couldn’t update proactive settings. Try again.")
             } finally { client.closeNative(); savingProactive = false }
         }
     }

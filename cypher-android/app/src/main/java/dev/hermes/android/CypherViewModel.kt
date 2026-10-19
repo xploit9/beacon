@@ -37,6 +37,7 @@ private const val LEGACY_CYPHER_SESSION_CACHE_KIND = "xara-session" // Migrate t
 private const val LEGACY_CYPHER_OPENING_CACHE_KIND = "xara-opening" // Migrate the existing encrypted creation marker on first read.
 private const val LEGACY_CYPHER_SESSION_HANDLE_PREFIX = "xara:" // Migrate existing scoped SavedStateHandle pointers on first read.
 private const val LEGACY_CYPHER_TAB_VALUE = "Xara" // Replace the released assistant tab value when restoring state.
+internal fun migratedTab(tab: String) = if (tab == LEGACY_CYPHER_TAB_VALUE) "Cypher" else tab
 
 data class Message(val id: String, val role: String, val text: String, val reasoning: String = "", val tools: List<JSONObject> = emptyList(), val attachments: List<JSONObject> = emptyList(), val mediaSnapshots: Map<String, String> = emptyMap(), val sessionId: String = "", val interrupted: Boolean = false, val voice: Boolean = false, val recordedAt: Long = 0L) {
     companion object {
@@ -132,9 +133,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     val preferences = app.preferences.data.map(AppPreferences::read).stateIn(viewModelScope, SharingStarted.Eagerly, AppPreferences())
     private fun restoredTab(): String {
         val tab = saved.get<String>("tab") ?: return "Chat"
-        if (tab != LEGACY_CYPHER_TAB_VALUE) return tab
-        saved["tab"] = "Cypher"
-        return "Cypher"
+        return migratedTab(tab).also { if (it != tab) saved["tab"] = it }
     }
     private fun cypherSessionHandleKey(scope: Scope) = "cypher:${scope.key}"
     private fun readCypherSessionHandle(scope: Scope): String? {
@@ -1240,7 +1239,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             ?.takeIf { it.string("scope") == owner }
         val routes = history?.optJSONArray("routes") ?: JSONArray()
         val previous = if (routes.length() > 0) routes.remove(routes.length() - 1) as? JSONObject else null
-        val targetTab = previous?.string("tab") ?: if (_ui.value.morePage.isBlank()) "Chat" else "More"
+        val targetTab = previous?.string("tab")?.let(::migratedTab) ?: if (_ui.value.morePage.isBlank()) "Chat" else "More"
         val targetPage = previous?.string("page") ?: dev.hermes.android.ui.settingsParent(_ui.value.morePage)
         saved["settings-navigation"] = json("scope" to owner, "routes" to routes).toString()
         ++navigationGeneration
@@ -1426,7 +1425,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                     currentCoroutineContext().ensureActive()
                     if (client !== restored || originGeneration != restoredGeneration) return@launch
                     normalModeReturn = null
-                    val tab = target.string("tab", "Chat")
+                    val tab = migratedTab(target.string("tab", "Chat"))
                     val page = target.string("page")
                     _ui.update { it.copy(botModeEnabled = false, tab = tab, morePage = page, query = target.string("query")) }
                     saved["tab"] = tab; saved["more"] = page
