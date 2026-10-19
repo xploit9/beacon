@@ -182,6 +182,8 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private var renderedServerProjection: Pair<Scope, String>? = null
     private var callReconcile: Job? = null
     private val streams = mutableMapOf<String, Job>()
+    /** The client each scope's stream chain uses; a re-attach hands the same detached client to its successor. */
+    private val streamClients = mutableMapOf<String, CypherClient>()
     private val drafts = mutableMapOf<String, Draft>()
     private val persistedDrafts = mutableMapOf<String, String>()
     private val initialShells = mutableMapOf<String, String>()
@@ -579,7 +581,9 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private suspend fun checkpointPhoneSettingsNow() {
         val owner = client?.scope ?: return
         phoneCheckpoint?.cancelAndJoin()
-        retainPhoneSettings(owner, phoneSettings.snapshotDraft())
+        // Like the debounced path: an oversized settings draft must not abort connecting, signing out or switching chats.
+        try { retainPhoneSettings(owner, phoneSettings.snapshotDraft()) }
+        catch (e: Throwable) { if (e is CancellationException) throw e; notice("This settings draft is too large to keep on the device. Shorten it before leaving.") }
     }
     internal suspend fun restorePhoneSettings(active: CypherClient) {
         phoneSettings.bind()
@@ -2056,6 +2060,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private fun attachStream(c: CypherClient, scope: Scope, stream: String, terminalAlreadyObserved: Boolean = false) {
         if (!foreground || client?.scope != c.scope || scope.copy(session = "") != c.scope) return
         streams[scope.key]?.cancel()
+        streamClients[scope.key] = c
         streams[scope.key] = viewModelScope.launch {
             val frameKey = "${scope.key}:$stream"
             val frame = liveFrames[frameKey] ?: app.cache.read(scope, "live:$stream")?.let(::JSONObject)
@@ -2159,7 +2164,9 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 }
             } catch (e: Throwable) { if (e is CancellationException) throw e; if (sourceScope == scope) fail(e) } finally {
                 if (terminalObserved && sourceScope == scope) _chat.update { releaseTerminalChat(it, stream, terminalReplyVisible, terminalError) }
-                if (streams[scope.key] == currentCoroutineContext()[Job]) streams.remove(scope.key)
+                if (streams[scope.key] == currentCoroutineContext()[Job]) { streams.remove(scope.key); streamClients.remove(scope.key) }
+                // Release this chain's detached socket once no successor reuses it; never the main client (it may hold a creating runtime).
+                if (c !== client && streamClients.values.none { it === c }) c.closeNative()
             }
         }
     }
@@ -2204,8 +2211,8 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         if (event.type in setOf("done", "state_saved")) projectCallTranscripts()
     }
     private suspend fun pollPrompts(c: CypherClient, scope: Scope) {
-        val approval = runCatching { c.get("/api/approval/pending", mapOf("session_id" to scope.session)).optJSONObject("pending") }.getOrNull()
-        val clarify = runCatching { c.get("/api/clarify/pending", mapOf("session_id" to scope.session)).optJSONObject("pending") }.getOrNull()
+        val approval = runCatching { c.get("/api/approval/pending", mapOf("session_id" to scope.session)).optJSONObject("pending") }.onFailure { if (it is CancellationException) throw it }.getOrNull()
+        val clarify = runCatching { c.get("/api/clarify/pending", mapOf("session_id" to scope.session)).optJSONObject("pending") }.onFailure { if (it is CancellationException) throw it }.getOrNull()
         if (sourceScope == scope) _chat.update { it.copy(approval = approval, clarification = clarify) }
     }
     private fun watchSession(c: CypherClient, scope: Scope) {
