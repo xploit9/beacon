@@ -106,9 +106,10 @@ internal class NativeGateway(private val client: CypherClient, private val socke
     internal fun sessionSnapshot(): JSONObject = synchronized(cursorLock) { sessionState.copy() }
     private fun bind(result: JSONObject): NativeSessionBinding = nativeSessionBinding(client.scope, result).also { synchronized(cursorLock) { sessionState = result.copy(); cursor = Cursor(it) } }
     suspend fun create(params: JSONObject): NativeSessionBinding = sessionLock.withLock { bind(rpc("session.create", params.copy().put("source", "android").put("close_on_disconnect", false))) }
-    suspend fun session(stored: String?): NativeSessionBinding = sessionLock.withLock {
+    /** [lazy]: reattach a live unsent shell or answer 4007, never let Hermes materialize an ownerless row for a runtime that is gone. */
+    suspend fun session(stored: String?, lazy: Boolean = false): NativeSessionBinding = sessionLock.withLock {
         synchronized(cursorLock) { cursor?.binding }?.takeIf { connection?.failure == null && connection?.ready?.isCompleted == true && it.scope == client.scope && (stored == it.storedSessionId || stored == it.runtimeSessionId) }?.let { return@withLock it }
-        bind(rpc(if (stored.isNullOrBlank()) "session.create" else "session.resume", if (stored.isNullOrBlank()) json("source" to "android", "close_on_disconnect" to false) else json("session_id" to stored, "close_on_disconnect" to false, "omit_messages" to false)))
+        bind(rpc(if (stored.isNullOrBlank()) "session.create" else "session.resume", if (stored.isNullOrBlank()) json("source" to "android", "close_on_disconnect" to false) else json("session_id" to stored, "close_on_disconnect" to false, "omit_messages" to false).apply { if (lazy && !stored.isNullOrBlank()) put("lazy", true) }))
     }
     suspend fun prepareReplay(lastId: String = "", beforePrompt: Boolean = false) = sessionLock.withLock {
         val snapshot = synchronized(cursorLock) { cursor } ?: return@withLock

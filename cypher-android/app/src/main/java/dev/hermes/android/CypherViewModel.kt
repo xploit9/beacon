@@ -1620,7 +1620,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         } catch (readError: Throwable) {
             if (readError is CancellationException) throw readError
             if (readError !is ApiFailure || readError.status != 404 || !current() || !clientCreatedShell()) throw readError
-            val resumed = c.nativeSession(id)
+            val resumed = c.nativeSession(id, lazy = true)
             require(resumed.storedSessionId == id) { "The resumed conversation changed identity" }
             c.get("/api/session", mapOf("session_id" to id))
         }
@@ -1774,7 +1774,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                     if (readError is CancellationException) throw readError
                     if (readError !is ApiFailure || readError.status != 404 || !sessionCanStillBeUnpersisted(clientCreated, _chat.value) || !current()) throw readError
                     nativeResumeAttempted = true
-                    val resumed = try { requireNotNull(active).nativeSession(id) }
+                    val resumed = try { requireNotNull(active).nativeSession(id, lazy = true) }
                     catch (resumeError: Throwable) {
                         if (resumeError is CancellationException) throw resumeError
                         if (resumeError is ApiFailure && resumeError.status == 4007 && resumeError.message == "session not found" && clientCreated) {

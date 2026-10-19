@@ -130,7 +130,7 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
     internal suspend fun nativeReplay(lastId: String = "", beforePrompt: Boolean = false) = native.prepareReplay(lastId, beforePrompt)
     internal suspend fun nativeCreate(params: JSONObject): NativeSessionBinding = native.create(params)
     internal fun nativeSessionSnapshot() = native.sessionSnapshot()
-    suspend fun nativeSession(storedSessionId: String?): NativeSessionBinding = native.session(storedSessionId)
+    suspend fun nativeSession(storedSessionId: String?, lazy: Boolean = false): NativeSessionBinding = native.session(storedSessionId, lazy)
     internal suspend fun nativeSessionStatus(storedSessionId: String, runtimeSessionId: String): String? {
         val identity = Regex("[A-Za-z0-9_.:-]{1,256}")
         if (!storedSessionId.matches(identity) || !runtimeSessionId.matches(identity)) return null

@@ -124,6 +124,17 @@ class NativeGatewayTest {
         fixture.client.closeNative()
     }
 
+    @Test fun unsentShellRecoveryResumesLazilySoHermesNeverMaterializesAnOwnerlessRow() = runBlocking<Unit> {
+        val fixture = GatewayFixture()
+        fixture.client.nativeSession("20261019_001507_a4cbef", lazy = true)
+        assertTrue(fixture.calls.single { it.first == "session.resume" }.second.optBoolean("lazy"))
+        fixture.client.closeNative()
+        val plain = GatewayFixture()
+        plain.client.nativeSession("20261019_001507_a4cbef")
+        assertFalse(plain.calls.single { it.first == "session.resume" }.second.has("lazy"))
+        plain.client.closeNative()
+    }
+
     @Test fun foregroundStatusUsesResumedRuntimeAfterBackgroundStreamWasCancelled() = runBlocking<Unit> {
         val fixture = RecoveryFixture()
         val created = fixture.client.post("/api/session/new")
