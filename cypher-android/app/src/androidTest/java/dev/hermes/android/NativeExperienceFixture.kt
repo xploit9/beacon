@@ -119,6 +119,25 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         incomingNotification = event
         return event
     }
+    fun emitTaskResult(profile: String = "default", conversationId: String = "chat-a"): JSONObject {
+        require(profile in notificationProfiles)
+        val id = java.util.UUID.randomUUID().toString().replace("-", "")
+        val sequence = notificationSequence.incrementAndGet()
+        val event = json(
+            "seq" to sequence,
+            "event_id" to id,
+            "owner_id" to scope.owner,
+            "profile" to profile,
+            "kind" to "task_result",
+            "source_ref" to "source-$profile-${id.take(12)}",
+            "conversation_ref" to "conversation-$profile-${id.take(12)}-$conversationId",
+            "conversation_id" to conversationId,
+            "session_id" to conversationId,
+            "expires_at" to (System.currentTimeMillis() / 1000 + 300),
+        )
+        incomingNotification = event
+        return event
+    }
     @Volatile var cronFailure: String? = null
     @Volatile var historyFailure = false
     /** When set, every optional `/api/plugins/cypher/` route answers with this status. */

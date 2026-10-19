@@ -105,7 +105,7 @@ class KeepConnectedUiTest {
         }
     }
 
-    @Test fun enablingPollsFixtureCallsAndReusesTheCypherIncomingCallPath() = runBlocking {
+    @Test fun enablingPollsFixtureTaskResultsAndCallsThroughTheirNativePaths() = runBlocking {
         val app = ApplicationProvider.getApplicationContext<CypherApplication>()
         val uiAutomation = InstrumentationRegistry.getInstrumentation().uiAutomation
         val hadNotifications = android.os.Build.VERSION.SDK_INT < 33 || app.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
@@ -205,15 +205,21 @@ class KeepConnectedUiTest {
             } else android.app.Notification.Builder(app)
             manager.notify(4083, signInPrompt.setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle("Sign in again").build())
 
+            val taskResultEvent = fixture.emitTaskResult()
+            testEvents += taskResultEvent
+            val taskResultKey = "${taskResultEvent.getString("source_ref")}\u0000${taskResultEvent.getString("event_id")}".digest()
+            compose.onNodeWithTag("keep-connected-toggle").performClick()
+            compose.waitUntil(15_000) {
+                KeepConnectedService.status(app) == KeepConnectedService.STATUS_CONNECTED &&
+                    manager.activeNotifications.count { it.tag == taskResultKey && it.id == 1 } == 1
+            }
+            assertEquals(1, manager.activeNotifications.count { it.tag == taskResultKey && it.id == 1 })
+
             val answerEvent = fixture.emitIncomingCall(conversationId = "chat-b")
             testEvents += answerEvent
             val answerSource = answerEvent.getString("source_ref")
             seedExistingFcmBinding(answerSource)
-            compose.onNodeWithTag("keep-connected-toggle").performClick()
-            compose.waitUntil(15_000) {
-                KeepConnectedService.status(app) == KeepConnectedService.STATUS_CONNECTED &&
-                    app.push.ringingInvitation(answerSource, answerEvent.getString("event_id")) != null
-            }
+            compose.waitUntil(15_000) { app.push.ringingInvitation(answerSource, answerEvent.getString("event_id")) != null }
             // The system applies notification cancels asynchronously.
             compose.waitUntil(5_000) { manager.activeNotifications.none { it.id == 4083 } }
             assertTrue(fixture.notificationWaits.contains(25L))

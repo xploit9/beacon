@@ -88,6 +88,57 @@ class KeepConnectedTest {
         assertEquals(0L, store.read("https://one.example", "another-owner", "default"))
     }
 
+    @Test fun taskResultPayloadPreservesFieldsUsedByTheNativePushPath() {
+        val event = JSONObject()
+            .put("source_ref", "source-1")
+            .put("event_id", "event-1")
+            .put("conversation_ref", "conversation-1")
+            .put("kind", "task_result")
+            .put("activity_ref", "activity-1")
+            .put("expires_at", "1234")
+            .put("release_version", "9")
+
+        assertEquals(
+            mapOf(
+                "source_ref" to "source-1",
+                "event_id" to "event-1",
+                "conversation_ref" to "conversation-1",
+                "kind" to "task_result",
+                "activity_ref" to "activity-1",
+                "expires_at" to "1234",
+                "release_version" to "9",
+            ),
+            keepConnectedPushData(event),
+        )
+    }
+
+    @Test fun outboxResetReplaysFromTheNewLowerCursor() = runTest {
+        val store = cursors().apply { advance("https://hermes.example", "owner", "default", 57) }
+        val event = JSONObject().put("event_id", "task-result-1")
+        val reset = parseKeepConnectedPage(
+            JSONObject().put("events", org.json.JSONArray().put(event)).put("next_cursor", 1).put("reset", true),
+            57,
+        )
+        val requests = mutableListOf<Long>()
+        val poller = KeepConnectedPoller(
+            origin = "https://hermes.example",
+            owner = "owner",
+            cursors = store,
+            profiles = { listOf("default") },
+            poll = { _, after ->
+                requests += after
+                if (after == 57L) reset else KeepConnectedPage(emptyList(), after)
+            },
+            onEvent = { _, _ -> },
+        )
+
+        poller.pollOnce()
+        poller.pollOnce()
+
+        assertEquals(listOf(57L, 1L), requests)
+        assertEquals(1L, store.read("https://hermes.example", "owner", "default"))
+    }
+
     @Test fun backoffDoublesAndStopsAtOneMinute() {
         assertEquals(1_000L, keepConnectedBackoffMs(1))
         assertEquals(2_000L, keepConnectedBackoffMs(2))

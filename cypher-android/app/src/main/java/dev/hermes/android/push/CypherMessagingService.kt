@@ -24,6 +24,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import org.json.JSONObject
 import dev.hermes.android.voice.IncomingCall
 import dev.hermes.android.voice.IncomingCallReceiver
+import dev.hermes.android.voice.incomingRecordMayBePruned
 import dev.hermes.android.voice.RelayCallbackPolicy
 import dev.hermes.android.voice.RelayCallbackPreferences
 import dev.hermes.android.voice.IncomingRingtoneService
@@ -63,8 +64,17 @@ class PushManager(private val app: CypherApplication) {
     private fun save(key: String, value: JSONObject) { check(privatePrefs.edit().putString(key,encoded(key,value)).commit()) }
     private fun read(key: String): JSONObject? = privatePrefs.getString(key, null)?.let { JSONObject(String(app.cipher.decrypt(android.util.Base64.decode(it, android.util.Base64.NO_WRAP), key))) }
     fun reconcileIncomingDeadlines() = synchronized(lock) {
+        val now = System.currentTimeMillis()
         privatePrefs.all.keys.filter { it.startsWith("incoming:") }.forEach { key ->
-            runCatching { read(key) }.getOrNull()?.let { expireInvitation(it.string("source"), it.string("event")) }
+            runCatching { read(key) }.getOrNull()?.let { saved ->
+                expireInvitation(saved.string("source"), saved.string("event"))
+                runCatching { read(key) }.getOrNull()?.let { current ->
+                    if (incomingRecordMayBePruned(current.optString("state", "missed"), current.optLong("expires_at"), now)) {
+                        dismissInvitation(current.string("source"), current.string("event"))
+                        check(privatePrefs.edit().remove(key).commit())
+                    }
+                }
+            }
         }
     }
     fun registeredTarget(scope: Scope): String? = synchronized(lock) { runCatching { read("active:${scope.key}")?.string("target")?.takeIf(String::isNotBlank) }.getOrNull() }

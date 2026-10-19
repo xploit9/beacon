@@ -575,21 +575,29 @@ async def notices(request:Request,after:int=0,wait:float=0):
         await asyncio.to_thread(sys.modules['cypher_callbacks'].prune_expired,mobile,owner)
         await asyncio.to_thread(watch,owner,provider,profile)
         return await asyncio.to_thread(_notices_after,owner,profile,after)
-    rows=await snapshot()
-    if rows or duration<=0:
-        return {'events':[notice_wire(r,owner) for r in rows],'next_cursor':rows[-1]['seq'] if rows else after}
+    rows,reset,cursor=await snapshot()
+    if rows or reset or duration<=0:
+        result={'events':[notice_wire(r,owner) for r in rows],'next_cursor':rows[-1]['seq'] if rows else cursor}
+        if reset: result['reset']=True
+        return result
     loop=asyncio.get_running_loop();deadline=loop.time()+duration
     while True:
         remaining=deadline-loop.time()
         if remaining<=0: break
         await asyncio.sleep(min(1.0,remaining))
-        rows=await snapshot()
-        if rows: break
-    return {'events':[notice_wire(r,owner) for r in rows],'next_cursor':rows[-1]['seq'] if rows else after}
+        rows,reset,cursor=await snapshot()
+        if rows or reset: break
+    result={'events':[notice_wire(r,owner) for r in rows],'next_cursor':rows[-1]['seq'] if rows else cursor}
+    if reset: result['reset']=True
+    return result
 
 def _notices_after(owner,profile,after):
     with mobile.connect() as conn:
-        return [dict(r) for r in conn.execute('SELECT * FROM notices WHERE owner=? AND profile=? AND seq>? ORDER BY seq LIMIT 100',(owner,profile,after))]
+        sequence=conn.execute("SELECT seq FROM sqlite_sequence WHERE name='notices'").fetchone()
+        max_seq=sequence[0] if sequence else 0
+        reset=after>max_seq
+        rows=conn.execute('SELECT * FROM notices WHERE owner=? AND profile=? AND seq>? ORDER BY seq LIMIT 100',(owner,profile,0 if reset else after))
+        return [dict(r) for r in rows],reset,max_seq if reset else after
 def notice_preview(kind):
     if kind=='release': return 'Cypher update available','Open Cypher to install the latest verified update.'
     if kind=='test': return 'Cypher notification test','Synthetic test. Seeing this notification confirms arrival on this phone.'

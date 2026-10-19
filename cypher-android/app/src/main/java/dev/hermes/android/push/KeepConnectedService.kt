@@ -54,7 +54,7 @@ import java.io.IOException
 import java.io.InterruptedIOException
 import java.util.UUID
 
-internal data class KeepConnectedPage(val events: List<JSONObject>, val nextCursor: Long)
+internal data class KeepConnectedPage(val events: List<JSONObject>, val nextCursor: Long, val reset: Boolean = false)
 internal class KeepConnectedPageException : IOException()
 private class KeepConnectedProfilesException : IOException()
 
@@ -68,10 +68,19 @@ internal fun parseKeepConnectedPage(response: JSONObject, after: Long): KeepConn
         is Long -> value
         else -> throw KeepConnectedPageException()
     }
-    if (after < 0 || next < after || rows.length() > 100) throw KeepConnectedPageException()
+    val reset = when (val value = response.opt("reset")) {
+        null -> false
+        is Boolean -> value
+        else -> throw KeepConnectedPageException()
+    }
+    if (after < 0 || next < 0 || (!reset && next < after) || rows.length() > 100) throw KeepConnectedPageException()
     val events = (0 until rows.length()).map { rows.optJSONObject(it) ?: throw KeepConnectedPageException() }
-    return KeepConnectedPage(events, next)
+    return KeepConnectedPage(events, next, reset)
 }
+
+internal fun keepConnectedPushData(event: JSONObject): Map<String, String> =
+    listOf("source_ref", "event_id", "conversation_ref", "kind", "activity_ref", "expires_at", "release_version")
+        .associateWith(event::optString)
 
 internal fun keepConnectedFailureReason(profile: String, error: Throwable): String = when (error) {
     is NativeAuthExpiredException -> "Hermes sign-in expired"
@@ -112,6 +121,11 @@ internal class KeepConnectedCursors(
 
     fun advance(origin: String, owner: String, profile: String, cursor: Long) {
         require(cursor >= read(origin, owner, profile)) { "Notification cursor moved backwards" }
+        check(write(key(origin, owner, profile), cursor.toString())) { "Could not persist notification cursor" }
+    }
+
+    fun reset(origin: String, owner: String, profile: String, cursor: Long) {
+        require(cursor >= 0) { "Invalid notification cursor" }
         check(write(key(origin, owner, profile), cursor.toString())) { "Could not persist notification cursor" }
     }
 
@@ -238,9 +252,10 @@ internal class KeepConnectedPoller(
             val after = cursors.read(origin, owner, profile)
             val page = permits.withPermit {
                 val result = poll(profile, after)
-                if (result.nextCursor < after || result.events.size > 100) throw KeepConnectedPageException()
+                if (result.nextCursor < 0 || (!result.reset && result.nextCursor < after) || result.events.size > 100) throw KeepConnectedPageException()
                 result.events.forEach { onEvent(profile, it) }
-                cursors.advance(origin, owner, profile, result.nextCursor)
+                if (result.reset) cursors.reset(origin, owner, profile, result.nextCursor)
+                else cursors.advance(origin, owner, profile, result.nextCursor)
                 result
             }
             if (page.events.isEmpty() || page.nextCursor == after) {
@@ -462,7 +477,12 @@ class KeepConnectedService : Service() {
                     parseKeepConnectedPage(response, after)
                 },
                 signedInProfile = { client?.auth?.profile.orEmpty() },
-                onEvent = { profile, event -> deliverIncomingCall(app, origin, owner, profile, event) },
+                onEvent = { profile, event ->
+                    if (event.optString("kind") == "incoming_call") deliverIncomingCall(app, origin, owner, profile, event)
+                    else if (app.push.bindKeepConnectedSource(Scope(origin, owner, profile), event.optString("source_ref"))) {
+                        receivePush(this, keepConnectedPushData(event))
+                    }
+                },
             )
         try {
             while (currentCoroutineContext().isActive && isEnabledFor(this, Scope(origin, owner, "default"))) {

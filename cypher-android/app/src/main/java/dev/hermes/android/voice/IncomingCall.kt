@@ -34,6 +34,11 @@ data class IncomingCall(val source: String, val event: String, val expiresAt: Lo
 fun validIncoming(source: String, event: String, expiresAt: Long, now: Long): Boolean =
     validOpaque(source) && validOpaque(event) && now >= 0 && expiresAt > now && expiresAt - now <= INCOMING_INVITATION_SECONDS + INCOMING_CLOCK_SKEW_SECONDS
 
+internal fun incomingRecordMayBePruned(state: String, expiresAtSeconds: Long, nowMillis: Long): Boolean {
+    val retentionSeconds = if (state == "missed") 7 * 24 * 60 * 60L else 5 * 60L
+    return expiresAtSeconds > 0 && expiresAtSeconds < nowMillis / 1000 - retentionSeconds
+}
+
 /** The FCM payload and intent only identify a saved invitation; they cannot authorize a call. */
 suspend fun resolveIncoming(app: CypherApplication, source: String, event: String): Pair<CypherClient, JSONObject> {
     val invite = app.push.invitation(source, event) ?: run { app.push.discardInvitation(source, event); error("This Cypher invitation has ended. Open Cypher history to view it.") }

@@ -13,6 +13,16 @@ import kotlinx.coroutines.test.runTest
 class IncomingCallTest {
     private fun route() = JSONObject("""{"source_ref":"source-1","profile":"default","kind":"incoming_call","state":"pending","callback_id":"callback-1","expires_at":1120}""")
 
+    @Test fun incomingRecordsExpireAfterTheirStateSpecificRetentionWindow() {
+        val now = 1_000_000_000_000L
+
+        assertFalse(incomingRecordMayBePruned("ended", 999_700_000L, now))
+        assertTrue(incomingRecordMayBePruned("ended", 999_699_000L, now))
+        assertFalse(incomingRecordMayBePruned("missed", 999_395_200L, now))
+        assertTrue(incomingRecordMayBePruned("missed", 999_395_199L, now))
+        assertFalse(incomingRecordMayBePruned("missed", 0L, now))
+    }
+
     @Test fun transientEngineLeaseAndNetworkFailuresKeepInvitationRetryable() {
         listOf(ApiFailure(503, "Engine unavailable"), ApiFailure(500, "Engine failed"), ApiFailure(409, "Call lease busy"), ApiFailure(400, "Unknown callback failure"), IOException("Response lost")).forEach { assertFalse(incomingFailureTerminal(it)) }
         listOf(401, 403, 404, 410).forEach { assertTrue(incomingFailureTerminal(ApiFailure(it, "Invitation authorization ended"))) }

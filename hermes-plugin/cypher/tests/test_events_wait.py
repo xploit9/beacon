@@ -81,6 +81,25 @@ def test_event_wait_times_out_empty_and_absent_wait_stays_immediate(harness):
     assert immediate.status_code == 200 and immediate.json() == {'events': [], 'next_cursor': 0}
 
 
+def test_outbox_sequence_reset_replays_events_from_zero(harness):
+    api, client, _, _, _ = harness
+    now = time.time()
+    with api.mobile.connect() as conn:
+        conn.execute(
+            "INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason) VALUES(?,?,?,?,?,?,?,?)",
+            ('reset-task-result', 'owner', 'default', 'task_result', 'native-stored', now, now + 300, 'fixture result'),
+        )
+        seq = conn.execute("SELECT seq FROM notices WHERE id='reset-task-result'").fetchone()[0]
+
+    response = client.get(EVENTS, params={'after': seq + 10})
+
+    assert response.status_code == 200
+    page = response.json()
+    assert page['reset'] is True
+    assert [event['event_id'] for event in page['events']] == ['reset-task-result']
+    assert page['next_cursor'] == seq
+
+
 def test_event_wait_is_clamped_to_zero_through_twenty_five_seconds(harness, monkeypatch):
     api, _, _, _, _ = harness
     assert api._bounded_event_wait(-1) == 0
