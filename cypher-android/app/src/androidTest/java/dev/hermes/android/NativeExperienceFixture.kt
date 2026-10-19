@@ -28,6 +28,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     val boardTasks = ConcurrentHashMap<String, JSONObject>()
     val projects = ConcurrentHashMap<String, JSONObject>()
     val closedSessions = ConcurrentHashMap.newKeySet<String>()
+    @Volatile var deleteMissingAfterClose = false
     @Volatile var skillEnabled = true
     @Volatile var skillText = "---\nname: travel-planning\ndescription: Plan a trip\n---\nRead verified sources."
     @Volatile var rejectSkillSave = false
@@ -665,7 +666,11 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             }
             "session.set_hidden" -> { val hidden = params.getBoolean("hidden"); sessions.getValue(id).getJSONObject("info").put("hidden", hidden); json("hidden" to hidden, "session_key" to id) }
             "session.close" -> { closedSessions.add(id); json("closed" to true) }
-            "session.delete" -> { require(id in closedSessions) { "cannot delete an active session" }; sessions.remove(id); json("deleted" to id) }
+            "session.delete" -> {
+                require(id in closedSessions) { "cannot delete an active session" }
+                if (deleteMissingAfterClose) { sessions.remove(id); throw FixtureRpcFailure(4007, "session not found") }
+                sessions.remove(id); json("deleted" to id)
+            }
             "session.branch" -> { val key = "branch-${sequence.incrementAndGet()}"; val rows = sessions.getValue(id).getJSONArray("messages"); history(key, params.string("name", "Branch"), JSONArray((0 until params.optInt("count", rows.length()).coerceIn(0, rows.length())).map(rows::get))).also { sessions[key] = it } }
             "session.compress" -> json("status" to "aborted")
             "session.undo" -> { sessions.getValue(id).put("messages", JSONArray()); json("ok" to true) }

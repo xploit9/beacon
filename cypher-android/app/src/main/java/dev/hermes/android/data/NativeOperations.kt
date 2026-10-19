@@ -203,11 +203,14 @@ internal class NativeOperations(private val c: CypherClient) {
                 require(target.storedSessionId == sid()) { "Conversation identity changed. Reopen before deleting." }
                 require(fresh.opt("running") is Boolean) { "Refresh this conversation to confirm whether a reply is still running." }
                 require(fresh.opt("running") == false && fresh.opt("inflight") in listOf(null, JSONObject.NULL) && fresh.opt("queued") in listOf(null, JSONObject.NULL)) { "Stop the current reply before deleting this conversation." }
-                val reserved = c.nativeRequest("/api/plugins/cypher/mobile/sessions/${target.storedSessionId}/reserve", "POST", JSONObject())
-                require(reserved.optBoolean("reserved") && reserved.string("stored_session_id") == target.storedSessionId && reserved.string("profile") == c.scope.profile) { "Conversation identity could not be confirmed before deletion." }
                 val closed = c.nativeRpc("session.close", json("session_id" to target.runtimeSessionId))
-                require(closed.opt("closed") is Boolean) { "Conversation close was not confirmed." }
-                return c.nativeRpc("session.delete", json("session_id" to target.storedSessionId)).also {
+                require(closed.opt("closed") == true) { "Conversation close was not confirmed." }
+                val deleted = try { c.nativeRpc("session.delete", json("session_id" to target.storedSessionId)) }
+                catch (error: ApiFailure) {
+                    if (error.status != 4007 || error.message != "session not found") throw error
+                    json("deleted" to target.storedSessionId)
+                }
+                return deleted.also {
                     require(it.string("deleted") == target.storedSessionId) { "Deletion was not confirmed. Refresh before trying again." }
                 }
             }

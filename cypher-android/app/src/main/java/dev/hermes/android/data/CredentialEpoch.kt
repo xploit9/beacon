@@ -8,7 +8,7 @@ internal class CredentialEpoch {
     private val revision=AtomicLong()
     private val writers=AtomicInteger()
     fun readVersion(): Long? = revision.get().takeIf { writers.get()==0 }
-    fun current(version: Long): Boolean = writers.get()==0 && revision.get()==version && writers.get()==0 && revision.get()==version
+    fun current(version: Long): Boolean = writers.get()==0 && revision.get()==version
     fun <T> mutate(write: () -> T): T {
         writers.incrementAndGet();revision.incrementAndGet()
         try { return write() }

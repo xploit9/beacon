@@ -1176,7 +1176,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         if (value == "Cypher" && _ui.value.authenticated) transition = openCypher()
         else if (value != "Cypher") {
             ++cypherGeneration; _ui.update { it.copy(cypherOpening = false, cypherError = "") }
-            if (previous == "Cypher") transition = returnFromAssistant()
+            if (assistantReturn() != null) transition = returnFromAssistant()
             if (value == "Chat" && resumeDraft && canComposeInitialChat()) {
                 val active = client
                 val owner = active?.scope ?: cachedOwnerScope
@@ -2871,6 +2871,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val startsCall=action in setOf("answer","callback")
         if (startsCall) { if (_incomingBusy.value) return@launch; _incomingBusy.value = true }
         var generation = -1
+        var temporaryClient: CypherClient? = null
         try {
             val credentialVersion=app.auth.authorityEpoch.readVersion()
             require(dev.hermes.android.push.validOpaque(source) && dev.hermes.android.push.validOpaque(event)) { "Notification route is invalid" }
@@ -2887,6 +2888,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             resetAppUpdate()
             cancelNewChatWork()
             val c = app.push.clientFor(binding)
+            temporaryClient = c
             val bootstrap = c.bootstrap()
             require(c.auth.owner == owner && c.auth.profile == binding.string("profile", "default")) { "Notification authorization no longer matches this account" }
             val route = c.nativeRequest("/api/plugins/cypher/mobile/notifications/events/$event")
@@ -2903,7 +2905,10 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             if (app.calls.state.value.active && !keepsRestoredCall(app.calls.state.value.conversationScope,c.scope,false)) app.calls.hangup()
             require(persistAuthIfCurrent(c.auth, credentialVersion)) { "Sign-in changed while opening this notification" }
             if (generation != originGeneration) return@launch
-            client = c.detached(); cachedOwnerScope = null
+            val refreshedAuth = withContext(Dispatchers.IO) { app.auth.read(origin) }
+            require(refreshedAuth.authorizesPushSource(notificationScope) && refreshedAuth.profile == notificationScope.profile) { "Sign-in changed while opening this notification" }
+            client = profileSwitchClientFactoryForTest?.invoke(refreshedAuth) ?: CypherClient(refreshedAuth, app.auth, persistContext = false)
+            cachedOwnerScope = null
             val restoredClient = requireNotNull(client)
             restoreBotMode(restoredClient.scope)
             if (generation != originGeneration || client !== restoredClient) return@launch
@@ -2945,7 +2950,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             if(needsVoiceKey) { pendingIncomingAfterKey=Triple(source,event,action);more(voiceKeySetupPage()) }
             if (e !is CancellationException && !needsVoiceKey && (generation == -1 || generation == originGeneration)) _ui.update { it.copy(loading = false, restoringSession = false, error = if (e is ApiFailure && e.status == 401) "Sign in to the notification's owner account to open this activity" else e.message.orEmpty()) }
         }
-        finally { if (startsCall) _incomingBusy.value = false }
+        finally { temporaryClient?.closeNative(); if (startsCall) _incomingBusy.value = false }
     }
     override fun onCleared() { botMode.clear(); sessionWatch?.cancel(); stopReadAloud(); speech?.shutdown(); super.onCleared() }
 }

@@ -1272,8 +1272,9 @@ class NativeExperienceUiTest {
             val switchesBefore = fixture.requests.count { it.string("path") == "/api/auth/me" }
             val target = fixture.scope.session("chat-b")
             app.calls.update { CallState(active = true, state = "listening", callId = callId, conversationScope = target) }
-            compose.runOnIdle { vm.openCurrentCall(callId) }
-
+            lateinit var opening: kotlinx.coroutines.Job
+            compose.runOnIdle { opening = vm.openCurrentCall(callId) }
+            runBlocking { kotlinx.coroutines.withTimeout(15_000) { opening.join() } }
             await { vm.ui.value.tab == "Chat" && vm.ui.value.profile == target.profile && vm.chat.value.sessionId == target.session && vm.chat.value.projectionReady }
             assertEquals(switchesBefore + 1, fixture.requests.count { it.string("path") == "/api/auth/me" })
             assertTrue(app.calls.state.value.active)
@@ -1335,6 +1336,61 @@ class NativeExperienceUiTest {
         } finally { app.calls.update { CallState() } }
     }
 
+    @Test fun pushForAnotherProfilePersistsSubsequentBearerRefreshes() = withFixture { vm, fixture ->
+        val source = "push-refresh-source"
+        val event = "push-refresh-event"
+        val scope = fixture.scope.copy(profile = "coder")
+        val now = System.currentTimeMillis() / 1000
+        val refreshToken = "push-refresh-token"
+        val bearer = dev.hermes.android.data.NativeBearerRecord("push-access", refreshToken, now + 3600, fixture.scope.origin, fixture.scope.owner, "default", "fixture", now - 60)
+        val auth = dev.hermes.android.data.AuthContext(fixture.scope.origin, emptyList(), fixture.scope.owner, "default", backend = "hermes-dashboard", bearer = bearer)
+        val previousFactory = dev.hermes.android.push.KeepConnectedService.clientFactoryForTest
+        val pushClients = mutableListOf<dev.hermes.android.data.CypherClient>()
+        val profileClients = mutableListOf<dev.hermes.android.data.CypherClient>()
+        try {
+            fixture.currentRefreshToken = refreshToken
+            runBlocking { app.auth.persist(auth) }
+            assertTrue(app.push.bindKeepConnectedSource(scope, source))
+            fixture.incomingNotification = json(
+                "seq" to 1,
+                "event_id" to event,
+                "owner_id" to scope.owner,
+                "profile" to scope.profile,
+                "kind" to "task_result",
+                "state" to "finished",
+                "source_ref" to source,
+                "session_id" to "chat-b",
+                "reason" to "Profile refresh test",
+            )
+            dev.hermes.android.push.KeepConnectedService.clientFactoryForTest = { current, store -> fixture.freshClientFor(current, store).also(pushClients::add) }
+            val profileSwitchClientFactory: (dev.hermes.android.data.AuthContext) -> dev.hermes.android.data.CypherClient = { current ->
+                fixture.freshClientFor(current, app.auth).also(profileClients::add)
+            }
+            field(vm, "profileSwitchClientFactoryForTest", profileSwitchClientFactory)
+            fixture.forceExpiredAccessToken = bearer.accessToken
+            vm.handlePush(source, event)
+            await { vm.ui.value.tab == "Chat" && vm.ui.value.profile == scope.profile && vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady }
+            val firstRefresh = requireNotNull(app.auth.read(auth.origin).bearer)
+            assertEquals(scope.profile, firstRefresh.profile)
+            assertEquals(fixture.currentRefreshToken, firstRefresh.refreshToken)
+            assertEquals(listOf(refreshToken), fixture.refreshTokensUsed.toList())
+
+            fixture.forceExpiredAccessToken = firstRefresh.accessToken
+            runBlocking { vm.refreshSessions(force = true).join() }
+            await { fixture.refreshTokensUsed.size == 2 && app.auth.read(auth.origin).bearer?.refreshToken == fixture.currentRefreshToken }
+            assertEquals(listOf(refreshToken, firstRefresh.refreshToken), fixture.refreshTokensUsed.toList())
+            assertEquals(fixture.currentRefreshToken, vm.client?.auth?.bearer?.refreshToken)
+            receipts += "Opening a notification for another profile rebuilds the active client from stored auth, so its next bearer rotation is persisted."
+        } finally {
+            fixture.forceExpiredAccessToken = null
+            vm.client?.closeNative()
+            profileClients.forEach { it.closeNative() }
+            pushClients.forEach { it.closeNative() }
+            dev.hermes.android.push.KeepConnectedService.clientFactoryForTest = previousFactory
+            app.getSharedPreferences("push-binding", android.content.Context.MODE_PRIVATE).edit().remove("source:" + source.digest()).commit()
+        }
+    }
+
     @Test fun leavingTheAssistantTabNeverLeavesItsConversationInChat() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.newChat() }
         await { vm.chat.value.sessionId.isBlank() || vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.newChatOpening }
@@ -1346,6 +1402,48 @@ class NativeExperienceUiTest {
         compose.waitUntil(5_000) { vm.chat.value.sessionId != assistant }
         assertEquals("Chat returns to the new chat it had", before, vm.chat.value.sessionId)
         receipts += "Leaving the assistant tab returns Chat to its own chat, even a new one, never the assistant's conversation."
+    }
+
+    @Test fun leavingAssistantThroughSettingsReturnsToChatsAndReenteringFromMoreStaysOnCypher() = withFixture { vm, fixture ->
+        val assistantScope = fixture.scope.copy(profile = "coder")
+        val profileClients = mutableListOf<dev.hermes.android.data.CypherClient>()
+        var assistantSession = ""
+        try {
+            val profileSwitchClientFactory: (dev.hermes.android.data.AuthContext) -> dev.hermes.android.data.CypherClient = { auth ->
+                fixture.freshClientFor(auth, app.auth).also(profileClients::add)
+            }
+            field(vm, "profileSwitchClientFactoryForTest", profileSwitchClientFactory)
+            runBlocking {
+                app.cache.delete(fixture.scope.session("chat-b"), "session")
+                listOf("cypher-session", "cypher-opening", "selected-session").forEach { app.cache.delete(assistantScope, it) }
+                app.preferences.edit { it[stringPreferencesKey("assistant_profile")] = "coder" }
+            }
+            await { vm.preferences.value.assistantProfile == "coder" }
+            compose.runOnIdle { vm.selectSession("chat-b") }
+            await { vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady }
+            compose.runOnIdle { vm.tab("Cypher") }
+            await { vm.ui.value.tab == "Cypher" && vm.ui.value.profile == "coder" && !vm.ui.value.cypherOpening && vm.chat.value.projectionReady && vm.isCypherConversation() }
+            assistantSession = vm.chat.value.sessionId
+
+            compose.runOnIdle { vm.more("Settings") }
+            await { vm.ui.value.tab == "More" && vm.ui.value.morePage == "Settings" }
+            compose.runOnIdle { vm.tab("Chat") }
+            await { vm.ui.value.tab == "Chat" && vm.ui.value.profile == fixture.scope.profile && vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady }
+
+            compose.runOnIdle { vm.more("Settings"); vm.tab("Cypher") }
+            await { vm.ui.value.tab == "Cypher" && vm.ui.value.profile == "coder" && !vm.ui.value.cypherOpening && vm.chat.value.sessionId == assistantSession && vm.chat.value.projectionReady }
+            receipts += "Leaving Cypher through Settings restores the original chat profile and session once; entering Cypher from More keeps its assistant profile."
+        } finally {
+            vm.client?.closeNative()
+            profileClients.forEach { it.closeNative() }
+            runBlocking {
+                app.preferences.edit { it.remove(stringPreferencesKey("assistant_profile")); it.remove(stringPreferencesKey("assistant_return")) }
+                app.cache.delete(fixture.scope.session("chat-b"), "session")
+                app.cache.delete(fixture.scope, "selected-session")
+                listOf("cypher-session", "cypher-opening", "selected-session").forEach { app.cache.delete(assistantScope, it) }
+                if (assistantSession.isNotBlank()) app.cache.delete(assistantScope.session(assistantSession), "session")
+            }
+        }
     }
 
     @Test fun pickingAProfileOnTheAssistantTabIsForTheChats() = withFixture { vm, fixture ->
@@ -2820,6 +2918,7 @@ class NativeExperienceUiTest {
         assertTrue(fixture.sessions.containsKey(branch))
         assertFalse(fixture.closedSessions.contains(branch))
         fixture.sessions[branch] = fixture.sessions.getValue(branch).copy().put("running", false)
+        fixture.deleteMissingAfterClose = true
         compose.onNodeWithText("Delete", useUnmergedTree = true).assertIsEnabled()
         compose.onNodeWithText("Delete", useUnmergedTree = true).performClick()
         try { await { !fixture.sessions.containsKey(branch) && vm.chat.value.sessionId != branch && !vm.ui.value.newChatOpening } }
@@ -2828,9 +2927,10 @@ class NativeExperienceUiTest {
             throw AssertionError("Delete recovery: present=${fixture.sessions.containsKey(branch)} id=${vm.chat.value.sessionId} opening=${vm.ui.value.newChatOpening} form=${vm.form.value?.error} error=${vm.ui.value.error} requests=$calls", error)
         }
         assertTrue(fixture.closedSessions.contains(branch))
+        assertFalse(fixture.requests.any { it.string("path").startsWith("/api/plugins/cypher/mobile/sessions/") && it.string("path").endsWith("/reserve") })
         assertEquals(2, fixture.sessions.getValue("chat-a").getJSONArray("messages").length())
         assertTrue(fixture.sessions.containsKey("chat-b"))
-        receipts += "Conversation archive/unarchive, compression result, branch/rename/undo and deletion use native receipts. Active work refuses deletion; only the idle confirmed target closes and deletes."
+        receipts += "Conversation archive/unarchive, compression result, branch/rename/undo and deletion use native receipts. Active work refuses deletion; an already-missing chat after confirmed close counts as deleted without the optional plugin."
         capture("audit-conversation-management")
     }
 
