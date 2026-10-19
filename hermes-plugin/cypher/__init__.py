@@ -52,7 +52,7 @@ def call_user(args,session_id=None,**kwargs):
         native.verify(owner,provider,profile,stored)
         reason=args.get('reason',row.get('title','')) if isinstance(args,dict) else row.get('title','')
         if reason is None: reason=''
-        if not isinstance(reason,str) or len(reason)>240: raise ValueError('Invalid callback reason')
+        reason=observers.reason_text(reason)
         event_id=mobile.invitation(owner,profile,stored,reason)
         # The durable outbox is the authority. FCM is asynchronous wake-up only.
         return json.dumps({'event_id':event_id,'status':'pending','expires_in_seconds':120,'conversation_id':stored})

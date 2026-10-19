@@ -41,7 +41,20 @@ async def lifespan(app):
     try: yield
     finally: await stop_watcher()
 router=APIRouter(lifespan=lifespan)
+def enforce_request_policy(request):
+    site=request.headers.get('sec-fetch-site')
+    if site is not None and site.strip().casefold() not in ('same-origin','none'):
+        raise HTTPException(403,'Cross-site requests are not allowed')
+    method=request.method.upper()
+    if method=='GET': return
+    content_type=request.headers.get('content-type')
+    has_body=(request.headers.get('content-length') not in (None,'0')
+              or request.headers.get('transfer-encoding') is not None)
+    if not has_body: return
+    if not content_type or content_type.split(';',1)[0].strip().casefold()!='application/json':
+        raise HTTPException(415,'JSON content type required')
 def identity(request,profile=None,owner_only=False,allow_loopback=False):
+    enforce_request_policy(request)
     auth_required=bool(getattr(request.app.state,'auth_required',False))
     session=getattr(request.state,'session',None)
     cfg=mobile.settings()
@@ -882,6 +895,10 @@ async def query_body(request,call_id,kind):
 async def get_context(call_id:str,request:Request):
     owner,provider,row,cfg=await call(request,call_id)
     result=await feature(voice_context.context,owner,provider,row['profile'],row['conversation'],call_id,timeout=8)
+    callback=result.get('callback')
+    reason=callback.get('reason','') if isinstance(callback,dict) else ''
+    result['reason']=reason if isinstance(reason,str) else ''
+    result['greeting']="I'm calling about your saved Hermes update." if callback else "I'm here."
     display=getattr(request.state.session,'display_name',None)
     if isinstance(display,str) and display: result['owner_display_name']=display[:120]
     return result

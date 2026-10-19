@@ -15,6 +15,22 @@ CLAIM_FIELDS = {"id", "message_id", "messageid", "event_id", "eventid", "task_id
                 "url", "uri", "link", "web_url", "subject", "title", "name", "summary"}
 
 
+INSTRUCTION_MARKERS = ("ignore previous", "ignore all", "system prompt", "override policy", "new instructions",
+                       "pre-approved", "preapproved", "send email", "mark as read", "tool_call")
+CALLBACK_REASON_CHARACTERS = re.compile(r"""[\w .,!?'"():;/@#&+-]*\Z""", re.UNICODE)
+
+
+def reason_text(value, limit=240):
+    """Every ring/notice reason passes here: one line of plain text, never instruction-shaped."""
+    if not isinstance(value, str) or len(value) > limit:
+        raise ValueError("Invalid callback reason")
+    if any(c in "\r\n" or ord(c) < 32 for c in value) or not CALLBACK_REASON_CHARACTERS.fullmatch(value):
+        raise ValueError("A callback reason must be a single line of plain text")
+    if any(term in value.casefold() for term in INSTRUCTION_MARKERS):
+        raise ValueError("Instruction-like text cannot be relayed as trusted call guidance")
+    return value
+
+
 def _number(value):
     try:
         value = float(value.decode("utf-8") if isinstance(value, bytes) else value)
@@ -242,8 +258,9 @@ def email_notice(mobile, native, cfg, profile, session_id, args, now):
         raise ValueError("Invalid Proactive signal")
     if not isinstance(item_id, str) or not 1 <= len(item_id.strip()) <= 256:
         raise ValueError("A source-returned item id, title, or URL is required")
-    if not isinstance(reason, str) or not reason.strip() or len(reason) > 240:
+    if not isinstance(reason, str) or not reason.strip():
         raise ValueError("A brief reason is required")
+    reason = reason_text(reason)
     setup = _setup(mobile, owner, profile, {name: [] for name in SIGNALS})
     if not enabled(mobile, owner, profile) or not _setup_complete(mobile, owner, profile):
         raise ValueError("Proactive is not enabled")
@@ -273,7 +290,7 @@ def email_notice(mobile, native, cfg, profile, session_id, args, now):
         raise ValueError("Choose an owned assistant conversation before enabling Proactive")
     native.verify(owner, provider, profile, stored)
     request_label = f"Request {request_id}: {request['text'][:100]}"
-    reason_text = (request_label + "; " + reason.strip())[:240]
+    relay_reason = (request_label + "; " + reason.strip())[:240]
     dedupe = "proactive-alert:" + owner + ":" + profile + ":" + request_id + ":" + _digest(source_id + "\0" + item_id)
     if request["action"] == "call":
         from cypher_mobile import invitation
@@ -289,11 +306,11 @@ def email_notice(mobile, native, cfg, profile, session_id, args, now):
             quiet_blocked = _inside_quiet(now, setup) and request.get("night") is not True
             callbacks_ready = cfg.get("callback_tool_enabled") is True and cfg.get("scheduled_callbacks_enabled") is True
             if not quiet_blocked and callbacks_ready and count < CALL_LIMIT:
-                event = invitation(owner, profile, stored, reason_text)
+                event = invitation(owner, profile, stored, relay_reason)
                 with mobile.connect() as conn:
                     conn.execute("INSERT INTO meta(key,value) VALUES(?,?)",
                                  ("proactive-call:" + owner + ":" + profile + ":" + uuid.uuid4().hex,
                                   str(now.timestamp()).encode()))
                     conn.execute("INSERT INTO meta(key,value) VALUES(?,?)", (dedupe, str(now.timestamp()).encode()))
                 return {"status": "pending", "event_id": event, "conversation_id": stored}
-    return _notice(mobile, owner, profile, stored, reason_text, dedupe, now)
+    return _notice(mobile, owner, profile, stored, relay_reason, dedupe, now)

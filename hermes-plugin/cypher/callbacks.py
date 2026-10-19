@@ -1,4 +1,5 @@
 """Native one-shot callback scheduling; the scheduler and durable outbox own delivery."""
+import importlib.util
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import hashlib
@@ -7,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import re
+import sys
 import tempfile
 
 ZONE = 'Asia/Dubai'
@@ -15,6 +17,11 @@ CALLBACK_EARLY_TOLERANCE_SECONDS=1
 CALLBACK_MARKER_RETENTION_SECONDS=CALLBACK_WINDOW_SECONDS+7*24*60*60
 CALLBACK_MARKER_PRUNE_BATCH=256
 _CALLBACK_EVENT=re.compile(r'[0-9a-f]{64}\Z')
+_OBSERVER_KEY='cypher_observers'
+observers=sys.modules.get(_OBSERVER_KEY)
+if observers is None:
+    spec=importlib.util.spec_from_file_location(_OBSERVER_KEY,Path(__file__).with_name('observers.py'))
+    observers=importlib.util.module_from_spec(spec);sys.modules[_OBSERVER_KEY]=observers;spec.loader.exec_module(observers)
 
 def _prune_expired(conn,now):
     cutoff=now-CALLBACK_MARKER_RETENTION_SECONDS-1
@@ -84,7 +91,8 @@ def schedule(mobile,native,owner,provider,row,cfg,value,now=None):
     native.verify(owner,provider,profile,stored)
     request=value.get('request_id');reason=value.get('reason')
     if not isinstance(request,str) or not mobile.ID.fullmatch(request): raise ValueError('Stable callback request_id required')
-    if not isinstance(reason,str) or not reason.strip() or len(reason)>240: raise ValueError('Brief callback reason required')
+    reason=observers.reason_text(reason)
+    if not reason.strip(): raise ValueError('Brief callback reason required')
     fingerprint=hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()
     key='scheduled-callback:'+hashlib.sha256((owner+'\0'+profile+'\0'+request).encode()).hexdigest()
     with mobile.LOCK:
