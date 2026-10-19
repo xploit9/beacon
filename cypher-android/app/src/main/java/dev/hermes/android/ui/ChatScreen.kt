@@ -76,6 +76,12 @@ internal fun separateToolResultIds(messages: List<JSONObject>): Set<String> = me
 
 internal fun toolCallResultId(tool: JSONObject): String = tool.string("tool_call_id").ifBlank { toolIdentity(tool) }
 
+/** Hermes stores the tool that produced a result row as `tool_name`; title the row after it. */
+internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> = messages.asSequence()
+    .filter { (it.string("role") == "tool" || it.string("role") == "function") && it.string("id").isNotBlank() }
+    .mapNotNull { row -> row.string("tool_name").takeIf { it.matches(Regex("[A-Za-z0-9_.:-]{1,80}")) }?.let { row.string("id") to it.replace('_', ' ').replaceFirstChar(Char::titlecase) + " result" } }
+    .toMap()
+
 @Composable fun SessionList(vm: CypherViewModel, modifier: Modifier = Modifier, beforeHistory: @Composable () -> Unit = {}) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val chat by vm.chat.collectAsStateWithLifecycle()
@@ -116,6 +122,7 @@ internal fun toolCallResultId(tool: JSONObject): String = tool.string("tool_call
     val chat = chatState.copy(messages = messages)
     val callMessagesById = remember(chatState.callMessages) { chatState.callMessages.associateBy { "call:${it.eventId}" } }
     val separateToolResults = remember(chat.raw) { separateToolResultIds(chat.raw.rows("messages")) }
+    val toolResultTitles = remember(chat.raw) { toolResultTitles(chat.raw.rows("messages")) }
     val call by vm.app.calls.state.collectAsStateWithLifecycle()
     var surfacedCallError by rememberSaveable { mutableStateOf("") }
     LaunchedEffect(call.error) {
@@ -308,7 +315,7 @@ internal fun toolCallResultId(tool: JSONObject): String = tool.string("tool_call
                     }
                 }
                 if (search.isNotBlank() && visibleMessages.isEmpty()) item { Text("No messages match your search.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                items(visibleMessages, key = { it.value.id }) { (index, message) -> MessageRow(vm, message, index, callMessagesById[message.id], separateToolResults, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }) }
+                items(visibleMessages, key = { it.value.id }) { (index, message) -> MessageRow(vm, message, index, callMessagesById[message.id], separateToolResults, toolResultTitles[message.id].orEmpty(), onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }) }
                 if (chat.streamId.isNotBlank() || chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank()) item("live") {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         if (chat.liveText.isNotBlank()) AssistantSurface { Markdown(chat.liveText, vm, vm.authenticatedScope(), interactive = false) }
@@ -546,11 +553,11 @@ internal fun acceptsInitialConversationEdit(
 }
 
 
-@Composable private fun MessageRow(vm: CypherViewModel, message: Message, index: Int, callTranscript: CallTranscript? = null, separateToolResults: Set<String> = emptySet(), onToolExpanded: (Boolean) -> Unit = {}) {
+@Composable private fun MessageRow(vm: CypherViewModel, message: Message, index: Int, callTranscript: CallTranscript? = null, separateToolResults: Set<String> = emptySet(), resultTitle: String = "", onToolExpanded: (Boolean) -> Unit = {}) {
     val context = LocalContext.current
     val origin = vm.authenticatedScope()?.session(message.sessionId.ifBlank { vm.chat.value.sessionId })
     val settings = LocalCypherSettings.current
-    val presentation = chatPresentation(message.role, message.text, tools = message.tools)
+    val presentation = chatPresentation(message.role, message.text, JSONObject().put("name", resultTitle), tools = message.tools)
     val reading by vm.readingAloud.collectAsStateWithLifecycle()
     val currentCall by vm.app.calls.state.collectAsStateWithLifecycle()
     var actions by remember(message.id) { mutableStateOf(false) }

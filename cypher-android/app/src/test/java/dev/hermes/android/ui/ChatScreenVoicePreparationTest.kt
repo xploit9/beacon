@@ -49,4 +49,17 @@ class ChatScreenVoicePreparationTest {
         assertEquals("tool call", toolDisplayName(call("tool_call", "{\"name\":\"<script>\"}")))
         assertEquals("web search", toolDisplayName(JSONObject().put("name", "web_search")))
     }
+
+    @Test fun toolResultRowsAreTitledAfterTheStoredToolName() {
+        val rows = listOf(
+            JSONObject().put("id", 19784).put("role", "tool").put("tool_name", "cypher_call_user"),
+            JSONObject().put("id", 19776).put("role", "tool").put("tool_name", "hindsight_recall"),
+            JSONObject().put("id", 19777).put("role", "tool").put("tool_name", "<b>x</b>"),
+            JSONObject().put("id", 19778).put("role", "assistant").put("tool_name", "ignored"),
+        )
+        val titles = toolResultTitles(rows)
+        assertEquals("Cypher call user result", titles["19784"])
+        assertEquals("Hindsight recall result", titles["19776"])
+        assertEquals(setOf("19784", "19776"), titles.keys)
+    }
 }
