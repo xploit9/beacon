@@ -1,5 +1,6 @@
 package dev.hermes.android
 
+import androidx.compose.ui.platform.testTag
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -137,7 +138,7 @@ class ProactiveUiTest {
             compose.runOnUiThread { vm = ViewModelProvider(store, viewModelFactory { initializer { CypherViewModel(app, SavedStateHandle()) } })[CypherViewModel::class.java] }
             compose.runOnIdle {
                 field(vm, "originGeneration", 100)
-                vm.client = fixture.client
+                field(vm, "client", fixture.client)
                 field(vm, "profileSwitchClientFactoryForTest", profileSwitchClientFactory)
                 field(vm, "sourceScope", fixture.scope.session("chat-a"))
                 app.calls.ownerScope = fixture.scope

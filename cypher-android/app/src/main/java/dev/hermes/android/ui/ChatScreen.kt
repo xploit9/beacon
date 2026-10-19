@@ -259,7 +259,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
     val activeHere = call.active && call.conversationScope == vm.authenticatedScope()
     val scope = rememberCoroutineScope()
     LaunchedEffect(promptSignature, promptText, promptMemory) {
-        if (pluginStatus != "absent" && promptSignature.isNotBlank() && promptText.isBlank() && promptMemory != null && promptMemory.first != promptSignature)
+        if (pluginStatus != "absent" && promptSignature.isNotBlank() && promptText.isBlank() && promptMemory?.let { it.first != promptSignature } == true)
             proactiveContext.preferences.edit { it[proactivePromptDismissedKey] = json("state" to promptSignature, "dismissed" to "").toString() }
     }
     LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, ui.tab, preferences.assistantProfile, pluginStatus) {

@@ -19,6 +19,7 @@ import dev.hermes.android.CypherViewModel
 import dev.hermes.android.core.Scope
 import dev.hermes.android.core.rows
 import dev.hermes.android.core.string
+import dev.hermes.android.core.json
 import dev.hermes.android.data.*
 import dev.hermes.android.voice.*
 import kotlinx.coroutines.CancellationException
