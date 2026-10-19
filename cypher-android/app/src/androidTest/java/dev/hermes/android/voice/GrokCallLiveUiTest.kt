@@ -37,7 +37,7 @@ class GrokCallLiveUiTest {
         lateinit var vm:CypherViewModel
         rule.runOnIdle { vm=ViewModelProvider(rule.activity)[CypherViewModel::class.java] }
         var reader:CypherClient?=null;var session="";var runtime="";var call=""
-        val admittedStyles=ConcurrentLinkedQueue<JSONObject>()
+        val callAdmissions=ConcurrentLinkedQueue<JSONObject>()
         val requests=ConcurrentLinkedQueue<String>();var started=0L
         val rejectGemini=java.util.concurrent.atomic.AtomicBoolean(false)
         var phase="restore"
@@ -83,9 +83,11 @@ class GrokCallLiveUiTest {
             val original=requireNotNull(vm.client)
             val traced=original.http.newBuilder().addNetworkInterceptor { chain ->
                 val request=chain.request()
-                if(request.url.pathSegments.last()=="calls"&&request.method=="POST"&&rejectGemini.get()) {
+                if(request.url.pathSegments.last()=="calls"&&request.method=="POST") {
                     val buffer=okio.Buffer();request.body?.writeTo(buffer)
-                    if(JSONObject(buffer.readUtf8()).optString("voice_provider")=="gemini") throw ApiFailure(503,"QA simulated Gemini admission unavailable")
+                    val body=JSONObject(buffer.readUtf8())
+                    callAdmissions.add(body)
+                    if(rejectGemini.get()&&body.optString("voice_provider")=="gemini") throw ApiFailure(503,"QA simulated Gemini admission unavailable")
                 }
                 var invocation: String?=null
                 if(request.url.pathSegments.last()=="invoke") {
@@ -96,13 +98,7 @@ class GrokCallLiveUiTest {
                 }
                 require(request.url.pathSegments.last() !in setOf("jobs","callback","decision")) { "No delegated work, write approval or callback in this test" }
                 chain.proceed(request).also { response ->
-                    if(response.isSuccessful) {
-                        invocation?.let(requests::add)
-                        if(request.url.pathSegments.last()=="token") {
-                            val grant=JSONObject(response.peekBody(65536).string())
-                            admittedStyles.add(json("provider" to grant.string("provider"),"voice" to grant.string("voice"),"personality" to grant.string("personality")))
-                        }
-                    }
+                    if(response.isSuccessful) invocation?.let(requests::add)
                 }
             }.build()
             rule.runOnIdle { CypherViewModel::class.java.getDeclaredField("client").apply { isAccessible=true }.set(vm,CypherClient(original.auth.copy(cookies=original.jar.snapshot()),null,null,traced){}) ; vm.tab("Chat") }
@@ -110,8 +106,11 @@ class GrokCallLiveUiTest {
             phase="connect-grok"
             await(45000) { app.calls.state.value.active&&app.calls.state.value.state=="listening"&&app.calls.state.value.transcripts.any { it.role=="assistant" } }
             call=app.calls.state.value.callId
-            assertTrue(admittedStyles.any { it.string("provider")=="grok"&&it.string("voice")==targetVoice&&it.string("personality")==targetPersonality })
             assertEquals("grok",app.calls.state.value.voiceProvider)
+            val admission=callAdmissions.firstOrNull { it.optString("voice_provider")=="grok" }
+            assertNotNull("The phone-key Grok admission must be captured",admission)
+            assertTrue(admission!!.optBoolean("client_key"))
+            assertFalse(admission.has("api_key")||admission.has("token"))
             for(control in listOf("xara-camera","cypher-share-screen")) {
                 rule.onNodeWithTag(control).assertIsEnabled().performClick()
                 rule.onNodeWithTag("cypher-cancel-vision-switch").performClick()
@@ -121,6 +120,14 @@ class GrokCallLiveUiTest {
             }
             val service=requireNotNull(app.calls.service)
             val direct=CypherCallService::class.java.getDeclaredField("directVoice").apply { isAccessible=true }.get(service) as DirectVoice
+            val callCredentials=DirectVoice::class.java.getDeclaredField("credentials").apply { isAccessible=true }.get(direct) as dev.hermes.android.data.VoiceSessionCredentials
+            assertEquals("grok",callCredentials.provider)
+            assertEquals(targetVoice,callCredentials.voice)
+            assertEquals(targetPersonality,callCredentials.personality)
+            val sessionUpdate=GrokWire().outbound(GeminiWire.setup(callCredentials.model,callCredentials.voice,null,
+                JSONObject().put("personality_instruction",callCredentials.personalityInstruction))).single().getJSONObject("session")
+            assertEquals(targetVoice,sessionUpdate.getString("voice"))
+            assertTrue(sessionUpdate.getString("instructions").contains(callCredentials.personalityInstruction))
             started=System.nanoTime()
             phase="direct-tool"
             val question="Use discover_tools to find read-only scrapling_fetch, then invoke_tool to fetch https://example.com with extraction_type text. Tell me the result. Do not delegate, send mail, write anything or call back."
@@ -205,7 +212,7 @@ class GrokCallLiveUiTest {
                 await(45000) { !app.calls.state.value.active&&app.calls.service==null }
             }
             File(app.filesDir,"vision-handoff-proof.json").writeText(json("cancel_preserved_grok" to true,"handoffs" to handoffs,"no_active_recorder" to app.getSystemService(android.media.AudioManager::class.java).activeRecordingConfigurations.isEmpty(),"version_code" to BuildConfig.VERSION_CODE).toString(),Charsets.UTF_8)
-            File(app.filesDir,"voice-settings-proof.json").writeText(json("voice_and_personality_ui_saved" to true,"grok_connected_with_selected_settings" to true,"admitted_styles" to JSONArray(admittedStyles.toList()),"version_code" to BuildConfig.VERSION_CODE).toString(),Charsets.UTF_8)
+            File(app.filesDir,"voice-settings-proof.json").writeText(json("voice_and_personality_ui_saved" to true,"grok_connected_with_selected_settings" to true,"phone_key_admission" to true,"client_key" to admission.optBoolean("client_key"),"phone_voice" to callCredentials.voice,"phone_personality" to callCredentials.personality,"session_update_voice" to sessionUpdate.getString("voice"),"personality_instructions_sent" to sessionUpdate.getString("instructions").contains(callCredentials.personalityInstruction),"version_code" to BuildConfig.VERSION_CODE).toString(),Charsets.UTF_8)
         } catch(error:Throwable) { primary=error;throw error }
         finally { withContext(NonCancellable) {
             val cleanup=mutableListOf<Throwable>()

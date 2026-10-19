@@ -37,3 +37,34 @@ def test_unowned_history_blocks_profile_reads(harness, monkeypatch):
     monkeypatch.setattr(voice, 'scoped', lambda *args: pytest.fail('Unowned call cannot read profile'))
     with pytest.raises(LookupError):
         voice.context('other', 'basic', 'default', 'native-stored', call_id)
+
+
+def test_search_source_urls_fit_the_android_evidence_limit(harness, monkeypatch):
+    api, _, _, root, _ = harness
+    voice = api.voice_context
+    long_url = 'https://example.test/' + 'x' * 2100
+    monkeypatch.setattr(voice, 'scoped', lambda profile, fn: fn(root))
+    monkeypatch.setitem(sys.modules, 'tools.web_tools', SimpleNamespace(web_search_tool=lambda query, limit: {
+        'success': True, 'data': {'web': [{'url': long_url, 'title': 'Example', 'description': 'A source'}]}
+    }))
+    url = voice.search('default', 'query')['sources'][0]['url']
+    assert len(url) <= 2000
+    assert url.startswith('https://example.test/')
+
+
+def test_recall_uses_only_the_matching_initialized_provider(harness, monkeypatch):
+    api, _, _, root, _ = harness
+    voice = api.voice_context
+    matching = object()
+    calls = []
+    manager = SimpleNamespace(_prefetch_provider=lambda provider, query, session_id: calls.append((provider, query, session_id)) or 'Verified existing memory')
+    monkeypatch.setattr(voice.native, 'verify', lambda *args: None)
+    monkeypatch.setattr(voice, 'scoped', lambda profile, fn: fn(root))
+    monkeypatch.setattr(voice, 'config', lambda root: {'memory': {'provider': 'hindsight'}})
+    monkeypatch.setattr(voice, 'external_provider', lambda *args: ((manager, matching), 'hindsight'))
+    monkeypatch.setitem(sys.modules, 'agent.memory_manager', SimpleNamespace(sanitize_context=lambda text: text))
+    monkeypatch.setattr(voice, 'builtin_memory', lambda *args: pytest.fail('Existing provider evidence must not be replaced'))
+    result = voice.recall('owner', 'basic', 'default', 'native-stored', 'current question')
+    assert result['summary'] == 'Verified existing memory'
+    assert result['sources'][0]['ref'] == 'native-memory:hindsight'
+    assert calls == [(matching, 'current question', 'native-stored')]

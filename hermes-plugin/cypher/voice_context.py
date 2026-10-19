@@ -81,24 +81,6 @@ def external_memory_configured(cfg):
     return name not in ('', 'default', 'builtin', 'built-in', 'none', 'disabled', 'off')
 
 
-def lookup_provider(name, owner, profile, stored, root):
-    # Use the installed native provider and its scoped configuration, without creating an LLM agent.
-    from plugins.memory import load_memory_provider
-    from agent.memory_manager import MemoryManager
-    provider = load_memory_provider(name)
-    if provider is None or not provider.is_available():
-        raise LookupError('Configured native memory provider is unavailable')
-    try:
-        provider.initialize(session_id=stored, platform='tui', agent_context='subagent',
-                            hermes_home=str(root), agent_identity=profile, agent_workspace='hermes', user_id=owner)
-        manager = MemoryManager(external_prefetch_timeout=10)
-        manager.add_provider(provider)
-        return manager, provider
-    except Exception:
-        provider.shutdown()
-        raise
-
-
 def skills(profile, query='', name='', scope=None):
     api = sys.modules['cypher_skills_api']
     def run(root):
@@ -218,10 +200,10 @@ def search(profile,query):
         sources=[];snippets=[]
         for item in items[:10] if isinstance(items,list) else []:
             if not isinstance(item,dict): continue
-            url=str(item.get('url',''))[:2048]
+            url=str(item.get('url',''))[:2000]
             parsed=urlsplit(url)
             if parsed.scheme not in ('http','https') or not parsed.hostname or parsed.username or parsed.password: continue
-            if private_text(url,2048)!=url: continue
+            if private_text(url,2000)!=url: continue
             title=private_text(item.get('title'),200)
             sources.append({'title':title,'url':url});snippets.append(title+': '+private_text(item.get('description',item.get('snippet')),1600))
             if len(sources)>=3: break
@@ -232,19 +214,13 @@ def recall(owner,provider,profile,stored,query):
     native.verify(owner,provider,profile,stored)
     def run(root):
         cfg=config(root);external,name=external_provider(owner,provider,profile,stored,cfg)
-        temporary = external is None and external_memory_configured(cfg)
-        if temporary:
-            external = lookup_provider(name, owner, profile, stored, root)
         if external:
             manager,matching=external
-            try:
-                if not callable(getattr(manager,'_prefetch_provider',None)): raise LookupError('Native memory recall unsupported')
-                text=manager._prefetch_provider(matching,query,session_id=stored)
-                from agent.memory_manager import sanitize_context
-                summary=private_text(sanitize_context(str(text or '')),8000)
-                return {'summary':summary,'sources':[{'title':'Native '+name+' memory','ref':'native-memory:'+name}],'observed_at':int(time.time())}
-            finally:
-                if temporary: matching.shutdown()
+            if not callable(getattr(manager,'_prefetch_provider',None)): raise LookupError('Native memory recall unsupported')
+            text=manager._prefetch_provider(matching,query,session_id=stored)
+            from agent.memory_manager import sanitize_context
+            summary=private_text(sanitize_context(str(text or '')),8000)
+            return {'summary':summary,'sources':[{'title':'Native '+name+' memory','ref':'native-memory:'+name}],'observed_at':int(time.time())}
         memory=builtin_memory(root,cfg)
         if not memory: raise LookupError('Native memory recall unavailable')
         words=set(re.findall(r'\w+',query.lower()))
