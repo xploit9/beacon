@@ -205,7 +205,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         listener.onFailure(socket, java.io.IOException("Synthetic native WebSocket interruption"), null)
     }
     val scope = Scope("https://ui-fixture.invalid", "synthetic-owner", "default")
-    private val configureHttp: (OkHttpClient.Builder) -> Unit = { builder ->
+    val configureHttp: (OkHttpClient.Builder) -> Unit = { builder ->
         builder.addInterceptor { chain ->
             val request = chain.request()
             check(request.url.host == "ui-fixture.invalid") { "UI fixture may not access a real host" }

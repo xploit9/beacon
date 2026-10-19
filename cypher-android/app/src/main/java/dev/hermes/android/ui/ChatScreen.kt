@@ -44,6 +44,10 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.onLongClick
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.stateDescription
@@ -193,6 +197,8 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
     val chatState by vm.chat.collectAsStateWithLifecycle()
     val composerDraft by vm.composer.collectAsStateWithLifecycle()
     val messages = remember(chatState.messages, chatState.callMessages, chatState.sessionId) { visibleTranscriptMessages(chatState.messages) + chatState.callMessages.map { Message("call:${it.eventId}", it.role, it.text, sessionId = chatState.sessionId) } }
+    // Branch keep_count counts Hermes rows, hidden steering rows included.
+    val transcriptIndex = remember(chatState.messages) { chatState.messages.withIndex().associate { it.value.id to it.index } }
     val latestAssistantMessageId = remember(chatState.messages) { chatState.messages.lastOrNull { it.role == "assistant" && it.text.isNotBlank() }?.id }
     val chat = chatState.copy(messages = messages)
     val callMessagesById = remember(chatState.callMessages) { chatState.callMessages.associateBy { "call:${it.eventId}" } }
@@ -309,7 +315,8 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
             val current = vm.chat.value
             if (follow) { if (current.anchor > 0 || current.anchorOffset > 0 || current.anchorId.isNotBlank()) vm.anchor(0, 0, "") }
             else {
-                val id = current.messages.getOrNull(position.first)?.id ?: current.callMessages.getOrNull(position.first - current.messages.size)?.let { "call:${it.eventId}" }
+                val shown = visibleTranscriptMessages(current.messages)
+                val id = shown.getOrNull(position.first)?.id ?: current.callMessages.getOrNull(position.first - shown.size)?.let { "call:${it.eventId}" }
                 if (id != null) vm.anchor(position.first, position.second, id)
             }
         }
@@ -395,7 +402,7 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                     }
                 }
                 if (search.isNotBlank() && visibleMessages.isEmpty()) item { Text("No messages match your search.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                items(visibleMessages, key = { it.value.id }) { (index, message) -> dayStarts[message.id]?.let { DayDivider(uiText(it)) }; MessageRow(vm, message, index, callMessagesById[message.id], separateToolResults, toolResultTitles[message.id].orEmpty(), isLatestAssistant = message.id == latestAssistantMessageId, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }) }
+                items(visibleMessages, key = { it.value.id }) { (index, message) -> dayStarts[message.id]?.let { DayDivider(uiText(it)) }; MessageRow(vm, message, transcriptIndex[message.id] ?: index, callMessagesById[message.id], separateToolResults, toolResultTitles[message.id].orEmpty(), isLatestAssistant = message.id == latestAssistantMessageId, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }) }
                 if (chat.streamId.isNotBlank() || chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank()) item("live") {
                     // Same header and spacing as the stored reply, so replacing this row does not move the text.
                     Column(Modifier.testTag("live-reply"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -534,8 +541,11 @@ internal fun acceptsInitialConversationEdit(
     // Camera photos go to a private cache folder the FileProvider shares with the camera app; stale ones are cleared at start.
     var photo by rememberSaveable { mutableStateOf<String?>(null) }
     var photoScopeKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var photoTaken by rememberSaveable { mutableStateOf(false) }
     val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { taken ->
         val request = attachmentRequest; attachmentRequest = null
+        // After process death the result can arrive before the restored client connects; it uploads once connected.
+        if (taken && photo != null && vm.client == null) { photoTaken = true; return@rememberLauncherForActivityResult }
         val uri = photo?.let(android.net.Uri::parse); photo = null
         val scopeKey = photoScopeKey; photoScopeKey = null
         val currentScope = vm.authenticatedScope()
@@ -544,6 +554,12 @@ internal fun acceptsInitialConversationEdit(
             val clientMatches = request == null || vm.client === request.first && currentScope == request.second
             if (scopeMatches && clientMatches) vm.upload(uri) else vm.notice("Reopen attachments in the original account and conversation.")
         }
+    }
+    LaunchedEffect(ui.connected, photoTaken) {
+        if (!photoTaken || !ui.connected || vm.client == null) return@LaunchedEffect
+        val uri = photo?.let(android.net.Uri::parse); val scopeKey = photoScopeKey
+        photo = null; photoScopeKey = null; photoTaken = false
+        if (uri != null && scopeKey != null && vm.authenticatedScope()?.key == scopeKey) vm.upload(uri) else vm.notice("Reopen attachments in the original account and conversation.")
     }
     val takePhoto = {
         val file = java.io.File(context.cacheDir, "camera").apply { mkdirs() }.let { java.io.File(it, "photo-${System.currentTimeMillis()}.jpg") }
@@ -678,6 +694,16 @@ internal fun acceptsInitialConversationEdit(
 }
 
 
+/**
+ * Tap shows the message's actions, long-press opens its menu (Relay MessageBubble). Unlike clickable, this does not merge the
+ * message's semantics, so checklists, links and code controls inside it stay separately reachable and tappable.
+ */
+@Composable private fun Modifier.messageGestures(onTap: () -> Unit, onLongPress: () -> Unit): Modifier {
+    val tap by rememberUpdatedState(onTap); val press by rememberUpdatedState(onLongPress)
+    val show = uiText("Show message actions"); val menu = uiText("Message actions")
+    return pointerInput(Unit) { detectTapGestures(onTap = { tap() }, onLongPress = { press() }) }
+        .semantics { onClick(show) { tap(); true }; onLongClick(menu) { press(); true } }
+}
 @Composable private fun MessageRow(vm: CypherViewModel, message: Message, index: Int, callTranscript: CallTranscript? = null, separateToolResults: Set<String> = emptySet(), resultTitle: String = "", isLatestAssistant: Boolean = false, onToolExpanded: (Boolean) -> Unit = {}) {
     val context = LocalContext.current
     val origin = vm.authenticatedScope()?.session(message.sessionId.ifBlank { vm.chat.value.sessionId })
@@ -711,7 +737,7 @@ internal fun acceptsInitialConversationEdit(
     Column(Modifier.fillMaxWidth().testTag("message-row:${message.id}"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (message.interrupted && callTranscript == null) Text(uiText("Interrupted"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         if (presentation.activity) {
-            Box(Modifier.fillMaxWidth().combinedClickable(onClick = toggleInlineActions, onLongClick = openMessageActions).testTag("message-bubble:${message.id}")) {
+            Box(Modifier.fillMaxWidth().messageGestures(toggleInlineActions, openMessageActions).testTag("message-bubble:${message.id}")) {
                 Disclosure(presentation.summary, message.text)
             }
         } else {
@@ -719,11 +745,11 @@ internal fun acceptsInitialConversationEdit(
                 Text(if (message.role == "user") uiText("You") else LocalAssistantName.current, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 if (callTranscript != null) { Spacer(Modifier.weight(1f)); Text(archivedCallLabel(callTranscript.final, callTranscript.interrupted, currentCall.active && currentCall.conversationScope == origin), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             }
-            if (message.role == "user") BoxWithConstraints(Modifier.fillMaxWidth().combinedClickable(onClick = toggleInlineActions, onLongClick = openMessageActions).testTag("message-bubble:${message.id}")) {
+            if (message.role == "user") BoxWithConstraints(Modifier.fillMaxWidth().messageGestures(toggleInlineActions, openMessageActions).testTag("message-bubble:${message.id}")) {
                 Surface(modifier = Modifier.widthIn(max = maxWidth * .9f).align(Alignment.CenterEnd), shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp, bottomStart = 22.dp, bottomEnd = 4.dp), color = MaterialTheme.colorScheme.primaryContainer) {
                     Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) { if (settings.optBoolean("render_user_markdown", true)) Markdown(presentation.text, vm, origin, message.mediaSnapshots, documentKey = message.id) else SelectionContainer { Text(presentation.text, style = MaterialTheme.typography.bodyLarge) }; BubbleTime(message) }
                 }
-            } else if (presentation.text.isNotBlank()) Box(Modifier.fillMaxWidth().combinedClickable(onClick = toggleInlineActions, onLongClick = openMessageActions).testTag("message-bubble:${message.id}"), contentAlignment = Alignment.CenterStart) {
+            } else if (presentation.text.isNotBlank()) Box(Modifier.fillMaxWidth().messageGestures(toggleInlineActions, openMessageActions).testTag("message-bubble:${message.id}"), contentAlignment = Alignment.CenterStart) {
                 AssistantSurface { Markdown(presentation.text, vm, origin, message.mediaSnapshots, documentKey = message.id); BubbleTime(message) }
             }
         }

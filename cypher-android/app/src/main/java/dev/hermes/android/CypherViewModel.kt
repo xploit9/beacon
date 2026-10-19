@@ -61,14 +61,9 @@ internal fun sessionCanStillBeUnpersisted(clientCreated: Boolean, chat: ChatStat
 // Hermes stores model-switch steering as user rows, so the reserved prefix identifies it.
 internal fun visibleTranscriptMessages(messages: List<Message>): List<Message> =
     messages.filterNot { it.text.trimStart().startsWith("[System:") }
-internal fun attachmentFitsLocalCheckpoint(draft: Draft, attachment: JSONObject, fileBytes: Long): Boolean {
-    if (fileBytes < 0L || fileBytes > MAX_CHAT_ATTACHMENT_BYTES) return false
-    val encodedDraft = draft.copy(attachments = draft.attachments + attachment.copy().put("staged_base64", "")).encode()
-    val encodedContent = 4L * ((fileBytes + 2) / 3)
-    val draftBytes = encodedDraft.toByteArray().size.toLong() + encodedContent
-    val receiptBytes = json("id" to "00000000-0000-0000-0000-000000000000", "draft" to encodedDraft).toString().toByteArray().size.toLong() + encodedContent
-    return maxOf(draftBytes, receiptBytes) + APP_CIPHER_OVERHEAD + 64L * 1024 <= LOCAL_CHECKPOINT_LIMIT_BYTES
-}
+// The send receipt holds the draft as JSON inside JSON, so it is the largest local checkpoint of the attachments.
+internal fun attachmentFitsLocalCheckpoint(send: PendingSend): Boolean =
+    send.encode().toByteArray().size.toLong() + APP_CIPHER_OVERHEAD <= LOCAL_CHECKPOINT_LIMIT_BYTES
 internal fun releaseTerminalChat(chat: ChatState, stream: String, replyConfirmed: Boolean, terminalStatus: String): ChatState {
     if (chat.streamId != stream) return chat
     return if (replyConfirmed) chat.copy(streamId = "", liveText = "", liveReasoning = "", liveTools = emptyList(), status = terminalStatus)
@@ -264,6 +259,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             val generation = originGeneration
             try {
                 val prefs = app.preferences.data.first()
+                if (!assistantReturnInitialized) setAssistantReturn(prefs[stringPreferencesKey("assistant_return")]?.let { runCatching { JSONObject(it) }.getOrNull() })
                 val origin = prefs[stringPreferencesKey("origin")] ?: BuildConfig.DEFAULT_ORIGIN
                 if (generation != originGeneration) return@launch
                 val auth = if (origin.isBlank()) AuthContext(origin, emptyList()) else withContext(Dispatchers.IO) { app.auth.read(origin) }
@@ -1229,13 +1225,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         tab("Chat")
     }
     /** Where the chats were when the assistant tab took over: their profile and open conversation. */
-    private suspend fun assistantReturn(): JSONObject? {
-        if (!assistantReturnInitialized) {
-            val persisted = app.preferences.data.first()[stringPreferencesKey("assistant_return")]?.let { runCatching { JSONObject(it) }.getOrNull() }
-            if (!assistantReturnInitialized) { assistantReturnValue = persisted; assistantReturnInitialized = true }
-        }
-        return assistantReturnValue?.copy()
-    }
+    private fun assistantReturn(): JSONObject? = assistantReturnValue?.copy()
     private fun setAssistantReturn(value: JSONObject?) {
         assistantReturnValue = value?.copy(); assistantReturnInitialized = true
     }
@@ -2638,10 +2628,8 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 uploadSlots.withPermit {
                     if (!current()) return@withPermit
                     val mime = resolver.getType(uri) ?: "application/octet-stream"
-                    val staged = json("id" to id, "state" to "ready", "scope_key" to scope.key, "staged_base64" to "", "name" to name, "mime" to mime)
-                    val attachmentFits = { fileBytes: Long -> attachmentFitsLocalCheckpoint(draft(), staged, fileBytes) }
                     val sizeHint = details.second
-                    if (!workspace && sizeHint != null && !withContext(Dispatchers.IO) { attachmentFits(sizeHint) }) error("Attachments are limited to about 11 MiB in total")
+                    if (!workspace && sizeHint != null && sizeHint > MAX_CHAT_ATTACHMENT_BYTES) error("Attachments are limited to about 11 MiB in total")
                     val file = File.createTempFile("upload", ".data", app.cacheDir)
                     try {
                         withContext(Dispatchers.IO) {
@@ -2655,8 +2643,9 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                                 }
                             } } ?: error("Could not read attachment")
                         }
-                        if (!workspace && !withContext(Dispatchers.IO) { attachmentFits(file.length()) }) error("Attachments are limited to about 11 MiB in total")
                         val response = c.upload(if (workspace) "/api/workspace/upload" else "/api/upload", file, name, mime, scope.session, directory)
+                        val items = if (workspace) emptyList() else response.rows("files").ifEmpty { listOf(response.optJSONObject("file") ?: response) }
+                        if (!workspace && !withContext(Dispatchers.IO) { attachmentFitsLocalCheckpoint(PendingSend.create(scope, draft().let { it.copy(attachments = it.attachments + items) })) }) error("Attachments are limited to about 11 MiB in total")
                         if (current()) {
                             if (workspace) {
                             notice("File uploaded")
@@ -2666,7 +2655,6 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                             }
                         }
                             else {
-                                val items = response.rows("files").ifEmpty { listOf(response.optJSONObject("file") ?: response) }
                                 _attachments.update { it + items }
                                 _attachmentPreparation.update { it.filterNot { row -> row.string("id") == id } }
                                 checkpoint()

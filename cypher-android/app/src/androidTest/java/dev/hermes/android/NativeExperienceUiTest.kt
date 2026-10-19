@@ -524,7 +524,11 @@ class NativeExperienceUiTest {
     }
 
     @Test fun messageCopyShareAndBothBranchActionsUseTheSelectedMessage() = withFixture { vm, fixture ->
-        val original = vm.chat.value.messages.first()
+        // Hermes keeps model-switch steering as a user row: hidden here, but counted by branch keep_count.
+        fixture.sessions.getValue("chat-a").put("messages", JSONArray().put(json("role" to "user", "text" to "[System: The active model changed]", "row_id" to 9)).apply { fixture.sessions.getValue("chat-a").rows("messages").forEach { put(it) } })
+        compose.runOnIdle { vm.selectSession("chat-a") }
+        await { vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady && vm.chat.value.messages.size == 3 }
+        val original = vm.chat.value.messages[1]
         val latestAssistant = vm.chat.value.messages.last { it.role == "assistant" && it.text.isNotBlank() }
         compose.onNodeWithTag("message-actions:${latestAssistant.id}").assertExists()
         compose.onNodeWithTag("message-actions:${original.id}").assertDoesNotExist()
@@ -557,14 +561,14 @@ class NativeExperienceUiTest {
         action("More message actions").performScrollTo().performClick()
         compose.onNodeWithText("Branch from here").performClick()
         await { vm.chat.value.sessionId.startsWith("branch-") }
-        assertEquals(1, fixture.requests.last { it.string("method") == "session.branch" }.getJSONObject("params").getInt("count"))
+        assertEquals(2, fixture.requests.last { it.string("method") == "session.branch" }.getJSONObject("params").getInt("count"))
         compose.runOnIdle { vm.selectSession("chat-a") }
         await { vm.chat.value.sessionId == "chat-a" && vm.chat.value.messages.isNotEmpty() }
         revealAction("More message actions")
         action("More message actions").performScrollTo().performClick()
         compose.onNodeWithText("Edit and branch").performClick()
         await { vm.chat.value.sessionId.startsWith("branch-") && vm.composer.value.text == original.text }
-        assertEquals(0, fixture.requests.last { it.string("method") == "session.branch" }.getJSONObject("params").getInt("count"))
+        assertEquals(1, fixture.requests.last { it.string("method") == "session.branch" }.getJSONObject("params").getInt("count"))
         assertFalse(fixture.requests.any { it.string("method") == "prompt.submit" })
         receipts += "Copy source preserves the selected message; system Share opens and cancels without sending; branch and edit/branch use exact native message boundaries."
         capture("audit-message-actions")
@@ -732,19 +736,53 @@ class NativeExperienceUiTest {
     @Test fun cameraResultRestoresItsConversationScopeAfterSavedStateRecreation() {
         val picker = PickerRegistry(app)
         val restoration = StateRestorationTester(compose)
-        withFixture(picker, restoration) { vm, _ ->
-            compose.onNodeWithTag("composer-attach").performClick()
-            compose.onNodeWithTag("attach-camera").performClick()
-            if (picker.intent?.action.orEmpty().contains("REQUEST_PERMISSIONS")) picker.deliver(true)
-            await { picker.intent?.action == android.provider.MediaStore.ACTION_IMAGE_CAPTURE }
-
-            restoration.emulateSavedInstanceStateRestore()
+        withFixture(picker, restoration) { vm, fixture ->
+            fun photos() = vm.attachments.value.count { it.string("name").startsWith("photo-") }
+            fun takePhotoThenRestore() {
+                picker.intent = null
+                compose.onNodeWithTag("composer-attach").performClick()
+                compose.onNodeWithTag("attach-camera").performClick()
+                if (picker.intent?.action.orEmpty().contains("REQUEST_PERMISSIONS")) picker.deliver(true)
+                await { picker.intent?.action == android.provider.MediaStore.ACTION_IMAGE_CAPTURE }
+                restoration.emulateSavedInstanceStateRestore()
+                // Like the camera app: write the photo to the FileProvider URI before returning RESULT_OK.
+                @Suppress("DEPRECATION") val output = requireNotNull(picker.intent?.getParcelableExtra<Uri>(android.provider.MediaStore.EXTRA_OUTPUT))
+                app.contentResolver.openOutputStream(output)!!.use { it.write(byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte())) }
+            }
+            takePhotoThenRestore()
             picker.deliver(Activity.RESULT_OK)
-
-            await { vm.attachments.value.any { it.string("name").startsWith("photo-") } }
+            await { photos() == 1 }
             assertTrue(vm.attachmentPreparation.value.isEmpty())
-            receipts += "The camera URI and original conversation key survive saved-state recreation; the result uploads when the restored account and conversation still match."
+
+            // After process death the result arrives while the restored client is still connecting.
+            takePhotoThenRestore()
+            compose.runOnIdle { field(vm, "client", null); flow<AppState>(vm, "_ui").let { it.value = it.value.copy(connected = false) } }
+            picker.deliver(Activity.RESULT_OK)
+            compose.waitForIdle()
+            assertEquals(1, photos())
+            compose.runOnIdle { field(vm, "client", fixture.client); flow<AppState>(vm, "_ui").let { it.value = it.value.copy(connected = true) } }
+            await { photos() == 2 }
+            assertTrue(vm.attachmentPreparation.value.isEmpty())
+            receipts += "The camera URI and original conversation key survive saved-state recreation; the result uploads when the restored account and conversation still match, also once a client that was still connecting connects."
         }
+    }
+
+    @Test fun attachmentCheckMeasuresTheRealAndroidSendReceipt() {
+        // Android org.json writes '/' as '\/', and the receipt nests the draft as a JSON string, so base64 grows past the 4/3 estimate.
+        val scope = Scope("https://ui-fixture.invalid", "synthetic-owner", "default", "attachment-budget")
+        val random = java.util.Random(7)
+        fun send(fileBytes: Int) = PendingSend.create(scope, dev.hermes.android.core.Draft("A short message", attachments = listOf(json("id" to "id", "name" to "photo.jpg", "mime" to "image/jpeg",
+            "staged_base64" to android.util.Base64.encodeToString(ByteArray(fileBytes).also(random::nextBytes), android.util.Base64.NO_WRAP)))))
+        try {
+            val fits = send(11 * 1024 * 1024)
+            assertTrue(attachmentFitsLocalCheckpoint(fits))
+            runBlocking { app.cache.write(scope, "pending", fits.encode(), true) }
+            // 11.7 MiB passed the old estimate but cannot be saved as a receipt.
+            val tooLarge = send(11 * 1024 * 1024 + 700 * 1024)
+            assertFalse(attachmentFitsLocalCheckpoint(tooLarge))
+            assertTrue(runCatching { runBlocking { app.cache.write(scope, "pending", tooLarge.encode(), true) } }.isFailure)
+            receipts += "The attachment limit measures the real encoded send receipt: what it admits can be saved, what it refuses cannot."
+        } finally { runBlocking { app.cache.delete(scope, "pending") } }
     }
 
     @Test fun workspaceMultiPickerRefreshesAfterAnOlderListingFinishes() {
@@ -1169,6 +1207,57 @@ class NativeExperienceUiTest {
         }
     }
 
+    @Test fun theAssistantTabReadsItsProfileFromSettingsNotTheLoadingFlow() = withFixture { vm, fixture ->
+        val coder = fixture.scope.copy(profile = "coder")
+        val switchesBefore = fixture.requests.count { it.string("path") == "/api/auth/me" }
+        try {
+            // Same main-thread step: the preferences flow cannot catch up between the write and the tap.
+            compose.runOnUiThread { runBlocking { app.preferences.edit { it[stringPreferencesKey("assistant_profile")] = "coder" } }; vm.tab("Xara") }
+            await { vm.ui.value.tab == "Xara" && vm.ui.value.profile == "coder" && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady && vm.chat.value.sessionId.isNotBlank() }
+            assertEquals("One switch to the assistant's profile", switchesBefore + 1, fixture.requests.count { it.string("path") == "/api/auth/me" })
+            receipts += "The assistant tab opens in the profile just chosen in Settings, through one switch, without waiting for the settings to reload."
+        } finally {
+            runBlocking {
+                app.preferences.edit { it.remove(stringPreferencesKey("assistant_profile")); it.remove(stringPreferencesKey("assistant_return")) }
+                listOf("xara-session", "xara-opening", "new-chat-shell", "selected-session").forEach { app.cache.delete(coder, it) }
+            }
+        }
+    }
+
+    @Test fun aColdStartKeepsTheSavedAssistantReturn() {
+        val key = stringPreferencesKey("assistant_return")
+        val saved = json("profile" to "default", "session" to "chat-b").toString()
+        runBlocking { app.preferences.edit { it[key] = saved } }
+        try {
+            withFixture { vm, _ ->
+                await { CypherViewModel::class.java.getDeclaredField("assistantReturnInitialized").apply { isAccessible = true }.getBoolean(vm) }
+                compose.runOnIdle { vm.tab("Xara") }
+                await { vm.ui.value.tab == "Xara" && vm.isCypherConversation() && vm.chat.value.projectionReady }
+                compose.runOnIdle { vm.tab("Chat") }
+                await { vm.ui.value.tab == "Chat" && vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady }
+                receipts += "A return record saved before a restart is loaded with the settings, so opening the assistant tab early cannot replace it."
+            }
+        } finally { runBlocking { app.preferences.edit { it.remove(key) } } }
+    }
+
+    @Test fun backgroundUpdateCheckKeepsTheRotatedBearer() = withFixture { _, fixture ->
+        val now = System.currentTimeMillis() / 1000
+        val bearer = dev.hermes.android.data.NativeBearerRecord("update-access", "update-refresh", now + 3600, fixture.scope.origin, fixture.scope.owner, "default", "fixture", now - 60)
+        val auth = dev.hermes.android.data.AuthContext(fixture.scope.origin, emptyList(), fixture.scope.owner, "default", backend = "hermes-dashboard", bearer = bearer)
+        fixture.currentRefreshToken = bearer.refreshToken
+        runBlocking { app.auth.persist(auth) }
+        try {
+            app.updates.clearAuthorization(); app.updates.authorize(fixture.freshClientFor(auth, app.auth))
+            app.updates.transportForTest = fixture.configureHttp
+            fixture.forceExpiredAccessToken = bearer.accessToken
+            // The release feed is absent from the fixture; the check fails after its bootstrap refreshed the sign-in.
+            runBlocking { runCatching { app.updates.backgroundCheck() } }
+            assertEquals(listOf(bearer.refreshToken), fixture.refreshTokensUsed.toList())
+            assertEquals(fixture.currentRefreshToken, app.auth.read(fixture.scope.origin).bearer?.refreshToken)
+            receipts += "The background update check saves a refreshed sign-in through the store, so the next check does not reuse a spent refresh token."
+        } finally { app.updates.transportForTest = null; app.updates.clearAuthorization() }
+    }
+
     @Test fun openingANonAssistantCallFromXaraReturnsToItsProfileAndChatOnce() = withFixture { vm, fixture ->
         val assistantScope = fixture.scope.copy(profile = "coder")
         val callId = "synthetic-return-call"
@@ -1177,13 +1266,14 @@ class NativeExperienceUiTest {
             await { vm.preferences.value.assistantProfile == "coder" }
             compose.runOnIdle { vm.tab("Xara") }
             await { vm.ui.value.tab == "Xara" && vm.ui.value.profile == "coder" && !vm.ui.value.xaraOpening && vm.chat.value.sessionId.isNotBlank() }
-            val switchesBefore = fixture.requests.count { it.string("path") == "/api/profile/switch" }
+            // Switching is client-side (bindProfile); each switch re-verifies the account with exactly one /api/auth/me.
+            val switchesBefore = fixture.requests.count { it.string("path") == "/api/auth/me" }
             val target = fixture.scope.session("chat-b")
             app.calls.update { CallState(active = true, state = "listening", callId = callId, conversationScope = target) }
             compose.runOnIdle { vm.openCurrentCall(callId) }
 
             await { vm.ui.value.tab == "Chat" && vm.ui.value.profile == target.profile && vm.chat.value.sessionId == target.session && vm.chat.value.projectionReady }
-            assertEquals(switchesBefore + 1, fixture.requests.count { it.string("path") == "/api/profile/switch" })
+            assertEquals(switchesBefore + 1, fixture.requests.count { it.string("path") == "/api/auth/me" })
             assertTrue(app.calls.state.value.active)
             receipts += "Opening a call from Xara returns directly to the call's profile and conversation through one profile switch."
         } finally {
@@ -1198,7 +1288,7 @@ class NativeExperienceUiTest {
     @Test fun openingACallForCyphersConversationStaysOnXara() = withFixture { vm, _ ->
         val callId = "synthetic-xara-call"
         compose.runOnIdle { vm.tab("Xara") }
-        await { vm.ui.value.tab == "Xara" && !vm.ui.value.xaraOpening && vm.chat.value.sessionId.isNotBlank() }
+        await { vm.ui.value.tab == "Xara" && vm.isCypherConversation() && vm.chat.value.projectionReady }
         val target = (vm.client?.scope ?: error("Xara client missing")).session(vm.chat.value.sessionId)
         app.calls.update { CallState(active = true, state = "listening", callId = callId, conversationScope = target) }
         try {
@@ -1215,7 +1305,8 @@ class NativeExperienceUiTest {
     @Test fun profileSwitchRefreshesAndRotatesTheStoredBearer() = withFixture { vm, fixture ->
         val now = System.currentTimeMillis() / 1000
         val refreshToken = "lane-r1-refresh"
-        val bearer = dev.hermes.android.data.NativeBearerRecord("lane-r1-access", refreshToken, now + 3600, fixture.scope.origin, fixture.scope.owner, "default", "fixture", now)
+        // Issued before the refresh, like a real stored sign-in: AuthStore keeps the incoming token when issue seconds tie.
+        val bearer = dev.hermes.android.data.NativeBearerRecord("lane-r1-access", refreshToken, now + 3600, fixture.scope.origin, fixture.scope.owner, "default", "fixture", now - 60)
         val auth = dev.hermes.android.data.AuthContext(fixture.scope.origin, emptyList(), fixture.scope.owner, "default", backend = "hermes-dashboard", bearer = bearer)
         fixture.currentRefreshToken = refreshToken
         runBlocking { app.auth.persist(auth) }

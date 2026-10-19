@@ -30,6 +30,8 @@ class UpdateManager(private val app: CypherApplication) {
     private val lock = Any()
     private val updater = ApkUpdater(app)
     private val notifications get() = app.getSystemService(NotificationManager::class.java)
+    /** Device tests route the saved client through their synthetic transport. */
+    internal var transportForTest: ((okhttp3.OkHttpClient.Builder) -> Unit)? = null
     private fun source(): UpdateSource? = prefs.getString("id", null)?.let {
         UpdateSource(prefs.getString("origin", "").orEmpty(), prefs.getString("owner", "").orEmpty(), it)
     }
@@ -94,7 +96,7 @@ class UpdateManager(private val app: CypherApplication) {
 
     private fun savedClient(expected: UpdateSource): CypherClient = synchronized(lock) {
         requireAuthorized(expected)
-        CypherClient(app.auth.read(expected.origin), app.auth, persistContext = false)
+        CypherClient(app.auth.read(expected.origin), app.auth, persistContext = false, configureHttp = transportForTest ?: {})
     }
 
     private suspend fun checkAuthenticated(client: CypherClient, expected: UpdateSource, notify: Boolean): Release? {

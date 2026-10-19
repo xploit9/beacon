@@ -164,6 +164,8 @@ class LoopbackSetupUiTest {
             assertTrue(store.persistIfUnchanged(tiedIncoming, store.authorityEpoch.readVersion()))
             assertEquals("tied-incoming", store.read(origin).bearer?.accessToken)
 
+            // write() keeps a newer stored sign-in, so start this legacy case from an empty record.
+            store.clear(origin)
             store.write(saved.copy(bearer = bearer("legacy-newest", 250)))
             val legacyRestore = saved.copy(bearer = bearer("legacy-restore", 200))
             assertTrue(store.persistIfUnchanged(legacyRestore, store.authorityEpoch.readVersion()))
