@@ -27,6 +27,7 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
@@ -2559,6 +2560,55 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Completed answer", useUnmergedTree = true).assertIsDisplayed()
         await { vm.chat.value.queued.isEmpty() }
         receipts += "A real synthetic WebSocket failure preserves partial progress and the queued follow-up while native status is unknown; a replayed terminal event persists the final assistant row, refreshes history immediately, and only then advances the queue."
+    }
+
+    @Test fun backgroundCompletedTurnSettlesOnResumeBeforeQueuedSend() = withFixture { vm, fixture ->
+        val subscriptionsBefore = fixture.streamSubscriptions.get()
+        compose.runOnIdle { vm.newChat() }
+        await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+        val creatingRuntime = vm.chat.value.raw.string("runtime_session_id")
+        fixture.persistTerminalMessages = true
+        compose.runOnIdle { vm.composer(TextFieldValue("First prompt")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId.isNotBlank() }
+        val firstRuntime = vm.chat.value.streamId
+        assertEquals("The first prompt stays on the runtime that created this chat", creatingRuntime,
+            fixture.requests.last { it.string("method") == "prompt.submit" }.getJSONObject("params").string("session_id"))
+        @Suppress("UNCHECKED_CAST")
+        val clientCreatedSessions = CypherViewModel::class.java.getDeclaredField("clientCreatedSessions").apply { isAccessible = true }.get(vm) as Set<String>
+        assertFalse("The creating-client marker ends after the first accepted prompt", clientCreatedSessions.contains(fixture.scope.session(vm.chat.value.sessionId).key))
+        await { fixture.streamSubscriptions.get() > subscriptionsBefore }
+        compose.runOnIdle { vm.composer(TextFieldValue("Queued follow-up")); vm.queue() }
+        await { vm.chat.value.queued.singleOrNull()?.text == "Queued follow-up" }
+
+        val observer = LifecycleEventObserver { _, event -> when (event) {
+            androidx.lifecycle.Lifecycle.Event.ON_STOP -> vm.foreground(false)
+            androidx.lifecycle.Lifecycle.Event.ON_START -> vm.foreground(true)
+            else -> Unit
+        } }
+        compose.runOnUiThread { compose.activity.lifecycle.addObserver(observer) }
+        try {
+            compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.CREATED)
+            fixture.nativeTurnStatus = "idle"
+            fixture.resumeRuntimeSessionId = "$firstRuntime-resumed"
+            fixture.retainNativeEvent(firstRuntime, "message.complete", json("text" to "Completed while backgrounded"))
+            compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.RESUMED)
+
+            await { vm.chat.value.messages.any { it.text == "Completed while backgrounded" } &&
+                fixture.requests.count { it.string("method") == "prompt.submit" } == 2 && vm.chat.value.queued.isEmpty() }
+            compose.onNodeWithText("Completed while backgrounded", useUnmergedTree = true).assertIsDisplayed()
+
+            await { fixture.streamSubscriptions.get() > subscriptionsBefore + 1 }
+            fixture.nativeTurnStatus = "idle"
+            fixture.emitNativeEvent("message.complete", json("text" to "Queued follow-up completed"))
+            await { vm.chat.value.messages.any { it.text == "Queued follow-up completed" } && vm.chat.value.streamId.isBlank() }
+            compose.onNodeWithText("Queued follow-up completed", useUnmergedTree = true).assertIsDisplayed()
+            compose.onNodeWithTag("message-input").performClick().performTextInput("Send after recovery")
+            compose.onNodeWithTag("message-send").assertIsEnabled().performClick()
+            await { fixture.requests.count { it.string("method") == "prompt.submit" } == 3 }
+            assertEquals("The first accepted prompt releases the creating-client marker for later sends", "$firstRuntime-resumed",
+                fixture.requests.last { it.string("method") == "prompt.submit" }.getJSONObject("params").string("session_id"))
+        } finally { compose.runOnUiThread { compose.activity.lifecycle.removeObserver(observer) } }
+        receipts += "A first prompt remains owner-bound to its creating runtime; terminal idle from a resumed runtime after Activity stop restores history, advances the queued prompt, and returns Send after completion."
     }
 
 }

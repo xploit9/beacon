@@ -1,6 +1,9 @@
 package dev.hermes.android.data
 
 import dev.hermes.android.core.json
+import dev.hermes.android.core.rows
+import dev.hermes.android.core.sessionRowId
+import dev.hermes.android.core.visibleSessionRows
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import okhttp3.*
@@ -18,7 +21,7 @@ import java.util.concurrent.CopyOnWriteArrayList
  *
  * Every response below is a SYNTHETIC FIXTURE served by an interceptor. It stands in for the stock dashboard routes
  * the Hermes Relay reference uses (DashboardApiClient.listSessions / getSessionMessages):
- *  - GET /api/sessions?profile=&archived=exclude|only|include&exclude_sources=cron&limit<=100&offset=   (Cypher keeps a 200-row window: 2x100)
+ *  - GET /api/sessions?profile=&archived=exclude|only|include&exclude_sources=cron&min_messages=1&limit<=100&offset=   (Cypher keeps a 200-row window: 2x100)
  *  - GET /api/sessions/{id}?profile=                                                (metadata)
  *  - GET /api/sessions/{id}/messages?profile=&limit<=500&offset=&order=latest|oldest
  *    -> {session_id (the resolved compression descendant), profile, messages (chronological, ancestors included),
@@ -70,10 +73,11 @@ class NativeStockHistoryTest {
             if (path == "/api/sessions") {
                 val limit = url.queryParameter("limit")?.toIntOrNull() ?: 20
                 if (limit !in 1..100) return 422 to json("detail" to "limit must be <= 100").toString()
+                val minMessages = url.queryParameter("min_messages")?.toIntOrNull() ?: 0
                 val rows = when (url.queryParameter("archived") ?: "exclude") {
                     "exclude" -> active; "only" -> archived; "include" -> active + archived
                     else -> return 422 to json("detail" to "bad archived").toString()
-                }
+                }.filter { it.optInt("message_count") >= minMessages }
                 var offset = url.queryParameter("offset")?.toIntOrNull() ?: 0
                 if (shiftSecondPage && offset > 0) offset -= 1
                 val page = rows.drop(offset).take(limit)
@@ -151,9 +155,20 @@ class NativeStockHistoryTest {
         assertTrue(stock.pluginHistory().isEmpty())
         assertTrue(stock.listPages().all { it.url.queryParameter("archived") in setOf(null, "exclude") })
         assertTrue("Cron runs are excluded from active recents", stock.listPages().all { it.url.queryParameter("exclude_sources") == "cron" })
+        assertTrue("Zero-message sessions are excluded from active recents", stock.listPages().all { it.url.queryParameter("min_messages") == "1" })
         assertTrue(stock.listPages().all { (it.url.queryParameter("limit")?.toInt() ?: 0) in 1..100 })
         assertProfiled(stock)
         assertTrue(probe.opened.isEmpty())
+    }
+
+    @Test fun emptySessionsAreFilteredAndConfirmedShellOverlaySurvivesRefresh() = runBlocking<Unit> {
+        val stock = Stock().apply { active = Stock.rows("active", 2) + json("id" to "old-empty", "title" to "Untitled conversation", "message_count" to 0) }
+        val result = list(client(stock))
+        assertEquals(listOf("active-0", "active-1"), ids(result))
+        val confirmedShell = json("session_id" to "phone-created", "title" to "New conversation", "message_count" to 0, "profile" to "work")
+        val refreshed = visibleSessionRows(result.rows("sessions"), listOf(confirmedShell), "", archived = false)
+        assertEquals(listOf("phone-created", "active-0", "active-1"), refreshed.map(::sessionRowId))
+        assertTrue("Every stock recents page requests the minimum message count", stock.listPages().all { it.url.queryParameter("min_messages") == "1" })
     }
 
     @Test fun archivedListContainsOnlyArchivedConversations() = runBlocking<Unit> {
@@ -163,6 +178,7 @@ class NativeStockHistoryTest {
         for (i in 0 until 2) assertTrue(result.getJSONArray("sessions").getJSONObject(i).getBoolean("archived"))
         assertTrue(stock.listPages().isNotEmpty() && stock.listPages().all { it.url.queryParameter("archived") == "only" })
         assertTrue("Cron runs are excluded from archived recents", stock.listPages().all { it.url.queryParameter("exclude_sources") == "cron" })
+        assertTrue("Zero-message sessions are excluded from archived recents", stock.listPages().all { it.url.queryParameter("min_messages") == "1" })
         assertProfiled(stock)
     }
 
@@ -198,6 +214,7 @@ class NativeStockHistoryTest {
         assertTrue(stock.pluginHistory().isEmpty())
         assertTrue(stock.listPages().all { (it.url.queryParameter("limit")?.toInt() ?: 0) in 1..100 })
         assertTrue("List and local-search requests both exclude cron runs", stock.listPages().all { it.url.queryParameter("exclude_sources") == "cron" })
+        assertTrue("List and local-search requests exclude zero-message sessions", stock.listPages().all { it.url.queryParameter("min_messages") == "1" })
         assertProfiled(stock)
     }
 

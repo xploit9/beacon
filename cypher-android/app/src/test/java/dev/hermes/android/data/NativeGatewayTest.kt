@@ -1,7 +1,14 @@
 package dev.hermes.android.data
 
+import dev.hermes.android.ChatState
+import dev.hermes.android.Message
+import dev.hermes.android.releaseTerminalChat
 import dev.hermes.android.core.*
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.ResponseBody.Companion.toResponseBody
@@ -12,6 +19,52 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class NativeGatewayTest {
+    private class RecoveryFixture : WebSocket.Factory {
+        val calls = mutableListOf<Pair<String, JSONObject>>()
+        val streamSubscribed = CompletableDeferred<Unit>()
+        val storedSessionId = "chat-background"
+        @Volatile var currentRuntimeId = "runtime-created"
+        @Volatile var turnStatus = "working"
+        val client = CypherClient(AuthContext("https://native.example", emptyList(), "owner", "default", backend = "hermes-dashboard"), null, this) { builder ->
+            builder.addInterceptor { chain -> Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
+                .body(json("ticket" to "fixture-ticket").toString().toResponseBody("application/json".toMediaType())).build() }
+        }
+
+        override fun newWebSocket(request: Request, listener: WebSocketListener): WebSocket {
+            val socket = object : WebSocket {
+                override fun request() = request
+                override fun queueSize() = 0L
+                override fun cancel() = Unit
+                override fun close(code: Int, reason: String?) = true
+                override fun send(bytes: ByteString) = false
+                override fun send(text: String): Boolean {
+                    val frame = JSONObject(text)
+                    val method = frame.getString("method")
+                    val params = frame.getJSONObject("params").copy()
+                    calls += method to params
+                    val result = when (method) {
+                        "session.create" -> json("session_id" to currentRuntimeId, "stored_session_id" to storedSessionId, "messages" to JSONArray(), "info" to json("lazy" to true))
+                        "session.resume" -> json("session_id" to currentRuntimeId, "session_key" to storedSessionId, "messages" to JSONArray(), "info" to json("lazy" to true))
+                        "session.events.since" -> {
+                            if (calls.count { it.first == method } >= 3) streamSubscribed.complete(Unit)
+                            json("events" to JSONArray(), "latest_seq" to 0, "epoch" to "fixture-epoch")
+                        }
+                        "prompt.submit" -> json("status" to "streaming", "user_row_id" to 1)
+                        "session.active_list" -> json("sessions" to JSONArray().apply {
+                            val runtime = params.string("current_session_id")
+                            if (runtime == currentRuntimeId) put(json("id" to runtime, "session_key" to storedSessionId, "status" to turnStatus))
+                        })
+                        else -> JSONObject()
+                    }
+                    listener.onMessage(this, json("jsonrpc" to "2.0", "id" to frame.getString("id"), "result" to result).toString())
+                    return true
+                }
+            }
+            listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Fixture").build())
+            return socket
+        }
+    }
+
     private class GatewayFixture {
         val calls = mutableListOf<Pair<String, JSONObject>>()
         var socketCount = 0
@@ -69,6 +122,32 @@ class NativeGatewayTest {
 
         assertEquals("android", fixture.calls.single { it.first == "session.resume" }.second.getString("source"))
         fixture.client.closeNative()
+    }
+
+    @Test fun foregroundStatusUsesResumedRuntimeAfterBackgroundStreamWasCancelled() = runBlocking<Unit> {
+        val fixture = RecoveryFixture()
+        val created = fixture.client.post("/api/session/new")
+        val stored = created.getString("session_id")
+        val accepted = fixture.client.post("/api/chat/start", json("session_id" to stored, "message" to "Hello", "attachments" to JSONArray()))
+        val originalRuntime = accepted.getString("stream_id")
+        val stream = launch { fixture.client.stream("/api/chat/stream", mapOf("session_id" to stored, "stream_id" to originalRuntime), "") {} }
+        withTimeout(5_000) { fixture.streamSubscribed.await() }
+        stream.cancelAndJoin()
+
+        fixture.currentRuntimeId = "runtime-resumed"
+        fixture.turnStatus = "idle"
+        val recovery = fixture.client.detached()
+
+        assertNull("A status read against the old socket runtime cannot prove the turn is idle", recovery.nativeSessionStatus(stored, originalRuntime))
+        assertEquals("idle", recovery.recoveredNativeSessionStatus(stored))
+        assertEquals("The recovered status must be scoped to the runtime bound by session.resume", "runtime-resumed",
+            fixture.calls.last { it.first == "session.active_list" }.second.getString("current_session_id"))
+        assertEquals("default", fixture.calls.last { it.first == "session.active_list" }.second.getString("profile"))
+        val finalReply = Message.from(json("role" to "assistant", "text" to "Background completion", "row_id" to 42), 0, stored)
+        val settled = releaseTerminalChat(ChatState(sessionId = stored, streamId = originalRuntime, status = "Working", messages = listOf(finalReply)), originalRuntime, replyConfirmed = true, terminalStatus = "")
+        assertEquals("The final projection remains visible", "Background completion", settled.messages.single().text)
+        assertEquals("The accepted turn no longer holds Send", "", settled.streamId)
+        assertEquals("The working status is cleared", "", settled.status)
     }
 
     @Test fun synchronousSocketFailureDoesNotRetainAConnection() = runBlocking<Unit> {

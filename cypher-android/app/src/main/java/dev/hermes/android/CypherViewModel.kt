@@ -525,7 +525,12 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 reconcile(scope, c)
                 if (!request.current() || !foreground) return@launch
                 val stream = _chat.value.streamId
-                if (stream.isNotBlank() && streams[scope.key]?.isActive != true) attachStream(c, scope, stream)
+                if (stream.isNotBlank() && streams[scope.key]?.isActive != true) {
+                    val nativeStatus = try { c.recoveredNativeSessionStatus(scope.session) }
+                    catch (e: Throwable) { if (e is CancellationException || e is ApiFailure && e.status in setOf(401, 403)) throw e; null }
+                    if (!request.current() || !foreground) return@launch
+                    attachStream(c, scope, stream, terminalAlreadyObserved = nativeStatus == "idle")
+                }
                 watchSession(c, scope)
                 _side.value?.takeIf { it.scope == scope && it.status !in setOf("Complete", "Stopped") }?.let { resumeSideQuestion() }
             } catch (e: Throwable) { if (request.current() && foreground) fail(e) }
@@ -1861,6 +1866,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             optionalLocalSave { app.cache.write(scope, "attachments:${result.optLong("user_row_id")}", json("attachments" to result.optJSONArray("attachment_receipts"), "display_text" to sent.text).toString(), true) }
         }
         val owner = scope.copy(session = "")
+        // The creating socket owns only the first accepted prompt; later turns resume by stored identity.
         clientCreatedSessions.remove(scope.key)
         optionalLocalSave { app.cache.delete(scope, "client-created-shell") }
         publishConfirmedSession(owner, scope.session, result, accepted = true)
@@ -1918,7 +1924,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         return action("/api/chat/steer", json("session_id" to state.sessionId, "text" to text), refresh = false) { _, response -> require(response.optBoolean("accepted")) { "Guidance was not accepted" }; if (_composer.value.text == text) composer(TextFieldValue()); notice("Guidance accepted") }
     }
     fun cancel() = viewModelScope.launch { val c = client ?: return@launch; try { c.get("/api/chat/cancel", mapOf("stream_id" to _chat.value.streamId)); notice("Stopping the current turn") } catch (e: Throwable) { fail(e) } }
-    private fun attachStream(c: CypherClient, scope: Scope, stream: String) {
+    private fun attachStream(c: CypherClient, scope: Scope, stream: String, terminalAlreadyObserved: Boolean = false) {
         if (!foreground || client?.scope != c.scope || scope.copy(session = "") != c.scope) return
         streams[scope.key]?.cancel()
         streams[scope.key] = viewModelScope.launch {
@@ -1932,11 +1938,11 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             var lastCheckpoint = 0L
             var retry = 0
             var terminalError = frame?.string("error").orEmpty()
-            var terminalObserved = false
+            var terminalObserved = terminalAlreadyObserved
             var terminalReplyVisible = false
             if (terminalError.isNotBlank() && sourceScope == scope) _ui.update { it.copy(error = terminalError) }
             try {
-                while (isActive) {
+                while (isActive && !terminalObserved) {
                     try {
                         c.stream("/api/chat/stream", mapOf("stream_id" to stream, "session_id" to scope.session, "replay" to "1"), cursor.lastId) { event ->
                             if (cursor.accept(event)) {
@@ -1981,7 +1987,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                     } catch (e: Throwable) {
                         if (e is CancellationException || e is ApiFailure && e.status in setOf(401, 403)) throw e
                     }
-                    val liveStatus = try { c.nativeSessionStatus(scope.session, stream) }
+                    val liveStatus = try { c.recoveredNativeSessionStatus(scope.session) }
                     catch (e: Throwable) {
                         if (e is CancellationException || e is ApiFailure && e.status in setOf(401, 403)) throw e
                         null
@@ -2018,10 +2024,8 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                     if (sourceScope == scope) {
                         _chat.update { releaseTerminalChat(it, stream, terminalReplyVisible, terminalError) }
                         pollPrompts(c, scope); refreshSessions()
-                        if (terminalReplyVisible) {
-                            val q = _chat.value.queued.firstOrNull()
-                            if (q != null && _composer.value.text.isBlank() && _attachments.value.isEmpty()) { removeQueued(0); _attachments.value = q.attachments; composer(TextFieldValue(q.text)); send(q) }
-                        }
+                        val q = _chat.value.queued.firstOrNull()
+                        if (q != null && _composer.value.text.isBlank() && _attachments.value.isEmpty()) { removeQueued(0); _attachments.value = q.attachments; composer(TextFieldValue(q.text)); send(q) }
                     }
                 }
             } catch (e: Throwable) { if (e is CancellationException) throw e; if (sourceScope == scope) fail(e) } finally {
