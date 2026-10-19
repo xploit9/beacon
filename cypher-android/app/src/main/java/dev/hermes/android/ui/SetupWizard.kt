@@ -75,7 +75,7 @@ internal data class CypherConnectInput(val origin: String, val sessionToken: Str
     override fun toString() = "CypherConnectInput(origin=$origin, sessionToken=<redacted>)"
 }
 
-internal fun parseCypherConnectLink(value: String): CypherConnectInput {
+internal fun parseCypherConnectLink(value: String, allowAddress: Boolean = true): CypherConnectInput {
     val input = value.trim()
     val uri = Uri.parse(input)
     val scannerPayload = runCatching { org.json.JSONObject(input) }.getOrNull()
@@ -89,7 +89,10 @@ internal fun parseCypherConnectLink(value: String): CypherConnectInput {
             uri.getQueryParameter("url")?.takeIf(String::isNotBlank)
                 ?: throw IllegalArgumentException("This Cypher link has no server address. Scan the QR again or paste the HTTPS address.")
         }
-        else -> input
+        else -> {
+            require(allowAddress) { "Scan a Cypher connection QR or paste an HTTPS Hermes address." }
+            input
+        }
     }
     val sessions = when {
         scannerPayload != null -> listOf((scannerPayload.opt("session") as? String)?.takeIf(String::isNotBlank)
@@ -104,6 +107,12 @@ internal fun parseCypherConnectLink(value: String): CypherConnectInput {
 }
 
 internal fun parseCypherConnectInput(value: String): String = parseCypherConnectLink(value).origin
+
+internal fun stageCypherConnectQr(value: String, onStage: (String) -> Unit): Boolean =
+    runCatching { parseCypherConnectLink(value, allowAddress = false) }.fold(
+        onSuccess = { onStage(value); true },
+        onFailure = { false },
+    )
 
 internal fun setupAddressForDisplay(value: String): String {
     val input = value.trim()
@@ -223,7 +232,7 @@ internal fun SetupWizardScreen(
 
     if (scanning) {
         QrScanner(
-            onResult = { value -> scanning = false; address = setupAddressForDisplay(value); onStageLink(value) },
+            onResult = { value -> stageCypherConnectQr(value) { scanning = false; address = setupAddressForDisplay(it); onStageLink(it) } },
             onClose = { scanning = false },
         )
         return

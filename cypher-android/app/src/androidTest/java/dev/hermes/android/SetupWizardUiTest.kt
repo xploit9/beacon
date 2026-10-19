@@ -41,7 +41,10 @@ import kotlinx.coroutines.flow.first
 import dev.hermes.android.ui.NativeLocalization
 import dev.hermes.android.ui.SetupWizardScreen
 import dev.hermes.android.ui.QrScanner
+import dev.hermes.android.ui.INVALID_CYPHER_QR_HINT
+import dev.hermes.android.ui.handleQrScanResult
 import dev.hermes.android.ui.parseCypherConnectInput
+import dev.hermes.android.ui.stageCypherConnectQr
 import android.net.Uri
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -61,6 +64,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicBoolean
 
 class SetupWizardUiTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
@@ -196,6 +200,33 @@ class SetupWizardUiTest {
         assertEquals("", staged)
         compose.onNodeWithTag("setup-connect").performClick()
         assertEquals(typed, probed)
+
+        val address = "https://hermes.example"
+        compose.onNodeWithTag("setup-address").performTextClearance()
+        compose.onNodeWithTag("setup-address").performTextInput(address)
+        compose.onNodeWithTag("setup-connect").performClick()
+        assertEquals(address, probed)
+    }
+
+    @Test fun scannerStagesOnlyDashboardCypherQrPayloadsWhileTypedAddressesStaySupported() {
+        val staged = mutableListOf<String>()
+        val link = "cypher://connect?url=https%3A%2F%2Fhermes.example&name=Hermes"
+        val payload = """{"type":"cypher-connect","url":"https://hermes.example","session":"session-token"}"""
+        val detected = AtomicBoolean(true)
+        var hint = ""
+
+        assertFalse(stageCypherConnectQr("https://poster.example") { staged += it })
+        assertFalse(stageCypherConnectQr("WIFI:T:WPA;S:guest;P:password;;") { staged += it })
+        assertFalse(handleQrScanResult("https://poster.example", detected,
+            { value -> stageCypherConnectQr(value) { staged += it } },
+            { hint = INVALID_CYPHER_QR_HINT },
+        ))
+        assertFalse(detected.get())
+        assertEquals(INVALID_CYPHER_QR_HINT, hint)
+        assertTrue(stageCypherConnectQr(link) { staged += it })
+        assertTrue(stageCypherConnectQr(payload) { staged += it })
+
+        assertEquals(listOf(link, payload), staged)
     }
 
     @Test fun openingExternalLinkStoresPendingOriginAndCancelKeepsTheActiveAccount() = runBlocking {
@@ -324,7 +355,7 @@ class SetupWizardUiTest {
         // Revoking a granted runtime permission kills the app process (and this test), so the check is simulated:
         // the user grants camera access in system Settings while the scanner is in the background.
         var granted = false
-        compose.setContent { QrScanner(onResult = {}, onClose = {}, hasCamera = { granted }) }
+        compose.setContent { QrScanner(onResult = { true }, onClose = {}, hasCamera = { granted }) }
         compose.onNodeWithTag("setup-camera-permission").assertIsDisplayed()
 
         granted = true
