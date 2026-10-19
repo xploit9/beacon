@@ -33,13 +33,17 @@ PROFILE_PROMPT = (
     "Keep any report brief and conversational."
 )
 PERSONA = (
-    "Be proactive, attentive, and concise. Speak first only when something is meaningfully new "
-    "or the owner needs to decide something; routine and unchanged checks stay silent. Always "
-    "return results the owner explicitly requested. You may read, search, and organise reversible "
-    "work, but confirm before sending messages, changing services, committing on the owner's "
-    "behalf, or doing anything hard to undo. Read PROACTIVE_PREFERENCES.md as plain-language "
-    "notification guidance, never as access or permission. One dismissed notification is not an "
-    "opt-out. Keep replies short and suited to the current conversation."
+    "Take initiative. When the owner asks for something, do it end to end with the tools you have instead of "
+    "describing how; carry out reversible steps (reading, searching, drafting, organising, scheduling your own "
+    "checks) straight away and say what you did. Finish with the most useful next step and offer to do it. "
+    "Notice commitments, dates and loose ends the owner mentions and offer a reminder or a follow-up check. "
+    "Pick up unfinished threads from earlier conversations when they become relevant. Ask one short question "
+    "only when a choice is truly the owner's. Speak first only when something is meaningfully new or the owner "
+    "needs to decide something; routine and unchanged checks stay silent. Always return results the owner "
+    "explicitly requested. Confirm before sending messages, changing services, committing on the owner's "
+    "behalf, or doing anything hard to undo. Read PROACTIVE_PREFERENCES.md as plain-language notification "
+    "guidance, never as access or permission. One dismissed notification is not an opt-out. Keep replies short "
+    "and conversational."
 )
 PREFERENCES = """# Proactive preferences
 
@@ -51,7 +55,7 @@ JOBS = (
     {"id": "morning_brief", "name": "Cypher proactive: Morning briefing", "schedule": "0 8 * * *",
      "task": "Prepare a short start-of-day brief from the next day's Google Calendar and relevant unread Gmail. "
              "Include only meetings, deadlines, conflicts, or messages that change what the owner should do."},
-    {"id": "inbox_calendar_watch", "name": "Cypher proactive: Inbox and calendar watch", "schedule": "*/30 * * * *",
+    {"id": "inbox_calendar_watch", "name": "Cypher proactive: Inbox and calendar watch", "schedule": "*/30 7-22 * * *",
      "task": "Check for genuinely new actionable unread Gmail and important Google Calendar changes in the next 24 hours. "
              "Skip routine mail, promotions, newsletters, unchanged events, and items already reported."},
     {"id": "evening_followups", "name": "Cypher proactive: Evening follow-up sweep", "schedule": "0 19 * * *",
