@@ -114,7 +114,7 @@ class NativeExperienceUiTest {
         // Fixture chat ids (new-N) repeat across cases and runs; drop their per-chat receipts, drafts and projections too.
         // shortcut: ids come from one counter shared with projects and branches; 24 covers every current case, widen it if one creates more.
         runBlocking { (1..24).forEach { n -> listOf("pending", "draft", "session", "client-created-shell", "side-question").forEach { app.cache.delete(fixture.scope.session("new-$n"), it) } } }
-        runBlocking { app.cache.delete(fixture.scope, "bot-mode-return"); app.cache.delete(fixture.scope, "xara-session"); app.cache.delete(fixture.scope, "xara-opening"); app.cache.delete(fixture.scope, "phone-editors"); app.cache.delete(fixture.scope, "editor:C:/synthetic-workspace/notes.md") }
+        runBlocking { app.cache.delete(fixture.scope, "bot-mode-return"); app.cache.delete(fixture.scope, "cypher-session"); app.cache.delete(fixture.scope, "cypher-opening"); app.cache.delete(fixture.scope, "phone-editors"); app.cache.delete(fixture.scope, "editor:C:/synthetic-workspace/notes.md") }
         lateinit var vm: CypherViewModel
         val profileSwitchClientFactory: (dev.hermes.android.data.AuthContext) -> dev.hermes.android.data.CypherClient = { auth -> fixture.freshClientFor(auth, app.auth) }
         try {
@@ -154,7 +154,7 @@ class NativeExperienceUiTest {
                 app.auth.remove(fixture.scope.origin)
                 if (priorChatPreferences == null) app.cache.delete(fixture.scope, "chat-preferences") else app.cache.write(fixture.scope, "chat-preferences", priorChatPreferences, true)
             }
-            runBlocking { app.cache.delete(fixture.scope, "bot-mode-return"); app.cache.delete(fixture.scope, "xara-session"); app.cache.delete(fixture.scope, "xara-opening"); app.cache.delete(fixture.scope, "phone-editors"); app.cache.delete(fixture.scope, "editor:C:/synthetic-workspace/notes.md") }
+            runBlocking { app.cache.delete(fixture.scope, "bot-mode-return"); app.cache.delete(fixture.scope, "cypher-session"); app.cache.delete(fixture.scope, "cypher-opening"); app.cache.delete(fixture.scope, "phone-editors"); app.cache.delete(fixture.scope, "editor:C:/synthetic-workspace/notes.md") }
         }
     }
     private fun clickText(text: String) = compose.onNodeWithText(text, useUnmergedTree = true).performScrollTo().performClick()
@@ -1190,8 +1190,8 @@ class NativeExperienceUiTest {
         runBlocking { app.preferences.edit { it[stringPreferencesKey("assistant_profile")] = "coder" } }
         try {
             await { vm.preferences.value.assistantProfile == "coder" && vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
-            compose.runOnIdle { vm.tab("Xara") }
-            await { vm.ui.value.tab == "Xara" && vm.ui.value.profile == "coder" && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady && vm.chat.value.sessionId.startsWith("new-") }
+            compose.runOnIdle { vm.tab("Cypher") }
+            await { vm.ui.value.tab == "Cypher" && vm.ui.value.profile == "coder" && !vm.ui.value.cypherOpening && vm.chat.value.projectionReady && vm.chat.value.sessionId.startsWith("new-") }
             assertTrue("The assistant's conversation is created in its profile", fixture.requests.any { it.string("method") == "session.create" && it.optJSONObject("params")?.string("profile") == "coder" })
             assertEquals("The drawer keeps the chats' profile", "default", vm.ui.value.chatProfile)
             assertTrue("The borrowed profile's assistant conversation is usable", vm.isCypherConversation())
@@ -1204,7 +1204,7 @@ class NativeExperienceUiTest {
         } finally {
             runBlocking {
                 app.preferences.edit { it.remove(stringPreferencesKey("assistant_profile")); it.remove(stringPreferencesKey("assistant_return")) }
-                listOf("xara-session", "xara-opening", "new-chat-shell", "selected-session").forEach { app.cache.delete(coder, it) }
+                listOf("cypher-session", "cypher-opening", "new-chat-shell", "selected-session").forEach { app.cache.delete(coder, it) }
             }
         }
     }
@@ -1214,14 +1214,14 @@ class NativeExperienceUiTest {
         val switchesBefore = fixture.requests.count { it.string("path") == "/api/auth/me" }
         try {
             // Same main-thread step: the preferences flow cannot catch up between the write and the tap.
-            compose.runOnUiThread { runBlocking { app.preferences.edit { it[stringPreferencesKey("assistant_profile")] = "coder" } }; vm.tab("Xara") }
-            await { vm.ui.value.tab == "Xara" && vm.ui.value.profile == "coder" && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady && vm.chat.value.sessionId.isNotBlank() }
+            compose.runOnUiThread { runBlocking { app.preferences.edit { it[stringPreferencesKey("assistant_profile")] = "coder" } }; vm.tab("Cypher") }
+            await { vm.ui.value.tab == "Cypher" && vm.ui.value.profile == "coder" && !vm.ui.value.cypherOpening && vm.chat.value.projectionReady && vm.chat.value.sessionId.isNotBlank() }
             assertEquals("One switch to the assistant's profile", switchesBefore + 1, fixture.requests.count { it.string("path") == "/api/auth/me" })
             receipts += "The assistant tab opens in the profile just chosen in Settings, through one switch, without waiting for the settings to reload."
         } finally {
             runBlocking {
                 app.preferences.edit { it.remove(stringPreferencesKey("assistant_profile")); it.remove(stringPreferencesKey("assistant_return")) }
-                listOf("xara-session", "xara-opening", "new-chat-shell", "selected-session").forEach { app.cache.delete(coder, it) }
+                listOf("cypher-session", "cypher-opening", "new-chat-shell", "selected-session").forEach { app.cache.delete(coder, it) }
             }
         }
     }
@@ -1233,8 +1233,8 @@ class NativeExperienceUiTest {
         try {
             withFixture { vm, _ ->
                 await { CypherViewModel::class.java.getDeclaredField("assistantReturnInitialized").apply { isAccessible = true }.getBoolean(vm) }
-                compose.runOnIdle { vm.tab("Xara") }
-                await { vm.ui.value.tab == "Xara" && vm.isCypherConversation() && vm.chat.value.projectionReady }
+                compose.runOnIdle { vm.tab("Cypher") }
+                await { vm.ui.value.tab == "Cypher" && vm.isCypherConversation() && vm.chat.value.projectionReady }
                 compose.runOnIdle { vm.tab("Chat") }
                 await { vm.ui.value.tab == "Chat" && vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady }
                 receipts += "A return record saved before a restart is loaded with the settings, so opening the assistant tab early cannot replace it."
@@ -1260,14 +1260,14 @@ class NativeExperienceUiTest {
         } finally { app.updates.transportForTest = null; app.updates.clearAuthorization() }
     }
 
-    @Test fun openingANonAssistantCallFromXaraReturnsToItsProfileAndChatOnce() = withFixture { vm, fixture ->
+    @Test fun openingANonAssistantCallFromCypherReturnsToItsProfileAndChatOnce() = withFixture { vm, fixture ->
         val assistantScope = fixture.scope.copy(profile = "coder")
         val callId = "synthetic-return-call"
         runBlocking { app.preferences.edit { it[stringPreferencesKey("assistant_profile")] = "coder" } }
         try {
             await { vm.preferences.value.assistantProfile == "coder" }
-            compose.runOnIdle { vm.tab("Xara") }
-            await { vm.ui.value.tab == "Xara" && vm.ui.value.profile == "coder" && !vm.ui.value.xaraOpening && vm.chat.value.sessionId.isNotBlank() }
+            compose.runOnIdle { vm.tab("Cypher") }
+            await { vm.ui.value.tab == "Cypher" && vm.ui.value.profile == "coder" && !vm.ui.value.cypherOpening && vm.chat.value.sessionId.isNotBlank() }
             // Switching is client-side (bindProfile); each switch re-verifies the account with exactly one /api/auth/me.
             val switchesBefore = fixture.requests.count { it.string("path") == "/api/auth/me" }
             val target = fixture.scope.session("chat-b")
@@ -1277,27 +1277,27 @@ class NativeExperienceUiTest {
             await { vm.ui.value.tab == "Chat" && vm.ui.value.profile == target.profile && vm.chat.value.sessionId == target.session && vm.chat.value.projectionReady }
             assertEquals(switchesBefore + 1, fixture.requests.count { it.string("path") == "/api/auth/me" })
             assertTrue(app.calls.state.value.active)
-            receipts += "Opening a call from Xara returns directly to the call's profile and conversation through one profile switch."
+            receipts += "Opening a call from Cypher returns directly to the call's profile and conversation through one profile switch."
         } finally {
             app.calls.update { CallState() }
             runBlocking {
                 app.preferences.edit { it.remove(stringPreferencesKey("assistant_profile")); it.remove(stringPreferencesKey("assistant_return")) }
-                listOf("xara-session", "xara-opening", "selected-session", "new-chat-shell").forEach { app.cache.delete(assistantScope, it) }
+                listOf("cypher-session", "cypher-opening", "selected-session", "new-chat-shell").forEach { app.cache.delete(assistantScope, it) }
             }
         }
     }
 
-    @Test fun openingACallForCyphersConversationStaysOnXara() = withFixture { vm, _ ->
-        val callId = "synthetic-xara-call"
-        compose.runOnIdle { vm.tab("Xara") }
-        await { vm.ui.value.tab == "Xara" && vm.isCypherConversation() && vm.chat.value.projectionReady }
-        val target = (vm.client?.scope ?: error("Xara client missing")).session(vm.chat.value.sessionId)
+    @Test fun openingACallForCyphersConversationStaysOnCypher() = withFixture { vm, _ ->
+        val callId = "synthetic-cypher-call"
+        compose.runOnIdle { vm.tab("Cypher") }
+        await { vm.ui.value.tab == "Cypher" && vm.isCypherConversation() && vm.chat.value.projectionReady }
+        val target = (vm.client?.scope ?: error("Cypher client missing")).session(vm.chat.value.sessionId)
         app.calls.update { CallState(active = true, state = "listening", callId = callId, conversationScope = target) }
         try {
             compose.runOnIdle { vm.openCurrentCall(callId) }
-            await { vm.ui.value.tab == "Xara" && vm.chat.value.sessionId == target.session && vm.chat.value.projectionReady }
+            await { vm.ui.value.tab == "Cypher" && vm.chat.value.sessionId == target.session && vm.chat.value.projectionReady }
             assertTrue(app.calls.state.value.active)
-            receipts += "Opening a call for Xara's own conversation keeps the assistant tab selected."
+            receipts += "Opening a call for Cypher's own conversation keeps the assistant tab selected."
         } finally {
             app.calls.update { CallState() }
             runBlocking { app.preferences.edit { it.remove(stringPreferencesKey("assistant_return")) } }
@@ -1339,8 +1339,8 @@ class NativeExperienceUiTest {
         compose.runOnIdle { vm.newChat() }
         await { vm.chat.value.sessionId.isBlank() || vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.newChatOpening }
         val before = vm.chat.value.sessionId
-        compose.runOnIdle { vm.tab("Xara") }
-        await { vm.ui.value.tab == "Xara" && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady && vm.chat.value.sessionId.isNotBlank() && vm.chat.value.sessionId != before }
+        compose.runOnIdle { vm.tab("Cypher") }
+        await { vm.ui.value.tab == "Cypher" && !vm.ui.value.cypherOpening && vm.chat.value.projectionReady && vm.chat.value.sessionId.isNotBlank() && vm.chat.value.sessionId != before }
         val assistant = vm.chat.value.sessionId
         compose.runOnIdle { vm.tab("Chat") }
         compose.waitUntil(5_000) { vm.chat.value.sessionId != assistant }
@@ -1349,8 +1349,8 @@ class NativeExperienceUiTest {
     }
 
     @Test fun pickingAProfileOnTheAssistantTabIsForTheChats() = withFixture { vm, fixture ->
-        compose.runOnIdle { vm.tab("Xara") }
-        await { vm.ui.value.tab == "Xara" && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady }
+        compose.runOnIdle { vm.tab("Cypher") }
+        await { vm.ui.value.tab == "Cypher" && !vm.ui.value.cypherOpening && vm.chat.value.projectionReady }
         try {
             compose.runOnIdle { vm.chooseProfile("coder") }
             await { vm.ui.value.tab == "Chat" && vm.ui.value.profile == "coder" }
@@ -1358,7 +1358,7 @@ class NativeExperienceUiTest {
         } finally {
             runBlocking {
                 app.preferences.edit { it.remove(stringPreferencesKey("assistant_return")) }
-                listOf("xara-session", "new-chat-shell", "selected-session").forEach { app.cache.delete(fixture.scope.copy(profile = "coder"), it) }
+                listOf("cypher-session", "new-chat-shell", "selected-session").forEach { app.cache.delete(fixture.scope.copy(profile = "coder"), it) }
             }
         }
     }
@@ -1371,8 +1371,8 @@ class NativeExperienceUiTest {
             compose.onNodeWithText("Configured provider · other-model").performClick()
             await { vm.preferences.value.let { it.assistantModel == "other-model" && it.assistantProvider == "fixture" } }
 
-            compose.runOnIdle { vm.tab("Xara") }
-            await { vm.ui.value.tab == "Xara" && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady }
+            compose.runOnIdle { vm.tab("Cypher") }
+            await { vm.ui.value.tab == "Cypher" && !vm.ui.value.cypherOpening && vm.chat.value.projectionReady }
             await { vm.chat.value.raw.string("model") == "other-model" }
             compose.onNodeWithTag("composer-model-effort").performClick()
             compose.onNodeWithTag("assistant-model-settings").performClick()
@@ -1391,8 +1391,8 @@ class NativeExperienceUiTest {
             await { vm.preferences.value.assistantName == "Nova" }
             assertEquals("Nova", dev.hermes.android.data.currentAssistantName)
 
-            compose.runOnIdle { vm.tab("Xara") }
-            await { vm.ui.value.tab == "Xara" && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady }
+            compose.runOnIdle { vm.tab("Cypher") }
+            await { vm.ui.value.tab == "Cypher" && !vm.ui.value.cypherOpening && vm.chat.value.projectionReady }
             compose.waitUntil(5_000) { compose.onAllNodesWithText("Message Nova", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
             compose.runOnIdle { vm.toggleSessions(true) }
             compose.waitUntil(5_000) { compose.onAllNodesWithText("Nova chat", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
@@ -1407,19 +1407,19 @@ class NativeExperienceUiTest {
         var pinnedId = ""
         var freshId = ""
         try {
-            compose.runOnIdle { vm.tab("Xara") }
-            await { vm.ui.value.tab == "Xara" && vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady }
+            compose.runOnIdle { vm.tab("Cypher") }
+            await { vm.ui.value.tab == "Cypher" && vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.cypherOpening && vm.chat.value.projectionReady }
             pinnedId = vm.chat.value.sessionId
-            assertEquals(pinnedId, runBlocking { app.cache.read(fixture.scope, "xara-session") })
+            assertEquals(pinnedId, runBlocking { app.cache.read(fixture.scope, "cypher-session") })
             fixture.markUnpromptedShell(pinnedId)
             fixture.forgetUnpromptedShell(pinnedId)
             fixture.client.closeNative()
             runBlocking { app.cache.delete(fixture.scope.session(pinnedId), "session") }
             compose.runOnIdle { vm.composer(TextFieldValue("Pinned draft")); vm.selectSession(pinnedId) }
 
-            await { vm.ui.value.tab == "Xara" && vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId != pinnedId && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady }
+            await { vm.ui.value.tab == "Cypher" && vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId != pinnedId && !vm.ui.value.cypherOpening && vm.chat.value.projectionReady }
             freshId = vm.chat.value.sessionId
-            assertEquals(freshId, runBlocking { app.cache.read(fixture.scope, "xara-session") })
+            assertEquals(freshId, runBlocking { app.cache.read(fixture.scope, "cypher-session") })
             assertEquals("Pinned draft", vm.composer.value.text)
             compose.runOnIdle { vm.send() }
             await { fixture.requests.count { it.string("method") == "prompt.submit" } == 1 }
@@ -1430,7 +1430,7 @@ class NativeExperienceUiTest {
                 listOf(pinnedId, freshId).filter(String::isNotBlank).forEach { id ->
                     listOf("client-created-shell", "session", "draft", "pending").forEach { app.cache.delete(fixture.scope.session(id), it) }
                 }
-                listOf("xara-session", "xara-opening", "selected-session", "initial-draft").forEach { app.cache.delete(fixture.scope, it) }
+                listOf("cypher-session", "cypher-opening", "selected-session", "initial-draft").forEach { app.cache.delete(fixture.scope, it) }
             }
         }
     }
@@ -1644,7 +1644,7 @@ class NativeExperienceUiTest {
         // With the draft now empty and the turn still streaming, the trailing voice slot becomes Stop, in the same 48dp footprint.
         compose.onNodeWithTag("message-stop").assertIsDisplayed().assertIsEnabled()
         compose.onNodeWithTag("message-send").assertDoesNotExist()
-        compose.onNodeWithTag("chat-call-xara").assertDoesNotExist()
+        compose.onNodeWithTag("chat-call-cypher").assertDoesNotExist()
         val stopFootprint = compose.onNodeWithTag("message-stop").getUnclippedBoundsInRoot()
         assertEquals("Stop is 48dp wide", 48f, (stopFootprint.right - stopFootprint.left).value, .75f)
         assertEquals("Stop is 48dp tall", 48f, (stopFootprint.bottom - stopFootprint.top).value, .75f)
@@ -1669,13 +1669,13 @@ class NativeExperienceUiTest {
         receipts += "Typing slash discovers commands without creating a conversation."
         capture("slash-commands")
         fixture.holdCreateAcknowledgement = true
-        compose.runOnIdle { vm.tab("Xara") }
+        compose.runOnIdle { vm.tab("Cypher") }
         await { fixture.requests.count { it.string("method") == "session.create" } == 1 }
-        compose.runOnIdle { repeat(50) { vm.openXara() } }
+        compose.runOnIdle { repeat(50) { vm.openCypher() } }
         fixture.releaseCreateAcknowledgement()
-        await { !vm.ui.value.xaraOpening && vm.chat.value.sessionId.startsWith("new-") }
+        await { !vm.ui.value.cypherOpening && vm.chat.value.sessionId.startsWith("new-") }
         assertEquals(1, fixture.requests.count { it.string("method") == "session.create" })
-        assertTrue(vm.ui.value.xaraError.isBlank())
+        assertTrue(vm.ui.value.cypherError.isBlank())
         receipts += "Fifty repeated Cypher opens while create ACK is delayed resolve one durable conversation."
         capture("stable-cypher")
     }
@@ -1894,7 +1894,7 @@ class NativeExperienceUiTest {
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(clarification = null, streamId = "", liveText = "", liveTools = emptyList()) }
         compose.onAllNodesWithTag("chat-activity-strip", useUnmergedTree = true).assertCountEquals(0)
         compose.onNodeWithTag("message-stop").assertDoesNotExist()
-        compose.onNodeWithTag("chat-call-xara").assertIsNotEnabled()
+        compose.onNodeWithTag("chat-call-cypher").assertIsNotEnabled()
         assertTrue(vm.chat.value.queued.isEmpty())
         assertTrue("Reference states never send, stop, approve or answer anything", fixture.requests.none { it.string("method") in setOf("prompt.submit", "session.create", "session.interrupt", "approval.respond", "request.answer") })
         receipts += "Live running/queued/approval/question work appears in the activity strip and read-only sheet from real chat state; the sheet has no stop control, queue removal is the only mutation, and the Cypher shell menus keep working. Nothing was sent."
@@ -2066,20 +2066,20 @@ class NativeExperienceUiTest {
         compose.setContent { CypherTheme(dark = args.getString("native_ui_theme") != "light") {
             LiveCallSurface(call, CallUiActions(mute = { call = call.copy(muted = !call.muted) }, camera = {}, flip = {}, allowBubble = {}, end = { ended = true }, route = {}, screen = {}), false, Modifier.fillMaxSize(), onConversation = {}) { Box(it) }
         } }
-        compose.onNodeWithTag("xara-mute").assertIsDisplayed().performClick()
+        compose.onNodeWithTag("cypher-mute").assertIsDisplayed().performClick()
         assertTrue(call.muted)
-        compose.onNodeWithTag("xara-mute").assertContentDescriptionEquals("Unmute")
+        compose.onNodeWithTag("cypher-mute").assertContentDescriptionEquals("Unmute")
         receipts += "Actual call control toggles synthetic mute; no sensor, service or provider."
         capture("call-muted")
         compose.runOnIdle { call=call.copy(state="connecting",held=true) }
-        compose.onNodeWithTag("xara-camera").assertIsNotEnabled()
+        compose.onNodeWithTag("cypher-camera").assertIsNotEnabled()
         compose.onNodeWithTag("cypher-share-screen").assertIsNotEnabled()
         compose.runOnIdle { call=call.copy(state="listening", held=false, cameraStopPending=true) }
         compose.onNodeWithTag("cypher-share-screen").assertIsNotEnabled()
-        compose.onNodeWithTag("xara-camera").assertIsEnabled()
+        compose.onNodeWithTag("cypher-camera").assertIsEnabled()
         compose.runOnIdle { call=call.copy(cameraStopPending=false,screenStopPending=true) }
         compose.onNodeWithTag("cypher-share-screen").assertIsEnabled()
-        compose.onNodeWithTag("xara-hang-up").performClick(); assertTrue(ended)
+        compose.onNodeWithTag("cypher-hang-up").performClick(); assertTrue(ended)
     }
     @Test fun fileDraftNeverOverwritesNewerFileAndDiscardCannotResurrect() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.navigate("Files") }
@@ -2250,7 +2250,7 @@ class NativeExperienceUiTest {
             await { compose.onAllNodesWithText("A previous action finished. This feedback must not block your call controls.").fetchSemanticsNodes().isNotEmpty() }
             compose.waitForIdle()
             val feedback=compose.onNodeWithTag("native-feedback").fetchSemanticsNode().boundsInRoot
-            for(tag in listOf("xara-camera","xara-hang-up","cypher-share-screen")) {
+            for(tag in listOf("cypher-camera","cypher-hang-up","cypher-share-screen")) {
                 val control=compose.onNodeWithTag(tag).fetchSemanticsNode().boundsInRoot
                 assertTrue("Feedback overlaps $tag",control.bottom<=feedback.top || control.top>=feedback.bottom)
             }
@@ -2264,8 +2264,8 @@ class NativeExperienceUiTest {
             compose.onNodeWithContentDescription("Show navigation").assertIsDisplayed()
             compose.onNodeWithContentDescription("Back to bots").assertDoesNotExist()
             compose.onNodeWithText("Open call").assertDoesNotExist()
-            compose.onAllNodesWithTag("xara-hang-up").assertCountEquals(1)
-            compose.onNodeWithTag("xara-hang-up").performClick()
+            compose.onAllNodesWithTag("cypher-hang-up").assertCountEquals(1)
+            compose.onNodeWithTag("cypher-hang-up").performClick()
             await { !app.calls.state.value.active }
             receipts += "Feedback reserves actual call space; camera, sharing and hangup targets are unobscured, and tapping Hang up reaches the controller."
         } finally { compose.runOnIdle { app.calls.update { before };vm.clearMessage() } }

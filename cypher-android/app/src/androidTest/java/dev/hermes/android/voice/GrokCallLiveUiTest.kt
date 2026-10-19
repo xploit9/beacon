@@ -102,7 +102,7 @@ class GrokCallLiveUiTest {
                 }
             }.build()
             rule.runOnIdle { CypherViewModel::class.java.getDeclaredField("client").apply { isAccessible=true }.set(vm,CypherClient(original.auth.copy(cookies=original.jar.snapshot()),null,null,traced){}) ; vm.tab("Chat") }
-            rule.onNodeWithTag("chat-call-xara").performClick()
+            rule.onNodeWithTag("chat-call-cypher").performClick()
             phase="connect-grok"
             await(45000) { app.calls.state.value.active&&app.calls.state.value.state=="listening"&&app.calls.state.value.transcripts.any { it.role=="assistant" } }
             call=app.calls.state.value.callId
@@ -111,7 +111,7 @@ class GrokCallLiveUiTest {
             assertNotNull("The phone-key Grok admission must be captured",admission)
             assertTrue(admission!!.optBoolean("client_key"))
             assertFalse(admission.has("api_key")||admission.has("token"))
-            for(control in listOf("xara-camera","cypher-share-screen")) {
+            for(control in listOf("cypher-camera","cypher-share-screen")) {
                 rule.onNodeWithTag(control).assertIsEnabled().performClick()
                 rule.onNodeWithTag("cypher-cancel-vision-switch").performClick()
                 assertEquals(call,app.calls.state.value.callId)
@@ -183,7 +183,7 @@ class GrokCallLiveUiTest {
                 val oldVoice=CypherCallService::class.java.getDeclaredField("directVoice").apply { isAccessible=true }.get(oldService) as DirectVoice
                 val oldHttp=DirectVoice::class.java.getDeclaredField("providerHttp").apply { isAccessible=true }.get(oldVoice) as okhttp3.OkHttpClient
                 rejectGemini.set(media=="failure")
-                rule.onNodeWithTag(if(media=="screen") "cypher-share-screen" else "xara-camera").performClick()
+                rule.onNodeWithTag(if(media=="screen") "cypher-share-screen" else "cypher-camera").performClick()
                 rule.onNodeWithTag("cypher-confirm-vision-switch").performClick()
                 phase="handoff-$media-connect"
                 if(media=="failure") {
@@ -208,7 +208,7 @@ class GrokCallLiveUiTest {
                 assertTrue(reader!!.nativeRequest("/api/plugins/cypher/mobile/calls/$oldId").optBoolean("closed"))
                 assertEquals("grok",voiceStore.settings().provider)
                 handoffs.put(json("media" to media,"old_closed" to true,"old_socket_closed" to true,"same_conversation" to true,"gemini_capture_sent" to true,"default_unchanged" to true))
-                rule.onNodeWithTag("xara-hang-up").performClick()
+                rule.onNodeWithTag("cypher-hang-up").performClick()
                 await(45000) { !app.calls.state.value.active&&app.calls.service==null }
             }
             File(app.filesDir,"vision-handoff-proof.json").writeText(json("cancel_preserved_grok" to true,"handoffs" to handoffs,"no_active_recorder" to app.getSystemService(android.media.AudioManager::class.java).activeRecordingConfigurations.isEmpty(),"version_code" to BuildConfig.VERSION_CODE).toString(),Charsets.UTF_8)

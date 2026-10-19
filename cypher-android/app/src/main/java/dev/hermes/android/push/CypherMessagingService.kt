@@ -445,7 +445,11 @@ class CypherMessagingService : FirebaseMessagingService() {
         app.push.tokenChanged(token)
     }
     override fun onMessageReceived(message: RemoteMessage) { receivePush(this, message.data) }
-    companion object { const val CHANNEL = "hermes-activity"; const val INCOMING_CHANNEL = "xara-incoming-call-v2" }
+    companion object {
+        const val CHANNEL = "hermes-activity"
+        // Keep the installed channel ID so owners retain its ringtone and importance settings.
+        const val INCOMING_CHANNEL = "xara-incoming-call-v2"
+    }
 }
 /** Same entry point for FCM and isolated native delivery checks. */
 fun receivePush(context: Context, data: Map<String, String>) = receivePush(context, data, null)
@@ -543,6 +547,7 @@ private fun receivePush(context: Context, data: Map<String, String>, localAction
         NotificationPreviewJob.enqueue(context, source, event, data["conversation_ref"].orEmpty(), data["kind"].orEmpty())
 }
 fun incomingCallChannel(manager: NotificationManager): String {
+    // Keep the old ID so owner-configured channel settings remain attached during migration.
     val legacy = manager.getNotificationChannel("xara-incoming")
     // Rename the existing channel object, retaining its sound, mute and vibration choices.
     legacy?.let { it.name = "Cypher incoming calls"; manager.createNotificationChannel(it) }

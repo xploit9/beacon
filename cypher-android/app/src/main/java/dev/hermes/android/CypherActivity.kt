@@ -202,7 +202,7 @@ internal fun NativeFeedbackEffect(
     }
     val pending = invite?.takeIf { remaining > 0 && vm.app.push.permitsIncoming(it.source) }
     if (pending != null && ui.authenticated && !call.active) {
-        ModalBottomSheet(onDismissRequest = { vm.app.push.dismissInvitation(pending.source, pending.event) }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag("xara-incoming-sheet"), sheetMaxWidth = 560.dp, containerColor = MaterialTheme.colorScheme.surfaceContainer) {
+        ModalBottomSheet(onDismissRequest = { vm.app.push.dismissInvitation(pending.source, pending.event) }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag("cypher-incoming-sheet"), sheetMaxWidth = 560.dp, containerColor = MaterialTheme.colorScheme.surfaceContainer) {
             Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Icon(Icons.Rounded.Call, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(32.dp))
@@ -211,8 +211,8 @@ internal fun NativeFeedbackEffect(
                 Text(uiText("Your microphone stays off until you answer."), style = MaterialTheme.typography.bodyLarge)
                 Text(uiText("The result stays in Cypher history if you miss or decline this invitation."), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
                 ui.error.ifBlank { call.error }.takeIf { it.isNotBlank() }?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium) }
-                Button(onClick = { onAnswer(pending.source, pending.event) }, enabled = !requestingPermission && !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("xara-incoming-answer")) { Icon(Icons.Rounded.Call, null); Spacer(Modifier.width(8.dp)); Text(uiText(when { requestingPermission -> "Waiting for microphone permission"; busy -> "Please wait"; else -> "Answer" })) }
-                OutlinedButton(onClick = { vm.declineIncoming(pending.source, pending.event) }, enabled = !requestingPermission && !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("xara-incoming-decline")) { Icon(Icons.Rounded.CallEnd, null); Spacer(Modifier.width(8.dp)); Text(uiText("Decline")) }
+                Button(onClick = { onAnswer(pending.source, pending.event) }, enabled = !requestingPermission && !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("cypher-incoming-answer")) { Icon(Icons.Rounded.Call, null); Spacer(Modifier.width(8.dp)); Text(uiText(when { requestingPermission -> "Waiting for microphone permission"; busy -> "Please wait"; else -> "Answer" })) }
+                OutlinedButton(onClick = { vm.declineIncoming(pending.source, pending.event) }, enabled = !requestingPermission && !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("cypher-incoming-decline")) { Icon(Icons.Rounded.CallEnd, null); Spacer(Modifier.width(8.dp)); Text(uiText("Decline")) }
             }
         }
     }
@@ -249,7 +249,7 @@ internal fun NativeFeedbackEffect(
         }
     }
     val call by vm.app.calls.state.collectAsStateWithLifecycle()
-    BackHandler(ui.authenticated && !ui.showSessions && ui.tab !in setOf("Chat", "Xara") && (ui.tab != "More" || ui.morePage.isBlank())) {
+    BackHandler(ui.authenticated && !ui.showSessions && ui.tab !in setOf("Chat", "Cypher") && (ui.tab != "More" || ui.morePage.isBlank())) {
         if (ui.tab == "More") vm.backFromSettings() else if (ui.tab == "Spaces" && vm.editor.value.path.isNotBlank()) vm.closeEditor() else if (ui.botModeEnabled) vm.showBotMode() else vm.tab("Chat")
     }
     NativeFeedbackEffect(ui.error, ui.notice, ui.setupWizard, snackbar, vm::clearMessage)
@@ -318,7 +318,7 @@ internal fun NativeFeedbackEffect(
                     else SessionList(vm, navigationModifier.testTag("navigation-menu"), beforeHistory = { SidebarNavigation(vm) })
                 }
         }) {
-            val hasComposer = ui.tab in setOf("Chat", "Xara") && !(call.active && call.conversationScope == vm.authenticatedScope())
+            val hasComposer = ui.tab in setOf("Chat", "Cypher") && !(call.active && call.conversationScope == vm.authenticatedScope())
             val snackbarBottom = with(LocalDensity.current) { if (hasComposer) composerHeightPx.toDp() else 0.dp }
             val feedbackReserve = with(LocalDensity.current) { if (hasComposer) 0.dp else feedbackHeightPx.toDp() }
             Scaffold(modifier = Modifier.imePadding(), contentWindowInsets = WindowInsets.safeDrawing, snackbarHost = { Box(Modifier.padding(bottom = snackbarBottom)) { feedbackHost() } }) { padding ->
@@ -331,12 +331,12 @@ internal fun NativeFeedbackEffect(
                                 TextButton(enabled = !ui.loading, onClick = { vm.connect(ui.origin) }) { Text(uiText("Reconnect")) }
                             }
                         }
-                        if (call.active && (ui.tab !in setOf("Chat","Xara") && !botChatVisible || call.conversationScope != vm.authenticatedScope())) Surface(color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.fillMaxWidth()) { Row(Modifier.padding(start = 16.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) { Text("${LocalAssistantName.current} · ${call.state}", Modifier.weight(1f)); TextButton(onClick = { vm.openCurrentCall() }) { Text(uiText("Open call")) }; IconButton(onClick = vm.app.calls::hangup) { Icon(Icons.Rounded.CallEnd, assistantText("Hang up Cypher")) } } }
+                        if (call.active && (ui.tab !in setOf("Chat","Cypher") && !botChatVisible || call.conversationScope != vm.authenticatedScope())) Surface(color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.fillMaxWidth()) { Row(Modifier.padding(start = 16.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) { Text("${LocalAssistantName.current} · ${call.state}", Modifier.weight(1f)); TextButton(onClick = { vm.openCurrentCall() }) { Text(uiText("Open call")) }; IconButton(onClick = vm.app.calls::hangup) { Icon(Icons.Rounded.CallEnd, assistantText("Hang up Cypher")) } } }
                         Box(Modifier.weight(1f).then(modeMotion)) {
                         if (vm.client == null && !ui.loading && ui.tab in setOf("Tasks", "Spaces", "Projects", "Kanban")) {
                             Header(when(ui.tab) { "Tasks" -> "Cron"; "Spaces" -> "Files"; else -> ui.tab }, menu = openMenu)
                             EmptyState("Reconnect to Hermes", "Keep Tailscale connected to open this page. Your drafts remain saved on this phone.", action = "Reconnect", onAction = { vm.connect(ui.origin) })
-                        } else when (ui.tab) { "Xara" -> ChatScreen(vm, xara = true, onComposerHeight = { composerHeightPx = it }); "Chat" -> ChatScreen(vm, onComposerHeight = { composerHeightPx = it }); "Tasks" -> TasksScreen(vm); "Spaces" -> SpacesScreen(vm); "Projects" -> NativeProjectsScreen(vm); "Kanban" -> KanbanScreen(vm); else -> MoreScreen(vm) }
+                        } else when (ui.tab) { "Cypher" -> ChatScreen(vm, cypher = true, onComposerHeight = { composerHeightPx = it }); "Chat" -> ChatScreen(vm, onComposerHeight = { composerHeightPx = it }); "Tasks" -> TasksScreen(vm); "Spaces" -> SpacesScreen(vm); "Projects" -> NativeProjectsScreen(vm); "Kanban" -> KanbanScreen(vm); else -> MoreScreen(vm) }
                         }
                     }
                 }

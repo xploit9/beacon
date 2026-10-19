@@ -326,7 +326,7 @@ class CypherCallService : Service() {
                 manager.registerAppWithTelecom(CallsManager.CAPABILITY_BASELINE)
                 currentCoroutineContext().ensureActive()
                 if(closed.get()||app.calls.service!==this@CypherCallService) return@launch
-                val attributes = CallAttributesCompat(displayName = dev.hermes.android.data.currentAssistantName, address = Uri.parse("hermes:xara"), direction = if (pending.incoming) CallAttributesCompat.DIRECTION_INCOMING else CallAttributesCompat.DIRECTION_OUTGOING, callType = CallAttributesCompat.CALL_TYPE_AUDIO_CALL)
+                val attributes = CallAttributesCompat(displayName = dev.hermes.android.data.currentAssistantName, address = Uri.parse("hermes:cypher"), direction = if (pending.incoming) CallAttributesCompat.DIRECTION_INCOMING else CallAttributesCompat.DIRECTION_OUTGOING, callType = CallAttributesCompat.CALL_TYPE_AUDIO_CALL)
                 manager.addCall(attributes, onAnswer = { _ -> hold(false) }, onDisconnect = { _ -> hangup() }, onSetActive = { hold(false) }, onSetInactive = { hold(true) }) {
                     control = this
                     launch { availableEndpoints.collect { values -> endpoints = values; app.calls.updateFrom(this@CypherCallService) { it.copy(routes = values.map { e -> AudioRoute(e.identifier.toString(), e.name.toString()) }) } } }
@@ -745,7 +745,19 @@ class CypherCallService : Service() {
         super.onDestroy()
         platformDestroyed.complete(Unit)
     }
-    companion object { const val EXTRA_CALL_ID = "hermes.call.ID"; const val START = "hermes.call.START"; const val HANGUP = "hermes.call.HANGUP"; const val MUTE = "hermes.call.MUTE"; const val STOP_SCREEN = "hermes.call.STOP_SCREEN"; const val TOOL_ALLOW="hermes.call.TOOL_ALLOW"; const val TOOL_DENY="hermes.call.TOOL_DENY"; const val TOOL_NOTIFICATION=43; const val CHANNEL = "xara-calls"; const val NOTIFICATION = 41 }
+    companion object {
+        const val EXTRA_CALL_ID = "hermes.call.ID"
+        const val START = "hermes.call.START"
+        const val HANGUP = "hermes.call.HANGUP"
+        const val MUTE = "hermes.call.MUTE"
+        const val STOP_SCREEN = "hermes.call.STOP_SCREEN"
+        const val TOOL_ALLOW = "hermes.call.TOOL_ALLOW"
+        const val TOOL_DENY = "hermes.call.TOOL_DENY"
+        const val TOOL_NOTIFICATION = 43
+        // Keep the installed channel ID so owners retain its sound and importance settings.
+        const val CHANNEL = "xara-calls"
+        const val NOTIFICATION = 41
+    }
 }
 
 

@@ -47,7 +47,7 @@ class CallTranscriptTest {
         org.junit.Assert.assertTrue(result.acceptTranscript(final).count { it.eventId == final.eventId } == 1)
     }
 
-    @Test fun savedVoiceTranscriptKeepsXaraAttributionInOrdinaryChats() {
+    @Test fun savedVoiceTranscriptKeepsCypherAttributionInOrdinaryChats() {
         val voice = Message.from(json("role" to "assistant", "content" to "Hello",
             "display_metadata" to json("channel" to "voice")), 0, "ordinary")
         assertTrue(voice.voice)

@@ -157,9 +157,9 @@ internal data class CallUiActions(val mute: () -> Unit, val camera: () -> Unit, 
 
         Row(Modifier.widthIn(max=480.dp).fillMaxWidth().padding(8.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(6.dp)) {
 
-            FilledIconButton(actions.camera,Modifier.size(52.dp).testTag("xara-camera").semantics { selected = call.cameraSharing; stateDescription = if (call.cameraStopPending) "Camera stop unconfirmed. Retry stopping." else if (call.cameraBusy) "Camera changing" else if (call.cameraSharing) "Camera sharing" else "Camera stopped" },enabled=call.active&&(call.cameraSharing||call.cameraBusy||call.cameraStopPending||!call.held&&call.state!="connecting")&&!call.screenSharing&&!call.screenBusy&&!call.screenStopPending,colors=buttonColors) { Icon(if(call.cameraSharing||call.cameraBusy||call.cameraStopPending) Icons.Rounded.VideocamOff else Icons.Rounded.Videocam,uiText(if(call.cameraSharing||call.cameraBusy||call.cameraStopPending) if(call.cameraStopPending) "Retry stop camera" else "Camera off" else "Camera")) }
+            FilledIconButton(actions.camera,Modifier.size(52.dp).testTag("cypher-camera").semantics { selected = call.cameraSharing; stateDescription = if (call.cameraStopPending) "Camera stop unconfirmed. Retry stopping." else if (call.cameraBusy) "Camera changing" else if (call.cameraSharing) "Camera sharing" else "Camera stopped" },enabled=call.active&&(call.cameraSharing||call.cameraBusy||call.cameraStopPending||!call.held&&call.state!="connecting")&&!call.screenSharing&&!call.screenBusy&&!call.screenStopPending,colors=buttonColors) { Icon(if(call.cameraSharing||call.cameraBusy||call.cameraStopPending) Icons.Rounded.VideocamOff else Icons.Rounded.Videocam,uiText(if(call.cameraSharing||call.cameraBusy||call.cameraStopPending) if(call.cameraStopPending) "Retry stop camera" else "Camera off" else "Camera")) }
 
-            FilledIconButton(actions.mute,Modifier.size(52.dp).testTag("xara-mute").semantics { selected = call.muted; stateDescription = if (call.muted) "Microphone muted" else "Microphone active" },enabled=call.active,colors=buttonColors) { Icon(if(call.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic,uiText(if(call.muted) "Unmute" else "Mute")) }
+            FilledIconButton(actions.mute,Modifier.size(52.dp).testTag("cypher-mute").semantics { selected = call.muted; stateDescription = if (call.muted) "Microphone muted" else "Microphone active" },enabled=call.active,colors=buttonColors) { Icon(if(call.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic,uiText(if(call.muted) "Unmute" else "Mute")) }
 
             Box(Modifier.weight(1f),contentAlignment=Alignment.Center) { VoiceWave(call,Modifier.widthIn(max=168.dp).fillMaxWidth().height(72.dp),motionEnabled) }
 
@@ -171,7 +171,7 @@ internal data class CallUiActions(val mute: () -> Unit, val camera: () -> Unit, 
 
             }
 
-            FilledIconButton(actions.end,Modifier.size(52.dp).testTag("xara-hang-up"),colors=IconButtonDefaults.filledIconButtonColors(containerColor=MaterialTheme.colorScheme.error,contentColor=MaterialTheme.colorScheme.onError)) { Icon(Icons.Rounded.CallEnd,uiText("Hang up")) }
+            FilledIconButton(actions.end,Modifier.size(52.dp).testTag("cypher-hang-up"),colors=IconButtonDefaults.filledIconButtonColors(containerColor=MaterialTheme.colorScheme.error,contentColor=MaterialTheme.colorScheme.onError)) { Icon(Icons.Rounded.CallEnd,uiText("Hang up")) }
 
         }
 

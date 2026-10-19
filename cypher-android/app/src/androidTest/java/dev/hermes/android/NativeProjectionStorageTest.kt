@@ -10,11 +10,33 @@ import org.junit.Assert.*
 import org.junit.Test
 import java.util.UUID
 
+private const val LEGACY_SESSION_KIND = "xara-session" // This test verifies the released cache kind is migrated.
+private const val LEGACY_OPENING_KIND = "xara-opening" // This test verifies the released cache kind is migrated.
+
 /** Real Android SQLite + keystore regression; never touches the owner's installed database. */
 class NativeProjectionStorageTest {
     private fun database(): ProjectionDb = Room.inMemoryDatabaseBuilder(
         ApplicationProvider.getApplicationContext(), ProjectionDb::class.java
     ).build()
+
+    @Test fun legacyAssistantCacheKindsMigrateWithoutLosingProtectedPointers() = runBlocking {
+        val db = database()
+        try {
+            val cache = ProjectionCache(db, AppCipher())
+            val scope = Scope("https://native.example", "fixture-owner", "default", "fixture-chat")
+            // Released builds stored the assistant pointer and unresolved-open marker under these kinds.
+            cache.write(scope, LEGACY_SESSION_KIND, "pinned-session", protected = true)
+            cache.write(scope, LEGACY_OPENING_KIND, "unknown", protected = true)
+
+            assertEquals("pinned-session", cache.readMigrating(scope, "cypher-session", LEGACY_SESSION_KIND))
+            assertEquals("unknown", cache.readMigrating(scope, "cypher-opening", LEGACY_OPENING_KIND))
+            assertEquals("pinned-session", cache.read(scope, "cypher-session"))
+            assertEquals("unknown", cache.read(scope, "cypher-opening"))
+            assertNull(cache.read(scope, LEGACY_SESSION_KIND))
+            assertNull(cache.read(scope, LEGACY_OPENING_KIND))
+            assertEquals(2, db.rows().protectedRows(scope.key).size)
+        } finally { db.close() }
+    }
 
     @Test fun existingLargeEncryptedDraftReadsMigratesAndOverwritesWithoutCursorOverflow() = runBlocking {
         val db = database()

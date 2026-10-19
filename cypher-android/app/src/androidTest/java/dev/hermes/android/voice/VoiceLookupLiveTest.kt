@@ -95,7 +95,7 @@ class VoiceLookupLiveTest {
             rule.runOnIdle { CypherViewModel::class.java.getDeclaredField("client").apply { isAccessible=true }.set(vm,CypherClient(original.auth.copy(cookies=original.jar.snapshot()),null,null,observed){}) ; vm.tab("Chat") }
             phases.put("phase","connecting")
             val start=System.nanoTime()
-            rule.onNodeWithTag("chat-call-xara").performClick()
+            rule.onNodeWithTag("chat-call-cypher").performClick()
             await(25_000) { app.calls.state.value.active&&app.calls.state.value.state in setOf("listening","speaking") }
             phases.put("ready_ms",(System.nanoTime()-start)/1_000_000)
             call=app.calls.state.value.callId
@@ -141,7 +141,7 @@ class VoiceLookupLiveTest {
                 phases.put("phase",kind+"-playback");drainSpeech()
             }
             phases.put("playback_drained",true).put("no_playback_overflow",app.calls.state.value.error.isBlank())
-            rule.onNodeWithTag("xara-hang-up").performClick()
+            rule.onNodeWithTag("cypher-hang-up").performClick()
             await { !app.calls.state.value.active&&app.calls.service==null }
             val final=client!!.nativeRequest("/api/plugins/cypher/mobile/calls/$call")
             assertFalse(final.optBoolean("audio_available"));assertEquals("saved",final.getString("transcript_status"))

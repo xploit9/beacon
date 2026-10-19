@@ -33,6 +33,10 @@ import java.io.File
 private val streamIdPattern = Regex("[A-Za-z0-9_.:-]{1,256}")
 private const val MAX_CHAT_ATTACHMENT_BYTES = 12L * 1024 * 1024
 private const val LOCAL_CHECKPOINT_LIMIT_BYTES = 16L * 1024 * 1024
+private const val LEGACY_CYPHER_SESSION_CACHE_KIND = "xara-session" // Migrate the existing encrypted conversation pointer on first read.
+private const val LEGACY_CYPHER_OPENING_CACHE_KIND = "xara-opening" // Migrate the existing encrypted creation marker on first read.
+private const val LEGACY_CYPHER_SESSION_HANDLE_PREFIX = "xara:" // Migrate existing scoped SavedStateHandle pointers on first read.
+private const val LEGACY_CYPHER_TAB_VALUE = "Xara" // Replace the released assistant tab value when restoring state.
 
 data class Message(val id: String, val role: String, val text: String, val reasoning: String = "", val tools: List<JSONObject> = emptyList(), val attachments: List<JSONObject> = emptyList(), val mediaSnapshots: Map<String, String> = emptyMap(), val sessionId: String = "", val interrupted: Boolean = false, val voice: Boolean = false, val recordedAt: Long = 0L) {
     companion object {
@@ -72,7 +76,7 @@ internal fun releaseTerminalChat(chat: ChatState, stream: String, replyConfirmed
 data class EditorState(val scope: Scope? = null, val path: String = "", val text: TextFieldValue = TextFieldValue(), val serverText: String = "", val metadata: JSONObject = JSONObject(), val loading: Boolean = false, val saving: Boolean = false, val error: String = "", val reviewRequired: Boolean = false) { val dirty get() = text.text != serverText }
 data class SideQuestion(val scope: Scope, val question: String, val sessionId: String, val streamId: String, val text: String = "", val status: String = "Responding", val cursor: String = "", val error: String = "")
 data class AppUpdateState(val release: Release? = null, val busy: Boolean = false, val ready: Boolean = false, val status: String = "Cypher checks for updates automatically while connected.")
-data class AppState(val origin: String = BuildConfig.DEFAULT_ORIGIN, val authenticated: Boolean = false, val profile: String = "default", val chatProfile: String = "", val owner: String = "", val tab: String = "Chat", val connected: Boolean = false, val loading: Boolean = false, val error: String = "", val notice: String = "", val bootstrap: JSONObject = JSONObject(), val sessions: List<JSONObject> = emptyList(), val query: String = "", val showSessions: Boolean = false, val morePage: String = "", val xaraOpening: Boolean = false, val xaraError: String = "", val newChatOpening: Boolean = false, val newChatError: String = "", val initialChatReady: Boolean = false, val restoringSession: Boolean = true, val botModeEnabled: Boolean = false, val botModeSwitching: Boolean = false, val setupWizard: Boolean = false, val setupComplete: Boolean = false, val setupStep: String = "connect", val setupPluginMessage: String = "", val setupOrigin: String = "", val historyLoading: Boolean = false)
+data class AppState(val origin: String = BuildConfig.DEFAULT_ORIGIN, val authenticated: Boolean = false, val profile: String = "default", val chatProfile: String = "", val owner: String = "", val tab: String = "Chat", val connected: Boolean = false, val loading: Boolean = false, val error: String = "", val notice: String = "", val bootstrap: JSONObject = JSONObject(), val sessions: List<JSONObject> = emptyList(), val query: String = "", val showSessions: Boolean = false, val morePage: String = "", val cypherOpening: Boolean = false, val cypherError: String = "", val newChatOpening: Boolean = false, val newChatError: String = "", val initialChatReady: Boolean = false, val restoringSession: Boolean = true, val botModeEnabled: Boolean = false, val botModeSwitching: Boolean = false, val setupWizard: Boolean = false, val setupComplete: Boolean = false, val setupStep: String = "connect", val setupPluginMessage: String = "", val setupOrigin: String = "", val historyLoading: Boolean = false)
 internal fun voiceKeySetupPage(): String = "Cypher"
 internal data class VoiceCallRequest(val scope:Scope,val conversationId:String)
 
@@ -126,7 +130,35 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     val phoneSettings = NativePhoneSettings(viewModelScope, saved, draftChanged = ::checkpointPhoneSettings, cache = app.cache) { client }
     val botMode = NativeBotModeController(viewModelScope, saved, openChat = ::openBotChat) { client }
     val preferences = app.preferences.data.map(AppPreferences::read).stateIn(viewModelScope, SharingStarted.Eagerly, AppPreferences())
-    private val _ui = MutableStateFlow(AppState(tab = saved["tab"] ?: "Chat", morePage = saved["more"] ?: ""))
+    private fun restoredTab(): String {
+        val tab = saved.get<String>("tab") ?: return "Chat"
+        if (tab != LEGACY_CYPHER_TAB_VALUE) return tab
+        saved["tab"] = "Cypher"
+        return "Cypher"
+    }
+    private fun cypherSessionHandleKey(scope: Scope) = "cypher:${scope.key}"
+    private fun readCypherSessionHandle(scope: Scope): String? {
+        val key = cypherSessionHandleKey(scope)
+        val oldKey = "$LEGACY_CYPHER_SESSION_HANDLE_PREFIX${scope.key}"
+        val value = saved.get<String>(key)
+        if (value != null) { saved.remove<String>(oldKey); return value }
+        val old = saved.get<String>(oldKey) ?: return null
+        saved[key] = old
+        saved.remove<String>(oldKey)
+        return old
+    }
+    private fun writeCypherSessionHandle(scope: Scope, id: String) {
+        saved[cypherSessionHandleKey(scope)] = id
+        saved.remove<String>("$LEGACY_CYPHER_SESSION_HANDLE_PREFIX${scope.key}")
+    }
+    private fun clearCypherSessionHandle(scope: Scope) {
+        saved.remove<String>(cypherSessionHandleKey(scope))
+        saved.remove<String>("$LEGACY_CYPHER_SESSION_HANDLE_PREFIX${scope.key}")
+    }
+    private suspend fun readCypherCache(scope: Scope): String? = app.cache.readMigrating(scope, "cypher-session", LEGACY_CYPHER_SESSION_CACHE_KIND)
+    private suspend fun readCypherOpening(scope: Scope): String? = app.cache.readMigrating(scope, "cypher-opening", LEGACY_CYPHER_OPENING_CACHE_KIND)
+    private suspend fun readCypherSession(scope: Scope): String? = readCypherSessionHandle(scope) ?: readCypherCache(scope)
+    private val _ui = MutableStateFlow(AppState(tab = restoredTab(), morePage = saved["more"] ?: ""))
     private var normalModeReturn: JSONObject? = null
     private var modeTransition: Job? = null
     val ui = _ui.asStateFlow()
@@ -194,8 +226,8 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private var startupIndex: Job? = null
     private var startupSettings: Job? = null
     private var optionalProbe: Job? = null
-    private var preparedXara: Pair<Scope, String>? = null
-    private val xaraResolveLock = Mutex()
+    private var preparedCypher: Pair<Scope, String>? = null
+    private val cypherResolveLock = Mutex()
     private var recoveryJob: Job? = null
     private var sessionWatch: Job? = null
     private var connectionProbe: Job? = null
@@ -231,7 +263,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     @Volatile private var originGeneration = 0
     @Volatile private var sessionGeneration = 0
     private var navigationGeneration = 0
-    private var xaraGeneration = 0
+    private var cypherGeneration = 0
     private var speech: android.speech.tts.TextToSpeech? = null
     private var speechReady = false
     private var speechPending: (() -> Unit)? = null
@@ -700,7 +732,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             client = null; cachedOwnerScope = null; sourceScope = null
             val message = if (loopbackRestart) error.message.orEmpty() else "Sign in again. Your local draft is retained."
             origin?.let { revoked -> val version = app.auth.authorityEpoch.readVersion(); viewModelScope.launch { runCatching { app.auth.removeIfUnchanged(revoked, version) }.onFailure { if (originGeneration == invalidation) notice("Local credential removal failed: ${it.message.orEmpty()}") } } }
-            _ui.update { it.copy(authenticated = false, connected = false, loading = false, restoringSession = false, setupWizard = true, setupComplete = false, setupStep = if (loopbackRestart) "connect" else "signin", setupOrigin = if (loopbackRestart) origin ?: it.setupOrigin else it.setupOrigin, xaraOpening = false, xaraError = "", newChatOpening = false, newChatError = "", initialChatReady = false, owner = "", query = "", sessions = emptyList(), bootstrap = JSONObject(), error = message) }
+            _ui.update { it.copy(authenticated = false, connected = false, loading = false, restoringSession = false, setupWizard = true, setupComplete = false, setupStep = if (loopbackRestart) "connect" else "signin", setupOrigin = if (loopbackRestart) origin ?: it.setupOrigin else it.setupOrigin, cypherOpening = false, cypherError = "", newChatOpening = false, newChatError = "", initialChatReady = false, owner = "", query = "", sessions = emptyList(), bootstrap = JSONObject(), error = message) }
             saveSetupProgress(if (loopbackRestart) "connect" else "signin", complete = false, setupOrigin = if (loopbackRestart) origin else null)
             _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList(); _data.value = emptyMap(); clearDetails()
         } else {
@@ -729,7 +761,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         if (generation != originGeneration) return@launch
         sessionWatch?.cancel(); selectionJob?.cancel(); ++sessionGeneration
         streams.values.forEach(Job::cancel); streams.clear()
-        _ui.update { it.copy(loading = true, restoringSession = true, error = "", xaraOpening = false, xaraError = "", newChatOpening = false, newChatError = "", initialChatReady = false, authenticated = false, connected = false, owner = "", query = "", sessions = emptyList(), bootstrap = JSONObject()) }
+        _ui.update { it.copy(loading = true, restoringSession = true, error = "", cypherOpening = false, cypherError = "", newChatOpening = false, newChatError = "", initialChatReady = false, authenticated = false, connected = false, owner = "", query = "", sessions = emptyList(), bootstrap = JSONObject()) }
         _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList(); _data.value = emptyMap(); clearDetails(); sourceScope = null; cachedOwnerScope = null; client = null
         var restoringClient: CypherClient? = null
         var restoringScope: Scope? = null
@@ -752,9 +784,9 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             val bootstrap = next.bootstrap()
             if (generation != originGeneration) return@launch
             trustedCache?.let(next.auth::requireCachedIdentity)
-            val xara = app.cache.read(next.scope, "xara-session")
+            val cypher = readCypherCache(next.scope)
             if (generation != originGeneration) return@launch
-            xara?.let { saved["xara:${next.scope.key}"] = it }
+            cypher?.let { writeCypherSessionHandle(next.scope, it) }
             if (!persistAuthIfCurrent(next.auth, credentialVersion)) {
                 if (generation == originGeneration) {
                     app.calls.hangup(); cachedOwnerScope = null; sourceScope = null
@@ -787,7 +819,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             dev.hermes.android.push.KeepConnectedService.startIfEnabled(app)
             checkForAppUpdate(quiet = true)
             prepareStartup()
-            if (_ui.value.tab == "Xara") openXara() else if (assistantReturn() != null) returnFromAssistant() else {
+            if (_ui.value.tab == "Cypher") openCypher() else if (assistantReturn() != null) returnFromAssistant() else {
                 val selected = saved.get<String>("session:${next.scope.key}") ?: sourceScope?.takeIf { it.copy(session = "") == next.scope }?.session
                 val shell = app.cache.read(next.scope, "new-chat-shell")
                 if (generation != originGeneration || client !== next) return@launch
@@ -993,7 +1025,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private suspend fun restoreCachedOwner(scope: Scope, generation: Int) {
         val index = app.cache.read(scope, "conversation-index")?.let(::JSONObject)
         val settings = app.cache.read(scope, "profile-settings")?.let(::JSONObject)
-        val xara = app.cache.read(scope, "xara-session")
+        val cypher = readCypherCache(scope)
         val selected = saved.get<String>("session:${scope.key}") ?: app.cache.read(scope, "selected-session")
         val shell = app.cache.read(scope, "new-chat-shell")
         if (generation != originGeneration) return
@@ -1001,11 +1033,11 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         restoreBotMode(scope)
         app.calls.ownerScope = scope
         restoreAppUpdate()
-        if (xara != null) saved["xara:${scope.key}"] = xara
+        if (cypher != null) writeCypherSessionHandle(scope, cypher)
         shell?.let { initialShells[scope.key] = it }
         settings?.let { _data.update { data -> data + ("profile-settings" to it) } }
         _ui.update { it.copy(origin = scope.origin, owner = scope.owner, profile = scope.profile, authenticated = true, connected = false, sessions = index?.rows("sessions").orEmpty()) }
-        val id = if (_ui.value.tab == "Xara") xara else selected
+        val id = if (_ui.value.tab == "Cypher") cypher else selected
         if (!id.isNullOrBlank()) {
             sourceScope = scope.session(id)
             val selection = ++sessionGeneration
@@ -1036,17 +1068,17 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val scope = owner.session(id)
         val retained = draft()
         // Hermes forgot the pinned Cypher conversation before its first turn: resolve a fresh one there instead of bouncing to Chat forever.
-        val pinned = saved.get<String>("xara:${owner.key}") == id || preparedXara?.let { it.first == owner && it.second == id } == true ||
-            runCatching { app.cache.read(owner, "xara-session") == id }.getOrDefault(false)
+        val pinned = readCypherSessionHandle(owner) == id || preparedCypher?.let { it.first == owner && it.second == id } == true ||
+            runCatching { readCypherCache(owner) == id }.getOrDefault(false)
         if (pinned) {
-            saved.remove<String>("xara:${owner.key}")
-            if (preparedXara?.second == id) preparedXara = null
-            try { app.cache.delete(owner, "xara-session"); app.cache.delete(scope, "client-created-shell"); app.cache.delete(scope, "session") }
+            clearCypherSessionHandle(owner)
+            if (preparedCypher?.second == id) preparedCypher = null
+            try { app.cache.delete(owner, "cypher-session"); app.cache.delete(owner, LEGACY_CYPHER_SESSION_CACHE_KIND); app.cache.delete(scope, "client-created-shell"); app.cache.delete(scope, "session") }
             catch (error: Throwable) { if (error is CancellationException) throw error; notice("Your draft is safe. Refresh to finish.") }
             if (!current()) return
-            if (_ui.value.tab == "Xara") {
+            if (_ui.value.tab == "Cypher") {
                 sessionWatch?.cancel(); ++sessionGeneration; sourceScope = null; clearDetails(); _chat.value = ChatState()
-                openXara(editorDraft = retained.text.takeIf { it.isNotBlank() })
+                openCypher(editorDraft = retained.text.takeIf { it.isNotBlank() })
                 return
             }
         }
@@ -1090,7 +1122,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         sessionWatch?.cancel(); sourceScope = null; clearDetails(); _chat.value = ChatState()
         saved.remove<String>("settings-navigation")
         saved["tab"] = "Chat"; saved["more"] = ""
-        _ui.update { it.copy(tab = "Chat", morePage = "", showSessions = false, initialChatReady = false, newChatOpening = false, newChatError = "", botModeEnabled = if (botReturn != null) false else it.botModeEnabled, botModeSwitching = if (botReturn != null) false else it.botModeSwitching, xaraOpening = false, xaraError = "") }
+        _ui.update { it.copy(tab = "Chat", morePage = "", showSessions = false, initialChatReady = false, newChatOpening = false, newChatError = "", botModeEnabled = if (botReturn != null) false else it.botModeEnabled, botModeSwitching = if (botReturn != null) false else it.botModeSwitching, cypherOpening = false, cypherError = "") }
         if (cleanupFailed) notice("Your draft is safe. Refresh to finish.")
         if (client !== active || originGeneration != origin) return
         restoreInitialDraft(owner, origin)
@@ -1130,22 +1162,22 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         }
         client = null; cachedOwnerScope = null; sourceScope = null; retireSavedDrafts(null); _chat.value = ChatState(); _composer.value = TextFieldValue(); _data.value = emptyMap(); _attachments.value = emptyList(); clearDetails()
         val setupStep = if (loopback) "connect" else "signin"
-        _ui.update { it.copy(authenticated = false, connected = false, loading = false, restoringSession = false, setupWizard = true, setupComplete = false, setupStep = setupStep, setupOrigin = if (loopback) origin.orEmpty() else it.setupOrigin, xaraOpening = false, xaraError = "", newChatOpening = false, newChatError = "", initialChatReady = false, sessions = emptyList(), query = "", owner = "", bootstrap = JSONObject()) }
+        _ui.update { it.copy(authenticated = false, connected = false, loading = false, restoringSession = false, setupWizard = true, setupComplete = false, setupStep = setupStep, setupOrigin = if (loopback) origin.orEmpty() else it.setupOrigin, cypherOpening = false, cypherError = "", newChatOpening = false, newChatError = "", initialChatReady = false, sessions = emptyList(), query = "", owner = "", bootstrap = JSONObject()) }
         saveSetupProgress(setupStep, complete = false, setupOrigin = if (loopback) origin else null)
     }
     fun tab(value: String) { if (_ui.value.botModeSwitching) return; botMode.back(); tab(value, resumeDraft = true) }
     private fun tab(value: String, resumeDraft: Boolean): Job? {
         val previous = _ui.value.tab
-        if (value == "Xara" && previous != "Xara") noteAssistantReturn(previous)
+        if (value == "Cypher" && previous != "Cypher") noteAssistantReturn(previous)
         saved.remove<String>("settings-navigation")
         ++navigationGeneration
         clearPendingVoiceKeyRequestsIfLeavingVoiceKeyPage(value, "")
         _ui.update { it.copy(tab = value, morePage = "", showSessions = false) }; saved["tab"] = value; saved["more"] = ""
         var transition: Job? = null
-        if (value == "Xara" && _ui.value.authenticated) transition = openXara()
-        else if (value != "Xara") {
-            ++xaraGeneration; _ui.update { it.copy(xaraOpening = false, xaraError = "") }
-            if (previous == "Xara") transition = returnFromAssistant()
+        if (value == "Cypher" && _ui.value.authenticated) transition = openCypher()
+        else if (value != "Cypher") {
+            ++cypherGeneration; _ui.update { it.copy(cypherOpening = false, cypherError = "") }
+            if (previous == "Cypher") transition = returnFromAssistant()
             if (value == "Chat" && resumeDraft && canComposeInitialChat()) {
                 val active = client
                 val owner = active?.scope ?: cachedOwnerScope
@@ -1219,7 +1251,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     fun toggleSessions(show: Boolean = !_ui.value.showSessions) { _ui.update { it.copy(showSessions = show) } }
     /** The drawer's profile choice is for chats; on the assistant tab it applies when the Chat tab opens. */
     fun chooseProfile(name: String): Job = viewModelScope.launch {
-        if (_ui.value.tab != "Xara") { switchProfile(name).join(); return@launch }
+        if (_ui.value.tab != "Cypher") { switchProfile(name).join(); return@launch }
         val record = json("profile" to name)
         setAssistantReturn(record); persistAssistantReturn(record); _ui.update { it.copy(chatProfile = name) }
         tab("Chat")
@@ -1236,7 +1268,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private fun noteAssistantReturn(previousTab: String) {
         if (assistantReturnInitialized && assistantReturnValue != null) return
         val profile = (client?.scope ?: cachedOwnerScope)?.profile ?: return
-        val session = _chat.value.sessionId.takeIf { previousTab == "Chat" && it.isNotBlank() && it != saved.get<String>("xara:${(client?.scope ?: cachedOwnerScope)?.key}") }.orEmpty()
+        val session = _chat.value.sessionId.takeIf { previousTab == "Chat" && it.isNotBlank() && it != (client?.scope ?: cachedOwnerScope)?.let(::readCypherSessionHandle) }.orEmpty()
         _ui.update { it.copy(chatProfile = profile) }
         val record = json("profile" to profile, "session" to session)
         setAssistantReturn(record)
@@ -1259,7 +1291,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     }
     fun setAssistantModel(model: String, provider: String) = viewModelScope.launch {
         app.preferences.edit { it[stringPreferencesKey("assistant_model")] = model; it[stringPreferencesKey("assistant_provider")] = provider }
-        if (_ui.value.tab == "Xara") keepAssistantModel(model, provider)
+        if (_ui.value.tab == "Cypher") keepAssistantModel(model, provider)
     }
     fun setAssistantName(name: String) = viewModelScope.launch { app.preferences.edit { it[stringPreferencesKey("assistant_name")] = dev.hermes.android.data.assistantNameOf(name) } }
     fun setAssistantProfile(profile: String) = viewModelScope.launch { app.preferences.edit { it[stringPreferencesKey("assistant_profile")] = profile } }
@@ -1292,14 +1324,14 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             if (generation != originGeneration || client !== restoredClient) return@launch
             app.updates.authorize(requireNotNull(client)); restoreAppUpdate()
             _data.value = emptyMap(); _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList(); clearDetails()
-            _ui.update { it.copy(profile = c.auth.profile, owner = c.auth.owner, bootstrap = bootstrap, xaraOpening = false, xaraError = "", newChatOpening = false, newChatError = "", initialChatReady = false, morePage = if (retainBotMode && navigation == navigationGeneration) "Bots" else if (retainBotMode) it.morePage else "", query = "", sessions = emptyList()) }
+            _ui.update { it.copy(profile = c.auth.profile, owner = c.auth.owner, bootstrap = bootstrap, cypherOpening = false, cypherError = "", newChatOpening = false, newChatError = "", initialChatReady = false, morePage = if (retainBotMode && navigation == navigationGeneration) "Bots" else if (retainBotMode) it.morePage else "", query = "", sessions = emptyList()) }
             prepareStartup()
             val next = requireNotNull(client)
             val shell = app.cache.read(next.scope, "new-chat-shell")
             if (generation != originGeneration || client !== next) return@launch
             shell?.let { initialShells[next.scope.key] = it }
             if (!retainBotMode) {
-                if (_ui.value.tab == "Xara") openXara() else restoreInitialDraft(next.scope, generation)
+                if (_ui.value.tab == "Cypher") openCypher() else restoreInitialDraft(next.scope, generation)
             }
         } catch (e: Throwable) { if (generation == originGeneration && client?.scope == oldScope) fail(e) }
     }
@@ -1431,7 +1463,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         preloadJobs.toList().forEach(Job::cancel); preloadJobs.clear()
         loads.values.toList().forEach(Job::cancel)
         ++sessionIndexRequest
-        if (preparedXara?.first != client?.scope) preparedXara = null
+        if (preparedCypher?.first != client?.scope) preparedCypher = null
     }
     private fun prepareStartup() {
         cancelStartup()
@@ -1472,23 +1504,21 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         startupJob = viewModelScope.launch {
             // Extra history work is sequential and expires; navigation owns its own live requests.
             withTimeoutOrNull(8_000) {
-                var xara = ""
+                var cypher = ""
                 if (owner.profile == preferences.value.assistantProfile) {
                     try {
-                        xara = preparedXara?.takeIf { it.first == owner }?.second
-                            ?: saved.get<String>("xara:${owner.key}")
-                            ?: app.cache.read(owner, "xara-session").orEmpty()
+                        cypher = preparedCypher?.takeIf { it.first == owner }?.second ?: readCypherSession(owner).orEmpty()
                         if (!current()) return@withTimeoutOrNull
-                        if (xara.isNotBlank()) {
-                            preparedXara = owner to xara
-                            val response = c.get("/api/session", mapOf("session_id" to xara), maxBytes = 1024 * 1024)
-                            if (current() && sourceScope != owner.session(xara)) app.cache.write(owner.session(xara), "session", response.toString())
+                        if (cypher.isNotBlank()) {
+                            preparedCypher = owner to cypher
+                            val response = c.get("/api/session", mapOf("session_id" to cypher), maxBytes = 1024 * 1024)
+                            if (current() && sourceScope != owner.session(cypher)) app.cache.write(owner.session(cypher), "session", response.toString())
                         }
                     } catch (e: Throwable) { if (e is CancellationException) throw e; if (current() && e is ApiFailure && e.status == 401) fail(e) }
                 }
                 index.join()
                 if (!current()) return@withTimeoutOrNull
-                for (id in startupRecentSessions(_ui.value.sessions.map { it.string("session_id", it.string("id")) }, xara)) {
+                for (id in startupRecentSessions(_ui.value.sessions.map { it.string("session_id", it.string("id")) }, cypher)) {
                     if (!current()) break
                     try {
                         val response = c.get("/api/session", mapOf("session_id" to id), maxBytes = 1024 * 1024)
@@ -1498,23 +1528,23 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             }
         }
     }
-    private suspend fun resolveXara(c: CypherClient, fixed: AppPreferences, current: () -> Boolean): String = xaraResolveLock.withLock {
-        preparedXara?.takeIf { it.first == c.scope }?.let { return@withLock it.second }
-        val bound = saved.get<String>("xara:${c.scope.key}") ?: app.cache.read(c.scope, "xara-session")
-        if (!bound.isNullOrBlank()) { require(current()) { "Account changed while preparing Cypher" }; preparedXara = c.scope to bound; return@withLock bound }
-        require(app.cache.read(c.scope, "xara-opening") == null) { "Cypher opening outcome is unknown. Review history before creating another conversation." }
+    private suspend fun resolveCypher(c: CypherClient, fixed: AppPreferences, current: () -> Boolean): String = cypherResolveLock.withLock {
+        preparedCypher?.takeIf { it.first == c.scope }?.let { return@withLock it.second }
+        val bound = readCypherSession(c.scope)
+        if (!bound.isNullOrBlank()) { require(current()) { "Account changed while preparing Cypher" }; preparedCypher = c.scope to bound; return@withLock bound }
+        require(readCypherOpening(c.scope) == null) { "Cypher opening outcome is unknown. Review history before creating another conversation." }
         currentCoroutineContext().ensureActive()
         require(current()) { "Account changed while preparing Cypher" }
-        app.cache.write(c.scope, "xara-opening", "unknown", true)
-        val result = c.post("/api/xara/open", JSONObject().apply { if (fixed.assistantModel.isNotBlank()) { put("model", fixed.assistantModel); if (fixed.assistantProvider.isNotBlank()) put("model_provider", fixed.assistantProvider) } })
+        app.cache.write(c.scope, "cypher-opening", "unknown", true)
+        val result = c.post("/api/cypher/open", JSONObject().apply { if (fixed.assistantModel.isNotBlank()) { put("model", fixed.assistantModel); if (fixed.assistantProvider.isNotBlank()) put("model_provider", fixed.assistantProvider) } })
         val id = result.string("session_id", result.string("conversation_id", result.optJSONObject("session")?.string("session_id").orEmpty()))
         require(id.isNotBlank()) { "Cypher did not return a conversation" }
         val sessionScope = c.scope.session(id)
         clientCreatedSessions.add(sessionScope.key)
         // The owned creation already happened; a newer navigation must not discard its identity.
-        saved["xara:${c.scope.key}"] = id
-        if (client?.scope == c.scope) preparedXara = c.scope to id
-        runCatching { app.cache.write(c.scope, "xara-session", id, protected = true); app.cache.delete(c.scope, "xara-opening"); app.cache.write(sessionScope, "client-created-shell", "1", protected = true) }.onFailure { if (it is CancellationException) throw it; if (client?.scope == c.scope) notice("Cypher opened; recovery checkpoint failed") }
+        writeCypherSessionHandle(c.scope, id)
+        if (client?.scope == c.scope) preparedCypher = c.scope to id
+        runCatching { app.cache.write(c.scope, "cypher-session", id, protected = true); app.cache.delete(c.scope, "cypher-opening"); app.cache.delete(c.scope, LEGACY_CYPHER_OPENING_CACHE_KIND); app.cache.write(sessionScope, "client-created-shell", "1", protected = true) }.onFailure { if (it is CancellationException) throw it; if (client?.scope == c.scope) notice("Cypher opened; recovery checkpoint failed") }
         id
     }
     private var indexFetch: Job? = null
@@ -1828,19 +1858,19 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val target=call.conversationScope ?: return@launch
         val owner=client?.scope ?: cachedOwnerScope ?: return@launch
         if(!call.active||call.callId!=expectedId||owner.origin!=target.origin||owner.owner!=target.owner) return@launch
-        if (_ui.value.tab == "Xara") {
+        if (_ui.value.tab == "Cypher") {
             val targetOwner = target.copy(session = "")
-            val assistantSession = saved.get<String>("xara:${targetOwner.key}") ?: app.cache.read(targetOwner, "xara-session")
-            if (_ui.value.tab != "Xara" || (client?.scope ?: cachedOwnerScope) != owner || !app.calls.state.value.active || app.calls.state.value.callId != expectedId) return@launch
+            val assistantSession = readCypherSession(targetOwner)
+            if (_ui.value.tab != "Cypher" || (client?.scope ?: cachedOwnerScope) != owner || !app.calls.state.value.active || app.calls.state.value.callId != expectedId) return@launch
             if (_ui.value.botModeSwitching) return@launch
-            if (assistantSession == target.session) tab("Xara", resumeDraft = false)?.join()
+            if (assistantSession == target.session) tab("Cypher", resumeDraft = false)?.join()
             else {
                 val record = json("profile" to target.profile, "session" to target.session)
                 setAssistantReturn(record); viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) { persistAssistantReturn(record) }
                 tab("Chat", resumeDraft = false)?.join()
                 selectionJob?.join()
             }
-            val selected = _ui.value.tab in setOf("Chat", "Xara") && authenticatedScope() == target && _chat.value.projectionReady
+            val selected = _ui.value.tab in setOf("Chat", "Cypher") && authenticatedScope() == target && _chat.value.projectionReady
             if(selected&&app.calls.state.value.active&&app.calls.state.value.callId==expectedId) app.calls.resumeWindow()
             return@launch
         }
@@ -1850,45 +1880,45 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         tab("Chat");selectSession(target.session);selectionJob?.join()
         if(app.calls.state.value.callId==expectedId) app.calls.resumeWindow()
     }
-    fun openXara(editorDraft: String? = null): Job {
+    fun openCypher(editorDraft: String? = null): Job {
         val active = client
         val owner = active?.scope ?: cachedOwnerScope
-        val generation = ++xaraGeneration
+        val generation = ++cypherGeneration
         val connection = originGeneration
         val c = active
-        fun current() = generation == xaraGeneration && connection == originGeneration && _ui.value.tab == "Xara" && client === active && (client?.scope ?: cachedOwnerScope) == owner
+        fun current() = generation == cypherGeneration && connection == originGeneration && _ui.value.tab == "Cypher" && client === active && (client?.scope ?: cachedOwnerScope) == owner
         return viewModelScope.launch {
             val fixed = app.preferences.data.first().let(AppPreferences::read)
             if (!current()) return@launch
-            if (owner == null || !_ui.value.authenticated) { _ui.update { it.copy(xaraOpening = false, xaraError = "Sign in again to open Cypher's conversation.") }; return@launch }
+            if (owner == null || !_ui.value.authenticated) { _ui.update { it.copy(cypherOpening = false, cypherError = "Sign in again to open Cypher's conversation.") }; return@launch }
             val wanted = fixed.assistantProfile
             if (owner.profile != wanted) {
                 // The assistant keeps its own profile; switching reopens this tab there, and leaving gives the chats' profile back.
-                _ui.update { it.copy(xaraOpening = true, xaraError = "") }
+                _ui.update { it.copy(cypherOpening = true, cypherError = "") }
                 switchProfile(wanted, false).join()
-                if (_ui.value.tab == "Xara" && (client?.scope ?: cachedOwnerScope)?.profile != wanted) _ui.update { it.copy(xaraOpening = false, xaraError = "The $wanted profile could not be opened. Choose another in Settings › Assistant.") }
+                if (_ui.value.tab == "Cypher" && (client?.scope ?: cachedOwnerScope)?.profile != wanted) _ui.update { it.copy(cypherOpening = false, cypherError = "The $wanted profile could not be opened. Choose another in Settings › Assistant.") }
                 return@launch
             }
-            _ui.update { it.copy(xaraOpening = true, xaraError = "") }
+            _ui.update { it.copy(cypherOpening = true, cypherError = "") }
             try {
-                val id = if (c == null) (saved.get<String>("xara:${owner.key}") ?: app.cache.read(owner, "xara-session")).orEmpty()
-                else preparedXara?.takeIf { it.first == owner }?.second ?: resolveXara(c, fixed) { current() }
+                val id = if (c == null) readCypherSession(owner).orEmpty()
+                else preparedCypher?.takeIf { it.first == owner }?.second ?: resolveCypher(c, fixed) { current() }
                 require(id.isNotBlank()) { "Reconnect to resolve Cypher's conversation. Your other conversation draft is retained." }
                 if (!current()) return@launch
-                selectSession(id, editorDraft = editorDraft, onCachedReady = { if (current()) _ui.update { it.copy(xaraOpening = false) } })
+                selectSession(id, editorDraft = editorDraft, onCachedReady = { if (current()) _ui.update { it.copy(cypherOpening = false) } })
                 selectionJob?.join()
-                if (current()) { _ui.update { it.copy(xaraOpening = false) }; keepAssistantModel(fixed.assistantModel, fixed.assistantProvider) }
-            } catch (e: Throwable) { if (current() && e !is CancellationException) { _ui.update { it.copy(xaraOpening = false, xaraError = e.message ?: "Cypher's conversation could not be opened. Retry to continue.") }; fail(e) } }
+                if (current()) { _ui.update { it.copy(cypherOpening = false) }; keepAssistantModel(fixed.assistantModel, fixed.assistantProvider) }
+            } catch (e: Throwable) { if (current() && e !is CancellationException) { _ui.update { it.copy(cypherOpening = false, cypherError = e.message ?: "Cypher's conversation could not be opened. Retry to continue.") }; fail(e) } }
         }
     }
     fun isCypherConversation(): Boolean {
         val owner = client?.scope ?: cachedOwnerScope
-        return canonicalConversationReady(owner, sourceScope, _chat.value.sessionId, true, owner?.let { saved.get<String>("xara:${it.key}") }, _ui.value.xaraOpening, _ui.value.xaraError.isNotBlank(), preferences.value.assistantProfile)
+        return canonicalConversationReady(owner, sourceScope, _chat.value.sessionId, true, owner?.let(::readCypherSessionHandle), _ui.value.cypherOpening, _ui.value.cypherError.isNotBlank(), preferences.value.assistantProfile)
     }
     private fun admitConversation(): Boolean {
         val owner = client?.scope ?: cachedOwnerScope
-        val ready = canonicalConversationReady(owner, sourceScope, _chat.value.sessionId, _ui.value.tab == "Xara", owner?.let { saved.get<String>("xara:${it.key}") }, _ui.value.xaraOpening, _ui.value.xaraError.isNotBlank(), preferences.value.assistantProfile)
-        if (!ready) notice(if (_ui.value.tab == "Xara") "Open Cypher's conversation before sending or changing it. Your scoped draft is retained." else "Open a conversation before continuing.")
+        val ready = canonicalConversationReady(owner, sourceScope, _chat.value.sessionId, _ui.value.tab == "Cypher", owner?.let(::readCypherSessionHandle), _ui.value.cypherOpening, _ui.value.cypherError.isNotBlank(), preferences.value.assistantProfile)
+        if (!ready) notice(if (_ui.value.tab == "Cypher") "Open Cypher's conversation before sending or changing it. Your scoped draft is retained." else "Open a conversation before continuing.")
         return ready
     }
     fun selectSession(id: String, editorDraft: String? = null, preserveInitialDraft: Boolean = false, initialResponse: JSONObject? = null, closeMenu: Boolean = true, onCachedReady: (() -> Unit)? = null) {
@@ -1919,7 +1949,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             initialResponse?.let { renderSession(it, scope) }
             try {
                 clientCreated = clientCreated || app.cache.read(scope, "client-created-shell") == "1" ||
-                    (saved.get<String>("xara:${ownerScope.key}") == id && app.cache.read(scope, "session") == null)
+                    (readCypherSessionHandle(ownerScope) == id && app.cache.read(scope, "session") == null)
                 if (clientCreated) {
                     clientCreatedSessions.add(scope.key)
                     optionalLocalSave { app.cache.write(scope, "client-created-shell", "1", protected = true) }
@@ -2883,14 +2913,14 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             app.updates.authorize(requireNotNull(client)); restoreAppUpdate()
             _data.value = emptyMap()
             _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList()
-            val destination = when { route.string("kind") == "incoming_call" -> "Xara"; route.string("kind") == "release" -> "More"; route.string("kind") == "task_result" && id.isBlank() -> "Tasks"; else -> "Chat" }
+            val destination = when { route.string("kind") == "incoming_call" -> "Cypher"; route.string("kind") == "release" -> "More"; route.string("kind") == "task_result" && id.isBlank() -> "Tasks"; else -> "Chat" }
             val destinationPage = if (route.string("kind") == "release") "App updates" else ""
             saved["tab"] = destination; saved["more"] = destinationPage
-            _ui.update { it.copy(origin = origin, owner = owner, profile = c.auth.profile, xaraOpening = false, xaraError = "", newChatOpening = false, newChatError = "", initialChatReady = false, query = "", authenticated = true, connected = true, restoringSession = false, bootstrap = bootstrap, tab = destination, morePage = destinationPage) }
+            _ui.update { it.copy(origin = origin, owner = owner, profile = c.auth.profile, cypherOpening = false, cypherError = "", newChatOpening = false, newChatError = "", initialChatReady = false, query = "", authenticated = true, connected = true, restoringSession = false, bootstrap = bootstrap, tab = destination, morePage = destinationPage) }
             prepareStartup()
             if (route.string("kind") == "incoming_call") {
                 if (action!="callback") { if (route.string("state") == "pending") app.push.presentInvitation(source, event) else app.push.discardInvitation(source, event) }
-                openXara()
+                openCypher()
                 if (action == "answer" && generation == originGeneration) {
                     stopReadAloud()
                     require(app.push.authorizeKeepConnectedAction(source, event, "answer")) { "This Cypher invitation has ended" }

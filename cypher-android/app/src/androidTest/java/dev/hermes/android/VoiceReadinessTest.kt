@@ -37,7 +37,7 @@ class VoiceReadinessTest {
         val manager = app.getSystemService(NotificationManager::class.java)
         try {
             assertTrue(manager.activeNotifications.none { it.id == 42 })
-            receivePush(app, mapOf("source_ref" to source, "event_id" to event, "conversation_ref" to "fixture-xara", "kind" to "incoming_call", "expires_at" to (System.currentTimeMillis() / 1000 + 60).toString()))
+            receivePush(app, mapOf("source_ref" to source, "event_id" to event, "conversation_ref" to "fixture-cypher", "kind" to "incoming_call", "expires_at" to (System.currentTimeMillis() / 1000 + 60).toString()))
             waitFor { manager.activeNotifications.any { it.id == 42 } }
             val firstCard = manager.activeNotifications.single { it.id == 42 }.notification
             val channel = manager.getNotificationChannel(firstCard.channelId)
@@ -59,7 +59,7 @@ class VoiceReadinessTest {
             val stops = List(8) { Thread { IncomingRingtoneService.silence(source, event) } }
             stops.forEach { it.start() }; stops.forEach { it.join() }
             waitFor { manager.activeNotifications.none { it.id == 42 } }
-            receivePush(app, mapOf("source_ref" to source, "event_id" to "$event-again", "conversation_ref" to "fixture-xara", "kind" to "incoming_call", "expires_at" to (System.currentTimeMillis() / 1000 + 60).toString()))
+            receivePush(app, mapOf("source_ref" to source, "event_id" to "$event-again", "conversation_ref" to "fixture-cypher", "kind" to "incoming_call", "expires_at" to (System.currentTimeMillis() / 1000 + 60).toString()))
             waitFor { manager.activeNotifications.any { it.id == 42 } }
             assertFalse("Incoming ringing never starts the microphone service", app.calls.state.value.active)
             prefs.edit().remove(key).commit()

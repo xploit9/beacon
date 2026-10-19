@@ -34,6 +34,37 @@ class ProjectionCache internal constructor(private val db: ProjectionDb, private
     private fun key(scope: Scope, kind: String) = "${scope.key}:${kind.digest()}"
     private fun legacyKey(scope: Scope, kind: String) = "${scope.key}:$kind"
     suspend fun read(scope: Scope, kind: String): String? = readMany(scope, listOf(kind))[kind]
+    suspend fun readMigrating(scope: Scope, kind: String, legacyKind: String): String? = withContext(Dispatchers.IO) {
+        require(kind != legacyKind)
+        lock.withLock {
+            db.withTransaction {
+                val rows = db.rows()
+                val newKey = key(scope, kind)
+                val oldKey = key(scope, legacyKind)
+                suspend fun read(row: ProjectionMetadata, target: String): String? {
+                    if (!row.protected && row.updated < System.currentTimeMillis() - MAX_AGE) { rows.delete(row.key); return null }
+                    require(row.scope == scope.key) { "Checkpoint belongs to another scope; saved state was retained" }
+                    val encrypted = readProjectionBlob(row) { start, count -> rows.encryptedChunk(row.key, start, count) }
+                    val clear = cipher.decrypt(encrypted, row.key)
+                    if (row.key != target) {
+                        val migrated = cipher.encrypt(clear, target)
+                        rows.put(Projection(target, row.scope, migrated, row.updated, row.protected, migrated.size.toLong()))
+                        rows.delete(row.key)
+                    }
+                    String(clear, Charsets.UTF_8)
+                }
+                val current = (rows.get(newKey) ?: rows.get(legacyKey(scope, kind)))?.let { read(it, newKey) }
+                if (current != null) {
+                    rows.delete(oldKey); rows.delete(legacyKey(scope, legacyKind))
+                    current
+                } else {
+                    val old = (rows.get(oldKey) ?: rows.get(legacyKey(scope, legacyKind)))?.let { read(it, newKey) }
+                    rows.delete(oldKey); rows.delete(legacyKey(scope, legacyKind))
+                    old
+                }
+            }
+        }
+    }
     suspend fun readMany(scope: Scope, kinds: List<String>): Map<String, String> = withContext(Dispatchers.IO) {
         lock.withLock {
             db.withTransaction {

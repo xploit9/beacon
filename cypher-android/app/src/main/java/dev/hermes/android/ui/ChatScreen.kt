@@ -196,7 +196,7 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
 
 private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt_dismissed")
 
-@Composable fun ChatScreen(vm: CypherViewModel, xara: Boolean = false, onComposerHeight: (Int) -> Unit = {}, navigationBack: (() -> Unit)? = null, titleOverride: String? = null) {
+@Composable fun ChatScreen(vm: CypherViewModel, cypher: Boolean = false, onComposerHeight: (Int) -> Unit = {}, navigationBack: (() -> Unit)? = null, titleOverride: String? = null) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val profileDefaults by vm.data.collectAsStateWithLifecycle()
     val preferences by vm.preferences.collectAsStateWithLifecycle()
@@ -225,7 +225,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
         confirmButton={TextButton(vm::cancelVoiceHandoff) { Text("Stop") }})
     val side by vm.side.collectAsStateWithLifecycle()
     val settings = LocalCypherSettings.current
-    val ready = !xara || vm.isCypherConversation()
+    val ready = !cypher || vm.isCypherConversation()
     val proactiveKey = proactiveSettingsKey(Scope(ui.origin, ui.owner, preferences.assistantProfile))
     val proactive = profileDefaults[proactiveKey]
     val proactiveLoaded = proactive != null && proactive.has("enabled") && !proactive.has("_error")
@@ -253,7 +253,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
         else -> "${Scope(ui.origin, ui.owner, preferences.assistantProfile).key}|on|gmail:$gmailStatus|google_calendar:$calendarStatus"
     }
     val promptDismissed = promptMemory?.let { it.first == promptSignature && it.second == promptSignature } == true
-    val showProactivePrompt = xara && ui.tab == "Xara" && pluginStatus == "available" && promptMemory != null && promptText.isNotBlank() && !promptDismissed
+    val showProactivePrompt = cypher && ui.tab == "Cypher" && pluginStatus == "available" && promptMemory != null && promptText.isNotBlank() && !promptDismissed
     val canonical = ready && chat.sessionId.isNotBlank()
     val permanentBotChat = ui.botModeEnabled && ui.tab == "More" && ui.morePage == "Bots"
     val activeHere = call.active && call.conversationScope == vm.authenticatedScope()
@@ -263,7 +263,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
             proactiveContext.preferences.edit { it[proactivePromptDismissedKey] = json("state" to promptSignature, "dismissed" to "").toString() }
     }
     LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, ui.tab, preferences.assistantProfile, pluginStatus) {
-        if (xara && ui.tab == "Xara" && ui.connected && ui.profile == preferences.assistantProfile && pluginStatus == "available")
+        if (cypher && ui.tab == "Cypher" && ui.connected && ui.profile == preferences.assistantProfile && pluginStatus == "available")
             vm.load(proactiveKey, PROACTIVE_SETTINGS_PATH, mapOf("profile" to preferences.assistantProfile), force = false)
     }
     var menu by remember { mutableStateOf(false) }
@@ -345,7 +345,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
     val callThisChat: () -> Unit = { vm.client?.let { requestCall(it,chat.sessionId) };Unit }
     LaunchedEffect(pendingVoiceCall,ui.tab,ui.morePage,permanentBotChat,chat.sessionId) {
         val pending=pendingVoiceCall?:return@LaunchedEffect
-        if(ui.tab !in setOf("Chat","Xara") && !permanentBotChat) return@LaunchedEffect
+        if(ui.tab !in setOf("Chat","Cypher") && !permanentBotChat) return@LaunchedEffect
         vm.consumeVoiceCallRequest(pending)
         val active=vm.client
         if(active==null||active.scope!=pending.scope||chat.sessionId!=pending.conversationId) vm.notice("The conversation changed. Start the call again.")
@@ -365,7 +365,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
         if (!position.third) ownerScrolling = false
     } }
     val conversationEntry = remember { Animatable(1f) }
-    LaunchedEffect(chat.sessionId, xara, motionEnabled) {
+    LaunchedEffect(chat.sessionId, cypher, motionEnabled) {
         if (motionEnabled) { conversationEntry.snapTo(.35f); conversationEntry.animateTo(1f, tween(180, easing = FastOutSlowInEasing)) }
         else conversationEntry.snapTo(1f)
     }
@@ -422,8 +422,8 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
             // Focus only while the field (and its requester) is composed; a hidden panel or rotation must not request focus.
             if (canonical && showSearch) LaunchedEffect(chat.sessionId) { searchFocusRequester.requestFocus() }
             if (canonical && showSearch) OutlinedTextField(search, { search = it }, placeholder = { Text(uiText("Find in conversation")) }, singleLine = true, suffix = if (search.isBlank()) null else ({ Text(visibleMessages.size.toString(), Modifier.testTag("search-count")) }), trailingIcon = { IconButton(onClick = { showSearch = false; search = "" }) { Icon(Icons.Rounded.Close, uiText("Close search")) } }, modifier = Modifier.fillMaxWidth().focusRequester(searchFocusRequester).padding(horizontal = 16.dp))
-            if (xara && !ready) Box(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
-                EmptyState(assistantText(if (ui.xaraOpening) "Opening Cypher’s conversation" else "Cypher’s conversation is unavailable"), ui.xaraError.ifBlank { "Your conversation is opening. Your other chats and drafts are safely saved." }, action = if (ui.xaraOpening) "" else assistantText("Retry Cypher"), onAction = { vm.openXara() })
+            if (cypher && !ready) Box(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
+                EmptyState(assistantText(if (ui.cypherOpening) "Opening Cypher’s conversation" else "Cypher’s conversation is unavailable"), ui.cypherError.ifBlank { "Your conversation is opening. Your other chats and drafts are safely saved." }, action = if (ui.cypherOpening) "" else assistantText("Retry Cypher"), onAction = { vm.openCypher() })
             } else if (chat.sessionId.isBlank()) Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
                 Box(Modifier.widthIn(max = 280.dp).fillMaxWidth(.9f).aspectRatio(1f).clipToBounds().testTag("chat-sphere-empty")) { ChatSphere(Modifier.fillMaxSize(), avatarState) }
                 EmptyState(if (ui.newChatOpening) "Opening your conversation" else "Make room for a thought", if (ui.newChatError.isNotBlank()) ui.newChatError else if (ui.newChatOpening) "Keep typing. Your draft stays here while the conversation opens." else "Ask, explore or turn an idea into working progress.", action = if (ui.newChatError.isNotBlank() && !ui.newChatOpening) "Retry" else "", onAction = { vm.retryInitialChat() })
@@ -455,7 +455,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
                     if (chat.messages.isEmpty() && chat.streamId.isBlank() && !chatSendInFlight(chat)) item("empty-state") {
                         Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
                             Box(Modifier.widthIn(max = 280.dp).fillMaxWidth(.9f).aspectRatio(1f).clipToBounds().testTag("chat-sphere-empty")) { ChatSphere(Modifier.fillMaxSize(), avatarState) }
-                            EmptyState("Where shall we begin?", if (xara) assistantText("Cypher keeps the same context across text, calls and completed tasks.") else "Your work starts here. Choose a model and send your first message.")
+                            EmptyState("Where shall we begin?", if (cypher) assistantText("Cypher keeps the same context across text, calls and completed tasks.") else "Your work starts here. Choose a model and send your first message.")
                             StarterPrompts { vm.composer(TextFieldValue(it, TextRange(it.length))) }
                         }
                     }
@@ -511,8 +511,8 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
             Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 if (navigationBack != null) IconButton(onClick = navigationBack, modifier = Modifier.testTag("bot-chat-back")) { Icon(Icons.Rounded.ArrowBack, "Back to bots") }
                 else IconButton(onClick = LocalOpenNavigationMenu.current ?: { vm.toggleSessions(!ui.showSessions) }, modifier = Modifier.testTag("navigation-toggle")) { Icon(Icons.Rounded.Menu, uiText(if (LocalPersistentNavigation.current) "Hide navigation" else "Show navigation")) }
-                Column(Modifier.weight(1f).padding(vertical = 8.dp)) { Text(titleOverride ?: if (xara || activeHere) LocalAssistantName.current else chat.title, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis); Text(if (xara || activeHere) uiText(if (call.active) "Voice conversation" else "Text and voice, together") else if (!canonical) uiText("Loading model…") else chat.raw.string("model").ifBlank { profileDefaults["profile-defaults"]?.takeIf { it.string("profile") == ui.profile && recordError(it).isBlank() }?.string("model").orEmpty() }.ifBlank { "Choose a model" }, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
-                if (!xara && !permanentBotChat) IconButton(onClick = { vm.newChat() }) { Icon(Icons.Rounded.Edit, uiText("New conversation")) }
+                Column(Modifier.weight(1f).padding(vertical = 8.dp)) { Text(titleOverride ?: if (cypher || activeHere) LocalAssistantName.current else chat.title, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis); Text(if (cypher || activeHere) uiText(if (call.active) "Voice conversation" else "Text and voice, together") else if (!canonical) uiText("Loading model…") else chat.raw.string("model").ifBlank { profileDefaults["profile-defaults"]?.takeIf { it.string("profile") == ui.profile && recordError(it).isBlank() }?.string("model").orEmpty() }.ifBlank { "Choose a model" }, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
+                if (!cypher && !permanentBotChat) IconButton(onClick = { vm.newChat() }) { Icon(Icons.Rounded.Edit, uiText("New conversation")) }
                 IconButton(onClick = { showSearch = !showSearch; if (activeHere && showSearch) showCallHistory = true }, enabled = canonical) { Icon(Icons.Rounded.Search, uiText("Search this conversation")) }
                 Box { IconButton(onClick = { menu = true }, enabled = ready) { Icon(Icons.Rounded.MoreVert, uiText("Conversation actions")) }; DropdownMenu(menu && ready, { menu = false }, modifier = Modifier.heightIn(max = actionMenuHeight).testTag("conversation-actions-menu")) {
                     conversationActionGroups.entries.forEachIndexed { index, (group, titles) ->
@@ -543,7 +543,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
             CypherCallStage(vm, call, motionEnabled, showCallHistory, { showCallHistory = it }, Modifier.weight(1f), conversationContent)
         } else {
             Column(Modifier.weight(1f).fillMaxWidth().clipToBounds()) {
-                if (!xara && call.conversationScope == vm.authenticatedScope() && call.transcriptStatus.isNotBlank()) Text(call.transcriptLabel(), Modifier.padding(horizontal = 20.dp, vertical = 8.dp), style = MaterialTheme.typography.labelSmall)
+                if (!cypher && call.conversationScope == vm.authenticatedScope() && call.transcriptStatus.isNotBlank()) Text(call.transcriptLabel(), Modifier.padding(horizontal = 20.dp, vertical = 8.dp), style = MaterialTheme.typography.labelSmall)
                 conversationContent(Modifier.weight(1f).widthIn(max = 840.dp).fillMaxWidth().align(Alignment.CenterHorizontally))
             }
         }
@@ -708,7 +708,7 @@ internal fun acceptsInitialConversationEdit(
                             }
                             DropdownMenu(modelMenu, { modelMenu = false }) {
                                 // The assistant's model is fixed in Settings › Assistant, so its chat changes it there.
-                                if (ui.tab == "Xara" && assistantModelFixed) DropdownMenuItem({ Text(uiText("Model · set in Settings")) }, { modelMenu = false; vm.more("Assistant") }, modifier = Modifier.testTag("assistant-model-settings"))
+                                if (ui.tab == "Cypher" && assistantModelFixed) DropdownMenuItem({ Text(uiText("Model · set in Settings")) }, { modelMenu = false; vm.more("Assistant") }, modifier = Modifier.testTag("assistant-model-settings"))
                                 else DropdownMenuItem({ Text("Model & provider") }, { modelMenu = false; vm.openCatalog("Model & provider") })
                                 DropdownMenuItem({ Text("Reasoning effort") }, { modelMenu = false; vm.openCatalog("Reasoning") })
                             }
@@ -723,7 +723,7 @@ internal fun acceptsInitialConversationEdit(
                             // The trailing slot morphs to Stop, so the bar never widens during a turn.
                             OutlinedIconButton(onClick = { vm.cancel() }, shape = CircleShape, border = BorderStroke(1.dp, MaterialTheme.colorScheme.error), modifier = Modifier.size(composerActionSize).testTag("message-stop")) { Icon(Icons.Rounded.Stop, uiText("Stop"), Modifier.size(24.dp), tint = MaterialTheme.colorScheme.error) }
                         } else if (voiceAction) {
-                            FilledIconButton(onClick = onCall, shape = CircleShape, modifier = Modifier.size(composerActionSize).testTag("chat-call-xara"), enabled = callAvailable && canonical && !callActive && !readOnly && chat.streamId.isBlank() && ui.bootstrap.optJSONObject("voice")?.optBoolean("available") == true) { Icon(Icons.Rounded.GraphicEq, assistantText("Talk to Cypher in this conversation"), Modifier.size(24.dp)) }
+                            FilledIconButton(onClick = onCall, shape = CircleShape, modifier = Modifier.size(composerActionSize).testTag("chat-call-cypher"), enabled = callAvailable && canonical && !callActive && !readOnly && chat.streamId.isBlank() && ui.bootstrap.optJSONObject("voice")?.optBoolean("available") == true) { Icon(Icons.Rounded.GraphicEq, assistantText("Talk to Cypher in this conversation"), Modifier.size(24.dp)) }
                         } else {
                             FilledIconButton(onClick = submit, shape = CircleShape, modifier = Modifier.size(composerActionSize).testTag("message-send"), enabled = editable && preparing.isEmpty() && chat.uncertain.isBlank() && !callActive && !readOnly) { Icon(Icons.Rounded.ArrowUpward, uiText(if (commandName != null) "Run command" else if (chat.streamId.isNotBlank()) "Queue" else "Send"), Modifier.size(24.dp)) }
                         }
@@ -1132,14 +1132,14 @@ internal fun queuedHeading(count: Int): String = "$count ${if (count == 1) "mess
     })
     val stage: @Composable (Modifier) -> Unit = { area ->
         LiveCallSurface(call,actions,motionEnabled,area,onConversation={onHistory(!showHistory)}) { preview ->
-            if (call.cameraSharing || call.cameraBusy) CameraPreview(vm.app.calls, call.callId, preview.testTag("xara-camera-preview"))
+            if (call.cameraSharing || call.cameraBusy) CameraPreview(vm.app.calls, call.callId, preview.testTag("cypher-camera-preview"))
         }
     }
-    BoxWithConstraints(modifier.fillMaxSize().testTag("xara-call-stage")) {
+    BoxWithConstraints(modifier.fillMaxSize().testTag("cypher-call-stage")) {
         if(maxWidth>=700.dp) Row(Modifier.fillMaxSize()) {
             stage(Modifier.weight(1f));VerticalDivider();conversation(Modifier.width(320.dp).fillMaxHeight())
         } else if(showHistory) Column(Modifier.fillMaxSize()) {
-            TextButton(onClick={onHistory(false)},modifier=Modifier.heightIn(min=48.dp).testTag("xara-conversation-toggle")) { Text(uiText("Return to call")) }
+            TextButton(onClick={onHistory(false)},modifier=Modifier.heightIn(min=48.dp).testTag("cypher-conversation-toggle")) { Text(uiText("Return to call")) }
             conversation(Modifier.weight(1f)); LiveCallDock(call,actions,motionEnabled)
         } else stage(Modifier.fillMaxSize())
     }

@@ -109,10 +109,10 @@ class NativeCallLiveUiTest {
             stored=vm.chat.value.sessionId;reader=requireNotNull(vm.client).detached()
             File(app.filesDir,"live-service-owned.json").writeText(json("session_id" to stored).toString(),Charsets.UTF_8)
             phase="composer"
-            val voiceBounds=rule.onNodeWithTag("chat-call-xara").fetchSemanticsNode().boundsInRoot
+            val voiceBounds=rule.onNodeWithTag("chat-call-cypher").fetchSemanticsNode().boundsInRoot
             capture("composer-voice")
             rule.onNodeWithTag("message-input").performTextInput("Composer verification")
-            rule.onNodeWithTag("chat-call-xara").assertDoesNotExist()
+            rule.onNodeWithTag("chat-call-cypher").assertDoesNotExist()
             val sendBounds=rule.onNodeWithTag("message-send").fetchSemanticsNode().boundsInRoot
             assertEquals(voiceBounds.width,sendBounds.width,1f)
             assertEquals(voiceBounds.height,sendBounds.height,1f)
@@ -157,7 +157,7 @@ class NativeCallLiveUiTest {
             }
             installGuard()
             assertEquals(stored,vm.authenticatedScope()?.session)
-            rule.onNodeWithTag("chat-call-xara").assertIsEnabled().performClick()
+            rule.onNodeWithTag("chat-call-cypher").assertIsEnabled().performClick()
             phase="voice-admission"
             await(20_000) { app.calls.state.value.active&&app.calls.state.value.conversationScope?.session==stored&&app.calls.state.value.callId.isNotBlank() }
             callId=app.calls.state.value.callId
@@ -287,11 +287,11 @@ class NativeCallLiveUiTest {
             rule.onNodeWithTag("cypher-share-screen").performClick()
             await(10_000) { !app.calls.state.value.screenSharing&&!app.calls.state.value.screenBusy&&!app.calls.state.value.screenStopPending }
             assertTrue("Call must survive confirmed screen stop",app.calls.state.value.active)
-            rule.onNodeWithTag("xara-camera").assertIsEnabled().performClick()
+            rule.onNodeWithTag("cypher-camera").assertIsEnabled().performClick()
             phase="camera-front"
             capture("camera-requested")
             await(15_000) { app.calls.state.value.cameraSharing&&!app.calls.state.value.cameraBusy }
-            rule.onNodeWithTag("xara-camera-preview").assertExists()
+            rule.onNodeWithTag("cypher-camera-preview").assertExists()
             capture("camera-front")
             val beforeVision=app.calls.state.value.transcripts.lastOrNull { it.role=="assistant"&&it.final }?.eventId
             phase="camera-description"
@@ -312,7 +312,7 @@ class NativeCallLiveUiTest {
             assertTrue("Camera toggles must not produce spontaneous Spanish",app.calls.state.value.transcripts.none { it.role=="assistant"&&Regex("(?i)todav[ií]a|puedo ver|podr[ií]a intentar").containsMatchIn(it.text) })
             assertTrue("No queue/projection/tool errors may be hidden",failures.isEmpty())
             phase="hangup-resource-proof"
-            rule.onNodeWithTag("xara-camera").assertIsEnabled().performClick()
+            rule.onNodeWithTag("cypher-camera").assertIsEnabled().performClick()
             await(15_000) { app.calls.state.value.cameraSharing && cameraAvailability.values.any { !it } }
             val audioManager=app.getSystemService(android.media.AudioManager::class.java)
             assertTrue("Positive control: this real call must own recording hardware before hang-up",audioManager.activeRecordingConfigurations.isNotEmpty())
@@ -332,7 +332,7 @@ class NativeCallLiveUiTest {
             val oldMute=oldNotification.actions.single { it.title.toString()=="Mute" }.actionIntent
             val oldHangup=hangupAction(oldNotification)
             val hangupAt=android.os.SystemClock.elapsedRealtime()
-            rule.onNodeWithTag("xara-hang-up").performClick()
+            rule.onNodeWithTag("cypher-hang-up").performClick()
             await(6_000) { audioManager.activeRecordingConfigurations.isEmpty() }
             val audioStopMillis=android.os.SystemClock.elapsedRealtime()-hangupAt
             await(8_000) { cameraManager.cameraIdList.all { cameraAvailability[it]==true } }

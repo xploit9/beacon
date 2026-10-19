@@ -14,7 +14,7 @@ class RedesignNavigationTest {
         assertEquals(NavigationRoute("More", "Bots"), navigationRoute("Bots"))
         assertEquals(NavigationRoute("Kanban"), navigationRoute("Kanban"))
         assertEquals(NavigationRoute("More"), navigationRoute("Settings"))
-        assertEquals(NavigationRoute("Xara"), navigationRoute("Cypher"))
+        assertEquals(NavigationRoute("Cypher"), navigationRoute("Cypher"))
     }
     @Test fun largeTypeReflowsAndKeepsBotsBesideKanban() {
         assertEquals(4, navigationColumns(320f, 1f))

@@ -166,7 +166,7 @@ class KeepConnectedUiTest {
             vmClient = fixture.clientFor(auth, app.auth)
             compose.runOnUiThread {
                 field(vm, "client", vmClient)
-                field(vm, "preparedXara", scope to "chat-b")
+                field(vm, "preparedCypher", scope to "chat-b")
                 flow<AppState>(vm, "_ui").value = AppState(origin = scope.origin, authenticated = true, connected = true, owner = scope.owner, profile = scope.profile, setupComplete = true, restoringSession = false)
                 app.calls.ownerScope = scope
                 app.calls.uiVisible = false
@@ -220,8 +220,8 @@ class KeepConnectedUiTest {
             assertTrue("The invite card must use its notification or ringtone foreground slot", isRingingSlot(cards.single()))
 
             compose.runOnIdle { showIncomingCall.value = true }
-            compose.onNodeWithTag("xara-incoming-answer").assertIsDisplayed().performClick()
-            compose.waitUntil(15_000) { vm.ui.value.tab == "Xara" && vm.chat.value.sessionId == "chat-b" }
+            compose.onNodeWithTag("cypher-incoming-answer").assertIsDisplayed().performClick()
+            compose.waitUntil(15_000) { vm.ui.value.tab == "Cypher" && vm.chat.value.sessionId == "chat-b" }
             assertEquals("chat-b", vm.chat.value.sessionId)
             val answerPath = "/api/plugins/cypher/mobile/callbacks/${answerEvent.getString("event_id")}/answer"
             // This fixture host is hidden; the service posts the explicit receipt before refusing to start a live call.
@@ -234,7 +234,7 @@ class KeepConnectedUiTest {
             val declineSource = declineEvent.getString("source_ref")
             seedExistingFcmBinding(declineSource)
             compose.waitUntil(10_000) { app.push.ringingInvitation(declineSource, declineEvent.getString("event_id")) != null }
-            compose.onNodeWithTag("xara-incoming-decline").performClick()
+            compose.onNodeWithTag("cypher-incoming-decline").performClick()
             compose.waitUntil(10_000) { fixture.incomingNotification?.optString("event_id") == declineEvent.getString("event_id") && fixture.incomingNotification?.optString("state") == "declined" }
 
             val expiryEvent = fixture.emitIncomingCall(conversationId = "chat-a", expiresInSeconds = 3)

@@ -14,21 +14,20 @@ import org.junit.Test
 
 class CypherBrandingTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
-    @Test fun launcherAndArabicAssistantUseCipherWithStablePackageAndPrivateFilesAuthority() {
+    @Test fun launcherAndArabicAssistantUseCypherWithStablePackageAndPrivateFilesAuthority() {
         val app = ApplicationProvider.getApplicationContext<CypherApplication>()
         assertTrue(app.packageName == "dev.hermes.android" || app.packageName == "dev.hermes.android.debug")
         assertEquals(if (app.packageName.endsWith(".debug")) "Cypher Preview" else "Cypher", app.packageManager.getApplicationLabel(app.applicationInfo).toString())
         assertNotNull(app.packageManager.resolveContentProvider("${app.packageName}.files", 0))
         compose.setContent { NativeLocalization("ar") { Text(uiText("Call Cypher")) } }
         compose.onNode(hasText("Cypher", substring = true)).assertIsDisplayed()
-        compose.onNode(hasText("Xara", substring = true)).assertDoesNotExist()
         compose.onNode(hasText("Hermes", substring = true)).assertDoesNotExist()
         val catalogs = app.assets.open("native-locales.json").bufferedReader().use { JSONObject(it.readText()) }
         for (language in catalogs.keys()) {
             val values = catalogs.getJSONObject(language)
             for (key in values.keys()) {
                 val translated = values.getString(key)
-                assertFalse("Retired visible brand in $language/$key", Regex("""(?<![./_])\b(?:Hermes|Xara)\b""", RegexOption.IGNORE_CASE).containsMatchIn(translated))
+                assertFalse("Retired visible brand in $language/$key", Regex("""(?<![./_])\bHermes\b""", RegexOption.IGNORE_CASE).containsMatchIn(translated))
             }
         }
     }

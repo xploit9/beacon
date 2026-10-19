@@ -8,6 +8,7 @@ import dev.hermes.android.updates.UpdateManager
 
 class CypherIdentityTest {
     @Test fun notificationIdsRemainCompatibleWithInstalledPreferences() {
+        // Keep these released IDs so existing per-channel preferences continue to apply.
         assertEquals("xara-calls", CypherCallService.CHANNEL)
         assertEquals("hermes-activity", CypherMessagingService.CHANNEL)
         assertEquals("xara-incoming-call-v2", CypherMessagingService.INCOMING_CHANNEL)

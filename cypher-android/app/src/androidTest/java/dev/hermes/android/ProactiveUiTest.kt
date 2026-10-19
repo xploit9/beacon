@@ -67,8 +67,8 @@ class ProactiveUiTest {
 
     @Test fun assistantPromptDismissesUntilItsStateChangesAndOpensAssistantSettings() = withFixture { vm, fixture ->
         await { vm.preferences.value.assistantProfile == "coder" }
-        compose.runOnIdle { vm.tab("Xara") }
-        await { vm.ui.value.tab == "Xara" && vm.ui.value.profile == "coder" && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady && vm.chat.value.sessionId.startsWith("new-") }
+        compose.runOnIdle { vm.tab("Cypher") }
+        await { vm.ui.value.tab == "Cypher" && vm.ui.value.profile == "coder" && !vm.ui.value.cypherOpening && vm.chat.value.projectionReady && vm.chat.value.sessionId.startsWith("new-") }
         await { vm.data.value[proactiveKey(fixture)]?.has("enabled") == true }
         compose.waitUntil(5_000) { compose.onAllNodesWithText("Let Cypher keep an eye on your day").fetchSemanticsNodes().isNotEmpty() }
 
@@ -76,8 +76,8 @@ class ProactiveUiTest {
         await { compose.onAllNodesWithText("Let Cypher keep an eye on your day").fetchSemanticsNodes().isEmpty() }
         compose.runOnIdle { vm.tab("Chat") }
         await { vm.ui.value.tab == "Chat" && vm.ui.value.profile == "default" && vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
-        compose.runOnIdle { vm.tab("Xara") }
-        await { vm.ui.value.tab == "Xara" && vm.ui.value.profile == "coder" && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady && vm.chat.value.sessionId.startsWith("new-") }
+        compose.runOnIdle { vm.tab("Cypher") }
+        await { vm.ui.value.tab == "Cypher" && vm.ui.value.profile == "coder" && !vm.ui.value.cypherOpening && vm.chat.value.projectionReady && vm.chat.value.sessionId.startsWith("new-") }
         compose.onAllNodesWithText("Let Cypher keep an eye on your day").assertCountEquals(0)
 
         fixture.proactiveEnabled["coder"] = true
@@ -97,8 +97,8 @@ class ProactiveUiTest {
         await { vm.preferences.value.assistantProfile == "coder" }
         compose.runOnIdle { vm.more("Assistant") }
         await { compose.onAllNodesWithText("Proactive").fetchSemanticsNodes().isEmpty() }
-        compose.runOnIdle { vm.tab("Xara") }
-        await { vm.ui.value.tab == "Xara" && vm.ui.value.profile == "coder" && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady && vm.chat.value.sessionId.startsWith("new-") }
+        compose.runOnIdle { vm.tab("Cypher") }
+        await { vm.ui.value.tab == "Cypher" && vm.ui.value.profile == "coder" && !vm.ui.value.cypherOpening && vm.chat.value.projectionReady && vm.chat.value.sessionId.startsWith("new-") }
         compose.onAllNodesWithTag("proactive-prompt-card").assertCountEquals(0)
         assertFalse(fixture.requests.any { it.string("path") == PROACTIVE_SETTINGS_PATH })
     }
@@ -133,7 +133,7 @@ class ProactiveUiTest {
         runBlocking {
             app.auth.remove(fixture.scope.origin)
             profileScopes.forEach { owner ->
-                listOf("xara-session", "xara-opening", "bot-mode-return", "new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session").forEach { app.cache.delete(owner, it) }
+                listOf("cypher-session", "cypher-opening", "bot-mode-return", "new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session").forEach { app.cache.delete(owner, it) }
                 (1..4).forEach { n -> listOf("pending", "draft", "session", "client-created-shell").forEach { app.cache.delete(owner.session("new-$n"), it) } }
             }
         }
@@ -186,7 +186,7 @@ class ProactiveUiTest {
             runBlocking {
                 app.auth.remove(fixture.scope.origin)
                 profileScopes.forEach { owner ->
-                    listOf("xara-session", "xara-opening", "bot-mode-return", "new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session").forEach { app.cache.delete(owner, it) }
+                    listOf("cypher-session", "cypher-opening", "bot-mode-return", "new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session").forEach { app.cache.delete(owner, it) }
                     (1..4).forEach { n -> listOf("pending", "draft", "session", "client-created-shell").forEach { app.cache.delete(owner.session("new-$n"), it) } }
                 }
                 app.preferences.updateData { prior }

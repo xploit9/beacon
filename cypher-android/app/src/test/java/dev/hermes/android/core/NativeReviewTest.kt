@@ -22,20 +22,20 @@ import org.scilab.forge.jlatexmath.CypherMathDefinitions
 class NativeReviewTest {
     private val scope = Scope("https://hermes.example", "owner-a", "default", "session-a")
 
-    @Test fun xaraAdmissionNeverAcceptsAnOldChatDuringResolutionFailureOrWrongProfile() {
+    @Test fun cypherAdmissionNeverAcceptsAnOldChatDuringResolutionFailureOrWrongProfile() {
         val owner = scope.copy(session = "")
         val draft = Draft("Keep my ordinary conversation draft", 4, 8, queued = listOf(QueuedMessage("later")))
-        assertFalse(canonicalConversationReady(owner, scope, scope.session, true, "xara-session"))
-        val xara = scope.session("xara-session")
-        assertFalse(canonicalConversationReady(owner, xara, xara.session, true, xara.session, opening = true))
-        assertFalse(canonicalConversationReady(owner, xara, xara.session, true, xara.session, resolutionError = true))
-        assertFalse(canonicalConversationReady(owner.copy(profile = "research"), xara.copy(profile = "research"), xara.session, true, xara.session))
+        assertFalse(canonicalConversationReady(owner, scope, scope.session, true, "cypher-session"))
+        val cypher = scope.session("cypher-session")
+        assertFalse(canonicalConversationReady(owner, cypher, cypher.session, true, cypher.session, opening = true))
+        assertFalse(canonicalConversationReady(owner, cypher, cypher.session, true, cypher.session, resolutionError = true))
+        assertFalse(canonicalConversationReady(owner.copy(profile = "research"), cypher.copy(profile = "research"), cypher.session, true, cypher.session))
         // The assistant tab may be bound to another profile in Settings › Assistant.
-        assertTrue(canonicalConversationReady(owner.copy(profile = "research"), xara.copy(profile = "research"), xara.session, true, xara.session, assistantProfile = "research"))
-        assertFalse(canonicalConversationReady(owner, xara, xara.session, true, xara.session, assistantProfile = "research"))
-        assertFalse(canonicalConversationReady(null, null, xara.session, true, xara.session))
-        assertFalse(canonicalConversationReady(owner, xara, scope.session, true, xara.session))
-        assertTrue(canonicalConversationReady(owner, xara, xara.session, true, xara.session))
+        assertTrue(canonicalConversationReady(owner.copy(profile = "research"), cypher.copy(profile = "research"), cypher.session, true, cypher.session, assistantProfile = "research"))
+        assertFalse(canonicalConversationReady(owner, cypher, cypher.session, true, cypher.session, assistantProfile = "research"))
+        assertFalse(canonicalConversationReady(null, null, cypher.session, true, cypher.session))
+        assertFalse(canonicalConversationReady(owner, cypher, scope.session, true, cypher.session))
+        assertTrue(canonicalConversationReady(owner, cypher, cypher.session, true, cypher.session))
         assertTrue(canonicalConversationReady(owner, scope, scope.session, false, null))
         assertEquals(draft, Draft.decode(draft.encode()))
     }

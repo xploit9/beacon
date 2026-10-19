@@ -65,10 +65,10 @@ class LiveCallInterfaceTest {
         rule.onNodeWithTag("cypher-persistent-navigation").assertExists();capture("expanded")
         assertEquals(id,LiveCallShowcaseActivity.source.value.callId);assertEquals(scope,LiveCallShowcaseActivity.source.value.conversationScope)
         assertEquals(1,LiveCallShowcaseActivity.mediaStarts)
-        rule.onNodeWithTag("xara-camera").performClick();rule.waitForIdle();capture("camera-front")
+        rule.onNodeWithTag("cypher-camera").performClick();rule.waitForIdle();capture("camera-front")
         rule.onNodeWithTag("cypher-camera-flip").performClick();rule.waitForIdle()
         assertTrue(LiveCallShowcaseActivity.source.value.cameraRear);capture("camera-back")
-        rule.onNodeWithTag("xara-camera").performClick();rule.waitForIdle()
+        rule.onNodeWithTag("cypher-camera").performClick();rule.waitForIdle()
         shell("settings put system font_scale 1.5");device.waitForIdle();Thread.sleep(800);capture("large-text")
         rule.activityRule.scenario.onActivity{it.motion(true)};rule.waitForIdle();capture("reduced-motion")
         rule.activityRule.scenario.onActivity{it.motion(false)}

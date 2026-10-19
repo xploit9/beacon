@@ -32,7 +32,7 @@ internal class NativeOperations(private val c: CypherClient) {
     suspend fun call(path: String, q: Map<String, String>, method: String, body: JSONObject?, maxBytes: Int): JSONObject {
         var keepCreatedSessionLive = false
         return try {
-            dispatch(path, q, method, body, maxBytes).also { keepCreatedSessionLive = path == "/api/session/new" || path == "/api/xara/open" }
+            dispatch(path, q, method, body, maxBytes).also { keepCreatedSessionLive = path == "/api/session/new" || path == "/api/cypher/open" }
         } finally { if (!keepCreatedSessionLive) c.closeNative() }
     }
     /**
@@ -73,7 +73,7 @@ internal class NativeOperations(private val c: CypherClient) {
                 return json("ok" to true, "profile" to name)
             }
             "/api/sessions", "/api/sessions/search" -> return sessionIndex(archived = q["include_archived"] == "1", query = q["q"].orEmpty(), threads = q["view"] == "threads", hidden = q["hidden_sources"].orEmpty(), order = q["order"].orEmpty())
-            "/api/session/new", "/api/xara/open" -> {
+            "/api/session/new", "/api/cypher/open" -> {
                 val params = JSONObject()
                 for (key in setOf("title", "model")) if (d.has(key) && !d.isNull(key)) params.put(key, d.opt(key))
                 d.string("model_provider").takeIf { it.isNotBlank() }?.let { params.put("provider", it) }

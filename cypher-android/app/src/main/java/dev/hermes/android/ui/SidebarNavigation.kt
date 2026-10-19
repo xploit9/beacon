@@ -32,7 +32,7 @@ internal fun navigationRoute(destination: String): NavigationRoute = when (desti
     "Files" -> NavigationRoute("Spaces")
     "Projects", "Kanban" -> NavigationRoute(destination)
     "Settings" -> NavigationRoute("More")
-    "Cypher" -> NavigationRoute("Xara")
+    "Cypher" -> NavigationRoute("Cypher")
     "Chat" -> NavigationRoute("Chat")
     else -> error("Unknown navigation destination: $destination")
 }
@@ -121,7 +121,7 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
                 }
             }
         }
-        NavigationDrawerItem(label = { Text(assistantText("Cypher chat")) }, selected = ui.tab == "Xara", onClick = { vm.navigate("Cypher") }, icon = { Icon(Icons.Rounded.GraphicEq, null) }, modifier = Modifier.testTag("navigation-cypher"))
+        NavigationDrawerItem(label = { Text(assistantText("Cypher chat")) }, selected = ui.tab == "Cypher", onClick = { vm.navigate("Cypher") }, icon = { Icon(Icons.Rounded.GraphicEq, null) }, modifier = Modifier.testTag("navigation-cypher"))
         HorizontalDivider()
     }
 }
