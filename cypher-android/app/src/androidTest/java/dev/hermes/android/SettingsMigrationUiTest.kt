@@ -102,7 +102,7 @@ class SettingsMigrationUiTest {
         shown("Appearance").assertTextContains("Dark · Graphite")
         shown("Profiles & model").assertTextContains("Active profile · work")
         shown("App updates").assertTextContains("Installed · 0.4.14")
-        shown("About & licenses").assertTextContains("Installed · 0.4.14")
+        shown("About & licenses").assertTextContains("Version · 0.4.14")
         val positions = settingsHubRoutes.map { shown(it).fetchSemanticsNode().positionInRoot }
         assertTrue("The hub uses one column", positions.all { it.x == positions.first().x })
         for (section in listOf("Assistant", "Hermes", "App")) compose.onNodeWithTag("settings-group:$section").assertExists()

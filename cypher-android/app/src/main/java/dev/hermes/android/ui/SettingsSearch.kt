@@ -138,7 +138,7 @@ internal fun settingsSummary(route: String, s: SettingsSnapshot): List<SettingsS
         )
         "App updates" -> updateSummary()
         "Assistant" -> listOfNotNull(literal(s.assistantName), literal(s.assistantProfile))
-        "About & licenses" -> literal(s.installedVersion)?.let { listOf(SettingsSummaryPart("Installed"), it) }.orEmpty()
+        "About & licenses" -> literal(s.installedVersion)?.let { listOf(SettingsSummaryPart("Version"), it) }.orEmpty()
         "Cypher", "Voice & calls" -> s.voiceKeySaved?.let { keySaved ->
             voiceProviderLabels[s.voiceProviderId]?.let { provider ->
                 listOf(SettingsSummaryPart(provider, translate = false), SettingsSummaryPart(if (keySaved) "Key saved" else "Add key"))

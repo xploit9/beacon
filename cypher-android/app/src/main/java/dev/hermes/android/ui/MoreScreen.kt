@@ -48,12 +48,13 @@ private fun settingsIcon(name: String): ImageVector = when (name) {
     "Appearance" -> Icons.Rounded.Palette
     "Chat", "Settings" -> Icons.Rounded.ChatBubbleOutline
     "Notifications & Keep connected", "Notifications" -> Icons.Rounded.NotificationsNone
-    "App updates", "Server", "Health", "Logs", "Server updates", "Session checkpoints" -> Icons.Rounded.SettingsSuggest
+    "App updates" -> Icons.Rounded.SystemUpdate
+    "Server", "Health", "Logs", "Server updates", "Session checkpoints" -> Icons.Rounded.SettingsSuggest
     "Profiles & model", "Profiles", "Providers & models" -> Icons.Rounded.AutoAwesome
     "Tools & MCP", "Tools & commands", "MCP servers" -> Icons.Rounded.Build
     "About & licenses", "Licenses" -> Icons.Rounded.Info
     "Connections", "Connection" -> Icons.Rounded.Link
-    "Skills" -> Icons.Rounded.AutoAwesome
+    "Skills" -> Icons.Rounded.Extension
     "Memory" -> Icons.Rounded.Psychology
     else -> Icons.Rounded.FolderOpen
 }

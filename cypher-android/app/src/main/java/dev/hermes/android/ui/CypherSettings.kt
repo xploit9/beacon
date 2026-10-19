@@ -59,11 +59,11 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
         item {
             // The saved choice stays listed even before the profile list loads or if it is gone, so it is never silently swapped.
             Choice("Profile", prefs.assistantProfile, voiceOptionsWithSelected(profiles, prefs.assistantProfile), { vm.setAssistantProfile(it) }, Modifier.fillMaxWidth().testTag("assistant-profile"))
-            Text(uiText("Its chat always uses this profile. Your other chats keep theirs."), Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         item {
             Choice("Model", selectedModel, voiceOptionsWithSelected(listOf("") + models.keys, selectedModel), { key -> vm.setAssistantModel(key.substringAfter('\t', ""), if (key.isBlank()) "" else key.substringBefore('\t')) },
                 Modifier.fillMaxWidth().testTag("assistant-model"), optionLabels = models + ("" to "Profile default") + (selectedModel to (models[selectedModel] ?: prefs.assistantModel)).takeIf { selectedModel.isNotBlank() }.let { listOfNotNull(it).toMap() })
+            Text(uiText("Its chat always uses this profile and model. Your other chats keep theirs."), Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
