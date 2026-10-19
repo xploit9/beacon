@@ -57,13 +57,28 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 internal fun cameraGranted(context: android.content.Context) = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
 
+internal const val INVALID_CYPHER_QR_HINT = "That isn't a Cypher QR code. Scan the code on your Hermes dashboard's Cypher tab."
+
+internal fun handleQrScanResult(
+    value: String,
+    detected: AtomicBoolean,
+    onResult: (String) -> Boolean,
+    onInvalid: () -> Unit,
+): Boolean {
+    if (onResult(value)) return true
+    onInvalid()
+    detected.set(false)
+    return false
+}
+
 @Composable
-fun QrScanner(onResult: (String) -> Unit, onClose: () -> Unit, hasCamera: (android.content.Context) -> Boolean = ::cameraGranted) {
+fun QrScanner(onResult: (String) -> Boolean, onClose: () -> Unit, hasCamera: (android.content.Context) -> Boolean = ::cameraGranted) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val latestResult by rememberUpdatedState(onResult)
     var permitted by remember { mutableStateOf(hasCamera(context)) }
     var cameraError by remember { mutableStateOf("") }
+    var invalidQr by remember { mutableStateOf(false) }
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { permitted = it }
     BackHandler(onBack = onClose)
     DisposableEffect(context, lifecycleOwner) {
@@ -125,7 +140,9 @@ fun QrScanner(onResult: (String) -> Unit, onClose: () -> Unit, hasCamera: (andro
                                         scanner.process(InputImage.fromMediaImage(image, proxy.imageInfo.rotationDegrees))
                                             .addOnSuccessListener { codes ->
                                                 val value = codes.firstNotNullOfOrNull { it.rawValue?.takeIf(String::isNotBlank) }
-                                                if (value != null && active.get() && detected.compareAndSet(false, true)) mainHandler.post { if (active.get()) latestResult(value) }
+                                                if (value != null && active.get() && detected.compareAndSet(false, true)) mainHandler.post {
+                                                    if (active.get()) handleQrScanResult(value, detected, latestResult) { invalidQr = true }
+                                                }
                                             }
                                             .addOnCompleteListener { proxy.close() }
                                     } catch (_: Exception) { proxy.close() }
@@ -140,6 +157,7 @@ fun QrScanner(onResult: (String) -> Unit, onClose: () -> Unit, hasCamera: (andro
                 },
                 modifier = Modifier.fillMaxWidth().aspectRatio(1f).clip(RoundedCornerShape(24.dp)).testTag("setup-qr-preview"),
             )
+            if (invalidQr) Text(INVALID_CYPHER_QR_HINT, color = MaterialTheme.colorScheme.error)
         }
         Spacer(Modifier.size(4.dp))
     }

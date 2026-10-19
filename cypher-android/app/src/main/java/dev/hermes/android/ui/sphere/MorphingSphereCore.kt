@@ -175,6 +175,16 @@ fun forEachSphereCell(frame: SphereFrame, onCell: SphereCellRenderer) =
     forEachSphereCell(frame, frame.time, frame.colorPhase, onCell)
 
 internal fun forEachSphereCell(frame: SphereFrame, time: Float, colorPhase: Float, onCell: SphereCellRenderer) {
+    forEachSphereCell(frame, time, colorPhase, outerBoundEarlyOut = true, onCell)
+}
+
+internal fun forEachSphereCell(
+    frame: SphereFrame,
+    time: Float,
+    colorPhase: Float,
+    outerBoundEarlyOut: Boolean,
+    onCell: SphereCellRenderer,
+) {
     val amp = if (frame.voiceMode) frame.voiceAmplitude.coerceIn(0f, 1f) else 0f
 
     // ── Voice modulation of animated base params ─────────────────
@@ -214,6 +224,8 @@ internal fun forEachSphereCell(frame: SphereFrame, time: Float, colorPhase: Floa
 
     val breathe = sin(t * breatheSpeed) * frame.breatheAmp
     val breathingRadius = baseRadius * (1f + breathe)
+    // smoothNoise is in [0,1], so 3-octave fbm is at most .875; this bounds the outer ring.
+    val maxDataRingOuter = java.lang.Math.nextUp(kotlin.math.abs(breathingRadius) * (1f + wobbleAmplitude) * 1.55f)
 
     val noiseJitter1 = fbm(t * 0.05f + 7.3f, 1.7f) * 0.5f
     val noiseJitter2 = fbm(3.1f, t * 0.04f + 13.7f) * 0.5f
@@ -244,6 +256,7 @@ internal fun forEachSphereCell(frame: SphereFrame, time: Float, colorPhase: Floa
             val dx = (col - cx) * charAspect
             val dy = (row - cy)
             val dist = sqrt(dx * dx + dy * dy)
+            if (outerBoundEarlyOut && dist > maxDataRingOuter) continue
             val angle = atan2(dy, dx)
 
             val perimeterNoise = fbm(

@@ -87,6 +87,20 @@ class SphereStateTest {
         assertNotEquals(cells(frame(true, 0f)), cells(frame(true, 1f)))
     }
 
+    @Test fun conservativeOuterBoundKeepsRenderedCellsIdenticalAcrossStatesAndTimes() {
+        val frames = listOf(
+            sphereFrame().copy(cols = 58, rows = 34),
+            sphereFrame().copy(cols = 58, rows = 34, state = SphereState.Thinking),
+            sphereFrame().copy(cols = 58, rows = 34, state = SphereState.Listening, voiceMode = true, voiceAmplitude = 0.9f),
+            sphereFrame().copy(cols = 58, rows = 34, state = SphereState.Speaking, voiceMode = true, voiceAmplitude = 0.7f),
+            sphereFrame().copy(cols = 58, rows = 34, state = SphereState.Error),
+        )
+
+        for (frame in frames) for (time in listOf(0f, 0.37f, 2.4f, 7.1f)) {
+            assertEquals(render(frame, time, 0.8f, outerBoundEarlyOut = false), render(frame, time, 0.8f, outerBoundEarlyOut = true))
+        }
+    }
+
     @Test fun relayLicenseIsAvailableInTheLicenseDocumentList() {
         assertTrue(licenseDocuments.contains("hermes-relay-LICENSE.txt"))
     }
@@ -102,6 +116,12 @@ class SphereStateTest {
 
     private fun render(frame: SphereFrame, time: Float, colorPhase: Float) = buildList {
         forEachSphereCell(frame, time, colorPhase) { col, row, char, r, g, b, alpha ->
+            add("$col:$row:$char:$r:$g:$b:$alpha")
+        }
+    }
+
+    private fun render(frame: SphereFrame, time: Float, colorPhase: Float, outerBoundEarlyOut: Boolean) = buildList {
+        forEachSphereCell(frame, time, colorPhase, outerBoundEarlyOut) { col, row, char, r, g, b, alpha ->
             add("$col:$row:$char:$r:$g:$b:$alpha")
         }
     }
