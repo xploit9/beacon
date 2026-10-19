@@ -4,6 +4,7 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioManager
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.google.firebase.messaging.FirebaseMessaging
@@ -23,6 +24,8 @@ import dev.hermes.android.voice.IncomingCall
 import dev.hermes.android.voice.IncomingCallReceiver
 import dev.hermes.android.voice.RelayCallbackPolicy
 import dev.hermes.android.voice.RelayCallbackPreferences
+import dev.hermes.android.voice.IncomingRingtoneService
+import dev.hermes.android.voice.callbackMayAlert
 import dev.hermes.android.core.Scope
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -390,6 +393,50 @@ class PushManager(private val app: CypherApplication) {
         true
     }
 }
+internal data class IncomingCallCardOptions(
+    val category: String,
+    val callStyle: Boolean,
+    val fullScreenIntent: Boolean,
+    val silent: Boolean,
+    val insistent: Boolean,
+    val onlyAlertOnce: Boolean,
+    val timeoutAfterMillis: Long,
+)
+
+internal fun incomingCallCardOptions(timeoutAfterMillis: Long, silent: Boolean): IncomingCallCardOptions = IncomingCallCardOptions(
+    category = NotificationCompat.CATEGORY_CALL,
+    callStyle = true,
+    fullScreenIntent = !silent,
+    silent = silent,
+    insistent = !silent,
+    onlyAlertOnce = true,
+    timeoutAfterMillis = timeoutAfterMillis.coerceAtLeast(1),
+)
+
+internal fun incomingCallMayAlert(
+    activeCall: Boolean,
+    audioModeNormal: Boolean,
+    invitationLive: Boolean,
+    invitationSilenced: Boolean,
+    notificationsEnabled: Boolean,
+    channelImportance: Int,
+    channelSound: Boolean,
+    ringerMode: Int,
+    ringVolume: Int,
+): Boolean = callbackMayAlert(activeCall, audioModeNormal) && invitationLive && !invitationSilenced &&
+    notificationsEnabled && channelImportance > NotificationManager.IMPORTANCE_NONE && channelSound &&
+    ringerMode == AudioManager.RINGER_MODE_NORMAL && ringVolume > 0
+
+internal fun incomingCallMayVibrate(
+    notificationSilent: Boolean,
+    notificationsEnabled: Boolean,
+    channelImportance: Int,
+    channelVibrates: Boolean,
+    ringerMode: Int,
+    dndAllows: Boolean,
+): Boolean = notificationSilent && notificationsEnabled && channelImportance >= NotificationManager.IMPORTANCE_DEFAULT &&
+    channelVibrates && ringerMode != AudioManager.RINGER_MODE_SILENT && dndAllows
+
 class CypherMessagingService : FirebaseMessagingService() {
     private val app get() = application as CypherApplication
     override fun onNewToken(token: String) {
@@ -449,34 +496,44 @@ private fun receivePush(context: Context, data: Map<String, String>, localAction
         if (invite != null && ring) {
             val invite = invite!!
             val incomingChannel = incomingCallChannel(manager)
+            val channel = manager.getNotificationChannel(incomingChannel)
+            val audio = context.getSystemService(AudioManager::class.java)
+            val alert = incomingCallMayAlert(
+                activeCall = app.calls.state.value.active,
+                audioModeNormal = audio.mode == AudioManager.MODE_NORMAL,
+                invitationLive = invite.ringDurationMillis() > 0,
+                invitationSilenced = IncomingRingtoneService.isSilenced(source, event),
+                notificationsEnabled = manager.areNotificationsEnabled(),
+                channelImportance = channel?.importance ?: NotificationManager.IMPORTANCE_NONE,
+                channelSound = channel?.sound != null,
+                ringerMode = audio.ringerMode,
+                ringVolume = audio.getStreamVolume(AudioManager.STREAM_RING),
+            )
+            val options = incomingCallCardOptions(invite.ringDurationMillis(), silent = !alert)
             val answerIntent = Intent(context, CypherActivity::class.java).setAction(invite.answerAction).setData(android.net.Uri.parse("hermes://incoming/$routeKey/answer")).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP).putExtra("push_source", source).putExtra("push_event", event)
             val answer = PendingIntent.getActivity(context, 0, answerIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
             val declineIntent = Intent(context, IncomingCallReceiver::class.java).setAction(invite.declineAction).setData(android.net.Uri.parse("hermes://incoming/$routeKey/decline")).putExtra("push_source", source).putExtra("push_event", event)
             val decline = PendingIntent.getBroadcast(context, 0, declineIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
             val person = androidx.core.app.Person.Builder().setName("Cypher").setImportant(true).build()
-            fun notification(callStyle: Boolean, silent: Boolean = true): Notification {
-                val builder = NotificationCompat.Builder(context, incomingChannel).setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle("Cypher is calling").setContentText("Answer to start a private voice call").setContentIntent(pending).setDeleteIntent(decline).setCategory(NotificationCompat.CATEGORY_CALL).setPriority(NotificationCompat.PRIORITY_HIGH).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).setPublicVersion(public).setTimeoutAfter(invite.ringDurationMillis().coerceAtLeast(1)).setOngoing(true)
+            fun notification(): Notification {
+                val card = options
+                val builder = NotificationCompat.Builder(context, incomingChannel).setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle("Cypher is calling").setContentText("Answer to start a private voice call").setContentIntent(pending).setDeleteIntent(decline).setCategory(card.category).setPriority(NotificationCompat.PRIORITY_HIGH).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).setPublicVersion(public).setTimeoutAfter(card.timeoutAfterMillis).setOnlyAlertOnce(card.onlyAlertOnce).setOngoing(true)
                 if(android.os.Build.VERSION.SDK_INT>=36) builder.setRequestPromotedOngoing(true).setShortCriticalText("Calling")
-                // Android requires CallStyle to have FSI or an active service. Ringing never starts our microphone service.
-                if (callStyle) builder.setFullScreenIntent(pending, true).setStyle(NotificationCompat.CallStyle.forIncomingCall(person, decline, answer))
+                // The alerting CallStyle falls back to heads-up when FSI is denied; ringing never starts the microphone.
+                if (card.fullScreenIntent) builder.setFullScreenIntent(pending, true)
+                if (card.callStyle) builder.setStyle(NotificationCompat.CallStyle.forIncomingCall(person, decline, answer))
                 else builder.addAction(R.drawable.ic_cypher, "Decline", decline).addAction(R.drawable.ic_cypher, "Answer", answer)
-                return builder.setSilent(silent).build().apply { if (!silent) flags = flags or Notification.FLAG_INSISTENT }
+                // A non-silent CallStyle card lets Android's existing user-configured channel own the single ringtone.
+                return builder.setSilent(card.silent).build().apply { if (card.insistent) flags = flags or Notification.FLAG_INSISTENT }
             }
-            // Android retains CallStyle while downgrading denied fullscreen requests to heads-up calls.
-            var ringingNotification = notification(true)
-            try { manager.notify(routeKey, 2, ringingNotification) }
-            catch (e: RuntimeException) {
-                if (e !is SecurityException && e !is IllegalArgumentException) throw e
-                // Permission can be revoked between the capability check and Android's notification validation.
-                ringingNotification = notification(false)
-                try { manager.notify(routeKey, 2, ringingNotification) } catch (_: SecurityException) { return }
-            }
+            // Post only once, in the foreground call slot, so a move from a route-tagged slot cannot replay the ringtone.
+            val ringingNotification = notification()
             try {
                 ContextCompat.startForegroundService(context, Intent(context, dev.hermes.android.voice.IncomingRingtoneService::class.java)
                     .putExtra("push_source", source).putExtra("push_event", event).putExtra("notification", ringingNotification))
             } catch (error: RuntimeException) {
-                android.util.Log.w("CypherRinging", "Background ringtone service rejected; retaining silent call card", error)
-                // A looping fallback cannot enforce the audio deadline after process death. Keep the silent card.
+                android.util.Log.w("CypherRinging", "Phone-call foreground service rejected; posting the deadline-bound call card", error)
+                try { manager.notify(routeKey, 2, ringingNotification) } catch (_: SecurityException) { return }
             }
         }
         NotificationPreviewJob.enqueue(context, source, event, data["conversation_ref"].orEmpty(), data["kind"].orEmpty())

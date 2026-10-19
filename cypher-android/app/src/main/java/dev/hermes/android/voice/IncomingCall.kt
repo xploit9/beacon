@@ -81,13 +81,25 @@ fun requireIncomingRoute(route: JSONObject, source: String, profile: String, now
     require(route.string("source_ref") == source && route.string("profile") == profile && route.string("kind") == "incoming_call" && route.string("state") == "pending" && validOpaque(route.string("callback_id")) && validIncoming(source, route.string("callback_id"), route.optLong("expires_at"), now)) { "This Cypher invitation is no longer available" }
 }
 
+internal suspend fun performIncomingDeclineRequest(
+    pending: () -> Boolean,
+    authorize: () -> Boolean,
+    request: suspend () -> Unit,
+) {
+    require(pending()) { "This Cypher invitation has already been handled" }
+    require(authorize()) { "This Cypher invitation has ended" }
+    request()
+}
+
 suspend fun declineIncoming(app: CypherApplication, source: String, event: String) = withTimeout(8000) {
-    require(app.push.authorizeKeepConnectedAction(source, event, "decline")) { "This Cypher invitation has ended" }
     require(app.push.claimInvitation(source, event)) { "This Cypher invitation has ended" }
     val (client, _) = resolveIncoming(app, source, event)
     try {
-        require(app.push.invitation(source, event) != null) { "This Cypher invitation has already been handled" }
-        client.nativeRequest("/api/plugins/cypher/mobile/callbacks/$event/decline", "POST", org.json.JSONObject())
+        performIncomingDeclineRequest(
+            pending = { app.push.invitation(source, event) != null },
+            authorize = { app.push.authorizeKeepConnectedAction(source, event, "decline") },
+            request = { client.nativeRequest("/api/plugins/cypher/mobile/callbacks/$event/decline", "POST", org.json.JSONObject()) },
+        )
         app.push.discardInvitation(source, event)
     } catch (e: Throwable) {
         if (e !is CancellationException) reconcileIncomingFailure(app, client, source, event, e)

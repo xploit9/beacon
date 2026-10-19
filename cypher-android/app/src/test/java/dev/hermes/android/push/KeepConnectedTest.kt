@@ -7,7 +7,12 @@ import dev.hermes.android.data.CypherClient
 import dev.hermes.android.data.NativeAuthExpiredException
 import dev.hermes.android.voice.RelayCallbackPhase
 import dev.hermes.android.voice.RelayCallbackPolicy
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.SocketPolicy
@@ -119,6 +124,86 @@ class KeepConnectedTest {
 
         assertEquals(KeepConnectedCycle.Connected, poller.pollOnce())
         assertEquals(mapOf("default" to 4L, "coder" to 9L), requests)
+    }
+
+    @Test fun profileLongPollsAreBoundedAndFiveNormalProfilesStayInOneCycle() = runTest {
+        suspend fun pollProfiles(profiles: List<String>): Pair<Set<String>, Int> {
+            var active = 0
+            var peak = 0
+            val seen = linkedSetOf<String>()
+            val poller = KeepConnectedPoller(
+                origin = "https://hermes.example",
+                owner = "owner",
+                cursors = cursors(),
+                profiles = { profiles },
+                poll = { profile, after ->
+                    active += 1
+                    peak = maxOf(peak, active)
+                    seen += profile
+                    delay(1)
+                    active -= 1
+                    KeepConnectedPage(emptyList(), after)
+                },
+                onEvent = { _, _ -> error("No events expected") },
+            )
+
+            assertEquals(KeepConnectedCycle.Connected, poller.pollOnce())
+            return seen to peak
+        }
+
+        val normal = (1..5).map { "profile-$it" }
+        val (normalSeen, normalPeak) = pollProfiles(normal)
+        assertEquals(normal.toSet(), normalSeen)
+        assertEquals(5, normalPeak)
+
+        val large = (1..20).map { "profile-$it" }
+        val (largeSeen, largePeak) = pollProfiles(large)
+        assertEquals(large.toSet(), largeSeen)
+        assertEquals(8, KEEP_CONNECTED_MAX_PROFILE_POLLS)
+        assertEquals(KEEP_CONNECTED_MAX_PROFILE_POLLS, largePeak)
+    }
+
+    @Test fun fastProfileRepollsBeforeASlowerProfileReturns() = runTest {
+        val slowStarted = CompletableDeferred<Unit>()
+        val releaseSlow = CompletableDeferred<Unit>()
+        val fastEventDelivered = CompletableDeferred<Unit>()
+        var fastPolls = 0
+        var slowPolls = 0
+        val poller = KeepConnectedPoller(
+            origin = "https://hermes.example",
+            owner = "owner",
+            cursors = cursors(),
+            profiles = { listOf("fast", "slow") },
+            nowMillis = { 0L },
+            poll = { profile, after ->
+                if (profile == "fast") {
+                    fastPolls += 1
+                    when (fastPolls) {
+                        1 -> KeepConnectedPage(listOf(JSONObject().put("event_id", "wake")), after + 1)
+                        2 -> KeepConnectedPage(listOf(JSONObject().put("event_id", "fast-call")), after + 1)
+                        else -> KeepConnectedPage(emptyList(), after)
+                    }
+                } else {
+                    slowPolls += 1
+                    slowStarted.complete(Unit)
+                    releaseSlow.await()
+                    KeepConnectedPage(emptyList(), after)
+                }
+            },
+            onEvent = { profile, event ->
+                if (profile == "fast" && event.getString("event_id") == "fast-call") fastEventDelivered.complete(Unit)
+            },
+        )
+        val cycle = async { poller.pollOnce() }
+
+        withTimeout(2_000) {
+            slowStarted.await()
+            fastEventDelivered.await()
+            while (fastPolls < 2) yield()
+        }
+        assertEquals("The slow profile remains in its first long poll", 1, slowPolls)
+        releaseSlow.complete(Unit)
+        assertEquals(KeepConnectedCycle.Connected, cycle.await())
     }
 
     @Test fun replayedIncomingEventUsesTheExistingReceiptToAvoidAnotherRing() = runTest {
@@ -257,7 +342,8 @@ class KeepConnectedTest {
 
             assertEquals(KeepConnectedCycle.Connected, poller.pollOnce())
             assertEquals("Hermes refused profile academic (403)", poller.lastFailureReason)
-            assertEquals(mapOf("default" to 1, "academic" to 1), attempts)
+            assertTrue(attempts.getOrDefault("default", 0) >= 1)
+            assertEquals(1, attempts["academic"])
             assertEquals(setOf("default:default-call"), delivered)
 
             assertEquals(KeepConnectedCycle.Connected, poller.pollOnce())

@@ -1,17 +1,48 @@
 package dev.hermes.android.voice
 
+import android.app.NotificationManager
+import android.media.AudioManager
+import dev.hermes.android.push.incomingCallMayAlert
+import dev.hermes.android.push.incomingCallMayVibrate
 import org.junit.Assert.*
 import org.junit.Test
 
 class VoiceReadinessTest {
-    @Test fun explicitMuteAndDndNeverRing() {
-        assertTrue(mayRing(true, 4, true, true, 5, true))
-        assertFalse(mayRing(false, 4, true, true, 5, true))
-        assertFalse(mayRing(true, 0, true, true, 5, true))
-        assertFalse(mayRing(true, 4, false, true, 5, true))
-        assertFalse(mayRing(true, 4, true, false, 5, true))
-        assertFalse(mayRing(true, 4, true, true, 0, true))
-        assertFalse(mayRing(true, 4, true, true, 5, false))
+    @Test fun incomingCallAlertHonorsAudioMuteAndNotificationSuppression() {
+        fun mayAlert(
+            activeCall: Boolean = false,
+            audioModeNormal: Boolean = true,
+            invitationLive: Boolean = true,
+            invitationSilenced: Boolean = false,
+            notificationsEnabled: Boolean = true,
+            channelImportance: Int = NotificationManager.IMPORTANCE_HIGH,
+            channelSound: Boolean = true,
+            ringerMode: Int = AudioManager.RINGER_MODE_NORMAL,
+            ringVolume: Int = 5,
+        ) = incomingCallMayAlert(activeCall, audioModeNormal, invitationLive, invitationSilenced,
+            notificationsEnabled, channelImportance, channelSound, ringerMode, ringVolume)
+
+        assertTrue(mayAlert())
+        assertFalse(mayAlert(activeCall = true))
+        assertFalse(mayAlert(audioModeNormal = false))
+        assertFalse(mayAlert(invitationLive = false))
+        assertFalse(mayAlert(invitationSilenced = true))
+        assertFalse(mayAlert(notificationsEnabled = false))
+        assertFalse(mayAlert(channelImportance = NotificationManager.IMPORTANCE_NONE))
+        assertFalse(mayAlert(channelSound = false))
+        assertFalse(mayAlert(ringerMode = AudioManager.RINGER_MODE_SILENT))
+        assertFalse(mayAlert(ringerMode = AudioManager.RINGER_MODE_VIBRATE))
+        assertFalse(mayAlert(ringVolume = 0))
+
+        assertTrue(incomingCallMayVibrate(true, true, NotificationManager.IMPORTANCE_HIGH, true, AudioManager.RINGER_MODE_VIBRATE, true))
+        assertTrue(incomingCallMayVibrate(true, true, NotificationManager.IMPORTANCE_HIGH, true, AudioManager.RINGER_MODE_NORMAL, true))
+        assertFalse(incomingCallMayVibrate(false, true, NotificationManager.IMPORTANCE_HIGH, true, AudioManager.RINGER_MODE_VIBRATE, true))
+        assertFalse(incomingCallMayVibrate(true, false, NotificationManager.IMPORTANCE_HIGH, true, AudioManager.RINGER_MODE_VIBRATE, true))
+        assertFalse(incomingCallMayVibrate(true, true, NotificationManager.IMPORTANCE_NONE, true, AudioManager.RINGER_MODE_VIBRATE, true))
+        assertFalse(incomingCallMayVibrate(true, true, NotificationManager.IMPORTANCE_HIGH, false, AudioManager.RINGER_MODE_VIBRATE, true))
+        assertFalse(incomingCallMayVibrate(true, true, NotificationManager.IMPORTANCE_HIGH, true, AudioManager.RINGER_MODE_SILENT, true))
+        assertFalse(incomingCallMayVibrate(true, true, NotificationManager.IMPORTANCE_HIGH, true, AudioManager.RINGER_MODE_VIBRATE, false))
+        assertFalse(incomingCallMayVibrate(false, true, NotificationManager.IMPORTANCE_HIGH, true, AudioManager.RINGER_MODE_NORMAL, true))
     }
 
     @Test fun healthyConnectionsRestoreRecoveryButRapidFlappingStillStops() {

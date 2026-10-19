@@ -1,6 +1,8 @@
 package dev.hermes.android
 
 import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.content.pm.PackageManager
@@ -134,6 +136,21 @@ class KeepConnectedUiTest {
             KeepConnectedService.clientFactoryForTest = { current, authStore -> fixture.clientFor(current, authStore) }
             audio.setStreamVolume(AudioManager.STREAM_RING, 0, 0)
             app.auth.write(auth)
+            val keepChannelId = "cypher_keep_connected"
+            if (manager.getNotificationChannel(keepChannelId) == null) {
+                manager.createNotificationChannel(NotificationChannel(keepChannelId, "Keep connected", NotificationManager.IMPORTANCE_LOW))
+            }
+            fun showSignInPrompt() {
+                manager.notify(4083, Notification.Builder(app, keepChannelId)
+                    .setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle("Sign in again").build())
+            }
+            showSignInPrompt()
+            KeepConnectedService.setEnabled(app, null, false)
+            assertTrue(manager.activeNotifications.none { it.id == 4083 })
+            assertTrue(keepPrefs.edit().putString(KeepConnectedService.KEY_ORIGIN, scope.origin).commit())
+            showSignInPrompt()
+            KeepConnectedService.onUserSignedOut(app, scope.origin)
+            assertTrue(manager.activeNotifications.none { it.id == 4083 })
             app.preferences.edit { values ->
                 values[originKey] = ""
                 values[setupCompleteKey] = true

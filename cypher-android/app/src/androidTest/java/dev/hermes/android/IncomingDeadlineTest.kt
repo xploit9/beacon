@@ -5,6 +5,7 @@ import android.app.Notification
 import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
+import android.media.AudioManager
 import androidx.core.content.ContextCompat
 import androidx.test.core.app.ApplicationProvider
 import dev.hermes.android.core.digest
@@ -39,6 +40,7 @@ class IncomingDeadlineTest {
         fixture { app,source,event,manager ->
             assertTrue("Grant notification permission before running the device gate",manager.areNotificationsEnabled())
             assertFalse("Run synthetic probe without an active call",app.calls.state.value.active)
+            assertEquals("Run the incoming probe in normal audio mode",AudioManager.MODE_NORMAL,app.getSystemService(AudioManager::class.java).mode)
             assertTrue("Do not replace an existing incoming foreground notification",manager.activeNotifications.none { it.id==42 })
             val data=mapOf("kind" to "incoming_call","source_ref" to source,"event_id" to event,
                 "conversation_ref" to "qa-conversation","expires_at" to (System.currentTimeMillis()/1000+120).toString())
@@ -51,6 +53,16 @@ class IncomingDeadlineTest {
                 original!=null
             }
             assertNotNull("Device must actually run the foreground ringtone service, not silently pass its fallback",original)
+            assertEquals(Notification.CATEGORY_CALL,original!!.category)
+            val audio=app.getSystemService(AudioManager::class.java)
+            val callChannel=manager.getNotificationChannel(original!!.channelId)
+            val alerting=dev.hermes.android.push.incomingCallMayAlert(false,true,true,false,manager.areNotificationsEnabled(),
+                callChannel?.importance?:NotificationManager.IMPORTANCE_NONE,callChannel?.sound!=null,audio.ringerMode,audio.getStreamVolume(AudioManager.STREAM_RING))
+            assertEquals(!alerting,original!!.group=="silent")
+            assertEquals(alerting,(original!!.flags and Notification.FLAG_INSISTENT)!=0)
+            assertEquals("Full-screen intent is only attached to an alerting card",alerting,original!!.fullScreenIntent!=null)
+            assertNull("The notification channel is the sole ringtone source",original!!.sound)
+            val channelToneConfigured=callChannel?.sound!=null
             if(android.os.Build.VERSION.SDK_INT>=36) {
                 assertTrue(original!!.extras.getBoolean("android.requestPromotedOngoing"))
                 if(manager.canPostPromotedNotifications()) assertTrue(original!!.hasPromotableCharacteristics())
@@ -59,7 +71,6 @@ class IncomingDeadlineTest {
             receivePush(app,data)
             assertEquals(first,app.push.deadlineInvitation(source,event))
             assertEquals(first,dev.hermes.android.push.PushManager(app).deadlineInvitation(source,event))
-            val audibleObserved=IncomingRingtoneService.playback(source,event)?.first==true
             ContextCompat.startForegroundService(app,Intent(app,IncomingRingtoneService::class.java)
                 .putExtra("push_source",source).putExtra("push_event",event).putExtra("notification",original))
             await(2000) { manager.activeNotifications.firstOrNull { it.id==42 }?.notification?.timeoutAfter?.let { it in 1..16000 }==true }
@@ -76,7 +87,6 @@ class IncomingDeadlineTest {
             assertTrue("Must observe a real twenty-second transition, not a pre-expired fixture",measured>=19500)
             assertTrue("Missed state must not be postponed by duplicate delivery or restart: $measured ms",measured<=21000)
             await(1000) { manager.activeNotifications.none { it.id==42 } }
-            assertNull("Ringtone playback must end with the missed transition",IncomingRingtoneService.playback(source,event))
             val cards=manager.activeNotifications.filter { it.tag==first.key }
             assertEquals(1,cards.size);assertEquals(2,cards.single().id)
             val missed=cards.single().notification
@@ -86,7 +96,7 @@ class IncomingDeadlineTest {
             assertFalse(app.push.claimInvitation(source,event))
             java.io.File(app.filesDir,"incoming-deadline-probe.json").writeText(json("measured_ms" to measured,
                 "poll_resolution_ms" to 20,"restarted_remaining_ms" to remaining,"duplicate_first_arrival_unchanged" to true,
-                "missed_cards" to cards.size,"answer_removed" to true,"foreground_stopped" to true,"audible_observed" to audibleObserved).toString())
+                "missed_cards" to cards.size,"answer_removed" to true,"foreground_stopped" to true,"channel_tone_configured" to channelToneConfigured).toString())
         }
     }
 
