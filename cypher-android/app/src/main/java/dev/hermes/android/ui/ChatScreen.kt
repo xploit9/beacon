@@ -366,7 +366,7 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                 if (chat.messages.isNotEmpty() || chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank() || sphereStreaming)
                     ChatSphere(Modifier.fillMaxSize().alpha(if (sphereStreaming) .5f else .12f).testTag("chat-sphere-background"), transcriptAvatarState)
                 LazyColumn(Modifier.fillMaxSize().nestedScroll(ownerScroll).testTag("conversation-transcript"), state = list, contentPadding = PaddingValues(horizontal = 20.dp, vertical = 20.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) {
-                if (chat.messages.isEmpty() && chat.streamId.isBlank()) item("empty-state") {
+                if (chat.messages.isEmpty() && chat.streamId.isBlank() && !chatSendInFlight(chat)) item("empty-state") {
                     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
                         Box(Modifier.widthIn(max = 280.dp).fillMaxWidth(.9f).aspectRatio(1f).clipToBounds().testTag("chat-sphere-empty")) { ChatSphere(Modifier.fillMaxSize(), avatarState) }
                         EmptyState("Where shall we begin?", if (xara) "Cypher keeps the same context across text, calls and completed tasks." else "Your work starts here. Choose a model and send your first message.")
@@ -378,9 +378,13 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                     // Same header and spacing as the stored reply, so replacing this row does not move the text.
                     Column(Modifier.testTag("live-reply"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("Cypher", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        if (chat.liveText.isNotBlank()) AssistantSurface { Markdown(chat.liveText, vm, vm.authenticatedScope(), interactive = false) }
-                        else LinearProgressIndicator(Modifier.width(120.dp))
-                        MessageActivity(chat.liveReasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), chat.liveTools, chat.status.ifBlank { "Working" }, streaming = true, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) })
+                        // The blank meta line and the status row hold the places of the stored reply's time and action row.
+                        if (chat.liveText.isNotBlank()) AssistantSurface { Markdown(chat.liveText, vm, vm.authenticatedScope(), interactive = false); Text(" ", Modifier.padding(top = 4.dp), style = nativeMetadataStyle()) }
+                        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("live-status"), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                            Text(chat.status.ifBlank { "Working" }, Modifier.testTag("message-activity-status"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        MessageActivity(chat.liveReasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), chat.liveTools, "", streaming = true, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) })
                     }
                 }
                 chat.approval?.let { p -> item("approval:${p.string("approval_id", p.string("id"))}") {
@@ -542,8 +546,8 @@ internal fun acceptsInitialConversationEdit(
                     // A visible state pill, so Queue vs. Guide does not depend on the trailing icon alone.
                     if (streaming && !voiceAction) Text(uiText("Queue next · delivers after this turn"), Modifier.padding(horizontal = 8.dp, vertical = 2.dp).clip(RoundedCornerShape(999.dp)).background(MaterialTheme.colorScheme.secondaryContainer).padding(horizontal = 8.dp, vertical = 3.dp).testTag("composer-queue-caption"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSecondaryContainer)
                     // In flight the transcript shows the message; the draft stays held (not shown twice) until Hermes accepts it.
-                    // Read-only, not disabled, so the keyboard stays up.
-                    OutlinedTextField(if (sending) TextFieldValue("") else draft, if (sending) { _ -> } else changeDraft, readOnly = sending, placeholder = { Text(if (sending) uiText("Sending…") else if (callActive) "Finish your call to continue typing" else if (readOnly) "Branch this conversation to reply" else if (streaming) uiText("Correct the response...") else "Message Cypher") }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp.coerceAtMost(editorHeight), max = editorHeight).testTag("message-input").onPreviewKeyEvent { event -> val key = event.nativeKeyEvent; val sendKey = settings.string("send_key", "enter"); val matched = when (sendKey) { "ctrl_enter", "ctrl+enter" -> key.isCtrlPressed && !key.isShiftPressed; "shift+enter" -> key.isShiftPressed && !key.isCtrlPressed; else -> !key.isShiftPressed && !key.isCtrlPressed && !key.isAltPressed }; if (key.action == android.view.KeyEvent.ACTION_DOWN && key.keyCode == android.view.KeyEvent.KEYCODE_ENTER && matched && !callActive && !readOnly) { if (editable && chat.uncertain.isBlank()) submit(); true } else false }, minLines = 1, maxLines = 6, enabled = editable && !callActive && !readOnly, shape = RoundedCornerShape(18.dp), colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = .5f)))
+                    // Edits are ignored rather than the field made read-only: read-only ends the input session and drops the keyboard.
+                    OutlinedTextField(if (sending) TextFieldValue("") else draft, if (sending) { _ -> } else changeDraft, placeholder = { Text(if (sending) uiText("Sending…") else if (callActive) "Finish your call to continue typing" else if (readOnly) "Branch this conversation to reply" else if (streaming) uiText("Correct the response...") else "Message Cypher") }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp.coerceAtMost(editorHeight), max = editorHeight).testTag("message-input").onPreviewKeyEvent { event -> val key = event.nativeKeyEvent; val sendKey = settings.string("send_key", "enter"); val matched = when (sendKey) { "ctrl_enter", "ctrl+enter" -> key.isCtrlPressed && !key.isShiftPressed; "shift+enter" -> key.isShiftPressed && !key.isCtrlPressed; else -> !key.isShiftPressed && !key.isCtrlPressed && !key.isAltPressed }; if (key.action == android.view.KeyEvent.ACTION_DOWN && key.keyCode == android.view.KeyEvent.KEYCODE_ENTER && matched && !callActive && !readOnly) { if (editable && chat.uncertain.isBlank()) submit(); true } else false }, minLines = 1, maxLines = 6, enabled = editable && !callActive && !readOnly, shape = RoundedCornerShape(18.dp), colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = .5f)))
                     if (streaming && !voiceAction) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                         TextButton(onClick = { vm.steer() }, enabled = canonical && preparing.isEmpty() && !readOnly && !callActive && draft.text.isNotBlank() && !draft.text.startsWith("/") && chat.uncertain.isBlank() && files.isEmpty(), modifier = Modifier.heightIn(min = 48.dp)) { Text("Guide") }
                         TextButton(onClick = { vm.cancel() }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Stop") }
@@ -805,7 +809,10 @@ internal fun chatSendInFlight(chat: ChatState): Boolean = chat.uncertain.isNotBl
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) { Text(uiText("You"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         BoxWithConstraints(Modifier.fillMaxWidth()) {
             Surface(Modifier.widthIn(max = maxWidth * .9f).align(Alignment.CenterEnd).alpha(.7f), shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp, bottomStart = 22.dp, bottomEnd = 4.dp), color = MaterialTheme.colorScheme.primaryContainer) {
-                Text(text.ifBlank { uiText("Attachment") }, Modifier.padding(horizontal = 16.dp, vertical = 12.dp))
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+                    Text(text.ifBlank { uiText("Attachment") })
+                    Text(messageTimeLabel(System.currentTimeMillis()).orEmpty(), Modifier.padding(top = 4.dp), style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
         }
         val sendingLabel = uiText("Sending…")

@@ -1904,7 +1904,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             old.copy(projectionReady = true,
                 approval = if (o.has("pending_approval")) o.optJSONObject("pending_approval") else old.approval,
                 clarification = if (o.has("pending_clarification")) o.optJSONObject("pending_clarification") else old.clarification,
-                sessionId = scope.session, title = o.string("title").ifBlank { "New conversation" }, messages = rows.mapIndexed { i, m -> Message.from(m, i, scope.session) }, raw = o,
+                sessionId = scope.session, title = o.string("title").ifBlank { old.title.takeIf { old.sessionId == scope.session } ?: "New conversation" }, messages = rows.mapIndexed { i, m -> Message.from(m, i, scope.session) }, raw = o,
                 status = if (streamEnded) "" else if (active.isNullOrBlank() && old.streamId.isNotBlank()) old.status.ifBlank { "Turn status unknown" } else "",
                 streamId = active?.takeIf { it.isNotBlank() } ?: if (streamEnded) "" else old.streamId,
                 liveText = if (streamEnded) "" else old.liveText,
@@ -1994,9 +1994,11 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         if (_chat.value.streamId.isNotBlank()) { queue(); return@launch }
         val send = PendingSend.create(scope, d)
         pending[scope.key] = send
+        if (sourceScope == scope) _chat.update { it.copy(uncertain = send.id, status = "Sending") }
         try {
-            app.cache.write(scope, "pending", send.encode(), true)
-            if (sourceScope == scope) _chat.update { it.copy(uncertain = send.id, status = "Sending") }
+            // Nothing was sent if the receipt cannot be kept: settle the in-flight state instead of reporting an unknown outcome.
+            try { app.cache.write(scope, "pending", send.encode(), true) }
+            catch (e: Throwable) { if (e !is CancellationException) { pending.remove(scope.key, send); if (sourceScope == scope && _chat.value.uncertain == send.id) _chat.update { it.copy(uncertain = "", status = "") } }; throw e }
             val model = queued?.model ?: _chat.value.raw.string("model")
             val provider = queued?.provider ?: _chat.value.raw.string("model_provider")
             val o = c.post("/api/chat/start", json("session_id" to scope.session, "message" to d.text, "attachments" to JSONArray(d.attachments), "profile" to scope.profile, "client_request_id" to send.id, "model" to model.ifBlank { null }, "model_provider" to provider.ifBlank { null }, "explicit_model_pick" to (queued != null || saved.get<Boolean>("model_pick:${scope.key}") == true)))
@@ -2032,7 +2034,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         if (sourceScope == scope) _chat.update { state ->
             val row = result.string("user_row_id")
             val receipt = result.optJSONArray("attachment_receipts") ?: JSONArray()
-            val confirmed = json("row_id" to row, "role" to "user", "content" to sent.text, "attachments" to receipt)
+            val confirmed = json("row_id" to row, "role" to "user", "content" to sent.text, "attachments" to receipt, "timestamp" to System.currentTimeMillis() / 1000.0)
             val append = row.isNotBlank() && state.messages.none { it.id == row }
             state.copy(messages = if (append) state.messages + Message.from(confirmed, state.messages.size, scope.session) else state.messages,
                 raw = if (append) state.raw.copy().put("messages", JSONArray(state.raw.rows("messages") + confirmed)) else state.raw,
