@@ -22,10 +22,11 @@ internal fun isPublicExternalMediaAddress(address: InetAddress): Boolean {
         !address.isSiteLocalAddress && !address.isMulticastAddress
 }
 
-internal fun externalMediaDns(system: Dns = Dns.SYSTEM): Dns = Dns { hostname ->
-    system.lookup(hostname).filter(::isPublicExternalMediaAddress).ifEmpty {
-        throw UnknownHostException("No public address for $hostname")
-    }
+internal fun externalMediaDns(system: Dns = Dns.SYSTEM): Dns = object : Dns {
+    override fun lookup(hostname: String): List<InetAddress> =
+        system.lookup(hostname).filter(::isPublicExternalMediaAddress).ifEmpty {
+            throw UnknownHostException("No public address for $hostname")
+        }
 }
 
 private val externalMediaHttp = OkHttpClient.Builder().dns(externalMediaDns()).cookieJar(CookieJar.NO_COOKIES).authenticator(Authenticator.NONE).proxyAuthenticator(Authenticator.NONE).followRedirects(false).followSslRedirects(false).connectTimeout(15, TimeUnit.SECONDS).readTimeout(20, TimeUnit.SECONDS).callTimeout(30, TimeUnit.SECONDS).build()

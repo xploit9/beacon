@@ -163,7 +163,7 @@ class CypherActivity : ComponentActivity() {
                         dismissButton = { TextButton(onClick = cancelConnectionLink) { Text("Cancel") } },
                     )
                 }
-            } } } } }
+            } } } }
         }
     }
     private var pendingReturn by mutableStateOf("")

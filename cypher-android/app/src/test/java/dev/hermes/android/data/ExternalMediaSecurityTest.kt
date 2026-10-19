@@ -39,10 +39,14 @@ class ExternalMediaSecurityTest {
     }
 
     @Test fun dnsDropsUnsafeAnswersAndFailsClosedWhenNoPublicAddressRemains() {
-        val mixed = externalMediaDns(Dns { listOf(address("192.168.1.1"), address("8.8.8.8")) })
+        val mixed = externalMediaDns(fixedDns(address("192.168.1.1"), address("8.8.8.8")))
         assertEquals(listOf(address("8.8.8.8")), mixed.lookup("media.example"))
 
-        val privateOnly = externalMediaDns(Dns { listOf(address("127.0.0.1"), address("::1")) })
+        val privateOnly = externalMediaDns(fixedDns(address("127.0.0.1"), address("::1")))
         assertThrows(UnknownHostException::class.java) { privateOnly.lookup("media.example") }
     }
+}
+
+private fun fixedDns(vararg answers: java.net.InetAddress) = object : Dns {
+    override fun lookup(hostname: String): List<java.net.InetAddress> = answers.toList()
 }
