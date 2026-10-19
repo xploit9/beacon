@@ -16,8 +16,8 @@ class IncomingCallTest {
     @Test fun incomingRecordsExpireAfterTheirStateSpecificRetentionWindow() {
         val now = 1_000_000_000_000L
 
-        assertFalse(incomingRecordMayBePruned("ended", 999_700_000L, now))
-        assertTrue(incomingRecordMayBePruned("ended", 999_699_000L, now))
+        assertFalse(incomingRecordMayBePruned("ended", 999_999_700L, now))
+        assertTrue(incomingRecordMayBePruned("ended", 999_999_699L, now))
         assertFalse(incomingRecordMayBePruned("missed", 999_395_200L, now))
         assertTrue(incomingRecordMayBePruned("missed", 999_395_199L, now))
         assertFalse(incomingRecordMayBePruned("missed", 0L, now))
