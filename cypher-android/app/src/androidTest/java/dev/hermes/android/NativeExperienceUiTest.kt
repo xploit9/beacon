@@ -116,11 +116,13 @@ class NativeExperienceUiTest {
         runBlocking { (1..24).forEach { n -> listOf("pending", "draft", "session", "client-created-shell", "side-question").forEach { app.cache.delete(fixture.scope.session("new-$n"), it) } } }
         runBlocking { app.cache.delete(fixture.scope, "bot-mode-return"); app.cache.delete(fixture.scope, "xara-session"); app.cache.delete(fixture.scope, "xara-opening"); app.cache.delete(fixture.scope, "phone-editors"); app.cache.delete(fixture.scope, "editor:C:/synthetic-workspace/notes.md") }
         lateinit var vm: CypherViewModel
+        val profileSwitchClientFactory: (dev.hermes.android.data.AuthContext) -> dev.hermes.android.data.CypherClient = { auth -> fixture.freshClientFor(auth, app.auth) }
         try {
             compose.runOnUiThread { vm = ViewModelProvider(store, viewModelFactory { initializer { CypherViewModel(app, SavedStateHandle()) } })[CypherViewModel::class.java] }
             compose.runOnIdle {
                 field(vm, "originGeneration", 100)
                 field(vm, "client", fixture.client)
+                field(vm, "profileSwitchClientFactoryForTest", profileSwitchClientFactory)
                 field(vm, "sourceScope", fixture.scope.session("chat-a"))
                 app.calls.ownerScope = fixture.scope
                 flow<AppState>(vm, "_ui").value = AppState(origin = fixture.scope.origin, authenticated = true, owner = fixture.scope.owner, connected = true, restoringSession = false,
@@ -177,6 +179,8 @@ class NativeExperienceUiTest {
         override fun <I, O> onLaunch(requestCode: Int, contract: ActivityResultContract<I, O>, input: I, options: ActivityOptionsCompat?) {
             code = requestCode; intent = contract.createIntent(context, input)
         }
+        fun deliver(granted: Boolean) { check(dispatchResult(code, granted)) }
+        fun deliver(resultCode: Int, data: Intent? = null) { check(dispatchResult(code, resultCode, data)) }
         fun deliver(uris: List<Uri>) {
             val result = Intent().apply { data = uris.singleOrNull() }
             if (uris.isNotEmpty()) result.clipData = ClipData.newRawUri("Selected files", uris.first()).apply { uris.drop(1).forEach { addItem(ClipData.Item(it)) } }
@@ -521,17 +525,23 @@ class NativeExperienceUiTest {
 
     @Test fun messageCopyShareAndBothBranchActionsUseTheSelectedMessage() = withFixture { vm, fixture ->
         val original = vm.chat.value.messages.first()
+        val latestAssistant = vm.chat.value.messages.last { it.role == "assistant" && it.text.isNotBlank() }
+        compose.onNodeWithTag("message-actions:${latestAssistant.id}").assertExists()
+        compose.onNodeWithTag("message-actions:${original.id}").assertDoesNotExist()
         fun action(label: String) = compose.onNode(hasContentDescription(label) and hasAnyAncestor(hasTestTag("message-actions:${original.id}")))
         fun revealAction(label: String) {
             val target = action(label)
-            val transcript = compose.onNodeWithTag("conversation-transcript")
-            repeat(8) {
-                if (runCatching { target.assertIsDisplayed() }.isSuccess) return
-                transcript.performTouchInput { swipeDown() }
-                compose.waitForIdle()
-            }
+            val bubble = compose.onNodeWithTag("message-bubble:${original.id}").performScrollTo()
+            if (runCatching { target.assertIsDisplayed() }.isFailure) bubble.performClick()
             target.assertIsDisplayed()
         }
+        val bubble = compose.onNodeWithTag("message-bubble:${original.id}").performScrollTo()
+        bubble.performClick()
+        compose.onNodeWithTag("message-actions:${original.id}").assertExists()
+        bubble.performClick()
+        compose.onNodeWithTag("message-actions:${original.id}").assertDoesNotExist()
+        bubble.performTouchInput { longClick() }
+        compose.onNodeWithText("Copy source").assertIsDisplayed().performClick()
         revealAction("More message actions")
         action("More message actions").performScrollTo().performClick()
         compose.onNodeWithText("Copy source").performClick()
@@ -558,6 +568,20 @@ class NativeExperienceUiTest {
         assertFalse(fixture.requests.any { it.string("method") == "prompt.submit" })
         receipts += "Copy source preserves the selected message; system Share opens and cancels without sending; branch and edit/branch use exact native message boundaries."
         capture("audit-message-actions")
+    }
+
+    @Test fun systemSteeringNoteStaysInRawHistoryButIsNotRendered() = withFixture { vm, _ ->
+        val before = vm.chat.value
+        val note = json("id" to "system-steering", "role" to "user", "text" to "[System: The active model changed]")
+        val message = Message.from(note, before.messages.size, before.sessionId)
+        val raw = before.raw.copy().put("messages", JSONArray().apply { before.raw.rows("messages").forEach { put(it.copy()) }; put(note.copy()) })
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = before.copy(messages = before.messages + message, raw = raw) }
+        compose.waitForIdle()
+
+        compose.onNodeWithTag("message-row:${message.id}").assertDoesNotExist()
+        assertTrue(vm.chat.value.messages.any { it.id == message.id })
+        assertTrue(vm.chat.value.raw.rows("messages").any { it.string("text").startsWith("[System:") })
+        receipts += "Hermes system steering rows stay in raw history but never become transcript bubbles."
     }
 
     @Test fun nativePdfPagerAndJsonTreeHaveWorkingBoundaries() = withFixture { vm, fixture ->
@@ -702,6 +726,24 @@ class NativeExperienceUiTest {
                 assertFalse(fixture.requests.any { it.string("method") == "prompt.submit" })
                 receipts += "Attach opens Photos/Files; Photos requests image/* and Files */*. System multi-document result preserves each file, deduplicates selection, supports removal/cancel/failure and rejects stale conversation results. No prompt sent."
             } finally { one.delete(); two.delete() }
+        }
+    }
+
+    @Test fun cameraResultRestoresItsConversationScopeAfterSavedStateRecreation() {
+        val picker = PickerRegistry(app)
+        val restoration = StateRestorationTester(compose)
+        withFixture(picker, restoration) { vm, _ ->
+            compose.onNodeWithTag("composer-attach").performClick()
+            compose.onNodeWithTag("attach-camera").performClick()
+            if (picker.intent?.action.orEmpty().contains("REQUEST_PERMISSIONS")) picker.deliver(true)
+            await { picker.intent?.action == android.provider.MediaStore.ACTION_IMAGE_CAPTURE }
+
+            restoration.emulateSavedInstanceStateRestore()
+            picker.deliver(Activity.RESULT_OK)
+
+            await { vm.attachments.value.any { it.string("name").startsWith("photo-") } }
+            assertTrue(vm.attachmentPreparation.value.isEmpty())
+            receipts += "The camera URI and original conversation key survive saved-state recreation; the result uploads when the restored account and conversation still match."
         }
     }
 
@@ -961,6 +1003,26 @@ class NativeExperienceUiTest {
         receipts += "A thread whose name another conversation holds is renamed with the next free number instead of losing its name."
     }
 
+    @Test fun aThreadStopsRenamingAfterAnUnrelatedHermesError() = withFixture { vm, fixture ->
+        val taken = fixture.sessions.getValue("chat-b").getJSONObject("info").string("title")
+        fixture.dropCreateTitle = true
+        fixture.renameFailure = "Synthetic rename service failure"
+        compose.runOnIdle { flow<AppState>(vm, "_ui").value = vm.ui.value.copy(sessions = emptyList()); vm.tab("Chat"); vm.newThread(taken) }
+        await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady }
+        val thread = vm.chat.value.sessionId
+        kotlinx.coroutines.runBlocking { app.cache.delete(fixture.scope.session(thread), "live:runtime-$thread") }
+        val subscriptionsBefore = fixture.streamSubscriptions.get()
+        compose.runOnIdle { fixture.persistTerminalMessages = true; vm.composer(TextFieldValue("First thread message")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId.isNotBlank() }
+        await { fixture.streamSubscriptions.get() > subscriptionsBefore }
+        fixture.nativeTurnStatus = "idle"
+        fixture.emitNativeEvent("message.complete", json("text" to "Thread reply"))
+
+        await { fixture.requests.count { it.string("method") == "session.title" } == 1 && vm.chat.value.streamId.isBlank() }
+        assertEquals(1, fixture.requests.count { it.string("method") == "session.title" })
+        receipts += "A non-duplicate Hermes rename failure stops after one title request instead of cycling numbered titles."
+    }
+
     @Test fun threadsLaneStartsANamedThreadAndDrawerFiltersRunInHermes() = withFixture { vm, fixture ->
         try {
             compose.runOnIdle { vm.toggleSessions(true) }
@@ -1105,6 +1167,79 @@ class NativeExperienceUiTest {
                 listOf("xara-session", "xara-opening", "new-chat-shell", "selected-session").forEach { app.cache.delete(coder, it) }
             }
         }
+    }
+
+    @Test fun openingANonAssistantCallFromXaraReturnsToItsProfileAndChatOnce() = withFixture { vm, fixture ->
+        val assistantScope = fixture.scope.copy(profile = "coder")
+        val callId = "synthetic-return-call"
+        runBlocking { app.preferences.edit { it[stringPreferencesKey("assistant_profile")] = "coder" } }
+        try {
+            await { vm.preferences.value.assistantProfile == "coder" }
+            compose.runOnIdle { vm.tab("Xara") }
+            await { vm.ui.value.tab == "Xara" && vm.ui.value.profile == "coder" && !vm.ui.value.xaraOpening && vm.chat.value.sessionId.isNotBlank() }
+            val switchesBefore = fixture.requests.count { it.string("path") == "/api/profile/switch" }
+            val target = fixture.scope.session("chat-b")
+            app.calls.update { CallState(active = true, state = "listening", callId = callId, conversationScope = target) }
+            compose.runOnIdle { vm.openCurrentCall(callId) }
+
+            await { vm.ui.value.tab == "Chat" && vm.ui.value.profile == target.profile && vm.chat.value.sessionId == target.session && vm.chat.value.projectionReady }
+            assertEquals(switchesBefore + 1, fixture.requests.count { it.string("path") == "/api/profile/switch" })
+            assertTrue(app.calls.state.value.active)
+            receipts += "Opening a call from Xara returns directly to the call's profile and conversation through one profile switch."
+        } finally {
+            app.calls.update { CallState() }
+            runBlocking {
+                app.preferences.edit { it.remove(stringPreferencesKey("assistant_profile")); it.remove(stringPreferencesKey("assistant_return")) }
+                listOf("xara-session", "xara-opening", "selected-session", "new-chat-shell").forEach { app.cache.delete(assistantScope, it) }
+            }
+        }
+    }
+
+    @Test fun openingACallForCyphersConversationStaysOnXara() = withFixture { vm, _ ->
+        val callId = "synthetic-xara-call"
+        compose.runOnIdle { vm.tab("Xara") }
+        await { vm.ui.value.tab == "Xara" && !vm.ui.value.xaraOpening && vm.chat.value.sessionId.isNotBlank() }
+        val target = (vm.client?.scope ?: error("Xara client missing")).session(vm.chat.value.sessionId)
+        app.calls.update { CallState(active = true, state = "listening", callId = callId, conversationScope = target) }
+        try {
+            compose.runOnIdle { vm.openCurrentCall(callId) }
+            await { vm.ui.value.tab == "Xara" && vm.chat.value.sessionId == target.session && vm.chat.value.projectionReady }
+            assertTrue(app.calls.state.value.active)
+            receipts += "Opening a call for Xara's own conversation keeps the assistant tab selected."
+        } finally {
+            app.calls.update { CallState() }
+            runBlocking { app.preferences.edit { it.remove(stringPreferencesKey("assistant_return")) } }
+        }
+    }
+
+    @Test fun profileSwitchRefreshesAndRotatesTheStoredBearer() = withFixture { vm, fixture ->
+        val now = System.currentTimeMillis() / 1000
+        val refreshToken = "lane-r1-refresh"
+        val bearer = dev.hermes.android.data.NativeBearerRecord("lane-r1-access", refreshToken, now + 3600, fixture.scope.origin, fixture.scope.owner, "default", "fixture", now)
+        val auth = dev.hermes.android.data.AuthContext(fixture.scope.origin, emptyList(), fixture.scope.owner, "default", backend = "hermes-dashboard", bearer = bearer)
+        fixture.currentRefreshToken = refreshToken
+        runBlocking { app.auth.persist(auth) }
+        compose.runOnUiThread {
+            field(vm, "client", fixture.clientFor(auth, app.auth))
+        }
+        try {
+            runBlocking { vm.switchProfile("coder").join() }
+            await { vm.ui.value.profile == "coder" && vm.client?.scope?.profile == "coder" }
+            fixture.forceExpiredAccessToken = bearer.accessToken
+            runBlocking { vm.refreshSessions(force = true).join() }
+            await { fixture.refreshTokensUsed.isNotEmpty() && app.auth.read(auth.origin).bearer?.refreshToken == fixture.currentRefreshToken }
+            assertEquals(listOf(refreshToken), fixture.refreshTokensUsed.toList())
+            assertEquals(fixture.currentRefreshToken, vm.client?.auth?.bearer?.refreshToken)
+            assertTrue(vm.ui.value.authenticated)
+
+            val stale = fixture.freshClientFor(auth.copy(profile = "coder", bearer = bearer.copy(profile = "coder")))
+            try {
+                val failure = runBlocking { runCatching { stale.get("/api/profiles") }.exceptionOrNull() }
+                assertTrue(failure is dev.hermes.android.data.NativeAuthExpiredException)
+                assertTrue(fixture.rejectedRefreshTokens.contains(refreshToken))
+            } finally { stale.closeNative() }
+            receipts += "After a profile switch an expired access token refreshes through the active profile client; the store keeps the rotated token, and replaying its predecessor is rejected."
+        } finally { app.calls.update { CallState() } }
     }
 
     @Test fun leavingTheAssistantTabNeverLeavesItsConversationInChat() = withFixture { vm, fixture ->

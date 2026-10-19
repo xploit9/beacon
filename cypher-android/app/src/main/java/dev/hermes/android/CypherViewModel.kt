@@ -31,6 +31,8 @@ import org.json.JSONObject
 import java.io.File
 
 private val streamIdPattern = Regex("[A-Za-z0-9_.:-]{1,256}")
+private const val MAX_CHAT_ATTACHMENT_BYTES = 12L * 1024 * 1024
+private const val LOCAL_CHECKPOINT_LIMIT_BYTES = 16L * 1024 * 1024
 
 data class Message(val id: String, val role: String, val text: String, val reasoning: String = "", val tools: List<JSONObject> = emptyList(), val attachments: List<JSONObject> = emptyList(), val mediaSnapshots: Map<String, String> = emptyMap(), val sessionId: String = "", val interrupted: Boolean = false, val voice: Boolean = false, val recordedAt: Long = 0L) {
     companion object {
@@ -53,6 +55,17 @@ internal fun renderedChatStatus(old: ChatState, active: String?, streamEnded: Bo
 data class ChatState(val sessionId: String = "", val title: String = "New conversation", val messages: List<Message> = emptyList(), val raw: JSONObject = JSONObject(), val streamId: String = "", val liveText: String = "", val liveReasoning: String = "", val liveTools: List<JSONObject> = emptyList(), val status: String = "", val approval: JSONObject? = null, val clarification: JSONObject? = null, val uncertain: String = "", val queued: List<QueuedMessage> = emptyList(), val anchor: Int = 0, val anchorOffset: Int = 0, val anchorId: String = "", val callMessages: List<CallTranscript> = emptyList(), val projectionReady: Boolean = true)
 internal fun sessionCanStillBeUnpersisted(clientCreated: Boolean, chat: ChatState): Boolean =
     clientCreated && chat.messages.isEmpty() && chat.callMessages.isEmpty() && chat.liveText.isBlank() && chat.streamId.isBlank() && chat.raw.optInt("message_count") == 0
+// Hermes stores model-switch steering as user rows, so the reserved prefix identifies it.
+internal fun visibleTranscriptMessages(messages: List<Message>): List<Message> =
+    messages.filterNot { it.text.trimStart().startsWith("[System:") }
+internal fun attachmentFitsLocalCheckpoint(draft: Draft, attachment: JSONObject, fileBytes: Long): Boolean {
+    if (fileBytes < 0L || fileBytes > MAX_CHAT_ATTACHMENT_BYTES) return false
+    val encodedDraft = draft.copy(attachments = draft.attachments + attachment.copy().put("staged_base64", "")).encode()
+    val encodedContent = 4L * ((fileBytes + 2) / 3)
+    val draftBytes = encodedDraft.toByteArray().size.toLong() + encodedContent
+    val receiptBytes = json("id" to "00000000-0000-0000-0000-000000000000", "draft" to encodedDraft).toString().toByteArray().size.toLong() + encodedContent
+    return maxOf(draftBytes, receiptBytes) + APP_CIPHER_OVERHEAD + 64L * 1024 <= LOCAL_CHECKPOINT_LIMIT_BYTES
+}
 internal fun releaseTerminalChat(chat: ChatState, stream: String, replyConfirmed: Boolean, terminalStatus: String): ChatState {
     if (chat.streamId != stream) return chat
     return if (replyConfirmed) chat.copy(streamId = "", liveText = "", liveReasoning = "", liveTools = emptyList(), status = terminalStatus)
@@ -138,6 +151,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private val _attachmentPreparation = MutableStateFlow<List<JSONObject>>(emptyList())
     val attachmentPreparation = _attachmentPreparation.asStateFlow()
     private val uploadSlots = kotlinx.coroutines.sync.Semaphore(2)
+    private val chatAttachmentLock = Mutex()
     private val uploadJobs = mutableMapOf<String, Job>()
     private val _data = MutableStateFlow<Map<String, JSONObject>>(emptyMap())
     val data = _data.asStateFlow()
@@ -173,6 +187,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             }
             field=value; app.calls.ownerScope=value?.scope
         }
+    internal var profileSwitchClientFactoryForTest: ((AuthContext) -> CypherClient)? = null
     @Volatile private var sourceScope: Scope? = null
     private var cachedOwnerScope: Scope? = null
     private var checkpointJob: Job? = null
@@ -211,6 +226,8 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private var sessionIndexThreads = false
     /** Thread names awaiting Hermes's first-turn title (scope key → name). shortcut: in memory only; a restart before the first reply leaves Hermes's own title. */
     private val pendingThreadTitles = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private var assistantReturnInitialized = false
+    private var assistantReturnValue: JSONObject? = null
     private val liveBoundaries = java.util.concurrent.ConcurrentHashMap<String, LiveAssistantBoundary>()
     private var chatHistoryRevision = 0L
     @Volatile private var originGeneration = 0
@@ -1118,17 +1135,18 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         saveSetupProgress(setupStep, complete = false, setupOrigin = if (loopback) origin else null)
     }
     fun tab(value: String) { if (_ui.value.botModeSwitching) return; botMode.back(); tab(value, resumeDraft = true) }
-    private fun tab(value: String, resumeDraft: Boolean) {
+    private fun tab(value: String, resumeDraft: Boolean): Job? {
         val previous = _ui.value.tab
         if (value == "Xara" && previous != "Xara") noteAssistantReturn(previous)
         saved.remove<String>("settings-navigation")
         ++navigationGeneration
         clearPendingVoiceKeyRequestsIfLeavingVoiceKeyPage(value, "")
         _ui.update { it.copy(tab = value, morePage = "", showSessions = false) }; saved["tab"] = value; saved["more"] = ""
-        if (value == "Xara" && _ui.value.authenticated) openXara()
+        var transition: Job? = null
+        if (value == "Xara" && _ui.value.authenticated) transition = openXara()
         else if (value != "Xara") {
             ++xaraGeneration; _ui.update { it.copy(xaraOpening = false, xaraError = "") }
-            if (previous == "Xara") returnFromAssistant()
+            if (previous == "Xara") transition = returnFromAssistant()
             if (value == "Chat" && resumeDraft && canComposeInitialChat()) {
                 val active = client
                 val owner = active?.scope ?: cachedOwnerScope
@@ -1142,6 +1160,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 }
             }
         }
+        return transition
     }
     fun loadNativeProjects(projectId: String = "", force: Boolean = false): Job {
         if (projectId.isBlank()) return load("native-projects", "/api/projects", force = force)
@@ -1202,37 +1221,52 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     /** The drawer's profile choice is for chats; on the assistant tab it applies when the Chat tab opens. */
     fun chooseProfile(name: String): Job = viewModelScope.launch {
         if (_ui.value.tab != "Xara") { switchProfile(name).join(); return@launch }
-        setAssistantReturn(json("profile" to name)); _ui.update { it.copy(chatProfile = name) }
+        val record = json("profile" to name)
+        setAssistantReturn(record); persistAssistantReturn(record); _ui.update { it.copy(chatProfile = name) }
         tab("Chat")
     }
     /** Where the chats were when the assistant tab took over: their profile and open conversation. */
-    private suspend fun assistantReturn(): JSONObject? = app.preferences.data.first()[stringPreferencesKey("assistant_return")]?.let { runCatching { JSONObject(it) }.getOrNull() }
-    private suspend fun setAssistantReturn(value: JSONObject?) = app.preferences.edit { if (value == null) it.remove(stringPreferencesKey("assistant_return")) else it[stringPreferencesKey("assistant_return")] = value.toString() }
+    private suspend fun assistantReturn(): JSONObject? {
+        if (!assistantReturnInitialized) {
+            val persisted = app.preferences.data.first()[stringPreferencesKey("assistant_return")]?.let { runCatching { JSONObject(it) }.getOrNull() }
+            if (!assistantReturnInitialized) { assistantReturnValue = persisted; assistantReturnInitialized = true }
+        }
+        return assistantReturnValue?.copy()
+    }
+    private fun setAssistantReturn(value: JSONObject?) {
+        assistantReturnValue = value?.copy(); assistantReturnInitialized = true
+    }
+    private suspend fun persistAssistantReturn(value: JSONObject?) {
+        val persisted = value?.toString()
+        app.preferences.edit { if (persisted == null) it.remove(stringPreferencesKey("assistant_return")) else it[stringPreferencesKey("assistant_return")] = persisted }
+    }
     private fun noteAssistantReturn(previousTab: String) {
+        if (assistantReturnInitialized && assistantReturnValue != null) return
         val profile = (client?.scope ?: cachedOwnerScope)?.profile ?: return
         val session = _chat.value.sessionId.takeIf { previousTab == "Chat" && it.isNotBlank() && it != saved.get<String>("xara:${(client?.scope ?: cachedOwnerScope)?.key}") }.orEmpty()
         _ui.update { it.copy(chatProfile = profile) }
-        viewModelScope.launch { if (assistantReturn() == null) setAssistantReturn(json("profile" to profile, "session" to session)) }
+        val record = json("profile" to profile, "session" to session)
+        setAssistantReturn(record)
+        viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) { persistAssistantReturn(record) }
     }
     private fun returnFromAssistant(): Job = viewModelScope.launch {
         val back = assistantReturn() ?: return@launch
-        setAssistantReturn(null); _ui.update { it.copy(chatProfile = "") }
+        setAssistantReturn(null); persistAssistantReturn(null); _ui.update { it.copy(chatProfile = "") }
         val profile = back.string("profile")
         if (profile.isNotBlank() && (client?.scope ?: cachedOwnerScope)?.profile != profile) switchProfile(profile, false).join()
         val session = back.string("session")
         if (session.isNotBlank() && _ui.value.tab == "Chat" && (client?.scope ?: cachedOwnerScope)?.profile == profile) selectSession(session)
     }
     /** Settings › Assistant fixes the assistant chat's model; a chat that drifted from it is moved back when it opens. */
-    private fun keepAssistantModel() {
-        val fixed = preferences.value
+    private fun keepAssistantModel(model: String, provider: String) {
         val raw = _chat.value.raw
-        if (fixed.assistantModel.isBlank() || raw.string("model") == fixed.assistantModel && (fixed.assistantProvider.isBlank() || raw.string("model_provider") == fixed.assistantProvider)) return
+        if (model.isBlank() || raw.string("model") == model && (provider.isBlank() || raw.string("model_provider") == provider)) return
         val scope = sourceScope ?: return
-        sessionAction("/api/session/update", json("model" to fixed.assistantModel, "model_provider" to fixed.assistantProvider.ifBlank { null })) { saved["model_pick:${scope.key}"] = true }
+        sessionAction("/api/session/update", json("model" to model, "model_provider" to provider.ifBlank { null })) { saved["model_pick:${scope.key}"] = true }
     }
     fun setAssistantModel(model: String, provider: String) = viewModelScope.launch {
         app.preferences.edit { it[stringPreferencesKey("assistant_model")] = model; it[stringPreferencesKey("assistant_provider")] = provider }
-        if (_ui.value.tab == "Xara") keepAssistantModel()
+        if (_ui.value.tab == "Xara") keepAssistantModel(model, provider)
     }
     fun setAssistantName(name: String) = viewModelScope.launch { app.preferences.edit { it[stringPreferencesKey("assistant_name")] = dev.hermes.android.data.assistantNameOf(name) } }
     fun setAssistantProfile(profile: String) = viewModelScope.launch { app.preferences.edit { it[stringPreferencesKey("assistant_profile")] = profile } }
@@ -1256,7 +1290,10 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             require(c.auth.owner == oldScope.owner) { "Profile switch changed account identity. Sign in again." }
             if (generation != originGeneration || client?.scope != oldScope) return@launch
             sessionWatch?.cancel(); selectionJob?.cancel(); sourceScope = null; ++sessionGeneration
-            app.auth.persist(c.auth); client = c.detached(); cachedOwnerScope = null; retireSavedDrafts(null)
+            app.auth.persist(c.auth)
+            val switchedAuth = withContext(Dispatchers.IO) { app.auth.read(c.auth.origin) }
+            client = profileSwitchClientFactoryForTest?.invoke(switchedAuth) ?: CypherClient(switchedAuth, app.auth, persistContext = false)
+            cachedOwnerScope = null; retireSavedDrafts(null)
             val restoredClient = client ?: return@launch
             restorePhoneSettings(restoredClient)
             if (generation != originGeneration || client !== restoredClient) return@launch
@@ -1468,7 +1505,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             }
         }
     }
-    private suspend fun resolveXara(c: CypherClient, current: () -> Boolean): String = xaraResolveLock.withLock {
+    private suspend fun resolveXara(c: CypherClient, fixed: AppPreferences, current: () -> Boolean): String = xaraResolveLock.withLock {
         preparedXara?.takeIf { it.first == c.scope }?.let { return@withLock it.second }
         val bound = saved.get<String>("xara:${c.scope.key}") ?: app.cache.read(c.scope, "xara-session")
         if (!bound.isNullOrBlank()) { require(current()) { "Account changed while preparing Cypher" }; preparedXara = c.scope to bound; return@withLock bound }
@@ -1476,7 +1513,6 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         currentCoroutineContext().ensureActive()
         require(current()) { "Account changed while preparing Cypher" }
         app.cache.write(c.scope, "xara-opening", "unknown", true)
-        val fixed = preferences.value
         val result = c.post("/api/xara/open", JSONObject().apply { if (fixed.assistantModel.isNotBlank()) { put("model", fixed.assistantModel); if (fixed.assistantProvider.isNotBlank()) put("model_provider", fixed.assistantProvider) } })
         val id = result.string("session_id", result.string("conversation_id", result.optJSONObject("session")?.string("session_id").orEmpty()))
         require(id.isNotBlank()) { "Cypher did not return a conversation" }
@@ -1600,13 +1636,14 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private suspend fun keepThreadTitle(c: CypherClient, scope: Scope, wanted: String, actual: String) {
         pendingThreadTitles.remove(scope.key)
         if (actual == wanted) return
-        for (candidate in listOf(wanted) + (2..9).map { "$wanted $it" }) {
+        val candidates = listOf(wanted) + (2..9).map { "$wanted $it" }
+        for ((index, candidate) in candidates.withIndex()) {
             try {
                 c.post("/api/session/rename", json("session_id" to scope.session, "title" to candidate))
                 if (sourceScope == scope) _chat.update { it.copy(title = candidate) }
                 refreshSessions()
                 return
-            } catch (e: Throwable) { if (e is CancellationException || e is ApiFailure && e.status in setOf(401, 403)) throw e }
+            } catch (e: Throwable) { if (e is CancellationException || e !is ApiFailure || e.status != 4022 || index == candidates.lastIndex) throw e }
         }
     }
     /** Which project (if any) holds a conversation, as Hermes files it; read when a conversation menu opens. */
@@ -1798,6 +1835,22 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val target=call.conversationScope ?: return@launch
         val owner=client?.scope ?: cachedOwnerScope ?: return@launch
         if(!call.active||call.callId!=expectedId||owner.origin!=target.origin||owner.owner!=target.owner) return@launch
+        if (_ui.value.tab == "Xara") {
+            val targetOwner = target.copy(session = "")
+            val assistantSession = saved.get<String>("xara:${targetOwner.key}") ?: app.cache.read(targetOwner, "xara-session")
+            if (_ui.value.tab != "Xara" || (client?.scope ?: cachedOwnerScope) != owner || !app.calls.state.value.active || app.calls.state.value.callId != expectedId) return@launch
+            if (_ui.value.botModeSwitching) return@launch
+            if (assistantSession == target.session) tab("Xara", resumeDraft = false)?.join()
+            else {
+                val record = json("profile" to target.profile, "session" to target.session)
+                setAssistantReturn(record); viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) { persistAssistantReturn(record) }
+                tab("Chat", resumeDraft = false)?.join()
+                selectionJob?.join()
+            }
+            val selected = _ui.value.tab in setOf("Chat", "Xara") && authenticatedScope() == target && _chat.value.projectionReady
+            if(selected&&app.calls.state.value.active&&app.calls.state.value.callId==expectedId) app.calls.resumeWindow()
+            return@launch
+        }
         if(owner.profile!=target.profile) switchProfile(target.profile).join()
         val current=client?.scope ?: cachedOwnerScope
         if(current!=target.copy(session="")||!app.calls.state.value.active||app.calls.state.value.callId!=expectedId) return@launch
@@ -1812,9 +1865,10 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val c = active
         fun current() = generation == xaraGeneration && connection == originGeneration && _ui.value.tab == "Xara" && client === active && (client?.scope ?: cachedOwnerScope) == owner
         return viewModelScope.launch {
+            val fixed = app.preferences.data.first().let(AppPreferences::read)
             if (!current()) return@launch
             if (owner == null || !_ui.value.authenticated) { _ui.update { it.copy(xaraOpening = false, xaraError = "Sign in again to open Cypher's conversation.") }; return@launch }
-            val wanted = preferences.value.assistantProfile
+            val wanted = fixed.assistantProfile
             if (owner.profile != wanted) {
                 // The assistant keeps its own profile; switching reopens this tab there, and leaving gives the chats' profile back.
                 _ui.update { it.copy(xaraOpening = true, xaraError = "") }
@@ -1825,12 +1879,12 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             _ui.update { it.copy(xaraOpening = true, xaraError = "") }
             try {
                 val id = if (c == null) (saved.get<String>("xara:${owner.key}") ?: app.cache.read(owner, "xara-session")).orEmpty()
-                else preparedXara?.takeIf { it.first == owner }?.second ?: resolveXara(c) { current() }
+                else preparedXara?.takeIf { it.first == owner }?.second ?: resolveXara(c, fixed) { current() }
                 require(id.isNotBlank()) { "Reconnect to resolve Cypher's conversation. Your other conversation draft is retained." }
                 if (!current()) return@launch
                 selectSession(id, editorDraft = editorDraft, onCachedReady = { if (current()) _ui.update { it.copy(xaraOpening = false) } })
                 selectionJob?.join()
-                if (current()) { _ui.update { it.copy(xaraOpening = false) }; keepAssistantModel() }
+                if (current()) { _ui.update { it.copy(xaraOpening = false) }; keepAssistantModel(fixed.assistantModel, fixed.assistantProvider) }
             } catch (e: Throwable) { if (current() && e !is CancellationException) { _ui.update { it.copy(xaraOpening = false, xaraError = e.message ?: "Cypher's conversation could not be opened. Retry to continue.") }; fail(e) } }
         }
     }
@@ -2483,7 +2537,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 }
             }
             _refreshing.update { it + key }
-            val response = c.get(path, query, maxBytes = if (cacheable) 1024 * 1024 else 32 * 1024 * 1024)
+            val response = c.get(path, query, maxBytes = if (cacheable) 1024 * 1024 else LOCAL_CHECKPOINT_LIMIT_BYTES.toInt())
             if (!visible()) return@launch
             val at = System.currentTimeMillis()
             if (cacheable) app.cache.write(scope, cacheKey, json("at" to at, "value" to response).toString())
@@ -2560,15 +2614,31 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             if (active == null || scope == null) return@launch
             val c = active.detached()
             var name = "Attachment"
+            var chatLocked = false
             fun current() = client === active && (if (workspace) pcScope() else sourceScope) == scope && uploadJobs.containsKey(id)
             try {
+                if (!workspace) { chatAttachmentLock.lock(); chatLocked = true }
                 val resolver = app.contentResolver
-                name = withContext(Dispatchers.IO) { resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { if (it.moveToFirst()) it.getString(0) else null } }?.takeIf(String::isNotBlank) ?: "Attachment"
+                val details = withContext(Dispatchers.IO) {
+                    resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+                        if (!cursor.moveToFirst()) "" to null else {
+                            val nameColumn = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            val sizeColumn = cursor.getColumnIndex(OpenableColumns.SIZE)
+                            (if (nameColumn >= 0) cursor.getString(nameColumn).orEmpty() else "") to
+                                sizeColumn.takeIf { it >= 0 && !cursor.isNull(it) }?.let(cursor::getLong)?.takeIf { it >= 0 }
+                        }
+                    } ?: ("" to null)
+                }
+                name = details.first.takeIf(String::isNotBlank) ?: "Attachment"
                 if (!current()) return@launch
                 if (!workspace) _attachmentPreparation.update { it + json("id" to id, "name" to name, "status" to "preparing") }
                 uploadSlots.withPermit {
                     if (!current()) return@withPermit
                     val mime = resolver.getType(uri) ?: "application/octet-stream"
+                    val staged = json("id" to id, "state" to "ready", "scope_key" to scope.key, "staged_base64" to "", "name" to name, "mime" to mime)
+                    val attachmentFits = { fileBytes: Long -> attachmentFitsLocalCheckpoint(draft(), staged, fileBytes) }
+                    val sizeHint = details.second
+                    if (!workspace && sizeHint != null && !withContext(Dispatchers.IO) { attachmentFits(sizeHint) }) error("Attachments are limited to about 11 MiB in total")
                     val file = File.createTempFile("upload", ".data", app.cacheDir)
                     try {
                         withContext(Dispatchers.IO) {
@@ -2577,11 +2647,12 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                                 while (true) {
                                     ensureActive()
                                     val n = input.read(bytes); if (n < 0) break
-                                    total += n; require(total <= 32L * 1024 * 1024) { "Attachment exceeds 32 MiB" }
+                                    total += n; require(total <= if (workspace) 32L * 1024 * 1024 else MAX_CHAT_ATTACHMENT_BYTES) { if (workspace) "Attachment exceeds 32 MiB" else "Attachments are limited to about 11 MiB in total" }
                                     out.write(bytes, 0, n)
                                 }
                             } } ?: error("Could not read attachment")
                         }
+                        if (!workspace && !withContext(Dispatchers.IO) { attachmentFits(file.length()) }) error("Attachments are limited to about 11 MiB in total")
                         val response = c.upload(if (workspace) "/api/workspace/upload" else "/api/upload", file, name, mime, scope.session, directory)
                         if (current()) {
                             if (workspace) {
@@ -2607,6 +2678,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                     else _attachmentPreparation.update { rows -> rows.filterNot { it.string("id") == id } + json("id" to id, "name" to name, "status" to "error", "error" to (e.message ?: "Couldn't prepare attachment. Remove it and choose the file again.")) }
                 }
             } finally {
+                if (chatLocked) chatAttachmentLock.unlock()
                 uploadJobs.remove(id)
                 _attachmentPreparation.update { rows -> rows.filterNot { it.string("id") == id && it.string("status") != "error" } }
                 c.closeNative()

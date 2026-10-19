@@ -37,6 +37,8 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
@@ -190,7 +192,8 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
     val profileDefaults by vm.data.collectAsStateWithLifecycle()
     val chatState by vm.chat.collectAsStateWithLifecycle()
     val composerDraft by vm.composer.collectAsStateWithLifecycle()
-    val messages = remember(chatState.messages, chatState.callMessages, chatState.sessionId) { chatState.messages + chatState.callMessages.map { Message("call:${it.eventId}", it.role, it.text, sessionId = chatState.sessionId) } }
+    val messages = remember(chatState.messages, chatState.callMessages, chatState.sessionId) { visibleTranscriptMessages(chatState.messages) + chatState.callMessages.map { Message("call:${it.eventId}", it.role, it.text, sessionId = chatState.sessionId) } }
+    val latestAssistantMessageId = remember(chatState.messages) { chatState.messages.lastOrNull { it.role == "assistant" && it.text.isNotBlank() }?.id }
     val chat = chatState.copy(messages = messages)
     val callMessagesById = remember(chatState.callMessages) { chatState.callMessages.associateBy { "call:${it.eventId}" } }
     val separateToolResults = remember(chat.raw) { separateToolResultIds(chat.raw.rows("messages")) }
@@ -392,7 +395,7 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                     }
                 }
                 if (search.isNotBlank() && visibleMessages.isEmpty()) item { Text("No messages match your search.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                items(visibleMessages, key = { it.value.id }) { (index, message) -> dayStarts[message.id]?.let { DayDivider(uiText(it)) }; MessageRow(vm, message, index, callMessagesById[message.id], separateToolResults, toolResultTitles[message.id].orEmpty(), onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }) }
+                items(visibleMessages, key = { it.value.id }) { (index, message) -> dayStarts[message.id]?.let { DayDivider(uiText(it)) }; MessageRow(vm, message, index, callMessagesById[message.id], separateToolResults, toolResultTitles[message.id].orEmpty(), isLatestAssistant = message.id == latestAssistantMessageId, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }) }
                 if (chat.streamId.isNotBlank() || chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank()) item("live") {
                     // Same header and spacing as the stored reply, so replacing this row does not move the text.
                     Column(Modifier.testTag("live-reply"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -530,14 +533,25 @@ internal fun acceptsInitialConversationEdit(
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris -> val request = attachmentRequest; attachmentRequest = null; if (uris.isNotEmpty()) { if (request != null && vm.client === request.first && vm.authenticatedScope() == request.second) uris.distinct().forEach { vm.upload(it) } else vm.notice("Reopen attachments in the original account and conversation.") } }
     // Camera photos go to a private cache folder the FileProvider shares with the camera app; stale ones are cleared at start.
     var photo by rememberSaveable { mutableStateOf<String?>(null) }
-    val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { taken -> val request = attachmentRequest; attachmentRequest = null; val uri = photo?.let(android.net.Uri::parse); photo = null
-        if (taken && uri != null) { if (request != null && vm.client === request.first && vm.authenticatedScope() == request.second) vm.upload(uri) else vm.notice("Reopen attachments in the original account and conversation.") } }
+    var photoScopeKey by rememberSaveable { mutableStateOf<String?>(null) }
+    val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { taken ->
+        val request = attachmentRequest; attachmentRequest = null
+        val uri = photo?.let(android.net.Uri::parse); photo = null
+        val scopeKey = photoScopeKey; photoScopeKey = null
+        val currentScope = vm.authenticatedScope()
+        if (taken && uri != null) {
+            val scopeMatches = scopeKey != null && currentScope?.key == scopeKey
+            val clientMatches = request == null || vm.client === request.first && currentScope == request.second
+            if (scopeMatches && clientMatches) vm.upload(uri) else vm.notice("Reopen attachments in the original account and conversation.")
+        }
+    }
     val takePhoto = {
         val file = java.io.File(context.cacheDir, "camera").apply { mkdirs() }.let { java.io.File(it, "photo-${System.currentTimeMillis()}.jpg") }
         val uri = androidx.core.content.FileProvider.getUriForFile(context, context.packageName + ".files", file)
-        photo = uri.toString(); runCatching { camera.launch(uri) }.onFailure { attachmentRequest = null; vm.notice("No camera app is available") }
+        photo = uri.toString(); photoScopeKey = attachmentRequest?.second?.key
+        runCatching { camera.launch(uri) }.onFailure { attachmentRequest = null; photo = null; photoScopeKey = null; vm.notice("No camera app is available") }
     }
-    val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted -> if (granted) takePhoto() else { attachmentRequest = null; vm.notice("Allow camera access to take a photo.") } }
+    val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted -> if (granted) takePhoto() else { attachmentRequest = null; photoScopeKey = null; vm.notice("Allow camera access to take a photo.") } }
     var dictationRequest by remember { mutableStateOf<Pair<CypherClient, Scope?>?>(null) }
     val dictation = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r -> val request = dictationRequest; dictationRequest = null; val text = r.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull(); if (r.resultCode == android.app.Activity.RESULT_OK && text != null) { if (request != null && vm.client === request.first && vm.authenticatedScope() == request.second) vm.dictated(text) else vm.notice("Reopen dictation in the original account and conversation.") } }
     var modelMenu by remember { mutableStateOf(false) }
@@ -664,18 +678,22 @@ internal fun acceptsInitialConversationEdit(
 }
 
 
-@Composable private fun MessageRow(vm: CypherViewModel, message: Message, index: Int, callTranscript: CallTranscript? = null, separateToolResults: Set<String> = emptySet(), resultTitle: String = "", onToolExpanded: (Boolean) -> Unit = {}) {
+@Composable private fun MessageRow(vm: CypherViewModel, message: Message, index: Int, callTranscript: CallTranscript? = null, separateToolResults: Set<String> = emptySet(), resultTitle: String = "", isLatestAssistant: Boolean = false, onToolExpanded: (Boolean) -> Unit = {}) {
     val context = LocalContext.current
     val origin = vm.authenticatedScope()?.session(message.sessionId.ifBlank { vm.chat.value.sessionId })
     val settings = LocalCypherSettings.current
     val presentation = chatPresentation(message.role, message.text, JSONObject().put("name", resultTitle), tools = message.tools)
     val reading by vm.readingAloud.collectAsStateWithLifecycle()
     val currentCall by vm.app.calls.state.collectAsStateWithLifecycle()
+    val haptic = LocalHapticFeedback.current
     var actions by remember(message.id) { mutableStateOf(false) }
+    var inlineActions by remember(message.id) { mutableStateOf(false) }
+    val toggleInlineActions = { inlineActions = !inlineActions }
+    val openMessageActions = { haptic.performHapticFeedback(HapticFeedbackType.LongPress); actions = true }
     val copy = { runCatching { ensureClipboardFits(message.text); (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Cypher message", message.text)) }.onSuccess { vm.notice("Message copied") }.onFailure { vm.notice("Couldn’t copy the whole message. Select a smaller section.") }; Unit }
     val share = { runCatching { context.startActivity(Intent.createChooser(formattedShareIntent(message.text), "Share message")) }.onFailure { vm.notice(if (it is IllegalArgumentException) it.message.orEmpty() else "No app is available to share this message") }; Unit }
     val renderActions: @Composable () -> Unit = {
-            if (callTranscript == null && message.text.isNotBlank()) Row(Modifier.horizontalScroll(rememberScrollState()).testTag("message-actions:${message.id}"), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+            if (callTranscript == null && message.text.isNotBlank() && (inlineActions || actions || isLatestAssistant)) Row(Modifier.horizontalScroll(rememberScrollState()).testTag("message-actions:${message.id}"), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                 IconButton(onClick = { runCatching { val (text, html) = formattedClipboard(message.text); (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newHtmlText("Cypher message", text, html)) }.onSuccess { vm.notice("Formatted message copied") }.onFailure { vm.notice("Couldn’t copy the whole message. Select a smaller section.") } }) { Icon(Icons.Rounded.ContentCopy, uiText("Copy formatted message")) }
                 IconButton(onClick = share) { Icon(Icons.Rounded.Share, uiText("Share text")) }
                 IconButton(onClick = { vm.quoteInReply(presentation.text) }, modifier = Modifier.testTag("message-quote:${message.id}")) { Icon(Icons.Rounded.FormatQuote, uiText("Quote in reply")) }
@@ -693,19 +711,23 @@ internal fun acceptsInitialConversationEdit(
     Column(Modifier.fillMaxWidth().testTag("message-row:${message.id}"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (message.interrupted && callTranscript == null) Text(uiText("Interrupted"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         if (presentation.activity) {
-            Disclosure(presentation.summary, message.text, renderActions)
+            Box(Modifier.fillMaxWidth().combinedClickable(onClick = toggleInlineActions, onLongClick = openMessageActions).testTag("message-bubble:${message.id}")) {
+                Disclosure(presentation.summary, message.text)
+            }
         } else {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = if (message.role == "user") Arrangement.End else Arrangement.Start) {
                 Text(if (message.role == "user") uiText("You") else LocalAssistantName.current, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 if (callTranscript != null) { Spacer(Modifier.weight(1f)); Text(archivedCallLabel(callTranscript.final, callTranscript.interrupted, currentCall.active && currentCall.conversationScope == origin), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             }
-            if (message.role == "user") BoxWithConstraints(Modifier.fillMaxWidth()) {
+            if (message.role == "user") BoxWithConstraints(Modifier.fillMaxWidth().combinedClickable(onClick = toggleInlineActions, onLongClick = openMessageActions).testTag("message-bubble:${message.id}")) {
                 Surface(modifier = Modifier.widthIn(max = maxWidth * .9f).align(Alignment.CenterEnd), shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp, bottomStart = 22.dp, bottomEnd = 4.dp), color = MaterialTheme.colorScheme.primaryContainer) {
                     Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) { if (settings.optBoolean("render_user_markdown", true)) Markdown(presentation.text, vm, origin, message.mediaSnapshots, documentKey = message.id) else SelectionContainer { Text(presentation.text, style = MaterialTheme.typography.bodyLarge) }; BubbleTime(message) }
                 }
-            } else if (presentation.text.isNotBlank()) AssistantSurface { Markdown(presentation.text, vm, origin, message.mediaSnapshots, documentKey = message.id); BubbleTime(message) }
-            renderActions()
+            } else if (presentation.text.isNotBlank()) Box(Modifier.fillMaxWidth().combinedClickable(onClick = toggleInlineActions, onLongClick = openMessageActions).testTag("message-bubble:${message.id}"), contentAlignment = Alignment.CenterStart) {
+                AssistantSurface { Markdown(presentation.text, vm, origin, message.mediaSnapshots, documentKey = message.id); BubbleTime(message) }
+            }
         }
+        renderActions()
         MessageActivity(message.reasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), message.tools, messageTime = message.recordedAt, separateToolResults = separateToolResults, onToolExpanded = onToolExpanded)
         message.attachments.forEach { attachment -> SecureAttachment(vm, attachment, origin, message.mediaSnapshots) }
     }

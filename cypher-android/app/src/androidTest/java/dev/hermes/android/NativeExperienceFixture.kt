@@ -20,6 +20,7 @@ internal suspend fun loginLiveTest(app: CypherApplication, origin: String, crede
 
 /** Synthetic in-process native protocol fixture. No socket, service, model, mailbox or sensor. */
 internal class NativeExperienceFixture : WebSocket.Factory {
+    private class FixtureRpcFailure(val code: Int, message: String) : RuntimeException(message)
     val requests = CopyOnWriteArrayList<JSONObject>()
     val sessions = ConcurrentHashMap<String, JSONObject>()
     private val unpromptedShells = ConcurrentHashMap<String, JSONObject>()
@@ -76,6 +77,11 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var notificationProfiles = listOf("default", "coder")
     @Volatile var incomingNotification: JSONObject? = null
     val notificationWaits = CopyOnWriteArrayList<Long>()
+    @Volatile var forceExpiredAccessToken: String? = null
+    @Volatile var currentRefreshToken = "synthetic-refresh"
+    val refreshTokensUsed = CopyOnWriteArrayList<String>()
+    val rejectedRefreshTokens = CopyOnWriteArrayList<String>()
+    private val refreshSequence = AtomicInteger()
     fun markUnpromptedShell(id: String) {
         unpromptedShells[id] = sessions.remove(id) ?: error("Synthetic session missing")
     }
@@ -116,6 +122,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var holdPromptAcknowledgement = false
     /** Like Hermes when another conversation already holds the requested title: the create-time title is dropped. */
     @Volatile var dropCreateTitle = false
+    @Volatile var renameFailure: String? = null
     private val delayedCreates = CopyOnWriteArrayList<() -> Unit>()
     @Volatile private var activeNativeListener: WebSocketListener? = null
     @Volatile private var activeNativeSocket: WebSocket? = null
@@ -198,7 +205,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         listener.onFailure(socket, java.io.IOException("Synthetic native WebSocket interruption"), null)
     }
     val scope = Scope("https://ui-fixture.invalid", "synthetic-owner", "default")
-    val client = CypherClient(AuthContext(scope.origin, emptyList(), scope.owner, scope.profile, backend = "hermes-dashboard"), null, this) { builder ->
+    private val configureHttp: (OkHttpClient.Builder) -> Unit = { builder ->
         builder.addInterceptor { chain ->
             val request = chain.request()
             check(request.url.host == "ui-fixture.invalid") { "UI fixture may not access a real host" }
@@ -219,13 +226,16 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 "body_fields" to JSONArray().apply { body.keys().forEach { put(it) } },
             )
                 else json("path" to request.url.encodedPath, "method" to request.method, "body" to body, "profile" to profile)
+            val expired = forceExpiredAccessToken?.let { request.header("Authorization") == "Bearer $it" } == true
             val outage = pluginStatus?.takeIf { request.url.encodedPath.startsWith("/api/plugins/cypher/") }
-            val (status, result) = if (outage != null) outage to json("detail" to "Synthetic optional plugin outage")
+            val (status, result) = if (expired) 401 to json("error" to "session_expired")
+                else if (outage != null) outage to json("detail" to "Synthetic optional plugin outage")
                 else http(request.url.encodedPath, request.method, body, profile, request.url.queryParameter("path").orEmpty(), request.url.queryParameter("include_archived") == "1" || request.url.queryParameter("archived") == "only", request.url)
             Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(status).message("Synthetic fixture")
                 .body(result.toString().toResponseBody("application/json".toMediaType())).build()
         }
     }
+    val client = CypherClient(AuthContext(scope.origin, emptyList(), scope.owner, scope.profile, backend = "hermes-dashboard"), null, this, configureHttp = configureHttp)
     fun clientFor(auth: AuthContext, authStore: AuthStore? = null) = CypherClient(
         initial = auth,
         authStore = authStore,
@@ -234,6 +244,8 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         persistContext = false,
         configureHttp = {},
     )
+    fun freshClientFor(auth: AuthContext, authStore: AuthStore? = null) =
+        CypherClient(auth, authStore, this, persistContext = false, configureHttp = configureHttp)
     init {
         projects["p_project_a"] = json("id" to "p_project_a", "name" to "Travel", "primary_path" to "C:/synthetic-workspace", "folders" to JSONArray().put(json("path" to "C:/synthetic-workspace", "is_primary" to true)))
         sessions["chat-a"] = history("chat-a", "Travel planning", JSONArray().put(json("role" to "user", "text" to "Compare the two plans.", "row_id" to 10)).put(json("role" to "assistant", "text" to "A clear comparison follows.\n\n| Plan | Duration | Status |\n|---|---:|---|\n| City | 3 days | Ready |\n| Mountains and the surrounding national park | 5 days | Needs dates |\n\n```kotlin\nval ready = true\n```", "row_id" to 11)))
@@ -361,8 +373,19 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         path.startsWith("/api/sessions/") -> stockSession(path, profile)
         path == "/api/auth/ws-ticket" -> 200 to json("ticket" to "synthetic-once")
         path == "/auth/native/authorize" -> 200 to json("ready" to true)
-        path == "/auth/native/token" -> if (body.string("code").isBlank() || body.string("code_verifier").isBlank()) 400 to json("detail" to "Invalid code or verifier") else 200 to json("access_token" to "synthetic-access", "refresh_token" to "synthetic-refresh", "expires_at" to 2_000_000_000L, "token_type" to "Bearer", "provider" to "fixture", "user_id" to scope.owner)
-        path == "/auth/native/refresh" -> if (body.string("refresh_token").isBlank()) 401 to json("error" to "session_expired") else 200 to json("access_token" to "synthetic-access-refreshed", "refresh_token" to "synthetic-refresh-refreshed", "expires_at" to 2_000_000_000L, "token_type" to "Bearer", "provider" to "fixture", "user_id" to scope.owner)
+        path == "/auth/native/token" -> if (body.string("code").isBlank() || body.string("code_verifier").isBlank()) 400 to json("detail" to "Invalid code or verifier") else { currentRefreshToken = "synthetic-refresh"; 200 to json("access_token" to "synthetic-access", "refresh_token" to currentRefreshToken, "expires_at" to 2_000_000_000L, "token_type" to "Bearer", "provider" to "fixture", "user_id" to scope.owner) }
+        path == "/auth/native/refresh" -> {
+            val supplied = body.string("refresh_token")
+            refreshTokensUsed += supplied
+            if (supplied.isBlank() || supplied != currentRefreshToken) {
+                rejectedRefreshTokens += supplied
+                401 to json("error" to "session_expired")
+            } else {
+                val number = refreshSequence.incrementAndGet()
+                currentRefreshToken = "synthetic-refresh-$number"
+                200 to json("access_token" to "synthetic-access-$number", "refresh_token" to currentRefreshToken, "expires_at" to (System.currentTimeMillis() / 1000 + 3600), "token_type" to "Bearer", "provider" to "fixture", "user_id" to scope.owner)
+            }
+        }
         path == "/api/auth/me" -> 200 to json("user_id" to scope.owner)
         path == "/auth/logout" -> 200 to json("ok" to true)
         path == "/api/model/options" -> 200 to json("providers" to JSONArray().put(json("slug" to "fixture", "name" to "Configured provider", "models" to JSONArray(listOf("synthetic-model", "other-model", "confirm-model")))))
@@ -526,6 +549,8 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                             activeNativeSocket = this
                         }
                     }
+                } catch (error: FixtureRpcFailure) {
+                    listener.onMessage(this, json("jsonrpc" to "2.0", "id" to frame.getString("id"), "error" to json("code" to error.code, "message" to error.message)).toString())
                 } catch (error: IllegalArgumentException) {
                     val missing = error.message == "Synthetic session missing"
                     listener.onMessage(this, json("jsonrpc" to "2.0", "id" to frame.getString("id"), "error" to json("code" to if (missing) 4007 else 404, "message" to if (missing) "session not found" else error.message)).toString())
@@ -596,7 +621,8 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             "session.usage" -> json("input_tokens" to 100, "output_tokens" to 20, "context_window" to 32000)
             "session.title" -> {
                 // Hermes titles are unique per profile (idx_sessions_title_unique).
-                require(sessions.none { (key, row) -> key != id && row.getJSONObject("info").string("title") == params.getString("title") }) { "Title already in use" }
+                renameFailure?.let { throw FixtureRpcFailure(500, it) }
+                if (sessions.any { (key, row) -> key != id && row.getJSONObject("info").string("title") == params.getString("title") }) throw FixtureRpcFailure(4022, "Title already in use")
                 sessions.getValue(id).getJSONObject("info").put("title", params.getString("title")); json("ok" to true)
             }
             "session.set_hidden" -> { val hidden = params.getBoolean("hidden"); sessions.getValue(id).getJSONObject("info").put("hidden", hidden); json("hidden" to hidden, "session_key" to id) }
