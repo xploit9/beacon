@@ -116,6 +116,7 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
 
 @Composable fun ChatScreen(vm: CypherViewModel, xara: Boolean = false, onComposerHeight: (Int) -> Unit = {}, navigationBack: (() -> Unit)? = null, titleOverride: String? = null) {
     val ui by vm.ui.collectAsStateWithLifecycle()
+    val profileDefaults by vm.data.collectAsStateWithLifecycle()
     val chatState by vm.chat.collectAsStateWithLifecycle()
     val composerDraft by vm.composer.collectAsStateWithLifecycle()
     val messages = remember(chatState.messages, chatState.callMessages, chatState.sessionId) { chatState.messages + chatState.callMessages.map { Message("call:${it.eventId}", it.role, it.text, sessionId = chatState.sessionId) } }
@@ -359,7 +360,7 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
             Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 if (navigationBack != null) IconButton(onClick = navigationBack, modifier = Modifier.testTag("bot-chat-back")) { Icon(Icons.Rounded.ArrowBack, "Back to bots") }
                 else IconButton(onClick = LocalOpenNavigationMenu.current ?: { vm.toggleSessions(!ui.showSessions) }, modifier = Modifier.testTag("navigation-toggle")) { Icon(Icons.Rounded.Menu, uiText(if (LocalPersistentNavigation.current) "Hide navigation" else "Show navigation")) }
-                Column(Modifier.weight(1f).padding(vertical = 8.dp)) { Text(titleOverride ?: if (xara || activeHere) "Cypher" else chat.title, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis); Text(if (xara || activeHere) uiText(if (call.active) "Voice conversation" else "Text and voice, together") else if (!canonical) uiText("Loading model…") else chat.raw.string("model", "Choose a model"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
+                Column(Modifier.weight(1f).padding(vertical = 8.dp)) { Text(titleOverride ?: if (xara || activeHere) "Cypher" else chat.title, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis); Text(if (xara || activeHere) uiText(if (call.active) "Voice conversation" else "Text and voice, together") else if (!canonical) uiText("Loading model…") else chat.raw.string("model").ifBlank { profileDefaults["profile-defaults"]?.takeIf { it.string("profile") == ui.profile && recordError(it).isBlank() }?.string("model").orEmpty() }.ifBlank { "Choose a model" }, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
                 if (!xara && !permanentBotChat) IconButton(onClick = { vm.newChat() }) { Icon(Icons.Rounded.Edit, uiText("New conversation")) }
                 IconButton(onClick = { showSearch = !showSearch; if (activeHere && showSearch) showCallHistory = true }, enabled = canonical) { Icon(Icons.Rounded.Search, uiText("Search this conversation")) }
                 Box { IconButton(onClick = { menu = true }, enabled = ready) { Icon(Icons.Rounded.MoreVert, uiText("Conversation actions")) }; DropdownMenu(menu && ready, { menu = false }, modifier = Modifier.heightIn(max = actionMenuHeight).testTag("conversation-actions-menu")) {
@@ -448,7 +449,7 @@ internal fun acceptsInitialConversationEdit(
     val effort = chat.raw.string("reasoning_effort", chat.raw.string("reasoning"))
     val followsProfile = chat.raw.string("model").isBlank() || effort.isBlank()
     val defaults = data["profile-defaults"]?.takeIf { followsProfile && it.string("profile") == ui.profile && recordError(it).isBlank() }
-    LaunchedEffect(ui.origin, ui.owner, ui.profile, followsProfile) { if (followsProfile) vm.load("profile-defaults", "/api/profile/defaults") }
+    LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, followsProfile) { if (followsProfile && ui.connected) vm.load("profile-defaults", "/api/profile/defaults") }
     BoxWithConstraints(Modifier.widthIn(max = 840.dp).fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
         // Reserve the action row before the editor grows. The editor scrolls its own long draft.
         val commandHeight = if (draft.text.startsWith("/")) (maxHeight - 160.dp).coerceIn(48.dp, 160.dp) else 0.dp
