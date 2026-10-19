@@ -195,6 +195,8 @@ def context(owner,provider,profile,stored,call_id):
         if soul: instruction+='\n\nProfile personality:\n'+soul
         if language: instruction+='\nPreferred spoken language: '+language
         greeting="I'm here." if not callback else "I'm calling about your saved Hermes update."
+        if callback.get('reason') and not callback.get('result'):
+            greeting="I'm calling about: "+callback['reason'][:120].rstrip(' .!?')+"."
         if callback.get('result'): greeting+=' '+callback['result'][:500]
         return {'profile':profile,'selected_session_id':stored,'system_instruction':instruction,'context_summary':summary,'greeting':greeting,'callback':callback,
                 'context':{'history':messages,'personality':soul,'memory':memory,**({'callback_reason':callback.get('reason'),'callback_result':callback.get('result','')} if callback else {}),**({'language':language} if language else {})},

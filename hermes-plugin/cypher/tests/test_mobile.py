@@ -199,18 +199,58 @@ def test_history_retention_never_follows_configured_archive_links(harness):
     assert response.status_code==200,response.text
     assert sentinel.read_text(encoding='utf-8')=='unowned fixture'
 
-def test_mail_monitor_prompt_uses_existing_24_hour_lookback(harness,monkeypatch):
+def test_mail_monitor_prompt_is_spaced_and_reuses_legacy_job_without_rewriting(harness,monkeypatch):
     api,_,_,_,_=harness
-    jobs=[]
+    jobs=[];existing=[]
+    def create(model,profile):
+        jobs.append((model,profile));existing.append(model);return model
     monkeypatch.setitem(sys.modules,'hermes_cli.web_server_cron',SimpleNamespace(
-        _call_cron_for_profile=lambda *args:[],
-        _create_cron_job_sync=lambda model,profile:jobs.append((model,profile)) or model))
+        _call_cron_for_profile=lambda *args:existing,
+        _create_cron_job_sync=create))
     monkeypatch.setitem(sys.modules,'hermes_cli.web_models',SimpleNamespace(CronJobCreate=lambda **kwargs:SimpleNamespace(**kwargs)))
     installed=api._install_mail_task('default',{'account':'fixture'})
     assert installed['existing'] is False
-    assert 'received in the last24 hours' in installed['job'].prompt
+    assert 'received in the last 24 hours' in installed['job'].prompt
+    assert 'unread for at least 15 minutes' in installed['job'].prompt
+    assert 'Quiet hours 22:00-10:00 Asia/Dubai' in installed['job'].prompt
     assert installed['job'].schedule=='0,15,30,45 10-21 * * *'
     assert installed['job'].enabled_toolsets==['cypher-mailbox','no_mcp']
+    old_prompt=installed['job'].prompt.replace('last 24 hours','last24 hours').replace('at least 15 minutes','at least15 minutes').replace('Quiet hours 22:00','Quiet hours22:00')
+    legacy={'name':installed['job'].name,'prompt':old_prompt}
+    existing[:]=[legacy]
+    reused=api._install_mail_task('default',{'account':'fixture'})
+    assert reused['existing'] is True and reused['job'] is legacy
+    assert legacy['prompt']==old_prompt and len(jobs)==1
+
+
+def test_call_authorization_is_offloaded_from_event_loop(harness,monkeypatch):
+    import asyncio
+    from contextlib import contextmanager
+    api,_,_,_,_=harness
+    loop_thread=threading.get_ident();observed=[]
+    def record(step): observed.append((step,threading.get_ident()))
+    def identity(request,profile=None,owner_only=False):
+        record('identity-owner' if owner_only else 'identity-profile')
+        return ('owner','basic',None,{'owner_id':'owner'}) if owner_only else ('owner','basic',profile,{'owner_id':'owner'})
+    @contextmanager
+    def connect():
+        record('connect')
+        yield object()
+    def owned(conn,call_id,owner,profile,writable):
+        record('owned')
+        return {'profile':'default','conversation':'native'}
+    def reject(owner,provider,profile,stored): record('conversation-owner')
+    monkeypatch.setattr(api,'identity',identity)
+    monkeypatch.setattr(api.mobile,'connect',connect)
+    monkeypatch.setattr(api.mobile,'owned',owned)
+    monkeypatch.setattr(api,'reject_unowned_conversation',reject)
+    request=SimpleNamespace(query_params={})
+
+    result=asyncio.run(api.call(request,'call'))
+
+    assert result[2]=={'profile':'default','conversation':'native'}
+    assert [step for step,_ in observed]==['identity-owner','connect','owned','identity-profile','conversation-owner']
+    assert all(thread_id!=loop_thread for _,thread_id in observed)
 
 def audio(seq=0,stream='user',at=0,pcm=None):
     rate=16000 if stream=='user' else 24000
@@ -591,6 +631,7 @@ def test_callback_context_uses_exact_verified_job_binding(harness,monkeypatch):
         conn.execute("INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,state,call_id,job_id,reason) VALUES('notice','owner','default','incoming_call','native-stored',1,9999999999,'answered',?,'verified-job','Stored callback reason')",(cid,))
     context=api.voice_context.context('owner','basic','default','native-stored',cid)
     assert context['callback']=={'reason':'Verified reason','job_id':'verified-job','result':'Verified saved result'}
+    assert context['greeting']=="I'm calling about your saved Hermes update. Verified saved result"
     assert 'Wrong newer result' not in context['context_summary']
 
 def test_actual_google_sdk_serializes_only_intended_constraints(harness,monkeypatch):
@@ -747,7 +788,7 @@ def test_context_config_shapes_and_greeting_ascii(harness,monkeypatch):
     with api.mobile.connect() as conn:
         conn.execute("UPDATE calls SET callback_context=? WHERE id=?",(json.dumps({'reason':'fixture callback','job_id':''}),cid))
     result=api.voice_context.context('owner','basic','default','native-stored',cid)
-    assert result['greeting']=="I'm calling about your saved Hermes update." and result['greeting'].isascii()
+    assert result['greeting']=="I'm calling about: fixture callback." and result['greeting'].isascii()
 
 
 def test_owned_synthetic_notification_status_and_test(harness):

@@ -131,7 +131,7 @@ def email_notice(mobile,native,cfg,profile,session_id,args,now):
         if not row: raise ValueError('Read the actual message using the verified read-only native mailbox tool first')
         proof=json.loads(row[0])
         if time.time()-proof['observed_at']>300 or not 0<=time.time()-proof['received_at']<=MAIL_LOOKBACK_SECONDS or args.get('received_at')!=proof['received_at']: raise ValueError('Mailbox evidence is stale or does not match the message')
-        if not urgent and time.time()-proof['received_at']<900: raise ValueError('Nonurgent important mail must be missed for at least15 minutes')
+        if not urgent and time.time()-proof['received_at']<900: raise ValueError('Nonurgent important mail must be missed for at least 15 minutes')
         if classification=='source' and (proof.get('action_required') is not True or (urgent and proof.get('urgent') is not True) or (not urgent and proof.get('important') is not True)): raise ValueError('Source importance flags unavailable; explicitly classify the untrusted message instead')
         if classification=='model' and proof.get('content_observed') is not True: raise ValueError('Read actual message content before an importance assessment')
         if classification=='model' and not reason.strip(): raise ValueError('Model importance assessment needs a reason')
