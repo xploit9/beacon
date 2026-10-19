@@ -17,6 +17,14 @@ private const val HISTORY_WINDOW = 500
 private const val MAX_COMPRESSION_CHAIN = 512
 private const val OPTIONAL_VOICE_HISTORY_TIMEOUT_MS = 1_500L
 
+internal suspend fun CypherClient.recoveredNativeSessionStatus(id: String): String? {
+    if (!id.matches(storedSessionId)) return null
+    // A resumed socket may bind a different runtime id than the stale ChatState stream id.
+    val binding = nativeSession(id)
+    if (binding.scope != scope || binding.storedSessionId != id) return null
+    return nativeSessionStatus(id, binding.runtimeSessionId)
+}
+
 internal class NativeOperations(private val c: CypherClient) {
     suspend fun call(path: String, q: Map<String, String>, method: String, body: JSONObject?, maxBytes: Int): JSONObject {
         var keepCreatedSessionLive = false
@@ -287,7 +295,7 @@ internal class NativeOperations(private val c: CypherClient) {
         var offset = 0
         while (offset < SESSION_INDEX_WINDOW) {
             val limit = minOf(SESSION_PAGE_LIMIT, SESSION_INDEX_WINDOW - offset)
-            val page = c.nativeGet("/api/sessions", mapOf("profile" to c.auth.profile, "archived" to if (archived) "only" else "exclude", "exclude_sources" to "cron", "limit" to "$limit", "offset" to "$offset"))
+            val page = c.nativeGet("/api/sessions", mapOf("profile" to c.auth.profile, "archived" to if (archived) "only" else "exclude", "exclude_sources" to "cron", "min_messages" to "1", "limit" to "$limit", "offset" to "$offset"))
             val items = listOf("sessions", "items", "data").firstNotNullOfOrNull { page.opt(it) as? JSONArray } ?: error("Hermes returned an unreadable conversation list")
             for (index in 0 until items.length()) {
                 val row = items.opt(index) as? JSONObject ?: error("Hermes returned an unreadable conversation list")

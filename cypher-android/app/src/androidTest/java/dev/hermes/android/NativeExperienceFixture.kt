@@ -114,8 +114,11 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile private var activeNativeSocket: WebSocket? = null
     @Volatile private var activeNativeSessionId: String? = null
     private val pendingNativeStreams = ConcurrentHashMap.newKeySet<String>()
+    private val runtimeStoredSessionIds = ConcurrentHashMap<String, String>()
+    private val currentRuntimeSessionIds = ConcurrentHashMap<String, String>()
     val streamSubscriptions = AtomicInteger()
     @Volatile var nativeTurnStatus = "idle"
+    @Volatile var resumeRuntimeSessionId: String? = null
     @Volatile var nativeStatusFailure = false
     @Volatile var persistTerminalMessages = false
     @Volatile var terminalOnActiveList: JSONObject? = null
@@ -151,7 +154,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     }
     fun clearCustomTabSeam() { NativeAuth.customTabLauncher = null }
     fun retainNativeEvent(runtimeSessionId: String, type: String, payload: JSONObject): JSONObject {
-        val storedSessionId = sessions.entries.firstOrNull { it.value.optString("session_id") == runtimeSessionId }?.key
+        val storedSessionId = runtimeStoredSessionIds[runtimeSessionId] ?: sessions.entries.firstOrNull { it.value.optString("session_id") == runtimeSessionId }?.key
             ?: error("Synthetic runtime session missing: $runtimeSessionId")
         val event = json("session_id" to runtimeSessionId, "seq" to nativeEventSequence.incrementAndGet(), "type" to type, "payload" to payload.copy())
         if (persistTerminalMessages && type == "message.complete") {
@@ -225,6 +228,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         projects["p_project_a"] = json("id" to "p_project_a", "name" to "Travel", "primary_path" to "C:/synthetic-workspace", "folders" to JSONArray().put(json("path" to "C:/synthetic-workspace", "is_primary" to true)))
         sessions["chat-a"] = history("chat-a", "Travel planning", JSONArray().put(json("role" to "user", "text" to "Compare the two plans.", "row_id" to 10)).put(json("role" to "assistant", "text" to "A clear comparison follows.\n\n| Plan | Duration | Status |\n|---|---:|---|\n| City | 3 days | Ready |\n| Mountains and the surrounding national park | 5 days | Needs dates |\n\n```kotlin\nval ready = true\n```", "row_id" to 11)))
         sessions["chat-b"] = history("chat-b", "Reading list", JSONArray().put(json("role" to "user", "text" to "Keep the literal <memory-context>example</memory-context> in this note.", "row_id" to 20)))
+        sessions.forEach { (id, row) -> runtimeStoredSessionIds[row.string("session_id")] = id; currentRuntimeSessionIds[id] = row.string("session_id") }
         jobs["task-a"] = json("id" to "task-a", "name" to "Morning summary", "prompt" to "Summarize synthetic sample notes. No external action.", "schedule" to json("kind" to "cron", "expression" to "0 10 * * *", "display" to "Every day at 10:00"), "schedule_display" to "0 10 * * *", "deliver" to "local", "paused" to false, "enabled" to true, "last_status" to "success", "next_run_at" to "2026-10-15T10:00:00+04:00", "scheduler_heartbeat_age_s" to 8)
         boardTasks["t_fixture"] = json("id" to "t_fixture", "title" to "Review travel options", "body" to "Compare the two plans before booking.", "status" to "todo", "assignee" to "default", "priority" to 1)
     }
@@ -513,7 +517,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     }
     private fun rpc(method: String, params: JSONObject): JSONObject {
         check(params.string("profile") in setOf("default", "coder"))
-        val id = params.string("session_id").removePrefix("runtime-")
+        val id = params.string("session_id").let { runtimeStoredSessionIds[it] ?: it.removePrefix("runtime-") }
         return when (method) {
             "session.list" -> json("sessions" to JSONArray(sessions.values.filter { params.optBoolean("include_hidden") || !it.getJSONObject("info").optBoolean("hidden") }.map { row -> row.getJSONObject("info").copy().put("id", row.string("stored_session_id")).put("stored_session_id", row.string("stored_session_id")) }))
             "projects.list" -> json("projects" to JSONArray(projects.values.toList()))
@@ -537,11 +541,21 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             "session.resume" -> {
                 require(!historyFailure) { "Synthetic history unavailable" }
                 val row = sessions[id] ?: unpromptedShells.remove(id)?.also { sessions[id] = it }
-                row?.copy()?.apply { put("session_key", id); remove("stored_session_id"); getJSONObject("info").put("stored_session_id", id); if (omitResumeYolo) getJSONObject("info").remove("yolo") }
+                row?.copy()?.apply {
+                    val runtime = resumeRuntimeSessionId ?: string("session_id")
+                    put("session_id", runtime)
+                    runtimeStoredSessionIds[runtime] = id
+                    currentRuntimeSessionIds[id] = runtime
+                    put("session_key", id); remove("stored_session_id"); getJSONObject("info").put("stored_session_id", id); if (omitResumeYolo) getJSONObject("info").remove("yolo")
+                }
                     ?: throw IllegalArgumentException("Synthetic session missing")
             }
             "session.history" -> { require(!historyFailure) { "Synthetic history unavailable" }; sessions[id]?.copy()?.apply { put("session_key", id); remove("stored_session_id"); getJSONObject("info").put("stored_session_id", id) } ?: throw IllegalArgumentException("Synthetic session missing") }
-            "session.create" -> { val key = "new-${sequence.incrementAndGet()}"; history(key, params.string("title", "New conversation"), JSONArray()).also { sessions[key] = it } }
+            "session.create" -> { val key = "new-${sequence.incrementAndGet()}"; history(key, params.string("title", "New conversation"), JSONArray()).also { row ->
+                runtimeStoredSessionIds[row.string("session_id")] = key
+                currentRuntimeSessionIds[key] = row.string("session_id")
+                sessions[key] = row
+            } }
             "session.events.since" -> json("epoch" to "synthetic", "latest_seq" to nativeEventSequence.get(), "events" to JSONArray(nativeEvents.filter { it.optLong("seq") > params.optLong("last_seen", 0) }))
             "session.active_list" -> {
                 if (nativeStatusFailure) throw IllegalArgumentException("Synthetic active status unavailable")
@@ -550,9 +564,9 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                     terminalOnActiveList = null
                     retainNativeEvent(runtime, "message.complete", payload)
                 }
-                val stored = runtime.takeIf { it.startsWith("runtime-") }?.removePrefix("runtime-")
+                val stored = runtimeStoredSessionIds[runtime] ?: runtime.takeIf { it.startsWith("runtime-") }?.removePrefix("runtime-")
                 val rows = JSONArray()
-                if (stored != null && sessions.containsKey(stored)) rows.put(json("id" to runtime, "session_key" to stored, "status" to nativeTurnStatus))
+                if (stored != null && sessions.containsKey(stored) && currentRuntimeSessionIds[stored]?.let { it == runtime } != false) rows.put(json("id" to runtime, "session_key" to stored, "status" to nativeTurnStatus))
                 json("sessions" to rows)
             }
             "session.usage" -> json("input_tokens" to 100, "output_tokens" to 20, "context_window" to 32000)
