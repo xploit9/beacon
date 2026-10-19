@@ -1006,6 +1006,21 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val origin = originGeneration
         val scope = owner.session(id)
         val retained = draft()
+        // Hermes forgot the pinned Cypher conversation before its first turn: resolve a fresh one there instead of bouncing to Chat forever.
+        val pinned = saved.get<String>("xara:${owner.key}") == id || preparedXara?.let { it.first == owner && it.second == id } == true ||
+            runCatching { app.cache.read(owner, "xara-session") == id }.getOrDefault(false)
+        if (pinned) {
+            saved.remove<String>("xara:${owner.key}")
+            if (preparedXara?.second == id) preparedXara = null
+            try { app.cache.delete(owner, "xara-session"); app.cache.delete(scope, "client-created-shell"); app.cache.delete(scope, "session") }
+            catch (error: Throwable) { if (error is CancellationException) throw error; notice("The draft is safe, but some pointers to the missing conversation could not be cleared.") }
+            if (!current()) return
+            if (_ui.value.tab == "Xara") {
+                sessionWatch?.cancel(); ++sessionGeneration; sourceScope = null; clearDetails(); _chat.value = ChatState()
+                openXara(editorDraft = retained.text.takeIf { it.isNotBlank() })
+                return
+            }
+        }
         try {
             app.cache.write(owner, "initial-draft", retained.encode(), retained.text.isNotBlank() || retained.attachments.isNotEmpty() || retained.queued.isNotEmpty())
         } catch (error: Throwable) {
@@ -1678,7 +1693,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         tab("Chat");selectSession(target.session);selectionJob?.join()
         if(app.calls.state.value.callId==expectedId) app.calls.resumeWindow()
     }
-    fun openXara(): Job {
+    fun openXara(editorDraft: String? = null): Job {
         val active = client
         val owner = active?.scope ?: cachedOwnerScope
         val generation = ++xaraGeneration
@@ -1695,7 +1710,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 else preparedXara?.takeIf { it.first == owner }?.second ?: resolveXara(c) { current() }
                 require(id.isNotBlank()) { "Reconnect to resolve Cypher's conversation. Your other conversation draft is retained." }
                 if (!current()) return@launch
-                selectSession(id, onCachedReady = { if (current()) _ui.update { it.copy(xaraOpening = false) } })
+                selectSession(id, editorDraft = editorDraft, onCachedReady = { if (current()) _ui.update { it.copy(xaraOpening = false) } })
                 selectionJob?.join()
                 if (current()) _ui.update { it.copy(xaraOpening = false) }
             } catch (e: Throwable) { if (current() && e !is CancellationException) { _ui.update { it.copy(xaraOpening = false, xaraError = e.message ?: "Cypher's conversation could not be opened. Retry to continue.") }; fail(e) } }

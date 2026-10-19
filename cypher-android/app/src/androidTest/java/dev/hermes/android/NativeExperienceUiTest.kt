@@ -1025,6 +1025,39 @@ class NativeExperienceUiTest {
         }
     }
 
+    @Test fun forgottenPinnedCypherConversationIsReplacedInPlaceWithItsDraft() = withFixture { vm, fixture ->
+        // Live 2026-10-19: the pinned Cypher chat kept a pointer to a shell Hermes never saved and refused every send.
+        var pinnedId = ""
+        var freshId = ""
+        try {
+            compose.runOnIdle { vm.tab("Xara") }
+            await { vm.ui.value.tab == "Xara" && vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady }
+            pinnedId = vm.chat.value.sessionId
+            assertEquals(pinnedId, runBlocking { app.cache.read(fixture.scope, "xara-session") })
+            fixture.markUnpromptedShell(pinnedId)
+            fixture.forgetUnpromptedShell(pinnedId)
+            fixture.client.closeNative()
+            runBlocking { app.cache.delete(fixture.scope.session(pinnedId), "session") }
+            compose.runOnIdle { vm.composer(TextFieldValue("Pinned draft")); vm.selectSession(pinnedId) }
+
+            await { vm.ui.value.tab == "Xara" && vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId != pinnedId && !vm.ui.value.xaraOpening && vm.chat.value.projectionReady }
+            freshId = vm.chat.value.sessionId
+            assertEquals(freshId, runBlocking { app.cache.read(fixture.scope, "xara-session") })
+            assertEquals("Pinned draft", vm.composer.value.text)
+            compose.runOnIdle { vm.send() }
+            await { fixture.requests.count { it.string("method") == "prompt.submit" } == 1 }
+            assertEquals("Pinned draft", fixture.requests.single { it.string("method") == "prompt.submit" }.getJSONObject("params").string("text"))
+            receipts += "A pinned Cypher conversation Hermes has forgotten is replaced by a fresh pinned one in place, with its draft, and sends once."
+        } finally {
+            runBlocking {
+                listOf(pinnedId, freshId).filter(String::isNotBlank).forEach { id ->
+                    listOf("client-created-shell", "session", "draft", "pending").forEach { app.cache.delete(fixture.scope.session(id), it) }
+                }
+                listOf("xara-session", "xara-opening", "selected-session", "initial-draft").forEach { app.cache.delete(fixture.scope, it) }
+            }
+        }
+    }
+
     @Test fun referenceNavigationAndNativeBoardControls() = withFixture { vm, fixture ->
         runBlocking { app.cache.delete(fixture.scope, "kanban-draft:default") }
         compose.runOnIdle { vm.toggleSessions(true) }
