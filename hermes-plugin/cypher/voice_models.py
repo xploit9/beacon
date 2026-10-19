@@ -23,12 +23,18 @@ def provider_selection(mobile, owner, profile, cfg, provider):
     value=configuration(cfg,provider)
     with mobile.connect() as conn:
         row=conn.execute('SELECT value FROM meta WHERE key=?',(options_key(owner,profile,provider),)).fetchone()
-    if row: value.update(json.loads(row[0]))
+    if row:
+        try: options=json.loads(row[0])
+        except (TypeError,ValueError): options={}
+        if isinstance(options,dict):
+            try: value.update(validate_options(provider,options))
+            except ValueError: pass
     value['personality_instruction']=PERSONALITIES[value['personality']]
     return value
 
 
 def validate_options(provider, value):
+    if provider not in PROVIDERS: raise ValueError('Unknown voice model')
     options={k:value[k] for k in ('voice','personality') if k in value}
     if 'voice' in options and (not isinstance(options['voice'],str) or options['voice'] not in VOICES[provider]): raise ValueError('Unsupported provider voice')
     if 'personality' in options and (not isinstance(options['personality'],str) or options['personality'] not in PERSONALITIES): raise ValueError('Unsupported personality')
@@ -61,12 +67,22 @@ def selected(mobile, owner, profile, cfg):
 
 def bound(row, cfg):
     # Calls admitted before this feature were Gemini calls, even if the preference changed.
-    value = json.loads(row.get('voice_config') or '{}')
+    try: value = json.loads(row.get('voice_config') or '{}')
+    except (TypeError,ValueError): raise ValueError('Invalid voice admission') from None
+    if not isinstance(value,dict): raise ValueError('Invalid voice admission')
     if not value:
         return configuration(cfg)
-    if value.get('provider') not in PROVIDERS or not all(isinstance(value.get(k), str) and value[k] for k in ('model', 'voice')):
+    provider=value.get('provider')
+    if provider not in PROVIDERS or not isinstance(value.get('model'),str) or not value['model']:
         raise ValueError('Invalid voice admission')
-    return value
+    try: options=validate_options(provider,value)
+    except ValueError: raise ValueError('Invalid voice admission') from None
+    if 'voice' not in options: raise ValueError('Invalid voice admission')
+    personality=options.get('personality','balanced')
+    selection=configuration(cfg,provider)
+    selection.update(model=value['model'],voice=options['voice'],personality=personality,
+                     personality_instruction=PERSONALITIES[personality])
+    return selection
 
 
 def xai_secret(cfg):
@@ -86,20 +102,31 @@ def xai_secret(cfg):
 def choices(cfg, google_secret, mobile=None, owner=None, profile=None):
     result = []
     for provider in PROVIDERS:
-        try:
-            configured = bool(google_secret(cfg)) if provider == 'gemini' else bool(xai_secret(cfg)) if provider == 'grok' else False
-        except Exception:
-            configured = False
+        configuration_error=None
+        if provider=='gemini': configured=bool(google_secret(cfg))
+        elif provider=='grok':
+            try: configured=bool(xai_secret(cfg))
+            except FileNotFoundError:
+                configured=False;configuration_error='Configured xAI credentials file is missing'
+            except (OSError,UnicodeError):
+                configured=False;configuration_error='Configured xAI credentials file is unavailable'
+            except ImportError:
+                configured=False;configuration_error='xAI credential store is unavailable'
+            except ValueError:
+                configured=False;configuration_error='Configured xAI credentials are invalid'
+        else: configured=False
         try:
             available = configured and (provider == 'grok' or provider == 'gemini' and importlib.util.find_spec('google.genai') is not None)
         except Exception:
             available = False
         value = provider_selection(mobile,owner,profile,cfg,provider) if mobile else configuration(cfg,provider)
         label = {'gemini': 'Gemini Live', 'grok': 'Grok Voice', 'openai': 'OpenAI Realtime'}[provider]
-        result.append({'id': provider, 'label': label,
-                       'model': value['model'], 'voice': value['voice'], 'voices': list(VOICES[provider]),
-                       'personality':value['personality'], 'personalities':[{'id':k,'label':k.title()} for k in PERSONALITIES], 'available': available,
-                       'configured': configured, 'vision': value['capabilities']['vision']})
+        choice={'id': provider, 'label': label,
+                'model': value['model'], 'voice': value['voice'], 'voices': list(VOICES[provider]),
+                'personality':value['personality'], 'personalities':[{'id':k,'label':k.title()} for k in PERSONALITIES], 'available': available,
+                'configured': configured, 'vision': value['capabilities']['vision']}
+        if configuration_error: choice['configuration_error']=configuration_error
+        result.append(choice)
     return result
 
 

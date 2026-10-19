@@ -1,6 +1,7 @@
 import importlib.util,json,sys
 from pathlib import Path
 from datetime import datetime,timedelta
+import threading
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
 import pytest
@@ -109,3 +110,53 @@ def test_uncertain_absent_native_save_is_never_replayed(env):
     with pytest.raises(TimeoutError):cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
     assert cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)['status']=='uncertain'
     assert jobs==[]
+
+def test_deliver_tolerates_subsecond_early_trigger(env):
+    cb,m,n,cfg,jobs,tmp=env
+    first=cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW.replace(microsecond=600000))
+    with m.connect() as c:key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]
+    due=datetime.fromisoformat(first['scheduled_at'])
+    assert cb.deliver(m,n,key,due-timedelta(milliseconds=250))['status']=='pending'
+    assert cb.deliver(m,n,key,due-timedelta(seconds=2))['status']=='skipped_expired'
+
+def test_schedule_does_not_hold_mobile_lock_during_native_creation(env):
+    cb,m,n,cfg,jobs,tmp=env;module=sys.modules['hermes_cli.web_server_cron']
+    original=module._create_cron_job_sync;entered=threading.Event();release=threading.Event();outcome={}
+    def create(model,profile):
+        entered.set()
+        if not release.wait(3): raise TimeoutError('fixture release timeout')
+        return original(model,profile)
+    module._create_cron_job_sync=create
+    def schedule():
+        try:outcome['result']=cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
+        except Exception as exc:outcome['error']=exc
+    worker=threading.Thread(target=schedule);worker.start();acquired=False;second=None
+    try:
+        assert entered.wait(1)
+        acquired=m.LOCK.acquire(timeout=1)
+        if acquired:
+            m.LOCK.release()
+            second=cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
+    finally:
+        release.set();worker.join(3)
+    assert acquired
+    assert second['status']=='uncertain'
+    assert not worker.is_alive() and 'error' not in outcome
+    assert outcome['result']['status']=='scheduled' and len(jobs)==1
+
+def test_prune_expired_uses_age_for_foreign_markers_and_keeps_unreadable_rows(env):
+    cb,m,n,cfg,jobs,tmp=env;now=NOW.timestamp()
+    expired=(NOW-timedelta(seconds=cb.CALLBACK_MARKER_RETENTION_SECONDS+5)).isoformat()
+    recent=(NOW-timedelta(seconds=cb.CALLBACK_MARKER_RETENTION_SECONDS-5)).isoformat()
+    rows={
+        'scheduled-callback:'+('a'*64):json.dumps({'owner':'foreign','scheduled_at':expired}).encode(),
+        'scheduled-callback:'+('b'*64):json.dumps({'scheduled_at':expired}).encode(),
+        'scheduled-callback:'+('c'*64):json.dumps({'owner':'foreign','scheduled_at':recent}).encode(),
+        'scheduled-callback:'+('d'*64):b'not-json',
+    }
+    with m.connect() as c:c.executemany('INSERT INTO meta(key,value) VALUES(?,?)',rows.items())
+    cb.prune_expired(m,'owner',now)
+    with m.connect() as c:
+        remaining={key for (key,) in c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchall()}
+    assert set(rows)-remaining==set(list(rows)[:2])
+    assert set(list(rows)[2:])<=remaining
