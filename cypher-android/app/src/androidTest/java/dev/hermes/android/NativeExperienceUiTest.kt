@@ -1084,6 +1084,30 @@ class NativeExperienceUiTest {
         receipts += "All Profiles labels history rows with Hermes display names and opens a selected row after switching to its authorized profile."
     }
 
+    @Test fun historyAllProfilesListsOtherProfilesWhenTheCurrentOneHasNoStore() = withFixture { vm, fixture ->
+        fixture.profileDisplayNames = mapOf("default" to "Personal profile", "coder" to "Code profile")
+        fixture.profileSessionIds = mapOf("default" to setOf("chat-a", "chat-b"))
+        // Real Hermes: a profile whose gateway never ran has no state.db, and its list read answers this 503.
+        val noStore = 503 to "Session store is not initialized. Start this profile's gateway to initialize it."
+        fixture.sessionListFailures = mapOf("coder" to noStore)
+        compose.runOnIdle { vm.switchProfile("coder") }
+        await { vm.ui.value.profile == "coder" }
+        compose.runOnIdle { vm.toggleSessions(true) }
+        await { fixture.requests.any { it.string("path") == "/api/sessions" && it.string("profile") == "coder" } && !vm.ui.value.historyLoading }
+        compose.onNodeWithText("No conversations here").assertExists()
+        compose.onNodeWithTag("history-all-profiles").performScrollTo().performClick()
+        await { vm.ui.value.sessions.count { it.string("profile") == "default" } == 2 && !vm.ui.value.historyLoading }
+        compose.onNodeWithTag("history-row:default:chat-a").assertExists()
+        assertTrue(vm.ui.value.historyUnreadable.isEmpty())
+        // A store Hermes cannot read is named instead of looking like an empty list.
+        fixture.sessionListFailures = mapOf("coder" to noStore, "default" to (503 to "Session store is busy (disk I/O or lock). Retry; the list was not cleared."))
+        compose.runOnIdle { vm.refreshSessions() }
+        await { vm.ui.value.historyUnreadable == listOf("default") && !vm.ui.value.historyLoading && vm.data.value["navigation-profiles"]?.rows("profiles")?.any { it.string("display_name") == "Personal profile" } == true }
+        compose.onNodeWithTag("history-unreadable:default").assertTextEquals("Couldn't load Personal profile's conversations")
+        compose.onNodeWithText("No conversations here").assertDoesNotExist()
+        receipts += "All Profiles lists another profile's chats when the current profile has no store yet, and names a profile whose chats could not be read."
+    }
+
     @Test fun reasoningDisclosureUsesMarkdownWithOneVisibleToggle() = withFixture { vm, _ ->
         val reasoning = "**Why this follows**\n\n- First step\n- Second step"
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(messages = vm.chat.value.messages + Message("reasoning-disclosure", "assistant", "Answer", reasoning = reasoning, sessionId = vm.chat.value.sessionId)) }

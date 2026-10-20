@@ -95,6 +95,8 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var notificationProfiles = listOf("default", "coder")
     @Volatile var profileDisplayNames = emptyMap<String, String>()
     @Volatile var profileSessionIds = emptyMap<String, Set<String>>()
+    /** Profile to (status, detail) for a failed list read, as Hermes answers it (sessions.get_sessions). */
+    @Volatile var sessionListFailures = emptyMap<String, Pair<Int, String>>()
     @Volatile var incomingNotification: JSONObject? = null
     val notificationWaits = CopyOnWriteArrayList<Long>()
     @Volatile var forceExpiredAccessToken: String? = null
@@ -469,7 +471,9 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             val only = url?.queryParameter("sources")?.split(',')?.filter(String::isNotBlank)?.toSet()
             val excluded = url?.queryParameter("exclude_sources").orEmpty().split(',').filter(String::isNotBlank).toSet()
             sessionListQueries += json("sources" to url?.queryParameter("sources"), "exclude_sources" to url?.queryParameter("exclude_sources"), "order" to url?.queryParameter("order"))
-            if (limit !in 1..100) 422 to json("detail" to "limit must be at most 100")
+            val failure = sessionListFailures[profile]
+            if (failure != null) failure.first to json("detail" to failure.second)
+            else if (limit !in 1..100) 422 to json("detail" to "limit must be at most 100")
             else 200 to json("sessions" to JSONArray(sessions.values.filter { profileSessionIds[profile]?.contains(it.string("stored_session_id")) != false && it.getJSONObject("info").optBoolean("hidden") == archived }
                 .filter { search.isBlank() || it.getJSONObject("info").string("title").contains(search, ignoreCase = true) }
                 .filter { row -> val source = row.getJSONObject("info").string("source"); (only == null || source in only) && source !in excluded }

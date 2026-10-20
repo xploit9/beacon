@@ -151,8 +151,13 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
         if (ui.historyLoading && ui.query.isNotBlank()) item("history-searching") {
             ListItem(headlineContent = { Text(uiText("Searching…")) }, leadingContent = { CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) }, colors = ListItemDefaults.colors(containerColor = Color.Transparent), modifier = Modifier.testTag("history-searching"))
         }
+        val unreadable = if (allProfiles) ui.historyUnreadable else emptyList()
+        unreadable.forEach { profile -> item("history-unreadable:$profile") {
+            Text("Couldn't load ${profileDisplayName(profile, profileRows)}'s conversations", Modifier.padding(horizontal = 16.dp, vertical = 8.dp).testTag("history-unreadable:$profile"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        } }
         val rows = historyRows(ui.sessions, view, order, ui.profile, preferences.assistantProfile, ui.assistantSessionId)
-        if (rows.isEmpty()) item("empty-history") {
+        // A failed read is not "no conversations".
+        if (rows.isEmpty() && (ui.historyLoading || unreadable.isEmpty())) item("empty-history") {
             // An empty list is only "empty" once the fetch has answered.
             if (ui.historyLoading) ListItem(headlineContent = { Text(uiText("Loading conversations…")) }, leadingContent = { CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) }, colors = ListItemDefaults.colors(containerColor = Color.Transparent), modifier = Modifier.testTag("history-loading"))
             else when (view) {

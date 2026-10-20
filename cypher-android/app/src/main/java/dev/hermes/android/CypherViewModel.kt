@@ -93,7 +93,7 @@ internal fun releaseTerminalChat(chat: ChatState, stream: String, replyConfirmed
 data class EditorState(val scope: Scope? = null, val path: String = "", val text: TextFieldValue = TextFieldValue(), val serverText: String = "", val metadata: JSONObject = JSONObject(), val loading: Boolean = false, val saving: Boolean = false, val error: String = "", val reviewRequired: Boolean = false) { val dirty get() = text.text != serverText }
 data class SideQuestion(val scope: Scope, val question: String, val sessionId: String, val streamId: String, val text: String = "", val status: String = "Responding", val cursor: String = "", val error: String = "")
 data class AppUpdateState(val release: Release? = null, val busy: Boolean = false, val ready: Boolean = false, val status: String = "Cypher checks for updates automatically while connected.")
-data class AppState(val origin: String = BuildConfig.DEFAULT_ORIGIN, val authenticated: Boolean = false, val profile: String = "default", val chatProfile: String = "", val owner: String = "", val tab: String = "Chat", val connected: Boolean = false, val loading: Boolean = false, val error: String = "", val notice: String = "", val bootstrap: JSONObject = JSONObject(), val sessions: List<JSONObject> = emptyList(), val query: String = "", val showSessions: Boolean = false, val morePage: String = "", val cypherOpening: Boolean = false, val cypherError: String = "", val newChatOpening: Boolean = false, val newChatError: String = "", val initialChatReady: Boolean = false, val restoringSession: Boolean = true, val botModeEnabled: Boolean = false, val botModeSwitching: Boolean = false, val setupWizard: Boolean = false, val setupComplete: Boolean = false, val setupStep: String = "connect", val setupPluginMessage: String = "", val setupOrigin: String = "", val historyLoading: Boolean = false, val assistantSessionId: String = "")
+data class AppState(val origin: String = BuildConfig.DEFAULT_ORIGIN, val authenticated: Boolean = false, val profile: String = "default", val chatProfile: String = "", val owner: String = "", val tab: String = "Chat", val connected: Boolean = false, val loading: Boolean = false, val error: String = "", val notice: String = "", val bootstrap: JSONObject = JSONObject(), val sessions: List<JSONObject> = emptyList(), val query: String = "", val showSessions: Boolean = false, val morePage: String = "", val cypherOpening: Boolean = false, val cypherError: String = "", val newChatOpening: Boolean = false, val newChatError: String = "", val initialChatReady: Boolean = false, val restoringSession: Boolean = true, val botModeEnabled: Boolean = false, val botModeSwitching: Boolean = false, val setupWizard: Boolean = false, val setupComplete: Boolean = false, val setupStep: String = "connect", val setupPluginMessage: String = "", val setupOrigin: String = "", val historyLoading: Boolean = false, val assistantSessionId: String = "", val historyUnreadable: List<String> = emptyList())
 internal fun voiceKeySetupPage(): String = "Cypher"
 internal data class VoiceCallRequest(val scope:Scope,val conversationId:String)
 
@@ -1599,6 +1599,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             val path = if (query.isBlank()) "/api/sessions" else "/api/sessions/search"
             val profileIds = if (allProfiles) (listOf(scope.profile) + c.nativeAuthorizedProfiles()).distinct() else listOf(scope.profile)
             var staleRequest = false
+            val unreadable = mutableListOf<String>()
             val serverRows = buildList {
                 for (profile in profileIds) {
                     if (!current()) { staleRequest = true; break }
@@ -1609,7 +1610,12 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                         val listed = result.rows("sessions").ifEmpty { result.rows("results") }
                         addAll(listed.map { it.copy().put("profile", profile) })
                     } catch (error: ApiFailure) {
-                        if (profile == scope.profile || error.status !in setOf(403, 404)) throw error
+                        // A profile whose gateway never ran has no store: Hermes answers 503, and its own profile sidebar lists it as empty.
+                        if (error.status == 503 && error.message.startsWith("Session store is not initialized")) continue
+                        if (profile != scope.profile && error.status in setOf(403, 404)) continue
+                        // One unreadable profile must not hide every other profile's chats.
+                        if (!allProfiles || error.status == 401) throw error
+                        unreadable += profile
                     } finally { if (profileClient !== c) profileClient.closeNative() }
                 }
             }
@@ -1625,7 +1631,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 .filter { !threads || dev.hermes.android.ui.isThreadSource(it.string("source")) }
             val rows = visibleSessionRows(serverRows, confirmed, query, archived)
             indexReadAt = System.currentTimeMillis()
-            _ui.update { it.copy(sessions = rows, connected = true, assistantSessionId = assistantSessionId) }
+            _ui.update { it.copy(sessions = rows, connected = true, assistantSessionId = assistantSessionId, historyUnreadable = unreadable) }
             if (current()) {
                 app.auth.persist(c.auth)
                 if (!allProfiles && query.isBlank() && !archived && !threads) app.cache.write(scope, "conversation-index", json("sessions" to JSONArray(rows)).toString())
