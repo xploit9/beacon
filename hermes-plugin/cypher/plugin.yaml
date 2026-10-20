@@ -10,7 +10,6 @@ provides_tools: [cypher_call_user, cypher_create_proactive_request, cypher_email
 python_dependencies:
   - fastapi>=0.115,<1
   - PyYAML>=6,<7
-  - google-genai>=2.19,<3
   - firebase-admin==7.7.0
   - httpx>=0.28,<1
   - python-dotenv>=1.2.2,<2
