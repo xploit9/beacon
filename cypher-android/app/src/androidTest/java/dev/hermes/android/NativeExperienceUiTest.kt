@@ -656,6 +656,12 @@ class NativeExperienceUiTest {
             try {
                 compose.runOnIdle { vm.navigate("Files") }
                 await { vm.data.value["files"] != null }
+                // Hidden dot folders stay out of the list until asked for.
+                await { compose.onAllNodesWithText("research").fetchSemanticsNodes().isNotEmpty() }
+                compose.onNodeWithText(".cache").assertDoesNotExist()
+                compose.onNodeWithTag("files-show-hidden").performClick()
+                await { compose.onAllNodesWithText(".cache").fetchSemanticsNodes().isNotEmpty() }
+                compose.onNodeWithTag("files-show-hidden").performClick()
                 compose.onNodeWithContentDescription("Create file").performClick()
                 await { vm.form.value != null }
                 compose.runOnIdle { vm.formValue("path", "C:/synthetic-workspace/created-audit.txt"); vm.formValue("content", "Exact synthetic text") }

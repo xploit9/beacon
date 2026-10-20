@@ -14,6 +14,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.*
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
@@ -60,12 +62,14 @@ import dev.hermes.android.data.CypherClient
                 IconButton(onClick = { chooseFolder = true }) { Icon(Icons.Rounded.FolderOpen, "Choose PC folder") }
             }
             Box(Modifier.weight(1f)) {
+                var showHidden by rememberSaveable { mutableStateOf(false) }
                 val tree: @Composable (Modifier) -> Unit = { modifier ->
                     Column(modifier) {
                         Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                             IconButton(onClick = { changeDirectory("") }) { Icon(Icons.Rounded.Home, "Home folder") }
                             IconButton(onClick = { changeDirectory(record?.string("parent").orEmpty()) }, enabled = !record?.string("parent").isNullOrBlank()) { Icon(Icons.Rounded.ArrowUpward, "Parent folder") }
                             Text(actual.ifBlank { "Home" }, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                            IconButton(onClick = { showHidden = !showHidden }, modifier = Modifier.testTag("files-show-hidden")) { Icon(if (showHidden) Icons.Rounded.Visibility else Icons.Rounded.VisibilityOff, if (showHidden) "Hide hidden files" else "Show hidden files") }
                             IconButton(onClick = { vm.client?.let { uploadRequest = Triple(it, scope, actual); upload.launch(arrayOf("*/*")) } }, enabled = actual.isNotBlank()) { Icon(Icons.Rounded.Upload, "Upload to this folder") }
                             IconButton(onClick = { vm.openForm(ActionForm("Create file", "/api/pc/file/create", listOf(Field("path", "PC file path", required = true), Field("content", "Initial content", FieldType.MULTILINE)), json("path" to actual.trimEnd('/', '\\') + "/"), onResult = { refresh() })) }, enabled = actual.isNotBlank()) { Icon(Icons.Rounded.NoteAdd, "Create file") }
                         }
@@ -73,13 +77,17 @@ import dev.hermes.android.data.CypherClient
                             if (record == null) item { LinearProgressIndicator(Modifier.fillMaxWidth().padding(16.dp)) }
                             else if (record.has("_error")) item { Text(record.string("_error"), Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error); TextButton(onClick = refresh) { Text("Retry") } }
                             else {
-                                if (record.rows("entries").isEmpty()) item { EmptyState("This folder is empty", "Create or upload a file to start working here.", Icons.Rounded.FolderOpen) }
-                                items(record.rows("entries"), key = { it.getString("path") }) { file ->
+                                val allEntries = record.rows("entries")
+                                // Dot files and folders (settings, caches) stay out of the way unless asked for, like a desktop file manager.
+                                val entries = if (showHidden) allEntries else allEntries.filterNot { it.string("name").startsWith(".") }
+                                if (allEntries.isEmpty()) item { EmptyState("This folder is empty", "Create or upload a file to start working here.", Icons.Rounded.FolderOpen) }
+                                else if (entries.isEmpty()) item { EmptyState("Only hidden items here", "Show hidden files to see them.", Icons.Rounded.VisibilityOff) }
+                                items(entries, key = { it.getString("path") }) { file ->
                                     val path = file.getString("path")
                                     val folder = file.optBoolean("is_directory")
                                     var actions by remember(path) { mutableStateOf(false) }
                                     ListItem(headlineContent = { Text(file.getString("name")) },
-                                        supportingContent = { Text(if (folder) "Folder" else "${file.optLong("size")} bytes", style = MaterialTheme.typography.bodySmall) },
+                                        supportingContent = { Text(if (folder) "Folder" else android.text.format.Formatter.formatShortFileSize(LocalContext.current, file.optLong("size")), style = MaterialTheme.typography.bodySmall) },
                                         leadingContent = { Icon(if (folder) Icons.Rounded.Folder else Icons.Rounded.Description, null) },
                                         trailingContent = if (folder) null else ({ Box {
                                             IconButton(onClick = { actions = true }) { Icon(Icons.Rounded.MoreVert, "File actions") }
