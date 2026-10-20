@@ -29,7 +29,7 @@ def tick(mobile,native,cfg,profile,now):
         # Consumed even if busy; later ticks must not catch up missed opportunities.
         conn.execute('INSERT INTO meta VALUES(?,?)',(key,b'considered'))
         conn.execute("DELETE FROM meta WHERE key LIKE ? AND key<?",('checkup:'+owner+':'+profile+':%', 'checkup:'+owner+':'+profile+':'+now.date().isoformat()))
-        busy=conn.execute('SELECT 1 FROM calls WHERE owner=? AND closed=0 AND created>?',(owner,time.time()-4*3600)).fetchone()
+        busy=mobile.active_calls(conn,owner)
         pending=conn.execute("SELECT 1 FROM notices WHERE owner=? AND profile=? AND kind='incoming_call' AND state='pending' AND expires>?",(owner,profile,time.time())).fetchone()
         if busy or pending: return {'state':'skipped_busy'}
         event=uuid.uuid4().hex
