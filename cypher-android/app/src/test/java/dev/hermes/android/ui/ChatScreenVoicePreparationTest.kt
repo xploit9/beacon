@@ -1,5 +1,6 @@
 package dev.hermes.android.ui
 
+import dev.hermes.android.Message
 import dev.hermes.android.data.VoiceKeyStore
 import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
@@ -25,15 +26,42 @@ class ChatScreenVoicePreparationTest {
         assertNotSame(caller, decryptThread.get())
     }
 
-    @Test fun storedToolResultsMatchTheirCallIdRowsOnly() {
+    @Test fun matchedToolResultsFoldIntoCallsAndUnmatchedStayVisible() {
         val messages = listOf(
-            JSONObject().put("role", "assistant").put("tool_calls", JSONArray().put(JSONObject().put("id", "call-1"))),
-            JSONObject().put("role", "tool").put("tool_call_id", "call-1").put("content", "saved result"),
-            JSONObject().put("role", "function").put("tool_call_id", "call-2").put("content", "legacy result"),
-            JSONObject().put("role", "assistant").put("tool_call_id", "call-3"),
+            JSONObject().put("id", "assistant-1").put("role", "assistant").put("tool_calls", JSONArray().put(JSONObject().put("id", "call-1"))),
+            JSONObject().put("id", "result-1").put("role", "tool").put("tool_call_id", "call-1").put("content", "saved result"),
+            JSONObject().put("id", "orphan-1").put("role", "function").put("tool_call_id", "missing-call").put("content", "legacy result"),
+        )
+        val cards = listOf(
+            Message("assistant-1", "assistant", "", tools = listOf(JSONObject().put("id", "call-1"))),
+            Message("result-1", "tool", "saved result"),
+            Message("orphan-1", "function", "legacy result"),
+        )
+        val folded = foldToolResults(messages, cards)
+
+        assertEquals(setOf("result-1"), folded.foldedMessageIds)
+        assertEquals("saved result", folded.byCallId["call-1"]?.content)
+        assertEquals(null, folded.byCallId["missing-call"])
+        assertEquals(false, "orphan-1" in folded.foldedMessageIds)
+    }
+
+    @Test fun assistantLabelsShowOncePerReplyAndResetAtBoundaries() {
+        val messages = listOf(
+            Message("orphan-first", "tool", "result before call"),
+            Message("assistant-1", "assistant", "First part"),
+            Message("tool-result", "tool", "result"),
+            Message("assistant-2", "assistant", "Second part"),
+            Message("user-1", "user", "Next turn"),
+            Message("assistant-3", "assistant", "New reply"),
+            Message("assistant-day", "assistant", "New day"),
+            Message("assistant-call", "assistant", "Call transcript"),
+            Message("assistant-4", "assistant", "After call"),
         )
 
-        assertEquals(setOf("call-1", "call-2"), separateToolResultIds(messages))
+        assertEquals(
+            setOf("assistant-1", "assistant-3", "assistant-day", "assistant-call"),
+            assistantLabelMessageIds(messages, setOf("assistant-day"), setOf("assistant-call")),
+        )
     }
 
     @Test fun explicitToolCallIdTakesPrecedenceWhenLinkingAStoredResult() {

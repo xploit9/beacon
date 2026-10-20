@@ -1912,27 +1912,35 @@ class NativeExperienceUiTest {
         val failedArguments = "path=C:/synthetic-workspace/missing.txt\nencoding=utf-8"
         val failedResult = "Error: file not found\nChecked 2 locations"
         val silentArguments = "query=synthetic release notes\nlimit=3"
-        val passed = json("tool_call_id" to "ref-tool-passed", "name" to "run_tests", "args" to passedArguments, "result" to passedResult, "duration_s" to 1.2)
-        val failed = json("tool_call_id" to "ref-tool-failed", "name" to "read_file", "args" to failedArguments, "result" to failedResult, "is_error" to true, "duration_s" to 0.4)
+        val passed = json("tool_call_id" to "ref-tool-passed", "name" to "run_tests", "args" to passedArguments, "duration_s" to 1.2)
+        val failed = json("tool_call_id" to "ref-tool-failed", "name" to "read_file", "args" to failedArguments, "duration_s" to 0.4)
         val silent = json("tool_call_id" to "ref-tool-silent", "name" to "web_search", "args" to silentArguments)
         // Tool lifecycle: a stored call that only ever said "running" has no terminal evidence. Its live sibling below has the same payload.
         val stale = json("tool_call_id" to "ref-tool-stale", "name" to "sync_notes", "args" to "target=notes.md", "status" to "running")
         // The native row key is `timestamp`; a row that has none must stay unrecorded.
         fun row(id: String, role: String, text: String, timestamp: Long? = null, vararg tools: JSONObject) =
             json("row_id" to id, "role" to role, "text" to text, "tool_calls" to JSONArray().apply { tools.forEach { put(it) } }).apply { timestamp?.let { put("timestamp", it) } }
-        val messages = listOf(
-            Message.from(row("ref-user-known", "user", "Summarize the build log.", known), 0, "chat-a"),
-            Message.from(row("ref-assistant-known", "assistant", "The build finished with one failed step.", known / 1000, passed, failed), 1, "chat-a"),
-            Message.from(row("ref-user-unknown", "user", "Try the follow-up search."), 2, "chat-a"),
-            Message.from(row("ref-assistant-unknown", "assistant", "No search completion was recorded.", null, silent, stale), 3, "chat-a"),
+        val passedRow = json("id" to "tool-result-passed", "role" to "tool", "tool_call_id" to "ref-tool-passed", "tool_name" to "run_tests", "content" to passedResult)
+        val failedRow = json("id" to "tool-result-failed", "role" to "tool", "tool_call_id" to "ref-tool-failed", "tool_name" to "read_file", "content" to failedResult, "is_error" to true)
+        val orphanRow = json("id" to "tool-result-orphan", "role" to "tool", "tool_call_id" to "missing-call", "tool_name" to "read_file", "content" to "orphan output")
+        val rows = listOf(
+            row("ref-user-known", "user", "Summarize the build log.", known),
+            row("ref-assistant-known", "assistant", "The build finished with one failed step.", known / 1000, passed, failed),
+            passedRow,
+            failedRow,
+            row("ref-user-unknown", "user", "Try the follow-up search."),
+            row("ref-assistant-unknown", "assistant", "No search completion was recorded.", null, silent, stale),
+            orphanRow,
         )
+        val messages = rows.mapIndexed { index, row -> Message.from(row, index, "chat-a") }
         // Parser wiring, not a test-side copy: native milliseconds and seconds both reach the same instant, and no timestamp stays 0.
         assertTrue(messages[0].recordedAt > 0 && messages[1].recordedAt > 0)
         assertEquals(shown, messageTimeLabel(messages[0].recordedAt, zone, locale))
         assertEquals(shown, messageTimeLabel(messages[1].recordedAt, zone, locale))
-        assertEquals(0L, messages[2].recordedAt)
-        assertEquals(0L, messages[3].recordedAt)
-        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(messages = messages) }
+        assertEquals(0L, messages.first { it.id == "ref-user-unknown" }.recordedAt)
+        assertEquals(0L, messages.first { it.id == "ref-assistant-unknown" }.recordedAt)
+        val raw = JSONObject(vm.chat.value.raw.toString()).put("messages", JSONArray().apply { rows.forEach { put(it) } })
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(messages = messages, raw = raw) }
         fun card(description: String): SemanticsMatcher = hasTestTag("tool-card") and hasContentDescription(description)
         fun part(card: SemanticsMatcher, tag: String) = compose.onNode(hasTestTag(tag) and hasAnyAncestor(card), useUnmergedTree = true)
         fun toggle(card: SemanticsMatcher) = compose.onNode(hasTestTag("tool-card-toggle") and hasAnyAncestor(card), useUnmergedTree = true).performScrollTo().performClick()
@@ -1956,6 +1964,12 @@ class NativeExperienceUiTest {
         val silentCard = card("web search, No result recorded")
         val staleCard = card("sync notes, No result recorded")
         await { compose.onAllNodes(silentCard, useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+
+        compose.onNodeWithTag("message-row:tool-result-passed", useUnmergedTree = true).assertDoesNotExist()
+        compose.onNodeWithTag("message-row:tool-result-failed", useUnmergedTree = true).assertDoesNotExist()
+        compose.onNodeWithTag("message-row:tool-result-orphan", useUnmergedTree = true).assertExists()
+        compose.onNodeWithTag("disclosure:Read file result").performClick()
+        compose.onNodeWithText("orphan output", useUnmergedTree = true).assertExists()
 
         // The tail is the unrecorded exchange: no time anywhere, and a tool without a completion is never successful.
         compose.onNodeWithTag("message-row:ref-assistant-unknown", useUnmergedTree = true).assertExists()

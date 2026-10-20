@@ -20,6 +20,7 @@ import androidx.compose.ui.unit.dp
 import dev.hermes.android.ui.*
 import dev.hermes.android.ui.sphere.MorphingSphere
 import dev.hermes.android.ui.sphere.SphereState
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Rule
@@ -165,17 +166,31 @@ class ChatMigrationUiTest {
         assertEquals(firstPage, shown())
     }
 
-    @Test fun separateToolResultRowNamesItsCallAndMarksTheToolCardAsTranscriptResult() {
+    @Test fun matchedToolResultAppearsInItsCardWithOutcomeAndCopyAction() {
         val call = tool("terminal", "tool_call_id" to "call-1")
-        val result = JSONObject().put("id", "tool-result-1").put("role", "tool").put("tool_call_id", "call-1").put("tool_name", "terminal")
-        val messages = listOf(result)
-        val separateResults = separateToolResultIds(messages)
-        assertEquals(setOf("call-1"), separateResults)
-        assertEquals("Terminal result", toolResultTitles(messages)["tool-result-1"])
+        val result = JSONObject().put("id", "tool-result-1").put("role", "tool").put("tool_call_id", "call-1").put("tool_name", "terminal").put("content", "saved output")
+        val messages = listOf(
+            JSONObject().put("role", "assistant").put("tool_calls", JSONArray().put(call)),
+            result,
+            JSONObject().put("id", "tool-result-orphan").put("role", "tool").put("tool_call_id", "missing-call").put("tool_name", "read_file").put("content", "orphan output"),
+        )
+        val cards = listOf(
+            Message("assistant-1", "assistant", "", tools = listOf(call)),
+            Message("tool-result-1", "tool", "saved output"),
+            Message("tool-result-orphan", "tool", "orphan output"),
+        )
+        val folded = foldToolResults(messages, cards)
+        assertEquals(setOf("tool-result-1"), folded.foldedMessageIds)
+        assertEquals("Terminal result", toolResultTitles(listOf(result))["tool-result-1"])
+        var copied = ""
 
-        compose.setContent { MaterialTheme { MessageActivity("", listOf(call), separateToolResults = separateResults) } }
+        compose.setContent { MaterialTheme { MessageActivity("", listOf(call), toolResultsByCallId = folded.byCallId, onCopyResult = { copied = it }) } }
+        compose.onNode(hasTestTag("tool-card") and hasContentDescription("terminal, Completed"), useUnmergedTree = true).assertExists()
         compose.onNodeWithTag("tool-card-toggle").performClick()
-        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertTextContains("Result in transcript", substring = true)
+        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertTextEquals("Status: Completed")
+        compose.onNodeWithTag("tool-card-result", useUnmergedTree = true).assertTextEquals("saved output")
+        compose.onNodeWithTag("tool-card-result-copy", useUnmergedTree = true).assertContentDescriptionEquals("Copy result").performClick()
+        assertEquals("saved output", copied)
     }
 
     @Test fun dispatchedDelegationReadsAsDispatchedNotCompleted() {

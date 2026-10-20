@@ -83,11 +83,43 @@ private fun String.takeCharacters(count: Int): String = substring(0, offsetByCod
 
 private val toolNamePattern = Regex("[A-Za-z0-9_.:-]{1,80}")
 
-internal fun separateToolResultIds(messages: List<JSONObject>): Set<String> = messages.asSequence()
-    .filter { it.string("role") == "tool" || it.string("role") == "function" }
-    .map { it.string("tool_call_id") }
-    .filter(String::isNotBlank)
-    .toSet()
+internal data class FoldedToolResult(val messageId: String, val content: String, val isError: Boolean)
+internal data class ToolResultFolding(val byCallId: Map<String, FoldedToolResult>, val foldedMessageIds: Set<String>)
+
+internal fun foldToolResults(messages: List<JSONObject>, displayedMessages: List<Message>): ToolResultFolding {
+    val callIds = displayedMessages.asSequence()
+        .filter { it.role == "assistant" }
+        .flatMap { it.tools.asSequence() }
+        .map(::toolCallResultId)
+        .filter(String::isNotBlank)
+        .toSet()
+    val messagesById = displayedMessages.associateBy { it.id }
+    val matched = messages.withIndex().mapNotNull { (index, row) ->
+        val callId = row.string("tool_call_id")
+        if ((row.string("role") != "tool" && row.string("role") != "function") || callId !in callIds) return@mapNotNull null
+        val messageId = row.string("id", row.string("message_id", row.string("row_id", row.string("_row_id", row.string("tool_call_id", "${row.string("role")}:$index")))))
+        val message = messagesById[messageId] ?: return@mapNotNull null
+        callId to FoldedToolResult(message.id, message.text, row.optBoolean("is_error"))
+    }
+    return ToolResultFolding(matched.toMap(), matched.mapTo(LinkedHashSet<String>()) { it.second.messageId })
+}
+
+internal fun assistantLabelMessageIds(messages: List<Message>, dayStartIds: Set<String>, callTranscriptIds: Set<String>): Set<String> {
+    val labels = LinkedHashSet<String>()
+    var inAssistantReply = false
+    messages.forEach { message ->
+        if (message.id in dayStartIds) inAssistantReply = false
+        when (message.role) {
+            "assistant" -> {
+                if (!inAssistantReply || message.id in callTranscriptIds) labels += message.id
+                inAssistantReply = true
+            }
+            "tool", "function" -> Unit
+            else -> inAssistantReply = false
+        }
+    }
+    return labels
+}
 
 internal fun toolCallResultId(tool: JSONObject): String = tool.string("tool_call_id").ifBlank { toolIdentity(tool) }
 
@@ -218,7 +250,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
     var taskFeedbackSent by remember(taskResult, taskResultNoticeId, chat.sessionId) { mutableStateOf(false) }
     var taskFeedbackSending by remember(taskResult, taskResultNoticeId, chat.sessionId) { mutableStateOf(false) }
     val callMessagesById = remember(chatState.callMessages) { chatState.callMessages.associateBy { "call:${it.eventId}" } }
-    val separateToolResults = remember(chat.raw) { separateToolResultIds(chat.raw.rows("messages")) }
+    val foldedToolResults = remember(chat.raw, chat.messages) { foldToolResults(chat.raw.rows("messages"), chat.messages) }
     val toolResultTitles = remember(chat.raw) { toolResultTitles(chat.raw.rows("messages")) }
     val call by vm.app.calls.state.collectAsStateWithLifecycle()
     var surfacedCallError by rememberSaveable { mutableStateOf("") }
@@ -318,9 +350,14 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
     val questionId = chat.clarification?.let { it.string("clarify_id", it.string("id")) }.orEmpty()
     var questionAnswers by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId, questionId,
         stateSaver = androidx.compose.runtime.saveable.mapSaver<Map<String, String>>(save = { it }, restore = { saved -> saved.mapValues { it.value as String } })) { mutableStateOf(emptyMap<String, String>()) }
-    val visibleMessages = remember(messages, search) { messages.withIndex().filter { search.isBlank() || it.value.text.contains(search, true) } }
+    val visibleMessages = remember(messages, search, foldedToolResults) {
+        messages.withIndex().filter { (search.isBlank() || it.value.text.contains(search, true) || it.value.tools.any { tool -> foldedToolResults.byCallId[toolCallResultId(tool)]?.content?.contains(search, true) == true }) && it.value.id !in foldedToolResults.foldedMessageIds }
+    }
     val dayStarts = remember(visibleMessages) { messageDayStarts(visibleMessages.map { it.value.id to it.value.recordedAt }) }
-    val messageIds = remember(chat.messages) { chat.messages.map { it.id } }
+    val assistantLabels = remember(visibleMessages, dayStarts, callMessagesById) {
+        assistantLabelMessageIds(visibleMessages.map { it.value }, dayStarts.keys, callMessagesById.keys)
+    }
+    val messageIds = remember(visibleMessages) { visibleMessages.map { it.value.id } }
     val list = key(ui.origin, ui.owner, ui.profile, chat.sessionId, chat.projectionReady) {
         val start = initialConversationPosition(messageIds, chat.anchorId, chat.anchor, chat.anchorOffset)
         rememberLazyListState(initialFirstVisibleItemIndex = start.first, initialFirstVisibleItemScrollOffset = start.second)
@@ -548,7 +585,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
                         }
                     }
                     if (search.isNotBlank() && visibleMessages.isEmpty()) item { Text("No messages match your search.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                    items(visibleMessages, key = { it.value.id }) { (index, message) -> dayStarts[message.id]?.let { DayDivider(uiText(it)) }; MessageRow(vm, message, transcriptIndex[message.id] ?: index, callMessagesById[message.id], separateToolResults, toolResultTitles[message.id].orEmpty(), isLatestAssistant = message.id == latestAssistantMessageId, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }) }
+                    items(visibleMessages, key = { it.value.id }) { (index, message) -> dayStarts[message.id]?.let { DayDivider(uiText(it)) }; MessageRow(vm, message, transcriptIndex[message.id] ?: index, callTranscript = callMessagesById[message.id], toolResultsByCallId = foldedToolResults.byCallId, resultTitle = toolResultTitles[message.id].orEmpty(), showAssistantLabel = message.id in assistantLabels, isLatestAssistant = message.id == latestAssistantMessageId, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }) }
                     if (chat.streamId.isNotBlank() || chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank()) item("live") {
                         // Same header and spacing as the stored reply, so replacing this row does not move the text.
                         Column(Modifier.testTag("live-reply"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -863,7 +900,7 @@ internal fun acceptsInitialConversationEdit(
     return pointerInput(Unit) { detectTapGestures(onTap = { tap() }, onLongPress = { press() }) }
         .semantics { onClick(show) { tap(); true }; onLongClick(menu) { press(); true } }
 }
-@Composable private fun MessageRow(vm: CypherViewModel, message: Message, index: Int, callTranscript: CallTranscript? = null, separateToolResults: Set<String> = emptySet(), resultTitle: String = "", isLatestAssistant: Boolean = false, onToolExpanded: (Boolean) -> Unit = {}) {
+@Composable private fun MessageRow(vm: CypherViewModel, message: Message, index: Int, callTranscript: CallTranscript? = null, toolResultsByCallId: Map<String, FoldedToolResult> = emptyMap(), resultTitle: String = "", showAssistantLabel: Boolean = true, isLatestAssistant: Boolean = false, onToolExpanded: (Boolean) -> Unit = {}) {
     val context = LocalContext.current
     val origin = vm.authenticatedScope()?.session(message.sessionId.ifBlank { vm.chat.value.sessionId })
     val settings = LocalCypherSettings.current
@@ -875,7 +912,7 @@ internal fun acceptsInitialConversationEdit(
     var inlineActions by remember(message.id) { mutableStateOf(false) }
     val toggleInlineActions = { inlineActions = !inlineActions }
     val openMessageActions = { haptic.performHapticFeedback(HapticFeedbackType.LongPress); actions = true }
-    val copy = { runCatching { ensureClipboardFits(message.text); (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Cypher message", message.text)) }.onSuccess { vm.notice("Message copied") }.onFailure { vm.notice("Couldn’t copy the whole message. Select a smaller section.") }; Unit }
+    val copySource: (String) -> Unit = { text -> runCatching { ensureClipboardFits(text); (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Cypher message", text)) }.onSuccess { vm.notice("Message copied") }.onFailure { vm.notice("Couldn’t copy the whole message. Select a smaller section.") }; Unit }
     val share = { runCatching { context.startActivity(Intent.createChooser(formattedShareIntent(message.text), "Share message")) }.onFailure { vm.notice(if (it is IllegalArgumentException) it.message.orEmpty() else "No app is available to share this message") }; Unit }
     val renderActions: @Composable () -> Unit = {
             if (callTranscript == null && message.text.isNotBlank() && (inlineActions || actions || isLatestAssistant)) Row(Modifier.horizontalScroll(rememberScrollState()).testTag("message-actions:${message.id}"), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -886,7 +923,7 @@ internal fun acceptsInitialConversationEdit(
                 Box {
                     IconButton(onClick = { actions = true }) { Icon(Icons.Rounded.MoreHoriz, uiText("More message actions")) }
                     DropdownMenu(actions, { actions = false }) {
-                        DropdownMenuItem({ Text("Copy source") }, { actions = false; copy() })
+                        DropdownMenuItem({ Text("Copy source") }, { actions = false; copySource(message.text) })
                         DropdownMenuItem({ Text(uiText("Branch from here")) }, { actions = false; vm.sessionAction("/api/session/branch", json("keep_count" to index + 1)) { o -> branchSessionId(o).takeIf(String::isNotBlank)?.let { id -> vm.selectSession(id); vm.notice("Branched into a new conversation") } } }, leadingIcon = { Icon(Icons.Rounded.CallSplit, null) })
                         if (message.role == "user") DropdownMenuItem({ Text(uiText("Edit and branch")) }, { actions = false; vm.sessionAction("/api/session/branch", json("keep_count" to index)) { o -> (o.optJSONObject("session") ?: o).string("session_id").takeIf(String::isNotBlank)?.let { vm.selectSession(it, message.text) } } }, leadingIcon = { Icon(Icons.Rounded.Edit, null) })
                     }
@@ -900,7 +937,7 @@ internal fun acceptsInitialConversationEdit(
                 Disclosure(presentation.summary, message.text)
             }
         } else {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = if (message.role == "user") Arrangement.End else Arrangement.Start) {
+            if (message.role != "assistant" || showAssistantLabel || callTranscript != null) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = if (message.role == "user") Arrangement.End else Arrangement.Start) {
                 Text(if (message.role == "user") uiText("You") else LocalAssistantName.current, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 if (callTranscript != null) { Spacer(Modifier.weight(1f)); Text(archivedCallLabel(callTranscript.final, callTranscript.interrupted, currentCall.active && currentCall.conversationScope == origin), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             }
@@ -913,7 +950,7 @@ internal fun acceptsInitialConversationEdit(
             }
         }
         renderActions()
-        MessageActivity(message.reasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), message.tools, messageTime = message.recordedAt, separateToolResults = separateToolResults, onToolExpanded = onToolExpanded, vm = vm, scope = origin)
+        MessageActivity(message.reasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), message.tools, messageTime = message.recordedAt, toolResultsByCallId = toolResultsByCallId, onToolExpanded = onToolExpanded, onCopyResult = copySource, vm = vm, scope = origin)
         message.attachments.forEach { attachment -> SecureAttachment(vm, attachment, origin, message.mediaSnapshots) }
     }
 }
@@ -939,12 +976,12 @@ internal fun acceptsInitialConversationEdit(
 // Only presentation is adapted; Cypher's own ChatState and callbacks supply every value.
 
 /** Each tool is its own collapsed card; reasoning and live status sit above them. */
-@Composable internal fun MessageActivity(reasoning: String, tools: List<JSONObject>, status: String = "", streaming: Boolean = false, messageTime: Long = 0L, separateToolResults: Set<String> = emptySet(), onToolExpanded: (Boolean) -> Unit = {}, vm: CypherViewModel? = null, scope: Scope? = null) {
+@Composable internal fun MessageActivity(reasoning: String, tools: List<JSONObject>, status: String = "", streaming: Boolean = false, messageTime: Long = 0L, toolResultsByCallId: Map<String, FoldedToolResult> = emptyMap(), onToolExpanded: (Boolean) -> Unit = {}, onCopyResult: (String) -> Unit = {}, vm: CypherViewModel? = null, scope: Scope? = null) {
     if (reasoning.isBlank() && tools.isEmpty() && status.isBlank()) return
     Column(Modifier.fillMaxWidth().testTag("message-activity"), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (status.isNotBlank()) Text(status, Modifier.testTag("message-activity-status"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         if (reasoning.isNotBlank()) Disclosure("Reasoning", reasoning, renderContent = if (vm == null) null else ({ Markdown(reasoning, vm, scope, interactive = false) }))
-        tools.forEachIndexed { index, tool -> key(tool.toolKey(index)) { ToolCard(tool, streaming, messageTime, onToolExpanded, toolCallResultId(tool) in separateToolResults) } }
+        tools.forEachIndexed { index, tool -> key(tool.toolKey(index)) { ToolCard(tool, streaming, messageTime, onToolExpanded, toolResultsByCallId[toolCallResultId(tool)], onCopyResult) } }
     }
 }
 
@@ -975,10 +1012,11 @@ private fun JSONObject.argumentsValue(): Any? = (opt("args") ?: opt("arguments")
 private fun JSONObject.durationSeconds(): Double? = (opt("duration_s") as? Number)?.toDouble()?.takeIf { it.isFinite() && it >= 0 }
 
 /** `preview` is partial output from a still-running call, so it is never terminal evidence. */
-private fun toolOutcomeOf(tool: JSONObject, streaming: Boolean): ToolOutcome {
+private fun toolOutcomeOf(tool: JSONObject, streaming: Boolean, foldedResult: FoldedToolResult? = null): ToolOutcome {
     val result = tool.recordedValue("result", "output")
-    val explicit = result != null || (tool.has("is_error") && !tool.isNull("is_error"))
-    return toolOutcome(tool.rawToolName(), tool.string("status"), tool.optBoolean("is_error"), result?.detailText(), explicit, streaming)
+    val resultText = foldedResult?.content ?: result?.detailText()
+    val explicit = result != null || (tool.has("is_error") && !tool.isNull("is_error")) || foldedResult != null
+    return toolOutcome(tool.rawToolName(), tool.string("status"), tool.optBoolean("is_error") || foldedResult?.isError == true, resultText, explicit, streaming)
 }
 
 private fun JSONObject.snapshot(index: Int, streaming: Boolean) =
@@ -992,10 +1030,9 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
     else -> Icons.Rounded.Build
 }
 
-@Composable fun ToolCard(tool: JSONObject, streaming: Boolean = false, messageTime: Long = 0L, onExpandedChange: (Boolean) -> Unit = {}, hasSeparateResult: Boolean = false) {
+@Composable fun ToolCard(tool: JSONObject, streaming: Boolean = false, messageTime: Long = 0L, onExpandedChange: (Boolean) -> Unit = {}, foldedResult: FoldedToolResult? = null, onCopyResult: (String) -> Unit = {}) {
     val rawName = tool.rawToolName()
-    val outcome = toolOutcomeOf(tool, streaming)
-    val separateResult = hasSeparateResult && outcome == ToolOutcome.NoResult
+    val outcome = toolOutcomeOf(tool, streaming, foldedResult)
     val running = outcome == ToolOutcome.Running
     val preparing = outcome == ToolOutcome.Preparing
     // A running tool opens like Relay's; history and preparing tools start folded.
@@ -1006,15 +1043,16 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
     // Native tool events carry a duration but no clock time; like Relay, a finished call shows its message's recorded time.
     val time = messageTimeLabel(messageTime.takeIf { finished } ?: 0L)
     val argumentsText = tool.argumentsValue()?.detailText()
-    val resultText = tool.recordedValue("result", "output")?.detailText().orEmpty()
+    val embeddedResult = tool.recordedValue("result", "output")?.detailText()
+    val resultText = foldedResult?.content ?: embeddedResult.orEmpty()
     val previewText = tool.recordedValue("preview")?.detailText().orEmpty().takeIf { resultText.isBlank() && it.isNotBlank() }
     val statusTitle = uiText("Status")
-    val meta = if (separateResult) "See transcript" else when (outcome) {
+    val meta = when (outcome) {
         ToolOutcome.Dispatched -> toolOutcomeLabel(outcome)
         ToolOutcome.NoResult -> "No result"
         else -> listOfNotNull(duration, time).joinToString(" · ")
     }
-    val (statusIcon, statusColor) = if (separateResult) Icons.Rounded.Description to MaterialTheme.colorScheme.primary else when (outcome) {
+    val (statusIcon, statusColor) = when (outcome) {
         ToolOutcome.Completed -> Icons.Rounded.Check to MaterialTheme.colorScheme.primary
         ToolOutcome.Failed -> Icons.Rounded.Close to MaterialTheme.colorScheme.error
         ToolOutcome.Preparing -> Icons.Rounded.MoreHoriz to MaterialTheme.colorScheme.onSurfaceVariant
@@ -1022,7 +1060,7 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
         ToolOutcome.Dispatched -> Icons.Rounded.Send to MaterialTheme.colorScheme.secondary
         ToolOutcome.NoResult -> Icons.Rounded.HelpOutline to MaterialTheme.colorScheme.onSurfaceVariant
     }
-    val label = if (separateResult) "Result in transcript" else toolOutcomeLabel(outcome)
+    val label = toolOutcomeLabel(outcome)
     Surface(Modifier.fillMaxWidth().testTag("tool-card").semantics { contentDescription = "${toolDisplayName(tool)}, $label" + (if (meta.isNotBlank() && outcome != ToolOutcome.Dispatched && outcome != ToolOutcome.NoResult) ", $meta" else "") }, shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
         Column(Modifier.padding(horizontal = 12.dp)) {
             Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(onClickLabel = uiText(if (expanded) "Hide details" else "Details")) { expanded = !expanded; onExpandedChange(expanded) }.testTag("tool-card-toggle"), verticalAlignment = Alignment.CenterVertically) {
@@ -1042,21 +1080,27 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
                 tool.string("description").takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                 // Full recorded text, newlines intact, in a bounded scroll area; plain text only.
                 argumentsText?.let { ToolDetailBlock("Arguments", it, "tool-card-arguments", MaterialTheme.colorScheme.onSurface, toolKey) }
-                if (resultText.isNotBlank()) ToolDetailBlock(if (outcome == ToolOutcome.Failed) "Error" else "Result", resultText, "tool-card-result", if (outcome == ToolOutcome.Failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface, toolKey)
+                if (resultText.isNotBlank()) ToolDetailBlock(if (outcome == ToolOutcome.Failed) "Error" else "Result", resultText, "tool-card-result", if (outcome == ToolOutcome.Failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface, toolKey, onCopy = if (foldedResult != null) ({ onCopyResult(resultText) }) else null)
                 else if (outcome == ToolOutcome.Completed || outcome == ToolOutcome.Failed) Text("The tool finished with an empty result.", Modifier.testTag("tool-card-empty-result"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 // Partial output is shown as such; it never marks the call finished.
                 previewText?.let { ToolDetailBlock("Preview (partial)", it, "tool-card-preview", MaterialTheme.colorScheme.onSurface, toolKey) }
-                if (separateResult) Text("The result is shown in a separate transcript row.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                else if (outcome == ToolOutcome.NoResult) Text("No completion was recorded for this tool.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (outcome == ToolOutcome.NoResult) Text("No completion was recorded for this tool.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } }
         }
     }
 }
 
-@Composable private fun ToolDetailBlock(title: String, text: String, tag: String, color: Color, toolKey: String) {
+@Composable private fun ToolDetailBlock(title: String, text: String, tag: String, color: Color, toolKey: String, onCopy: (() -> Unit)? = null) {
     var detailLimit by rememberSaveable(toolKey, tag) { mutableStateOf(ToolDetailPageSize) }
     val shownLimit = detailLimit.coerceAtMost(ToolDetailLimit)
-    Text(title, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    if (onCopy == null) Text(title, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    else Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(title, Modifier.weight(1f), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        val copyLabel = uiText("Copy result")
+        IconButton(onCopy, Modifier.size(48.dp).testTag("$tag-copy").semantics { contentDescription = copyLabel }) {
+            Icon(Icons.Rounded.ContentCopy, null)
+        }
+    }
     Box(Modifier.fillMaxWidth().heightIn(max = 320.dp).clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.surfaceContainerLowest).verticalScroll(rememberScrollState()).padding(8.dp)) {
         Text(boundedDetail(text, shownLimit), Modifier.testTag(tag), style = MaterialTheme.typography.bodySmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace), color = color)
     }
