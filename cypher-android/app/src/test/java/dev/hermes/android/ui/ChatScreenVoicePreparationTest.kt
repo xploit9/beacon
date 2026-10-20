@@ -44,6 +44,9 @@ class ChatScreenVoicePreparationTest {
     @Test fun toolCallMetaToolShowsTheToolHermesRan() {
         fun call(name: String, arguments: String) = JSONObject().put("type", "function").put("function", JSONObject().put("name", name).put("arguments", arguments))
         assertEquals("cypher call user", toolDisplayName(call("tool_call", "{\"name\":\"cypher_call_user\",\"arguments\":{}}")))
+        assertEquals("list calendar events · personal", humanToolName("mcp__personal__list_calendar_events"))
+        assertEquals("search emails result · tool gateway meeting", humanToolName("mcp__tool_gateway_meeting__search_emails", " result"))
+        assertEquals("terminal", humanToolName("terminal"))
         assertEquals("tool describe", toolDisplayName(call("tool_describe", "{\"names\":[\"cypher_call_user\"]}")))
         assertEquals("tool call", toolDisplayName(call("tool_call", "not json")))
         assertEquals("tool call", toolDisplayName(call("tool_call", "{\"name\":\"<script>\"}")))

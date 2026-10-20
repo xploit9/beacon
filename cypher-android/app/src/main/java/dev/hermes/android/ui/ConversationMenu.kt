@@ -61,7 +61,7 @@ import org.json.JSONObject
 }
 
 @Composable internal fun DeleteConversationDialog(vm: CypherViewModel, id: String, profile: String, title: String, onDismiss: () -> Unit) {
-    AlertDialog(onDismissRequest = onDismiss, title = { Text(uiText("Delete conversation?")) }, text = { Text(title.ifBlank { uiText("Untitled conversation") }) },
+    AlertDialog(onDismissRequest = onDismiss, title = { Text(uiText("Delete conversation?")) }, text = { Text(title.ifBlank { uiText("Untitled conversation") } + "\n\n" + "This deletes it from Hermes on every device. It can’t be undone.") },
         confirmButton = { TextButton(onClick = { onDismiss(); vm.conversationAction(id, "/api/session/delete", done = "Deleted", profile = profile) }, modifier = Modifier.testTag("conversation-delete-confirm")) { Text(uiText("Delete"), color = MaterialTheme.colorScheme.error) } },
         dismissButton = { TextButton(onClick = onDismiss) { Text(uiText("Cancel")) } })
 }

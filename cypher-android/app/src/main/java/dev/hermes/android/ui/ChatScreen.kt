@@ -94,7 +94,7 @@ internal fun toolCallResultId(tool: JSONObject): String = tool.string("tool_call
 /** Hermes stores the tool that produced a result row as `tool_name`; title the row after it. */
 internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> = messages.asSequence()
     .filter { (it.string("role") == "tool" || it.string("role") == "function") && it.string("id").isNotBlank() }
-    .mapNotNull { row -> row.string("tool_name").takeIf { it.matches(toolNamePattern) }?.let { row.string("id") to it.replace('_', ' ').replaceFirstChar(Char::titlecase) + " result" } }
+    .mapNotNull { row -> row.string("tool_name").takeIf { it.matches(toolNamePattern) }?.let { row.string("id") to humanToolName(it, " result").replaceFirstChar(Char::titlecase) } }
     .toMap()
 
 @Composable fun SessionList(vm: CypherViewModel, modifier: Modifier = Modifier, beforeHistory: @Composable () -> Unit = {}) {
@@ -952,7 +952,15 @@ private fun JSONObject.rawToolName(): String {
     }
     return name.ifBlank { "tool" }
 }
-internal fun toolDisplayName(tool: JSONObject): String = tool.rawToolName().replace('_', ' ')
+internal fun toolDisplayName(tool: JSONObject): String = humanToolName(tool.rawToolName())
+/** Hermes names MCP tools `mcp__<server>__<tool>`: show "list calendar events · personal", not the raw id. */
+internal fun humanToolName(raw: String, suffix: String = ""): String {
+    val parts = raw.split("__")
+    val mcp = parts.size >= 3 && parts[0] == "mcp" && parts[1].isNotBlank()
+    fun words(value: String) = value.replace('_', ' ').trim().replace(Regex("\\s+"), " ")
+    val name = words(if (mcp) parts.drop(2).joinToString("_") else raw).ifBlank { raw }
+    return name + suffix + if (mcp) " · " + words(parts[1]) else ""
+}
 private fun JSONObject.toolKey(index: Int): String = toolIdentity(this).ifBlank { "${rawToolName()}:$index" }
 /** Native completion carries `result` (possibly empty) and `is_error`; a present key is a recorded fact even when empty. */
 private fun JSONObject.recordedValue(vararg keys: String): Any? = keys.firstNotNullOfOrNull { key -> if (has(key) && !isNull(key)) opt(key) else null }
@@ -1258,7 +1266,7 @@ private fun chatAction(vm: CypherViewModel, title: String) {
         }
         "Undo last turn" -> vm.openForm(ActionForm(title, "/api/session/undo", emptyList(), seed, explanation = "Undo the latest conversation turn.", actionLabel = "Undo", onResult = result))
         "Usage" -> { vm.more("Session usage") }
-        "Delete conversation" -> vm.openForm(ActionForm(title, "/api/session/delete", emptyList(), seed, explanation = "Delete this conversation from Cypher. This cannot be undone by the app.", actionLabel = "Delete", onResult = { vm.newChat(); vm.refreshSessions() }))
+        "Delete conversation" -> vm.openForm(ActionForm(title, "/api/session/delete", emptyList(), seed, explanation = "This deletes it from Hermes on every device. It can’t be undone.", actionLabel = "Delete", onResult = { vm.newChat(); vm.refreshSessions() }))
     }
 }
 
