@@ -152,7 +152,7 @@ def local_time(profile):
         return ''
 
 
-def greeting_for(display_name,clock,callback):
+def _owner_first_name(display_name):
     name=''
     if isinstance(display_name,str) and display_name.strip():
         for char in display_name.strip().split()[0]:
@@ -161,6 +161,11 @@ def greeting_for(display_name,clock,callback):
         name=name.strip("-'’")[:40]
         # A login name like "maya" is spoken as a name; any casing the owner chose stays.
         if name.islower(): name=name[:1].upper()+name[1:]
+    return name
+
+
+def greeting_for(display_name,clock,callback):
+    name=_owner_first_name(display_name)
     if callback:
         return (f"Hi, {name}. I'm calling about your saved Hermes update." if name
                 else "I'm calling about your saved Hermes update.")
@@ -217,9 +222,10 @@ def context(owner,provider,profile,stored,call_id,display_name=''):
         if language: instruction+='\nPreferred spoken language: '+language
         clock=local_time(profile)
         if clock: instruction+='\nCurrent local time for the owner: '+clock
+        first_name=_owner_first_name(display_name)
         greeting=greeting_for(display_name,clock,bool(callback))
         return {'profile':profile,'selected_session_id':stored,'system_instruction':instruction,'context_summary':summary,
-                'tool_catalogue':catalogue,'greeting':greeting,'callback':callback,
+                'tool_catalogue':catalogue,'greeting':greeting,'owner_first_name':first_name,'callback':callback,
                 'context':{'history':messages,'personality':soul,'memory':memory,**({'callback_reason':{'untrusted_text':callback.get('reason')},'callback_result':callback.get('result','')} if callback else {}),**({'language':language} if language else {})},
                 'configured_memory_provider':name if external_memory_configured(cfg) else 'builtin' if memory else None,
                 'capabilities':{'web_search':True,'memory_recall':bool(memory or external_memory_configured(cfg)),'skills':True,'profile_context':True},

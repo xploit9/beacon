@@ -26,10 +26,9 @@ POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix='
 SLOTS = threading.BoundedSemaphore(4)
 CATALOG_LOCK = threading.RLock()
 CATALOG_CACHE = {}
-NATIVE_READ_ONLY = frozenset({'read_file','search_files','web_search','web_extract','session_search',
-                              'skills_list','skill_view','vision_analyze'})
+NATIVE_READ_ONLY = frozenset({'read_file','search_files','web_search','skills_list','skill_view'})
 NATIVE_READ_ONLY_ACTIONS = {'cronjob_manage': frozenset({'list'}), 'process_manage': frozenset({'list'})}
-NATIVE_EXCLUDED_TOOLS = frozenset({'clarify','delegate_task','todo_list','memory',
+NATIVE_EXCLUDED_TOOLS = frozenset({'clarify','delegate_task','todo_list','memory','session_search',
                                    'cypher_create_proactive_request','cypher_email_notice','cypher_email_checked'})
 NATIVE_EXCLUDED_TOOLSETS = frozenset({'browser','cypher-interactive','cypher-mailbox'})
 QUERY_FILLER = set('a an the my me please could can you i would like want get read list find look pull show to for of in on and from up most latest recent current last today now one two three four five six ten tool tools'.split())
@@ -173,11 +172,7 @@ def readonly_methods(schema):
     return tuple(methods) if isinstance(methods,list) and methods and all(value in ('GET','HEAD') for value in methods) else ()
 
 
-def _hermes_read_only(entry, name):
-    for value in (getattr(entry,'read_only',None), getattr(entry,'read_only_hint',None),
-                  (entry.schema.get('annotations') or {}).get('readOnlyHint'),
-                  entry.schema.get('read_only'), entry.schema.get('readOnlyHint')):
-        if type(value) is bool: return value
+def _hermes_read_only(name):
     return name in NATIVE_READ_ONLY
 
 
@@ -209,7 +204,7 @@ def native_catalog():
                 name in NATIVE_EXCLUDED_TOOLS or name.startswith('browser_')):
             continue
         schema=json.loads(encoded(function.get('parameters',{})))
-        read_only=_hermes_read_only(entry,name)
+        read_only=_hermes_read_only(name)
         output.append({'tool_id':digest(['hermes-native',registry.current_scope_key(),registry._generation,
                                          config_digest,name,toolset,schema,read_only]),
                        'name':name,'description':safe(function.get('description',''),1200),
@@ -237,7 +232,7 @@ class NativeMcp:
         except Exception:
             return None
 
-    def catalog(self):
+    def catalog(self, discover=True):
         from tools import mcp_tool as core
         from tools.mcp_tool_config import _load_mcp_config
         from tools.mcp_tool_common import mcp_server_enabled
@@ -247,7 +242,7 @@ class NativeMcp:
         from tools.mcp_tool_handlers import _tool_is_read_only, _make_tool_handler
         from tools.registry import registry
         # Native discovery loads only operator config; the caller supplies no connection address.
-        discover_mcp_tools()
+        if discover: discover_mcp_tools()
         config = _load_mcp_config()
         output = []
         for entry in registry.get_all_entries():
@@ -322,10 +317,10 @@ class NativeMcp:
                             used=True
                         approval.resolve_gateway_approval(key,'once' if accept else 'deny',request_id=request)
                     approval.register_gateway_notify(key,notify);registered=True
-                from tools.registry import registry
-                # Hermes dispatch retains the native handler's checks, including terminal safety guards.
-                return registry.dispatch(tool['_raw'],arguments,task_id=scope[3],session_id=session_id,
-                                         current_session_id=session_id,enabled_tools=tool.get('_enabled_tools'))
+                from model_tools import handle_function_call
+                # Keep Hermes hooks, middleware, and terminal safety guards in the call path.
+                return handle_function_call(tool['_raw'],arguments,task_id=scope[3],session_id=session_id,
+                                            enabled_tools=tool.get('_enabled_tools'))
             finally:
                 if registered: approval.unregister_gateway_notify(key)
                 if token is not None: approval_context.reset_current_session_key(token)
@@ -351,7 +346,9 @@ class NativeMcp:
             approval.resolve_gateway_approval(key, 'once' if accept else 'deny', request_id=request)
         approval.register_gateway_notify(key, notify)
         try:
-            return tool['_handler'](arguments, session_id=session_id)
+            from model_tools import handle_function_call
+            return handle_function_call(tool['name'],arguments,task_id=scope[3],session_id=session_id,
+                                        enabled_tools=tool.get('_enabled_tools'))
         finally:
             approval.unregister_gateway_notify(key)
             approval_context.reset_current_session_key(token)
@@ -373,7 +370,9 @@ class Gateway:
                 PRIMARY KEY(owner,provider,profile,call_id,request_id))''')
             yield conn
 
-    def catalog(self, profile):
+    def catalog(self, profile, discover=True):
+        if not discover:
+            return self.scoped(profile,lambda _:self.backend.catalog(discover=False))
         with CATALOG_LOCK:
             def load(_):
                 key_fn=getattr(self.backend,'cache_key',None)
@@ -397,7 +396,7 @@ class Gateway:
 
     def compact_catalogue(self, profile):
         lines=[];size=0
-        for tool in sorted(self.catalog(profile),key=lambda item:str(item.get('name',''))):
+        for tool in sorted(self.catalog(profile,discover=False),key=lambda item:str(item.get('name',''))):
             name=re.sub(r'[^A-Za-z0-9_.:/-]','',str(tool.get('name') or ''))[:120]
             if not name: continue
             description=safe(tool.get('description',''),1200)
@@ -601,7 +600,8 @@ class Gateway:
                 if self.status(scope,request)['status']!='running':
                     raise HTTPException(409,'Tool admission cancelled or expired')
                 cfg=self.mobile.settings()
-                if cfg.get('owner_id')!=scope[0] or cfg.get('owner_provider')!=scope[1] or scope[2] not in cfg.get('profiles',[]):
+                if (cfg.get('owner_id')!=scope[0] or cfg.get('owner_provider')!=scope[1]
+                        or 'profiles' in cfg and scope[2] not in cfg['profiles']):
                     raise HTTPException(403,'Owner authority changed')
                 dispatched=True
                 return self.backend.execute(current,arguments,scope,approved,session_id=session_id)

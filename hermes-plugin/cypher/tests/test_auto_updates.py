@@ -22,7 +22,12 @@ def _auto(api, monkeypatch, *, plugin_version='1.0.0', busy=False):
     checked=[]
     updated=[]
     installed=['1.0.0']
-    monkeypatch.setattr(api, '_check_release_and_announce', lambda cfg: checked.append(True) or _release(plugin_version))
+    def check(cfg,before_apk=None):
+        checked.append(True)
+        release=_release(plugin_version)
+        if before_apk: before_apk(release['version_name'],release['plugin_version'])
+        return release
+    monkeypatch.setattr(api, '_check_release_and_announce', check)
     monkeypatch.setattr(api, '_installed_plugin_version', lambda: installed[0])
     monkeypatch.setattr(api, '_hermes_busy', lambda owner: busy)
     def update():
@@ -61,7 +66,7 @@ def test_auto_check_is_six_hour_throttled_across_module_restart(harness,monkeypa
 
     api.auto_update_check(cfg,now=now)
     restarted=_restarted_api(api)
-    monkeypatch.setattr(restarted,'_check_release_and_announce',lambda cfg: checked.append(True) or _release())
+    monkeypatch.setattr(restarted,'_check_release_and_announce',lambda cfg,before_apk=None: checked.append(True) or _release())
     monkeypatch.setattr(restarted,'_installed_plugin_version',lambda:'1.0.0')
     monkeypatch.setattr(restarted,'_hermes_busy',lambda owner:False)
     assert restarted.auto_update_check(cfg,now=now+6*60*60-1)['result']=='throttled'
@@ -150,7 +155,7 @@ def test_deferred_plugin_update_retries_when_hermes_becomes_idle_without_another
 def test_auto_checks_serialize_one_in_flight_release_check(harness,monkeypatch):
     api,_,cfg,_,_=harness
     entered=threading.Event();release=threading.Event();calls=[]
-    def slow_check(cfg):
+    def slow_check(cfg,before_apk=None):
         calls.append(True);entered.set();release.wait(2);return _release()
     monkeypatch.setattr(api,'_check_release_and_announce',slow_check)
     monkeypatch.setattr(api,'_installed_plugin_version',lambda:'1.0.0')
@@ -168,7 +173,7 @@ def test_auto_checks_serialize_one_in_flight_release_check(harness,monkeypatch):
 
 def test_failed_release_check_is_recorded_without_stopping_watcher(harness,monkeypatch):
     api,client,cfg,_,_=harness
-    def fail(_cfg): raise OSError('offline')
+    def fail(_cfg,before_apk=None): raise OSError('offline')
     monkeypatch.setattr(api,'_check_release_and_announce',fail)
 
     result=api.auto_update_check(cfg,now=2_000_000)
@@ -221,6 +226,18 @@ async def test_watcher_keeps_call_and_notice_delivery_moving_during_auto_check(h
         await api.stop_watcher()
 
 
+def test_failed_proactive_rebuild_is_retried_in_the_same_process(harness,monkeypatch):
+    api=harness[0]
+    profile=('owner','default')
+    api._jobs_upgraded.add(profile)
+    def fail_rebuild(*args): raise RuntimeError('rebuild failed')
+    monkeypatch.setattr(api.proactive,'upgrade_jobs',fail_rebuild)
+
+    api._warm_profile(*profile)
+
+    assert profile not in api._jobs_upgraded
+
+
 def test_restart_hint_survives_a_later_up_to_date_check(harness,monkeypatch):
     api,_,cfg,_,_=harness
     checked,updated=_auto(api,monkeypatch,plugin_version='1.0.0')
@@ -240,7 +257,7 @@ def test_restart_hint_clears_when_process_runs_the_installed_version(harness,mon
     api.mobile.record_auto_update_status(owner,2_000_000,'restart_required','1.0.0','1.1.0','Restart Hermes to finish the plugin update.')
     monkeypatch.setattr(api,'_RUNNING_PLUGIN_VERSION','1.1.0')
     monkeypatch.setattr(api,'_installed_plugin_version',lambda:'1.1.0')
-    monkeypatch.setattr(api,'_check_release_and_announce',lambda cfg:pytest.fail('throttled check should not fetch releases'))
+    monkeypatch.setattr(api,'_check_release_and_announce',lambda cfg,before_apk=None:pytest.fail('throttled check should not fetch releases'))
 
     result=api.auto_update_check(cfg,now=2_000_001)
 

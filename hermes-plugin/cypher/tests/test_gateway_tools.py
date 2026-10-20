@@ -113,6 +113,16 @@ def test_direct_read_and_exact_idempotency(gateway):
     assert error.value.status_code==409
 
 
+def test_gateway_executes_native_tool_when_owner_settings_omit_profiles(tmp_path):
+    mobile=Mobile(tmp_path/'native-profiles.sqlite')
+    mobile.settings=lambda:{'owner_id':'owner','owner_provider':'password'}
+    api=g.Gateway(mobile,lambda profile,fn:fn(tmp_path),Backend())
+
+    invoke(api)
+
+    assert settled(api)['status']=='completed'
+
+
 def test_unknown_effect_requires_server_proposal_and_explicit_decision(gateway):
     api,backend,_=gateway;backend.read_only=False
     proposal=invoke(api)
@@ -276,7 +286,9 @@ def test_native_trust_gate_uses_receipt_once_and_denies_server_elicitation(tmp_p
         outcomes.append(request_elicitation_consent('Additional server confirmation','Cannot reuse the approval'))
         outcomes.append(_trust_gate_check('isolated','write'))
         return '{"result":"done"}'
-    tool={'_handler':handler,'_server':'isolated','_raw':'write','_trust':'untrusted'}
+    tool={'name':'mcp__isolated__write','_handler':handler,'_server':'isolated','_raw':'write','_trust':'untrusted'}
+    monkeypatch.setitem(sys.modules,'model_tools',SimpleNamespace(
+        handle_function_call=lambda name,args,**kwargs:tool['_handler'](args,session_id=kwargs.get('session_id'))))
     g.NativeMcp().execute(tool,{},SCOPE,True)
     assert outcomes[0] is None and outcomes[1]=='decline' and outcomes[2] is not None
     outcomes.clear();g.NativeMcp().execute(tool,{},SCOPE,False)
@@ -485,7 +497,10 @@ def test_native_approval_atomic_once_and_invalid_identity_fail_closed(tmp_path,m
         with g.concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
             list(pool.map(ask,range(12)))
         return '{"result":"success"}'
-    g.NativeMcp().execute({'_handler':handler,'_server':'isolated','_raw':'write','_trust':'untrusted'}, {},SCOPE,True)
+    tool={'name':'mcp__isolated__write','_handler':handler,'_server':'isolated','_raw':'write','_trust':'untrusted'}
+    monkeypatch.setitem(sys.modules,'model_tools',SimpleNamespace(
+        handle_function_call=lambda name,args,**kwargs:tool['_handler'](args,session_id=kwargs.get('session_id'))))
+    g.NativeMcp().execute(tool, {},SCOPE,True)
     assert choices.count('once')==1 and choices.count('deny')==11
 
 
@@ -600,7 +615,7 @@ def test_discovery_preserves_inflected_description_matches(gateway):
 
 def test_native_tools_are_discovered_for_the_api_profile_and_exclusions_are_applied(monkeypatch,tmp_path):
     names=[
-        ('read_file','file'),('write_file','file'),('web_search','web'),('vision_analyze','vision'),
+        ('read_file','file'),('write_file','file'),('web_search','web'),('web_extract','web'),('vision_analyze','vision'),
         ('session_search','session_search'),('memory','memory'),('todo_list','todo'),('video_analyze','video'),
         ('clarify','clarify'),('delegate_task','delegation'),('browser_click','browser'),
         ('cypher_create_proactive_request','cypher-interactive'),('cypher_email_notice','cypher-mailbox'),
@@ -610,7 +625,9 @@ def test_native_tools_are_discovered_for_the_api_profile_and_exclusions_are_appl
                                  read_only=True if name=='metadata_read' else None)
              for name,toolset in names}
     definitions=[{'type':'function','function':{'name':name,'description':f'{name} purpose',
-                 'parameters':{'type':'object','properties':{},'additionalProperties':False}}} for name,_ in names]
+                 'parameters':({'type':'object','properties':{'url':{'type':'string'}},'required':['url'],'additionalProperties':False}
+                               if name in {'web_extract','vision_analyze'} else
+                               {'type':'object','properties':{},'additionalProperties':False})}} for name,_ in names]
     config={'agent':{'disabled_toolsets':['video']}}
     seen={}
     enabled={'file','web','vision','session_search','memory','todo','video','clarify','delegation','browser',
@@ -633,12 +650,13 @@ def test_native_tools_are_discovered_for_the_api_profile_and_exclusions_are_appl
     native_catalog=getattr(g,'native_catalog',lambda:[])()
 
     catalog={item['name']:item for item in native_catalog}
-    assert {'read_file','write_file','web_search','vision_analyze','session_search','metadata_read'} <= set(catalog)
+    assert {'read_file','write_file','web_search','web_extract','vision_analyze','metadata_read'} <= set(catalog)
+    assert 'session_search' not in catalog
     assert not {'memory','todo_list','clarify','delegate_task','browser_click','cypher_create_proactive_request',
                 'cypher_email_notice','mcp-weather','video_analyze'} & set(catalog)
     assert catalog['read_file']['read_only'] and catalog['web_search']['read_only']
-    assert catalog['vision_analyze']['read_only'] and catalog['session_search']['read_only']
-    assert catalog['metadata_read']['read_only']
+    assert not catalog['web_extract']['read_only'] and not catalog['vision_analyze']['read_only']
+    assert not catalog['metadata_read']['read_only']
     assert not catalog['write_file']['read_only']
     assert seen['enabled_toolsets']==sorted(enabled)
     assert seen['disabled_toolsets']==['video']
@@ -649,15 +667,25 @@ def test_native_tools_are_discovered_for_the_api_profile_and_exclusions_are_appl
                   lambda value,limit:str(value)[:limit])
     discovered=api.discover('profile','read_file')['tools']
     assert discovered[0]['name']=='read_file' and discovered[0]['read_only'] is True
+    for index,name in enumerate(('web_extract','vision_analyze')):
+        url=f'https://mail.example/messages/{index}'
+        proposal=api.invoke(SCOPE,{'request_id':f'fetch-{index}','tool_id':catalog[name]['tool_id'],
+                                   'arguments':{'url':url}})
+        assert proposal['status']=='needs_approval'
+        assert proposal['proposal']['arguments']=={'url':url}
 
 
 def test_native_tool_receipts_dispatch_in_profile_conversation_and_gate_mutations(tmp_path,monkeypatch):
-    dispatches=[];session={}
+    dispatches=[];handled=[];session={}
     def dispatch(name,args,**kwargs):
         dispatches.append((name,args,kwargs,dict(session)))
         return {'result':'x'*40000} if name=='read_file' else {'ok':True}
     registry=SimpleNamespace(dispatch=dispatch)
     monkeypatch.setitem(sys.modules,'tools.registry',SimpleNamespace(registry=registry))
+    def handle_function_call(name,args,**kwargs):
+        handled.append((name,args,kwargs))
+        return json.dumps(dispatch(name,args,task_id=kwargs.get('task_id'),session_id=kwargs.get('session_id')))
+    monkeypatch.setitem(sys.modules,'model_tools',SimpleNamespace(handle_function_call=handle_function_call))
     session_context=SimpleNamespace(
         set_session_vars=lambda **kwargs:session.update(kwargs) or kwargs,
         clear_session_vars=lambda _:session.clear())
@@ -690,10 +718,11 @@ def test_native_tool_receipts_dispatch_in_profile_conversation_and_gate_mutation
     read=settled(api,'native-read')
     assert read['status']=='completed' and read['truncated'] is True, (read,dispatches,session)
     assert len(g.encoded(read['result']).encode())<=g.MAX_RESULT
+    assert handled and handled[0][0]=='read_file'
+    assert handled[0][2]['task_id']=='call' and handled[0][2]['session_id']=='native-stored'
+    assert handled[0][2]['enabled_tools']==['read_file','write_file']
     assert dispatches[0][0]=='read_file' and dispatches[0][2]['session_id']=='native-stored'
     assert dispatches[0][2]['task_id']=='call'
-    assert dispatches[0][2]['current_session_id']=='native-stored'
-    assert dispatches[0][2]['enabled_tools']==['read_file','write_file']
     assert dispatches[0][3]['profile']=='profile' and dispatches[0][3]['session_id']=='native-stored'
 
     proposal=api.invoke(SCOPE,{'request_id':'native-write','tool_id':'b'*64,
@@ -731,6 +760,40 @@ def test_native_mixed_tools_are_read_only_only_for_explicit_read_actions():
     assert read_only(process,{'action':'list'}) and not read_only(process,{'action':'write'})
 
 
+@pytest.mark.parametrize('kind',['hermes','mcp'])
+def test_read_only_gateway_tools_are_stopped_by_hermes_pre_tool_hook(tmp_path,monkeypatch,kind):
+    monkeypatch.syspath_prepend(str(_hermes_agent_source()))
+    import model_tools
+    from hermes_cli import plugins
+    from tools.registry import registry
+
+    seen=[];dispatched=[];session={}
+    original=model_tools.handle_function_call
+    def handle(name,args,**kwargs):
+        seen.append((name,args,kwargs))
+        return original(name,args,**kwargs)
+    monkeypatch.setattr(model_tools,'handle_function_call',handle)
+    monkeypatch.setattr(plugins,'_dispatch_pre_tool_call_hooks',lambda *args,**kwargs:('Blocked by owner policy',None))
+    monkeypatch.setattr(registry,'dispatch',lambda *args,**kwargs:dispatched.append((args,kwargs)) or {'ok':True})
+    session_context=SimpleNamespace(set_session_vars=lambda **kwargs:session.update(kwargs) or kwargs,
+                                    clear_session_vars=lambda _:session.clear())
+    monkeypatch.setitem(sys.modules,'gateway',SimpleNamespace(session_context=session_context))
+
+    if kind=='hermes':
+        tool={'name':'read_file','_kind':'hermes','_raw':'read_file','_enabled_tools':['read_file'],'read_only':True}
+    else:
+        tool={'name':'mcp__mail__search_messages','_kind':'mcp','_raw':'search_messages','_server':'mail',
+              '_trust':'trusted','_handler':lambda *args,**kwargs:{'ok':True},'read_only':True}
+    result=g.NativeMcp().execute(tool,{'path':'private.txt'},SCOPE,False,session_id='native-stored')
+    result=json.loads(result) if isinstance(result,str) else result
+
+    assert seen and seen[0][0]==tool['name']
+    assert seen[0][2]['task_id']=='call' and seen[0][2]['session_id']=='native-stored'
+    if kind=='hermes': assert seen[0][2]['enabled_tools']==['read_file']
+    assert result.get('error')=='Blocked by owner policy'
+    assert dispatched==[]
+
+
 def test_terminal_native_dispatch_resolves_only_its_exact_approved_hermes_guard(monkeypatch):
     pending={};choices=[];session={};registered_keys=[]
     approval=SimpleNamespace(
@@ -751,6 +814,9 @@ def test_terminal_native_dispatch_resolves_only_its_exact_approved_hermes_guard(
     monkeypatch.setitem(sys.modules,'tools.approval_context',approval_context)
     monkeypatch.setitem(sys.modules,'tools.registry',tools_package.registry)
     monkeypatch.setitem(sys.modules,'gateway',SimpleNamespace(session_context=session_context))
+    monkeypatch.setitem(sys.modules,'model_tools',SimpleNamespace(
+        handle_function_call=lambda name,args,**kwargs:registry.dispatch(
+            name,args,task_id=kwargs.get('task_id'),session_id=kwargs.get('session_id'))))
     command='remove a generated build directory'
     tool={'_kind':'hermes','_raw':'terminal','read_only':False}
 
@@ -765,26 +831,45 @@ def test_terminal_native_dispatch_resolves_only_its_exact_approved_hermes_guard(
     assert choices==[(registered_keys[-1], 'deny', 'b'*32)]
 
 
-def test_voice_tool_catalogue_is_bounded_cached_by_profile_and_config_digest(tmp_path):
-    class CachedBackend:
-        def __init__(self): self.digest='config-v1';self.calls=0
-        def cache_key(self): return self.digest
-        def catalog(self):
-            self.calls+=1
+def test_voice_tool_catalogue_is_bounded_live_and_uncached(tmp_path):
+    class Backend:
+        def __init__(self): self.calls=0;self.discover=[]
+        def catalog(self,discover=True):
+            self.calls+=1;self.discover.append(discover)
             return [{'name':f'tool_{i:03}','description':'A useful tool that reads data safely. '*5}
                     for i in range(100)]
-    backend=CachedBackend();api=g.Gateway(Mobile(tmp_path/'catalog.sqlite'),lambda profile,fn:fn(tmp_path),backend)
-    started=time.perf_counter();first=getattr(api,'compact_catalogue',lambda profile:'')('profile')
-    cold_ms=(time.perf_counter()-started)*1000
-    started=time.perf_counter();again=getattr(api,'compact_catalogue',lambda profile:'')('profile')
-    cached_ms=(time.perf_counter()-started)*1000
+    backend=Backend();api=g.Gateway(Mobile(tmp_path/'catalog.sqlite'),lambda profile,fn:fn(tmp_path),backend)
+    started=time.perf_counter();first=api.compact_catalogue('profile')
+    first_ms=(time.perf_counter()-started)*1000
+    started=time.perf_counter();again=api.compact_catalogue('profile')
+    repeated_ms=(time.perf_counter()-started)*1000
     assert first==again and len(first.encode('utf-8'))<=3072
-    assert 'tool_000:' in first and backend.calls==1
-    backend.digest='config-v2'
+    assert 'tool_000:' in first and backend.calls==2 and backend.discover==[False,False]
     api.compact_catalogue('profile')
     api.compact_catalogue('other-profile')
-    assert backend.calls==3
-    print(f'voice_catalogue_latency_ms: cold={cold_ms:.3f}, cached={cached_ms:.3f}')
+    assert backend.calls==4 and backend.discover==[False]*4
+    print(f'voice_catalogue_latency_ms: first={first_ms:.3f}, repeated={repeated_ms:.3f}')
+
+
+def test_native_mcp_catalog_can_skip_discovery_for_call_context(monkeypatch):
+    discoveries=[]
+    core=SimpleNamespace(_servers={},_lazy_server_configs={})
+    monkeypatch.setitem(sys.modules,'tools',SimpleNamespace(mcp_tool=core))
+    monkeypatch.setitem(sys.modules,'tools.mcp_tool_config',SimpleNamespace(_load_mcp_config=lambda:{}))
+    monkeypatch.setitem(sys.modules,'tools.mcp_tool_common',SimpleNamespace(mcp_server_enabled=lambda cfg:True))
+    monkeypatch.setitem(sys.modules,'tools.mcp_tool_discovery',SimpleNamespace(discover_mcp_tools=lambda:discoveries.append(True)))
+    monkeypatch.setitem(sys.modules,'tools.mcp_tool_registration',SimpleNamespace(
+        _same_server_route=lambda *args,**kwargs:True,_make_tool_filter=lambda *args:lambda raw:True,
+        _normalize_server_trust=lambda value:'trusted'))
+    monkeypatch.setitem(sys.modules,'tools.mcp_tool_scope',SimpleNamespace(_resolve_server_key=lambda server:server))
+    monkeypatch.setitem(sys.modules,'tools.mcp_tool_handlers',SimpleNamespace(
+        _tool_is_read_only=lambda *args:False,_make_tool_handler=lambda *args:None))
+    monkeypatch.setitem(sys.modules,'tools.registry',SimpleNamespace(registry=SimpleNamespace(
+        get_all_entries=lambda:[],current_scope_key=lambda:'profile',_generation=0)))
+    monkeypatch.setattr(g,'native_catalog',lambda:[])
+
+    assert g.NativeMcp().catalog(discover=False)==[]
+    assert discoveries==[]
 
 
 def test_numbers_and_booleans_sent_as_strings_match_the_schema():

@@ -344,21 +344,26 @@ def upgrade_jobs(mobile, owner, profile):
     if _meta_get(mobile, key) == JOBS_VERSION:
         return False
     with _SET_ENABLED_LOCK:
-        # remove_job clears the old job's notepad; the rebuilt watch keeps its email lower bound.
+        # remove_job clears notepads, so retain the watch cursor in meta until its replacement exists.
         previous = _managed_id(mobile, owner, profile, "watch_email")
-        checked_until = None
+        cursor_key = _key(owner, profile, "checked_until")
+        checked_until = _meta_get(mobile, cursor_key)
         if previous:
             from hermes_cli.web_server_profiles import _profile_scope
             from cron.notepad import get_note
             with _profile_scope(profile):
-                checked_until = get_note(previous, "checked_until")
+                checked_until = get_note(previous, "checked_until") or checked_until
+        if checked_until:
+            _meta_set(mobile, cursor_key, checked_until)
         _managed_delete_all(mobile, owner, profile)
         _sync_request_jobs(mobile, owner, profile, list_requests(mobile, owner, profile))
         rebuilt = _managed_id(mobile, owner, profile, "watch_email")
         if checked_until and rebuilt:
+            from hermes_cli.web_server_profiles import _profile_scope
             from cron.notepad import set_note
             with _profile_scope(profile):
                 set_note(rebuilt, "checked_until", checked_until)
+            _meta_set(mobile, cursor_key, None)
         if enabled(mobile, owner, profile):
             _write_profile_instructions(_home(profile), True)
         _meta_set(mobile, key, JOBS_VERSION)

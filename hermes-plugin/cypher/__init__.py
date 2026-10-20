@@ -252,6 +252,10 @@ _BLOCKED_PROACTIVE_TOOLSETS={'delegation','code_execution','computer_use','kanba
 _BLOCKED_PROACTIVE_TOOLS={'delegate_task','execute_code','computer_use','kanban','cronjob_manage',
                           'cypher_call_user','browser_click','browser_type','browser_press',
                           'browser_cdp','browser_exec','web_extract','web_fetch'}
+_TERMINAL_NETWORK_CLIENTS={'curl','wget','iwr','irm','invoke-webrequest','invoke-restmethod',
+                           'nc','ncat','ssh','scp','sftp','ftp','telnet'}
+_TERMINAL_MAIL_CLIENTS={'gws','gmail','himalaya','mutt','msmtp','sendmail'}
+_TERMINAL_MAIL_WRITES={'send','reply','forward','delete','trash','move','archive'}
 _READ_ONLY_MESSAGE='Proactive runs are read-only; this would change something.'
 
 def _tool_words(name):
@@ -311,9 +315,15 @@ def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**
 
     if tool_name=='web_search':
         return None
+    if tool_name in {'cypher_email_notice','cypher_email_checked'}:
+        return None
     if _contains_http_url(args):
         return {'action':'block','message':_READ_ONLY_MESSAGE}
-    if tool_name in {'cypher_email_notice','cypher_email_checked','terminal'}:
+    if tool_name=='terminal':
+        command=args.get('command') if isinstance(args,dict) else None
+        words=set(re.findall(r'[A-Za-z0-9_-]+',command.casefold())) if isinstance(command,str) else set()
+        if words&_TERMINAL_NETWORK_CLIENTS or words&_TERMINAL_MAIL_CLIENTS and words&_TERMINAL_MAIL_WRITES:
+            return {'action':'block','message':_READ_ONLY_MESSAGE}
         return None
     if tool_name in _BLOCKED_PROACTIVE_TOOLS:
         return {'action':'block','message':_READ_ONLY_MESSAGE}

@@ -126,6 +126,23 @@ def test_claim_persists_owner_and_authorizes_native_profiles_including_new_ones(
     assert client.get(path + '?profile=default').status_code == 403
 
 
+def test_fresh_install_bot_mode_uses_native_profiles_without_yaml_profiles(harness, monkeypatch):
+    api, client, _, home, _ = harness
+    _write_config(home, {})
+    _use_real_settings(api, monkeypatch)
+    _native_profiles(monkeypatch, ['default'])
+    monkeypatch.setattr(api.native, 'rpc', lambda owner, provider, method, params: {
+        'profiles.list': {'profiles': [{'name': 'default', 'display_name': 'Default'}]},
+        'groups.list': {'rooms': [], 'next_offset': None},
+    }[method])
+
+    assert client.post('/api/plugins/cypher/owner/claim').status_code == 200
+    response = client.get('/api/plugins/cypher/mobile/bot-mode')
+
+    assert response.status_code == 200, response.text
+    assert [row['profile'] for row in response.json()['bots']] == ['default']
+
+
 def test_explicit_yaml_owner_settings_win_over_stored_claim(harness, monkeypatch):
     api, client, _, home, _ = harness
     _write_config(home, {

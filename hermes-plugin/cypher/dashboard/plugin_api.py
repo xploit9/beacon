@@ -53,7 +53,7 @@ def _stale(module):
     seen=getattr(module,'_cypher_mtime',None)
     try: return seen is not None and seen!=Path(module.__file__).stat().st_mtime_ns
     except (OSError,TypeError): return True
-_MODULE_NAMES=('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_api','bot_mode_api','callbacks','callback_api','call_history_api','proactive')
+_MODULE_NAMES=('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_tools','gateway_api','bot_mode_api','observers','callbacks','callback_api','call_history_api','proactive')
 # Only purge the siblings loaded here; other plugin entry points may still serve live work.
 if any(_stale(sys.modules.get('cypher_'+name)) for name in _MODULE_NAMES):
     for name in _MODULE_NAMES: sys.modules.pop('cypher_'+name,None)
@@ -124,12 +124,12 @@ def identity(request,profile=None,owner_only=False,allow_loopback=False):
     profiles=cfg['profiles'] if 'profiles' in cfg else _native_profile_names()
     if not isinstance(profiles,list) or not 1<=len(profiles)<=64 or any(not isinstance(p,str) or not p.strip() or len(p)>80 for p in profiles) or len(set(profiles))!=len(profiles):
         raise HTTPException(403,'Profile configuration invalid')
-    if owner_only: return owner,provider,None,cfg
+    if owner_only: return owner,provider,None,{**cfg,'profiles':profiles}
     if profile is not None and not isinstance(profile,str): raise HTTPException(403,'Profile not authorized')
     profile=profile or request.query_params.get('cypher_profile') or request.query_params.get('profile') or (profiles[0] if len(profiles)==1 else None)
     if not isinstance(profiles,list) or not profile or profile not in profiles:
         raise HTTPException(403,'Profile not authorized')
-    return owner,provider,profile,mobile.settings(profile)
+    return owner,provider,profile,{**mobile.settings(profile),'profiles':profiles}
 
 def connect_info_url():
     try:
@@ -1001,12 +1001,17 @@ def _release(cfg,optional=False,digest=None,package=None,root_path=None):
     expected=cfg.get('android_stable_certificate_sha256') if stable else cfg.get('android_certificate_sha256')
     if stable and not expected: expected=data['certificate_sha256']
     if not isinstance(expected,str) or not re.fullmatch(r'[a-fA-F0-9]{64}',expected) or expected.lower()!=data['certificate_sha256'].lower(): raise ValueError('Unexpected signing identity')
+    version_name=data.get('version_name')
+    if not isinstance(version_name,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}',version_name): raise ValueError('Invalid release version')
     aapt=cfg.get('aapt');signer=cfg.get('apksigner')
-    if not aapt or not signer or not Path(aapt).is_file() or not Path(signer).is_file(): raise RuntimeError('APK verification tools unavailable')
+    # The stable phone checks package, version, hash, and signer before install; Android refuses signer changes.
+    verify_apk=not (stable and not aapt and not signer)
     tools=[]
-    for tool in (aapt,signer):
-        tool_path=Path(tool);tool_stat=tool_path.stat()
-        tools.append((str(tool_path.resolve()),tool_stat.st_size,tool_stat.st_mtime_ns))
+    if verify_apk:
+        if not aapt or not signer or not Path(aapt).is_file() or not Path(signer).is_file(): raise RuntimeError('APK verification tools unavailable')
+        for tool in (aapt,signer):
+            tool_path=Path(tool);tool_stat=tool_path.stat()
+            tools.append((str(tool_path.resolve()),tool_stat.st_size,tool_stat.st_mtime_ns))
     cache_key=(str(manifest.resolve()),manifest_stat.st_size,manifest_stat.st_mtime_ns,
                str(path.resolve()),artifact_stat.st_size,artifact_stat.st_mtime_ns,
                digest,package_name,expected.lower(),tuple(tools))
@@ -1016,14 +1021,15 @@ def _release(cfg,optional=False,digest=None,package=None,root_path=None):
     if digest is not None and digest!=computed: raise ValueError('Immutable manifest hash mismatch')
     digest=computed
     if digest!=data.get('sha256'): raise ValueError('Release artifact changed')
-    flags=subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0
-    try:
-        badging=subprocess.run([aapt,'dump','badging',str(path)],capture_output=True,text=True,check=True,timeout=20,creationflags=flags).stdout
-        certificates=subprocess.run([signer,'verify','--print-certs',str(path)],capture_output=True,text=True,check=True,timeout=20,creationflags=flags).stdout
-    except (OSError,subprocess.SubprocessError): raise RuntimeError('APK verification failed') from None
-    package=re.search(r"package: name='([^']+)' versionCode='([0-9]+)' versionName='([^']+)'",badging)
-    digests=re.findall(r'Signer #[0-9]+ certificate SHA-256 digest: ([a-fA-F0-9]{64})',certificates)
-    if not package or package[1]!=data['package_name'] or int(package[2])!=data['version_code'] or package[3]!=data['version_name'] or len(digests)!=1 or digests[0].lower()!=expected.lower(): raise ValueError('APK metadata/signature mismatch')
+    if verify_apk:
+        flags=subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0
+        try:
+            badging=subprocess.run([aapt,'dump','badging',str(path)],capture_output=True,text=True,check=True,timeout=20,creationflags=flags).stdout
+            certificates=subprocess.run([signer,'verify','--print-certs',str(path)],capture_output=True,text=True,check=True,timeout=20,creationflags=flags).stdout
+        except (OSError,subprocess.SubprocessError): raise RuntimeError('APK verification failed') from None
+        package=re.search(r"package: name='([^']+)' versionCode='([0-9]+)' versionName='([^']+)'",badging)
+        digests=re.findall(r'Signer #[0-9]+ certificate SHA-256 digest: ([a-fA-F0-9]{64})',certificates)
+        if not package or package[1]!=data['package_name'] or int(package[2])!=data['version_code'] or package[3]!=version_name or len(digests)!=1 or digests[0].lower()!=expected.lower(): raise ValueError('APK metadata/signature mismatch')
     # The app sends ?package= on download; a query here fails its artifact-path check.
     artifact_path='/api/plugins/cypher/mobile/releases/'+digest+'/download'
     result={k:data[k] for k in ('version_code','version_name','package_name','certificate_sha256','sha256','size_bytes')} | {'available':True,'download_url':artifact_path,'artifact_path':artifact_path,'min_contract_version':2,'max_contract_version':2}
@@ -1095,7 +1101,7 @@ def _plugin_version_tuple(value):
     match=re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)',value) if isinstance(value,str) else None
     return tuple(int(part) for part in match.groups()) if match else None
 
-def _check_github_release(cfg):
+def _check_github_release(cfg,before_apk=None):
     global _RELEASE_CACHE_KEY,_RELEASE_CACHE_VALUE
     repo=_safe_release_repo(cfg)
     gh=shutil.which('gh')
@@ -1141,6 +1147,7 @@ def _check_github_release(cfg):
                 or not isinstance(data.get('sha256'),str) or not re.fullmatch(r'[a-f0-9]{64}',data['sha256'])
                 or not isinstance(data.get('certificate_sha256'),str) or not re.fullmatch(r'[a-fA-F0-9]{64}',data['certificate_sha256'])):
             raise ReleaseCheckError('The GitHub release metadata does not describe a stable Cypher APK.')
+        if before_apk: before_apk(data['version_name'],plugin_version)
         digest=data['sha256']
         previous=None
         try: previous=release(cfg,optional=True,package=_STABLE_PACKAGE)
@@ -1195,9 +1202,9 @@ def _check_github_release(cfg):
                 except OSError: pass
         return {'version_name':verified['version_name'],'version_code':verified['version_code'],'plugin_version':plugin_version,'available':True}
 
-def _check_release_and_announce(cfg):
+def _check_release_and_announce(cfg,before_apk=None):
     with _RELEASE_CHECK_LOCK:
-        checked=_check_github_release(cfg)
+        checked=_check_github_release(cfg,before_apk)
         if checked.get('available'): announce_release(cfg,package=_STABLE_PACKAGE)
         return checked
 
@@ -1272,8 +1279,17 @@ def auto_update_check(cfg,now=None):
                 return mobile.record_auto_update_status(owner,now,'plugin_updated',current_state.get('app_version',''),current_state.get('plugin_version',''),'Cypher plugin updated.')
             return {**current_state,'result':'throttled'}
         mobile.record_auto_update_status(owner,now,'checking',current_state.get('app_version',''),current_state.get('plugin_version',''),'Checking for updates.')
+        plugin_update=[]
+        def update_plugin_before_apk(app_version,plugin_version):
+            latest=_plugin_version_tuple(plugin_version)
+            installed=_plugin_version_tuple(_installed_plugin_version())
+            if latest is None or installed is None or latest<=installed: return
+            try: plugin_update.append(_auto_update_plugin(owner,now,app_version,plugin_version))
+            except Exception:
+                plugin_update.append(mobile.record_auto_update_status(owner,now,'error',app_version,plugin_version,'Could not update the Cypher plugin. Try again later.'))
         try:
-            release_info=_check_release_and_announce(cfg)
+            release_info=_check_release_and_announce(cfg,before_apk=update_plugin_before_apk)
+            if plugin_update: return plugin_update[-1]
             app_version=release_info.get('version_name','')
             plugin_version=release_info.get('plugin_version','')
             installed_version=_installed_plugin_version()
@@ -1289,8 +1305,10 @@ def auto_update_check(cfg,now=None):
                 return mobile.record_auto_update_status(owner,now,'restart_required',app_version,plugin_version,'Restart Hermes to finish the plugin update.')
             return mobile.record_auto_update_status(owner,now,result,app_version,plugin_version,message)
         except ReleaseCheckError:
+            if plugin_update: return plugin_update[-1]
             return mobile.record_auto_update_status(owner,now,'error',message='Could not check for updates. Try again later.')
         except Exception:
+            if plugin_update: return plugin_update[-1]
             return mobile.record_auto_update_status(owner,now,'error',message='Could not check for updates. Try again later.')
     finally: _AUTO_UPDATE_LOCK.release()
 
@@ -1304,7 +1322,8 @@ _jobs_upgraded=set()
 def _warm_profile(owner,profile):
     try:
         proactive.upgrade_jobs(mobile,owner,profile)
-    except Exception: pass  # a failure retries after the next restart
+    except Exception:
+        _jobs_upgraded.discard((owner,profile))
 async def start_watcher():
     global _watch_task
     async def loop():

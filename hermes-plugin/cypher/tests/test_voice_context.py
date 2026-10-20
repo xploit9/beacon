@@ -147,6 +147,24 @@ def test_context_includes_the_compact_tool_catalogue_and_personal_opening(harnes
     assert result['tool_catalogue'] == 'read_file: Read a local file'
 
 
+def test_get_context_returns_the_clean_owner_first_name(harness,monkeypatch):
+    api,client,_,root,_=harness
+    call_id=reserve(client)
+    voice=api.voice_context
+    monkeypatch.setattr(voice,'scoped',lambda profile,fn:fn(root))
+    monkeypatch.setattr(voice,'config',lambda root:{})
+    monkeypatch.setattr(voice,'personality',lambda root:'')
+    monkeypatch.setattr(voice,'builtin_memory',lambda root,cfg:'')
+    monkeypatch.setattr(voice,'history',lambda *args:[])
+    monkeypatch.setattr(voice,'tool_catalogue',lambda profile:'')
+
+    response=client.get(f'/api/plugins/cypher/mobile/calls/{call_id}/context',
+                        headers={'x-fixture-display-name':'Maya Example'})
+
+    assert response.status_code==200,response.text
+    assert response.json()['owner_first_name']=='Maya'
+
+
 def test_greeting_capitalises_a_lowercase_login_name(harness):
     api, _, _, _, _ = harness
     greet = api.voice_context.greeting_for

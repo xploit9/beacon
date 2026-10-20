@@ -266,6 +266,18 @@ def test_upgrade_rebuilds_managed_jobs_once_per_jobs_version(harness, monkeypatc
         get_note=lambda job_id, key: notes.get((job_id, key)),
         set_note=lambda job_id, key, value: notes.__setitem__((job_id, key), value)))
 
+    sync_request_jobs = api.proactive._sync_request_jobs
+    fail_once = [True]
+    def fail_rebuild_once(*args):
+        if fail_once[0]:
+            fail_once[0] = False
+            raise RuntimeError("Cron rebuild failed")
+        return sync_request_jobs(*args)
+    monkeypatch.setattr(api.proactive, "_sync_request_jobs", fail_rebuild_once)
+    with pytest.raises(RuntimeError, match="Cron rebuild failed"):
+        api.proactive.upgrade_jobs(api.mobile, "owner", "default")
+    monkeypatch.setattr(api.proactive, "_sync_request_jobs", sync_request_jobs)
+
     assert api.proactive.upgrade_jobs(api.mobile, "owner", "default") is True
     assert api.proactive.upgrade_jobs(api.mobile, "owner", "default") is False
     assert api.proactive._meta_get(api.mobile, api.proactive._key("owner", "default", "jobs-version")) == api.proactive.JOBS_VERSION

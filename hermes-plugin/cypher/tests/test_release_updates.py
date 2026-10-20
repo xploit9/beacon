@@ -53,6 +53,36 @@ def _fake_github(api, monkeypatch, cfg, assets, versions):
     return patterns
 
 
+def test_auto_update_and_stable_metadata_work_without_local_android_tools(harness,monkeypatch):
+    api,client,cfg,tmp,_=harness
+    cfg.pop('aapt',None);cfg.pop('apksigner',None)
+    apk,manifest=_release()
+    manifest['plugin_version']='1.1.0'
+    patterns=_fake_github(api,monkeypatch,cfg,
+        {manifest['artifact_filename']:apk,'Cypher-1.0.0.json':json.dumps(manifest).encode()},
+        {manifest['artifact_filename']:(100,'1.0.0')})
+    installed=['1.0.0'];updates=[]
+    monkeypatch.setattr(api,'_installed_plugin_version',lambda:installed[0])
+    monkeypatch.setattr(api,'_hermes_busy',lambda owner:False)
+    monkeypatch.setattr(api,'_update_cypher_plugin',lambda:updates.append('cypher') or installed.__setitem__(0,'1.1.0') or {'ok':True})
+    release_checks=[]
+    release=api.release
+    def track_release(*args,**kwargs):
+        release_checks.append(list(updates))
+        return release(*args,**kwargs)
+    monkeypatch.setattr(api,'release',track_release)
+
+    result=api.auto_update_check(cfg,now=2_000_000)
+    metadata=client.get('/api/plugins/cypher/mobile/releases/latest?package=dev.hermes.android.stable')
+
+    assert updates==['cypher'] and result['result']=='restart_required'
+    assert release_checks and release_checks[0]==['cypher']
+    assert patterns==['Cypher-*.json','Cypher-1.0.0.apk']
+    assert metadata.status_code==200,metadata.text
+    assert metadata.json()['plugin_version']=='1.1.0'
+    assert metadata.json()['sha256']==manifest['sha256']
+
+
 def test_release_check_keeps_stable_feed_separate_from_production(harness,monkeypatch):
     api,client,cfg,tmp,_=harness
     apk,manifest=_release()
