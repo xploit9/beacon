@@ -459,8 +459,7 @@ class Gateway:
         if set(value)!={'request_id','tool_id','arguments'}: raise HTTPException(400, 'Invalid tool request fields')
         try: request=self.mobile.ident(value['request_id'])
         except ValueError: raise HTTPException(400,'Invalid tool request identity') from None
-        # A call may name a tool from its catalogue instead of a discovered id; both resolve against the current catalogue.
-        if not isinstance(value['tool_id'],str) or not re.fullmatch(r'[a-f0-9]{64}|[A-Za-z0-9_.:/-]{1,128}',value['tool_id']): raise HTTPException(400, 'Invalid tool handle')
+        if not isinstance(value['tool_id'],str) or len(value['tool_id'])!=64: raise HTTPException(400, 'Invalid tool handle')
         try: signature=digest(value)
         except (ValueError,TypeError): raise HTTPException(400,'Invalid tool request') from None
         with self.db() as conn:
@@ -469,9 +468,6 @@ class Gateway:
                 if previous['signature']!=signature: raise HTTPException(409, 'Request identity conflicts with its original arguments')
                 return self.status(scope,request)
         tools=self.catalog(scope[2]);tool=next((t for t in tools if t['tool_id']==value['tool_id']),None)
-        if tool is None and len(value['tool_id'])!=64:
-            named=[t for t in tools if t['name']==value['tool_id']]
-            tool=named[0] if len(named)==1 else None
         if not tool: raise HTTPException(409, 'Tool changed or is no longer configured; rediscover it')
         arguments=coerce(tool['parameters'], value['arguments'])
         validate(tool['parameters'], arguments)

@@ -344,6 +344,13 @@ internal class DirectVoice(private val client:CypherClient,private val callId:St
         if(!accepted) visualPending.set(false)
         return accepted
     }
+    private suspend fun resolveToolName(name:String):String? {
+        val found=try { withTimeoutOrNull(8000) { gatewayRequests.withPermit { gateway.discover(name) } } }
+            catch(error:CancellationException) { throw error } catch(_:Exception) { null } ?: return null
+        val tools=found.optJSONArray("tools") ?: return null
+        return (0 until tools.length()).mapNotNull(tools::optJSONObject).singleOrNull { it.optString("name")==name }
+            ?.optString("tool_id")?.takeIf { it.matches(Regex("[a-f0-9]{64}")) }
+    }
     private suspend fun toolResponse(id:String,name:String,result:JSONObject):Boolean {
         if(stopped) return false
         return try {
@@ -408,10 +415,14 @@ internal class DirectVoice(private val client:CypherClient,private val callId:St
             } else if(name=="invoke_tool") {
                 val args=call.getJSONObject("args")
                 require(args.keys().asSequence().toSet()==setOf("tool_id","arguments")) { "Only tool identity and arguments are accepted" }
-                val toolId=args.getString("tool_id")
-                require(toolId.matches(Regex("[a-f0-9]{64}|[A-Za-z0-9_.:/-]{1,128}")))
+                val requested=args.getString("tool_id")
+                require(requested.matches(Regex("[a-f0-9]{64}|[A-Za-z0-9_.:/-]{1,128}")))
                 val rawArguments=args.getString("arguments");require(rawArguments.toByteArray(Charsets.UTF_8).size<=16384)
                 val arguments=JSONObject(rawArguments)
+                // The call's catalogue lists names: resolve one to its current tool_id with a quick lookup, not a model turn.
+                val toolId=if(requested.matches(Regex("[a-f0-9]{64}"))) requested else resolveToolName(requested)
+                if(toolId==null) JSONObject().put("status","failed").put("request_id",requestId).put("tool_name",requested)
+                    .put("reason","Not run: no tool named $requested; use discover_tools.") else {
                 val duplicate=gatewayReceipts.reserve(requestId,id,toolId,arguments)
                 if(duplicate!=null) duplicate else {
                 if(!claimMutation(id)) return
@@ -425,6 +436,7 @@ internal class DirectVoice(private val client:CypherClient,private val callId:St
                     publishGatewayReceipt(requestId,receipt)
                 }
                 gatewayReceipts.receipt(requestId)!!
+                }
                 }
             } else if(name !in setOf("hermes_search","hermes_memory","hermes_skills","hermes_context","hermes_callback","schedule_callback","hermes_cancel","hermes_work")) {
                 JSONObject().put("status","unsupported").put("request_id",requestId).put("message","Unknown function; no work was submitted.")

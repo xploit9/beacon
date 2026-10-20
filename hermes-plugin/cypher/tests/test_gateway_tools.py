@@ -787,17 +787,6 @@ def test_voice_tool_catalogue_is_bounded_cached_by_profile_and_config_digest(tmp
     print(f'voice_catalogue_latency_ms: cold={cold_ms:.3f}, cached={cached_ms:.3f}')
 
 
-def test_a_call_can_invoke_a_catalogued_tool_by_its_exact_name(gateway):
-    api,backend,_=gateway
-    # The call's preloaded catalogue lists names; invoking by name skips a discovery round trip.
-    receipt=api.invoke(SCOPE,{'request_id':'by-name','tool_id':'configured_search','arguments':{'query':'weather'}})
-    assert receipt['tool_id']=='a'*64 and receipt['tool_name']=='configured_search'
-    assert settled(api,'by-name')['status']=='completed'
-    with pytest.raises(HTTPException) as unknown:
-        api.invoke(SCOPE,{'request_id':'unknown-name','tool_id':'not_configured','arguments':{'query':'weather'}})
-    assert unknown.value.status_code==409
-
-
 def test_numbers_and_booleans_sent_as_strings_match_the_schema():
     schema = {'type': 'object', 'properties': {'days': {'type': 'integer'}, 'ratio': {'type': 'number'},
               'unread': {'type': 'boolean'}, 'query': {'type': 'string'}, 'ids': {'type': 'array', 'items': {'type': 'integer'}}}}
