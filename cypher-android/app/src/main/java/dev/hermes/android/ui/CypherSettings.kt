@@ -36,6 +36,8 @@ import java.util.concurrent.TimeUnit
 
 internal fun voiceOptionsWithSelected(options: List<String>, selected: String): List<String> = (listOf(selected) + options).distinct()
 internal fun voiceChoiceLabel(voice: String): String = voice.replaceFirstChar(Char::titlecase)
+/** The plugin's capabilities sit at the top of the merged bootstrap (mergeOptionalFeatures), not under optional_features. */
+internal fun callbacksAvailable(bootstrap: org.json.JSONObject): Boolean = bootstrap.optJSONObject("capabilities")?.optBoolean("callbacks") == true
 internal const val PROACTIVE_SETTINGS_PATH = "/api/plugins/cypher/mobile/proactive"
 internal fun proactiveSettingsKey(scope: Scope) = "proactive-settings:${scope.copy(session = "").key}"
 
@@ -76,8 +78,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
     val proactiveLoaded = proactive != null && proactive.has("enabled") && !proactive.has("_error")
     val proactiveEnabled = proactiveLoaded && proactive?.optBoolean("enabled") == true
     val pluginStatus = ui.bootstrap.optJSONObject("optional_features")?.optString("plugin").orEmpty()
-    val callbacksAvailable = ui.bootstrap.optJSONObject("optional_features")
-        ?.optJSONObject("capabilities")?.optBoolean("callbacks") == true
+    val callbacksAvailable = callbacksAvailable(ui.bootstrap)
     val scope = rememberCoroutineScope()
     var savingProactive by remember(profile) { mutableStateOf(false) }
     var proactiveRefresh by remember(profile) { mutableIntStateOf(0) }

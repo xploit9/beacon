@@ -68,4 +68,9 @@ class CypherSettingsTest {
             proactiveErrorMessage(ApiFailure(409, "Choose an owned assistant conversation before enabling Proactive", plugin = true), "fallback"))
         assertEquals("fallback", proactiveErrorMessage(RuntimeException(""), "fallback"))
     }
+    @Test fun callsCountAsOnWhenThePluginSaysSo() {
+        val on = dev.hermes.android.data.mergeOptionalFeatures(JSONObject(), JSONObject().put("plugin", "available").put("capabilities", JSONObject().put("callbacks", true)))
+        assertTrue(callbacksAvailable(on))
+        assertFalse(callbacksAvailable(dev.hermes.android.data.mergeOptionalFeatures(JSONObject(), JSONObject().put("capabilities", JSONObject().put("callbacks", false)))))
+    }
 }
