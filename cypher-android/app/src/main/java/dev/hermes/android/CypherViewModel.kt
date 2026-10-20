@@ -859,19 +859,19 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         _ui.update { it.copy(setupOrigin = safeAddress, setupWizard = true, setupStep = "connect", loading = false, restoringSession = false, setupPluginMessage = "", error = "", notice = "") }
         saveSetupProgress("connect", active = true, setupOrigin = safeAddress)
     }
-    fun openSetupLink(value: String) {
+    fun openSetupLink(value: String, confirmed: Boolean = false) {
         ++originGeneration
         setupProbeJob?.cancel(); ++setupProbeGeneration
         pendingSetupLink = null
         val parsed = try { dev.hermes.android.ui.parseCypherConnectLink(value) }
         catch (error: Exception) {
             _ui.update { it.copy(setupOrigin = "", setupWizard = true, setupStep = "connect", loading = false, restoringSession = false, error = error.message ?: "Enter an HTTPS Hermes address or scan its QR code.", notice = "") }
-            saveSetupProgress("connect", active = true, setupOrigin = "")
+            if (confirmed) saveSetupProgress("connect", active = true, setupOrigin = "")
             return
         }
         pendingSetupLink = parsed.takeIf { it.sessionToken != null }
         _ui.update { it.copy(setupOrigin = parsed.origin, setupWizard = true, setupStep = "connect", loading = false, restoringSession = false, setupPluginMessage = "", error = "", notice = "") }
-        saveSetupProgress("connect", active = true, setupOrigin = parsed.origin)
+        if (confirmed) saveSetupProgress("connect", active = true, setupOrigin = parsed.origin)
     }
     fun cancelSetupWizard() {
         pendingSetupLink = null

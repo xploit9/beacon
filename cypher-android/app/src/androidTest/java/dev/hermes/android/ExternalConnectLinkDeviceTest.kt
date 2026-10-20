@@ -109,8 +109,76 @@ class ExternalConnectLinkDeviceTest {
         }
     }
 
+    @Test fun signInRecoveryLinkRequiresConfirmationBeforeReplacingKnownOrigin() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<CypherApplication>()
+        val origin = stringPreferencesKey("origin")
+        val setupOrigin = stringPreferencesKey("setup_origin")
+        val setupStep = stringPreferencesKey("setup_step")
+        val setupComplete = booleanPreferencesKey("setup_complete")
+        val setupActive = booleanPreferencesKey("setup_active")
+        val before = app.preferences.data.first()
+        val storedOrigin = "https://expired.example"
+        val incomingOrigin = "https://replacement.example:9443"
+        val vm = activityViewModel()
+        val activity = compose.activity
+        try {
+            compose.waitUntil(5_000) { !vm.ui.value.restoringSession }
+            app.preferences.edit {
+                it[origin] = storedOrigin
+                it.remove(setupOrigin)
+                it[setupStep] = "signin"
+                it[setupComplete] = false
+                it[setupActive] = true
+            }
+            compose.runOnUiThread {
+                CypherViewModel::class.java.getDeclaredField("client").apply { isAccessible = true }.set(vm, null)
+                ui(vm).value = AppState(
+                    origin = storedOrigin,
+                    setupWizard = true,
+                    setupComplete = false,
+                    setupStep = "signin",
+                    restoringSession = false,
+                )
+            }
+
+            openLink(activity, incomingOrigin)
+            compose.onNodeWithText("Connect to $incomingOrigin?").assertIsDisplayed()
+            assertEquals(storedOrigin, vm.ui.value.origin)
+            assertEquals("", vm.ui.value.setupOrigin)
+            assertNull(app.preferences.data.first()[setupOrigin])
+            compose.onNodeWithText("Cancel").performClick()
+            assertEquals("", vm.ui.value.setupOrigin)
+            assertNull(app.preferences.data.first()[setupOrigin])
+
+            app.preferences.edit {
+                it.remove(origin)
+                it[setupOrigin] = storedOrigin
+            }
+            compose.runOnUiThread {
+                ui(vm).value = vm.ui.value.copy(origin = "", setupOrigin = storedOrigin, setupStep = "connect")
+            }
+            openLink(activity, incomingOrigin)
+            compose.onNodeWithText("Connect to $incomingOrigin?").assertIsDisplayed()
+            assertEquals(storedOrigin, app.preferences.data.first()[setupOrigin])
+            compose.onNodeWithText("Connect").performClick()
+            compose.waitUntil(5_000) { vm.ui.value.setupWizard && vm.ui.value.setupOrigin == incomingOrigin }
+            compose.waitUntil(5_000) { runBlocking { app.preferences.data.first()[setupOrigin] == incomingOrigin } }
+        } finally {
+            compose.runOnUiThread { activity.finish() }
+            compose.waitUntil(5_000) { compose.runOnUiThread { activity.isDestroyed } }
+            app.preferences.edit { values ->
+                before[origin]?.let { values[origin] = it } ?: values.remove(origin)
+                before[setupOrigin]?.let { values[setupOrigin] = it } ?: values.remove(setupOrigin)
+                before[setupStep]?.let { values[setupStep] = it } ?: values.remove(setupStep)
+                before[setupComplete]?.let { values[setupComplete] = it } ?: values.remove(setupComplete)
+                before[setupActive]?.let { values[setupActive] = it } ?: values.remove(setupActive)
+            }
+        }
+    }
+
     @Test fun firstRunLinkPrefillsSetupWithAnExternalLinkLabelWithoutConfirmation() = runBlocking {
         val app = ApplicationProvider.getApplicationContext<CypherApplication>()
+        val origin = stringPreferencesKey("origin")
         val setupOrigin = stringPreferencesKey("setup_origin")
         val setupStep = stringPreferencesKey("setup_step")
         val setupComplete = booleanPreferencesKey("setup_complete")
@@ -122,9 +190,11 @@ class ExternalConnectLinkDeviceTest {
         try {
             compose.waitUntil(5_000) { !vm.ui.value.restoringSession }
             app.preferences.edit {
+                it.remove(origin)
                 it[setupComplete] = false
                 it[setupActive] = false
                 it.remove(setupOrigin)
+                it.remove(setupStep)
             }
             compose.runOnUiThread {
                 CypherViewModel::class.java.getDeclaredField("client").apply { isAccessible = true }.set(vm, null)
@@ -135,11 +205,13 @@ class ExternalConnectLinkDeviceTest {
             compose.waitUntil(5_000) { vm.ui.value.setupWizard && vm.ui.value.setupOrigin == incomingOrigin }
             compose.onNodeWithText("Connect to $incomingOrigin?").assertDoesNotExist()
             compose.onNodeWithText("Address from external link: $incomingOrigin").assertIsDisplayed()
-            compose.waitUntil(5_000) { runBlocking { app.preferences.data.first()[setupOrigin] == incomingOrigin } }
+            assertNull(app.preferences.data.first()[setupOrigin])
+            assertFalse(app.preferences.data.first()[setupActive] ?: false)
         } finally {
             compose.runOnUiThread { activity.finish() }
             compose.waitUntil(5_000) { compose.runOnUiThread { activity.isDestroyed } }
             app.preferences.edit { values ->
+                before[origin]?.let { values[origin] = it } ?: values.remove(origin)
                 before[setupOrigin]?.let { values[setupOrigin] = it } ?: values.remove(setupOrigin)
                 before[setupStep]?.let { values[setupStep] = it } ?: values.remove(setupStep)
                 before[setupComplete]?.let { values[setupComplete] = it } ?: values.remove(setupComplete)

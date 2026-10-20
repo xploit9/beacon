@@ -60,6 +60,7 @@ import ru.noties.jlatexmath.JLatexMathDrawable
 import org.scilab.forge.jlatexmath.CypherMathDefinitions
 import java.io.File
 import java.nio.ByteBuffer
+import okhttp3.HttpUrl.Companion.toHttpUrl
 
 @Composable fun Markdown(source: String, vm: CypherViewModel, origin: Scope? = vm.authenticatedScope(), snapshots: Map<String, String> = emptyMap(), documentKey: String = "", interactive: Boolean = true) {
     val checklist = checklistReading(vm, origin, documentKey, source, interactive)
@@ -124,10 +125,18 @@ import java.nio.ByteBuffer
         }
     }
     node.descendants().filter { it is org.commonmark.node.Image || it is NativeMediaNode }.forEach { media ->
-        val reference = if (media is org.commonmark.node.Image) media.destination else (media as NativeMediaNode).reference
-        val label = if (media is org.commonmark.node.Image) media.plain().ifBlank { media.title?.takeIf(String::isNotBlank) ?: reference } else (media as NativeMediaNode).source
-        if (origin != null) NativeReferencePreview(vm, resolveNativeReference(reference, origin, snapshots), label, origin)
-        else Text("$reference · Select an authenticated conversation to preview", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        key(media, origin?.key) {
+            val reference = if (media is org.commonmark.node.Image) media.destination else (media as NativeMediaNode).reference
+            val label = if (media is org.commonmark.node.Image) media.plain().ifBlank { media.title?.takeIf(String::isNotBlank) ?: reference } else (media as NativeMediaNode).source
+            if (origin != null) {
+                val resolved = resolveNativeReference(reference, origin, snapshots)
+                if (media is org.commonmark.node.Image && resolved is NativeReference.ExternalMedia && !sameOrigin(resolved.url, origin.origin.toHttpUrl())) {
+                    var loadExternalImage by remember { mutableStateOf(false) }
+                    if (loadExternalImage) NativeReferencePreview(vm, resolved, label, origin)
+                    else OutlinedButton(onClick = { loadExternalImage = true }) { Text("Load image from ${resolved.url.host}") }
+                } else NativeReferencePreview(vm, resolved, label, origin)
+            } else Text("$reference · Select an authenticated conversation to preview", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
     }
     linkedMedia?.let { (reference, label) -> AlertDialog(onDismissRequest = { linkedMedia = null }, title = { Text(label.take(160)) }, text = { Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState())) { if (origin != null) NativeReferencePreview(vm, reference, label, origin) } }, confirmButton = { TextButton(onClick = { linkedMedia = null }) { Text(uiText("Close")) } }) }
 }

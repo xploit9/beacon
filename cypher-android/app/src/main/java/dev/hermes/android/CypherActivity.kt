@@ -85,7 +85,8 @@ class CypherActivity : ComponentActivity() {
             val pendingConnectionOrigin = remember(pendingConnectionLink) {
                 pendingConnectionLink?.let { runCatching { parseCypherConnectLink(it).origin }.getOrNull() }
             }
-            LaunchedEffect(model, pendingConnectionLink, pendingConnectionSessionNotice, ui.restoringSession, ui.setupComplete) {
+            val hasKnownOrigin = ui.setupOrigin.isNotBlank() || ui.origin.isNotBlank()
+            LaunchedEffect(model, pendingConnectionLink, pendingConnectionSessionNotice, ui.restoringSession, ui.origin, ui.setupOrigin) {
                 val link = pendingConnectionLink ?: return@LaunchedEffect
                 if (ui.restoringSession) return@LaunchedEffect
                 val origin = pendingConnectionOrigin
@@ -93,9 +94,9 @@ class CypherActivity : ComponentActivity() {
                     model.notice("This Cypher connection link is invalid.")
                     pendingConnectionLink = null
                     pendingConnectionSessionNotice = false
-                } else if (!ui.setupComplete) {
+                } else if (!hasKnownOrigin) {
                     externalConnectionLinkOrigin = origin
-                    model.openSetupLink(link)
+                    model.openSetupLink(link, confirmed = false)
                     if (pendingConnectionSessionNotice) model.notice("For this dashboard, scan the QR code with Cypher's scanner to sign in.")
                     pendingConnectionLink = null
                     pendingConnectionSessionNotice = false
@@ -139,7 +140,7 @@ class CypherActivity : ComponentActivity() {
             CompositionLocalProvider(LocalCypherSettings provides (data["profile-settings"] ?: emptySettings), LocalAssistantName provides preferences.assistantName) { NativeLocalization(nativeLanguageFor(LocalConfiguration.current.locales[0])) { CypherTheme(dark, preferences.skin) { NativeWindowLayout(this@CypherActivity) {
                 CypherRoot(model, externalConnectionLinkOrigin) { externalConnectionLinkOrigin = null }
                 IncomingCallSheet(model, permissionSource.isNotBlank(), answer)
-                if (pendingConnectionLink != null && pendingConnectionOrigin != null && !ui.restoringSession && ui.setupComplete) {
+                if (pendingConnectionLink != null && pendingConnectionOrigin != null && !ui.restoringSession && hasKnownOrigin) {
                     val cancelConnectionLink = {
                         pendingConnectionLink = null
                         pendingConnectionSessionNotice = false
@@ -147,14 +148,13 @@ class CypherActivity : ComponentActivity() {
                     AlertDialog(
                         onDismissRequest = cancelConnectionLink,
                         title = { Text("Connect to $pendingConnectionOrigin?") },
-                        text = { Text("This link will open setup for the named Hermes server. Review the address before continuing.") },
                         confirmButton = {
                             TextButton(onClick = {
                                 val link = pendingConnectionLink
                                 val origin = pendingConnectionOrigin
                                 if (link != null && origin != null) {
                                     externalConnectionLinkOrigin = origin
-                                    model.openSetupLink(link)
+                                    model.openSetupLink(link, confirmed = true)
                                     if (pendingConnectionSessionNotice) model.notice("For this dashboard, scan the QR code with Cypher's scanner to sign in.")
                                 }
                                 cancelConnectionLink()

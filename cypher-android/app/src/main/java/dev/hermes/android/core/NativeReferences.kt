@@ -39,7 +39,7 @@ private fun percentBytes(source: String): ByteArray {
     }
     return output.toByteArray()
 }
-private fun sameOrigin(a: HttpUrl, b: HttpUrl) = a.scheme == b.scheme && a.host == b.host && a.port == b.port
+internal fun sameOrigin(a: HttpUrl, b: HttpUrl) = a.scheme == b.scheme && a.host == b.host && a.port == b.port
 private fun validReferenceText(value: String, max: Int) = value.length in 1..max && value.none { it.code < 32 || it.code == 127 }
 private fun validSessionReference(value: String) = validReferenceText(value, 200) && value.none { it in "/\\" || it.isWhitespace() }
 private fun fileReferencePath(source: String): String {

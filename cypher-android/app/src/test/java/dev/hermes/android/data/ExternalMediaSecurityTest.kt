@@ -1,6 +1,7 @@
 package dev.hermes.android.data
 
 import okhttp3.Dns
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
@@ -21,11 +22,12 @@ class ExternalMediaSecurityTest {
         return Inet6Address.getByAddress(null, bytes, null)
     }
 
-    @Test fun rejectsNonPublicAddressClassesIncludingIpv4MappedIpv6() {
+    @Test fun rejectsNonPublicAddressClassesIncludingMappedIpv6CgnatAndNat64() {
         listOf(
             "127.0.0.1", "::1", "10.0.0.1", "172.16.0.1", "192.168.1.1",
             "169.254.1.1", "fe80::1", "224.0.0.1", "ff02::1", "0.0.0.0",
-            "::", "fc00::1", "fd00::1",
+            "::", "fc00::1", "fd00::1", "100.64.0.0", "100.100.100.100", "100.127.255.255",
+            "64:ff9b::10.0.0.1", "64:ff9b::192.168.1.1", "64:ff9b::100.100.100.100",
         ).forEach { value -> assertFalse("$value must not be fetched", isPublicExternalMediaAddress(address(value))) }
         listOf("127.0.0.1", "192.168.1.1").forEach { value ->
             val mapped = mappedIpv4(value)
@@ -33,8 +35,22 @@ class ExternalMediaSecurityTest {
             assertFalse("IPv4-mapped $value must not be fetched", isPublicExternalMediaAddress(mapped))
         }
 
-        listOf("8.8.8.8", "2606:4700:4700::1111").forEach { value ->
+        listOf("8.8.8.8", "2606:4700:4700::1111", "100.63.255.255", "100.128.0.0", "64:ff9b::8.8.8.8").forEach { value ->
             assertTrue("$value is a public address", isPublicExternalMediaAddress(address(value)))
+        }
+    }
+
+    @Test fun rejectsPrivateIpLiteralUrlsAndRedirectTargets() {
+        listOf("https://192.168.1.1/image.png", "https://[::1]/image.png").forEach { value ->
+            assertThrows(IllegalArgumentException::class.java) {
+                externalMediaRequest(value.toHttpUrl())
+            }
+        }
+
+        val redirect = "https://images.example/image.png".toHttpUrl()
+            .resolve("https://192.168.1.1/private.png")!!
+        assertThrows(IllegalArgumentException::class.java) {
+            externalMediaRequest(redirect)
         }
     }
 
