@@ -922,7 +922,8 @@ def test_plugin_settings_copy_authority_and_track_replacement(harness,monkeypatc
         replacement=tmp/'replacement.yaml';replacement.write_text(text);replacement.replace(path)
     replace('first');value=module.settings()
     value['owner_id']='mutated';value['profiles'].append('foreign')
-    assert module.settings()=={'owner_id':'first','profiles':['default'],'release_repo':'xploit9/cypher'}
+    assert module.settings()=={'owner_id':'first','profiles':['default'],'release_repo':'xploit9/cypher',
+                               'android_stable_certificate_sha256':''}
     replace('second',release_repo='owner/other-cypher');assert module.settings()['release_repo']=='owner/other-cypher'
     replace('second',False);assert module.settings()=={}
     path.write_text('plugins: [');assert module.settings()=={}

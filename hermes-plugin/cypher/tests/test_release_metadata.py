@@ -7,12 +7,26 @@ import pytest
 
 
 SCRIPT=Path(__file__).resolve().parents[3]/'cypher-android'/'tools'/'release-metadata.py'
+ROOT=Path(__file__).resolve().parents[3]
 
 
 def _script():
     spec=importlib.util.spec_from_file_location('cypher_release_metadata',SCRIPT)
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
     return module
+
+
+def test_obsolete_review_disposition_file_is_removed():
+    assert not (ROOT/'hermes-plugin'/'cypher'/'REVIEW-DISPOSITIONS.md').exists()
+    assert 'REVIEW-DISPOSITIONS.md' not in (ROOT/'hermes-plugin'/'cypher'/'README.md').read_text(encoding='utf-8')
+
+
+def test_plugin_metadata_remains_version_1_0_0():
+    manifest=json.loads((ROOT/'hermes-plugin'/'cypher'/'dashboard'/'manifest.json').read_text(encoding='utf-8'))
+    readme=(ROOT/'hermes-plugin'/'cypher'/'README.md').read_text(encoding='utf-8')
+
+    assert manifest['version']=='1.0.0'
+    assert '2.1.0' not in readme
 
 
 def test_release_script_writes_canonical_stable_asset_and_feed_fields(tmp_path,monkeypatch):

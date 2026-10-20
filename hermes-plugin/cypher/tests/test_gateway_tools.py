@@ -1,6 +1,7 @@
 """Isolated receipts and native contracts; never sends real email or callbacks."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -14,6 +15,28 @@ ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('cypher_gateway_test',ROOT/'gateway_tools.py')
 g=importlib.util.module_from_spec(spec);spec.loader.exec_module(g)
 SCOPE=('owner','password','profile','call')
+
+
+DEFAULT_HERMES_AGENT_SOURCE=Path('C:/Users/XPLoiT999/AppData/Local/hermes/hermes-agent')
+
+
+def _hermes_agent_source():
+    source=Path(os.environ.get('HERMES_AGENT_SOURCE',str(DEFAULT_HERMES_AGENT_SOURCE)))
+    if not source.is_dir(): pytest.skip('Hermes source required; set HERMES_AGENT_SOURCE')
+    return source
+
+
+def test_hermes_source_override_and_missing_source(tmp_path,monkeypatch):
+    monkeypatch.delenv('HERMES_AGENT_SOURCE',raising=False)
+    if DEFAULT_HERMES_AGENT_SOURCE.is_dir():
+        assert _hermes_agent_source()==DEFAULT_HERMES_AGENT_SOURCE
+    else:
+        with pytest.raises(pytest.skip.Exception):_hermes_agent_source()
+    override=tmp_path/'hermes-agent';override.mkdir()
+    monkeypatch.setenv('HERMES_AGENT_SOURCE',str(override))
+    assert _hermes_agent_source()==override
+    monkeypatch.setenv('HERMES_AGENT_SOURCE',str(tmp_path/'missing'))
+    with pytest.raises(pytest.skip.Exception):_hermes_agent_source()
 
 
 @pytest.mark.parametrize('arguments',[{'proxy':'dummy'},{'options':{'proxy':'dummy'}},{'options':[{'connection':{'cdp_url':'dummy'}}]}])
@@ -238,7 +261,7 @@ def test_cancel_before_approval_and_after_dispatch_never_replays(gateway):
 
 
 def test_native_trust_gate_uses_receipt_once_and_denies_server_elicitation(tmp_path,monkeypatch):
-    native=Path('C:/Users/XPLoiT999/AppData/Local/hermes/hermes-agent')
+    native=_hermes_agent_source()
     monkeypatch.syspath_prepend(str(native));monkeypatch.setenv('HERMES_HOME',str(tmp_path))
     from tools.approval_prompt import request_elicitation_consent
     from tools.mcp_tool_handlers import _trust_gate_check
@@ -260,7 +283,7 @@ def test_native_trust_gate_uses_receipt_once_and_denies_server_elicitation(tmp_p
 
 
 def test_native_error_aliases_nested_content_and_truncation_are_not_completed(gateway,tmp_path,monkeypatch):
-    monkeypatch.syspath_prepend('C:/Users/XPLoiT999/AppData/Local/hermes/hermes-agent')
+    monkeypatch.syspath_prepend(str(_hermes_agent_source()))
     monkeypatch.setenv('HERMES_HOME',str(tmp_path))
     from tools.mcp_tool_handlers import _render_call_tool_result
     api,backend,_=gateway
@@ -444,7 +467,7 @@ def test_malformed_or_changed_approval_display_is_rejected_before_receipt(gatewa
 
 
 def test_native_approval_atomic_once_and_invalid_identity_fail_closed(tmp_path,monkeypatch):
-    monkeypatch.syspath_prepend('C:/Users/XPLoiT999/AppData/Local/hermes/hermes-agent')
+    monkeypatch.syspath_prepend(str(_hermes_agent_source()))
     monkeypatch.setenv('HERMES_HOME',str(tmp_path))
     from tools import approval
     captured={};choices=[]

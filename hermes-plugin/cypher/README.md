@@ -84,7 +84,7 @@ Release metadata includes artifact_path and min_contract_version=max_contract_ve
 
 C6 wire: GET `/mobile/sessions/{stored_id}/voice-history?profile=` requires current native owner/profile verification and returns `{session_id,profile,events:[{call_id,event_id:"<call>:<role>:<turn>",session_id,role,text,final,interrupted,at_ms,created_at}],truncated}`. Versions group by call/role/turn with stable IDs; actual final text replaces earlier partials, while unfinished dialogue remains final=false with an explicit marker. Latest 200 grouped events and at most 1 MiB UTF-8 text return chronologically. created_at is the server reservation timestamp plus the call-relative at_ms offset. Authenticated response is no-store; unowned legacy sessions fail without relabelling. New-call context includes a bounded prior voice-dialogue excerpt marked historical reference data, never instructions. Nothing is inserted into native core history and no prompt is auto-run.
 
-The mobile API does not retain call audio; audio-storage requests are rejected and finalization reports `audio_available: false`. Transcript, call, and job metadata remain separate from audio. Detailed disposition of all 15 OCR findings is in REVIEW-DISPOSITIONS.md.
+The mobile API does not retain call audio; audio-storage requests are rejected and finalization reports `audio_available: false`. Transcript, call, and job metadata remain separate from audio.
 
 
 ## Native Tasks and category notification contracts
@@ -97,7 +97,7 @@ GET `/mobile/tasks/capabilities` reports the actually resolved profile timezone 
 
 
 
-## Phone connection and client-owned realtime keys (2.1.0)
+## Phone connection and client-owned realtime keys
 
 The visible Cypher dashboard tab includes a **Connect phone** QR and copyable `cypher://connect?url=<encoded-url>&name=<encoded-name>` link. The public HTTPS QR carries the URL and name. In loopback mode, the loopback QR includes the Hermes sign-in value in `session` for the local setup flow. On the phone: install Cypher, tap Scan QR, then sign in through Hermes OAuth.
 

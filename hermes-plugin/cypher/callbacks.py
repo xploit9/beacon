@@ -177,6 +177,21 @@ def deferred_allowed(mobile,event,now,owner=None):
     except (TypeError,ValueError,KeyError): return False
     return row.get('delivered')==event and 0<=(now-target).total_seconds()<CALLBACK_WINDOW_SECONDS
 
+def missed_reason(mobile,event,now,owner,profile):
+    if not isinstance(event,str) or not _CALLBACK_EVENT.fullmatch(event): return None
+    key='scheduled-callback:'+event
+    with mobile.LOCK,mobile.connect() as conn:
+        found=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
+    if not found: return None
+    try:
+        row=json.loads(found[0]);target=datetime.fromisoformat(row['scheduled_at'])
+    except (TypeError,ValueError,KeyError): return None
+    if not isinstance(row,dict) or target.tzinfo is None or target.utcoffset() is None: return None
+    if (row.get('delivered')!=event or row.get('owner')!=owner or row.get('profile')!=profile
+            or (now-target).total_seconds()<CALLBACK_WINDOW_SECONDS): return None
+    try: return observers.reason_text(row.get('reason'))
+    except ValueError: return None
+
 def run(key):
     import importlib.util,sys
     for name in ('mobile','native'):

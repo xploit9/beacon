@@ -44,6 +44,7 @@ def settings():
     if not isinstance(value,dict): return {}
     result=deepcopy(value)
     result.setdefault('release_repo','xploit9/cypher')
+    result.setdefault('android_stable_certificate_sha256','')
     return result
 
 def home():

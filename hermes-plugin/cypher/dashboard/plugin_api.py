@@ -703,17 +703,44 @@ def activate(owner,profile):
             mobile.prune_notices(conn)
             if mobile.active_calls(conn,owner): return
             deferred=[dict(row) for row in conn.execute('SELECT * FROM deferred WHERE owner=? AND profile=? ORDER BY created LIMIT 32',(owner,profile)).fetchall()]
-        observers=sys.modules['cypher_callbacks'].observers
+        callbacks=sys.modules['cypher_callbacks'];observers=callbacks.observers
         quiet=None;quiet_now=None
         for row in deferred:
             now=datetime.now(timezone.utc)
-            explicit=sys.modules['cypher_callbacks'].deferred_allowed(mobile,row['id'],now,owner)
+            missed=callbacks.missed_reason(mobile,row['id'],now,owner,profile)
+            explicit=callbacks.deferred_allowed(mobile,row['id'],now,owner)
             if explicit is False:
+                if missed is not None:
+                    try:
+                        observers._notice(mobile,owner,profile,row['conversation'],
+                                          'Missed scheduled callback: '+missed,
+                                          'missed-callback:'+row['id'],now)
+                    except Exception:
+                        continue
                 with mobile.connect() as conn: conn.execute('DELETE FROM deferred WHERE id=?',(row['id'],))
                 continue
-            request_id=re.match(r'(?:Request|Email rule): ([0-9a-f]{32})[;:] ',row['reason'] or '')
-            request=request_id and next((r for r in proactive.list_requests(mobile,owner,profile) if r.get('id')==request_id.group(1)),None)
-            if explicit is None and request and request.get('night') is not True:
+            with mobile.connect() as conn:
+                email_notice=conn.execute('SELECT 1 FROM meta WHERE key=?',
+                                          ('proactive-email-notice:'+row['id'],)).fetchone()
+                email_rule=conn.execute('SELECT value FROM meta WHERE key=?',
+                                         ('proactive-email-rule:'+row['id'],)).fetchone()
+            request=None;proactive_call=email_notice is not None
+            if email_notice:
+                rule_id='default'
+                if email_rule:
+                    try:
+                        value=json.loads(email_rule[0]).get('rule_id')
+                        if isinstance(value,str): rule_id=value
+                    except (AttributeError,TypeError,ValueError): pass
+                if re.fullmatch(r'[0-9a-f]{32}',rule_id):
+                    request=next((r for r in proactive.list_requests(mobile,owner,profile)
+                                  if r.get('id')==rule_id),None)
+            else:
+                request_id=re.match(r'(?:Request|Email rule): ([0-9a-f]{32})[;:] ',row['reason'] or '')
+                request=request_id and next((r for r in proactive.list_requests(mobile,owner,profile)
+                                             if r.get('id')==request_id.group(1)),None)
+                proactive_call=request is not None
+            if explicit is None and proactive_call and not (request and request.get('night') is True):
                 if quiet is None:
                     setup=proactive._setup(mobile,owner,profile)
                     quiet_now=proactive.profile_now(profile)
@@ -776,6 +803,8 @@ def _push_devices(owner,profile):
                 if not remaining and accepted: conn.execute("UPDATE notices SET push='sent' WHERE id=?",(row['id'],))
     except Exception: return
 
+_PRODUCTION_PACKAGE='dev.hermes.android'
+_STABLE_PACKAGE='dev.hermes.android.stable'
 _release_failures={}
 def announce_release(cfg):
     """A changed verified feed creates durable hints; clients still verify before installing."""
@@ -811,11 +840,15 @@ def announce_release(cfg):
             conn.execute('INSERT OR IGNORE INTO notices(id,owner,profile,kind,conversation,created,expires,release_version) VALUES(?,?,?,?,?,?,?,?)',
                          (event,owner,profile,'release','release-'+str(version),time.time(),time.time()+7*86400,version))
             conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(key(profile),version))
-def release(cfg,optional=False,digest=None):
+def release(cfg,optional=False,digest=None,package=None,root_path=None):
     with _RELEASE_CACHE_LOCK:
-        return _release(cfg,optional,digest)
+        return _release(cfg,optional,digest,package,root_path)
 
-def _release_root(cfg,create=False):
+def _release_root(cfg,create=False,stable=False):
+    if stable:
+        root=mobile.home()/'plugin-data'/'cypher'/'releases-stable'
+        if create: mobile.protect(root)
+        return root
     configured=cfg.get('release_root')
     if isinstance(configured,str) and configured.strip():
         root=Path(configured).expanduser()
@@ -827,9 +860,11 @@ def _release_root(cfg,create=False):
         if create: mobile.protect(root)
     return root
 
-def _release(cfg,optional=False,digest=None):
+def _release(cfg,optional=False,digest=None,package=None,root_path=None):
     global _RELEASE_CACHE_KEY,_RELEASE_CACHE_VALUE
-    root_path=_release_root(cfg)
+    stable=package==_STABLE_PACKAGE
+    package_name=_STABLE_PACKAGE if stable else _PRODUCTION_PACKAGE
+    root_path=Path(root_path) if root_path is not None else _release_root(cfg,stable=stable)
     if not root_path.is_dir():
         if optional: return {'available':False}
         raise LookupError('Release unavailable')
@@ -843,16 +878,18 @@ def _release(cfg,optional=False,digest=None):
     manifest_stat=manifest.stat()
     if manifest_stat.st_size>16384: raise ValueError('Oversized release manifest')
     data=json.loads(manifest.read_text(encoding='utf-8-sig'))
+    if not isinstance(data,dict): raise ValueError('Invalid release manifest')
     filename=data.get('artifact_filename','')
     if not re.fullmatch(r'[A-Za-z0-9_.-]+\.apk',filename): raise ValueError('Invalid artifact name')
     path=root/filename
     if path.is_symlink() or getattr(path,'is_junction',lambda:False)() or path.resolve().parent!=root: raise ValueError('Unsafe artifact')
-    if data.get('package_name') not in {'dev.hermes.android','dev.hermes.android.stable'} or type(data.get('version_code')) is not int or data['version_code']<=20 or not re.fullmatch(r'[a-fA-F0-9]{64}',data.get('certificate_sha256','')): raise ValueError('Invalid release identity')
+    if data.get('package_name')!=package_name or type(data.get('version_code')) is not int or data['version_code']<=20 or not re.fullmatch(r'[a-fA-F0-9]{64}',data.get('certificate_sha256','')): raise ValueError('Invalid release identity')
     artifact_stat=path.stat()
     if not 1<=artifact_stat.st_size<=256*1024*1024: raise ValueError('APK size outside bounds')
     if artifact_stat.st_size!=data.get('size_bytes') or not re.fullmatch(r'[a-fA-F0-9]{64}',data.get('sha256','')): raise ValueError('Release artifact changed')
-    expected=cfg.get('android_certificate_sha256')
-    if not expected or expected.lower()!=data['certificate_sha256'].lower(): raise ValueError('Unexpected signing identity')
+    expected=cfg.get('android_stable_certificate_sha256') if stable else cfg.get('android_certificate_sha256')
+    if stable and not expected: expected=data['certificate_sha256']
+    if not isinstance(expected,str) or not re.fullmatch(r'[a-fA-F0-9]{64}',expected) or expected.lower()!=data['certificate_sha256'].lower(): raise ValueError('Unexpected signing identity')
     aapt=cfg.get('aapt');signer=cfg.get('apksigner')
     if not aapt or not signer or not Path(aapt).is_file() or not Path(signer).is_file(): raise RuntimeError('APK verification tools unavailable')
     tools=[]
@@ -861,7 +898,7 @@ def _release(cfg,optional=False,digest=None):
         tools.append((str(tool_path.resolve()),tool_stat.st_size,tool_stat.st_mtime_ns))
     cache_key=(str(manifest.resolve()),manifest_stat.st_size,manifest_stat.st_mtime_ns,
                str(path.resolve()),artifact_stat.st_size,artifact_stat.st_mtime_ns,
-               digest,expected.lower(),tuple(tools))
+               digest,package_name,expected.lower(),tuple(tools))
     if cache_key==_RELEASE_CACHE_KEY:
         return dict(_RELEASE_CACHE_VALUE)
     with path.open('rb') as stream: computed=hashlib.file_digest(stream,'sha256').hexdigest()
@@ -876,17 +913,20 @@ def _release(cfg,optional=False,digest=None):
     package=re.search(r"package: name='([^']+)' versionCode='([0-9]+)' versionName='([^']+)'",badging)
     digests=re.findall(r'Signer #[0-9]+ certificate SHA-256 digest: ([a-fA-F0-9]{64})',certificates)
     if not package or package[1]!=data['package_name'] or int(package[2])!=data['version_code'] or package[3]!=data['version_name'] or len(digests)!=1 or digests[0].lower()!=expected.lower(): raise ValueError('APK metadata/signature mismatch')
-    result={k:data[k] for k in ('version_code','version_name','package_name','certificate_sha256','sha256','size_bytes')} | {'available':True,'download_url':'/api/plugins/cypher/mobile/releases/'+digest+'/download','artifact_path':'/api/plugins/cypher/mobile/releases/'+digest+'/download','min_contract_version':2,'max_contract_version':2}
+    artifact_path='/api/plugins/cypher/mobile/releases/'+digest+'/download'
+    if stable: artifact_path+='?package='+_STABLE_PACKAGE
+    result={k:data[k] for k in ('version_code','version_name','package_name','certificate_sha256','sha256','size_bytes')} | {'available':True,'download_url':artifact_path,'artifact_path':artifact_path,'min_contract_version':2,'max_contract_version':2}
     _RELEASE_CACHE_KEY=cache_key;_RELEASE_CACHE_VALUE=dict(result)
     return result
 @router.get('/mobile/releases/latest')
 async def latest(request:Request):
-    _,_,_,cfg=identity(request);return await asyncio.to_thread(safely,release,cfg)
+    _,_,_,cfg=identity(request);return await asyncio.to_thread(safely,release,cfg,False,None,request.query_params.get('package'))
 @router.get('/mobile/releases/{digest}/download')
 async def download(digest:str,request:Request):
-    _,_,_,cfg=identity(request);metadata=await asyncio.to_thread(safely,release,cfg,False,digest)
+    _,_,_,cfg=identity(request);package=request.query_params.get('package')
+    metadata=await asyncio.to_thread(safely,release,cfg,False,digest,package)
     if digest!=metadata['sha256']: raise HTTPException(404,'Immutable artifact unavailable')
-    root=_release_root(cfg).resolve();data=json.loads((root/(digest+'.json')).read_text(encoding='utf-8-sig'));path=root/data['artifact_filename']
+    root=_release_root(cfg,stable=package==_STABLE_PACKAGE).resolve();data=json.loads((root/(digest+'.json')).read_text(encoding='utf-8-sig'));path=root/data['artifact_filename']
     # Snapshot immutable bytes before any response headers; a concurrent replacement
     # cannot turn validated metadata into a different delivered package.
     content=await asyncio.to_thread(path.read_bytes)
@@ -943,57 +983,72 @@ def _check_github_release(cfg):
     flags=subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0
     with tempfile.TemporaryDirectory(prefix='cypher-release-') as temporary:
         download_dir=Path(temporary)
-        try:
-            result=subprocess.run([gh,'release','download','--repo',repo,'--pattern','Cypher-*.apk','--pattern','Cypher-*.json','--dir',str(download_dir)],
-                                  cwd=str(download_dir),capture_output=True,text=True,check=False,timeout=120,shell=False,creationflags=flags)
-        except subprocess.TimeoutExpired: raise ReleaseCheckError('GitHub release check timed out on your PC. Try again.') from None
-        except OSError: raise ReleaseCheckError('GitHub CLI could not start on your PC.') from None
-        if result.returncode:
-            detail=(result.stderr+'\n'+result.stdout).casefold()
-            if any(part in detail for part in ('not logged in','not logged into','auth login','authentication required','http 401')):
-                raise ReleaseCheckError('GitHub CLI is not signed in on your PC. Sign in with gh auth login.')
-            if 'release not found' in detail or 'no releases found' in detail:
-                raise ReleaseCheckError('No stable Cypher release was found in the configured GitHub repository.')
-            if 'no assets found' in detail or 'no matching assets' in detail:
-                raise ReleaseCheckError('The latest GitHub release is missing the Cypher APK or metadata.')
-            raise ReleaseCheckError('GitHub CLI cannot access the configured release repository on your PC.')
-        apks=[path for path in download_dir.iterdir() if path.name.startswith('Cypher-') and path.suffix.casefold()=='.apk']
-        manifests=[path for path in download_dir.iterdir() if path.name.startswith('Cypher-') and path.suffix.casefold()=='.json']
-        if len(apks)!=1 or len(manifests)!=1: raise ReleaseCheckError('The GitHub release must contain one Cypher APK and one metadata file.')
-        apk,manifest=apks[0],manifests[0]
-        if _is_link(apk) or _is_link(manifest) or apk.resolve().parent!=download_dir.resolve() or manifest.resolve().parent!=download_dir.resolve():
+        def download(pattern):
+            try:
+                result=subprocess.run([gh,'release','download','--repo',repo,'--pattern',pattern,'--dir',str(download_dir)],
+                                      cwd=str(download_dir),capture_output=True,text=True,check=False,timeout=120,shell=False,creationflags=flags)
+            except subprocess.TimeoutExpired: raise ReleaseCheckError('GitHub release check timed out on your PC. Try again.') from None
+            except OSError: raise ReleaseCheckError('GitHub CLI could not start on your PC.') from None
+            if result.returncode:
+                detail=(result.stderr+'\n'+result.stdout).casefold()
+                if any(part in detail for part in ('not logged in','not logged into','auth login','authentication required','http 401')):
+                    raise ReleaseCheckError('GitHub CLI is not signed in on your PC. Sign in with gh auth login.')
+                if 'release not found' in detail or 'no releases found' in detail:
+                    raise ReleaseCheckError('No stable Cypher release was found in the configured GitHub repository.')
+                if 'no assets found' in detail or 'no matching assets' in detail:
+                    raise ReleaseCheckError('The latest GitHub release is missing the Cypher APK or metadata.')
+                raise ReleaseCheckError('GitHub CLI cannot access the configured release repository on your PC.')
+            return list(download_dir.glob(pattern))
+
+        manifests=download('Cypher-*.json')
+        if len(manifests)!=1: raise ReleaseCheckError('The GitHub release must contain one Cypher metadata file.')
+        manifest=manifests[0]
+        if _is_link(manifest) or manifest.resolve().parent!=download_dir.resolve():
             raise ReleaseCheckError('The GitHub release contains an unsafe artifact path.')
-        name=re.fullmatch(r'Cypher-([A-Za-z0-9][A-Za-z0-9._-]{0,63})\.apk',apk.name)
-        if not name or manifest.name!=f'Cypher-{name[1]}.json': raise ReleaseCheckError('The GitHub APK and metadata names do not match.')
-        if not 1<=apk.stat().st_size<=256*1024*1024 or manifest.stat().st_size>16384:
-            raise ReleaseCheckError('The GitHub release artifact is outside the supported size limits.')
+        name=re.fullmatch(r'Cypher-([A-Za-z0-9][A-Za-z0-9._-]{0,63})\.json',manifest.name)
+        if not name or manifest.stat().st_size>16384:
+            raise ReleaseCheckError('The GitHub release metadata is outside the supported size limits.')
         try:
             manifest_bytes=manifest.read_bytes();data=json.loads(manifest_bytes.decode('utf-8-sig'))
         except Exception: raise ReleaseCheckError('The GitHub release metadata is invalid.') from None
-        if (not isinstance(data,dict) or data.get('artifact_filename')!=apk.name or data.get('package_name')!='dev.hermes.android.stable'
+        artifact_name=f'Cypher-{name[1]}.apk'
+        if (not isinstance(data,dict) or data.get('artifact_filename')!=artifact_name or data.get('package_name')!=_STABLE_PACKAGE
                 or data.get('version_name')!=name[1] or type(data.get('version_code')) is not int or data['version_code']<=20
-                or type(data.get('size_bytes')) is not int or data['size_bytes']!=apk.stat().st_size
+                or type(data.get('size_bytes')) is not int or not 1<=data['size_bytes']<=256*1024*1024
                 or not isinstance(data.get('sha256'),str) or not re.fullmatch(r'[a-f0-9]{64}',data['sha256'])
                 or not isinstance(data.get('certificate_sha256'),str) or not re.fullmatch(r'[a-fA-F0-9]{64}',data['certificate_sha256'])):
             raise ReleaseCheckError('The GitHub release metadata does not describe a stable Cypher APK.')
         digest=data['sha256']
+        previous=None
+        try: previous=release(cfg,optional=True,package=_STABLE_PACKAGE)
+        except Exception: pass
+        if previous and previous.get('package_name')==_STABLE_PACKAGE:
+            if data['version_code']<previous['version_code']:
+                return {'version_name':data['version_name'],'version_code':data['version_code'],'available':False}
+            if data['version_code']==previous['version_code']:
+                if digest!=previous['sha256']:
+                    raise ReleaseCheckError('A published Cypher version cannot be replaced with different APK bytes.')
+                if (data['version_name']!=previous['version_name'] or
+                        data['certificate_sha256'].lower()!=previous['certificate_sha256'].lower()):
+                    raise ReleaseCheckError('A published Cypher version cannot change its release metadata.')
+                return {'version_name':data['version_name'],'version_code':data['version_code'],'available':False}
+
+        apks=download(artifact_name)
+        if len(apks)!=1 or apks[0].name!=artifact_name:
+            raise ReleaseCheckError('The GitHub release must contain the APK named by its metadata.')
+        apk=apks[0]
+        if _is_link(apk) or apk.resolve().parent!=download_dir.resolve():
+            raise ReleaseCheckError('The GitHub release contains an unsafe artifact path.')
+        if not 1<=apk.stat().st_size<=256*1024*1024 or apk.stat().st_size!=data['size_bytes']:
+            raise ReleaseCheckError('The GitHub release artifact is outside the supported size limits.')
         if _file_sha256(apk)!=digest: raise ReleaseCheckError('The GitHub APK checksum does not match its metadata.')
         stage=download_dir/'feed';stage.mkdir()
         shutil.copyfile(apk,stage/apk.name)
         (stage/(digest+'.json')).write_bytes(manifest_bytes)
         (stage/'latest.json').write_bytes(manifest_bytes)
-        try: verified=release({**cfg,'release_root':str(stage)})
+        try: verified=release(cfg,package=_STABLE_PACKAGE,root_path=stage)
         except Exception: raise ReleaseCheckError('The downloaded Cypher APK failed signature or metadata verification.') from None
-        previous=None
-        try: previous=release(cfg,optional=True)
-        except Exception: pass
-        if previous and previous.get('package_name')==verified['package_name']:
-            if verified['version_code']<previous['version_code']:
-                return {'version_name':verified['version_name'],'version_code':verified['version_code'],'available':False}
-            if verified['version_code']==previous['version_code']:
-                if verified['sha256']!=previous['sha256']: raise ReleaseCheckError('A published Cypher version cannot be replaced with different APK bytes.')
-                return {'version_name':verified['version_name'],'version_code':verified['version_code'],'available':False}
-        root=_release_root(cfg,create=True)
+        root=_release_root(cfg,create=True,stable=True)
         if not root.is_dir(): raise ReleaseCheckError('The verified release feed could not be saved on Hermes.')
         root=root.resolve(strict=True)
         _atomic_copy(apk,root/data['artifact_filename'],digest)
@@ -1055,7 +1110,7 @@ def clear_lookup_counts(call_id):
     with mobile.LOCK:
         for key in list(_feature_counts):
             if key[0]==call_id: _feature_counts.pop(key,None)
-async def feature(fn,*args,timeout=12):
+async def feature(fn,*args,timeout=12,value_error_status=409):
     if not _feature_slots.acquire(blocking=False): raise HTTPException(429,'Native lookup capacity busy')
     context=contextvars.copy_context()
     def run():
@@ -1070,7 +1125,7 @@ async def feature(fn,*args,timeout=12):
     except asyncio.TimeoutError: raise HTTPException(504,'Native lookup timed out') from None
     except HTTPException: raise
     except LookupError: raise HTTPException(404,'Owned native context unavailable') from None
-    except ValueError as exc: raise HTTPException(409,str(exc)) from None
+    except ValueError as exc: raise HTTPException(value_error_status,str(exc)) from None
     except Exception: raise HTTPException(503,'Native lookup unavailable') from None
 def lookup_budget(call_id,kind):
     key=(call_id,kind)
@@ -1228,7 +1283,7 @@ async def proactive_request_create(request:Request):
         raise HTTPException(400,'signal must be email or null')
     if type(night) is not bool: raise HTTPException(400,'Request night must be a boolean')
     owner,_,profile,_=identity(request)
-    try: return await feature(proactive.create_request,mobile,owner,profile,text,action,signal,night,timeout=30)
+    try: return await feature(proactive.create_request,mobile,owner,profile,text,action,signal,night,timeout=30,value_error_status=400)
     except ValueError as exc: raise HTTPException(400,str(exc)) from None
     except RuntimeError: raise HTTPException(503,'Proactive request could not be saved') from None
 
@@ -1237,7 +1292,7 @@ async def proactive_request_patch(request_id:str,request:Request):
     value=await body(request,2048)
     if not value or set(value)-{'enabled','action','night'}: raise HTTPException(400,'Invalid Proactive request fields')
     owner,_,profile,_=identity(request)
-    try: return await feature(proactive.patch_request,mobile,owner,profile,request_id,value,timeout=30)
+    try: return await feature(proactive.patch_request,mobile,owner,profile,request_id,value,timeout=30,value_error_status=400)
     except LookupError as exc: raise HTTPException(404,str(exc)) from None
     except ValueError as exc: raise HTTPException(400,str(exc)) from None
     except RuntimeError: raise HTTPException(503,'Proactive request could not be updated') from None

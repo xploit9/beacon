@@ -63,8 +63,13 @@ def prune_meta(conn, now):
             observed = None
         if type(observed) not in (int, float) or not math.isfinite(observed) or now - observed > EVIDENCE_TTL:
             conn.execute("DELETE FROM meta WHERE key=?", (key,))
-    for key, value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'proactive-alert:%' OR key LIKE 'proactive-call:%' OR key LIKE 'proactive-email-notice:%' OR key LIKE 'mail-notified:%' ORDER BY key LIMIT ?", (PRUNE_BATCH,)).fetchall():
+    for key, value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'proactive-alert:%' OR key LIKE 'proactive-call:%' OR key LIKE 'proactive-email-notice:%' OR key LIKE 'proactive-email-rule:%' OR key LIKE 'mail-notified:%' ORDER BY key LIMIT ?", (PRUNE_BATCH,)).fetchall():
         created = _number(value)
+        if key.startswith("proactive-email-rule:"):
+            try:
+                created = _number(json.loads(value).get("created"))
+            except (AttributeError, TypeError, ValueError):
+                created = None
         retention = CALL_WINDOW if key.startswith("proactive-call:") else ALERT_RETENTION
         if created is None or created > now or now - created > retention:
             conn.execute("DELETE FROM meta WHERE key=?", (key,))
@@ -251,7 +256,7 @@ def _notice(mobile, owner, profile, conversation, reason, alert_key, now, email_
 
 
 def email_notice(mobile, native, cfg, profile, session_id, args, now):
-    from cypher_proactive import _setup, _setup_complete, enabled, list_requests
+    from cypher_proactive import EMAIL_RULE_PREFIX, _setup, _setup_complete, enabled, list_requests
 
     owner, provider = cfg.get("owner_id"), cfg.get("owner_provider")
     if not owner or not provider or profile not in cfg.get("profiles", []) or not session_id:
@@ -309,7 +314,10 @@ def email_notice(mobile, native, cfg, profile, session_id, args, now):
             callbacks_ready = cfg.get("callback_tool_enabled") is True and cfg.get("scheduled_callbacks_enabled") is True
             if not quiet_blocked and callbacks_ready and count < CALL_LIMIT:
                 rule_reason = f"Email rule: {request['text'][:100]}; " if request else ""
-                relay_reason = reason_text((rule_reason + reason.strip())[:240])
+                try:
+                    relay_reason = reason_text((rule_reason + reason.strip())[:240])
+                except ValueError:
+                    relay_reason = reason_text(reason.strip())
                 event = invitation(owner, profile, stored, relay_reason)
                 with mobile.connect() as conn:
                     conn.execute("INSERT INTO meta(key,value) VALUES(?,?)",
@@ -318,5 +326,8 @@ def email_notice(mobile, native, cfg, profile, session_id, args, now):
                     conn.execute("INSERT INTO meta(key,value) VALUES(?,?)", (dedupe, str(now.timestamp()).encode()))
                     conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
                                  ("proactive-email-notice:" + event, str(now.timestamp()).encode()))
+                    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+                                 (EMAIL_RULE_PREFIX + event,
+                                  json.dumps({"created": now.timestamp(), "rule_id": request_id or "default"}).encode()))
                 return {"status": "pending", "event_id": event, "conversation_id": stored}
     return _notice(mobile, owner, profile, stored, reason.strip(), dedupe, now, email_alert=True)

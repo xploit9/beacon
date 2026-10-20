@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import importlib.util
@@ -73,23 +73,40 @@ def test_deferred_call_user_invitation_appears_after_active_call_closes(harness,
 REQUEST_ID = 'a' * 32
 
 
-def _replay_deferred_proactive_call(api, client, monkeypatch, night):
+def _replay_deferred_proactive_call(api, client, cfg, monkeypatch, night):
     monkeypatch.setattr(api, 'watch', lambda *args: None)
-    monkeypatch.setattr(api.proactive, 'list_requests', lambda *args: [{'id': REQUEST_ID, 'night': night}])
+    cfg.update(callback_tool_enabled=True, scheduled_callbacks_enabled=True,
+               scheduled_callback_conversation_id='native-stored')
+    setup = api.proactive.default_setup()
+    api.proactive._meta_set(api.mobile, api.proactive._key('owner', 'default', 'setup'), json.dumps(setup))
+    api.proactive._meta_set(api.mobile, api.proactive._key('owner', 'default', 'enabled'), '1')
+    api.proactive._meta_set(api.mobile, api.proactive._key('owner', 'default', 'setup_complete'), '1')
+    rule = {'id': REQUEST_ID, 'text': 'Client review moved', 'action': 'call', 'night': night,
+            'enabled': True, 'signal': 'email'}
+    monkeypatch.setattr(api.proactive, 'list_requests', lambda *args: [rule])
     active_call = client.post('/api/plugins/cypher/mobile/calls', json={'profile': 'default'}).json()['call_id']
-    reason = f'Email rule: {REQUEST_ID}; An urgent update'
-    invitation = api.mobile.invitation('owner', 'default', 'native-stored', reason)
-    now = datetime(2026, 10, 20, 23, 0, tzinfo=ZoneInfo('Asia/Dubai'))
+    now = datetime(2026, 10, 20, 12, 0, tzinfo=ZoneInfo('Asia/Dubai'))
+    observers = api.sys.modules['cypher_observers']
+    monkeypatch.setattr(observers, 'time', SimpleNamespace(time=lambda: now.timestamp()))
+    assert observers.source_observed(api.mobile, cfg, 'default', 'watch-run', 'mcp__mail__read_email',
+                                     {'id': 'message-1'}, 'ok')
+    alert = observers.email_notice(api.mobile, api.native, cfg, 'default', 'watch-run', {
+        'request_id': REQUEST_ID, 'item_id': 'message-1', 'reason': 'An urgent update',
+    }, now)
+    invitation = alert['event_id']
+    with api.mobile.connect() as conn:
+        reason = conn.execute('SELECT reason FROM deferred WHERE id=?', (invitation,)).fetchone()['reason']
+    quiet_now = datetime(2026, 10, 20, 23, 0, tzinfo=ZoneInfo('Asia/Dubai'))
     monkeypatch.setattr(api.proactive, '_setup', lambda *args: {'quiet_start': '22:00', 'quiet_end': '07:00'})
-    monkeypatch.setattr(api.proactive, 'profile_now', lambda profile: now)
+    monkeypatch.setattr(api.proactive, 'profile_now', lambda profile: quiet_now)
     assert client.delete(f'/api/plugins/cypher/mobile/calls/{active_call}').status_code == 200
     api.activate('owner', 'default')
     return invitation, reason
 
 
 def test_deferred_proactive_call_replays_as_notice_inside_quiet_hours(harness, monkeypatch):
-    api, client, _, _, _ = harness
-    invitation, reason = _replay_deferred_proactive_call(api, client, monkeypatch, night=False)
+    api, client, cfg, _, _ = harness
+    invitation, reason = _replay_deferred_proactive_call(api, client, cfg, monkeypatch, night=False)
 
     with api.mobile.connect() as conn:
         notice = conn.execute('SELECT kind,reason FROM notices WHERE id!=? AND conversation=? ORDER BY seq DESC LIMIT 1',
@@ -99,11 +116,55 @@ def test_deferred_proactive_call_replays_as_notice_inside_quiet_hours(harness, m
 
 
 def test_deferred_night_request_still_rings_inside_quiet_hours(harness, monkeypatch):
-    api, client, _, _, _ = harness
-    invitation, _ = _replay_deferred_proactive_call(api, client, monkeypatch, night=True)
+    api, client, cfg, _, _ = harness
+    invitation, _ = _replay_deferred_proactive_call(api, client, cfg, monkeypatch, night=True)
 
     with api.mobile.connect() as conn:
         assert conn.execute("SELECT kind FROM notices WHERE id=?", (invitation,)).fetchone()['kind'] == 'incoming_call'
+
+
+def test_missed_scheduled_callback_posts_notice_before_delete(harness, monkeypatch):
+    api, client, cfg, _, _ = harness
+    cfg['scheduled_callbacks_enabled'] = True
+    target = datetime(2026, 10, 20, 12, 0, tzinfo=ZoneInfo('Asia/Dubai'))
+    event = 'c' * 64
+    key = 'scheduled-callback:' + event
+    record = {
+        'owner': 'owner', 'provider': 'basic', 'profile': 'default', 'conversation': 'native-stored',
+        'scheduled_at': target.isoformat(), 'reason': 'Client moved the review',
+        'request_id': 'request', 'status': 'scheduled',
+    }
+    with api.mobile.connect() as conn:
+        conn.execute('INSERT INTO meta(key,value) VALUES(?,?)', (key, json.dumps(record).encode()))
+    active_call = client.post('/api/plugins/cypher/mobile/calls', json={'profile': 'default'}).json()['call_id']
+    callbacks = api.sys.modules['cypher_callbacks']
+    assert callbacks.deliver(api.mobile, api.native, key, target)['status'] == 'pending'
+    activate = api.activate
+    monkeypatch.setattr(api, 'activate', lambda *args: None)
+    assert client.delete(f'/api/plugins/cypher/mobile/calls/{active_call}').status_code == 200
+    missed_at = target + timedelta(seconds=callbacks.CALLBACK_WINDOW_SECONDS + 1)
+    monkeypatch.setattr(api, 'datetime', SimpleNamespace(now=lambda tz: missed_at))
+    notices = []
+    observers = callbacks.observers
+    create_notice = observers._notice
+
+    def observe_notice(*args, **kwargs):
+        with api.mobile.connect() as conn:
+            assert conn.execute('SELECT 1 FROM deferred WHERE id=?', (event,)).fetchone()
+        notices.append(args[4])
+        return create_notice(*args, **kwargs)
+
+    monkeypatch.setattr(observers, '_notice', observe_notice)
+
+    activate('owner', 'default')
+
+    assert notices == ['Missed scheduled callback: Client moved the review']
+    with api.mobile.connect() as conn:
+        assert conn.execute('SELECT 1 FROM deferred WHERE id=?', (event,)).fetchone() is None
+        notice = conn.execute('SELECT kind,reason FROM notices WHERE reason LIKE ?',
+                              ('Missed scheduled callback:%',)).fetchone()
+        assert notice['kind'] == 'task_result'
+        assert notice['reason'] == notices[0]
 
 
 def test_event_long_poll_does_not_rescan_native_activity(harness, monkeypatch):

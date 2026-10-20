@@ -6,7 +6,8 @@ from test_mobile import harness, load_private
 
 
 def _install_profile_db(monkeypatch, session_id, row, identity):
-    db = SimpleNamespace(get_session=lambda requested: row if requested == session_id else None,
+    db = SimpleNamespace(get_conversation_root=lambda requested: requested,
+                         get_session=lambda requested: row if requested == session_id else None,
                          cron_run_identity=lambda requested: identity if requested == session_id else None)
     server = SimpleNamespace(_profile_db=lambda scope: nullcontext(db))
     monkeypatch.setitem(sys.modules, "tui_gateway", SimpleNamespace(server=server))
@@ -20,6 +21,12 @@ def test_managed_persona_retries_old_requests_and_requires_current_tool_evidence
     assert "tool result in this turn" in persona
     assert "i couldn't verify" in persona
     assert "do it again rather than refuse" in persona
+
+
+def test_catalog_names_uses_three_argument_contract(harness):
+    live = load_private("__init__").live_context
+
+    assert live._catalog_names([{"_server": "mail"}], "_server", "mcp") == ["mail"]
 
 
 def test_nightly_memory_upkeep_corrects_stale_capabilities_and_preserves_owner_facts(harness):

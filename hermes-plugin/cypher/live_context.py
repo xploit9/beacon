@@ -34,13 +34,13 @@ def _time_label(value):
     return time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(value))
 
 
-def _catalog_names(rows, key, kind, selected):
+def _catalog_names(rows, key, kind):
     names = set()
     for row in rows:
         if not isinstance(row, dict):
             continue
         source_name = row.get(key)
-        if not isinstance(source_name, str) or f"{kind}:{source_name}" in selected:
+        if not isinstance(source_name, str):
             continue
         label = _label(source_name)
         if label:
@@ -73,7 +73,7 @@ def _build_snapshot(mobile, owner, profile, proactive, job_scope=False):
     with _profile_scope(profile):
         mcp_rows = [{"_server": entry.toolset[4:]} for entry in registry.get_all_entries()
                     if isinstance(entry.toolset, str) and entry.toolset.startswith("mcp-")]
-    mcp_names = _catalog_names(mcp_rows, "_server", "mcp", set())
+    mcp_names = _catalog_names(mcp_rows, "_server", "mcp")
     if mcp_names:
         items.append("Other MCP (health unknown): " + ", ".join(mcp_names))
     return _format(items, job_scope)

@@ -72,9 +72,10 @@ def current_profile(cfg):
 def _cron_row(profile,session_id):
     from tui_gateway import server
     with server._profile_db({'profile':profile}) as db:
-        row=db.get_session(session_id) if db else None
+        root_id=db.get_conversation_root(session_id) if db else None
+        row=db.get_session(root_id) if db and root_id else None
         if row and row.get('source')=='cron':
-            identity=db.cron_run_identity(session_id)
+            identity=db.cron_run_identity(root_id)
             if identity and identity.get('cron_job_id'):
                 row={**row,'cron_job_id':identity['cron_job_id']}
         return row
@@ -228,8 +229,14 @@ def native_voice_context(session_id=None, conversation_history=None, **kwargs):
 _READ_TOOL_WORDS={'get','list','search','read','fetch','find','query','view','show','describe','lookup','check'}
 _WRITE_TOOL_WORDS={'send','create','delete','remove','modify','update','manage','draft','reply','forward',
                    'move','archive','trash','label','post','write','upload','accept','decline','invite',
-                   'share','set','add','patch','put'}
+                   'share','set','add','patch','put','mark','star','unread','snooze','mute','block',
+                   'unsubscribe','replace','rename','merge','approve','submit','cancel','execute','run',
+                   'import','restore','copy','insert','append','apply','push','commit','pay','transfer'}
 _ARG_WRITE_TOOL_WORDS=_WRITE_TOOL_WORDS|{'run','trigger','install','edit','enable','disable','pause','resume','schedule'}
+_BLOCKED_PROACTIVE_TOOLSETS={'delegation','code_execution','computer_use','kanban','cronjob'}
+_BLOCKED_PROACTIVE_TOOLS={'delegate_task','execute_code','computer_use','kanban','cronjob_manage',
+                          'cypher_call_user','browser_click','browser_type','browser_press',
+                          'browser_cdp','browser_exec'}
 _READ_ONLY_MESSAGE='Proactive runs are read-only; this would change something.'
 
 def _tool_words(name):
@@ -252,7 +259,7 @@ def _mcp_read_only(tool_name,profile):
             hints=mcp_tool._tool_read_only_hints.get(_resolve_server_key(server_name),{}) or {}
         for raw_name,hint in hints.items():
             if mcp_prefixed_tool_name(server_name,raw_name)==tool_name:
-                return hint is True or _named_read_only(raw_name)
+                return not bool(_tool_words(raw_name)&_WRITE_TOOL_WORDS) and (hint is True or _named_read_only(raw_name))
     except Exception:
         return False
     return False
@@ -274,7 +281,7 @@ def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**
 
     if tool_name in {'cypher_email_notice','cypher_email_checked','terminal'}:
         return None
-    if tool_name=='cronjob' or tool_name=='cypher_call_user':
+    if tool_name in _BLOCKED_PROACTIVE_TOOLS:
         return {'action':'block','message':_READ_ONLY_MESSAGE}
     args=args if isinstance(args,dict) else {}
     argument_words=set()
@@ -290,6 +297,8 @@ def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**
             toolset=registry.get_toolset_for_tool(tool_name) or ''
     except Exception:
         toolset=''
+    if toolset in _BLOCKED_PROACTIVE_TOOLSETS:
+        return {'action':'block','message':_READ_ONLY_MESSAGE}
     if toolset.startswith('mcp-') or tool_name.startswith('mcp__'):
         if _mcp_read_only(tool_name,profile): return None
         return {'action':'block','message':_READ_ONLY_MESSAGE}
