@@ -56,6 +56,9 @@ internal fun endsSignIn(error: Throwable): Boolean =
     error is LoopbackSessionRefreshFailed || error is ApiFailure && error.status == 401 && !error.plugin || error is CachedIdentityMismatch
 internal fun isMissingCypherPluginRoute(error: Throwable): Boolean =
     (error as? ApiFailure)?.let { it.plugin && (it.status == 404 || it.message.contains("unknown route", ignoreCase = true) || it.message.contains("route not found", ignoreCase = true)) } == true
+internal fun cypherOwnerSetupMessage(error: Throwable): String? =
+    (error as? ApiFailure)?.takeIf { it.plugin && it.status == 403 && it.message.equals("Owner not authorized", ignoreCase = true) }
+        ?.let { "Finish setup on your Hermes dashboard: open the Cypher tab." }
 internal fun updatedHistoryRows(rows: List<JSONObject>, id: String, path: String, body: JSONObject, result: JSONObject, archivedView: Boolean, query: String, profile: String = ""): List<JSONObject> =
     rows.mapNotNull { row ->
         if (sessionRowId(row) != id || profile.isNotBlank() && row.string("profile", profile) != profile) return@mapNotNull row
@@ -755,7 +758,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             saveSetupProgress(if (loopbackRestart) "connect" else "signin", complete = false, setupOrigin = if (loopbackRestart) origin else null)
             _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList(); _data.value = emptyMap(); clearDetails()
         } else {
-            _ui.update { it.copy(error = error.message ?: "The operation failed. Try again.") }
+            _ui.update { it.copy(error = cypherOwnerSetupMessage(error) ?: error.message ?: "The operation failed. Try again.") }
             if (error is java.io.IOException && error !is ApiFailure && connectionProbe?.isActive != true) {
                 val active = client ?: return
                 connectionProbe = viewModelScope.launch {
@@ -2643,7 +2646,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
           } catch (e: Throwable) {
             if (e is CancellationException) throw e
             if (visible()) {
-                _data.update { values -> values + (key to ((if (cacheable) values[key]?.copy() else null) ?: JSONObject()).put("_error", e.message ?: "Unavailable").apply { if (cacheable && length() > 1) put("_stale", true); if (path == "/api/commands/catalog") { put("available", false); if (!has("commands")) put("commands", JSONArray()) } }) }
+                _data.update { values -> values + (key to ((if (cacheable) values[key]?.copy() else null) ?: JSONObject()).put("_error", cypherOwnerSetupMessage(e) ?: e.message ?: "Unavailable").apply { if (cacheable && length() > 1) put("_stale", true); if (path == "/api/commands/catalog") { put("available", false); if (!has("commands")) put("commands", JSONArray()) } }) }
                 if (force || !cacheable || e is ApiFailure && e.status == 401) fail(e)
             }
           } finally { c.closeNative(); if (loads[key] === currentCoroutineContext()[Job]) _refreshing.update { it - key } }

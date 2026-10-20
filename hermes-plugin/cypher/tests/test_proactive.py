@@ -18,6 +18,20 @@ def _install_profile_db(monkeypatch, rows, cron_runs=None):
     monkeypatch.setitem(sys.modules, "tui_gateway", SimpleNamespace(server=server))
 
 
+def test_current_profile_uses_native_profiles_when_claim_config_has_none(harness, monkeypatch, tmp_path):
+    api, _, _, _, _ = harness
+    work_home=tmp_path/'work'
+    monkeypatch.setitem(sys.modules, 'hermes_constants', SimpleNamespace(
+        get_hermes_home=lambda:work_home, get_process_hermes_home=lambda:work_home))
+    monkeypatch.setitem(sys.modules, 'tui_gateway', SimpleNamespace(server=SimpleNamespace(
+        _profile_home=lambda profile:tmp_path/profile)))
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, 'list_profiles', lambda *, lazy_skill_count=False:
+                        [SimpleNamespace(name='default'), SimpleNamespace(name='work')])
+
+    assert api.proactive.current_profile({'owner_id':'owner'})=='work'
+
+
 def test_cron_row_resolves_current_local_cron_run_identity(monkeypatch):
     plugin = load_private("__init__")
     session_id = "local-6b123"
@@ -146,7 +160,7 @@ def _fake_cron(api, monkeypatch, home, initial=()):
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles", SimpleNamespace(
         _profile_scope=lambda profile: nullcontext(), _config_profile_scope=lambda profile: nullcontext()))
     monkeypatch.setitem(sys.modules, "hermes_cli.profile_distribution", SimpleNamespace(read_manifest=lambda profile_home: None))
-    monkeypatch.setattr(api.proactive, "_profile_timezone", lambda profile: "Asia/Dubai")
+    monkeypatch.setattr(api.proactive, "_profile_timezone", lambda profile: "America/Los_Angeles")
     monkeypatch.setattr(api.proactive, "learned_notes", lambda profile: [])
     monkeypatch.setattr(api.proactive, "_home", lambda profile: home)
     return jobs, calls
@@ -350,7 +364,7 @@ def test_v4_migrates_v2_and_v3_saved_setups(harness, legacy, check_minutes, deli
 
 def test_v4_routes_are_topic_free_fast_and_strict(harness, monkeypatch):
     api, client, _, home, _ = harness
-    monkeypatch.setattr(api.proactive, "_profile_timezone", lambda profile: "Asia/Dubai")
+    monkeypatch.setattr(api.proactive, "_profile_timezone", lambda profile: "America/Los_Angeles")
     monkeypatch.setattr(api.proactive, "learned_notes",
                         lambda profile: ["Emails like a client review are important."], raising=False)
     monkeypatch.setattr(api.proactive, "_home", lambda profile: home)
@@ -366,7 +380,7 @@ def test_v4_routes_are_topic_free_fast_and_strict(harness, monkeypatch):
     body = result.json()
     assert set(body) == {"enabled", "setup_complete", "timezone", "delivery", "check_minutes",
                          "quiet_start", "quiet_end", "health", "rules", "learned", "jobs"}
-    assert body["timezone"] == "Asia/Dubai" and body["learned"] == ["Emails like a client review are important."]
+    assert body["timezone"] == "America/Los_Angeles" and body["learned"] == ["Emails like a client review are important."]
     assert body["health"]["state"] == "unknown"
 
     setup = {"enabled": False, "delivery": "call", "check_minutes": 30,
@@ -418,7 +432,7 @@ def test_v4_feedback_learns_from_an_alert_in_hermes_user_memory_and_can_be_remov
     monkeypatch.syspath_prepend(str(native))
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles", SimpleNamespace(
         _profile_scope=lambda profile: nullcontext()))
-    monkeypatch.setattr(api.proactive, "_profile_timezone", lambda profile: "Asia/Dubai")
+    monkeypatch.setattr(api.proactive, "_profile_timezone", lambda profile: "America/Los_Angeles")
     monkeypatch.setattr(api.proactive, "_cron_helpers", lambda: (lambda *args: [], None, None, None))
     cfg["scheduled_callback_conversation_id"] = "assistant-chat"
     setup = api.proactive.default_setup()
@@ -428,7 +442,7 @@ def test_v4_feedback_learns_from_an_alert_in_hermes_user_memory_and_can_be_remov
     monkeypatch.setattr(api.native, "verify", lambda *args: {"messages": []})
     from test_mobile import load_private
     observers = load_private("observers")
-    now = __import__("datetime").datetime.fromisoformat("2026-10-20T12:00:00+04:00")
+    now = __import__("datetime").datetime.fromisoformat("2026-10-20T12:00:00-07:00")
     monkeypatch.setattr(observers, "time", SimpleNamespace(time=lambda: now.timestamp()))
     assert observers.source_observed(api.mobile, cfg, "default", "watch-run", "mcp__mail__read_email",
                                      {"id": "message-1"}, "ok")

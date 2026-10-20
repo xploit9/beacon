@@ -76,11 +76,14 @@ def enforce_request_policy(request):
     if not has_body: return
     if not content_type or content_type.split(';',1)[0].strip().casefold()!='application/json':
         raise HTTPException(415,'JSON content type required')
-def identity(request,profile=None,owner_only=False,allow_loopback=False):
-    enforce_request_policy(request)
+def dashboard_identity(request,allow_loopback=False,browser_only=False):
     auth_required=bool(getattr(request.app.state,'auth_required',False))
     session=getattr(request.state,'session',None)
-    cfg=mobile.settings()
+    if browser_only:
+        authorization=request.headers.get('authorization','').strip().casefold()
+        if (not auth_required or getattr(request.state,'native_http_principal',None)
+                or getattr(request.state,'token_authenticated',False) or authorization.startswith('bearer ')):
+            raise HTTPException(401,'Verified dashboard browser session required')
     if not auth_required and allow_loopback:
         from hermes_cli.web_server import _has_valid_session_token
         if not _has_valid_session_token(request): raise HTTPException(401,'Verified dashboard session required')
@@ -89,9 +92,27 @@ def identity(request,profile=None,owner_only=False,allow_loopback=False):
         if not auth_required or session is None: raise HTTPException(401,'Verified native session required')
         owner=str(getattr(session,'user_id','') or '')
         provider=str(getattr(session,'provider','') or '')
+    if not owner or not provider: raise HTTPException(401,'Verified dashboard identity required')
+    return owner,provider
+
+def _native_profile_names():
+    try:
+        from hermes_cli import profiles as native_profiles
+        names=[getattr(profile,'name',None) for profile in native_profiles.list_profiles(lazy_skill_count=True)]
+    except Exception:
+        raise HTTPException(503,'Native profiles unavailable') from None
+    if (not 1<=len(names)<=64 or any(not isinstance(name,str) or not name.strip() or len(name)>80 for name in names)
+            or len(set(names))!=len(names)):
+        raise HTTPException(503,'Native profiles unavailable')
+    return names
+
+def identity(request,profile=None,owner_only=False,allow_loopback=False):
+    enforce_request_policy(request)
+    owner,provider=dashboard_identity(request,allow_loopback)
+    cfg=mobile.settings()
     if not owner or not provider or not cfg.get('owner_id') or owner!=cfg['owner_id'] or provider!=cfg.get('owner_provider'):
         raise HTTPException(403,'Owner not authorized')
-    profiles=cfg.get('profiles',[])
+    profiles=cfg['profiles'] if 'profiles' in cfg else _native_profile_names()
     if not isinstance(profiles,list) or not 1<=len(profiles)<=64 or any(not isinstance(p,str) or not p.strip() or len(p)>80 for p in profiles) or len(set(profiles))!=len(profiles):
         raise HTTPException(403,'Profile configuration invalid')
     if owner_only: return owner,provider,None,cfg
@@ -99,7 +120,7 @@ def identity(request,profile=None,owner_only=False,allow_loopback=False):
     profile=profile or request.query_params.get('cypher_profile') or request.query_params.get('profile') or (profiles[0] if len(profiles)==1 else None)
     if not isinstance(profiles,list) or not profile or profile not in profiles:
         raise HTTPException(403,'Profile not authorized')
-    return owner,provider,profile,cfg
+    return owner,provider,profile,mobile.settings(profile)
 
 def connect_info_url():
     try:
@@ -153,6 +174,17 @@ def _bounded_event_wait(value):
 
 @router.get('/connect-info')
 async def connect_info(request:Request):
+    enforce_request_policy(request)
+    cfg=mobile.settings()
+    authorization=request.headers.get('authorization','').strip().casefold()
+    if (getattr(request.app.state,'auth_required',False)
+            and 'owner_id' not in cfg and 'owner_provider' not in cfg
+            and getattr(request.state,'session',None) is not None
+            and not authorization.startswith('bearer ')
+            and not getattr(request.state,'native_http_principal',None)
+            and not getattr(request.state,'token_authenticated',False)):
+        dashboard_identity(request,browser_only=True)
+        return JSONResponse({'claim_required':True},headers={'Cache-Control':'no-store'})
     loopback=not bool(getattr(request.app.state,'auth_required',False))
     identity(request,owner_only=True,allow_loopback=loopback)
     url,name=connect_info_url()
@@ -161,6 +193,22 @@ async def connect_info(request:Request):
         from hermes_cli.web_server import _SESSION_TOKEN
         result['session']=_SESSION_TOKEN
     return JSONResponse(result,headers={'Cache-Control':'no-store'})
+
+@router.post('/owner/claim')
+async def claim_owner(request:Request):
+    enforce_request_policy(request)
+    owner,provider=dashboard_identity(request,browser_only=True)
+    cfg=mobile.settings()
+    if 'owner_id' in cfg or 'owner_provider' in cfg:
+        raise HTTPException(409,'Cypher owner already configured')
+    _native_profile_names()
+    try:
+        created=mobile.claim_owner(owner,provider)
+    except ValueError:
+        raise HTTPException(403,'Verified dashboard identity invalid') from None
+    if not created:
+        raise HTTPException(409,'Cypher owner already configured')
+    return {'claimed':True}
 
 async def body(request,limit=65536):
     raw=bytearray()
@@ -171,6 +219,20 @@ async def body(request,limit=65536):
     except Exception: raise HTTPException(400,'Invalid JSON') from None
     if not isinstance(value,dict): raise HTTPException(400,'Expected object')
     return value
+
+@router.put('/mobile/assistant-conversation')
+async def register_assistant_conversation(request:Request):
+    value=await body(request,1024)
+    if set(value)!={'profile','session_id'} or not isinstance(value.get('profile'),str) or not isinstance(value.get('session_id'),str):
+        raise HTTPException(400,'Profile and session_id are required')
+    owner,provider,profile,_=identity(request,value['profile'])
+    try: await feature(native.verify,owner,provider,profile,value['session_id'],timeout=8)
+    except HTTPException as exc:
+        if exc.status_code==404: raise HTTPException(404,'Owned assistant conversation unavailable') from None
+        raise
+    if not mobile.register_assistant_conversation(owner,provider,profile,value['session_id']):
+        raise HTTPException(409,'Assistant conversation registration unavailable')
+    return {'registered':True}
 
 def skill_scope(profile,fn):
     # Skills use import-bound directories; use the native router's shared profile lock.
@@ -210,7 +272,7 @@ async def call(request,call_id,writable=False):
                 conn.execute('UPDATE calls SET seen=? WHERE id=? AND owner=? AND profile=? AND closed=0',(time.time(),call_id,owner,row['profile']))
         selected=request.query_params.get('cypher_profile') or request.query_params.get('profile')
         if selected and selected!=row['profile']: raise HTTPException(403,'Call profile mismatch')
-        identity(request,row['profile'])
+        _,_,_,cfg=identity(request,row['profile'])
         reject_unowned_conversation(owner,provider,row['profile'],row['conversation'])
         return owner,provider,row,cfg
     return await asyncio.to_thread(authorize)
@@ -233,7 +295,7 @@ async def bootstrap(request:Request):
     choice=next(item for item in voice_models.choices(cfg,secret) if item['id']==selection['provider'])
     return {'contract_version':2,'backend':'hermes-dashboard','owner_id':owner,'profile':profile,
             'voice':{**selection,'available':choice['available'],'configured':choice['configured'],'availability_scope':'local_configuration'},
-            'capabilities':{'native_jobs':True,'pc_recording':False,'callbacks':bool(cfg.get('callback_tool_enabled',False)),'push':bool(cfg.get('firebase_credentials')),'permanent_recording_retention':False}}
+            'capabilities':{'native_jobs':True,'pc_recording':False,'callbacks':cfg.get('callback_tool_enabled') is True and cfg.get('scheduled_callbacks_enabled') is True,'push':bool(cfg.get('firebase_credentials')),'permanent_recording_retention':False}}
 @router.get('/mobile/voice-settings')
 async def voice_settings(request:Request):
     owner,_,profile,cfg=identity(request)
@@ -467,17 +529,17 @@ def task_clock(profile):
 async def task_capabilities(request:Request):
     owner,provider,profile,cfg=identity(request)
     zone=await feature(task_clock,profile,timeout=8)
-    ready=cfg.get('scheduled_callbacks_enabled') is True and bool(cfg.get('scheduled_callback_conversation_id')) and zone=='Asia/Dubai'
-    return {'timezone':zone,'checkups_ready':ready,'checkups_preview':'3–4 random opportunities daily, 10:00 inclusive to 22:00 exclusive, Asia/Dubai; busy and missed opportunities are skipped.'}
+    ready=cfg.get('scheduled_callbacks_enabled') is True and bool(cfg.get('scheduled_callback_conversation_id')) and bool(zone)
+    return {'timezone':zone,'checkups_ready':ready,'checkups_preview':'3–4 random opportunities daily, 10:00 inclusive to 22:00 exclusive, profile local time; busy and missed opportunities are skipped.'}
 @router.post('/mobile/tasks/checkups')
 async def create_checkups(request:Request):
     value=await body(request,1024)
-    if value: raise HTTPException(400,'Check-up cadence is fixed to the reviewed 3–4 daily Dubai window')
+    if value: raise HTTPException(400,'Check-up cadence is fixed to 3–4 daily opportunities in the profile local 10:00–22:00 window')
     owner,provider,profile,cfg=identity(request)
     if cfg.get('scheduled_callbacks_enabled') is not True: raise HTTPException(409,'Scheduled callbacks are disabled on the host')
     stored=cfg.get('scheduled_callback_conversation_id')
     await feature(native.verify,owner,provider,profile,stored,timeout=8)
-    if await feature(task_clock,profile,timeout=8)!='Asia/Dubai': raise HTTPException(409,'The native profile clock must resolve to Asia/Dubai')
+    if not await feature(task_clock,profile,timeout=8): raise HTTPException(409,'The native profile timezone is unavailable')
     return await task_install(install_checkup_task,profile)
 async def task_install(fn,*args):
     try: return await feature(fn,*args,timeout=8)
@@ -492,9 +554,10 @@ def _install_checkup_task(profile):
     from hermes_cli.web_server_cron import _cron_profile_home,_call_cron_for_profile,_create_cron_job_sync
     from hermes_cli.web_models import CronJobCreate
     _,home=_cron_profile_home(profile)
-    name='Cypher check-ups · 3–4 daily · Dubai 10–22'
+    name='Cypher check-ups · 3–4 daily · local 10–22'
     existing=_call_cron_for_profile(profile,'list_jobs',True)
-    matches=[job for job in existing if job.get('name')==name and job.get('script')=='cypher-checkups.py']
+    matches=[job for job in existing if job.get('script')=='cypher-checkups.py']
+    if len(matches)>1: raise RuntimeError('Multiple Cypher check-up tasks require host inspection')
     scripts=Path(home)/'scripts'
     scripts.mkdir(parents=True,exist_ok=True)
     if scripts.is_symlink() or getattr(scripts,'is_junction',lambda:False)() or scripts.resolve().parent!=Path(home).resolve(): raise ValueError('Unsafe scripts directory')
@@ -505,8 +568,13 @@ def _install_checkup_task(profile):
     legacy=("import importlib.util\nfrom pathlib import Path\nspec=importlib.util.spec_from_file_location('cypher_checkups',"+repr(str(ROOT/'checkups.py'))+")\nmodule=importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\nmodule.run("+repr(str(ROOT))+","+repr(profile)+")\n")
     if target.exists() and target.read_text(encoding='utf-8') not in (source,legacy): raise ValueError('Existing check-up script differs; review it on the host')
     target.write_text(source,encoding='utf-8')
-    if matches: return {'job':matches[0],'existing':True}
-    return {'job':_create_cron_job_sync(CronJobCreate(name=name,schedule='every 1m',prompt='Owner-requested check-ups: 3–4 random opportunities in Asia/Dubai, 10:00–22:00; missed/busy opportunities skipped.',deliver='local',script='cypher-checkups.py',no_agent=True),profile),'existing':False}
+    if matches:
+        if matches[0].get('name')!=name:
+            renamed=_call_cron_for_profile(profile,'update_job',matches[0]['id'],{'name':name})
+            if not isinstance(renamed,dict): raise RuntimeError('Existing check-up task could not be renamed')
+            matches[0]=renamed
+        return {'job':matches[0],'existing':True}
+    return {'job':_create_cron_job_sync(CronJobCreate(name=name,schedule='every 1m',prompt='Owner-requested check-ups: 3–4 random opportunities in the profile local 10:00–22:00 window; missed/busy opportunities skipped.',deliver='local',script='cypher-checkups.py',no_agent=True),profile),'existing':False}
 @router.get('/mobile/notifications/targets')
 async def targets(request:Request):
     owner,_,profile,_=identity(request)
@@ -836,7 +904,10 @@ _release_failures={}
 def announce_release(cfg,package=_PRODUCTION_PACKAGE):
     """A changed verified feed creates durable hints; clients still verify before installing."""
     if package not in (_PRODUCTION_PACKAGE,_STABLE_PACKAGE): raise ValueError('Invalid Cypher package')
-    owner=cfg.get('owner_id');profiles=cfg.get('profiles',[])
+    owner=cfg.get('owner_id');profiles=cfg.get('profiles')
+    if profiles is None:
+        try: profiles=_native_profile_names()
+        except HTTPException: return
     if not owner or not cfg.get('owner_provider') or not profiles: return
     stable=package==_STABLE_PACKAGE
     manifest=_release_root(cfg,stable=stable)/'latest.json'
@@ -1242,7 +1313,9 @@ async def start_watcher():
                         auto_task=asyncio.create_task(run_auto_update(cfg))
                     try: await asyncio.to_thread(announce_release,cfg)
                     except Exception: pass  # A missing/invalid release must not stop call/approval delivery.
-                    for profile in cfg.get('profiles',[]):
+                    profiles=cfg.get('profiles')
+                    if profiles is None: profiles=_native_profile_names()
+                    for profile in profiles:
                         if (cfg['owner_id'],profile) not in _jobs_upgraded:
                             # Once per process, off the delivery loop: warm the slow source scan, then rebuild jobs after an upgrade.
                             _jobs_upgraded.add((cfg['owner_id'],profile))

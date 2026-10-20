@@ -20,7 +20,7 @@ def install_cron_context(api, cfg, tmp_path, monkeypatch, sessions):
     monkeypatch.setitem(sys.modules, 'tui_gateway', SimpleNamespace(server=server))
     monkeypatch.setattr(plugin, 'mobile', api.mobile)
     monkeypatch.setattr(plugin, 'native', api.native)
-    monkeypatch.setattr(api.mobile, 'settings', lambda: cfg)
+    monkeypatch.setattr(api.mobile, 'settings', lambda profile=None: cfg)
     monkeypatch.setattr(api.mobile, 'home', lambda: tmp_path)
     cfg.update(
         callback_tool_enabled=True,

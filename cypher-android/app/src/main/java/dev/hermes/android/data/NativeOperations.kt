@@ -93,6 +93,12 @@ internal class NativeOperations(private val c: CypherClient) {
                 val b = c.nativeCreate(params)
                 require(b.storedSessionId.isNotBlank()) { "Native session has no durable identity yet; submit the first prompt before saving selection" }
                 val cappedEffort = if (path == "/api/cypher/open") capAssistantEffort(b.runtimeSessionId) else null
+                if (path == "/api/cypher/open") try {
+                    kotlinx.coroutines.withTimeoutOrNull(1_500L) {
+                        c.nativeRequest("/api/plugins/cypher/mobile/assistant-conversation", "PUT",
+                            json("profile" to c.auth.profile, "session_id" to b.storedSessionId))
+                    }
+                } catch (cancelled: CancellationException) { throw cancelled } catch (_: Exception) {}
                 return sessionProjection(c.nativeSessionSnapshot().put("messages", JSONArray()).put("acknowledged_shell", true), b).put("profile", c.auth.profile).apply {
                     // The composer shows the effort this chat really got.
                     cappedEffort?.let { put("reasoning_effort", it) }

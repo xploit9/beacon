@@ -27,26 +27,107 @@ HISTORY_RETENTION_EVENTS_PER_BATCH = 1000
 HISTORY_RETENTION_CALLS_PER_BATCH = 100
 AUTO_UPDATE_INTERVAL_SECONDS = 6 * 60 * 60
 
-def settings():
+def _yaml_settings():
     from copy import deepcopy
     path=home()/'config.yaml'
     try:
         from utils import load_yaml_file_readonly
-        if not path.is_file() or path.stat().st_size>1024*1024: return {}
+        if not path.is_file() or path.stat().st_size>1024*1024: return None
         cfg=load_yaml_file_readonly(path)
-    except Exception: return {}  # Native YAML engines differ; unreadable authority always fails closed.
-    if not isinstance(cfg,dict): return {}
+    except Exception: return None  # Native YAML engines differ; unreadable authority always fails closed.
+    if not isinstance(cfg,dict): return None
     plugins=cfg.get('plugins')
-    if not isinstance(plugins,dict): return {}
+    if not isinstance(plugins,dict): return None
     enabled,disabled=plugins.get('enabled',[]),plugins.get('disabled',[])
-    if not isinstance(enabled,list) or not isinstance(disabled,list) or 'cypher' not in enabled or 'cypher' in disabled: return {}
-    entries=plugins.get('entries');entry=entries.get('cypher') if isinstance(entries,dict) else None
-    value=entry.get('settings') if isinstance(entry,dict) else None
-    if not isinstance(value,dict): return {}
-    result=deepcopy(value)
+    if not isinstance(enabled,list) or not isinstance(disabled,list) or 'cypher' not in enabled or 'cypher' in disabled: return None
+    entries=plugins.get('entries')
+    if 'entries' in plugins and not isinstance(entries,dict): return None
+    entry=entries.get('cypher') if isinstance(entries,dict) else None
+    if entry is None: return {}
+    if not isinstance(entry,dict): return None
+    if 'settings' not in entry or entry['settings'] is None: return {}
+    value=entry['settings']
+    return deepcopy(value) if isinstance(value,dict) else None
+
+def _valid_owner_identity(owner,provider):
+    return all(isinstance(value,str) and value.strip() and len(value)<=256 and not any(ord(c)<32 or ord(c)==127 for c in value)
+               for value in (owner,provider))
+
+def _owner_claim():
+    with LOCK,connect() as conn:
+        row=conn.execute("SELECT value FROM meta WHERE key='owner_claim'").fetchone()
+    if not row: return {}
+    try:
+        raw=row['value']
+        if not isinstance(raw,(str,bytes)) or len(raw)>32768: return {}
+        claim=json.loads(raw.decode('utf-8') if isinstance(raw,bytes) else raw)
+        owner,provider=claim.get('owner_id'),claim.get('owner_provider')
+        if not _valid_owner_identity(owner,provider): return {}
+        result={'owner_id':owner,'owner_provider':provider}
+        for key in ('callback_tool_enabled','scheduled_callbacks_enabled'):
+            if type(claim.get(key)) is bool: result[key]=claim[key]
+        conversations=claim.get('scheduled_callback_conversations')
+        if isinstance(conversations,dict) and len(conversations)<=64:
+            result['scheduled_callback_conversations']={profile:session for profile,session in conversations.items()
+                if isinstance(profile,str) and 1<=len(profile)<=80 and not any(ord(c)<32 or ord(c)==127 for c in profile)
+                and isinstance(session,str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,256}',session)}
+        return result
+    except Exception:
+        return {}
+
+def settings(profile=None):
+    result=_yaml_settings()
+    if result is None: return {}
+    claim=_owner_claim()
+    if 'owner_id' not in result and 'owner_provider' not in result:
+        result.update({key:claim[key] for key in ('owner_id','owner_provider') if key in claim})
+    if result.get('owner_id')==claim.get('owner_id') and result.get('owner_provider')==claim.get('owner_provider'):
+        for key in ('callback_tool_enabled','scheduled_callbacks_enabled'):
+            if key not in result and key in claim: result[key]=claim[key]
+        conversations=claim.get('scheduled_callback_conversations',{})
+        if profile and 'scheduled_callback_conversation_id' not in result:
+            stored=conversations.get(profile)
+            if stored: result['scheduled_callback_conversation_id']=stored
     result.setdefault('release_repo','xploit9/cypher')
     result.setdefault('android_stable_certificate_sha256','')
     return result
+
+def claim_owner(owner,provider):
+    if not _valid_owner_identity(owner,provider): raise ValueError('Invalid dashboard owner')
+    settings=_yaml_settings()
+    if settings is None or 'owner_id' in settings or 'owner_provider' in settings: return False
+    value=json.dumps({'owner_id':owner,'owner_provider':provider,'callback_tool_enabled':True,
+                      'scheduled_callbacks_enabled':True},separators=(',',':'))
+    with LOCK,connect() as conn:
+        created=conn.execute('INSERT OR IGNORE INTO meta(key,value) VALUES(?,?)',('owner_claim',value)).rowcount==1
+    return created
+
+def register_assistant_conversation(owner,provider,profile,session_id):
+    if (not _valid_owner_identity(owner,provider) or not isinstance(profile,str) or not 1<=len(profile)<=80
+            or any(ord(c)<32 or ord(c)==127 for c in profile)
+            or not isinstance(session_id,str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,256}',session_id)):
+        raise ValueError('Invalid assistant conversation registration')
+    configured=_yaml_settings()
+    if configured is None or ('owner_id' in configured or 'owner_provider' in configured) and (
+            configured.get('owner_id')!=owner or configured.get('owner_provider')!=provider):
+        return False
+    with LOCK,connect() as conn:
+        row=conn.execute("SELECT value FROM meta WHERE key='owner_claim'").fetchone()
+        try: claim=json.loads(row['value']) if row else {'owner_id':owner,'owner_provider':provider}
+        except (TypeError,ValueError): return False
+        if not isinstance(claim,dict): return False
+        if claim.get('owner_id')!=owner or claim.get('owner_provider')!=provider:
+            if configured.get('owner_id')!=owner or configured.get('owner_provider')!=provider: return False
+            claim={'owner_id':owner,'owner_provider':provider}
+        conversations=claim.get('scheduled_callback_conversations',{})
+        if not isinstance(conversations,dict) or len(conversations)>64: return False
+        if profile not in conversations and len(conversations)>=64: return False
+        conversations[profile]=session_id
+        claim['scheduled_callback_conversations']=conversations
+        value=json.dumps(claim,separators=(',',':'))
+        if len(value)>32768: return False
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('owner_claim',?)",(value,))
+    return True
 
 def home():
     from hermes_constants import get_process_hermes_home

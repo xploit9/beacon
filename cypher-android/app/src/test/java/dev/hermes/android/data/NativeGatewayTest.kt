@@ -14,6 +14,7 @@ import kotlinx.coroutines.channels.Channel
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.Buffer
 import okio.ByteString
 import org.json.JSONArray
 import org.json.JSONObject
@@ -74,6 +75,8 @@ class NativeGatewayTest {
         val eventsReady = CompletableDeferred<Unit>()
         var socketCount = 0
         var rejectCapabilities = false
+        var assistantRegistrationStatus = 200
+        val nativeRequests = mutableListOf<Triple<String, String, JSONObject>>()
         var requestDuringResume: JSONObject? = null
         var currentSocket: WebSocket? = null
         var currentListener: WebSocketListener? = null
@@ -122,8 +125,18 @@ class NativeGatewayTest {
                 listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Fixture").build())
                 socket
             }) { builder ->
-                builder.addInterceptor { chain -> Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
-                    .body(json("ticket" to "fixture-ticket").toString().toResponseBody("application/json".toMediaType())).build() }
+                builder.addInterceptor { chain ->
+                    val request=chain.request();val body=Buffer()
+                    request.body?.writeTo(body)
+                    val payload=body.readUtf8().takeIf(String::isNotBlank)?.let(::JSONObject) ?: JSONObject()
+                    nativeRequests += Triple(request.url.encodedPath,request.method,payload)
+                    val registration=request.url.encodedPath.endsWith("/mobile/assistant-conversation")
+                    val status=if(registration) assistantRegistrationStatus else 200
+                    val response=if(registration && status>=400) json("detail" to "fixture rejection")
+                        else if(registration) json("registered" to true) else json("ticket" to "fixture-ticket")
+                    Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(status).message("Fixture")
+                        .body(response.toString().toResponseBody("application/json".toMediaType())).build()
+                }
             }
 
         fun emitServerRequest(method: String, id: Any, params: JSONObject) {
@@ -155,6 +168,20 @@ class NativeGatewayTest {
         assertTrue(fixture.connectionCalls.single().indexOf("client.capabilities") < fixture.connectionCalls.single().indexOf("session.create"))
         assertEquals("phone-runtime", fixture.calls.last().second.getString("session_id"))
         fixture.client.closeNative()
+    }
+
+    @Test fun assistantOpenRegistersItsStoredConversationBestEffort() = runBlocking<Unit> {
+        val fixture=GatewayFixture().apply { assistantRegistrationStatus=403 }
+
+        val opened=fixture.client.post("/api/cypher/open")
+
+        assertEquals("20261019_001507_a4cbef",opened.getString("session_id"))
+        assertEquals(1,fixture.nativeRequests.size)
+        val (path,method,body)=fixture.nativeRequests.single()
+        assertEquals("/api/plugins/cypher/mobile/assistant-conversation",path)
+        assertEquals("PUT",method)
+        assertEquals("default",body.getString("profile"))
+        assertEquals("20261019_001507_a4cbef",body.getString("session_id"))
     }
 
     @Test fun capabilitiesPrecedeEveryConnectionAndMethodNotFoundDoesNotBlockResume() = runBlocking<Unit> {

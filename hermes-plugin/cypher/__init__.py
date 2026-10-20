@@ -27,21 +27,14 @@ def call_user(args,session_id=None,**kwargs):
     cfg=mobile.settings()
     if cfg.get('callback_tool_enabled') is not True:
         return json.dumps({'error':'Native callback tool disabled'})
-    from hermes_constants import get_hermes_home
     from tui_gateway import server
     owner=cfg.get('owner_id');provider=cfg.get('owner_provider')
     if not owner or not provider or not session_id:
         return json.dumps({'error':'Bound native owner/session required'})
-    # Identify current profile by the native context home, never a tool-supplied profile.
-    matches=[];resolution_failed=False
-    for profile in cfg.get('profiles',[]):
-        try:
-            requested=server._profile_home(profile)
-            target=Path(requested) if requested else mobile.home()
-            if target.resolve()==Path(get_hermes_home()).resolve(): matches.append(profile)
-        except Exception: resolution_failed=True
-    if len(matches)!=1: return json.dumps({'error':'Native profile scope unavailable','reason':'profile_resolution_failed' if resolution_failed else 'no_unique_profile'})
-    profile=matches[0]
+    # Resolve from native profiles when the owner claim leaves profiles unset.
+    try: profile=current_profile(cfg)
+    except Exception: return json.dumps({'error':'Native profile scope unavailable','reason':'profile_resolution_failed'})
+    cfg=mobile.settings(profile)
     try:
         stored=session_id
         with server._profile_db({'profile':profile}) as db:
@@ -107,6 +100,7 @@ def native_live_context(session_id=None,**kwargs):
     try:
         if not session_id: return None
         profile=current_profile(cfg)
+        cfg=mobile.settings(profile)
         owner,provider=cfg.get('owner_id'),cfg.get('owner_provider')
         if not owner or not provider: return None
     except (LookupError,ValueError,RuntimeError):
@@ -124,7 +118,8 @@ def native_live_context(session_id=None,**kwargs):
 
 def _watch_context(cfg,profile,session_id):
     owner,provider=cfg.get('owner_id'),cfg.get('owner_provider')
-    if not owner or not provider or profile not in cfg.get('profiles',[]) or not session_id:
+    if (not owner or not provider or not session_id
+            or 'profiles' in cfg and (not isinstance(cfg['profiles'],list) or profile not in cfg['profiles'])):
         raise LookupError('Owned Proactive profile required')
     row=_cron_row(profile,session_id)
     if not row or row.get('source')!='cron': raise LookupError('A Proactive watch session is required')
@@ -140,6 +135,7 @@ def native_mailbox_observation(tool_name=None,result=None,status=None,session_id
     cfg=mobile.settings()
     try:
         profile=current_profile(cfg)
+        cfg=mobile.settings(profile)
         _watch_context(cfg,profile,session_id)
         observers.source_observed(mobile,cfg,profile,session_id,tool_name,result,status)
     except (ImportError,LookupError,RuntimeError,ValueError):
@@ -148,6 +144,7 @@ def native_mailbox_observation(tool_name=None,result=None,status=None,session_id
 def email_notice(args,session_id=None,**kwargs):
     try:
         cfg=mobile.settings();profile=current_profile(cfg)
+        cfg=mobile.settings(profile)
         _watch_context(cfg,profile,session_id)
         return json.dumps(observers.email_notice(mobile,native,cfg,profile,session_id,args,proactive.profile_now(profile)))
     except (LookupError,ValueError,RuntimeError) as exc:
@@ -156,6 +153,7 @@ def email_notice(args,session_id=None,**kwargs):
 def email_checked(args,session_id=None,**kwargs):
     try:
         cfg=mobile.settings();profile=current_profile(cfg)
+        cfg=mobile.settings(profile)
         spec=_watch_context(cfg,profile,session_id)
         return json.dumps(proactive.record_email_check(profile,spec['job_id'],args))
     except (LookupError,ValueError,RuntimeError) as exc:
@@ -165,6 +163,7 @@ def create_proactive_request(args,session_id=None,**kwargs):
     try:
         if not isinstance(args,dict): raise ValueError('Request fields are required')
         cfg=mobile.settings();profile=current_profile(cfg)
+        cfg=mobile.settings(profile)
         owner,provider=cfg.get('owner_id'),cfg.get('owner_provider')
         if not owner or not provider or not session_id: raise LookupError('Owned interactive conversation required')
         row=_cron_row(profile,session_id)
@@ -184,6 +183,7 @@ def native_completion(**kwargs):
     cfg=mobile.settings()
     try:
         profile=current_profile(cfg)
+        cfg=mobile.settings(profile)
         observers.completion(mobile,native,cfg,profile,**kwargs)
     except (LookupError,ValueError,RuntimeError): return
 
@@ -194,6 +194,7 @@ def native_voice_context(session_id=None, conversation_history=None, **kwargs):
         if not session_id:
             return None
         profile = current_profile(cfg)
+        cfg = mobile.settings(profile)
         owner, provider = cfg.get('owner_id'), cfg.get('owner_provider')
         if not owner or not provider:
             return None

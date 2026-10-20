@@ -76,6 +76,8 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
     val proactiveLoaded = proactive != null && proactive.has("enabled") && !proactive.has("_error")
     val proactiveEnabled = proactiveLoaded && proactive?.optBoolean("enabled") == true
     val pluginStatus = ui.bootstrap.optJSONObject("optional_features")?.optString("plugin").orEmpty()
+    val callbacksAvailable = ui.bootstrap.optJSONObject("optional_features")
+        ?.optJSONObject("capabilities")?.optBoolean("callbacks") == true
     val scope = rememberCoroutineScope()
     var savingProactive by remember(profile) { mutableStateOf(false) }
     var proactiveRefresh by remember(profile) { mutableIntStateOf(0) }
@@ -219,6 +221,8 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                     val controlsEnabled = ui.connected && vm.client != null && !savingProactive
                     Text(uiText("When one arrives"), style = MaterialTheme.typography.titleMedium)
                     Choice("Delivery", proactiveDelivery, listOf("notify", "call"), { proactiveDelivery = it }, Modifier.testTag("proactive-delivery"), mapOf("notify" to "Notify", "call" to "Call"), controlsEnabled)
+                    if (proactiveCallsUnavailable(proactive, proactiveDelivery, callbacksAvailable))
+                        Text(uiText("Calls are off on this Hermes. You'll get a notification instead."), Modifier.testTag("proactive-calls-off"), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Choice("Check every", proactiveCheckMinutes.toString(), listOf("5", "15", "30"), { proactiveCheckMinutes = it.toInt() }, Modifier.testTag("proactive-check-minutes"), mapOf("5" to "5 min", "15" to "15 min", "30" to "30 min"), controlsEnabled)
                     ProactiveTimePicker("Quiet hours start", proactiveQuietStart, controlsEnabled) { proactiveQuietStart = it }
                     ProactiveTimePicker("Quiet hours end", proactiveQuietEnd, controlsEnabled) { proactiveQuietEnd = it }

@@ -94,7 +94,7 @@ def completion(mobile, native, cfg, profile, session_id, turn_id, completed=Fals
     if (completed is not True and failed is not True) or interrupted or not session_id or not turn_id:
         return
     owner, provider = cfg.get("owner_id"), cfg.get("owner_provider")
-    if not owner or not provider or profile not in cfg.get("profiles", []):
+    if not owner or not provider or not _profile_allowed(cfg,profile):
         return
     row = native.verify(owner, provider, profile, session_id)
     kind = "failure" if failed is True else ("task_result" if row.get("source") == "cron" else "completion")
@@ -189,9 +189,12 @@ def _source_error(value, depth=0, budget=None):
 def _evidence_key(owner, profile, session_id):
     return f"email-evidence:{owner}:{profile}:{session_id}"
 
+def _profile_allowed(cfg,profile):
+    return 'profiles' not in cfg or isinstance(cfg['profiles'],list) and profile in cfg['profiles']
+
 
 def source_observed(mobile, cfg, profile, session_id, tool_name, result, status):
-    if (status not in ("ok", "success") or not session_id or profile not in cfg.get("profiles", [])):
+    if (status not in ("ok", "success") or not session_id or not _profile_allowed(cfg,profile)):
         return False
     if _source_error(result):
         return False
@@ -264,7 +267,7 @@ def email_notice(mobile, native, cfg, profile, session_id, args, now):
     from cypher_proactive import EMAIL_RULE_PREFIX, _setup, _setup_complete, enabled, list_requests
 
     owner, provider = cfg.get("owner_id"), cfg.get("owner_provider")
-    if not owner or not provider or profile not in cfg.get("profiles", []) or not session_id:
+    if not owner or not provider or not _profile_allowed(cfg,profile) or not session_id:
         raise ValueError("Owned proactive session required")
     if not isinstance(args, dict) or set(args) - {"request_id", "item_id", "reason"} or not {"item_id", "reason"} <= set(args):
         raise ValueError("Item id and reason are required; request_id is optional")

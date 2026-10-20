@@ -29,7 +29,7 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)
     cfg = {'owner_id': 'owner', 'owner_provider': 'basic', 'profiles': ['default']}
-    monkeypatch.setattr(module.mobile, 'settings', lambda: cfg)
+    monkeypatch.setattr(module.mobile, 'settings', lambda profile=None: cfg)
     return module
 
 
@@ -49,7 +49,7 @@ def invoke_call_user(env, monkeypatch, args, title='Plain conversation'):
     plugin.mobile = mobile
     plugin.native = native
     cfg.update(callback_tool_enabled=True)
-    monkeypatch.setattr(mobile, 'settings', lambda: cfg)
+    monkeypatch.setattr(mobile, 'settings', lambda profile=None: cfg)
     monkeypatch.setattr(mobile, 'home', lambda: tmp_path)
     monkeypatch.setattr(native, 'verify', lambda *values: {})
     row = {'user_id': 'basic:owner', 'title': title}
@@ -117,7 +117,7 @@ def test_email_notice_rejects_invalid_reason_with_real_evidence(harness, monkeyp
     api.proactive._meta_set(api.mobile, api.proactive._key('owner', 'default', 'enabled'), '1')
     api.proactive._meta_set(api.mobile, api.proactive._key('owner', 'default', 'setup_complete'), '1')
     monkeypatch.setattr(api.native, 'verify', lambda *args: {'messages': []})
-    now = datetime(2026, 10, 16, 12, tzinfo=ZoneInfo('Asia/Dubai'))
+    now = datetime(2026, 10, 16, 12, tzinfo=ZoneInfo('America/Los_Angeles'))
     monkeypatch.setattr(observers, 'time', SimpleNamespace(time=lambda: now.timestamp()))
     assert observers.source_observed(api.mobile, cfg, 'default', 'watch-session',
                                      'mcp__mail__read_message', {'messages': [{'id': 'message-1'}]}, 'ok')

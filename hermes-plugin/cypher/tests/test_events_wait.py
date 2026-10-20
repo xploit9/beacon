@@ -85,7 +85,7 @@ def _replay_deferred_proactive_call(api, client, cfg, monkeypatch, night):
             'enabled': True, 'signal': 'email'}
     monkeypatch.setattr(api.proactive, 'list_requests', lambda *args: [rule])
     active_call = client.post('/api/plugins/cypher/mobile/calls', json={'profile': 'default'}).json()['call_id']
-    now = datetime(2026, 10, 20, 12, 0, tzinfo=ZoneInfo('Asia/Dubai'))
+    now = datetime(2026, 10, 20, 12, 0, tzinfo=ZoneInfo('America/Los_Angeles'))
     observers = api.sys.modules['cypher_observers']
     monkeypatch.setattr(observers, 'time', SimpleNamespace(time=lambda: now.timestamp()))
     assert observers.source_observed(api.mobile, cfg, 'default', 'watch-run', 'mcp__mail__read_email',
@@ -96,7 +96,7 @@ def _replay_deferred_proactive_call(api, client, cfg, monkeypatch, night):
     invitation = alert['event_id']
     with api.mobile.connect() as conn:
         reason = conn.execute('SELECT reason FROM deferred WHERE id=?', (invitation,)).fetchone()['reason']
-    quiet_now = datetime(2026, 10, 20, 23, 0, tzinfo=ZoneInfo('Asia/Dubai'))
+    quiet_now = datetime(2026, 10, 20, 23, 0, tzinfo=ZoneInfo('America/Los_Angeles'))
     monkeypatch.setattr(api.proactive, '_setup', lambda *args: {'quiet_start': '22:00', 'quiet_end': '07:00'})
     monkeypatch.setattr(api.proactive, 'profile_now', lambda profile: quiet_now)
     assert client.delete(f'/api/plugins/cypher/mobile/calls/{active_call}').status_code == 200
@@ -126,7 +126,7 @@ def test_deferred_night_request_still_rings_inside_quiet_hours(harness, monkeypa
 def test_missed_scheduled_callback_posts_notice_before_delete(harness, monkeypatch):
     api, client, cfg, _, _ = harness
     cfg['scheduled_callbacks_enabled'] = True
-    target = datetime(2026, 10, 20, 12, 0, tzinfo=ZoneInfo('Asia/Dubai'))
+    target = datetime(2026, 10, 20, 12, 0, tzinfo=ZoneInfo('America/Los_Angeles'))
     event = 'c' * 64
     key = 'scheduled-callback:' + event
     record = {

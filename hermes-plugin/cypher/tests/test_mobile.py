@@ -22,7 +22,8 @@ def harness(tmp_path,monkeypatch):
     spec=importlib.util.spec_from_file_location(name,ROOT/'dashboard'/'plugin_api.py')
     api=importlib.util.module_from_spec(spec);sys.modules[name]=api;spec.loader.exec_module(api)
     cfg={'owner_id':'owner','owner_provider':'basic','profiles':['default'],'scheduled_callback_conversation_id':'assistant-chat','archive_root':str(tmp_path/'call-recordings')}
-    monkeypatch.setattr(api.mobile,'settings',lambda:cfg)
+    api._cypher_original_mobile_settings=api.mobile.settings
+    monkeypatch.setattr(api.mobile,'settings',lambda profile=None:cfg)
     monkeypatch.setattr(api.mobile,'home',lambda:tmp_path)
     monkeypatch.setattr(api,'secret',lambda cfg:None)
     monkeypatch.setattr(api.native,'verify',lambda *args:{'messages':[]})
@@ -34,7 +35,9 @@ def harness(tmp_path,monkeypatch):
     @app.middleware('http')
     async def auth(request:Request,call_next):
         # Fixture injection is defined in this test only; production exposes no bypass.
-        if request.headers.get('x-fixture-owner'):
+        if request.headers.get('x-fixture-bearer'):
+            request.state.session=SimpleNamespace(user_id=request.headers['x-fixture-bearer'],provider='basic')
+        elif request.headers.get('x-fixture-owner'):
             request.state.session=SimpleNamespace(user_id=request.headers['x-fixture-owner'],provider='basic')
         return await call_next(request)
     app.include_router(api.router,prefix='/api/plugins/cypher')
@@ -799,24 +802,25 @@ def load_private(name):
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
     return module
 
-def test_checkup_slots_are_daily_bounded_persistent_and_no_catchup(harness):
+def test_checkup_slots_are_daily_bounded_persistent_and_no_catchup(harness,monkeypatch):
     from datetime import datetime
     from datetime import tzinfo,timedelta
     class FixtureZone(tzinfo):
         def __init__(self,key): self.key=key
-        def utcoffset(self,dt): return timedelta(hours=4 if self.key=="Asia/Dubai" else 0)
+        def utcoffset(self,dt): return timedelta(hours=-7 if self.key=="America/Los_Angeles" else 0)
         def dst(self,dt): return timedelta(0)
     ZoneInfo=FixtureZone
     api,c,cfg,tmp,app=harness
     check=load_private('checkups')
     cfg.update(scheduled_callbacks_enabled=True,scheduled_callback_conversation_id='owned-chat')
+    monkeypatch.setattr(check,'_profile_timezone',lambda profile:'America/Los_Angeles')
     for day in ('2026-10-13','2026-10-14','2026-10-15'):
         times=check.slots('owner','default',day)
         assert len(times) in (3,4) and len(set(times))==len(times)
         assert all(600<=minute<1320 for minute in times)
     times=check.slots('owner','default','2026-10-14')
     minute=times[0]
-    now=datetime(2026,10,14,minute//60,minute%60,tzinfo=ZoneInfo('Asia/Dubai'))
+    now=datetime(2026,10,14,minute//60,minute%60,tzinfo=ZoneInfo('America/Los_Angeles'))
     first=check.tick(api.mobile,api.native,cfg,'default',now)
     assert first['state']=='pending'
     assert check.tick(api.mobile,api.native,cfg,'default',now)['state']=='already_considered'
@@ -851,6 +855,22 @@ def test_task_presets_fail_closed_and_never_install_from_unverified_capabilities
     assert c.post(base+'/mail-monitor',json={}).status_code==404
     assert c.post(base+'/checkups',json={'schedule':'every random hour'}).status_code==400
     assert not (tmp/'scripts').exists()
+
+
+def test_checkups_accept_a_non_default_profile_timezone(harness,monkeypatch):
+    api,c,cfg,_,_=harness
+    cfg.update(scheduled_callbacks_enabled=True,scheduled_callback_conversation_id='owned-chat')
+    monkeypatch.setattr(api,'task_clock',lambda profile:'America/Los_Angeles')
+    async def install(fn,profile): return {'installed_for':profile}
+    monkeypatch.setattr(api,'task_install',install)
+    base='/api/plugins/cypher/mobile/tasks'
+
+    capabilities=c.get(base+'/capabilities')
+    assert capabilities.status_code==200
+    assert capabilities.json()['timezone']=='America/Los_Angeles'
+    assert capabilities.json()['checkups_ready'] is True
+    created=c.post(base+'/checkups',json={})
+    assert created.status_code==200 and created.json()=={'installed_for':'default'}
 
 
 def test_native_task_presets_use_native_cron_contract_and_script_only_fixture_home(harness,monkeypatch):

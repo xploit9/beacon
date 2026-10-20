@@ -70,6 +70,7 @@ From the dashboard's authenticated browser session, verify that:
 
 - The dashboard is reachable.
 - The **Cypher** tab is visible.
+- The owner opens the Cypher tab and, if prompted, taps “Use Cypher with this Hermes account” once.
 - The owner-authorized `GET /api/plugins/cypher/connect-info` succeeds and the tab displays its QR.
 
 Do not copy, print, or log the route response. Loopback mode may include a session value in that response. If the route reports that a public HTTPS URL is required, the phone cannot use a loopback or plain-HTTP address. Tailscale Serve over HTTPS is the recommended way to make the dashboard reachable from the phone. Ask before changing network settings; do not enable Serve, open ports, or change firewall/bind settings on your own.

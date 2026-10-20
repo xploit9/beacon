@@ -19,6 +19,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.hermes.android.CypherViewModel
+import dev.hermes.android.cypherOwnerSetupMessage
 import dev.hermes.android.isMissingCypherPluginRoute
 import dev.hermes.android.core.rows
 import dev.hermes.android.core.string
@@ -84,8 +85,9 @@ internal fun CallHistorySheet(vm: CypherViewModel, onOpenCall: (conversationId: 
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: Exception) {
-            retryAvailable = !isMissingCypherPluginRoute(failure)
-            error = if (retryAvailable) "Call history unavailable" else "Update the Cypher plugin on Hermes to see call history."
+            val ownerSetup = cypherOwnerSetupMessage(failure)
+            retryAvailable = ownerSetup == null && !isMissingCypherPluginRoute(failure)
+            error = ownerSetup ?: if (retryAvailable) "Call history unavailable" else "Update the Cypher plugin on Hermes to see call history."
         } finally {
             loading = false
         }

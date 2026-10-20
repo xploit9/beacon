@@ -21,6 +21,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import dev.hermes.android.CypherViewModel
+import dev.hermes.android.cypherOwnerSetupMessage
 import dev.hermes.android.core.json
 import dev.hermes.android.core.string
 import dev.hermes.android.data.AppPreferences
@@ -61,6 +62,13 @@ internal fun proactiveSettingsValid(settings: JSONObject): Boolean =
         proactiveTimePattern.matches(settings.optString("quiet_start")) &&
         proactiveTimePattern.matches(settings.optString("quiet_end"))
 
+internal fun proactiveCallsUnavailable(proactive: JSONObject?, delivery: String, callbacksAvailable: Boolean): Boolean {
+    if (callbacksAvailable) return false
+    if (delivery == "call") return true
+    val rules=proactive?.optJSONArray("rules") ?: return false
+    return (0 until rules.length()).any { rules.optJSONObject(it)?.string("action") == "call" }
+}
+
 internal fun proactiveHealthText(proactive: JSONObject): String {
     val health = proactive.optJSONObject("health") ?: JSONObject()
     return when (health.string("state", "unknown")) {
@@ -78,8 +86,9 @@ internal fun proactiveHealthText(proactive: JSONObject): String {
 }
 
 internal fun proactiveErrorMessage(error: Throwable, fallback: String): String =
-    if (isMissingCypherPluginRoute(error)) "Update the Cypher plugin on Hermes to use Proactive."
-    else (error as? ApiFailure)?.message?.takeIf(String::isNotBlank) ?: error.message?.takeIf(String::isNotBlank) ?: fallback
+    cypherOwnerSetupMessage(error)
+        ?: if (isMissingCypherPluginRoute(error)) "Update the Cypher plugin on Hermes to use Proactive."
+        else (error as? ApiFailure)?.message?.takeIf(String::isNotBlank) ?: error.message?.takeIf(String::isNotBlank) ?: fallback
 
 internal fun proactiveLearnedNotes(proactive: JSONObject): List<String> {
     val notes = proactive.optJSONArray("learned") ?: return emptyList()

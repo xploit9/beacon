@@ -98,11 +98,21 @@ def watch_job_ids(mobile, owner, profile):
 
 
 def current_profile(cfg):
-    from hermes_constants import get_hermes_home, get_process_hermes_home
+    import hermes_constants
     from tui_gateway import server
+    get_hermes_home=hermes_constants.get_hermes_home
+    get_process_hermes_home=getattr(hermes_constants,'get_process_hermes_home',get_hermes_home)
 
+    profiles=cfg.get('profiles')
+    if 'profiles' not in cfg:
+        from hermes_cli import profiles as native_profiles
+        profiles=[getattr(profile,'name',None) for profile in native_profiles.list_profiles(lazy_skill_count=True)]
+    if (not isinstance(profiles,list) or not 1<=len(profiles)<=64
+            or any(not isinstance(profile,str) or not profile.strip() or len(profile)>80 for profile in profiles)
+            or len(set(profiles))!=len(profiles)):
+        raise ValueError("Native profile scope unavailable")
     matches = []
-    for profile in cfg.get("profiles", []):
+    for profile in profiles:
         requested = server._profile_home(profile)
         target = Path(requested) if requested else Path(get_process_hermes_home())
         if target.resolve() == Path(get_hermes_home()).resolve():

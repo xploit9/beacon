@@ -11,7 +11,6 @@ import re
 import sys
 import tempfile
 
-ZONE = 'Asia/Dubai'
 CALLBACK_WINDOW_SECONDS=120
 CALLBACK_EARLY_TOLERANCE_SECONDS=1
 CALLBACK_MARKER_RETENTION_SECONDS=CALLBACK_WINDOW_SECONDS+7*24*60*60
@@ -22,6 +21,13 @@ observers=sys.modules.get(_OBSERVER_KEY)
 if observers is None:
     spec=importlib.util.spec_from_file_location(_OBSERVER_KEY,Path(__file__).with_name('observers.py'))
     observers=importlib.util.module_from_spec(spec);sys.modules[_OBSERVER_KEY]=observers;spec.loader.exec_module(observers)
+
+def _profile_timezone(profile):
+    key='cypher_proactive'
+    if key not in sys.modules:
+        spec=importlib.util.spec_from_file_location(key,Path(__file__).with_name('proactive.py'))
+        module=importlib.util.module_from_spec(spec);sys.modules[key]=module;spec.loader.exec_module(module)
+    return sys.modules[key]._profile_timezone(profile)
 
 def _prune_expired(conn,now):
     cutoff=now-CALLBACK_MARKER_RETENTION_SECONDS-1
@@ -34,7 +40,7 @@ def _prune_expired(conn,now):
     conn.executemany('DELETE FROM meta WHERE key=?',keys)
 
 def prune_expired(mobile,owner,now=None):
-    now=now if now is not None else datetime.now(ZoneInfo(ZONE)).timestamp()
+    now=now if now is not None else datetime.now().timestamp()
     key='scheduled-callback-prune:'+hashlib.sha256(owner.encode('utf-8')).hexdigest()
     with mobile.LOCK,mobile.connect() as conn:
         row=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
@@ -55,7 +61,7 @@ def target_time(value, now):
         if not isinstance(value['at'],str): raise ValueError('Expected timezone-aware ISO callback time')
         target=datetime.fromisoformat(value['at'].replace('Z','+00:00'))
         if target.tzinfo is None or target.utcoffset() is None: raise ValueError('Callback time needs a timezone')
-    target=target.astimezone(ZoneInfo(ZONE))
+    target=target.astimezone(now.tzinfo)
     if not now<target<=now+timedelta(days=366): raise ValueError('Callback must be within the next year')
     return target
 
@@ -84,10 +90,14 @@ def script_file(home, name, source):
 def schedule(mobile,native,owner,provider,row,cfg,value,now=None):
     from hermes_cli.web_server_cron import _cron_profile_home,_call_cron_for_profile,_create_cron_job_sync
     from hermes_cli.web_models import CronJobCreate
-    now=now or datetime.now(ZoneInfo(ZONE))
     profile=row['profile'];stored=row['conversation']
+    timezone_name=_profile_timezone(profile);zone=ZoneInfo(timezone_name)
+    now=now or datetime.now(zone)
+    if now.tzinfo is None or now.utcoffset() is None: raise ValueError('Callback time needs the profile timezone')
+    now=now.astimezone(zone)
     if cfg.get('scheduled_callbacks_enabled') is not True: raise ValueError('Scheduled callbacks are disabled on the host')
-    if owner!=cfg.get('owner_id') or provider!=cfg.get('owner_provider') or profile not in cfg.get('profiles',[]): raise LookupError('Callback owner/profile unavailable')
+    if (owner!=cfg.get('owner_id') or provider!=cfg.get('owner_provider')
+            or 'profiles' in cfg and (not isinstance(cfg['profiles'],list) or profile not in cfg['profiles'])): raise LookupError('Callback owner/profile unavailable')
     native.verify(owner,provider,profile,stored)
     request=value.get('request_id');reason=value.get('reason')
     if not isinstance(request,str) or not mobile.ID.fullmatch(request): raise ValueError('Stable callback request_id required')
@@ -113,7 +123,7 @@ def schedule(mobile,native,owner,provider,row,cfg,value,now=None):
                 record=json.loads(conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()[0])
             if record['fingerprint']!=fingerprint or record['conversation']!=stored: raise ValueError('Callback request_id already used for another request')
         if record['status']=='scheduled':
-            return {k:record[k] for k in ('status','request_id','job_id','scheduled_at')} | {'timezone':ZONE,'conversation_id':stored}
+            return {k:record[k] for k in ('status','request_id','job_id','scheduled_at')} | {'timezone':timezone_name,'conversation_id':stored}
     # Persist intent before native creation. A crash/timeout can be reconciled by its stable name.
     name='Cypher callback '+key.split(':')[1]
     matches=[j for j in _call_cron_for_profile(profile,'list_jobs',True) if j.get('name')==name]
@@ -139,19 +149,20 @@ def schedule(mobile,native,owner,provider,row,cfg,value,now=None):
             current=json.loads(conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()[0])
             if current.get('delivered'): record['delivered']=current['delivered']
             conn.execute('UPDATE meta SET value=? WHERE key=?',(json.dumps(record).encode(),key))
-    return {k:record[k] for k in ('status','request_id','job_id','scheduled_at')} | {'timezone':ZONE,'conversation_id':stored}
+    return {k:record[k] for k in ('status','request_id','job_id','scheduled_at')} | {'timezone':timezone_name,'conversation_id':stored}
 
 def deliver(mobile,native,key,now):
-    cfg=mobile.settings()
     with mobile.LOCK,mobile.connect() as conn:
         _prune_expired(conn,now.timestamp())
         found=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
         if not found: raise ValueError('Callback intent unavailable')
-        row=json.loads(found[0]);target=datetime.fromisoformat(row['scheduled_at'])
+        row=json.loads(found[0]);cfg=mobile.settings(row['profile']);target=datetime.fromisoformat(row['scheduled_at'])
         age=(now-target).total_seconds()
         if not -CALLBACK_EARLY_TOLERANCE_SECONDS<=age<CALLBACK_WINDOW_SECONDS: return {'status':'skipped_expired'}
         if row.get('delivered'): return {'status':'duplicate'}
-        if cfg.get('scheduled_callbacks_enabled') is not True or cfg.get('owner_id')!=row['owner'] or cfg.get('owner_provider')!=row['provider'] or row['profile'] not in cfg.get('profiles',[]): raise ValueError('Callback authority changed')
+        if (cfg.get('scheduled_callbacks_enabled') is not True or cfg.get('owner_id')!=row['owner']
+                or cfg.get('owner_provider')!=row['provider']
+                or 'profiles' in cfg and (not isinstance(cfg['profiles'],list) or row['profile'] not in cfg['profiles'])): raise ValueError('Callback authority changed')
         native.verify(row['owner'],row['provider'],row['profile'],row['conversation'])
         # Exact deterministic notice id makes retry atomic with its delivery marker.
         event=key.split(':')[1]
@@ -199,4 +210,9 @@ def run(key):
         if module_key not in sys.modules:
             spec=importlib.util.spec_from_file_location(module_key,Path(__file__).with_name(name+'.py'))
             module=importlib.util.module_from_spec(spec);sys.modules[module_key]=module;spec.loader.exec_module(module)
-    deliver(sys.modules['cypher_mobile'],sys.modules['cypher_native'],key,datetime.now(ZoneInfo(ZONE)))
+    with sys.modules['cypher_mobile'].connect() as conn:
+        found=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
+    if not found: raise ValueError('Callback intent unavailable')
+    profile=json.loads(found[0])['profile']
+    deliver(sys.modules['cypher_mobile'],sys.modules['cypher_native'],key,
+            datetime.now(ZoneInfo(_profile_timezone(profile))))

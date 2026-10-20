@@ -12,15 +12,16 @@ def load(name):
 def env(tmp_path,monkeypatch):
     m=load('mobile');monkeypatch.setattr(m,'home',lambda:tmp_path)
     cfg={'owner_id':'owner','owner_provider':'basic','profiles':['default'],'scheduled_callbacks_enabled':True}
-    monkeypatch.setattr(m,'settings',lambda:cfg)
+    monkeypatch.setattr(m,'settings',lambda profile=None:cfg)
     jobs=[]
     def create(model,profile):
         job={**vars(model),'id':'native'+str(len(jobs))};jobs.append(job);return job
     monkeypatch.setitem(sys.modules,'hermes_cli.web_server_cron',SimpleNamespace(_cron_profile_home=lambda p:(p,tmp_path),_call_cron_for_profile=lambda *a:jobs,_create_cron_job_sync=create))
     monkeypatch.setitem(sys.modules,'hermes_cli.web_models',SimpleNamespace(CronJobCreate=lambda **kw:SimpleNamespace(**kw)))
     native=SimpleNamespace(verify=lambda *a: {})
-    return load('callbacks'),m,native,cfg,jobs,tmp_path
-NOW=datetime(2026,10,16,23,tzinfo=ZoneInfo('Asia/Dubai'))
+    cb=load('callbacks');monkeypatch.setattr(cb,'_profile_timezone',lambda profile:'America/Los_Angeles',raising=False)
+    return cb,m,native,cfg,jobs,tmp_path
+NOW=datetime(2026,10,16,19,tzinfo=ZoneInfo('UTC'))
 ROW={'profile':'default','conversation':'owned','closed':0}
 VALUE={'request_id':'stable','reason':'Requested reminder','delay_seconds':60}
 def test_schedule_native_one_shot_replay_after_call_end(env):
@@ -28,7 +29,8 @@ def test_schedule_native_one_shot_replay_after_call_end(env):
     first=cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
     with pytest.raises(ValueError,match='expired'):
         cb.schedule(m,n,'owner','basic',{**ROW,'closed':1},cfg,VALUE,NOW+timedelta(hours=1))
-    assert first['scheduled_at']=='2026-10-16T23:01:00+04:00'
+    assert first['scheduled_at']=='2026-10-16T12:01:00-07:00'
+    assert first['timezone']=='America/Los_Angeles'
     assert len(jobs)==1 and jobs[0]['no_agent'] is True and jobs[0]['schedule']==first['scheduled_at']
     assert (tmp/'scripts'/jobs[0]['script']).exists()
     with pytest.raises(ValueError): cb.schedule(m,n,'owner','basic',ROW,cfg,{**VALUE,'reason':'different'},NOW)
@@ -110,6 +112,12 @@ def test_uncertain_absent_native_save_is_never_replayed(env):
     with pytest.raises(TimeoutError):cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
     assert cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)['status']=='uncertain'
     assert jobs==[]
+
+def test_schedule_uses_the_profile_timezone_for_callback_time(env):
+    cb,m,n,cfg,jobs,tmp=env
+    result=cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
+    assert result['scheduled_at']=='2026-10-16T12:01:00-07:00'
+    assert result['timezone']=='America/Los_Angeles'
 
 def test_deliver_tolerates_subsecond_early_trigger(env):
     cb,m,n,cfg,jobs,tmp=env

@@ -33,7 +33,8 @@ def _modules():
 def _profile_state():
     mobile, _, proactive = _modules()
     cfg = mobile.settings()
-    return mobile, cfg, proactive.current_profile(cfg)
+    profile = proactive.current_profile(cfg)
+    return mobile, mobile.settings(profile), profile
 
 
 def check_requirements():
@@ -47,7 +48,7 @@ def validate_config(config):
 def is_connected(config):
     try:
         mobile, cfg, _ = _profile_state()
-        return bool(cfg.get("owner_id") and cfg.get("owner_provider") and cfg.get("profiles"))
+        return bool(cfg.get("owner_id") and cfg.get("owner_provider"))
     except Exception:
         return False
 

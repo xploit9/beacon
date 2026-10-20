@@ -3,6 +3,17 @@ import hashlib
 import random
 import time
 import uuid
+import importlib.util
+from pathlib import Path
+import sys
+
+
+def _profile_timezone(profile):
+    key='cypher_proactive'
+    if key not in sys.modules:
+        spec=importlib.util.spec_from_file_location(key,Path(__file__).with_name('proactive.py'))
+        module=importlib.util.module_from_spec(spec);sys.modules[key]=module;spec.loader.exec_module(module)
+    return sys.modules[key]._profile_timezone(profile)
 
 
 def slots(owner,profile,day):
@@ -17,9 +28,12 @@ def slots(owner,profile,day):
 def tick(mobile,native,cfg,profile,now):
     owner=cfg.get('owner_id');provider=cfg.get('owner_provider')
     stored=cfg.get('scheduled_callback_conversation_id')
-    if cfg.get('scheduled_callbacks_enabled') is not True or not owner or not provider or profile not in cfg.get('profiles',[]) or not stored:
+    if (cfg.get('scheduled_callbacks_enabled') is not True or not owner or not provider or not stored
+            or 'profiles' in cfg and (not isinstance(cfg['profiles'],list) or profile not in cfg['profiles'])):
         raise ValueError('Configure an owned callback conversation before enabling check-ups')
-    if getattr(now.tzinfo,'key',None)!='Asia/Dubai': raise ValueError('Check-ups require a verified Asia/Dubai profile timezone')
+    if (now.tzinfo is None or now.utcoffset() is None
+            or getattr(now.tzinfo,'key',None)!=_profile_timezone(profile)):
+        raise ValueError('Check-up time must match the profile timezone')
     minute=now.hour*60+now.minute
     if minute not in slots(owner,profile,now.date().isoformat()): return {'state':'no_opportunity'}
     native.verify(owner,provider,profile,stored)
@@ -44,10 +58,9 @@ def run(plugin_root,profile,timezone_name=None,now=None):
         timezone_name=hermes_time.get_timezone_name();now=hermes_time.now()
     elif timezone_name is None or now is None:
         raise ValueError('Check-up clock must include the target profile timezone and time')
-    if timezone_name!='Asia/Dubai': raise ValueError('Profile clock must resolve to Asia/Dubai')
-    import importlib.util
-    from pathlib import Path
-    import sys
+    profile_timezone=_profile_timezone(profile)
+    if timezone_name!=profile_timezone or getattr(now.tzinfo,'key',None)!=profile_timezone:
+        raise ValueError('Check-up clock does not match the profile timezone')
     root=Path(plugin_root)
     for name in ('mobile','native'):
         key='cypher_'+name
@@ -55,5 +68,5 @@ def run(plugin_root,profile,timezone_name=None,now=None):
             spec=importlib.util.spec_from_file_location(key,root/(name+'.py'))
             module=importlib.util.module_from_spec(spec);sys.modules[key]=module;spec.loader.exec_module(module)
     mobile=sys.modules['cypher_mobile']
-    tick(mobile,sys.modules['cypher_native'],mobile.settings(),profile,now)
+    tick(mobile,sys.modules['cypher_native'],mobile.settings(profile),profile,now)
     # Empty stdout makes no_agent native runs silent. The owned durable outbox wakes the phone.
