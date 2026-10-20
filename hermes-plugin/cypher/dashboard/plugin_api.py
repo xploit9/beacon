@@ -845,6 +845,11 @@ async def download(digest:str,request:Request):
     return StreamingResponse(iter(content[i:i+65536] for i in range(0,len(content),65536)),media_type='application/vnd.android.package-archive',headers={'Content-Length':str(len(content)),'ETag':'"'+digest+'"','Cache-Control':'private, immutable'})
 _watch_task=None
 _jobs_upgraded=set()
+def _warm_profile(owner,profile):
+    try:
+        proactive.discover_sources(profile)
+        proactive.upgrade_jobs(mobile,owner,profile)
+    except Exception: pass  # a failure retries after the next restart
 async def start_watcher():
     global _watch_task
     async def loop():
@@ -856,9 +861,9 @@ async def start_watcher():
                     except Exception: pass  # A missing/invalid release must not stop call/approval delivery.
                     for profile in cfg.get('profiles',[]):
                         if (cfg['owner_id'],profile) not in _jobs_upgraded:
-                            _jobs_upgraded.add((cfg['owner_id'],profile))  # once per process; a failure retries after restart
-                            try: await asyncio.to_thread(proactive.upgrade_jobs,mobile,cfg['owner_id'],profile)
-                            except Exception: pass
+                            # Once per process, off the delivery loop: warm the slow source scan, then rebuild jobs after an upgrade.
+                            _jobs_upgraded.add((cfg['owner_id'],profile))
+                            asyncio.create_task(asyncio.to_thread(_warm_profile,cfg['owner_id'],profile))
                         await asyncio.to_thread(watch,cfg['owner_id'],cfg['owner_provider'],profile)
                         await asyncio.to_thread(push,cfg['owner_id'],profile)
             except Exception:
@@ -984,7 +989,12 @@ async def get_voice_history(stored_id:str,request:Request):
 @router.get('/mobile/proactive')
 async def proactive_status(request:Request):
     owner,_,profile,_=identity(request)
-    return await feature(proactive.status,mobile,owner,profile,timeout=30)
+    # Refresh finds a newly added MCP server or skill; a lookup that times out below keeps filling the cache.
+    if request.query_params.get('refresh')=='1': proactive.forget_sources(profile)
+    try: return await feature(proactive.status,mobile,owner,profile,timeout=30)
+    except HTTPException as error:
+        if error.status_code!=504: raise
+        raise HTTPException(503,'Still finding your sources. Try again in a minute.') from None
 
 @router.put('/mobile/proactive')
 async def proactive_enabled(request:Request):

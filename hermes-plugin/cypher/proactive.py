@@ -1,4 +1,5 @@
 """Owner-controlled proactive jobs for a single Hermes profile."""
+import copy
 import json
 import os
 from pathlib import Path
@@ -285,10 +286,35 @@ def _discover_sources():
     return sources
 
 
-def discover_sources(profile):
-    from hermes_cli.web_server_profiles import _profile_scope
-    with _profile_scope(profile):
-        return _discover_sources()
+SOURCES_TTL = 600
+_SOURCES = {}
+_SOURCES_LOCKS = {}
+_SOURCES_GUARD = threading.Lock()
+
+
+def _cached_sources(profile):
+    cached = _SOURCES.get(profile)
+    return copy.deepcopy(cached[1]) if cached and time.monotonic() - cached[0] < SOURCES_TTL else None
+
+
+def discover_sources(profile, fresh=False):
+    """Profile sources, cached ten minutes: a full MCP scan can take most of a minute on a busy Hermes."""
+    if not fresh and (cached := _cached_sources(profile)) is not None:
+        return cached
+    with _SOURCES_GUARD:
+        scan = _SOURCES_LOCKS.setdefault(profile, threading.Lock())
+    with scan:  # one scan per profile at a time; callers that waited reuse its result
+        if not fresh and (cached := _cached_sources(profile)) is not None:
+            return cached
+        from hermes_cli.web_server_profiles import _profile_scope
+        with _profile_scope(profile):
+            sources = _discover_sources()
+        _SOURCES[profile] = (time.monotonic(), sources)
+        return copy.deepcopy(sources)
+
+
+def forget_sources(profile):
+    _SOURCES.pop(profile, None)
 
 
 def default_setup(sources):

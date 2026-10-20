@@ -22,6 +22,7 @@ def harness(tmp_path,monkeypatch):
     spec=importlib.util.spec_from_file_location(name,ROOT/'dashboard'/'plugin_api.py')
     api=importlib.util.module_from_spec(spec);sys.modules[name]=api;spec.loader.exec_module(api)
     cfg={'owner_id':'owner','owner_provider':'basic','profiles':['default'],'scheduled_callback_conversation_id':'assistant-chat','archive_root':str(tmp_path/'call-recordings')}
+    monkeypatch.setattr(api.proactive,'_SOURCES',{})  # the source cache is per process; each test starts cold
     monkeypatch.setattr(api.mobile,'settings',lambda:cfg)
     monkeypatch.setattr(api.mobile,'home',lambda:tmp_path)
     monkeypatch.setattr(api,'secret',lambda cfg:None)

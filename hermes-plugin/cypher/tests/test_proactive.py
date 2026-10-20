@@ -163,7 +163,7 @@ def test_discovery_offers_builtin_web_for_news_and_handles_no_sources(harness, m
     }]
 
     monkeypatch.setattr(api.proactive, "_web_available", lambda: False)
-    sources = api.proactive.discover_sources("default")
+    sources = api.proactive.discover_sources("default", fresh=True)
     assert all(rows == [] for rows in sources.values())
 
 
@@ -868,3 +868,16 @@ def test_upgrade_rebuilds_managed_jobs_once_per_jobs_version(harness, monkeypatc
     assert api.proactive.upgrade_jobs(api.mobile, "owner", "default") is True
     assert api.proactive.upgrade_jobs(api.mobile, "owner", "default") is False
     assert synced == [("owner", "default")]
+
+
+def test_source_discovery_is_cached_and_refresh_forgets_it(harness, monkeypatch):
+    api = harness[0]
+    scans = []
+    monkeypatch.setattr(api.proactive, "_discover_sources", lambda: scans.append(1) or {"email": [], "calendar": [], "tasks": [], "news": []})
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles", SimpleNamespace(_profile_scope=lambda profile: nullcontext()))
+    first = api.proactive.discover_sources("default")
+    first["email"].append({"id": "mutated"})
+    assert api.proactive.discover_sources("default") == {"email": [], "calendar": [], "tasks": [], "news": []}
+    api.proactive.forget_sources("default")
+    api.proactive.discover_sources("default")
+    assert len(scans) == 2
