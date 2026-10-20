@@ -333,7 +333,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         "quiet_end" to (proactiveQuietEnd[profile] ?: "07:00"),
         "health" to (proactiveHealth[profile] ?: json("state" to "unknown")).copy(),
         "rules" to JSONArray(proactiveRequests[profile]?.map { it.copy() } ?: emptyList<JSONObject>()),
-        "learned" to JSONArray(proactiveLearned[profile]?.toList() ?: emptyList()),
+        "learned" to JSONArray(proactiveLearned[profile]?.toList() ?: emptyList<String>()),
         "jobs" to JSONArray(),
     )
     private fun http(path: String, method: String, body: JSONObject, profile: String, directory: String, archived: Boolean = false, url: HttpUrl? = null): Pair<Int, JSONObject> {
