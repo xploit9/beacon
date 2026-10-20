@@ -22,6 +22,8 @@ import dev.hermes.android.core.*
 import dev.hermes.android.data.AuthContext
 import dev.hermes.android.data.CypherClient
 import dev.hermes.android.push.KeepConnectedService
+import dev.hermes.android.push.persistPushBindings
+import dev.hermes.android.push.refreshNotificationPreview
 import dev.hermes.android.ui.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
@@ -168,7 +170,7 @@ class ProactiveUiTest {
             "kind" to "task_result",
             "state" to "finished",
             "source_ref" to source,
-            "conversation_ref" to "chat-a",
+            "conversation_ref" to "ref-chat-a",
             "session_id" to "chat-a",
             "reason" to reason,
             "email_alert" to true,
@@ -194,14 +196,62 @@ class ProactiveUiTest {
             assertEquals("not_important", request.getJSONObject("body").string("verdict"))
             await { compose.onAllNodesWithText("Thanks — Cypher will remember.").fetchSemanticsNodes().isNotEmpty() }
             await { runBlocking { app.cache.read(taskScope, "task-result") == null } }
-            val sessionReads = fixture.requests.count { it.string("path") == "/api/session" }
-            compose.runOnIdle { vm.storeData("task-result:${taskScope.key}", JSONObject()); vm.selectSession("chat-a") }
-            await { fixture.requests.count { it.string("path") == "/api/session" } > sessionReads && vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
+            compose.runOnIdle { vm.storeData("task-result:${taskScope.key}", JSONObject()) }
+            // Leave and come back, so the chat restores from its saved state.
+            compose.runOnIdle { vm.selectSession("chat-b") }
+            await { vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady }
+            compose.runOnIdle { vm.selectSession("chat-a") }
+            await { vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
             compose.onNodeWithTag("task-result-card").assertDoesNotExist()
         } finally {
             vm.client?.closeNative()
             pushClients.forEach(CypherClient::closeNative)
             KeepConnectedService.clientFactoryForTest = previousFactory
+            app.getSharedPreferences("push-binding", android.content.Context.MODE_PRIVATE).edit()
+                .remove("source:${source.digest()}").commit()
+            runBlocking { app.auth.remove(fixture.scope.origin) }
+        }
+    }
+
+    @Test fun emailAlertPreviewSavesTheCardForItsChatWhenTheRouteRefIsAHash() = withFixture { _, fixture ->
+        val source = "email-alert-preview-test"
+        val noticeId = "preview-email-notice"
+        val reason = "The client review moved to Friday."
+        runBlocking { app.auth.persist(fixture.client.auth) }
+        // A plain push binding (not Keep connected), as an FCM-delivered alert has.
+        val bindingKey = "source:${source.digest()}"
+        val binding = JSONObject().put("source", source).put("origin", fixture.scope.origin).put("owner", fixture.scope.owner)
+            .put("profile", fixture.scope.profile).put("backend", "hermes-dashboard").put("target", "fixture-target")
+        persistPushBindings(app.getSharedPreferences("push-binding", android.content.Context.MODE_PRIVATE), mapOf(bindingKey to
+            android.util.Base64.encodeToString(app.cipher.encrypt(binding.toString().toByteArray(), bindingKey), android.util.Base64.NO_WRAP)))
+        assertTrue(app.push.permitsIncoming(source))
+        // Hermes sends conversation_ref as an HMAC of the conversation, so it never equals session_id.
+        fixture.incomingNotification = json(
+            "seq" to 1,
+            "event_id" to noticeId,
+            "owner_id" to fixture.scope.owner,
+            "profile" to fixture.scope.profile,
+            "kind" to "task_result",
+            "state" to "finished",
+            "source_ref" to source,
+            "conversation_ref" to "ref-chat-a",
+            "session_id" to "chat-a",
+            "reason" to reason,
+            "email_alert" to true,
+            "expires_at" to System.currentTimeMillis() / 1000 + 3600,
+            "preview" to json("title" to "Important email", "body" to reason),
+        )
+        val previousFactory = KeepConnectedService.clientFactoryForTest
+        val pushClients = mutableListOf<CypherClient>()
+        KeepConnectedService.clientFactoryForTest = { auth, store -> fixture.freshClientFor(auth, store).also(pushClients::add) }
+        try {
+            runBlocking { refreshNotificationPreview(app, source, noticeId, "ref-chat-a", "task_result") }
+            val saved = runBlocking { app.cache.read(fixture.scope.session("chat-a"), "task-result") }
+            assertEquals(noticeId, JSONObject(requireNotNull(saved) { "the alert card was not saved" }).string("notice_id"))
+        } finally {
+            pushClients.forEach(CypherClient::closeNative)
+            KeepConnectedService.clientFactoryForTest = previousFactory
+            runBlocking { app.cache.delete(fixture.scope.session("chat-a"), "task-result") }
             app.getSharedPreferences("push-binding", android.content.Context.MODE_PRIVATE).edit()
                 .remove("source:${source.digest()}").commit()
             runBlocking { app.auth.remove(fixture.scope.origin) }
@@ -284,9 +334,11 @@ class ProactiveUiTest {
         compose.onNodeWithTag("task-result-dismiss").performClick()
         await { runBlocking { app.cache.read(scope, "task-result") == null } && vm.data.value["task-result:${scope.key}"]?.string("reason").isNullOrBlank() }
 
-        val sessionReads = fixture.requests.count { it.string("path") == "/api/session" }
+        // Leave and come back, so the chat restores from its saved state.
+        compose.runOnIdle { vm.selectSession("chat-b") }
+        await { vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady }
         compose.runOnIdle { vm.selectSession("chat-a") }
-        await { fixture.requests.count { it.string("path") == "/api/session" } > sessionReads && vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
+        await { vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
         compose.onNodeWithTag("task-result-card").assertDoesNotExist()
     }
 
@@ -309,7 +361,7 @@ class ProactiveUiTest {
             "kind" to "task_result",
             "state" to "finished",
             "source_ref" to source,
-            "conversation_ref" to "chat-a",
+            "conversation_ref" to "ref-chat-a",
             "session_id" to "chat-a",
             "reason" to "The client review moved to Friday.",
             "email_alert" to true,

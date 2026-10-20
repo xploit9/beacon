@@ -3077,11 +3077,11 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             if (route.string("kind") == "task_result" && id.isNotBlank()) {
                 val emailAlert = route.optBoolean("email_alert")
                 val expiresAt = route.optLong("expires_at")
-                route.string("reason").takeIf { it.isNotBlank() && (!emailAlert || route.string("conversation_ref") == id && expiresAt > System.currentTimeMillis() / 1000) }?.let {
+                route.string("reason").takeIf { it.isNotBlank() && (!emailAlert || expiresAt > System.currentTimeMillis() / 1000) }?.let {
                     storeData("task-result:${c.scope.session(id).key}", json("reason" to it, "notice_id" to route.string("event_id").ifBlank { event }, "email_alert" to emailAlert, "expires_at" to expiresAt))
                 }
             }
-            val destination = when { route.string("kind") == "incoming_call" -> "Cypher"; route.string("kind") == "task_result" && id.isNotBlank() && route.string("conversation_ref") == id && readCypherSessionHandle(c.scope) == id -> "Cypher"; route.string("kind") == "release" -> "More"; route.string("kind") == "task_result" && id.isBlank() -> "Tasks"; else -> "Chat" }
+            val destination = when { route.string("kind") == "incoming_call" -> "Cypher"; route.string("kind") == "task_result" && id.isNotBlank() && readCypherSessionHandle(c.scope) == id -> "Cypher"; route.string("kind") == "release" -> "More"; route.string("kind") == "task_result" && id.isBlank() -> "Tasks"; else -> "Chat" }
             val destinationPage = if (route.string("kind") == "release") "App updates" else ""
             saved["tab"] = destination; saved["more"] = destinationPage
             _ui.update { it.copy(origin = origin, owner = owner, profile = c.auth.profile, cypherOpening = false, cypherError = "", newChatOpening = false, newChatError = "", initialChatReady = false, query = "", authenticated = true, connected = true, restoringSession = false, bootstrap = bootstrap, tab = destination, morePage = destinationPage) }

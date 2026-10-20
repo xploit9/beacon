@@ -84,7 +84,7 @@ suspend fun refreshNotificationPreview(context: Context, source: String, event: 
             val session = route.string("session_id")
             val expiresAt = route.optLong("expires_at")
             val reason = route.string("reason")
-            if (validOpaque(session) && session == conversation && reason.isNotBlank() && expiresAt > System.currentTimeMillis() / 1000) {
+            if (validOpaque(session) && reason.isNotBlank() && expiresAt > System.currentTimeMillis() / 1000) {
                 val taskScope = scope.session(session)
                 val card = json("reason" to reason, "notice_id" to event, "email_alert" to true, "expires_at" to expiresAt)
                 app.cache.write(taskScope, "task-result", card.toString(), protected = true)
@@ -130,7 +130,7 @@ private suspend fun sendEmailFeedback(context: Context, source: String, event: S
         catch (e: CancellationException) { throw e } catch (_: Exception) { false }
         if (saved && authorized()) {
             val session = route.string("session_id")
-            if (validOpaque(session) && session == route.string("conversation_ref")) {
+            if (validOpaque(session)) {
                 val taskScope = scope.session(session)
                 val stored = app.cache.read(taskScope, "task-result")
                 if (stored != null && runCatching { JSONObject(stored).string("notice_id") }.getOrNull() == event)
