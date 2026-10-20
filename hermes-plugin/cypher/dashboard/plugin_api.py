@@ -49,11 +49,20 @@ def _read_plugin_version(path):
         return version.strip() if isinstance(version,str) else ''
     except Exception: return ''
 _RUNNING_PLUGIN_VERSION=_read_plugin_version(ROOT/'plugin.yaml')
+def _stale(module):
+    seen=getattr(module,'_cypher_mtime',None)
+    try: return seen is not None and seen!=Path(module.__file__).stat().st_mtime_ns
+    except (OSError,TypeError): return True
+# A plugin update reloads this file inside a running Hermes; siblings cached from the old install would mix old and new
+# code (settings() signature crash), so any changed file drops them all and they load fresh.
+if any(_stale(m) for k,m in list(sys.modules.items()) if k.startswith('cypher_')):
+    for k in [k for k in sys.modules if k.startswith('cypher_')]: sys.modules.pop(k,None)
 for name in ('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_api','bot_mode_api','callbacks','callback_api','call_history_api','proactive'):
     key='cypher_'+name
     if key not in sys.modules:
-        spec=importlib.util.spec_from_file_location(key,ROOT/(name+'.py'))
-        module=importlib.util.module_from_spec(spec);sys.modules[key]=module;spec.loader.exec_module(module)
+        path=ROOT/(name+'.py');spec=importlib.util.spec_from_file_location(key,path)
+        module=importlib.util.module_from_spec(spec);module._cypher_mtime=path.stat().st_mtime_ns
+        sys.modules[key]=module;spec.loader.exec_module(module)
 mobile=sys.modules['cypher_mobile'];native=sys.modules['cypher_native'];voice_context=sys.modules['cypher_voice_context']
 activity=sys.modules['cypher_activity']
 voice_models=sys.modules['cypher_voice_models']
