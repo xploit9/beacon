@@ -82,6 +82,9 @@ internal fun renderedChatStatus(old: ChatState, active: String?, streamEnded: Bo
 data class ChatState(val sessionId: String = "", val title: String = "New conversation", val messages: List<Message> = emptyList(), val raw: JSONObject = JSONObject(), val streamId: String = "", val liveText: String = "", val liveReasoning: String = "", val liveTools: List<JSONObject> = emptyList(), val status: String = "", val approval: JSONObject? = null, val clarification: JSONObject? = null, val uncertain: String = "", val queued: List<QueuedMessage> = emptyList(), val anchor: Int = 0, val anchorOffset: Int = 0, val anchorId: String = "", val callMessages: List<CallTranscript> = emptyList(), val projectionReady: Boolean = true, val sessionReasoningEffort: String = "")
 internal fun sessionCanStillBeUnpersisted(clientCreated: Boolean, chat: ChatState): Boolean =
     clientCreated && chat.messages.isEmpty() && chat.callMessages.isEmpty() && chat.liveText.isBlank() && chat.streamId.isBlank() && chat.raw.optInt("message_count") == 0
+/** Hermes stores a new chat at its first message; until then reads of the open, phone-created chat answer 404. */
+internal fun unsavedOpenChatRead(error: Throwable, id: String, clientCreated: Boolean, chat: ChatState): Boolean =
+    error is ApiFailure && error.status == 404 && id.isNotBlank() && chat.sessionId == id && sessionCanStillBeUnpersisted(clientCreated, chat)
 /** A prompt event wraps its prompt in `pending` (null clears it); a Hermes server request is the prompt itself.
  *  `isNull` is also true for a missing key, which dropped every server-request prompt. */
 internal fun pendingPrompt(event: JSONObject): JSONObject? = event.optJSONObject("pending") ?: event.takeUnless { it.has("pending") }
@@ -638,7 +641,11 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 }
                 watchSession(c, scope)
                 _side.value?.takeIf { it.scope == scope && it.status !in setOf("Complete", "Stopped") }?.let { resumeSideQuestion() }
-            } catch (e: Throwable) { if (request.current() && foreground) fail(e) }
+            } catch (e: Throwable) {
+                if (e is CancellationException) throw e
+                if (!request.current() || !foreground) return@launch
+                if (unsavedOpenChatRead(e, scope.session, clientCreatedSessions.contains(scope.key), _chat.value)) watchSession(c, scope) else fail(e)
+            }
         }
     }
     private fun checkpointPhoneSettings() {
@@ -2647,7 +2654,9 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             if (e is CancellationException) throw e
             if (visible()) {
                 _data.update { values -> values + (key to ((if (cacheable) values[key]?.copy() else null) ?: JSONObject()).put("_error", cypherOwnerSetupMessage(e) ?: e.message ?: "Unavailable").apply { if (cacheable && length() > 1) put("_stale", true); if (path == "/api/commands/catalog") { put("available", false); if (!has("commands")) put("commands", JSONArray()) } }) }
-                if (force || !cacheable || e is ApiFailure && e.status == 401) fail(e)
+                val chatId = query["chat"].orEmpty()
+                val unsaved = path == "/api/projects/for-session" && unsavedOpenChatRead(e, chatId, clientCreatedSessions.contains(scope.session(chatId).key), _chat.value)
+                if (!unsaved && (force || !cacheable || e is ApiFailure && e.status == 401)) fail(e)
             }
           } finally { c.closeNative(); if (loads[key] === currentCoroutineContext()[Job]) _refreshing.update { it - key } }
         }
