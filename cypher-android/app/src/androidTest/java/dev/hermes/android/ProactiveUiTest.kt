@@ -41,7 +41,8 @@ class ProactiveUiTest {
         fixture.profileDisplayNames = mapOf("default" to "Personal profile", "coder" to "Code profile")
         compose.runOnIdle { vm.load("navigation-profiles", "/api/profiles", force = true); vm.more("Assistant") }
         await { vm.data.value[proactiveKey(fixture)]?.has("enabled") == true }
-        compose.onNodeWithText("Profile: Code profile").assertExists()
+        // Display names arrive with the profile list, a moment after the Proactive settings.
+        await { compose.onAllNodesWithText("Profile: Code profile").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("coder", substring = false).assertDoesNotExist()
 
         compose.onNodeWithText("Important emails · Code profile").assertExists()
