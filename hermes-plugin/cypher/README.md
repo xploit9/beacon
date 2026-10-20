@@ -1,6 +1,6 @@
 # Cypher native dashboard plugin
 
-Supported native Hermes user plugin, manifest name `cypher`. Install or update it with Hermes' native CLI as described below. No Hermes core files, archived WebUI/Pipecat code or live credentials are imported. `dashboard/plugin_api.py` is mounted by Hermes at `/api/plugins/cypher`. The API requires secure native auth middleware and a verified session on every request, including APK bytes. Native Hermes itself only logs cross-login session attachment: this plugin additionally verifies persisted `sessions.user_id` and runtime `auth_user_id` against `provider:owner_id`.
+Supported native Hermes user plugin, manifest name `cypher`. Install or update it with Hermes' native CLI as described below. It ships no Hermes core files and no live secrets. `dashboard/plugin_api.py` is mounted by Hermes at `/api/plugins/cypher`. The API requires secure native auth middleware and a verified session on every request, including APK bytes. Native Hermes itself only logs cross-login session attachment: this plugin additionally verifies persisted `sessions.user_id` and runtime `auth_user_id` against `provider:owner_id`.
 
 ## Install
 
