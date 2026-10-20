@@ -221,7 +221,7 @@ class NativeGatewayProtocolTest {
         val created = c.post("/api/session/new")
         assertEquals("stored-a", created.getString("session_id"))
         assertTrue(created.getBoolean("acknowledged_shell"))
-        assertEquals(listOf("session.create"), wire.sent.map { it.getString("method") })
+        assertEquals(listOf("client.capabilities", "session.create"), wire.sent.map { it.getString("method") })
         wire.sent.clear()
         val fetched = c.get("/api/session", mapOf("session_id" to "stored-a"))
         assertEquals("stored-a", fetched.getString("session_id"))
@@ -249,7 +249,7 @@ class NativeGatewayProtocolTest {
         val wire = Wire(); val c = client(wire)
         val catalog = c.get("/api/commands/catalog")
         assertEquals("help", catalog.getJSONArray("commands").getJSONObject(0).getString("name"))
-        assertEquals(listOf("commands.catalog"), wire.sent.map { it.getString("method") })
+        assertEquals(listOf("client.capabilities", "commands.catalog"), wire.sent.map { it.getString("method") })
         val archive = c.get("/api/sessions", mapOf("include_archived" to "1"))
         assertEquals(1, archive.getJSONArray("sessions").length())
         assertEquals("hidden", archive.getJSONArray("sessions").getJSONObject(0).getString("session_id"))
@@ -266,8 +266,10 @@ class NativeGatewayProtocolTest {
         assertEquals("runtime-a", binding.runtimeSessionId)
         assertNull(wire.requests.single().url.queryParameter("ticket"))
         assertEquals("hermes-gateway-v1, hermes-gateway-ticket.fixture-single-use-ticket", wire.requests.single().header("Sec-WebSocket-Protocol"))
-        assertEquals("work", wire.sent.single().getJSONObject("params").getString("profile"))
-        assertFalse(wire.sent.single().getJSONObject("params").getBoolean("close_on_disconnect"))
+        assertEquals(listOf("client.capabilities", "session.create"), wire.sent.map { it.getString("method") })
+        val create = wire.sent.single { it.getString("method") == "session.create" }.getJSONObject("params")
+        assertEquals("work", create.getString("profile"))
+        assertFalse(create.getBoolean("close_on_disconnect"))
         gateway.close()
         gateway.rpc("session.history", json("session_id" to "runtime-a"))
         assertEquals(2, wire.requests.size)
@@ -294,7 +296,7 @@ class NativeGatewayProtocolTest {
         val stop = IOException("fixture-stop")
         try { gateway.events { frame -> val seq = frame.getJSONObject("params").getLong("seq"); received.add(seq); if (seq == 2L) throw stop } } catch (e: IOException) { assertSame(stop, e) }
         assertEquals(listOf(1L, 2L), received)
-        assertEquals("android", wire.sent.first().getJSONObject("params").getString("source"))
+        assertEquals("android", wire.sent.first { it.getString("method") == "session.resume" }.getJSONObject("params").getString("source"))
         gateway.close()
     }
     @Test fun currentTurnReplayDoesNotTerminateOnAnOlderCompletion() = runBlocking<Unit> {
@@ -366,10 +368,10 @@ class NativeGatewayProtocolTest {
     @Test fun stopWithRuntimeIdNeverCreatesOrResumesASession() = runBlocking<Unit> {
         val wire = Wire(); val c = client(wire)
         c.get("/api/chat/cancel", mapOf("stream_id" to "runtime-a"))
-        assertEquals(listOf("session.interrupt"), wire.sent.map { it.getString("method") })
-        assertEquals("runtime-a", wire.sent.single().getJSONObject("params").getString("session_id"))
+        assertEquals(listOf("client.capabilities", "session.interrupt"), wire.sent.map { it.getString("method") })
+        assertEquals("runtime-a", wire.sent.single { it.getString("method") == "session.interrupt" }.getJSONObject("params").getString("session_id"))
         assertTrue(runCatching { c.get("/api/chat/cancel") }.isFailure)
-        assertEquals(1, wire.sent.size)
+        assertEquals(2, wire.sent.size)
     }
 
     @Test fun missingVoiceArchiveDoesNotBlockNativeHistoryButNativeAuthFailurePropagates() = runBlocking<Unit> {
@@ -482,7 +484,8 @@ class NativeGatewayProtocolTest {
         assertEquals("hermes-gateway-v1, hermes-gateway-ticket.fixture-single-use-ticket", wire.requests.single().header("Sec-WebSocket-Protocol"))
         assertNull(wire.requests.single().header("Authorization"))
         assertEquals("native.example", wire.requests.single().url.host)
-        assertEquals("work", wire.sent.single().getJSONObject("params").getString("profile"))
+        assertEquals(listOf("client.capabilities", "session.resume"), wire.sent.map { it.getString("method") })
+        assertEquals("work", wire.sent.single { it.getString("method") == "session.resume" }.getJSONObject("params").getString("profile"))
         c.closeNative()
     }
 

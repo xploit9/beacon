@@ -117,8 +117,8 @@ class NativeGatewayTest {
                         return true
                     }
                 }
-                currentSocket = socket
-                currentListener = listener
+                // Like Hermes, prompts keep going to the subscribed stream socket, not to a later per-action socket.
+                if (!eventsReady.isCompleted) { currentSocket = socket; currentListener = listener }
                 listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Fixture").build())
                 socket
             }) { builder ->
@@ -184,7 +184,8 @@ class NativeGatewayTest {
         try {
             withTimeout(5_000) { fixture.eventsReady.await() }
             assertEquals("approval", withTimeout(5_000) { events.receive() }.string("method"))
-            fixture.client.post("/api/approval/respond", json("session_id" to stored, "scope_key" to fixture.client.scope.session(stored).key,
+            // Like CypherViewModel.action, the answer comes from a detached client, not the stream's.
+            fixture.client.detached().post("/api/approval/respond", json("session_id" to stored, "scope_key" to fixture.client.scope.session(stored).key,
                 "approval_id" to "approval-during-resume-queue", "choice" to "once"))
             assertEquals("approval-during-resume", fixture.serverResponses.single().getString("id"))
             assertEquals("phone-runtime", binding.runtimeSessionId)
@@ -204,7 +205,14 @@ class NativeGatewayTest {
             withTimeout(5_000) { fixture.eventsReady.await() }
             fixture.emitServerRequest("approval", 41, json("session_id" to binding.runtimeSessionId, "request_id" to "approval-queue-41", "choices" to JSONArray().put("once").put("deny")))
             assertEquals("approval", withTimeout(5_000) { events.receive() }.string("method"))
-            fixture.client.post("/api/approval/respond", json("session_id" to stored, "scope_key" to fixture.client.scope.session(stored).key,
+            val otherProfile = fixture.client.forAuthorizedProfile("other")
+            assertTrue("Another profile never answers this conversation's prompt", runCatching {
+                otherProfile.nativeAnswerServerRequest("approval", "approval-queue-41", binding.runtimeSessionId, json("choice" to "once"))
+            }.isFailure)
+            assertTrue(fixture.serverResponses.isEmpty())
+            // Like CypherViewModel.action, each answer comes from a detached client, not the stream's.
+            val answers = fixture.client.detached()
+            answers.post("/api/approval/respond", json("session_id" to stored, "scope_key" to fixture.client.scope.session(stored).key,
                 "approval_id" to "approval-queue-41", "choice" to "once"))
             val approval = fixture.serverResponses.single()
             assertEquals(41, approval.optInt("id"))
@@ -213,7 +221,7 @@ class NativeGatewayTest {
 
             fixture.emitServerRequest("approval", "approval-wire-all", json("session_id" to binding.runtimeSessionId, "request_id" to "approval-queue-all", "choices" to JSONArray().put("deny")))
             assertEquals("approval", withTimeout(5_000) { events.receive() }.string("method"))
-            fixture.client.post("/api/approval/respond", json("session_id" to stored, "scope_key" to fixture.client.scope.session(stored).key,
+            answers.post("/api/approval/respond", json("session_id" to stored, "scope_key" to fixture.client.scope.session(stored).key,
                 "approval_id" to "approval-queue-all", "choice" to "deny", "all" to true))
             val approvalAll = fixture.serverResponses.last()
             assertEquals("approval-wire-all", approvalAll.getString("id"))
@@ -224,7 +232,7 @@ class NativeGatewayTest {
                 .put(json("qid" to "notes:b", "question" to "Anything else?"))
             fixture.emitServerRequest("clarify", "clarify-wire-id", json("session_id" to binding.runtimeSessionId, "questions" to questions))
             assertEquals("clarify", withTimeout(5_000) { events.receive() }.string("method"))
-            fixture.client.post("/api/clarify/respond", json("session_id" to stored, "scope_key" to fixture.client.scope.session(stored).key,
+            answers.post("/api/clarify/respond", json("session_id" to stored, "scope_key" to fixture.client.scope.session(stored).key,
                 "clarify_id" to "clarify-wire-id", "answers" to json("route/a" to "Canary", "notes:b" to "Keep rollback ready")))
             val clarify = fixture.serverResponses.last()
             assertEquals("clarify-wire-id", clarify.getString("id"))
@@ -260,15 +268,17 @@ class NativeGatewayTest {
                 assertEquals("unsupported-$index", fixture.serverResponses.last().getString("id"))
             }
             fixture.emitServerRequest("clarify", "foreign-clarify", json("session_id" to "another-runtime", "questions" to JSONArray().put(json("qid" to "q", "question" to "No?"))))
-            assertEquals(-32602, fixture.serverResponses.last().getJSONObject("error").getInt("code"))
+            // A prompt waits in the event queue for its session binding, so the collector rejects it after this suspension.
             assertNull(withTimeoutOrNull(50) { events.receive() })
+            assertEquals("foreign-clarify", fixture.serverResponses.last().getString("id"))
+            assertEquals(-32602, fixture.serverResponses.last().getJSONObject("error").getInt("code"))
 
             fixture.emitServerRequest("clarify", "cancel-me", json("session_id" to binding.runtimeSessionId, "questions" to JSONArray().put(json("qid" to "q", "question" to "Continue?"))))
             assertEquals("clarify", withTimeout(5_000) { events.receive() }.string("method"))
             fixture.cancelServerRequest("cancel-me", "clarify", binding.runtimeSessionId)
             val before = fixture.serverResponses.size
             assertTrue(runCatching {
-                fixture.client.post("/api/clarify/respond", json("session_id" to stored, "scope_key" to fixture.client.scope.session(stored).key,
+                fixture.client.detached().post("/api/clarify/respond", json("session_id" to stored, "scope_key" to fixture.client.scope.session(stored).key,
                     "clarify_id" to "cancel-me", "answers" to json("q" to "late")))
             }.isFailure)
             assertEquals(before, fixture.serverResponses.size)

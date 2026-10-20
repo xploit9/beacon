@@ -60,6 +60,10 @@ internal class NativeGateway(private val client: CypherClient, private val socke
         @Volatile var failure: IOException? = null
     }
     private class Cursor(val binding: NativeSessionBinding, var sequence: Long = 0, var epoch: String = "")
+    private companion object {
+        // Weak, so a gateway leaves with its client; answers are only routed between gateways of one account and profile.
+        val gateways: MutableSet<NativeGateway> = java.util.Collections.newSetFromMap(java.util.WeakHashMap())
+    }
     private val connectLock = Mutex()
     private val sessionLock = Mutex()
     private val lifecycle = Any()
@@ -68,6 +72,7 @@ internal class NativeGateway(private val client: CypherClient, private val socke
     private val generation = java.util.concurrent.atomic.AtomicLong()
     @Volatile private var connection: Connection? = null
     private var cursor: Cursor? = null
+    init { synchronized(gateways) { gateways += this } }
     private suspend fun connect(): Connection = connectLock.withLock {
         connection?.takeIf { it.failure == null && it.ready.isCompleted }?.let { return@withLock it }
         require(client.auth.backend == "hermes-dashboard" && client.auth.owner.isNotBlank() && client.auth.profile.isNotBlank()) { "Verify native dashboard identity before connecting" }
@@ -95,17 +100,16 @@ internal class NativeGateway(private val client: CypherClient, private val socke
                     if (text.length > 8 * 1024 * 1024) { terminate(mine, IOException("Native frame exceeds size limit")); ws.cancel(); return }
                     val frame = runCatching { JSONObject(text) }.getOrNull() ?: return
                     val id = frame.optString("id")
+                    val method = frame.optString("method")
                     if (!frame.has("method") && id.isNotBlank()) mine.pending.remove(id)?.complete(frame)
-                    else if (frame.has("method") && frame.optString("method") != "event") {
-                        if (frame.optString("method") == "approval" || frame.optString("method") == "clarify") {
-                            // A prompt can precede the session.resume acknowledgement that installs its owner binding.
-                            if (!frame.has("id")) serverRequestError(mine, JSONObject.NULL, -32600, "Invalid request id")
-                            else if (!mine.frames.trySend(frame).isSuccess) {
-                                terminate(mine, IOException("Native event queue overflow; reconcile history")); ws.cancel()
-                            }
-                        } else {
-                            prepareServerRequest(mine, frame)
+                    else if (method == "approval" || method == "clarify") {
+                        // A prompt can precede the session.resume acknowledgement that installs its owner binding.
+                        // Without an id it is a notification: JSON-RPC never answers one, and it cannot be answered.
+                        if (frame.has("id") && !mine.frames.trySend(frame).isSuccess) {
+                            terminate(mine, IOException("Native event queue overflow; reconcile history")); ws.cancel()
                         }
+                    } else if (isServerRequest(frame)) {
+                        prepareServerRequest(mine, frame)
                     } else {
                         retireCancelledServerRequest(mine, frame)
                         if (!mine.frames.trySend(frame).isSuccess) { terminate(mine, IOException("Native event queue overflow; reconcile history")); ws.cancel() }
@@ -145,21 +149,26 @@ internal class NativeGateway(private val client: CypherClient, private val socke
         } finally { mine.pending.remove(id) }
     }
 
-    // Adapted from Hermes Relay's GatewayChatClient request lifecycle; Cypher keeps its existing native session cursor.
-    internal fun answerServerRequest(method: String, requestId: String, sessionId: String, payload: JSONObject): JSONObject {
-        val mine = connection?.takeIf { it.failure == null && it.ready.isCompleted }
-            ?: throw IOException("Native server request is no longer connected")
+    /** The live connection of this gateway that received [requestId] for its bound conversation, if any. */
+    private fun openServerRequest(method: String, requestId: String, sessionId: String): Triple<NativeGateway, Connection, NativeServerRequest>? {
+        val mine = connection?.takeIf { it.failure == null && it.ready.isCompleted } ?: return null
         val binding = synchronized(cursorLock) { cursor?.binding }
-        if (binding == null || binding.scope != client.scope || binding.runtimeSessionId != sessionId) {
-            throw IOException("Native server request is not owned by this conversation")
-        }
-        val requests = synchronized(mine.requestLock) {
+        if (binding == null || binding.scope != client.scope || binding.runtimeSessionId != sessionId) return null
+        val open = synchronized(mine.requestLock) {
             mine.serverRequests.values.filter { request ->
                 request.method == method && request.sessionId == sessionId &&
                     (if (method == "approval") request.params.string("request_id") == requestId else request.idText == requestId)
-            }
-        }
-        val open = requests.singleOrNull() ?: throw IOException("Native server request is no longer active")
+            }.singleOrNull()
+        } ?: return null
+        return Triple(this, mine, open)
+    }
+
+    // Adapted from Hermes Relay's GatewayChatClient request lifecycle; Cypher keeps its existing native session cursor.
+    internal fun answerServerRequest(method: String, requestId: String, sessionId: String, payload: JSONObject): JSONObject {
+        // A chat action answers from its own detached client, but the request stays owned by the stream connection that received it.
+        val peers = synchronized(gateways) { gateways.filter { it !== this && it.client.scope == client.scope } }
+        val (owner, mine, open) = (listOf(this) + peers).firstNotNullOfOrNull { it.openServerRequest(method, requestId, sessionId) }
+            ?: throw IOException("Native server request is no longer active")
         val result = when (method) {
             "approval" -> {
                 val choice = payload.string("choice")
@@ -188,7 +197,7 @@ internal class NativeGateway(private val client: CypherClient, private val socke
             else -> throw IOException("Not available on the phone")
         }
         synchronized(mine.requestLock) {
-            if (mine.serverRequests[open.idKey] !== open || connection !== mine || mine.failure != null || open.socket !== mine.socket) {
+            if (mine.serverRequests[open.idKey] !== open || owner.connection !== mine || mine.failure != null || open.socket !== mine.socket) {
                 throw IOException("Native server request is no longer active")
             }
             val response = JSONObject().put("jsonrpc", "2.0").put("id", open.id).put("result", result)
@@ -197,6 +206,9 @@ internal class NativeGateway(private val client: CypherClient, private val socke
         }
         return JSONObject().put("ok", true)
     }
+
+    /** A JSON-RPC request needs an id; a method-only frame (for example `message.complete`) is an event notification. */
+    private fun isServerRequest(frame: JSONObject) = frame.has("id") && frame.has("method") && frame.optString("method") != "event"
 
     private fun requestId(frame: JSONObject): ParsedNativeRequestId? {
         if (!frame.has("id")) return null
@@ -263,7 +275,8 @@ internal class NativeGateway(private val client: CypherClient, private val socke
                     failure = -32602 to "Request identity changed"
                     null
                 }
-                previous != null -> previous.apply { params = params.copy() }
+                // A replayed request keeps its identity and takes the latest parameters.
+                previous != null -> previous.also { it.params = params.copy() }
                 mine.serverRequests.size >= 64 -> {
                     failure = -32000 to "Too many open requests"
                     null
@@ -358,7 +371,7 @@ internal class NativeGateway(private val client: CypherClient, private val socke
         } finally { consuming.set(false); if (mine?.failure != null) mine.frames.cancel() }
     }
     private suspend fun deliver(mine: Connection, frame: JSONObject, callback: suspend (JSONObject) -> Unit) {
-        if (frame.has("method") && frame.optString("method") != "event") {
+        if (isServerRequest(frame)) {
             val request = sessionLock.withLock { prepareServerRequest(mine, frame) } ?: return
             val shouldDeliver = synchronized(mine.requestLock) {
                 if (mine.serverRequests[request.idKey] !== request || request.delivered) false
