@@ -69,7 +69,11 @@ android {
         }
     }
     buildTypes {
-        debug { applicationIdSuffix = ".debug"; versionNameSuffix = "-preview" }
+        debug {
+            applicationIdSuffix = ".debug"; versionNameSuffix = "-preview"
+            // Local crash reports for test builds; blank (the default) keeps the reporter off.
+            buildConfigField("String", "BUGSINK_DSN", quoted(System.getenv("CYPHER_DEBUG_BUGSINK_DSN") ?: owner.getProperty("debug.bugsinkDsn", "")))
+        }
         release {
             isMinifyEnabled = true
             if (signing.isNotEmpty()) signingConfig = signingConfigs.getByName("owner")
