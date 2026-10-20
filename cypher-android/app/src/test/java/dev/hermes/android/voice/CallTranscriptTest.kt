@@ -30,6 +30,12 @@ class CallTranscriptTest {
         assertEquals(2,archived.size)
         assertEquals(live,live.acceptTranscript(assistant.copy(text="Late tokens",final=false,interrupted=false)))
     }
+    @Test fun speakingFirstInAFreshTurnDoesNotMarkTheComingReplyInterrupted() {
+        assertFalse(interruptsReply(true,emptyMap()))
+        assertFalse(interruptsReply(true,mapOf("user" to "Is there anything")))
+        assertTrue(interruptsReply(true,mapOf("assistant" to "Tomorrow you have")))
+        assertFalse(interruptsReply(false,mapOf("assistant" to "Tomorrow you have")))
+    }
     @Test fun ordinaryDirectTurnUsesSameFinalPayloadWithoutInterruptedLabel() {
         val captions=mutableMapOf("assistant" to "Complete answer")
         var event:CallTranscript?=null

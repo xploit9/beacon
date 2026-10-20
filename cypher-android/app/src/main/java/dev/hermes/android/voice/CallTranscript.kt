@@ -38,6 +38,9 @@ internal fun CallState.transcriptsFor(scope: Scope?, messages: List<Message>): L
     if (scope == null || conversationScope != scope) emptyList() else transcripts.pendingTranscripts(messages, active)
 
 /** Commit the same final caption to live state and the archive; consuming it prevents duplicate completion. */
+/** Grok and OpenAI flag every new user utterance; only a reply already under way is interrupted by it. */
+internal fun interruptsReply(interrupted:Boolean,captions:Map<String,String>)=interrupted&&!captions["assistant"].isNullOrBlank()
+
 internal fun finishDirectTranscriptTurn(callId:String,sessionId:String,turn:Long,captions:MutableMap<String,String>,atMs:Long,
     interrupted:Boolean=false,deliver:(JSONObject)->Unit):Long {
     if(captions.isEmpty()) return turn

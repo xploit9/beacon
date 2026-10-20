@@ -464,10 +464,11 @@ class CypherCallService : Service() {
     private fun finishDirectTurn(interrupted:Boolean=false) {
         val pending=spec?:return
         val turn=transcriptTurn
-        transcriptTurn=finishDirectTranscriptTurn(pending.grant.string("call_id"),pending.grant.string("conversation_id"),turn,transcriptText,pcm?.clock()?:0,interrupted) {
+        val cut=interruptsReply(interrupted,transcriptText)
+        transcriptTurn=finishDirectTranscriptTurn(pending.grant.string("call_id"),pending.grant.string("conversation_id"),turn,transcriptText,pcm?.clock()?:0,cut) {
             handleControl(it);transcriptSync?.event(it)
         }
-        if(interrupted) transcriptSync?.event(json("event_id" to "${pending.grant.string("call_id")}:assistant:interrupt:$turn","turn_id" to turn.toString(),"type" to "interrupted","interrupted" to true,"at_ms" to (pcm?.clock()?:0)))
+        if(cut) transcriptSync?.event(json("event_id" to "${pending.grant.string("call_id")}:assistant:interrupt:$turn","turn_id" to turn.toString(),"type" to "interrupted","interrupted" to true,"at_ms" to (pcm?.clock()?:0)))
     }
     fun camera(value:Boolean) { if(value&&!app.calls.state.value.visionAvailable) return;updateCamera(value,app.calls.state.value.cameraRear) }
     internal fun previewFailed(expectedCall:String) { if(app.calls.state.value.callId==expectedCall) camera(false) }
