@@ -6,14 +6,14 @@ import dev.hermes.android.core.string
 import dev.hermes.android.core.Scope
 import org.json.JSONObject
 
-data class CallTranscript(val eventId: String, val role: String, val text: String, val final: Boolean = true, val messageId: String = "", val interrupted: Boolean = false) {
+data class CallTranscript(val eventId: String, val role: String, val text: String, val final: Boolean = true, val messageId: String = "", val interrupted: Boolean = false, val at: Long = 0L) {
     companion object {
         fun from(value: JSONObject, sessionId: String, callId: String): CallTranscript? {
             val role = value.string("role")
             val id = value.string("event_id")
             val prefix = "$callId:$role:"
             if (role !in setOf("user", "assistant") || callId.isBlank() || sessionId.isBlank() || id.length > 256 || !id.startsWith(prefix) || id.removePrefix(prefix).isBlank() || value.string("session_id") != sessionId) return null
-            return CallTranscript(id, role, value.string("text", value.string("transcript")), value.optBoolean("final", true), value.string("message_id"), value.optBoolean("interrupted"))
+            return CallTranscript(id, role, value.string("text", value.string("transcript")), value.optBoolean("final", true), value.string("message_id"), value.optBoolean("interrupted"), dev.hermes.android.core.recordedMessageTime(value.opt("created_at")))
         }
     }
 }
@@ -26,6 +26,16 @@ internal fun List<CallTranscript>.acceptTranscript(event: CallTranscript): List<
     // A final item supersedes transient progress of that role; partials never persist.
     val retained = if (next.final) filterNot { it.role == next.role && !it.final && it.eventId != next.eventId } else this
     return if (previous == null) retained + next else retained.map { if (it.eventId == next.eventId) next else it }
+}
+
+/** Saved call turns sit where they happened among text messages; untimed (live) turns stay at the end. */
+internal fun interleaveCallMessages(messages: List<Message>, calls: List<Message>): List<Message> {
+    val out = ArrayList<Message>(messages.size + calls.size); var next = 0
+    for (message in messages) {
+        while (next < calls.size && calls[next].recordedAt > 0 && message.recordedAt > 0 && calls[next].recordedAt < message.recordedAt) out += calls[next++]
+        out += message
+    }
+    return out + calls.drop(next)
 }
 
 /** The database remains authoritative; these rows never enter chat raw data or draft caches. */

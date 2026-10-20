@@ -257,7 +257,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
     val preferences by vm.preferences.collectAsStateWithLifecycle()
     val chatState by vm.chat.collectAsStateWithLifecycle()
     val composerDraft by vm.composer.collectAsStateWithLifecycle()
-    val messages = remember(chatState.messages, chatState.callMessages, chatState.sessionId) { visibleTranscriptMessages(chatState.messages) + chatState.callMessages.map { Message("call:${it.eventId}", it.role, it.text, sessionId = chatState.sessionId) } }
+    val messages = remember(chatState.messages, chatState.callMessages, chatState.sessionId) { dev.hermes.android.voice.interleaveCallMessages(visibleTranscriptMessages(chatState.messages), chatState.callMessages.map { Message("call:${it.eventId}", it.role, it.text, sessionId = chatState.sessionId, recordedAt = it.at) }) }
     // Branch keep_count counts Hermes rows, hidden steering rows included.
     val transcriptIndex = remember(chatState.messages) { chatState.messages.withIndex().associate { it.value.id to it.index } }
     val latestAssistantMessageId = remember(chatState.messages) { chatState.messages.lastOrNull { it.role == "assistant" && it.text.isNotBlank() }?.id }
