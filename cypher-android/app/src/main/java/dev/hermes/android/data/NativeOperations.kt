@@ -193,8 +193,8 @@ internal class NativeOperations(private val c: CypherClient) {
             "/api/approval/respond", "/api/clarify/respond" -> {
                 require(d.string("scope_key") == c.scope.session(sid()).key) { "Reopen this request in its original conversation." }
                 val target = binding()
-                return if (path == "/api/approval/respond") c.nativeRpc("approval.respond", json("session_id" to target.runtimeSessionId, "request_id" to d.getString("approval_id"), "choice" to d.getString("choice")))
-                else c.nativeRpc("request.answer", json("id" to d.getString("clarify_id"), "result" to if (d.has("answers")) json("answers" to d.getJSONObject("answers")) else json("answer" to d.getString("response"))))
+                return if (path == "/api/approval/respond") c.nativeAnswerServerRequest("approval", d.getString("approval_id"), target.runtimeSessionId, d)
+                else c.nativeAnswerServerRequest("clarify", d.getString("clarify_id"), target.runtimeSessionId, d)
             }
             "/api/session/branch" -> {
                 val result = c.nativeRpc("session.branch", json("session_id" to binding().runtimeSessionId, "name" to d.string("title").ifBlank { null }, "count" to if (d.has("keep_count")) d.getInt("keep_count") else null))

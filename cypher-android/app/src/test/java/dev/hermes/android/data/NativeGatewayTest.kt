@@ -9,6 +9,8 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.channels.Channel
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.ResponseBody.Companion.toResponseBody
@@ -67,10 +69,19 @@ class NativeGatewayTest {
 
     private class GatewayFixture {
         val calls = mutableListOf<Pair<String, JSONObject>>()
+        val connectionCalls = mutableListOf<MutableList<String>>()
+        val serverResponses = mutableListOf<JSONObject>()
+        val eventsReady = CompletableDeferred<Unit>()
         var socketCount = 0
+        var rejectCapabilities = false
+        var requestDuringResume: JSONObject? = null
+        var currentSocket: WebSocket? = null
+        var currentListener: WebSocketListener? = null
         val client = CypherClient(AuthContext("https://native.example", emptyList(), "owner", "default", backend = "hermes-dashboard"), null,
             WebSocket.Factory { request, listener ->
                 socketCount++
+                val methods = mutableListOf<String>()
+                connectionCalls += methods
                 val socket = object : WebSocket {
                     override fun request() = request
                     override fun queueSize() = 0L
@@ -79,26 +90,54 @@ class NativeGatewayTest {
                     override fun send(bytes: ByteString) = false
                     override fun send(text: String): Boolean {
                         val frame = JSONObject(text)
+                        if (!frame.has("method")) {
+                            serverResponses += frame.copy()
+                            return true
+                        }
                         val method = frame.getString("method")
                         val params = frame.getJSONObject("params").copy()
                         calls += method to params
+                        methods += method
+                        if (method == "client.capabilities" && rejectCapabilities) {
+                            listener.onMessage(this, json("jsonrpc" to "2.0", "id" to frame.getString("id"), "error" to json("code" to -32601, "message" to "method not found")).toString())
+                            return true
+                        }
                         val result = when (method) {
                             "session.create" -> json("session_id" to "phone-runtime", "stored_session_id" to "20261019_001507_a4cbef", "messages" to JSONArray(), "info" to json("lazy" to true))
                             "session.resume" -> json("session_id" to "phone-runtime", "session_key" to "20261019_001507_a4cbef", "messages" to JSONArray(), "info" to json("lazy" to true))
-                            "session.events.since" -> json("events" to JSONArray(), "latest_seq" to 0, "epoch" to "fixture-epoch")
+                            "session.events.since" -> json("events" to JSONArray(), "latest_seq" to 0, "epoch" to "fixture-epoch").also { eventsReady.complete(Unit) }
                             "prompt.submit" -> json("status" to "streaming", "user_row_id" to 1)
                             else -> JSONObject()
+                        }
+                        if (method == "session.resume") requestDuringResume?.also {
+                            requestDuringResume = null
+                            listener.onMessage(this, it.toString())
                         }
                         listener.onMessage(this, json("jsonrpc" to "2.0", "id" to frame.getString("id"), "result" to result).toString())
                         return true
                     }
                 }
+                currentSocket = socket
+                currentListener = listener
                 listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Fixture").build())
                 socket
             }) { builder ->
                 builder.addInterceptor { chain -> Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
                     .body(json("ticket" to "fixture-ticket").toString().toResponseBody("application/json".toMediaType())).build() }
             }
+
+        fun emitServerRequest(method: String, id: Any, params: JSONObject) {
+            requireNotNull(currentListener).onMessage(requireNotNull(currentSocket),
+                json("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to params.copy()).toString())
+        }
+
+        fun cancelServerRequest(id: Any, method: String, sessionId: String) {
+            val event = json("method" to "event", "params" to json("session_id" to sessionId, "type" to "request.cancel",
+                "payload" to json("id" to id, "method" to method, "reason" to "timeout")))
+            requireNotNull(currentListener).onMessage(requireNotNull(currentSocket), event.toString())
+        }
+
+        fun disconnect() = requireNotNull(currentListener).onClosed(requireNotNull(currentSocket), 1001, "fixture reconnect")
     }
 
     @Test fun newChatFirstPromptUsesTheLiveRuntimeCreatedForThatChat() = runBlocking<Unit> {
@@ -111,9 +150,132 @@ class NativeGatewayTest {
         assertEquals(stored, created.getString("session_id"))
         assertTrue(accepted.getBoolean("accepted"))
         assertEquals("The creating client keeps one live socket through the first prompt", 1, fixture.socketCount)
-        assertEquals(listOf("session.create", "session.events.since", "prompt.submit"), fixture.calls.map { it.first })
+        assertEquals(listOf("client.capabilities", "session.create", "session.events.since", "prompt.submit"), fixture.calls.map { it.first })
+        assertEquals(true, fixture.calls.first().second.optBoolean("server_requests"))
+        assertTrue(fixture.connectionCalls.single().indexOf("client.capabilities") < fixture.connectionCalls.single().indexOf("session.create"))
         assertEquals("phone-runtime", fixture.calls.last().second.getString("session_id"))
         fixture.client.closeNative()
+    }
+
+    @Test fun capabilitiesPrecedeEveryConnectionAndMethodNotFoundDoesNotBlockResume() = runBlocking<Unit> {
+        val fixture = GatewayFixture().apply { rejectCapabilities = true }
+        fixture.client.nativeSession("20261019_001507_a4cbef")
+        fixture.disconnect()
+        fixture.client.nativeSession("20261019_001507_a4cbef")
+
+        assertEquals(2, fixture.connectionCalls.size)
+        fixture.connectionCalls.forEach { methods ->
+            assertEquals("client.capabilities", methods.first())
+            assertTrue(methods.indexOf("client.capabilities") < methods.indexOf("session.resume"))
+        }
+        assertEquals(2, fixture.calls.count { it.first == "client.capabilities" })
+        assertEquals(2, fixture.calls.count { it.first == "session.resume" })
+        fixture.client.closeNative()
+    }
+
+    @Test fun requestArrivingBeforeResumeAcknowledgementWaitsForSessionBinding() = runBlocking<Unit> {
+        val fixture = GatewayFixture()
+        val stored = "20261019_001507_a4cbef"
+        fixture.requestDuringResume = json("jsonrpc" to "2.0", "id" to "approval-during-resume", "method" to "approval",
+            "params" to json("session_id" to "phone-runtime", "request_id" to "approval-during-resume-queue", "choices" to JSONArray().put("once")))
+        val binding = fixture.client.nativeSession(stored)
+        val events = Channel<JSONObject>(Channel.UNLIMITED)
+        val collector = launch { fixture.client.nativeEvents { events.send(it) } }
+        try {
+            withTimeout(5_000) { fixture.eventsReady.await() }
+            assertEquals("approval", withTimeout(5_000) { events.receive() }.string("method"))
+            fixture.client.post("/api/approval/respond", json("session_id" to stored, "scope_key" to fixture.client.scope.session(stored).key,
+                "approval_id" to "approval-during-resume-queue", "choice" to "once"))
+            assertEquals("approval-during-resume", fixture.serverResponses.single().getString("id"))
+            assertEquals("phone-runtime", binding.runtimeSessionId)
+        } finally {
+            collector.cancelAndJoin()
+            fixture.client.closeNative()
+        }
+    }
+
+    @Test fun approvalAndClarifyUseTheOriginalRequestIdsAndHermesResultShapes() = runBlocking<Unit> {
+        val fixture = GatewayFixture()
+        val stored = "20261019_001507_a4cbef"
+        val binding = fixture.client.nativeSession(stored)
+        val events = Channel<JSONObject>(Channel.UNLIMITED)
+        val collector = launch { fixture.client.nativeEvents { events.send(it) } }
+        try {
+            withTimeout(5_000) { fixture.eventsReady.await() }
+            fixture.emitServerRequest("approval", 41, json("session_id" to binding.runtimeSessionId, "request_id" to "approval-queue-41", "choices" to JSONArray().put("once").put("deny")))
+            assertEquals("approval", withTimeout(5_000) { events.receive() }.string("method"))
+            fixture.client.post("/api/approval/respond", json("session_id" to stored, "scope_key" to fixture.client.scope.session(stored).key,
+                "approval_id" to "approval-queue-41", "choice" to "once"))
+            val approval = fixture.serverResponses.single()
+            assertEquals(41, approval.optInt("id"))
+            assertEquals(setOf("choice"), approval.getJSONObject("result").keys().asSequence().toSet())
+            assertEquals("once", approval.getJSONObject("result").getString("choice"))
+
+            fixture.emitServerRequest("approval", "approval-wire-all", json("session_id" to binding.runtimeSessionId, "request_id" to "approval-queue-all", "choices" to JSONArray().put("deny")))
+            assertEquals("approval", withTimeout(5_000) { events.receive() }.string("method"))
+            fixture.client.post("/api/approval/respond", json("session_id" to stored, "scope_key" to fixture.client.scope.session(stored).key,
+                "approval_id" to "approval-queue-all", "choice" to "deny", "all" to true))
+            val approvalAll = fixture.serverResponses.last()
+            assertEquals("approval-wire-all", approvalAll.getString("id"))
+            assertEquals(setOf("choice", "all"), approvalAll.getJSONObject("result").keys().asSequence().toSet())
+            assertTrue(approvalAll.getJSONObject("result").getBoolean("all"))
+
+            val questions = JSONArray().put(json("qid" to "route/a", "question" to "Which route?"))
+                .put(json("qid" to "notes:b", "question" to "Anything else?"))
+            fixture.emitServerRequest("clarify", "clarify-wire-id", json("session_id" to binding.runtimeSessionId, "questions" to questions))
+            assertEquals("clarify", withTimeout(5_000) { events.receive() }.string("method"))
+            fixture.client.post("/api/clarify/respond", json("session_id" to stored, "scope_key" to fixture.client.scope.session(stored).key,
+                "clarify_id" to "clarify-wire-id", "answers" to json("route/a" to "Canary", "notes:b" to "Keep rollback ready")))
+            val clarify = fixture.serverResponses.last()
+            assertEquals("clarify-wire-id", clarify.getString("id"))
+            assertEquals(setOf("answers", "outcome"), clarify.getJSONObject("result").keys().asSequence().toSet())
+            assertEquals("submitted", clarify.getJSONObject("result").getString("outcome"))
+            assertEquals("Canary", clarify.getJSONObject("result").getJSONObject("answers").getString("route/a"))
+            assertEquals("Keep rollback ready", clarify.getJSONObject("result").getJSONObject("answers").getString("notes:b"))
+            assertTrue(fixture.calls.none { it.first in setOf("approval.respond", "request.answer", "clarify.lock") })
+        } finally {
+            collector.cancelAndJoin()
+            fixture.client.closeNative()
+        }
+    }
+
+    @Test fun unsupportedForeignAndCancelledRequestsNeverLeaveAnAnswerablePrompt() = runBlocking<Unit> {
+        val fixture = GatewayFixture()
+        val stored = "20261019_001507_a4cbef"
+        val binding = fixture.client.nativeSession(stored)
+        val events = Channel<JSONObject>(Channel.UNLIMITED)
+        val collector = launch { fixture.client.nativeEvents { events.send(it) } }
+        try {
+            withTimeout(5_000) { fixture.eventsReady.await() }
+            val unsupported = listOf(
+                "secret" to -32601, "sudo" to -32601, "display.install.sudo" to -32601,
+                "vault.code" to -32601, "vault.save_login" to -32601, "vault.unlock_prompt" to -32601,
+                "theme.apply" to -32601, "theme.pick" to -32601, "setup_beat" to -32601,
+                "preview.act" to 4404, "preview.read" to 4404, "terminal.read" to 4404,
+                "window.read" to 4404, "tour" to 4404, "future.method" to -32601,
+            )
+            unsupported.forEachIndexed { index, (method, code) ->
+                fixture.emitServerRequest(method, "unsupported-$index", json("session_id" to binding.runtimeSessionId))
+                assertEquals(code, fixture.serverResponses.last().getJSONObject("error").getInt("code"))
+                assertEquals("unsupported-$index", fixture.serverResponses.last().getString("id"))
+            }
+            fixture.emitServerRequest("clarify", "foreign-clarify", json("session_id" to "another-runtime", "questions" to JSONArray().put(json("qid" to "q", "question" to "No?"))))
+            assertEquals(-32602, fixture.serverResponses.last().getJSONObject("error").getInt("code"))
+            assertNull(withTimeoutOrNull(50) { events.receive() })
+
+            fixture.emitServerRequest("clarify", "cancel-me", json("session_id" to binding.runtimeSessionId, "questions" to JSONArray().put(json("qid" to "q", "question" to "Continue?"))))
+            assertEquals("clarify", withTimeout(5_000) { events.receive() }.string("method"))
+            fixture.cancelServerRequest("cancel-me", "clarify", binding.runtimeSessionId)
+            val before = fixture.serverResponses.size
+            assertTrue(runCatching {
+                fixture.client.post("/api/clarify/respond", json("session_id" to stored, "scope_key" to fixture.client.scope.session(stored).key,
+                    "clarify_id" to "cancel-me", "answers" to json("q" to "late")))
+            }.isFailure)
+            assertEquals(before, fixture.serverResponses.size)
+        } finally {
+            collector.cancelAndJoin()
+            fixture.client.closeNative()
+        }
     }
 
     @Test fun everyStoredSessionResumeCarriesAndroidSource() = runBlocking<Unit> {

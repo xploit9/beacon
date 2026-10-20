@@ -14,6 +14,22 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /** Hermes `source` for a named Cypher thread (Relay tags its threads `phone`); every other phone chat is `android`. */
 internal const val CYPHER_THREAD_SOURCE = "android_thread"
+private val WINDOW_SERVER_REQUESTS = setOf("preview.act", "preview.read", "terminal.read", "window.read", "tour")
+
+private data class ParsedNativeRequestId(val key: String, val text: String)
+private data class NativeRequestIdentity(val idKey: String, val method: String, val sessionId: String)
+private data class NativeServerRequest(
+    val id: Any,
+    val idText: String,
+    val idKey: String,
+    val method: String,
+    val sessionId: String,
+    var params: JSONObject,
+    val socket: WebSocket,
+    var delivered: Boolean = false,
+) {
+    val identity get() = NativeRequestIdentity(idKey, method, sessionId)
+}
 
 data class NativeSessionBinding(val scope: Scope, val storedSessionId: String, val runtimeSessionId: String)
 
@@ -36,6 +52,9 @@ internal class NativeGateway(private val client: CypherClient, private val socke
     private class Connection {
         val frames = Channel<JSONObject>(256)
         val pending = ConcurrentHashMap<String, CompletableDeferred<JSONObject>>()
+        val requestLock = Any()
+        val serverRequests = linkedMapOf<String, NativeServerRequest>()
+        val retiredServerRequests = linkedSetOf<NativeRequestIdentity>()
         val ready = CompletableDeferred<Unit>()
         @Volatile var socket: WebSocket? = null
         @Volatile var failure: IOException? = null
@@ -62,6 +81,13 @@ internal class NativeGateway(private val client: CypherClient, private val socke
                 override fun onOpen(ws: WebSocket, response: Response) {
                     mine.socket = ws
                     if (connection !== mine || mine.failure != null) { ws.cancel(); return }
+                    // No acknowledgement is required; a legacy gateway's method-not-found response is dropped below.
+                    if (ws.send(json("jsonrpc" to "2.0", "id" to "capabilities-${UUID.randomUUID()}", "method" to "client.capabilities",
+                            "params" to json("server_requests" to true)).toString()) != true) {
+                        terminate(mine, IOException("Native connection could not advertise server-request support"))
+                        ws.cancel()
+                        return
+                    }
                     mine.ready.complete(Unit)
                 }
                 override fun onMessage(ws: WebSocket, text: String) {
@@ -70,7 +96,20 @@ internal class NativeGateway(private val client: CypherClient, private val socke
                     val frame = runCatching { JSONObject(text) }.getOrNull() ?: return
                     val id = frame.optString("id")
                     if (!frame.has("method") && id.isNotBlank()) mine.pending.remove(id)?.complete(frame)
-                    else if (!mine.frames.trySend(frame).isSuccess) { terminate(mine, IOException("Native event queue overflow; reconcile history")); ws.cancel() }
+                    else if (frame.has("method") && frame.optString("method") != "event") {
+                        if (frame.optString("method") == "approval" || frame.optString("method") == "clarify") {
+                            // A prompt can precede the session.resume acknowledgement that installs its owner binding.
+                            if (!frame.has("id")) serverRequestError(mine, JSONObject.NULL, -32600, "Invalid request id")
+                            else if (!mine.frames.trySend(frame).isSuccess) {
+                                terminate(mine, IOException("Native event queue overflow; reconcile history")); ws.cancel()
+                            }
+                        } else {
+                            prepareServerRequest(mine, frame)
+                        }
+                    } else {
+                        retireCancelledServerRequest(mine, frame)
+                        if (!mine.frames.trySend(frame).isSuccess) { terminate(mine, IOException("Native event queue overflow; reconcile history")); ws.cancel() }
+                    }
                 }
                 override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) { terminate(mine, IOException("Native connection interrupted", t)) }
                 override fun onClosing(ws: WebSocket, code: Int, reason: String) { terminate(mine, IOException("Native connection closed ($code)")); ws.close(code, reason) }
@@ -105,6 +144,170 @@ internal class NativeGateway(private val client: CypherClient, private val socke
             return response.optJSONObject("result") ?: JSONObject().put("value", response.opt("result"))
         } finally { mine.pending.remove(id) }
     }
+
+    // Adapted from Hermes Relay's GatewayChatClient request lifecycle; Cypher keeps its existing native session cursor.
+    internal fun answerServerRequest(method: String, requestId: String, sessionId: String, payload: JSONObject): JSONObject {
+        val mine = connection?.takeIf { it.failure == null && it.ready.isCompleted }
+            ?: throw IOException("Native server request is no longer connected")
+        val binding = synchronized(cursorLock) { cursor?.binding }
+        if (binding == null || binding.scope != client.scope || binding.runtimeSessionId != sessionId) {
+            throw IOException("Native server request is not owned by this conversation")
+        }
+        val requests = synchronized(mine.requestLock) {
+            mine.serverRequests.values.filter { request ->
+                request.method == method && request.sessionId == sessionId &&
+                    (if (method == "approval") request.params.string("request_id") == requestId else request.idText == requestId)
+            }
+        }
+        val open = requests.singleOrNull() ?: throw IOException("Native server request is no longer active")
+        val result = when (method) {
+            "approval" -> {
+                val choice = payload.string("choice")
+                val offered = open.params.optJSONArray("choices")?.let { choices -> (0 until choices.length()).map { choices.optString(it) } }.orEmpty()
+                if (choice !in offered.ifEmpty { listOf("deny") }) throw IOException("Approval choice was not offered by Hermes")
+                JSONObject().put("choice", choice).apply {
+                    if (payload.has("all")) {
+                        if (payload.opt("all") !is Boolean) throw IOException("Invalid approval response")
+                        put("all", payload.getBoolean("all"))
+                    }
+                }
+            }
+            "clarify" -> {
+                val questions = open.params.optJSONArray("questions") ?: throw IOException("Invalid clarify request")
+                val qids = (0 until questions.length()).map { questions.getJSONObject(it).getString("qid") }
+                val answers = payload.optJSONObject("answers")?.copy() ?: run {
+                    if (qids.size != 1 || !payload.has("response") || payload.opt("response") !is String) throw IOException("Answer every clarification question before continuing")
+                    JSONObject().put(qids.single(), payload.getString("response"))
+                }
+                val answerIds = answers.keys().asSequence().toSet()
+                if (answerIds != qids.toSet() || answerIds.size != qids.size || qids.any { answers.opt(it) !is String && answers.opt(it) != JSONObject.NULL }) {
+                    throw IOException("Answer every clarification question before continuing")
+                }
+                JSONObject().put("answers", answers).put("outcome", "submitted")
+            }
+            else -> throw IOException("Not available on the phone")
+        }
+        synchronized(mine.requestLock) {
+            if (mine.serverRequests[open.idKey] !== open || connection !== mine || mine.failure != null || open.socket !== mine.socket) {
+                throw IOException("Native server request is no longer active")
+            }
+            val response = JSONObject().put("jsonrpc", "2.0").put("id", open.id).put("result", result)
+            if (open.socket.send(response.toString()) != true) throw IOException("Native server request response could not be sent")
+            retireServerRequestLocked(mine, open)
+        }
+        return JSONObject().put("ok", true)
+    }
+
+    private fun requestId(frame: JSONObject): ParsedNativeRequestId? {
+        if (!frame.has("id")) return null
+        return when (val id = frame.opt("id")) {
+            is String -> id.takeIf(String::isNotBlank)?.let { ParsedNativeRequestId("s:$it", it) }
+            is Number -> id.toString().takeIf(String::isNotBlank)?.let { ParsedNativeRequestId("n:$it", it) }
+            else -> null
+        }
+    }
+
+    private fun prepareServerRequest(mine: Connection, frame: JSONObject): NativeServerRequest? {
+        val method = frame.optString("method")
+        val id = frame.opt("id") ?: JSONObject.NULL
+        val idParts = requestId(frame)
+        if (idParts == null) {
+            val responseId = when (id) { is String, is Number -> id; else -> JSONObject.NULL }
+            serverRequestError(mine, responseId, -32600, "Invalid request id")
+            return null
+        }
+        if (frame.optString("jsonrpc") != "2.0") {
+            serverRequestError(mine, id, -32600, "Invalid JSON-RPC request")
+            return null
+        }
+        if (method in WINDOW_SERVER_REQUESTS) {
+            serverRequestError(mine, id, 4404, "This request is not shown on the phone")
+            return null
+        }
+        if (method != "approval" && method != "clarify") {
+            serverRequestError(mine, id, -32601, "Not available on the phone")
+            return null
+        }
+        val params = frame.optJSONObject("params")
+        if (params == null) {
+            serverRequestError(mine, id, -32602, "Invalid request parameters")
+            return null
+        }
+        val sessionId = params.string("session_id")
+        val binding = synchronized(cursorLock) { cursor?.binding }
+        if (sessionId.isBlank() || binding == null || binding.scope != client.scope || binding.runtimeSessionId != sessionId) {
+            serverRequestError(mine, id, -32602, "Request is not owned by this conversation")
+            return null
+        }
+        if (method == "approval" && params.string("request_id").isBlank()) {
+            serverRequestError(mine, id, -32602, "Invalid approval request")
+            return null
+        }
+        if (method == "clarify") {
+            val questions = params.optJSONArray("questions")
+            val qids = questions?.let { rows -> (0 until rows.length()).mapNotNull { rows.optJSONObject(it)?.string("qid")?.takeIf(String::isNotBlank) } }.orEmpty()
+            val valid = questions != null && questions.length() in 1..5 && qids.size == questions.length() && qids.distinct().size == qids.size &&
+                (0 until questions.length()).all { questions.optJSONObject(it)?.string("question")?.isNotBlank() == true }
+            if (!valid) {
+                serverRequestError(mine, id, -32602, "Invalid clarify request")
+                return null
+            }
+        }
+        val identity = NativeRequestIdentity(idParts.key, method, sessionId)
+        var failure: Pair<Int, String>? = null
+        val open = synchronized(mine.requestLock) {
+            if (identity in mine.retiredServerRequests) return null
+            val previous = mine.serverRequests[idParts.key]
+            when {
+                previous != null && (previous.method != method || previous.sessionId != sessionId) -> {
+                    failure = -32602 to "Request identity changed"
+                    null
+                }
+                previous != null -> previous.apply { params = params.copy() }
+                mine.serverRequests.size >= 64 -> {
+                    failure = -32000 to "Too many open requests"
+                    null
+                }
+                else -> NativeServerRequest(id, idParts.text, idParts.key, method, sessionId, params.copy(), mine.socket!!)
+                    .also { mine.serverRequests[idParts.key] = it }
+            }
+        }
+        failure?.let { serverRequestError(mine, id, it.first, it.second) }
+        return open
+    }
+
+    private fun retireCancelledServerRequest(mine: Connection, frame: JSONObject) {
+        val params = frame.optJSONObject("params") ?: return
+        if (params.string("type", frame.optString("method")) != "request.cancel") return
+        val payload = params.optJSONObject("payload") ?: params
+        val idParts = requestId(json("id" to payload.opt("id"))) ?: return
+        val method = payload.string("method")
+        val sessionId = params.string("session_id").ifBlank { payload.string("session_id") }
+        if (method.isBlank() || sessionId.isBlank()) return
+        synchronized(mine.requestLock) {
+            val identity = NativeRequestIdentity(idParts.key, method, sessionId)
+            mine.serverRequests[idParts.key]?.takeIf { it.method == method && it.sessionId == sessionId }?.let { mine.serverRequests.remove(idParts.key) }
+            rememberRetiredRequestLocked(mine, identity)
+        }
+    }
+
+    private fun retireServerRequestLocked(mine: Connection, request: NativeServerRequest) {
+        if (mine.serverRequests[request.idKey] === request) mine.serverRequests.remove(request.idKey)
+        rememberRetiredRequestLocked(mine, request.identity)
+    }
+
+    private fun rememberRetiredRequestLocked(mine: Connection, identity: NativeRequestIdentity) {
+        mine.retiredServerRequests += identity
+        if (mine.retiredServerRequests.size > 256) mine.retiredServerRequests.remove(mine.retiredServerRequests.first())
+    }
+
+    private fun serverRequestError(mine: Connection, id: Any, code: Int, message: String) {
+        if (connection !== mine || mine.failure != null) return
+        val response = JSONObject().put("jsonrpc", "2.0").put("id", id)
+            .put("error", JSONObject().put("code", code).put("message", message))
+        if (mine.socket?.send(response.toString()) != true) terminate(mine, IOException("Native server request error could not be sent"))
+    }
+
     private var sessionState = JSONObject()
     internal fun sessionSnapshot(): JSONObject = synchronized(cursorLock) { sessionState.copy() }
     private fun bind(result: JSONObject): NativeSessionBinding = nativeSessionBinding(client.scope, result).also { synchronized(cursorLock) { sessionState = result.copy(); cursor = Cursor(it) } }
@@ -145,14 +348,26 @@ internal class NativeGateway(private val client: CypherClient, private val socke
                 }
                 synchronized(cursorLock) { if (cursor === snapshot) { if (reconcile) snapshot.sequence = replay.optLong("latest_seq", 0); snapshot.epoch = nextEpoch } }
                 if (synchronized(cursorLock) { cursor === snapshot }) {
-                    replay.rows("open_requests").forEach { deliver(it, onEvent) }
-                    replay.rows("events").forEach { deliver(json("method" to "event", "params" to it), onEvent) }
+                    val events = replay.rows("events")
+                    events.forEach { retireCancelledServerRequest(mine, it) }
+                    replay.rows("open_requests").forEach { deliver(mine, it, onEvent) }
+                    events.forEach { deliver(mine, json("method" to "event", "params" to it), onEvent) }
                 }
             }
-            for (frame in mine.frames) { mine.failure?.let { throw it }; deliver(frame, onEvent) }
+            for (frame in mine.frames) { mine.failure?.let { throw it }; deliver(mine, frame, onEvent) }
         } finally { consuming.set(false); if (mine?.failure != null) mine.frames.cancel() }
     }
-    private suspend fun deliver(frame: JSONObject, callback: suspend (JSONObject) -> Unit) {
+    private suspend fun deliver(mine: Connection, frame: JSONObject, callback: suspend (JSONObject) -> Unit) {
+        if (frame.has("method") && frame.optString("method") != "event") {
+            val request = sessionLock.withLock { prepareServerRequest(mine, frame) } ?: return
+            val shouldDeliver = synchronized(mine.requestLock) {
+                if (mine.serverRequests[request.idKey] !== request || request.delivered) false
+                else { request.delivered = true; true }
+            }
+            if (shouldDeliver) callback(frame)
+            return
+        }
+        retireCancelledServerRequest(mine, frame)
         val p = frame.optJSONObject("params") ?: frame
         val snapshot = synchronized(cursorLock) { cursor }
         val b = snapshot?.binding

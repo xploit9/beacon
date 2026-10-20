@@ -112,6 +112,8 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
     }
     private val native = NativeGateway(this, socketFactory ?: http)
     suspend fun nativeRpc(method: String, params: JSONObject = JSONObject()): JSONObject = native.rpc(method, params)
+    internal fun nativeAnswerServerRequest(method: String, requestId: String, sessionId: String, payload: JSONObject): JSONObject =
+        native.answerServerRequest(method, requestId, sessionId, payload)
     suspend fun nativeRequest(path: String, method: String = "GET", body: JSONObject? = null, params: Map<String, String> = emptyMap()): JSONObject {
         require(NativeOperationPolicy.direct(path, method)) { "Unsupported native endpoint" }
         if (body?.has("profile") == true) require(body.string("profile") == auth.profile) { "Native request belongs to another profile" }

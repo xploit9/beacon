@@ -342,61 +342,76 @@ class NativeExperienceUiTest {
     }
 
     @Test fun stalePromptButtonsCannotApproveOrAnswerTheNextRequest() = withFixture { vm, fixture ->
-        fun approval(id: String) = json("approval_id" to id, "command" to "Synthetic $id", "choices" to JSONArray().put("once").put("deny"))
-        fun question(id: String) = json("clarify_id" to id, "question" to "Synthetic $id", "choices" to JSONArray().put("Choose this"))
-        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = approval("old-approval")) }
+        fun approval(id: String) = json("request_id" to "queue-$id", "command" to "Synthetic $id", "choices" to JSONArray().put("once").put("deny"))
+        fun shownApproval(id: String) = json("approval_id" to "queue-$id", "command" to "Synthetic $id", "choices" to JSONArray().put("once").put("deny"))
+        fun question(id: String) = json("questions" to JSONArray().put(json("qid" to "qid-$id", "question" to "Synthetic $id", "choices" to JSONArray().put("Choose this"))))
+        val subscriptionsBeforeSend = fixture.streamSubscriptions.get()
+        compose.runOnIdle { vm.composer(TextFieldValue("Ask for permission")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && fixture.streamSubscriptions.get() > subscriptionsBeforeSend }
+
+        fixture.emitNativeServerRequest("approval", "wire-old-approval", approval("old-approval"))
+        await { vm.chat.value.approval?.string("approval_id") == "queue-old-approval" }
         val staleApproval = requireNotNull(compose.onNodeWithText("Allow once").performScrollTo().fetchSemanticsNode().config[androidx.compose.ui.semantics.SemanticsActions.OnClick].action)
-        compose.runOnIdle {
-            flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = approval("new-approval"))
-            assertTrue(staleApproval())
-            assertTrue(vm.ui.value.notice.contains("request changed"))
-        }
+        fixture.emitNativeServerRequest("approval", "wire-new-approval", approval("new-approval"))
+        await { vm.chat.value.approval?.string("approval_id") == "queue-new-approval" }
+        compose.runOnIdle { assertTrue(staleApproval()); assertTrue(vm.ui.value.notice.contains("request changed")) }
         compose.waitForIdle()
-        assertTrue(fixture.requests.none { it.string("method") == "approval.respond" })
+        assertTrue(fixture.nativeServerResponses.isEmpty())
+        fixture.emitNativeEvent("request.cancel", json("id" to "wire-old-approval", "method" to "approval", "reason" to "test"))
         compose.runOnIdle { vm.clearMessage() }
         await { compose.onAllNodesWithText("This request changed. Refresh it before responding.").fetchSemanticsNodes().isEmpty() }
         await { compose.onAllNodesWithText("Synthetic new-approval").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("Allow once").performScrollTo().performClick()
-        await { fixture.requests.any { it.string("method") == "approval.respond" } }
-        assertEquals("new-approval", fixture.requests.last { it.string("method") == "approval.respond" }.getJSONObject("params").string("request_id"))
+        await { fixture.nativeServerResponses.size == 1 }
+        assertEquals("wire-new-approval", fixture.nativeServerResponses.last().getString("id"))
+        assertEquals("once", fixture.nativeServerResponses.last().getJSONObject("result").getString("choice"))
         await { vm.chat.value.approval == null }
 
         compose.runOnIdle {
-            flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = approval("racing-approval"))
-            fixture.onPromptResponse = { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = approval("replacement-approval")) }
+            fixture.onPromptResponse = { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = shownApproval("replacement-approval")) }
         }
+        fixture.emitNativeServerRequest("approval", "wire-racing-approval", approval("racing-approval"))
+        await { vm.chat.value.approval?.string("approval_id") == "queue-racing-approval" }
         compose.onNodeWithText("Allow once").performScrollTo().performClick()
-        await { fixture.requests.count { it.string("method") == "approval.respond" } == 2 }
-        assertEquals("racing-approval", fixture.requests.last { it.string("method") == "approval.respond" }.getJSONObject("params").string("request_id"))
-        await { vm.chat.value.approval?.string("approval_id") == "replacement-approval" }
+        await { fixture.nativeServerResponses.size == 2 }
+        assertEquals("wire-racing-approval", fixture.nativeServerResponses.last().getString("id"))
+        await { vm.chat.value.approval?.string("approval_id") == "queue-replacement-approval" }
 
         compose.runOnIdle {
-            flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = approval("failed-approval"))
             fixture.rejectPromptResponse = true
         }
+        fixture.emitNativeServerRequest("approval", "wire-failed-approval", approval("failed-approval"))
+        await { vm.chat.value.approval?.string("approval_id") == "queue-failed-approval" }
         compose.onNodeWithText("Allow once").performScrollTo().performClick()
-        await { fixture.requests.count { it.string("method") == "approval.respond" } == 3 }
-        await { vm.ui.value.error.contains("Synthetic prompt response rejected") }
-        assertEquals("A failed acknowledgement retains the displayed prompt", "failed-approval", vm.chat.value.approval?.string("approval_id"))
+        await { vm.ui.value.error.contains("could not be sent") }
+        assertEquals(2, fixture.nativeServerResponses.size)
+        assertEquals("A failed socket send retains the displayed prompt", "queue-failed-approval", vm.chat.value.approval?.string("approval_id"))
+        fixture.emitNativeEvent("request.cancel", json("id" to "wire-failed-approval", "method" to "approval", "reason" to "test"))
+        await { vm.chat.value.approval == null }
         compose.runOnIdle {
             vm.clearMessage()
-            flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = null, clarification = question("old-question"))
         }
-        val staleAnswer = requireNotNull(compose.onNodeWithText("Choose this").performScrollTo().fetchSemanticsNode().config[androidx.compose.ui.semantics.SemanticsActions.OnClick].action)
-        compose.runOnIdle {
-            flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(clarification = question("new-question"))
-            assertTrue(staleAnswer())
-            assertTrue(vm.ui.value.notice.contains("request changed"))
-        }
+        fixture.emitNativeServerRequest("clarify", "wire-old-question", question("old-question"))
+        await { vm.chat.value.clarification?.string("clarify_id") == "wire-old-question" }
+        compose.onNodeWithText("Your answer").performScrollTo().performTextInput("Old answer")
+        val staleAnswer = requireNotNull(compose.onNodeWithText("Continue").performScrollTo().fetchSemanticsNode().config[androidx.compose.ui.semantics.SemanticsActions.OnClick].action)
+        fixture.emitNativeServerRequest("clarify", "wire-new-question", question("new-question"))
+        await { vm.chat.value.clarification?.string("clarify_id") == "wire-new-question" }
+        compose.runOnIdle { assertTrue(staleAnswer()); assertTrue(vm.ui.value.notice.contains("request changed")) }
         compose.waitForIdle()
-        assertTrue(fixture.requests.none { it.string("method") == "request.answer" })
+        assertEquals(2, fixture.nativeServerResponses.size)
+        fixture.emitNativeEvent("request.cancel", json("id" to "wire-old-question", "method" to "clarify", "reason" to "test"))
         compose.runOnIdle { vm.clearMessage() }
         await { compose.onAllNodesWithText("This request changed. Refresh it before responding.").fetchSemanticsNodes().isEmpty() }
         await { compose.onAllNodesWithText("Synthetic new-question").fetchSemanticsNodes().isNotEmpty() }
-        compose.onNodeWithText("Choose this").performScrollTo().performClick()
-        await { fixture.requests.any { it.string("method") == "request.answer" } }
-        assertEquals("new-question", fixture.requests.single { it.string("method") == "request.answer" }.getJSONObject("params").string("id"))
+        compose.onNodeWithText("Your answer").performScrollTo().performTextInput("Keep rollback ready")
+        compose.onNodeWithText("Continue").performScrollTo().performClick()
+        await { fixture.nativeServerResponses.size == 3 }
+        assertEquals("wire-new-question", fixture.nativeServerResponses.last().getString("id"))
+        assertEquals("Keep rollback ready", fixture.nativeServerResponses.last().getJSONObject("result").getJSONObject("answers").getString("qid-new-question"))
+        assertEquals("submitted", fixture.nativeServerResponses.last().getJSONObject("result").getString("outcome"))
         await { vm.chat.value.clarification == null }
+        assertTrue(fixture.requests.none { it.string("method") in setOf("approval.respond", "request.answer") })
         receipts += "A retained click from a replaced approval/question sends nothing; fresh actions carry only their displayed request ID."
         capture("audit-prompt-identity")
     }
@@ -2097,7 +2112,8 @@ class NativeExperienceUiTest {
         compose.onNodeWithTag("message-stop").assertDoesNotExist()
         compose.onNodeWithTag("chat-call-cypher").assertIsNotEnabled()
         assertTrue(vm.chat.value.queued.isEmpty())
-        assertTrue("Reference states never send, stop, approve or answer anything", fixture.requests.none { it.string("method") in setOf("prompt.submit", "session.create", "session.interrupt", "approval.respond", "request.answer") })
+        assertTrue("Reference states never send or stop anything", fixture.requests.none { it.string("method") in setOf("prompt.submit", "session.create", "session.interrupt") })
+        assertTrue("Reference states never answer a native server request", fixture.nativeServerResponses.isEmpty())
         receipts += "Live running/queued/approval/question work appears in the activity strip and read-only sheet from real chat state; the sheet has no stop control, queue removal is the only mutation, and the Cypher shell menus keep working. Nothing was sent."
         capture("migration-chat-settled")
     }

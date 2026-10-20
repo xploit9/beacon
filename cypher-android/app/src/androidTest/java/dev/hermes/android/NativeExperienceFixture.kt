@@ -169,6 +169,10 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile private var activeNativeListener: WebSocketListener? = null
     @Volatile private var activeNativeSocket: WebSocket? = null
     @Volatile private var activeNativeSessionId: String? = null
+    private val serverRequestCapabilities = ConcurrentHashMap<WebSocket, Boolean>()
+    private val openNativeServerRequests = ConcurrentHashMap<String, JSONObject>()
+    private val nativeServerRequestSequence = AtomicInteger()
+    val nativeServerResponses = CopyOnWriteArrayList<JSONObject>()
     private val pendingNativeStreams = ConcurrentHashMap.newKeySet<String>()
     private val runtimeStoredSessionIds = ConcurrentHashMap<String, String>()
     private val currentRuntimeSessionIds = ConcurrentHashMap<String, String>()
@@ -234,10 +238,24 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     }
     fun activeRuntimeForTest(): String? = activeNativeSessionId
     fun emitNativeEvent(type: String, payload: JSONObject) {
+        if (type in setOf("approval", "clarify")) {
+            emitNativeServerRequest(type, "fixture-$type-${nativeServerRequestSequence.incrementAndGet()}", payload)
+            return
+        }
         val runtime = activeNativeSessionId ?: error("No active native conversation is selected")
         val event = retainNativeEvent(runtime, type, payload)
         val (listener, socket) = awaitActiveNativeSocket(0)
+        if (type == "request.cancel") payload.opt("id")?.takeIf { it != JSONObject.NULL }?.let { openNativeServerRequests.remove(it.toString()) }
         listener.onMessage(socket, json("method" to "event", "params" to event).toString())
+    }
+    fun emitNativeServerRequest(method: String, id: String, payload: JSONObject) {
+        require(method in setOf("approval", "clarify") && id.isNotBlank())
+        val runtime = activeNativeSessionId ?: error("No active native conversation is selected")
+        val (listener, socket) = awaitActiveNativeSocket(0)
+        check(serverRequestCapabilities[socket] == true) { "The fixture may emit $method only after client.capabilities server_requests=true" }
+        val frame = json("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to payload.copy().put("session_id", runtime))
+        check(openNativeServerRequests.putIfAbsent(id, frame.copy()) == null) { "Duplicate synthetic server request id: $id" }
+        listener.onMessage(socket, frame.toString())
     }
     fun interruptActiveNativeStream() {
         val (listener, socket) = awaitActiveNativeSocket(0)
@@ -636,10 +654,23 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             override fun close(code: Int, reason: String?) = true
             override fun cancel() = Unit
             override fun send(text: String): Boolean {
-                val frame = JSONObject(text); requests += frame.copy()
+                val frame = JSONObject(text)
+                if (!frame.has("method")) {
+                    if (rejectPromptResponse) { rejectPromptResponse = false; return false }
+                    nativeServerResponses += frame.copy()
+                    frame.opt("id")?.takeIf { it != JSONObject.NULL }?.let { openNativeServerRequests.remove(it.toString()) }
+                    onPromptResponse?.also { onPromptResponse = null }?.invoke()
+                    return true
+                }
+                requests += frame.copy()
                 try {
                     val method = frame.getString("method")
                     val params = frame.optJSONObject("params") ?: JSONObject()
+                    if (method == "client.capabilities") {
+                        serverRequestCapabilities[this] = params.optBoolean("server_requests")
+                        listener.onMessage(this, json("jsonrpc" to "2.0", "id" to frame.getString("id"), "result" to JSONObject()).toString())
+                        return true
+                    }
                     when (method) {
                         "prompt.submit", "session.steer" -> params.string("session_id").takeIf(String::isNotBlank)?.let(pendingNativeStreams::add)
                         "session.active_list" -> params.string("current_session_id").takeIf(String::isNotBlank)?.let(pendingNativeStreams::add)
@@ -720,7 +751,9 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 currentRuntimeSessionIds[key] = row.string("session_id")
                 sessions[key] = row
             } }
-            "session.events.since" -> json("epoch" to "synthetic", "latest_seq" to nativeEventSequence.get(), "events" to JSONArray(nativeEvents.filter { it.optLong("seq") > params.optLong("last_seen", 0) }))
+            "session.events.since" -> json("epoch" to "synthetic", "latest_seq" to nativeEventSequence.get(),
+                "events" to JSONArray(nativeEvents.filter { it.optLong("seq") > params.optLong("last_seen", 0) }),
+                "open_requests" to JSONArray(openNativeServerRequests.values.filter { it.optJSONObject("params")?.string("session_id") == params.string("session_id") }))
             "session.active_list" -> {
                 if (nativeStatusFailure) throw IllegalArgumentException("Synthetic active status unavailable")
                 val runtime = params.optString("current_session_id")
@@ -779,11 +812,6 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                     row.put("model_config", JSONObject(row.optString("model_config").ifBlank { "{}" }).put("yolo_mode", on).toString())
                 }
                 json("ok" to true, "key" to key, "value" to if (key == "yolo") if (value in setOf("1", "on", "true")) "1" else "0" else value)
-            }
-            "approval.respond", "request.answer" -> {
-                if (rejectPromptResponse) { rejectPromptResponse = false; throw IllegalArgumentException("Synthetic prompt response rejected") }
-                onPromptResponse?.also { onPromptResponse = null }?.invoke()
-                json("ok" to true)
             }
             "approval.pending" -> json("approvals" to JSONArray())
             "commands.catalog" -> {
