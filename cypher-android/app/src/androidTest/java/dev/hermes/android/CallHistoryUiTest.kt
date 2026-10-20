@@ -114,12 +114,8 @@ class CallHistoryUiTest {
             compose.onNodeWithTag("call-history-row:$callId").performClick()
             compose.waitUntil(5_000) { compose.onAllNodesWithText("Transcript from completed call").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("Transcript from completed call").assertIsDisplayed()
-            compose.onNodeWithContentDescription("Conversation actions").performClick()
-            compose.onNodeWithTag("call-history-open").performClick()
-            compose.waitUntil(10_000) { compose.onAllNodesWithText("Missed call").fetchSemanticsNodes().isNotEmpty() }
-            compose.onNodeWithTag("call-history-row:call-history-missed").performClick()
-            compose.waitUntil(5_000) { vm.chat.value.sessionId == "chat-b" }
 
+            // Checked while the assistant chat is open: after the jump to chat-b this screen's actions menu is disabled.
             fixture.callHistoryRouteMissing = true
             compose.onNodeWithContentDescription("Conversation actions").performClick()
             compose.onNodeWithTag("call-history-open").performClick()
@@ -133,6 +129,14 @@ class CallHistoryUiTest {
             compose.onNodeWithTag("call-history-open").performClick()
             compose.waitUntil(10_000) { compose.onAllNodesWithText("Call history unavailable").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("Retry").assertExists()
+            compose.onNodeWithTag("call-history-close").performClick()
+            fixture.pluginStatus = null
+
+            compose.onNodeWithContentDescription("Conversation actions").performClick()
+            compose.onNodeWithTag("call-history-open").performClick()
+            compose.waitUntil(10_000) { compose.onAllNodesWithText("Missed call").fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithTag("call-history-row:call-history-missed").performClick()
+            compose.waitUntil(5_000) { vm.chat.value.sessionId == "chat-b" }
         } finally {
             compose.runOnUiThread { store.clear(); fixture.client.closeNative(); app.calls.ownerScope = priorCallOwnerScope }
             runBlocking {

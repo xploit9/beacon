@@ -205,15 +205,20 @@ class KeepConnectedUiTest {
             } else android.app.Notification.Builder(app)
             manager.notify(4083, signInPrompt.setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle("Sign in again").build())
 
-            val taskResultEvent = fixture.emitTaskResult()
-            testEvents += taskResultEvent
-            val taskResultKey = "${taskResultEvent.getString("source_ref")}\u0000${taskResultEvent.getString("event_id")}".digest()
+            fun notificationKey(event: JSONObject) = "${event.getString("source_ref")}\u0000${event.getString("event_id")}".digest()
+            // The first connection starts every profile's cursor at Hermes's current head: an older event is not replayed.
+            val olderEvent = fixture.emitTaskResult()
+            testEvents += olderEvent
             compose.onNodeWithTag("keep-connected-toggle").performClick()
             compose.waitUntil(15_000) {
-                KeepConnectedService.status(app) == KeepConnectedService.STATUS_CONNECTED &&
-                    manager.activeNotifications.count { it.tag == taskResultKey && it.id == 1 } == 1
+                KeepConnectedService.status(app) == KeepConnectedService.STATUS_CONNECTED && fixtureCursors.all(keepPrefs::contains)
             }
+            val taskResultEvent = fixture.emitTaskResult()
+            testEvents += taskResultEvent
+            val taskResultKey = notificationKey(taskResultEvent)
+            compose.waitUntil(15_000) { manager.activeNotifications.count { it.tag == taskResultKey && it.id == 1 } == 1 }
             assertEquals(1, manager.activeNotifications.count { it.tag == taskResultKey && it.id == 1 })
+            assertTrue(manager.activeNotifications.none { it.tag == notificationKey(olderEvent) })
 
             val answerEvent = fixture.emitIncomingCall(conversationId = "chat-b")
             testEvents += answerEvent

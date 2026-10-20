@@ -39,6 +39,8 @@ class HistoryFiltersTest {
         assertEquals(listOf("chat"), shown.map { it.getString("id") })
         assertEquals("default:shared", historyRowKey(json("id" to "shared", "profile" to "default")))
         assertEquals("coder:shared", historyRowKey(json("id" to "shared", "profile" to "coder")))
+        // A cached row without a profile keeps its key once a refresh adds the current profile.
+        assertEquals(historyRowKey(json("id" to "shared", "profile" to "default"), "default"), historyRowKey(json("id" to "shared"), "default"))
     }
 
     @Test fun sourceFilterOffersListedAndHiddenSourcesButNotThreadsOrCron() {

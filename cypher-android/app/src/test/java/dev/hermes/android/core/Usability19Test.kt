@@ -124,6 +124,9 @@ class Usability19Test {
         val row = json("session_id" to "server-canonical", "message_count" to 1)
         assertEquals("server-canonical", sessionRowId(visibleSessionRows(emptyList(), listOf(row), "", false).single()))
         assertEquals(1, visibleSessionRows(listOf(row), listOf(row), "", false).size)
+        // A cached row without a profile is the same conversation as its confirmed, profile-tagged copy.
+        assertEquals(1, visibleSessionRows(listOf(row), listOf(row.copy().put("profile", "default")), "", false, "default").size)
+        assertEquals(2, visibleSessionRows(listOf(row.copy().put("profile", "coder")), listOf(row.copy().put("profile", "default")), "", false, "default").size)
     }
     @Test fun visibilitySearchAndArchiveFiltersStayAuthoritative() {
         val row = json("session_id" to "confirmed")

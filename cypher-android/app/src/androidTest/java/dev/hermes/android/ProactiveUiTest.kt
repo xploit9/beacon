@@ -43,7 +43,7 @@ class ProactiveUiTest {
         await { vm.data.value["navigation-profiles"]?.rows("profiles")?.any { it.string("display_name") == "Code profile" } == true }
         compose.runOnIdle { vm.more("Assistant") }
         await { vm.data.value[proactiveKey(fixture)]?.has("enabled") == true }
-        compose.onNodeWithText("Code profile").assertExists()
+        compose.onNodeWithText("Profile: Code profile").assertExists()
         compose.onNodeWithText("Proactive · Code profile").assertExists()
         compose.onNodeWithText("coder", substring = false).assertDoesNotExist()
     }

@@ -121,7 +121,8 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
                                 Column(Modifier.fillMaxWidth().heightIn(min = 64.dp).padding(horizontal = 4.dp, vertical = 10.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(5.dp)) {
                                     Icon(navigationIcon(name), null, Modifier.size(20.dp), tint = if (isBotToggle && active) MaterialTheme.colorScheme.primary else LocalContentColor.current)
                                     Text(uiText(if (isBotToggle) "Bot Mode" else name), style = MaterialTheme.typography.labelMedium, color = if (isBotToggle && active) MaterialTheme.colorScheme.primary else LocalContentColor.current)
-                                    if (isBotToggle && active) Text(uiText("On"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                                    // Not uiText: the bundled catalog's "on" is the preposition ("в" in Russian), not the switch state.
+                                    if (isBotToggle && active) Text("On", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                                 }
                             }
                         }

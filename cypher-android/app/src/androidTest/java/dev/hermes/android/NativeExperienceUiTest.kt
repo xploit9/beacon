@@ -159,6 +159,12 @@ class NativeExperienceUiTest {
     }
     private fun clickText(text: String) = compose.onNodeWithText(text, useUnmergedTree = true).performScrollTo().performClick()
     private fun await(condition: () -> Boolean) = compose.waitUntil(15_000, condition)
+    /** Hermes reports display names on its first profile read; a case that adds them after the UI loaded the catalog reloads it. */
+    private fun showProfileDisplayNames(vm: CypherViewModel, fixture: NativeExperienceFixture) {
+        fixture.profileDisplayNames = mapOf("default" to "Personal profile", "coder" to "Code profile")
+        compose.runOnIdle { vm.load("navigation-profiles", "/api/profiles", force = true) }
+        await { vm.data.value["navigation-profiles"]?.rows("profiles")?.any { it.string("display_name") == "Code profile" } == true }
+    }
     private fun recentCalls(fixture: NativeExperienceFixture) = fixture.requests.takeLast(10).map { "${it.string("method")} ${it.string("path")}".trim() }
     /** Menus and sheets are checked with the IME away, so neither a keyboard nor a stale focus can cover them. */
     private fun closeKeyboard() {
@@ -946,9 +952,7 @@ class NativeExperienceUiTest {
     }
 
     @Test fun botModeToggleRestoresProfileChatDraftAndHistory() = withFixture { vm, fixture ->
-        fixture.profileDisplayNames = mapOf("default" to "Personal profile", "coder" to "Code profile")
-        compose.runOnIdle { vm.load("navigation-profiles", "/api/profiles", force = true) }
-        await { vm.data.value["navigation-profiles"]?.rows("profiles")?.any { it.string("display_name") == "Code profile" } == true }
+        showProfileDisplayNames(vm, fixture)
         fun toggle() {
             compose.onNodeWithTag(if (vm.ui.value.botModeEnabled) "bot-mode-sidebar" else "navigation-menu").performScrollToNode(hasTestTag("navigation-bots"))
             compose.onNodeWithTag("navigation-bots").performClick()
@@ -1040,7 +1044,9 @@ class NativeExperienceUiTest {
         compose.runOnIdle { vm.newChat() }
         await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
         val id = vm.chat.value.sessionId
-        assertFalse(fixture.requests.any { it.string("path") == "/api/sessions/$id" })
+        // The chat's project lookup reads the stored row once (ChatScreen); opening the shell adds no detail read of its own.
+        await { vm.data.value["project-of:$id"]?.has("project") == true }
+        assertEquals(1, fixture.requests.count { it.string("path") == "/api/sessions/$id" })
         compose.onNodeWithTag("message-input").performClick().performTextInput("Draft after the shell opens")
         await { vm.composer.value.text == "Draft after the shell opens" }
         receipts += "The acknowledged native shell opens the composer without waiting for a redundant detail read; Hermes-side new-session delay remains."
@@ -1048,11 +1054,14 @@ class NativeExperienceUiTest {
 
     @Test fun historySearchShowsProgressWhileStaleRowsRemainVisible() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.toggleSessions(true) }
-        await { vm.ui.value.sessions.isNotEmpty() && !vm.ui.value.historyLoading }
+        // The drawer reads its list after a short debounce; hold the search that follows, not that first read.
+        await { fixture.requests.any { it.string("path") == "/api/sessions" } && vm.ui.value.sessions.isNotEmpty() && !vm.ui.value.historyLoading }
         fixture.holdNextSessionList.set(true)
         try {
             compose.onNodeWithTag("history-search").performTextReplacement("No matching conversation")
-            assertTrue(fixture.sessionListCaptured.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            // waitUntil advances the test clock past the search debounce; a blocking latch wait would not.
+            compose.waitUntil(5_000) { fixture.sessionListCaptured.count == 0L }
+            assertEquals("No matching conversation", vm.ui.value.query)
             compose.onNodeWithTag("history-searching").assertExists()
             compose.onNodeWithTag("history-row:chat-a").assertExists()
         } finally { fixture.releaseSessionList.countDown() }
@@ -1062,7 +1071,7 @@ class NativeExperienceUiTest {
     }
 
     @Test fun historyAllProfilesShowsDisplayNamesAndSwitchesToTheSelectedProfile() = withFixture { vm, fixture ->
-        fixture.profileDisplayNames = mapOf("default" to "Personal profile", "coder" to "Code profile")
+        showProfileDisplayNames(vm, fixture)
         fixture.profileSessionIds = mapOf("default" to setOf("chat-a", "chat-b"))
         fixture.addProfileConversation("coder", "coder-chat", "Coder notes")
         compose.runOnIdle { vm.toggleSessions(true) }
@@ -1601,12 +1610,12 @@ class NativeExperienceUiTest {
 
     @Test fun referenceNavigationAndNativeBoardControls() = withFixture { vm, fixture ->
         runBlocking { app.cache.delete(fixture.scope, "kanban-draft:default") }
-        fixture.profileDisplayNames = mapOf("default" to "Personal profile", "coder" to "Code profile")
+        showProfileDisplayNames(vm, fixture)
         compose.runOnIdle { vm.toggleSessions(true) }
-        compose.onNodeWithTag("navigation-profile").assertIsDisplayed().performClick()
+        compose.onNodeWithTag("navigation-profile").assertIsDisplayed().assertTextContains("Personal profile").performClick()
         await { vm.data.value["navigation-profiles"] != null }
-        compose.onNodeWithText("Personal profile").assertExists()
-        compose.onNodeWithText("Code profile").assertExists()
+        compose.onNode(hasText("Personal profile") and hasAnyAncestor(isPopup())).assertExists()
+        compose.onNode(hasText("Code profile") and hasAnyAncestor(isPopup())).assertExists()
         capture("reference-profiles")
         androidx.test.espresso.Espresso.pressBack()
         compose.onNodeWithTag("navigation-kanban").performScrollTo().performClick()
@@ -2947,10 +2956,11 @@ class NativeExperienceUiTest {
                 compose.onNodeWithTag("voice-model-$provider").performScrollTo().performClick()
                 await { store.settings().provider == provider }
                 val before = store.settings(provider)
-                compose.onNodeWithText("Voice: ${before.voice}").performScrollTo().performClick()
+                // Labels are capitalised; the stored and requested voice id keeps the provider's spelling.
+                compose.onNodeWithText("Voice: ${before.voice.replaceFirstChar(Char::titlecase)}").performScrollTo().performClick()
                 val choices = if (provider == "grok") listOf("eve", "ara", "rex", "sal", "leo") else listOf("Puck", "Charon", "Kore", "Fenrir", "Aoede", "Leda", "Orus", "Zephyr")
                 val voice = choices.first { it != before.voice }
-                compose.onNodeWithText(voice).performClick()
+                compose.onNodeWithText(voice.replaceFirstChar(Char::titlecase)).performClick()
                 await { store.settings(provider).voice == voice }
                 val currentPersonality = store.settings(provider).personality
                 val personality = if (currentPersonality == "concise") "warm" else "concise"
@@ -3175,15 +3185,17 @@ class NativeExperienceUiTest {
     }
 
     @Test fun profileDisplayNamesReachSettingsConnectionAssistantAndProfiles() = withFixture { vm, fixture ->
-        fixture.profileDisplayNames = mapOf("default" to "Personal profile", "coder" to "Code profile")
-        compose.runOnIdle { vm.load("navigation-profiles", "/api/profiles", force = true) }
-        await { vm.data.value["navigation-profiles"]?.rows("profiles")?.any { it.string("display_name") == "Code profile" } == true }
+        // The assistant uses a different profile than the chats, so both labels are checked.
+        runBlocking { app.preferences.edit { it[stringPreferencesKey("assistant_profile")] = "coder"; it[stringPreferencesKey("assistant_name")] = "Cypher" } }
+        await { vm.preferences.value.assistantProfile == "coder" && vm.preferences.value.assistantName == "Cypher" }
+        showProfileDisplayNames(vm, fixture)
         compose.runOnIdle { vm.more("") }
         await { vm.ui.value.tab == "More" && vm.ui.value.morePage.isBlank() }
-        fun summary(route: String, text: String) = compose.onNode(hasText(text) and hasAnyAncestor(hasTestTag("settings-row:$route")), useUnmergedTree = true)
-        summary("Connection", "Connected privately · Personal profile").assertExists()
-        summary("Profiles", "Active profile · Personal profile").assertExists()
-        summary("Assistant", "Cypher · Code profile").assertExists()
+        // Hub rows keep their compatibility tags (Connection is settings-connection).
+        fun summary(tag: String, text: String) = compose.onNode(hasText(text) and hasAnyAncestor(hasTestTag(tag)), useUnmergedTree = true)
+        summary("settings-connection", "Connected privately · Personal profile").assertExists()
+        summary("settings-row:Profiles", "Active profile · Personal profile").assertExists()
+        summary("settings-row:Assistant", "Cypher · Code profile").assertExists()
 
         compose.runOnIdle { vm.more("Connection") }
         compose.onNodeWithText("Profile · Personal profile").assertExists()
@@ -3192,7 +3204,8 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Proactive · Code profile").assertExists()
         compose.runOnIdle { vm.more("Profiles") }
         await { vm.phoneSettings.bots.value.profiles.isNotEmpty() && !vm.phoneSettings.bots.value.loading }
-        compose.onNodeWithText("Personal profile").assertExists()
+        // The closed drawer's profile switcher shows the same name.
+        compose.onNode(hasText("Personal profile") and !hasAnyAncestor(hasTestTag("navigation-menu"))).assertExists()
         compose.runOnIdle { vm.tab("Tasks") }
         await { vm.data.value["crons"]?.rows("jobs")?.isNotEmpty() == true }
         compose.onNode(hasText(" · Personal profile · ", substring = true)).assertExists()

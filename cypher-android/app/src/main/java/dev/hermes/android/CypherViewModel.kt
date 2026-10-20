@@ -686,18 +686,6 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         reasoningChange = job
         job.invokeOnCompletion { if (reasoningChange === job) _reasoningSaving.value = false }
     }
-    private fun refreshSessionReasoning(active: CypherClient, scope: Scope, generation: Int, path: String) {
-        val c = active.detached()
-        viewModelScope.launch {
-            try {
-                val result = c.get(path, mapOf("session_id" to scope.session))
-                if (client === active && originGeneration == generation && sourceScope == scope)
-                    _chat.update { state -> if (state.sessionId == scope.session) state.copy(sessionReasoningEffort = result.string("value")) else state }
-            } catch (error: CancellationException) { throw error }
-            catch (_: Throwable) { }
-            finally { c.closeNative() }
-        }
-    }
     fun closeCatalog() { _catalog.value = "" }
     fun pickModel(model: String, provider: String) { if (!admitConversation()) return; val scope = sourceScope ?: return; sessionAction("/api/session/update", json("model" to model, "model_provider" to provider.ifBlank { null })) { saved["model_pick:${scope.key}"] = true; closeCatalog() } }
     private suspend fun exportDownload(c: CypherClient, uri: Uri, path: String, query: Map<String, String>, limit: Long) = withContext(Dispatchers.IO) {
@@ -1657,7 +1645,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         // Only server-confirmed IDs enter this temporary index overlay.
         confirmedSessions["${owner.key}:$id"] = row
         ++sessionIndexRevision
-        if (_ui.value.query.isBlank() && !sessionIndexArchived && (!sessionIndexThreads || dev.hermes.android.ui.isThreadSource(row.string("source")))) _ui.update { it.copy(sessions = visibleSessionRows(it.sessions, listOf(row), "", false)) }
+        if (_ui.value.query.isBlank() && !sessionIndexArchived && (!sessionIndexThreads || dev.hermes.android.ui.isThreadSource(row.string("source")))) _ui.update { it.copy(sessions = visibleSessionRows(it.sessions, listOf(row), "", false, owner.profile)) }
     }
     private fun initialDraftOwner(): Scope? = (client?.scope ?: cachedOwnerScope)?.takeIf { _ui.value.authenticated && sourceScope == null && _chat.value.sessionId.isBlank() }
     fun canComposeInitialChat(): Boolean = _ui.value.initialChatReady && _ui.value.tab == "Chat" && initialDraftOwner() != null
@@ -2066,7 +2054,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 }
                 if (!current()) return@launch
                 renderSession(response, scope)
-                refreshSessionReasoning(requireNotNull(active), scope, origin, if (isCypherConversation()) "/api/mobile/cypher/reasoning" else "/api/reasoning")
+                // No per-chat effort read here: native config.get needs a resumed session, and browsing never resumes an agent.
                 app.cache.write(scope, "session", response.toString())
                 val session = response.optJSONObject("session") ?: response
                 if (session.rows("messages").isNotEmpty() || session.optInt("message_count") > 0 || session.string("active_stream_id").isNotBlank()) {

@@ -30,7 +30,7 @@ internal enum class HistoryOrder(val key: String, val label: String) {
 }
 
 internal fun isThreadSource(source: String?): Boolean = source?.trim()?.lowercase(Locale.ROOT) in setOf(CYPHER_THREAD_SOURCE, "phone")
-internal fun historyRowKey(row: JSONObject): String = sessionRowKey(row)
+internal fun historyRowKey(row: JSONObject, currentProfile: String = ""): String = sessionRowKey(row, currentProfile)
 
 /** Readable names for Hermes session sources; an unknown platform keeps its own name. */
 internal fun historySourceLabel(source: String): String = when (source.trim().lowercase(Locale.ROOT)) {

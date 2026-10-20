@@ -161,10 +161,10 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                 HistoryView.All -> EmptyState("No conversations here", "Start a conversation or try another search.", action = "New conversation", onAction = { vm.toggleSessions(false); vm.newChat() })
             }
         }
-        items(rows, key = { "session:" + historyRowKey(it) }) { row ->
+        items(rows, key = { "session:" + historyRowKey(it, ui.profile) }) { row ->
             val id = sessionRowId(row)
             val rowProfile = row.string("profile", ui.profile)
-            val rowKey = historyRowKey(row)
+            val rowKey = historyRowKey(row, ui.profile)
             val rowTag = if (allProfiles) rowKey else id
             val source = row.string("source")
             val thread = isThreadSource(source)
