@@ -2941,7 +2941,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     fun declineIncoming(source: String, event: String) = viewModelScope.launch {
         if (_incomingBusy.value) return@launch
         _incomingBusy.value = true
-        try { dev.hermes.android.voice.declineIncoming(app, source, event); notice("Cypher invitation declined. The result stays in Cypher history.") }
+        try { dev.hermes.android.voice.declineIncoming(app, source, event); notice("Call declined. It will be waiting in the ${dev.hermes.android.data.currentAssistantName} chat.") }
         catch (e: Throwable) { if (e !is CancellationException) fail(e) }
         finally { _incomingBusy.value = false }
     }
