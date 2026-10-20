@@ -409,7 +409,7 @@ internal class DirectVoice(private val client:CypherClient,private val callId:St
                 val args=call.getJSONObject("args")
                 require(args.keys().asSequence().toSet()==setOf("tool_id","arguments")) { "Only tool identity and arguments are accepted" }
                 val toolId=args.getString("tool_id")
-                require(toolId.matches(Regex("[a-f0-9]{64}")))
+                require(toolId.matches(Regex("[a-f0-9]{64}|[A-Za-z0-9_.:/-]{1,128}")))
                 val rawArguments=args.getString("arguments");require(rawArguments.toByteArray(Charsets.UTF_8).size<=16384)
                 val arguments=JSONObject(rawArguments)
                 val duplicate=gatewayReceipts.reserve(requestId,id,toolId,arguments)
