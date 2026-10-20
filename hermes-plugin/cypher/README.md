@@ -24,8 +24,6 @@ plugins:
         profiles: [default]
         model: gemini-3.8-live
         voice: Aoede
-        google_api_key_env: GOOGLE_API_KEY
-        google_credentials_file: C:/Users/XPLoiT999/AppData/Local/hermes/secrets/cipher-gemini.env
         firebase_credentials: C:/Users/XPLoiT999/AppData/Local/hermes/secrets/hermes-fcm.json
         callback_tool_enabled: true
         scheduled_callbacks_enabled: true
@@ -36,7 +34,7 @@ plugins:
         apksigner: ABSOLUTE_APKSIGNER_PATH
 ```
 
-On a fresh install, leave `owner_id`, `owner_provider`, `profiles`, and `scheduled_callback_conversation_id` unset: claim Cypher once from its authenticated Hermes dashboard tab, then the app registers its assistant chat for that profile after opening it. Explicit YAML settings always take precedence, so `scheduled_callback_conversation_id` can remain an operator-managed override and either callback flag can explicitly turn calls off. Paths above describe configuration shape only. No credentials are supplied by this plugin. `google_credentials_file` reads at most 16 KiB of an existing private env file server-side. Without it, native `agent.secret_scope.get_secret` resolves the configured env name. Provider/key failures return unavailable, never another provider. Required Python packages are in requirements.txt; test dependencies in requirements-test.txt. Native Hermes must already supply its own dashboard/gateway packages on Python's import path.
+On a fresh install, leave `owner_id`, `owner_provider`, `profiles`, and `scheduled_callback_conversation_id` unset: claim Cypher once from its authenticated Hermes dashboard tab, then the app registers its assistant chat for that profile after opening it. Explicit YAML settings always take precedence, so `scheduled_callback_conversation_id` can remain an operator-managed override and either callback flag can explicitly turn calls off. Voice provider keys are configured and kept on the phone; the plugin requires no Gemini, Grok, or OpenAI credentials on the Hermes host. Required Python packages are in requirements.txt; test dependencies in requirements-test.txt. Native Hermes must already supply its own dashboard/gateway packages on Python's import path.
 
 The Cypher plugin does not accept or retain call audio: the legacy `/mobile/calls/{call_id}/audio` storage route rejects uploads, and finalized call records report `recording_status: "disabled"` and `audio_available: false`. Transcript text and call metadata are stored separately. Other limits include 64 events per batch, 20k timeline events per call, a 4h call clock, eight active calls per owner, 64 native job links per call, 32 device targets, 10k notification invitations, and 256 deferred callbacks.
 
@@ -78,7 +76,7 @@ POST `/mobile/calls/{id}/search` `{query}` returns `{summary,sources:[{title,url
 
 Lookup workers have a separate four-worker pool and live-slot cap so slow lookups cannot consume call HTTP/disk workers. Context deadline 8 seconds; search/recall 12 seconds; provider work that outlives a deadline retains its live slot until it actually ends. Each call permits 60 lookups per kind. Closing/finalizing clears counter bookkeeping; call audio is not stored. Callback answer returns call metadata; Cypher Android fetches `/mobile/calls/{id}/context` when the call starts. Callback results bind exact invitation job_id; scheduled cypher_call_user accepts optional bounded 240-character reason and never treats another same-chat job as its result.
 
-Google token creation now sets `lock_additional_fields=[]`: tested SDK 2.30.1 serializes fieldMask as `model,generationConfig.responseModalities,generationConfig.speechConfig`, so custom Android functions, input/output transcription and context setup remain unlocked. This is verified by a real SDK serialization fixture with intercepted transport and zero network calls; actual Google admission/audio remains a parent integration gate. The SDK is optional and not a plugin dependency: Hermes pins google-auth 2.55.1, which google-genai 2.19+ cannot resolve with, so the native installer would refuse it. Server-held Gemini keys need google-genai (2.19+) already present in the Hermes environment; without it the token route answers a truthful 503 and phone-held keys work as usual. This leaf did not install packages into the live Hermes venv or launch/retry native services.
+Realtime provider connections go directly from Cypher to Gemini Live, Grok, or OpenAI Realtime. Provider keys stay encrypted on the phone; call admission sends only the provider id and `client_key: true` to Hermes. The plugin neither holds provider keys nor mints server-side voice tokens.
 
 Release metadata includes artifact_path and min_contract_version=max_contract_version=2 for the current Android native contract. Authenticated notifications include preview.title/body; FCM preview remains generic and carries opaque references. No WebUI presence-check capability is advertised or simulated.
 
@@ -101,4 +99,4 @@ GET `/mobile/tasks/capabilities` reports the actually resolved profile timezone 
 
 The visible Cypher dashboard tab includes a **Connect phone** QR and copyable `cypher://connect?url=<encoded-url>&name=<encoded-name>` link. A verified dashboard session can claim the plugin once; after that the QR appears. The public HTTPS QR carries the URL and name. In loopback mode, the loopback QR includes the Hermes sign-in value in `session` for the local setup flow. On the phone: install Cypher, tap Scan QR, then sign in through Hermes OAuth.
 
-`POST /mobile/calls` and `POST /mobile/callbacks/{invitation_id}/answer` accept `voice_provider` plus `client_key: true` for phone-held Gemini, Grok or OpenAI Realtime keys. Provider keys are not accepted or stored by Hermes; existing requests without `client_key` keep the server-key admission path. `GET /mobile/notifications/events` keeps its existing `{events,next_cursor}` response and accepts optional `wait` from 0 to 25 seconds (default 0). These additions do not enable or retain call audio.
+`POST /mobile/calls` and `POST /mobile/callbacks/{invitation_id}/answer` require `voice_provider` plus `client_key: true` for phone-held Gemini, Grok, or OpenAI Realtime keys. Requests without phone-key mode are rejected, and provider keys are never accepted or stored by Hermes. `GET /mobile/notifications/events` keeps its existing `{events,next_cursor}` response and accepts optional `wait` from 0 to 25 seconds (default 0). These additions do not enable or retain call audio.

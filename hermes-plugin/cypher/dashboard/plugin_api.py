@@ -168,12 +168,11 @@ def _contains_provider_key(value):
 def _client_key_mode(value):
     if _contains_provider_key(value):
         raise HTTPException(400,'Provider keys must remain on the phone')
-    client_key=value.get('client_key',False)
-    if type(client_key) is not bool:
-        raise HTTPException(400,'Invalid client_key flag')
-    if client_key and 'voice_provider' not in value:
+    if value.get('client_key') is not True:
+        raise HTTPException(400,'Update Cypher: provider keys stay on the phone.')
+    if 'voice_provider' not in value:
         raise HTTPException(400,'Choose a voice provider for a phone-key call')
-    return client_key
+    return True
 
 def _bounded_event_wait(value):
     try: value=float(value)
@@ -288,29 +287,18 @@ async def call(request,call_id,writable=False):
     return await asyncio.to_thread(authorize)
 router.include_router(sys.modules['cypher_gateway_api'].build_router(call,body,voice_context.scoped,mobile))
 
-def secret(cfg):
-    from agent.secret_scope import get_secret
-    key=cfg.get('google_api_key_env','GEMINI_API_KEY')
-    configured=cfg.get('google_credentials_file')
-    if configured:
-        from dotenv import dotenv_values
-        path=Path(configured).resolve(strict=True)
-        if not path.is_file() or path.stat().st_size>16384: raise RuntimeError('Invalid private credential file')
-        return dotenv_values(path).get(key)
-    return get_secret(key)
 @router.get('/mobile/bootstrap')
 async def bootstrap(request:Request):
     owner,provider,profile,cfg=identity(request)
     selection=voice_models.selected(mobile,owner,profile,cfg)
-    choice=next(item for item in voice_models.choices(cfg,secret) if item['id']==selection['provider'])
     return {'contract_version':2,'backend':'hermes-dashboard','owner_id':owner,'profile':profile,
-            'voice':{**selection,'available':choice['available'],'configured':choice['configured'],'availability_scope':'local_configuration'},
+            'voice':{**selection,'available':True,'configured':True,'availability_scope':'plugin_enabled'},
             'capabilities':{'native_jobs':True,'pc_recording':False,'callbacks':cfg.get('callback_tool_enabled') is True and cfg.get('scheduled_callbacks_enabled') is True,'push':bool(cfg.get('firebase_credentials')),'permanent_recording_retention':False}}
 @router.get('/mobile/voice-settings')
 async def voice_settings(request:Request):
     owner,_,profile,cfg=identity(request)
     return {'selected_provider':voice_models.selected(mobile,owner,profile,cfg)['provider'],
-            'providers':voice_models.choices(cfg,secret,mobile,owner,profile),'applies_to':'next_call'}
+            'providers':voice_models.choices(cfg,mobile,owner,profile),'applies_to':'next_call'}
 @router.get('/mobile/history-retention')
 async def history_retention(request:Request):
     owner,_,_,_=identity(request)
@@ -340,8 +328,6 @@ async def save_voice_settings(request:Request):
     owner,_,profile,cfg=identity(request);value=await body(request,1024)
     if 'provider' not in value or set(value)-{'provider','voice','personality'} or value['provider'] not in voice_models.PROVIDERS:
         raise HTTPException(400,'Choose an available voice model')
-    choice=next(item for item in voice_models.choices(cfg,secret) if item['id']==value['provider'])
-    if not choice['available']: raise HTTPException(409,'This voice model needs server setup')
     options=safely(voice_models.validate_options,value['provider'],value)
     current=voice_models.provider_selection(mobile,owner,profile,cfg,value['provider'])
     options={k:options.get(k,current[k]) for k in ('voice','personality')}
@@ -353,22 +339,10 @@ async def save_voice_settings(request:Request):
 async def calls(request:Request):
     value=await body(request);owner,provider,profile,cfg=identity(request,value.get('profile'))
     client_key=_client_key_mode(value)
-    selection=voice_models.selected(mobile,owner,profile,cfg)
+    requested=value['voice_provider']
+    if requested not in voice_models.PROVIDERS: raise HTTPException(400,'Unknown voice model')
+    selection=voice_models.provider_selection(mobile,owner,profile,cfg,requested)
     conversation=value.get('conversation_id')
-    if 'voice_provider' in value:
-        requested=value['voice_provider']
-        if requested not in voice_models.PROVIDERS: raise HTTPException(400,'Unknown voice model')
-        if client_key:
-            selection=voice_models.provider_selection(mobile,owner,profile,cfg,requested)
-        else:
-            if requested=='openai': raise HTTPException(409,'OpenAI Realtime requires a phone-held key')
-            if not next(item for item in voice_models.choices(cfg,secret) if item['id']==requested)['available']:
-                raise HTTPException(409,'Requested voice model needs server setup')
-            selection=voice_models.provider_selection(mobile,owner,profile,cfg,requested)
-    elif client_key:
-        raise HTTPException(400,'Choose a voice provider for a phone-key call')
-    elif selection['provider']=='openai':
-        raise HTTPException(409,'OpenAI Realtime requires a phone-held key')
     if conversation:
         await asyncio.to_thread(reject_unowned_conversation,owner,provider,profile,conversation)
         await asyncio.to_thread(safely,native.reserve_conversation,owner,provider,profile,conversation)
@@ -392,29 +366,6 @@ async def close_call(call_id:str,request:Request):
     row['closed']=1
     clear_lookup_counts(call_id)
     return mobile.status(row)
-@router.post('/mobile/calls/{call_id}/token')
-async def token(call_id:str,request:Request):
-    await body(request,1024);owner,provider,row,cfg=await call(request,call_id,True)
-    selection=safely(voice_models.bound,row,cfg)
-    if selection['provider']=='openai' or json.loads(row.get('voice_config') or '{}').get('client_key') is True:
-        raise HTTPException(409,'This voice call requires a phone-held key')
-    if selection['provider']=='grok':
-        try: return JSONResponse(await asyncio.to_thread(voice_models.mint_xai,cfg,selection),headers={'Cache-Control':'no-store'})
-        except Exception: raise HTTPException(503,'Grok voice could not connect. Check the server key and account credit.') from None
-    def mint():
-        from google import genai
-        key=secret(cfg)
-        if not key: raise RuntimeError('Google credential unavailable')
-        now=datetime.now(timezone.utc); expiry=now+timedelta(minutes=30);admission=now+timedelta(minutes=1)
-        model=selection['model'];voice=selection['voice']
-        client=genai.Client(api_key=key,http_options={'api_version':'v1alpha','timeout':15000})
-        try:
-            minted=client.auth_tokens.create(config={'uses':1,'expire_time':expiry,'new_session_expire_time':admission,
-                'lock_additional_fields':[],'live_connect_constraints':{'model':model,'config':{'response_modalities':['AUDIO'],'speech_config':{'voice_config':{'prebuilt_voice_config':{'voice_name':voice}}}}}})
-        finally: client.close()
-        return {**selection,'token':minted.name,'websocket_url':'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained','model':model,'voice':voice,'expires_at':expiry.isoformat(),'new_session_expires_at':admission.isoformat()}
-    try: return JSONResponse(await asyncio.to_thread(mint),headers={'Cache-Control':'no-store'})
-    except Exception: raise HTTPException(503,'Google ephemeral token unavailable') from None
 @router.post('/mobile/calls/{call_id}/audio')
 async def audio(call_id:str,request:Request):
     value=await body(request,32768);owner,_,_,_=await call(request,call_id,True)
@@ -760,7 +711,7 @@ async def activity_answer(event_id:str,request:Request):
 async def answer(invitation_id:str,action:str,request:Request):
     value=await body(request,1024);owner,provider,profile,cfg=identity(request)
     if action not in ('answer','decline'): raise HTTPException(404,'Unknown callback action')
-    client_key=_client_key_mode(value) if action=='answer' else False
+    if action=='answer': _client_key_mode(value)
     def peek():
         with mobile.connect() as conn:
             row=conn.execute('SELECT * FROM notices WHERE id=? AND owner=? AND profile=?',(invitation_id,owner,profile)).fetchone()
@@ -773,20 +724,10 @@ async def answer(invitation_id:str,action:str,request:Request):
         await asyncio.to_thread(safely,native.verify,owner,provider,profile,initial['conversation'])
     source=await asyncio.to_thread(mobile.refs,owner,profile)
     selection=voice_models.selected(mobile,owner,profile,cfg)
-    if action=='answer' and 'voice_provider' in value:
+    if action=='answer':
         requested=value['voice_provider']
         if requested not in voice_models.PROVIDERS: raise HTTPException(400,'Unknown voice model')
-        if client_key:
-            selection=voice_models.provider_selection(mobile,owner,profile,cfg,requested)
-        else:
-            if requested=='openai': raise HTTPException(409,'OpenAI Realtime requires a phone-held key')
-            if not next(item for item in voice_models.choices(cfg,secret) if item['id']==requested)['available']:
-                raise HTTPException(409,'Requested voice model needs server setup')
-            selection=voice_models.provider_selection(mobile,owner,profile,cfg,requested)
-    elif action=='answer' and client_key:
-        raise HTTPException(400,'Choose a voice provider for a phone-key call')
-    elif action=='answer' and selection['provider']=='openai':
-        raise HTTPException(409,'OpenAI Realtime requires a phone-held key')
+        selection=voice_models.provider_selection(mobile,owner,profile,cfg,requested)
     def consume():
         with mobile.LOCK,mobile.connect() as conn:
             row=conn.execute('SELECT * FROM notices WHERE id=? AND owner=? AND profile=?',(invitation_id,owner,profile)).fetchone()
@@ -798,7 +739,7 @@ async def answer(invitation_id:str,action:str,request:Request):
             if mobile.active_calls(conn,owner)>=mobile.MAX_ACTIVE_CALLS: raise HTTPException(409,'Active call limit reached')
             cid=uuid.uuid4().hex
             context={key:row[key] for key in ('id','reason','job_id','conversation')}
-            voice_config={**selection,**({'client_key':True} if client_key else {})}
+            voice_config={**selection,'client_key':True}
             conn.execute('INSERT INTO calls(id,owner,profile,conversation,created,callback_context,voice_config) VALUES(?,?,?,?,?,?,?)',(cid,owner,profile,row['conversation'],time.time(),json.dumps(context),json.dumps(voice_config)))
             conn.execute("UPDATE notices SET state='answered',call_id=? WHERE id=?",(cid,invitation_id))
         return {'call_id':cid,'conversation_id':row['conversation'],'profile':profile,'recording_status':'disabled','transcript_status':'pending','callback_id':invitation_id,'kind':'incoming_call','state':'answered',**selection,**mobile.refs(owner,profile,row['conversation'])}

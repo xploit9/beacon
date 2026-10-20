@@ -10,7 +10,7 @@ import time
 from types import ModuleType, SimpleNamespace
 from zoneinfo import ZoneInfo
 
-from test_mobile import harness
+from test_mobile import harness, reserve
 
 
 EVENTS = '/api/plugins/cypher/mobile/notifications/events'
@@ -59,7 +59,7 @@ def test_event_wait_returns_early_when_cypher_call_user_creates_invitation(harne
 def test_deferred_call_user_invitation_appears_after_active_call_closes(harness, monkeypatch):
     api, client, cfg, tmp_path, _ = harness
     call_user = call_user_tool(api, cfg, tmp_path, monkeypatch)
-    active_call = client.post('/api/plugins/cypher/mobile/calls', json={'profile': 'default'}).json()['call_id']
+    active_call = reserve(client)
     invitation = json.loads(call_user({'reason': 'Call after this session'}, session_id='native-stored'))
     assert client.get(EVENTS).json()['events'] == []
 
@@ -84,7 +84,7 @@ def _replay_deferred_proactive_call(api, client, cfg, monkeypatch, night):
     rule = {'id': REQUEST_ID, 'text': 'Client review moved', 'action': 'call', 'night': night,
             'enabled': True, 'signal': 'email'}
     monkeypatch.setattr(api.proactive, 'list_requests', lambda *args: [rule])
-    active_call = client.post('/api/plugins/cypher/mobile/calls', json={'profile': 'default'}).json()['call_id']
+    active_call = reserve(client)
     now = datetime(2026, 10, 20, 12, 0, tzinfo=ZoneInfo('America/Los_Angeles'))
     observers = api.sys.modules['cypher_observers']
     monkeypatch.setattr(observers, 'time', SimpleNamespace(time=lambda: now.timestamp()))
@@ -136,7 +136,7 @@ def test_missed_scheduled_callback_posts_notice_before_delete(harness, monkeypat
     }
     with api.mobile.connect() as conn:
         conn.execute('INSERT INTO meta(key,value) VALUES(?,?)', (key, json.dumps(record).encode()))
-    active_call = client.post('/api/plugins/cypher/mobile/calls', json={'profile': 'default'}).json()['call_id']
+    active_call = reserve(client)
     callbacks = api.sys.modules['cypher_callbacks']
     assert callbacks.deliver(api.mobile, api.native, key, target)['status'] == 'pending'
     activate = api.activate

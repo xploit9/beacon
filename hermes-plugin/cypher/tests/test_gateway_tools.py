@@ -507,7 +507,7 @@ def test_native_approval_atomic_once_and_invalid_identity_fail_closed(tmp_path,m
 def test_router_reuses_native_owner_profile_and_closed_call_authority(tmp_path,monkeypatch):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
-    from test_mobile import harness
+    from test_mobile import harness, reserve
     # Borrow the real dashboard's authentication/call checks with a private fixture DB.
     host,client,cfg,root,app=harness.__wrapped__(tmp_path,monkeypatch)
     spec=importlib.util.spec_from_file_location('cypher_gateway_api_test',ROOT/'gateway_api.py')
@@ -517,7 +517,7 @@ def test_router_reuses_native_owner_profile_and_closed_call_authority(tmp_path,m
     monkeypatch.setattr(native_module,'NativeMcp',lambda:backend)
     monkeypatch.setattr(native_module.Gateway,'catalog',lambda self,profile:backend.catalog())
     app.include_router(api.build_router(host.call,host.body,lambda p,fn:fn(tmp_path),host.mobile),prefix='/api/plugins/cypher')
-    call=client.post('/api/plugins/cypher/mobile/calls',json={'profile':'default'}).json()['call_id']
+    call=reserve(client)
     path=f'/api/plugins/cypher/mobile/calls/{call}/tools'
     assert client.get(path).status_code==200
     assert client.get(path+'?profile=foreign').status_code==403

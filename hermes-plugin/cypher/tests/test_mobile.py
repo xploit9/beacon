@@ -26,7 +26,6 @@ def harness(tmp_path,monkeypatch):
     api._cypher_original_mobile_settings=api.mobile.settings
     monkeypatch.setattr(api.mobile,'settings',lambda profile=None:cfg)
     monkeypatch.setattr(api.mobile,'home',lambda:tmp_path)
-    monkeypatch.setattr(api,'secret',lambda cfg:None)
     monkeypatch.setattr(api.native,'verify',lambda *args:{'messages':[]})
     monkeypatch.setattr(api.native,'create',lambda *args:'native-stored')
     monkeypatch.setitem(sys.modules,'tui_gateway',SimpleNamespace(
@@ -46,7 +45,10 @@ def harness(tmp_path,monkeypatch):
     return api,client,cfg,tmp_path,app
 
 def reserve(client):
-    result=client.post('/api/plugins/cypher/mobile/calls',json={'profile':'default'})
+    provider=client.get('/api/plugins/cypher/mobile/voice-settings?profile=default').json()['selected_provider']
+    result=client.post('/api/plugins/cypher/mobile/calls',json={
+        'profile':'default','voice_provider':provider,'client_key':True,
+    })
     assert result.status_code==200,result.text
     return result.json()['call_id']
 
@@ -288,7 +290,7 @@ def test_gateway_tool_error_codes_are_admitted(harness,code,status):
 
 def test_auth_insecure_owner_and_profiles(harness):
     api,c,cfg,tmp,app=harness
-    assert c.get('/api/plugins/cypher/mobile/bootstrap').json()['voice']['available'] is False
+    assert c.get('/api/plugins/cypher/mobile/bootstrap').json()['voice']['available'] is True
     assert c.get('/api/plugins/cypher/mobile/bootstrap?profile=foreign').status_code==403
     c.headers['x-fixture-owner']='foreign'
     assert c.get('/api/plugins/cypher/mobile/bootstrap').status_code==403
@@ -296,6 +298,16 @@ def test_auth_insecure_owner_and_profiles(harness):
     assert c.get('/api/plugins/cypher/mobile/bootstrap').status_code==401
     c.headers['x-fixture-owner']='owner';app.state.auth_required=False
     assert c.get('/api/plugins/cypher/mobile/bootstrap').status_code==401
+
+
+def test_bootstrap_advertises_phone_key_voice_without_server_credentials(harness):
+    _, client, _, _, _ = harness
+
+    response = client.get('/api/plugins/cypher/mobile/bootstrap')
+
+    assert response.status_code == 200, response.text
+    assert response.json()['voice']['available'] is True
+    assert response.json()['voice']['configured'] is True
 
 
 
@@ -316,26 +328,21 @@ def test_foreign_calls_and_limits(harness):
     events['events'][0]['state']='thinking'
     assert c.post(url+'/events',json=events).status_code==409
 
-def test_token_unavailable_no_secret_leak(harness):
-    api,c,cfg,tmp,app=harness;cid=reserve(c)
-    result=c.post(f'/api/plugins/cypher/mobile/calls/{cid}/token',json={})
-    assert result.status_code==503
-    assert 'token' not in result.json()
-
 def test_owned_callback_consumption_expiry(harness):
     api,c,cfg,tmp,app=harness
     nid=api.mobile.invitation('owner','default','native-stored')
     url=f'/api/plugins/cypher/mobile/callbacks/{nid}/answer'
-    result=c.post(url,json={});assert result.status_code==200,result.text
+    payload={'voice_provider':'gemini','client_key':True}
+    result=c.post(url,json=payload);assert result.status_code==200,result.text
     assert result.json()['conversation_id']=='native-stored'
-    assert c.post(url,json={}).status_code==409
+    assert c.post(url,json=payload).status_code==409
     assert c.delete('/api/plugins/cypher/mobile/calls/'+result.json()['call_id']).status_code==200
     nid=api.mobile.invitation('owner','default','native-stored')
     assert c.post(f'/api/plugins/cypher/mobile/callbacks/{nid}/decline',json={}).json()['declined']
-    assert c.post(f'/api/plugins/cypher/mobile/callbacks/{nid}/answer',json={}).status_code==409
+    assert c.post(f'/api/plugins/cypher/mobile/callbacks/{nid}/answer',json=payload).status_code==409
     nid=api.mobile.invitation('owner','default','native-stored')
     with api.mobile.connect() as conn: conn.execute('UPDATE notices SET expires=0 WHERE id=?',(nid,))
-    assert c.post(f'/api/plugins/cypher/mobile/callbacks/{nid}/answer',json={}).status_code==409
+    assert c.post(f'/api/plugins/cypher/mobile/callbacks/{nid}/answer',json=payload).status_code==409
 
 def test_targets_durable_scoped_no_tokens_in_reads(harness):
     api,c,cfg,tmp,app=harness
@@ -425,25 +432,6 @@ def test_archive_rejects_dot_identity(harness):
     for value in ('.','..','C:escape','nested\\escape'):
         with pytest.raises(ValueError): api.mobile.reserve('owner','default',value)
 
-def test_google_token_constraints_and_revoke(harness,monkeypatch):
-    api,c,cfg,tmp,app=harness;cid=reserve(c);seen={}
-    monkeypatch.setattr(api,'secret',lambda cfg:'fixture-private-key')
-    class Client:
-        def __init__(self,**kwargs):
-            seen['constructor']=kwargs;self.auth_tokens=self
-        def create(self,config):seen['config']=config;return SimpleNamespace(name='fixture-ephemeral-token')
-        def close(self):seen['closed']=True
-    monkeypatch.setitem(sys.modules,'google',SimpleNamespace(genai=SimpleNamespace(Client=Client)))
-    result=c.post(f'/api/plugins/cypher/mobile/calls/{cid}/token',json={})
-    assert result.status_code==200,result.text
-    assert result.json()['token']=='fixture-ephemeral-token'
-    assert 'fixture-private-key' not in result.text
-    assert seen['config']['uses']==1 and seen['closed']
-    assert seen['config']['live_connect_constraints']['model']==result.json()['model']
-    assert (seen['config']['expire_time']-seen['config']['new_session_expire_time']).total_seconds()==29*60
-    assert c.delete(f'/api/plugins/cypher/mobile/calls/{cid}').status_code==200
-    assert c.post(f'/api/plugins/cypher/mobile/calls/{cid}/token',json={}).status_code==409
-
 def test_signed_immutable_release_and_tamper(harness,monkeypatch):
     api,c,cfg,tmp,app=harness
     import hashlib
@@ -469,7 +457,9 @@ def test_callback_defers_until_calls_end(harness):
     api,c,cfg,tmp,app=harness;cid=reserve(c)
     nid=api.mobile.invitation('owner','default','native-stored')
     assert c.get('/api/plugins/cypher/mobile/notifications/events').json()['events']==[]
-    assert c.post(f'/api/plugins/cypher/mobile/callbacks/{nid}/answer',json={}).status_code==404
+    assert c.post(f'/api/plugins/cypher/mobile/callbacks/{nid}/answer',json={
+        'voice_provider':'gemini','client_key':True,
+    }).status_code==404
     assert c.delete(f'/api/plugins/cypher/mobile/calls/{cid}').status_code==200
     events=c.get('/api/plugins/cypher/mobile/notifications/events').json()['events']
     assert len(events)==1 and events[0]['event_id']==nid
@@ -641,27 +631,6 @@ def test_callback_context_uses_exact_verified_job_binding(harness,monkeypatch):
     assert context['greeting']=="I'm calling about your saved Hermes update."
     assert 'Verified reason' not in context['greeting']
     assert 'Wrong newer result' not in context['context_summary']
-
-def test_actual_google_sdk_serializes_only_intended_constraints(harness,monkeypatch):
-    api,c,cfg,tmp,app=harness;cid=reserve(c)
-    from google import genai
-    from google.genai import types
-    factory=genai.Client;seen={}
-    def create(**kwargs):
-        client=factory(**kwargs)
-        def request(method,path,body,options):
-            seen['body']=body
-            return types.HttpResponse(body=json.dumps({'name':'auth_tokens/fixture'}))
-        monkeypatch.setattr(client._api_client,'request',request)
-        return client
-    monkeypatch.setattr(genai,'Client',create)
-    monkeypatch.setattr(api,'secret',lambda cfg:'fixture-private-key')
-    result=c.post('/api/plugins/cypher/mobile/calls/'+cid+'/token',json={})
-    assert result.status_code==200,result.text
-    body=seen['body'];mask=set(body['fieldMask'].split(','))
-    assert mask=={'model','generationConfig.responseModalities','generationConfig.speechConfig'}
-    assert 'tools' not in mask and 'systemInstruction' not in mask
-    assert body['uses']==1 and body['bidiGenerateContentSetup']['model']=='models/gemini-3.8-live'
 
 def test_unfinalized_transcript_is_retained_and_never_claimed_complete(harness):
     api,c,cfg,tmp,app=harness;cid=reserve(c);path='/api/plugins/cypher/mobile/calls/'+cid
