@@ -176,8 +176,10 @@ class NativeGatewayTest {
         val opened=fixture.client.post("/api/cypher/open")
 
         assertEquals("20261019_001507_a4cbef",opened.getString("session_id"))
-        assertEquals(1,fixture.nativeRequests.size)
-        val (path,method,body)=fixture.nativeRequests.single()
+        // The interceptor also records the socket ticket request; only one registration may be sent.
+        val registrations=fixture.nativeRequests.filter { it.first.endsWith("/mobile/assistant-conversation") }
+        assertEquals(1,registrations.size)
+        val (path,method,body)=registrations.single()
         assertEquals("/api/plugins/cypher/mobile/assistant-conversation",path)
         assertEquals("PUT",method)
         assertEquals("default",body.getString("profile"))
