@@ -18,6 +18,8 @@ class NativeExperiencePresentationTest {
     @Test fun sharedColumnsIncludeLongBodyCellsAndRaggedRows() {
         assertEquals(listOf(280, 100), tableColumnWidths(listOf(listOf("Name", "Value"), listOf("Long body ".repeat(50), "1"), listOf("Only one"))))
         assertTrue(tableColumnWidths(emptyList()).isEmpty())
+        // A measured amount sets its column's width, so it never wraps mid-number.
+        assertEquals(listOf(134), tableColumnWidths(listOf(listOf("Total"), listOf("€484,968.26"))) { it.length * 10 })
     }
     @Test fun slashDiscoveryFiltersWithoutTreatingArgumentsAsCommands() {
         assertTrue(slashMatches("/help", "Commands", "/he"))

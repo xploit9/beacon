@@ -208,7 +208,11 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 @Composable fun NativeTable(rows: List<List<String>>, cellContent: (@Composable (Int,Int) -> Unit)? = null) {
     if(rows.isEmpty()) return
     val context=androidx.compose.ui.platform.LocalContext.current
-    val widths=remember(rows) { tableColumnWidths(rows) }
+    val measurer=rememberTextMeasurer()
+    val density=LocalDensity.current
+    val cellStyle=MaterialTheme.typography.bodyMedium.copy(fontWeight=FontWeight.SemiBold)
+    // Measured, so amounts and dates stay on one line at any font size; very long lines just take the widest column.
+    val widths=remember(rows,cellStyle,density) { tableColumnWidths(rows) { line -> if(line.length>80) 1000 else with(density) { measurer.measure(line,cellStyle,softWrap=false,maxLines=1).size.width.toDp().value.toInt()+4 } } }
     var column by remember(rows) { mutableStateOf<Int?>(null) }
     var descending by remember(rows) { mutableStateOf(false) }
     val order=remember(rows,column,descending) { tableRowOrder(rows,column,descending) }
@@ -218,11 +222,10 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
     val horizontal=rememberScrollState()
     Column {
         Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically) {
-            Text("${rows.size-1} rows · tap a header to sort", Modifier.weight(1f), style=MaterialTheme.typography.labelSmall)
+            Text(if(rows.size==2) "1 row" else "${rows.size-1} rows", Modifier.weight(1f), style=MaterialTheme.typography.labelSmall)
             IconButton(onClick={ runCatching { (context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("Table",tableClipboard(sorted))) }.onFailure { copyError=it.message.orEmpty() } }) { Icon(Icons.Rounded.ContentCopy,"Copy table") }
         }
         if(copyError.isNotBlank()) Text(copyError,color=MaterialTheme.colorScheme.error)
-        if(horizontal.canScrollForward || horizontal.canScrollBackward) Text("Scroll horizontally for more columns",style=MaterialTheme.typography.labelSmall)
         Column(Modifier.horizontalScroll(horizontal).border(1.dp,MaterialTheme.colorScheme.outlineVariant)) {
             sorted.take(visible).forEachIndexed { index,row ->
                 Row(Modifier.background(if(index==0) MaterialTheme.colorScheme.surfaceContainerHigh else Color.Transparent)) {

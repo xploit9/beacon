@@ -5,9 +5,10 @@ internal fun nativeConversationAction(action: String): Boolean = action in setOf
     "New conversation", "Rename", "Pin", "Archive", "Branch", "Model & provider", "Reasoning", "Toolsets", "Compress context", "Undo last turn", "Usage", "Delete conversation"
 )
 
-internal fun tableColumnWidths(rows: List<List<String>>): List<Int> =
+/** Column widths in dp: the widest line ([measure] gives its width in dp) plus padding, kept within 100-280. */
+internal fun tableColumnWidths(rows: List<List<String>>, measure: (String) -> Int = { it.length * 7 }): List<Int> =
     (0 until (rows.maxOfOrNull { it.size } ?: 0)).map { column ->
-        (rows.take(200).maxOfOrNull { it.getOrNull(column).orEmpty().lineSequence().maxOfOrNull(String::length) ?: 0 }?.times(7)?.plus(24) ?: 100).coerceIn(100, 280)
+        (rows.take(200).maxOfOrNull { row -> row.getOrNull(column).orEmpty().lineSequence().maxOfOrNull(measure) ?: 0 }?.plus(24) ?: 100).coerceIn(100, 280)
     }
 
 internal fun slashMatches(name: String, description: String, draft: String): Boolean =
