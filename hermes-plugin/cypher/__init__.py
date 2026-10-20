@@ -10,11 +10,11 @@ def _stale(module):
     seen=getattr(module,'_cypher_mtime',None)
     try: return seen is not None and seen!=Path(module.__file__).stat().st_mtime_ns
     except (OSError,TypeError): return True
-# A plugin update reloads this file inside a running Hermes; siblings cached from the old install would mix old and new
-# code (settings() signature crash), so any changed file drops them all and they load fresh.
-if any(_stale(m) for k,m in list(sys.modules.items()) if k.startswith('cypher_')):
-    for k in [k for k in sys.modules if k.startswith('cypher_')]: sys.modules.pop(k,None)
-for name in ('mobile','native','observers','proactive','phone_delivery','live_context'):
+_MODULE_NAMES=('mobile','native','observers','proactive','phone_delivery','live_context')
+# Only purge the siblings loaded here; dashboard-only modules may still serve live routes.
+if any(_stale(sys.modules.get('cypher_'+name)) for name in _MODULE_NAMES):
+    for name in _MODULE_NAMES: sys.modules.pop('cypher_'+name,None)
+for name in _MODULE_NAMES:
     key='cypher_'+name
     if key not in sys.modules:
         path=ROOT/(name+'.py');spec=importlib.util.spec_from_file_location(key,path)
@@ -281,6 +281,14 @@ def _mcp_read_only(tool_name,profile):
         return False
     return False
 
+def _contains_http_url(value):
+    if isinstance(value,str):
+        lowered=value.casefold()
+        return 'http://' in lowered or 'https://' in lowered
+    if isinstance(value,dict): return any(_contains_http_url(item) for item in value.values())
+    if isinstance(value,list): return any(_contains_http_url(item) for item in value)
+    return False
+
 def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**kwargs):
     """Veto write-capable tools only in Cypher's email-watch cron session, including a run that
     outlives Proactive being turned off or its jobs being rebuilt (Hermes does not stop it)."""
@@ -301,6 +309,10 @@ def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**
         # Only cron runs reach here, never ordinary chats; an unreadable ownership check fails closed.
         return {'action':'block','message':_READ_ONLY_MESSAGE}
 
+    if tool_name=='web_search':
+        return None
+    if _contains_http_url(args):
+        return {'action':'block','message':_READ_ONLY_MESSAGE}
     if tool_name in {'cypher_email_notice','cypher_email_checked','terminal'}:
         return None
     if tool_name in _BLOCKED_PROACTIVE_TOOLS:
@@ -328,8 +340,6 @@ def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**
         action=args.get('action')
         if action in {'read','search','get','list','query'}: return None
         return {'action':'block','message':_READ_ONLY_MESSAGE}
-    if toolset=='web' and tool_name=='web_search':
-        return None
     # Deny by default: any other tool runs only when its own name clearly reads (skill_view, session_search,
     # read_file); a read-sounding action argument never vouches for the tool's other arguments.
     if tool_name in _PROACTIVE_READ_TOOLS or _named_read_only(tool_name):

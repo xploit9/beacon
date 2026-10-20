@@ -53,11 +53,11 @@ def _stale(module):
     seen=getattr(module,'_cypher_mtime',None)
     try: return seen is not None and seen!=Path(module.__file__).stat().st_mtime_ns
     except (OSError,TypeError): return True
-# A plugin update reloads this file inside a running Hermes; siblings cached from the old install would mix old and new
-# code (settings() signature crash), so any changed file drops them all and they load fresh.
-if any(_stale(m) for k,m in list(sys.modules.items()) if k.startswith('cypher_')):
-    for k in [k for k in sys.modules if k.startswith('cypher_')]: sys.modules.pop(k,None)
-for name in ('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_api','bot_mode_api','callbacks','callback_api','call_history_api','proactive'):
+_MODULE_NAMES=('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_api','bot_mode_api','callbacks','callback_api','call_history_api','proactive')
+# Only purge the siblings loaded here; other plugin entry points may still serve live work.
+if any(_stale(sys.modules.get('cypher_'+name)) for name in _MODULE_NAMES):
+    for name in _MODULE_NAMES: sys.modules.pop('cypher_'+name,None)
+for name in _MODULE_NAMES:
     key='cypher_'+name
     if key not in sys.modules:
         path=ROOT/(name+'.py');spec=importlib.util.spec_from_file_location(key,path)
@@ -239,9 +239,10 @@ async def register_assistant_conversation(request:Request):
     except HTTPException as exc:
         if exc.status_code==404: raise HTTPException(404,'Owned assistant conversation unavailable') from None
         raise
-    if not mobile.register_assistant_conversation(owner,provider,profile,value['session_id']):
+    conversation_id=mobile.register_assistant_conversation(owner,provider,profile,value['session_id'],native.verify)
+    if not conversation_id:
         raise HTTPException(409,'Assistant conversation registration unavailable')
-    return {'registered':True}
+    return {'registered':True,'conversation_id':conversation_id}
 
 def skill_scope(profile,fn):
     # Skills use import-bound directories; use the native router's shared profile lock.
@@ -533,7 +534,8 @@ def watch(owner,provider,profile):
                 conn.execute("UPDATE jobs SET status='callback_pending',history_updated=? WHERE id=?",(time.time(),job['id']))
     activate(owner,profile)
 def task_clock(profile):
-    return proactive._profile_timezone(profile)
+    now=proactive.profile_now(profile)
+    return getattr(now.tzinfo,'key',None) or now.tzname()
 @router.get('/mobile/tasks/capabilities')
 async def task_capabilities(request:Request):
     owner,provider,profile,cfg=identity(request)
@@ -1266,6 +1268,8 @@ def auto_update_check(cfg,now=None):
             if current_state.get('result')=='waiting_for_idle' and pending_version and installed_version and pending_version>installed_version:
                 try: return _auto_update_plugin(owner,last,current_state.get('app_version',''),current_state.get('plugin_version',''))
                 except Exception: return mobile.record_auto_update_status(owner,last,'error',current_state.get('app_version',''),current_state.get('plugin_version',''),'Could not update the Cypher plugin. Try again later.')
+            if current_state.get('result')=='restart_required' and _RUNNING_PLUGIN_VERSION==_installed_plugin_version():
+                return mobile.record_auto_update_status(owner,now,'plugin_updated',current_state.get('app_version',''),current_state.get('plugin_version',''),'Cypher plugin updated.')
             return {**current_state,'result':'throttled'}
         mobile.record_auto_update_status(owner,now,'checking',current_state.get('app_version',''),current_state.get('plugin_version',''),'Checking for updates.')
         try:

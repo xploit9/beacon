@@ -190,7 +190,7 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
     memory_read = plugin.native_proactive_read_only_guard(
         tool_name="memory", args={"action": "list"}, session_id="watch-run")
     web_read = plugin.native_proactive_read_only_guard(
-        tool_name="web_search", args={"query": "latest release"}, session_id="watch-run")
+        tool_name="web_search", args={"query": "latest release https://example.test"}, session_id="watch-run")
     terminal = plugin.native_proactive_read_only_guard(
         tool_name="terminal", args={"command": "cat inbox"}, session_id="watch-run")
 
@@ -203,6 +203,13 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
     # An injected email could carry other mail out through a fetched URL.
     for fetcher in ("web_extract", "web_fetch"):
         assert plugin.native_proactive_read_only_guard(tool_name=fetcher, args={"url": "https://x.test/?q=mail"}, session_id="watch-run") == blocked
+    fetcher = "mcp__tool_gateway_research__scrapling-fetch"
+    mcp_tool._mcp_tool_server_names[fetcher] = "tool_gateway_research"
+    mcp_tool._tool_read_only_hints["tool_gateway_research"] = {"scrapling-fetch": True}
+    assert plugin.native_proactive_read_only_guard(
+        tool_name=fetcher, args={"request": {"targets": ["https://x.test/?q=mail"]}}, session_id="watch-run") == blocked
+    assert plugin.native_proactive_read_only_guard(
+        tool_name="mcp__mail__search_inbox", args={"query": "from:owner subject:receipt"}, session_id="watch-run") is None
     # Deny by default (Strix vuln-0001): unknown tools are blocked; clearly read-only ones still run.
     for unknown in ('api_call', 'trigger_job', 'gmail_tool', 'browser_navigate'):
         assert plugin.native_proactive_read_only_guard(tool_name=unknown, args={}, session_id="watch-run") == blocked, unknown

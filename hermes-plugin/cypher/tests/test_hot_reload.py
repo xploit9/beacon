@@ -22,3 +22,23 @@ def test_a_plugin_update_reloads_sibling_modules_cached_from_the_old_install(har
         for k in [k for k in sys.modules if k.startswith('cypher_')]:
             del sys.modules[k]
         sys.modules.update(saved)
+
+
+def test_reloading_native_loader_keeps_dashboard_notification_route_live(harness):
+    _, client, *_ = harness
+    saved = {k: v for k, v in sys.modules.items() if k.startswith('cypher_')}
+    callbacks = sys.modules['cypher_callbacks']
+    stale = types.ModuleType('cypher_mobile')
+    stale.__file__ = str(ROOT / 'mobile.py')
+    stale._cypher_mtime = 1
+    try:
+        sys.modules['cypher_mobile'] = stale
+        plugin = load_private('__init__')
+
+        assert plugin.mobile is not stale
+        assert sys.modules['cypher_callbacks'] is callbacks
+        assert client.get('/api/plugins/cypher/mobile/notifications/events').status_code == 200
+    finally:
+        for k in [k for k in sys.modules if k.startswith('cypher_')]:
+            del sys.modules[k]
+        sys.modules.update(saved)

@@ -1,7 +1,6 @@
 """Native one-shot callback scheduling; the scheduler and durable outbox own delivery."""
 import importlib.util
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
@@ -22,12 +21,12 @@ if observers is None:
     spec=importlib.util.spec_from_file_location(_OBSERVER_KEY,Path(__file__).with_name('observers.py'))
     observers=importlib.util.module_from_spec(spec);sys.modules[_OBSERVER_KEY]=observers;spec.loader.exec_module(observers)
 
-def _profile_timezone(profile):
+def _profile_now(profile):
     key='cypher_proactive'
     if key not in sys.modules:
         spec=importlib.util.spec_from_file_location(key,Path(__file__).with_name('proactive.py'))
         module=importlib.util.module_from_spec(spec);sys.modules[key]=module;spec.loader.exec_module(module)
-    return sys.modules[key]._profile_timezone(profile)
+    return sys.modules[key].profile_now(profile)
 
 def _prune_expired(conn,now):
     cutoff=now-CALLBACK_MARKER_RETENTION_SECONDS-1
@@ -40,7 +39,7 @@ def _prune_expired(conn,now):
     conn.executemany('DELETE FROM meta WHERE key=?',keys)
 
 def prune_expired(mobile,owner,now=None):
-    now=now if now is not None else datetime.now().timestamp()
+    now=now if now is not None else datetime.now(timezone.utc).timestamp()
     key='scheduled-callback-prune:'+hashlib.sha256(owner.encode('utf-8')).hexdigest()
     with mobile.LOCK,mobile.connect() as conn:
         row=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
@@ -91,10 +90,13 @@ def schedule(mobile,native,owner,provider,row,cfg,value,now=None):
     from hermes_cli.web_server_cron import _cron_profile_home,_call_cron_for_profile,_create_cron_job_sync
     from hermes_cli.web_models import CronJobCreate
     profile=row['profile'];stored=row['conversation']
-    timezone_name=_profile_timezone(profile);zone=ZoneInfo(timezone_name)
-    now=now or datetime.now(zone)
+    profile_clock=_profile_now(profile)
+    if profile_clock.tzinfo is None or profile_clock.utcoffset() is None: raise ValueError('Callback time needs the profile timezone')
+    zone=profile_clock.tzinfo
+    now=now or profile_clock
     if now.tzinfo is None or now.utcoffset() is None: raise ValueError('Callback time needs the profile timezone')
     now=now.astimezone(zone)
+    timezone_name=getattr(now.tzinfo,'key',None) or now.tzname()
     if cfg.get('scheduled_callbacks_enabled') is not True: raise ValueError('Scheduled callbacks are disabled on the host')
     if (owner!=cfg.get('owner_id') or provider!=cfg.get('owner_provider')
             or 'profiles' in cfg and (not isinstance(cfg['profiles'],list) or profile not in cfg['profiles'])): raise LookupError('Callback owner/profile unavailable')
@@ -215,4 +217,4 @@ def run(key):
     if not found: raise ValueError('Callback intent unavailable')
     profile=json.loads(found[0])['profile']
     deliver(sys.modules['cypher_mobile'],sys.modules['cypher_native'],key,
-            datetime.now(ZoneInfo(_profile_timezone(profile))))
+            datetime.now(timezone.utc))

@@ -102,7 +102,7 @@ def claim_owner(owner,provider):
         created=conn.execute('INSERT OR IGNORE INTO meta(key,value) VALUES(?,?)',('owner_claim',value)).rowcount==1
     return created
 
-def register_assistant_conversation(owner,provider,profile,session_id):
+def register_assistant_conversation(owner,provider,profile,session_id,native_verify):
     if (not _valid_owner_identity(owner,provider) or not isinstance(profile,str) or not 1<=len(profile)<=80
             or any(ord(c)<32 or ord(c)==127 for c in profile)
             or not isinstance(session_id,str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,256}',session_id)):
@@ -122,12 +122,18 @@ def register_assistant_conversation(owner,provider,profile,session_id):
         conversations=claim.get('scheduled_callback_conversations',{})
         if not isinstance(conversations,dict) or len(conversations)>64: return False
         if profile not in conversations and len(conversations)>=64: return False
+        stored=conversations.get(profile)
+        if isinstance(stored,str) and stored:
+            if stored==session_id: return stored
+            try: native_verify(owner,provider,profile,stored)
+            except LookupError: pass
+            else: return stored
         conversations[profile]=session_id
         claim['scheduled_callback_conversations']=conversations
         value=json.dumps(claim,separators=(',',':'))
         if len(value)>32768: return False
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('owner_claim',?)",(value,))
-    return True
+    return session_id
 
 def home():
     from hermes_constants import get_process_hermes_home

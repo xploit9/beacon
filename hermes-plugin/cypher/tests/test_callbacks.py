@@ -1,6 +1,6 @@
 import importlib.util,json,sys
 from pathlib import Path
-from datetime import datetime,timedelta
+from datetime import datetime,timedelta,timezone
 import threading
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
@@ -19,7 +19,10 @@ def env(tmp_path,monkeypatch):
     monkeypatch.setitem(sys.modules,'hermes_cli.web_server_cron',SimpleNamespace(_cron_profile_home=lambda p:(p,tmp_path),_call_cron_for_profile=lambda *a:jobs,_create_cron_job_sync=create))
     monkeypatch.setitem(sys.modules,'hermes_cli.web_models',SimpleNamespace(CronJobCreate=lambda **kw:SimpleNamespace(**kw)))
     native=SimpleNamespace(verify=lambda *a: {})
-    cb=load('callbacks');monkeypatch.setattr(cb,'_profile_timezone',lambda profile:'America/Los_Angeles',raising=False)
+    cb=load('callbacks');proactive=load('proactive')
+    monkeypatch.setattr(proactive,'_profile_timezone',lambda profile:'America/Los_Angeles')
+    monkeypatch.setattr(proactive,'profile_now',lambda profile:datetime(2026,10,16,12,tzinfo=ZoneInfo('America/Los_Angeles')))
+    monkeypatch.setitem(sys.modules,'cypher_proactive',proactive)
     return cb,m,native,cfg,jobs,tmp_path
 NOW=datetime(2026,10,16,19,tzinfo=ZoneInfo('UTC'))
 ROW={'profile':'default','conversation':'owned','closed':0}
@@ -118,6 +121,23 @@ def test_schedule_uses_the_profile_timezone_for_callback_time(env):
     result=cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
     assert result['scheduled_at']=='2026-10-16T12:01:00-07:00'
     assert result['timezone']=='America/Los_Angeles'
+
+
+@pytest.mark.parametrize('configured_timezone',['','Unknown/Timezone'])
+def test_schedule_uses_hermes_clock_fallback_for_empty_or_unknown_profile_timezone(env,monkeypatch,configured_timezone):
+    cb,m,n,cfg,jobs,tmp=env
+    fallback=datetime(2026,10,16,19,tzinfo=timezone.utc).astimezone()
+    proactive=load('proactive')
+    monkeypatch.setattr(proactive,'profile_now',lambda profile:fallback)
+    monkeypatch.setattr(proactive,'_profile_timezone',lambda profile:configured_timezone)
+    monkeypatch.setitem(sys.modules,'cypher_proactive',proactive)
+
+    result=cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
+
+    expected=(NOW+timedelta(seconds=60)).astimezone(fallback.tzinfo)
+    assert result['status']=='scheduled'
+    assert result['scheduled_at']==expected.isoformat()
+    assert result['timezone']==fallback.tzname()
 
 def test_deliver_tolerates_subsecond_early_trigger(env):
     cb,m,n,cfg,jobs,tmp=env

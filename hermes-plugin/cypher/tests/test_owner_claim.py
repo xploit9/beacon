@@ -168,10 +168,15 @@ def test_assistant_conversation_registration_verifies_and_persists_per_profile(h
     session = '20261020_123456_abcd'
     response = client.put(path, json={'profile': 'work', 'session_id': session})
     assert response.status_code == 200, response.text
-    assert response.json() == {'registered': True}
+    assert response.json() == {'registered': True, 'conversation_id': session}
     assert verified[-1] == ('owner', 'basic', 'work', session)
     assert api.mobile.settings(profile='work').get('scheduled_callback_conversation_id') == session
     assert 'scheduled_callback_conversation_id' not in api.mobile.settings(profile='default')
+
+    second = client.put(path, json={'profile': 'work', 'session_id': '20261020_123457_abcd'})
+    assert second.status_code == 200, second.text
+    assert second.json() == {'registered': True, 'conversation_id': session}
+    assert api.mobile.settings(profile='work').get('scheduled_callback_conversation_id') == session
 
     enabled = []
     monkeypatch.setattr(api.proactive, 'set_enabled', lambda mobile, owner, profile, value: enabled.append((owner, profile, value)) or {'enabled': value})
@@ -189,6 +194,33 @@ def test_assistant_conversation_registration_verifies_and_persists_per_profile(h
 
     client.headers['x-fixture-owner'] = 'foreign'
     assert client.put(path, json={'profile': 'work', 'session_id': session}).status_code == 403
+
+
+def test_assistant_conversation_registration_replaces_a_gone_stored_chat(harness, monkeypatch):
+    api, client, _, home, _ = harness
+    _write_config(home, {})
+    _use_real_settings(api, monkeypatch)
+    _native_profiles(monkeypatch, ['default'])
+    assert client.post('/api/plugins/cypher/owner/claim').status_code == 200
+    gone_checks = 0
+
+    def verify(owner, provider, profile, session_id, **kwargs):
+        nonlocal gone_checks
+        if session_id == 'gone-chat':
+            gone_checks += 1
+            if gone_checks > 1:
+                raise LookupError('conversation no longer exists')
+        return {'id': session_id}
+
+    monkeypatch.setattr(api.native, 'verify', verify)
+    path = '/api/plugins/cypher/mobile/assistant-conversation'
+    first = client.put(path, json={'profile': 'default', 'session_id': 'gone-chat'})
+    assert first.status_code == 200, first.text
+    replacement = client.put(path, json={'profile': 'default', 'session_id': 'replacement-chat'})
+
+    assert replacement.status_code == 200, replacement.text
+    assert replacement.json() == {'registered': True, 'conversation_id': 'replacement-chat'}
+    assert api.mobile.settings(profile='default').get('scheduled_callback_conversation_id') == 'replacement-chat'
 
 
 def test_claimed_profile_call_delivery_uses_registered_assistant_conversation(harness, monkeypatch):

@@ -8,12 +8,12 @@ from pathlib import Path
 import sys
 
 
-def _profile_timezone(profile):
+def _profile_now(profile):
     key='cypher_proactive'
     if key not in sys.modules:
         spec=importlib.util.spec_from_file_location(key,Path(__file__).with_name('proactive.py'))
         module=importlib.util.module_from_spec(spec);sys.modules[key]=module;spec.loader.exec_module(module)
-    return sys.modules[key]._profile_timezone(profile)
+    return sys.modules[key].profile_now(profile)
 
 
 def slots(owner,profile,day):
@@ -31,11 +31,15 @@ def tick(mobile,native,cfg,profile,now):
     if (cfg.get('scheduled_callbacks_enabled') is not True or not owner or not provider or not stored
             or 'profiles' in cfg and (not isinstance(cfg['profiles'],list) or profile not in cfg['profiles'])):
         raise ValueError('Configure an owned callback conversation before enabling check-ups')
-    if (now.tzinfo is None or now.utcoffset() is None
-            or getattr(now.tzinfo,'key',None)!=_profile_timezone(profile)):
-        raise ValueError('Check-up time must match the profile timezone')
     minute=now.hour*60+now.minute
     if minute not in slots(owner,profile,now.date().isoformat()): return {'state':'no_opportunity'}
+    profile_clock=_profile_now(profile)
+    if profile_clock.tzinfo is None or profile_clock.utcoffset() is None:
+        raise ValueError('Check-up time must match the profile timezone')
+    profile_timezone=getattr(profile_clock.tzinfo,'key',None) or profile_clock.tzname()
+    if (now.tzinfo is None or now.utcoffset() is None
+            or (getattr(now.tzinfo,'key',None) or now.tzname())!=profile_timezone):
+        raise ValueError('Check-up time must match the profile timezone')
     native.verify(owner,provider,profile,stored)
     key='checkup:'+owner+':'+profile+':'+now.date().isoformat()+':'+str(minute)
     with mobile.LOCK,mobile.connect() as conn:
@@ -55,12 +59,9 @@ def tick(mobile,native,cfg,profile,now):
 def run(plugin_root,profile,timezone_name=None,now=None):
     if timezone_name is None and now is None:
         import hermes_time
-        timezone_name=hermes_time.get_timezone_name();now=hermes_time.now()
+        now=hermes_time.now()
     elif timezone_name is None or now is None:
         raise ValueError('Check-up clock must include the target profile timezone and time')
-    profile_timezone=_profile_timezone(profile)
-    if timezone_name!=profile_timezone or getattr(now.tzinfo,'key',None)!=profile_timezone:
-        raise ValueError('Check-up clock does not match the profile timezone')
     root=Path(plugin_root)
     for name in ('mobile','native'):
         key='cypher_'+name

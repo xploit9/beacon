@@ -232,3 +232,17 @@ def test_restart_hint_survives_a_later_up_to_date_check(harness,monkeypatch):
 
     assert updated==[] and result['result']=='restart_required'
     assert result['message']=='Restart Hermes to finish the plugin update.'
+
+
+def test_restart_hint_clears_when_process_runs_the_installed_version(harness,monkeypatch):
+    api,_,cfg,_,_=harness
+    owner=cfg['owner_id']
+    api.mobile.record_auto_update_status(owner,2_000_000,'restart_required','1.0.0','1.1.0','Restart Hermes to finish the plugin update.')
+    monkeypatch.setattr(api,'_RUNNING_PLUGIN_VERSION','1.1.0')
+    monkeypatch.setattr(api,'_installed_plugin_version',lambda:'1.1.0')
+    monkeypatch.setattr(api,'_check_release_and_announce',lambda cfg:pytest.fail('throttled check should not fetch releases'))
+
+    result=api.auto_update_check(cfg,now=2_000_001)
+
+    assert result['result']=='plugin_updated'
+    assert result['message']=='Cypher plugin updated.'

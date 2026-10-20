@@ -305,7 +305,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
         keyMask=withContext(Dispatchers.IO) { store.maskedKey(selection.provider).orEmpty() }
     }
     // A key typed here is never lost: it is saved (encrypted, per provider) on switch, Test or leaving the screen.
-    DisposableEffect(Unit) { onDispose { if(draft.isNotBlank()) runCatching { store.saveKey(selection.provider,draft) } } }
+    DisposableEffect(selection.provider) { onDispose { if(draft.isNotBlank()) runCatching { store.saveKey(selection.provider,draft) } } }
 
     LaunchedEffect(selection.provider,catalogRefresh) {
         val apiKey=withContext(Dispatchers.IO) { store.key(selection.provider) }

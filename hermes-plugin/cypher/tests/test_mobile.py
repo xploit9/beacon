@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from types import SimpleNamespace
+from datetime import datetime,timezone
 
 import pytest
 from fastapi import FastAPI,Request
@@ -48,6 +49,21 @@ def reserve(client):
     result=client.post('/api/plugins/cypher/mobile/calls',json={'profile':'default'})
     assert result.status_code==200,result.text
     return result.json()['call_id']
+
+
+@pytest.mark.parametrize('configured_timezone',['','Unknown/Timezone'])
+def test_task_capabilities_use_hermes_clock_timezone_fallback(harness,monkeypatch,configured_timezone):
+    api,client,cfg,_,_=harness
+    cfg['scheduled_callbacks_enabled']=True
+    fallback=datetime(2026,10,20,12,tzinfo=timezone.utc).astimezone()
+    monkeypatch.setattr(api.proactive,'_profile_timezone',lambda profile:configured_timezone,raising=False)
+    monkeypatch.setattr(api.proactive,'profile_now',lambda profile:fallback)
+
+    response=client.get('/api/plugins/cypher/mobile/tasks/capabilities')
+
+    assert response.status_code==200,response.text
+    assert response.json()['timezone']==fallback.tzname()
+    assert response.json()['checkups_ready'] is True
 
 def test_history_retention_setting_is_owner_and_profile_scoped(harness):
     api,client,cfg,tmp,_=harness
@@ -818,7 +834,7 @@ def test_checkup_slots_are_daily_bounded_persistent_and_no_catchup(harness,monke
     api,c,cfg,tmp,app=harness
     check=load_private('checkups')
     cfg.update(scheduled_callbacks_enabled=True,scheduled_callback_conversation_id='owned-chat')
-    monkeypatch.setattr(check,'_profile_timezone',lambda profile:'America/Los_Angeles')
+    monkeypatch.setattr(check,'_profile_now',lambda profile:datetime(2026,10,14,12,tzinfo=ZoneInfo('America/Los_Angeles')))
     for day in ('2026-10-13','2026-10-14','2026-10-15'):
         times=check.slots('owner','default',day)
         assert len(times) in (3,4) and len(set(times))==len(times)

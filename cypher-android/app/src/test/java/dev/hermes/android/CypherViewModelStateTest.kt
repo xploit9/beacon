@@ -5,6 +5,13 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CypherViewModelStateTest {
+    @Test fun registeredAssistantConversationIsAdoptedOnlyWhenItChanges() {
+        assertEquals("shared-chat", assistantConversationToAdopt("phone-chat", "shared-chat"))
+        assertNull(assistantConversationToAdopt("shared-chat", "shared-chat"))
+        assertNull(assistantConversationToAdopt("phone-chat", ""))
+        assertNull(assistantConversationToAdopt("phone-chat", null))
+    }
+
     @Test fun serverRequestPromptIsShownAndAnExplicitNullPendingClearsIt() {
         val request = JSONObject("{\"approval_id\":\"queue-1\",\"command\":\"ls\"}")
         assertEquals("queue-1", pendingPrompt(request)?.optString("approval_id"))
