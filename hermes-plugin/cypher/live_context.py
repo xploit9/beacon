@@ -8,9 +8,12 @@ import time
 
 MAX_CONTEXT_CHARS = 600
 CACHE_SECONDS = 60
+NOTE_REPEAT_SECONDS = 30 * 60
+MAX_SENT_SESSIONS = 512
 _RULE = ("Your abilities are the tools and skills available in this turn, not what earlier messages, summaries, or memories say. "
          "If something failed before, try it again once and report the actual error.")
 _CACHE = {}
+_SENT = {}
 _LOCK = threading.Lock()
 
 
@@ -68,7 +71,7 @@ def _recent_successes(mobile, owner, profile, source_ids, now):
 def _format(items, job_scope=False):
     prefix = "Live capabilities: "
     rule = _RULE + (" This scheduled Proactive run is limited to its enabled toolset." if job_scope else "")
-    details = "; ".join(items) or "No sources are currently discoverable."
+    details = "; ".join(items) or "No sources are selected."
     room = MAX_CONTEXT_CHARS - len(prefix) - len(rule) - 1
     if len(details) > room:
         details = details[:max(0, room - 1)].rstrip(" ,;") + "…"
@@ -76,67 +79,60 @@ def _format(items, job_scope=False):
 
 
 def _build_snapshot(mobile, owner, profile, proactive, job_scope=False):
-    status = proactive.status(mobile, owner, profile)
-    if not isinstance(status, dict) or not isinstance(status.get("signals"), list):
-        raise ValueError("Proactive status is unavailable")
-
-    items, selected, health_rows = [], set(), []
-    if status.get("enabled") is True and status.get("setup_complete") is True:
-        for signal in status["signals"]:
-            if not isinstance(signal, dict):
-                continue
-            source_id = signal.get("source")
+    setup = proactive._setup(mobile, owner, profile, {name: [] for name in proactive.SIGNALS})
+    items, selected = [], set()
+    if proactive.enabled(mobile, owner, profile) and proactive._setup_complete(mobile, owner, profile):
+        for signal, label in proactive.SIGNALS.items():
+            source_id = setup.get("signals", {}).get(signal)
             if not isinstance(source_id, str) or not source_id:
                 continue
             selected.add(source_id)
-            source = next((row for row in signal.get("sources", ())
-                           if isinstance(row, dict) and row.get("id") == source_id), {})
-            signal_name = _label(signal.get("label") or signal.get("id"))
-            source_name = _label(source.get("label") or source_id)
-            health = signal.get("health")
-            state = health.get("state") if isinstance(health, dict) else None
-            if state not in ("ok", "error", "unknown"):
-                state = "unknown"
-            checked_at = health.get("checked_at") if isinstance(health, dict) else None
-            health_rows.append((signal_name, source_name, source_id, state, checked_at))
+            source_name = _label(source_id.split(":", 1)[-1])
+            items.append((label, source_name or "selected source", source_id))
 
     successful_at = _recent_successes(mobile, owner, profile, selected, time.time()) if selected else {}
-    for signal_name, source_name, source_id, state, checked_at in health_rows:
-        timestamp = _time_label(checked_at)
-        detail = f"health {state}"
-        if timestamp:
-            detail += f" {timestamp}"
-        elif state == "unknown" and source_id in successful_at:
-            detail += f"; last successful read {_time_label(successful_at[source_id])}"
-        items.append(f"{signal_name or 'Proactive'}: {source_name or 'selected source'} ({detail})")
+    items = [
+        f"{_label(signal) or 'Proactive'}: {source} (health unknown" +
+        (f"; last successful read {_time_label(successful_at[source_id])}" if source_id in successful_at else "") + ")"
+        for signal, source, source_id in items
+    ]
 
-    # Skills are already indexed in Hermes' system prompt; a ~100-name list would only be truncated here.
     from hermes_cli.web_server_profiles import _profile_scope
+    from tools.registry import registry
     with _profile_scope(profile):
-        mcp_rows = proactive._mcp_catalog()
-    if not isinstance(mcp_rows, list):
-        raise ValueError("Profile source discovery is unavailable")
-
+        mcp_rows = [{"_server": entry.toolset[4:]} for entry in registry.get_all_entries()
+                    if isinstance(entry.toolset, str) and entry.toolset.startswith("mcp-")]
     mcp_names = _catalog_names(mcp_rows, "_server", "mcp", selected)
     if mcp_names:
         items.append("Other MCP (health unknown): " + ", ".join(mcp_names))
     return _format(items, job_scope)
 
 
-def snapshot(mobile, owner, profile, proactive, job_scope=False):
-    """Return a cached, redacted capability snapshot, or None when discovery fails."""
+def snapshot(mobile, owner, profile, proactive, job_scope=False, session_id=None):
+    """Return a cached, redacted capability snapshot, or None when local state is unavailable."""
     key = (owner, profile, job_scope)
     now = time.monotonic()
     with _LOCK:
         cached = _CACHE.get(key)
-        if cached and now - cached[0] < CACHE_SECONDS:
-            return cached[1]
-    try:
-        context = _build_snapshot(mobile, owner, profile, proactive, job_scope)
-    except Exception:
-        return None
-    if not isinstance(context, str) or not context:
-        return None
-    with _LOCK:
-        _CACHE[key] = (time.monotonic(), context)
+    if cached and now - cached[0] < CACHE_SECONDS:
+        context = cached[1]
+    else:
+        try:
+            context = _build_snapshot(mobile, owner, profile, proactive, job_scope)
+        except Exception:
+            return None
+        if not isinstance(context, str) or not context:
+            return None
+        with _LOCK:
+            _CACHE[key] = (time.monotonic(), context)
+    if session_id:
+        with _LOCK:
+            sent = _SENT.get(session_id)
+            now = time.monotonic()
+            if sent and sent[:2] == (key, context) and now - sent[2] < NOTE_REPEAT_SECONDS:
+                return None
+            _SENT.pop(session_id, None)
+            _SENT[session_id] = (key, context, now)
+            while len(_SENT) > MAX_SENT_SESSIONS:
+                _SENT.pop(next(iter(_SENT)))
     return context

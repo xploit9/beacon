@@ -51,9 +51,14 @@ def call_user(args,session_id=None,**kwargs):
                 return json.dumps({'error':'This chat is not linked to your Hermes sign-in, so Cypher cannot ring from it. Start a new chat in Cypher and ask again.','reason':'conversation_not_owned'})
             stored=cfg.get('scheduled_callback_conversation_id')
         native.verify(owner,provider,profile,stored)
+        provided_reason=isinstance(args,dict) and args.get('reason') is not None
         reason=args.get('reason',row.get('title','')) if isinstance(args,dict) else row.get('title','')
         if reason is None: reason=''
-        reason=observers.reason_text(reason)
+        try:
+            reason=observers.reason_text(reason)
+        except ValueError as exc:
+            if provided_reason: return json.dumps({'error':str(exc)})
+            reason=''
         event_id=mobile.invitation(owner,profile,stored,reason)
         # The durable outbox is the authority. FCM is asynchronous wake-up only.
         return json.dumps({'event_id':event_id,'status':'pending','expires_in_seconds':120,'conversation_id':stored})
@@ -66,7 +71,12 @@ def current_profile(cfg):
 def _cron_row(profile,session_id):
     from tui_gateway import server
     with server._profile_db({'profile':profile}) as db:
-        return db.get_session(session_id) if db else None
+        row=db.get_session(session_id) if db else None
+        if row and row.get('source')=='cron':
+            identity=db.cron_run_identity(session_id)
+            if identity and identity.get('cron_job_id'):
+                row={**row,'cron_job_id':identity['cron_job_id']}
+        return row
 
 def _cron_job_id(row,session_id):
     job_id=row.get('cron_job_id')
@@ -105,7 +115,7 @@ def native_live_context(session_id=None,**kwargs):
     except (LookupError,ValueError,RuntimeError):
         if not _owned_proactive_run(owner,profile,session_id): return None
         job_scope=True
-    context=live_context.snapshot(mobile,owner,profile,proactive,job_scope=job_scope)
+    context=live_context.snapshot(mobile,owner,profile,proactive,job_scope=job_scope,session_id=session_id)
     return {'context':context} if context else None
 
 
@@ -152,12 +162,8 @@ def native_mailbox_observation(tool_name=None,result=None,status=None,session_id
             if not any(entry.name==tool_name and entry.toolset=='web' for entry in registry.get_all_entries()): return
         elif kind=='skill' and tool_name!='terminal':
             return
-        if spec['signal']=='email':
-            observers.mailbox_observed(mobile,cfg,profile,session_id,tool_name,result,status,read_only,
-                                       source_id,spec['signal'])
-        else:
-            observers.source_observed(mobile,cfg,profile,session_id,spec['signal'],source_id,
-                                      tool_name,result,status,read_only)
+        observers.source_observed(mobile,cfg,profile,session_id,spec['signal'],source_id,
+                                  tool_name,result,status,read_only)
     except (ImportError,LookupError,RuntimeError,ValueError):
         return
 
@@ -183,8 +189,8 @@ def create_proactive_request(args,session_id=None,**kwargs):
         native.verify(owner,provider,profile,session_id)
         action=args.get('action')
         if action is None:
-            sources=proactive.discover_sources(profile)
-            action=proactive._setup(mobile,owner,profile,sources).get('urgent',proactive.DEFAULT_URGENT)['delivery']
+            action=proactive._setup(mobile,owner,profile,{s:[] for s in proactive.SIGNALS}).get(
+                'urgent',proactive.DEFAULT_URGENT)['delivery']
         request=proactive.create_request(mobile,owner,profile,args.get('text'),action,
                                          args.get('signal'),args.get('night',False))
         return json.dumps({'saved':True,'request':request})

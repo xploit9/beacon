@@ -4,6 +4,7 @@ import json
 import math
 import re
 import time
+import unicodedata
 import uuid
 
 EVIDENCE_TTL = 300
@@ -11,23 +12,38 @@ ALERT_RETENTION = 24 * 60 * 60
 CALL_WINDOW = 60 * 60
 CALL_LIMIT = 3
 PRUNE_BATCH = 256
+MAX_EVIDENCE_HASHES = 1024
 CLAIM_FIELDS = {"id", "message_id", "messageid", "event_id", "eventid", "task_id", "taskid",
                 "url", "uri", "link", "web_url", "subject", "title", "name", "summary"}
 
 
 INSTRUCTION_MARKERS = ("ignore previous", "ignore all", "system prompt", "override policy", "new instructions",
                        "pre-approved", "preapproved", "send email", "mark as read", "tool_call")
-CALLBACK_REASON_CHARACTERS = re.compile(r"""[\w .,!?'"():;/@#&+-]*\Z""", re.UNICODE)
+CALLBACK_REASON_CHARACTERS = re.compile(r"""[\w .,!?'"():;/@#&+$%€-]*\Z""", re.UNICODE)
+
+
+def normalize_callback_text(value, limit=240):
+    if not isinstance(value, str):
+        raise ValueError("Invalid callback reason")
+    value = unicodedata.normalize("NFKC", value).translate(str.maketrans({
+        "‘": "'", "’": "'", "“": '"', "”": '"', "–": "-", "—": "-", "…": "...",
+    }))
+    if len(value) > limit:
+        raise ValueError("Invalid callback reason")
+    return value
+
+
+def check_instruction_markers(value):
+    if any(term in value.casefold() for term in INSTRUCTION_MARKERS):
+        raise ValueError("Instruction-like text cannot be relayed as trusted call guidance")
 
 
 def reason_text(value, limit=240):
     """Every ring/notice reason passes here: one line of plain text, never instruction-shaped."""
-    if not isinstance(value, str) or len(value) > limit:
-        raise ValueError("Invalid callback reason")
+    value = normalize_callback_text(value, limit)
     if any(c in "\r\n" or ord(c) < 32 for c in value) or not CALLBACK_REASON_CHARACTERS.fullmatch(value):
         raise ValueError("A callback reason must be a single line of plain text")
-    if any(term in value.casefold() for term in INSTRUCTION_MARKERS):
-        raise ValueError("Instruction-like text cannot be relayed as trusted call guidance")
+    check_instruction_markers(value)
     return value
 
 
@@ -137,12 +153,14 @@ def _source_error(value, depth=0, budget=None):
         try:
             value = json.loads(value)
         except (TypeError, ValueError):
-            return False
+            return bool(re.search(r"(?i)^error(?::|\b)", value.lstrip()) or "Traceback" in value)
     if isinstance(value, list):
         return any(_source_error(child, depth + 1, budget) for child in value[:64])
     if not isinstance(value, dict):
         return False
     if value.get("isError") is True or value.get("is_error") is True or value.get("outcome_uncertain") is True:
+        return True
+    if value.get("exit_code") not in (None, 0, "0"):
         return True
     if value.get("error") not in (None, False, "", {}, []):
         return True
@@ -189,29 +207,28 @@ def source_observed(mobile, cfg, profile, session_id, signal, source_id, tool_na
         return False
     now = time.time()
     key = _evidence_key(owner, profile, session_id, source_id, signal)
-    record = {"source_id": source_id, "signal": signal, "tool_name": tool_name,
-              "item_hashes": claims, "observed_at": now}
     with mobile.LOCK, mobile.connect() as conn:
         prune_meta(conn, now)
+        previous = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        if previous:
+            try:
+                old = json.loads(previous[0])
+                observed = old.get("observed_at") if isinstance(old, dict) else None
+                old_hashes = old.get("item_hashes", []) if isinstance(old, dict) else []
+                if (old.get("source_id") == source_id and old.get("signal") == signal
+                        and type(observed) in (int, float) and math.isfinite(observed)
+                        and 0 <= now - observed <= EVIDENCE_TTL and isinstance(old_hashes, list)):
+                    claims = list(dict.fromkeys(
+                        [value for value in old_hashes
+                         if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)] + claims
+                    ))[-MAX_EVIDENCE_HASHES:]
+            except (AttributeError, TypeError, ValueError, UnicodeError):
+                pass
+        record = {"source_id": source_id, "signal": signal, "tool_name": tool_name,
+                  "item_hashes": claims[-MAX_EVIDENCE_HASHES:], "observed_at": now}
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
                      (key, json.dumps(record, separators=(",", ":")).encode()))
     return True
-
-
-def mailbox_observed(mobile, cfg, profile, session_id, tool_name, result, status, read_only_verified,
-                     source_id=None, signal="email"):
-    """Compatibility entry point: old email evidence now follows the selected signal source."""
-    owner = cfg.get("owner_id")
-    if not source_id and owner:
-        try:
-            from cypher_proactive import SIGNALS, _setup
-            source_id = _setup(mobile, owner, profile, {name: [] for name in SIGNALS})["signals"].get(signal)
-        except (ImportError, LookupError, RuntimeError, ValueError):
-            return False
-    if not source_id:
-        return False
-    return source_observed(mobile, cfg, profile, session_id, signal, source_id, tool_name,
-                           result, status, read_only_verified)
 
 
 def _inside_quiet(now, setup):

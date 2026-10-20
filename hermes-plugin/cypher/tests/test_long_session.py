@@ -1,6 +1,15 @@
+import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 from test_mobile import harness, load_private
+
+
+def _install_profile_db(monkeypatch, session_id, row, identity):
+    db = SimpleNamespace(get_session=lambda requested: row if requested == session_id else None,
+                         cron_run_identity=lambda requested: identity if requested == session_id else None)
+    server = SimpleNamespace(_profile_db=lambda scope: nullcontext(db))
+    monkeypatch.setitem(sys.modules, "tui_gateway", SimpleNamespace(server=server))
 
 
 def test_managed_persona_retries_old_requests_and_requires_current_tool_evidence(harness):
@@ -50,6 +59,7 @@ def test_live_context_callback_injects_only_a_verified_owner_conversation(harnes
 
     assert result == {"context": "live capabilities"}
     assert scope["job_scope"] is False
+    assert scope["session_id"] == "owned-chat"
 
 
 def test_live_context_callback_injects_managed_proactive_cron_runs(harness, monkeypatch):
@@ -61,15 +71,15 @@ def test_live_context_callback_injects_managed_proactive_cron_runs(harness, monk
     monkeypatch.setattr(plugin, "current_profile", lambda cfg: "default")
     monkeypatch.setattr(plugin.native, "verify",
                         lambda *args: (_ for _ in ()).throw(LookupError("Cron principal")))
-    monkeypatch.setattr(plugin, "_cron_row", lambda profile, session_id: {
-        "source": "cron", "cron_job_id": "cypher-job",
-    })
+    session_id = "local-cypher-run"
+    _install_profile_db(monkeypatch, session_id, {"id": session_id, "source": "cron"},
+                        {"cron_job_id": "cypher-job", "cron_execution_id": "run-1"})
     monkeypatch.setattr(plugin.proactive, "_managed_ids", lambda *args: {"brief_email": "cypher-job"})
     monkeypatch.setattr(plugin.proactive, "enabled", lambda *args: True)
     monkeypatch.setattr(plugin.proactive, "_setup_complete", lambda *args: True)
     monkeypatch.setattr(live, "snapshot", lambda *args, **kwargs: scope.update(kwargs) or "live capabilities")
 
-    result = plugin.native_live_context("cron-run")
+    result = plugin.native_live_context(session_id)
 
     assert result == {"context": "live capabilities"}
     assert scope["job_scope"] is True
@@ -83,13 +93,13 @@ def test_live_context_callback_skips_unmanaged_cron_runs(harness, monkeypatch):
     monkeypatch.setattr(plugin, "current_profile", lambda cfg: "default")
     monkeypatch.setattr(plugin.native, "verify",
                         lambda *args: (_ for _ in ()).throw(LookupError("Cron principal")))
-    monkeypatch.setattr(plugin, "_cron_row", lambda profile, session_id: {
-        "source": "cron", "cron_job_id": "unrelated-job",
-    })
+    session_id = "local-unrelated-run"
+    _install_profile_db(monkeypatch, session_id, {"id": session_id, "source": "cron"},
+                        {"cron_job_id": "unrelated-job", "cron_execution_id": "run-2"})
     monkeypatch.setattr(plugin.proactive, "_managed_ids", lambda *args: {"brief_email": "cypher-job"})
     monkeypatch.setattr(live, "snapshot", lambda *args: "must not be injected")
 
-    assert plugin.native_live_context("unrelated-cron-run") is None
+    assert plugin.native_live_context(session_id) is None
 
 
 def test_live_context_callback_skips_unowned_interactive_sessions(harness, monkeypatch):
@@ -106,7 +116,7 @@ def test_live_context_callback_skips_unowned_interactive_sessions(harness, monke
     assert plugin.native_live_context("foreign-chat") is None
 
 
-def test_live_snapshot_lists_current_sources_without_exposing_source_content(harness, monkeypatch):
+def test_live_snapshot_uses_registered_mcp_toolsets_without_discovery(harness, monkeypatch):
     from contextlib import nullcontext
     import sys
 
@@ -115,16 +125,19 @@ def test_live_snapshot_lists_current_sources_without_exposing_source_content(har
     live = getattr(plugin, "live_context", None)
     assert live is not None
     live._CACHE.clear()
-    source = {"id": "mcp:mail", "label": "mail", "kind": "mcp"}
-    monkeypatch.setattr(api.proactive, "status", lambda *args, **kwargs: {
-        "enabled": True, "setup_complete": True,
-        "signals": [{"id": "email", "label": "Email", "source": "mcp:mail", "sources": [source],
-                     "health": {"state": "unknown", "checked_at": None}}],
-    })
-    monkeypatch.setattr(api.proactive, "_mcp_catalog", lambda: [
-        {"_server": "mail", "description": "Private message body"},
-        {"_server": "calendar", "description": "Private event body"},
-        {"_server": "private-token", "description": "Sensitive configuration"},
+    live._SENT.clear()
+    setup = {"signals": {"email": "mcp:mail", "calendar": None, "tasks": None, "news": None}}
+    monkeypatch.setattr(api.proactive, "_setup", lambda *args: setup)
+    monkeypatch.setattr(api.proactive, "enabled", lambda *args: True)
+    monkeypatch.setattr(api.proactive, "_setup_complete", lambda *args: True)
+    fail = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("slow discovery path used"))
+    for name in ("status", "_mcp_catalog", "discover_sources", "_cron_helpers", "_profile_timezone"):
+        monkeypatch.setattr(api.proactive, name, fail)
+    from tools.registry import registry
+    monkeypatch.setattr(registry, "get_all_entries", lambda: [
+        SimpleNamespace(toolset="mcp-mail"),
+        SimpleNamespace(toolset="mcp-calendar"),
+        SimpleNamespace(toolset="mcp-private-token"),
     ])
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles",
                         SimpleNamespace(_profile_scope=lambda profile: nullcontext()))
@@ -132,9 +145,10 @@ def test_live_snapshot_lists_current_sources_without_exposing_source_content(har
                         SimpleNamespace(redact_sensitive_text=lambda value, **kwargs:
                                         value.replace("private-token", "[redacted]")))
 
-    context = live.snapshot(api.mobile, "owner", "default", api.proactive, job_scope=True)
+    context = live.snapshot(api.mobile, "owner", "default", api.proactive, job_scope=True,
+                            session_id="snapshot-session")
 
-    assert "mail" in context and "calendar" in context
+    assert "Email: mail" in context and "calendar" in context
     assert "unknown" in context and "tools and skills available in this turn" in context
     assert "try it again once" in context
     assert "limited to its enabled toolset" in context
@@ -142,6 +156,31 @@ def test_live_snapshot_lists_current_sources_without_exposing_source_content(har
     assert "Private event body" not in context
     assert "private-token" not in context and "[redacted]" in context
     assert len(context) <= 600
+
+
+def test_live_snapshot_deduplicates_unchanged_notes_per_session_and_bounds_cache(harness, monkeypatch):
+    api, _, _, _, _ = harness
+    live = load_private("__init__").live_context
+    live._CACHE.clear()
+    live._SENT.clear()
+    clock = [100.0]
+    monkeypatch.setattr(live.time, "monotonic", lambda: clock[0])
+    note = ["first note"]
+    monkeypatch.setattr(live, "_build_snapshot", lambda *args, **kwargs: note[0])
+
+    assert live.snapshot(api.mobile, "owner", "default", api.proactive, session_id="conversation") == "first note"
+    assert live.snapshot(api.mobile, "owner", "default", api.proactive, session_id="conversation") is None
+    note[0] = "updated note"
+    clock[0] += live.CACHE_SECONDS + 1
+    assert live.snapshot(api.mobile, "owner", "default", api.proactive, session_id="conversation") == "updated note"
+    assert live.snapshot(api.mobile, "owner", "default", api.proactive, session_id="conversation") is None
+    clock[0] += 1800
+    assert live.snapshot(api.mobile, "owner", "default", api.proactive, session_id="conversation") == "updated note"
+
+    for index in range(513):
+        live.snapshot(api.mobile, "owner", "default", api.proactive, session_id=f"session-{index}")
+    assert len(live._SENT) == 512
+    assert "conversation" not in live._SENT
 
 
 def test_live_snapshot_cache_is_profile_scoped_and_expires_after_one_minute(harness, monkeypatch):
@@ -183,7 +222,7 @@ def test_live_snapshot_fails_open_when_source_discovery_raises(harness, monkeypa
     assert live.snapshot(api.mobile, "owner", "default", api.proactive) is None
 
 
-def test_live_snapshot_preserves_proactive_error_state_and_check_time(harness, monkeypatch):
+def test_live_snapshot_uses_saved_selection_without_status_probe(harness, monkeypatch):
     from contextlib import nullcontext
     import sys
 
@@ -192,19 +231,23 @@ def test_live_snapshot_preserves_proactive_error_state_and_check_time(harness, m
     live = getattr(plugin, "live_context", None)
     assert live is not None
     live._CACHE.clear()
-    monkeypatch.setattr(api.proactive, "status", lambda *args, **kwargs: {
-        "enabled": True, "setup_complete": True,
-        "signals": [{"id": "email", "label": "Email", "source": "mcp:mail", "sources": [],
-                     "health": {"state": "error", "checked_at": 1700000000}}],
-    })
-    monkeypatch.setattr(api.proactive, "_mcp_catalog", lambda: [])
+    live._SENT.clear()
+    setup = {"signals": {"email": "mcp:mail", "calendar": None, "tasks": None, "news": None}}
+    monkeypatch.setattr(api.proactive, "_setup", lambda *args: setup)
+    monkeypatch.setattr(api.proactive, "enabled", lambda *args: True)
+    monkeypatch.setattr(api.proactive, "_setup_complete", lambda *args: True)
+    fail = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("status discovery used"))
+    monkeypatch.setattr(api.proactive, "status", fail)
+    monkeypatch.setattr(api.proactive, "_mcp_catalog", fail)
+    from tools.registry import registry
+    monkeypatch.setattr(registry, "get_all_entries", lambda: [])
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles",
                         SimpleNamespace(_profile_scope=lambda profile: nullcontext()))
 
     context = live.snapshot(api.mobile, "owner", "default", api.proactive)
 
-    assert "error" in context
-    assert "2023-11-14 22:13Z" in context
+    assert "Email: mail (health unknown)" in context
+    assert "2023-11-14 22:13Z" not in context
 
 
 def test_live_snapshot_caps_large_catalogs_and_keeps_retry_rule(harness, monkeypatch):
@@ -216,11 +259,16 @@ def test_live_snapshot_caps_large_catalogs_and_keeps_retry_rule(harness, monkeyp
     live = getattr(plugin, "live_context", None)
     assert live is not None
     live._CACHE.clear()
-    monkeypatch.setattr(api.proactive, "status", lambda *args, **kwargs: {
-        "enabled": False, "setup_complete": False, "signals": [],
-    })
-    monkeypatch.setattr(api.proactive, "_mcp_catalog", lambda: [
-        {"_server": f"source-{index}-" + "x" * 80} for index in range(30)
+    live._SENT.clear()
+    monkeypatch.setattr(api.proactive, "_setup",
+                        lambda *args: {"signals": {signal: None for signal in api.proactive.SIGNALS}})
+    monkeypatch.setattr(api.proactive, "enabled", lambda *args: False)
+    monkeypatch.setattr(api.proactive, "_setup_complete", lambda *args: False)
+    monkeypatch.setattr(api.proactive, "status",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("status discovery used")))
+    from tools.registry import registry
+    monkeypatch.setattr(registry, "get_all_entries", lambda: [
+        SimpleNamespace(toolset=f"mcp-source-{index}-" + "x" * 80) for index in range(30)
     ])
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles",
                         SimpleNamespace(_profile_scope=lambda profile: nullcontext()))
@@ -242,14 +290,14 @@ def test_live_snapshot_shows_only_recent_successful_read_time_as_source_evidence
     live = getattr(plugin, "live_context", None)
     assert live is not None
     live._CACHE.clear()
+    live._SENT.clear()
     monkeypatch.setattr(live.time, "time", lambda: 1700000010)
-    source = {"id": "mcp:mail", "label": "mail", "kind": "mcp"}
-    monkeypatch.setattr(api.proactive, "status", lambda *args, **kwargs: {
-        "enabled": True, "setup_complete": True,
-        "signals": [{"id": "email", "label": "Email", "source": "mcp:mail", "sources": [source],
-                     "health": {"state": "unknown", "checked_at": None}}],
-    })
-    monkeypatch.setattr(api.proactive, "_mcp_catalog", lambda: [{"_server": "mail"}])
+    setup = {"signals": {"email": "mcp:mail", "calendar": None, "tasks": None, "news": None}}
+    monkeypatch.setattr(api.proactive, "_setup", lambda *args: setup)
+    monkeypatch.setattr(api.proactive, "enabled", lambda *args: True)
+    monkeypatch.setattr(api.proactive, "_setup_complete", lambda *args: True)
+    from tools.registry import registry
+    monkeypatch.setattr(registry, "get_all_entries", lambda: [SimpleNamespace(toolset="mcp-mail")])
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles",
                         SimpleNamespace(_profile_scope=lambda profile: nullcontext()))
     with api.mobile.connect() as conn:

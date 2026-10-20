@@ -429,6 +429,9 @@ def _save_requests(mobile, owner, profile, rows):
 
 def create_request(mobile, owner, profile, text, action, signal=None, night=False):
     text = _validate_request_fields(text, action, signal, night)
+    from cypher_observers import check_instruction_markers, normalize_callback_text
+    text = normalize_callback_text(text, 300)
+    check_instruction_markers(text)
     with _SET_ENABLED_LOCK:
         rows = list_requests(mobile, owner, profile)
         if len(rows) >= 20:
@@ -503,12 +506,10 @@ def _job_prompt(spec, source=None, requests=()):
         task = (f"Use only the selected {source['kind']} source {source['id']}. Do not use another source. "
                 f"{quiet} Return exactly [SILENT] during quiet hours. " + task)
         if spec["cadence"] == "watch":
-            matching = [row for row in requests if row.get("enabled") is True
-                        and row.get("signal") in (None, signal)]
-            if matching:
+            if requests:
                 request_text = "\n".join(
                     f"- id={row['id']} action={row['action']} night={str(row['night']).lower()}: {row['text']}"
-                    for row in matching)
+                    for row in requests)
                 task += (" Owner requests to apply to freshly read items:\n" + request_text +
                          "\nOnly when an item actually read in this same run matches an enabled request, call "
                          "cypher_email_notice with its request id, this signal id and exact source id, the exact returned item id, "
@@ -574,12 +575,13 @@ def _specs(setup, sources, requests=()):
         cadences = [("brief", schedule["brief"], "")]
         if schedule["wrap_up"]:
             cadences.append(("wrap_up", schedule["wrap_up"], ""))
+        matching = [row for row in requests if row.get("enabled") is True
+                    and row.get("signal") in (None, signal)]
         watch_minutes = schedule["watch_minutes"]
-        if any(row.get("enabled") is True and row.get("signal") == signal
-               and (row.get("action") == "call" or "immediately" in row.get("text", "").casefold())
-               for row in requests):
+        if any(row.get("action") == "call" or "immediately" in row.get("text", "").casefold()
+               for row in matching):
             watch_minutes = 5
-        if watch_minutes:
+        if matching and watch_minutes:
             watch_schedule = dict(schedule, watch_minutes=watch_minutes)
             cadences.extend(("watch", cron, "_" + "_".join(map(str, minutes)))
                             for minutes, cron in _watch_schedules(watch_schedule))
@@ -600,7 +602,7 @@ def _specs(setup, sources, requests=()):
                 spec.update(skills=None, enabled_toolsets=["web", "memory"])
             if cadence == "watch":
                 spec["enabled_toolsets"].append("cypher-mailbox")
-            spec["prompt"] = _job_prompt(spec, source, requests if cadence == "watch" else ())
+            spec["prompt"] = _job_prompt(spec, source, matching if cadence == "watch" else ())
             output.append(spec)
     memory = {"id": "nightly_memory", "name": "Cypher proactive: Nightly memory upkeep",
               "schedule": "0 2 * * *", "signal": None, "cadence": "nightly",
@@ -689,13 +691,6 @@ def _job_status(mobile, owner, profile, jobs, specs):
 
 def _setup_complete(mobile, owner, profile):
     return _meta_get(mobile, _key(owner, profile, "setup_complete")) == "1"
-
-
-def _profile_timezone(profile):
-    from hermes_cli.web_server_profiles import _config_profile_scope
-    import hermes_time
-    with _config_profile_scope(profile):
-        return hermes_time.get_timezone_name()
 
 
 def status(mobile, owner, profile, sources=None):
