@@ -90,3 +90,24 @@ def test_recall_uses_only_the_matching_initialized_provider(harness, monkeypatch
     assert result['summary'] == 'Verified existing memory'
     assert result['sources'][0]['ref'] == 'native-memory:hindsight'
     assert calls == [(matching, 'current question', 'native-stored')]
+
+
+def test_instruction_carries_the_owners_local_time(harness, monkeypatch):
+    api, _, _, root, _ = harness
+    call_id = api.mobile.reserve('owner', 'default', 'native-stored')['call_id']
+    voice = api.voice_context
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    monkeypatch.setitem(sys.modules, 'cypher_proactive', SimpleNamespace(
+        profile_now=lambda profile: datetime(2026, 10, 20, 16, 15, tzinfo=ZoneInfo('Europe/Lisbon'))))
+    monkeypatch.setattr(voice, 'scoped', lambda profile, fn: fn(root))
+    monkeypatch.setattr(voice, 'config', lambda root: {})
+    monkeypatch.setattr(voice, 'personality', lambda root: '')
+    monkeypatch.setattr(voice, 'builtin_memory', lambda root, cfg: '')
+    monkeypatch.setattr(voice, 'history', lambda *args: [])
+
+    instruction = voice.context('owner', 'basic', 'default', 'native-stored', call_id)['system_instruction']
+
+    # Without it "tomorrow" was a guess: a call read today's events out as tomorrow's.
+    assert 'Current local time for the owner: Tuesday 20 October 2026, 16:15 (Europe/Lisbon)' in instruction
+
