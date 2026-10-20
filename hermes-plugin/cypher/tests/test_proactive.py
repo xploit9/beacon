@@ -120,6 +120,17 @@ def test_email_call_falls_back_to_valid_alert_reason(harness, monkeypatch):
     assert result["status"] == "pending"
     assert relayed == ["Client moved the review"]
 
+    monkeypatch.setattr(api.proactive, "list_requests", lambda *args: [{
+        "id": request_id, "text": "Call me if a client moves a meeting", "action": "call", "night": False,
+        "enabled": True, "signal": "email",
+    }])
+    assert observers.source_observed(api.mobile, cfg, "default", "watch-run", "mcp__mail__read_email",
+                                     {"id": "message-2"}, "ok")
+    observers.email_notice(api.mobile, api.native, cfg, "default", "watch-run", {
+        "request_id": request_id, "item_id": "message-2", "reason": "Flight LIS → BER moved to 09:10",
+    }, now)
+    assert relayed[-1] == "Flight LIS to BER moved to 09:10. Rule: Call me if a client moves a meeting"
+
 
 def _fake_cron(api, monkeypatch, home, initial=()):
     jobs = [dict(job) for job in initial]

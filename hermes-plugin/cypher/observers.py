@@ -26,8 +26,9 @@ def normalize_callback_text(value, limit=240):
     if not isinstance(value, str):
         raise ValueError("Invalid callback reason")
     value = unicodedata.normalize("NFKC", value).translate(str.maketrans({
-        "‘": "'", "’": "'", "“": '"', "”": '"', "–": "-", "—": "-", "…": "...",
+        "‘": "'", "’": "'", "“": '"', "”": '"', "–": "-", "—": "-", "…": "...", "→": " to ",
     }))
+    value = re.sub(" {2,}", " ", value)
     if len(value) > limit:
         raise ValueError("Invalid callback reason")
     return value
@@ -321,9 +322,11 @@ def email_notice(mobile, native, cfg, profile, session_id, args, now):
             quiet_blocked = _inside_quiet(now, setup) and not (request and request.get("night") is True)
             callbacks_ready = cfg.get("callback_tool_enabled") is True and cfg.get("scheduled_callbacks_enabled") is True
             if not quiet_blocked and callbacks_ready and count < CALL_LIMIT:
-                rule_reason = f"Email rule: {request['text'][:100]}; " if request else ""
+                # The email's own reason leads (call history shows it first); the rule follows.
+                rule_note = f" Rule: {request['text'][:100]}" if request else ""
+                lead = reason.strip() if not rule_note or reason.strip()[-1:] in ".!?" else reason.strip() + "."
                 try:
-                    relay_reason = reason_text((rule_reason + reason.strip())[:240])
+                    relay_reason = reason_text((lead + rule_note)[:240])
                 except ValueError:
                     relay_reason = reason_text(reason.strip())
                 event = invitation(owner, profile, stored, relay_reason)
