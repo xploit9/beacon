@@ -58,7 +58,7 @@ Do not delete the backup. Ensure Cypher is enabled in the selected profile:
 hermes -p <profile> plugins enable cypher
 ```
 
-If Hermes asks to install Python dependencies, explain the packages and wait for the user's approval. Do not bypass the native security scan or dependency-consent prompt.
+If Hermes asks to install Python dependencies, explain the packages and wait for the user's approval. An agent running without a terminal prompt then repeats the install command with `--yes-deps`; without it Hermes declines and changes nothing. Do not bypass the native security scan.
 
 ## 3. Restart and verify the dashboard
 
