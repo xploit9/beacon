@@ -232,6 +232,8 @@ _WRITE_TOOL_WORDS={'send','create','delete','remove','modify','update','manage',
                    'share','set','add','patch','put','mark','star','unread','snooze','mute','block',
                    'unsubscribe','replace','rename','merge','approve','submit','cancel','execute','run',
                    'import','restore','copy','insert','append','apply','push','commit','pay','transfer'}
+# Native tools whose names carry no read word but only read or plan inside the run.
+_PROACTIVE_READ_TOOLS={'todo'}
 _ARG_WRITE_TOOL_WORDS=_WRITE_TOOL_WORDS|{'run','trigger','install','edit','enable','disable','pause','resume','schedule'}
 _BLOCKED_PROACTIVE_TOOLSETS={'delegation','code_execution','computer_use','kanban','cronjob'}
 _BLOCKED_PROACTIVE_TOOLS={'delegate_task','execute_code','computer_use','kanban','cronjob_manage',
@@ -308,9 +310,12 @@ def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**
         return {'action':'block','message':_READ_ONLY_MESSAGE}
     if toolset=='web' and tool_name in {'web_search','web_extract','web_fetch'}:
         return None
-    if _tool_words(tool_name)&_WRITE_TOOL_WORDS:
-        return {'action':'block','message':_READ_ONLY_MESSAGE}
-    return None
+    # Deny by default: any other tool runs only when its name or its requested action clearly reads
+    # (skill_view, session_search, read_file, skills with action=list).
+    reads_by_action=bool(argument_words) and argument_words<=_READ_TOOL_WORDS and not _tool_words(tool_name)&_WRITE_TOOL_WORDS
+    if tool_name in _PROACTIVE_READ_TOOLS or _named_read_only(tool_name) or reads_by_action:
+        return None
+    return {'action':'block','message':_READ_ONLY_MESSAGE}
 
 
 def register(ctx):

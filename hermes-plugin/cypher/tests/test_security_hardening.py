@@ -164,7 +164,9 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
                                  "skills" if name == "skills" else
                                  "memory" if name == "memory" else
                                  "messaging" if name == "send_message" else
-                                 "web" if name == "web_search" else "mcp-mail")))
+                                 "web" if name == "web_search" else
+                                 "native" if name in {"api_call", "trigger_job", "gmail_tool", "browser_navigate",
+                                                      "skill_view", "session_search", "read_file", "todo"} else "mcp-mail")))
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles",
                         SimpleNamespace(_profile_scope=lambda profile: nullcontext()))
     hooks = []
@@ -200,6 +202,11 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
     assert send_message == blocked
     assert allowed is None and outside is None and skills_list is None
     assert memory_read is None and web_read is None and terminal is None
+    # Deny by default (Strix vuln-0001): unknown tools are blocked; clearly read-only ones still run.
+    for unknown in ('api_call', 'trigger_job', 'gmail_tool', 'browser_navigate'):
+        assert plugin.native_proactive_read_only_guard(tool_name=unknown, args={}, session_id="watch-run") == blocked, unknown
+    for reader in ('skill_view', 'session_search', 'read_file', 'todo'):
+        assert plugin.native_proactive_read_only_guard(tool_name=reader, args={}, session_id="watch-run") is None, reader
     assert ("pre_tool_call", plugin.native_proactive_read_only_guard) in hooks
 
 
