@@ -49,11 +49,11 @@ internal class NativeOperations(private val c: CypherClient) {
         ((config as? JSONObject) ?: (config as? String)?.takeIf(String::isNotBlank)?.let(::JSONObject) ?: JSONObject()).optBoolean("yolo_mode")
     } catch (e: ApiFailure) { if (e.status == 404) null else throw e }
     /** The assistant chat answers everyday questions: start it at "high" when the profile default is slower; the owner can raise it per chat. */
-    private suspend fun capAssistantEffort(runtimeSessionId: String) {
-        try {
+    private suspend fun capAssistantEffort(runtimeSessionId: String): String? {
+        return try {
             val current = c.nativeRpc("config.get", json("session_id" to runtimeSessionId, "key" to "reasoning")).string("value")
-            assistantEffortCap(current)?.let { c.nativeRpc("config.set", json("session_id" to runtimeSessionId, "key" to "reasoning", "value" to it, "scope" to "session")) }
-        } catch (error: CancellationException) { throw error } catch (_: Exception) { } // the chat still opens at the profile default
+            assistantEffortCap(current)?.also { c.nativeRpc("config.set", json("session_id" to runtimeSessionId, "key" to "reasoning", "value" to it, "scope" to "session")) }
+        } catch (error: CancellationException) { throw error } catch (_: Exception) { null } // the chat still opens at the profile default
     }
     /** Adapts Hermes Relay's session-scoped GatewayChatClient.setYolo wire contract. */
     private suspend fun setSessionYolo(target: NativeSessionBinding, enabled: Boolean) {
@@ -92,8 +92,10 @@ internal class NativeOperations(private val c: CypherClient) {
                 if (d.optBoolean("thread")) params.put("source", CYPHER_THREAD_SOURCE)
                 val b = c.nativeCreate(params)
                 require(b.storedSessionId.isNotBlank()) { "Native session has no durable identity yet; submit the first prompt before saving selection" }
-                if (path == "/api/cypher/open") capAssistantEffort(b.runtimeSessionId)
+                val cappedEffort = if (path == "/api/cypher/open") capAssistantEffort(b.runtimeSessionId) else null
                 return sessionProjection(c.nativeSessionSnapshot().put("messages", JSONArray()).put("acknowledged_shell", true), b).put("profile", c.auth.profile).apply {
+                    // The composer shows the effort this chat really got.
+                    cappedEffort?.let { put("reasoning_effort", it) }
                     // Hermes holds a create title until the first turn; show it (and the thread lane) from the start.
                     if (string("title").isBlank() && params.string("title").isNotBlank()) put("title", params.string("title"))
                     if (params.string("source") == CYPHER_THREAD_SOURCE) put("source", CYPHER_THREAD_SOURCE)
