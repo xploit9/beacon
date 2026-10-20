@@ -95,7 +95,7 @@ class GeminiWireTest {
         assertTrue(instructions.contains("call get_visual_state"))
         assertTrue(instructions.contains("Before every tool or Hermes call, say one short natural sentence"))
         assertTrue(instructions.contains("If it takes long, give one brief progress line"))
-        assertTrue(instructions.contains("never read tool names or ids aloud"))
+        assertTrue(instructions.contains("Never fall silent or read tool names or ids aloud"))
         val configured=GeminiWire.setup("model","",null,org.json.JSONObject().put("context",org.json.JSONObject().put("language","French"))).getJSONObject("setup")
         assertTrue(configured.getJSONObject("systemInstruction").toString().contains("Configured call language: French"))
     }
