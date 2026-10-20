@@ -125,6 +125,22 @@ internal fun assistantLabelMessageIds(messages: List<Message>, dayStartIds: Set<
     return labels
 }
 
+/** Hermes stores each tool round of one reply as its own assistant message; show a run of tool-only rounds as one
+ *  activity, so its steps fold together instead of stacking card after card above the answer. */
+internal fun mergeToolOnlyRuns(messages: List<IndexedValue<Message>>): List<IndexedValue<Message>> {
+    fun toolOnly(message: Message) = message.role == "assistant" && message.text.isBlank() && message.attachments.isEmpty() && message.tools.isNotEmpty()
+    val merged = ArrayList<IndexedValue<Message>>(messages.size)
+    for (entry in messages) {
+        val last = merged.lastOrNull()
+        if (last != null && toolOnly(last.value) && toolOnly(entry.value)) {
+            val reasoning = listOf(last.value.reasoning, entry.value.reasoning).filter(String::isNotBlank).joinToString("\n\n")
+            merged[merged.size - 1] = IndexedValue(last.index, last.value.copy(tools = last.value.tools + entry.value.tools, reasoning = reasoning,
+                recordedAt = maxOf(last.value.recordedAt, entry.value.recordedAt)))
+        } else merged += entry
+    }
+    return merged
+}
+
 internal fun toolCallResultId(tool: JSONObject): String = tool.string("tool_call_id").ifBlank { toolIdentity(tool) }
 
 /** Hermes stores the tool that produced a result row as `tool_name`; title the row after it. */
@@ -355,7 +371,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
     var questionAnswers by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId, questionId,
         stateSaver = androidx.compose.runtime.saveable.mapSaver<Map<String, String>>(save = { it }, restore = { saved -> saved.mapValues { it.value as String } })) { mutableStateOf(emptyMap<String, String>()) }
     val visibleMessages = remember(messages, search, foldedToolResults) {
-        messages.withIndex().filter { (search.isBlank() || it.value.text.contains(search, true) || it.value.tools.any { tool -> foldedToolResults.byCallId[toolCallResultId(tool)]?.content?.contains(search, true) == true }) && it.value.id !in foldedToolResults.foldedMessageIds }
+        messages.withIndex().filter { (search.isBlank() || it.value.text.contains(search, true) || it.value.tools.any { tool -> foldedToolResults.byCallId[toolCallResultId(tool)]?.content?.contains(search, true) == true }) && it.value.id !in foldedToolResults.foldedMessageIds }.let(::mergeToolOnlyRuns)
     }
     val dayStarts = remember(visibleMessages) { messageDayStarts(visibleMessages.map { it.value.id to it.value.recordedAt }) }
     val assistantLabels = remember(visibleMessages, dayStarts, callMessagesById) {
@@ -985,20 +1001,50 @@ internal fun acceptsInitialConversationEdit(
     Column(Modifier.fillMaxWidth().testTag("message-activity"), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (status.isNotBlank()) Text(status, Modifier.testTag("message-activity-status"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         if (reasoning.isNotBlank()) Disclosure("Reasoning", reasoning, renderContent = if (vm == null) null else ({ Markdown(reasoning, vm, scope, interactive = false) }))
-        tools.forEachIndexed { index, tool -> key(tool.toolKey(index)) { ToolCard(tool, streaming, messageTime, onToolExpanded, toolResultsByCallId[toolCallResultId(tool)], onCopyResult) } }
+        val grouped = tools.size >= 3 && !streaming
+        var showSteps by rememberSaveable(tools.firstOrNull()?.toolKey(0)) { mutableStateOf(false) }
+        if (grouped && !showSteps) {
+            val failed = tools.count { toolOutcomeOf(it, false, toolResultsByCallId[toolCallResultId(it)]) == ToolOutcome.Failed }
+            Surface(Modifier.fillMaxWidth().testTag("tool-steps"), shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+                Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(onClickLabel = uiText("Show steps")) { showSteps = true }.padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Rounded.Build, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.width(6.dp))
+                    Text(toolStepsSummary(tools), Modifier.weight(1f), style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                    if (failed > 0) { Text("$failed failed", style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.error); Spacer(Modifier.width(6.dp)) }
+                    Icon(Icons.Rounded.ExpandMore, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        } else {
+            tools.forEachIndexed { index, tool -> key(tool.toolKey(index)) { ToolCard(tool, streaming, messageTime, onToolExpanded, toolResultsByCallId[toolCallResultId(tool)], onCopyResult) } }
+            if (grouped) TextButton(onClick = { showSteps = false }, modifier = Modifier.testTag("tool-steps-hide")) { Text(uiText("Hide steps")) }
+        }
     }
 }
 
 private fun JSONObject.rawToolName(): String {
     val name = string("name", optJSONObject("function")?.string("name") ?: "")
     // Hermes runs deferred tools through its `tool_call` meta-tool; name the tool it actually ran.
-    if (name == "tool_call") {
-        val inner = argumentsValue()?.let { it as? JSONObject ?: runCatching { JSONObject(it.toString()) }.getOrNull() }?.string("name").orEmpty()
-        if (inner.matches(toolNamePattern)) return inner
-    }
+    if (name == "tool_call") innerToolNames().firstOrNull()?.let { return it }
     return name.ifBlank { "tool" }
 }
-internal fun toolDisplayName(tool: JSONObject): String = humanToolName(tool.rawToolName())
+/** `tool_call` carries one `name` or a batch of `calls`, each with its own `name`. */
+private fun JSONObject.innerToolNames(): List<String> {
+    val args = argumentsValue()?.let { it as? JSONObject ?: runCatching { JSONObject(it.toString()) }.getOrNull() } ?: return emptyList()
+    val batch = args.optJSONArray("calls")
+    val names = if (batch != null) List(batch.length()) { batch.optJSONObject(it)?.string("name").orEmpty() } else listOf(args.string("name"))
+    return names.filter { it.matches(toolNamePattern) }
+}
+internal fun toolDisplayName(tool: JSONObject): String {
+    val more = if (tool.string("name", tool.optJSONObject("function")?.string("name") ?: "") == "tool_call") tool.innerToolNames().size - 1 else 0
+    return humanToolName(tool.rawToolName()) + if (more > 0) " and $more more" else ""
+}
+/** Hermes' own lookup steps say nothing about the work; a step summary names the tools that did it. */
+private val toolLookupNames = setOf("tool_search", "tool_describe", "skills_list", "skill_view")
+internal fun toolStepsSummary(tools: List<JSONObject>): String {
+    val names = tools.filterNot { it.rawToolName() in toolLookupNames }.map { humanToolName(it.rawToolName()) }.distinct()
+    val shown = names.take(3).joinToString(", ").replaceFirstChar(Char::titlecase)
+    return "${tools.size} steps" + if (shown.isNotBlank()) " · " + shown + if (names.size > 3) "…" else "" else ""
+}
 /** Calls use the phone's own provider key; Hermes only needs the Cypher plugin. A missing phone key opens Voice & calls. */
 internal fun voiceCallsOffered(bootstrap: JSONObject): Boolean = bootstrap.optJSONObject("optional_features")?.optString("plugin") == "available"
 /** Hermes names MCP tools `mcp__<server>__<tool>`: show "list calendar events · personal", not the raw id. */
