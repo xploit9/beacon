@@ -531,11 +531,11 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
                     update.release != null || update.ready -> update.status
                     update.status.contains("up to date", ignoreCase = true) -> "You're up to date."
                     update.status.startsWith("Reconnect to Tailscale") -> "Reconnect to Tailscale to check for updates."
-                    update.status.startsWith("Cypher checks for updates") -> update.status
+                    update.status.startsWith("Cypher checks for updates") -> "" // the switch above already says so
                     update.busy -> "Checking for an update…"
                     else -> "Check for updates when you're connected to Hermes."
                 }
-                Text(appMessage, style = MaterialTheme.typography.bodyLarge)
+                if (appMessage.isNotBlank()) Text(appMessage, style = MaterialTheme.typography.bodyLarge)
                 if (!previewBuild) {
                     if (update.busy || releaseCheckBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
                     val installing = update.ready || update.release != null && (!stableBuild || releaseCheckComplete)

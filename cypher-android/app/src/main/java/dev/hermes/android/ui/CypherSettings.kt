@@ -245,7 +245,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                                 Switch(rule.optBoolean("night"), { updateProactiveRule(id, "PATCH", json("night" to it)) }, enabled = enabled, modifier = Modifier.testTag("proactive-rule-night-$id"))
                             }
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(uiText(if (rule.optBoolean("enabled")) "On" else "Off"), Modifier.weight(1f).testTag("proactive-rule-status-$id"))
+                                Text(uiText(if (rule.optBoolean("enabled")) "On" else "Off").replaceFirstChar(Char::titlecase), Modifier.weight(1f).testTag("proactive-rule-status-$id"))
                                 Switch(rule.optBoolean("enabled"), { updateProactiveRule(id, "PATCH", json("enabled" to it)) }, enabled = enabled, modifier = Modifier.testTag("proactive-rule-enabled-$id"))
                                 TextButton(onClick = { updateProactiveRule(id, "DELETE") }, enabled = enabled, modifier = Modifier.testTag("proactive-rule-delete-$id")) { Text(uiText("Delete")) }
                             }
