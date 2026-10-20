@@ -81,7 +81,20 @@ def _set_managed_id(mobile, owner, profile, job_key, job_id):
 
 
 def _delete_managed_id(mobile, owner, profile, job_key):
+    job_id = _managed_id(mobile, owner, profile, job_key) if job_key == "watch_email" else None
+    if job_id:
+        # Hermes' remove_job does not stop a run already in progress; its read-only guard must still know it.
+        key = _key(owner, profile, "retired-watch-ids")
+        retired = [value for value in json.loads(_meta_get(mobile, key) or "[]") if value != job_id]
+        _meta_set(mobile, key, json.dumps((retired + [job_id])[-8:], separators=(",", ":")))
     _meta_set(mobile, _key(owner, profile, "job:" + job_key), None)
+
+
+def watch_job_ids(mobile, owner, profile):
+    """The current email-watch job id plus recently retired ones."""
+    current = _managed_id(mobile, owner, profile, "watch_email")
+    retired = json.loads(_meta_get(mobile, _key(owner, profile, "retired-watch-ids")) or "[]")
+    return set(retired) | ({current} if current else set())
 
 
 def current_profile(cfg):
@@ -321,8 +334,21 @@ def upgrade_jobs(mobile, owner, profile):
     if _meta_get(mobile, key) == JOBS_VERSION:
         return False
     with _SET_ENABLED_LOCK:
+        # remove_job clears the old job's notepad; the rebuilt watch keeps its email lower bound.
+        previous = _managed_id(mobile, owner, profile, "watch_email")
+        checked_until = None
+        if previous:
+            from hermes_cli.web_server_profiles import _profile_scope
+            from cron.notepad import get_note
+            with _profile_scope(profile):
+                checked_until = get_note(previous, "checked_until")
         _managed_delete_all(mobile, owner, profile)
         _sync_request_jobs(mobile, owner, profile, list_requests(mobile, owner, profile))
+        rebuilt = _managed_id(mobile, owner, profile, "watch_email")
+        if checked_until and rebuilt:
+            from cron.notepad import set_note
+            with _profile_scope(profile):
+                set_note(rebuilt, "checked_until", checked_until)
         if enabled(mobile, owner, profile):
             _write_profile_instructions(_home(profile), True)
         _meta_set(mobile, key, JOBS_VERSION)

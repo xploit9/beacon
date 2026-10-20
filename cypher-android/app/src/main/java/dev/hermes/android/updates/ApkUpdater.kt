@@ -35,7 +35,7 @@ class ApkUpdater(private val context: Context) {
         val dir = File(context.filesDir, "updates").apply { mkdirs() }
         val part = File(dir, "${client.scope.key}-${java.util.UUID.randomUUID()}.part")
         try {
-            val size = part.outputStream().use { client.copyTo(safeArtifactPath(release.path), it, limit = release.size) }
+            val size = part.outputStream().use { client.copyTo(safeArtifactPath(release.path), it, query = mapOf("package" to context.packageName), limit = release.size) }
             require(size == release.size && sha256(part).equals(release.sha, true)) { "Update checksum or size failed. The installed app is unchanged." }
             val parsed = context.packageManager.getPackageArchiveInfo(part.absolutePath, PackageManager.GET_SIGNING_CERTIFICATES) ?: error("Update is not a valid APK")
             require(parsed.packageName == context.packageName && parsed.longVersionCode == release.version) { "APK package or version differs from the release manifest" }

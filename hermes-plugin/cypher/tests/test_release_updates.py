@@ -81,13 +81,33 @@ def test_release_check_keeps_stable_feed_separate_from_production(harness,monkey
     assert (production/'latest.json').read_bytes()==production_latest
     stable=client.get('/api/plugins/cypher/mobile/releases/latest?package=dev.hermes.android.stable')
     assert stable.status_code==200 and stable.json()['package_name']=='dev.hermes.android.stable'
-    assert 'package=dev.hermes.android.stable' in stable.json()['artifact_path']
-    downloaded=client.get(stable.json()['artifact_path'])
+    assert '?' not in stable.json()['artifact_path']
+    downloaded=client.get(stable.json()['artifact_path']+'?package=dev.hermes.android.stable')
     assert downloaded.status_code==200 and downloaded.content==apk
     latest=client.get('/api/plugins/cypher/mobile/releases/latest')
     assert latest.status_code==200 and latest.json()['package_name']=='dev.hermes.android'
     assert latest.json()['artifact_path'].endswith('/download')
     assert patterns[0]=='Cypher-*.json'
+
+
+def test_new_stable_release_keeps_only_itself_and_the_release_it_replaces(harness,monkeypatch):
+    api,client,cfg,tmp,_=harness
+    _verification_tools(cfg,tmp)
+    root=tmp/'plugin-data'/'cypher'/'releases-stable';root.mkdir(parents=True)
+    for code,name,content in ((90,'0.9.0',b'oldest apk'),(95,'0.9.5',b'previous apk')):
+        old_apk,old=_release(code,name,content)
+        (root/old['artifact_filename']).write_bytes(old_apk)
+        (root/(old['sha256']+'.json')).write_text(json.dumps(old))
+    (root/'latest.json').write_text(json.dumps(old))
+    apk,manifest=_release()
+    _fake_github(api,monkeypatch,cfg,{manifest['artifact_filename']:apk,'Cypher-1.0.0.json':json.dumps(manifest).encode()},
+                 {manifest['artifact_filename']:(100,'1.0.0'),'Cypher-0.9.5.apk':(95,'0.9.5'),'Cypher-0.9.0.apk':(90,'0.9.0')})
+
+    response=client.post('/api/plugins/cypher/mobile/releases/check')
+
+    assert response.status_code==200 and response.json()['available'] is True,response.text
+    assert sorted(path.name for path in root.iterdir())==sorted(
+        ['latest.json','Cypher-1.0.0.apk',manifest['sha256']+'.json','Cypher-0.9.5.apk',old['sha256']+'.json'])
 
 
 @pytest.mark.parametrize(('pin','expected_status'),[(None,200),('b'*64,503)])

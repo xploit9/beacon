@@ -239,6 +239,18 @@ def test_upgrade_rebuilds_managed_jobs_once_per_jobs_version(harness, monkeypatc
     }))
     api.proactive._set_managed_id(api.mobile, "owner", "default", "brief_email", "old-brief")
     api.proactive._set_managed_id(api.mobile, "owner", "default", "watch_email", "old-watch")
+    # Hermes' remove_job clears the removed job's notepad (cron/jobs.py).
+    notes = {("old-watch", "checked_until"): "2026-10-20T01:30:00Z"}
+    def remove_clears_notes(profile, action, job_id, changes=None):
+        if action == "remove_job":
+            for key in [key for key in notes if key[0] == job_id]: del notes[key]
+        return mutate(profile, action, job_id, changes)
+    cron = sys.modules["hermes_cli.web_server_cron"]
+    mutate = cron._mutate_cron_for_profile
+    monkeypatch.setattr(cron, "_mutate_cron_for_profile", remove_clears_notes)
+    monkeypatch.setitem(sys.modules, "cron.notepad", SimpleNamespace(
+        get_note=lambda job_id, key: notes.get((job_id, key)),
+        set_note=lambda job_id, key, value: notes.__setitem__((job_id, key), value)))
 
     assert api.proactive.upgrade_jobs(api.mobile, "owner", "default") is True
     assert api.proactive.upgrade_jobs(api.mobile, "owner", "default") is False
@@ -246,6 +258,9 @@ def test_upgrade_rebuilds_managed_jobs_once_per_jobs_version(harness, monkeypatc
     assert {row["name"] for row in jobs} == {
         "Owner report", "Cypher: important emails", "Cypher proactive: Nightly memory upkeep"}
     assert calls["remove"] == 2 and calls["create"] == 2
+    watch = api.proactive._managed_id(api.mobile, "owner", "default", "watch_email")
+    assert watch != "old-watch" and notes == {(watch, "checked_until"): "2026-10-20T01:30:00Z"}
+    assert api.proactive.watch_job_ids(api.mobile, "owner", "default") == {"old-watch", watch}
 
 
 

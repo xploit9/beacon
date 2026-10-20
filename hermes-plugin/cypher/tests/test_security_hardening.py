@@ -141,10 +141,8 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
     api, _, cfg, _, _ = harness
     plugin = load_private("__init__")
     monkeypatch.setattr(plugin, "current_profile", lambda cfg: "default")
-    monkeypatch.setattr(plugin, "_owned_proactive_run",
-                        lambda owner, profile, session_id: session_id == "watch-run")
     monkeypatch.setattr(plugin, "_cron_row", lambda profile, session_id: {
-        "source": "cron", "cron_job_id": "watch-job"})
+        "source": "cron", "cron_job_id": "watch-job"} if session_id == "watch-run" else {"source": "tui"})
     monkeypatch.setattr(plugin.proactive, "_managed_id", lambda mobile, owner, profile, job_key:
                         "watch-job" if job_key == "watch_email" else "memory-job")
     mcp_tool = SimpleNamespace(
@@ -164,7 +162,7 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
                                  "skills" if name == "skills" else
                                  "memory" if name == "memory" else
                                  "messaging" if name == "send_message" else
-                                 "web" if name == "web_search" else
+                                 "web" if name in {"web_search", "web_extract", "web_fetch"} else
                                  "native" if name in {"api_call", "trigger_job", "gmail_tool", "browser_navigate",
                                                       "skill_view", "session_search", "read_file", "todo"} else "mcp-mail")))
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles",
@@ -202,6 +200,9 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
     assert send_message == blocked
     assert allowed is None and outside is None and skills_list is None
     assert memory_read is None and web_read is None and terminal is None
+    # An injected email could carry other mail out through a fetched URL.
+    for fetcher in ("web_extract", "web_fetch"):
+        assert plugin.native_proactive_read_only_guard(tool_name=fetcher, args={"url": "https://x.test/?q=mail"}, session_id="watch-run") == blocked
     # Deny by default (Strix vuln-0001): unknown tools are blocked; clearly read-only ones still run.
     for unknown in ('api_call', 'trigger_job', 'gmail_tool', 'browser_navigate'):
         assert plugin.native_proactive_read_only_guard(tool_name=unknown, args={}, session_id="watch-run") == blocked, unknown
@@ -227,7 +228,6 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
 def test_pre_tool_guard_blocks_parametrized_tools(harness, monkeypatch, tool_name, toolset):
     plugin = load_private("__init__")
     monkeypatch.setattr(plugin, "current_profile", lambda cfg: "default")
-    monkeypatch.setattr(plugin, "_owned_proactive_run", lambda *args: True)
     monkeypatch.setattr(plugin, "_cron_row", lambda *args: {
         "source": "cron", "cron_job_id": "watch-job"})
     monkeypatch.setattr(plugin.proactive, "_managed_id", lambda *args: "watch-job")
@@ -252,6 +252,37 @@ def test_pre_tool_guard_blocks_parametrized_tools(harness, monkeypatch, tool_nam
     result = plugin.native_proactive_read_only_guard(tool_name=tool_name, session_id="watch-run")
 
     assert result == {"action": "block", "message": plugin._READ_ONLY_MESSAGE}
+
+
+def test_pre_tool_guard_still_blocks_a_watch_run_after_proactive_is_turned_off(harness, monkeypatch):
+    plugin = load_private("__init__")
+    proactive, mobile = plugin.proactive, plugin.mobile
+    monkeypatch.setattr(plugin, "current_profile", lambda cfg: "default")
+    monkeypatch.setattr(plugin, "_cron_row", lambda profile, session_id: {
+        "source": "cron", "cron_job_id": "watch-job"} if session_id == "watch-run" else {"source": "tui"})
+    monkeypatch.setitem(sys.modules, "tools.registry", SimpleNamespace(
+        registry=SimpleNamespace(get_toolset_for_tool=lambda name: "messaging")))
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles",
+                        SimpleNamespace(_profile_scope=lambda profile: nullcontext()))
+    proactive._meta_set(mobile, proactive._key("owner", "default", "enabled"), "1")
+    proactive._meta_set(mobile, proactive._key("owner", "default", "setup_complete"), "1")
+    proactive._set_managed_id(mobile, "owner", "default", "watch_email", "watch-job")
+    blocked = {"action": "block", "message": plugin._READ_ONLY_MESSAGE}
+    assert plugin.native_proactive_read_only_guard(tool_name="send_message", args={}, session_id="watch-run") == blocked
+
+    # Turning Proactive off removes the job, but Hermes' remove_job does not stop this run.
+    jobs = [{"id": "watch-job"}]
+    monkeypatch.setattr(proactive, "_cron_helpers", lambda: (None, None, lambda profile, action, job_id: jobs.pop() if jobs else False, None))
+    proactive._managed_delete_all(mobile, "owner", "default", jobs=list(jobs))
+    proactive._meta_set(mobile, proactive._key("owner", "default", "enabled"), None)
+    assert proactive._managed_ids(mobile, "owner", "default") == {}
+
+    assert plugin.native_proactive_read_only_guard(tool_name="send_message", args={}, session_id="watch-run") == blocked
+    assert plugin.native_proactive_read_only_guard(tool_name="send_message", args={}, session_id="owner-chat") is None
+    # Inside a known cron run an unreadable ownership check fails closed; ordinary chats stay unaffected.
+    monkeypatch.setattr(proactive, "watch_job_ids", lambda *args: (_ for _ in ()).throw(OSError("meta locked")))
+    assert plugin.native_proactive_read_only_guard(tool_name="send_message", args={}, session_id="watch-run") == blocked
+    assert plugin.native_proactive_read_only_guard(tool_name="send_message", args={}, session_id="owner-chat") is None
 
 
 @pytest.mark.parametrize("session_id", ["delegate-task-child", "compressed-watch-continuation"])

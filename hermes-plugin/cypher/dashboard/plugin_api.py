@@ -231,12 +231,9 @@ async def bootstrap(request:Request):
     owner,provider,profile,cfg=identity(request)
     selection=voice_models.selected(mobile,owner,profile,cfg)
     choice=next(item for item in voice_models.choices(cfg,secret) if item['id']==selection['provider'])
-    try: release_info=await asyncio.to_thread(safely,release,cfg,True)
-    except HTTPException: release_info={'available':False,'reason':'release_unavailable'}
     return {'contract_version':2,'backend':'hermes-dashboard','owner_id':owner,'profile':profile,
             'voice':{**selection,'available':choice['available'],'configured':choice['configured'],'availability_scope':'local_configuration'},
-            'capabilities':{'native_jobs':True,'pc_recording':False,'callbacks':bool(cfg.get('callback_tool_enabled',False)),'push':bool(cfg.get('firebase_credentials')),'permanent_recording_retention':False},
-            'release':release_info}
+            'capabilities':{'native_jobs':True,'pc_recording':False,'callbacks':bool(cfg.get('callback_tool_enabled',False)),'push':bool(cfg.get('firebase_credentials')),'permanent_recording_retention':False}}
 @router.get('/mobile/voice-settings')
 async def voice_settings(request:Request):
     owner,_,profile,cfg=identity(request)
@@ -553,10 +550,10 @@ async def target(request:Request):
     value=await body(request,8192);owner,_,profile,_=identity(request,value.get('profile'))
     tok=value.get('token') or value.get('fcm_token')
     package=value.get('package_name',_PRODUCTION_PACKAGE)
+    if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Cypher package')
     tid=value.get('id') or value.get('device_id') or hashlib.sha256((owner+':'+profile+':'+package+':'+str(tok)).encode()).hexdigest()
     safely(mobile.ident,tid)
     if not isinstance(tok,str) or not 20<=len(tok)<=4096 or any(ord(c)<32 for c in tok): raise HTTPException(400,'Invalid FCM target')
-    if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Cypher package')
     with mobile.LOCK,mobile.connect() as conn:
         conn.execute('DELETE FROM targets WHERE expires<=?',(time.time(),))
         if conn.execute('SELECT COUNT(*) FROM targets').fetchone()[0]>=32 and not conn.execute('SELECT 1 FROM targets WHERE id=?',(tid,)).fetchone(): raise HTTPException(409,'Target capacity reached')
@@ -945,8 +942,8 @@ def _release(cfg,optional=False,digest=None,package=None,root_path=None):
     package=re.search(r"package: name='([^']+)' versionCode='([0-9]+)' versionName='([^']+)'",badging)
     digests=re.findall(r'Signer #[0-9]+ certificate SHA-256 digest: ([a-fA-F0-9]{64})',certificates)
     if not package or package[1]!=data['package_name'] or int(package[2])!=data['version_code'] or package[3]!=data['version_name'] or len(digests)!=1 or digests[0].lower()!=expected.lower(): raise ValueError('APK metadata/signature mismatch')
+    # The app sends ?package= on download; a query here fails its artifact-path check.
     artifact_path='/api/plugins/cypher/mobile/releases/'+digest+'/download'
-    if stable: artifact_path+='?package='+_STABLE_PACKAGE
     result={k:data[k] for k in ('version_code','version_name','package_name','certificate_sha256','sha256','size_bytes')} | {'available':True,'download_url':artifact_path,'artifact_path':artifact_path,'min_contract_version':2,'max_contract_version':2}
     if isinstance(data.get('plugin_version'),str): result['plugin_version']=data['plugin_version']
     _RELEASE_CACHE_KEY=cache_key;_RELEASE_CACHE_VALUE=dict(result)
@@ -1106,6 +1103,14 @@ def _check_github_release(cfg):
         _atomic_write(root/(digest+'.json'),manifest_bytes,immutable=True)
         _atomic_write(root/'latest.json',manifest_bytes)
         with _RELEASE_CACHE_LOCK: _RELEASE_CACHE_KEY=None;_RELEASE_CACHE_VALUE=None
+        # Keep this release and the one it replaces (a phone may be mid-download); drop older ones.
+        keep={data['artifact_filename'],digest+'.json'}
+        if previous and previous.get('package_name')==_STABLE_PACKAGE:
+            keep|={'Cypher-'+previous['version_name']+'.apk',previous['sha256']+'.json'}
+        for stale in root.iterdir():
+            if stale.name not in keep and (re.fullmatch(r'Cypher-.+\.apk',stale.name) or re.fullmatch(r'[a-f0-9]{64}\.json',stale.name)):
+                try: stale.unlink()
+                except OSError: pass
         return {'version_name':verified['version_name'],'version_code':verified['version_code'],'plugin_version':plugin_version,'available':True}
 
 def _check_release_and_announce(cfg):
@@ -1127,11 +1132,14 @@ def _installed_plugin_version():
 def _hermes_busy(owner):
     try:
         from gateway.status import get_running_pid,read_runtime_status
-        runtime=read_runtime_status()
-        if runtime is None:
-            if get_running_pid() is not None: return True
-        elif (type(runtime.get('active_agents')) is not int or runtime['active_agents']>0 or runtime.get('active_work')
-              or runtime.get('gateway_state') not in ('running','degraded')): return True
+        from hermes_cli.web_server_idle_exit import busy_ledger
+        # A stopped gateway runs nothing; only a live one's state can hold work.
+        if get_running_pid() is not None:
+            runtime=read_runtime_status() or {}
+            if (type(runtime.get('active_agents')) is not int or runtime['active_agents']>0 or runtime.get('active_work')
+                  or runtime.get('gateway_state') not in ('running','degraded')): return True
+        # Dashboard chat turns, delegations and cron runs; None means a ledger was unreadable.
+        if busy_ledger()!='': return True
         with mobile.connect() as conn:
             return mobile.active_calls(conn,owner)>0
     except Exception:
@@ -1139,13 +1147,16 @@ def _hermes_busy(owner):
 
 def _update_cypher_plugin():
     from hermes_cli.plugins_cmd import dashboard_update_user_plugin
-    return dashboard_update_user_plugin('cypher')
+    from hermes_cli.web_server_profiles import _config_profile_scope
+    # Hermes' own update route uses this scope; unscoped, a multi-profile Hermes raises UnscopedSecretError.
+    with _config_profile_scope(None):
+        return dashboard_update_user_plugin('cypher')
 
 def _auto_update_plugin(owner,checked_at,app_version,plugin_version):
     if not mobile.auto_update_settings(owner)['enabled']:
         return mobile.record_auto_update_status(owner,checked_at,'plugin_update_available',app_version,plugin_version,'Plugin update available.')
     if _hermes_busy(owner):
-        state=mobile.record_auto_update_status(owner,checked_at,'restart_required',app_version,plugin_version,'Restart Hermes to finish the plugin update.')
+        state=mobile.record_auto_update_status(owner,checked_at,'waiting_for_idle',app_version,plugin_version,'Plugin update waits until Hermes is idle.')
         return {**state,'_deferred':True}
     update=_update_cypher_plugin()
     if update.get('consent_required'):
@@ -1156,7 +1167,8 @@ def _auto_update_plugin(owner,checked_at,app_version,plugin_version):
     latest=_plugin_version_tuple(plugin_version)
     if installed is None or latest is None or installed<latest:
         return mobile.record_auto_update_status(owner,checked_at,'error',app_version,plugin_version,'The updated plugin version could not be confirmed.')
-    if update.get('restart_required'):
+    # Git and subfolder installs never report restart_required; this process still runs the old code.
+    if update.get('restart_required') or _RUNNING_PLUGIN_VERSION!=_installed_plugin_version():
         return mobile.record_auto_update_status(owner,checked_at,'restart_required',app_version,plugin_version,'Restart Hermes to finish the plugin update.')
     return mobile.record_auto_update_status(owner,checked_at,'plugin_updated',app_version,plugin_version,'Cypher plugin updated.')
 
@@ -1171,7 +1183,7 @@ def auto_update_check(cfg,now=None):
         if type(last) in (int,float) and last and now>=last and now-last<mobile.AUTO_UPDATE_INTERVAL_SECONDS:
             pending_version=_plugin_version_tuple(current_state.get('plugin_version',''))
             installed_version=_plugin_version_tuple(_installed_plugin_version())
-            if current_state.get('result')=='restart_required' and pending_version and installed_version and pending_version>installed_version:
+            if current_state.get('result')=='waiting_for_idle' and pending_version and installed_version and pending_version>installed_version:
                 try: return _auto_update_plugin(owner,last,current_state.get('app_version',''),current_state.get('plugin_version',''))
                 except Exception: return mobile.record_auto_update_status(owner,last,'error',current_state.get('app_version',''),current_state.get('plugin_version',''),'Could not update the Cypher plugin. Try again later.')
             return {**current_state,'result':'throttled'}

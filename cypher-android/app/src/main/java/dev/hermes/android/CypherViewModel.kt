@@ -79,6 +79,9 @@ internal fun renderedChatStatus(old: ChatState, active: String?, streamEnded: Bo
 data class ChatState(val sessionId: String = "", val title: String = "New conversation", val messages: List<Message> = emptyList(), val raw: JSONObject = JSONObject(), val streamId: String = "", val liveText: String = "", val liveReasoning: String = "", val liveTools: List<JSONObject> = emptyList(), val status: String = "", val approval: JSONObject? = null, val clarification: JSONObject? = null, val uncertain: String = "", val queued: List<QueuedMessage> = emptyList(), val anchor: Int = 0, val anchorOffset: Int = 0, val anchorId: String = "", val callMessages: List<CallTranscript> = emptyList(), val projectionReady: Boolean = true, val sessionReasoningEffort: String = "")
 internal fun sessionCanStillBeUnpersisted(clientCreated: Boolean, chat: ChatState): Boolean =
     clientCreated && chat.messages.isEmpty() && chat.callMessages.isEmpty() && chat.liveText.isBlank() && chat.streamId.isBlank() && chat.raw.optInt("message_count") == 0
+/** A prompt event wraps its prompt in `pending` (null clears it); a Hermes server request is the prompt itself.
+ *  `isNull` is also true for a missing key, which dropped every server-request prompt. */
+internal fun pendingPrompt(event: JSONObject): JSONObject? = event.optJSONObject("pending") ?: event.takeUnless { it.has("pending") }
 // Hermes stores model-switch steering as user rows, so the reserved prefix identifies it.
 internal fun visibleTranscriptMessages(messages: List<Message>): List<Message> =
     messages.filterNot { it.text.trimStart().startsWith("[System:") }
@@ -2468,8 +2471,8 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 s.copy(liveText = if (owned) "" else body.text, liveReasoning = if (owned) "" else body.reasoning)
             }
             "title" -> s.copy(title = o.string("title").ifBlank { s.title })
-            "approval" -> s.copy(approval = o.optJSONObject("pending") ?: o.takeUnless { it.isNull("pending") })
-            "clarify" -> s.copy(clarification = o.optJSONObject("pending") ?: o.takeUnless { it.isNull("pending") })
+            "approval" -> s.copy(approval = pendingPrompt(o))
+            "clarify" -> s.copy(clarification = pendingPrompt(o))
             "request_cancel" -> s.copy(approval = s.approval?.takeUnless { it.string("id") == o.string("id") }, clarification = s.clarification?.takeUnless { it.string("id") == o.string("id") })
             "todo_state" -> s.copy(raw = s.raw.copy().put("todo_state", o))
             "goal" -> s.copy(raw = s.raw.copy().put("goal", o))

@@ -5,6 +5,13 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CypherViewModelStateTest {
+    @Test fun serverRequestPromptIsShownAndAnExplicitNullPendingClearsIt() {
+        val request = JSONObject("{\"approval_id\":\"queue-1\",\"command\":\"ls\"}")
+        assertEquals("queue-1", pendingPrompt(request)?.optString("approval_id"))
+        assertEquals("queue-2", pendingPrompt(JSONObject("{\"pending\":{\"approval_id\":\"queue-2\"}}"))?.optString("approval_id"))
+        assertNull(pendingPrompt(JSONObject("{\"pending\":null}")))
+    }
+
     @Test fun releasedAssistantTabValueMigrates() {
         assertEquals("Cypher", migratedTab("Xara"))
         assertEquals("Chat", migratedTab("Chat"))

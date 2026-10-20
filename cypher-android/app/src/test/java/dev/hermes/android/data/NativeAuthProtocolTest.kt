@@ -52,7 +52,6 @@ class NativeAuthProtocolTest {
                                 "contract_version" to 2, "backend" to "hermes-dashboard", "owner_id" to owner, "profile" to profile,
                                 "voice" to json("available" to true, "configured" to true),
                                 "capabilities" to json("native_jobs" to true, "pc_recording" to false, "callbacks" to true, "push" to false, "permanent_recording_retention" to false),
-                                "release" to json("available" to true, "version_code" to 37L),
                             ).toString())
                         }
                     }

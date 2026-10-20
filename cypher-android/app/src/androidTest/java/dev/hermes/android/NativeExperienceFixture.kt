@@ -254,7 +254,8 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         val (listener, socket) = awaitActiveNativeSocket(0)
         check(serverRequestCapabilities[socket] == true) { "The fixture may emit $method only after client.capabilities server_requests=true" }
         val frame = json("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to payload.copy().put("session_id", runtime))
-        check(openNativeServerRequests.putIfAbsent(id, frame.copy()) == null) { "Duplicate synthetic server request id: $id" }
+        // Hermes replays open_requests as {id, method, params} without "jsonrpc" (server_requests.py snapshot()).
+        check(openNativeServerRequests.putIfAbsent(id, frame.copy().apply { remove("jsonrpc") }) == null) { "Duplicate synthetic server request id: $id" }
         listener.onMessage(socket, frame.toString())
     }
     fun interruptActiveNativeStream() {

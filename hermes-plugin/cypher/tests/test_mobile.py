@@ -322,6 +322,10 @@ def test_targets_durable_scoped_no_tokens_in_reads(harness):
     api,c,cfg,tmp,app=harness
     result=c.post('/api/plugins/cypher/mobile/notifications/targets',json={'id':'device1','token':'fixture-token-'+'x'*30,'profile':'default'})
     assert result.status_code==200
+    # A non-string package is rejected before it reaches the target-id hash.
+    for package in (7,['dev.hermes.android'],'evil.app'):
+        bad=c.post('/api/plugins/cypher/mobile/notifications/targets',json={'token':'fixture-token-'+'x'*30,'package_name':package})
+        assert bad.status_code==400,bad.text
     assert 'token' not in c.get('/api/plugins/cypher/mobile/notifications/targets').text
     assert c.get('/api/plugins/cypher/mobile/notifications/events?after=-1').status_code==400
     assert c.request('DELETE','/api/plugins/cypher/mobile/notifications/targets',json={'id':'device1'}).status_code==200
@@ -688,18 +692,12 @@ def test_native_create_failure_rolls_back_only_own_draft(harness,monkeypatch):
     with pytest.raises(RuntimeError):native.create('owner','basic','default')
     assert calls==['session.create'] and server._sessions['new'] is replacement
 
-def test_bootstrap_release_work_is_off_loop_and_degrades(harness,monkeypatch):
+def test_bootstrap_never_verifies_a_release_and_safely_hides_errors(harness,monkeypatch):
     api,c,cfg,tmp,app=harness
-    import threading
-    main=[None]
-    @app.middleware('http')
-    async def note_thread(request,call_next):main[0]=threading.get_ident();return await call_next(request)
-    def broken(cfg,optional=False):
-        assert threading.get_ident()!=main[0]
-        raise KeyError('version_name')
-    monkeypatch.setattr(api,'release',broken)
+    def broken(cfg,optional=False): raise KeyError('version_name')
+    monkeypatch.setattr(api,'release',lambda *args,**kwargs:pytest.fail('bootstrap must not re-verify an APK'))
     result=c.get('/api/plugins/cypher/mobile/bootstrap')
-    assert result.status_code==200 and result.json()['release']=={'available':False,'reason':'release_unavailable'}
+    assert result.status_code==200 and 'release' not in result.json()
     with pytest.raises(Exception) as exc:api.safely(broken,cfg)
     assert exc.value.status_code==503
 

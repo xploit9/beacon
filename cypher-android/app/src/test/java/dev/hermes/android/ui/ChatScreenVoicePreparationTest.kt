@@ -45,6 +45,25 @@ class ChatScreenVoicePreparationTest {
         assertEquals(false, "orphan-1" in folded.foldedMessageIds)
     }
 
+    @Test fun ambiguousOrImageToolResultsStayVisible() {
+        val messages = listOf(
+            JSONObject().put("id", "assistant-1").put("role", "assistant"),
+            JSONObject().put("id", "twin-a").put("role", "tool").put("tool_call_id", "call-twin").put("content", "first"),
+            JSONObject().put("id", "twin-b").put("role", "tool").put("tool_call_id", "call-twin").put("content", "second"),
+            JSONObject().put("id", "image-result").put("role", "tool").put("tool_call_id", "call-image").put("content", "screenshot"),
+        )
+        val cards = listOf(
+            Message("assistant-1", "assistant", "", tools = listOf(JSONObject().put("id", "call-twin"), JSONObject().put("id", "call-image"))),
+            Message("twin-a", "tool", "first"),
+            Message("twin-b", "tool", "second"),
+            Message("image-result", "tool", "screenshot", attachments = listOf(JSONObject().put("kind", "image").put("url", "/api/media/shot.png"))),
+        )
+        val folded = foldToolResults(messages, cards)
+
+        assertEquals(emptySet<String>(), folded.foldedMessageIds)
+        assertEquals(emptyMap<String, FoldedToolResult>(), folded.byCallId)
+    }
+
     @Test fun assistantLabelsShowOncePerReplyAndResetAtBoundaries() {
         val messages = listOf(
             Message("orphan-first", "tool", "result before call"),

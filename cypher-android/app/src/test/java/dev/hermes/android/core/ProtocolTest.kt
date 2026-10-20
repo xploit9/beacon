@@ -179,6 +179,9 @@ class ProtocolTest {
         rejects { release.copy(minContract = 3).validate("dev.hermes.android", 1, sha) }
         rejects { release.copy(minContract = 1, maxContract = 1).validate("dev.hermes.android", 1, sha) }
         rejects { release.copy(version = 1).validate("dev.hermes.android", 1, sha) }
+        // Stable and production feeds share one query-free path; the app adds ?package= itself.
+        val stable = Release.from(json("version_code" to 100, "version_name" to "1.0.0", "package_name" to "dev.hermes.android.stable", "artifact_path" to "/api/plugins/cypher/mobile/releases/$sha/download", "sha256" to sha, "size_bytes" to 1000, "certificate_sha256" to sha, "min_contract_version" to 2, "max_contract_version" to 2))
+        assertEquals(stable.path, safeArtifactPath(stable.path))
         listOf("https://evil.example/a.apk", "//evil.example/a.apk", "/api/../secret", "/api/%2e%2e/secret", "/api/%252e%252e/secret", "/api/a%5cb", "/api/a?token=secret", "/api/a%0d%0aevil").forEach { rejects { safeArtifactPath(it) } }
     }
     @Test fun nativeConfigurationSerializesTypedNestedFieldsAndPreservesMaskedSecrets() {

@@ -295,7 +295,7 @@ def set_auto_plugin_updates(owner,enabled):
 
 def record_auto_update_status(owner,checked_at,result,app_version='',plugin_version='',message=''):
     if type(checked_at) not in (int,float) or not math.isfinite(checked_at): raise ValueError('Invalid check time')
-    if result not in {'checking','up_to_date','app_staged','plugin_updated','plugin_update_available','restart_required','consent_required','error'}:
+    if result not in {'checking','up_to_date','app_staged','plugin_updated','plugin_update_available','waiting_for_idle','restart_required','consent_required','error'}:
         raise ValueError('Invalid auto-update result')
     status={'checked_at':checked_at,'result':result,'app_version':str(app_version)[:64],
             'plugin_version':str(plugin_version)[:64],'message':str(message)[:240]}

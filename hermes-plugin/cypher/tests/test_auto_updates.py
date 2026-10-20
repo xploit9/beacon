@@ -27,7 +27,8 @@ def _auto(api, monkeypatch, *, plugin_version='1.0.0', busy=False):
     monkeypatch.setattr(api, '_hermes_busy', lambda owner: busy)
     def update():
         updated.append('cypher');installed[0]=plugin_version
-        return {'ok': True, 'gateway_reloaded': True, 'restart_required': False}
+        # Hermes' git-install shape (plugins_cmd_update.py): no restart_required key.
+        return {'ok': True, 'name': 'cypher', 'output': 'Updated cypher.', 'unchanged': False}
     monkeypatch.setattr(api, '_update_cypher_plugin', update)
     return checked, updated
 
@@ -77,8 +78,38 @@ def test_newer_plugin_uses_hermes_native_update_path_when_enabled(harness,monkey
     result=api.auto_update_check(cfg,now=2_000_000)
 
     assert len(checked)==1 and updated==['cypher']
-    assert result['result']=='plugin_updated'
+    # This process still runs 1.0.0 code, so the update finishes only after a restart.
+    assert result['result']=='restart_required'
+    assert result['message']=='Restart Hermes to finish the plugin update.'
     assert client.get('/api/plugins/cypher/mobile/update-settings').json()['plugin_version']=='1.1.0'
+
+
+def test_plugin_update_is_complete_when_running_code_matches_installed(harness,monkeypatch):
+    api,_,cfg,_,_=harness
+    _,updated=_auto(api,monkeypatch,plugin_version='1.1.0')
+    monkeypatch.setattr(api,'_RUNNING_PLUGIN_VERSION','1.1.0')
+
+    result=api.auto_update_check(cfg,now=2_000_000)
+
+    assert updated==['cypher'] and result['result']=='plugin_updated'
+
+
+def test_plugin_update_runs_inside_hermes_profile_secret_scope(harness,monkeypatch):
+    api,_,_,_,_=harness
+    scope=[]
+    class Scope:
+        def __init__(self,profile): self.profile=profile
+        def __enter__(self): scope.append(self.profile)
+        def __exit__(self,*_): scope.pop()
+    def update(name):
+        # Mirrors agent/secret_scope.py: a multi-profile Hermes refuses unscoped secret reads.
+        if scope!=[None]: raise RuntimeError('UnscopedSecretError')
+        return {'ok':True,'name':name,'output':'Already up to date.','unchanged':True}
+    monkeypatch.setitem(sys.modules,'hermes_cli.web_server_profiles',SimpleNamespace(_config_profile_scope=Scope))
+    monkeypatch.setitem(sys.modules,'hermes_cli.plugins_cmd',SimpleNamespace(dashboard_update_user_plugin=update))
+
+    assert api._update_cypher_plugin()['ok'] is True
+    assert scope==[]
 
 
 def test_disabled_plugin_auto_update_does_not_call_hermes_updater(harness,monkeypatch):
@@ -98,8 +129,8 @@ def test_active_hermes_work_defers_reload_and_records_restart_hint(harness,monke
     result=api.auto_update_check(cfg,now=2_000_000)
 
     assert len(checked)==1 and updated==[]
-    assert result['result']=='restart_required'
-    assert result['message']=='Restart Hermes to finish the plugin update.'
+    assert result['result']=='waiting_for_idle'
+    assert result['message']=='Plugin update waits until Hermes is idle.'
     assert client.get('/api/plugins/cypher/mobile/update-settings').json()['message']==result['message']
 
 
@@ -107,12 +138,12 @@ def test_deferred_plugin_update_retries_when_hermes_becomes_idle_without_another
     api,_,cfg,_,_=harness
     checked,updated=_auto(api,monkeypatch,plugin_version='1.1.0',busy=True)
     first=api.auto_update_check(cfg,now=2_000_000)
-    assert first['result']=='restart_required' and updated==[]
+    assert first['result']=='waiting_for_idle' and updated==[]
     monkeypatch.setattr(api,'_hermes_busy',lambda owner:False)
 
     result=api.auto_update_check(cfg,now=2_000_060)
 
-    assert result['result']=='plugin_updated'
+    assert result['result']=='restart_required'
     assert len(checked)==1 and updated==['cypher']
 
 
@@ -150,11 +181,21 @@ def test_failed_release_check_is_recorded_without_stopping_watcher(harness,monke
 def test_idle_guard_detects_active_hermes_work_and_phone_calls(harness,monkeypatch):
     api,_,_,_,_=harness
     status={'active_agents':1,'active_work':['chat'],'gateway_state':'running'}
+    pid=[123];ledger=['']
     monkeypatch.setitem(sys.modules,'gateway.status',SimpleNamespace(
-        get_running_pid=lambda:123,read_runtime_status=lambda:status))
+        get_running_pid=lambda:pid[0],read_runtime_status=lambda:status))
+    monkeypatch.setitem(sys.modules,'hermes_cli.web_server_idle_exit',SimpleNamespace(busy_ledger=lambda:ledger[0]))
 
     assert api._hermes_busy('owner')
     status.update(active_agents=0,active_work=[],gateway_state='running')
+    assert not api._hermes_busy('owner')
+    # A stopped gateway leaves a stale state file; it must not block the update forever.
+    pid[0]=None;status.update(active_agents=2,gateway_state='stopped')
+    assert not api._hermes_busy('owner')
+    for busy in ('session:dashboard-chat',None):
+        ledger[0]=busy
+        assert api._hermes_busy('owner')
+    ledger[0]=''
     api.mobile.reserve('owner','default','active-call-session')
     assert api._hermes_busy('owner')
 

@@ -1,5 +1,6 @@
 package dev.hermes.android.updates
 
+import android.app.ActivityManager
 import dev.hermes.android.core.Release
 import dev.hermes.android.data.AuthContext
 
@@ -18,13 +19,17 @@ internal data class UpdateSource(val origin: String, val owner: String, val id: 
 internal fun updateCheckDue(lastCheck: Long, now: Long, force: Boolean): Boolean =
     force || lastCheck == 0L || now < lastCheck || now - lastCheck >= 12 * 60 * 60_000L
 
-internal fun autoUpdateEnabled(stored: Boolean?): Boolean = stored ?: true
-
 internal fun autoUpdateCheckDue(enabled: Boolean, lastCheck: Long, now: Long): Boolean =
     enabled && updateCheckDue(lastCheck, now, false)
 
 internal fun autoUpdateInstallAllowed(enabled: Boolean, unmetered: Boolean, callActive: Boolean): Boolean =
     enabled && unmetered && !callActive
+
+/** A silent install closes Cypher, so it also waits while Cypher is on screen. Keep connected's
+ *  foreground service alone is not on screen, and it restarts after the update. */
+internal fun silentInstallAllowed(sdk: Int, canRequestInstalls: Boolean, callActive: Boolean, importance: Int): Boolean =
+    sdk >= 31 && canRequestInstalls && !callActive && (importance > ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE ||
+        importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND_SERVICE)
 
 internal fun updateNotificationDue(version: Long, lastNotified: Long): Boolean = version > lastNotified
 

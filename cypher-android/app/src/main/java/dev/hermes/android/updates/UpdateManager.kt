@@ -46,9 +46,7 @@ class UpdateManager(private val app: CypherApplication) {
         require(source() == expected && expected.authorizedBy(app.auth.read(expected.origin))) { "Update authorization changed. Sign in and check again." }
     }
 
-    fun autoUpdateEnabled(): Boolean = dev.hermes.android.updates.autoUpdateEnabled(
-        if (prefs.contains(AUTO_APP_UPDATES)) prefs.getBoolean(AUTO_APP_UPDATES, true) else null,
-    )
+    fun autoUpdateEnabled(): Boolean = prefs.getBoolean(AUTO_APP_UPDATES, true)
 
     fun setAutoUpdateEnabled(enabled: Boolean) {
         check(prefs.edit().putBoolean(AUTO_APP_UPDATES, enabled).commit()) { "Could not save automatic app updates" }
@@ -62,6 +60,8 @@ class UpdateManager(private val app: CypherApplication) {
     private fun supportsAutomaticAppUpdates() = app.packageName == "dev.hermes.android" || app.packageName == "dev.hermes.android.stable"
     private fun callActive() = app.calls.state.value.active || app.calls.state.value.state == "ending" ||
         app.calls.service != null || app.calls.spec != null || app.push.incoming.value != null
+    private fun canInstallSilently() = silentInstallAllowed(Build.VERSION.SDK_INT, app.packageManager.canRequestPackageInstalls(), callActive(),
+        ActivityManager.RunningAppProcessInfo().also(ActivityManager::getMyMemoryState).importance)
     private fun unmeteredNetwork(): Boolean {
         val connectivity = app.getSystemService(ConnectivityManager::class.java) ?: return false
         val network = connectivity.activeNetwork ?: return false
@@ -153,9 +153,8 @@ class UpdateManager(private val app: CypherApplication) {
             synchronized(lock) { requireAuthorized(expected); notifyRelease(expected,release) }
             return
         }
-        downloadOwned(client,release,expected,automatic=true)
-        if (Build.VERSION.SDK_INT < 31 || !app.packageManager.canRequestPackageInstalls() || callActive())
-            postReadyNotification(expected,release.version,release.name)
+        downloadOwned(client,release,expected)
+        if (!canInstallSilently()) postReadyNotification(expected,release.version,release.name)
         else installPending(automatic=true)
     }
 
@@ -255,14 +254,14 @@ class UpdateManager(private val app: CypherApplication) {
         return try { downloadOwned(detached, release, expected) } finally { detached.closeNative() }
     }
 
-    private suspend fun downloadOwned(client: CypherClient, release: Release, expected: UpdateSource, automatic: Boolean = false): File {
+    private suspend fun downloadOwned(client: CypherClient, release: Release, expected: UpdateSource): File {
         val file = updater.download(client, release)
         try {
             synchronized(lock) {
                 requireAuthorized(expected)
                 check(prefs.edit().putString("pending_file", file.name).putString("pending_source", expected.id)
                     .putString("pending_sha", release.sha).putLong("pending_size", release.size).putLong("pending_version", release.version)
-                    .putString("pending_version_name",release.name).putBoolean("pending_auto_install",automatic)
+                    .putString("pending_version_name",release.name)
                     .remove("pending_session_id").putBoolean("continue_install", true).putBoolean("awaiting_permission", false).commit())
                 notifications.cancel(NOTIFICATION_ID)
             }
@@ -289,7 +288,7 @@ class UpdateManager(private val app: CypherApplication) {
     private fun clearPending() {
         val obsolete = prefs.getString("pending_file", null)?.let { runCatching { pendingFile(it) }.getOrNull() }
         check(prefs.edit().remove("pending_file").remove("pending_source").remove("pending_sha").remove("pending_size").remove("pending_version")
-            .remove("pending_version_name").remove("pending_auto_install").remove("pending_session_id")
+            .remove("pending_version_name").remove("pending_session_id")
             .remove("awaiting_permission").remove("continue_install").commit())
         obsolete?.delete()
     }
@@ -304,7 +303,15 @@ class UpdateManager(private val app: CypherApplication) {
 
     /** Run again after Android settings returns; automatic sessions ask Android to skip its prompt when allowed. */
     suspend fun installPending(automatic: Boolean = false): Boolean = withContext(Dispatchers.IO) {
-        if (synchronized(lock) { prefs.getInt("pending_session_id",-1)>=0 }) return@withContext true
+        synchronized(lock) {
+            val session = prefs.getInt("pending_session_id",-1)
+            if (session>=0) {
+                if (automatic) return@withContext true
+                // A manual tap replaces a leftover silent session with Android's installer.
+                runCatching { app.packageManager.packageInstaller.abandonSession(session) }
+                check(prefs.edit().remove("pending_session_id").commit())
+            }
+        }
         val pending = synchronized(lock) {
             val expected = source() ?: error("Sign in and download the update again")
             requireAuthorized(expected)
@@ -323,27 +330,29 @@ class UpdateManager(private val app: CypherApplication) {
             throw e
         }
         val coroutine = currentCoroutineContext()
-        val autoInstall = automatic || synchronized(lock) { prefs.getBoolean("pending_auto_install",false) && autoUpdateEnabled() }
-        if (automatic && (!autoUpdateEnabled() || Build.VERSION.SDK_INT < 31 || !app.packageManager.canRequestPackageInstalls() || callActive())) {
+        if (automatic && (!autoUpdateEnabled() || !canInstallSilently())) {
             postReadyNotification(expected,prefs.getLong("pending_version",0),bytes.third)
             return@withContext false
         }
         if (callActive()) error("Finish your call before installing the update.")
         coroutine.ensureActive()
-        if (autoInstall && Build.VERSION.SDK_INT >= 31 && app.packageManager.canRequestPackageInstalls()) {
+        if (automatic) {
+            var stored = -1
             try {
                 updater.installWithoutUserAction(file,::installResultPendingIntent) { sessionId ->
                     synchronized(lock) {
                         require(prefs.getInt("pending_session_id",-1)<0) { "An app update is already being installed." }
                         requireAuthorized(expected)
                         require(prefs.getString("pending_file",null)==file.name && prefs.getString("pending_sha",null)==bytes.second) { "The pending update changed. Try again." }
-                        require(!callActive() && autoUpdateEnabled()) { "The automatic update is paused. Finish your call or turn automatic updates back on." }
+                        require(canInstallSilently() && autoUpdateEnabled()) { "The automatic update is paused. Finish your call or turn automatic updates back on." }
                         check(prefs.edit().putInt("pending_session_id",sessionId).putBoolean("awaiting_permission",false).putBoolean("continue_install",false).commit())
+                        stored = sessionId
                     }
                 }
             } catch (error: Throwable) {
-                synchronized(lock) { prefs.edit().remove("pending_session_id").commit() }
-                if (callActive() || !autoUpdateEnabled()) postReadyNotification(expected,prefs.getLong("pending_version",0),bytes.third)
+                // Only this attempt's session id; another attempt's stays tracked.
+                synchronized(lock) { if (stored>=0 && prefs.getInt("pending_session_id",-1)==stored) prefs.edit().remove("pending_session_id").commit() }
+                if (!canInstallSilently() || !autoUpdateEnabled()) postReadyNotification(expected,prefs.getLong("pending_version",0),bytes.third)
                 throw error
             }
             return@withContext true
@@ -380,12 +389,12 @@ class UpdateManager(private val app: CypherApplication) {
                 val prompt=installPrompt(result)
                 if (callActive() || prompt==null) {
                     runCatching { app.packageManager.packageInstaller.abandonSession(sessionId) }
-                    synchronized(lock) { prefs.edit().remove("pending_session_id").putBoolean("pending_auto_install",false).commit() }
+                    synchronized(lock) { prefs.edit().remove("pending_session_id").commit() }
                     postReadyNotification(expected,prefs.getLong("pending_version",0),prefs.getString("pending_version_name","").orEmpty())
                 } else postInstallerPrompt(expected,sessionId,prompt,prefs.getString("pending_version_name","").orEmpty())
             }
             else -> {
-                synchronized(lock) { prefs.edit().remove("pending_session_id").putBoolean("pending_auto_install",false).commit() }
+                synchronized(lock) { prefs.edit().remove("pending_session_id").commit() }
                 postReadyNotification(expected,prefs.getLong("pending_version",0),prefs.getString("pending_version_name","").orEmpty())
             }
         }

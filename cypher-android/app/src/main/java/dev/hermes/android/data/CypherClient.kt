@@ -430,7 +430,6 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
             put("voice", voice)
             put("capabilities", capabilities)
             put("unavailable", unavailable)
-            payload?.opt("release")?.takeIf { it != JSONObject.NULL }?.let { put("release", it) }
         }
     }
 
@@ -524,7 +523,6 @@ fun mergeOptionalFeatures(projection: JSONObject, optional: JSONObject): JSONObj
         "unavailable" to (optional.optJSONArray("unavailable") ?: JSONArray()),
         "independent_of_native_chat" to true,
     ))
-    optional.opt("release")?.takeIf { it != JSONObject.NULL }?.let { merged.put("release", it) }
     return merged
 }
 

@@ -1361,7 +1361,7 @@ class NativeExperienceUiTest {
         } finally { runBlocking { app.preferences.edit { it.remove(key) } } }
     }
 
-    @Test fun backgroundUpdateCheckKeepsTheRotatedBearer() = withFixture { _, fixture ->
+    @Test fun savedUpdateSignInKeepsTheRotatedBearer() = withFixture { _, fixture ->
         val now = System.currentTimeMillis() / 1000
         val bearer = dev.hermes.android.data.NativeBearerRecord("update-access", "update-refresh", now + 3600, fixture.scope.origin, fixture.scope.owner, "default", "fixture", now - 60)
         val auth = dev.hermes.android.data.AuthContext(fixture.scope.origin, emptyList(), fixture.scope.owner, "default", backend = "hermes-dashboard", bearer = bearer)
@@ -1371,11 +1371,14 @@ class NativeExperienceUiTest {
             app.updates.clearAuthorization(); app.updates.authorize(fixture.freshClientFor(auth, app.auth))
             app.updates.transportForTest = fixture.configureHttp
             fixture.forceExpiredAccessToken = bearer.accessToken
+            // The hand-installed preview runs no background check; a release notice's recheck uses the same saved sign-in.
+            app.updates.notifyPush(fixture.scope.origin, fixture.scope.owner, Long.MAX_VALUE.toString())
+            val token = requireNotNull(app.getSharedPreferences("android-updates", Context.MODE_PRIVATE).getString("notification_token", null))
             // The release feed is absent from the fixture; the check fails after its bootstrap refreshed the sign-in.
-            runBlocking { runCatching { app.updates.backgroundCheck() } }
+            runBlocking { runCatching { app.updates.downloadNotification(token) } }
             assertEquals(listOf(bearer.refreshToken), fixture.refreshTokensUsed.toList())
             assertEquals(fixture.currentRefreshToken, app.auth.read(fixture.scope.origin).bearer?.refreshToken)
-            receipts += "The background update check saves a refreshed sign-in through the store, so the next check does not reuse a spent refresh token."
+            receipts += "An update recheck through the saved sign-in stores the refreshed bearer, so the next check does not reuse a spent refresh token."
         } finally { app.updates.transportForTest = null; app.updates.clearAuthorization() }
     }
 
@@ -1973,6 +1976,8 @@ class NativeExperienceUiTest {
 
         compose.onNodeWithTag("message-row:tool-result-passed", useUnmergedTree = true).assertDoesNotExist()
         compose.onNodeWithTag("message-row:tool-result-failed", useUnmergedTree = true).assertDoesNotExist()
+        // The orphan result is the last row; a compact window composes it only once it is scrolled into view.
+        compose.onNodeWithTag("conversation-transcript").performScrollToNode(hasTestTag("message-row:tool-result-orphan"))
         compose.onNodeWithTag("message-row:tool-result-orphan", useUnmergedTree = true).assertExists()
         compose.onNodeWithTag("disclosure:Read file result").performClick()
         compose.onNodeWithText("orphan output", useUnmergedTree = true).assertExists()

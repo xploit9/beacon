@@ -363,7 +363,8 @@ internal class NativeGateway(private val client: CypherClient, private val socke
                 if (synchronized(cursorLock) { cursor === snapshot }) {
                     val events = replay.rows("events")
                     events.forEach { retireCancelledServerRequest(mine, it) }
-                    replay.rows("open_requests").forEach { deliver(mine, it, onEvent) }
+                    // Hermes replays open requests as {id, method, params}, without the JSON-RPC envelope field.
+                    replay.rows("open_requests").forEach { deliver(mine, it.put("jsonrpc", "2.0"), onEvent) }
                     events.forEach { deliver(mine, json("method" to "event", "params" to it), onEvent) }
                 }
             }

@@ -236,9 +236,10 @@ _WRITE_TOOL_WORDS={'send','create','delete','remove','modify','update','manage',
 _PROACTIVE_READ_TOOLS={'todo'}
 _ARG_WRITE_TOOL_WORDS=_WRITE_TOOL_WORDS|{'run','trigger','install','edit','enable','disable','pause','resume','schedule'}
 _BLOCKED_PROACTIVE_TOOLSETS={'delegation','code_execution','computer_use','kanban','cronjob'}
+# web_extract/web_fetch could carry another email's content out in a URL an injected email asks for.
 _BLOCKED_PROACTIVE_TOOLS={'delegate_task','execute_code','computer_use','kanban','cronjob_manage',
                           'cypher_call_user','browser_click','browser_type','browser_press',
-                          'browser_cdp','browser_exec'}
+                          'browser_cdp','browser_exec','web_extract','web_fetch'}
 _READ_ONLY_MESSAGE='Proactive runs are read-only; this would change something.'
 
 def _tool_words(name):
@@ -267,19 +268,24 @@ def _mcp_read_only(tool_name,profile):
     return False
 
 def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**kwargs):
-    """Veto write-capable tools only in Cypher's owned email-watch cron session."""
+    """Veto write-capable tools only in Cypher's email-watch cron session, including a run that
+    outlives Proactive being turned off or its jobs being rebuilt (Hermes does not stop it)."""
     if not isinstance(tool_name,str) or not session_id:
         return None
     try:
         cfg=mobile.settings();owner=cfg.get('owner_id');profile=current_profile(cfg)
-        if (not owner or not _owned_proactive_run(owner,profile,session_id)):
-            return None
-        row=_cron_row(profile,session_id)
-        job_id=_cron_job_id(row or {},session_id)
-        if job_id!=proactive._managed_id(mobile,owner,profile,'watch_email'):
-            return None
+        row=_cron_row(profile,session_id) if owner else None
     except Exception:
         return None
+    if not row or row.get('source')!='cron':
+        return None
+    try:
+        job_id=_cron_job_id(row,session_id)
+        if not job_id or job_id not in proactive.watch_job_ids(mobile,owner,profile):
+            return None
+    except Exception:
+        # Only cron runs reach here, never ordinary chats; an unreadable ownership check fails closed.
+        return {'action':'block','message':_READ_ONLY_MESSAGE}
 
     if tool_name in {'cypher_email_notice','cypher_email_checked','terminal'}:
         return None
@@ -308,7 +314,7 @@ def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**
         action=args.get('action')
         if action in {'read','search','get','list','query'}: return None
         return {'action':'block','message':_READ_ONLY_MESSAGE}
-    if toolset=='web' and tool_name in {'web_search','web_extract','web_fetch'}:
+    if toolset=='web' and tool_name=='web_search':
         return None
     # Deny by default: any other tool runs only when its name or its requested action clearly reads
     # (skill_view, session_search, read_file, skills with action=list).

@@ -71,9 +71,6 @@ class UpdatePolicyTest {
     }
 
     @Test fun automaticUpdateDefaultsOnAndNeedsUnmeteredNetworkWithoutAnActiveCall() {
-        assertTrue(autoUpdateEnabled(null))
-        assertTrue(autoUpdateEnabled(true))
-        assertFalse(autoUpdateEnabled(false))
         assertTrue(autoUpdateCheckDue(true,0,1))
         assertFalse(autoUpdateCheckDue(false,0,1))
         assertFalse(autoUpdateCheckDue(true,1_000,1_000+12*60*60_000L-1))
@@ -82,6 +79,19 @@ class UpdatePolicyTest {
         assertFalse(autoUpdateInstallAllowed(false, unmetered = true, callActive = false))
         assertFalse(autoUpdateInstallAllowed(true, unmetered = false, callActive = false))
         assertFalse(autoUpdateInstallAllowed(true, unmetered = true, callActive = true))
+    }
+
+    @Test fun silentInstallWaitsWhileCypherIsOnScreenOrInACall() {
+        val background = android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_CACHED
+        val visible = android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE
+        val foreground = android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
+        assertTrue(silentInstallAllowed(31, canRequestInstalls = true, callActive = false, importance = background))
+        assertFalse(silentInstallAllowed(31, canRequestInstalls = true, callActive = false, importance = foreground))
+        assertFalse(silentInstallAllowed(31, canRequestInstalls = true, callActive = false, importance = visible))
+        assertTrue(silentInstallAllowed(31, canRequestInstalls = true, callActive = false, importance = android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND_SERVICE))
+        assertFalse(silentInstallAllowed(31, canRequestInstalls = true, callActive = true, importance = background))
+        assertFalse(silentInstallAllowed(30, canRequestInstalls = true, callActive = false, importance = background))
+        assertFalse(silentInstallAllowed(31, canRequestInstalls = false, callActive = false, importance = background))
     }
 
     @Test fun externalIntentCannotSupplyUrlIdentityOrCredentials() {

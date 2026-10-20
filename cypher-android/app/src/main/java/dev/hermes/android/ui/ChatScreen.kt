@@ -94,11 +94,15 @@ internal fun foldToolResults(messages: List<JSONObject>, displayedMessages: List
         .filter(String::isNotBlank)
         .toSet()
     val messagesById = displayedMessages.associateBy { it.id }
-    val matched = messages.withIndex().mapNotNull { (index, row) ->
+    val results = messages.withIndex().filter { (_, row) -> (row.string("role") == "tool" || row.string("role") == "function") && row.string("tool_call_id") in callIds }
+    // A call id shared by several result rows is ambiguous; folding one would hide the others.
+    val unique = results.groupingBy { it.value.string("tool_call_id") }.eachCount().filterValues { it == 1 }.keys
+    val matched = results.mapNotNull { (index, row) ->
         val callId = row.string("tool_call_id")
-        if ((row.string("role") != "tool" && row.string("role") != "function") || callId !in callIds) return@mapNotNull null
+        if (callId !in unique) return@mapNotNull null
         val messageId = row.string("id", row.string("message_id", row.string("row_id", row.string("_row_id", row.string("tool_call_id", "${row.string("role")}:$index")))))
-        val message = messagesById[messageId] ?: return@mapNotNull null
+        // The folded card shows text only, so a result with images stays a visible row.
+        val message = messagesById[messageId]?.takeIf { it.attachments.isEmpty() } ?: return@mapNotNull null
         callId to FoldedToolResult(message.id, message.text, row.optBoolean("is_error"))
     }
     return ToolResultFolding(matched.toMap(), matched.mapTo(LinkedHashSet<String>()) { it.second.messageId })
