@@ -202,6 +202,8 @@ class NativeReviewTest {
         assertTrue(resolveNativeReference("data:image/png;base64," + "A".repeat(DATA_IMAGE_LIMIT), scope) is NativeReference.Unsupported)
         listOf("javascript:alert(1)", "data:text/html,evil", "http://cdn.example/a.png", "https://user:password@cdn.example/a.png", "file://other-server/a.png", "/api/media?path=%00evil", "workspace://%00evil", "session://%00evil").forEach { assertTrue(it, resolveNativeReference(it, scope) is NativeReference.Unsupported) }
         val external = resolveNativeReference("https://cdn.example/image?token=public-reference", scope) as NativeReference.ExternalMedia
+        assertTrue("outside media waits for a tap", externalMediaNeedsTap(external, scope.origin.toHttpUrl()))
+        assertFalse(externalMediaNeedsTap(NativeReference.ExternalMedia(scope.origin.toHttpUrl().resolve("/a.png")!!), scope.origin.toHttpUrl()))
         val request = externalMediaRequest(external.url)
         assertEquals(setOf("Accept"), request.headers.names())
         assertNull(request.header("Cookie")); assertNull(request.header("Authorization")); assertNull(request.header("X-Hermes-CSRF-Token")); assertNull(request.header("Referer"))

@@ -3201,7 +3201,7 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Profile · Personal profile").assertExists()
         compose.runOnIdle { vm.more("Assistant") }
         compose.onNodeWithText("Profile: Code profile").assertExists()
-        compose.onNodeWithText("Proactive · Code profile").assertExists()
+        compose.onNodeWithText("Important emails · Code profile").assertExists()
         compose.runOnIdle { vm.more("Profiles") }
         await { vm.phoneSettings.bots.value.profiles.isNotEmpty() && !vm.phoneSettings.bots.value.loading }
         // The closed drawer's profile switcher shows the same name.

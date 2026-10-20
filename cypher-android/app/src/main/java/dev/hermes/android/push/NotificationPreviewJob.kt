@@ -113,14 +113,16 @@ private suspend fun sendEmailFeedback(context: Context, source: String, event: S
         val route = client.nativeRequest("/api/plugins/cypher/mobile/notifications/events/$event")
         val conversation = route.string("conversation_ref")
         if (!isEmailAlertNotificationRoute(route, source, event, scope, conversation) || !authorized()) return@withTimeout
-        client.nativeRequest(EMAIL_FEEDBACK_PATH, "POST", json("notice_id" to event, "verdict" to verdict))
+        // A refused save (for example, full Hermes memory) must not look like success; the buttons stay for a retry.
+        val saved = try { client.nativeRequest(EMAIL_FEEDBACK_PATH, "POST", json("notice_id" to event, "verdict" to verdict)); true }
+        catch (e: CancellationException) { throw e } catch (_: Exception) { false }
         val manager = context.getSystemService(NotificationManager::class.java)
         val tag = "$source\u0000$event".digest()
         val posted = manager.activeNotifications.firstOrNull { it.tag == tag && it.id == 1 } ?: return@withTimeout
         if (!authorized() || manager.activeNotifications.firstOrNull { it.tag == tag && it.id == 1 }?.postTime != posted.postTime) return@withTimeout
-        val body = "Thanks — Cypher will remember."
+        val body = if (saved) "Thanks — Cypher will remember." else "Couldn't save your choice. Try again."
         val updated = NotificationCompat.Builder(context, posted.notification)
-            .clearActions().setContentText(body).setStyle(NotificationCompat.BigTextStyle().bigText(body)).setOnlyAlertOnce(true).build()
+            .apply { if (saved) clearActions() }.setContentText(body).setStyle(NotificationCompat.BigTextStyle().bigText(body)).setOnlyAlertOnce(true).build()
         try { manager.notify(tag, 1, updated) } catch (_: SecurityException) { }
     }
 }

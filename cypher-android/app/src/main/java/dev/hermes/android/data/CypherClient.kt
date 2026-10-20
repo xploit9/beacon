@@ -112,10 +112,10 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
     }
     private val native = NativeGateway(this, socketFactory ?: http)
     suspend fun nativeRpc(method: String, params: JSONObject = JSONObject()): JSONObject = native.rpc(method, params)
-    suspend fun nativeRequest(path: String, method: String = "GET", body: JSONObject? = null): JSONObject {
+    suspend fun nativeRequest(path: String, method: String = "GET", body: JSONObject? = null, params: Map<String, String> = emptyMap()): JSONObject {
         require(NativeOperationPolicy.direct(path, method)) { "Unsupported native endpoint" }
         if (body?.has("profile") == true) require(body.string("profile") == auth.profile) { "Native request belongs to another profile" }
-        val query = if (path.startsWith(CYPHER_PLUGIN_PATH)) cypherPluginProfileQuery(emptyMap(), auth.profile) else emptyMap()
+        val query = if (path.startsWith(CYPHER_PLUGIN_PATH)) cypherPluginProfileQuery(params, auth.profile) else params
         return rawCall(path, query = query, method = method, data = body)
     }
     suspend fun nativeCallContext(callId: String): JSONObject = kotlinx.coroutines.withTimeout(20_000) {

@@ -130,10 +130,10 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
             val label = if (media is org.commonmark.node.Image) media.plain().ifBlank { media.title?.takeIf(String::isNotBlank) ?: reference } else (media as NativeMediaNode).source
             if (origin != null) {
                 val resolved = resolveNativeReference(reference, origin, snapshots)
-                if (media is org.commonmark.node.Image && resolved is NativeReference.ExternalMedia && !sameOrigin(resolved.url, origin.origin.toHttpUrl())) {
+                if (resolved is NativeReference.ExternalMedia && externalMediaNeedsTap(resolved, origin.origin.toHttpUrl())) {
                     var loadExternalImage by remember { mutableStateOf(false) }
                     if (loadExternalImage) NativeReferencePreview(vm, resolved, label, origin)
-                    else OutlinedButton(onClick = { loadExternalImage = true }) { Text("Load image from ${resolved.url.host}") }
+                    else OutlinedButton(onClick = { loadExternalImage = true }) { Text((if (media is org.commonmark.node.Image) "Load image from " else "Load media from ") + resolved.url.host) }
                 } else NativeReferencePreview(vm, resolved, label, origin)
             } else Text("$reference · Select an authenticated conversation to preview", color = MaterialTheme.colorScheme.onSurfaceVariant)
         }

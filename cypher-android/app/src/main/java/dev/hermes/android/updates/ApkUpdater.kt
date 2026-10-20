@@ -23,7 +23,8 @@ class ApkUpdater(private val context: Context) {
         return sha256(certificate.toByteArray())
     }
     suspend fun check(client: CypherClient): Release? {
-        val release = Release.from(client.nativeRequest("/api/plugins/cypher/mobile/releases/latest"))
+        // Stable and production builds have separate release feeds on Hermes.
+        val release = Release.from(client.nativeRequest("/api/plugins/cypher/mobile/releases/latest", params = mapOf("package" to context.packageName)))
         return newerRelease(release, context.packageName, installed().longVersionCode, signer())
     }
     suspend fun download(client: CypherClient, release: Release): File = withContext(Dispatchers.IO) {

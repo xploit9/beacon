@@ -110,12 +110,12 @@ class ProactiveUiTest {
         fixture.proactiveEnabled["coder"] = true
         fixture.proactiveLearned["coder"] = CopyOnWriteArrayList(listOf("Client moved the review"))
         compose.runOnIdle { vm.more("Assistant") }
-        await { vm.data.value[proactiveKey(fixture)]?.rows("learned")?.isNotEmpty() == true }
+        await { vm.data.value[proactiveKey(fixture)]?.optJSONArray("learned")?.length() == 1 }
 
         compose.onNodeWithText("What Cypher learned").performScrollTo().assertExists()
         compose.onNodeWithText("Client moved the review").performScrollTo().assertExists()
         compose.onNodeWithTag("proactive-learned-remove-0").performScrollTo().performClick()
-        await { fixture.proactiveLearned["coder"]?.isEmpty() == true && vm.data.value[proactiveKey(fixture)]?.rows("learned")?.isEmpty() == true }
+        await { fixture.proactiveLearned["coder"]?.isEmpty() == true && vm.data.value[proactiveKey(fixture)]?.optJSONArray("learned")?.length() == 0 }
         val removal = fixture.requests.last { it.string("path") == "$PROACTIVE_SETTINGS_PATH/learned" && it.string("method") == "DELETE" }
         assertEquals("coder", removal.string("profile"))
         assertEquals("Client moved the review", removal.getJSONObject("body").string("note"))
@@ -146,7 +146,8 @@ class ProactiveUiTest {
         compose.onNodeWithText("Let Cypher flag important emails").assertExists()
         compose.onNodeWithTag("proactive-prompt-settings").performClick()
         await { vm.ui.value.tab == "More" && vm.ui.value.morePage == "Assistant" }
-        compose.onNodeWithText("Important emails · Code profile").assertExists()
+        // The profile label depends on cached display names; this test only checks it lands on the email settings.
+        await { compose.onAllNodesWithText("Important emails · ", substring = true).fetchSemanticsNodes().isNotEmpty() }
         assertFalse(fixture.proactiveEnabled["coder"] == true)
     }
 
@@ -176,7 +177,8 @@ class ProactiveUiTest {
         try {
             vm.handlePush(source, noticeId)
             await { vm.ui.value.tab == "Chat" && vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
-            compose.onNodeWithText("Important email").assertExists()
+            // The chat was already open, so wait for the notification's card itself.
+            await { compose.onAllNodesWithText("Important email").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText(reason).assertExists()
             compose.onNodeWithTag("task-result-feedback-important").assertExists()
             compose.onNodeWithTag("task-result-feedback-not-important").performClick()
