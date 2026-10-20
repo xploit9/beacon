@@ -1106,6 +1106,8 @@ class NativeExperienceUiTest {
     }
 
     @Test fun historyAllProfilesListsOtherProfilesWhenTheCurrentOneHasNoStore() = withFixture { vm, fixture ->
+        // An earlier test may have cached the profile catalogue (fresh for two minutes) without these names.
+        runBlocking { listOf("default", "coder").forEach { app.cache.delete(fixture.scope.copy(profile = it), "read:/api/profiles") } }
         fixture.profileDisplayNames = mapOf("default" to "Personal profile", "coder" to "Code profile")
         fixture.profileSessionIds = mapOf("default" to setOf("chat-a", "chat-b"))
         // Real Hermes: a profile whose gateway never ran has no state.db, and its list read answers this 503.
