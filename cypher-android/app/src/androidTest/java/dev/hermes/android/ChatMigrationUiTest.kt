@@ -216,12 +216,17 @@ class ChatMigrationUiTest {
         assertEquals(listOf(false, true), reported)
     }
 
-    @Test fun eachToolGetsItsOwnCardWithItsName() {
+    @Test fun finishedStepsFoldIntoOneRowThatOpensToEachNamedCard() {
         compose.setContent { MaterialTheme { MessageActivity("", listOf(tool("terminal", "result" to "a"), tool("read_file", "result" to "b"), tool("web_search", "result" to "c"))) } }
+        // Three or more finished steps fold, so the answer sits under the question.
+        compose.onAllNodesWithTag("tool-card").assertCountEquals(0)
+        compose.onNodeWithText("3 steps · Terminal, read file, web search").assertIsDisplayed()
+        compose.onNodeWithTag("tool-steps").performClick()
         compose.onAllNodesWithTag("tool-card").assertCountEquals(3)
         compose.onNodeWithText("Terminal").assertIsDisplayed()
         compose.onNodeWithText("Read file").assertIsDisplayed()
         compose.onNodeWithText("Web search").assertIsDisplayed()
+        compose.onNodeWithTag("tool-steps-hide").assertIsDisplayed()
     }
 
     @Test fun toolCardsFitANarrowPhone() {
