@@ -1030,7 +1030,7 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
     else -> Icons.Rounded.Build
 }
 
-@Composable fun ToolCard(tool: JSONObject, streaming: Boolean = false, messageTime: Long = 0L, onExpandedChange: (Boolean) -> Unit = {}, foldedResult: FoldedToolResult? = null, onCopyResult: (String) -> Unit = {}) {
+@Composable internal fun ToolCard(tool: JSONObject, streaming: Boolean = false, messageTime: Long = 0L, onExpandedChange: (Boolean) -> Unit = {}, foldedResult: FoldedToolResult? = null, onCopyResult: (String) -> Unit = {}) {
     val rawName = tool.rawToolName()
     val outcome = toolOutcomeOf(tool, streaming, foldedResult)
     val running = outcome == ToolOutcome.Running
