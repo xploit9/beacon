@@ -143,10 +143,12 @@ class SetupWizardUiTest {
     @Test fun authReturnDeepLinkReturnsToCypher() {
         val app = ApplicationProvider.getApplicationContext<CypherApplication>()
         val instrumentation = InstrumentationRegistry.getInstrumentation()
-        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("cypher://auth/complete")).setPackage(app.packageName)
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("${app.packageName}://auth/complete")).setPackage(app.packageName)
+        // Other Cypher builds use their own package as the scheme, so the shared old link no longer reaches this one.
+        assertNull(app.packageManager.resolveActivity(Intent(Intent.ACTION_VIEW, Uri.parse("cypher://auth/complete")).setPackage(app.packageName), PackageManager.MATCH_DEFAULT_ONLY))
         val target = app.packageManager.resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)
         assertEquals("dev.hermes.android.AuthReturnActivity", target?.activityInfo?.name)
-        val unrelated = Intent(Intent.ACTION_VIEW, Uri.parse("cypher://auth/other")).setPackage(app.packageName)
+        val unrelated = Intent(Intent.ACTION_VIEW, Uri.parse("${app.packageName}://auth/other")).setPackage(app.packageName)
         assertTrue(app.packageManager.resolveActivity(unrelated, PackageManager.MATCH_DEFAULT_ONLY)?.activityInfo?.name != "dev.hermes.android.AuthReturnActivity")
         val monitor = instrumentation.addMonitor(CypherActivity::class.java.name, null, false)
         try {

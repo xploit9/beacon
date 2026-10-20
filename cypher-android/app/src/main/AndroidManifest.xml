@@ -38,7 +38,8 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="cypher" android:host="auth" android:path="/complete" />
+                <!-- Package-specific, so production, preview and stable never share a sign-in return link. -->
+                <data android:scheme="${applicationId}" android:host="auth" android:path="/complete" />
             </intent-filter>
         </activity>
         <!-- Installed launcher component remains a technical compatibility alias. -->

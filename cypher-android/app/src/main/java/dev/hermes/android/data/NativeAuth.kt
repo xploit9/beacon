@@ -359,14 +359,14 @@ class NativeAuth internal constructor(
         private const val MAX_RESPONSE_BYTES = 32 * 1024
         private const val MAX_HEADER_LINE_CHARS = 8_192
         private const val MAX_HEADER_LINES = 32
-        private const val AUTH_RETURN_URI = "cypher://auth/complete"
+        private const val AUTH_RETURN_URI = "${dev.hermes.android.BuildConfig.APPLICATION_ID}://auth/complete"
         private const val TIMEOUT_MESSAGE = "Hermes sign-in timed out. Try again."
         private const val NETWORK_ERROR_MESSAGE = "Couldn't reach Hermes. Check Tailscale or VPN, then try again."
         private const val GENERIC_ERROR_MESSAGE = "Sign-in didn't finish. Try again."
         private const val RESUME_CANCEL_MESSAGE = "Sign-in wasn't finished. Tap Sign in with Hermes to try again."
         private const val DECLINED_MESSAGE = "Hermes sign-in was declined. Try again."
         private const val INVALID_CALLBACK_MESSAGE = "This sign-in callback was not accepted. Return to Cypher and try again."
-        private const val CALLBACK_HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>Sign-in complete</title><style>:root{color-scheme:light dark;font:16px system-ui,sans-serif;background:#0C1014;color:#F4EEE5}body{margin:0;min-height:100vh;display:grid;place-items:center}main{max-width:26rem;padding:2rem}a{display:inline-block;margin-top:1rem;padding:.8rem 1rem;border-radius:.8rem;background:#E7B579;color:#0C1014;text-decoration:none;font-weight:600}@media(prefers-color-scheme:light){:root{background:#F4EEE5;color:#20272D}a{background:#80511D;color:#F4EEE5}}</style></head><body><main><h1>Sign-in complete</h1><p>Return to Cypher to finish signing in.</p><a href="cypher://auth/complete">Return to Cypher</a></main></body></html>"""
+        private const val CALLBACK_HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>Sign-in complete</title><style>:root{color-scheme:light dark;font:16px system-ui,sans-serif;background:#0C1014;color:#F4EEE5}body{margin:0;min-height:100vh;display:grid;place-items:center}main{max-width:26rem;padding:2rem}a{display:inline-block;margin-top:1rem;padding:.8rem 1rem;border-radius:.8rem;background:#E7B579;color:#0C1014;text-decoration:none;font-weight:600}@media(prefers-color-scheme:light){:root{background:#F4EEE5;color:#20272D}a{background:#80511D;color:#F4EEE5}}</style></head><body><main><h1>Sign-in complete</h1><p>Return to Cypher to finish signing in.</p><a href="$AUTH_RETURN_URI">Return to Cypher</a></main></body></html>"""
         private val DARK_TAB_TOOLBAR = Color.rgb(21, 28, 34)
         private val LIGHT_TAB_TOOLBAR = Color.rgb(236, 231, 222)
         private val DARK_TAB_NAVIGATION = Color.rgb(12, 16, 20)

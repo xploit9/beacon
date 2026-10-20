@@ -98,7 +98,7 @@ class NativeAuthTest {
             val response = sendCallback(server.localPort, "/callback?code=one-time&state=expected")
             assertEquals("one-time", result.get(5, TimeUnit.SECONDS))
             val location = response.lineSequence().firstOrNull { it.startsWith("Location:", ignoreCase = true) }?.substringAfter(':')?.trim()
-            assertEquals("cypher://auth/complete", location)
+            assertEquals("${dev.hermes.android.BuildConfig.APPLICATION_ID}://auth/complete", location)
             assertFalse(location.orEmpty().contains('?'))
             assertTrue(response.contains("Content-Type: text/html"))
             assertTrue(response.contains("Cache-Control: no-store"))

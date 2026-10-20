@@ -55,9 +55,12 @@ internal suspend fun testVoiceProvider(provider:String,apiKey:String,model:Strin
     } catch(error:CancellationException) { throw error }
     catch(_:Exception) { VoiceProviderTestResult.Unreachable
     } finally {
-        http.dispatcher.cancelAll()
-        http.connectionPool.evictAll()
-        http.dispatcher.executorService.shutdown()
+        // Closing a pooled TLS socket writes to the network, which Android forbids on the main thread.
+        withContext(NonCancellable + Dispatchers.IO) {
+            http.dispatcher.cancelAll()
+            http.connectionPool.evictAll()
+            http.dispatcher.executorService.shutdown()
+        }
     }
 }
 
@@ -523,7 +526,9 @@ internal class DirectVoice(private val client:CypherClient,private val callId:St
         val localJobs=synchronized(toolJobs) { toolJobs.filterValues { id -> synchronized(toolReceipts) { directToolMayCancel(toolReceipts[id]?.optString("status")) } }.keys.toList() }
         localJobs.forEach(Job::cancel)
         // Drain native events until the service closes this client after accepted writes settle.
-        socket?.cancel();run?.cancel();polling?.cancel();gatewayPolling?.cancel();microphone.close();controls.close();visualFrames.cancel();providerHttp.dispatcher.executorService.shutdown();providerHttp.connectionPool.evictAll()
+        socket?.cancel();run?.cancel();polling?.cancel();gatewayPolling?.cancel();microphone.close();controls.close();visualFrames.cancel();providerHttp.dispatcher.executorService.shutdown()
+        // close() can run on the main thread; evicting pooled TLS sockets writes to the network.
+        kotlin.concurrent.thread(name = "cypher-voice-close") { providerHttp.connectionPool.evictAll() }
         return disposition
     }
 }
