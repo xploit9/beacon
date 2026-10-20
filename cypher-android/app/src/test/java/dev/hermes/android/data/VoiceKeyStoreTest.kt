@@ -43,6 +43,21 @@ class VoiceKeyStoreTest {
         assertFalse(storage.containsKey("key.gemini"))
     }
 
+    @Test fun everyProvidersKeyStaysEncryptedAndSavedWhileSwitchingProviders() {
+        store.saveKey("grok", "fixture-grok-key-1111")
+        store.saveKey("gemini", "fixture-gemini-key-2222")
+        store.saveKey("openai", "fixture-openai-key-3333")
+        listOf("gemini", "openai", "grok", "gemini").forEach { store.setSelection(store.settings(it)) }
+        val reopened = VoiceKeyStore(storage, ::encrypt, ::decrypt)
+        assertEquals("fixture-grok-key-1111", reopened.key("grok"))
+        assertEquals("fixture-gemini-key-2222", reopened.key("gemini"))
+        assertEquals("fixture-openai-key-3333", reopened.key("openai"))
+        // Only ciphertext is stored, and each key is bound to its own provider.
+        assertTrue(storage.values.none { it.contains("fixture-") })
+        storage["key.grok"] = storage.getValue("key.gemini")
+        assertNull(reopened.key("grok"))
+    }
+
     @Test fun localProviderModelVoiceAndPersonalitySurviveAStoreReopen() {
         store.setSelection(VoicePreferences("openai", "gpt-realtime-2.1", "marin", "warm"))
         val reopened = VoiceKeyStore(storage, ::encrypt, ::decrypt)

@@ -300,6 +300,8 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
     LaunchedEffect(selection.provider) {
         keyMask=withContext(Dispatchers.IO) { store.maskedKey(selection.provider).orEmpty() }
     }
+    // A key typed here is never lost: it is saved (encrypted, per provider) on switch, Test or leaving the screen.
+    DisposableEffect(Unit) { onDispose { if(draft.isNotBlank()) runCatching { store.saveKey(selection.provider,draft) } } }
 
     LaunchedEffect(selection.provider,catalogRefresh) {
         val apiKey=withContext(Dispatchers.IO) { store.key(selection.provider) }
@@ -346,8 +348,13 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                     modifier=Modifier.fillMaxWidth().testTag("voice-model-$id").selectable(selected=selection.provider==id,role=Role.RadioButton,onClick={
                         if(selection.provider!=id&&!busy) {
                             val next=store.settings(id)
+                            val typed=draft.trim()
+                            val leaving=selection.provider
                             draft=""
                             status=""
+                            if(typed.isNotEmpty()) scope.launch {
+                                if(runCatchingCancellable { withContext(Dispatchers.IO) { store.saveKey(leaving,typed) } }.isFailure) status="That key couldn't be saved. Check it and try again."
+                            }
                             saveSelection(next)
                         }
                     }),
@@ -377,20 +384,22 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                     scope.launch {
                         val apiKey=entered.ifBlank { withContext(Dispatchers.IO) { store.key(provider).orEmpty() } }
                         if(apiKey.isBlank()) { status="Enter an API key first.";busy=false;return@launch }
+                        val newlySaved=entered.isNotBlank()&&runCatchingCancellable { withContext(Dispatchers.IO) { store.saveKey(provider,apiKey) } }.isSuccess
+                        if(entered.isNotBlank()&&!newlySaved) { status="That key couldn't be saved. Check it and try again.";busy=false;return@launch }
+                        if(newlySaved) {
+                            draft=""
+                            keyMask=withContext(Dispatchers.IO) { store.maskedKey(provider).orEmpty() }
+                            catalogRefresh++
+                        }
+                        val saved=if(newlySaved) "Key saved. " else ""
                         when(testVoiceProvider(provider,apiKey,model)) {
                             dev.hermes.android.voice.VoiceProviderTestResult.Success -> {
-                                val saved=runCatchingCancellable { if(entered.isNotBlank()) withContext(Dispatchers.IO) { store.saveKey(provider,apiKey) };true }.getOrDefault(false)
-                                if(saved) {
-                                    draft=""
-                                    keyMask=withContext(Dispatchers.IO) { store.maskedKey(provider).orEmpty() }
-                                    catalogRefresh++
-                                    status="Connection succeeded. The key is stored on this phone."
-                                    onKeySaved()
-                                } else status="Connection succeeded, but the key could not be saved."
+                                status="Connection succeeded. The key is stored on this phone."
+                                onKeySaved()
                             }
-                            dev.hermes.android.voice.VoiceProviderTestResult.KeyRejected -> status="The provider rejected this key. Check the key and account access."
-                            dev.hermes.android.voice.VoiceProviderTestResult.Unreachable -> status="The provider could not be reached. Check your connection and try again."
-                            dev.hermes.android.voice.VoiceProviderTestResult.ProviderError -> status="The provider responded with an error. Check the selected model or try again."
+                            dev.hermes.android.voice.VoiceProviderTestResult.KeyRejected -> status=saved+"The provider rejected this key. Check the key and account access."
+                            dev.hermes.android.voice.VoiceProviderTestResult.Unreachable -> status=saved+"The provider could not be reached. Check your connection and try again."
+                            dev.hermes.android.voice.VoiceProviderTestResult.ProviderError -> status=saved+"The provider responded with an error. Check the selected model or try again."
                         }
                         busy=false
                     }
