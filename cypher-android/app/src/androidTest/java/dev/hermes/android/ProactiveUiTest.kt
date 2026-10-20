@@ -143,7 +143,7 @@ class ProactiveUiTest {
         compose.runOnIdle { vm.tab("Cypher") }
         await { vm.ui.value.tab == "Cypher" && vm.ui.value.profile == "coder" && vm.chat.value.projectionReady }
         await { vm.data.value[proactiveKey(fixture)]?.has("enabled") == true }
-        compose.onNodeWithText("Let Cypher flag important emails").assertExists()
+        await { compose.onAllNodesWithText("Let Cypher flag important emails").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithTag("proactive-prompt-settings").performClick()
         await { vm.ui.value.tab == "More" && vm.ui.value.morePage == "Assistant" }
         // The profile label depends on cached display names; this test only checks it lands on the email settings.
