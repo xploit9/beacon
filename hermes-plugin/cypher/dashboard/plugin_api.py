@@ -580,14 +580,26 @@ def _notices_after(owner,profile,after):
 def notice_preview(kind):
     if kind=='release': return 'Cypher update available','Open Cypher to install the latest verified update.'
     if kind=='test': return 'Cypher notification test','Synthetic test. Seeing this notification confirms arrival on this phone.'
-    if kind=='approval': return 'Approval needed','Open Cypher to review the native request.'
-    if kind=='clarify': return 'Question for you','Answer the native question or open Cypher to review it.'
-    if kind=='working': return 'Cypher working','Your native Hermes session is working.'
+    if kind=='approval': return 'Approval needed','Open Cypher to review the request.'
+    if kind=='clarify': return 'Question for you','Answer here or open Cypher.'
+    if kind=='working': return 'Cypher working','Hermes is working on your chat.'
     if kind=='activity_end': return 'Activity ended','Open Cypher to review your session.'
     if kind=='task_result': return 'Task finished','A task finished.'
-    if kind=='failure': return 'Cypher work failed','Open Cypher to review the native session error.'
+    if kind=='failure': return 'Cypher work failed','Open Cypher to see what went wrong.'
     if kind=='completion': return 'Reply ready','A reply is ready.'
     return 'Cypher calling','Open Cypher to hear the saved result.'
+def reply_preview(messages,limit=300):
+    """The newest assistant reply as one plain line for a notification."""
+    for message in reversed(messages):
+        if not isinstance(message,dict) or message.get('role')!='assistant': continue
+        content=message.get('content')
+        if isinstance(content,list): content=' '.join(part.get('text','') for part in content if isinstance(part,dict))
+        if not isinstance(content,str) or not content.strip(): continue
+        text=re.sub(r'```.*?```',' ',content,flags=re.S)
+        text=re.sub(r'[*_`#>]+','',text)
+        text=' '.join(text.split())
+        return text[:limit-1]+'…' if len(text)>limit else text
+    return ''
 def notice_wire(row,owner,key=None):
     state='expired' if row['state']=='pending' and row['expires']<=time.time() else row['state']
     title,body=notice_preview(row['kind'])
@@ -601,6 +613,13 @@ async def notice_detail(event_id:str,request:Request):
         row=conn.execute('SELECT * FROM notices WHERE id=? AND owner=? AND profile=?',(event_id,owner,profile)).fetchone()
     if not row: raise HTTPException(404,'Owned notification unavailable')
     result=notice_wire(dict(row),owner)
+    if row['kind']=='completion' and row['conversation']:
+        # The notification shows what the reply says; Android's lock-screen setting still hides it when locked.
+        try:
+            snapshot=await feature(native.conversation_snapshot,owner,provider,profile,row['conversation'],timeout=6)
+            reply=reply_preview(snapshot.get('messages') or [])
+            if reply: result['preview']={'title':str(snapshot.get('title') or 'Reply ready')[:120],'body':reply}
+        except Exception: pass  # the generic text stays
     if row['request_id'] and result['state']=='pending':
         frame=await asyncio.to_thread(safely,activity.pending,native,owner,provider,profile,dict(row))
         result['actions']=activity.request_actions(frame)

@@ -11,8 +11,8 @@ import dev.hermes.android.data.*
 import kotlinx.coroutines.*
 import org.json.JSONObject
 fun notificationFallback(kind: String): Pair<String, String> = when (kind) {
-    "working" -> "Cypher · Working" to "Your native Hermes session is working."
-    "failure" -> "Cypher · Work failed" to "Open Cypher to review the native session error."
+    "working" -> "Cypher · Working" to "Hermes is working on your chat."
+    "failure" -> "Cypher · Work failed" to "Open Cypher to see what went wrong."
     "completion" -> "Cypher · Reply ready" to "A chat reply is ready. Open Cypher to read it."
     "approval" -> "Cypher · Approval needed" to "A chat needs your approval before continuing."
     "clarify" -> "Cypher · Question for you" to "A chat needs your answer before continuing."
