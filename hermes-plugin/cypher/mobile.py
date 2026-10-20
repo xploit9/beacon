@@ -571,7 +571,8 @@ def voice_history(owner,profile,stored,limit=200,text_budget=1024*1024):
     with connect() as conn:
         calls=conn.execute("SELECT id,created FROM calls c WHERE owner=? AND profile=? AND conversation=? AND EXISTS(SELECT 1 FROM timeline t WHERE t.call_id=c.id AND json_extract(t.payload,'$.type')='transcript') ORDER BY created DESC,id DESC LIMIT ?",(owner,profile,stored,limit+1)).fetchall()
         for call_index,call in enumerate(calls):
-            groups=conn.execute("SELECT json_extract(payload,'$.role') AS role,json_extract(payload,'$.turn_id') AS turn,MAX(json_extract(payload,'$.at_ms')) AS last_at FROM timeline WHERE call_id=? AND json_extract(payload,'$.type')='transcript' GROUP BY role,turn ORDER BY last_at DESC,role,turn LIMIT ?",(call['id'],limit+1)).fetchall()
+            # A turn sits where it began: speech transcription can finalize after the reply has started.
+            groups=conn.execute("SELECT json_extract(payload,'$.role') AS role,json_extract(payload,'$.turn_id') AS turn,MIN(json_extract(payload,'$.at_ms')) AS first_at FROM timeline WHERE call_id=? AND json_extract(payload,'$.type')='transcript' GROUP BY role,turn ORDER BY first_at DESC,role,turn LIMIT ?",(call['id'],limit+1)).fetchall()
             for group in groups:
                 if len(output)>=limit: truncated=True;break
                 params=(call['id'],group['role'],group['turn'])
@@ -593,7 +594,7 @@ def voice_history(owner,profile,stored,limit=200,text_budget=1024*1024):
                 interrupted=bool(event.get('interrupted'))
                 if group['role']=='assistant' and not interrupted:
                     interrupted=bool(conn.execute("SELECT 1 FROM timeline WHERE call_id=? AND json_extract(payload,'$.type')='interruption' AND json_extract(payload,'$.turn_id') IS ? LIMIT 1",(call['id'],group['turn'])).fetchone())
-                output.append({'call_id':call['id'],'event_id':call['id']+':'+group['role']+':'+str(group['turn'] or 'none'),'session_id':stored,'role':group['role'],'text':text,'final':is_final,'interrupted':interrupted,'at_ms':event['at_ms'],'created_at':call['created']+event['at_ms']/1000})
+                output.append({'call_id':call['id'],'event_id':call['id']+':'+group['role']+':'+str(group['turn'] or 'none'),'session_id':stored,'role':group['role'],'text':text,'final':is_final,'interrupted':interrupted,'at_ms':event['at_ms'],'created_at':call['created']+(group['first_at'] or 0)/1000})
                 if remaining<=0: truncated=True;break
             if len(output)>=limit or remaining<=0:
                 if call_index+1<len(calls): truncated=True

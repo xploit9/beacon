@@ -709,6 +709,17 @@ def test_owned_voice_history_reopens_dedupes_and_scopes(harness):
     assert c.get(url).json()==result.json()
     c.headers['x-fixture-owner']='foreign';assert c.get(url).status_code==403
 
+def test_voice_history_orders_turns_by_when_they_began(harness):
+    api,c,cfg,tmp,app=harness;cid=reserve(c)
+    # The question starts first, but its transcript finalizes after the assistant's "Checking..." filler.
+    api.mobile.events(cid,'owner',{'events':[
+        {'event_id':'q1','turn_id':'u1','type':'transcript','role':'user','text':'What is on','final':False,'at_ms':1000},
+        {'event_id':'f1','turn_id':'a1','type':'transcript','role':'assistant','text':'Checking your calendar.','final':True,'at_ms':2500},
+        {'event_id':'q2','turn_id':'u1','type':'transcript','role':'user','text':'What is on my calendar?','final':True,'at_ms':3000}]})
+    rows=api.mobile.voice_history('owner','default','native-stored')['events']
+    assert [r['text'] for r in rows]==['What is on my calendar?','Checking your calendar.']
+
+
 def test_voice_history_truncates_latest_groups_and_text(harness):
     api,c,cfg,tmp,app=harness;cid=reserve(c)
     for offset in range(0,205,64):
