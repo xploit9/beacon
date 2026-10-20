@@ -64,6 +64,8 @@ If Hermes asks to install Python dependencies, explain the packages and wait for
 
 Identify how this dashboard instance is running (foreground process, Windows service/task, systemd, launchd, or container). Ask the user before restarting it. After approval, restart only the selected dashboard instance using its existing platform manager or launch command; do not restart unrelated Hermes services.
 
+The dashboard serves the plugin's phone routes, and it is often a separate process from the gateway: `hermes gateway restart` alone leaves the old plugin running there. After restarting, confirm that the process listening on the dashboard port started after the install.
+
 From the dashboard's authenticated browser session, verify that:
 
 - The dashboard is reachable.
