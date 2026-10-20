@@ -42,14 +42,16 @@ def find_tool(name, explicit=None):
         path=Path(configured).expanduser()
         if path.is_file(): return str(path)
         raise ReleaseMetadataError(f'{env_name} does not point to a file.')
-    executable=name+('.exe' if os.name=='nt' else '')
+    # Windows SDKs ship aapt.exe but apksigner.bat.
+    executables=(name+'.exe',name+'.bat') if os.name=='nt' else (name,)
     for sdk in (os.environ.get('ANDROID_SDK_ROOT'),os.environ.get('ANDROID_HOME')):
         if not sdk: continue
         roots=Path(sdk)/'build-tools'
         if roots.is_dir():
             for version in sorted((item for item in roots.iterdir() if item.is_dir()),key=_build_tools_key,reverse=True):
-                candidate=version/executable
-                if candidate.is_file(): return str(candidate)
+                for executable in executables:
+                    candidate=version/executable
+                    if candidate.is_file(): return str(candidate)
     found=shutil.which(name)
     if found: return found
     raise ReleaseMetadataError(f'{name} was not found; set ANDROID_SDK_ROOT or pass --{name}.')

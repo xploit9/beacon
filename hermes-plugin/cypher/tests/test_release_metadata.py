@@ -50,3 +50,12 @@ def test_release_script_refuses_a_production_apk(tmp_path,monkeypatch):
 
     with pytest.raises(module.ReleaseMetadataError,match='not the Cypher stable package'):
         module.metadata_for_apk(apk,str(aapt),str(signer))
+
+
+def test_release_script_finds_the_windows_apksigner_batch_file(tmp_path,monkeypatch):
+    module=_script()
+    tools=tmp_path/'sdk'/'build-tools'/'36.0.0';tools.mkdir(parents=True);(tools/'apksigner.bat').touch()
+    monkeypatch.setattr(module.os,'name','nt')
+    monkeypatch.setenv('ANDROID_SDK_ROOT',str(tmp_path/'sdk'));monkeypatch.delenv('ANDROID_HOME',raising=False);monkeypatch.delenv('APKSIGNER',raising=False)
+
+    assert module.find_tool('apksigner')==str(tools/'apksigner.bat')
