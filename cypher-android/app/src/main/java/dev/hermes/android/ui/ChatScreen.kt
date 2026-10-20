@@ -378,6 +378,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
         assistantLabelMessageIds(visibleMessages.map { it.value }, dayStarts.keys, callMessagesById.keys)
     }
     val messageIds = remember(visibleMessages) { visibleMessages.map { it.value.id } }
+    val ids by rememberUpdatedState(messageIds)
     val list = key(ui.origin, ui.owner, ui.profile, chat.sessionId, chat.projectionReady) {
         val start = initialConversationPosition(messageIds, chat.anchorId, chat.anchor, chat.anchorOffset)
         rememberLazyListState(initialFirstVisibleItemIndex = start.first, initialFirstVisibleItemScrollOffset = start.second)
@@ -453,8 +454,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
             val current = vm.chat.value
             if (follow) { if (current.anchor > 0 || current.anchorOffset > 0 || current.anchorId.isNotBlank()) vm.anchor(0, 0, "") }
             else {
-                val shown = visibleTranscriptMessages(current.messages)
-                val id = shown.getOrNull(position.first)?.id ?: current.callMessages.getOrNull(position.first - shown.size)?.let { "call:${it.eventId}" }
+                val id = ids.getOrNull(position.first)
                 if (id != null) vm.anchor(position.first, position.second, id)
             }
         }

@@ -164,7 +164,7 @@ class DirectVoiceStartupTest {
                 val body=JSONObject(buffer.readUtf8())
                 assertEquals(300,body.getInt("delay_seconds"))
                 posts.incrementAndGet()
-                val receipt=json("status" to "scheduled","request_id" to body.getString("request_id"),"job_id" to "job", "scheduled_at" to "2026-10-16T20:00:00+04:00","timezone" to "Asia/Dubai","conversation_id" to if(mismatch) "foreign" else "stored")
+                val receipt=json("status" to "scheduled","request_id" to body.getString("request_id"),"job_id" to "job", "scheduled_at" to "2026-10-16T20:00:00+01:00","timezone" to "Europe/London","conversation_id" to if(mismatch) "foreign" else "stored")
                 Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(httpStatus).message("Fixture")
                     .body((if(httpStatus==200) receipt else json("detail" to if(httpStatus==409) "Choose delay_seconds or at" else "Unconfirmed cron provider failure")).toString().toResponseBody("application/json".toMediaType())).build()
             }

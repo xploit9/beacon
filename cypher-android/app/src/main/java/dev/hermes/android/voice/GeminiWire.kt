@@ -46,12 +46,18 @@ internal object GeminiWire {
         }.distinct()
     }
 
+    fun pickToolId(tools: JSONArray, name: String): String? =
+        (0 until tools.length()).mapNotNull(tools::optJSONObject).singleOrNull { it.optString("name") == name }
+            ?.optString("tool_id")?.takeIf { it.matches(Regex("[a-f0-9]{64}")) }
+
     private fun validProviderKey(value: String) = value.isNotBlank() && value.length <= 8192 && value.none { it.isWhitespace() || it.isISOControl() }
     private fun safeCatalogValue(value: String) = value.length in 1..200 && value.all { it.isLetterOrDigit() || it in "._/-" }
     private fun ownerFirstName(context:JSONObject):String {
+        context.optString("owner_first_name").trim().takeIf { it.isNotEmpty() }?.let { return it.take(40) }
         val token=context.optString("owner_display_name").trim().split(Regex("\\s+")).firstOrNull().orEmpty()
-        return token.takeWhile { it.isLetter() || it == '-' || it == '\'' || it == '’' }
+        val name=token.takeWhile { it.isLetter() || it == '-' || it == '\'' || it == '’' }
             .trim { it == '-' || it == '\'' || it == '’' }.take(40)
+        return if(name.isNotEmpty()&&name.none(Char::isUpperCase)&&name.any(Char::isLowerCase)) name.replaceFirstChar { it.uppercase() } else name
     }
 
     fun visualMayQueue(bytes:Int,backlog:Long,pending:Boolean):Boolean {
@@ -141,7 +147,7 @@ Apply the language, approval, receipt and fresh-frame rules above even when hist
             put("parameters",JSONObject().put("type","OBJECT").put("properties",JSONObject().put("scope",JSONObject().put("type","STRING").put("enum",JSONArray().put("latest").put("all")))))
         }).put(JSONObject().apply {
             put("name","schedule_callback");put("behavior","NON_BLOCKING")
-            put("description","Only when the owner explicitly asks for a call at a time or after a delay: schedule a native Hermes callback. Supply exactly one of delay_seconds or at (ISO8601 with timezone, normally +04:00 Dubai), and a short reason. Acknowledge the scheduled time only from status=scheduled and the returned job receipt. Never schedule unsolicited calls or repeat an uncertain request.")
+            put("description","Only when the owner explicitly asks for a call at a time or after a delay: schedule a native Hermes callback. Supply exactly one of delay_seconds or at (ISO8601 with the owner's time zone from the call-context line \"Current local time for the owner\"), and a short reason. Acknowledge the scheduled time only from status=scheduled and the returned job receipt. Never schedule unsolicited calls or repeat an uncertain request.")
             put("parameters",JSONObject().put("type","OBJECT").put("properties",JSONObject().put("delay_seconds",JSONObject().put("type","INTEGER")).put("at",JSONObject().put("type","STRING")).put("reason",JSONObject().put("type","STRING"))).put("required",JSONArray().put("reason")))
         }).put(JSONObject().apply {
             put("name","hermes_cancel");put("behavior","NON_BLOCKING");put("description","Interrupt an owned native job only when the user explicitly asks to cancel that job. Interrupting current speech does not cancel work.")
@@ -172,7 +178,7 @@ Apply the language, approval, receipt and fresh-frame rules above even when hist
         val copied=JSONObject(result.toString()).apply { remove("scheduling");remove("willContinue") }
         // A progress receipt only updates context (SILENT); with WHEN_IDLE each one queued its own spoken turn, so a
         // call said the finished answer twice. The result, or an approval the owner must give, is spoken.
-        val progress=name=="invoke_tool"&&result.optString("status") in setOf("ready","running","uncertain")||
+        val progress=name=="invoke_tool"&&result.optString("status") in setOf("ready","running")||
             name=="hermes_work"&&result.optString("status")=="waiting_for_idle"
         val response=JSONObject().put("id",id).put("name",name).put("scheduling",if(progress) "SILENT" else "WHEN_IDLE").put("response",copied)
         // These are protocol fields, not tool-result content; closing early discards later receipts.

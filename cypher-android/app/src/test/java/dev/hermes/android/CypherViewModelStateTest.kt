@@ -1,5 +1,6 @@
 package dev.hermes.android
 
+import dev.hermes.android.core.Scope
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
@@ -10,6 +11,14 @@ class CypherViewModelStateTest {
         assertNull(assistantConversationToAdopt("shared-chat", "shared-chat"))
         assertNull(assistantConversationToAdopt("phone-chat", ""))
         assertNull(assistantConversationToAdopt("phone-chat", null))
+    }
+
+    @Test fun registeredConversationOpensOnlyForTheOriginalChatInTheSameScope() {
+        val profile=Scope("https://hermes.example", "owner", "default")
+        assertEquals("shared-chat",assistantConversationToSelect(profile.session("phone-chat"),"phone-chat",profile,"phone-chat","shared-chat"))
+        assertNull(assistantConversationToSelect(profile.copy(profile="other").session("phone-chat"),"phone-chat",profile,"phone-chat","shared-chat"))
+        assertNull(assistantConversationToSelect(profile.session("other-chat"),"other-chat",profile,"phone-chat","shared-chat"))
+        assertNull(assistantConversationToSelect(profile.session("phone-chat"),"phone-chat",profile,"phone-chat","phone-chat"))
     }
 
     @Test fun serverRequestPromptIsShownAndAnExplicitNullPendingClearsIt() {

@@ -40,6 +40,11 @@ private const val LEGACY_CYPHER_TAB_VALUE = "Xara" // Replace the released assis
 internal fun migratedTab(tab: String) = if (tab == LEGACY_CYPHER_TAB_VALUE) "Cypher" else tab
 internal fun assistantConversationToAdopt(currentId: String, registeredId: String?): String? =
     registeredId?.takeIf { it.isNotBlank() && it != currentId }
+internal fun assistantConversationToSelect(openScope: Scope?, openSessionId: String, assistantScope: Scope, currentId: String, registeredId: String?): String? {
+    val open = openScope ?: return null
+    val shared = assistantConversationToAdopt(currentId, registeredId) ?: return null
+    return shared.takeIf { open.copy(session = "") == assistantScope.copy(session = "") && open.session == currentId && openSessionId == currentId }
+}
 
 data class Message(val id: String, val role: String, val text: String, val reasoning: String = "", val tools: List<JSONObject> = emptyList(), val attachments: List<JSONObject> = emptyList(), val mediaSnapshots: Map<String, String> = emptyMap(), val sessionId: String = "", val interrupted: Boolean = false, val voice: Boolean = false, val recordedAt: Long = 0L) {
     companion object {
@@ -1568,7 +1573,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private fun registerAssistantChat(c: CypherClient, id: String) {
         val key = c.scope.session(id).key
         if (!registeredAssistantChats.add(key)) return
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.Main.immediate) {
             val response = try {
                 withTimeoutOrNull(5_000L) { c.nativeRequest("/api/plugins/cypher/mobile/assistant-conversation", "PUT", json("profile" to c.scope.profile, "session_id" to id)) }
             } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
@@ -1578,8 +1583,10 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             }
             assistantConversationToAdopt(id, response.string("conversation_id"))?.let { shared ->
                 writeCypherSessionHandle(c.scope, shared)
+                optionalLocalSave { app.cache.write(c.scope, "cypher-session", shared, protected = true) }
                 if (client?.scope == c.scope) preparedCypher = c.scope to shared
                 registeredAssistantChats.add(c.scope.session(shared).key)
+                assistantConversationToSelect(sourceScope, _chat.value.sessionId, c.scope, id, shared)?.let { selectSession(it) }
             }
         }
     }

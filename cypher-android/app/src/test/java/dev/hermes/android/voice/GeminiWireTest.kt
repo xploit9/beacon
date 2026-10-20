@@ -84,6 +84,12 @@ class GeminiWireTest {
         val named=(0 until functions.length()).associate { functions.getJSONObject(it).getString("name") to functions.getJSONObject(it) }
         assertTrue(named.keys.containsAll(listOf("discover_tools","invoke_tool","tool_status","get_visual_state","hermes_work")))
         assertTrue(named.getValue("discover_tools").getString("description").contains("enabled native Hermes and connected MCP tools"))
+        val scheduleDescription=named.getValue("schedule_callback").getString("description")
+        assertTrue(scheduleDescription.contains("Current local time for the owner"))
+        assertFalse(scheduleDescription.contains("Dubai"))
+        val ownerClock="Current local time for the owner: Friday 16 October 2026, 10:00 (Europe/London)"
+        val localSetup=GeminiWire.setup("model","",null,org.json.JSONObject().put("system_instruction",ownerClock)).getJSONObject("setup")
+        assertTrue(localSetup.getJSONObject("systemInstruction").toString().contains(ownerClock))
         assertTrue(named.getValue("hermes_work").getString("description").contains("Direct native Hermes and MCP tools"))
         assertFalse(named.keys.any { it.contains("decision") || it.contains("approve") })
         assertEquals(setOf("tool_id","arguments"),named.getValue("invoke_tool").getJSONObject("parameters").getJSONObject("properties").keys().asSequence().toSet())
@@ -109,6 +115,7 @@ class GeminiWireTest {
         assertEquals("WHEN_IDLE", response("needs_approval").getString("scheduling"))
         assertEquals("WHEN_IDLE", response("completed").getString("scheduling"))
         assertTrue(response("uncertain").getBoolean("willContinue"))
+        assertEquals("WHEN_IDLE", response("uncertain").getString("scheduling"))
         assertFalse(response("completed").getBoolean("willContinue"))
         assertFalse(response("denied").getBoolean("willContinue"))
         assertEquals("same-id",response("completed").getString("id"))
@@ -131,6 +138,24 @@ class GeminiWireTest {
         val prompt=setup.getJSONObject("systemInstruction").getJSONArray("parts").getJSONObject(0).getString("text")
         assertTrue(prompt.contains("Speak warmly and patiently."))
         assertTrue(prompt.contains("all tool and approval rules above still apply"))
+    }
+
+    @Test fun ownerFirstNamePrefersTheServerFieldAndCapitalizesLegacyLowercaseNames() {
+        fun prompt(context:org.json.JSONObject)=GeminiWire.setup("model","",null,context).getJSONObject("setup")
+            .getJSONObject("systemInstruction").getJSONArray("parts").getJSONObject(0).getString("text")
+        assertTrue(prompt(org.json.JSONObject().put("owner_first_name","Maya").put("owner_display_name","Riley Example")).contains("authenticated owner Maya"))
+        assertTrue(prompt(org.json.JSONObject().put("owner_display_name","maya example")).contains("authenticated owner Maya"))
+        assertTrue(prompt(org.json.JSONObject().put("owner_display_name","deShawn Lee")).contains("authenticated owner deShawn"))
+    }
+
+    @Test fun discoveredToolNameMustHaveOneExactCatalogMatch() {
+        val id="a".repeat(64)
+        val tools=org.json.JSONArray().put(org.json.JSONObject().put("name","read_file").put("tool_id",id))
+            .put(org.json.JSONObject().put("name","read_files").put("tool_id","b".repeat(64)))
+        assertEquals(id,GeminiWire.pickToolId(tools,"read_file"))
+        assertNull(GeminiWire.pickToolId(tools,"read"))
+        tools.put(org.json.JSONObject().put("name","read_file").put("tool_id","c".repeat(64)))
+        assertNull(GeminiWire.pickToolId(tools,"read_file"))
     }
 
     @Test fun aRefusedToolCallSaysWhyAndCanBeCorrected() {

@@ -46,7 +46,7 @@ import kotlinx.coroutines.launch
             if (capability == null) LinearProgressIndicator(Modifier.fillMaxWidth())
             else if (recordError(capability).isNotBlank()) { Text(recordError(capability), color = MaterialTheme.colorScheme.error); TextButton(onClick = refresh) { Text("Retry task setup status") } }
 
-            OutlinedButton(enabled = capability?.optBoolean("checkups_ready") == true, onClick = { vm.openForm(ActionForm("Create check-up task", "/api/plugins/cypher/mobile/tasks/checkups", emptyList(), explanation = "Create an ordinary native schedule. 3–4 random opportunities daily from 10:00 through before 22:00 Asia/Dubai; no missed-slot catch-up. Android call permission, quiet and DND policy still apply.", actionLabel = "Create task", onResult = { refresh() })) }) { Text("Create check-up task") }
+            OutlinedButton(enabled = capability?.optBoolean("checkups_ready") == true, onClick = { vm.openForm(ActionForm("Create check-up task", "/api/plugins/cypher/mobile/tasks/checkups", emptyList(), explanation = "Create an ordinary native schedule. 3–4 random opportunities daily from 10:00 to before 22:00 in your local time zone; no missed-slot catch-up. Android call permission, quiet and DND policy still apply.", actionLabel = "Create task", onResult = { refresh() })) }) { Text("Create check-up task") }
             if (capability != null && recordError(capability).isBlank() && !capability.optBoolean("checkups_ready")) Text("Set up scheduled callbacks on your computer to enable check-up calls.", style = MaterialTheme.typography.bodySmall)
             }
         }

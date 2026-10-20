@@ -348,8 +348,7 @@ internal class DirectVoice(private val client:CypherClient,private val callId:St
         val found=try { withTimeoutOrNull(8000) { gatewayRequests.withPermit { gateway.discover(name) } } }
             catch(error:CancellationException) { throw error } catch(_:Exception) { null } ?: return null
         val tools=found.optJSONArray("tools") ?: return null
-        return (0 until tools.length()).mapNotNull(tools::optJSONObject).singleOrNull { it.optString("name")==name }
-            ?.optString("tool_id")?.takeIf { it.matches(Regex("[a-f0-9]{64}")) }
+        return GeminiWire.pickToolId(tools,name)
     }
     private suspend fun toolResponse(id:String,name:String,result:JSONObject):Boolean {
         if(stopped) return false
@@ -454,7 +453,7 @@ internal class DirectVoice(private val client:CypherClient,private val callId:St
                 val args=JSONObject(call.getJSONObject("args").toString()).put("request_id",requestId)
                 if(!claimMutation(id)) JSONObject().put("status","not_sent") else {
                     val receipt=client.nativeRequest("/api/plugins/cypher/mobile/calls/$callId/schedule-callback","POST",args)
-                    require(receipt.optString("status")=="scheduled"&&receipt.optString("request_id")==requestId&&receipt.optString("conversation_id")==selectedSession&&receipt.optString("job_id").isNotBlank()&&receipt.optString("scheduled_at").isNotBlank()&&receipt.optString("timezone")=="Asia/Dubai") { "Callback receipt identity mismatch" }
+                    require(receipt.optString("status")=="scheduled"&&receipt.optString("request_id")==requestId&&receipt.optString("conversation_id")==selectedSession&&receipt.optString("job_id").isNotBlank()&&receipt.optString("scheduled_at").isNotBlank()) { "Callback receipt identity mismatch" }
                     receipt
                 }
             } else if(name=="hermes_callback") {
