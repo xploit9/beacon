@@ -620,6 +620,10 @@ async def notice_detail(event_id:str,request:Request):
             reply=reply_preview(snapshot.get('messages') or [])
             if reply: result['preview']={'title':str(snapshot.get('title') or 'Reply ready')[:120],'body':reply}
         except Exception: pass  # the generic text stays
+    if row['kind']=='task_result':
+        with mobile.connect() as conn:
+            email_alert=conn.execute('SELECT 1 FROM meta WHERE key=?',('proactive-email-notice:'+event_id,)).fetchone() is not None
+        if email_alert: result.update(email_alert=True,preview={'title':'Important email','body':result['preview']['body']})
     if row['request_id'] and result['state']=='pending':
         frame=await asyncio.to_thread(safely,activity.pending,native,owner,provider,profile,dict(row))
         result['actions']=activity.request_actions(frame)

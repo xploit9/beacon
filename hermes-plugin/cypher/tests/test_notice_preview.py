@@ -26,3 +26,18 @@ def test_completion_notice_detail_carries_the_reply(harness, monkeypatch):
                      (event, "owner", "default", "completion", "native-stored", time.time(), time.time() + 300))
     detail = client.get(f"/api/plugins/cypher/mobile/notifications/events/{event}").json()
     assert detail["preview"] == {"title": "Weekend in Lisbon", "body": "Here is a two-day plan."}
+
+
+def test_email_alert_notice_detail_says_important_email(harness):
+    import time
+    api, client, _, _, _ = harness
+    event = "e" * 32
+    with api.mobile.connect() as conn:
+        conn.execute("INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason) VALUES(?,?,?,?,?,?,?,?)",
+                     (event, "owner", "default", "task_result", "native-stored", time.time(), time.time() + 300,
+                      "Daniel moved the client review to 09:00 tomorrow"))
+        conn.execute("INSERT INTO meta(key,value) VALUES(?,?)", ("proactive-email-notice:" + event, b"1"))
+    detail = client.get(f"/api/plugins/cypher/mobile/notifications/events/{event}").json()
+    assert detail["email_alert"] is True
+    assert detail["preview"] == {"title": "Important email", "body": "Daniel moved the client review to 09:00 tomorrow"}
+
