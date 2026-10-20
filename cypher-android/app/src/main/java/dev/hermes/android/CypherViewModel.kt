@@ -264,6 +264,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private val persistedDrafts = mutableMapOf<String, String>()
     private val initialShells = mutableMapOf<String, String>()
     private val clientCreatedSessions = mutableSetOf<String>()
+    private val registeredAssistantChats = java.util.Collections.synchronizedSet(mutableSetOf<String>())
     private val initialCreateAttempts = mutableMapOf<String, String>()
     private val newChatJobs = mutableMapOf<String, Job>()
     private val initialCreateError = "Conversation opening failed or was not confirmed. Your draft is safe. Retry to open an empty conversation."
@@ -1560,10 +1561,22 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             }
         }
     }
+    /** Alerts and calls go to the Cypher chat: tell the plugin which one, once per run. Hermes saves a chat only at its
+     *  first message, so an unsaved chat is registered again after its first prompt or on a later run. */
+    private fun registerAssistantChat(c: CypherClient, id: String) {
+        val key = c.scope.session(id).key
+        if (!registeredAssistantChats.add(key)) return
+        viewModelScope.launch {
+            val registered = try {
+                withTimeoutOrNull(5_000L) { c.nativeRequest("/api/plugins/cypher/mobile/assistant-conversation", "PUT", json("profile" to c.scope.profile, "session_id" to id)) } != null
+            } catch (e: CancellationException) { throw e } catch (_: Exception) { false }
+            if (!registered) registeredAssistantChats.remove(key)
+        }
+    }
     private suspend fun resolveCypher(c: CypherClient, fixed: AppPreferences, current: () -> Boolean): String = cypherResolveLock.withLock {
         preparedCypher?.takeIf { it.first == c.scope }?.let { return@withLock it.second }
         val bound = readCypherSession(c.scope)
-        if (!bound.isNullOrBlank()) { require(current()) { "Account changed while preparing Cypher" }; preparedCypher = c.scope to bound; return@withLock bound }
+        if (!bound.isNullOrBlank()) { require(current()) { "Account changed while preparing Cypher" }; preparedCypher = c.scope to bound; registerAssistantChat(c, bound); return@withLock bound }
         require(readCypherOpening(c.scope) == null) { "Cypher opening outcome is unknown. Review history before creating another conversation." }
         currentCoroutineContext().ensureActive()
         require(current()) { "Account changed while preparing Cypher" }
@@ -2269,6 +2282,10 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             val provider = queued?.provider ?: _chat.value.raw.string("model_provider")
             val o = c.post("/api/chat/start", json("session_id" to scope.session, "message" to d.text, "attachments" to JSONArray(d.attachments), "profile" to scope.profile, "client_request_id" to send.id, "model" to model.ifBlank { null }, "model_provider" to provider.ifBlank { null }, "explicit_model_pick" to (queued != null || saved.get<Boolean>("model_pick:${scope.key}") == true)))
             accepted(scope, c, o, send)
+            if (readCypherSessionHandle(scope.copy(session = "")) == scope.session) viewModelScope.launch {
+                delay(3_000)
+                client?.takeIf { it.scope == scope.copy(session = "") }?.let { registerAssistantChat(it.detached(), scope.session) }
+            }
         } catch (e: Throwable) { if (e is CancellationException) throw e; if (e is ApiFailure && e.status == 409) { try { reconcile(scope, c) } catch (receiptError: Throwable) { if (receiptError is CancellationException) throw receiptError; if (sourceScope == scope) fail(receiptError) }; return@launch }; if (e is ApiFailure && e.status in 400..499 && e.status !in setOf(408, 429)) { pending.remove(scope.key, send); optionalLocalSave { app.cache.delete(scope, "pending", send.encode()) }; if (sourceScope == scope && pending[scope.key] == null) _chat.update { it.copy(uncertain = "", status = "") } }; if (sourceScope == scope && _chat.value.uncertain == send.id) _chat.update { it.copy(status = "Send outcome unknown") }; if (sourceScope == scope) fail(e) }
     }
     private suspend fun accepted(scope: Scope, c: CypherClient, result: JSONObject, send: PendingSend) {

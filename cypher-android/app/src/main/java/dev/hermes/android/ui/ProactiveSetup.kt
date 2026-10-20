@@ -87,6 +87,8 @@ internal fun proactiveHealthText(proactive: JSONObject): String {
 
 internal fun proactiveErrorMessage(error: Throwable, fallback: String): String =
     cypherOwnerSetupMessage(error)
+        ?: if ((error as? ApiFailure)?.message == "Choose an owned assistant conversation before enabling Proactive")
+            "Send ${dev.hermes.android.data.currentAssistantName} a message first, then turn this on." else null
         ?: if (isMissingCypherPluginRoute(error)) "Update the Cypher plugin on Hermes to use Proactive."
         else (error as? ApiFailure)?.message?.takeIf(String::isNotBlank) ?: error.message?.takeIf(String::isNotBlank) ?: fallback
 
