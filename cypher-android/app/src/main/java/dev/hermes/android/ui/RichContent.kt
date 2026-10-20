@@ -25,6 +25,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -205,6 +206,16 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
     }
 }
 
+/** A table wider than the bubble fades at the side that has more columns, so it reads as scrollable. */
+internal fun Modifier.scrollEdgeFade(state: androidx.compose.foundation.ScrollState): Modifier =
+    graphicsLayer { compositingStrategy = androidx.compose.ui.graphics.CompositingStrategy.Offscreen }.drawWithContent {
+        drawContent()
+        val fade = 40.dp.toPx().coerceAtMost(size.width / 4)
+        if (state.canScrollForward) drawRect(androidx.compose.ui.graphics.Brush.horizontalGradient(listOf(Color.Black, Color.Transparent), startX = size.width - fade, endX = size.width),
+            topLeft = androidx.compose.ui.geometry.Offset(size.width - fade, 0f), size = androidx.compose.ui.geometry.Size(fade, size.height), blendMode = androidx.compose.ui.graphics.BlendMode.DstIn)
+        if (state.canScrollBackward) drawRect(androidx.compose.ui.graphics.Brush.horizontalGradient(listOf(Color.Transparent, Color.Black), startX = 0f, endX = fade),
+            size = androidx.compose.ui.geometry.Size(fade, size.height), blendMode = androidx.compose.ui.graphics.BlendMode.DstIn)
+    }
 @Composable fun NativeTable(rows: List<List<String>>, cellContent: (@Composable (Int,Int) -> Unit)? = null) {
     if(rows.isEmpty()) return
     val context=androidx.compose.ui.platform.LocalContext.current
@@ -226,7 +237,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
             IconButton(onClick={ runCatching { (context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("Table",tableClipboard(sorted))) }.onFailure { copyError=it.message.orEmpty() } }) { Icon(Icons.Rounded.ContentCopy,"Copy table") }
         }
         if(copyError.isNotBlank()) Text(copyError,color=MaterialTheme.colorScheme.error)
-        Column(Modifier.horizontalScroll(horizontal).border(1.dp,MaterialTheme.colorScheme.outlineVariant)) {
+        Column(Modifier.scrollEdgeFade(horizontal).horizontalScroll(horizontal).border(1.dp,MaterialTheme.colorScheme.outlineVariant)) {
             sorted.take(visible).forEachIndexed { index,row ->
                 Row(Modifier.background(if(index==0) MaterialTheme.colorScheme.surfaceContainerHigh else Color.Transparent)) {
                     widths.indices.forEach { col ->
