@@ -146,3 +146,10 @@ def test_context_includes_the_compact_tool_catalogue_and_personal_opening(harnes
     assert result['greeting'] == 'Good evening, Maya. What can I do for you?'
     assert result['tool_catalogue'] == 'read_file: Read a local file'
 
+
+def test_greeting_capitalises_a_lowercase_login_name(harness):
+    api, _, _, _, _ = harness
+    greet = api.voice_context.greeting_for
+    assert greet('maya', 'Tuesday 20 October 2026, 21:38 (Europe/Lisbon)', {}) == 'Good evening, Maya. What can I do for you?'
+    assert greet('deShawn Lee', 'Tuesday 20 October 2026, 09:05', {}) == 'Good morning, deShawn. What can I do for you?'
+

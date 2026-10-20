@@ -159,6 +159,8 @@ def greeting_for(display_name,clock,callback):
             if char.isalpha() or char in "-'’": name+=char
             else: break
         name=name.strip("-'’")[:40]
+        # A login name like "maya" is spoken as a name; any casing the owner chose stays.
+        if name.islower(): name=name[:1].upper()+name[1:]
     if callback:
         return (f"Hi, {name}. I'm calling about your saved Hermes update." if name
                 else "I'm calling about your saved Hermes update.")
