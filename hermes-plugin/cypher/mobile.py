@@ -103,6 +103,7 @@ def _initialize_schema(conn):
     if 'voice_config' not in call_columns: conn.execute("ALTER TABLE calls ADD COLUMN voice_config TEXT NOT NULL DEFAULT '{}'")
     if 'callback_context' not in call_columns: conn.execute("ALTER TABLE calls ADD COLUMN callback_context TEXT NOT NULL DEFAULT '{}'")
     if 'ended' not in call_columns: conn.execute('ALTER TABLE calls ADD COLUMN ended REAL')
+    if 'seen' not in call_columns: conn.execute('ALTER TABLE calls ADD COLUMN seen REAL')
     columns={r[1] for r in conn.execute('PRAGMA table_info(jobs)')}
     for name in ('result','error'):
         if name not in columns: conn.execute('ALTER TABLE jobs ADD COLUMN '+name+" TEXT DEFAULT ''")
@@ -268,16 +269,21 @@ def call_lock(call_id):
             lock=threading.RLock();_CALL_LOCKS[call_id]=lock
         return lock
 
+def active_calls(conn,owner):
+    return conn.execute('SELECT COUNT(*) FROM calls WHERE owner=? AND closed=0 AND COALESCE(seen,created)>=?',(owner,time.time()-300)).fetchone()[0]
+
 def prune_notices(conn):
+    now=time.time()
+    conn.execute("UPDATE calls SET closed=1,ended=COALESCE(ended,?),status='failed' WHERE closed=0 AND COALESCE(seen,created)<?",(now,now-300))
     prune_call_history(conn)
     # Move legacy answered invitation metadata into its owned call before pruning
     # the delivery outbox; call, timeline and job history use separate retention.
-    rows=conn.execute("SELECT n.* FROM notices n JOIN calls c ON c.id=n.call_id AND c.owner=n.owner AND c.profile=n.profile WHERE n.state='answered' AND n.expires<? AND c.callback_context='{}'",(time.time(),)).fetchall()
+    rows=conn.execute("SELECT n.* FROM notices n JOIN calls c ON c.id=n.call_id AND c.owner=n.owner AND c.profile=n.profile WHERE n.state='answered' AND n.expires<? AND c.callback_context='{}'",(now,)).fetchall()
     for row in rows:
         context={key:row[key] for key in ('id','reason','job_id','conversation')}
         conn.execute('UPDATE calls SET callback_context=? WHERE id=?',(json.dumps(context),row['call_id']))
     # Keep expired native-request admission until it settles; polling must not renew an old action.
-    conn.execute("DELETE FROM notices WHERE expires<? AND NOT(activity_key!='' AND state='pending' AND kind IN ('working','approval','clarify'))",(time.time(),))
+    conn.execute("DELETE FROM notices WHERE expires<? AND NOT(activity_key!='' AND state='pending' AND kind IN ('working','approval','clarify'))",(now,))
 
 
 def prune_call_history(conn,now=None):
@@ -307,7 +313,7 @@ def owned(conn, call_id, owner, profile=None, writable=False):
 def reserve(owner, profile, conversation, voice=None, client_key=False):
     call_id = uuid.uuid4().hex
     with LOCK, connect() as conn:
-        active=conn.execute('SELECT COUNT(*) FROM calls WHERE owner=? AND closed=0 AND created>?',(owner,time.time()-4*3600)).fetchone()[0]
+        active=active_calls(conn,owner)
         if active>=MAX_ACTIVE_CALLS: raise ValueError('Active call limit reached')
         config={**(voice or {}),**({'client_key':True} if client_key else {})}
         conn.execute('INSERT INTO calls(id,owner,profile,conversation,created,voice_config) VALUES(?,?,?,?,?,?)', (call_id,owner,profile,ident(conversation),time.time(),json.dumps(config)))
@@ -401,7 +407,7 @@ def invitation(owner,profile,conversation,reason=None):
     reason=str(reason or '')[:240]
     with LOCK,connect() as conn:
         prune_notices(conn)
-        active=conn.execute('SELECT COUNT(*) FROM calls WHERE owner=? AND closed=0 AND created>?',(owner,time.time()-4*3600)).fetchone()[0]
+        active=active_calls(conn,owner)
         if active:
             if conn.execute('SELECT COUNT(*) FROM deferred').fetchone()[0]>=256: raise RuntimeError('Deferred callback capacity reached')
             conn.execute('INSERT INTO deferred(id,owner,profile,conversation,created,reason) VALUES(?,?,?,?,?,?)',(nid,owner,profile,ident(conversation),time.time(),reason))
@@ -411,12 +417,17 @@ def invitation(owner,profile,conversation,reason=None):
     return nid
 
 
-def refs(owner,profile,conversation=None):
+def reference_key():
     with LOCK,connect() as conn:
         row=conn.execute("SELECT value FROM meta WHERE key='reference_key'").fetchone()
         if row: key=bytes(row[0])
         else:
             key=os.urandom(32);conn.execute("INSERT INTO meta VALUES('reference_key',?)",(key,))
+
+    return key
+
+def refs(owner,profile,conversation=None,key=None):
+    if key is None: key=reference_key()
     def digest(value): return hmac.new(key,value.encode(),hashlib.sha256).hexdigest()
     result={'source_ref':digest('source:'+owner+':'+profile)}
     if conversation: result['conversation_ref']=digest('conversation:'+owner+':'+profile+':'+conversation)

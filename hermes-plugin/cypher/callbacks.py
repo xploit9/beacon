@@ -155,8 +155,7 @@ def deliver(mobile,native,key,now):
         native.verify(row['owner'],row['provider'],row['profile'],row['conversation'])
         # Exact deterministic notice id makes retry atomic with its delivery marker.
         event=key.split(':')[1]
-        busy=conn.execute('SELECT 1 FROM calls WHERE owner=? AND closed=0 AND created>?',(row['owner'],now.timestamp()-4*3600)).fetchone()
-        if busy:
+        if mobile.active_calls(conn,row['owner']):
             if conn.execute('SELECT COUNT(*) FROM deferred').fetchone()[0]>=256: raise RuntimeError('Deferred callback capacity reached')
             conn.execute('INSERT INTO deferred(id,owner,profile,conversation,created,reason) VALUES(?,?,?,?,?,?)',(event,row['owner'],row['profile'],row['conversation'],now.timestamp(),row['reason']))
         else:

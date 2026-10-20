@@ -92,12 +92,15 @@ def test_legacy_jobs_without_a_change_time_are_preserved_on_migration(harness):
     ''')
     old=time.time()-400*86400
     legacy.execute("INSERT INTO calls(id,owner,profile,conversation,created,closed,status) VALUES('legacy-call','owner','default','stored',?,1,'failed')",(old,))
+    legacy.execute("INSERT INTO calls(id,owner,profile,conversation,created,closed,status) VALUES('legacy-active-call','owner','default','stored',?,0,'pending')",(time.time(),))
     legacy.execute("INSERT INTO jobs(id,call_id,owner,profile,stored,runtime,request,title,callback,epoch,seq,status) VALUES('legacy-job','legacy-call','owner','default','stored','runtime','request','fixture',0,'epoch',1,'failed')")
     legacy.commit();legacy.close()
     saved=client.put('/api/plugins/cypher/mobile/history-retention',json={'history_retention_days':30})
     assert saved.status_code==200,saved.text
     with api.mobile.connect() as conn:
         assert conn.execute('SELECT 1 FROM calls WHERE id=\'legacy-call\'').fetchone()
+        assert 'seen' in {row[1] for row in conn.execute('PRAGMA table_info(calls)')}
+        assert api.mobile.active_calls(conn,'owner')==1
         assert conn.execute('SELECT history_updated FROM jobs WHERE id=\'legacy-job\'').fetchone()[0]>=time.time()-60
 
 def test_shortened_history_retention_prunes_only_expired_closed_owner_history(harness):
@@ -211,10 +214,10 @@ def test_call_authorization_is_offloaded_from_event_loop(harness,monkeypatch):
     @contextmanager
     def connect():
         record('connect')
-        yield object()
+        yield SimpleNamespace(execute=lambda *args: record('seen'))
     def owned(conn,call_id,owner,profile,writable):
         record('owned')
-        return {'profile':'default','conversation':'native'}
+        return {'profile':'default','conversation':'native','closed':0}
     def reject(owner,provider,profile,stored): record('conversation-owner')
     monkeypatch.setattr(api,'identity',identity)
     monkeypatch.setattr(api.mobile,'connect',connect)
@@ -224,8 +227,8 @@ def test_call_authorization_is_offloaded_from_event_loop(harness,monkeypatch):
 
     result=asyncio.run(api.call(request,'call'))
 
-    assert result[2]=={'profile':'default','conversation':'native'}
-    assert [step for step,_ in observed]==['identity-owner','connect','owned','identity-profile','conversation-owner']
+    assert result[2]=={'profile':'default','conversation':'native','closed':0}
+    assert [step for step,_ in observed]==['identity-owner','connect','owned','seen','identity-profile','conversation-owner']
     assert all(thread_id!=loop_thread for _,thread_id in observed)
 
 def audio(seq=0,stream='user',at=0,pcm=None):
@@ -607,7 +610,8 @@ def test_callback_context_uses_exact_verified_job_binding(harness,monkeypatch):
         conn.execute("INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,state,call_id,job_id,reason) VALUES('notice','owner','default','incoming_call','native-stored',1,9999999999,'answered',?,'verified-job','Stored callback reason')",(cid,))
     context=api.voice_context.context('owner','basic','default','native-stored',cid)
     assert context['callback']=={'reason':'Verified reason','job_id':'verified-job','result':'Verified saved result'}
-    assert context['greeting']=="I'm calling about your saved Hermes update. Verified saved result"
+    assert context['greeting']=="I'm calling about your saved Hermes update."
+    assert 'Verified reason' not in context['greeting']
     assert 'Wrong newer result' not in context['context_summary']
 
 def test_actual_google_sdk_serializes_only_intended_constraints(harness,monkeypatch):
@@ -764,7 +768,8 @@ def test_context_config_shapes_and_greeting_ascii(harness,monkeypatch):
     with api.mobile.connect() as conn:
         conn.execute("UPDATE calls SET callback_context=? WHERE id=?",(json.dumps({'reason':'fixture callback','job_id':''}),cid))
     result=api.voice_context.context('owner','basic','default','native-stored',cid)
-    assert result['greeting']=="I'm calling about: fixture callback." and result['greeting'].isascii()
+    assert result['greeting']=="I'm calling about your saved Hermes update." and result['greeting'].isascii()
+    assert 'fixture callback' not in result['greeting']
 
 
 def test_owned_synthetic_notification_status_and_test(harness):

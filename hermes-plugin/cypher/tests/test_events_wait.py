@@ -1,3 +1,4 @@
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import importlib.util
@@ -7,6 +8,7 @@ import sys
 import threading
 import time
 from types import ModuleType, SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from test_mobile import harness
 
@@ -66,6 +68,83 @@ def test_deferred_call_user_invitation_appears_after_active_call_closes(harness,
 
     assert any(row['event_id'] == invitation['event_id'] and row['kind'] == 'incoming_call'
                for row in response.json()['events'])
+
+
+def test_deferred_proactive_call_replays_as_notice_inside_quiet_hours(harness, monkeypatch):
+    api, client, _, _, _ = harness
+    monkeypatch.setattr(api, 'watch', lambda *args: None)
+    active_call = client.post('/api/plugins/cypher/mobile/calls', json={'profile': 'default'}).json()['call_id']
+    invitation = api.mobile.invitation('owner', 'default', 'native-stored', 'Request email-1: An urgent update')
+    now = datetime(2026, 10, 20, 23, 0, tzinfo=ZoneInfo('Asia/Dubai'))
+    monkeypatch.setattr(api.proactive, '_setup', lambda *args: {'schedule': {'quiet_start': '22:00', 'quiet_end': '07:00'}})
+    monkeypatch.setattr(api.proactive, 'profile_now', lambda profile: now)
+    assert client.delete(f'/api/plugins/cypher/mobile/calls/{active_call}').status_code == 200
+
+    api.activate('owner', 'default')
+
+    with api.mobile.connect() as conn:
+        notice = conn.execute('SELECT kind,reason FROM notices WHERE id!=? AND conversation=? ORDER BY seq DESC LIMIT 1',
+                              (invitation, 'native-stored')).fetchone()
+        assert notice['kind'] == 'task_result' and notice['reason'] == 'Request email-1: An urgent update'
+        assert conn.execute('SELECT 1 FROM deferred WHERE id=?', (invitation,)).fetchone() is None
+
+
+def test_event_long_poll_does_not_rescan_native_activity(harness, monkeypatch):
+    api, client, _, _, _ = harness
+    watch_calls, history_prunes, callback_prunes, after_calls, disconnect_calls = [], [], [], [], []
+    monkeypatch.setattr(api, 'watch', lambda *args: watch_calls.append(args))
+    monkeypatch.setattr(api.mobile, 'prune_history', lambda owner: history_prunes.append(owner))
+    callbacks = api.sys.modules['cypher_callbacks']
+    monkeypatch.setattr(callbacks, 'prune_expired', lambda *args: callback_prunes.append(args))
+    original_after = api._notices_after
+    monkeypatch.setattr(api, '_notices_after', lambda *args: after_calls.append(args) or original_after(*args))
+    original_sleep = api.asyncio.sleep
+
+    async def quick_sleep(delay):
+        await original_sleep(min(delay, 0.01))
+
+    async def disconnected(request):
+        disconnect_calls.append(True)
+        return True
+
+    monkeypatch.setattr(api.asyncio, 'sleep', quick_sleep)
+    monkeypatch.setattr(api.Request, 'is_disconnected', disconnected)
+
+    response = client.get(EVENTS, params={'wait': 0.08})
+
+    assert response.status_code == 200 and response.json()['events'] == []
+    assert len(watch_calls) == len(history_prunes) == len(callback_prunes) == 1
+    assert len(after_calls) == 2 and len(disconnect_calls) == 1
+
+
+def test_event_page_reads_reference_key_once(harness, monkeypatch):
+    api, client, _, _, _ = harness
+    monkeypatch.setattr(api, 'watch', lambda *args: None)
+    monkeypatch.setattr(api.mobile, 'prune_history', lambda owner: 0)
+    monkeypatch.setattr(api.sys.modules['cypher_callbacks'], 'prune_expired', lambda *args: 0)
+    rows = [
+        {'id': f'event-{index}', 'owner': 'owner', 'profile': 'default', 'kind': 'incoming_call',
+         'conversation': f'chat-{index}', 'created': time.time(), 'expires': time.time() + 120,
+         'state': 'pending', 'reason': '', 'seq': index}
+        for index in (1, 2)
+    ]
+    monkeypatch.setattr(api, '_notices_after', lambda *args: (rows, False, 2))
+    original_connect = api.mobile.connect
+    connections = []
+
+    def counted_connect(*args, **kwargs):
+        connections.append(True)
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(api.mobile, 'connect', counted_connect)
+
+    response = client.get(EVENTS)
+
+    assert response.status_code == 200
+    events = response.json()['events']
+    assert len(events) == 2 and events[0]['source_ref'] == events[1]['source_ref']
+    assert events[0]['conversation_ref'] != events[1]['conversation_ref']
+    assert len(connections) == 1
 
 
 def test_event_wait_times_out_empty_and_absent_wait_stays_immediate(harness):

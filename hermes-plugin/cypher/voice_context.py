@@ -177,11 +177,8 @@ def context(owner,provider,profile,stored,call_id):
         if soul: instruction+='\n\nProfile personality:\n'+soul
         if language: instruction+='\nPreferred spoken language: '+language
         greeting="I'm here." if not callback else "I'm calling about your saved Hermes update."
-        if callback.get('reason') and not callback.get('result'):
-            greeting="I'm calling about: "+callback['reason'][:120].rstrip(' .!?')+"."
-        if callback.get('result'): greeting+=' '+callback['result'][:500]
         return {'profile':profile,'selected_session_id':stored,'system_instruction':instruction,'context_summary':summary,'greeting':greeting,'callback':callback,
-                'context':{'history':messages,'personality':soul,'memory':memory,**({'callback_reason':callback.get('reason'),'callback_result':callback.get('result','')} if callback else {}),**({'language':language} if language else {})},
+                'context':{'history':messages,'personality':soul,'memory':memory,**({'callback_reason':{'untrusted_text':callback.get('reason')},'callback_result':callback.get('result','')} if callback else {}),**({'language':language} if language else {})},
                 'configured_memory_provider':name if external_memory_configured(cfg) else 'builtin' if memory else None,
                 'capabilities':{'web_search':True,'memory_recall':bool(memory or external_memory_configured(cfg)),'skills':True,'profile_context':True},
                 'capability_details':{'web_search':search,'memory_recall':{'available':None if external_memory_configured(cfg) else bool(memory),'provider':name if external_memory_configured(cfg) else 'builtin' if memory else None,'reason':'verify_on_use' if external_memory_configured(cfg) else None if memory else 'native_memory_unavailable'},**details}}

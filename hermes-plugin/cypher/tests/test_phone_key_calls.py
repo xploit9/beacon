@@ -171,7 +171,6 @@ def test_callback_answer_accepts_phone_key_provider_without_server_keys(harness,
     api, client, cfg, _, _ = harness
     monkeypatch.setattr(api, 'secret', lambda *_: pytest.fail('Callback phone-key admission read a Hermes server key'))
     monkeypatch.setattr(api.voice_models, 'xai_secret', lambda *_: pytest.fail('Callback phone-key admission read an xAI server key'))
-    monkeypatch.setattr(api.voice_context, 'context', lambda *args: {'context_summary': 'callback context'})
     invitation = api.mobile.invitation('owner', 'default', 'native-stored')
 
     response = client.post(f'/api/plugins/cypher/mobile/callbacks/{invitation}/answer', json={
@@ -180,12 +179,28 @@ def test_callback_answer_accepts_phone_key_provider_without_server_keys(harness,
 
     assert response.status_code == 200, response.text
     call = response.json()
-    assert call['provider'] == provider and call['context_summary'] == 'callback context'
+    assert call['provider'] == provider
+    assert 'context_summary' not in call
     assert 'token' not in call
     with api.mobile.connect() as conn:
         row = api.mobile.owned(conn, call['call_id'], 'owner')
     assert json.loads(row['voice_config'])['provider'] == provider
     assert json.loads(row['voice_config'])['client_key'] is True
+
+
+def test_callback_answer_does_not_build_context_again(harness, monkeypatch):
+    api, client, _, _, _ = harness
+    invitation = api.mobile.invitation('owner', 'default', 'native-stored')
+    contexts = []
+    monkeypatch.setattr(api.voice_context, 'context', lambda *args: contexts.append(args) or {'context_summary': 'duplicate'})
+
+    response = client.post(f'/api/plugins/cypher/mobile/callbacks/{invitation}/answer', json={
+        'voice_provider': 'openai', 'client_key': True,
+    })
+
+    assert response.status_code == 200, response.text
+    assert contexts == []
+    assert 'context_summary' not in response.json()
 
 
 def test_legacy_call_without_client_key_still_uses_server_key_admission(harness, monkeypatch):

@@ -173,6 +173,12 @@ def test_failure_is_standard_private_notification(harness):
     assert 'actions' not in route and route['activity_ref']==''
 
 
+def test_result_notification_copy_is_plain_and_titles_stay_same(harness):
+    api, *_ = harness
+    assert api.notice_preview('completion') == ('Reply ready', 'A reply is ready.')
+    assert api.notice_preview('task_result') == ('Task finished', 'A task finished.')
+
+
 def test_capacity_does_not_settle_existing_requests_after_a_new_request(activity_harness):
     api, _, frames, work, _ = activity_harness
     now = time.time()

@@ -183,6 +183,8 @@ async def call(request,call_id,writable=False):
         owner,provider,profile,cfg=identity(request,owner_only=True)
         with mobile.connect() as conn:
             row=safely(mobile.owned,conn,call_id,owner,None,writable)
+            if not row['closed']:
+                conn.execute('UPDATE calls SET seen=? WHERE id=? AND owner=? AND profile=? AND closed=0',(time.time(),call_id,owner,row['profile']))
         selected=request.query_params.get('cypher_profile') or request.query_params.get('profile')
         if selected and selected!=row['profile']: raise HTTPException(403,'Call profile mismatch')
         identity(request,row['profile'])
@@ -270,7 +272,7 @@ async def calls(request:Request):
         await asyncio.to_thread(safely,native.reserve_conversation,owner,provider,profile,conversation)
     else:
         with mobile.connect() as conn:
-            if conn.execute('SELECT COUNT(*) FROM calls WHERE owner=? AND closed=0 AND created>?',(owner,time.time()-4*3600)).fetchone()[0]>=mobile.MAX_ACTIVE_CALLS:
+            if mobile.active_calls(conn,owner)>=mobile.MAX_ACTIVE_CALLS:
                 raise HTTPException(409,'Active call limit reached')
         conversation=await asyncio.to_thread(safely,native.create,owner,provider,profile)
     return safely(mobile.reserve,owner,profile,conversation,selection,client_key)
@@ -422,7 +424,7 @@ def watch(owner,provider,profile):
             current=conn.execute('SELECT * FROM jobs WHERE id=?',(job['id'],)).fetchone()
             ended=conn.execute('SELECT closed FROM calls WHERE id=?',(job['call_id'],)).fetchone()
             mobile.prune_notices(conn)
-            active=conn.execute('SELECT COUNT(*) FROM calls WHERE owner=? AND closed=0 AND created>?',(owner,time.time()-4*3600)).fetchone()[0]
+            active=mobile.active_calls(conn,owner)
             capacity=conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]<10000
             if current['status']=='completed' and current['callback'] and ended and ended[0] and not active and capacity:
                 nid=uuid.uuid4().hex
@@ -430,9 +432,7 @@ def watch(owner,provider,profile):
                 conn.execute("UPDATE jobs SET status='callback_pending',history_updated=? WHERE id=?",(time.time(),job['id']))
     activate(owner,profile)
 def task_clock(profile):
-    from hermes_cli.web_server_profiles import _config_profile_scope
-    import hermes_time
-    with _config_profile_scope(profile): return hermes_time.get_timezone_name()
+    return proactive._profile_timezone(profile)
 @router.get('/mobile/tasks/capabilities')
 async def task_capabilities(request:Request):
     owner,provider,profile,cfg=identity(request)
@@ -553,7 +553,8 @@ async def notices(request:Request,after:int=0,wait:float=0):
         return await asyncio.to_thread(_notices_after,owner,profile,after)
     rows,reset,cursor=await snapshot()
     if rows or reset or duration<=0:
-        result={'events':[notice_wire(r,owner) for r in rows],'next_cursor':rows[-1]['seq'] if rows else cursor}
+        key=mobile.reference_key() if rows else None
+        result={'events':[notice_wire(r,owner,key) for r in rows],'next_cursor':rows[-1]['seq'] if rows else cursor}
         if reset: result['reset']=True
         return result
     loop=asyncio.get_running_loop();deadline=loop.time()+duration
@@ -561,9 +562,11 @@ async def notices(request:Request,after:int=0,wait:float=0):
         remaining=deadline-loop.time()
         if remaining<=0: break
         await asyncio.sleep(min(1.0,remaining))
-        rows,reset,cursor=await snapshot()
+        rows,reset,cursor=await asyncio.to_thread(_notices_after,owner,profile,after)
         if rows or reset: break
-    result={'events':[notice_wire(r,owner) for r in rows],'next_cursor':rows[-1]['seq'] if rows else cursor}
+        if await request.is_disconnected(): break
+    key=mobile.reference_key() if rows else None
+    result={'events':[notice_wire(r,owner,key) for r in rows],'next_cursor':rows[-1]['seq'] if rows else cursor}
     if reset: result['reset']=True
     return result
 
@@ -581,16 +584,16 @@ def notice_preview(kind):
     if kind=='clarify': return 'Question for you','Answer the native question or open Cypher to review it.'
     if kind=='working': return 'Cypher working','Your native Hermes session is working.'
     if kind=='activity_end': return 'Activity ended','Open Cypher to review your session.'
-    if kind=='task_result': return 'Task finished','Open Cypher to read the native task result.'
+    if kind=='task_result': return 'Task finished','A task finished.'
     if kind=='failure': return 'Cypher work failed','Open Cypher to review the native session error.'
-    if kind=='completion': return 'Reply ready','Open Cypher to read the native reply.'
+    if kind=='completion': return 'Reply ready','A reply is ready.'
     return 'Cypher calling','Open Cypher to hear the saved result.'
-def notice_wire(row,owner):
+def notice_wire(row,owner,key=None):
     state='expired' if row['state']=='pending' and row['expires']<=time.time() else row['state']
     title,body=notice_preview(row['kind'])
     if row['kind']=='task_result' and row.get('reason'):
         body=row['reason'][:240]+('…' if len(row['reason'])>240 else '')
-    return {**row,'event_id':row['id'],'callback_id':row['id'],'owner_id':owner,'conversation_id':row['conversation'],'session_id':row['conversation'] if row['kind']!='test' else '', 'expires_at':int(row['expires']),'state':state,'title':title,'body':body,'activity_ref':row.get('activity_key',''),'preview':{'title':title,'body':body},**mobile.refs(owner,row['profile'],row['conversation'])}
+    return {**row,'event_id':row['id'],'callback_id':row['id'],'owner_id':owner,'conversation_id':row['conversation'],'session_id':row['conversation'] if row['kind']!='test' else '', 'expires_at':int(row['expires']),'state':state,'title':title,'body':body,'activity_ref':row.get('activity_key',''),'preview':{'title':title,'body':body},**mobile.refs(owner,row['profile'],row['conversation'],key)}
 @router.get('/mobile/notifications/events/{event_id}')
 async def notice_detail(event_id:str,request:Request):
     owner,provider,profile,_=identity(request)
@@ -651,7 +654,7 @@ async def answer(invitation_id:str,action:str,request:Request):
             if action=='decline':
                 conn.execute("UPDATE notices SET state='declined' WHERE id=?",(invitation_id,))
                 return {'declined':True,'state':'declined','callback_id':invitation_id,'kind':'incoming_call','profile':profile,**source}
-            if conn.execute('SELECT COUNT(*) FROM calls WHERE owner=? AND closed=0 AND created>?',(owner,time.time()-4*3600)).fetchone()[0]>=mobile.MAX_ACTIVE_CALLS: raise HTTPException(409,'Active call limit reached')
+            if mobile.active_calls(conn,owner)>=mobile.MAX_ACTIVE_CALLS: raise HTTPException(409,'Active call limit reached')
             cid=uuid.uuid4().hex
             context={key:row[key] for key in ('id','reason','job_id','conversation')}
             voice_config={**selection,**({'client_key':True} if client_key else {})}
@@ -659,25 +662,37 @@ async def answer(invitation_id:str,action:str,request:Request):
             conn.execute("UPDATE notices SET state='answered',call_id=? WHERE id=?",(cid,invitation_id))
         return {'call_id':cid,'conversation_id':row['conversation'],'profile':profile,'recording_status':'disabled','transcript_status':'pending','callback_id':invitation_id,'kind':'incoming_call','state':'answered',**selection,**mobile.refs(owner,profile,row['conversation'])}
     result=await asyncio.to_thread(consume)
-    if action=='answer':
-        try: result.update(await feature(voice_context.context,owner,provider,profile,initial['conversation'],result['call_id'],timeout=8))
-        except HTTPException: result['context_error']='native_context_unavailable'
     return result
 def activate(owner,profile):
-    with mobile.LOCK,mobile.connect() as conn:
-        mobile.prune_notices(conn)
-        active=conn.execute('SELECT COUNT(*) FROM calls WHERE owner=? AND closed=0 AND created>?',(owner,time.time()-4*3600)).fetchone()[0]
-        if active: return
-        deferred=conn.execute('SELECT * FROM deferred WHERE owner=? AND profile=? ORDER BY created LIMIT 32',(owner,profile)).fetchall()
+    with mobile.LOCK:
+        with mobile.connect() as conn:
+            mobile.prune_notices(conn)
+            if mobile.active_calls(conn,owner): return
+            deferred=[dict(row) for row in conn.execute('SELECT * FROM deferred WHERE owner=? AND profile=? ORDER BY created LIMIT 32',(owner,profile)).fetchall()]
+        observers=sys.modules['cypher_callbacks'].observers
+        quiet=None;quiet_now=None
         for row in deferred:
             now=datetime.now(timezone.utc)
             explicit=sys.modules['cypher_callbacks'].deferred_allowed(mobile,row['id'],now,owner)
             if explicit is False:
-                conn.execute('DELETE FROM deferred WHERE id=?',(row['id'],));continue
-            # Unscheduled legacy callbacks are owner requests; proactive producers enforce their own quiet window.
-            if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: break
-            conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason) VALUES(?,?,?,?,?,?,?,?)',(row['id'],owner,profile,'incoming_call',row['conversation'],time.time(),time.time()+120,row['reason']))
-            conn.execute('DELETE FROM deferred WHERE id=?',(row['id'],))
+                with mobile.connect() as conn: conn.execute('DELETE FROM deferred WHERE id=?',(row['id'],))
+                continue
+            if explicit is None and (row['reason'] or '').startswith('Request '):
+                if quiet is None:
+                    setup=proactive._setup(mobile,owner,profile,{name:[] for name in proactive.SIGNALS})
+                    quiet_now=proactive.profile_now(profile)
+                    quiet=observers._inside_quiet(quiet_now,setup)
+                if quiet:
+                    with mobile.connect() as conn:
+                        if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: break
+                    observers._notice(mobile,owner,profile,row['conversation'],row['reason'],
+                                      'proactive-alert:deferred:'+row['id'],quiet_now)
+                    with mobile.connect() as conn: conn.execute('DELETE FROM deferred WHERE id=?',(row['id'],))
+                    continue
+            with mobile.connect() as conn:
+                if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: break
+                conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason) VALUES(?,?,?,?,?,?,?,?)',(row['id'],owner,profile,'incoming_call',row['conversation'],time.time(),time.time()+120,row['reason']))
+                conn.execute('DELETE FROM deferred WHERE id=?',(row['id'],))
 def push(owner,profile):
     # A successful second device must not consume the first device's failed delivery.
     if not mobile.PUSH_LOCK.acquire(blocking=False): return

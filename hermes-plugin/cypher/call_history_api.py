@@ -59,7 +59,7 @@ def _page(mobile, owner, profile, limit, before):
         ).fetchall()
 
     with mobile.LOCK, mobile.connect() as conn:
-        mobile.prune_call_history(conn, now)
+        mobile.prune_notices(conn)
         calls = query(
             'calls c',
             "c.id,c.conversation,c.created,c.ended,c.closed,c.status,c.voice_config,"

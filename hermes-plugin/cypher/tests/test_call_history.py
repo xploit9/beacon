@@ -138,6 +138,35 @@ def test_call_history_duration_is_recorded_when_transcript_finalizes(harness):
     assert row['duration_s'] >= 3
 
 
+def test_stale_call_releases_waiting_invitation_and_history_ends(harness, monkeypatch):
+    api, client, _, _, _ = harness
+    monkeypatch.setattr(api, 'watch', lambda *args: None)
+    call_id = add_call(api)
+
+    polled = client.get(f'{PATH}/{call_id}')
+
+    assert polled.status_code == 200, polled.text
+    with api.mobile.connect() as conn:
+        seen = conn.execute('SELECT seen FROM calls WHERE id=?', (call_id,)).fetchone()['seen']
+    assert seen is not None and seen >= time.time() - 1
+
+    invitation = api.mobile.invitation('owner', 'default', 'native-stored', 'Call after this session')
+    with api.mobile.connect() as conn:
+        assert conn.execute('SELECT 1 FROM deferred WHERE id=?', (invitation,)).fetchone()
+        conn.execute('UPDATE calls SET seen=? WHERE id=?', (time.time() - 301, call_id))
+
+    row = next(row for row in history(client)['calls'] if row['id'] == call_id)
+    assert row['state'] == 'failed' and row['duration_s'] is not None
+
+    api.activate('owner', 'default')
+
+    with api.mobile.connect() as conn:
+        call = conn.execute('SELECT closed,ended,status FROM calls WHERE id=?', (call_id,)).fetchone()
+        assert call['closed'] == 1 and call['ended'] is not None and call['status'] == 'failed'
+        assert conn.execute('SELECT 1 FROM deferred WHERE id=?', (invitation,)).fetchone() is None
+        assert conn.execute("SELECT 1 FROM notices WHERE id=? AND kind='incoming_call'", (invitation,)).fetchone()
+
+
 def test_call_history_pages_newest_first_with_a_stable_cursor(harness):
     api, client, _, _, _ = harness
     now = time.time()
