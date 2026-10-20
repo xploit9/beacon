@@ -43,10 +43,11 @@ internal fun CallState.withServerWarning(message: String, eventCallId: String, a
     if (!active || callId.isBlank() || callId != authorizedCallId || eventCallId.isNotBlank() && eventCallId != callId || message.isBlank() || message.length > 240) return this
     return copy(error = message)
 }
+// Normal syncing during a call stays quiet; only the end state or a gap is worth a line.
 internal fun CallState.transcriptLabel(): String = when (transcriptStatus) {
-    "partial", "unavailable", "failed" -> "Text synchronization incomplete"
-    "syncing", "finalizing" -> "Synchronizing text"
-    "saved" -> "Text conversation synchronized"
+    "partial", "unavailable", "failed" -> "Some of this call wasn't saved to the chat"
+    "finalizing" -> "Saving to the chat"
+    "saved" -> "Saved to the chat"
     else -> ""
 }
 internal fun CallState.afterCleanupFailure(error: Throwable): CallState =

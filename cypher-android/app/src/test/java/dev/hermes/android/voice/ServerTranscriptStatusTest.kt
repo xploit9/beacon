@@ -7,7 +7,9 @@ class ServerTranscriptStatusTest {
     private val active = CallState(active = true, callId = "current")
     @Test fun labelsDescribeTextSynchronizationAndNeverAudioRecording() {
         assertEquals("",active.transcriptLabel())
-        assertEquals("Text synchronization incomplete",active.copy(transcriptStatus="partial").transcriptLabel())
+        assertEquals("Some of this call wasn't saved to the chat",active.copy(transcriptStatus="partial").transcriptLabel())
+        assertEquals("",active.copy(transcriptStatus="syncing").transcriptLabel())
+        assertEquals("Saved to the chat",active.copy(transcriptStatus="saved").transcriptLabel())
     }
     @Test fun warningsStayVisibleAndNonfatalOnlyForTheAuthorizedActiveCall() {
         val current = active.copy(state = "listening", transcriptStatus = "syncing", muted = true)
