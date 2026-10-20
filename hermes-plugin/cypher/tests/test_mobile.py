@@ -22,7 +22,6 @@ def harness(tmp_path,monkeypatch):
     spec=importlib.util.spec_from_file_location(name,ROOT/'dashboard'/'plugin_api.py')
     api=importlib.util.module_from_spec(spec);sys.modules[name]=api;spec.loader.exec_module(api)
     cfg={'owner_id':'owner','owner_provider':'basic','profiles':['default'],'scheduled_callback_conversation_id':'assistant-chat','archive_root':str(tmp_path/'call-recordings')}
-    monkeypatch.setattr(api.proactive,'_SOURCES',{})  # the source cache is per process; each test starts cold
     monkeypatch.setattr(api.mobile,'settings',lambda:cfg)
     monkeypatch.setattr(api.mobile,'home',lambda:tmp_path)
     monkeypatch.setattr(api,'secret',lambda cfg:None)
@@ -885,8 +884,8 @@ def test_registered_native_completion_and_callback_tools_are_real(harness):
     tools=[];hooks=[]
     ctx=SimpleNamespace(register_tool=lambda **kwargs:tools.append(kwargs),register_hook=lambda name,handler:hooks.append((name,handler)))
     plugin.register(ctx)
-    assert {name for name,handler in hooks}=={'on_session_end','pre_llm_call','post_tool_call'}
-    assert {tool['name'] for tool in tools}=={'cypher_call_user','cypher_create_proactive_request','cypher_email_notice'}
+    assert {name for name,handler in hooks}=={'on_session_end','pre_llm_call','post_tool_call','pre_tool_call'}
+    assert {tool['name'] for tool in tools}=={'cypher_call_user','cypher_create_proactive_request','cypher_email_notice','cypher_email_checked'}
     assert all(callable(handler) for name,handler in hooks)
 
 
@@ -1145,7 +1144,7 @@ def test_phone_delivery_uses_owned_assistant_chat_for_cron_owner_rows(harness, m
         'Cronjob Response: Example\n(job_id: cron-job)\n-------------\n\n'
         + result
         + '\n\nTo stop or manage this job, send me a new message '
-        '(e.g. "stop reminder Cypher proactive: Inbox and calendar watch").')
+        '(e.g. "stop reminder Cypher: important emails").')
     first = asyncio.run(adapter.send('phone', cron_message, metadata={'job_id': 'cron-job'}))
     second = asyncio.run(phone['standalone_sender_fn'](None, 'phone', cron_message))
     assert first.success is True

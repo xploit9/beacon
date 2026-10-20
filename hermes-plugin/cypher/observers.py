@@ -56,14 +56,14 @@ def _number(value):
 
 
 def prune_meta(conn, now):
-    for key, value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'source-evidence:%' OR key LIKE 'mail-evidence:%' ORDER BY key LIMIT ?", (PRUNE_BATCH,)).fetchall():
+    for key, value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'email-evidence:%' OR key LIKE 'source-evidence:%' OR key LIKE 'mail-evidence:%' ORDER BY key LIMIT ?", (PRUNE_BATCH,)).fetchall():
         try:
             observed = json.loads(value).get("observed_at")
         except (AttributeError, TypeError, ValueError):
             observed = None
         if type(observed) not in (int, float) or not math.isfinite(observed) or now - observed > EVIDENCE_TTL:
             conn.execute("DELETE FROM meta WHERE key=?", (key,))
-    for key, value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'proactive-alert:%' OR key LIKE 'proactive-call:%' OR key LIKE 'mail-notified:%' ORDER BY key LIMIT ?", (PRUNE_BATCH,)).fetchall():
+    for key, value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'proactive-alert:%' OR key LIKE 'proactive-call:%' OR key LIKE 'proactive-email-notice:%' OR key LIKE 'mail-notified:%' ORDER BY key LIMIT ?", (PRUNE_BATCH,)).fetchall():
         created = _number(value)
         retention = CALL_WINDOW if key.startswith("proactive-call:") else ALERT_RETENTION
         if created is None or created > now or now - created > retention:
@@ -176,17 +176,12 @@ def _source_error(value, depth=0, budget=None):
     return any(_source_error(child, depth + 1, budget) for child in children[:64])
 
 
-def _evidence_key(owner, profile, session_id, source_id, signal):
-    source = hashlib.sha256((source_id + "\0" + signal).encode("utf-8")).hexdigest()[:24]
-    return f"source-evidence:{owner}:{profile}:{session_id}:{source}"
+def _evidence_key(owner, profile, session_id):
+    return f"email-evidence:{owner}:{profile}:{session_id}"
 
 
-def source_observed(mobile, cfg, profile, session_id, signal, source_id, tool_name, result,
-                    status, read_only_verified=None):
-    if (status not in ("ok", "success") or not session_id or not isinstance(source_id, str)
-            or profile not in cfg.get("profiles", [])):
-        return False
-    if source_id.startswith("mcp:") and read_only_verified is not True:
+def source_observed(mobile, cfg, profile, session_id, tool_name, result, status):
+    if (status not in ("ok", "success") or not session_id or profile not in cfg.get("profiles", [])):
         return False
     if _source_error(result):
         return False
@@ -194,11 +189,8 @@ def source_observed(mobile, cfg, profile, session_id, signal, source_id, tool_na
     if not owner or not isinstance(tool_name, str) or not tool_name:
         return False
     try:
-        from cypher_proactive import SIGNALS, _setup, _setup_complete, enabled
+        from cypher_proactive import _setup_complete, enabled
         if not enabled(mobile, owner, profile) or not _setup_complete(mobile, owner, profile):
-            return False
-        setup = _setup(mobile, owner, profile, {name: [] for name in SIGNALS})
-        if setup["signals"].get(signal) != source_id:
             return False
     except (ImportError, LookupError, RuntimeError, ValueError):
         return False
@@ -206,7 +198,7 @@ def source_observed(mobile, cfg, profile, session_id, signal, source_id, tool_na
     if not claims:
         return False
     now = time.time()
-    key = _evidence_key(owner, profile, session_id, source_id, signal)
+    key = _evidence_key(owner, profile, session_id)
     with mobile.LOCK, mobile.connect() as conn:
         prune_meta(conn, now)
         previous = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
@@ -215,8 +207,7 @@ def source_observed(mobile, cfg, profile, session_id, signal, source_id, tool_na
                 old = json.loads(previous[0])
                 observed = old.get("observed_at") if isinstance(old, dict) else None
                 old_hashes = old.get("item_hashes", []) if isinstance(old, dict) else []
-                if (old.get("source_id") == source_id and old.get("signal") == signal
-                        and type(observed) in (int, float) and math.isfinite(observed)
+                if (type(observed) in (int, float) and math.isfinite(observed)
                         and 0 <= now - observed <= EVIDENCE_TTL and isinstance(old_hashes, list)):
                     claims = list(dict.fromkeys(
                         [value for value in old_hashes
@@ -224,15 +215,14 @@ def source_observed(mobile, cfg, profile, session_id, signal, source_id, tool_na
                     ))[-MAX_EVIDENCE_HASHES:]
             except (AttributeError, TypeError, ValueError, UnicodeError):
                 pass
-        record = {"source_id": source_id, "signal": signal, "tool_name": tool_name,
-                  "item_hashes": claims[-MAX_EVIDENCE_HASHES:], "observed_at": now}
+        record = {"tool_name": tool_name, "item_hashes": claims[-MAX_EVIDENCE_HASHES:], "observed_at": now}
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
                      (key, json.dumps(record, separators=(",", ":")).encode()))
     return True
 
 
 def _inside_quiet(now, setup):
-    start, end = setup["schedule"]["quiet_start"], setup["schedule"]["quiet_end"]
+    start, end = setup["quiet_start"], setup["quiet_end"]
     if start == end:
         return False
     minute = now.hour * 60 + now.minute
@@ -241,7 +231,7 @@ def _inside_quiet(now, setup):
     return first <= minute < last if first < last else minute >= first or minute < last
 
 
-def _notice(mobile, owner, profile, conversation, reason, alert_key, now):
+def _notice(mobile, owner, profile, conversation, reason, alert_key, now, email_alert=False):
     with mobile.LOCK, mobile.connect() as conn:
         prune_meta(conn, now.timestamp())
         if conn.execute("SELECT 1 FROM meta WHERE key=?", (alert_key,)).fetchone():
@@ -254,41 +244,37 @@ def _notice(mobile, owner, profile, conversation, reason, alert_key, now):
                      (event, owner, profile, "task_result", conversation, now.timestamp(),
                       now.timestamp() + 86400, reason[:240]))
         conn.execute("INSERT INTO meta(key,value) VALUES(?,?)", (alert_key, str(now.timestamp()).encode()))
+        if email_alert:
+            conn.execute("INSERT INTO meta(key,value) VALUES(?,?)",
+                         ("proactive-email-notice:" + event, str(now.timestamp()).encode()))
     return {"status": "notified", "event_id": event}
 
 
 def email_notice(mobile, native, cfg, profile, session_id, args, now):
-    from cypher_proactive import SIGNALS, _setup, _setup_complete, enabled, list_requests
+    from cypher_proactive import _setup, _setup_complete, enabled, list_requests
 
     owner, provider = cfg.get("owner_id"), cfg.get("owner_provider")
     if not owner or not provider or profile not in cfg.get("profiles", []) or not session_id:
         raise ValueError("Owned proactive session required")
-    if not isinstance(args, dict) or set(args) != {"request_id", "signal", "source_id", "item_id", "reason"}:
-        raise ValueError("Request id, signal, source id, item id, and reason are required")
-    request_id, signal, source_id, item_id, reason = (args.get("request_id"), args.get("signal"),
-                                                       args.get("source_id"), args.get("item_id"), args.get("reason"))
-    if not isinstance(request_id, str) or not mobile.ID.fullmatch(request_id):
-        raise ValueError("Invalid Proactive request id")
-    if not isinstance(source_id, str) or len(source_id) > 256:
-        raise ValueError("Invalid source id")
-    if signal not in ("email", "calendar", "tasks", "news"):
-        raise ValueError("Invalid Proactive signal")
+    if not isinstance(args, dict) or set(args) - {"request_id", "item_id", "reason"} or not {"item_id", "reason"} <= set(args):
+        raise ValueError("Item id and reason are required; request_id is optional")
+    request_id, item_id, reason = args.get("request_id"), args.get("item_id"), args.get("reason")
+    if request_id is not None and (not isinstance(request_id, str) or not mobile.ID.fullmatch(request_id)):
+        raise ValueError("Invalid Proactive rule id")
     if not isinstance(item_id, str) or not 1 <= len(item_id.strip()) <= 256:
         raise ValueError("A source-returned item id, title, or URL is required")
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("A brief reason is required")
     reason = reason_text(reason)
-    setup = _setup(mobile, owner, profile, {name: [] for name in SIGNALS})
+    setup = _setup(mobile, owner, profile)
     if not enabled(mobile, owner, profile) or not _setup_complete(mobile, owner, profile):
         raise ValueError("Proactive is not enabled")
-    if setup["signals"].get(signal) != source_id:
-        raise ValueError("Source is not selected for this profile")
     request = next((row for row in list_requests(mobile, owner, profile)
                     if row.get("id") == request_id and row.get("enabled") is True
-                    and row.get("signal") in (None, signal)), None)
-    if not request:
-        raise ValueError("No enabled request matches this selected signal")
-    evidence_key = _evidence_key(owner, profile, session_id, source_id, signal)
+                    and row.get("signal") in (None, "email")), None) if request_id else None
+    if request_id and not request:
+        raise ValueError("No enabled email rule matches this alert")
+    evidence_key = _evidence_key(owner, profile, session_id)
     with mobile.connect() as conn:
         row = conn.execute("SELECT value FROM meta WHERE key=?", (evidence_key,)).fetchone()
     try:
@@ -298,18 +284,17 @@ def email_notice(mobile, native, cfg, profile, session_id, args, now):
         proof, observed = None, None
     if (not proof or type(observed) not in (int, float) or not math.isfinite(observed)
             or not 0 <= now.timestamp() - observed <= EVIDENCE_TTL
-            or proof.get("source_id") != source_id or proof.get("signal") != signal
             or _digest(item_id) not in proof.get("item_hashes", [])):
-        raise ValueError("Fresh same-session evidence from the selected source is required")
+        raise ValueError("Fresh same-session evidence from a successful tool read is required")
 
     stored = cfg.get("scheduled_callback_conversation_id")
     if not isinstance(stored, str) or not stored.strip():
         raise ValueError("Choose an owned assistant conversation before enabling Proactive")
     native.verify(owner, provider, profile, stored)
-    request_label = f"Request {request_id}: {request['text'][:100]}"
-    relay_reason = (request_label + "; " + reason.strip())[:240]
-    dedupe = "proactive-alert:" + owner + ":" + profile + ":" + request_id + ":" + _digest(source_id + "\0" + item_id)
-    if request["action"] == "call":
+    delivery = request["action"] if request else setup["delivery"]
+    dedupe_rule = request_id or "default"
+    dedupe = "proactive-alert:" + owner + ":" + profile + ":" + dedupe_rule + ":" + _digest(item_id)
+    if delivery == "call":
         from cypher_mobile import invitation
         with mobile.LOCK:
             with mobile.connect() as conn:
@@ -320,14 +305,18 @@ def email_notice(mobile, native, cfg, profile, session_id, args, now):
                 count = sum((_number(row[0]) or 0) > now.timestamp() - CALL_WINDOW
                             for row in conn.execute("SELECT value FROM meta WHERE substr(key,1,?)=?",
                                                     (len(prefix), prefix)))
-            quiet_blocked = _inside_quiet(now, setup) and request.get("night") is not True
+            quiet_blocked = _inside_quiet(now, setup) and not (request and request.get("night") is True)
             callbacks_ready = cfg.get("callback_tool_enabled") is True and cfg.get("scheduled_callbacks_enabled") is True
             if not quiet_blocked and callbacks_ready and count < CALL_LIMIT:
+                rule_reason = f"Email rule: {request['text'][:100]}; " if request else ""
+                relay_reason = reason_text((rule_reason + reason.strip())[:240])
                 event = invitation(owner, profile, stored, relay_reason)
                 with mobile.connect() as conn:
                     conn.execute("INSERT INTO meta(key,value) VALUES(?,?)",
                                  ("proactive-call:" + owner + ":" + profile + ":" + uuid.uuid4().hex,
                                   str(now.timestamp()).encode()))
                     conn.execute("INSERT INTO meta(key,value) VALUES(?,?)", (dedupe, str(now.timestamp()).encode()))
+                    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+                                 ("proactive-email-notice:" + event, str(now.timestamp()).encode()))
                 return {"status": "pending", "event_id": event, "conversation_id": stored}
-    return _notice(mobile, owner, profile, stored, relay_reason, dedupe, now)
+    return _notice(mobile, owner, profile, stored, reason.strip(), dedupe, now, email_alert=True)

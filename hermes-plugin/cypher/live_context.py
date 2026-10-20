@@ -48,29 +48,9 @@ def _catalog_names(rows, key, kind, selected):
     return sorted(names)
 
 
-def _recent_successes(mobile, owner, profile, source_ids, now):
-    from cypher_observers import EVIDENCE_TTL
-
-    prefix = f"source-evidence:{owner}:{profile}:"
-    with mobile.connect() as conn:
-        rows = conn.execute("SELECT value FROM meta WHERE substr(key,1,?)=?", (len(prefix), prefix)).fetchall()
-    latest = {}
-    for row in rows:
-        try:
-            record = json.loads(row[0])
-        except (TypeError, ValueError, UnicodeError):
-            continue
-        source_id = record.get("source_id") if isinstance(record, dict) else None
-        observed = record.get("observed_at") if isinstance(record, dict) else None
-        if (source_id in source_ids and type(observed) in (int, float) and math.isfinite(observed)
-                and 0 <= now - observed <= EVIDENCE_TTL and observed > latest.get(source_id, 0)):
-            latest[source_id] = observed
-    return latest
-
-
 def _format(items, job_scope=False):
     prefix = "Live capabilities: "
-    rule = _RULE + (" This scheduled Proactive run is limited to its enabled toolset." if job_scope else "")
+    rule = _RULE + (" This Proactive email watch is read-only; use only this profile's tools and its email notice/check tools." if job_scope else "")
     details = "; ".join(items) or "No sources are selected."
     room = MAX_CONTEXT_CHARS - len(prefix) - len(rule) - 1
     if len(details) > room:
@@ -79,30 +59,21 @@ def _format(items, job_scope=False):
 
 
 def _build_snapshot(mobile, owner, profile, proactive, job_scope=False):
-    setup = proactive._setup(mobile, owner, profile, {name: [] for name in proactive.SIGNALS})
-    items, selected = [], set()
+    setup = proactive._setup(mobile, owner, profile)
+    items = []
     if proactive.enabled(mobile, owner, profile) and proactive._setup_complete(mobile, owner, profile):
-        for signal, label in proactive.SIGNALS.items():
-            source_id = setup.get("signals", {}).get(signal)
-            if not isinstance(source_id, str) or not source_id:
-                continue
-            selected.add(source_id)
-            source_name = _label(source_id.split(":", 1)[-1])
-            items.append((label, source_name or "selected source", source_id))
-
-    successful_at = _recent_successes(mobile, owner, profile, selected, time.time()) if selected else {}
-    items = [
-        f"{_label(signal) or 'Proactive'}: {source} (health unknown" +
-        (f"; last successful read {_time_label(successful_at[source_id])}" if source_id in successful_at else "") + ")"
-        for signal, source, source_id in items
-    ]
+        health = proactive.health(mobile, owner, profile, setup)
+        checked = _time_label(health.get("checked_at"))
+        detail = f"{health['state']}" + (f"; last checked {checked}" if checked else "")
+        notes = proactive.learned_notes(profile)
+        items.append(f"Proactive important email: {detail}; {len(notes)} owner importance notes in Hermes memory")
 
     from hermes_cli.web_server_profiles import _profile_scope
     from tools.registry import registry
     with _profile_scope(profile):
         mcp_rows = [{"_server": entry.toolset[4:]} for entry in registry.get_all_entries()
                     if isinstance(entry.toolset, str) and entry.toolset.startswith("mcp-")]
-    mcp_names = _catalog_names(mcp_rows, "_server", "mcp", selected)
+    mcp_names = _catalog_names(mcp_rows, "_server", "mcp", set())
     if mcp_names:
         items.append("Other MCP (health unknown): " + ", ".join(mcp_names))
     return _format(items, job_scope)

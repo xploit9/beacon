@@ -112,28 +112,16 @@ def test_email_notice_rejects_invalid_reason_with_real_evidence(harness, monkeyp
     api, _, cfg, _, _ = harness
     observers = load_private('observers')
     cfg.update(callback_tool_enabled=True, scheduled_callback_conversation_id='assistant-chat')
-    sources = {
-        'email': [{'id': 'mcp:mail', 'label': 'mail', 'kind': 'mcp', 'read_only': True,
-                   'needs_terminal': False}],
-        'calendar': [], 'tasks': [], 'news': [],
-    }
-    monkeypatch.setattr(api.proactive, 'discover_sources', lambda profile: sources)
-    setup = api.proactive.default_setup(sources)
-    setup['signals']['email'] = 'mcp:mail'
+    setup = api.proactive.default_setup()
     api.proactive._meta_set(api.mobile, api.proactive._key('owner', 'default', 'setup'), json.dumps(setup))
     api.proactive._meta_set(api.mobile, api.proactive._key('owner', 'default', 'enabled'), '1')
     api.proactive._meta_set(api.mobile, api.proactive._key('owner', 'default', 'setup_complete'), '1')
-    monkeypatch.setattr(api.proactive, '_sync_request_jobs', lambda *args: None)
     monkeypatch.setattr(api.native, 'verify', lambda *args: {'messages': []})
-    request = api.proactive.create_request(api.mobile, 'owner', 'default', 'Notify me about a blocker',
-                                           'notify', 'email')
     now = datetime(2026, 10, 16, 12, tzinfo=ZoneInfo('Asia/Dubai'))
     monkeypatch.setattr(observers, 'time', SimpleNamespace(time=lambda: now.timestamp()))
-    assert observers.source_observed(api.mobile, cfg, 'default', 'watch-session', 'email', 'mcp:mail',
-                                     'mcp__mail__read_message', {'messages': [{'id': 'message-1'}]},
-                                     'ok', True)
-    args = {'request_id': request['id'], 'signal': 'email', 'source_id': 'mcp:mail',
-            'item_id': 'message-1', 'reason': 'Check this\nline break'}
+    assert observers.source_observed(api.mobile, cfg, 'default', 'watch-session',
+                                     'mcp__mail__read_message', {'messages': [{'id': 'message-1'}]}, 'ok')
+    args = {'item_id': 'message-1', 'reason': 'Check this\nline break'}
     checked = []
     original_reason_text = observers.reason_text
 
@@ -147,6 +135,72 @@ def test_email_notice_rejects_invalid_reason_with_real_evidence(harness, monkeyp
     assert checked == ['Check this\nline break']
     with api.mobile.connect() as conn:
         assert conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0] == 0
+
+
+def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(harness, monkeypatch):
+    api, _, cfg, _, _ = harness
+    plugin = load_private("__init__")
+    monkeypatch.setattr(plugin, "current_profile", lambda cfg: "default")
+    monkeypatch.setattr(plugin, "_owned_proactive_run",
+                        lambda owner, profile, session_id: session_id == "watch-run")
+    monkeypatch.setattr(plugin, "_cron_row", lambda profile, session_id: {
+        "source": "cron", "cron_job_id": "watch-job"})
+    monkeypatch.setattr(plugin.proactive, "_managed_id", lambda mobile, owner, profile, job_key:
+                        "watch-job" if job_key == "watch_email" else "memory-job")
+    mcp_tool = SimpleNamespace(
+        _mcp_tool_server_names={"mcp__mail__send_email": "mail", "mcp__mail__search_inbox": "mail"},
+        _tool_read_only_hints={"mail": {"send_email": False, "search_inbox": False}},
+    )
+    import tools
+    monkeypatch.setitem(sys.modules, "tools.mcp_tool", mcp_tool)
+    monkeypatch.setattr(tools, "mcp_tool", mcp_tool, raising=False)
+    monkeypatch.setitem(sys.modules, "tools.mcp_tool_schema",
+                        SimpleNamespace(mcp_prefixed_tool_name=lambda server, raw: f"mcp__{server}__{raw}"))
+    monkeypatch.setitem(sys.modules, "tools.mcp_tool_scope",
+                        SimpleNamespace(_resolve_server_key=lambda server: server))
+    monkeypatch.setitem(sys.modules, "tools.registry", SimpleNamespace(
+        registry=SimpleNamespace(get_toolset_for_tool=lambda name:
+                                 "cronjob" if name == "cronjob" else
+                                 "skills" if name == "skills" else
+                                 "memory" if name == "memory" else
+                                 "messaging" if name == "send_message" else
+                                 "web" if name == "web_search" else "mcp-mail")))
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles",
+                        SimpleNamespace(_profile_scope=lambda profile: nullcontext()))
+    hooks = []
+    plugin.register(SimpleNamespace(register_tool=lambda **kwargs: None,
+                                    register_hook=lambda name, handler: hooks.append((name, handler))))
+
+    blocked = plugin.native_proactive_read_only_guard(
+        tool_name="mcp__mail__send_email", args={}, session_id="watch-run")
+    allowed = plugin.native_proactive_read_only_guard(
+        tool_name="mcp__mail__search_inbox", args={}, session_id="watch-run")
+    outside = plugin.native_proactive_read_only_guard(
+        tool_name="mcp__mail__send_email", args={}, session_id="owner-chat")
+    cronjob_create = plugin.native_proactive_read_only_guard(
+        tool_name="cronjob", args={"action": "CrEaTe"}, session_id="watch-run")
+    skills_list = plugin.native_proactive_read_only_guard(
+        tool_name="skills", args={"action": "list"}, session_id="watch-run")
+    skills_install = plugin.native_proactive_read_only_guard(
+        tool_name="skills", args={"action": "install"}, session_id="watch-run")
+    scheduled_operation = plugin.native_proactive_read_only_guard(
+        tool_name="reminder", args={"operation": "schedule"}, session_id="watch-run")
+    send_message = plugin.native_proactive_read_only_guard(
+        tool_name="send_message", args={"target": "phone"}, session_id="watch-run")
+    memory_read = plugin.native_proactive_read_only_guard(
+        tool_name="memory", args={"action": "list"}, session_id="watch-run")
+    web_read = plugin.native_proactive_read_only_guard(
+        tool_name="web_search", args={"query": "latest release"}, session_id="watch-run")
+    terminal = plugin.native_proactive_read_only_guard(
+        tool_name="terminal", args={"command": "cat inbox"}, session_id="watch-run")
+
+    assert blocked == {"action": "block", "message": "Proactive runs are read-only; this would change something."}
+    assert cronjob_create == blocked
+    assert skills_install == blocked and scheduled_operation == blocked
+    assert send_message == blocked
+    assert allowed is None and outside is None and skills_list is None
+    assert memory_read is None and web_read is None and terminal is None
+    assert ("pre_tool_call", plugin.native_proactive_read_only_guard) in hooks
 
 
 def test_call_context_keeps_reason_separate_from_fixed_greeting(api, monkeypatch):

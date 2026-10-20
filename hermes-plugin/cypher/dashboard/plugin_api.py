@@ -696,11 +696,11 @@ def activate(owner,profile):
             if explicit is False:
                 with mobile.connect() as conn: conn.execute('DELETE FROM deferred WHERE id=?',(row['id'],))
                 continue
-            request_id=re.match(r'Request ([0-9a-f]{32}): ',row['reason'] or '')
+            request_id=re.match(r'(?:Request|Email rule): ([0-9a-f]{32})[;:] ',row['reason'] or '')
             request=request_id and next((r for r in proactive.list_requests(mobile,owner,profile) if r.get('id')==request_id.group(1)),None)
             if explicit is None and request and request.get('night') is not True:
                 if quiet is None:
-                    setup=proactive._setup(mobile,owner,profile,{name:[] for name in proactive.SIGNALS})
+                    setup=proactive._setup(mobile,owner,profile)
                     quiet_now=proactive.profile_now(profile)
                     quiet=observers._inside_quiet(quiet_now,setup)
                 if quiet:
@@ -866,7 +866,6 @@ _watch_task=None
 _jobs_upgraded=set()
 def _warm_profile(owner,profile):
     try:
-        proactive.discover_sources(profile)
         proactive.upgrade_jobs(mobile,owner,profile)
     except Exception: pass  # a failure retries after the next restart
 async def start_watcher():
@@ -1008,12 +1007,7 @@ async def get_voice_history(stored_id:str,request:Request):
 @router.get('/mobile/proactive')
 async def proactive_status(request:Request):
     owner,_,profile,_=identity(request)
-    # Refresh finds a newly added MCP server or skill; a lookup that times out below keeps filling the cache.
-    if request.query_params.get('refresh')=='1': proactive.forget_sources(profile)
-    try: return await feature(proactive.status,mobile,owner,profile,timeout=30)
-    except HTTPException as error:
-        if error.status_code!=504: raise
-        raise HTTPException(503,'Still finding your sources. Try again in a minute.') from None
+    return await feature(proactive.status,mobile,owner,profile,timeout=8)
 
 @router.put('/mobile/proactive')
 async def proactive_enabled(request:Request):
@@ -1022,15 +1016,12 @@ async def proactive_enabled(request:Request):
     if toggle:
         if type(value['enabled']) is not bool: raise HTTPException(400,'enabled must be a boolean')
     else:
-        allowed={'enabled','signals','schedule','level','urgent','model','provider'}
+        allowed={'enabled','delivery','check_minutes','quiet_start','quiet_end','model','provider'}
         if set(value)-allowed or type(value.get('enabled')) is not bool:
             raise HTTPException(400,'Invalid Proactive setup fields')
     owner,provider,profile,cfg=identity(request)
-    sources=None
     if not toggle:
-        sources=await feature(proactive.discover_sources,profile,timeout=30)
-        try: proactive.validate_setup(value,sources)
-        except proactive.SourceUnavailable as exc: raise HTTPException(409,str(exc)) from None
+        try: proactive.validate_setup(value)
         except ValueError as exc: raise HTTPException(400,str(exc)) from None
     if value.get('enabled') is True:
         stored=cfg.get('scheduled_callback_conversation_id')
@@ -1043,57 +1034,45 @@ async def proactive_enabled(request:Request):
             raise
     function=proactive.set_enabled if toggle else proactive.configure
     try:
-        args=(mobile,owner,profile,value['enabled']) if toggle else (mobile,owner,profile,value,sources)
+        args=(mobile,owner,profile,value['enabled']) if toggle else (mobile,owner,profile,value)
         return await feature(function,*args,
                              timeout=30)
-    except proactive.SourceUnavailable as exc:
-        raise HTTPException(409,str(exc)) from None
-    except proactive.SetupIncomplete as exc:
-        raise HTTPException(409,str(exc)) from None
     except ValueError as exc:
         raise HTTPException(400,str(exc)) from None
     except RuntimeError:
         raise HTTPException(503,'Proactive setup could not be saved') from None
 
-@router.post('/mobile/proactive/preview')
-async def proactive_preview(request:Request):
-    value=await body(request,1024)
-    if value: raise HTTPException(400,'Preview does not accept fields')
-    owner,provider,profile,cfg=identity(request)
-    stored=cfg.get('scheduled_callback_conversation_id')
-    if not isinstance(stored,str) or not stored.strip():
-        raise HTTPException(409,'Choose an owned assistant conversation before previewing Proactive')
-    try: await feature(native.verify,owner,provider,profile,stored,timeout=8)
-    except HTTPException as exc:
-        if exc.status_code==404:
-            raise HTTPException(409,'Choose an owned assistant conversation before previewing Proactive') from None
-        raise
-    try: return await feature(proactive.preview,mobile,owner,profile,timeout=30)
-    except proactive.SetupIncomplete as exc: raise HTTPException(409,str(exc)) from None
-    except proactive.SourceUnavailable as exc: raise HTTPException(409,str(exc)) from None
-    except RuntimeError: raise HTTPException(503,'Proactive preview could not be queued') from None
-
 @router.post('/mobile/proactive/feedback')
 async def proactive_feedback(request:Request):
     value=await body(request,1024)
-    if set(value)!={'verdict','topic'}: raise HTTPException(400,'Expected verdict and topic')
-    if value['verdict'] not in ('more','less') or not isinstance(value['topic'],str) or len(value['topic'])>200:
-        raise HTTPException(400,'Feedback must be more/less with a topic up to 200 characters')
+    if set(value)!={'notice_id','verdict'} or value['verdict'] not in ('important','not_important'):
+        raise HTTPException(400,'Expected notice_id and verdict important or not_important')
     owner,_,profile,_=identity(request)
-    try: return await feature(proactive.add_feedback,mobile,owner,profile,value['verdict'],value['topic'],timeout=8)
+    try: return await feature(proactive.add_email_feedback,mobile,owner,profile,value['notice_id'],value['verdict'],timeout=15)
+    except LookupError as exc: raise HTTPException(404,str(exc)) from None
     except ValueError as exc: raise HTTPException(400,str(exc)) from None
-    except RuntimeError: raise HTTPException(503,'Proactive preferences could not be saved') from None
+    except RuntimeError: raise HTTPException(503,'Email importance could not be learned') from None
+
+@router.delete('/mobile/proactive/learned')
+async def proactive_learned_delete(request:Request):
+    value=await body(request,512)
+    if set(value)!={'note'}: raise HTTPException(400,'Expected one learned note')
+    _,_,profile,_=identity(request)
+    try: return await feature(proactive.delete_learned,profile,value['note'],timeout=12)
+    except LookupError as exc: raise HTTPException(404,str(exc)) from None
+    except ValueError as exc: raise HTTPException(400,str(exc)) from None
+    except RuntimeError: raise HTTPException(503,'Learned email preference could not be removed') from None
 
 @router.post('/mobile/proactive/requests')
 async def proactive_request_create(request:Request):
     value=await body(request,2048)
     if set(value)-{'text','action','signal','night'} or not {'text','action'}<=set(value):
-        raise HTTPException(400,'Expected text and action, with optional signal and night')
+        raise HTTPException(400,'Expected text and action, with optional email signal and night')
     text=value.get('text');action=value.get('action');signal=value.get('signal');night=value.get('night',False)
     if not isinstance(text,str) or len(text)>300 or action not in ('notify','call'):
         raise HTTPException(400,'Request text and action are invalid')
-    if signal is not None and (not isinstance(signal,str) or signal not in proactive.SIGNALS):
-        raise HTTPException(400,'Unknown request signal')
+    if signal not in (None,'email'):
+        raise HTTPException(400,'signal must be email or null')
     if type(night) is not bool: raise HTTPException(400,'Request night must be a boolean')
     owner,_,profile,_=identity(request)
     try: return await feature(proactive.create_request,mobile,owner,profile,text,action,signal,night,timeout=30)

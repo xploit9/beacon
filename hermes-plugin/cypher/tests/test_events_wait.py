@@ -77,10 +77,10 @@ def _replay_deferred_proactive_call(api, client, monkeypatch, night):
     monkeypatch.setattr(api, 'watch', lambda *args: None)
     monkeypatch.setattr(api.proactive, 'list_requests', lambda *args: [{'id': REQUEST_ID, 'night': night}])
     active_call = client.post('/api/plugins/cypher/mobile/calls', json={'profile': 'default'}).json()['call_id']
-    reason = f'Request {REQUEST_ID}: An urgent update'
+    reason = f'Email rule: {REQUEST_ID}; An urgent update'
     invitation = api.mobile.invitation('owner', 'default', 'native-stored', reason)
     now = datetime(2026, 10, 20, 23, 0, tzinfo=ZoneInfo('Asia/Dubai'))
-    monkeypatch.setattr(api.proactive, '_setup', lambda *args: {'schedule': {'quiet_start': '22:00', 'quiet_end': '07:00'}})
+    monkeypatch.setattr(api.proactive, '_setup', lambda *args: {'quiet_start': '22:00', 'quiet_end': '07:00'})
     monkeypatch.setattr(api.proactive, 'profile_now', lambda profile: now)
     assert client.delete(f'/api/plugins/cypher/mobile/calls/{active_call}').status_code == 200
     api.activate('owner', 'default')

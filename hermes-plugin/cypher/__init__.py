@@ -2,6 +2,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import re
 import sys
 
 ROOT=Path(__file__).resolve().parent
@@ -114,7 +115,8 @@ def native_live_context(session_id=None,**kwargs):
         native.verify(owner,provider,profile,session_id)
     except (LookupError,ValueError,RuntimeError):
         if not _owned_proactive_run(owner,profile,session_id): return None
-        job_scope=True
+        row=_cron_row(profile,session_id)
+        job_scope=bool(row and _cron_job_id(row,session_id)==proactive._managed_id(mobile,owner,profile,'watch_email'))
     context=live_context.snapshot(mobile,owner,profile,proactive,job_scope=job_scope,session_id=session_id)
     return {'context':context} if context else None
 
@@ -125,55 +127,36 @@ def _watch_context(cfg,profile,session_id):
         raise LookupError('Owned Proactive profile required')
     row=_cron_row(profile,session_id)
     if not row or row.get('source')!='cron': raise LookupError('A Proactive watch session is required')
+    job_id=_cron_job_id(row,session_id)
+    if (not job_id or not _owned_proactive_run(owner,profile,session_id)
+            or job_id!=proactive._managed_id(mobile,owner,profile,'watch_email')):
+        raise LookupError('Session is not an owned Proactive email watch')
     stored=cfg.get('scheduled_callback_conversation_id')
     native.verify(owner,provider,profile,stored)
-    job_id=_cron_job_id(row,session_id)
-    if not job_id or not proactive.enabled(mobile,owner,profile) or not proactive._setup_complete(mobile,owner,profile):
-        raise LookupError('Proactive watch is not enabled')
-    sources=proactive.discover_sources(profile)
-    setup=proactive._setup(mobile,owner,profile,sources)
-    requests=proactive.list_requests(mobile,owner,profile)
-    for spec in proactive._specs(setup,sources,requests):
-        if (spec['cadence']=='watch' and
-                proactive._managed_id(mobile,owner,profile,spec['id'])==job_id):
-            return spec
-    raise LookupError('Session is not an owned Proactive watch')
+    return {'id':'watch_email','job_id':job_id}
 
 def native_mailbox_observation(tool_name=None,result=None,status=None,session_id=None,**kwargs):
     cfg=mobile.settings()
     try:
         profile=current_profile(cfg)
-        spec=_watch_context(cfg,profile,session_id)
-        source_id=spec['source_id'];kind=spec['source_kind'];read_only=None
-        if kind=='mcp':
-            from hermes_cli.web_server_profiles import _profile_scope
-            from tools import mcp_tool
-            from tools.mcp_tool_schema import mcp_prefixed_tool_name
-            from tools.mcp_tool_scope import _resolve_server_key
-            with _profile_scope(profile):
-                server_name=source_id[4:]
-                if tool_name.rsplit('__',1)[-1].replace('_','-').endswith('make-request'): return
-                hints=mcp_tool._tool_read_only_hints.get(_resolve_server_key(server_name),{}) or {}
-                read_only=any(hint is True and mcp_prefixed_tool_name(server_name,name)==tool_name
-                              for name,hint in hints.items())
-            if not read_only: return
-        elif kind=='builtin':
-            from tools.registry import registry
-            if not any(entry.name==tool_name and entry.toolset=='web' for entry in registry.get_all_entries()): return
-        elif kind=='skill' and tool_name!='terminal':
-            return
-        observers.source_observed(mobile,cfg,profile,session_id,spec['signal'],source_id,
-                                  tool_name,result,status,read_only)
+        _watch_context(cfg,profile,session_id)
+        observers.source_observed(mobile,cfg,profile,session_id,tool_name,result,status)
     except (ImportError,LookupError,RuntimeError,ValueError):
         return
 
 def email_notice(args,session_id=None,**kwargs):
     try:
         cfg=mobile.settings();profile=current_profile(cfg)
-        spec=_watch_context(cfg,profile,session_id)
-        if args.get('source_id')!=spec['source_id'] or args.get('signal')!=spec['signal']:
-            raise ValueError('Alert signal and source must match this watch')
+        _watch_context(cfg,profile,session_id)
         return json.dumps(observers.email_notice(mobile,native,cfg,profile,session_id,args,proactive.profile_now(profile)))
+    except (LookupError,ValueError,RuntimeError) as exc:
+        return json.dumps({'error':str(exc)})
+
+def email_checked(args,session_id=None,**kwargs):
+    try:
+        cfg=mobile.settings();profile=current_profile(cfg)
+        spec=_watch_context(cfg,profile,session_id)
+        return json.dumps(proactive.record_email_check(profile,spec['job_id'],args))
     except (LookupError,ValueError,RuntimeError) as exc:
         return json.dumps({'error':str(exc)})
 
@@ -189,8 +172,7 @@ def create_proactive_request(args,session_id=None,**kwargs):
         native.verify(owner,provider,profile,session_id)
         action=args.get('action')
         if action is None:
-            action=proactive._setup(mobile,owner,profile,{s:[] for s in proactive.SIGNALS}).get(
-                'urgent',proactive.DEFAULT_URGENT)['delivery']
+            action=proactive._setup(mobile,owner,profile)['delivery']
         request=proactive.create_request(mobile,owner,profile,args.get('text'),action,
                                          args.get('signal'),args.get('night',False))
         return json.dumps({'saved':True,'request':request})
@@ -243,29 +225,114 @@ def native_voice_context(session_id=None, conversation_history=None, **kwargs):
         return {'context': 'Earlier voice context could not be read for this turn. Do not guess missing spoken details.'}
 
 
+_READ_TOOL_WORDS={'get','list','search','read','fetch','find','query','view','show','describe','lookup','check'}
+_WRITE_TOOL_WORDS={'send','create','delete','remove','modify','update','manage','draft','reply','forward',
+                   'move','archive','trash','label','post','write','upload','accept','decline','invite',
+                   'share','set','add','patch','put'}
+_ARG_WRITE_TOOL_WORDS=_WRITE_TOOL_WORDS|{'run','trigger','install','edit','enable','disable','pause','resume','schedule'}
+_READ_ONLY_MESSAGE='Proactive runs are read-only; this would change something.'
+
+def _tool_words(name):
+    spaced=re.sub(r'([a-z0-9])([A-Z])',r'\1 \2',name or '')
+    return set(re.findall(r'[a-z0-9]+',spaced.casefold()))
+
+def _named_read_only(raw_name):
+    words=_tool_words(raw_name)
+    return bool(words&_READ_TOOL_WORDS) and not bool(words&_WRITE_TOOL_WORDS)
+
+def _mcp_read_only(tool_name,profile):
+    try:
+        from hermes_cli.web_server_profiles import _profile_scope
+        from tools import mcp_tool
+        from tools.mcp_tool_schema import mcp_prefixed_tool_name
+        from tools.mcp_tool_scope import _resolve_server_key
+        server_name=mcp_tool._mcp_tool_server_names.get(tool_name)
+        if not isinstance(server_name,str) or not server_name: return False
+        with _profile_scope(profile):
+            hints=mcp_tool._tool_read_only_hints.get(_resolve_server_key(server_name),{}) or {}
+        for raw_name,hint in hints.items():
+            if mcp_prefixed_tool_name(server_name,raw_name)==tool_name:
+                return hint is True or _named_read_only(raw_name)
+    except Exception:
+        return False
+    return False
+
+def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**kwargs):
+    """Veto write-capable tools only in Cypher's owned email-watch cron session."""
+    if not isinstance(tool_name,str) or not session_id:
+        return None
+    try:
+        cfg=mobile.settings();owner=cfg.get('owner_id');profile=current_profile(cfg)
+        if (not owner or not _owned_proactive_run(owner,profile,session_id)):
+            return None
+        row=_cron_row(profile,session_id)
+        job_id=_cron_job_id(row or {},session_id)
+        if job_id!=proactive._managed_id(mobile,owner,profile,'watch_email'):
+            return None
+    except Exception:
+        return None
+
+    if tool_name in {'cypher_email_notice','cypher_email_checked','terminal'}:
+        return None
+    if tool_name=='cronjob' or tool_name=='cypher_call_user':
+        return {'action':'block','message':_READ_ONLY_MESSAGE}
+    args=args if isinstance(args,dict) else {}
+    argument_words=set()
+    for field in ('action','operation'):
+        value=args.get(field)
+        if isinstance(value,str): argument_words.update(_tool_words(value))
+    if argument_words&_ARG_WRITE_TOOL_WORDS:
+        return {'action':'block','message':_READ_ONLY_MESSAGE}
+    try:
+        from hermes_cli.web_server_profiles import _profile_scope
+        from tools.registry import registry
+        with _profile_scope(profile):
+            toolset=registry.get_toolset_for_tool(tool_name) or ''
+    except Exception:
+        toolset=''
+    if toolset.startswith('mcp-') or tool_name.startswith('mcp__'):
+        if _mcp_read_only(tool_name,profile): return None
+        return {'action':'block','message':_READ_ONLY_MESSAGE}
+    if toolset=='memory':
+        action=args.get('action')
+        if action in {'read','search','get','list','query'}: return None
+        return {'action':'block','message':_READ_ONLY_MESSAGE}
+    if toolset=='web' and tool_name in {'web_search','web_extract','web_fetch'}:
+        return None
+    if _tool_words(tool_name)&_WRITE_TOOL_WORDS:
+        return {'action':'block','message':_READ_ONLY_MESSAGE}
+    return None
+
+
 def register(ctx):
     ctx.register_tool(name='cypher_call_user',toolset='cypher',description='Ring the owner through Cypher Android using the current saved native conversation. An invitation is pending, not proof of answering. Use only for owner-requested callbacks.',
         schema={'name':'cypher_call_user','description':'Ring an authorized native callback invitation','parameters':{'type':'object','properties':{'reason':{'type':'string','maxLength':240,'description':'Brief owner-requested reason for the call; do not claim unverified work is finished'}},'additionalProperties':False}},handler=call_user)
 
     ctx.register_tool(name='cypher_create_proactive_request',toolset='cypher-interactive',
-        description='Save an owner-approved plain-language Proactive watch request in this interactive owner chat. Never call from scheduled work; confirm the saved request to the owner.',
+        description='Save an owner-approved plain-language rule for important email in this interactive owner chat. Never call from scheduled work; confirm the saved rule to the owner.',
         schema={'name':'cypher_create_proactive_request','parameters':{'type':'object','properties':{
             'text':{'type':'string','maxLength':300},'action':{'type':'string','enum':['notify','call']},
-            'signal':{'type':['string','null'],'enum':['email','calendar','tasks','news',None]},
+            'signal':{'type':['string','null'],'enum':['email',None]},
             'night':{'type':'boolean'}},'required':['text'],'additionalProperties':False}},
         handler=create_proactive_request)
     ctx.register_tool(name='cypher_email_notice',toolset='cypher-mailbox',
-        description='Notify or ring only for an enabled owner request matched by an item freshly read from this watch job’s selected source in the same session. Model claims alone are never evidence.',
+        description='Notify or ring for an important email backed by a successful same-session tool read. Include request_id only when an enabled email rule matches; otherwise use the saved default delivery.',
         schema={'name':'cypher_email_notice','parameters':{'type':'object','properties':{
-            'request_id':{'type':'string','pattern':'^[a-f0-9]{32}$'},'source_id':{'type':'string','maxLength':256},
-            'signal':{'type':'string','enum':['email','calendar','tasks','news']},
+            'request_id':{'type':'string','pattern':'^[a-f0-9]{32}$'},
             'item_id':{'type':'string','maxLength':256,'description':'Exact source-returned item id, title, or URL'},
             'reason':{'type':'string','maxLength':240}},
-            'required':['request_id','signal','source_id','item_id','reason'],'additionalProperties':False}},
+            'required':['item_id','reason'],'additionalProperties':False}},
         handler=email_notice)
+    ctx.register_tool(name='cypher_email_checked',toolset='cypher-mailbox',
+        description='Record how far the owned Proactive email watch checked and its short result. Only effective in that watch session.',
+        schema={'name':'cypher_email_checked','parameters':{'type':'object','properties':{
+            'checked_until':{'type':['string','number']},'ok':{'type':'boolean'},'note':{'type':'string','maxLength':120}},
+            'required':['checked_until','ok','note'],'additionalProperties':False}},
+        handler=email_checked)
 
     ctx.register_hook('pre_llm_call',native_voice_context)
     ctx.register_hook('pre_llm_call',native_live_context)
     ctx.register_hook('on_session_end',native_completion)
     ctx.register_hook('post_tool_call',native_mailbox_observation)
+    ctx.register_hook('pre_tool_call',native_proactive_read_only_guard)
     phone_delivery.register(ctx)

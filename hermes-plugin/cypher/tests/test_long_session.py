@@ -24,14 +24,14 @@ def test_managed_persona_retries_old_requests_and_requires_current_tool_evidence
 
 def test_nightly_memory_upkeep_corrects_stale_capabilities_and_preserves_owner_facts(harness):
     api, _, _, _, _ = harness
-    sources = {signal: [] for signal in api.proactive.SIGNALS}
-    setup = api.proactive.default_setup(sources)
-    memory = next(spec for spec in api.proactive._specs(setup, sources) if spec["id"] == "nightly_memory")
+    setup = api.proactive.default_setup()
+    memory = next(spec for spec in api.proactive._specs(setup) if spec["id"] == "nightly_memory")
     prompt = memory["prompt"].casefold()
 
     assert "missing capability" in prompt
     assert "stale tool/account state" in prompt
-    assert "preferences, people, requests and facts the owner gave" in prompt
+    assert "important email notes" in prompt
+    assert "never save transcripts" in prompt
 
 
 def test_live_capability_context_uses_pre_llm_hook_without_replacing_voice_context(harness):
@@ -74,7 +74,8 @@ def test_live_context_callback_injects_managed_proactive_cron_runs(harness, monk
     session_id = "local-cypher-run"
     _install_profile_db(monkeypatch, session_id, {"id": session_id, "source": "cron"},
                         {"cron_job_id": "cypher-job", "cron_execution_id": "run-1"})
-    monkeypatch.setattr(plugin.proactive, "_managed_ids", lambda *args: {"brief_email": "cypher-job"})
+    monkeypatch.setattr(plugin.proactive, "_managed_ids", lambda *args: {"watch_email": "cypher-job"})
+    monkeypatch.setattr(plugin.proactive, "_managed_id", lambda *args: "cypher-job")
     monkeypatch.setattr(plugin.proactive, "enabled", lambda *args: True)
     monkeypatch.setattr(plugin.proactive, "_setup_complete", lambda *args: True)
     monkeypatch.setattr(live, "snapshot", lambda *args, **kwargs: scope.update(kwargs) or "live capabilities")
@@ -96,7 +97,7 @@ def test_live_context_callback_skips_unmanaged_cron_runs(harness, monkeypatch):
     session_id = "local-unrelated-run"
     _install_profile_db(monkeypatch, session_id, {"id": session_id, "source": "cron"},
                         {"cron_job_id": "unrelated-job", "cron_execution_id": "run-2"})
-    monkeypatch.setattr(plugin.proactive, "_managed_ids", lambda *args: {"brief_email": "cypher-job"})
+    monkeypatch.setattr(plugin.proactive, "_managed_ids", lambda *args: {"watch_email": "cypher-job"})
     monkeypatch.setattr(live, "snapshot", lambda *args: "must not be injected")
 
     assert plugin.native_live_context(session_id) is None
@@ -126,12 +127,14 @@ def test_live_snapshot_uses_registered_mcp_toolsets_without_discovery(harness, m
     assert live is not None
     live._CACHE.clear()
     live._SENT.clear()
-    setup = {"signals": {"email": "mcp:mail", "calendar": None, "tasks": None, "news": None}}
+    setup = api.proactive.default_setup()
     monkeypatch.setattr(api.proactive, "_setup", lambda *args: setup)
     monkeypatch.setattr(api.proactive, "enabled", lambda *args: True)
     monkeypatch.setattr(api.proactive, "_setup_complete", lambda *args: True)
+    monkeypatch.setattr(api.proactive, "health", lambda *args: {"state": "unknown", "checked_at": None, "message": "Not checked yet"})
+    monkeypatch.setattr(api.proactive, "learned_notes", lambda *args: [])
     fail = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("slow discovery path used"))
-    for name in ("status", "_mcp_catalog", "discover_sources", "_cron_helpers", "_profile_timezone"):
+    for name in ("status", "_cron_helpers", "_profile_timezone"):
         monkeypatch.setattr(api.proactive, name, fail)
     from tools.registry import registry
     monkeypatch.setattr(registry, "get_all_entries", lambda: [
@@ -148,10 +151,10 @@ def test_live_snapshot_uses_registered_mcp_toolsets_without_discovery(harness, m
     context = live.snapshot(api.mobile, "owner", "default", api.proactive, job_scope=True,
                             session_id="snapshot-session")
 
-    assert "Email: mail" in context and "calendar" in context
+    assert "Proactive important email" in context and "Other MCP" in context
     assert "unknown" in context and "tools and skills available in this turn" in context
     assert "try it again once" in context
-    assert "limited to its enabled toolset" in context
+    assert "Proactive email watch is read-only" in context
     assert "Private message body" not in context
     assert "Private event body" not in context
     assert "private-token" not in context and "[redacted]" in context
@@ -216,8 +219,10 @@ def test_live_snapshot_fails_open_when_source_discovery_raises(harness, monkeypa
     live = getattr(plugin, "live_context", None)
     assert live is not None
     live._CACHE.clear()
-    monkeypatch.setattr(api.proactive, "status",
-                        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("discovery failed")))
+    monkeypatch.setattr(api.proactive, "enabled", lambda *args: True)
+    monkeypatch.setattr(api.proactive, "_setup_complete", lambda *args: True)
+    monkeypatch.setattr(api.proactive, "learned_notes",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("memory unavailable")))
 
     assert live.snapshot(api.mobile, "owner", "default", api.proactive) is None
 
@@ -232,13 +237,14 @@ def test_live_snapshot_uses_saved_selection_without_status_probe(harness, monkey
     assert live is not None
     live._CACHE.clear()
     live._SENT.clear()
-    setup = {"signals": {"email": "mcp:mail", "calendar": None, "tasks": None, "news": None}}
+    setup = api.proactive.default_setup()
     monkeypatch.setattr(api.proactive, "_setup", lambda *args: setup)
     monkeypatch.setattr(api.proactive, "enabled", lambda *args: True)
     monkeypatch.setattr(api.proactive, "_setup_complete", lambda *args: True)
+    monkeypatch.setattr(api.proactive, "health", lambda *args: {"state": "unknown", "checked_at": None, "message": "Not checked yet"})
+    monkeypatch.setattr(api.proactive, "learned_notes", lambda *args: [])
     fail = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("status discovery used"))
     monkeypatch.setattr(api.proactive, "status", fail)
-    monkeypatch.setattr(api.proactive, "_mcp_catalog", fail)
     from tools.registry import registry
     monkeypatch.setattr(registry, "get_all_entries", lambda: [])
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles",
@@ -246,7 +252,7 @@ def test_live_snapshot_uses_saved_selection_without_status_probe(harness, monkey
 
     context = live.snapshot(api.mobile, "owner", "default", api.proactive)
 
-    assert "Email: mail (health unknown)" in context
+    assert "Proactive important email: unknown" in context
     assert "2023-11-14 22:13Z" not in context
 
 
@@ -261,9 +267,10 @@ def test_live_snapshot_caps_large_catalogs_and_keeps_retry_rule(harness, monkeyp
     live._CACHE.clear()
     live._SENT.clear()
     monkeypatch.setattr(api.proactive, "_setup",
-                        lambda *args: {"signals": {signal: None for signal in api.proactive.SIGNALS}})
+                        lambda *args: api.proactive.default_setup())
     monkeypatch.setattr(api.proactive, "enabled", lambda *args: False)
     monkeypatch.setattr(api.proactive, "_setup_complete", lambda *args: False)
+    monkeypatch.setattr(api.proactive, "learned_notes", lambda *args: [])
     monkeypatch.setattr(api.proactive, "status",
                         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("status discovery used")))
     from tools.registry import registry
@@ -276,15 +283,11 @@ def test_live_snapshot_caps_large_catalogs_and_keeps_retry_rule(harness, monkeyp
     context = live.snapshot(api.mobile, "owner", "default", api.proactive, job_scope=True)
 
     assert len(context) <= 600
-    assert context.endswith(live._RULE + " This scheduled Proactive run is limited to its enabled toolset.")
+    assert context.endswith(live._RULE + " This Proactive email watch is read-only; use only this profile's tools and its email notice/check tools.")
     assert "…" in context
 
 
-def test_live_snapshot_shows_only_recent_successful_read_time_as_source_evidence(harness, monkeypatch):
-    from contextlib import nullcontext
-    import json
-    import sys
-
+def test_live_snapshot_shows_watch_health_and_learned_count(harness, monkeypatch):
     api, _, _, _, _ = harness
     plugin = load_private("__init__")
     live = getattr(plugin, "live_context", None)
@@ -292,28 +295,19 @@ def test_live_snapshot_shows_only_recent_successful_read_time_as_source_evidence
     live._CACHE.clear()
     live._SENT.clear()
     monkeypatch.setattr(live.time, "time", lambda: 1700000010)
-    setup = {"signals": {"email": "mcp:mail", "calendar": None, "tasks": None, "news": None}}
+    setup = api.proactive.default_setup()
     monkeypatch.setattr(api.proactive, "_setup", lambda *args: setup)
     monkeypatch.setattr(api.proactive, "enabled", lambda *args: True)
     monkeypatch.setattr(api.proactive, "_setup_complete", lambda *args: True)
-    from tools.registry import registry
-    monkeypatch.setattr(registry, "get_all_entries", lambda: [SimpleNamespace(toolset="mcp-mail")])
+    monkeypatch.setattr(api.proactive, "health", lambda *args: {
+        "state": "ok", "checked_at": 1700000000, "message": "Read complete"})
+    monkeypatch.setattr(api.proactive, "learned_notes", lambda *args: ["important", "not important"])
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles",
                         SimpleNamespace(_profile_scope=lambda profile: nullcontext()))
-    with api.mobile.connect() as conn:
-        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (
-            "source-evidence:owner:default:session:source", json.dumps({
-                "source_id": "mcp:mail", "signal": "email", "tool_name": "mcp__mail__search",
-                "item_hashes": ["opaque"], "observed_at": 1700000000,
-            }).encode("utf-8"),
-        ))
+    from tools.registry import registry
+    monkeypatch.setattr(registry, "get_all_entries", lambda: [SimpleNamespace(toolset="mcp-mail")])
 
     context = live.snapshot(api.mobile, "owner", "default", api.proactive)
 
-    assert "health unknown" in context
-    assert "last successful read 2023-11-14 22:13Z" in context
-    monkeypatch.setattr(live.time, "time", lambda: 1700000400)
-    live._CACHE.clear()
-    expired = live.snapshot(api.mobile, "owner", "default", api.proactive)
-    assert "health unknown" in expired
-    assert "last successful read" not in expired
+    assert "Proactive important email: ok" in context
+    assert "2 owner importance notes" in context
