@@ -1386,13 +1386,14 @@ async def query_body(request,call_id,kind):
 @router.get('/mobile/calls/{call_id}/context')
 async def get_context(call_id:str,request:Request):
     owner,provider,row,cfg=await call(request,call_id)
-    result=await feature(voice_context.context,owner,provider,row['profile'],row['conversation'],call_id,timeout=8)
+    display=getattr(request.state.session,'display_name',None)
+    display=display[:120] if isinstance(display,str) else ''
+    result=await feature(voice_context.context,owner,provider,row['profile'],row['conversation'],call_id,display,timeout=8)
     callback=result.get('callback')
     reason=callback.get('reason','') if isinstance(callback,dict) else ''
     result['reason']=reason if isinstance(reason,str) else ''
-    result['greeting']="I'm calling about your saved Hermes update." if callback else "I'm here."
-    display=getattr(request.state.session,'display_name',None)
-    if isinstance(display,str) and display: result['owner_display_name']=display[:120]
+    if not result.get('greeting'): result['greeting']="I'm calling about your saved Hermes update." if callback else "I'm here."
+    if display: result['owner_display_name']=display
     return result
 @router.post('/mobile/calls/{call_id}/search')
 async def quick_search(call_id:str,request:Request):

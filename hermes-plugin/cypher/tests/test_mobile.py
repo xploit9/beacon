@@ -36,9 +36,9 @@ def harness(tmp_path,monkeypatch):
     async def auth(request:Request,call_next):
         # Fixture injection is defined in this test only; production exposes no bypass.
         if request.headers.get('x-fixture-bearer'):
-            request.state.session=SimpleNamespace(user_id=request.headers['x-fixture-bearer'],provider='basic')
+            request.state.session=SimpleNamespace(user_id=request.headers['x-fixture-bearer'],provider='basic',display_name=request.headers.get('x-fixture-display-name'))
         elif request.headers.get('x-fixture-owner'):
-            request.state.session=SimpleNamespace(user_id=request.headers['x-fixture-owner'],provider='basic')
+            request.state.session=SimpleNamespace(user_id=request.headers['x-fixture-owner'],provider='basic',display_name=request.headers.get('x-fixture-display-name'))
         return await call_next(request)
     app.include_router(api.router,prefix='/api/plugins/cypher')
     client=TestClient(app);client.headers['x-fixture-owner']='owner'
@@ -550,10 +550,15 @@ def test_plugin_lifespan_starts_and_stops_watcher(harness):
 
 def test_context_query_routes_are_owned_bounded_and_explicit(harness,monkeypatch):
     api,c,cfg,tmp,app=harness;cid=reserve(c);path='/api/plugins/cypher/mobile/calls/'+cid
-    context={'profile':'default','selected_session_id':'native-stored','system_instruction':'fixture persona','context_summary':'fixture memory and history','greeting':'fixture greeting','callback':{},'capabilities':{'web_search':True,'memory_recall':False}}
-    monkeypatch.setattr(api.voice_context,'context',lambda *args:context)
+    context={'profile':'default','selected_session_id':'native-stored','system_instruction':'fixture persona','context_summary':'fixture memory and history','greeting':'Good evening, Maya. What can I do for you?','callback':{},'capabilities':{'web_search':True,'memory_recall':False}}
+    received=[]
+    monkeypatch.setattr(api.voice_context,'context',lambda *args:received.append(args) or context)
     monkeypatch.setattr(api.voice_context,'search',lambda profile,query:{'summary':'fresh fixture evidence','sources':[{'title':'Primary source','url':'https://example.test/source'}],'observed_at':123})
-    assert c.get(path+'/context').json()['selected_session_id']=='native-stored'
+    c.headers['x-fixture-display-name']='Maya Example'
+    response=c.get(path+'/context').json()
+    assert response['selected_session_id']=='native-stored'
+    assert response['greeting']==context['greeting'] and response['owner_display_name']=='Maya Example'
+    assert received[0][-1]=='Maya Example'
     assert c.post(path+'/search',json={'query':'fresh lookup'}).json()['sources'][0]['title']=='Primary source'
     assert c.post(path+'/search',json={'query':'x'*1025}).status_code==400
     monkeypatch.setattr(api.voice_context,'recall',lambda *args: (_ for _ in ()).throw(LookupError('unsupported')))

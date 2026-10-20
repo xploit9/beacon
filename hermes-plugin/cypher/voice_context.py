@@ -151,9 +151,37 @@ def local_time(profile):
     except Exception:
         return ''
 
-def context(owner,provider,profile,stored,call_id):
+
+def greeting_for(display_name,clock,callback):
+    name=''
+    if isinstance(display_name,str) and display_name.strip():
+        for char in display_name.strip().split()[0]:
+            if char.isalpha() or char in "-'’": name+=char
+            else: break
+        name=name.strip("-'’")[:40]
+    if callback:
+        return (f"Hi, {name}. I'm calling about your saved Hermes update." if name
+                else "I'm calling about your saved Hermes update.")
+    match=re.search(r'\b([01]?\d|2[0-3]):[0-5]\d\b',clock or '')
+    if not match: return "I'm here."
+    hour=int(match.group(1))
+    part='morning' if hour<12 else 'afternoon' if hour<17 else 'evening'
+    return f"Good {part}{', '+name if name else ''}. What can I do for you?"
+
+
+def tool_catalogue(profile):
+    try:
+        module=sys.modules.get('cypher_gateway_tools')
+        if module: return module.Gateway(mobile,scoped).compact_catalogue(profile)
+    except Exception:
+        pass
+    return ''
+
+
+def context(owner,provider,profile,stored,call_id,display_name=''):
     # history verifies ownership before any profile data is loaded.
     messages=history(owner,provider,profile,stored)
+    catalogue=tool_catalogue(profile)
     def load(root):
         cfg=config(root);details={}
         try: soul=personality(root)
@@ -187,8 +215,9 @@ def context(owner,provider,profile,stored,call_id):
         if language: instruction+='\nPreferred spoken language: '+language
         clock=local_time(profile)
         if clock: instruction+='\nCurrent local time for the owner: '+clock
-        greeting="I'm here." if not callback else "I'm calling about your saved Hermes update."
-        return {'profile':profile,'selected_session_id':stored,'system_instruction':instruction,'context_summary':summary,'greeting':greeting,'callback':callback,
+        greeting=greeting_for(display_name,clock,bool(callback))
+        return {'profile':profile,'selected_session_id':stored,'system_instruction':instruction,'context_summary':summary,
+                'tool_catalogue':catalogue,'greeting':greeting,'callback':callback,
                 'context':{'history':messages,'personality':soul,'memory':memory,**({'callback_reason':{'untrusted_text':callback.get('reason')},'callback_result':callback.get('result','')} if callback else {}),**({'language':language} if language else {})},
                 'configured_memory_provider':name if external_memory_configured(cfg) else 'builtin' if memory else None,
                 'capabilities':{'web_search':True,'memory_recall':bool(memory or external_memory_configured(cfg)),'skills':True,'profile_context':True},

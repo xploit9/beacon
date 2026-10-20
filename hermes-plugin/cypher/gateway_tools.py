@@ -1,4 +1,4 @@
-"""Call-scoped receipts around Hermes' configured MCP handlers; no model or proxy."""
+"""Call-scoped receipts around Hermes' MCP and native registry handlers; no model or proxy."""
 import concurrent.futures
 import contextvars
 import hashlib
@@ -16,13 +16,22 @@ from fastapi import HTTPException
 MAX_ARGUMENTS = 16384
 MAX_RESULT = 24576
 MAX_TOOLS = 12
+MAX_CATALOGUE_BYTES = 3072
 # Eight active calls at 128 receipts each; old closed or expired receipts make room.
 MAX_RECEIPTS = 1024
 DEADLINE = 90
+CATALOG_TTL = 15
 BOOT = uuid.uuid4().hex
 POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix='cypher-mcp')
 SLOTS = threading.BoundedSemaphore(4)
 CATALOG_LOCK = threading.RLock()
+CATALOG_CACHE = {}
+NATIVE_READ_ONLY = frozenset({'read_file','search_files','web_search','web_extract','session_search',
+                              'skills_list','skill_view','vision_analyze'})
+NATIVE_READ_ONLY_ACTIONS = {'cronjob_manage': frozenset({'list'}), 'process_manage': frozenset({'list'})}
+NATIVE_EXCLUDED_TOOLS = frozenset({'clarify','delegate_task','todo_list','memory',
+                                   'cypher_create_proactive_request','cypher_email_notice','cypher_email_checked'})
+NATIVE_EXCLUDED_TOOLSETS = frozenset({'browser','cypher-interactive','cypher-mailbox'})
 QUERY_FILLER = set('a an the my me please could can you i would like want get read list find look pull show to for of in on and from up most latest recent current last today now one two three four five six ten tool tools'.split())
 QUERY_ALIASES = {
     'email': {'email', 'mail', 'gmail', 'inbox', 'outlook'},
@@ -145,8 +154,70 @@ def readonly_methods(schema):
     return tuple(methods) if isinstance(methods,list) and methods and all(value in ('GET','HEAD') for value in methods) else ()
 
 
+def _hermes_read_only(entry, name):
+    for value in (getattr(entry,'read_only',None), getattr(entry,'read_only_hint',None),
+                  (entry.schema.get('annotations') or {}).get('readOnlyHint'),
+                  entry.schema.get('read_only'), entry.schema.get('readOnlyHint')):
+        if type(value) is bool: return value
+    return name in NATIVE_READ_ONLY
+
+
+def native_catalog():
+    """Build enabled non-MCP tools from Hermes' profile-filtered registry definitions."""
+    from agent.skill_utils import parse_config_string_list
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.tools_config import _get_platform_tools
+    from model_tools import get_tool_definitions
+    from tools.registry import registry
+
+    config=load_config_readonly()
+    agent_config=config.get('agent') if isinstance(config.get('agent'),dict) else {}
+    disabled=parse_config_string_list(agent_config.get('disabled_toolsets')) or None
+    enabled=sorted(_get_platform_tools(config,'api_server'))
+    config_digest=digest(config)
+    output=[]
+    definitions=get_tool_definitions(enabled_toolsets=enabled,disabled_toolsets=disabled,quiet_mode=True,
+                                     skip_tool_search_assembly=True)
+    enabled_tools=[item['function']['name'] for item in definitions if isinstance(item.get('function'),dict)
+                   and isinstance(item['function'].get('name'),str)]
+    for definition in definitions:
+        function=definition.get('function') if isinstance(definition,dict) else None
+        name=function.get('name') if isinstance(function,dict) else None
+        entry=registry.get_entry(name) if isinstance(name,str) else None
+        if not entry: continue
+        toolset=entry.toolset
+        if (toolset.startswith('mcp-') or toolset in NATIVE_EXCLUDED_TOOLSETS or
+                name in NATIVE_EXCLUDED_TOOLS or name.startswith('browser_')):
+            continue
+        schema=json.loads(encoded(function.get('parameters',{})))
+        read_only=_hermes_read_only(entry,name)
+        output.append({'tool_id':digest(['hermes-native',registry.current_scope_key(),registry._generation,
+                                         config_digest,name,toolset,schema,read_only]),
+                       'name':name,'description':safe(function.get('description',''),1200),
+                       'parameters':schema,'read_only':read_only,'_kind':'hermes','_raw':name,
+                       '_toolset':toolset,'_enabled_tools':enabled_tools})
+    return output
+
+
+def tool_read_only(tool, arguments):
+    if tool.get('read_only'): return True
+    if tool.get('_kind')!='hermes': return False
+    name=tool.get('_raw')
+    return arguments.get('action') in NATIVE_READ_ONLY_ACTIONS.get(name,())
+
+
 class NativeMcp:
-    """Only native registrations whose exact connection still matches this profile's config."""
+    """Direct MCP and Hermes registry tool catalog and dispatch for the active profile."""
+    def cache_key(self):
+        try:
+            from hermes_cli.config import load_config_readonly
+            from tools.mcp_tool_config import _load_mcp_config
+            from tools.registry import registry
+            return (registry.current_scope_key(),registry._generation,
+                    digest(load_config_readonly()),digest(_load_mcp_config()))
+        except Exception:
+            return None
+
     def catalog(self):
         from tools import mcp_tool as core
         from tools.mcp_tool_config import _load_mcp_config
@@ -199,14 +270,49 @@ class NativeMcp:
                            '_handler':_make_tool_handler(server,raw,min(60,float(closure.get('tool_timeout') or 60))),
                            '_server':server, '_raw':raw,
                            '_trust':_normalize_server_trust(cfg.get('trust'))})
+        output.extend(native_catalog())
         return output
 
-    def execute(self, tool, arguments, scope, approved):
-        from tools import approval, approval_context
+    def execute(self, tool, arguments, scope, approved, session_id=None):
         from gateway import session_context
+        session_id=session_id or scope[3]
         key = 'cypher-tool/' + uuid.uuid4().hex
         session_tokens = session_context.set_session_vars(platform='api_server', source='cypher',
-            user_id=scope[1]+':'+scope[0], profile=scope[2], session_key=key, session_id=scope[3])
+            user_id=scope[1]+':'+scope[0], profile=scope[2], session_key=key, session_id=session_id)
+        if tool.get('_kind')=='hermes':
+            terminal=tool.get('_raw')=='terminal'
+            registered=False
+            token=None
+            try:
+                if not tool.get('read_only') and not approved:
+                    raise HTTPException(403,'Hermes tool requires owner approval')
+                if terminal:
+                    # The call proposal displays the exact command, so it can satisfy Hermes' one-shot guard only on an exact match.
+                    from tools import approval, approval_context
+                    token=approval_context.set_current_session_key(key)
+                    used=False
+                    once_lock=threading.Lock()
+                    def notify(data):
+                        nonlocal used
+                        request=data.get('request_id') if isinstance(data,dict) else None
+                        if not isinstance(request,str) or not re.fullmatch(r'[a-f0-9]{32}',request):
+                            raise ValueError('Invalid native approval request identity')
+                        with once_lock:
+                            accept=(approved and not used and bool(data.get('pattern_key')) and
+                                    data.get('command')==arguments.get('command'))
+                            used=True
+                        approval.resolve_gateway_approval(key,'once' if accept else 'deny',request_id=request)
+                    approval.register_gateway_notify(key,notify);registered=True
+                from tools.registry import registry
+                # Hermes dispatch retains the native handler's checks, including terminal safety guards.
+                return registry.dispatch(tool['_raw'],arguments,task_id=scope[3],session_id=session_id,
+                                         current_session_id=session_id,enabled_tools=tool.get('_enabled_tools'))
+            finally:
+                if registered: approval.unregister_gateway_notify(key)
+                if token is not None: approval_context.reset_current_session_key(token)
+                session_context.clear_session_vars(session_tokens)
+
+        from tools import approval, approval_context
         token = approval_context.set_current_session_key(key)
         # This native gate represents the SAME approved operation, not another grant.
         expected = (f"MCP tool '{tool['_raw']}' on UNTRUSTED server '{tool['_server']}' wants to run. "
@@ -226,7 +332,7 @@ class NativeMcp:
             approval.resolve_gateway_approval(key, 'once' if accept else 'deny', request_id=request)
         approval.register_gateway_notify(key, notify)
         try:
-            return tool['_handler'](arguments, session_id=scope[3])
+            return tool['_handler'](arguments, session_id=session_id)
         finally:
             approval.unregister_gateway_notify(key)
             approval_context.reset_current_session_key(token)
@@ -250,7 +356,38 @@ class Gateway:
 
     def catalog(self, profile):
         with CATALOG_LOCK:
-            return self.scoped(profile, lambda _: self.backend.catalog())
+            def load(_):
+                key_fn=getattr(self.backend,'cache_key',None)
+                try: cache_key=(profile,key_fn()) if callable(key_fn) else None
+                except Exception: cache_key=None
+                now=time.monotonic()
+                if cache_key and cache_key[1] is not None:
+                    cached=CATALOG_CACHE.get(cache_key)
+                    if cached and now-cached[0]<CATALOG_TTL: return cached[1]
+                rows=self.backend.catalog()
+                try: final_key=(profile,key_fn()) if callable(key_fn) else None
+                except Exception: final_key=None
+                if final_key and final_key[1] is not None:
+                    now=time.monotonic()
+                    for key,(created,_) in list(CATALOG_CACHE.items()):
+                        if now-created>=CATALOG_TTL: CATALOG_CACHE.pop(key,None)
+                    if len(CATALOG_CACHE)>=16: CATALOG_CACHE.pop(next(iter(CATALOG_CACHE)))
+                    CATALOG_CACHE[final_key]=(now,rows)
+                return rows
+            return self.scoped(profile,load)
+
+    def compact_catalogue(self, profile):
+        lines=[];size=0
+        for tool in sorted(self.catalog(profile),key=lambda item:str(item.get('name',''))):
+            name=re.sub(r'[^A-Za-z0-9_.:/-]','',str(tool.get('name') or ''))[:120]
+            if not name: continue
+            description=safe(tool.get('description',''),1200)
+            description=re.sub(r'\s+',' ',''.join(c for c in description if c.isprintable())).strip()[:56]
+            line=name+(': '+description if description else '')
+            line_bytes=len(line.encode('utf-8'))+1
+            if size+line_bytes>MAX_CATALOGUE_BYTES: break
+            lines.append(line);size+=line_bytes
+        return '\n'.join(lines)
 
     def discover(self, profile, query=''):
         if not isinstance(query, str) or len(query)>240: raise HTTPException(400, 'Invalid tool query')
@@ -299,7 +436,7 @@ class Gateway:
                 self._save(conn,scope,request,value)
         return {k:v for k,v in value.items() if not k.startswith('_')}
 
-    def invoke(self, scope, value):
+    def invoke(self, scope, value, session_id=None):
         if set(value)!={'request_id','tool_id','arguments'}: raise HTTPException(400, 'Invalid tool request fields')
         try: request=self.mobile.ident(value['request_id'])
         except ValueError: raise HTTPException(400,'Invalid tool request identity') from None
@@ -319,10 +456,13 @@ class Gateway:
         if 'method' not in arguments and methods:
             arguments={**arguments,'method':'GET' if 'GET' in methods else 'HEAD'}
             validate(tool['parameters'],arguments)
+        read_only=tool_read_only(tool,arguments)
+        tool={**tool,'read_only':read_only}
         result={'request_id':request,'tool_id':tool['tool_id'],'tool_name':tool['name'],
-                'status':'ready' if tool['read_only'] else 'needs_approval',
-                '_arguments':arguments, '_expires':time.time()+120}
-        if not tool['read_only']:
+                'status':'ready' if read_only else 'needs_approval',
+                '_arguments':arguments,'_read_only':read_only,'_session_id':session_id or scope[3],
+                '_expires':time.time()+120}
+        if not read_only:
             serialized=encoded(arguments)
             try:
                 displayed=json.loads(self.sanitize(serialized,MAX_ARGUMENTS))
@@ -352,7 +492,7 @@ class Gateway:
                     if expired: conn.commit()
                     raise HTTPException(429,'Tool receipt capacity reached')
             conn.execute('INSERT INTO tool_receipts VALUES(?,?,?,?,?,?,?,?)',(*scope,request,signature,encoded(result),time.time()))
-        if tool['read_only']: self._start(scope,request,tool,False)
+        if read_only: self._start(scope,request,tool,False)
         return self.status(scope,request)
 
     def decide(self, scope, request, value):
@@ -409,7 +549,9 @@ class Gateway:
                 self._save(conn,scope,request,value)
             context=contextvars.copy_context()
             try:
-                POOL.submit(context.run,self._run,scope,request,tool,value['_arguments'],approved)
+                operation={**tool,'read_only':value.get('_read_only',tool.get('read_only',False))}
+                POOL.submit(context.run,self._run,scope,request,operation,value['_arguments'],approved,
+                            value.get('_session_id',scope[3]))
             except Exception:
                 with self.db() as conn:
                     row=self._row(conn,scope,request)
@@ -423,7 +565,7 @@ class Gateway:
         finally:
             if not submitted: SLOTS.release()
 
-    def _run(self, scope, request, tool, arguments, approved):
+    def _run(self, scope, request, tool, arguments, approved, session_id):
         dispatched=False
         try:
             # Recheck authority and config at the last boundary before the RPC.
@@ -432,6 +574,9 @@ class Gateway:
             # Use the same lock->profile order as discover/invoke; never hold it across RPC.
             current=next((t for t in self.catalog(scope[2]) if t['tool_id']==tool['tool_id']),None)
             if not current: raise HTTPException(409,'Tool configuration changed')
+            current_read_only=tool_read_only(current,arguments)
+            if current_read_only!=tool['read_only']: raise HTTPException(409,'Tool access classification changed')
+            current={**current,'read_only':current_read_only}
             def execute(_):
                 nonlocal dispatched
                 if self.status(scope,request)['status']!='running':
@@ -440,7 +585,7 @@ class Gateway:
                 if cfg.get('owner_id')!=scope[0] or cfg.get('owner_provider')!=scope[1] or scope[2] not in cfg.get('profiles',[]):
                     raise HTTPException(403,'Owner authority changed')
                 dispatched=True
-                return self.backend.execute(current,arguments,scope,approved)
+                return self.backend.execute(current,arguments,scope,approved,session_id=session_id)
             raw=self.scoped(scope[2],execute)
             if not isinstance(raw,str): raw=encoded(raw)
             state=outcome(raw,tool['read_only'])

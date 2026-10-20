@@ -1,4 +1,4 @@
-"""Authenticated call-bound direct MCP endpoints."""
+"""Authenticated call-bound direct Hermes and MCP endpoints."""
 import asyncio
 import importlib.util
 from pathlib import Path
@@ -19,7 +19,7 @@ def build_router(call, body, scoped, mobile):
 
     async def scope(request,call_id,writable=False):
         owner,provider,row,_=await call(request,call_id,writable)
-        return owner,provider,row['profile'],call_id
+        return (owner,provider,row['profile'],call_id),row['conversation']
 
     async def bounded(fn,*args):
         # Disconnects must not cancel a mutation receipt or replay its execution.
@@ -35,29 +35,29 @@ def build_router(call, body, scoped, mobile):
 
     @router.get('/mobile/calls/{call_id}/tools')
     async def discover(call_id:str,request:Request,query:str=''):
-        binding=await scope(request,call_id,True)
+        binding,_=await scope(request,call_id,True)
         return await bounded(gateway.discover,binding[2],query)
 
     @router.post('/mobile/calls/{call_id}/tools/invoke')
     async def invoke(call_id:str,request:Request):
-        binding=await scope(request,call_id,True)
+        binding,session_id=await scope(request,call_id,True)
         value=await body(request,20000)
-        return await bounded(gateway.invoke,binding,value)
+        return await bounded(gateway.invoke,binding,value,session_id)
 
     @router.get('/mobile/calls/{call_id}/tools/requests/{request_id}')
     async def status(call_id:str,request_id:str,request:Request):
-        binding=await scope(request,call_id)
+        binding,_=await scope(request,call_id)
         return await bounded(gateway.status,binding,request_id)
 
     @router.post('/mobile/calls/{call_id}/tools/requests/{request_id}/decision')
     async def decision(call_id:str,request_id:str,request:Request):
-        binding=await scope(request,call_id,True)
+        binding,_=await scope(request,call_id,True)
         value=await body(request,1024)
         return await bounded(gateway.decide,binding,request_id,value)
 
     @router.post('/mobile/calls/{call_id}/tools/requests/{request_id}/cancel')
     async def cancel(call_id:str,request_id:str,request:Request):
-        binding=await scope(request,call_id)
+        binding,_=await scope(request,call_id)
         return await bounded(gateway.cancel,binding,request_id)
 
     return router

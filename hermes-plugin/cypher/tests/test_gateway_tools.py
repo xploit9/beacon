@@ -7,7 +7,7 @@ import sqlite3
 import sys
 import threading
 import time
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
@@ -76,8 +76,8 @@ class Backend:
         return [{'tool_id':self.version*64,'name':'configured_search','description':'search web',
                  'parameters':{'type':'object','properties':{'query':{'type':'string'}},'required':['query'],'additionalProperties':False},
                  'read_only':self.read_only}]
-    def execute(self,tool,args,scope,approved):
-        self.calls.append((args,scope,approved))
+    def execute(self,tool,args,scope,approved,session_id=None):
+        self.calls.append((args,scope,approved,session_id))
         self.started.set()
         if self.wait: self.wait.wait(2)
         return json.dumps(self.result)
@@ -156,6 +156,7 @@ def test_scope_isolation_and_argument_negative_controls(gateway):
 
 def test_method_schema_requiring_post_is_write_capable(gateway,monkeypatch):
     api,backend,_=gateway
+    monkeypatch.setattr(g,'native_catalog',lambda:[])
     def entry(name,method):
         def handler(): return name
         # Capture the values NativeMcp reads from the actual registered handler.
@@ -320,15 +321,15 @@ def test_worker_catalog_is_locked_but_rpc_is_not(gateway,monkeypatch):
     catalog,execute=backend.catalog,backend.execute;calls=[]
     def checked_catalog():
         assert lock._is_owned();calls.append('catalog');return catalog()
-    def checked_execute(*args):
-        assert not lock._is_owned();return execute(*args)
+    def checked_execute(*args,**kwargs):
+        assert not lock._is_owned();return execute(*args,**kwargs)
     backend.catalog=checked_catalog;backend.execute=checked_execute
     invoke(api);assert settled(api)['status']=='completed' and len(calls)==2
 
 
 def test_post_dispatch_http_exception_preserves_uncertainty_and_code(gateway):
     api,backend,_=gateway;backend.read_only=False
-    def execute(*args): raise HTTPException(502,'Secret account and transport detail must not escape')
+    def execute(*args,**kwargs): raise HTTPException(502,'Secret account and transport detail must not escape')
     backend.execute=execute
     proposal=invoke(api);api.decide(SCOPE,'r1',{'proposal_id':proposal['proposal']['id'],'decision':'approve'})
     result=settled(api)
@@ -351,7 +352,7 @@ def test_generic_pre_dispatch_failure_is_failed_not_uncertain(gateway):
 
 def test_generic_read_only_failure_is_failed_not_uncertain(gateway):
     api,backend,_=gateway
-    def fail(*args): raise RuntimeError('Private read failure')
+    def fail(*args,**kwargs): raise RuntimeError('Private read failure')
     backend.execute=fail
     invoke(api)
     result=settled(api)
@@ -424,7 +425,7 @@ def test_cancelled_lookup_retrieves_worker_exception(tmp_path):
         monkeypatcher.setitem(sys.modules,'cypher_gateway_tools',SimpleNamespace(Gateway=ExplodingGateway))
         module_spec=importlib.util.spec_from_file_location('cypher_gateway_api_cancel_test',ROOT/'gateway_api.py')
         api=importlib.util.module_from_spec(module_spec);module_spec.loader.exec_module(api)
-        async def call(*args,**kwargs): return 'owner','password',{'profile':'profile'},{}
+        async def call(*args,**kwargs): return 'owner','password',{'profile':'profile','conversation':'native-stored'},{}
         router=api.build_router(call,lambda *args,**kwargs:{},lambda profile,fn:fn(tmp_path),Mobile(tmp_path/'api.sqlite'))
         endpoint=next(route.endpoint for route in router.routes if route.path.endswith('/tools'))
         async def exercise():
@@ -516,6 +517,35 @@ def test_router_reuses_native_owner_profile_and_closed_call_authority(tmp_path,m
     assert not backend.calls
 
 
+def test_gateway_router_passes_the_call_conversation_to_native_dispatch(tmp_path,monkeypatch):
+    from fastapi import FastAPI,Request
+    from fastapi.testclient import TestClient
+    from test_mobile import harness
+    host,_,_,_,_=harness.__wrapped__(tmp_path,monkeypatch)
+    spec=importlib.util.spec_from_file_location('cypher_gateway_api_session_test',ROOT/'gateway_api.py')
+    api=importlib.util.module_from_spec(spec);spec.loader.exec_module(api)
+    backend=Backend();native_module=sys.modules['cypher_gateway_tools']
+    monkeypatch.setattr(native_module,'NativeMcp',lambda:backend)
+    app=FastAPI();app.state.auth_required=True
+    @app.middleware('http')
+    async def authenticated(request:Request,call_next):
+        request.state.session=SimpleNamespace(user_id='owner',provider='basic')
+        return await call_next(request)
+    app.include_router(api.build_router(host.call,host.body,lambda p,fn:fn(tmp_path),host.mobile),
+                       prefix='/api/plugins/cypher')
+    call=host.mobile.reserve('owner','default','native-stored')['call_id']
+    path=f'/api/plugins/cypher/mobile/calls/{call}/tools'
+    with TestClient(app) as client:
+        response=client.post(path+'/invoke',json={'request_id':'session-bound','tool_id':'a'*64,
+                                                   'arguments':{'query':'weather'}})
+        assert response.status_code==200
+        for _ in range(100):
+            receipt=client.get(path+'/requests/session-bound').json()
+            if receipt['status']!='running': break
+            time.sleep(.01)
+    assert receipt['status']=='completed' and backend.calls[0][3]=='native-stored'
+
+
 def test_natural_tool_discovery_finds_mail_and_preserves_write_intent(gateway):
     api,backend,_=gateway
     def tool(name,description,read_only=True):
@@ -566,3 +596,192 @@ def test_discovery_preserves_inflected_description_matches(gateway):
     ]
     for query,name in [('search','inbox_reader'),('fetch','page_reader'),('address','people')]:
         assert api.discover('profile',query)['tools'][0]['name']==name
+
+
+def test_native_tools_are_discovered_for_the_api_profile_and_exclusions_are_applied(monkeypatch,tmp_path):
+    names=[
+        ('read_file','file'),('write_file','file'),('web_search','web'),('vision_analyze','vision'),
+        ('session_search','session_search'),('memory','memory'),('todo_list','todo'),('video_analyze','video'),
+        ('clarify','clarify'),('delegate_task','delegation'),('browser_click','browser'),
+        ('cypher_create_proactive_request','cypher-interactive'),('cypher_email_notice','cypher-mailbox'),
+        ('mcp-weather','mcp-weather'),('metadata_read','custom'),
+    ]
+    entries={name:SimpleNamespace(name=name,toolset=toolset,schema={'description':f'{name} purpose'},
+                                 read_only=True if name=='metadata_read' else None)
+             for name,toolset in names}
+    definitions=[{'type':'function','function':{'name':name,'description':f'{name} purpose',
+                 'parameters':{'type':'object','properties':{},'additionalProperties':False}}} for name,_ in names]
+    config={'agent':{'disabled_toolsets':['video']}}
+    seen={}
+    enabled={'file','web','vision','session_search','memory','todo','video','clarify','delegation','browser',
+             'cypher-interactive','cypher-mailbox','mcp-weather','custom'}
+    def platform_tools(received,platform):
+        assert received is config and platform=='api_server'
+        return enabled
+    def get_definitions(**kwargs):
+        seen.update(kwargs)
+        disabled=set(kwargs['disabled_toolsets'] or [])
+        active=set(kwargs['enabled_toolsets'])-disabled
+        return [item for item in definitions if entries[item['function']['name']].toolset in active]
+    registry=SimpleNamespace(current_scope_key=lambda:'profile-scope',_generation=7,
+                              get_entry=lambda name:entries.get(name))
+    monkeypatch.setitem(sys.modules,'hermes_cli.config',SimpleNamespace(load_config_readonly=lambda:config))
+    monkeypatch.setitem(sys.modules,'hermes_cli.tools_config',SimpleNamespace(_get_platform_tools=platform_tools))
+    monkeypatch.setitem(sys.modules,'model_tools',SimpleNamespace(get_tool_definitions=get_definitions))
+    monkeypatch.setitem(sys.modules,'tools.registry',SimpleNamespace(registry=registry))
+
+    native_catalog=getattr(g,'native_catalog',lambda:[])()
+
+    catalog={item['name']:item for item in native_catalog}
+    assert {'read_file','write_file','web_search','vision_analyze','session_search','metadata_read'} <= set(catalog)
+    assert not {'memory','todo_list','clarify','delegate_task','browser_click','cypher_create_proactive_request',
+                'cypher_email_notice','mcp-weather','video_analyze'} & set(catalog)
+    assert catalog['read_file']['read_only'] and catalog['web_search']['read_only']
+    assert catalog['vision_analyze']['read_only'] and catalog['session_search']['read_only']
+    assert catalog['metadata_read']['read_only']
+    assert not catalog['write_file']['read_only']
+    assert seen['enabled_toolsets']==sorted(enabled)
+    assert seen['disabled_toolsets']==['video']
+    assert seen['skip_tool_search_assembly'] is True
+
+    backend=SimpleNamespace(catalog=lambda:native_catalog)
+    api=g.Gateway(Mobile(tmp_path/'discover.sqlite'),lambda profile,fn:fn(tmp_path),backend,
+                  lambda value,limit:str(value)[:limit])
+    discovered=api.discover('profile','read_file')['tools']
+    assert discovered[0]['name']=='read_file' and discovered[0]['read_only'] is True
+
+
+def test_native_tool_receipts_dispatch_in_profile_conversation_and_gate_mutations(tmp_path,monkeypatch):
+    dispatches=[];session={}
+    def dispatch(name,args,**kwargs):
+        dispatches.append((name,args,kwargs,dict(session)))
+        return {'result':'x'*40000} if name=='read_file' else {'ok':True}
+    registry=SimpleNamespace(dispatch=dispatch)
+    monkeypatch.setitem(sys.modules,'tools.registry',SimpleNamespace(registry=registry))
+    session_context=SimpleNamespace(
+        set_session_vars=lambda **kwargs:session.update(kwargs) or kwargs,
+        clear_session_vars=lambda _:session.clear())
+    monkeypatch.setitem(sys.modules,'gateway',SimpleNamespace(session_context=session_context))
+
+    native=g.NativeMcp()
+    native.cache_key=lambda:None
+    native.catalog=lambda:[
+        {'tool_id':'a'*64,'name':'read_file','description':'Read a file',
+             'parameters':{'type':'object','properties':{'path':{'type':'string'}},'required':['path'],'additionalProperties':False},
+             'read_only':True,'_kind':'hermes','_raw':'read_file','_toolset':'file','_enabled_tools':['read_file','write_file']},
+        {'tool_id':'b'*64,'name':'write_file','description':'Write a file',
+         'parameters':{'type':'object','properties':{'path':{'type':'string'},'content':{'type':'string'}},
+                       'required':['path','content'],'additionalProperties':False},
+         'read_only':False,'_kind':'hermes','_raw':'write_file','_toolset':'file','_enabled_tools':['read_file','write_file']},
+        {'tool_id':'c'*64,'name':'cronjob_manage','description':'Manage scheduled jobs',
+         'parameters':{'type':'object','properties':{'action':{'type':'string','enum':['list','run']}},
+                       'required':['action'],'additionalProperties':False},
+         'read_only':False,'_kind':'hermes','_raw':'cronjob_manage','_toolset':'cronjob'},
+        {'tool_id':'d'*64,'name':'process_manage','description':'Manage background processes',
+         'parameters':{'type':'object','properties':{'action':{'type':'string','enum':['list','write']}},
+                       'required':['action'],'additionalProperties':False},
+         'read_only':False,'_kind':'hermes','_raw':'process_manage','_toolset':'terminal'},
+    ]
+    mobile=Mobile(tmp_path/'native.sqlite')
+    api=g.Gateway(mobile,lambda profile,fn:fn(tmp_path),native,lambda value,limit:str(value)[:limit])
+
+    read=api.invoke(SCOPE,{'request_id':'native-read','tool_id':'a'*64,'arguments':{'path':'notes.txt'}},
+                    session_id='native-stored')
+    read=settled(api,'native-read')
+    assert read['status']=='completed' and read['truncated'] is True, (read,dispatches,session)
+    assert len(g.encoded(read['result']).encode())<=g.MAX_RESULT
+    assert dispatches[0][0]=='read_file' and dispatches[0][2]['session_id']=='native-stored'
+    assert dispatches[0][2]['task_id']=='call'
+    assert dispatches[0][2]['current_session_id']=='native-stored'
+    assert dispatches[0][2]['enabled_tools']==['read_file','write_file']
+    assert dispatches[0][3]['profile']=='profile' and dispatches[0][3]['session_id']=='native-stored'
+
+    proposal=api.invoke(SCOPE,{'request_id':'native-write','tool_id':'b'*64,
+                               'arguments':{'path':'notes.txt','content':'safe text'}},
+                        session_id='native-stored')
+    assert proposal['status']=='needs_approval' and len(dispatches)==1
+    api.decide(SCOPE,'native-write',{'proposal_id':proposal['proposal']['id'],'decision':'approve'})
+    result=settled(api,'native-write')
+    assert result['status']=='completed' and len(dispatches)==2
+    assert dispatches[1][0]=='write_file' and dispatches[1][2]['session_id']=='native-stored'
+
+    for request,name,tool_id in [('cron-list','cronjob_manage','c'*64),('process-list','process_manage','d'*64)]:
+        receipt=api.invoke(SCOPE,{'request_id':request,'tool_id':tool_id,'arguments':{'action':'list'}},
+                           session_id='native-stored')
+        assert receipt['status'] in ('running','completed')
+        assert settled(api,request)['status']=='completed'
+        assert dispatches[-1][0]==name
+    for request,name,tool_id,action in [('cron-run','cronjob_manage','c'*64,'run'),
+                                        ('process-write','process_manage','d'*64,'write')]:
+        before=len(dispatches)
+        receipt=api.invoke(SCOPE,{'request_id':request,'tool_id':tool_id,'arguments':{'action':action}},
+                           session_id='native-stored')
+        assert receipt['status']=='needs_approval' and len(dispatches)==before
+
+
+def test_native_mixed_tools_are_read_only_only_for_explicit_read_actions():
+    read_only=getattr(g,'tool_read_only',lambda tool,args:bool(tool.get('read_only')))
+    cron={'_kind':'hermes','_raw':'cronjob_manage','read_only':False}
+    process={'_kind':'hermes','_raw':'process_manage','read_only':False}
+    memory={'_kind':'hermes','_raw':'memory','read_only':False}
+    todo={'_kind':'hermes','_raw':'todo_list','read_only':False}
+    assert not read_only(todo,{})
+    assert not read_only(memory,{'action':'add'})
+    assert read_only(cron,{'action':'list'}) and not read_only(cron,{'action':'run'})
+    assert read_only(process,{'action':'list'}) and not read_only(process,{'action':'write'})
+
+
+def test_terminal_native_dispatch_resolves_only_its_exact_approved_hermes_guard(monkeypatch):
+    pending={};choices=[];session={};registered_keys=[]
+    approval=SimpleNamespace(
+        register_gateway_notify=lambda key,callback:(registered_keys.append(key),pending.update(key=key,callback=callback)),
+        unregister_gateway_notify=lambda key:pending.clear(),
+        resolve_gateway_approval=lambda key,choice,**kwargs:choices.append((key,choice,kwargs['request_id'])))
+    approval_context=SimpleNamespace(set_current_session_key=lambda key:key,
+                                     reset_current_session_key=lambda token:None)
+    session_context=SimpleNamespace(set_session_vars=lambda **kwargs:session.update(kwargs) or kwargs,
+                                    clear_session_vars=lambda _:session.clear())
+    tools_package=ModuleType('tools');tools_package.__path__=[]
+    tools_package.approval=approval;tools_package.approval_context=approval_context
+    registry=SimpleNamespace(dispatch=lambda name,args,**kwargs:pending['callback'](
+        {'request_id':'a'*32,'pattern_key':'dangerous_path','command':args['command']}) or {'ok':True})
+    tools_package.registry=SimpleNamespace(registry=registry)
+    monkeypatch.setitem(sys.modules,'tools',tools_package)
+    monkeypatch.setitem(sys.modules,'tools.approval',approval)
+    monkeypatch.setitem(sys.modules,'tools.approval_context',approval_context)
+    monkeypatch.setitem(sys.modules,'tools.registry',tools_package.registry)
+    monkeypatch.setitem(sys.modules,'gateway',SimpleNamespace(session_context=session_context))
+    command='remove a generated build directory'
+    tool={'_kind':'hermes','_raw':'terminal','read_only':False}
+
+    result=g.NativeMcp().execute(tool,{'command':command},SCOPE,True,session_id='native-stored')
+
+    assert result=={'ok':True} and choices==[(registered_keys[-1], 'once', 'a'*32)]
+
+    choices.clear()
+    registry.dispatch=lambda name,args,**kwargs:pending['callback'](
+        {'request_id':'b'*32,'pattern_key':'dangerous_path','command':'different command'}) or {'ok':True}
+    g.NativeMcp().execute(tool,{'command':command},SCOPE,True,session_id='native-stored')
+    assert choices==[(registered_keys[-1], 'deny', 'b'*32)]
+
+
+def test_voice_tool_catalogue_is_bounded_cached_by_profile_and_config_digest(tmp_path):
+    class CachedBackend:
+        def __init__(self): self.digest='config-v1';self.calls=0
+        def cache_key(self): return self.digest
+        def catalog(self):
+            self.calls+=1
+            return [{'name':f'tool_{i:03}','description':'A useful tool that reads data safely. '*5}
+                    for i in range(100)]
+    backend=CachedBackend();api=g.Gateway(Mobile(tmp_path/'catalog.sqlite'),lambda profile,fn:fn(tmp_path),backend)
+    started=time.perf_counter();first=getattr(api,'compact_catalogue',lambda profile:'')('profile')
+    cold_ms=(time.perf_counter()-started)*1000
+    started=time.perf_counter();again=getattr(api,'compact_catalogue',lambda profile:'')('profile')
+    cached_ms=(time.perf_counter()-started)*1000
+    assert first==again and len(first.encode('utf-8'))<=3072
+    assert 'tool_000:' in first and backend.calls==1
+    backend.digest='config-v2'
+    api.compact_catalogue('profile')
+    api.compact_catalogue('other-profile')
+    assert backend.calls==3
+    print(f'voice_catalogue_latency_ms: cold={cold_ms:.3f}, cached={cached_ms:.3f}')
