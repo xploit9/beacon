@@ -104,6 +104,10 @@ class GeminiWireTest {
     @Test fun pendingDirectReceiptKeepsAsyncFunctionOpenUntilTerminalResult() {
         fun response(status:String)=GeminiWire.tool("same-id","invoke_tool",org.json.JSONObject().put("status",status)).getJSONObject("toolResponse").getJSONArray("functionResponses").getJSONObject(0)
         assertTrue(response("needs_approval").getBoolean("willContinue"))
+        assertEquals("SILENT", response("running").getString("scheduling"))
+        assertEquals("SILENT", response("ready").getString("scheduling"))
+        assertEquals("WHEN_IDLE", response("needs_approval").getString("scheduling"))
+        assertEquals("WHEN_IDLE", response("completed").getString("scheduling"))
         assertTrue(response("uncertain").getBoolean("willContinue"))
         assertFalse(response("completed").getBoolean("willContinue"))
         assertFalse(response("denied").getBoolean("willContinue"))

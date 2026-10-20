@@ -170,7 +170,11 @@ Apply the language, approval, receipt and fresh-frame rules above even when hist
     fun image(data: String) = JSONObject().put("realtimeInput",JSONObject().put("video",JSONObject().put("mimeType","image/jpeg").put("data",data)))
     fun tool(id:String,name:String,result:JSONObject):JSONObject {
         val copied=JSONObject(result.toString()).apply { remove("scheduling");remove("willContinue") }
-        val response=JSONObject().put("id",id).put("name",name).put("scheduling","WHEN_IDLE").put("response",copied)
+        // A progress receipt only updates context (SILENT); with WHEN_IDLE each one queued its own spoken turn, so a
+        // call said the finished answer twice. The result, or an approval the owner must give, is spoken.
+        val progress=name=="invoke_tool"&&result.optString("status") in setOf("ready","running","uncertain")||
+            name=="hermes_work"&&result.optString("status")=="waiting_for_idle"
+        val response=JSONObject().put("id",id).put("name",name).put("scheduling",if(progress) "SILENT" else "WHEN_IDLE").put("response",copied)
         // These are protocol fields, not tool-result content; closing early discards later receipts.
         if(name=="invoke_tool") response.put("willContinue",result.optString("status") in setOf("ready","running","needs_approval","uncertain"))
         else if(name=="hermes_work") response.put("willContinue",result.optString("status")=="waiting_for_idle")
