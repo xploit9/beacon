@@ -51,6 +51,7 @@ class RedesignKanbanTest {
         assertTrue(runCatching { boardTaskFields(" ", "", "") }.isFailure)
         assertTrue(runCatching { boardTaskFields("Task", "x".repeat(16_001), "") }.isFailure)
         assertTrue(runCatching { boardTaskFields("Task", "", "evil\nprofile") }.isFailure)
+        assertFalse(boardTaskFields("Task", "Body", " ").has("assignee"))
         assertEquals("Task", boardTaskFields(" Task ", "Body", "work").getString("title"))
         assertFalse(NativeOperationPolicy.direct("/api/plugins/kanban/tasks/t_1/force", "GET"))
         assertFalse(NativeOperationPolicy.direct("/api/plugins/kanban/../settings", "GET"))

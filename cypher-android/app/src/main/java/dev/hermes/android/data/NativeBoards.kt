@@ -23,7 +23,8 @@ internal fun boardTaskFields(title: String, body: String, assignee: String): JSO
     require(title.isNotBlank() && title.length <= 160) { "Enter a title of up to 160 characters" }
     require(body.length <= 16_000) { "Keep the description under 16,000 characters" }
     require(assignee.length <= 80 && assignee.none { it.isISOControl() }) { "Invalid bot profile" }
-    return json("title" to title.trim(), "body" to body, "assignee" to assignee.trim())
+    // Hermes rejects an empty profile name, so an unassigned task leaves the field out.
+    return json("title" to title.trim(), "body" to body).apply { assignee.trim().takeIf(String::isNotEmpty)?.let { put("assignee", it) } }
 }
 internal fun boardMoveFields(status: String): JSONObject {
     require(status in boardStatuses && status != "running") { "Hermes starts a task when its worker claims it" }
