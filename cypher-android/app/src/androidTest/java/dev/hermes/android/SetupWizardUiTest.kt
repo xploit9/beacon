@@ -69,6 +69,18 @@ import java.util.concurrent.atomic.AtomicBoolean
 class SetupWizardUiTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
 
+    @Test fun bareDashboardHostDefaultsToHttpsAndInvalidInputUsesPlainLanguage() {
+        assertEquals("https://dashboard.example.ts.net:8443", parseCypherConnectInput("dashboard.example.ts.net:8443"))
+        val error = runCatching { parseCypherConnectInput("http://dashboard.example.ts.net") }.exceptionOrNull()
+        assertTrue(error is IllegalArgumentException)
+        assertFalse(error?.message.orEmpty().contains("Expected URL scheme"))
+    }
+
+    @Test fun backgroundUseActionIsOnlyNeededWhileBatteryOptimized() {
+        assertTrue(setupNeedsBackgroundExemption(isIgnoringBatteryOptimizations = false))
+        assertFalse(setupNeedsBackgroundExemption(isIgnoringBatteryOptimizations = true))
+    }
+
     @Test fun setupWizardSuppressedNoticeAndErrorAreClearedWhenItCloses() {
         var setupWizard by mutableStateOf(true)
         var error by mutableStateOf("")

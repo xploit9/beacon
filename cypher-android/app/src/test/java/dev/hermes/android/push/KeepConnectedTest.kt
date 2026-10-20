@@ -80,12 +80,47 @@ class KeepConnectedTest {
         val store = cursors(values)
 
         assertEquals(0L, store.read("https://one.example", "owner", "default"))
+        assertNull(store.readIfPresent("https://one.example", "owner", "default"))
         store.advance("https://one.example", "owner", "default", 12)
 
         assertEquals(12L, cursors(values).read("https://one.example", "owner", "default"))
         assertEquals(0L, store.read("https://two.example", "owner", "default"))
         assertEquals(0L, store.read("https://one.example", "owner", "coder"))
         assertEquals(0L, store.read("https://one.example", "another-owner", "default"))
+    }
+
+    @Test fun firstConnectionDrainsOldPagesWithoutNotifyingAndThenDeliversNewEvents() = runTest {
+        val values = mutableMapOf<String, String>()
+        val store = cursors(values)
+        val old = JSONObject().put("event_id", "old-reply")
+        val fresh = JSONObject().put("event_id", "new-reply")
+        val seedRequests = mutableListOf<Long>()
+        val pollRequests = mutableListOf<Long>()
+        val delivered = mutableListOf<String>()
+        val poller = KeepConnectedPoller(
+            origin = "https://hermes.example",
+            owner = "owner",
+            cursors = store,
+            profiles = { listOf("default") },
+            poll = { _, after ->
+                pollRequests += after
+                KeepConnectedPage(listOf(fresh), after + 1)
+            },
+            onEvent = { _, event -> delivered += event.getString("event_id") },
+            initialize = { _, after ->
+                seedRequests += after
+                if (after == 0L) KeepConnectedPage(listOf(old), 1) else KeepConnectedPage(emptyList(), 5)
+            },
+        )
+
+        assertEquals(KeepConnectedCycle.Connected, poller.pollOnce())
+        assertEquals(listOf(0L, 1L), seedRequests)
+        assertTrue(delivered.isEmpty())
+        assertEquals(5L, store.read("https://hermes.example", "owner", "default"))
+
+        assertEquals(KeepConnectedCycle.Connected, poller.pollOnce())
+        assertEquals(listOf(5L), pollRequests)
+        assertEquals(listOf("new-reply"), delivered)
     }
 
     @Test fun taskResultPayloadPreservesFieldsUsedByTheNativePushPath() {
@@ -223,9 +258,12 @@ class KeepConnectedTest {
         val poller = KeepConnectedPoller(
             origin = "https://hermes.example",
             owner = "owner",
-            cursors = cursors(),
             profiles = { listOf("fast", "slow") },
             nowMillis = { 0L },
+            cursors = cursors().apply {
+                reset("https://hermes.example", "owner", "fast", 0)
+                reset("https://hermes.example", "owner", "slow", 0)
+            },
             poll = { profile, after ->
                 if (profile == "fast") {
                     fastPolls += 1
@@ -258,7 +296,7 @@ class KeepConnectedTest {
     }
 
     @Test fun replayedIncomingEventUsesTheExistingReceiptToAvoidAnotherRing() = runTest {
-        val store = cursors()
+        val store = cursors().apply { reset("https://hermes.example", "owner", "default", 0) }
         val event = JSONObject().put("event_id", "call-1")
         val receipts = mutableSetOf<String>()
         var rings = 0
@@ -360,6 +398,10 @@ class KeepConnectedTest {
         }
     }
 
+    @Test fun profileFailureReasonUsesDisplayNameWhenProvided() {
+        assertEquals("Hermes refused profile Research (403)", keepConnectedFailureReason("academic", ApiFailure(403, "private details"), "Research"))
+    }
+
     @Test fun pluginUnauthorizedProfileDoesNotBlockSignedInProfileAndRetriesOnBackoff() = runTest {
         val server = MockWebServer().apply { start() }
         server.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
@@ -380,7 +422,10 @@ class KeepConnectedTest {
             val poller = KeepConnectedPoller(
                 origin = "https://hermes.example",
                 owner = "owner",
-                cursors = cursors(),
+                cursors = cursors().apply {
+                    reset("https://hermes.example", "owner", "default", 0)
+                    reset("https://hermes.example", "owner", "academic", 0)
+                },
                 profiles = { profiles },
                 signedInProfile = { "default" },
                 nowMillis = { now },

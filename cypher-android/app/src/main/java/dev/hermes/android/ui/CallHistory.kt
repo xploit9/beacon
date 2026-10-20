@@ -19,6 +19,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.hermes.android.CypherViewModel
+import dev.hermes.android.isMissingCypherPluginRoute
 import dev.hermes.android.core.rows
 import dev.hermes.android.core.string
 import kotlinx.coroutines.CancellationException
@@ -63,6 +64,7 @@ internal fun CallHistorySheet(vm: CypherViewModel, onOpenCall: (conversationId: 
     var next by remember(activeClient, requestScope) { mutableStateOf<String?>(null) }
     var loading by remember(activeClient, requestScope) { mutableStateOf(false) }
     var error by remember(activeClient, requestScope) { mutableStateOf("") }
+    var retryAvailable by remember(activeClient, requestScope) { mutableStateOf(true) }
     val list = rememberLazyListState()
     val coroutineScope = rememberCoroutineScope()
 
@@ -70,6 +72,7 @@ internal fun CallHistorySheet(vm: CypherViewModel, onOpenCall: (conversationId: 
         if (loading || activeClient == null || requestScope == null || client == null) return
         loading = true
         error = ""
+        retryAvailable = true
         try {
             val query = mutableMapOf("profile" to requestScope.profile, "limit" to "50")
             cursor?.let { query["before"] = it }
@@ -80,8 +83,9 @@ internal fun CallHistorySheet(vm: CypherViewModel, onOpenCall: (conversationId: 
             next = response.string("next").ifBlank { null }
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (_: Exception) {
-            error = "Call history unavailable"
+        } catch (failure: Exception) {
+            retryAvailable = !isMissingCypherPluginRoute(failure)
+            error = if (retryAvailable) "Call history unavailable" else "Update the Cypher plugin on Hermes to see call history."
         } finally {
             loading = false
         }
@@ -106,7 +110,7 @@ internal fun CallHistorySheet(vm: CypherViewModel, onOpenCall: (conversationId: 
             when {
                 error.isNotBlank() -> Column(Modifier.weight(1f).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
                     Text(error, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    TextButton(onClick = { coroutineScope.launch { calls = emptyList(); next = null; load() } }) { Text("Retry") }
+                    if (retryAvailable) TextButton(onClick = { coroutineScope.launch { calls = emptyList(); next = null; load() } }) { Text("Retry") }
                 }
                 calls.isEmpty() && loading -> Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
                 calls.isEmpty() -> Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {

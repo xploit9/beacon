@@ -82,14 +82,14 @@ internal fun keepConnectedPushData(event: JSONObject): Map<String, String> =
     listOf("source_ref", "event_id", "conversation_ref", "kind", "activity_ref", "expires_at", "release_version")
         .associateWith(event::optString)
 
-internal fun keepConnectedFailureReason(profile: String, error: Throwable): String = when (error) {
+internal fun keepConnectedFailureReason(profile: String, error: Throwable, profileLabel: String = profile): String = when (error) {
     is NativeAuthExpiredException -> "Hermes sign-in expired"
     is KeepConnectedPageException -> "Hermes returned an invalid notification page"
     is KeepConnectedProfilesException -> "Hermes returned no authorized profiles"
     is InterruptedIOException -> "Hermes did not answer in time"
     is ApiFailure -> when {
         error.status == 401 -> "Hermes rejected the connection (401)"
-        error.status == 403 -> "Hermes refused profile ${profile.takeIf(::validNativeProfile)?.take(32) ?: "current"} (403)"
+        error.status == 403 -> "Hermes refused profile ${profileLabel.takeIf(String::isNotBlank) ?: profile.takeIf(::validNativeProfile)?.take(32) ?: "current"} (403)"
         error.status == 404 -> "Cypher plugin route missing (404)"
         error.status == 409 -> "Hermes refused the notification request (409)"
         error.status in 500..599 -> "Hermes server error (${error.status})"
@@ -116,8 +116,10 @@ internal class KeepConnectedCursors(
     private val read: (String) -> String?,
     private val write: (String, String) -> Boolean,
 ) {
-    fun read(origin: String, owner: String, profile: String): Long =
-        read(key(origin, owner, profile))?.toLongOrNull()?.takeIf { it >= 0 } ?: 0
+    fun readIfPresent(origin: String, owner: String, profile: String): Long? =
+        read(key(origin, owner, profile))?.toLongOrNull()?.takeIf { it >= 0 }
+
+    fun read(origin: String, owner: String, profile: String): Long = readIfPresent(origin, owner, profile) ?: 0
 
     fun advance(origin: String, owner: String, profile: String, cursor: Long) {
         require(cursor >= read(origin, owner, profile)) { "Notification cursor moved backwards" }
@@ -150,6 +152,8 @@ internal class KeepConnectedPoller(
     private val nowMillis: () -> Long = { System.nanoTime() / 1_000_000L },
     private val poll: suspend (String, Long) -> KeepConnectedPage,
     private val onEvent: suspend (String, JSONObject) -> Unit,
+    private val initialize: suspend (String, Long) -> KeepConnectedPage = poll,
+    private val profileLabel: (String) -> String = { it },
 ) {
     private data class ProfileFailure(val attempts: Int, val retryAtMillis: Long, val reason: String)
     private data class ProfilePollResult(val profile: String, val failure: Exception?, val completedAtMillis: Long)
@@ -249,7 +253,26 @@ internal class KeepConnectedPoller(
     private suspend fun pollProfile(profile: String, permits: Semaphore): ProfilePollResult {
         val startedAt = nowMillis()
         return try {
-            val after = cursors.read(origin, owner, profile)
+            val savedCursor = cursors.readIfPresent(origin, owner, profile)
+            if (savedCursor == null) {
+                var after = 0L
+                var pages = 0
+                while (true) {
+                    val page = permits.withPermit { initialize(profile, after) }
+                    if (page.nextCursor < 0 || (!page.reset && page.nextCursor < after) || page.events.size > 100) throw KeepConnectedPageException()
+                    when {
+                        page.reset -> { after = page.nextCursor; break }
+                        page.events.isEmpty() -> { after = page.nextCursor; break }
+                        page.nextCursor <= after -> throw KeepConnectedPageException()
+                        else -> after = page.nextCursor
+                    }
+                    pages++
+                    if (pages > 1_000) throw KeepConnectedPageException()
+                }
+                cursors.reset(origin, owner, profile, after)
+                return ProfilePollResult(profile, null, nowMillis())
+            }
+            val after = savedCursor
             val page = permits.withPermit {
                 val result = poll(profile, after)
                 if (result.nextCursor < 0 || (!result.reset && result.nextCursor < after) || result.events.size > 100) throw KeepConnectedPageException()
@@ -282,7 +305,7 @@ internal class KeepConnectedPoller(
             profileFailures[result.profile] = ProfileFailure(
                 attempts,
                 result.completedAtMillis + keepConnectedBackoffMs(attempts),
-                keepConnectedFailureReason(result.profile, error),
+                keepConnectedFailureReason(result.profile, error, profileLabel(result.profile)),
             )
         }
     }
@@ -450,6 +473,7 @@ class KeepConnectedService : Service() {
         )
         var client: CypherClient? = null
         var authorizedProfiles = emptyList<String>()
+        var profileDisplayNames = emptyMap<String, String>()
         val poller = KeepConnectedPoller(
             origin = origin,
             owner = owner,
@@ -463,7 +487,19 @@ class KeepConnectedService : Service() {
                     current?.closeNative()
                     client = createClient(app, auth)
                 }
-                authorizedProfiles = requireNotNull(client).nativeAuthorizedProfiles()
+                val profileClient = requireNotNull(client)
+                val profiles = try { profileClient.nativeGet("/api/profiles").rows("profiles") }
+                catch (error: NativeAuthExpiredException) { throw error }
+                catch (error: CancellationException) { throw error }
+                catch (error: ApiFailure) { if (error.status == 401) throw NativeAuthExpiredException() else null }
+                catch (_: IOException) { null }
+                catch (_: Exception) { null }
+                authorizedProfiles = profiles?.map { it.string("name").trim() }?.filter(::validNativeProfile)?.distinct()?.take(256)
+                    ?: listOf(profileClient.auth.profile).filter(::validNativeProfile)
+                profileDisplayNames = profiles.orEmpty().associate { row ->
+                    val id = row.string("name").trim()
+                    id to (row.string("display_name").trim().takeIf(String::isNotBlank) ?: id)
+                }
                 authorizedProfiles
             },
                 poll = { profile, after ->
@@ -476,6 +512,16 @@ class KeepConnectedService : Service() {
                     )
                     parseKeepConnectedPage(response, after)
                 },
+                initialize = { profile, after ->
+                    val response = requireNotNull(client).nativeGetForProfile(
+                        "/api/plugins/cypher/mobile/notifications/events",
+                        profile,
+                        authorizedProfiles,
+                        query = mapOf("after" to after.toString(), "wait" to "0"),
+                        maxBytes = 1_048_576,
+                    )
+                    parseKeepConnectedPage(response, after)
+                },
                 signedInProfile = { client?.auth?.profile.orEmpty() },
                 onEvent = { profile, event ->
                     if (event.optString("kind") == "incoming_call") deliverIncomingCall(app, origin, owner, profile, event)
@@ -483,6 +529,7 @@ class KeepConnectedService : Service() {
                         receivePush(this, keepConnectedPushData(event))
                     }
                 },
+                profileLabel = { profile -> profileDisplayNames[profile] ?: profile },
             )
         try {
             while (currentCoroutineContext().isActive && isEnabledFor(this, Scope(origin, owner, "default"))) {

@@ -109,7 +109,7 @@ class NativeStockHistoryTest {
         }
 
         companion object {
-            fun rows(prefix: String, count: Int, profile: String? = null) = (0 until count).map {
+            fun rows(prefix: String, count: Int, profile: String? = "work") = (0 until count).map {
                 json("id" to "$prefix-$it", "title" to "$prefix title $it", "preview" to "secret preview words", "message_count" to 2)
                     .apply { profile?.let { p -> put("profile", p) } }
             }

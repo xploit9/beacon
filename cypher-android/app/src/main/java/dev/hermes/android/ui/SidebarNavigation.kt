@@ -57,6 +57,11 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
 @Composable internal fun SidebarNavigation(vm: CypherViewModel) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
+    val profileCatalog = data["navigation-profiles"]
+    val profileRows = profileCatalog?.rows("profiles").orEmpty()
+    val currentProfile = ui.chatProfile.ifBlank { ui.profile }
+    val currentProfileLabel = profileDisplayLabel(currentProfile, profileRows, ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading")))
+    LaunchedEffect(ui.origin, ui.owner, ui.connected) { if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     var profilesOpen by remember(ui.origin, ui.owner, ui.profile) { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         if (ui.botModeEnabled) {
@@ -69,6 +74,9 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
                 }
                 Icon(Icons.Rounded.ChevronRight, null)
             }
+            TextButton(onClick = vm::toggleBotMode, enabled = !ui.botModeSwitching, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("navigation-leave-bot-mode")) {
+                Text(uiText("Leave Bot Mode"))
+            }
         } else {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.weight(1f)) {
@@ -77,7 +85,7 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
                         Spacer(Modifier.width(8.dp))
                         Column(Modifier.weight(1f), horizontalAlignment = Alignment.Start) {
                             // The chats' profile, even while the assistant tab uses its own.
-                            Text(ui.chatProfile.ifBlank { ui.profile }, style = MaterialTheme.typography.titleMedium)
+                            Text(currentProfileLabel, style = MaterialTheme.typography.titleMedium)
                             Text(uiText("Switch profile"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         Icon(Icons.Rounded.ExpandMore, null)
@@ -88,8 +96,8 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
                             record == null || record.optBoolean("_loading") -> DropdownMenuItem(text = { Text(uiText("Loading profiles…")) }, onClick = {}, enabled = false)
                             record.string("_error").isNotBlank() -> DropdownMenuItem(text = { Text(uiText("Retry profiles")) }, onClick = { vm.load("navigation-profiles", "/api/profiles") })
                             else -> record.rows("profiles").forEach { profile ->
-                                val name = profile.string("name")
-                                if (name.isNotBlank()) DropdownMenuItem(text = { Text(name) }, leadingIcon = { if (name == ui.chatProfile.ifBlank { ui.profile }) Icon(Icons.Rounded.Check, null) }, onClick = { profilesOpen = false; if (name != ui.chatProfile.ifBlank { ui.profile }) vm.chooseProfile(name) })
+                                val id = profile.string("name")
+                                if (id.isNotBlank()) DropdownMenuItem(text = { Text(profileDisplayName(id, profileRows)) }, leadingIcon = { if (id == currentProfile) Icon(Icons.Rounded.Check, null) }, onClick = { profilesOpen = false; if (id != currentProfile) vm.chooseProfile(id) })
                             }
                         }
                         DropdownMenuItem(text = { Text(uiText("Manage profiles")) }, onClick = { profilesOpen = false; vm.more("Profiles") })
@@ -109,10 +117,11 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
                             val route = navigationRoute(name)
                             val isBotToggle = name == "Bots"
                             val active = if (isBotToggle) ui.botModeEnabled else ui.tab == route.tab && ui.morePage == route.page
-                            Surface(onClick = { vm.navigate(name) }, enabled = !isBotToggle || !ui.botModeSwitching, modifier = Modifier.weight(1f).shadow(if (isBotToggle && active) 12.dp else 0.dp, RoundedCornerShape(12.dp), clip = false, ambientColor = MaterialTheme.colorScheme.primary, spotColor = MaterialTheme.colorScheme.primary).semantics { role = if (isBotToggle) Role.Switch else Role.Button; if (isBotToggle) { toggleableState = if (ui.botModeEnabled) ToggleableState.On else ToggleableState.Off; if (ui.botModeSwitching) stateDescription = "Switching" } else selected = active }.testTag("navigation-${name.lowercase()}"), shape = RoundedCornerShape(12.dp), color = if (active) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh, border = androidx.compose.foundation.BorderStroke(if (isBotToggle && active) 2.dp else 1.dp, if (isBotToggle && active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant)) {
+                            Surface(onClick = { vm.navigate(name) }, enabled = !isBotToggle || !ui.botModeSwitching, modifier = Modifier.weight(1f).shadow(if (isBotToggle && active) 12.dp else 0.dp, RoundedCornerShape(12.dp), clip = false, ambientColor = MaterialTheme.colorScheme.primary, spotColor = MaterialTheme.colorScheme.primary).semantics { role = if (isBotToggle) Role.Switch else Role.Button; if (isBotToggle) { toggleableState = if (ui.botModeEnabled) ToggleableState.On else ToggleableState.Off; stateDescription = if (ui.botModeSwitching) "Switching" else if (ui.botModeEnabled) "On" else "Off" } else selected = active }.testTag("navigation-${name.lowercase()}"), shape = RoundedCornerShape(12.dp), color = if (active) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh, border = androidx.compose.foundation.BorderStroke(if (isBotToggle && active) 2.dp else 1.dp, if (isBotToggle && active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant)) {
                                 Column(Modifier.fillMaxWidth().heightIn(min = 64.dp).padding(horizontal = 4.dp, vertical = 10.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(5.dp)) {
                                     Icon(navigationIcon(name), null, Modifier.size(20.dp), tint = if (isBotToggle && active) MaterialTheme.colorScheme.primary else LocalContentColor.current)
-                                    Text(uiText(name), style = MaterialTheme.typography.labelMedium, color = if (isBotToggle && active) MaterialTheme.colorScheme.primary else LocalContentColor.current)
+                                    Text(uiText(if (isBotToggle) "Bot Mode" else name), style = MaterialTheme.typography.labelMedium, color = if (isBotToggle && active) MaterialTheme.colorScheme.primary else LocalContentColor.current)
+                                    if (isBotToggle && active) Text(uiText("On"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                                 }
                             }
                         }

@@ -38,29 +38,30 @@ import org.json.JSONObject
 /** The long-press menu of a conversation in history: pin, rename, project, archive, delete. */
 @Composable internal fun ConversationMenuItems(vm: CypherViewModel, row: JSONObject, onDone: () -> Unit, onRename: () -> Unit, onProject: () -> Unit, onDelete: () -> Unit) {
     val id = sessionRowId(row)
+    val profile = row.string("profile", vm.ui.value.profile)
     val pinned = row.optBoolean("pinned")
     val archived = row.optBoolean("archived")
-    DropdownMenuItem({ Text(uiText(if (pinned) "Unpin" else "Pin")) }, leadingIcon = { Icon(Icons.Rounded.PushPin, null) }, modifier = Modifier.testTag("conversation-pin"),
-        onClick = { onDone(); vm.conversationAction(id, "/api/session/pin", json("pinned" to !pinned), if (pinned) "Unpinned" else "Pinned") })
-    DropdownMenuItem({ Text(uiText("Rename")) }, leadingIcon = { Icon(Icons.Rounded.Edit, null) }, onClick = { onDone(); onRename() })
-    ConversationProjectItem(vm, id, onAdd = onProject, onDone = onDone)
-    DropdownMenuItem({ Text(uiText(if (archived) "Unarchive" else "Archive")) }, leadingIcon = { Icon(if (archived) Icons.Rounded.Unarchive else Icons.Rounded.Archive, null) },
-        onClick = { onDone(); vm.conversationAction(id, "/api/session/archive", json("archived" to !archived), if (archived) "Unarchived" else "Archived") })
-    DropdownMenuItem({ Text(uiText("Delete"), color = MaterialTheme.colorScheme.error) }, leadingIcon = { Icon(Icons.Rounded.DeleteOutline, null, tint = MaterialTheme.colorScheme.error) },
+    DropdownMenuItem({ Text(conversationMenuTitle(uiText(if (pinned) "Unpin" else "Pin"))) }, leadingIcon = { Icon(Icons.Rounded.PushPin, null) }, modifier = Modifier.testTag("conversation-pin"),
+        onClick = { onDone(); vm.conversationAction(id, "/api/session/pin", json("pinned" to !pinned), if (pinned) "Unpinned" else "Pinned", profile) })
+    DropdownMenuItem({ Text(conversationMenuTitle(uiText("Rename"))) }, leadingIcon = { Icon(Icons.Rounded.Edit, null) }, onClick = { onDone(); onRename() })
+    if (profile == vm.ui.value.profile) ConversationProjectItem(vm, id, onAdd = onProject, onDone = onDone)
+    DropdownMenuItem({ Text(conversationMenuTitle(uiText(if (archived) "Unarchive" else "Archive"))) }, leadingIcon = { Icon(if (archived) Icons.Rounded.Unarchive else Icons.Rounded.Archive, null) },
+        onClick = { onDone(); vm.conversationAction(id, "/api/session/archive", json("archived" to !archived), if (archived) "Unarchived" else "Archived", profile) })
+    DropdownMenuItem({ Text(conversationMenuTitle(uiText("Delete")), color = MaterialTheme.colorScheme.error) }, leadingIcon = { Icon(Icons.Rounded.DeleteOutline, null, tint = MaterialTheme.colorScheme.error) },
         modifier = Modifier.testTag("conversation-delete"), onClick = { onDone(); onDelete() })
 }
 
-@Composable internal fun RenameConversationDialog(vm: CypherViewModel, id: String, title: String, onDismiss: () -> Unit) {
+@Composable internal fun RenameConversationDialog(vm: CypherViewModel, id: String, profile: String, title: String, onDismiss: () -> Unit) {
     var name by remember(id) { mutableStateOf(title) }
     AlertDialog(onDismissRequest = onDismiss, title = { Text(uiText("Rename")) },
         text = { OutlinedTextField(name, { name = it.take(200) }, singleLine = true, modifier = Modifier.testTag("conversation-rename-field")) },
-        confirmButton = { TextButton(onClick = { onDismiss(); vm.conversationAction(id, "/api/session/rename", json("title" to name.trim()), "Renamed") }, enabled = name.isNotBlank() && name.trim() != title) { Text(uiText("Save")) } },
+        confirmButton = { TextButton(onClick = { onDismiss(); vm.conversationAction(id, "/api/session/rename", json("title" to name.trim()), "Renamed", profile) }, enabled = name.isNotBlank() && name.trim() != title) { Text(uiText("Save")) } },
         dismissButton = { TextButton(onClick = onDismiss) { Text(uiText("Cancel")) } })
 }
 
-@Composable internal fun DeleteConversationDialog(vm: CypherViewModel, id: String, title: String, onDismiss: () -> Unit) {
+@Composable internal fun DeleteConversationDialog(vm: CypherViewModel, id: String, profile: String, title: String, onDismiss: () -> Unit) {
     AlertDialog(onDismissRequest = onDismiss, title = { Text(uiText("Delete conversation?")) }, text = { Text(title.ifBlank { uiText("Untitled conversation") }) },
-        confirmButton = { TextButton(onClick = { onDismiss(); vm.conversationAction(id, "/api/session/delete", done = "Deleted") }, modifier = Modifier.testTag("conversation-delete-confirm")) { Text(uiText("Delete"), color = MaterialTheme.colorScheme.error) } },
+        confirmButton = { TextButton(onClick = { onDismiss(); vm.conversationAction(id, "/api/session/delete", done = "Deleted", profile = profile) }, modifier = Modifier.testTag("conversation-delete-confirm")) { Text(uiText("Delete"), color = MaterialTheme.colorScheme.error) } },
         dismissButton = { TextButton(onClick = onDismiss) { Text(uiText("Cancel")) } })
 }
 

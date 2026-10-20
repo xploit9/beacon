@@ -36,7 +36,7 @@ import kotlinx.coroutines.launch
         if (page == "Skills") editor.loadSkills(force = false) else editor.loadMemory(force = false)
     }
     Column(Modifier.fillMaxSize()) {
-        Header(page, back = if (page == "Skills" && skills.selected == null) null else back, menu = LocalOpenNavigationMenu.current) {
+        Header(page, back = if (page == "Memory" || page == "Skills" && skills.selected == null) null else back, menu = LocalOpenNavigationMenu.current) {
             if (page == "Memory") IconButton(onClick = { editor.loadMemory() }, enabled = vm.client != null && !memory.loading && !memory.saving && memory.editing.isBlank()) { Icon(Icons.Rounded.Refresh, "Refresh memory") }
             else IconButton(onClick = { skills.selected?.let(editor::openSkill) ?: editor.loadSkills() }, enabled = vm.client != null && !skills.loading && !skills.saving && !skills.editing) { Icon(Icons.Rounded.Refresh, "Refresh skills") }
         }
@@ -80,6 +80,10 @@ import kotlinx.coroutines.launch
 
 @Composable internal fun NativeProfilesPage(vm: CypherViewModel) {
     val ui by vm.ui.collectAsStateWithLifecycle()
+    val data by vm.data.collectAsStateWithLifecycle()
+    val profileCatalog = data["navigation-profiles"]
+    val profileRows = profileCatalog?.rows("profiles").orEmpty()
+    val profileLoading = ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
     val state by vm.phoneSettings.bots.collectAsStateWithLifecycle()
     val models by vm.phoneSettings.botModels.collectAsStateWithLifecycle()
     var discard by remember { mutableStateOf<(() -> Unit)?>(null) }
@@ -91,7 +95,7 @@ import kotlinx.coroutines.launch
     }
     val back = { leave { if (state.editing) vm.phoneSettings.editBot(false) else if (state.selected != null) vm.phoneSettings.closeBot() else vm.backFromSettings() } }
     BackHandler(onBack = back)
-    LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, vm.client) { vm.phoneSettings.bind(); vm.phoneSettings.loadBots() }
+    LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, vm.client) { vm.phoneSettings.bind(); vm.phoneSettings.loadBots(); if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     Column(Modifier.fillMaxSize()) {
         Header("Profiles", back = back, menu = LocalOpenNavigationMenu.current)
         NativeBotSettings(state, vm.phoneSettings::openBot, { leave(vm.phoneSettings::closeBot) }, { vm.phoneSettings.editBot(true) },
@@ -100,7 +104,8 @@ import kotlinx.coroutines.launch
                 if (profile != vm.ui.value.profile) vm.switchProfile(profile).join()
                 if (vm.ui.value.profile == profile && vm.ui.value.tab == "More" && vm.ui.value.morePage in setOf("", "Profiles")) vm.more(settingsRoute(page))
             } }, onRefresh = { state.selected?.let { vm.phoneSettings.openBot(it.profile) } ?: vm.phoneSettings.loadBots() }, models = models,
-            renderBehavior = { Markdown(it, vm) })
+            renderBehavior = { Markdown(it, vm) },
+            profileLabel = { profile -> profileDisplayLabel(profile, profileRows, profileLoading) })
     }
     discard?.let { action -> AlertDialog(onDismissRequest = { discard = null }, title = { Text("Discard model selection?") },
         confirmButton = { TextButton(onClick = { discard = null; action() }) { Text("Discard") } },

@@ -37,6 +37,35 @@ class ProactiveUiTest {
     private val app get() = ApplicationProvider.getApplicationContext<CypherApplication>()
     private fun proactiveKey(fixture: NativeExperienceFixture) = proactiveSettingsKey(fixture.scope.copy(profile = "coder"))
 
+    @Test fun assistantProfileAndProactiveUseHermesDisplayName() = withFixture { vm, fixture ->
+        fixture.profileDisplayNames = mapOf("default" to "Personal profile", "coder" to "Code profile")
+        compose.runOnIdle { vm.load("navigation-profiles", "/api/profiles", force = true) }
+        await { vm.data.value["navigation-profiles"]?.rows("profiles")?.any { it.string("display_name") == "Code profile" } == true }
+        compose.runOnIdle { vm.more("Assistant") }
+        await { vm.data.value[proactiveKey(fixture)]?.has("enabled") == true }
+        compose.onNodeWithText("Code profile").assertExists()
+        compose.onNodeWithText("Proactive · Code profile").assertExists()
+        compose.onNodeWithText("coder", substring = false).assertDoesNotExist()
+    }
+
+    @Test fun missingProactiveRouteExplainsPluginUpdateAndOtherErrorsKeepRetry() = withFixture { vm, fixture ->
+        await { vm.preferences.value.assistantProfile == "coder" }
+        fixture.proactiveRouteMissing = true
+        compose.runOnIdle { vm.more("Assistant") }
+        await { vm.data.value[proactiveKey(fixture)]?.optBoolean("_pluginUpdateRequired") == true }
+        compose.onNodeWithText("Update the Cypher plugin on Hermes to use Proactive.").assertExists()
+        compose.onNodeWithText("Retry").assertDoesNotExist()
+
+        fixture.proactiveRouteMissing = false
+        fixture.pluginStatus = 503
+        compose.runOnIdle { vm.tab("Cypher") }
+        await { vm.ui.value.tab == "Cypher" }
+        compose.runOnIdle { vm.more("Assistant") }
+        await { vm.data.value[proactiveKey(fixture)]?.let { it.has("_error") && !it.optBoolean("_pluginUpdateRequired") } == true }
+        compose.onNodeWithText("Proactive settings couldn’t be loaded.").assertExists()
+        compose.onNodeWithText("Retry").assertExists()
+    }
+
     @Test fun taskResultNotificationShowsFullReasonAndCanBeDismissed() = withFixture { vm, fixture ->
         val source = "task-result-source-test"
         val eventId = "task-result-event-test"

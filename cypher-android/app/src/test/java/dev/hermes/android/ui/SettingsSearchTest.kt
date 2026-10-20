@@ -126,16 +126,6 @@ class SettingsSearchTest {
         for (stored in listOf("", "shift_enter", "alt+enter", "Enter ")) assertNull("$stored is not a composer shortcut", settingsSendKeyLabel(stored))
         for (route in settingsSearchRoutes - setOf("Connection", "Profiles", "Profiles & model", "Chat", "Appearance", "App updates", "Voice & calls", "Notifications & Keep connected", "Assistant", "About & licenses")) assertTrue("$route has no observable state to summarize", settingsSummary(route, known).isEmpty())
     }
-    @Test fun statusChipCopyMatchesTheAndroidVersion() {
-        assertEquals(
-            "Status chips aren't supported on this Android 16 build. Calls and requests use standard notifications.",
-            statusChipUnsupportedDescription("16", 36),
-        )
-        assertEquals(
-            "Status chips require Android 16 or later. Calls and requests use standard notifications.",
-            statusChipUnsupportedDescription("15", 35),
-        )
-    }
     @Test fun userDataStaysVerbatimWhileFixedWordsTranslate() {
         val parts = settingsSummary("Profiles & model", SettingsSnapshot(profile = "Settings"))
         assertEquals(listOf(SettingsSummaryPart("Active profile", true), SettingsSummaryPart("Settings", false)), parts)

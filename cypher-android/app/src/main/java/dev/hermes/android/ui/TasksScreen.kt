@@ -24,13 +24,16 @@ import kotlinx.coroutines.launch
 @Composable private fun Schedules(vm: CypherViewModel) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
+    val profileCatalog = data["navigation-profiles"]
+    val profileRows = profileCatalog?.rows("profiles").orEmpty()
+    val profileLoading = ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
     var selected by rememberSaveable(ui.profile) { mutableStateOf("") }
     var showPresets by rememberSaveable(ui.profile) { mutableStateOf(false) }
     val actionScope = rememberCoroutineScope()
     var pending by remember(ui.profile) { mutableStateOf("") }
     val crons = data["crons"]
     val refresh: () -> Unit = { refreshSchedules(vm) }
-    LaunchedEffect(ui.origin, ui.owner, ui.profile) { refresh() }
+    LaunchedEffect(ui.origin, ui.owner, ui.profile) { refresh(); if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     LaunchedEffect(ui.origin, ui.owner, ui.profile, selected, crons) { if (selected.isNotBlank()) vm.load("cron-history:$selected", "/api/crons/history", mapOf("job_id" to selected)) }
     val deliveries = data["cron-delivery"]?.rows("targets").orEmpty()
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -56,7 +59,7 @@ import kotlinx.coroutines.launch
                 Text(job.string("name", "Scheduled task"), style = MaterialTheme.typography.titleMedium)
                 Text(job.string("prompt"), style = MaterialTheme.typography.bodyMedium, maxLines = if (selected == id) Int.MAX_VALUE else 3)
                 Text(job.optJSONObject("schedule")?.string("display").orEmpty().ifBlank { job.string("schedule_display") }, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                Text("${scheduleState(job)} · ${job.string("profile", ui.profile)} · ${if(job.string("deliver", "local") == "local") "Save result in Cypher" else job.string("deliver")}", style = MaterialTheme.typography.bodySmall)
+                Text("${scheduleState(job)} · ${profileDisplayLabel(job.string("profile", ui.profile), profileRows, profileLoading)} · ${if(job.string("deliver", "local") == "local") "Save result in Cypher" else job.string("deliver")}", style = MaterialTheme.typography.bodySmall)
                 val timezone = data["task-capabilities"]?.string("timezone").orEmpty()
                 Text("Next: ${scheduleTime(job.string("next_run_at"), timezone, "Not scheduled")}", style = MaterialTheme.typography.bodySmall)
                 Text("Last: ${scheduleTime(job.string("last_run_at"), timezone, "No recorded run")}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

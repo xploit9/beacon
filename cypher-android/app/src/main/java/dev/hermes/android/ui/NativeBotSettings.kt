@@ -13,7 +13,7 @@ import dev.hermes.android.data.NativeBotsState
 
 @Composable fun NativeBotSettings(state: NativeBotsState, onOpen: (String) -> Unit, onBack: () -> Unit,
     onEditModel: () -> Unit, onModelDraft: (String, String) -> Unit, onSaveModel: () -> Unit, onCancel: () -> Unit,
-    onSettings: (String, String) -> Unit, onRefresh: () -> Unit, models: List<Pair<String, String>> = emptyList(), renderBehavior: @Composable (String) -> Unit = { SelectionContainer { Text(it, style = MaterialTheme.typography.bodyLarge) } }) {
+    onSettings: (String, String) -> Unit, onRefresh: () -> Unit, models: List<Pair<String, String>> = emptyList(), renderBehavior: @Composable (String) -> Unit = { SelectionContainer { Text(it, style = MaterialTheme.typography.bodyLarge) } }, profileLabel: (String) -> String = { it }) {
     var showBehavior by rememberSaveable(state.selected?.profile) { mutableStateOf(false) }
     var modelSearch by rememberSaveable(state.selected?.profile, state.editing) { mutableStateOf("") }
     var customModel by rememberSaveable(state.selected?.profile, state.editing) { mutableStateOf(false) }
@@ -25,13 +25,13 @@ import dev.hermes.android.data.NativeBotsState
         if (state.selected == null) {
             if (!state.loading && state.profiles.isEmpty()) item { Text("No authorized profiles were returned. Refresh to try again.") }
             items(state.profiles, key = { it.profile }) { bot ->
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { Text(bot.title, style = MaterialTheme.typography.titleMedium); Text(bot.purpose.ifBlank { "No purpose description has been written." }); OutlinedButton(onClick = { onOpen(bot.profile) }, enabled = !state.loading) { Text("View profile settings") }; HorizontalDivider() }
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { Text(profileLabel(bot.profile), style = MaterialTheme.typography.titleMedium); Text(bot.purpose.ifBlank { "No purpose description has been written." }); OutlinedButton(onClick = { onOpen(bot.profile) }, enabled = !state.loading) { Text("View profile settings") }; HorizontalDivider() }
             }
         } else {
             val bot = state.selected
-            item { Text(bot.title, style = MaterialTheme.typography.titleLarge); TextButton(onClick = onBack, enabled = !state.saving && !state.editing) { Text("All profiles") } }
+            item { Text(profileLabel(bot.profile), style = MaterialTheme.typography.titleLarge); TextButton(onClick = onBack, enabled = !state.saving && !state.editing) { Text("All profiles") } }
             item { Text("Purpose", style = MaterialTheme.typography.titleMedium); SelectionContainer { Text(bot.description.ifBlank { "No purpose description has been written. Native Hermes uses this description to help route Kanban work." }) } }
-            item { Text("Default model", style = MaterialTheme.typography.titleMedium); Text("${bot.provider.ifBlank { "Provider not set" }} · ${bot.model.ifBlank { "Model not set" }}"); Text("Default for new chats in this profile.", style = MaterialTheme.typography.bodyMedium) }
+            item { Text("Default model", style = MaterialTheme.typography.titleMedium); Text("${bot.provider.ifBlank { "Provider not set" }} · ${bot.model.ifBlank { "Model not set" }}"); Text("Default for new chats in ${profileLabel(bot.profile)}.", style = MaterialTheme.typography.bodyMedium) }
             if (state.editing) {
                 item {
                     Text("Choose a configured model", style = MaterialTheme.typography.titleMedium)

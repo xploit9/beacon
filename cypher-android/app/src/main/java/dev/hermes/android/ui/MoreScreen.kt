@@ -141,6 +141,10 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
     val prefs by vm.preferences.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
     val update by vm.appUpdate.collectAsStateWithLifecycle()
+    val profileCatalog = data["navigation-profiles"]
+    val profileRows = profileCatalog?.rows("profiles").orEmpty()
+    val profileLoading = ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
+    LaunchedEffect(ui.origin, ui.owner, ui.connected) { if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     val context = LocalContext.current.applicationContext
     var keepConnectedEnabled by remember(context) { mutableStateOf(KeepConnectedService.isEnabled(context)) }
     DisposableEffect(context) {
@@ -161,12 +165,12 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         }
     }
     val snapshot = SettingsSnapshot(
-        connected = ui.connected, profile = ui.profile,
+        connected = ui.connected, profile = profileDisplayLabel(ui.profile, profileRows, profileLoading),
         theme = prefs.theme, colorStyle = prefs.skin,
         installedVersion = BuildConfig.VERSION_NAME, updateName = update.release?.name.orEmpty(), updateReady = update.ready,
         voiceProviderId = phoneVoice?.first.orEmpty(), voiceKeySaved = phoneVoice?.second,
         keepConnectedEnabled = keepConnectedEnabled,
-        assistantName = prefs.assistantName, assistantProfile = prefs.assistantProfile,
+        assistantName = prefs.assistantName, assistantProfile = profileDisplayLabel(prefs.assistantProfile, profileRows, profileLoading),
     ).withLoaded(data["profile-settings"])
     val summaries = localizedSettingsSummaries(snapshot)
     SettingsOverview(summaries, { vm.more(it) }, category)
@@ -191,7 +195,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
     if (remotePage && vm.client == null && !ui.loading) {
         androidx.activity.compose.BackHandler { vm.backFromSettings() }
         Column(Modifier.fillMaxSize()) {
-            Header(uiText(settingsLabel(page)), back = if (page in setOf("Skills", "Bots")) null else ({ vm.backFromSettings() }), menu = LocalOpenNavigationMenu.current)
+            Header(uiText(settingsLabel(page)), back = if (page in setOf("Skills", "Memory", "Bots")) null else ({ vm.backFromSettings() }), menu = LocalOpenNavigationMenu.current)
             EmptyState("Reconnect to Hermes", "Keep Tailscale connected, then retry. Your saved drafts stay on this phone.", action = "Reconnect", onAction = { vm.connect(ui.origin) })
         }
         return
@@ -278,12 +282,17 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
 
 @Composable private fun ConnectionSettings(vm: CypherViewModel) {
     val ui by vm.ui.collectAsStateWithLifecycle()
+    val data by vm.data.collectAsStateWithLifecycle()
+    val profileCatalog = data["navigation-profiles"]
+    val profileRows = profileCatalog?.rows("profiles").orEmpty()
+    val profileLabel = profileDisplayLabel(ui.profile, profileRows, ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading")))
+    LaunchedEffect(ui.origin, ui.owner, ui.connected) { if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     var origin by rememberSaveable(ui.origin) { mutableStateOf(ui.origin) }
     Column(Modifier.fillMaxSize().imePadding().verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
         Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text(if (ui.connected) "Connected privately" else "Connection needs attention", style = MaterialTheme.typography.titleLarge)
             Text("Signed-in account · ${ui.owner.ifBlank { "Not signed in" }}", style = MaterialTheme.typography.bodyLarge)
-            Text("Profile · ${ui.profile}", style = MaterialTheme.typography.bodyLarge)
+            Text("Profile · $profileLabel", style = MaterialTheme.typography.bodyLarge)
             Text("Keep Tailscale connected to reach your private Cypher server.", color = MaterialTheme.colorScheme.onSurfaceVariant)
         } }
         OutlinedTextField(origin, { origin = it }, label = { Text(uiText("Server address")) }, supportingText = { Text("Your private Hermes address, starting with https://") }, enabled = !ui.loading, modifier = Modifier.fillMaxWidth(), singleLine = true)

@@ -119,6 +119,20 @@ class CallHistoryUiTest {
             compose.waitUntil(10_000) { compose.onAllNodesWithText("Missed call").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithTag("call-history-row:call-history-missed").performClick()
             compose.waitUntil(5_000) { vm.chat.value.sessionId == "chat-b" }
+
+            fixture.callHistoryRouteMissing = true
+            compose.onNodeWithContentDescription("Conversation actions").performClick()
+            compose.onNodeWithTag("call-history-open").performClick()
+            compose.waitUntil(10_000) { compose.onAllNodesWithText("Update the Cypher plugin on Hermes to see call history.").fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithText("Retry").assertDoesNotExist()
+
+            compose.onNodeWithTag("call-history-close").performClick()
+            fixture.callHistoryRouteMissing = false
+            fixture.pluginStatus = 503
+            compose.onNodeWithContentDescription("Conversation actions").performClick()
+            compose.onNodeWithTag("call-history-open").performClick()
+            compose.waitUntil(10_000) { compose.onAllNodesWithText("Call history unavailable").fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithText("Retry").assertExists()
         } finally {
             compose.runOnUiThread { store.clear(); fixture.client.closeNative(); app.calls.ownerScope = priorCallOwnerScope }
             runBlocking {

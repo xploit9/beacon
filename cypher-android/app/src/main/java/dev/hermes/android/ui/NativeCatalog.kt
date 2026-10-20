@@ -106,7 +106,7 @@ import org.json.JSONObject
                 val catalog = data["slash:catalog"]
                 if (catalog == null) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
                 if (recordError(catalog).isNotBlank()) item { Text(recordError(catalog), color = MaterialTheme.colorScheme.error) }
-                val commands = catalog?.rows("commands").orEmpty().filter { query.isBlank() || (it.string("name") + it.string("description")).contains(query, true) }
+                val commands = mobileSlashCommands(catalog?.rows("commands").orEmpty()).filter { query.isBlank() || (it.string("name") + it.string("description")).contains(query, true) }
                 if (catalog != null && commands.isEmpty()) item { Text("No matching commands") }
                 items(commands) { row -> ActionRow("/${row.string("name")}", row.string("description")) { vm.tab("Chat"); vm.composer(androidx.compose.ui.text.input.TextFieldValue("/${row.string("name").removePrefix("/")} ")) } }
             }

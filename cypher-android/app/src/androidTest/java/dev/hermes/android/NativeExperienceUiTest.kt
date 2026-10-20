@@ -561,6 +561,8 @@ class NativeExperienceUiTest {
         action("More message actions").performScrollTo().performClick()
         compose.onNodeWithText("Branch from here").performClick()
         await { vm.chat.value.sessionId.startsWith("branch-") }
+        await { vm.ui.value.notice == "Branched into a new conversation" }
+        compose.onNodeWithText("Branched into a new conversation").assertExists()
         assertEquals(2, fixture.requests.last { it.string("method") == "session.branch" }.getJSONObject("params").getInt("count"))
         compose.runOnIdle { vm.selectSession("chat-a") }
         await { vm.chat.value.sessionId == "chat-a" && vm.chat.value.messages.isNotEmpty() }
@@ -944,6 +946,9 @@ class NativeExperienceUiTest {
     }
 
     @Test fun botModeToggleRestoresProfileChatDraftAndHistory() = withFixture { vm, fixture ->
+        fixture.profileDisplayNames = mapOf("default" to "Personal profile", "coder" to "Code profile")
+        compose.runOnIdle { vm.load("navigation-profiles", "/api/profiles", force = true) }
+        await { vm.data.value["navigation-profiles"]?.rows("profiles")?.any { it.string("display_name") == "Code profile" } == true }
         fun toggle() {
             compose.onNodeWithTag(if (vm.ui.value.botModeEnabled) "bot-mode-sidebar" else "navigation-menu").performScrollToNode(hasTestTag("navigation-bots"))
             compose.onNodeWithTag("navigation-bots").performClick()
@@ -966,6 +971,10 @@ class NativeExperienceUiTest {
         }
         receipts += "Normal and Bot Mode tile widths, left alignment and relative rows match."
         compose.onNodeWithTag("navigation-bots").assertIsOn()
+        compose.onNodeWithText("On").assertExists()
+        compose.onNodeWithTag("navigation-leave-bot-mode").assertTextContains("Leave Bot Mode")
+        compose.onNodeWithTag("bot-mode-sidebar").performScrollToNode(hasTestTag("bot-row-coder"))
+        compose.onNodeWithTag("bot-row-coder").assertTextContains("Code profile")
         compose.onNodeWithText("Search conversations").assertDoesNotExist()
         capture("bot-mode-toggle-on")
         coder()
@@ -979,7 +988,8 @@ class NativeExperienceUiTest {
         await { vm.botMode.state.value.activeBot?.profile == "coder" }
         compose.onNodeWithContentDescription("New conversation").assertDoesNotExist()
         compose.runOnIdle { vm.composer(TextFieldValue("Coder bot draft")); vm.toggleSessions(true) }
-        toggle()
+        compose.onNodeWithTag("bot-mode-sidebar").performScrollToNode(hasTestTag("navigation-leave-bot-mode"))
+        compose.onNodeWithTag("navigation-leave-bot-mode").performClick()
         await { !vm.ui.value.botModeEnabled && !vm.ui.value.botModeSwitching }
         assertEquals("default", vm.ui.value.profile)
         assertEquals("chat-a", vm.chat.value.sessionId)
@@ -1019,6 +1029,61 @@ class NativeExperienceUiTest {
         await { !vm.ui.value.historyLoading && vm.ui.value.sessions.isNotEmpty() }
         compose.onNodeWithTag("history-loading").assertDoesNotExist()
         receipts += "While the conversation list is being fetched the drawer shows a loading row, never a false empty state."
+    }
+
+    @Test fun initialConversationShellIsUsableBeforeTheDetailReadFinishes() = withFixture { vm, fixture ->
+        compose.runOnUiThread {
+            field(vm, "sourceScope", null)
+            flow<ChatState>(vm, "_chat").value = ChatState()
+            flow<AppState>(vm, "_ui").value = vm.ui.value.copy(tab = "Chat", initialChatReady = true, newChatOpening = false, sessions = emptyList())
+        }
+        compose.runOnIdle { vm.newChat() }
+        await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+        val id = vm.chat.value.sessionId
+        assertFalse(fixture.requests.any { it.string("path") == "/api/sessions/$id" })
+        compose.onNodeWithTag("message-input").performClick().performTextInput("Draft after the shell opens")
+        await { vm.composer.value.text == "Draft after the shell opens" }
+        receipts += "The acknowledged native shell opens the composer without waiting for a redundant detail read; Hermes-side new-session delay remains."
+    }
+
+    @Test fun historySearchShowsProgressWhileStaleRowsRemainVisible() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.toggleSessions(true) }
+        await { vm.ui.value.sessions.isNotEmpty() && !vm.ui.value.historyLoading }
+        fixture.holdNextSessionList.set(true)
+        try {
+            compose.onNodeWithTag("history-search").performTextReplacement("No matching conversation")
+            assertTrue(fixture.sessionListCaptured.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            compose.onNodeWithTag("history-searching").assertExists()
+            compose.onNodeWithTag("history-row:chat-a").assertExists()
+        } finally { fixture.releaseSessionList.countDown() }
+        await { !vm.ui.value.historyLoading }
+        compose.onNodeWithTag("history-searching").assertDoesNotExist()
+        receipts += "A slow history search shows Searching while the previous rows remain visible until Hermes answers."
+    }
+
+    @Test fun historyAllProfilesShowsDisplayNamesAndSwitchesToTheSelectedProfile() = withFixture { vm, fixture ->
+        fixture.profileDisplayNames = mapOf("default" to "Personal profile", "coder" to "Code profile")
+        fixture.profileSessionIds = mapOf("default" to setOf("chat-a", "chat-b"))
+        fixture.addProfileConversation("coder", "coder-chat", "Coder notes")
+        compose.runOnIdle { vm.toggleSessions(true) }
+        await { vm.ui.value.sessions.any { sessionRowId(it) == "chat-a" } && !vm.ui.value.historyLoading }
+        compose.onNodeWithTag("history-all-profiles").performScrollTo().performClick()
+        await { vm.data.value["navigation-profiles"]?.rows("profiles")?.any { it.string("name") == "coder" && it.string("display_name") == "Code profile" } == true && vm.ui.value.sessions.any { it.string("profile") == "coder" && sessionRowId(it) == "coder-chat" } && !vm.ui.value.historyLoading }
+        compose.onNodeWithTag("history-row:coder:coder-chat").assertTextContains("Code profile").performClick()
+        await { vm.ui.value.profile == "coder" && vm.chat.value.sessionId == "coder-chat" && vm.chat.value.projectionReady }
+        assertTrue(fixture.requests.any { it.string("path") == "/api/sessions" && it.string("profile") == "coder" })
+        receipts += "All Profiles labels history rows with Hermes display names and opens a selected row after switching to its authorized profile."
+    }
+
+    @Test fun reasoningDisclosureUsesMarkdownWithOneVisibleToggle() = withFixture { vm, _ ->
+        val reasoning = "**Why this follows**\n\n- First step\n- Second step"
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(messages = vm.chat.value.messages + Message("reasoning-disclosure", "assistant", "Answer", reasoning = reasoning, sessionId = vm.chat.value.sessionId)) }
+        await { compose.onAllNodesWithTag("disclosure:Reasoning").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("disclosure:Reasoning").performClick()
+        compose.onNodeWithText("Details").assertDoesNotExist()
+        compose.onNodeWithText("Why this follows").assertExists()
+        compose.onNodeWithText("First step").assertExists()
+        receipts += "Reasoning uses the native Markdown renderer and one chevron/title disclosure control."
     }
 
     @Test fun aThreadKeepsItsNameWhenAnotherConversationHoldsIt() = withFixture { vm, fixture ->
@@ -1085,7 +1150,7 @@ class NativeExperienceUiTest {
             compose.runOnIdle { vm.setHistoryFilters(emptySet(), "recent") }
             await { vm.preferences.value.historyOrder == "recent" && vm.preferences.value.historyHiddenSources.isEmpty() }
         }
-        receipts += "Threads sit under Search: the lane asks Hermes for Cypher and Relay threads only, a named thread is created natively with its own source and title, and source/order filters are applied by Hermes."
+        receipts += "Threads and New thread sit in the compact history filter row; the lane asks Hermes for Cypher and Relay threads only, creates a named thread natively, and applies source/order filters through Hermes."
     }
 
     @Test fun unsentChatComposerShowsTheProfileModelAndEffort() = withFixture { vm, fixture ->
@@ -1536,9 +1601,12 @@ class NativeExperienceUiTest {
 
     @Test fun referenceNavigationAndNativeBoardControls() = withFixture { vm, fixture ->
         runBlocking { app.cache.delete(fixture.scope, "kanban-draft:default") }
+        fixture.profileDisplayNames = mapOf("default" to "Personal profile", "coder" to "Code profile")
         compose.runOnIdle { vm.toggleSessions(true) }
         compose.onNodeWithTag("navigation-profile").assertIsDisplayed().performClick()
         await { vm.data.value["navigation-profiles"] != null }
+        compose.onNodeWithText("Personal profile").assertExists()
+        compose.onNodeWithText("Code profile").assertExists()
         capture("reference-profiles")
         androidx.test.espresso.Espresso.pressBack()
         compose.onNodeWithTag("navigation-kanban").performScrollTo().performClick()
@@ -1576,6 +1644,7 @@ class NativeExperienceUiTest {
         capture("reference-skills")
         compose.runOnIdle { vm.navigate("Memory") }
         await { vm.phoneSettings.memory.value.documents.size == 2 && !vm.phoneSettings.memory.value.loading }
+        compose.onNodeWithContentDescription("Show navigation").assertIsDisplayed()
         compose.onNodeWithText("Agent notes").assertExists()
         capture("reference-memory")
     }
@@ -2086,6 +2155,7 @@ class NativeExperienceUiTest {
 
     @Test fun settingsAndMenusExposeHonestState() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.tab("More"); vm.more("") }
+        await { vm.data.value["navigation-profiles"]?.rows("profiles")?.isNotEmpty() == true }
         fun summary(route: String, text: String, substring: Boolean = false) =
             compose.onNode(hasText(text, substring = substring) and hasAnyAncestor(hasTestTag("settings-row:$route")), useUnmergedTree = true)
         // The overview reports only local state it actually holds; the Cypher left menu is still the way into navigation.
@@ -2373,6 +2443,7 @@ class NativeExperienceUiTest {
     @Test fun disconnectedSettingsAndProjectPickerExplainHowToRecover() = withFixture { vm, _ ->
         compose.runOnIdle { field(vm, "client", null); vm.more("Memory") }
         compose.onNodeWithText("Reconnect to Hermes").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Show navigation").assertIsDisplayed()
         compose.onNodeWithText("Reconnect").assertIsEnabled()
         compose.runOnIdle { vm.more("Connection") }
         assertEquals("Connection", vm.ui.value.morePage)
@@ -2475,7 +2546,13 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Unpin").assertExists()
         compose.onNodeWithText("Rename").performClick()
         compose.onNodeWithTag("conversation-rename-field").performTextReplacement("Renamed from history")
-        compose.onNodeWithText("Save").performClick()
+        fixture.holdNextSessionList.set(true)
+        try {
+            compose.onNodeWithText("Save").performClick()
+            assertTrue(fixture.sessionListCaptured.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await { vm.ui.value.sessions.single { sessionRowId(it) == "chat-b" }.string("title") == "Renamed from history" }
+            compose.onNodeWithTag("history-row:chat-b").assertTextContains("Renamed from history")
+        } finally { fixture.releaseSessionList.countDown() }
         await { fixture.sessions.getValue("chat-b").getJSONObject("info").string("title") == "Renamed from history" }
         assertEquals("Acting on another conversation leaves the open chat in place", "chat-a", vm.chat.value.sessionId)
 
@@ -2650,11 +2727,19 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Reasoning effort").performClick()
         await { vm.data.value["picker:reasoning"]?.optJSONArray("options")?.strings()?.contains("high") == true }
         compose.onNode(hasText("Reasoning effort:", substring = true) and hasClickAction()).performClick()
-        compose.onNodeWithTag("choice-option:Reasoning effort:high").performClick()
+        compose.onNodeWithTag("choice-option:Reasoning effort:low").performClick()
         compose.onNodeWithText("Apply to conversation").performClick()
-        await { vm.catalog.value.isBlank() && vm.chat.value.raw.string("reasoning_effort") == "high" }
-        assertEquals("high", fixture.reasoningEffort)
-        receipts += "Configured/custom models show fresh native readback; native confirmation cancel makes no change; confirmed selection preserves messages; effort applies and returns to chat."
+        await { vm.catalog.value.isBlank() && vm.chat.value.raw.string("reasoning_effort") == "low" && vm.chat.value.sessionReasoningEffort == "low" }
+        assertEquals("medium", fixture.reasoningEffort)
+        assertEquals("low", fixture.sessionReasoning["chat-a"])
+        compose.onNodeWithTag("message-input").performClick().performTextInput("Keep low reasoning for this conversation")
+        compose.onNodeWithTag("message-send").performClick()
+        await { fixture.requests.any { it.string("method") == "prompt.submit" && it.optJSONObject("params")?.string("text") == "Keep low reasoning for this conversation" } }
+        compose.onNodeWithTag("composer-model-effort").assertTextContains("low")
+        compose.runOnIdle { vm.selectSession("chat-a") }
+        await { vm.chat.value.projectionReady && vm.chat.value.sessionReasoningEffort == "low" }
+        compose.onNodeWithTag("composer-model-effort").assertTextContains("low")
+        receipts += "Configured/custom models show fresh native readback; native confirmation cancel makes no change; confirmed selection preserves messages; low effort stays session-scoped after send and refresh."
         capture("audit-model-effort")
     }
 
@@ -3087,6 +3172,34 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Server update completed").performScrollTo().assertExists()
         receipts += "Profile behavior, model edit/keep/save, cross-page return, health/log categories/search, checkpoints and server-update cancel/apply/result exercised on isolated native responses."
         capture("audit-server-update")
+    }
+
+    @Test fun profileDisplayNamesReachSettingsConnectionAssistantAndProfiles() = withFixture { vm, fixture ->
+        fixture.profileDisplayNames = mapOf("default" to "Personal profile", "coder" to "Code profile")
+        compose.runOnIdle { vm.load("navigation-profiles", "/api/profiles", force = true) }
+        await { vm.data.value["navigation-profiles"]?.rows("profiles")?.any { it.string("display_name") == "Code profile" } == true }
+        compose.runOnIdle { vm.more("") }
+        await { vm.ui.value.tab == "More" && vm.ui.value.morePage.isBlank() }
+        fun summary(route: String, text: String) = compose.onNode(hasText(text) and hasAnyAncestor(hasTestTag("settings-row:$route")), useUnmergedTree = true)
+        summary("Connection", "Connected privately · Personal profile").assertExists()
+        summary("Profiles", "Active profile · Personal profile").assertExists()
+        summary("Assistant", "Cypher · Code profile").assertExists()
+
+        compose.runOnIdle { vm.more("Connection") }
+        compose.onNodeWithText("Profile · Personal profile").assertExists()
+        compose.runOnIdle { vm.more("Assistant") }
+        compose.onNodeWithText("Profile: Code profile").assertExists()
+        compose.onNodeWithText("Proactive · Code profile").assertExists()
+        compose.runOnIdle { vm.more("Profiles") }
+        await { vm.phoneSettings.bots.value.profiles.isNotEmpty() && !vm.phoneSettings.bots.value.loading }
+        compose.onNodeWithText("Personal profile").assertExists()
+        compose.runOnIdle { vm.tab("Tasks") }
+        await { vm.data.value["crons"]?.rows("jobs")?.isNotEmpty() == true }
+        compose.onNode(hasText(" · Personal profile · ", substring = true)).assertExists()
+        compose.runOnIdle { vm.tab("Chat") }
+        compose.onNodeWithTag("composer-approvals").performClick()
+        compose.onNodeWithTag("approvals-menu").assertExists()
+        compose.onNodeWithText("Approvals · Personal profile").assertExists()
     }
 
     @Test fun botOverviewIsNavigationAndMembershipDeletionAreExplicitActions() = withFixture { vm, fixture ->

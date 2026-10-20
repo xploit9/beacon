@@ -54,13 +54,29 @@ data class Message(val id: String, val role: String, val text: String, val reaso
 /** Errors that end the native sign-in. A plugin's 401 is not one: a no-account loopback dashboard answers 401 to plugin routes. */
 internal fun endsSignIn(error: Throwable): Boolean =
     error is LoopbackSessionRefreshFailed || error is ApiFailure && error.status == 401 && !error.plugin || error is CachedIdentityMismatch
+internal fun isMissingCypherPluginRoute(error: Throwable): Boolean =
+    (error as? ApiFailure)?.let { it.plugin && (it.status == 404 || it.message.contains("unknown route", ignoreCase = true) || it.message.contains("route not found", ignoreCase = true)) } == true
+internal fun updatedHistoryRows(rows: List<JSONObject>, id: String, path: String, body: JSONObject, result: JSONObject, archivedView: Boolean, query: String, profile: String = ""): List<JSONObject> =
+    rows.mapNotNull { row ->
+        if (sessionRowId(row) != id || profile.isNotBlank() && row.string("profile", profile) != profile) return@mapNotNull row
+        when (path) {
+            "/api/session/rename" -> row.copy().put("title", result.optJSONObject("session")?.string("title")?.takeIf(String::isNotBlank) ?: result.string("title").takeIf(String::isNotBlank) ?: body.string("title"))
+                .takeIf { query.isBlank() || it.string("title").contains(query, ignoreCase = true) }
+            "/api/session/pin" -> row.copy().put("pinned", result.optBoolean("pinned", body.optBoolean("pinned")))
+            "/api/session/archive" -> result.optBoolean("hidden", body.optBoolean("archived")).let { archived ->
+                if (archived != archivedView) null else row.copy().put("archived", archived)
+            }
+            "/api/session/delete" -> null
+            else -> row
+        }
+    }
 internal fun renderedChatStatus(old: ChatState, active: String?, streamEnded: Boolean): String = when {
     old.uncertain.isNotBlank() && old.status == "Sending" -> old.status
     streamEnded -> ""
     active.isNullOrBlank() && old.streamId.isNotBlank() -> old.status.ifBlank { "Turn status unknown" }
     else -> ""
 }
-data class ChatState(val sessionId: String = "", val title: String = "New conversation", val messages: List<Message> = emptyList(), val raw: JSONObject = JSONObject(), val streamId: String = "", val liveText: String = "", val liveReasoning: String = "", val liveTools: List<JSONObject> = emptyList(), val status: String = "", val approval: JSONObject? = null, val clarification: JSONObject? = null, val uncertain: String = "", val queued: List<QueuedMessage> = emptyList(), val anchor: Int = 0, val anchorOffset: Int = 0, val anchorId: String = "", val callMessages: List<CallTranscript> = emptyList(), val projectionReady: Boolean = true)
+data class ChatState(val sessionId: String = "", val title: String = "New conversation", val messages: List<Message> = emptyList(), val raw: JSONObject = JSONObject(), val streamId: String = "", val liveText: String = "", val liveReasoning: String = "", val liveTools: List<JSONObject> = emptyList(), val status: String = "", val approval: JSONObject? = null, val clarification: JSONObject? = null, val uncertain: String = "", val queued: List<QueuedMessage> = emptyList(), val anchor: Int = 0, val anchorOffset: Int = 0, val anchorId: String = "", val callMessages: List<CallTranscript> = emptyList(), val projectionReady: Boolean = true, val sessionReasoningEffort: String = "")
 internal fun sessionCanStillBeUnpersisted(clientCreated: Boolean, chat: ChatState): Boolean =
     clientCreated && chat.messages.isEmpty() && chat.callMessages.isEmpty() && chat.liveText.isBlank() && chat.streamId.isBlank() && chat.raw.optInt("message_count") == 0
 // Hermes stores model-switch steering as user rows, so the reserved prefix identifies it.
@@ -77,7 +93,7 @@ internal fun releaseTerminalChat(chat: ChatState, stream: String, replyConfirmed
 data class EditorState(val scope: Scope? = null, val path: String = "", val text: TextFieldValue = TextFieldValue(), val serverText: String = "", val metadata: JSONObject = JSONObject(), val loading: Boolean = false, val saving: Boolean = false, val error: String = "", val reviewRequired: Boolean = false) { val dirty get() = text.text != serverText }
 data class SideQuestion(val scope: Scope, val question: String, val sessionId: String, val streamId: String, val text: String = "", val status: String = "Responding", val cursor: String = "", val error: String = "")
 data class AppUpdateState(val release: Release? = null, val busy: Boolean = false, val ready: Boolean = false, val status: String = "Cypher checks for updates automatically while connected.")
-data class AppState(val origin: String = BuildConfig.DEFAULT_ORIGIN, val authenticated: Boolean = false, val profile: String = "default", val chatProfile: String = "", val owner: String = "", val tab: String = "Chat", val connected: Boolean = false, val loading: Boolean = false, val error: String = "", val notice: String = "", val bootstrap: JSONObject = JSONObject(), val sessions: List<JSONObject> = emptyList(), val query: String = "", val showSessions: Boolean = false, val morePage: String = "", val cypherOpening: Boolean = false, val cypherError: String = "", val newChatOpening: Boolean = false, val newChatError: String = "", val initialChatReady: Boolean = false, val restoringSession: Boolean = true, val botModeEnabled: Boolean = false, val botModeSwitching: Boolean = false, val setupWizard: Boolean = false, val setupComplete: Boolean = false, val setupStep: String = "connect", val setupPluginMessage: String = "", val setupOrigin: String = "", val historyLoading: Boolean = false)
+data class AppState(val origin: String = BuildConfig.DEFAULT_ORIGIN, val authenticated: Boolean = false, val profile: String = "default", val chatProfile: String = "", val owner: String = "", val tab: String = "Chat", val connected: Boolean = false, val loading: Boolean = false, val error: String = "", val notice: String = "", val bootstrap: JSONObject = JSONObject(), val sessions: List<JSONObject> = emptyList(), val query: String = "", val showSessions: Boolean = false, val morePage: String = "", val cypherOpening: Boolean = false, val cypherError: String = "", val newChatOpening: Boolean = false, val newChatError: String = "", val initialChatReady: Boolean = false, val restoringSession: Boolean = true, val botModeEnabled: Boolean = false, val botModeSwitching: Boolean = false, val setupWizard: Boolean = false, val setupComplete: Boolean = false, val setupStep: String = "connect", val setupPluginMessage: String = "", val setupOrigin: String = "", val historyLoading: Boolean = false, val assistantSessionId: String = "")
 internal fun voiceKeySetupPage(): String = "Cypher"
 internal data class VoiceCallRequest(val scope:Scope,val conversationId:String)
 
@@ -253,6 +269,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private var sessionIndexRevision = 0L
     private var sessionIndexArchived = false
     private var sessionIndexThreads = false
+    private var sessionIndexAllProfiles = false
     /** Thread names awaiting Hermes's first-turn title (scope key → name). shortcut: in memory only; a restart before the first reply leaves Hermes's own title. */
     private val pendingThreadTitles = java.util.concurrent.ConcurrentHashMap<String, String>()
     private var assistantReturnInitialized = false
@@ -662,12 +679,24 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         _reasoningSaving.value = true
         val job = action("/api/reasoning", json("session_id" to _chat.value.sessionId, "effort" to effort), refresh = false) { _, result ->
             val effective = result.getString("value")
-            _chat.update { it.copy(raw = it.raw.copy().put("reasoning_effort", effective)) }
+            _chat.update { it.copy(sessionReasoningEffort = effective, raw = it.raw.copy().put("reasoning_effort", effective)) }
             notice("Reasoning effort: $effective")
             if (_catalog.value == "Reasoning") closeCatalog()
         }
         reasoningChange = job
         job.invokeOnCompletion { if (reasoningChange === job) _reasoningSaving.value = false }
+    }
+    private fun refreshSessionReasoning(active: CypherClient, scope: Scope, generation: Int, path: String) {
+        val c = active.detached()
+        viewModelScope.launch {
+            try {
+                val result = c.get(path, mapOf("session_id" to scope.session))
+                if (client === active && originGeneration == generation && sourceScope == scope)
+                    _chat.update { state -> if (state.sessionId == scope.session) state.copy(sessionReasoningEffort = result.string("value")) else state }
+            } catch (error: CancellationException) { throw error }
+            catch (_: Throwable) { }
+            finally { c.closeNative() }
+        }
     }
     fun closeCatalog() { _catalog.value = "" }
     fun pickModel(model: String, provider: String) { if (!admitConversation()) return; val scope = sourceScope ?: return; sessionAction("/api/session/update", json("model" to model, "model_provider" to provider.ifBlank { null })) { saved["model_pick:${scope.key}"] = true; closeCatalog() } }
@@ -1553,44 +1582,65 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private var indexFetchKey = ""
     private var indexReadAt = 0L
     /** Defaults keep the drawer's current view (archived/threads), so a background refresh never swaps the list under it. */
-    fun refreshSessions(query: String = _ui.value.query, archived: Boolean = sessionIndexArchived, force: Boolean = true, threads: Boolean = sessionIndexThreads): Job {
+    fun refreshSessions(query: String = _ui.value.query, archived: Boolean = sessionIndexArchived, force: Boolean = true, threads: Boolean = sessionIndexThreads, allProfiles: Boolean = sessionIndexAllProfiles): Job {
         val active = client ?: return viewModelScope.launch {}
         val c = active.detached()
         val scope = c.scope
         val generation = originGeneration
         val hidden = preferences.value.historyHiddenSources.sorted().joinToString(",")
         val order = preferences.value.historyOrder
-        val fetchKey = "${scope.key}:$generation:$query:$archived:$threads:$hidden:$order"
+        val fetchKey = "${scope.key}:$generation:$query:$archived:$threads:$allProfiles:$hidden:$order"
         if (indexFetchKey == fetchKey) {
             if (!force) indexFetch?.takeIf { it.isActive }?.let { return it }
-            if (!force && startupReadFresh(indexReadAt, System.currentTimeMillis())) return viewModelScope.launch {}
+            if (!allProfiles && !force && startupReadFresh(indexReadAt, System.currentTimeMillis())) return viewModelScope.launch {}
         }
         indexFetchKey = fetchKey
         val request = ++sessionIndexRequest
         val revision = sessionIndexRevision
         sessionIndexArchived = archived
         sessionIndexThreads = threads
+        sessionIndexAllProfiles = allProfiles
         _ui.update { it.copy(query = query, historyLoading = true) }
         fun current() = client === active && generation == originGeneration && _ui.value.authenticated && sessionIndexCurrent(request, sessionIndexRequest, revision, sessionIndexRevision)
         return viewModelScope.launch {
           try { supervisorScope {
+            val assistantScope = scope.copy(profile = preferences.value.assistantProfile)
+            val assistantSessionId = readCypherSession(assistantScope).orEmpty()
             val params = mutableMapOf("profile" to scope.profile, "include_archived" to if (archived) "1" else "0", "hidden_sources" to hidden, "order" to order)
             if (threads) params["view"] = "threads"
-            val sessions = if (query.isBlank()) c.get("/api/sessions", params) else c.get("/api/sessions/search", params + ("q" to query))
-            if (!current()) return@supervisorScope
-            val serverRows = sessions.rows("sessions").ifEmpty { sessions.rows("results") }
+            val path = if (query.isBlank()) "/api/sessions" else "/api/sessions/search"
+            val profileIds = if (allProfiles) (listOf(scope.profile) + c.nativeAuthorizedProfiles()).distinct() else listOf(scope.profile)
+            var staleRequest = false
+            val serverRows = buildList {
+                for (profile in profileIds) {
+                    if (!current()) { staleRequest = true; break }
+                    val profileClient = if (profile == scope.profile) c else c.forAuthorizedProfile(profile)
+                    try {
+                        val queryParams = params.toMutableMap().apply { put("profile", profile); if (query.isNotBlank()) put("q", query) }
+                        val result = profileClient.get(path, queryParams)
+                        val listed = result.rows("sessions").ifEmpty { result.rows("results") }
+                        addAll(listed.map { it.copy().put("profile", profile) })
+                    } catch (error: ApiFailure) {
+                        if (profile == scope.profile || error.status !in setOf(403, 404)) throw error
+                    } finally { if (profileClient !== c) profileClient.closeNative() }
+                }
+            }
+            if (staleRequest || !current()) return@supervisorScope
             if (query.isBlank() && !archived) serverRows.forEach { row ->
-                val key = "${scope.key}:${sessionRowId(row)}"
+                val rowScope = scope.copy(profile = row.string("profile", scope.profile))
+                val key = "${rowScope.key}:${sessionRowId(row)}"
                 val local = confirmedSessions[key]
                 if (local != null && row.optInt("message_count") >= local.optInt("message_count")) confirmedSessions.remove(key)
             }
-            val confirmed = confirmedSessions.filterKeys { it.startsWith("${scope.key}:") }.values.toList().asReversed().filter { !threads || dev.hermes.android.ui.isThreadSource(it.string("source")) }
+            val confirmed = (if (allProfiles) profileIds.flatMap { profile -> confirmedSessions.filterKeys { it.startsWith("${scope.copy(profile = profile).key}:") }.values.toList().asReversed() }
+                else confirmedSessions.filterKeys { it.startsWith("${scope.key}:") }.values.toList().asReversed())
+                .filter { !threads || dev.hermes.android.ui.isThreadSource(it.string("source")) }
             val rows = visibleSessionRows(serverRows, confirmed, query, archived)
             indexReadAt = System.currentTimeMillis()
-            _ui.update { it.copy(sessions = rows, connected = true) }
+            _ui.update { it.copy(sessions = rows, connected = true, assistantSessionId = assistantSessionId) }
             if (current()) {
                 app.auth.persist(c.auth)
-                if (query.isBlank() && !archived && !threads) app.cache.write(scope, "conversation-index", json("sessions" to JSONArray(rows)).toString())
+                if (!allProfiles && query.isBlank() && !archived && !threads) app.cache.write(scope, "conversation-index", json("sessions" to JSONArray(rows)).toString())
             }
 
           } } catch (e: Throwable) { if (e is CancellationException) throw e; if (current()) fail(e) }
@@ -1600,7 +1650,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private fun publishConfirmedSession(owner: Scope, id: String, response: JSONObject, accepted: Boolean = false) {
         if (client?.scope != owner || !_ui.value.authenticated) return
         val session = response.optJSONObject("session") ?: response
-        val existing = _ui.value.sessions.firstOrNull { sessionRowId(it) == id }
+        val existing = _ui.value.sessions.firstOrNull { it.string("profile", owner.profile) == owner.profile && sessionRowId(it) == id }
         val row = (existing ?: session).copy().put("session_id", id).put("profile", owner.profile)
         if (row.string("title").isBlank()) row.put("title", _chat.value.title.takeIf { _chat.value.sessionId == id } ?: "New conversation")
         if (accepted) row.put("message_count", maxOf(1, row.optInt("message_count"))).put("active_stream_id", response.string("stream_id"))
@@ -1675,21 +1725,25 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     // Keyed by its chat, so it is not tied to the open chat like session_id page reads are.
     fun loadConversationProject(id: String, force: Boolean = true) = load("project-of:$id", "/api/projects/for-session", mapOf("chat" to id), force = force)
     /** Pin, rename, archive, project and delete for any listed conversation; the open chat follows the change. */
-    fun conversationAction(id: String, path: String, body: JSONObject = JSONObject(), done: String = "Saved"): Job = viewModelScope.launch {
+    fun conversationAction(id: String, path: String, body: JSONObject = JSONObject(), done: String = "Saved", profile: String = client?.scope?.profile.orEmpty()): Job = viewModelScope.launch {
         val active = client ?: run { notice("Reconnect before changing this conversation."); return@launch }
-        val c = active.detached()
+        val c = if (profile.isBlank() || profile == active.scope.profile) active.detached() else active.forAuthorizedProfile(profile)
         val target = c.scope.session(id)
         try {
             val result = c.call(path, method = "POST", data = body.copy().put("session_id", id).put("scope_key", target.key))
             if (client !== active) return@launch
             if (sourceScope == target) _chat.update { chat ->
                 when (path) {
-                    "/api/session/rename" -> chat.copy(title = body.string("title"), raw = chat.raw.copy().put("title", body.string("title")))
+                    "/api/session/rename" -> {
+                        val title = result.optJSONObject("session")?.string("title")?.takeIf(String::isNotBlank) ?: result.string("title").takeIf(String::isNotBlank) ?: body.string("title")
+                        chat.copy(title = title, raw = chat.raw.copy().put("title", title))
+                    }
                     "/api/session/pin" -> chat.copy(raw = chat.raw.copy().put("pinned", body.getBoolean("pinned")))
                     "/api/session/archive" -> chat.copy(raw = chat.raw.copy().put("archived", result.optBoolean("hidden", body.optBoolean("archived"))))
                     else -> chat
                 }
             }
+            _ui.update { state -> state.copy(sessions = updatedHistoryRows(state.sessions, id, path, body, result, sessionIndexArchived, state.query, target.profile)) }
             if (path.startsWith("/api/projects/")) {
                 loadConversationProject(id)
                 // The open chat's working folder changed with its project; show the new one.
@@ -1752,7 +1806,6 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 _ui.update { it.copy(tab = "Chat", connected = true, newChatError = "") }; saved["tab"] = "Chat"
                 selectSession(id, preserveInitialDraft = initial, initialResponse = response, closeMenu = !initial)
                 refreshSessions()
-                selectionJob?.join()
             } catch (e: Throwable) {
                 // Settle only the original owner's marker, even after navigation.
                 // Retry waits for this job to finish, so its marker cannot race this exit.
@@ -1850,6 +1903,15 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     }
     fun openConversation(row: JSONObject) {
         val id = sessionRowId(row)
+        val currentProfile = (client?.scope ?: cachedOwnerScope)?.profile.orEmpty()
+        val targetProfile = row.string("profile", currentProfile)
+        if (targetProfile.isNotBlank() && targetProfile != currentProfile) {
+            viewModelScope.launch {
+                switchProfile(targetProfile).join()
+                if (client?.scope?.profile == targetProfile) openConversation(row)
+            }
+            return
+        }
         val source = row.string("session_source", row.string("raw_source", row.string("source_tag", row.string("source")))).lowercase()
         if (source != "webui" && (row.optBoolean("is_cli_session") || source in setOf("telegram", "discord", "slack", "whatsapp", "signal", "matrix", "messenger", "sms", "email"))) {
             action("/api/session/import_cli", json("session_id" to id), refresh = false) { _, _ -> selectSession(id); refreshSessions() }
@@ -1937,6 +1999,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             sessionWatch?.cancel()
             val scope = ownerScope.session(id)
             fun current() = generation == sessionGeneration && origin == originGeneration && navigation == navigationGeneration && sourceScope == scope && client === active
+            val previousEffort = _chat.value.takeIf { it.sessionId == id }?.sessionReasoningEffort.orEmpty()
             clientCreatedSessions.removeAll { it != scope.key }
             var clientCreated = initialShells[ownerScope.key] == id || clientCreatedSessions.contains(scope.key)
             var nativeResumeAttempted = false
@@ -1945,7 +2008,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             sourceScope = scope; clearDetails()
             saved["session:${ownerScope.key}"] = id
             _ui.update { it.copy(showSessions = if (closeMenu) false else it.showSessions, newChatError = "") }
-            _chat.value = ChatState(sessionId = id, projectionReady = false)
+            _chat.value = ChatState(sessionId = id, projectionReady = false, sessionReasoningEffort = previousEffort)
             if (!preserveInitialDraft) { _composer.value = TextFieldValue(); _attachments.value = emptyList() }
             else initialDraft?.let { restoreDraft(it, preserveActiveInput = true) }
             initialResponse?.let { renderSession(it, scope) }
@@ -1966,7 +2029,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 }
                 if (editorDraft != null) { _composer.value = TextFieldValue(editorDraft); checkpoint() }
                 if (c == null) { _chat.update { it.copy(projectionReady = true, status = "Cached · reconnect to synchronize") }; return@launch }
-                val response = try { c.get("/api/session", mapOf("session_id" to id)) }
+                val response = try { initialResponse?.takeIf { it.optBoolean("acknowledged_shell") } ?: c.get("/api/session", mapOf("session_id" to id)) }
                 catch (readError: Throwable) {
                     if (readError is CancellationException) throw readError
                     if (readError !is ApiFailure || readError.status != 404 || !sessionCanStillBeUnpersisted(clientCreated, _chat.value) || !current()) throw readError
@@ -2003,6 +2066,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 }
                 if (!current()) return@launch
                 renderSession(response, scope)
+                refreshSessionReasoning(requireNotNull(active), scope, origin, if (isCypherConversation()) "/api/mobile/cypher/reasoning" else "/api/reasoning")
                 app.cache.write(scope, "session", response.toString())
                 val session = response.optJSONObject("session") ?: response
                 if (session.rows("messages").isNotEmpty() || session.optInt("message_count") > 0 || session.string("active_stream_id").isNotBlank()) {
@@ -2613,7 +2677,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 if (path == "/api/session/archive" && selected != null) {
                     val archived = result.getBoolean("hidden")
                     _chat.update { it.copy(raw = it.raw.copy().put("archived", archived)) }
-                    _ui.update { it.copy(sessions = it.sessions.map { row -> if (row.string("session_id") == selected.session) row.copy().put("archived", archived) else row }) }
+                    _ui.update { it.copy(sessions = updatedHistoryRows(it.sessions, selected.session, path, body, result, sessionIndexArchived, it.query, selected.profile)) }
                 }
                 if (path != "/api/profile/switch") app.auth.persist(c.auth)
                 val invalidation = System.currentTimeMillis(); readInvalidations[scope.key] = invalidation
@@ -2846,7 +2910,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         try {
             exportDownload(c, uri, if (pc) "/api/files/download" else if (folder) "/api/folder/download" else "/api/file/raw", mapOf("session_id" to scope.session, "path" to path), 256L * 1024 * 1024)
             if (current()) notice("Download saved")
-        } catch (e: Throwable) { if (current()) fail(e) } finally { c.closeNative() }
+        } catch (e: Throwable) { if (e is CancellationException) throw e else if (current()) notice(dev.hermes.android.ui.fileDownloadError(e)) } finally { c.closeNative() }
     }
 
     fun readAloud(text: String) {

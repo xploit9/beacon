@@ -38,6 +38,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var connectionEnabled = true
     @Volatile var profileModel = "synthetic-model"
     @Volatile var reasoningEffort = "medium"
+    val sessionReasoning = ConcurrentHashMap<String, String>()
     @Volatile var updateApplied = false
     @Volatile var voiceProvider = "gemini"
     val proactiveEnabled = ConcurrentHashMap(mapOf("default" to false, "coder" to false))
@@ -64,6 +65,8 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     val roomEvents = CopyOnWriteArrayList<JSONObject>()
     val roomActions = CopyOnWriteArrayList<JSONObject>()
     @Volatile var callHistoryResponse = json("calls" to JSONArray(), "next" to "")
+    @Volatile var callHistoryRouteMissing = false
+    @Volatile var proactiveRouteMissing = false
     val workspaceFiles = ConcurrentHashMap<String, String>()
     val downloads = ConcurrentHashMap<String, ByteArray>()
     val fileRequests = CopyOnWriteArrayList<String>()
@@ -91,6 +94,8 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     private val sequence = AtomicInteger(1)
     private val notificationSequence = AtomicInteger()
     @Volatile var notificationProfiles = listOf("default", "coder")
+    @Volatile var profileDisplayNames = emptyMap<String, String>()
+    @Volatile var profileSessionIds = emptyMap<String, Set<String>>()
     @Volatile var incomingNotification: JSONObject? = null
     val notificationWaits = CopyOnWriteArrayList<Long>()
     @Volatile var forceExpiredAccessToken: String? = null
@@ -292,6 +297,13 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     }
     private fun history(id: String, title: String, messages: JSONArray) = json("session_id" to "runtime-$id", "stored_session_id" to id,
         "info" to json("title" to title, "model" to "synthetic-model", "provider" to "fixture", "cwd" to "C:/synthetic-workspace", "yolo" to false), "messages" to messages, "running" to false)
+    fun addProfileConversation(profile: String, id: String, title: String) {
+        val row = history(id, title, JSONArray().put(json("role" to "user", "text" to "Synthetic conversation for $profile."))).put("profile", profile)
+        sessions[id] = row
+        runtimeStoredSessionIds[row.string("session_id")] = id
+        currentRuntimeSessionIds[id] = row.string("session_id")
+        profileSessionIds = profileSessionIds + (profile to (profileSessionIds[profile].orEmpty() + id))
+    }
     fun snapshot(id: String) = sessions.getValue(id).copy().apply {
         val info = getJSONObject("info"); info.keys().forEach { put(it, info.opt(it)) }
         put("runtime_session_id", getString("session_id")); put("session_id", id)
@@ -301,7 +313,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         val parts = path.removePrefix("/api/sessions/").split('/')
         val id = parts.first()
         val row = sessions[id]
-        if (historyFailure || row == null) return 404 to json("detail" to "Session not found")
+        if (historyFailure || row == null || profileSessionIds[profile]?.contains(id) == false) return 404 to json("detail" to "Session not found")
         val messages = row.getJSONArray("messages")
         return when (parts.getOrNull(1)) {
             null -> 200 to row.getJSONObject("info").copy().put("id", id).put("profile", profile).put("message_count", messages.length()).put("model_config", row.optString("model_config").ifBlank { "{}" })
@@ -331,11 +343,12 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     )
     private fun http(path: String, method: String, body: JSONObject, profile: String, directory: String, archived: Boolean = false, url: HttpUrl? = null): Pair<Int, JSONObject> {
         if (path == "/api/plugins/cypher/mobile/bot-mode/space/fixture-room" && holdNextRoomRead.getAndSet(false)) { roomReadCaptured.countDown(); check(releaseRoomRead.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
-        if (path == "/api/sessions" && holdNextSessionList.getAndSet(false)) { sessionListCaptured.countDown(); check(releaseSessionList.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
+        if (path in setOf("/api/sessions", "/api/sessions/search") && holdNextSessionList.getAndSet(false)) { sessionListCaptured.countDown(); check(releaseSessionList.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
         return when {
-        path == "/api/profiles" -> 200 to json("profiles" to JSONArray(notificationProfiles.map { json("name" to it) }))
+        path == "/api/profiles" -> 200 to json("profiles" to JSONArray(notificationProfiles.map { id -> json("name" to id).apply { profileDisplayNames[id]?.let { put("display_name", it) } } }))
         path == "/api/profiles/active" -> 200 to json("current" to profile, "active" to profile)
         path == "/api/plugins/cypher/mobile/proactive" -> {
+            if (proactiveRouteMissing) return 404 to json("detail" to "Unknown route")
             if (method == "PUT") {
                 proactiveEnabled[profile] = body.getBoolean("enabled")
                 if (body.length() > 1) {
@@ -381,7 +394,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 200 to request.copy()
             }
         }
-        path == "/api/plugins/cypher/mobile/calls" -> 200 to callHistoryResponse.copy()
+        path == "/api/plugins/cypher/mobile/calls" -> if (callHistoryRouteMissing) 404 to json("detail" to "Unknown route") else 200 to callHistoryResponse.copy()
         path == "/api/plugins/cypher/mobile/notifications/events" -> {
             val after = url?.queryParameter("after")?.toLongOrNull() ?: 0L
             val wait = url?.queryParameter("wait")?.toLongOrNull() ?: 0L
@@ -453,16 +466,18 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         }
         path == "/api/plugins/cypher/mobile/bot-mode/space/fixture-room/rename" -> { roomName = body.getString("name"); 200 to json("room" to json("room_id" to "fixture-room", "name" to roomName)) }
         path == "/api/plugins/cypher/mobile/bot-mode/space/fixture-room" -> 200 to json("room" to json("room_id" to "fixture-room", "name" to roomName, "members" to JSONArray(roomMembers.map { json("profile" to it) })), "events" to JSONArray(roomEvents.toList()), "driver_status" to json("running" to true, "pending_actions" to JSONArray(roomActions.toList())))
-        path == "/api/sessions" -> {
+        path in setOf("/api/sessions", "/api/sessions/search") -> {
             // Stock dashboard index: profile-scoped pages of at most 100, archived=exclude|only.
             val limit = url?.queryParameter("limit")?.toIntOrNull() ?: 20
             val offset = url?.queryParameter("offset")?.toIntOrNull() ?: 0
+            val search = if (path == "/api/sessions/search") url?.queryParameter("q").orEmpty() else ""
             // Like Hermes: `sources` keeps only those platforms, `exclude_sources` drops them.
             val only = url?.queryParameter("sources")?.split(',')?.filter(String::isNotBlank)?.toSet()
             val excluded = url?.queryParameter("exclude_sources").orEmpty().split(',').filter(String::isNotBlank).toSet()
             sessionListQueries += json("sources" to url?.queryParameter("sources"), "exclude_sources" to url?.queryParameter("exclude_sources"), "order" to url?.queryParameter("order"))
             if (limit !in 1..100) 422 to json("detail" to "limit must be at most 100")
-            else 200 to json("sessions" to JSONArray(sessions.values.filter { it.getJSONObject("info").optBoolean("hidden") == archived }
+            else 200 to json("sessions" to JSONArray(sessions.values.filter { profileSessionIds[profile]?.contains(it.string("stored_session_id")) != false && it.getJSONObject("info").optBoolean("hidden") == archived }
+                .filter { search.isBlank() || it.getJSONObject("info").string("title").contains(search, ignoreCase = true) }
                 .filter { row -> val source = row.getJSONObject("info").string("source"); (only == null || source in only) && source !in excluded }
                 .map { row -> row.getJSONObject("info").copy().put("id", row.string("stored_session_id")).put("profile", profile).put("message_count", row.getJSONArray("messages").length()) }
                 .drop(offset).take(limit)))
@@ -689,6 +704,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             "projects.project_sessions" -> json("project" to json("id" to params.getString("project_id"), "label" to "Travel", "sessionIds" to JSONArray().put("chat-a").put("chat-b"), "previewSessions" to JSONArray().put(json("id" to "chat-a", "title" to "Travel planning", "profile" to scope.profile))))
             "session.resume" -> {
                 require(!historyFailure) { "Synthetic history unavailable" }
+                if (profileSessionIds[profile]?.contains(id) == false) throw IllegalArgumentException("Synthetic session missing")
                 val row = sessions[id] ?: unpromptedShells.remove(id)?.also { sessions[id] = it }
                 row?.copy()?.apply {
                     val runtime = resumeRuntimeSessionIds[id] ?: string("session_id")
@@ -737,7 +753,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             "session.compress" -> json("status" to "aborted")
             "session.undo" -> { sessions.getValue(id).put("messages", JSONArray()); json("ok" to true) }
             "config.get" -> if (params.string("key") == "provider") json("model" to profileModel, "provider" to "fixture")
-                else json("value" to if (params.string("key") == "approvals.mode") approvalMode else reasoningEffort)
+                else json("value" to when (params.string("key")) { "approvals.mode" -> approvalMode; "reasoning" -> params.string("session_id").takeIf(String::isNotBlank)?.let { sessionReasoning[id] } ?: reasoningEffort; else -> reasoningEffort })
             "config.set" -> {
                 val key = params.string("key")
                 val value = params.string("value")
@@ -748,7 +764,9 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                     sessions.getValue(id).getJSONObject("info").put("model", model).put("provider", requested.substringAfter(" --provider ", "fixture"))
                     return json("key" to "model", "value" to model, "confirm_required" to false)
                 }
-                if (key == "reasoning") reasoningEffort = value
+                if (key == "reasoning") {
+                    if (params.string("session_id").isBlank()) reasoningEffort = value else sessionReasoning[id] = value
+                }
                 check(value !in setOf("show", "hide"))
                 if (key == "approvals.mode") {
                     require(!rejectApprovalWrite) { "Synthetic approval write refused" }

@@ -29,6 +29,18 @@ class HistoryFiltersTest {
         assertEquals(HistoryOrder.Recent, HistoryOrder.of("unknown"))
     }
 
+    @Test fun assistantConversationIsHiddenAndAllProfileRowsHaveDistinctKeys() {
+        val assistant = json("id" to "assistant", "profile" to "coder", "source" to "cli", "pinned" to true)
+        val other = json("id" to "chat", "profile" to "coder", "source" to "android", "pinned" to true)
+        val shown = historyRows(
+            listOf(assistant, other), HistoryView.Pinned, HistoryOrder.Recent,
+            currentProfile = "default", assistantProfile = "coder", assistantSessionId = "assistant",
+        )
+        assertEquals(listOf("chat"), shown.map { it.getString("id") })
+        assertEquals("default:shared", historyRowKey(json("id" to "shared", "profile" to "default")))
+        assertEquals("coder:shared", historyRowKey(json("id" to "shared", "profile" to "coder")))
+    }
+
     @Test fun sourceFilterOffersListedAndHiddenSourcesButNotThreadsOrCron() {
         val offered = historySources(rows + json("id" to "f", "source" to "cron"), hidden = setOf("discord"))
         assertEquals(listOf("android", "discord", "telegram", "webui"), offered)

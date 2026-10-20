@@ -17,6 +17,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.CypherViewModel
+import dev.hermes.android.isMissingCypherPluginRoute
 import dev.hermes.android.core.Scope
 import dev.hermes.android.core.rows
 import dev.hermes.android.core.string
@@ -34,6 +35,7 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 internal fun voiceOptionsWithSelected(options: List<String>, selected: String): List<String> = (listOf(selected) + options).distinct()
+internal fun voiceChoiceLabel(voice: String): String = voice.replaceFirstChar(Char::titlecase)
 internal const val PROACTIVE_SETTINGS_PATH = "/api/plugins/cypher/mobile/proactive"
 internal fun proactiveSettingsKey(scope: Scope) = "proactive-settings:${scope.copy(session = "").key}"
 
@@ -46,6 +48,21 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
 }
 
 private data class VoiceCatalog(val models: List<String> = emptyList(), val voices: List<String> = emptyList())
+
+@Composable private fun AssistantProfileChoice(selected: String, options: List<String>, profiles: List<JSONObject>, loading: Boolean, onSelect: (String) -> Unit, modifier: Modifier = Modifier) {
+    var expanded by remember(selected) { mutableStateOf(false) }
+    Box(modifier) {
+        OutlinedButton(onClick = { expanded = true }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+            Text(uiText("Profile") + ": " + if (loading) uiText("Loading profile…") else profileDisplayName(selected, profiles), Modifier.weight(1f))
+        }
+        DropdownMenu(expanded, { expanded = false }) {
+            voiceOptionsWithSelected(options, selected).forEach { id ->
+                val label = if (loading && id == selected) uiText("Loading profile…") else profileDisplayName(id, profiles)
+                DropdownMenuItem(text = { Text(label) }, onClick = { expanded = false; onSelect(id) }, modifier = Modifier.testTag("choice-option:Profile:$id"))
+            }
+        }
+    }
+}
 
 /** The assistant's name (on this phone) and the profile its chat always uses. */
 @Composable internal fun AssistantSettings(vm: CypherViewModel) {
@@ -85,7 +102,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
         } catch (error: Throwable) {
             if (error is CancellationException) throw error
             if (vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile)
-                vm.storeData(proactiveKey, JSONObject().put("_error", "Couldn’t load proactive settings."))
+                vm.storeData(proactiveKey, JSONObject().put("_error", true).put("_pluginUpdateRequired", isMissingCypherPluginRoute(error)))
         } finally { client.closeNative() }
     }
     fun setProactive(enabled: Boolean) {
@@ -167,7 +184,11 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
         }
     }
     LaunchedEffect(Unit) { vm.load("navigation-profiles", "/api/profiles", force = false); vm.load("picker:models", "/api/models", force = false) }
-    val profiles = data["navigation-profiles"]?.rows("profiles")?.map { it.string("name") }?.filter(String::isNotBlank).orEmpty()
+    val profileCatalog = data["navigation-profiles"]
+    val profileRows = profileCatalog?.rows("profiles").orEmpty()
+    val profileLoading = ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
+    val profileLabel = profileDisplayLabel(profile, profileRows, profileLoading)
+    val profiles = profileRows.map { it.string("name") }.filter(String::isNotBlank)
     // "provider\tmodel" keys; blank = the profile's default. The saved pick stays listed even before the list loads.
     val models = data["picker:models"]?.rows("groups").orEmpty().flatMap { group -> group.rows("models").map { group.string("provider_id") + "\t" + it.string("id") to group.string("provider") + " · " + it.string("label", it.string("id")) } }.toMap()
     val selectedModel = if (prefs.assistantModel.isBlank()) "" else prefs.assistantProvider + "\t" + prefs.assistantModel
@@ -178,7 +199,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
         }
         item {
             // The saved choice stays listed even before the profile list loads or if it is gone, so it is never silently swapped.
-            Choice("Profile", prefs.assistantProfile, voiceOptionsWithSelected(profiles, prefs.assistantProfile), { vm.setAssistantProfile(it) }, Modifier.fillMaxWidth().testTag("assistant-profile"))
+            AssistantProfileChoice(prefs.assistantProfile, profiles, profileRows, profileLoading, { vm.setAssistantProfile(it) }, Modifier.fillMaxWidth().testTag("assistant-profile"))
         }
         item {
             Choice("Model", selectedModel, voiceOptionsWithSelected(listOf("") + models.keys, selectedModel), { key -> vm.setAssistantModel(key.substringAfter('\t', ""), if (key.isBlank()) "" else key.substringBefore('\t')) },
@@ -189,7 +210,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
-                        Text(uiText("Proactive"), style = MaterialTheme.typography.titleMedium)
+                        Text(uiText("Proactive") + " · " + profileLabel, style = MaterialTheme.typography.titleMedium)
                         Text(uiText("Briefings, follow-ups and alerts"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     Switch(checked = proactiveEnabled, onCheckedChange = ::setProactive, enabled = proactiveLoaded && ui.connected && vm.client != null && !savingProactive && !proactiveChoicesChanged,
@@ -198,8 +219,9 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                 if (proactive?.optBoolean("_loading") == true || ui.connected && vm.client != null && proactive == null) LinearProgressIndicator(Modifier.fillMaxWidth())
                 else if (!ui.connected || vm.client == null) Text(uiText("Connect to Hermes to manage Proactive."), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 else if (proactive?.has("_error") == true) {
-                    Text(uiText("Proactive settings couldn’t be loaded."), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    TextButton(onClick = { proactiveRefresh++ }) { Text(uiText("Retry")) }
+                    val pluginUpdateRequired = proactive.optBoolean("_pluginUpdateRequired")
+                    Text(uiText(if (pluginUpdateRequired) "Update the Cypher plugin on Hermes to use Proactive." else "Proactive settings couldn’t be loaded."), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (!pluginUpdateRequired) TextButton(onClick = { proactiveRefresh++ }) { Text(uiText("Retry")) }
                 }
             }
         }
@@ -417,10 +439,10 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
             }
         }
         Box {
-            TextButton(onClick={voiceMenu=true},enabled=!busy) { Text("Voice: " + selection.voice) }
+            TextButton(onClick={voiceMenu=true},enabled=!busy) { Text("Voice: " + voiceChoiceLabel(selection.voice)) }
             DropdownMenu(expanded=voiceMenu,onDismissRequest={voiceMenu=false}) {
                 voices.distinct().forEach { voice ->
-                    DropdownMenuItem(text={Text(voice)},onClick={
+                    DropdownMenuItem(text={Text(voiceChoiceLabel(voice))},onClick={
                         voiceMenu=false
                         saveSelection(selection.copy(voice=voice))
                     })

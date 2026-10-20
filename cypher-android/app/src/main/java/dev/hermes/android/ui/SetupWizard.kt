@@ -63,6 +63,8 @@ internal fun handleSetupPermissionResult(granted: Boolean, advance: () -> Unit, 
     if (granted) advance() else denied()
 }
 
+internal fun setupNeedsBackgroundExemption(isIgnoringBatteryOptimizations: Boolean): Boolean = !isIgnoringBatteryOptimizations
+
 internal fun setupPermissionRequiresSettings(denied: Boolean, showRationale: Boolean): Boolean = denied && !showRationale
 
 private tailrec fun Context.findActivity(): android.app.Activity? = when (this) {
@@ -103,7 +105,8 @@ internal fun parseCypherConnectLink(value: String, allowAddress: Boolean = true)
     require(sessions.size <= 1) { "This Cypher link has an invalid session. Scan the Connect QR again." }
     val session = sessions.singleOrNull()?.takeIf(String::isNotBlank)
     require(session == null || validLoopbackSessionToken(session)) { "This Cypher link has an invalid session. Scan the Connect QR again." }
-    return CypherConnectInput(trustedOrigin(address), session)
+    val explicitScheme = Regex("^[A-Za-z][A-Za-z0-9+.-]*://").containsMatchIn(address.trim())
+    return CypherConnectInput(trustedOrigin(if (explicitScheme) address else "https://$address"), session)
 }
 
 internal fun parseCypherConnectInput(value: String): String = parseCypherConnectLink(value).origin
@@ -141,6 +144,10 @@ fun SetupWizard(vm: CypherViewModel, modifier: Modifier = Modifier, externalLink
         onReopen = vm::reopenSetupWizard,
         onCancel = { vm.cancelSetupWizard(); onExternalLinkCleared() },
         onStageLink = vm::openSetupLink,
+        onOpenBackgroundSettings = {
+            runCatching { context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
+                .onFailure { vm.notice("Open Cypher’s app settings in Android and allow background use.") }
+        },
     )
 }
 
@@ -156,9 +163,16 @@ internal fun SetupWizardScreen(
     onCancel: () -> Unit,
     onVoiceKeySaved: () -> Unit = {},
     onStageLink: (String) -> Unit = {},
+    onOpenBackgroundSettings: () -> Unit = {},
     externalLinkOrigin: String? = null,
 ) {
     val context = LocalContext.current
+    val powerManager = remember(context) { context.getSystemService(android.os.PowerManager::class.java) }
+    var ignoringBatteryOptimizations by remember(context) { mutableStateOf(powerManager.isIgnoringBatteryOptimizations(context.packageName)) }
+    androidx.lifecycle.compose.LifecycleResumeEffect(context) {
+        ignoringBatteryOptimizations = powerManager.isIgnoringBatteryOptimizations(context.packageName)
+        onPauseOrDispose { }
+    }
     val initialAddress = setupAddressForDisplay(state.setupOrigin.ifBlank { state.origin })
     val visibleOrigin = setupAddressForDisplay(state.setupOrigin.ifBlank { state.origin })
     var address by rememberSaveable(initialAddress) { mutableStateOf(initialAddress) }
@@ -355,7 +369,7 @@ internal fun SetupWizardScreen(
                             Switch(checked = keepConnected, onCheckedChange = { keepConnected = it; if (it) requestKeepConnectedNotifications() }, modifier = Modifier.testTag("setup-keep-connected"))
                         }
                         if (keepConnected && !notificationAllowed) Text("Allow notifications so incoming call alerts can appear.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                        Text("Allow Cypher to run in the background so calls reach you.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+                        if (setupNeedsBackgroundExemption(ignoringBatteryOptimizations)) TextButton(onClick = onOpenBackgroundSettings, modifier = Modifier.testTag("setup-background-use")) { Text("Allow Cypher to run in the background") }
                         Button(onClick = { onFinish(keepConnected) }, enabled = state.authenticated, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-finish")) { Text("Open chat") }
                     }
                     else -> {

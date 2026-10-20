@@ -24,6 +24,9 @@ import kotlinx.coroutines.launch
     val refreshing by vm.refreshing.collectAsStateWithLifecycle()
     val ui by vm.ui.collectAsStateWithLifecycle()
     val chat by vm.chat.collectAsStateWithLifecycle()
+    val profileCatalog = data["navigation-profiles"]
+    val profileRows = profileCatalog?.rows("profiles").orEmpty()
+    val profileLoading = ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
     val capturedClient = vm.client
     val capturedScope = vm.authenticatedScope()?.takeIf { it.origin == ui.origin && it.owner == ui.owner && it.profile == ui.profile && it.session == chat.sessionId }
     val scope = rememberCoroutineScope()
@@ -34,6 +37,7 @@ import kotlinx.coroutines.launch
     var lastVerifiedYolo by remember(capturedClient, capturedScope) { mutableStateOf<Boolean?>(null) }
     val key = "picker:approvals"
     val path = "/api/approval/mode"
+    LaunchedEffect(ui.origin, ui.owner, ui.connected) { if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     val record = data[key]
     val scopedRecord = record?.takeIf { it.string("scope_key") == capturedClient?.scope?.key && it.string("session_id") == capturedScope?.session }
     val current = scopedRecord?.string("value").orEmpty()
@@ -86,7 +90,7 @@ import kotlinx.coroutines.launch
             Icon(Icons.Rounded.Shield, uiText(if (yolo) "Approvals · YOLO on" else "Approvals"), tint = if (yolo) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant)
         }
         DropdownMenu(open, { open = false }, modifier = Modifier.heightIn(max = 360.dp).testTag("approvals-menu")) {
-            DropdownMenuItem({ Text("Approvals · ${capturedClient?.scope?.profile.orEmpty()}") }, {}, enabled = false)
+            DropdownMenuItem({ Text("Approvals · ${profileDisplayLabel(capturedClient?.scope?.profile.orEmpty(), profileRows, profileLoading)}") }, {}, enabled = false)
             if (loading || saving) DropdownMenuItem({ Text(if (saving) "Saving…" else "Refreshing…") }, {}, enabled = false)
             val error = recordError(record)
             if (error.isNotBlank()) DropdownMenuItem({ Text(error, maxLines = 3, color = MaterialTheme.colorScheme.error) }, { refresh() })

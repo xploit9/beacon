@@ -31,6 +31,11 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 @Composable fun NativeBotModeSidebar(vm: CypherViewModel, modifier: Modifier = Modifier, beforeRoster: @Composable () -> Unit = {}) {
     val state by vm.botMode.state.collectAsState()
     val ui by vm.ui.collectAsState()
+    val data by vm.data.collectAsState()
+    val profileCatalog = data["navigation-profiles"]
+    val profileRows = profileCatalog?.rows("profiles").orEmpty()
+    val profileLoading = ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
+    LaunchedEffect(ui.origin, ui.owner, ui.connected) { if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     LaunchedEffect(vm.botMode) { vm.botMode.refresh(silent = true) }
     LazyColumn(modifier.background(MaterialTheme.colorScheme.surfaceContainer).testTag("bot-mode-sidebar"), contentPadding = PaddingValues(bottom = 16.dp)) {
         item("destinations") { beforeRoster() }
@@ -42,7 +47,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
         if (state.bots.isEmpty() && !state.loading) item { Text("No bots available.", Modifier.padding(16.dp)) }
         items(state.bots, key = { "bot:${it.profile}" }) { bot ->
             val active = state.activeBot?.profile == bot.profile
-            ListItem(headlineContent = { Text(bot.title, maxLines = 2) },
+            ListItem(headlineContent = { Text(profileDisplayLabel(bot.profile, profileRows, profileLoading), maxLines = 2) },
                 supportingContent = if (bot.description.isNotBlank()) ({ Text(bot.description, maxLines = 2, style = MaterialTheme.typography.bodySmall) }) else null,
                 leadingContent = { Icon(Icons.Rounded.SmartToy, null) },
                 colors = ListItemDefaults.colors(containerColor = if (active) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainer),
@@ -65,6 +70,12 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
     val controller = vm.botMode
     val state by controller.state.collectAsState()
     val chat by vm.chat.collectAsState()
+    val owner by vm.ui.collectAsState()
+    val data by vm.data.collectAsState()
+    val profileCatalog = data["navigation-profiles"]
+    val profileRows = profileCatalog?.rows("profiles").orEmpty()
+    val profileLoading = owner.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
+    LaunchedEffect(owner.origin, owner.owner, owner.connected) { if (owner.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     BackHandler(state.activeBot != null || state.openingBot != null || state.selectedSpace.isNotBlank()) { vm.showBotMode() }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     LaunchedEffect(controller, lifecycle, state.selectedSpace, state.activeBot) {
@@ -75,9 +86,10 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
     }
     val bot = state.activeBot ?: state.openingBot
     if (bot != null) {
-        if (state.activeBot != null && chat.sessionId == state.sessionId) ChatScreen(vm, titleOverride = "${bot.title} · Bot Chat")
+        val botName = profileDisplayLabel(bot.profile, profileRows, profileLoading)
+        if (state.activeBot != null && chat.sessionId == state.sessionId) ChatScreen(vm, titleOverride = "$botName · Bot Chat")
         else Column(Modifier.fillMaxSize()) {
-            Header("${bot.title} · Bot Chat", menu = LocalOpenNavigationMenu.current)
+            Header("$botName · Bot Chat", menu = LocalOpenNavigationMenu.current)
             if (state.loading) {
                 LinearProgressIndicator(Modifier.fillMaxWidth())
                 Text("Opening Bot Chat…", Modifier.padding(20.dp))
@@ -89,7 +101,6 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
         return
     }
     val shared = state.selectedSpace.isNotBlank()
-    val owner by vm.ui.collectAsState()
     val spaceName = state.spaces.firstOrNull { it.id == state.selectedSpace }?.name ?: "Shared space"
     var menu by remember(owner.origin, owner.owner, owner.profile, state.selectedSpace) { mutableStateOf(false) }
     var editing by rememberSaveable(owner.origin, owner.owner, owner.profile, state.selectedSpace) { mutableStateOf(false) }
@@ -113,7 +124,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
                 Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).toggleable(bot.profile in members, enabled = !state.loading, role = androidx.compose.ui.semantics.Role.Checkbox) {
                     members = if (bot.profile in members) members - bot.profile else if (members.size < 6) members + bot.profile else members
                 }, verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                    Checkbox(bot.profile in members, onCheckedChange = null); Text(bot.title, Modifier.padding(start = 8.dp))
+                    Checkbox(bot.profile in members, onCheckedChange = null); Text(profileDisplayLabel(bot.profile, profileRows, profileLoading), Modifier.padding(start = 8.dp))
                 }
             }
             if (state.error.isNotBlank()) Text(state.error, color = MaterialTheme.colorScheme.error)
@@ -132,7 +143,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
         text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             OutlinedTextField(draftName, { draftName = it.take(120) }, label = { Text("Name") }, singleLine = true, enabled = !state.loading, modifier = Modifier.testTag("shared-space-name"))
             Text("Bots", style = MaterialTheme.typography.titleSmall)
-            Text(state.members.map { profile -> state.bots.firstOrNull { it.profile == profile }?.title ?: profile }.joinToString(", "))
+            Text(state.members.map { profile -> profileDisplayLabel(profile, profileRows, profileLoading) }.joinToString(", "))
             TextButton({ editing = false; members = state.members.toSet(); membersSubmitted = false; choosingMembers = true }) { Text("Change bots") }
             if (state.error.isNotBlank()) Text(state.error, color = MaterialTheme.colorScheme.error)
         } },
@@ -160,7 +171,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
                 item { Text("Chat with one bot, or bring several into a shared space.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
                 item { Text("Bots", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(top = 8.dp)) }
                 items(state.bots, key = { "overview-bot:${it.profile}" }) { bot ->
-                    ActionRow(bot.title, bot.description, Icons.Rounded.SmartToy) { vm.openBot(bot) }
+                    ActionRow(profileDisplayLabel(bot.profile, profileRows, profileLoading), bot.description, Icons.Rounded.SmartToy) { vm.openBot(bot) }
                 }
                 item { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                     Text("Shared spaces", style = MaterialTheme.typography.titleLarge)
@@ -175,7 +186,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
                 items(state.bots, key = { "member:${it.profile}" }) { member ->
                     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).toggleable(value = member.profile in state.selectedBots, enabled = !state.loading, role = androidx.compose.ui.semantics.Role.Checkbox, onValueChange = { controller.toggleBot(member.profile) }), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                         Checkbox(checked = member.profile in state.selectedBots, onCheckedChange = null, enabled = !state.loading)
-                        Text(member.title, Modifier.padding(start = 12.dp))
+                        Text(profileDisplayLabel(member.profile, profileRows, profileLoading), Modifier.padding(start = 12.dp))
                     }
                 }
                 item { Button(onClick = { controller.createSpace() }, enabled = !state.loading && state.selectedBots.size in 2..6) { Text("Create shared space") } }

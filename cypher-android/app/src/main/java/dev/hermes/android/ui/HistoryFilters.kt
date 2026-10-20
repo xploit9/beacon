@@ -11,6 +11,8 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import dev.hermes.android.data.CYPHER_THREAD_SOURCE
 import dev.hermes.android.core.string
+import dev.hermes.android.core.sessionRowId
+import dev.hermes.android.core.sessionRowKey
 import org.json.JSONObject
 import java.util.Locale
 
@@ -28,6 +30,7 @@ internal enum class HistoryOrder(val key: String, val label: String) {
 }
 
 internal fun isThreadSource(source: String?): Boolean = source?.trim()?.lowercase(Locale.ROOT) in setOf(CYPHER_THREAD_SOURCE, "phone")
+internal fun historyRowKey(row: JSONObject): String = sessionRowKey(row)
 
 /** Readable names for Hermes session sources; an unknown platform keeps its own name. */
 internal fun historySourceLabel(source: String): String = when (source.trim().lowercase(Locale.ROOT)) {
@@ -51,11 +54,14 @@ internal fun historySources(rows: List<JSONObject>, hidden: Set<String>): List<S
         .filterNot { it == "cron" || isThreadSource(it) }.distinct().sortedBy { historySourceLabel(it).lowercase(Locale.ROOT) }
 
 /** The rows a view shows, in the chosen order (pinned first, as Relay does). */
-internal fun historyRows(rows: List<JSONObject>, view: HistoryView, order: HistoryOrder): List<JSONObject> {
+internal fun historyRows(rows: List<JSONObject>, view: HistoryView, order: HistoryOrder, currentProfile: String = "", assistantProfile: String = "", assistantSessionId: String = ""): List<JSONObject> {
+    val visible = rows.filterNot { row ->
+        assistantSessionId.isNotBlank() && row.string("profile", currentProfile) == assistantProfile && sessionRowId(row) == assistantSessionId
+    }
     val shown = when (view) {
-        HistoryView.All -> rows
-        HistoryView.Threads -> rows.filter { isThreadSource(it.string("source")) }
-        HistoryView.Pinned -> rows.filter { it.optBoolean("pinned") }
+        HistoryView.All -> visible
+        HistoryView.Threads -> visible.filter { isThreadSource(it.string("source")) }
+        HistoryView.Pinned -> visible.filter { it.optBoolean("pinned") }
     }
     return if (order == HistoryOrder.Title) shown.sortedWith(compareByDescending<JSONObject> { it.optBoolean("pinned") }.thenBy { it.string("title").lowercase(Locale.ROOT) }) else shown
 }
