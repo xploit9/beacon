@@ -501,7 +501,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
                 } else if ((!anchorRestored || !follow) && chat.messages.isNotEmpty()) {
                     // Await this panel's layout, not the last session's retained item count.
                     withFrameNanos { }
-                    snapshotFlow { list.layoutInfo.totalItemsCount }.first { it >= chat.messages.size }
+                    snapshotFlow { list.layoutInfo.totalItemsCount }.first { it >= visibleMessages.size }
                     if (chat.anchor > 0 || chat.anchorOffset > 0 || chat.anchorId.isNotBlank()) {
                         follow = false
                         val index = anchoredIndex(messageIds, chat.anchorId, chat.anchor) ?: 0
@@ -511,14 +511,15 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
                     anchorRestored = true
                 }
             }
-            LaunchedEffect(anchorRestored, follow, search, chat.messages.size, chat.liveText, chat.callMessages) {
+            LaunchedEffect(anchorRestored, follow, search, chat.messages.size, visibleMessages.size, chat.liveText, chat.callMessages) {
                 if (anchorRestored && follow && search.isBlank() && chat.messages.isNotEmpty()) {
                     if (chat.anchor > 0 || chat.anchorOffset > 0 || chat.anchorId.isNotBlank()) vm.anchor(0, 0, "")
                     // Markdown, media and fold layouts can grow after the first measurement.
                     // Keep following their measured tail, rather than only the incoming text/count.
                     snapshotFlow {
                         val layout = list.layoutInfo
-                        if (list.canScrollForward && layout.totalItemsCount >= chat.messages.size) {
+                        // Rows shown, not raw messages: folded tool results and merged tool rounds take no row of their own.
+                        if (list.canScrollForward && layout.totalItemsCount >= visibleMessages.size) {
                             val target = (layout.totalItemsCount - 1).coerceAtLeast(0)
                             val available = (layout.viewportEndOffset - layout.viewportStartOffset - layout.beforeContentPadding - layout.afterContentPadding).coerceAtLeast(1)
                             val offset = ((layout.visibleItemsInfo.firstOrNull { it.index == target }?.size ?: 0) - available).coerceAtLeast(0)
