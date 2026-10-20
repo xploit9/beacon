@@ -102,7 +102,6 @@ class UpdateManager(private val app: CypherApplication) {
 
     /** A throttled foreground check; force=true preserves manual retry. */
     suspend fun check(client: CypherClient, force: Boolean = false, notify: Boolean = true): Release? {
-        if (!force && !autoUpdateEnabled()) return null
         val expected = synchronized(lock) {
             val current = source() ?: error("Sign in before checking updates")
             require(current.authorizedBy(client.auth)) { "Update belongs to another owner or server" }
@@ -127,13 +126,13 @@ class UpdateManager(private val app: CypherApplication) {
     private fun beginAutomaticCheck(expected: UpdateSource): Boolean {
         requireAuthorized(expected)
         val now = System.currentTimeMillis()
-        if (!autoUpdateCheckDue(autoUpdateEnabled(), prefs.getLong("last_check", 0), now)) return false
+        if (!updateCheckDue(prefs.getLong("last_check", 0), now, false)) return false
         check(prefs.edit().putLong("last_check", now).commit())
         return true
     }
 
     suspend fun backgroundCheck() {
-        if (!autoUpdateEnabled() || !supportsAutomaticAppUpdates()) return
+        if (!supportsAutomaticAppUpdates()) return
         val expected = synchronized(lock) {
             val current = source() ?: return
             if (!current.authorizedBy(app.auth.read(current.origin))) { clearAuthorization(); return }
@@ -143,7 +142,9 @@ class UpdateManager(private val app: CypherApplication) {
         val client = savedClient(expected)
         try {
             val release = checkAuthenticated(client, expected, false) ?: return
-            automaticUpdate(client,expected,release)
+            // With automatic updates off, a newer release is only announced, never downloaded.
+            if (autoUpdateEnabled()) automaticUpdate(client,expected,release)
+            else synchronized(lock) { requireAuthorized(expected); notifyRelease(expected,release) }
         } finally { client.closeNative() }
     }
 

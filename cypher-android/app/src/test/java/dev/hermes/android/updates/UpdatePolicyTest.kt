@@ -71,10 +71,10 @@ class UpdatePolicyTest {
     }
 
     @Test fun automaticUpdateDefaultsOnAndNeedsUnmeteredNetworkWithoutAnActiveCall() {
-        assertTrue(autoUpdateCheckDue(true,0,1))
-        assertFalse(autoUpdateCheckDue(false,0,1))
-        assertFalse(autoUpdateCheckDue(true,1_000,1_000+12*60*60_000L-1))
-        assertTrue(autoUpdateCheckDue(true,1_000,1_000+12*60*60_000L))
+        // Background checks run every 12 hours whether or not automatic updates are on (off only announces).
+        assertTrue(updateCheckDue(0,1,false))
+        assertFalse(updateCheckDue(1_000,1_000+12*60*60_000L-1,false))
+        assertTrue(updateCheckDue(1_000,1_000+12*60*60_000L,false))
         assertTrue(autoUpdateInstallAllowed(true, unmetered = true, callActive = false))
         assertFalse(autoUpdateInstallAllowed(false, unmetered = true, callActive = false))
         assertFalse(autoUpdateInstallAllowed(true, unmetered = false, callActive = false))

@@ -1200,6 +1200,9 @@ def auto_update_check(cfg,now=None):
             message='A stable app update is ready.' if release_info.get('available') else 'Up to date.'
             if latest>installed:
                 return _auto_update_plugin(owner,now,app_version,plugin_version)
+            # An installed update this process has not loaded yet still needs a restart, even when nothing newer exists.
+            if _RUNNING_PLUGIN_VERSION!=installed_version:
+                return mobile.record_auto_update_status(owner,now,'restart_required',app_version,plugin_version,'Restart Hermes to finish the plugin update.')
             return mobile.record_auto_update_status(owner,now,result,app_version,plugin_version,message)
         except ReleaseCheckError:
             return mobile.record_auto_update_status(owner,now,'error',message='Could not check for updates. Try again later.')

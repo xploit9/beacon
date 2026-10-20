@@ -219,3 +219,16 @@ async def test_watcher_keeps_call_and_notice_delivery_moving_during_auto_check(h
     finally:
         release.set()
         await api.stop_watcher()
+
+
+def test_restart_hint_survives_a_later_up_to_date_check(harness,monkeypatch):
+    api,_,cfg,_,_=harness
+    checked,updated=_auto(api,monkeypatch,plugin_version='1.0.0')
+    # 1.1.0 is installed on disk but this process still runs 1.0.0, and the release page has nothing newer.
+    monkeypatch.setattr(api,'_installed_plugin_version',lambda:'1.1.0')
+    monkeypatch.setattr(api,'_RUNNING_PLUGIN_VERSION','1.0.0')
+
+    result=api.auto_update_check(cfg,now=2_000_000)
+
+    assert updated==[] and result['result']=='restart_required'
+    assert result['message']=='Restart Hermes to finish the plugin update.'
