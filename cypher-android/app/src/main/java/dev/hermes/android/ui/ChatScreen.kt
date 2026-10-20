@@ -864,7 +864,7 @@ internal fun acceptsInitialConversationEdit(
                             // The trailing slot morphs to Stop, so the bar never widens during a turn.
                             OutlinedIconButton(onClick = { vm.cancel() }, shape = CircleShape, border = BorderStroke(1.dp, MaterialTheme.colorScheme.error), modifier = Modifier.size(composerActionSize).testTag("message-stop")) { Icon(Icons.Rounded.Stop, uiText("Stop"), Modifier.size(24.dp), tint = MaterialTheme.colorScheme.error) }
                         } else if (voiceAction) {
-                            FilledIconButton(onClick = onCall, shape = CircleShape, modifier = Modifier.size(composerActionSize).testTag("chat-call-cypher"), enabled = callAvailable && canonical && !callActive && !readOnly && chat.streamId.isBlank() && ui.bootstrap.optJSONObject("voice")?.optBoolean("available") == true) { Icon(Icons.Rounded.GraphicEq, assistantText("Talk to Cypher in this conversation"), Modifier.size(24.dp)) }
+                            FilledIconButton(onClick = onCall, shape = CircleShape, modifier = Modifier.size(composerActionSize).testTag("chat-call-cypher"), enabled = callAvailable && canonical && !callActive && !readOnly && chat.streamId.isBlank() && voiceCallsOffered(ui.bootstrap)) { Icon(Icons.Rounded.GraphicEq, assistantText("Talk to Cypher in this conversation"), Modifier.size(24.dp)) }
                         } else {
                             FilledIconButton(onClick = submit, shape = CircleShape, modifier = Modifier.size(composerActionSize).testTag("message-send"), enabled = editable && preparing.isEmpty() && chat.uncertain.isBlank() && !callActive && !readOnly) { Icon(Icons.Rounded.ArrowUpward, uiText(if (commandName != null) "Run command" else if (chat.streamId.isNotBlank()) "Queue" else "Send"), Modifier.size(24.dp)) }
                         }
@@ -999,6 +999,8 @@ private fun JSONObject.rawToolName(): String {
     return name.ifBlank { "tool" }
 }
 internal fun toolDisplayName(tool: JSONObject): String = humanToolName(tool.rawToolName())
+/** Calls use the phone's own provider key; Hermes only needs the Cypher plugin. A missing phone key opens Voice & calls. */
+internal fun voiceCallsOffered(bootstrap: JSONObject): Boolean = bootstrap.optJSONObject("optional_features")?.optString("plugin") == "available"
 /** Hermes names MCP tools `mcp__<server>__<tool>`: show "list calendar events · personal", not the raw id. */
 internal fun humanToolName(raw: String, suffix: String = ""): String {
     val parts = raw.split("__")

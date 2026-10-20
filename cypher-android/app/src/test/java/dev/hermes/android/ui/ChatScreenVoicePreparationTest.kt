@@ -6,6 +6,7 @@ import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -94,6 +95,9 @@ class ChatScreenVoicePreparationTest {
         assertEquals("list calendar events · personal", humanToolName("mcp__personal__list_calendar_events"))
         assertEquals("search emails result · tool gateway meeting", humanToolName("mcp__tool_gateway_meeting__search_emails", " result"))
         assertEquals("terminal", humanToolName("terminal"))
+        // Hermes reports only its own server-held keys; a phone-held key still allows the call.
+        assertTrue(voiceCallsOffered(JSONObject().put("optional_features", JSONObject().put("plugin", "available")).put("voice", JSONObject().put("available", false))))
+        assertFalse(voiceCallsOffered(JSONObject().put("optional_features", JSONObject().put("plugin", "absent"))))
         assertEquals("tool describe", toolDisplayName(call("tool_describe", "{\"names\":[\"cypher_call_user\"]}")))
         assertEquals("tool call", toolDisplayName(call("tool_call", "not json")))
         assertEquals("tool call", toolDisplayName(call("tool_call", "{\"name\":\"<script>\"}")))
