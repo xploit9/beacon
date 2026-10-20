@@ -65,6 +65,11 @@ internal fun handleSetupPermissionResult(granted: Boolean, advance: () -> Unit, 
 
 internal fun setupNeedsBackgroundExemption(isIgnoringBatteryOptimizations: Boolean): Boolean = !isIgnoringBatteryOptimizations
 
+/** Android's one-tap "run in background" dialog, else the battery list. Behaviour adapted from Hermes Relay util/BatteryOptimizations.kt (MIT). */
+internal fun requestBackgroundUse(context: Context): Boolean =
+    runCatching { context.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, android.net.Uri.parse("package:${context.packageName}"))) }
+        .recoverCatching { context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }.isSuccess
+
 internal fun setupPermissionRequiresSettings(denied: Boolean, showRationale: Boolean): Boolean = denied && !showRationale
 
 private tailrec fun Context.findActivity(): android.app.Activity? = when (this) {
@@ -144,10 +149,7 @@ fun SetupWizard(vm: CypherViewModel, modifier: Modifier = Modifier, externalLink
         onReopen = vm::reopenSetupWizard,
         onCancel = { vm.cancelSetupWizard(); onExternalLinkCleared() },
         onStageLink = vm::openSetupLink,
-        onOpenBackgroundSettings = {
-            runCatching { context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
-                .onFailure { vm.notice("Open Cypher’s app settings in Android and allow background use.") }
-        },
+        onOpenBackgroundSettings = { if (!requestBackgroundUse(context)) vm.notice("Open Cypher’s app settings in Android and allow background use.") },
     )
 }
 

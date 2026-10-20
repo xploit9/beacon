@@ -272,6 +272,7 @@ import org.json.JSONObject
         TextButton(onClick = { context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)) }) { Text(uiText("Android notification settings")) }
         Text("Background delivery",style=MaterialTheme.typography.titleMedium)
         Text(when { restricted -> "Android is restricting Cypher in the background. Open app settings and allow background activity."; optimized -> "Battery optimization is on. If alerts arrive late, allow background activity in your phone’s app or battery settings."; else -> "Android battery optimization is off for Cypher." },color=if(restricted) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+        if (optimized && !restricted) TextButton(onClick = { if (!requestBackgroundUse(context)) vm.notice("Open Cypher’s app settings in Android and allow background use.") }) { Text("Allow background use") }
         Text("Shows a quiet notification and uses some battery.", style=MaterialTheme.typography.bodySmall, color=MaterialTheme.colorScheme.onSurfaceVariant)
         Text("Keep Tailscale on. On Honor phones, allow Cypher to run in the background.",style=MaterialTheme.typography.bodySmall)
         Text("After a force stop, open Cypher once to receive calls again.",style=MaterialTheme.typography.bodySmall)
