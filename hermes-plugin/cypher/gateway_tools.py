@@ -111,6 +111,25 @@ def safe(value, limit):
     return redact_sensitive_text(str(value), force=True, redact_url_credentials=True)[:limit]
 
 
+def coerce(schema, value):
+    """Realtime voice models often send numbers and booleans as strings ("2", "true"); match the declared scalar type
+    before strict validation. Anything ambiguous is left as sent, so validation still decides."""
+    if not isinstance(schema, dict): return value
+    kind = schema.get('type')
+    kinds = set(kind) if isinstance(kind, list) else {kind}
+    if isinstance(value, dict) and isinstance(schema.get('properties'), dict):
+        return {key: coerce(schema['properties'].get(key), item) for key, item in value.items()}
+    if isinstance(value, list) and isinstance(schema.get('items'), dict):
+        return [coerce(schema['items'], item) for item in value]
+    if isinstance(value, str) and 'string' not in kinds:
+        text = value.strip()
+        if 'integer' in kinds and re.fullmatch(r'[+-]?\d{1,15}', text): return int(text)
+        if 'number' in kinds and re.fullmatch(r'[+-]?(\d{1,15}(\.\d{0,12})?|\.\d{1,12})', text): return float(text)
+        if 'boolean' in kinds and text.casefold() in ('true', 'false'): return text.casefold() == 'true'
+    if isinstance(value, float) and 'integer' in kinds and 'number' not in kinds and value.is_integer(): return int(value)
+    return value
+
+
 def validate(schema, arguments):
     from jsonschema import validators
     if not isinstance(arguments, dict):
@@ -454,7 +473,7 @@ class Gateway:
             named=[t for t in tools if t['name']==value['tool_id']]
             tool=named[0] if len(named)==1 else None
         if not tool: raise HTTPException(409, 'Tool changed or is no longer configured; rediscover it')
-        arguments=value['arguments']
+        arguments=coerce(tool['parameters'], value['arguments'])
         validate(tool['parameters'], arguments)
         methods=readonly_methods(tool['parameters'])
         if 'method' not in arguments and methods:

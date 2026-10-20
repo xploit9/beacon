@@ -129,4 +129,12 @@ class GeminiWireTest {
         assertTrue(prompt.contains("all tool and approval rules above still apply"))
     }
 
+    @Test fun aRefusedToolCallSaysWhyAndCanBeCorrected() {
+        val refused = directInvokeFailure("r1", "mcp__personal__list_calendar_events", dev.hermes.android.data.ApiFailure(400, "Arguments do not match the configured tool schema", plugin = true))
+        assertEquals("failed", refused.getString("status"))
+        assertEquals("Not run: Arguments do not match the configured tool schema", refused.getString("reason"))
+        assertEquals("mcp__personal__list_calendar_events", refused.getString("tool_name"))
+        assertEquals("uncertain", directInvokeFailure("r2", "a".repeat(64), java.io.IOException("reset")).getString("status"))
+        assertEquals("uncertain", directInvokeFailure("r3", "a".repeat(64), dev.hermes.android.data.ApiFailure(429, "Busy")).getString("status"))
+    }
 }

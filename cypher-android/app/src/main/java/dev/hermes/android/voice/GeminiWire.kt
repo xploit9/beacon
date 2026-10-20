@@ -230,6 +230,13 @@ internal class DirectVisualEvidence {
 }
 
 /** Keeps immutable invocation/proposal identity. Status polling never repeats invoke. */
+/** Hermes refused the request before anything ran (4xx): say why, so the call can correct it. Anything else may have run. */
+internal fun directInvokeFailure(requestId: String, toolId: String, error: Throwable): JSONObject {
+    val refused = (error as? dev.hermes.android.data.ApiFailure)?.takeIf { it.status in 400..499 && it.status != 408 && it.status != 429 }
+    val receipt = JSONObject().put("request_id", requestId).put("tool_id", toolId).put("tool_name", toolId.takeIf { it.length != 64 } ?: "MCP tool request")
+    return if (refused != null) receipt.put("status", "failed").put("reason", "Not run: " + refused.message.take(200))
+    else receipt.put("status", "uncertain").put("reason", "Tool submission outcome is unconfirmed. Read this request_id; never invoke it again.")
+}
 internal class DirectGatewayReceipts {
     private data class Request(val functionId: String, val toolId: String, val arguments: JSONObject, var receipt: JSONObject)
     private val requests = linkedMapOf<String,Request>()

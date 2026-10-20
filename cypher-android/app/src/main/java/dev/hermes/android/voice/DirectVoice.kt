@@ -417,7 +417,7 @@ internal class DirectVoice(private val client:CypherClient,private val callId:St
                 if(!claimMutation(id)) return
                 var receipt=try { withTimeoutOrNull(20000) { gatewayRequests.withPermit { check(callOwned()) { "Call authority changed" };gateway.invoke(requestId,toolId,arguments) } } ?: throw java.io.IOException("Tool submission timed out") }
                 catch(error:CancellationException) { throw error }
-                catch(error:Exception) { JSONObject().put("request_id",requestId).put("tool_id",toolId).put("tool_name","MCP tool request").put("status","uncertain").put("reason","Tool submission outcome is unconfirmed. Read this request_id; never invoke it again.") }
+                catch(error:Exception) { directInvokeFailure(requestId,toolId,error) }
                 try { publishGatewayReceipt(requestId,receipt) }
                 catch(error:CancellationException) { throw error }
                 catch(error:Exception) {
