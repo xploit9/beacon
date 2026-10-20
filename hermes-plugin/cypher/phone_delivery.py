@@ -53,7 +53,7 @@ def is_connected(config):
         return False
 
 
-def _queue_standalone_result(message):
+def _queue_standalone_result(message, is_cron=False):
     mobile, cfg, profile = _profile_state()
     _, native, _ = _modules()
     owner, provider = cfg.get("owner_id"), cfg.get("owner_provider")
@@ -63,17 +63,17 @@ def _queue_standalone_result(message):
     native.verify(owner, provider, profile, conversation)
     bucket = int(time.time() // 300)
     digest = hashlib.sha256((str(message) + ":" + str(bucket)).encode("utf-8")).hexdigest()[:32]
-    job_id = "phone-" + digest
+    job_id = ("phone-cron-" if is_cron else "phone-hermes-") + digest
     return mobile.enqueue_task_result(owner, profile, conversation, job_id, str(message)[:4000])
 
 
 def _strip_cron_header(message):
     header = re.match(r"(?s)^Cronjob Response: [^\r\n]{1,240}\r?\n\(job_id: [A-Za-z0-9_-]{1,160}\)\r?\n", message)
     if not header:
-        return message
+        return message, False
     body = message[header.end():]
     body = re.sub(r"^-{3,}\r?\n(?:\r?\n)?", "", body, count=1)
-    return re.sub(r'\n\nTo stop or manage this job, send me a new message \(e\.g\. "stop reminder [^\n]*"\)\.\s*\Z', "", body)
+    return re.sub(r'\n\nTo stop or manage this job, send me a new message \(e\.g\. "stop reminder [^\n]*"\)\.\s*\Z', "", body), True
 
 
 class CypherPhoneAdapter(BasePlatformAdapter):
@@ -98,7 +98,8 @@ class CypherPhoneAdapter(BasePlatformAdapter):
         if not isinstance(content, str) or not content.strip():
             return SendResult(success=False, error="Refusing to queue an empty phone result")
         try:
-            event = _queue_standalone_result(_strip_cron_header(content))
+            message,is_cron=_strip_cron_header(content)
+            event = _queue_standalone_result(message,is_cron)
             return SendResult(success=True, message_id=event)
         except Exception as exc:
             return SendResult(success=False, error=str(exc)[:240], retryable=True)
@@ -111,7 +112,8 @@ async def standalone_send(pconfig, chat_id, message, *, thread_id=None, media_fi
     if not isinstance(message, str) or not message.strip():
         return {"error": "Refusing to queue an empty phone result"}
     try:
-        event = _queue_standalone_result(_strip_cron_header(message))
+        message,is_cron=_strip_cron_header(message)
+        event = _queue_standalone_result(message,is_cron)
         return {"success": True, "platform": "phone", "chat_id": chat_id or "phone", "message_id": event}
     except Exception as exc:
         return {"error": str(exc)[:240]}

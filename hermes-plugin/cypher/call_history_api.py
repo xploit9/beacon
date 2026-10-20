@@ -66,12 +66,15 @@ def _page(mobile, owner, profile, limit, before):
             "COALESCE(NULLIF(c.callback_context,'{}'),(SELECT json_object('id',n.id,'reason',n.reason) "
             "FROM notices n WHERE n.call_id=c.id AND n.owner=c.owner AND n.profile=c.profile "
             "AND n.state='answered' ORDER BY n.created DESC LIMIT 1),'{}') AS callback_context,"
+            "(SELECT CASE WHEN l.feedback_verdict IS NULL THEN NULLIF(l.email_notice_id,'') END "
+            "FROM call_log l WHERE l.call_id=c.id AND l.owner=c.owner AND l.profile=c.profile LIMIT 1) AS email_notice_id,"
             "EXISTS(SELECT 1 FROM timeline t WHERE t.call_id=c.id "
             "AND json_extract(t.payload,'$.type')='transcript') AS has_transcript",
             '', (),
         )
         call_logs = query(
-            'call_log l', 'l.id,l.call_id,l.conversation,l.created,l.expires,l.state,l.reason',
+            'call_log l', "l.id,l.call_id,l.conversation,l.created,l.expires,l.state,l.reason,"
+            "CASE WHEN l.feedback_verdict IS NULL THEN NULLIF(l.email_notice_id,'') END AS email_notice_id",
             " AND (l.state!='answered' OR NOT EXISTS (SELECT 1 FROM calls c "
             "WHERE c.id=l.call_id AND c.owner=l.owner AND c.profile=l.profile))", (),
         )
@@ -102,6 +105,7 @@ def _page(mobile, owner, profile, limit, before):
             'conversation_id': row['conversation'],
             'reason': (callback['reason'][:120] or None) if isinstance(callback.get('reason'), str) else None,
             'has_transcript': bool(row['has_transcript']),
+            **({'email_notice_id': row['email_notice_id']} if row['email_notice_id'] else {}),
         })
     for row in call_logs:
         try:
@@ -125,6 +129,7 @@ def _page(mobile, owner, profile, limit, before):
             'conversation_id': row['conversation'],
             'reason': (row['reason'][:120] or None) if isinstance(row['reason'], str) else None,
             'has_transcript': False,
+            **({'email_notice_id': row['email_notice_id']} if row['email_notice_id'] else {}),
         })
 
     rows.sort(key=lambda item: (item['_created'], item['id']), reverse=True)

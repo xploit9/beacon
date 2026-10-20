@@ -239,7 +239,7 @@ class NativeMcp:
         from tools.mcp_tool_discovery import discover_mcp_tools
         from tools.mcp_tool_registration import _same_server_route, _make_tool_filter, _normalize_server_trust
         from tools.mcp_tool_scope import _resolve_server_key
-        from tools.mcp_tool_handlers import _tool_is_read_only, _make_tool_handler
+        from tools.mcp_tool_handlers import _tool_is_read_only
         from tools.registry import registry
         # Native discovery loads only operator config; the caller supplies no connection address.
         if discover: discover_mcp_tools()
@@ -277,11 +277,12 @@ class NativeMcp:
             has_method=isinstance(properties,dict) and 'method' in properties
             readonly = (_tool_is_read_only(server, raw) and not generic_http
                         and not (has_method and not method_read_only))
+            tool_timeout=float(closure.get('tool_timeout') or 60)
             version = digest([registry.current_scope_key(), server, raw, cfg, schema, readonly])
             output.append({'tool_id':version, 'name':entry.name,
                            'description':safe(entry.schema.get('description', ''), 1200),
                            'parameters':schema, 'read_only':readonly,
-                           '_handler':_make_tool_handler(server,raw,min(60,float(closure.get('tool_timeout') or 60))),
+                           '_timeout':tool_timeout,
                            '_server':server, '_raw':raw,
                            '_trust':_normalize_server_trust(cfg.get('trust'))})
         output.extend(native_catalog())
@@ -443,7 +444,8 @@ class Gateway:
             row = self._row(conn,scope,request)
             if not row: raise HTTPException(404, 'Tool request unavailable')
             value = json.loads(row['payload'])
-            if value['status']=='running' and (value.get('_boot')!=BOOT or time.time()-value['_started']>DEADLINE):
+            if value['status']=='running' and (value.get('_boot')!=BOOT or
+                    time.time()-value['_started']>value.get('_deadline_seconds',DEADLINE)):
                 value.update(status='uncertain', reason='Execution may have completed; do not retry automatically')
                 self._save(conn,scope,request,value)
             if value['status']=='needs_approval' and time.time()>value['_expires']:
@@ -480,6 +482,8 @@ class Gateway:
                 'status':'ready' if read_only else 'needs_approval',
                 '_arguments':arguments,'_read_only':read_only,'_session_id':session_id or scope[3],
                 '_expires':time.time()+120}
+        if '_timeout' in tool:
+            result['_deadline_seconds']=max(DEADLINE,float(tool['_timeout'])+30)
         if not read_only:
             serialized=encoded(arguments)
             try:

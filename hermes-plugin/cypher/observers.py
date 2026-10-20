@@ -340,5 +340,7 @@ def email_notice(mobile, native, cfg, profile, session_id, args, now):
                     conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
                                  (EMAIL_RULE_PREFIX + event,
                                   json.dumps({"created": now.timestamp(), "rule_id": request_id or "default"}).encode()))
+                    conn.execute("UPDATE call_log SET email_notice_id=? WHERE id=? AND owner=? AND profile=?",
+                                 (event, event, owner, profile))
                 return {"status": "pending", "event_id": event, "conversation_id": stored}
     return _notice(mobile, owner, profile, stored, reason.strip(), dedupe, now, email_alert=True)

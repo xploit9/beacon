@@ -226,16 +226,49 @@ async def test_watcher_keeps_call_and_notice_delivery_moving_during_auto_check(h
         await api.stop_watcher()
 
 
-def test_failed_proactive_rebuild_is_retried_in_the_same_process(harness,monkeypatch):
+@pytest.mark.asyncio
+async def test_watcher_pushes_later_profiles_after_one_profile_raises(harness,monkeypatch):
+    api,_,cfg,_,_=harness
+    cfg['profiles']=['first','second']
+    pushed=[];second_push=threading.Event()
+    monkeypatch.setattr(api.mobile,'settings',lambda profile=None:cfg)
+    monkeypatch.setattr(api,'auto_update_check',lambda _cfg:None)
+    monkeypatch.setattr(api,'announce_release',lambda _cfg:None)
+    monkeypatch.setattr(api,'_warm_profile',lambda *_args:None)
+    def watch(owner,provider,profile):
+        if profile=='first': raise RuntimeError('first profile failed')
+    def push(owner,profile):
+        pushed.append(profile)
+        if profile=='second': second_push.set()
+    monkeypatch.setattr(api,'watch',watch)
+    monkeypatch.setattr(api,'push',push)
+    api._jobs_upgraded.clear()
+    await api.start_watcher()
+    try:
+        assert await asyncio.to_thread(second_push.wait,1)
+    finally:
+        await api.stop_watcher()
+
+    assert pushed==['first','second']
+
+
+def test_failed_proactive_rebuild_waits_ten_minutes_before_retry(harness,monkeypatch):
     api=harness[0]
     profile=('owner','default')
+    api._jobs_retry_after={}
     api._jobs_upgraded.add(profile)
-    def fail_rebuild(*args): raise RuntimeError('rebuild failed')
+    attempts=[]
+    def fail_rebuild(*args):
+        attempts.append(True)
+        raise RuntimeError('rebuild failed')
     monkeypatch.setattr(api.proactive,'upgrade_jobs',fail_rebuild)
 
     api._warm_profile(*profile)
+    api._warm_profile(*profile)
 
     assert profile not in api._jobs_upgraded
+    assert len(attempts)==1
+    assert api._jobs_retry_after[profile]-api.time.monotonic()>590
 
 
 def test_restart_hint_survives_a_later_up_to_date_check(harness,monkeypatch):

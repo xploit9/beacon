@@ -180,13 +180,14 @@ def _initialize_schema(conn):
     conn.executescript('''
     CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value BLOB);
     CREATE TABLE IF NOT EXISTS calls(id TEXT PRIMARY KEY, owner TEXT, profile TEXT, conversation TEXT, created REAL, ended REAL, closed INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', receipt TEXT DEFAULT '{}');
-    CREATE TABLE IF NOT EXISTS call_log(id TEXT PRIMARY KEY, owner TEXT, profile TEXT, conversation TEXT, created REAL, expires REAL, state TEXT DEFAULT 'pending', call_id TEXT, reason TEXT DEFAULT '');
+    CREATE TABLE IF NOT EXISTS call_log(id TEXT PRIMARY KEY, owner TEXT, profile TEXT, conversation TEXT, created REAL, expires REAL, state TEXT DEFAULT 'pending', call_id TEXT, reason TEXT DEFAULT '', email_notice_id TEXT DEFAULT '', feedback_verdict TEXT);
     CREATE TABLE IF NOT EXISTS timeline(call_id TEXT,event_id TEXT,digest TEXT,payload TEXT,PRIMARY KEY(call_id,event_id));
     CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,call_id TEXT,owner TEXT,profile TEXT,stored TEXT,runtime TEXT,request TEXT,title TEXT,callback INTEGER,epoch TEXT,seq INTEGER,status TEXT DEFAULT 'watching',UNIQUE(owner,profile,request));
     CREATE TABLE IF NOT EXISTS targets(id TEXT PRIMARY KEY,owner TEXT,profile TEXT,token TEXT,expires REAL,payload TEXT);
     CREATE TABLE IF NOT EXISTS deferred(id TEXT PRIMARY KEY,owner TEXT,profile TEXT,conversation TEXT,created REAL);
     CREATE TABLE IF NOT EXISTS notices(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE,owner TEXT,profile TEXT,kind TEXT,conversation TEXT,created REAL,expires REAL,state TEXT DEFAULT 'pending',call_id TEXT,push TEXT DEFAULT 'pending');
     CREATE TABLE IF NOT EXISTS notice_deliveries(event TEXT REFERENCES notices(id) ON DELETE CASCADE,target TEXT REFERENCES targets(id) ON DELETE CASCADE,accepted REAL DEFAULT 0,attempts INTEGER DEFAULT 0,next_attempt REAL DEFAULT 0,last_error TEXT DEFAULT '',PRIMARY KEY(event,target));
+    CREATE TABLE IF NOT EXISTS tool_receipts(owner TEXT,provider TEXT,profile TEXT,call_id TEXT,request_id TEXT,signature TEXT NOT NULL,payload TEXT NOT NULL,updated REAL NOT NULL,PRIMARY KEY(owner,provider,profile,call_id,request_id));
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS owned_voice_calls ON calls(owner,profile,conversation,created DESC)')
     conn.execute('CREATE INDEX IF NOT EXISTS owned_call_log ON call_log(owner,profile,created DESC)')
@@ -204,6 +205,9 @@ def _initialize_schema(conn):
         # Legacy jobs have no change time; preserve them until their age is known.
         conn.execute('UPDATE jobs SET history_updated=?',(time.time(),))
     notice_columns={r[1] for r in conn.execute('PRAGMA table_info(notices)')}
+    call_log_columns={r[1] for r in conn.execute('PRAGMA table_info(call_log)')}
+    if 'email_notice_id' not in call_log_columns: conn.execute("ALTER TABLE call_log ADD COLUMN email_notice_id TEXT DEFAULT ''")
+    if 'feedback_verdict' not in call_log_columns: conn.execute('ALTER TABLE call_log ADD COLUMN feedback_verdict TEXT')
     if 'release_version' not in notice_columns: conn.execute('ALTER TABLE notices ADD COLUMN release_version INTEGER NOT NULL DEFAULT 0')
     if 'reason' not in notice_columns: conn.execute("ALTER TABLE notices ADD COLUMN reason TEXT DEFAULT ''")
     if 'job_id' not in notice_columns: conn.execute("ALTER TABLE notices ADD COLUMN job_id TEXT DEFAULT ''")
@@ -230,6 +234,8 @@ def _initialize_schema(conn):
     if not conn.execute("SELECT 1 FROM meta WHERE key='incoming_call_log_migrated'").fetchone():
         conn.execute("INSERT OR IGNORE INTO call_log(id,owner,profile,conversation,created,expires,state,call_id,reason) SELECT id,owner,profile,conversation,created,expires,state,call_id,reason FROM notices WHERE kind='incoming_call'")
         conn.execute("INSERT INTO meta(key,value) VALUES('incoming_call_log_migrated','1')")
+    conn.execute("UPDATE call_log SET email_notice_id=id WHERE email_notice_id='' AND EXISTS "
+                 "(SELECT 1 FROM meta WHERE key='proactive-email-notice:'||call_log.id)")
     deferred_columns={r[1] for r in conn.execute('PRAGMA table_info(deferred)')}
     if 'reason' not in deferred_columns: conn.execute("ALTER TABLE deferred ADD COLUMN reason TEXT DEFAULT ''")
 
@@ -325,6 +331,7 @@ def _prune_history(conn,owner,days,now):
         deleted=conn.execute("""DELETE FROM calls WHERE id=? AND owner=? AND profile=? AND closed=1 AND created<?
             AND NOT EXISTS (SELECT 1 FROM jobs WHERE call_id=?)""",(call_id,owner,profile,cutoff,call_id)).rowcount
         if not deleted: break
+        conn.execute('DELETE FROM tool_receipts WHERE call_id=? AND owner=? AND profile=?',(call_id,owner,profile))
         removed_calls+=deleted
     return removed_events+removed_calls+removed_logs
 
@@ -441,12 +448,12 @@ def owned(conn, call_id, owner, profile=None, writable=False):
         raise ValueError('Call is closed')
     return dict(row)
 
-def reserve(owner, profile, conversation, voice=None, client_key=False):
+def reserve(owner, profile, conversation, voice=None):
     call_id = uuid.uuid4().hex
     with LOCK, connect() as conn:
         active=active_calls(conn,owner)
         if active>=MAX_ACTIVE_CALLS: raise ValueError('Active call limit reached')
-        config={**(voice or {}),**({'client_key':True} if client_key else {})}
+        config={**(voice or {}),'client_key':True}
         conn.execute('INSERT INTO calls(id,owner,profile,conversation,created,voice_config) VALUES(?,?,?,?,?,?)', (call_id,owner,profile,ident(conversation),time.time(),json.dumps(config)))
     return {'call_id':call_id,'conversation_id':conversation,'profile':profile,'transport':'gemini_live_direct','recording_status':'disabled','transcript_status':'pending',**(voice or {})}
 
@@ -533,11 +540,18 @@ def finalize(call_id,owner,body):
         call.update(status=state,closed=1,ended=call['ended'] or ended,receipt=json.dumps(receipt))
         return status(call)
 
-def invitation(owner,profile,conversation,reason=None):
+def invitation(owner,profile,conversation,reason=None,*,deduplicate=False):
     nid=uuid.uuid4().hex
     reason=str(reason or '')[:240]
     with LOCK,connect() as conn:
         prune_notices(conn)
+        if deduplicate:
+            existing=conn.execute("SELECT id FROM notices WHERE owner=? AND profile=? AND kind='incoming_call' AND state='pending' AND expires>? ORDER BY created,id LIMIT 1",
+                                  (owner,profile,time.time())).fetchone()
+            if existing: return existing['id']
+            existing=conn.execute('SELECT id FROM deferred WHERE owner=? AND profile=? ORDER BY created,id LIMIT 1',
+                                  (owner,profile)).fetchone()
+            if existing: return existing['id']
         active=active_calls(conn,owner)
         if active:
             if conn.execute('SELECT COUNT(*) FROM deferred').fetchone()[0]>=256: raise RuntimeError('Deferred callback capacity reached')

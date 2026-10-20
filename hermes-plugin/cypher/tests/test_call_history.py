@@ -86,6 +86,25 @@ def test_call_history_distinguishes_missed_and_answered_incoming_calls(harness):
     assert answered_notice not in rows
 
 
+def test_answered_email_call_hides_feedback_id_only_after_it_is_saved(harness):
+    api,client,_,_,_=harness
+    notice_id=api.mobile.invitation('owner','default','email-chat','Important email')
+    call_id=add_call(api,conversation='email-chat',closed=1,status='saved',
+                     callback={'id':notice_id,'reason':'Important email'})
+    with api.mobile.connect() as conn:
+        conn.execute("UPDATE notices SET state='answered',call_id=? WHERE id=?",(call_id,notice_id))
+        conn.execute('UPDATE call_log SET call_id=?,email_notice_id=? WHERE id=?',
+                     (call_id,notice_id,notice_id))
+
+    row=next(row for row in history(client)['calls'] if row['id']==call_id)
+    assert row['direction']=='incoming' and row['email_notice_id']==notice_id
+    with api.mobile.connect() as conn:
+        conn.execute("UPDATE call_log SET feedback_verdict='important' WHERE id=?",(notice_id,))
+
+    row=next(row for row in history(client)['calls'] if row['id']==call_id)
+    assert 'email_notice_id' not in row
+
+
 def test_incoming_outcomes_survive_notice_pruning(harness):
     api, client, _, _, _ = harness
     now = time.time()

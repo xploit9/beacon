@@ -62,7 +62,7 @@ def call_user(args,session_id=None,**kwargs):
         except ValueError as exc:
             if provided_reason: return json.dumps({'error':str(exc)})
             reason=''
-        event_id=mobile.invitation(owner,profile,stored,reason)
+        event_id=mobile.invitation(owner,profile,stored,reason,deduplicate=True)
         # The durable outbox is the authority. FCM is asynchronous wake-up only.
         return json.dumps({'event_id':event_id,'status':'pending','expires_in_seconds':120,'conversation_id':stored})
     except Exception:
@@ -252,10 +252,8 @@ _BLOCKED_PROACTIVE_TOOLSETS={'delegation','code_execution','computer_use','kanba
 _BLOCKED_PROACTIVE_TOOLS={'delegate_task','execute_code','computer_use','kanban','cronjob_manage',
                           'cypher_call_user','browser_click','browser_type','browser_press',
                           'browser_cdp','browser_exec','web_extract','web_fetch'}
-_TERMINAL_NETWORK_CLIENTS={'curl','wget','iwr','irm','invoke-webrequest','invoke-restmethod',
-                           'nc','ncat','ssh','scp','sftp','ftp','telnet'}
-_TERMINAL_MAIL_CLIENTS={'gws','gmail','himalaya','mutt','msmtp','sendmail'}
-_TERMINAL_MAIL_WRITES={'send','reply','forward','delete','trash','move','archive'}
+_TERMINAL_WRITE_WORDS={'send','reply','forward','delete','trash','move','archive','modify','flag','copy',
+                       'expunge','insert','import','mark','untrash','batchdelete','batchmodify','draft'}
 _READ_ONLY_MESSAGE='Proactive runs are read-only; this would change something.'
 
 def _tool_words(name):
@@ -293,6 +291,16 @@ def _contains_http_url(value):
     if isinstance(value,list): return any(_contains_http_url(item) for item in value)
     return False
 
+def _watch_terminal_read_only(command):
+    if not isinstance(command,str) or not command.strip() or any(char in command for char in ';|&$`<>()\r\n'):
+        return False
+    match=re.match(r'^\s*(?:"([^"]+)"|\'([^\']+)\'|(\S+))',command)
+    if not match: return False
+    executable=next(value for value in match.groups() if value is not None)
+    basename=re.split(r'[\\/]',executable)[-1].casefold()
+    if basename.endswith('.exe'): basename=basename[:-4]
+    return basename in {'gws','himalaya'} and not bool(_tool_words(command)&_TERMINAL_WRITE_WORDS)
+
 def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**kwargs):
     """Veto write-capable tools only in Cypher's email-watch cron session, including a run that
     outlives Proactive being turned off or its jobs being rebuilt (Hermes does not stop it)."""
@@ -321,8 +329,7 @@ def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**
         return {'action':'block','message':_READ_ONLY_MESSAGE}
     if tool_name=='terminal':
         command=args.get('command') if isinstance(args,dict) else None
-        words=set(re.findall(r'[A-Za-z0-9_-]+',command.casefold())) if isinstance(command,str) else set()
-        if words&_TERMINAL_NETWORK_CLIENTS or words&_TERMINAL_MAIL_CLIENTS and words&_TERMINAL_MAIL_WRITES:
+        if not _watch_terminal_read_only(command):
             return {'action':'block','message':_READ_ONLY_MESSAGE}
         return None
     if tool_name in _BLOCKED_PROACTIVE_TOOLS:

@@ -2,7 +2,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
-from test_mobile import harness  # noqa: F401  (fixture)
+import pytest
+from test_mobile import harness, load_private  # noqa: F401  (fixture)
 
 
 def test_reply_preview_is_the_newest_assistant_reply_as_plain_text(harness):
@@ -40,4 +41,29 @@ def test_email_alert_notice_detail_says_important_email(harness):
     detail = client.get(f"/api/plugins/cypher/mobile/notifications/events/{event}").json()
     assert detail["email_alert"] is True
     assert detail["preview"] == {"title": "Important email", "body": "Daniel moved the client review to 09:00 tomorrow"}
+
+
+@pytest.mark.asyncio
+async def test_phone_delivery_keeps_cron_title_and_uses_hermes_for_standalone(harness,monkeypatch):
+    api,client,cfg,_,_=harness
+    cfg['scheduled_callback_conversation_id']='assistant-chat'
+    phone=load_private('phone_delivery')
+    monkeypatch.setattr(phone,'_modules',lambda:(api.mobile,api.native,api.proactive))
+    monkeypatch.setattr(phone,'_profile_state',lambda:(api.mobile,cfg,'default'))
+    monkeypatch.setattr(api.native,'verify',lambda *args:{'messages':[]})
+
+    cron=await phone.CypherPhoneAdapter({}).send(
+        'phone','Cronjob Response: Daily brief\n(job_id: daily-brief)\n---\nYour task result.')
+    standalone=await phone.standalone_send({},'phone','Hermes is shutting down.')
+
+    assert cron.success and standalone['success']
+    with api.mobile.connect() as conn:
+        cron_job=conn.execute('SELECT job_id FROM notices WHERE id=?',(cron.message_id,)).fetchone()['job_id']
+        standalone_job=conn.execute('SELECT job_id FROM notices WHERE id=?',(standalone['message_id'],)).fetchone()['job_id']
+    assert cron_job.startswith('phone-cron-') and standalone_job.startswith('phone-hermes-')
+    cron_detail=client.get(f"/api/plugins/cypher/mobile/notifications/events/{cron.message_id}").json()
+    standalone_detail=client.get(
+        f"/api/plugins/cypher/mobile/notifications/events/{standalone['message_id']}").json()
+    assert cron_detail['preview']['title']=='Task finished'
+    assert standalone_detail['preview']['title']=='Hermes'
 

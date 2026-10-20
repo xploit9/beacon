@@ -355,8 +355,11 @@ def upgrade_jobs(mobile, owner, profile):
                 checked_until = get_note(previous, "checked_until") or checked_until
         if checked_until:
             _meta_set(mobile, cursor_key, checked_until)
+        if enabled(mobile, owner, profile):
+            _write_profile_instructions(_home(profile), True)
         _managed_delete_all(mobile, owner, profile)
         _sync_request_jobs(mobile, owner, profile, list_requests(mobile, owner, profile))
+        _meta_set(mobile, key, JOBS_VERSION)
         rebuilt = _managed_id(mobile, owner, profile, "watch_email")
         if checked_until and rebuilt:
             from hermes_cli.web_server_profiles import _profile_scope
@@ -364,9 +367,6 @@ def upgrade_jobs(mobile, owner, profile):
             with _profile_scope(profile):
                 set_note(rebuilt, "checked_until", checked_until)
             _meta_set(mobile, cursor_key, None)
-        if enabled(mobile, owner, profile):
-            _write_profile_instructions(_home(profile), True)
-        _meta_set(mobile, key, JOBS_VERSION)
     return True
 
 
@@ -780,43 +780,61 @@ def add_email_feedback(mobile, owner, profile, notice_id, verdict):
         raise ValueError("Invalid email notice id")
     if verdict not in ("important", "not_important"):
         raise ValueError("verdict must be important or not_important")
-    with mobile.connect() as conn:
-        notice = conn.execute("SELECT owner,profile,kind,reason FROM notices WHERE id=?", (notice_id,)).fetchone()
-        if not notice:
-            notice = conn.execute("SELECT owner,profile,'incoming_call' AS kind,reason FROM deferred WHERE id=?",
-                                  (notice_id,)).fetchone()
-        marker = conn.execute("SELECT 1 FROM meta WHERE key=?", (EMAIL_NOTICE_PREFIX + notice_id,)).fetchone()
-    if (not notice or not marker or notice["owner"] != owner or notice["profile"] != profile
-            or notice["kind"] not in ("task_result", "incoming_call")):
+    call_log_id=None
+    with mobile.LOCK,mobile.connect() as conn:
+        email_call=conn.execute("SELECT id,owner,profile,reason,feedback_verdict FROM call_log WHERE email_notice_id=?",
+                                (notice_id,)).fetchone()
+        if email_call:
+            if email_call["owner"]!=owner or email_call["profile"]!=profile:
+                raise LookupError("Proactive email alert not found")
+            if email_call["feedback_verdict"] is not None:
+                return {"ok":True}
+            claimed=conn.execute("UPDATE call_log SET feedback_verdict=? WHERE id=? AND owner=? AND profile=? AND feedback_verdict IS NULL",
+                                 (verdict,email_call["id"],owner,profile)).rowcount
+            if not claimed:
+                return {"ok":True}
+            call_log_id=email_call["id"]
+            notice={"owner":owner,"profile":profile,"kind":"incoming_call","reason":email_call["reason"]}
+        else:
+            notice = conn.execute("SELECT owner,profile,kind,reason FROM notices WHERE id=? AND kind='task_result'", (notice_id,)).fetchone()
+            marker = conn.execute("SELECT 1 FROM meta WHERE key=?", (EMAIL_NOTICE_PREFIX + notice_id,)).fetchone()
+    if not call_log_id and (not notice or not marker or notice["owner"] != owner or notice["profile"] != profile):
         raise LookupError("Proactive email alert not found")
     from cypher_observers import reason_text
     summary = reason_text(notice["reason"], 240)
     note = LEARNED_PREFIX + f"Emails like {summary} are " + (
         "important to the owner." if verdict == "important" else "not important to the owner.")
 
-    from hermes_cli.web_server_profiles import _profile_scope
-    from tools.memory_tool import load_on_disk_store
-    from tools.memory_tool_store import ENTRY_DELIMITER
-    with _profile_scope(profile):
-        store = load_on_disk_store()
-        entries = list(store.user_entries)
-        learned = _learned_entries(store)
-        remove = [entry for entry in learned if _same_sender_or_subject(entry, summary, verdict)]
-        if note in entries and not remove and len(learned) <= 20:
-            return {"ok": True}
-        add = note not in entries
-        candidates = [entry for entry in learned if entry not in remove and entry != note]
-        while (len(learned) - len(remove) + int(add) > 20 or
-               len(ENTRY_DELIMITER.join([entry for entry in entries if entry not in remove] + ([note] if add else [])))
-                   > store.user_char_limit):
-            if not candidates:
-                raise RuntimeError("Hermes user memory has no room for this email preference")
-            remove.append(candidates.pop(0))
-        operations = [{"action": "remove", "old_text": entry, "matched_entry": entry} for entry in remove]
-        if add:
-            operations.append({"action": "add", "content": note})
-        if operations and not store.apply_batch("user", operations).get("success"):
-            raise RuntimeError("Hermes user memory could not save this email preference")
+    try:
+        from hermes_cli.web_server_profiles import _profile_scope
+        from tools.memory_tool import load_on_disk_store
+        from tools.memory_tool_store import ENTRY_DELIMITER
+        with _profile_scope(profile):
+            store = load_on_disk_store()
+            entries = list(store.user_entries)
+            learned = _learned_entries(store)
+            remove = [entry for entry in learned if _same_sender_or_subject(entry, summary, verdict)]
+            if note in entries and not remove and len(learned) <= 20:
+                return {"ok": True}
+            add = note not in entries
+            candidates = [entry for entry in learned if entry not in remove and entry != note]
+            while (len(learned) - len(remove) + int(add) > 20 or
+                   len(ENTRY_DELIMITER.join([entry for entry in entries if entry not in remove] + ([note] if add else [])))
+                        > store.user_char_limit):
+                if not candidates:
+                    raise RuntimeError("Hermes user memory has no room for this email preference")
+                remove.append(candidates.pop(0))
+            operations = [{"action": "remove", "old_text": entry, "matched_entry": entry} for entry in remove]
+            if add:
+                operations.append({"action": "add", "content": note})
+            if operations and not store.apply_batch("user", operations).get("success"):
+                raise RuntimeError("Hermes user memory could not save this email preference")
+    except Exception:
+        if call_log_id:
+            with mobile.LOCK,mobile.connect() as conn:
+                conn.execute("UPDATE call_log SET feedback_verdict=NULL WHERE id=? AND owner=? AND profile=? AND feedback_verdict=?",
+                             (call_log_id,owner,profile,verdict))
+        raise
     return {"ok": True}
 
 

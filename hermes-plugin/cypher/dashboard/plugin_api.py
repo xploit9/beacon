@@ -172,7 +172,6 @@ def _client_key_mode(value):
         raise HTTPException(400,'Update Cypher: provider keys stay on the phone.')
     if 'voice_provider' not in value:
         raise HTTPException(400,'Choose a voice provider for a phone-key call')
-    return True
 
 def _bounded_event_wait(value):
     try: value=float(value)
@@ -338,7 +337,7 @@ async def save_voice_settings(request:Request):
 @router.post('/mobile/calls')
 async def calls(request:Request):
     value=await body(request);owner,provider,profile,cfg=identity(request,value.get('profile'))
-    client_key=_client_key_mode(value)
+    _client_key_mode(value)
     requested=value['voice_provider']
     if requested not in voice_models.PROVIDERS: raise HTTPException(400,'Unknown voice model')
     selection=voice_models.provider_selection(mobile,owner,profile,cfg,requested)
@@ -351,7 +350,7 @@ async def calls(request:Request):
             if mobile.active_calls(conn,owner)>=mobile.MAX_ACTIVE_CALLS:
                 raise HTTPException(409,'Active call limit reached')
         conversation=await asyncio.to_thread(safely,native.create,owner,provider,profile)
-    return safely(mobile.reserve,owner,profile,conversation,selection,client_key)
+    return safely(mobile.reserve,owner,profile,conversation,selection)
 @router.get('/mobile/calls/{call_id}')
 async def get_call(call_id:str,request:Request):
     owner,provider,row,cfg=await call(request,call_id)
@@ -692,7 +691,12 @@ async def notice_detail(event_id:str,request:Request):
     if row['kind']=='task_result':
         with mobile.connect() as conn:
             email_alert=conn.execute('SELECT 1 FROM meta WHERE key=?',('proactive-email-notice:'+event_id,)).fetchone() is not None
+        phone_job=row['job_id'] if isinstance(row['job_id'],str) else ''
         if email_alert: result.update(email_alert=True,preview={'title':'Important email','body':result['preview']['body']})
+        elif phone_job.startswith('phone-cron-') or phone_job.startswith('phone-') and not phone_job.startswith('phone-hermes-'):
+            result['preview']={'title':'Task finished','body':result['preview']['body']}
+        elif phone_job.startswith('phone-hermes-'):
+            result['preview']={'title':'Hermes','body':result['preview']['body']}
     if row['request_id'] and result['state']=='pending':
         frame=await asyncio.to_thread(safely,activity.pending,native,owner,provider,profile,dict(row))
         result['actions']=activity.request_actions(frame)
@@ -803,6 +807,9 @@ def activate(owner,profile):
             with mobile.connect() as conn:
                 if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: break
                 conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason) VALUES(?,?,?,?,?,?,?,?)',(row['id'],owner,profile,'incoming_call',row['conversation'],time.time(),time.time()+120,row['reason']))
+                if email_notice:
+                    conn.execute('UPDATE call_log SET email_notice_id=? WHERE id=? AND owner=? AND profile=?',
+                                 (row['id'],row['id'],owner,profile))
                 conn.execute('DELETE FROM deferred WHERE id=?',(row['id'],))
 def push(owner,profile):
     # A successful second device must not consume the first device's failed delivery.
@@ -1260,11 +1267,19 @@ async def plugin_version(request:Request):
 
 _watch_task=None
 _jobs_upgraded=set()
+_jobs_retry_after={}
+_JOB_WARM_RETRY_SECONDS=600
 def _warm_profile(owner,profile):
+    key=(owner,profile)
+    if time.monotonic()<_jobs_retry_after.get(key,0): return
     try:
         proactive.upgrade_jobs(mobile,owner,profile)
     except Exception:
-        _jobs_upgraded.discard((owner,profile))
+        _jobs_upgraded.discard(key)
+        _jobs_retry_after[key]=time.monotonic()+_JOB_WARM_RETRY_SECONDS
+    else:
+        _jobs_upgraded.add(key)
+        _jobs_retry_after.pop(key,None)
 async def start_watcher():
     global _watch_task
     async def loop():
@@ -1289,12 +1304,15 @@ async def start_watcher():
                     profiles=cfg.get('profiles')
                     if profiles is None: profiles=_native_profile_names()
                     for profile in profiles:
-                        if (cfg['owner_id'],profile) not in _jobs_upgraded:
+                        profile_key=(cfg['owner_id'],profile)
+                        if profile_key not in _jobs_upgraded and time.monotonic()>=_jobs_retry_after.get(profile_key,0):
                             # Once per process, off the delivery loop: warm the slow source scan, then rebuild jobs after an upgrade.
-                            _jobs_upgraded.add((cfg['owner_id'],profile))
+                            _jobs_upgraded.add(profile_key)
                             asyncio.create_task(asyncio.to_thread(_warm_profile,cfg['owner_id'],profile))
-                        await asyncio.to_thread(watch,cfg['owner_id'],cfg['owner_provider'],profile)
-                        await asyncio.to_thread(push,cfg['owner_id'],profile)
+                        try: await asyncio.to_thread(watch,cfg['owner_id'],cfg['owner_provider'],profile)
+                        except Exception: pass
+                        try: await asyncio.to_thread(push,cfg['owner_id'],profile)
+                        except Exception: pass
             except Exception:
                 pass
             await asyncio.sleep(3)

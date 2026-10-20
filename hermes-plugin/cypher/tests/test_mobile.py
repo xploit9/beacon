@@ -101,6 +101,23 @@ def test_history_retention_zero_preserves_old_closed_call_history(harness):
         assert conn.execute('SELECT 1 FROM calls WHERE id=?',(call_id,)).fetchone()
         assert conn.execute('SELECT 1 FROM timeline WHERE call_id=?',(call_id,)).fetchone()
 
+
+def test_pruned_closed_call_deletes_tool_receipts(harness):
+    api,_,_,_,_=harness
+    call_id=api.mobile.reserve('owner','default','native-stored')['call_id']
+    now=time.time()
+    api.mobile.set_history_retention_days('owner',30)
+    with api.mobile.connect() as conn:
+        conn.execute('INSERT INTO tool_receipts VALUES(?,?,?,?,?,?,?,?)',
+                     ('owner','basic','default',call_id,'request','signature','{}',now))
+        conn.execute('UPDATE calls SET created=?,closed=1,status=\'saved\' WHERE id=?',
+                     (now-31*86400,call_id))
+
+    with api.mobile.connect() as conn:
+        api.mobile._prune_history(conn,'owner',30,now)
+        assert conn.execute('SELECT 1 FROM tool_receipts WHERE call_id=?',(call_id,)).fetchone() is None
+
+
 def test_legacy_jobs_without_a_change_time_are_preserved_on_migration(harness):
     api,client,_,tmp,_=harness
     root=tmp/'plugin-data'/'cypher'

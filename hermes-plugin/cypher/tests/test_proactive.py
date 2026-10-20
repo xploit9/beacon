@@ -1,5 +1,6 @@
 import json
 import pytest
+import time
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -300,6 +301,27 @@ def test_upgrade_rebuilds_managed_jobs_once_per_jobs_version(harness, monkeypatc
     assert api.proactive.watch_job_ids(api.mobile, "owner", "default") == {"old-watch", watch}
 
 
+def test_upgrade_keeps_existing_jobs_when_profile_instruction_write_fails(harness, monkeypatch):
+    api, _, _, home, _ = harness
+    old_jobs = [
+        {"id": "old-watch", "name": "Cypher proactive: Email watch"},
+        {"id": "owner-job", "name": "Owner report"},
+    ]
+    jobs, calls = _fake_cron(api, monkeypatch, home, old_jobs)
+    api.proactive._meta_set(api.mobile, api.proactive._key("owner", "default", "enabled"), "1")
+    api.proactive._meta_set(api.mobile, api.proactive._key("owner", "default", "jobs-version"), "old-version")
+    api.proactive._set_managed_id(api.mobile, "owner", "default", "watch_email", "old-watch")
+    monkeypatch.setitem(sys.modules, "cron.notepad", SimpleNamespace(get_note=lambda *_: None))
+    def fail_write(*args):
+        raise OSError("SOUL write failed")
+    monkeypatch.setattr(api.proactive, "_write_profile_instructions", fail_write)
+
+    with pytest.raises(OSError, match="SOUL write failed"):
+        api.proactive.upgrade_jobs(api.mobile, "owner", "default")
+
+    assert jobs == old_jobs and calls["remove"] == 0
+
+
 
 
 @pytest.mark.parametrize(("is_enabled", "expected_calls"), [(True, 1), (False, 0)])
@@ -491,6 +513,69 @@ def test_v4_feedback_learns_from_an_alert_in_hermes_user_memory_and_can_be_remov
     assert "Client moved the review" not in user_file.read_text(encoding="utf-8")
     assert client.post("/api/plugins/cypher/mobile/proactive/feedback",
                        json={"notice_id": "f" * 32, "verdict": "not_important"}).status_code == 404
+
+
+def test_call_feedback_survives_ringing_and_hides_the_id_after_idempotent_save(harness, monkeypatch):
+    api, client, cfg, _, _ = harness
+    cfg.update(callback_tool_enabled=True, scheduled_callbacks_enabled=True,
+               scheduled_callback_conversation_id="assistant-chat")
+    setup=api.proactive.default_setup();setup["delivery"]="call"
+    api.proactive._meta_set(api.mobile,api.proactive._key("owner","default","setup"),json.dumps(setup))
+    api.proactive._meta_set(api.mobile,api.proactive._key("owner","default","enabled"),"1")
+    api.proactive._meta_set(api.mobile,api.proactive._key("owner","default","setup_complete"),"1")
+    monkeypatch.setattr(api.native,"verify",lambda *args:{"messages":[]})
+    observers=load_private("observers")
+    now=datetime.fromisoformat("2026-10-20T12:00:00-07:00")
+    monkeypatch.setattr(observers,"time",SimpleNamespace(time=lambda:now.timestamp()))
+    assert observers.source_observed(api.mobile,cfg,"default","watch-run","mcp__mail__read_email",
+                                     {"id":"message-1"},"ok")
+    alert=observers.email_notice(api.mobile,api.native,cfg,"default","watch-run",
+                                 {"item_id":"message-1","reason":"Daniel Reyes / Client moved the review"},now)
+    notice_id=alert["event_id"]
+    ten_minutes_ago=time.time()-600
+    with api.mobile.connect() as conn:
+        conn.execute("UPDATE notices SET created=?,expires=? WHERE id=?",
+                     (ten_minutes_ago,ten_minutes_ago+120,notice_id))
+        conn.execute("UPDATE call_log SET created=? WHERE id=?",(ten_minutes_ago,notice_id))
+        api.mobile.prune_notices(conn)
+        assert conn.execute("SELECT 1 FROM notices WHERE id=?",(notice_id,)).fetchone() is None
+        assert conn.execute("SELECT 1 FROM deferred WHERE id=?",(notice_id,)).fetchone() is None
+
+    monkeypatch.setitem(sys.modules,"hermes_cli.web_server_profiles",SimpleNamespace(
+        _profile_scope=lambda profile:nullcontext()))
+    class Store:
+        user_char_limit=4096
+        def __init__(self): self.user_entries=[]
+        def apply_batch(self,target,operations):
+            assert target=="user"
+            for operation in operations:
+                if operation["action"]=="remove": self.user_entries.remove(operation["old_text"])
+                else: self.user_entries.append(operation["content"])
+            return {"success":True}
+    store=Store()
+    monkeypatch.setitem(sys.modules,"tools.memory_tool",SimpleNamespace(load_on_disk_store=lambda:store))
+    monkeypatch.setitem(sys.modules,"tools.memory_tool_store",SimpleNamespace(ENTRY_DELIMITER="\n"))
+
+    row=next(item for item in client.get("/api/plugins/cypher/mobile/calls").json()["calls"]
+             if item["id"]==notice_id)
+    assert row["email_notice_id"]==notice_id
+    first=client.post("/api/plugins/cypher/mobile/proactive/feedback",
+                      json={"notice_id":notice_id,"verdict":"important"})
+    repeated=client.post("/api/plugins/cypher/mobile/proactive/feedback",
+                         json={"notice_id":notice_id,"verdict":"not_important"})
+
+    assert first.status_code==200 and repeated.status_code==200
+    assert len(store.user_entries)==1 and "important to the owner" in store.user_entries[0]
+    row=next(item for item in client.get("/api/plugins/cypher/mobile/calls").json()["calls"]
+             if item["id"]==notice_id)
+    assert "email_notice_id" not in row
+    with api.mobile.connect() as conn:
+        conn.execute("INSERT INTO call_log(id,owner,profile,conversation,created,expires,state,reason,email_notice_id) "
+                     "VALUES(?,?,?,?,?,?,?,?,?)",
+                     ("other-call","other","default","assistant-chat",time.time(),time.time()+120,
+                      "missed","Another owner's email","f"*32))
+    assert client.post("/api/plugins/cypher/mobile/proactive/feedback",
+                       json={"notice_id":"f"*32,"verdict":"important"}).status_code==404
 
 
 @pytest.mark.parametrize(("old_summary", "old_verdict", "new_summary", "new_verdict"), [

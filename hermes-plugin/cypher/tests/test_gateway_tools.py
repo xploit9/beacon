@@ -189,8 +189,7 @@ def test_method_schema_requiring_post_is_write_capable(gateway,monkeypatch):
         'tools.mcp_tool_registration':SimpleNamespace(_same_server_route=lambda *a,**k:True,
             _make_tool_filter=lambda *a:lambda raw:True,_normalize_server_trust=lambda trust:'trusted'),
         'tools.mcp_tool_scope':SimpleNamespace(_resolve_server_key=lambda server:server),
-        'tools.mcp_tool_handlers':SimpleNamespace(_tool_is_read_only=lambda *args:True,
-            _make_tool_handler=lambda *args:lambda arguments,**kwargs:arguments),
+        'tools.mcp_tool_handlers':SimpleNamespace(_tool_is_read_only=lambda *args:True),
         'tools.registry':SimpleNamespace(registry=registry),
     }
     for name,module in modules.items(): monkeypatch.setitem(sys.modules,name,module)
@@ -198,6 +197,7 @@ def test_method_schema_requiring_post_is_write_capable(gateway,monkeypatch):
     tools={tool['_raw']:tool for tool in g.NativeMcp().catalog()}
     assert tools['http_fetch']['read_only'] is False
     assert tools['safe_fetch']['read_only'] is True
+    assert tools['http_fetch']['_timeout']==10 and '_handler' not in tools['http_fetch']
     assert tools['make_request']['parameters']['properties']['method']['enum']==['GET']
 
     backend.catalog=lambda:[tools['http_fetch']]
@@ -220,6 +220,27 @@ def test_get_only_method_default_is_receipted_and_executed(gateway):
     api.decide(SCOPE,'get-default',{'proposal_id':proposal['proposal']['id'],'decision':'approve'})
     assert settled(api,'get-default')['status']=='completed'
     assert backend.calls[0][0]['method']=='GET'
+
+
+def test_receipt_deadline_covers_native_mcp_tool_timeout(gateway,monkeypatch):
+    api,backend,mobile=gateway
+    tool={'tool_id':'a'*64,'name':'configured_search','description':'search web',
+          'parameters':{'type':'object','properties':{'query':{'type':'string'}},
+                        'required':['query'],'additionalProperties':False},
+          'read_only':True,'_timeout':300}
+    backend.catalog=lambda:[tool]
+    class Slots:
+        def acquire(self,blocking=False): return True
+        def release(self): pass
+    monkeypatch.setattr(g,'SLOTS',Slots())
+    monkeypatch.setattr(g.POOL,'submit',lambda *args,**kwargs:None)
+
+    receipt=invoke(api,'slow-mcp')
+
+    assert receipt['status']=='running'
+    with mobile.connect() as conn:
+        payload=json.loads(conn.execute("SELECT payload FROM tool_receipts WHERE request_id='slow-mcp'").fetchone()[0])
+    assert payload['_deadline_seconds']>=330
 
 
 def test_timeout_restart_and_late_return_are_uncertain_without_replay(gateway,monkeypatch):
@@ -286,9 +307,9 @@ def test_native_trust_gate_uses_receipt_once_and_denies_server_elicitation(tmp_p
         outcomes.append(request_elicitation_consent('Additional server confirmation','Cannot reuse the approval'))
         outcomes.append(_trust_gate_check('isolated','write'))
         return '{"result":"done"}'
-    tool={'name':'mcp__isolated__write','_handler':handler,'_server':'isolated','_raw':'write','_trust':'untrusted'}
     monkeypatch.setitem(sys.modules,'model_tools',SimpleNamespace(
-        handle_function_call=lambda name,args,**kwargs:tool['_handler'](args,session_id=kwargs.get('session_id'))))
+        handle_function_call=lambda name,args,**kwargs:handler(args,**kwargs)))
+    tool={'name':'mcp__isolated__write','_server':'isolated','_raw':'write','_trust':'untrusted'}
     g.NativeMcp().execute(tool,{},SCOPE,True)
     assert outcomes[0] is None and outcomes[1]=='decline' and outcomes[2] is not None
     outcomes.clear();g.NativeMcp().execute(tool,{},SCOPE,False)
@@ -497,9 +518,9 @@ def test_native_approval_atomic_once_and_invalid_identity_fail_closed(tmp_path,m
         with g.concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
             list(pool.map(ask,range(12)))
         return '{"result":"success"}'
-    tool={'name':'mcp__isolated__write','_handler':handler,'_server':'isolated','_raw':'write','_trust':'untrusted'}
     monkeypatch.setitem(sys.modules,'model_tools',SimpleNamespace(
-        handle_function_call=lambda name,args,**kwargs:tool['_handler'](args,session_id=kwargs.get('session_id'))))
+        handle_function_call=lambda name,args,**kwargs:handler(args,**kwargs)))
+    tool={'name':'mcp__isolated__write','_server':'isolated','_raw':'write','_trust':'untrusted'}
     g.NativeMcp().execute(tool, {},SCOPE,True)
     assert choices.count('once')==1 and choices.count('deny')==11
 
@@ -783,7 +804,7 @@ def test_read_only_gateway_tools_are_stopped_by_hermes_pre_tool_hook(tmp_path,mo
         tool={'name':'read_file','_kind':'hermes','_raw':'read_file','_enabled_tools':['read_file'],'read_only':True}
     else:
         tool={'name':'mcp__mail__search_messages','_kind':'mcp','_raw':'search_messages','_server':'mail',
-              '_trust':'trusted','_handler':lambda *args,**kwargs:{'ok':True},'read_only':True}
+              '_trust':'trusted','read_only':True}
     result=g.NativeMcp().execute(tool,{'path':'private.txt'},SCOPE,False,session_id='native-stored')
     result=json.loads(result) if isinstance(result,str) else result
 
@@ -863,7 +884,7 @@ def test_native_mcp_catalog_can_skip_discovery_for_call_context(monkeypatch):
         _normalize_server_trust=lambda value:'trusted'))
     monkeypatch.setitem(sys.modules,'tools.mcp_tool_scope',SimpleNamespace(_resolve_server_key=lambda server:server))
     monkeypatch.setitem(sys.modules,'tools.mcp_tool_handlers',SimpleNamespace(
-        _tool_is_read_only=lambda *args:False,_make_tool_handler=lambda *args:None))
+        _tool_is_read_only=lambda *args:False))
     monkeypatch.setitem(sys.modules,'tools.registry',SimpleNamespace(registry=SimpleNamespace(
         get_all_entries=lambda:[],current_scope_key=lambda:'profile',_generation=0)))
     monkeypatch.setattr(g,'native_catalog',lambda:[])
