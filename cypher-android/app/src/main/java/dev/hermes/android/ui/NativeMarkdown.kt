@@ -47,7 +47,8 @@ private object MathInlineFactory : InlineContentParserFactory {
             val end = scan.position()
             if (scan.next(closing)) {
                 val expression = scan.getSource(content, end).content
-                if (expression.isBlank() || opening == "$" && expression.last().isWhitespace()) return@InlineContentParser ParsedInline.none()
+                // Pandoc's rule: a closing $ followed by a digit is a price ("$600 card ... $1,400"), not math.
+                if (expression.isBlank() || opening == "$" && (expression.last().isWhitespace() || scan.peek().isDigit())) return@InlineContentParser ParsedInline.none()
                 return@InlineContentParser ParsedInline.of(MathNode(expression, scan.getSource(begin, scan.position()).content, display), scan.position())
             }
             if (!display && scan.peek() == '\n') return@InlineContentParser ParsedInline.none()

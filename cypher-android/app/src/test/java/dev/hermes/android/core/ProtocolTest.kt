@@ -85,6 +85,12 @@ class ProtocolTest {
         assertFalse(signedIn.copy(owner = "").authorizesPushSource(source))
         assertFalse(signedIn.copy(backend = "").authorizesPushSource(source))
     }
+    @Test fun dollarAmountsStayTextWhileRealInlineMathStillRenders() {
+        val reply = "I'd pay off the **\$600 card balance**, as long as the remaining **\$1,400** covers emergencies. " +
+            "That costs about **\$12 a month** in interest (roughly **\$144 a year**). Energy is \$E=mc^2\$."
+        val math = nativeMarkdownParser.parse(reply).descendants().filterIsInstance<MathNode>()
+        assertEquals(listOf("E=mc^2"), math.map { it.expression }.toList())
+    }
     @Test fun nativeMathExtensionPreservesDelimitersStyledLinksAndLiteralCode() {
         val source = "**bold** \$x_i\$ and *soft* [linked \\(y^2\\)](https://hermes.example/docs) plus `\$code\$ \\(literal\\)` and \$\$z^2\$\$.\n\n\\[\\frac{a}{b}\\]\n\n```text\n\$fenced\$ \\(literal\\)\n```"
         val document = nativeMarkdownParser.parse(source)
