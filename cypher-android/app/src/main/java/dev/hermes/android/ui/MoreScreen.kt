@@ -29,10 +29,16 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.BuildConfig
 import dev.hermes.android.CypherViewModel
 import dev.hermes.android.core.*
+import dev.hermes.android.data.CypherClient
 import dev.hermes.android.data.VoiceKeyStore
 import dev.hermes.android.push.KeepConnectedService
+import dev.hermes.android.updates.HermesPluginUpdater
+import dev.hermes.android.updates.PluginUpdateRowState
+import dev.hermes.android.updates.PluginVersions
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -303,11 +309,105 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
 }
 @Composable private fun AppUpdates(vm: CypherViewModel) {
     val update by vm.appUpdate.collectAsStateWithLifecycle()
+    val ui by vm.ui.collectAsStateWithLifecycle()
     val call by vm.app.calls.state.collectAsStateWithLifecycle()
     val incoming by vm.incomingBusy.collectAsStateWithLifecycle()
     val callBusy = call.active || incoming || call.state == "ending"
     val context = LocalContext.current
     val previewBuild = BuildConfig.APPLICATION_ID.endsWith(".debug")
+    val stableBuild = BuildConfig.APPLICATION_ID.endsWith(".stable")
+    val client = vm.client
+    val scope = rememberCoroutineScope()
+    var releaseCheckComplete by remember(client, ui.origin, ui.owner) { mutableStateOf(false) }
+    var releaseCheckBusy by remember { mutableStateOf(false) }
+    var releaseCheckError by remember { mutableStateOf(false) }
+    var pluginVersions by remember(client, ui.origin, ui.owner) { mutableStateOf<PluginVersions?>(null) }
+    var pluginChecking by remember(client, ui.origin, ui.owner) { mutableStateOf(false) }
+    var pluginBusy by remember(client, ui.origin, ui.owner) { mutableStateOf(false) }
+    var pluginError by remember(client, ui.origin, ui.owner) { mutableStateOf(false) }
+    var consentRequired by remember(client, ui.origin, ui.owner) { mutableStateOf(false) }
+    var consentLines by remember(client, ui.origin, ui.owner) { mutableStateOf(emptyList<String>()) }
+    val pluginRow = PluginUpdateRowState(pluginVersions, pluginChecking, pluginBusy, consentRequired, pluginError)
+    suspend fun refreshPluginVersion(active: CypherClient) {
+        if (vm.client !== active) return
+        pluginChecking = true
+        pluginError = false
+        val detached = active.detached()
+        try {
+            val versions = HermesPluginUpdater(detached).version()
+            if (vm.client === active) pluginVersions = versions
+        } catch (error: CancellationException) { throw error }
+        catch (_: Exception) { if (vm.client === active) pluginError = true }
+        finally { detached.closeNative(); if (vm.client === active) pluginChecking = false }
+    }
+    fun updatePlugin(acceptCapabilities: Boolean = false) {
+        val active = vm.client ?: return
+        if (!ui.connected) return
+        scope.launch {
+            if (vm.client !== active) return@launch
+            pluginBusy = true
+            pluginError = false
+            val detached = active.detached()
+            try {
+                val updater = HermesPluginUpdater(detached)
+                val current = runCatching { updater.version() }.getOrNull()
+                if (vm.client !== active) return@launch
+                if (current != null) {
+                    pluginVersions = current
+                    if (current.restartRequired) return@launch
+                }
+                val response = updater.update(acceptCapabilities)
+                if (vm.client !== active) return@launch
+                if (response.optBoolean("consent_required")) {
+                    val changes = response.optJSONArray("delta_lines")
+                    consentLines = changes?.let { rows -> (0 until rows.length()).mapNotNull { index -> rows.optString(index).takeIf { it.isNotBlank() && it != "null" } } }.orEmpty()
+                    consentRequired = true
+                    return@launch
+                }
+                if (!response.optBoolean("ok")) throw IllegalStateException()
+                var latest = runCatching { updater.version() }.getOrNull()
+                if (!response.optBoolean("unchanged")) {
+                    for (attempt in 0 until 10) {
+                        if (latest != null && latest != current) break
+                        delay(1000)
+                        latest = runCatching { updater.version() }.getOrNull() ?: latest
+                    }
+                }
+                if (vm.client === active) {
+                    pluginVersions = latest
+                    if (latest == null) pluginError = true
+                }
+            } catch (error: CancellationException) { throw error }
+            catch (_: Exception) { if (vm.client === active) pluginError = true }
+            finally { detached.closeNative(); if (vm.client === active) pluginBusy = false }
+        }
+    }
+    fun checkAppUpdate() {
+        val active = vm.client
+        if (!stableBuild || active == null) { vm.checkForAppUpdate(); return }
+        scope.launch {
+            releaseCheckBusy = true
+            releaseCheckError = false
+            releaseCheckComplete = false
+            val detached = active.detached()
+            try {
+                detached.nativeRequest("/api/plugins/cypher/mobile/releases/check", "POST", JSONObject())
+                if (vm.client === active) {
+                    vm.checkForAppUpdate()
+                    releaseCheckComplete = true
+                }
+            } catch (error: CancellationException) { throw error }
+            catch (_: Exception) { if (vm.client === active) releaseCheckError = true }
+            finally { detached.closeNative(); releaseCheckBusy = false }
+        }
+    }
+    LaunchedEffect(client, ui.origin, ui.owner, ui.connected) {
+        pluginVersions = null
+        pluginError = false
+        consentRequired = false
+        consentLines = emptyList()
+        if (ui.connected && client != null) refreshPluginVersion(client)
+    }
     fun alertsEnabled(): Boolean = androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled() &&
         context.getSystemService(android.app.NotificationManager::class.java).getNotificationChannel(dev.hermes.android.updates.UpdateManager.CHANNEL)?.importance != android.app.NotificationManager.IMPORTANCE_NONE
     var alertsAllowed by remember { mutableStateOf(alertsEnabled()) }
@@ -323,16 +423,39 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         Glass(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 Icon(Icons.Rounded.SystemUpdate, null, Modifier.size(36.dp), tint = MaterialTheme.colorScheme.primary)
-                Text(update.release?.let { "Cypher ${it.name}" } ?: "Keep Cypher up to date", style = MaterialTheme.typography.headlineSmall)
-                Text(if (previewBuild) "Preview builds are installed manually." else update.status, style = MaterialTheme.typography.bodyLarge)
+                Text(update.release?.takeIf { !stableBuild || releaseCheckComplete }?.let { "Cypher ${it.name}" } ?: "Cypher", style = MaterialTheme.typography.headlineSmall)
+                val appMessage = when {
+                    previewBuild -> "Preview builds are installed manually."
+                    releaseCheckBusy -> "Checking for updates through Hermes…"
+                    releaseCheckError -> "Couldn't check for updates. Check your Hermes connection and GitHub CLI sign-in."
+                    update.release != null || update.ready -> update.status
+                    update.status.contains("up to date", ignoreCase = true) -> "You're up to date."
+                    update.status.startsWith("Reconnect to Tailscale") -> "Reconnect to Tailscale to check for updates."
+                    update.status.startsWith("Cypher checks for updates") -> update.status
+                    update.busy -> "Checking for an update…"
+                    else -> "Check for updates when you're connected to Hermes."
+                }
+                Text(appMessage, style = MaterialTheme.typography.bodyLarge)
                 if (!previewBuild) {
-                    if (update.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-                    Button(onClick = { if (update.release == null && !update.ready) vm.checkForAppUpdate() else vm.downloadAppUpdate() }, enabled = !update.busy && !(callBusy && (update.release != null || update.ready)), modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
-                        Text(when { update.busy -> "Updating…"; update.ready -> "Install update"; update.release != null -> "Update"; else -> "Check for updates" })
+                    if (update.busy || releaseCheckBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                    val installing = update.ready || update.release != null && (!stableBuild || releaseCheckComplete)
+                    Button(onClick = { if (!installing) checkAppUpdate() else vm.downloadAppUpdate() }, enabled = !update.busy && !releaseCheckBusy && !(callBusy && installing), modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
+                        Text(when { releaseCheckBusy || update.busy -> "Checking…"; update.ready -> "Install update"; update.release != null && (!stableBuild || releaseCheckComplete) -> "Update"; else -> "Check for updates" })
                     }
                     if (callBusy && (update.release != null || update.ready)) Text(if(call.state=="ending") "Call cleanup is finishing. The update will be available shortly." else "Finish your call before installing the update.", style = MaterialTheme.typography.bodyMedium)
                 }
-                Text("Installed · ${BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Current version · ${BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        Glass(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("Cypher plugin on Hermes", style = MaterialTheme.typography.titleLarge)
+                Text(pluginVersions?.summary() ?: pluginRow.message, style = MaterialTheme.typography.bodyLarge)
+                if (pluginVersions?.restartRequired == true || pluginError) Text(pluginRow.message, color = if (pluginError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
+                if (pluginChecking || pluginBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                Button(onClick = { updatePlugin() }, enabled = ui.connected && client != null && pluginRow.canUpdate, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
+                    Text(pluginRow.buttonText)
+                }
             }
         }
         if (!previewBuild) {
@@ -344,6 +467,19 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         }
     }
     }
+    if (consentRequired) AlertDialog(
+        onDismissRequest = { consentRequired = false; consentLines = emptyList() },
+        title = { Text("Review plugin capability changes") },
+        text = {
+            Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("This update changes what the Cypher plugin can access. Review the changes before continuing.")
+                if (consentLines.isEmpty()) Text("Hermes did not provide a change list. Review the plugin update on your PC before allowing it.")
+                consentLines.forEach { Text("• $it", style = MaterialTheme.typography.bodySmall) }
+            }
+        },
+        confirmButton = { TextButton(onClick = { consentRequired = false; updatePlugin(acceptCapabilities = true) }) { Text("Allow and update") } },
+        dismissButton = { TextButton(onClick = { consentRequired = false; consentLines = emptyList() }) { Text("Cancel") } },
+    )
 }
 
 @Composable private fun AppearanceSettings(vm: CypherViewModel) {

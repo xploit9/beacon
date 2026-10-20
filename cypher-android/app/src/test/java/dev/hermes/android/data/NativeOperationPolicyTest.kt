@@ -104,4 +104,16 @@ class NativeOperationPolicyTest {
         assertTrue(NativeOperationPolicy.direct("/api/tools/toolsets/mcp.research", "GET"))
         assertTrue(NativeOperationPolicy.direct("/api/plugins/cypher/mobile/bootstrap", "GET"))
     }
+
+    @Test fun onlyTheOwnerPluginUpdatePostIsAllowedOutsideThePluginNamespace() {
+        val path = "/api/dashboard/agent-plugins/cypher/update"
+        assertTrue(NativeOperationPolicy.direct(path, "POST"))
+        for (method in listOf("GET", "PUT", "PATCH", "DELETE", "post"))
+            assertFalse("$method $path", NativeOperationPolicy.direct(path, method))
+        for (other in listOf(
+            "/api/dashboard/agent-plugins/other/update",
+            "/api/dashboard/agent-plugins/cypher/enable",
+            "/api/dashboard/agent-plugins/cypher/update/",
+        )) assertFalse("POST $other", NativeOperationPolicy.direct(other, "POST"))
+    }
 }

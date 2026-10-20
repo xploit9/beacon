@@ -41,7 +41,10 @@ def settings():
     if not isinstance(enabled,list) or not isinstance(disabled,list) or 'cypher' not in enabled or 'cypher' in disabled: return {}
     entries=plugins.get('entries');entry=entries.get('cypher') if isinstance(entries,dict) else None
     value=entry.get('settings') if isinstance(entry,dict) else None
-    return deepcopy(value) if isinstance(value,dict) else {}
+    if not isinstance(value,dict): return {}
+    result=deepcopy(value)
+    result.setdefault('release_repo','xploit9/cypher')
+    return result
 
 def home():
     from hermes_constants import get_process_hermes_home

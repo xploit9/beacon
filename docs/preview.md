@@ -2,10 +2,17 @@
 
 The preview is a private test build of this migration branch. It is **not** a production release and does not replace the installed Cypher app.
 
+## Stable channel
+- The `stable` build type has application ID `dev.hermes.android.stable` and launcher label "Cypher", so it installs beside production and the preview.
+- Stable starts at version code `100` and version `1.0.0`. It inherits release minification and is not debuggable.
+- A stable APK is unsigned unless `cypherStableSigning` (or `CYPHER_STABLE_SIGNING`) points to an external properties file with the four Android signing fields. Never store that file or its keystore in this repository. The stable signer is separate from production.
+- Release assets are named `Cypher-<version>.apk`; Settings **App updates** checks the private GitHub release through the owner's Hermes plugin, then verifies the APK before Android asks to install it.
+- Installing stable does not replace production. Production replacement remains held until physical-phone acceptance and original signer/data-preservation checks pass.
+
 ## What the preview is
 - It is the existing `debug` build type. Nothing else is added (no product flavors, no new dependencies).
 - Application ID `dev.hermes.android.debug`, so it installs **next to** production `dev.hermes.android` and never upgrades it.
-- Version name `0.4.15-preview`. The launcher label is "Cypher Preview" (set only in `app/src/debug/AndroidManifest.xml`); the release label stays "Cypher".
+- Version name `1.0.0-preview`. The launcher label is "Cypher Preview" (set only in `app/src/debug/AndroidManifest.xml`); the release label stays "Cypher".
 - It is signed with the local Android debug key, not the production signer. Android will never accept it as an update to production, and production cannot update it.
 - It is a debuggable build. As in every debug build of this project, `src/debug/res/xml/fixture_network_security.xml` keeps cleartext disabled and also trusts the bundled test-fixture CA (`cypher_fixture_ca.pem`) through `debug-overrides`. Use the preview only on your own test devices.
 

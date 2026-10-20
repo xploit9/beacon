@@ -915,13 +915,15 @@ def test_plugin_settings_copy_authority_and_track_replacement(harness,monkeypatc
     # This fixture writes JSON, so it does not depend on Hermes' optional YAML adapter.
     monkeypatch.setitem(sys.modules,'utils',SimpleNamespace(load_yaml_file_readonly=lambda path:json.loads(Path(path).read_text(encoding='utf-8'))))
     path=tmp/'config.yaml'
-    def replace(owner,enabled=True):
-        text=json.dumps({'plugins':{'enabled':['cypher'] if enabled else [],'entries':{'cypher':{'settings':{'owner_id':owner,'profiles':['default']}}}},'other_secret':'fixture-private-value'})
+    def replace(owner,enabled=True,release_repo=None):
+        settings={'owner_id':owner,'profiles':['default']}
+        if release_repo is not None: settings['release_repo']=release_repo
+        text=json.dumps({'plugins':{'enabled':['cypher'] if enabled else [],'entries':{'cypher':{'settings':settings}}},'other_secret':'fixture-private-value'})
         replacement=tmp/'replacement.yaml';replacement.write_text(text);replacement.replace(path)
     replace('first');value=module.settings()
     value['owner_id']='mutated';value['profiles'].append('foreign')
-    assert module.settings()=={'owner_id':'first','profiles':['default']}
-    replace('second');assert module.settings()['owner_id']=='second'
+    assert module.settings()=={'owner_id':'first','profiles':['default'],'release_repo':'xploit9/cypher'}
+    replace('second',release_repo='owner/other-cypher');assert module.settings()['release_repo']=='owner/other-cypher'
     replace('second',False);assert module.settings()=={}
     path.write_text('plugins: [');assert module.settings()=={}
 

@@ -15,6 +15,19 @@ val signing = Properties().apply {
     val file = rootProject.file("../.signing/signing.properties")
     if (file.exists()) file.inputStream().use { load(it) }
 }
+val stableSigningFile = providers.gradleProperty("cypherStableSigning")
+    .orElse(providers.environmentVariable("CYPHER_STABLE_SIGNING"))
+    .orNull?.takeIf { it.isNotBlank() }?.let { File(it).canonicalFile }
+val stableSigning = Properties().apply {
+    stableSigningFile?.let { file ->
+        require(!file.toPath().startsWith(rootProject.projectDir.parentFile.canonicalFile.toPath())) {
+            "cypherStableSigning must point to a properties file outside the repository"
+        }
+        if (file.isFile) file.inputStream().use { load(it) }
+    }
+}
+val stableSigningConfigured = listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
+    .all { !stableSigning.getProperty(it).isNullOrBlank() }
 fun quoted(value: String) = "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 
 android {
@@ -24,8 +37,8 @@ android {
         applicationId = "dev.hermes.android"
         minSdk = 29
         targetSdk = 36
-        versionCode = 36
-        versionName = "0.4.15"
+        versionCode = 100
+        versionName = "1.0.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "DEFAULT_ORIGIN", quoted(owner.getProperty("native.origin", "")))
         buildConfigField("String", "FIREBASE_APP_ID", quoted(owner.getProperty("firebase.appId", "")))
@@ -42,12 +55,32 @@ android {
             keyPassword = signing.getProperty("keyPassword")
         }
     }
+    if (stableSigningConfigured) {
+        signingConfigs.create("stable") {
+            val configuredStore = File(stableSigning.getProperty("storeFile"))
+            val stableStoreFile = if (configuredStore.isAbsolute) configuredStore else File(stableSigningFile!!.parentFile, configuredStore.path)
+            require(!stableStoreFile.canonicalFile.toPath().startsWith(rootProject.projectDir.parentFile.canonicalFile.toPath())) {
+                "The stable signing keystore must be outside the repository"
+            }
+            storeFile = stableStoreFile
+            storePassword = stableSigning.getProperty("storePassword")
+            keyAlias = stableSigning.getProperty("keyAlias")
+            keyPassword = stableSigning.getProperty("keyPassword")
+        }
+    }
     buildTypes {
         debug { applicationIdSuffix = ".debug"; versionNameSuffix = "-preview" }
         release {
             isMinifyEnabled = true
             if (signing.isNotEmpty()) signingConfig = signingConfigs.getByName("owner")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+        create("stable") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".stable"
+            isDebuggable = false
+            matchingFallbacks += listOf("release")
+            signingConfig = if (stableSigningConfigured) signingConfigs.getByName("stable") else null
         }
     }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }

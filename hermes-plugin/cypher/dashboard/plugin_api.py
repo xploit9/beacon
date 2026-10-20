@@ -4,7 +4,10 @@ import contextvars
 from concurrent.futures import ThreadPoolExecutor
 import ipaddress
 import math
+import os
+import shutil
 import threading
+import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime,timedelta,timezone
 import hashlib
@@ -26,6 +29,14 @@ ROOT=Path(__file__).resolve().parent.parent
 _RELEASE_CACHE_LOCK=threading.RLock()
 _RELEASE_CACHE_KEY=None
 _RELEASE_CACHE_VALUE=None
+def _read_plugin_version(path):
+    try:
+        import yaml
+        value=yaml.safe_load(Path(path).read_text(encoding='utf-8-sig'))
+        version=value.get('version') if isinstance(value,dict) else None
+        return version.strip() if isinstance(version,str) else ''
+    except Exception: return ''
+_RUNNING_PLUGIN_VERSION=_read_plugin_version(ROOT/'plugin.yaml')
 for name in ('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_api','bot_mode_api','callbacks','callback_api','call_history_api','proactive'):
     key='cypher_'+name
     if key not in sys.modules:
@@ -768,9 +779,9 @@ def _push_devices(owner,profile):
 _release_failures={}
 def announce_release(cfg):
     """A changed verified feed creates durable hints; clients still verify before installing."""
-    owner=cfg.get('owner_id');profiles=cfg.get('profiles',[]);root=cfg.get('release_root')
-    if not owner or not cfg.get('owner_provider') or not root or not profiles: return
-    manifest=Path(root)/'latest.json'
+    owner=cfg.get('owner_id');profiles=cfg.get('profiles',[])
+    if not owner or not cfg.get('owner_provider') or not profiles: return
+    manifest=_release_root(cfg)/'latest.json'
     if not manifest.is_file(): return
     with manifest.open('rb') as stream: raw=stream.read(16385)
     if len(raw)>16384: return
@@ -804,16 +815,31 @@ def release(cfg,optional=False,digest=None):
     with _RELEASE_CACHE_LOCK:
         return _release(cfg,optional,digest)
 
+def _release_root(cfg,create=False):
+    configured=cfg.get('release_root')
+    if isinstance(configured,str) and configured.strip():
+        root=Path(configured).expanduser()
+        if create:
+            if root.is_symlink() or getattr(root,'is_junction',lambda:False)(): raise ValueError('Unsafe release directory')
+            root.mkdir(parents=True,exist_ok=True)
+    else:
+        root=mobile.home()/'plugin-data'/'cypher'/'releases'
+        if create: mobile.protect(root)
+    return root
+
 def _release(cfg,optional=False,digest=None):
     global _RELEASE_CACHE_KEY,_RELEASE_CACHE_VALUE
-    configured=cfg.get('release_root')
-    if not configured:
+    root_path=_release_root(cfg)
+    if not root_path.is_dir():
         if optional: return {'available':False}
         raise LookupError('Release unavailable')
-    root=Path(configured).resolve(strict=True)
+    root=root_path.resolve(strict=True)
     if digest is not None and not re.fullmatch(r'[a-f0-9]{64}',digest): raise LookupError('Invalid immutable release')
     manifest=root/((digest+'.json') if digest else 'latest.json')
     if manifest.is_symlink() or getattr(manifest,'is_junction',lambda:False)(): raise ValueError('Unsafe release manifest')
+    if not manifest.is_file():
+        if optional: return {'available':False}
+        raise LookupError('Release unavailable')
     manifest_stat=manifest.stat()
     if manifest_stat.st_size>16384: raise ValueError('Oversized release manifest')
     data=json.loads(manifest.read_text(encoding='utf-8-sig'))
@@ -821,7 +847,7 @@ def _release(cfg,optional=False,digest=None):
     if not re.fullmatch(r'[A-Za-z0-9_.-]+\.apk',filename): raise ValueError('Invalid artifact name')
     path=root/filename
     if path.is_symlink() or getattr(path,'is_junction',lambda:False)() or path.resolve().parent!=root: raise ValueError('Unsafe artifact')
-    if data.get('package_name')!='dev.hermes.android' or type(data.get('version_code')) is not int or data['version_code']<=20 or not re.fullmatch(r'[a-fA-F0-9]{64}',data.get('certificate_sha256','')): raise ValueError('Invalid release identity')
+    if data.get('package_name') not in {'dev.hermes.android','dev.hermes.android.stable'} or type(data.get('version_code')) is not int or data['version_code']<=20 or not re.fullmatch(r'[a-fA-F0-9]{64}',data.get('certificate_sha256','')): raise ValueError('Invalid release identity')
     artifact_stat=path.stat()
     if not 1<=artifact_stat.st_size<=256*1024*1024: raise ValueError('APK size outside bounds')
     if artifact_stat.st_size!=data.get('size_bytes') or not re.fullmatch(r'[a-fA-F0-9]{64}',data.get('sha256','')): raise ValueError('Release artifact changed')
@@ -860,12 +886,135 @@ async def latest(request:Request):
 async def download(digest:str,request:Request):
     _,_,_,cfg=identity(request);metadata=await asyncio.to_thread(safely,release,cfg,False,digest)
     if digest!=metadata['sha256']: raise HTTPException(404,'Immutable artifact unavailable')
-    root=Path(cfg['release_root']).resolve();data=json.loads((root/(digest+'.json')).read_text(encoding='utf-8-sig'));path=root/data['artifact_filename']
+    root=_release_root(cfg).resolve();data=json.loads((root/(digest+'.json')).read_text(encoding='utf-8-sig'));path=root/data['artifact_filename']
     # Snapshot immutable bytes before any response headers; a concurrent replacement
     # cannot turn validated metadata into a different delivered package.
     content=await asyncio.to_thread(path.read_bytes)
     if hashlib.sha256(content).hexdigest()!=digest: raise HTTPException(409,'Artifact changed')
     return StreamingResponse(iter(content[i:i+65536] for i in range(0,len(content),65536)),media_type='application/vnd.android.package-archive',headers={'Content-Length':str(len(content)),'ETag':'"'+digest+'"','Cache-Control':'private, immutable'})
+
+class ReleaseCheckError(Exception): pass
+
+def _safe_release_repo(cfg):
+    repo=cfg.get('release_repo','xploit9/cypher')
+    if not isinstance(repo,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}',repo):
+        raise ReleaseCheckError('The configured GitHub release repository is invalid.')
+    return repo
+
+def _is_link(path):
+    return path.is_symlink() or getattr(path,'is_junction',lambda:False)()
+
+def _file_sha256(path):
+    with path.open('rb') as stream: return hashlib.file_digest(stream,'sha256').hexdigest()
+
+def _atomic_copy(source,destination,digest):
+    if _is_link(destination): raise ReleaseCheckError('The configured release feed contains an unsafe file.')
+    if destination.exists():
+        if destination.is_file() and _file_sha256(destination)==digest: return
+        raise ReleaseCheckError('A published Cypher APK filename cannot be replaced with different bytes.')
+    temporary=destination.with_name('.'+destination.name+'.'+uuid.uuid4().hex+'.tmp')
+    try:
+        with source.open('rb') as incoming,temporary.open('xb') as outgoing:
+            shutil.copyfileobj(incoming,outgoing,1024*1024);outgoing.flush();os.fsync(outgoing.fileno())
+        if _file_sha256(temporary)!=digest: raise ReleaseCheckError('The verified Cypher APK changed while it was being saved.')
+        os.replace(temporary,destination)
+    finally:
+        try: temporary.unlink()
+        except FileNotFoundError: pass
+
+def _atomic_write(destination,content,immutable=False):
+    if _is_link(destination): raise ReleaseCheckError('The configured release feed contains an unsafe file.')
+    if immutable and destination.exists():
+        if destination.is_file() and destination.read_bytes()==content: return
+        raise ReleaseCheckError('A published Cypher release manifest cannot be replaced.')
+    temporary=destination.with_name('.'+destination.name+'.'+uuid.uuid4().hex+'.tmp')
+    try:
+        with temporary.open('xb') as stream:
+            stream.write(content);stream.flush();os.fsync(stream.fileno())
+        os.replace(temporary,destination)
+    finally:
+        try: temporary.unlink()
+        except FileNotFoundError: pass
+
+def _check_github_release(cfg):
+    repo=_safe_release_repo(cfg)
+    gh=shutil.which('gh')
+    if not gh: raise ReleaseCheckError('GitHub CLI is not installed on your PC.')
+    flags=subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0
+    with tempfile.TemporaryDirectory(prefix='cypher-release-') as temporary:
+        download_dir=Path(temporary)
+        try:
+            result=subprocess.run([gh,'release','download','--repo',repo,'--pattern','Cypher-*.apk','--pattern','Cypher-*.json','--dir',str(download_dir)],
+                                  cwd=str(download_dir),capture_output=True,text=True,check=False,timeout=120,shell=False,creationflags=flags)
+        except subprocess.TimeoutExpired: raise ReleaseCheckError('GitHub release check timed out on your PC. Try again.') from None
+        except OSError: raise ReleaseCheckError('GitHub CLI could not start on your PC.') from None
+        if result.returncode:
+            detail=(result.stderr+'\n'+result.stdout).casefold()
+            if any(part in detail for part in ('not logged in','not logged into','auth login','authentication required','http 401')):
+                raise ReleaseCheckError('GitHub CLI is not signed in on your PC. Sign in with gh auth login.')
+            if 'release not found' in detail or 'no releases found' in detail:
+                raise ReleaseCheckError('No stable Cypher release was found in the configured GitHub repository.')
+            if 'no assets found' in detail or 'no matching assets' in detail:
+                raise ReleaseCheckError('The latest GitHub release is missing the Cypher APK or metadata.')
+            raise ReleaseCheckError('GitHub CLI cannot access the configured release repository on your PC.')
+        apks=[path for path in download_dir.iterdir() if path.name.startswith('Cypher-') and path.suffix.casefold()=='.apk']
+        manifests=[path for path in download_dir.iterdir() if path.name.startswith('Cypher-') and path.suffix.casefold()=='.json']
+        if len(apks)!=1 or len(manifests)!=1: raise ReleaseCheckError('The GitHub release must contain one Cypher APK and one metadata file.')
+        apk,manifest=apks[0],manifests[0]
+        if _is_link(apk) or _is_link(manifest) or apk.resolve().parent!=download_dir.resolve() or manifest.resolve().parent!=download_dir.resolve():
+            raise ReleaseCheckError('The GitHub release contains an unsafe artifact path.')
+        name=re.fullmatch(r'Cypher-([A-Za-z0-9][A-Za-z0-9._-]{0,63})\.apk',apk.name)
+        if not name or manifest.name!=f'Cypher-{name[1]}.json': raise ReleaseCheckError('The GitHub APK and metadata names do not match.')
+        if not 1<=apk.stat().st_size<=256*1024*1024 or manifest.stat().st_size>16384:
+            raise ReleaseCheckError('The GitHub release artifact is outside the supported size limits.')
+        try:
+            manifest_bytes=manifest.read_bytes();data=json.loads(manifest_bytes.decode('utf-8-sig'))
+        except Exception: raise ReleaseCheckError('The GitHub release metadata is invalid.') from None
+        if (not isinstance(data,dict) or data.get('artifact_filename')!=apk.name or data.get('package_name')!='dev.hermes.android.stable'
+                or data.get('version_name')!=name[1] or type(data.get('version_code')) is not int or data['version_code']<=20
+                or type(data.get('size_bytes')) is not int or data['size_bytes']!=apk.stat().st_size
+                or not isinstance(data.get('sha256'),str) or not re.fullmatch(r'[a-f0-9]{64}',data['sha256'])
+                or not isinstance(data.get('certificate_sha256'),str) or not re.fullmatch(r'[a-fA-F0-9]{64}',data['certificate_sha256'])):
+            raise ReleaseCheckError('The GitHub release metadata does not describe a stable Cypher APK.')
+        digest=data['sha256']
+        if _file_sha256(apk)!=digest: raise ReleaseCheckError('The GitHub APK checksum does not match its metadata.')
+        stage=download_dir/'feed';stage.mkdir()
+        shutil.copyfile(apk,stage/apk.name)
+        (stage/(digest+'.json')).write_bytes(manifest_bytes)
+        (stage/'latest.json').write_bytes(manifest_bytes)
+        try: verified=release({**cfg,'release_root':str(stage)})
+        except Exception: raise ReleaseCheckError('The downloaded Cypher APK failed signature or metadata verification.') from None
+        previous=None
+        try: previous=release(cfg,optional=True)
+        except Exception: pass
+        if previous and previous.get('package_name')==verified['package_name']:
+            if verified['version_code']<previous['version_code']:
+                return {'version_name':verified['version_name'],'version_code':verified['version_code'],'available':False}
+            if verified['version_code']==previous['version_code']:
+                if verified['sha256']!=previous['sha256']: raise ReleaseCheckError('A published Cypher version cannot be replaced with different APK bytes.')
+                return {'version_name':verified['version_name'],'version_code':verified['version_code'],'available':False}
+        root=_release_root(cfg,create=True)
+        if not root.is_dir(): raise ReleaseCheckError('The verified release feed could not be saved on Hermes.')
+        root=root.resolve(strict=True)
+        _atomic_copy(apk,root/data['artifact_filename'],digest)
+        _atomic_write(root/(digest+'.json'),manifest_bytes,immutable=True)
+        _atomic_write(root/'latest.json',manifest_bytes)
+        global _RELEASE_CACHE_KEY,_RELEASE_CACHE_VALUE
+        with _RELEASE_CACHE_LOCK: _RELEASE_CACHE_KEY=None;_RELEASE_CACHE_VALUE=None
+        return {'version_name':verified['version_name'],'version_code':verified['version_code'],'available':True}
+
+@router.post('/mobile/releases/check')
+async def check_release_updates(request:Request):
+    _,_,_,cfg=identity(request,owner_only=True)
+    try: return await asyncio.to_thread(_check_github_release,cfg)
+    except ReleaseCheckError as error: raise HTTPException(503,str(error)) from None
+    except Exception: raise HTTPException(503,'The verified Cypher release could not be saved on Hermes.') from None
+
+@router.get('/mobile/plugin/version')
+async def plugin_version(request:Request):
+    identity(request,owner_only=True)
+    return JSONResponse({'running':_RUNNING_PLUGIN_VERSION,'installed':_read_plugin_version(ROOT/'plugin.yaml')},headers={'Cache-Control':'no-store'})
+
 _watch_task=None
 _jobs_upgraded=set()
 def _warm_profile(owner,profile):
