@@ -226,7 +226,8 @@ def native_voice_context(session_id=None, conversation_history=None, **kwargs):
         return {'context': 'Earlier voice context could not be read for this turn. Do not guess missing spoken details.'}
 
 
-_READ_TOOL_WORDS={'get','list','search','read','fetch','find','query','view','show','describe','lookup','check'}
+# query, fetch and check also name SQL runners and URL fetchers, so they do not count as reads by name alone.
+_READ_TOOL_WORDS={'get','list','search','read','find','view','show','describe','lookup'}
 _WRITE_TOOL_WORDS={'send','create','delete','remove','modify','update','manage','draft','reply','forward',
                    'move','archive','trash','label','post','write','upload','accept','decline','invite',
                    'share','set','add','patch','put','mark','star','unread','snooze','mute','block',
@@ -235,6 +236,7 @@ _WRITE_TOOL_WORDS={'send','create','delete','remove','modify','update','manage',
 # Native tools whose names carry no read word but only read or plan inside the run.
 _PROACTIVE_READ_TOOLS={'todo'}
 _ARG_WRITE_TOOL_WORDS=_WRITE_TOOL_WORDS|{'run','trigger','install','edit','enable','disable','pause','resume','schedule'}
+_UNSAFE_NAME_WORDS=_ARG_WRITE_TOOL_WORDS|{'exec','sql','call','invoke','eval','shell','command','script','http','request'}
 _BLOCKED_PROACTIVE_TOOLSETS={'delegation','code_execution','computer_use','kanban','cronjob'}
 # web_extract/web_fetch could carry another email's content out in a URL an injected email asks for.
 _BLOCKED_PROACTIVE_TOOLS={'delegate_task','execute_code','computer_use','kanban','cronjob_manage',
@@ -248,7 +250,7 @@ def _tool_words(name):
 
 def _named_read_only(raw_name):
     words=_tool_words(raw_name)
-    return bool(words&_READ_TOOL_WORDS) and not bool(words&_WRITE_TOOL_WORDS)
+    return bool(words&_READ_TOOL_WORDS) and not bool(words&_UNSAFE_NAME_WORDS)
 
 def _mcp_read_only(tool_name,profile):
     try:
@@ -262,7 +264,9 @@ def _mcp_read_only(tool_name,profile):
             hints=mcp_tool._tool_read_only_hints.get(_resolve_server_key(server_name),{}) or {}
         for raw_name,hint in hints.items():
             if mcp_prefixed_tool_name(server_name,raw_name)==tool_name:
-                return not bool(_tool_words(raw_name)&_WRITE_TOOL_WORDS) and (hint is True or _named_read_only(raw_name))
+                # Hermes records a missing and a false readOnlyHint alike, so an unannotated mail reader still runs
+                # when its name plainly reads; anything named like a write or a runner is blocked either way.
+                return not bool(_tool_words(raw_name)&_UNSAFE_NAME_WORDS) and (hint is True or _named_read_only(raw_name))
     except Exception:
         return False
     return False
@@ -316,10 +320,9 @@ def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**
         return {'action':'block','message':_READ_ONLY_MESSAGE}
     if toolset=='web' and tool_name=='web_search':
         return None
-    # Deny by default: any other tool runs only when its name or its requested action clearly reads
-    # (skill_view, session_search, read_file, skills with action=list).
-    reads_by_action=bool(argument_words) and argument_words<=_READ_TOOL_WORDS and not _tool_words(tool_name)&_WRITE_TOOL_WORDS
-    if tool_name in _PROACTIVE_READ_TOOLS or _named_read_only(tool_name) or reads_by_action:
+    # Deny by default: any other tool runs only when its own name clearly reads (skill_view, session_search,
+    # read_file); a read-sounding action argument never vouches for the tool's other arguments.
+    if tool_name in _PROACTIVE_READ_TOOLS or _named_read_only(tool_name):
         return None
     return {'action':'block','message':_READ_ONLY_MESSAGE}
 

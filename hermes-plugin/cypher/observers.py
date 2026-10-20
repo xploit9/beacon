@@ -33,8 +33,13 @@ def normalize_callback_text(value, limit=240):
     return value
 
 
+def _squashed(value):
+    return re.sub(r"[\W_]+", "", value.casefold())
+
+
 def check_instruction_markers(value):
-    if any(term in value.casefold() for term in INSTRUCTION_MARKERS):
+    # Compare letters and digits only, so "ignore-previous" or "system  prompt" still match.
+    if any(_squashed(term) in _squashed(value) for term in INSTRUCTION_MARKERS):
         raise ValueError("Instruction-like text cannot be relayed as trusted call guidance")
 
 
