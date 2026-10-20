@@ -206,9 +206,12 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
     val latestAssistantMessageId = remember(chatState.messages) { chatState.messages.lastOrNull { it.role == "assistant" && it.text.isNotBlank() }?.id }
     val chat = chatState.copy(messages = messages)
     val taskResultKey = "task-result:${Scope(ui.origin, ui.owner, ui.profile).session(chat.sessionId).key}"
-    val taskResult = profileDefaults[taskResultKey]?.string("reason").orEmpty()
-    var taskFeedbackSent by remember(taskResult, chat.sessionId) { mutableStateOf(false) }
-    var taskFeedbackSending by remember(taskResult, chat.sessionId) { mutableStateOf(false) }
+    val taskResultData = profileDefaults[taskResultKey]
+    val taskResult = taskResultData?.string("reason").orEmpty()
+    val taskResultNoticeId = taskResultData?.string("notice_id").orEmpty()
+    val taskResultIsEmailAlert = taskResultData?.optBoolean("email_alert") == true && taskResultNoticeId.isNotBlank()
+    var taskFeedbackSent by remember(taskResult, taskResultNoticeId, chat.sessionId) { mutableStateOf(false) }
+    var taskFeedbackSending by remember(taskResult, taskResultNoticeId, chat.sessionId) { mutableStateOf(false) }
     val callMessagesById = remember(chatState.callMessages) { chatState.callMessages.associateBy { "call:${it.eventId}" } }
     val separateToolResults = remember(chat.raw) { separateToolResultIds(chat.raw.rows("messages")) }
     val toolResultTitles = remember(chat.raw) { toolResultTitles(chat.raw.rows("messages")) }
@@ -232,8 +235,6 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
     val proactive = profileDefaults[proactiveKey]
     val proactiveLoaded = proactive != null && proactive.has("enabled") && !proactive.has("_error")
     val proactiveEnabled = proactiveLoaded && proactive?.optBoolean("enabled") == true
-    val proactiveSetupComplete = proactive?.optBoolean("setup_complete") == true
-    var showProactiveSetup by remember(proactiveKey) { mutableStateOf(false) }
     val pluginStatus = ui.bootstrap.optJSONObject("optional_features")?.optString("plugin").orEmpty()
     val proactiveContext = LocalContext.current.applicationContext
     val promptMemory by remember(proactiveContext) {
@@ -244,12 +245,12 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
     }.collectAsStateWithLifecycle(initialValue = null as Pair<String, String>?)
     val promptText = when {
         !proactiveLoaded || pluginStatus != "available" -> ""
-        !proactiveEnabled -> assistantText("Let Cypher keep an eye on your day")
+        !proactiveEnabled -> assistantText("Let Cypher flag important emails")
         else -> ""
     }
     val promptSignature = when {
         !proactiveLoaded -> ""
-        !proactiveEnabled -> "${Scope(ui.origin, ui.owner, preferences.assistantProfile).key}|off|setup:$proactiveSetupComplete"
+        !proactiveEnabled -> "${Scope(ui.origin, ui.owner, preferences.assistantProfile).key}|off"
         else -> "${Scope(ui.origin, ui.owner, preferences.assistantProfile).key}|on"
     }
     val promptDismissed = promptMemory?.let { it.first == promptSignature && it.second == promptSignature } == true
@@ -259,30 +260,41 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
     val activeHere = call.active && call.conversationScope == vm.authenticatedScope()
     val scope = rememberCoroutineScope()
     fun sendTaskFeedback(verdict: String) {
-        if (taskFeedbackSending) return
+        if (taskFeedbackSending || !taskResultIsEmailAlert || verdict !in setOf("important", "not_important")) return
         val source = vm.client ?: return
-        val client = try { source.forAuthorizedProfile(ui.profile) } catch (_: Throwable) { vm.notice("Couldn’t send feedback. Try again."); return }
+        val client = try { source.forAuthorizedProfile(ui.profile) } catch (_: Throwable) { vm.notice("Couldn't send feedback. Try again."); return }
         taskFeedbackSending = true
         scope.launch {
             try {
-                client.call("$PROACTIVE_SETTINGS_PATH/feedback", mapOf("profile" to ui.profile), method = "POST", data = json("verdict" to verdict, "topic" to taskResult.takeCharacters(200)))
+                client.call("$PROACTIVE_SETTINGS_PATH/feedback", mapOf("profile" to ui.profile), method = "POST", data = json("notice_id" to taskResultNoticeId, "verdict" to verdict))
                 taskFeedbackSent = true
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
-                vm.notice("Couldn’t send feedback. Try again.")
+                vm.notice(proactiveErrorMessage(error, "Couldn't send feedback. Try again."))
             } finally { client.closeNative(); taskFeedbackSending = false }
         }
     }
-    if (showProactiveSetup && proactive != null) ProactiveSetupSheet(vm, preferences.assistantProfile, proactive, onDismiss = { showProactiveSetup = false }, onSaved = {
-        if (vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == preferences.assistantProfile) vm.storeData(proactiveKey, it)
-    })
     LaunchedEffect(promptSignature, promptText, promptMemory) {
         if (pluginStatus == "available" && promptSignature.isNotBlank() && promptText.isBlank() && promptMemory?.let { it.first != promptSignature } == true)
             proactiveContext.preferences.edit { it[proactivePromptDismissedKey] = json("state" to promptSignature, "dismissed" to "").toString() }
     }
     LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, ui.tab, preferences.assistantProfile, pluginStatus) {
-        if (cypher && ui.tab == "Cypher" && ui.connected && ui.profile == preferences.assistantProfile && pluginStatus == "available")
-            vm.load(proactiveKey, PROACTIVE_SETTINGS_PATH, mapOf("profile" to preferences.assistantProfile), force = false)
+        if (cypher && ui.tab == "Cypher" && ui.connected && ui.profile == preferences.assistantProfile && pluginStatus == "available") {
+            val source = vm.client ?: return@LaunchedEffect
+            val profile = preferences.assistantProfile
+            vm.storeData(proactiveKey, JSONObject().put("_loading", true))
+            try {
+                val response = fetchProactiveSettings(source, profile)
+                if (vm.client === source && vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile)
+                    vm.storeData(proactiveKey, response)
+            } catch (error: Throwable) {
+                if (error is CancellationException) throw error
+                if (vm.client === source && vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile)
+                    vm.storeData(proactiveKey, JSONObject().put("_error", true)
+                        .put("_pluginUpdateRequired", isMissingCypherPluginRoute(error))
+                        .put("_message", proactiveErrorMessage(error, "Couldn't load email settings. Try again.")))
+            }
+        }
     }
     var menu by remember { mutableStateOf(false) }
     var activitySheet by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(false) }
@@ -487,7 +499,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
                 ) {
                     Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(uiText("Task result"), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+                            Text(uiText(if (taskResultIsEmailAlert) "Important email" else "Task result"), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
                             IconButton(onClick = { vm.storeData(taskResultKey, JSONObject()) }, modifier = Modifier.testTag("task-result-dismiss")) {
                                 Icon(Icons.Rounded.Close, contentDescription = uiText("Dismiss"))
                             }
@@ -495,11 +507,11 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
                         Column(Modifier.heightIn(max = 240.dp).verticalScroll(rememberScrollState())) {
                             Markdown(taskResult, vm, Scope(ui.origin, ui.owner, ui.profile).session(chat.sessionId), interactive = false)
                         }
-                        if (pluginStatus == "available") {
-                            if (taskFeedbackSent) Text("Got it", Modifier.padding(start = 12.dp, bottom = 8.dp).testTag("task-result-feedback-sent"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (pluginStatus == "available" && taskResultIsEmailAlert) {
+                            if (taskFeedbackSent) Text("Thanks — Cypher will remember.", Modifier.padding(start = 12.dp, bottom = 8.dp).testTag("task-result-feedback-sent"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             else Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                                TextButton(onClick = { sendTaskFeedback("more") }, enabled = !taskFeedbackSending && ui.connected && vm.client != null, modifier = Modifier.testTag("task-result-feedback-more")) { Text(uiText("More like this")) }
-                                TextButton(onClick = { sendTaskFeedback("less") }, enabled = !taskFeedbackSending && ui.connected && vm.client != null, modifier = Modifier.testTag("task-result-feedback-less")) { Text(uiText("Less like this")) }
+                                TextButton(onClick = { sendTaskFeedback("important") }, enabled = !taskFeedbackSending && ui.connected && vm.client != null, modifier = Modifier.testTag("task-result-feedback-important")) { Text(uiText("Important")) }
+                                TextButton(onClick = { sendTaskFeedback("not_important") }, enabled = !taskFeedbackSending && ui.connected && vm.client != null, modifier = Modifier.testTag("task-result-feedback-not-important")) { Text(uiText("Not important")) }
                             }
                         }
                     }
@@ -516,7 +528,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
                                 Icon(Icons.Rounded.Close, contentDescription = uiText("Dismiss"))
                             }
                         }
-                        TextButton(onClick = { if (!proactiveSetupComplete) showProactiveSetup = true else vm.more("Assistant") }, modifier = Modifier.testTag("proactive-prompt-settings")) { Text(uiText(if (proactiveSetupComplete) "Assistant settings" else "Set up Proactive")) }
+                        TextButton(onClick = { vm.more("Assistant") }, modifier = Modifier.testTag("proactive-prompt-settings")) { Text(uiText("Email settings")) }
                     }
                 }
                 Box(Modifier.weight(1f).fillMaxWidth().testTag("transcript-layer")) {

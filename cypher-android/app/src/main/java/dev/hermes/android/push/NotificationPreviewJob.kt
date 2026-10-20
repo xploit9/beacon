@@ -1,9 +1,11 @@
 package dev.hermes.android.push
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.job.*
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import androidx.core.app.NotificationCompat
 import dev.hermes.android.CypherApplication
 import dev.hermes.android.core.*
@@ -33,6 +35,24 @@ fun boundedNotificationText(value: String, limit: Int, preserveWhitespace:Boolea
 fun matchesNotificationRoute(route: JSONObject, source: String, event: String, scope: Scope, conversation: String, kind: String): Boolean =
     route.string("source_ref") == source && route.string("event_id") == event && route.string("owner_id") == scope.owner &&
         route.string("profile") == scope.profile && route.string("conversation_ref") == conversation && route.string("kind") == kind
+fun isEmailAlertNotificationRoute(route: JSONObject, source: String, event: String, scope: Scope, conversation: String): Boolean =
+    route.optBoolean("email_alert") && validOpaque(conversation) && matchesNotificationRoute(route, source, event, scope, conversation, "task_result")
+
+private const val EMAIL_FEEDBACK_PATH = "/api/plugins/cypher/mobile/proactive/feedback"
+private fun validEmailVerdict(verdict: String) = verdict == "important" || verdict == "not_important"
+
+private fun emailFeedbackAction(context: Context, source: String, event: String, verdict: String, label: String): NotificationCompat.Action {
+    val tag = "$source\u0000$event".digest()
+    val intent = Intent(context, NativeActivityReceiver::class.java)
+        .setAction(NativeActivityReceiver.ACTION_EMAIL_FEEDBACK)
+        .setData(Uri.parse("cypher://email-feedback/$tag/$verdict"))
+        .putExtra("source", source)
+        .putExtra("event", event)
+        .putExtra("verdict", verdict)
+    val pending = PendingIntent.getBroadcast(context, "$source:$event:$verdict".hashCode(), intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+    return NotificationCompat.Action.Builder(0, label, pending).build()
+}
+
 /** Private text is fetched only from the encrypted registered owner binding. */
 suspend fun refreshNotificationPreview(context: Context, source: String, event: String, conversation: String, kind: String) {
     if (kind == "incoming_call") return // The incoming/missed card owns its actions and fixed deadline.
@@ -67,11 +87,44 @@ suspend fun refreshNotificationPreview(context: Context, source: String, event: 
         val posted = active(1) ?: return@withTimeout
         val builder = NotificationCompat.Builder(context, posted.notification)
             .setContentTitle(title).setContentText(body).setStyle(NotificationCompat.BigTextStyle().bigText(body)).setOnlyAlertOnce(true)
+        if (isEmailAlertNotificationRoute(route, source, event, scope, conversation)) {
+            builder.clearActions()
+            builder.addAction(emailFeedbackAction(context, source, event, "important", "Important"))
+            builder.addAction(emailFeedbackAction(context, source, event, "not_important", "Not important"))
+        }
         if (!authorized() || active(1)?.postTime != posted.postTime) return@withTimeout
         try { manager.notify(tag, 1, builder.build()) } catch (_: SecurityException) { return@withTimeout }
         // Updating the looping call with ONLY_ALERT_ONCE stops its ringtone; hydrate only its context notification.
     }
 }
+
+private suspend fun sendEmailFeedback(context: Context, source: String, event: String, verdict: String) {
+    if (!validOpaque(source) || !validOpaque(event) || !validEmailVerdict(verdict)) return
+    val app = context.applicationContext as CypherApplication
+    if (!app.push.permitsIncoming(source)) return
+    val binding = app.push.binding(source) ?: return
+    val scope = Scope(trustedOrigin(binding.getString("origin")), binding.getString("owner"), binding.getString("profile"))
+    fun authorized() = app.push.binding(source)?.toString() == binding.toString() && app.auth.read(scope.origin).authorizesPushSource(scope)
+    if (!authorized()) return
+    val client = app.push.clientFor(binding)
+    withTimeout(20000) {
+        client.bootstrap()
+        if (client.scope != scope || !authorized()) return@withTimeout
+        val route = client.nativeRequest("/api/plugins/cypher/mobile/notifications/events/$event")
+        val conversation = route.string("conversation_ref")
+        if (!isEmailAlertNotificationRoute(route, source, event, scope, conversation) || !authorized()) return@withTimeout
+        client.nativeRequest(EMAIL_FEEDBACK_PATH, "POST", json("notice_id" to event, "verdict" to verdict))
+        val manager = context.getSystemService(NotificationManager::class.java)
+        val tag = "$source\u0000$event".digest()
+        val posted = manager.activeNotifications.firstOrNull { it.tag == tag && it.id == 1 } ?: return@withTimeout
+        if (!authorized() || manager.activeNotifications.firstOrNull { it.tag == tag && it.id == 1 }?.postTime != posted.postTime) return@withTimeout
+        val body = "Thanks — Cypher will remember."
+        val updated = NotificationCompat.Builder(context, posted.notification)
+            .clearActions().setContentText(body).setStyle(NotificationCompat.BigTextStyle().bigText(body)).setOnlyAlertOnce(true).build()
+        try { manager.notify(tag, 1, updated) } catch (_: SecurityException) { }
+    }
+}
+
 class NotificationPreviewJob : JobService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var running: Job? = null
@@ -82,7 +135,11 @@ class NotificationPreviewJob : JobService() {
                     val work = params.dequeueWork() ?: break
                     try {
                         val i = work.intent
-                        refreshNotificationPreview(this@NotificationPreviewJob, i.getStringExtra("source").orEmpty(), i.getStringExtra("event").orEmpty(), i.getStringExtra("conversation").orEmpty(), i.getStringExtra("kind").orEmpty())
+                        val source = i.getStringExtra("source").orEmpty()
+                        val event = i.getStringExtra("event").orEmpty()
+                        val verdict = i.getStringExtra("verdict").orEmpty()
+                        if (verdict.isNotBlank()) sendEmailFeedback(this@NotificationPreviewJob, source, event, verdict)
+                        else refreshNotificationPreview(this@NotificationPreviewJob, source, event, i.getStringExtra("conversation").orEmpty(), i.getStringExtra("kind").orEmpty())
                     } catch (_: TimeoutCancellationException) {
                         currentCoroutineContext().ensureActive() // Only the per-fetch timeout may leave a fallback and continue.
                     }
@@ -112,6 +169,17 @@ class NotificationPreviewJob : JobService() {
             }.getOrDefault(false)
             if (!accepted) runCatching { scheduler.enqueue(builder().setOverrideDeadline(0).build(), JobWorkItem(work)) }
             // If both requests exceed scheduler quota, the immediate typed fallback remains.
+        }
+        fun enqueueFeedback(context: Context, source: String, event: String, verdict: String): Boolean {
+            if (!validOpaque(source) || !validOpaque(event) || !validEmailVerdict(verdict) || !(context.applicationContext as CypherApplication).push.permitsIncoming(source)) return false
+            val scheduler = context.getSystemService(JobScheduler::class.java) ?: return false
+            val work = Intent().putExtra("source", source).putExtra("event", event).putExtra("verdict", verdict)
+            fun queue(expedited: Boolean) = runCatching {
+                val builder = JobInfo.Builder(JOB_ID, ComponentName(context, NotificationPreviewJob::class.java))
+                val job = if (expedited && android.os.Build.VERSION.SDK_INT >= 31) builder.setExpedited(true).build() else builder.setOverrideDeadline(0).build()
+                scheduler.enqueue(job, JobWorkItem(work)) == JobScheduler.RESULT_SUCCESS
+            }.getOrDefault(false)
+            return queue(true) || queue(false)
         }
     }
 }

@@ -91,6 +91,15 @@ fun presentNativeActivity(context: Context, source: String, event: String, activ
 
 class NativeActivityReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == ACTION_EMAIL_FEEDBACK) {
+            NotificationPreviewJob.enqueueFeedback(
+                context,
+                intent.getStringExtra("source").orEmpty(),
+                intent.getStringExtra("event").orEmpty(),
+                intent.getStringExtra("verdict").orEmpty(),
+            )
+            return
+        }
         if (intent.action == "dismiss") {
             intent.getStringExtra("tag")?.takeIf { it.startsWith("native:") }?.let {
                 finishNativeActivity(context,it)
@@ -111,6 +120,10 @@ class NativeActivityReceiver : BroadcastReceiver() {
             try { manager.notify(tag,3,Notification.Builder.recoverBuilder(context,posted).setContentTitle("Response not sent").setContentText(message)
                 .setStyle(Notification.BigTextStyle().bigText(message)).setActions(review.build()).setOnlyAlertOnce(true).build()) } catch(_:SecurityException) { }
         }
+    }
+
+    companion object {
+        const val ACTION_EMAIL_FEEDBACK = "dev.hermes.android.push.EMAIL_FEEDBACK"
     }
 }
 

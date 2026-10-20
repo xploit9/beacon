@@ -39,4 +39,17 @@ class NotificationContentTest {
             assertFalse(it, matchesNotificationRoute(route().put(it, "forged"), "source", "event", scope, "chat", "completion"))
         }
     }
+
+    @Test fun onlyAnAuthorizedEmailAlertTaskResultEnablesImportanceFeedback() {
+        val scope = Scope("https://localhost:8796", "owner", "default")
+        fun route(kind: String = "task_result", emailAlert: Boolean = true) = JSONObject()
+            .put("event_id", "event").put("owner_id", "owner").put("profile", "default")
+            .put("source_ref", "source").put("conversation_ref", "chat").put("kind", kind)
+            .put("email_alert", emailAlert)
+
+        assertTrue(isEmailAlertNotificationRoute(route(), "source", "event", scope, "chat"))
+        assertFalse(isEmailAlertNotificationRoute(route(emailAlert = false), "source", "event", scope, "chat"))
+        assertFalse(isEmailAlertNotificationRoute(route(kind = "completion"), "source", "event", scope, "chat"))
+        assertFalse(isEmailAlertNotificationRoute(route(), "other", "event", scope, "chat"))
+    }
 }

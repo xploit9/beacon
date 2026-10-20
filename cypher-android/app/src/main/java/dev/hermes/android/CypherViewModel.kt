@@ -2984,7 +2984,9 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             _data.value = emptyMap()
             _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList()
             if (route.string("kind") == "task_result" && id.isNotBlank())
-                route.string("reason").takeIf(String::isNotBlank)?.let { storeData("task-result:${c.scope.session(id).key}", json("reason" to it)) }
+                route.string("reason").takeIf(String::isNotBlank)?.let {
+                    storeData("task-result:${c.scope.session(id).key}", json("reason" to it, "notice_id" to route.string("event_id").ifBlank { event }, "email_alert" to route.optBoolean("email_alert")))
+                }
             val destination = when { route.string("kind") == "incoming_call" -> "Cypher"; route.string("kind") == "release" -> "More"; route.string("kind") == "task_result" && id.isBlank() -> "Tasks"; else -> "Chat" }
             val destinationPage = if (route.string("kind") == "release") "App updates" else ""
             saved["tab"] = destination; saved["more"] = destinationPage
