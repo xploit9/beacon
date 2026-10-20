@@ -15,10 +15,12 @@ class CypherViewModelStateTest {
 
     @Test fun registeredConversationOpensOnlyForTheOriginalChatInTheSameScope() {
         val profile=Scope("https://hermes.example", "owner", "default")
-        assertEquals("shared-chat",assistantConversationToSelect(profile.session("phone-chat"),"phone-chat",profile,"phone-chat","shared-chat"))
-        assertNull(assistantConversationToSelect(profile.copy(profile="other").session("phone-chat"),"phone-chat",profile,"phone-chat","shared-chat"))
-        assertNull(assistantConversationToSelect(profile.session("other-chat"),"other-chat",profile,"phone-chat","shared-chat"))
-        assertNull(assistantConversationToSelect(profile.session("phone-chat"),"phone-chat",profile,"phone-chat","phone-chat"))
+        assertEquals("shared-chat",assistantConversationToSelect(profile.session("phone-chat"),"phone-chat",profile,"phone-chat","shared-chat",true,""))
+        assertNull(assistantConversationToSelect(profile.copy(profile="other").session("phone-chat"),"phone-chat",profile,"phone-chat","shared-chat",true,""))
+        assertNull(assistantConversationToSelect(profile.session("other-chat"),"other-chat",profile,"phone-chat","shared-chat",true,""))
+        assertNull(assistantConversationToSelect(profile.session("phone-chat"),"phone-chat",profile,"phone-chat","phone-chat",true,""))
+        assertNull(assistantConversationToSelect(profile.session("phone-chat"),"phone-chat",profile,"phone-chat","shared-chat",false,""))
+        assertNull(assistantConversationToSelect(profile.session("phone-chat"),"phone-chat",profile,"phone-chat","shared-chat",true,"streaming"))
     }
 
     @Test fun serverRequestPromptIsShownAndAnExplicitNullPendingClearsIt() {

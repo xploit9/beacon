@@ -17,7 +17,7 @@ Production and stable builds offer default-on app and plugin automatic updates i
 - Application ID `dev.hermes.android.debug`, so it installs **next to** production `dev.hermes.android` and never upgrades it.
 - Version name `1.0.0-preview`. The launcher label is "Cypher Preview" (set only in `app/src/debug/AndroidManifest.xml`); the release label stays "Cypher".
 - It is signed with the local Android debug key, not the production signer. Android will never accept it as an update to production, and production cannot update it.
-- It is a debuggable build. As in every debug build of this project, `src/debug/res/xml/fixture_network_security.xml` keeps cleartext disabled and also trusts the bundled test-fixture CA (`cypher_fixture_ca.pem`) through `debug-overrides`. Use the preview only on your own test devices.
+- It is a debuggable build. `src/debug/res/xml/fixture_network_security.xml` allows cleartext only to `10.0.2.2` for the local crash reporter, and trusts the bundled test-fixture CA (`cypher_fixture_ca.pem`) through `debug-overrides`. Use the preview only on your own test devices.
 
 ## Build
 From `cypher-android`, with JDK 21 and Android SDK 36:

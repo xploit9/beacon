@@ -18,6 +18,7 @@ import java.util.concurrent.TimeUnit
 /** Debug builds only: uncaught crashes go to a local Bugsink (Sentry protocol). Off when BUGSINK_DSN is blank. */
 class BugsinkCrashReporter : ContentProvider() {
     override fun onCreate(): Boolean {
+        if (Build.HARDWARE != "ranchu" && Build.HARDWARE != "goldfish") return true
         val target = BugsinkTarget.parse(BuildConfig.BUGSINK_DSN) ?: return true
         val dir = File(requireNotNull(context).cacheDir, "bugsink").apply { mkdirs() }
         val previous = Thread.getDefaultUncaughtExceptionHandler()

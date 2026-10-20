@@ -54,7 +54,8 @@ class CallHistoryUiTest {
         val now = System.currentTimeMillis() / 1000
         fixture.callHistoryResponse = json("calls" to JSONArray()
             .put(json("id" to callId, "direction" to "outgoing", "state" to "completed", "started_at" to now,
-                "duration_s" to 83, "provider" to "gemini", "conversation_id" to "chat-a", "reason" to null, "has_transcript" to true))
+                "duration_s" to 83, "provider" to "gemini", "conversation_id" to "chat-a", "reason" to null, "has_transcript" to true,
+                "email_notice_id" to "email-notice-42"))
             .put(json("id" to "call-history-missed", "direction" to "incoming", "state" to "missed", "started_at" to now - 60,
                 "duration_s" to null, "provider" to null, "conversation_id" to "chat-b", "reason" to "No answer", "has_transcript" to false)), "next" to null)
         val messages = buildList {
@@ -111,6 +112,19 @@ class CallHistoryUiTest {
             compose.onNodeWithText("Outgoing call").assertExists()
             compose.onNodeWithText("Missed call").assertExists()
             compose.onNodeWithText(" · 1:23 · Gemini", substring = true).assertExists()
+            fixture.proactiveFeedbackStatusCode = 503
+            compose.onNodeWithTag("call-history-feedback-not-important:$callId").performClick()
+            compose.waitUntil(5_000) { compose.onAllNodesWithText("Couldn't save your choice. Try again.").fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithTag("call-history-feedback-not-important:$callId").assertExists()
+            fixture.proactiveFeedbackStatusCode = 200
+            compose.onNodeWithTag("call-history-feedback-not-important:$callId").performClick()
+            compose.waitUntil(5_000) {
+                fixture.proactiveFeedbacks.size == 1 && compose.onAllNodesWithText("Thanks — Cypher will remember.").fetchSemanticsNodes().isNotEmpty()
+            }
+            val feedback = fixture.proactiveFeedbacks.single()
+            assertEquals("email-notice-42", feedback.string("notice_id"))
+            assertEquals("not_important", feedback.string("verdict"))
+            compose.onNodeWithTag("call-history-feedback-not-important:$callId").assertDoesNotExist()
             compose.onNodeWithTag("call-history-row:$callId").performClick()
             compose.waitUntil(5_000) { compose.onAllNodesWithText("Transcript from completed call").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("Transcript from completed call").assertIsDisplayed()
@@ -121,6 +135,7 @@ class CallHistoryUiTest {
             compose.onNodeWithTag("call-history-open").performClick()
             compose.waitUntil(10_000) { compose.onAllNodesWithText("Update the Cypher plugin on Hermes to see call history.").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("Retry").assertDoesNotExist()
+            compose.onNodeWithTag("call-history-feedback-not-important:$callId").assertDoesNotExist()
 
             compose.onNodeWithTag("call-history-close").performClick()
             fixture.callHistoryRouteMissing = false

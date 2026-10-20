@@ -475,7 +475,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
         val rowId = chat.callMessages.firstOrNull { it.eventId == event.eventId }?.let { "call:${event.eventId}" }
             ?: listOf(event.messageId, event.eventId).firstOrNull { id -> id.isNotBlank() && messages.any { it.id == id } }
             ?: return@LaunchedEffect
-        val index = messages.indexOfFirst { it.id == rowId }
+        val index = visibleMessages.indexOfFirst { it.value.id == rowId }
         if (index >= 0) {
             showSearch = false
             search = ""

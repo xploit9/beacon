@@ -38,7 +38,7 @@ fun matchesNotificationRoute(route: JSONObject, source: String, event: String, s
 fun isEmailAlertNotificationRoute(route: JSONObject, source: String, event: String, scope: Scope, conversation: String): Boolean =
     route.optBoolean("email_alert") && validOpaque(conversation) && matchesNotificationRoute(route, source, event, scope, conversation, "task_result")
 
-private const val EMAIL_FEEDBACK_PATH = "/api/plugins/cypher/mobile/proactive/feedback"
+internal const val EMAIL_FEEDBACK_PATH = "/api/plugins/cypher/mobile/proactive/feedback"
 private fun validEmailVerdict(verdict: String) = verdict == "important" || verdict == "not_important"
 
 private fun emailFeedbackAction(context: Context, source: String, event: String, verdict: String, label: String): NotificationCompat.Action {
@@ -50,7 +50,7 @@ private fun emailFeedbackAction(context: Context, source: String, event: String,
         .putExtra("event", event)
         .putExtra("verdict", verdict)
     val pending = PendingIntent.getBroadcast(context, "$source:$event:$verdict".hashCode(), intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-    return NotificationCompat.Action.Builder(0, label, pending).build()
+    return NotificationCompat.Action.Builder(0, label, pending).setAuthenticationRequired(true).build()
 }
 
 /** Private text is fetched only from the encrypted registered owner binding. */
@@ -87,7 +87,7 @@ suspend fun refreshNotificationPreview(context: Context, source: String, event: 
             if (validOpaque(session) && reason.isNotBlank() && expiresAt > System.currentTimeMillis() / 1000) {
                 val taskScope = scope.session(session)
                 val card = json("reason" to reason, "notice_id" to event, "email_alert" to true, "expires_at" to expiresAt)
-                app.cache.write(taskScope, "task-result", card.toString(), protected = true)
+                runCatching { app.cache.write(taskScope, "task-result", card.toString(), protected = true) }
                 app.push.emailAlerts.emit(taskScope to card)
             }
         }

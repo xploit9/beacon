@@ -64,6 +64,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     val roomActions = CopyOnWriteArrayList<JSONObject>()
     @Volatile var callHistoryResponse = json("calls" to JSONArray(), "next" to "")
     @Volatile var callHistoryRouteMissing = false
+    @Volatile var proactiveFeedbackStatusCode = 200
     @Volatile var proactiveRouteMissing = false
     @Volatile var proactiveStatusCode = 200
     val workspaceFiles = ConcurrentHashMap<String, String>()
@@ -376,6 +377,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             200 to proactiveResponse(profile)
         }
         path == "/api/plugins/cypher/mobile/proactive/feedback" && method == "POST" -> {
+            if (proactiveFeedbackStatusCode != 200) return proactiveFeedbackStatusCode to json("detail" to "Feedback unavailable")
             require(body.has("notice_id") && !body.has("topic") && body.getString("verdict") in setOf("important", "not_important"))
             proactiveFeedbacks += body.copy()
             200 to json("ok" to true)

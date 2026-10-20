@@ -17,7 +17,8 @@ internal fun mergeVoiceTranscripts(archived: List<CallTranscript>, live: List<Ca
     for (event in archived + live) {
         val previous = merged[event.eventId]
         if (previous?.final == true && !event.final) continue
-        merged[event.eventId] = if (event.interrupted && !event.final) event.copy(text = "", final = true) else event
+        val timed = event.copy(at = event.at.takeIf { it > 0 } ?: previous?.at ?: 0)
+        merged[event.eventId] = if (timed.interrupted && !timed.final) timed.copy(text = "", final = true) else timed
     }
     return merged.values.filter { it.text.isNotBlank() && it.eventId !in messageIds && (it.messageId.isBlank() || it.messageId !in messageIds) }
 }

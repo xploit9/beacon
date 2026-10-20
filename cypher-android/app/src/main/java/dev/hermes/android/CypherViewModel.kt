@@ -40,7 +40,8 @@ private const val LEGACY_CYPHER_TAB_VALUE = "Xara" // Replace the released assis
 internal fun migratedTab(tab: String) = if (tab == LEGACY_CYPHER_TAB_VALUE) "Cypher" else tab
 internal fun assistantConversationToAdopt(currentId: String, registeredId: String?): String? =
     registeredId?.takeIf { it.isNotBlank() && it != currentId }
-internal fun assistantConversationToSelect(openScope: Scope?, openSessionId: String, assistantScope: Scope, currentId: String, registeredId: String?): String? {
+internal fun assistantConversationToSelect(openScope: Scope?, openSessionId: String, assistantScope: Scope, currentId: String, registeredId: String?, openMessagesEmpty: Boolean, streamId: String): String? {
+    if (!openMessagesEmpty || streamId.isNotBlank()) return null
     val open = openScope ?: return null
     val shared = assistantConversationToAdopt(currentId, registeredId) ?: return null
     return shared.takeIf { open.copy(session = "") == assistantScope.copy(session = "") && open.session == currentId && openSessionId == currentId }
@@ -1607,7 +1608,8 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 optionalLocalSave { app.cache.write(c.scope, "cypher-session", shared, protected = true) }
                 if (client?.scope == c.scope) preparedCypher = c.scope to shared
                 registeredAssistantChats.add(c.scope.session(shared).key)
-                assistantConversationToSelect(sourceScope, _chat.value.sessionId, c.scope, id, shared)?.let { selectSession(it) }
+                val openChat = _chat.value
+                assistantConversationToSelect(sourceScope, openChat.sessionId, c.scope, id, shared, openChat.messages.isEmpty(), openChat.streamId)?.let { selectSession(it) }
             }
         }
     }

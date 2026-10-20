@@ -23,6 +23,8 @@ import dev.hermes.android.cypherOwnerSetupMessage
 import dev.hermes.android.isMissingCypherPluginRoute
 import dev.hermes.android.core.rows
 import dev.hermes.android.core.string
+import dev.hermes.android.push.EMAIL_FEEDBACK_PATH
+import dev.hermes.android.push.validOpaque
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -40,6 +42,7 @@ private data class CallHistoryEntry(
     val provider: String?,
     val conversationId: String,
     val reason: String?,
+    val emailNoticeId: String?,
 ) {
     companion object {
         fun from(value: JSONObject) = CallHistoryEntry(
@@ -51,6 +54,7 @@ private data class CallHistoryEntry(
             provider = value.string("provider").takeIf(String::isNotBlank),
             conversationId = value.string("conversation_id"),
             reason = value.string("reason").takeIf(String::isNotBlank),
+            emailNoticeId = value.string("email_notice_id").takeIf(::validOpaque),
         ).takeIf { it.id.isNotBlank() && it.conversationId.isNotBlank() && it.startedAt > 0 }
     }
 }
@@ -66,6 +70,7 @@ internal fun CallHistorySheet(vm: CypherViewModel, onOpenCall: (conversationId: 
     var loading by remember(activeClient, requestScope) { mutableStateOf(false) }
     var error by remember(activeClient, requestScope) { mutableStateOf("") }
     var retryAvailable by remember(activeClient, requestScope) { mutableStateOf(true) }
+    var feedback by remember(activeClient, requestScope) { mutableStateOf(emptyMap<String, String>()) }
     val list = rememberLazyListState()
     val coroutineScope = rememberCoroutineScope()
 
@@ -90,6 +95,31 @@ internal fun CallHistorySheet(vm: CypherViewModel, onOpenCall: (conversationId: 
             error = ownerSetup ?: if (retryAvailable) "Call history unavailable" else "Update the Cypher plugin on Hermes to see call history."
         } finally {
             loading = false
+        }
+    }
+
+    fun sendFeedback(call: CallHistoryEntry, verdict: String) {
+        val noticeId = call.emailNoticeId ?: return
+        if (feedback[noticeId] == "sending" || feedback[noticeId] == "saved") return
+        val feedbackClient = client ?: return
+        val scope = requestScope ?: return
+        if (vm.client !== activeClient || vm.authenticatedScope()?.copy(session = "") != scope) return
+        feedback = feedback + (noticeId to "sending")
+        coroutineScope.launch {
+            val saved = try {
+                if (vm.client !== activeClient || vm.authenticatedScope()?.copy(session = "") != scope) false
+                else {
+                    feedbackClient.nativeRequest(EMAIL_FEEDBACK_PATH, "POST", JSONObject().put("notice_id", noticeId).put("verdict", verdict))
+                    vm.client === activeClient && vm.authenticatedScope()?.copy(session = "") == scope
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                false
+            }
+            feedback = if (vm.client === activeClient && vm.authenticatedScope()?.copy(session = "") == scope) {
+                feedback + (noticeId to if (saved) "saved" else "failed")
+            } else feedback - noticeId
         }
     }
 
@@ -121,7 +151,7 @@ internal fun CallHistorySheet(vm: CypherViewModel, onOpenCall: (conversationId: 
                 else -> LazyColumn(Modifier.weight(1f), state = list, contentPadding = PaddingValues(bottom = 24.dp)) {
                     itemsIndexed(calls, key = { _, call -> call.id }) { _, call ->
                         dayStarts[call.id]?.let { DayDivider(uiText(it)) }
-                        CallHistoryRow(call) { onOpenCall(call.conversationId, call.id) }
+                        CallHistoryRow(call, call.emailNoticeId?.let { feedback[it] }, { sendFeedback(call, it) }) { onOpenCall(call.conversationId, call.id) }
                     }
                     if (loading) item("call-history-loading") { Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() } }
                     else if (next != null) item("call-history-more") {
@@ -134,7 +164,7 @@ internal fun CallHistorySheet(vm: CypherViewModel, onOpenCall: (conversationId: 
 }
 
 @Composable
-private fun CallHistoryRow(call: CallHistoryEntry, onOpen: () -> Unit) {
+private fun CallHistoryRow(call: CallHistoryEntry, feedbackStatus: String?, onFeedback: (String) -> Unit, onOpen: () -> Unit) {
     val icon = when {
         call.state == "missed" -> Icons.Rounded.PhoneMissed
         call.direction == "incoming" -> Icons.Rounded.CallReceived
@@ -152,18 +182,30 @@ private fun CallHistoryRow(call: CallHistoryEntry, onOpen: () -> Unit) {
         call.durationSeconds?.let { add(formatCallDuration(it)) }
         call.provider?.let { add(if (it == "openai") "OpenAI" else it.replaceFirstChar { character -> character.uppercase() }) }
     }.joinToString(" · ")
-    Row(
-        Modifier.fillMaxWidth()
-            .clickable(onClick = onOpen)
-            .testTag("call-history-row:${call.id}")
-            .padding(vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(icon, null, Modifier.padding(end = 12.dp), tint = if (call.state == "missed") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
-        Column(Modifier.weight(1f)) {
-            Text(title, style = MaterialTheme.typography.bodyLarge)
-            Text(details, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            call.reason?.let { Text(it, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+    Column(Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
+        Row(
+            Modifier.fillMaxWidth()
+                .clickable(onClick = onOpen)
+                .testTag("call-history-row:${call.id}"),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(icon, null, Modifier.padding(end = 12.dp), tint = if (call.state == "missed") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
+            Column(Modifier.weight(1f)) {
+                Text(title, style = MaterialTheme.typography.bodyLarge)
+                Text(details, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                call.reason?.let { Text(it, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            }
+        }
+        if (call.emailNoticeId != null) {
+            if (feedbackStatus == "saved") {
+                Text("Thanks — Cypher will remember.", Modifier.padding(start = 56.dp).testTag("call-history-feedback-sent:${call.id}"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else {
+                if (feedbackStatus == "failed") Text("Couldn't save your choice. Try again.", Modifier.padding(start = 56.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    TextButton(onClick = { onFeedback("important") }, enabled = feedbackStatus != "sending", modifier = Modifier.testTag("call-history-feedback-important:${call.id}")) { Text("Important") }
+                    TextButton(onClick = { onFeedback("not_important") }, enabled = feedbackStatus != "sending", modifier = Modifier.testTag("call-history-feedback-not-important:${call.id}")) { Text("Not important") }
+                }
+            }
         }
     }
 }

@@ -21,6 +21,11 @@ class NativeVoiceHistoryTest {
         assertEquals(listOf(final), mergeVoiceTranscripts(listOf(final), listOf(partial), emptySet()))
         assertTrue(mergeVoiceTranscripts(listOf(final), emptyList(), setOf(final.eventId)).isEmpty())
     }
+    @Test fun untimedLiveTurnKeepsTheSavedTurnTime() {
+        val saved = CallTranscript("call-a:user:1", "user", "saved", at = 1_800_000_000_000)
+        val live = saved.copy(text = "updated", at = 0)
+        assertEquals(saved.at, mergeVoiceTranscripts(listOf(saved), listOf(live), emptySet()).single().at)
+    }
     @Test fun foreignProfileSessionAndRowAreRejected() {
         assertTrue(runCatching { archivedVoiceTranscripts(scope, archive().put("profile", "foreign")) }.isFailure)
         assertTrue(runCatching { archivedVoiceTranscripts(scope, archive().put("session_id", "foreign")) }.isFailure)

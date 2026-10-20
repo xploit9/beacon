@@ -92,6 +92,7 @@ fun presentNativeActivity(context: Context, source: String, event: String, activ
 class NativeActivityReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action == ACTION_EMAIL_FEEDBACK) {
+            if (context.getSystemService(KeyguardManager::class.java).isDeviceLocked) return
             NotificationPreviewJob.enqueueFeedback(
                 context,
                 intent.getStringExtra("source").orEmpty(),

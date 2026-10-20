@@ -35,6 +35,7 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 private val opaquePattern=Regex("[A-Za-z0-9_.:-]+")
 fun validOpaque(value: String): Boolean = value.length in 1..200 && value != "." && value != ".." && value.matches(opaquePattern)
+internal fun shouldPostPushNotification(kind: String, uiVisible: Boolean) = kind != "completion" || !uiVisible
 internal fun requiresLocalKeepConnectedReceipt(localActionToken: String?): Boolean = localActionToken != null
 internal fun canAuthorizeWithoutKeepConnectedReceipt(receiptRequired: Boolean, action: String): Boolean =
     !receiptRequired && (action == "answer" || action == "decline")
@@ -510,7 +511,7 @@ private fun receivePush(context: Context, data: Map<String, String>, localAction
         val pending = PendingIntent.getActivity(context, "$source:$event".hashCode(), intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val content = notificationFallback(data["kind"].orEmpty())
         val public = NotificationCompat.Builder(context, activityChannel).setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle(content.first).setContentText("Open Cypher to view private activity.").build()
-        if (!incoming) try { manager.notify(routeKey, 1, NotificationCompat.Builder(context, activityChannel).setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle(content.first).setContentText(content.second).setStyle(NotificationCompat.BigTextStyle().bigText(content.second)).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).setPublicVersion(public).setSilent(incoming).setContentIntent(pending).setAutoCancel(true).build()) } catch (_: SecurityException) { return }
+        if (!incoming && shouldPostPushNotification(nativeKind, app.calls.uiVisible)) try { manager.notify(routeKey, 1, NotificationCompat.Builder(context, activityChannel).setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle(content.first).setContentText(content.second).setStyle(NotificationCompat.BigTextStyle().bigText(content.second)).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).setPublicVersion(public).setSilent(incoming).setContentIntent(pending).setAutoCancel(true).build()) } catch (_: SecurityException) { return }
         if (invite != null && ring) {
             val invite = invite!!
             val assistantName = runBlocking { context.applicationContext.preferences.data.first().let(AppPreferences::read).assistantName }
