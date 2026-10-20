@@ -143,7 +143,8 @@ def build_router(identity, mobile):
     async def call_history(request: Request):
         owner, _, profile, _ = identity(request)
         raw_limit = request.query_params.get('limit', '50')
-        if not raw_limit.isdigit() or not 1 <= int(raw_limit) <= 50:
+        # ASCII digits only: str.isdigit() also accepts '²', which int() rejects.
+        if not (raw_limit.isascii() and raw_limit.isdigit()) or not 1 <= int(raw_limit) <= 50:
             raise HTTPException(400, 'Invalid call history limit')
         before = _read_cursor(request.query_params.get('before'), mobile)
         result = await asyncio.to_thread(_page, mobile, owner, profile, int(raw_limit), before)

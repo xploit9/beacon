@@ -180,7 +180,7 @@ def test_call_history_pages_newest_first_with_a_stable_cursor(harness):
     assert first['next'] and second['next'] is None
 
 
-@pytest.mark.parametrize('params', [{'limit': '0'}, {'limit': '51'}, {'before': 'invalid'}])
+@pytest.mark.parametrize('params', [{'limit': '0'}, {'limit': '51'}, {'limit': '²'}, {'before': 'invalid'}])
 def test_call_history_rejects_invalid_page_arguments(harness, params):
     _, client, _, _, _ = harness
     assert client.get(PATH, params=params).status_code == 400
