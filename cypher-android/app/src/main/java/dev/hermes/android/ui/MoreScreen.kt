@@ -27,7 +27,9 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.BuildConfig
+import dev.hermes.android.CypherApplication
 import dev.hermes.android.CypherViewModel
+import dev.hermes.android.isMissingCypherPluginRoute
 import dev.hermes.android.core.*
 import dev.hermes.android.data.CypherClient
 import dev.hermes.android.data.VoiceKeyStore
@@ -42,6 +44,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 
 fun settingsParent(page: String): String = when {
     page.startsWith("category:") -> ""
@@ -64,6 +71,30 @@ private fun settingsIcon(name: String): ImageVector = when (name) {
     "Memory" -> Icons.Rounded.Psychology
     else -> Icons.Rounded.FolderOpen
 }
+
+private fun pluginAutoUpdateLine(status: JSONObject): String {
+    val message=status.optString("message").ifBlank {
+        if (status.optString("result")=="never") {
+            if (status.optBoolean("enabled",true)) "Automatic updates are on." else "Automatic updates are off."
+        } else "Up to date."
+    }
+    val versions=listOfNotNull(
+        status.optString("app_version").takeIf(String::isNotBlank)?.let { "App $it" },
+        status.optString("plugin_version").takeIf(String::isNotBlank)?.let { "Plugin $it" },
+    ).joinToString(" · ")
+    val checked=status.optDouble("checked_at",0.0)
+    val whenText=runCatching {
+        if (checked<=0) "" else {
+            val zone=ZoneId.systemDefault()
+            val value=Instant.ofEpochMilli((checked*1000).toLong()).atZone(zone)
+            val time=value.format(DateTimeFormatter.ofPattern("HH:mm",Locale.getDefault()))
+            if (value.toLocalDate()==LocalDate.now(zone)) "Checked today $time"
+            else "Checked ${value.format(DateTimeFormatter.ofPattern("MMM d HH:mm",Locale.getDefault()))}"
+        }
+    }.getOrDefault("")
+    return listOf(whenText,versions,message).filter(String::isNotBlank).joinToString(" · ")
+}
+
 /** Touch floor of every Settings row; UI tests assert against this same value. */
 internal val SettingsRowMinHeight = 78.dp
 
@@ -314,10 +345,12 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
     val incoming by vm.incomingBusy.collectAsStateWithLifecycle()
     val callBusy = call.active || incoming || call.state == "ending"
     val context = LocalContext.current
+    val app=context.applicationContext as CypherApplication
     val previewBuild = BuildConfig.APPLICATION_ID.endsWith(".debug")
     val stableBuild = BuildConfig.APPLICATION_ID.endsWith(".stable")
     val client = vm.client
     val scope = rememberCoroutineScope()
+    var appAutoUpdates by remember(context) { mutableStateOf(app.updates.autoUpdateEnabled()) }
     var releaseCheckComplete by remember(client, ui.origin, ui.owner) { mutableStateOf(false) }
     var releaseCheckBusy by remember { mutableStateOf(false) }
     var releaseCheckError by remember { mutableStateOf(false) }
@@ -327,6 +360,12 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
     var pluginError by remember(client, ui.origin, ui.owner) { mutableStateOf(false) }
     var consentRequired by remember(client, ui.origin, ui.owner) { mutableStateOf(false) }
     var consentLines by remember(client, ui.origin, ui.owner) { mutableStateOf(emptyList<String>()) }
+    var pluginAutoUpdates by remember(client,ui.origin,ui.owner) { mutableStateOf(true) }
+    var pluginAutoSettings by remember(client,ui.origin,ui.owner) { mutableStateOf(JSONObject()) }
+    var pluginAutoSettingsAvailable by remember(client,ui.origin,ui.owner) { mutableStateOf(false) }
+    var pluginAutoSettingsMissing by remember(client,ui.origin,ui.owner) { mutableStateOf(false) }
+    var pluginAutoSettingsError by remember(client,ui.origin,ui.owner) { mutableStateOf(false) }
+    var pluginAutoSaving by remember { mutableStateOf(false) }
     val pluginRow = PluginUpdateRowState(pluginVersions, pluginChecking, pluginBusy, consentRequired, pluginError)
     suspend fun refreshPluginVersion(active: CypherClient) {
         if (vm.client !== active) return
@@ -339,6 +378,55 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         } catch (error: CancellationException) { throw error }
         catch (_: Exception) { if (vm.client === active) pluginError = true }
         finally { detached.closeNative(); if (vm.client === active) pluginChecking = false }
+    }
+    suspend fun refreshPluginAutoUpdates(active: CypherClient) {
+        if (vm.client !== active) return
+        val detached=active.detached()
+        try {
+            val state=detached.nativeRequest("/api/plugins/cypher/mobile/update-settings")
+            if (vm.client===active) {
+                pluginAutoSettings=state
+                pluginAutoUpdates=state.optBoolean("enabled",true)
+                pluginAutoSettingsAvailable=true
+                pluginAutoSettingsMissing=false
+                pluginAutoSettingsError=false
+            }
+        } catch (error: CancellationException) { throw error }
+        catch (error: Exception) {
+            if (vm.client===active) {
+                pluginAutoSettingsAvailable=false
+                pluginAutoSettingsMissing=isMissingCypherPluginRoute(error)
+                pluginAutoSettingsError=!pluginAutoSettingsMissing
+            }
+        } finally { detached.closeNative() }
+    }
+    fun setPluginAutoUpdates(enabled: Boolean) {
+        val active=vm.client ?: return
+        val previous=pluginAutoUpdates
+        pluginAutoUpdates=enabled
+        scope.launch {
+            if (vm.client!==active) return@launch
+            pluginAutoSaving=true
+            val detached=active.detached()
+            try {
+                val state=detached.nativeRequest("/api/plugins/cypher/mobile/update-settings","PUT",JSONObject().put("enabled",enabled))
+                if (vm.client===active) {
+                    pluginAutoSettings=state
+                    pluginAutoUpdates=state.optBoolean("enabled",enabled)
+                    pluginAutoSettingsAvailable=true
+                    pluginAutoSettingsMissing=false
+                    pluginAutoSettingsError=false
+                }
+            } catch (error: CancellationException) { throw error }
+            catch (error: Exception) {
+                if (vm.client===active) {
+                    pluginAutoUpdates=previous
+                    pluginAutoSettingsMissing=isMissingCypherPluginRoute(error)
+                    pluginAutoSettingsAvailable=false
+                    pluginAutoSettingsError=!pluginAutoSettingsMissing
+                }
+            } finally { detached.closeNative(); if (vm.client===active) pluginAutoSaving=false }
+        }
     }
     fun updatePlugin(acceptCapabilities: Boolean = false) {
         val active = vm.client ?: return
@@ -406,7 +494,15 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         pluginError = false
         consentRequired = false
         consentLines = emptyList()
-        if (ui.connected && client != null) refreshPluginVersion(client)
+        pluginAutoSettings=JSONObject()
+        pluginAutoUpdates=true
+        pluginAutoSettingsAvailable=false
+        pluginAutoSettingsMissing=false
+        pluginAutoSettingsError=false
+        if (ui.connected && client != null) {
+            refreshPluginVersion(client)
+            refreshPluginAutoUpdates(client)
+        }
     }
     fun alertsEnabled(): Boolean = androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled() &&
         context.getSystemService(android.app.NotificationManager::class.java).getNotificationChannel(dev.hermes.android.updates.UpdateManager.CHANNEL)?.importance != android.app.NotificationManager.IMPORTANCE_NONE
@@ -424,10 +520,14 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
             Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 Icon(Icons.Rounded.SystemUpdate, null, Modifier.size(36.dp), tint = MaterialTheme.colorScheme.primary)
                 Text(update.release?.takeIf { !stableBuild || releaseCheckComplete }?.let { "Cypher ${it.name}" } ?: "Cypher", style = MaterialTheme.typography.headlineSmall)
+                if (!previewBuild) LabeledToggle("Update the app automatically",appAutoUpdates,{ enabled ->
+                    appAutoUpdates=enabled
+                    app.updates.setAutoUpdateEnabled(enabled)
+                },"Install verified app updates when your connection allows.")
                 val appMessage = when {
                     previewBuild -> "Preview builds are installed manually."
                     releaseCheckBusy -> "Checking for updates through Hermes…"
-                    releaseCheckError -> "Couldn't check for updates. Check your Hermes connection and GitHub CLI sign-in."
+                    releaseCheckError -> "Couldn't check for updates. Check your Hermes connection and try again."
                     update.release != null || update.ready -> update.status
                     update.status.contains("up to date", ignoreCase = true) -> "You're up to date."
                     update.status.startsWith("Reconnect to Tailscale") -> "Reconnect to Tailscale to check for updates."
@@ -453,17 +553,27 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
                 Text(pluginVersions?.summary() ?: pluginRow.message, style = MaterialTheme.typography.bodyLarge)
                 if (pluginVersions?.restartRequired == true || pluginError) Text(pluginRow.message, color = if (pluginError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
                 if (pluginChecking || pluginBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                LabeledToggle("Update the Cypher plugin automatically",pluginAutoUpdates,{ enabled -> setPluginAutoUpdates(enabled) },
+                    "Update the plugin on Hermes when a new version is ready.",enabled=pluginAutoSettingsAvailable && !pluginAutoSaving)
+                when {
+                    pluginAutoSettingsAvailable -> Text(pluginAutoUpdateLine(pluginAutoSettings),style=MaterialTheme.typography.bodySmall,
+                        color=MaterialTheme.colorScheme.onSurfaceVariant,maxLines=1,overflow=androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                    pluginAutoSettingsMissing -> Text("Update the Cypher plugin on Hermes to manage automatic plugin updates.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
+                    pluginAutoSettingsError -> Text("Couldn't load automatic plugin updates. Try again.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.error)
+                    !ui.connected || client==null -> Text("Connect to Hermes to change this setting.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                if (pluginAutoSaving) LinearProgressIndicator(Modifier.fillMaxWidth())
                 Button(onClick = { updatePlugin() }, enabled = ui.connected && client != null && pluginRow.canUpdate, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
                     Text(pluginRow.buttonText)
                 }
             }
         }
         if (!previewBuild) {
-            Text("Cypher downloads and verifies the update; Android asks you to install it.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Cypher verifies each app update before installing it.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (!alertsAllowed) OutlinedButton(onClick = {
                 context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
             }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Allow update notifications") }
-            Text("Background checks need Tailscale.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Automatic app updates need a connection to Hermes.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
     }

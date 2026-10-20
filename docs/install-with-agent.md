@@ -76,7 +76,7 @@ Do not copy, print, or log the route response. Loopback mode may include a sessi
 
 ## 4. Finish on the phone
 
-Tell the user to download and install the latest stable `Cypher-<version>.apk` from the private repository's [Releases page](https://github.com/xploit9/cypher/releases), open the dashboard's **Cypher** tab, and scan the QR with the Cypher app. Later app and plugin updates arrive in Settings **App updates**.
+Tell the user to download and install the latest stable `Cypher-<version>.apk` from the private repository's [Releases page](https://github.com/xploit9/cypher/releases), open the dashboard's **Cypher** tab, and scan the QR with the Cypher app. App and plugin automatic updates are on by default in Settings **App updates**; app downloads use an unmetered connection and keep package, version, checksum and signer verification, with a tap-to-install notice whenever Android requires confirmation.
 
 Sign-in uses Hermes' normal OAuth browser flow. If the browser is already signed in, one tap completes it. That single sign-in covers chat, history, plugin pages, calls, and Keep connected. If the dashboard has no accounts and is in loopback mode, scanning the QR signs in immediately.
 

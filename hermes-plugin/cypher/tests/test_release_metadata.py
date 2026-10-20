@@ -39,6 +39,7 @@ def test_release_script_writes_canonical_stable_asset_and_feed_fields(tmp_path,m
             return "package: name='dev.hermes.android.stable' versionCode='100' versionName='1.0.0'"
         return 'Signer #1 certificate SHA-256 digest: '+certificate
     monkeypatch.setattr(module,'_run',run)
+    plugin_version=next(line.split(':',1)[1].strip() for line in (ROOT/'hermes-plugin'/'cypher'/'plugin.yaml').read_text(encoding='utf-8').splitlines() if line.startswith('version:'))
 
     artifact,manifest,metadata=module.write_release_metadata(apk,tmp_path/'release',aapt=str(aapt),apksigner=str(signer))
 
@@ -49,6 +50,7 @@ def test_release_script_writes_canonical_stable_asset_and_feed_fields(tmp_path,m
         'package_name':'dev.hermes.android.stable',
         'version_code':100,
         'version_name':'1.0.0',
+        'plugin_version':plugin_version,
         'certificate_sha256':certificate,
         'sha256':hashlib.sha256(contents).hexdigest(),
         'size_bytes':len(contents),

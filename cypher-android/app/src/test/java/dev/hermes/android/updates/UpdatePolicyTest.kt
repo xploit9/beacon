@@ -65,8 +65,23 @@ class UpdatePolicyTest {
         assertTrue(updateCheckDue(0, 1, false))
         assertFalse(updateCheckDue(1_000, 2_000, false))
         assertTrue(updateCheckDue(1_000, 2_000, true))
-        assertTrue(updateCheckDue(1_000, 901_000, false))
+        assertFalse(updateCheckDue(1_000, 1_000 + 12 * 60 * 60_000L - 1, false))
+        assertTrue(updateCheckDue(1_000, 1_000 + 12 * 60 * 60_000L, false))
         assertTrue(updateCheckDue(2_000, 1_000, false))
+    }
+
+    @Test fun automaticUpdateDefaultsOnAndNeedsUnmeteredNetworkWithoutAnActiveCall() {
+        assertTrue(autoUpdateEnabled(null))
+        assertTrue(autoUpdateEnabled(true))
+        assertFalse(autoUpdateEnabled(false))
+        assertTrue(autoUpdateCheckDue(true,0,1))
+        assertFalse(autoUpdateCheckDue(false,0,1))
+        assertFalse(autoUpdateCheckDue(true,1_000,1_000+12*60*60_000L-1))
+        assertTrue(autoUpdateCheckDue(true,1_000,1_000+12*60*60_000L))
+        assertTrue(autoUpdateInstallAllowed(true, unmetered = true, callActive = false))
+        assertFalse(autoUpdateInstallAllowed(false, unmetered = true, callActive = false))
+        assertFalse(autoUpdateInstallAllowed(true, unmetered = false, callActive = false))
+        assertFalse(autoUpdateInstallAllowed(true, unmetered = true, callActive = true))
     }
 
     @Test fun externalIntentCannotSupplyUrlIdentityOrCredentials() {

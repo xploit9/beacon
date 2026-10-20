@@ -1,0 +1,180 @@
+import asyncio
+import importlib.util
+import sys
+import threading
+import uuid
+from types import SimpleNamespace
+
+import pytest
+from test_mobile import harness
+
+
+def _release(plugin_version='1.0.0', available=False):
+    return {
+        'version_code': 100,
+        'version_name': '1.0.0',
+        'plugin_version': plugin_version,
+        'available': available,
+    }
+
+
+def _auto(api, monkeypatch, *, plugin_version='1.0.0', busy=False):
+    checked=[]
+    updated=[]
+    installed=['1.0.0']
+    monkeypatch.setattr(api, '_check_release_and_announce', lambda cfg: checked.append(True) or _release(plugin_version))
+    monkeypatch.setattr(api, '_installed_plugin_version', lambda: installed[0])
+    monkeypatch.setattr(api, '_hermes_busy', lambda owner: busy)
+    def update():
+        updated.append('cypher');installed[0]=plugin_version
+        return {'ok': True, 'gateway_reloaded': True, 'restart_required': False}
+    monkeypatch.setattr(api, '_update_cypher_plugin', update)
+    return checked, updated
+
+
+def _restarted_api(api):
+    name='cypher_auto_update_restart_'+uuid.uuid4().hex
+    spec=importlib.util.spec_from_file_location(name,api.ROOT/'dashboard'/'plugin_api.py')
+    restarted=importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(restarted)
+    return restarted
+
+
+def test_plugin_update_setting_defaults_on_and_is_owner_scoped(harness):
+    _,client,_,_,_=harness
+    path='/api/plugins/cypher/mobile/update-settings'
+
+    assert client.get(path).json()['enabled'] is True
+    assert client.put(path,json={'enabled':False}).json()['enabled'] is False
+    assert client.get(path).json()['enabled'] is False
+    assert client.put(path,json={'enabled':0}).status_code==400
+    client.headers['x-fixture-owner']='foreign'
+    assert client.get(path).status_code==403
+    assert client.put(path,json={'enabled':True}).status_code==403
+
+
+def test_auto_check_is_six_hour_throttled_across_module_restart(harness,monkeypatch):
+    api,_,cfg,_,_=harness
+    checked,_=_auto(api,monkeypatch)
+    now=2_000_000
+
+    api.auto_update_check(cfg,now=now)
+    restarted=_restarted_api(api)
+    monkeypatch.setattr(restarted,'_check_release_and_announce',lambda cfg: checked.append(True) or _release())
+    monkeypatch.setattr(restarted,'_installed_plugin_version',lambda:'1.0.0')
+    monkeypatch.setattr(restarted,'_hermes_busy',lambda owner:False)
+    assert restarted.auto_update_check(cfg,now=now+6*60*60-1)['result']=='throttled'
+    assert len(checked)==1
+
+    restarted.auto_update_check(cfg,now=now+6*60*60)
+    assert len(checked)==2
+
+
+def test_newer_plugin_uses_hermes_native_update_path_when_enabled(harness,monkeypatch):
+    api,client,cfg,_,_=harness
+    checked,updated=_auto(api,monkeypatch,plugin_version='1.1.0')
+
+    result=api.auto_update_check(cfg,now=2_000_000)
+
+    assert len(checked)==1 and updated==['cypher']
+    assert result['result']=='plugin_updated'
+    assert client.get('/api/plugins/cypher/mobile/update-settings').json()['plugin_version']=='1.1.0'
+
+
+def test_disabled_plugin_auto_update_does_not_call_hermes_updater(harness,monkeypatch):
+    api,client,cfg,_,_=harness
+    client.put('/api/plugins/cypher/mobile/update-settings',json={'enabled':False})
+    checked,updated=_auto(api,monkeypatch,plugin_version='1.1.0')
+
+    api.auto_update_check(cfg,now=2_000_000)
+
+    assert len(checked)==1 and updated==[]
+
+
+def test_active_hermes_work_defers_reload_and_records_restart_hint(harness,monkeypatch):
+    api,client,cfg,_,_=harness
+    checked,updated=_auto(api,monkeypatch,plugin_version='1.1.0',busy=True)
+
+    result=api.auto_update_check(cfg,now=2_000_000)
+
+    assert len(checked)==1 and updated==[]
+    assert result['result']=='restart_required'
+    assert result['message']=='Restart Hermes to finish the plugin update.'
+    assert client.get('/api/plugins/cypher/mobile/update-settings').json()['message']==result['message']
+
+
+def test_deferred_plugin_update_retries_when_hermes_becomes_idle_without_another_release_check(harness,monkeypatch):
+    api,_,cfg,_,_=harness
+    checked,updated=_auto(api,monkeypatch,plugin_version='1.1.0',busy=True)
+    first=api.auto_update_check(cfg,now=2_000_000)
+    assert first['result']=='restart_required' and updated==[]
+    monkeypatch.setattr(api,'_hermes_busy',lambda owner:False)
+
+    result=api.auto_update_check(cfg,now=2_000_060)
+
+    assert result['result']=='plugin_updated'
+    assert len(checked)==1 and updated==['cypher']
+
+
+def test_auto_checks_serialize_one_in_flight_release_check(harness,monkeypatch):
+    api,_,cfg,_,_=harness
+    entered=threading.Event();release=threading.Event();calls=[]
+    def slow_check(cfg):
+        calls.append(True);entered.set();release.wait(2);return _release()
+    monkeypatch.setattr(api,'_check_release_and_announce',slow_check)
+    monkeypatch.setattr(api,'_installed_plugin_version',lambda:'1.0.0')
+    monkeypatch.setattr(api,'_hermes_busy',lambda owner:False)
+    first=threading.Thread(target=lambda:api.auto_update_check(cfg,now=2_000_000))
+    first.start()
+    assert entered.wait(2)
+    second=api.auto_update_check(cfg,now=2_000_000)
+    release.set();first.join(2)
+
+    assert not first.is_alive()
+    assert len(calls)==1
+    assert second['result'] in {'in_progress','throttled'}
+
+
+def test_failed_release_check_is_recorded_without_stopping_watcher(harness,monkeypatch):
+    api,client,cfg,_,_=harness
+    def fail(_cfg): raise OSError('offline')
+    monkeypatch.setattr(api,'_check_release_and_announce',fail)
+
+    result=api.auto_update_check(cfg,now=2_000_000)
+
+    assert result['result']=='error'
+    saved=client.get('/api/plugins/cypher/mobile/update-settings').json()
+    assert saved['checked_at']==2_000_000 and saved['result']=='error'
+
+
+def test_idle_guard_detects_active_hermes_work_and_phone_calls(harness,monkeypatch):
+    api,_,_,_,_=harness
+    status={'active_agents':1,'active_work':['chat'],'gateway_state':'running'}
+    monkeypatch.setitem(sys.modules,'gateway.status',SimpleNamespace(
+        get_running_pid=lambda:123,read_runtime_status=lambda:status))
+
+    assert api._hermes_busy('owner')
+    status.update(active_agents=0,active_work=[],gateway_state='running')
+    api.mobile.reserve('owner','default','active-call-session')
+    assert api._hermes_busy('owner')
+
+
+@pytest.mark.asyncio
+async def test_watcher_keeps_call_and_notice_delivery_moving_during_auto_check(harness,monkeypatch):
+    api,_,_,_,_=harness
+    entered=threading.Event();release=threading.Event();delivered=[]
+    def slow_check(_cfg): entered.set();release.wait(2)
+    monkeypatch.setattr(api,'auto_update_check',slow_check)
+    monkeypatch.setattr(api,'announce_release',lambda _cfg:None)
+    monkeypatch.setattr(api,'_warm_profile',lambda *_args:None)
+    monkeypatch.setattr(api,'watch',lambda *_args:delivered.append('watch'))
+    monkeypatch.setattr(api,'push',lambda *_args:delivered.append('push'))
+    api._jobs_upgraded.clear()
+    await api.start_watcher()
+    try:
+        assert await asyncio.to_thread(entered.wait,1)
+        await asyncio.sleep(0.05)
+        assert 'watch' in delivered and 'push' in delivered
+    finally:
+        release.set()
+        await api.stop_watcher()

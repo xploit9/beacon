@@ -29,6 +29,18 @@ ROOT=Path(__file__).resolve().parent.parent
 _RELEASE_CACHE_LOCK=threading.RLock()
 _RELEASE_CACHE_KEY=None
 _RELEASE_CACHE_VALUE=None
+_PRODUCTION_PACKAGE='dev.hermes.android'
+_STABLE_PACKAGE='dev.hermes.android.stable'
+_PREVIEW_PACKAGE='dev.hermes.android.debug'
+_SUPPORTED_PHONE_PACKAGES=(_PRODUCTION_PACKAGE,_STABLE_PACKAGE,_PREVIEW_PACKAGE)
+_RELEASE_CHECK_LOCK=threading.Lock()
+_AUTO_UPDATE_LOCK=threading.Lock()
+def _target_package(payload):
+    try: package=json.loads(payload or '{}').get('package_name')
+    except Exception: package=None
+    return package if package in _SUPPORTED_PHONE_PACKAGES else _PRODUCTION_PACKAGE
+def _notice_package(row):
+    return _STABLE_PACKAGE if str(row.get('conversation','')).startswith('release-stable-') else _PRODUCTION_PACKAGE
 def _read_plugin_version(path):
     try:
         import yaml
@@ -244,6 +256,16 @@ async def save_history_retention(request:Request):
         raise HTTPException(400,'Choose Forever, 1 year, 90 days, or 30 days')
     days=await asyncio.to_thread(mobile.set_history_retention_days,owner,days)
     return JSONResponse({'history_retention_days':days},headers={'Cache-Control':'no-store'})
+@router.get('/mobile/update-settings')
+async def auto_update_settings(request:Request):
+    owner,_,_,_=identity(request,owner_only=True)
+    return JSONResponse(await asyncio.to_thread(mobile.auto_update_settings,owner),headers={'Cache-Control':'no-store'})
+@router.put('/mobile/update-settings')
+async def save_auto_update_settings(request:Request):
+    owner,_,_,_=identity(request,owner_only=True);value=await body(request,1024)
+    enabled=value.get('enabled')
+    if set(value)!={'enabled'} or type(enabled) is not bool: raise HTTPException(400,'Choose whether Cypher updates the plugin automatically')
+    return JSONResponse(await asyncio.to_thread(mobile.set_auto_plugin_updates,owner,enabled),headers={'Cache-Control':'no-store'})
 @router.put('/mobile/voice-settings')
 async def save_voice_settings(request:Request):
     owner,_,profile,cfg=identity(request);value=await body(request,1024)
@@ -530,16 +552,18 @@ async def notification_test(request:Request):
 async def target(request:Request):
     value=await body(request,8192);owner,_,profile,_=identity(request,value.get('profile'))
     tok=value.get('token') or value.get('fcm_token')
-    tid=value.get('id') or value.get('device_id') or hashlib.sha256((owner+':'+profile+':'+str(tok)).encode()).hexdigest()
+    package=value.get('package_name',_PRODUCTION_PACKAGE)
+    tid=value.get('id') or value.get('device_id') or hashlib.sha256((owner+':'+profile+':'+package+':'+str(tok)).encode()).hexdigest()
     safely(mobile.ident,tid)
     if not isinstance(tok,str) or not 20<=len(tok)<=4096 or any(ord(c)<32 for c in tok): raise HTTPException(400,'Invalid FCM target')
+    if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Cypher package')
     with mobile.LOCK,mobile.connect() as conn:
         conn.execute('DELETE FROM targets WHERE expires<=?',(time.time(),))
         if conn.execute('SELECT COUNT(*) FROM targets').fetchone()[0]>=32 and not conn.execute('SELECT 1 FROM targets WHERE id=?',(tid,)).fetchone(): raise HTTPException(409,'Target capacity reached')
         old=conn.execute('SELECT owner,profile,token FROM targets WHERE id=?',(tid,)).fetchone()
         if old and (old['owner']!=owner or old['profile']!=profile): raise HTTPException(409,'Target already owned')
         if old and old['token']!=tok: conn.execute('DELETE FROM notice_deliveries WHERE target=?',(tid,))
-        conn.execute('INSERT INTO targets VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET token=excluded.token,expires=excluded.expires',(tid,owner,profile,tok,time.time()+30*86400,'{}'))
+        conn.execute('INSERT INTO targets VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET token=excluded.token,expires=excluded.expires,payload=excluded.payload',(tid,owner,profile,tok,time.time()+30*86400,json.dumps({'package_name':package})))
     return {'id':tid,'target_id':tid,'registered':True,'target':{'id':tid,'target_id':tid,**mobile.refs(owner,profile)},**mobile.refs(owner,profile)}
 @router.delete('/mobile/notifications/targets')
 async def remove_target(request:Request):
@@ -555,17 +579,19 @@ async def remove_target_id(target_id:str,request:Request):
 @router.get('/mobile/notifications/events')
 async def notices(request:Request,after:int=0,wait:float=0):
     owner,provider,profile,_=identity(request)
+    package=request.query_params.get('package',_PRODUCTION_PACKAGE)
+    if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Cypher package')
     if after<0: raise HTTPException(400,'Invalid cursor')
     duration=_bounded_event_wait(wait)
     async def snapshot():
         await asyncio.to_thread(mobile.prune_history,owner)
         await asyncio.to_thread(sys.modules['cypher_callbacks'].prune_expired,mobile,owner)
         await asyncio.to_thread(watch,owner,provider,profile)
-        return await asyncio.to_thread(_notices_after,owner,profile,after)
+        return await asyncio.to_thread(_notices_after,owner,profile,after,package)
     rows,reset,cursor=await snapshot()
     if rows or reset or duration<=0:
         key=mobile.reference_key() if rows else None
-        result={'events':[notice_wire(r,owner,key) for r in rows],'next_cursor':rows[-1]['seq'] if rows else cursor}
+        result={'events':[notice_wire(r,owner,key) for r in rows],'next_cursor':cursor}
         if reset: result['reset']=True
         return result
     loop=asyncio.get_running_loop();deadline=loop.time()+duration
@@ -573,21 +599,24 @@ async def notices(request:Request,after:int=0,wait:float=0):
         remaining=deadline-loop.time()
         if remaining<=0: break
         await asyncio.sleep(min(1.0,remaining))
-        rows,reset,cursor=await asyncio.to_thread(_notices_after,owner,profile,after)
+        rows,reset,cursor=await asyncio.to_thread(_notices_after,owner,profile,after,package)
         if rows or reset: break
+        after=cursor
         if await request.is_disconnected(): break
     key=mobile.reference_key() if rows else None
-    result={'events':[notice_wire(r,owner,key) for r in rows],'next_cursor':rows[-1]['seq'] if rows else cursor}
+    result={'events':[notice_wire(r,owner,key) for r in rows],'next_cursor':cursor}
     if reset: result['reset']=True
     return result
 
-def _notices_after(owner,profile,after):
+def _notices_after(owner,profile,after,package=_PRODUCTION_PACKAGE):
     with mobile.connect() as conn:
         sequence=conn.execute("SELECT seq FROM sqlite_sequence WHERE name='notices'").fetchone()
         max_seq=sequence[0] if sequence else 0
         reset=after>max_seq
-        rows=conn.execute('SELECT * FROM notices WHERE owner=? AND profile=? AND seq>? ORDER BY seq LIMIT 100',(owner,profile,0 if reset else after))
-        return [dict(r) for r in rows],reset,max_seq if reset else after
+        rows=[dict(r) for r in conn.execute('SELECT * FROM notices WHERE owner=? AND profile=? AND seq>? ORDER BY seq LIMIT 100',(owner,profile,0 if reset else after))]
+    cursor=rows[-1]['seq'] if rows else max_seq if reset else after
+    visible=[row for row in rows if row['kind']!='release' or _notice_package(row)==package]
+    return visible,reset,cursor
 def notice_preview(kind):
     if kind=='release': return 'Cypher update available','Open Cypher to install the latest verified update.'
     if kind=='test': return 'Cypher notification test','Synthetic test. Seeing this notification confirms arrival on this phone.'
@@ -620,9 +649,11 @@ def notice_wire(row,owner,key=None):
 @router.get('/mobile/notifications/events/{event_id}')
 async def notice_detail(event_id:str,request:Request):
     owner,provider,profile,_=identity(request)
+    package=request.query_params.get('package',_PRODUCTION_PACKAGE)
+    if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Cypher package')
     with mobile.connect() as conn:
         row=conn.execute('SELECT * FROM notices WHERE id=? AND owner=? AND profile=?',(event_id,owner,profile)).fetchone()
-    if not row: raise HTTPException(404,'Owned notification unavailable')
+    if not row or row['kind']=='release' and _notice_package(dict(row))!=package: raise HTTPException(404,'Owned notification unavailable')
     result=notice_wire(dict(row),owner)
     if row['kind']=='completion' and row['conversation']:
         # The notification shows what the reply says; Android's lock-screen setting still hides it when locked.
@@ -768,7 +799,7 @@ def _push_devices(owner,profile):
     if not credentials: return
     with mobile.connect() as conn:
         rows=[dict(r) for r in conn.execute("SELECT * FROM notices WHERE owner=? AND profile=? AND push='pending' AND state='pending' AND expires>? ORDER BY seq LIMIT 64",(owner,profile,time.time()))]
-        targets=[dict(r) for r in conn.execute('SELECT id,token FROM targets WHERE owner=? AND profile=? AND expires>?',(owner,profile,time.time()))]
+        targets=[dict(r) for r in conn.execute('SELECT id,token,payload FROM targets WHERE owner=? AND profile=? AND expires>?',(owner,profile,time.time()))]
     if not targets: return
     try:
         import firebase_admin
@@ -776,7 +807,8 @@ def _push_devices(owner,profile):
         try: app=firebase_admin.get_app('cypher')
         except ValueError: app=firebase_admin.initialize_app(fb_credentials.Certificate(credentials),options={'httpTimeout':10},name='cypher')
         for row in rows:
-            for target in targets:
+            eligible_targets=[target for target in targets if row['kind']!='release' or _target_package(target.get('payload'))==_notice_package(row)]
+            for target in eligible_targets:
                 now=time.time()
                 with mobile.LOCK,mobile.connect() as conn:
                     current=conn.execute("SELECT 1 FROM notices WHERE id=? AND state='pending' AND expires>?",(row['id'],now)).fetchone()
@@ -798,19 +830,19 @@ def _push_devices(owner,profile):
                         conn.execute('INSERT OR REPLACE INTO notice_deliveries VALUES(?,?,?,?,?,?)',(row['id'],target['id'],accepted,attempts,0 if accepted else time.time()+min(60,3*2**min(attempts-1,5)),error))
                         if error=='UnregisteredError': conn.execute('UPDATE targets SET expires=0 WHERE id=?',(target['id'],))
             with mobile.LOCK,mobile.connect() as conn:
-                remaining=conn.execute('SELECT COUNT(*) FROM targets t WHERE t.owner=? AND t.profile=? AND t.expires>? AND NOT EXISTS(SELECT 1 FROM notice_deliveries d WHERE d.event=? AND d.target=t.id AND d.accepted>0)',(owner,profile,time.time(),row['id'])).fetchone()[0]
+                remaining=sum(not conn.execute('SELECT 1 FROM notice_deliveries WHERE event=? AND target=? AND accepted>0',(row['id'],target['id'])).fetchone() for target in eligible_targets)
                 accepted=conn.execute('SELECT COUNT(*) FROM notice_deliveries WHERE event=? AND accepted>0',(row['id'],)).fetchone()[0]
                 if not remaining and accepted: conn.execute("UPDATE notices SET push='sent' WHERE id=?",(row['id'],))
     except Exception: return
 
-_PRODUCTION_PACKAGE='dev.hermes.android'
-_STABLE_PACKAGE='dev.hermes.android.stable'
 _release_failures={}
-def announce_release(cfg):
+def announce_release(cfg,package=_PRODUCTION_PACKAGE):
     """A changed verified feed creates durable hints; clients still verify before installing."""
+    if package not in (_PRODUCTION_PACKAGE,_STABLE_PACKAGE): raise ValueError('Invalid Cypher package')
     owner=cfg.get('owner_id');profiles=cfg.get('profiles',[])
     if not owner or not cfg.get('owner_provider') or not profiles: return
-    manifest=_release_root(cfg)/'latest.json'
+    stable=package==_STABLE_PACKAGE
+    manifest=_release_root(cfg,stable=stable)/'latest.json'
     if not manifest.is_file(): return
     with manifest.open('rb') as stream: raw=stream.read(16385)
     if len(raw)>16384: return
@@ -818,12 +850,12 @@ def announce_release(cfg):
     if _release_failures.get(cache_key)==fingerprint: return
     candidate=json.loads(raw.decode('utf-8-sig')).get('version_code')
     if type(candidate) is not int or not 20<candidate<=2147483647: return
-    def key(profile): return 'release-announced:'+hashlib.sha256((owner+'\0'+profile).encode()).hexdigest()
+    def key(profile): return 'release-announced:'+hashlib.sha256((owner+'\0'+profile+'\0'+package).encode()).hexdigest()
     with mobile.connect() as conn:
-        wanted=[profile for profile in profiles if conn.execute('SELECT 1 FROM targets WHERE owner=? AND profile=? AND expires>?',(owner,profile,time.time())).fetchone()
+        wanted=[profile for profile in profiles if any(_target_package(row['payload'])==package for row in conn.execute('SELECT payload FROM targets WHERE owner=? AND profile=? AND expires>?',(owner,profile,time.time())))
                 and int((conn.execute('SELECT value FROM meta WHERE key=?',(key(profile),)).fetchone() or [0])[0])<candidate]
     if not wanted: return
-    try: verified=release(cfg)
+    try: verified=release(cfg,package=package)
     except Exception:
         _release_failures[cache_key]=fingerprint
         raise
@@ -833,12 +865,12 @@ def announce_release(cfg):
         for profile in wanted:
             previous=conn.execute('SELECT value FROM meta WHERE key=?',(key(profile),)).fetchone()
             if previous and int(previous[0])>=version: continue
-            if not conn.execute('SELECT 1 FROM targets WHERE owner=? AND profile=? AND expires>?',(owner,profile,time.time())).fetchone(): continue
+            if not any(_target_package(row['payload'])==package for row in conn.execute('SELECT payload FROM targets WHERE owner=? AND profile=? AND expires>?',(owner,profile,time.time()))): continue
             mobile.prune_notices(conn)
             if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: raise RuntimeError('Notification capacity reached')
-            event=hashlib.sha256((owner+'\0'+profile+'\0release:'+str(version)+':'+verified['sha256']).encode()).hexdigest()
+            event=hashlib.sha256((owner+'\0'+profile+'\0release:'+package+':'+str(version)+':'+verified['sha256']).encode()).hexdigest()
             conn.execute('INSERT OR IGNORE INTO notices(id,owner,profile,kind,conversation,created,expires,release_version) VALUES(?,?,?,?,?,?,?,?)',
-                         (event,owner,profile,'release','release-'+str(version),time.time(),time.time()+7*86400,version))
+                         (event,owner,profile,'release',('release-stable-' if stable else 'release-')+str(version),time.time(),time.time()+7*86400,version))
             conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(key(profile),version))
 def release(cfg,optional=False,digest=None,package=None,root_path=None):
     with _RELEASE_CACHE_LOCK:
@@ -916,14 +948,18 @@ def _release(cfg,optional=False,digest=None,package=None,root_path=None):
     artifact_path='/api/plugins/cypher/mobile/releases/'+digest+'/download'
     if stable: artifact_path+='?package='+_STABLE_PACKAGE
     result={k:data[k] for k in ('version_code','version_name','package_name','certificate_sha256','sha256','size_bytes')} | {'available':True,'download_url':artifact_path,'artifact_path':artifact_path,'min_contract_version':2,'max_contract_version':2}
+    if isinstance(data.get('plugin_version'),str): result['plugin_version']=data['plugin_version']
     _RELEASE_CACHE_KEY=cache_key;_RELEASE_CACHE_VALUE=dict(result)
     return result
 @router.get('/mobile/releases/latest')
 async def latest(request:Request):
-    _,_,_,cfg=identity(request);return await asyncio.to_thread(safely,release,cfg,False,None,request.query_params.get('package'))
+    _,_,_,cfg=identity(request);package=request.query_params.get('package')
+    if package and package not in (_PRODUCTION_PACKAGE,_STABLE_PACKAGE): raise HTTPException(400,'Unsupported Cypher update package')
+    return await asyncio.to_thread(safely,release,cfg,False,None,package)
 @router.get('/mobile/releases/{digest}/download')
 async def download(digest:str,request:Request):
     _,_,_,cfg=identity(request);package=request.query_params.get('package')
+    if package and package not in (_PRODUCTION_PACKAGE,_STABLE_PACKAGE): raise HTTPException(400,'Unsupported Cypher update package')
     metadata=await asyncio.to_thread(safely,release,cfg,False,digest,package)
     if digest!=metadata['sha256']: raise HTTPException(404,'Immutable artifact unavailable')
     root=_release_root(cfg,stable=package==_STABLE_PACKAGE).resolve();data=json.loads((root/(digest+'.json')).read_text(encoding='utf-8-sig'));path=root/data['artifact_filename']
@@ -976,7 +1012,12 @@ def _atomic_write(destination,content,immutable=False):
         try: temporary.unlink()
         except FileNotFoundError: pass
 
+def _plugin_version_tuple(value):
+    match=re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)',value) if isinstance(value,str) else None
+    return tuple(int(part) for part in match.groups()) if match else None
+
 def _check_github_release(cfg):
+    global _RELEASE_CACHE_KEY,_RELEASE_CACHE_VALUE
     repo=_safe_release_repo(cfg)
     gh=shutil.which('gh')
     if not gh: raise ReleaseCheckError('GitHub CLI is not installed on your PC.')
@@ -1012,6 +1053,9 @@ def _check_github_release(cfg):
             manifest_bytes=manifest.read_bytes();data=json.loads(manifest_bytes.decode('utf-8-sig'))
         except Exception: raise ReleaseCheckError('The GitHub release metadata is invalid.') from None
         artifact_name=f'Cypher-{name[1]}.apk'
+        plugin_version=data.get('plugin_version') if isinstance(data,dict) else None
+        if _plugin_version_tuple(plugin_version) is None:
+            raise ReleaseCheckError('The GitHub release metadata must include a valid Cypher plugin version.')
         if (not isinstance(data,dict) or data.get('artifact_filename')!=artifact_name or data.get('package_name')!=_STABLE_PACKAGE
                 or data.get('version_name')!=name[1] or type(data.get('version_code')) is not int or data['version_code']<=20
                 or type(data.get('size_bytes')) is not int or not 1<=data['size_bytes']<=256*1024*1024
@@ -1024,14 +1068,21 @@ def _check_github_release(cfg):
         except Exception: pass
         if previous and previous.get('package_name')==_STABLE_PACKAGE:
             if data['version_code']<previous['version_code']:
-                return {'version_name':data['version_name'],'version_code':data['version_code'],'available':False}
+                return {'version_name':data['version_name'],'version_code':data['version_code'],'plugin_version':plugin_version,'available':False}
             if data['version_code']==previous['version_code']:
                 if digest!=previous['sha256']:
                     raise ReleaseCheckError('A published Cypher version cannot be replaced with different APK bytes.')
                 if (data['version_name']!=previous['version_name'] or
                         data['certificate_sha256'].lower()!=previous['certificate_sha256'].lower()):
                     raise ReleaseCheckError('A published Cypher version cannot change its release metadata.')
-                return {'version_name':data['version_name'],'version_code':data['version_code'],'available':False}
+                previous_plugin=previous.get('plugin_version','')
+                if _plugin_version_tuple(previous_plugin) and _plugin_version_tuple(plugin_version)<_plugin_version_tuple(previous_plugin):
+                    raise ReleaseCheckError('A published Cypher release cannot downgrade its plugin version.')
+                if plugin_version!=previous_plugin:
+                    root=_release_root(cfg,create=True,stable=True)
+                    _atomic_write(root.resolve()/'latest.json',manifest_bytes)
+                    with _RELEASE_CACHE_LOCK: _RELEASE_CACHE_KEY=None;_RELEASE_CACHE_VALUE=None
+                return {'version_name':data['version_name'],'version_code':data['version_code'],'plugin_version':plugin_version,'available':False}
 
         apks=download(artifact_name)
         if len(apks)!=1 or apks[0].name!=artifact_name:
@@ -1054,16 +1105,95 @@ def _check_github_release(cfg):
         _atomic_copy(apk,root/data['artifact_filename'],digest)
         _atomic_write(root/(digest+'.json'),manifest_bytes,immutable=True)
         _atomic_write(root/'latest.json',manifest_bytes)
-        global _RELEASE_CACHE_KEY,_RELEASE_CACHE_VALUE
         with _RELEASE_CACHE_LOCK: _RELEASE_CACHE_KEY=None;_RELEASE_CACHE_VALUE=None
-        return {'version_name':verified['version_name'],'version_code':verified['version_code'],'available':True}
+        return {'version_name':verified['version_name'],'version_code':verified['version_code'],'plugin_version':plugin_version,'available':True}
+
+def _check_release_and_announce(cfg):
+    with _RELEASE_CHECK_LOCK:
+        checked=_check_github_release(cfg)
+        if checked.get('available'): announce_release(cfg,package=_STABLE_PACKAGE)
+        return checked
 
 @router.post('/mobile/releases/check')
 async def check_release_updates(request:Request):
     _,_,_,cfg=identity(request,owner_only=True)
-    try: return await asyncio.to_thread(_check_github_release,cfg)
+    try: return await asyncio.to_thread(_check_release_and_announce,cfg)
     except ReleaseCheckError as error: raise HTTPException(503,str(error)) from None
     except Exception: raise HTTPException(503,'The verified Cypher release could not be saved on Hermes.') from None
+
+def _installed_plugin_version():
+    return _read_plugin_version(ROOT/'plugin.yaml')
+
+def _hermes_busy(owner):
+    try:
+        from gateway.status import get_running_pid,read_runtime_status
+        runtime=read_runtime_status()
+        if runtime is None:
+            if get_running_pid() is not None: return True
+        elif (type(runtime.get('active_agents')) is not int or runtime['active_agents']>0 or runtime.get('active_work')
+              or runtime.get('gateway_state') not in ('running','degraded')): return True
+        with mobile.connect() as conn:
+            return mobile.active_calls(conn,owner)>0
+    except Exception:
+        return True
+
+def _update_cypher_plugin():
+    from hermes_cli.plugins_cmd import dashboard_update_user_plugin
+    return dashboard_update_user_plugin('cypher')
+
+def _auto_update_plugin(owner,checked_at,app_version,plugin_version):
+    if not mobile.auto_update_settings(owner)['enabled']:
+        return mobile.record_auto_update_status(owner,checked_at,'plugin_update_available',app_version,plugin_version,'Plugin update available.')
+    if _hermes_busy(owner):
+        state=mobile.record_auto_update_status(owner,checked_at,'restart_required',app_version,plugin_version,'Restart Hermes to finish the plugin update.')
+        return {**state,'_deferred':True}
+    update=_update_cypher_plugin()
+    if update.get('consent_required'):
+        return mobile.record_auto_update_status(owner,checked_at,'consent_required',app_version,plugin_version,'Review plugin capability changes in Settings.')
+    if not update.get('ok'):
+        return mobile.record_auto_update_status(owner,checked_at,'error',app_version,plugin_version,'Could not update the Cypher plugin. Try again later.')
+    installed=_plugin_version_tuple(_installed_plugin_version())
+    latest=_plugin_version_tuple(plugin_version)
+    if installed is None or latest is None or installed<latest:
+        return mobile.record_auto_update_status(owner,checked_at,'error',app_version,plugin_version,'The updated plugin version could not be confirmed.')
+    if update.get('restart_required'):
+        return mobile.record_auto_update_status(owner,checked_at,'restart_required',app_version,plugin_version,'Restart Hermes to finish the plugin update.')
+    return mobile.record_auto_update_status(owner,checked_at,'plugin_updated',app_version,plugin_version,'Cypher plugin updated.')
+
+def auto_update_check(cfg,now=None):
+    owner=cfg.get('owner_id')
+    if not owner or not cfg.get('owner_provider'): return None
+    if not _AUTO_UPDATE_LOCK.acquire(blocking=False): return {'result':'in_progress'}
+    try:
+        now=time.time() if now is None else now
+        current_state=mobile.auto_update_settings(owner)
+        last=current_state.get('checked_at',0)
+        if type(last) in (int,float) and last and now>=last and now-last<mobile.AUTO_UPDATE_INTERVAL_SECONDS:
+            pending_version=_plugin_version_tuple(current_state.get('plugin_version',''))
+            installed_version=_plugin_version_tuple(_installed_plugin_version())
+            if current_state.get('result')=='restart_required' and pending_version and installed_version and pending_version>installed_version:
+                try: return _auto_update_plugin(owner,last,current_state.get('app_version',''),current_state.get('plugin_version',''))
+                except Exception: return mobile.record_auto_update_status(owner,last,'error',current_state.get('app_version',''),current_state.get('plugin_version',''),'Could not update the Cypher plugin. Try again later.')
+            return {**current_state,'result':'throttled'}
+        mobile.record_auto_update_status(owner,now,'checking',current_state.get('app_version',''),current_state.get('plugin_version',''),'Checking for updates.')
+        try:
+            release_info=_check_release_and_announce(cfg)
+            app_version=release_info.get('version_name','')
+            plugin_version=release_info.get('plugin_version','')
+            installed_version=_installed_plugin_version()
+            latest=_plugin_version_tuple(plugin_version)
+            installed=_plugin_version_tuple(installed_version)
+            if latest is None or installed is None: raise ReleaseCheckError('The Cypher plugin version is unavailable.')
+            result='app_staged' if release_info.get('available') else 'up_to_date'
+            message='A stable app update is ready.' if release_info.get('available') else 'Up to date.'
+            if latest>installed:
+                return _auto_update_plugin(owner,now,app_version,plugin_version)
+            return mobile.record_auto_update_status(owner,now,result,app_version,plugin_version,message)
+        except ReleaseCheckError:
+            return mobile.record_auto_update_status(owner,now,'error',message='Could not check for updates. Try again later.')
+        except Exception:
+            return mobile.record_auto_update_status(owner,now,'error',message='Could not check for updates. Try again later.')
+    finally: _AUTO_UPDATE_LOCK.release()
 
 @router.get('/mobile/plugin/version')
 async def plugin_version(request:Request):
@@ -1079,10 +1209,22 @@ def _warm_profile(owner,profile):
 async def start_watcher():
     global _watch_task
     async def loop():
+        auto_task=None;auto_owner=None;auto_not_before=0
         while True:
             try:
                 cfg=mobile.settings()
                 if cfg.get('owner_id') and cfg.get('owner_provider'):
+                    owner=(cfg['owner_id'],cfg['owner_provider'])
+                    if owner!=auto_owner: auto_owner=owner;auto_not_before=0
+                    if auto_task is not None and auto_task.done():
+                        try: outcome=auto_task.result()
+                        except Exception: outcome=None
+                        auto_task=None;auto_not_before=time.time()+(60 if outcome and outcome.get('_deferred') else mobile.AUTO_UPDATE_INTERVAL_SECONDS)
+                    if auto_task is None and time.time()>=auto_not_before:
+                        async def run_auto_update(snapshot):
+                            try: return await asyncio.to_thread(auto_update_check,snapshot)
+                            except Exception: return None
+                        auto_task=asyncio.create_task(run_auto_update(cfg))
                     try: await asyncio.to_thread(announce_release,cfg)
                     except Exception: pass  # A missing/invalid release must not stop call/approval delivery.
                     for profile in cfg.get('profiles',[]):

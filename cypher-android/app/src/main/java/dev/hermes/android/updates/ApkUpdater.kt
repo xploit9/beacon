@@ -2,8 +2,11 @@ package dev.hermes.android.updates
 
 import android.content.Context
 import android.content.Intent
+import android.app.PendingIntent
+import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.provider.Settings
 import androidx.core.content.FileProvider
 import dev.hermes.android.core.*
@@ -49,6 +52,34 @@ class ApkUpdater(private val context: Context) {
         require(file.canonicalFile.parentFile == File(context.filesDir, "updates").canonicalFile) { "Reopen the verified app update" }
         val archive = context.packageManager.getPackageArchiveInfo(file.absolutePath, PackageManager.GET_SIGNING_CERTIFICATES) ?: error("The verified update is no longer available")
         require(archive.packageName == context.packageName && archive.longVersionCode > installed().longVersionCode && archive.signingInfo?.apkContentsSigners?.singleOrNull()?.let { sha256(it.toByteArray()).equals(signer(), true) } == true) { "The APK no longer matches the installed package, newer version or signing identity" }
+    }
+    /** Best-effort no-tap self-update; Android can still return PENDING_USER_ACTION. */
+    internal fun installWithoutUserAction(file: File, pendingIntent: (Int) -> PendingIntent, beforeCommit: (Int) -> Unit) {
+        validateInstall(file)
+        val installer = context.packageManager.packageInstaller
+        val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL).apply {
+            setAppPackageName(context.packageName)
+            setSize(file.length())
+            if (Build.VERSION.SDK_INT >= 31) setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
+        }
+        val sessionId = installer.createSession(params)
+        var committed = false
+        try {
+            installer.openSession(sessionId).use { session ->
+                file.inputStream().use { input ->
+                    session.openWrite("base.apk", 0, file.length()).use { output ->
+                        input.copyTo(output)
+                        session.fsync(output)
+                    }
+                }
+                beforeCommit(sessionId)
+                session.commit(pendingIntent(sessionId).intentSender)
+                committed = true
+            }
+        } catch (error: Throwable) {
+            if (!committed) runCatching { installer.abandonSession(sessionId) }
+            throw error
+        }
     }
     /** Call only after validating private bytes and rechecking local authorization. */
     internal fun launchInstaller(file: File): Boolean {

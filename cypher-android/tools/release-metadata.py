@@ -66,6 +66,18 @@ def _run(args):
     return result.stdout
 
 
+def _plugin_version():
+    manifest=Path(__file__).resolve().parents[2]/'hermes-plugin'/'cypher'/'plugin.yaml'
+    try: lines=manifest.read_text(encoding='utf-8-sig').splitlines()
+    except OSError: raise ReleaseMetadataError('The Cypher plugin version is unavailable.') from None
+    for line in lines:
+        if line.startswith('version:'):
+            value=line.split(':',1)[1].split('#',1)[0].strip().strip("'\"")
+            if re.fullmatch(r'\d+\.\d+\.\d+',value): return value
+            break
+    raise ReleaseMetadataError('The Cypher plugin version is invalid.')
+
+
 def metadata_for_apk(apk_path, aapt, apksigner):
     apk=Path(apk_path).expanduser()
     if not apk.is_file() or apk.is_symlink(): raise ReleaseMetadataError('Choose a built stable APK file.')
@@ -86,6 +98,7 @@ def metadata_for_apk(apk_path, aapt, apksigner):
         'package_name':identity[1],
         'version_code':version_code,
         'version_name':version_name,
+        'plugin_version':_plugin_version(),
         'certificate_sha256':digests[0].lower(),
         'sha256':_sha256(apk),
         'size_bytes':size,

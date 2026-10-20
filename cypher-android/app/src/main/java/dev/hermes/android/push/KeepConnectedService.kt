@@ -509,7 +509,7 @@ class KeepConnectedService : Service() {
                         "/api/plugins/cypher/mobile/notifications/events",
                         profile,
                         authorizedProfiles,
-                        query = mapOf("after" to after.toString(), "wait" to KEEP_CONNECTED_LONG_POLL_SECONDS.toString()),
+                        query = mapOf("after" to after.toString(), "wait" to KEEP_CONNECTED_LONG_POLL_SECONDS.toString(), "package" to BuildConfig.APPLICATION_ID),
                         maxBytes = 1_048_576,
                     )
                     parseKeepConnectedPage(response, after)
@@ -519,7 +519,7 @@ class KeepConnectedService : Service() {
                         "/api/plugins/cypher/mobile/notifications/events",
                         profile,
                         authorizedProfiles,
-                        query = mapOf("after" to after.toString(), "wait" to "0"),
+                        query = mapOf("after" to after.toString(), "wait" to "0", "package" to BuildConfig.APPLICATION_ID),
                         maxBytes = 1_048_576,
                     )
                     parseKeepConnectedPage(response, after)

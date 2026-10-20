@@ -16,7 +16,15 @@ internal data class UpdateSource(val origin: String, val owner: String, val id: 
 }
 
 internal fun updateCheckDue(lastCheck: Long, now: Long, force: Boolean): Boolean =
-    force || lastCheck == 0L || now < lastCheck || now - lastCheck >= 15 * 60_000L
+    force || lastCheck == 0L || now < lastCheck || now - lastCheck >= 12 * 60 * 60_000L
+
+internal fun autoUpdateEnabled(stored: Boolean?): Boolean = stored ?: true
+
+internal fun autoUpdateCheckDue(enabled: Boolean, lastCheck: Long, now: Long): Boolean =
+    enabled && updateCheckDue(lastCheck, now, false)
+
+internal fun autoUpdateInstallAllowed(enabled: Boolean, unmetered: Boolean, callActive: Boolean): Boolean =
+    enabled && unmetered && !callActive
 
 internal fun updateNotificationDue(version: Long, lastNotified: Long): Boolean = version > lastNotified
 

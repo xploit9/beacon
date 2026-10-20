@@ -14,8 +14,9 @@ def _release(version_code=100, version_name='1.0.0', apk_bytes=b'signed stable a
         'artifact_filename': f'Cypher-{version_name}.apk',
         'package_name': 'dev.hermes.android.stable',
         'version_code': version_code,
-        'version_name': version_name,
-        'certificate_sha256': certificate,
+    'version_name': version_name,
+    'plugin_version': '1.0.0',
+    'certificate_sha256': certificate,
         'sha256': digest,
         'size_bytes': len(apk_bytes),
     }
@@ -71,7 +72,7 @@ def test_release_check_keeps_stable_feed_separate_from_production(harness,monkey
     response=client.post('/api/plugins/cypher/mobile/releases/check')
 
     assert response.status_code==200,response.text
-    assert response.json()=={'version_name':'1.0.0','version_code':100,'available':True}
+    assert response.json()=={'version_name':'1.0.0','version_code':100,'plugin_version':'1.0.0','available':True}
     root=tmp/'plugin-data'/'cypher'/'releases-stable'
     digest=manifest['sha256']
     assert (root/manifest['artifact_filename']).read_bytes()==apk
@@ -118,7 +119,44 @@ def test_release_check_skips_apk_download_when_unchanged(harness,monkeypatch):
     response=client.post('/api/plugins/cypher/mobile/releases/check')
 
     assert response.status_code==200,response.text
-    assert response.json()=={'version_name':'1.0.0','version_code':100,'available':False}
+    assert response.json()=={'version_name':'1.0.0','version_code':100,'plugin_version':'1.0.0','available':False}
+    assert patterns==['Cypher-*.json']
+
+
+def test_release_check_refreshes_plugin_metadata_without_redownloading_same_apk(harness,monkeypatch):
+    api,client,cfg,tmp,_=harness
+    apk,manifest=_release()
+    _verification_tools(cfg,tmp)
+    root=tmp/'plugin-data'/'cypher'/'releases-stable';root.mkdir(parents=True)
+    old=dict(manifest,plugin_version='1.0.0')
+    (root/old['artifact_filename']).write_bytes(apk)
+    (root/(old['sha256']+'.json')).write_text(json.dumps(old))
+    (root/'latest.json').write_text(json.dumps(old))
+    manifest['plugin_version']='1.1.0'
+    patterns=_fake_github(api,monkeypatch,cfg,{'Cypher-1.0.0.json':json.dumps(manifest).encode()},
+                          {manifest['artifact_filename']:(100,'1.0.0')})
+
+    response=client.post('/api/plugins/cypher/mobile/releases/check')
+
+    assert response.status_code==200,response.text
+    assert response.json()['plugin_version']=='1.1.0'
+    assert response.json()['available'] is False
+    assert json.loads((root/'latest.json').read_text())['plugin_version']=='1.1.0'
+    assert patterns==['Cypher-*.json']
+
+
+def test_release_check_rejects_metadata_without_plugin_version(harness,monkeypatch):
+    api,client,cfg,tmp,_=harness
+    apk,manifest=_release()
+    _verification_tools(cfg,tmp)
+    manifest.pop('plugin_version')
+    patterns=_fake_github(api,monkeypatch,cfg,{'Cypher-1.0.0.json':json.dumps(manifest).encode()},
+                          {manifest['artifact_filename']:(100,'1.0.0')})
+
+    response=client.post('/api/plugins/cypher/mobile/releases/check')
+
+    assert response.status_code==503
+    assert 'plugin version' in response.json()['detail'].lower()
     assert patterns==['Cypher-*.json']
 
 

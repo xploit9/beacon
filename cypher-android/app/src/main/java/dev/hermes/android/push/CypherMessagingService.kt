@@ -90,7 +90,7 @@ class PushManager(private val app: CypherApplication) {
             runCatching { read("active:${client.scope.key}") }.getOrNull()?.takeIf { validOpaque(it.string("source"))&&validOpaque(it.string("target")) }
                 ?:bindings().firstOrNull { it.string("origin")==client.scope.origin&&it.string("owner")==client.scope.owner&&it.string("profile")==client.scope.profile&&validOpaque(it.string("source"))&&validOpaque(it.string("target")) }
         }
-        val o = client.nativeRequest("/api/plugins/cypher/mobile/notifications/targets", "POST", json("kind" to "fcm", "token" to token, "app_version_code" to BuildConfig.VERSION_CODE))
+        val o = client.nativeRequest("/api/plugins/cypher/mobile/notifications/targets", "POST", json("kind" to "fcm", "token" to token, "app_version_code" to BuildConfig.VERSION_CODE, "package_name" to BuildConfig.APPLICATION_ID))
         val target = o.getString("target_id")
         val source = o.string("source_ref")
         try {

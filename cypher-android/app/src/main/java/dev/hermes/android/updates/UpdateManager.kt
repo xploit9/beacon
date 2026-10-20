@@ -7,7 +7,10 @@ import android.app.job.JobScheduler
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import androidx.core.app.NotificationCompat
@@ -21,6 +24,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import java.io.File
 import java.util.UUID
 
@@ -29,6 +35,7 @@ class UpdateManager(private val app: CypherApplication) {
     private val prefs = app.getSharedPreferences("android-updates", Context.MODE_PRIVATE)
     private val lock = Any()
     private val updater = ApkUpdater(app)
+    private val automatic = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val notifications get() = app.getSystemService(NotificationManager::class.java)
     /** Device tests route the saved client through their synthetic transport. */
     internal var transportForTest: ((okhttp3.OkHttpClient.Builder) -> Unit)? = null
@@ -39,12 +46,35 @@ class UpdateManager(private val app: CypherApplication) {
         require(source() == expected && expected.authorizedBy(app.auth.read(expected.origin))) { "Update authorization changed. Sign in and check again." }
     }
 
-    fun schedule() {
+    fun autoUpdateEnabled(): Boolean = dev.hermes.android.updates.autoUpdateEnabled(
+        if (prefs.contains(AUTO_APP_UPDATES)) prefs.getBoolean(AUTO_APP_UPDATES, true) else null,
+    )
+
+    fun setAutoUpdateEnabled(enabled: Boolean) {
+        check(prefs.edit().putBoolean(AUTO_APP_UPDATES, enabled).commit()) { "Could not save automatic app updates" }
+        if (enabled) requestAutomaticCheck()
+    }
+
+    fun requestAutomaticCheck() {
+        automatic.launch { runCatching { backgroundCheck() } }
+    }
+
+    private fun supportsAutomaticAppUpdates() = app.packageName == "dev.hermes.android" || app.packageName == "dev.hermes.android.stable"
+    private fun callActive() = app.calls.state.value.active || app.calls.state.value.state == "ending" ||
+        app.calls.service != null || app.calls.spec != null || app.push.incoming.value != null
+    private fun unmeteredNetwork(): Boolean {
+        val connectivity = app.getSystemService(ConnectivityManager::class.java) ?: return false
+        val network = connectivity.activeNetwork ?: return false
+        return connectivity.getNetworkCapabilities(network)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == true
+    }
+
+    fun schedule(checkNow: Boolean = true) {
         notifications.createNotificationChannel(NotificationChannel(CHANNEL, "Cypher app updates", NotificationManager.IMPORTANCE_DEFAULT))
         // Android defers this in Doze and while the private server is unreachable.
         val scheduler = app.getSystemService(JobScheduler::class.java)
         if (scheduler.getPendingJob(JOB_ID) == null) scheduler.schedule(JobInfo.Builder(JOB_ID, ComponentName(app, UpdateCheckJob::class.java))
             .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY).setPersisted(true).setPeriodic(6 * 60 * 60_000L).build())
+        if (checkNow) requestAutomaticCheck()
     }
 
     /** Call only after the UI's successful bootstrap has been saved to AuthStore. */
@@ -56,24 +86,34 @@ class UpdateManager(private val app: CypherApplication) {
             clearAuthorization()
             check(prefs.edit().putString("origin", auth.origin).putString("owner", auth.owner).putString("id", UUID.randomUUID().toString()).commit())
         }
-        schedule()
+        schedule(checkNow = false)
     }
 
     /** Local revocation must precede logout/account replacement network requests. */
     fun clearAuthorization() = synchronized(lock) {
+        val autoUpdates=autoUpdateEnabled()
+        prefs.getInt("pending_session_id",-1).takeIf { it>=0 }?.let { session ->
+            runCatching { app.packageManager.packageInstaller.abandonSession(session) }
+        }
         prefs.getString("pending_file", null)?.let { name -> runCatching { pendingFile(name).delete() } }
-        check(prefs.edit().clear().commit()) { "Could not revoke update authorization" }
+        check(prefs.edit().clear().putBoolean(AUTO_APP_UPDATES,autoUpdates).commit()) { "Could not revoke update authorization" }
         notifications.cancel(NOTIFICATION_ID)
     }
 
     /** A throttled foreground check; force=true preserves manual retry. */
     suspend fun check(client: CypherClient, force: Boolean = false, notify: Boolean = true): Release? {
+        if (!force && !autoUpdateEnabled()) return null
         val expected = synchronized(lock) {
             val current = source() ?: error("Sign in before checking updates")
             require(current.authorizedBy(client.auth)) { "Update belongs to another owner or server" }
             current.takeIf { beginCheck(it, force) }
         } ?: return null
-        return checkAuthenticated(client.detached(), expected, notify)
+        val detached=client.detached()
+        return try {
+            val release=checkAuthenticated(detached, expected, notify)
+            if (!force && release!=null) automaticUpdate(detached,expected,release)
+            release
+        } finally { detached.closeNative() }
     }
 
     private fun beginCheck(expected: UpdateSource, force: Boolean): Boolean {
@@ -84,14 +124,39 @@ class UpdateManager(private val app: CypherApplication) {
         return true
     }
 
+    private fun beginAutomaticCheck(expected: UpdateSource): Boolean {
+        requireAuthorized(expected)
+        val now = System.currentTimeMillis()
+        if (!autoUpdateCheckDue(autoUpdateEnabled(), prefs.getLong("last_check", 0), now)) return false
+        check(prefs.edit().putLong("last_check", now).commit())
+        return true
+    }
+
     suspend fun backgroundCheck() {
+        if (!autoUpdateEnabled() || !supportsAutomaticAppUpdates()) return
         val expected = synchronized(lock) {
             val current = source() ?: return
             if (!current.authorizedBy(app.auth.read(current.origin))) { clearAuthorization(); return }
-            if (!beginCheck(current, false)) return
+            if (!beginAutomaticCheck(current)) return
             current
         }
-        checkAuthenticated(savedClient(expected), expected, true)
+        val client = savedClient(expected)
+        try {
+            val release = checkAuthenticated(client, expected, false) ?: return
+            automaticUpdate(client,expected,release)
+        } finally { client.closeNative() }
+    }
+
+    private suspend fun automaticUpdate(client: CypherClient, expected: UpdateSource, release: Release) {
+        if (!autoUpdateEnabled() || !supportsAutomaticAppUpdates()) return
+        if (!autoUpdateInstallAllowed(autoUpdateEnabled(),unmeteredNetwork(),callActive())) {
+            synchronized(lock) { requireAuthorized(expected); notifyRelease(expected,release) }
+            return
+        }
+        downloadOwned(client,release,expected,automatic=true)
+        if (Build.VERSION.SDK_INT < 31 || !app.packageManager.canRequestPackageInstalls() || callActive())
+            postReadyNotification(expected,release.version,release.name)
+        else installPending(automatic=true)
     }
 
     private fun savedClient(expected: UpdateSource): CypherClient = synchronized(lock) {
@@ -130,9 +195,10 @@ class UpdateManager(private val app: CypherApplication) {
         if (pushReleaseVersion(versionHint, updater.installedVersion(), prefs.getLong("notified_version", 0)) == null) return@synchronized
         // Do not persist an unverified hint as notified_version or required download version.
         postNotification(expected, 0, "Cypher update available")
+        if (autoUpdateEnabled()) requestAutomaticCheck()
     }
 
-    private fun postNotification(expected: UpdateSource, version: Long, title: String): Boolean {
+    private fun postNotification(expected: UpdateSource, version: Long, title: String, message: String = "Update Cypher to the latest verified Android release."): Boolean {
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(app, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return false
         if (!notifications.areNotificationsEnabled() || notifications.getNotificationChannel(CHANNEL)?.importance == NotificationManager.IMPORTANCE_NONE) return false
         requireAuthorized(expected)
@@ -143,24 +209,39 @@ class UpdateManager(private val app: CypherApplication) {
         // Retain before posting so the immediately actionable handle already resolves.
         check(prefs.edit().putString("notification_token", token).putLong("notification_version", version).commit())
         notifications.notify(NOTIFICATION_ID, NotificationCompat.Builder(app, CHANNEL).setSmallIcon(R.drawable.ic_cypher_notification)
-            .setContentTitle(title).setContentText("Update Cypher to the latest verified Android release.")
+            .setContentTitle(title).setContentText(message)
             .setContentIntent(pending).addAction(0, "Update", pending).setAutoCancel(true).build())
         return true
     }
 
+    private fun postReadyNotification(expected: UpdateSource, version: Long, name: String) {
+        postNotification(expected, version, "Cypher $name is ready — tap to install", "Tap to finish installing the verified update.")
+    }
+
     /** Resolves no URL, owner, cookie or version supplied by the caller. */
     suspend fun downloadNotification(token: String): File? {
+        var retained: File? = null
         val expected = synchronized(lock) {
             require(validToken(token) && token == prefs.getString("notification_token", null)) { "This update notification expired. Check for updates in Cypher." }
-            (source() ?: error("Sign in to update Cypher")).also(::requireAuthorized)
+            (source() ?: error("Sign in to update Cypher")).also { source ->
+                requireAuthorized(source)
+                val name=prefs.getString("pending_file",null)
+                if (name!=null && prefs.getString("pending_source",null)==source.id &&
+                    prefs.getLong("pending_version",0)>=prefs.getLong("notification_version",0) && hasPendingInstall()) {
+                    retained=pendingFile(name)
+                }
+            }
         }
+        if (retained!=null) return retained
         val client = savedClient(expected)
-        val release = checkAuthenticated(client, expected, false) ?: return null
-        synchronized(lock) {
-            requireAuthorized(expected)
-            require(token == prefs.getString("notification_token", null) && release.version >= prefs.getLong("notification_version", 0)) { "The advertised update changed. Check again." }
-        }
-        return downloadOwned(client, release, expected)
+        try {
+            val release = checkAuthenticated(client, expected, false) ?: return null
+            synchronized(lock) {
+                requireAuthorized(expected)
+                require(token == prefs.getString("notification_token", null) && release.version >= prefs.getLong("notification_version", 0)) { "The advertised update changed. Check again." }
+            }
+            return downloadOwned(client, release, expected)
+        } finally { client.closeNative() }
     }
 
     suspend fun download(client: CypherClient, release: Release): File {
@@ -170,17 +251,19 @@ class UpdateManager(private val app: CypherApplication) {
                 require(it.authorizedBy(client.auth)) { "Update belongs to another owner or server" }
             }
         }
-        return downloadOwned(client.detached(), release, expected)
+        val detached=client.detached()
+        return try { downloadOwned(detached, release, expected) } finally { detached.closeNative() }
     }
 
-    private suspend fun downloadOwned(client: CypherClient, release: Release, expected: UpdateSource): File {
+    private suspend fun downloadOwned(client: CypherClient, release: Release, expected: UpdateSource, automatic: Boolean = false): File {
         val file = updater.download(client, release)
         try {
             synchronized(lock) {
                 requireAuthorized(expected)
                 check(prefs.edit().putString("pending_file", file.name).putString("pending_source", expected.id)
                     .putString("pending_sha", release.sha).putLong("pending_size", release.size).putLong("pending_version", release.version)
-                    .putBoolean("continue_install", true).putBoolean("awaiting_permission", false).commit())
+                    .putString("pending_version_name",release.name).putBoolean("pending_auto_install",automatic)
+                    .remove("pending_session_id").putBoolean("continue_install", true).putBoolean("awaiting_permission", false).commit())
                 notifications.cancel(NOTIFICATION_ID)
             }
         } catch (e: Throwable) { file.delete(); throw e }
@@ -205,7 +288,9 @@ class UpdateManager(private val app: CypherApplication) {
 
     private fun clearPending() {
         val obsolete = prefs.getString("pending_file", null)?.let { runCatching { pendingFile(it) }.getOrNull() }
-        check(prefs.edit().remove("pending_file").remove("pending_source").remove("pending_sha").remove("pending_size").remove("pending_version").remove("awaiting_permission").remove("continue_install").commit())
+        check(prefs.edit().remove("pending_file").remove("pending_source").remove("pending_sha").remove("pending_size").remove("pending_version")
+            .remove("pending_version_name").remove("pending_auto_install").remove("pending_session_id")
+            .remove("awaiting_permission").remove("continue_install").commit())
         obsolete?.delete()
     }
 
@@ -217,8 +302,9 @@ class UpdateManager(private val app: CypherApplication) {
         prefs.getBoolean("continue_install", false) && hasPendingInstall()
     }
 
-    /** Run again after Android settings returns. Android still confirms installation. */
-    suspend fun installPending(): Boolean = withContext(Dispatchers.IO) {
+    /** Run again after Android settings returns; automatic sessions ask Android to skip its prompt when allowed. */
+    suspend fun installPending(automatic: Boolean = false): Boolean = withContext(Dispatchers.IO) {
+        if (synchronized(lock) { prefs.getInt("pending_session_id",-1)>=0 }) return@withContext true
         val pending = synchronized(lock) {
             val expected = source() ?: error("Sign in and download the update again")
             requireAuthorized(expected)
@@ -226,7 +312,7 @@ class UpdateManager(private val app: CypherApplication) {
             if (prefs.getLong("pending_version", 0) <= updater.installedVersion()) { clearPending(); error("Cypher is already up to date") }
             val file = pendingFile(prefs.getString("pending_file", null) ?: error("Download and verify an update first"))
             val size = prefs.getLong("pending_size", 0)
-            Triple(expected, file, size to prefs.getString("pending_sha", "").orEmpty())
+            Triple(expected, file, Triple(size,prefs.getString("pending_sha", "").orEmpty(),prefs.getString("pending_version_name","").orEmpty()))
         }
         val (expected, file, bytes) = pending
         try {
@@ -237,12 +323,34 @@ class UpdateManager(private val app: CypherApplication) {
             throw e
         }
         val coroutine = currentCoroutineContext()
+        val autoInstall = automatic || synchronized(lock) { prefs.getBoolean("pending_auto_install",false) && autoUpdateEnabled() }
+        if (automatic && (!autoUpdateEnabled() || Build.VERSION.SDK_INT < 31 || !app.packageManager.canRequestPackageInstalls() || callActive())) {
+            postReadyNotification(expected,prefs.getLong("pending_version",0),bytes.third)
+            return@withContext false
+        }
+        if (callActive()) error("Finish your call before installing the update.")
+        coroutine.ensureActive()
+        if (autoInstall && Build.VERSION.SDK_INT >= 31 && app.packageManager.canRequestPackageInstalls()) {
+            try {
+                updater.installWithoutUserAction(file,::installResultPendingIntent) { sessionId ->
+                    synchronized(lock) {
+                        require(prefs.getInt("pending_session_id",-1)<0) { "An app update is already being installed." }
+                        requireAuthorized(expected)
+                        require(prefs.getString("pending_file",null)==file.name && prefs.getString("pending_sha",null)==bytes.second) { "The pending update changed. Try again." }
+                        require(!callActive() && autoUpdateEnabled()) { "The automatic update is paused. Finish your call or turn automatic updates back on." }
+                        check(prefs.edit().putInt("pending_session_id",sessionId).putBoolean("awaiting_permission",false).putBoolean("continue_install",false).commit())
+                    }
+                }
+            } catch (error: Throwable) {
+                synchronized(lock) { prefs.edit().remove("pending_session_id").commit() }
+                if (callActive() || !autoUpdateEnabled()) postReadyNotification(expected,prefs.getLong("pending_version",0),bytes.third)
+                throw error
+            }
+            return@withContext true
+        }
         synchronized(lock) {
             requireAuthorized(expected)
             require(prefs.getString("pending_file", null) == file.name && prefs.getString("pending_sha", null) == bytes.second) { "The pending update changed. Try again." }
-            // Keep verified bytes if the user cancels Android's installer. The UI
-            // controls permission-return retry; launching never schedules auto-install.
-            coroutine.ensureActive()
             // Consume continuation before leaving this process for Android confirmation.
             val needsPermission = !app.packageManager.canRequestPackageInstalls()
             check(prefs.edit().putBoolean("awaiting_permission", needsPermission).putBoolean("continue_install", needsPermission).commit())
@@ -250,9 +358,59 @@ class UpdateManager(private val app: CypherApplication) {
         }
     }
 
+    private fun installResultPendingIntent(sessionId: Int): PendingIntent {
+        val intent=Intent(app,UpdateInstallReceiver::class.java).setAction(ACTION_INSTALL_RESULT).putExtra(EXTRA_SESSION_ID,sessionId)
+        return PendingIntent.getBroadcast(app,sessionId,intent,PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE)
+    }
+
+    internal fun handleInstallResult(result: Intent) {
+        val sessionId=result.getIntExtra(PackageInstaller.EXTRA_SESSION_ID,-1)
+        val expected=synchronized(lock) {
+            if (sessionId<0 || prefs.getInt("pending_session_id",-1)!=sessionId) return
+            val current=source() ?: return
+            if (runCatching { requireAuthorized(current) }.isFailure) return
+            current
+        }
+        when (result.getIntExtra(PackageInstaller.EXTRA_STATUS,PackageInstaller.STATUS_FAILURE)) {
+            PackageInstaller.STATUS_SUCCESS -> synchronized(lock) {
+                if (prefs.getInt("pending_session_id",-1)==sessionId) clearPending()
+                notifications.cancel(NOTIFICATION_ID)
+            }
+            PackageInstaller.STATUS_PENDING_USER_ACTION -> {
+                val prompt=installPrompt(result)
+                if (callActive() || prompt==null) {
+                    runCatching { app.packageManager.packageInstaller.abandonSession(sessionId) }
+                    synchronized(lock) { prefs.edit().remove("pending_session_id").putBoolean("pending_auto_install",false).commit() }
+                    postReadyNotification(expected,prefs.getLong("pending_version",0),prefs.getString("pending_version_name","").orEmpty())
+                } else postInstallerPrompt(expected,sessionId,prompt,prefs.getString("pending_version_name","").orEmpty())
+            }
+            else -> {
+                synchronized(lock) { prefs.edit().remove("pending_session_id").putBoolean("pending_auto_install",false).commit() }
+                postReadyNotification(expected,prefs.getLong("pending_version",0),prefs.getString("pending_version_name","").orEmpty())
+            }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun installPrompt(result: Intent): Intent? = if (Build.VERSION.SDK_INT >= 33)
+        result.getParcelableExtra(Intent.EXTRA_INTENT,Intent::class.java) else result.getParcelableExtra(Intent.EXTRA_INTENT)
+
+    private fun postInstallerPrompt(expected: UpdateSource,sessionId: Int,prompt: Intent,name: String) {
+        if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(app,Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED) return
+        if (!notifications.areNotificationsEnabled() || notifications.getNotificationChannel(CHANNEL)?.importance==NotificationManager.IMPORTANCE_NONE) return
+        requireAuthorized(expected)
+        val pending=PendingIntent.getActivity(app,sessionId,prompt.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        notifications.notify(NOTIFICATION_ID,NotificationCompat.Builder(app,CHANNEL).setSmallIcon(R.drawable.ic_cypher_notification)
+            .setContentTitle("Cypher $name is ready — tap to install").setContentText("Tap to confirm the update in Android.")
+            .setContentIntent(pending).addAction(0,"Install",pending).setAutoCancel(true).build())
+    }
+
     companion object {
         const val EXTRA_TOKEN = "update_token"
+        const val EXTRA_SESSION_ID = "update_session_id"
         const val CHANNEL = "hermes-updates"
+        const val ACTION_INSTALL_RESULT = "dev.hermes.android.updates.INSTALL_RESULT"
+        private const val AUTO_APP_UPDATES = "auto_app_updates"
         private const val JOB_ID = 4202
         private const val NOTIFICATION_ID = 4202
         fun validToken(token: String): Boolean = validUpdateToken(token)

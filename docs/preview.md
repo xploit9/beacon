@@ -6,7 +6,9 @@ The preview is a private test build of this migration branch. It is **not** a pr
 - The `stable` build type has application ID `dev.hermes.android.stable` and launcher label "Cypher", so it installs beside production and the preview.
 - Stable starts at version code `100` and version `1.0.0`. It inherits release minification and is not debuggable.
 - A stable APK is unsigned unless `cypherStableSigning` (or `CYPHER_STABLE_SIGNING`) points to an external properties file with the four Android signing fields. Never store that file or its keystore in this repository. The stable signer is separate from production.
-- Release assets are named `Cypher-<version>.apk`; Settings **App updates** checks the private GitHub release through the owner's Hermes plugin, then verifies the APK before Android asks to install it.
+- Release assets are named `Cypher-<version>.apk`; Settings **App updates** checks the private GitHub release through the owner's Hermes plugin and verifies the APK before installation.
+
+Production and stable builds offer default-on app and plugin automatic updates in Settings **App updates**; app downloads use unmetered connections and retain package, version, checksum and signer verification, with a tap-to-install notice whenever Android requires confirmation. The debug preview remains manually installed.
 - The Hermes plugin stores stable releases separately from production and can pin them with `android_stable_certificate_sha256`. If that pin is unset, the app still requires the downloaded APK to have the same signer as the installed stable app.
 - Installing stable does not replace production. Production replacement remains held until physical-phone acceptance and original signer/data-preservation checks pass.
 

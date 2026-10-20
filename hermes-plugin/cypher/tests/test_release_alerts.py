@@ -11,7 +11,7 @@ def configured(harness,monkeypatch):
     cfg['firebase_credentials']='private-fixture'
     manifest=tmp/'releases/latest.json';manifest.write_text(json.dumps({'version_code':28}))
     calls=[]
-    def verified(config): calls.append(True);return {'version_code':28,'sha256':'a'*64}
+    def verified(config,**kwargs): calls.append(True);return {'version_code':28,'sha256':'a'*64}
     monkeypatch.setattr(api,'release',verified)
     sent=[];failure=[False]
     def send(message,app=None):
@@ -22,8 +22,8 @@ def configured(harness,monkeypatch):
     return api,c,cfg,manifest,calls,sent,failure
 
 
-def register(c,id,version=0):
-    result=c.post('/api/plugins/cypher/mobile/notifications/targets',json={'id':id,'token':'fixture-'+id+'-token-'+'x'*30,'app_version_code':version})
+def register(c,id,version=0,package='dev.hermes.android'):
+    result=c.post('/api/plugins/cypher/mobile/notifications/targets',json={'id':id,'token':'fixture-'+id+'-token-'+'x'*30,'app_version_code':version,'package_name':package})
     assert result.status_code==200
 
 
@@ -52,7 +52,7 @@ def test_publication_announces_once_retries_and_sends_no_download_credentials(ha
 
 def test_invalid_signed_release_never_queues_or_advances_marker(harness,monkeypatch):
     api,c,cfg,_,_,_,_=configured(harness,monkeypatch);register(c,'old')
-    def invalid(cfg):raise ValueError('signature rejected')
+    def invalid(cfg,**kwargs):raise ValueError('signature rejected')
     monkeypatch.setattr(api,'release',invalid)
     with pytest.raises(ValueError):api.announce_release(cfg)
     with api.mobile.connect() as db:
@@ -63,7 +63,7 @@ def test_invalid_signed_release_never_queues_or_advances_marker(harness,monkeypa
 def test_failed_release_verification_is_not_repeated_for_unchanged_manifest(harness,monkeypatch):
     api,c,cfg,manifest,checks,sent,_=configured(harness,monkeypatch);register(c,'old')
     attempts=[]
-    def invalid(cfg):
+    def invalid(cfg,**kwargs):
         attempts.append(True)
         raise ValueError('signature rejected')
     monkeypatch.setattr(api,'release',invalid)
@@ -83,7 +83,7 @@ def test_new_version_and_profile_are_separate(harness,monkeypatch):
     api.announce_release(cfg);api.push('owner','default')
     assert len(sent)==1
     manifest.write_text(json.dumps({'version_code':29}))
-    monkeypatch.setattr(api,'release',lambda cfg:{'version_code':29,'sha256':'b'*64})
+    monkeypatch.setattr(api,'release',lambda cfg,**kwargs:{'version_code':29,'sha256':'b'*64})
     api.announce_release(cfg);api.push('owner','default');assert len(sent)==2 and sent[-1]['data']['release_version']=='29'
     cfg['profiles'].append('academic')
     assert c.post('/api/plugins/cypher/mobile/notifications/targets?profile=academic',json={'id':'academic-device','token':'fixture-token-'+'x'*30}).status_code==200
@@ -96,3 +96,32 @@ def test_profile_without_phone_does_not_trigger_repeated_apk_verification(harnes
     register(c,'phone');cfg['profiles'].append('academic')
     api.announce_release(cfg);api.announce_release(cfg)
     assert len(checks)==1
+
+
+def test_stable_release_notice_reaches_only_stable_package_targets(harness,monkeypatch):
+    api,c,cfg,_,_,sent,_=configured(harness,monkeypatch)
+    register(c,'production',package='dev.hermes.android')
+    register(c,'stable',package='dev.hermes.android.stable')
+    root=api.mobile.home()/'plugin-data'/'cypher'/'releases-stable';root.mkdir(parents=True)
+    (root/'latest.json').write_text(json.dumps({'version_code':29}))
+    monkeypatch.setattr(api,'release',lambda cfg,**kwargs:{'version_code':29,'sha256':'b'*64})
+
+    api.announce_release(cfg,package='dev.hermes.android.stable')
+    api.push('owner','default')
+
+    assert len(sent)==1 and sent[0]['token'].startswith('fixture-stable-')
+    assert sent[0]['data']['kind']=='release'
+    production=c.get('/api/plugins/cypher/mobile/notifications/events?package=dev.hermes.android').json()
+    stable=c.get('/api/plugins/cypher/mobile/notifications/events?package=dev.hermes.android.stable').json()
+    assert not any(event['kind']=='release' for event in production['events'])
+    assert any(event['kind']=='release' for event in stable['events'])
+
+
+def test_notification_target_identity_includes_package(harness):
+    _,client,_,_,_=harness
+    token='same-fixture-token-'+'x'*32
+    production=client.post('/api/plugins/cypher/mobile/notifications/targets',json={'token':token,'package_name':'dev.hermes.android'})
+    stable=client.post('/api/plugins/cypher/mobile/notifications/targets',json={'token':token,'package_name':'dev.hermes.android.stable'})
+
+    assert production.status_code==stable.status_code==200
+    assert production.json()['target_id']!=stable.json()['target_id']

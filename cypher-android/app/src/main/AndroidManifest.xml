@@ -20,6 +20,7 @@
     <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
     <!-- Sideload-only app: lets Setup show Android's one-tap "run in background" dialog so Keep connected rings arrive. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <queries>
@@ -54,6 +55,7 @@
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Maintains an HTTPS notification event connection to the signed-in Hermes account so incoming Cypher calls can reach the phone while the user enables Keep connected." />
         </service>
         <receiver android:name=".voice.IncomingCallReceiver" android:exported="false" />
+        <receiver android:name=".updates.UpdateInstallReceiver" android:exported="false" />
         <receiver android:name=".push.DeviceRestartReceiver" android:exported="false">
             <intent-filter><action android:name="android.intent.action.BOOT_COMPLETED" /><action android:name="android.intent.action.MY_PACKAGE_REPLACED" /></intent-filter>
         </receiver>

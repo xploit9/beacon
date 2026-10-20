@@ -25,6 +25,7 @@ MAX_ACTIVE_CALLS = 8
 HISTORY_RETENTION_DAYS = (0,30,90,365)
 HISTORY_RETENTION_EVENTS_PER_BATCH = 1000
 HISTORY_RETENTION_CALLS_PER_BATCH = 100
+AUTO_UPDATE_INTERVAL_SECONDS = 6 * 60 * 60
 
 def settings():
     from copy import deepcopy
@@ -265,6 +266,43 @@ def set_history_retention_days(owner,days):
             last_key='history_retention_last_run:'+hashlib.sha256(owner.encode('utf-8')).hexdigest()
             conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(last_key,str(now).encode()))
     return days
+
+def _auto_update_key(kind,owner):
+    if not isinstance(owner,str) or not owner: raise ValueError('Invalid owner')
+    return 'auto-update:'+kind+':'+hashlib.sha256(owner.encode('utf-8')).hexdigest()
+
+def auto_update_settings(owner):
+    enabled_key=_auto_update_key('plugin-enabled',owner)
+    status_key=_auto_update_key('status',owner)
+    with LOCK,connect() as conn:
+        enabled_row=conn.execute('SELECT value FROM meta WHERE key=?',(enabled_key,)).fetchone()
+        status_row=conn.execute('SELECT value FROM meta WHERE key=?',(status_key,)).fetchone()
+    stored=enabled_row[0].decode() if enabled_row and isinstance(enabled_row[0],bytes) else str(enabled_row[0]) if enabled_row else None
+    result={'checked_at':0,'result':'never','app_version':'','plugin_version':'','message':''}
+    if status_row:
+        try:
+            saved=json.loads(status_row[0].decode() if isinstance(status_row[0],bytes) else status_row[0])
+            if isinstance(saved,dict): result.update(saved)
+        except Exception: pass
+    return {'enabled':stored!='0',**result}
+
+def set_auto_plugin_updates(owner,enabled):
+    if type(enabled) is not bool: raise ValueError('Invalid auto-update setting')
+    key=_auto_update_key('plugin-enabled',owner)
+    with LOCK,connect() as conn:
+        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(key,b'1' if enabled else b'0'))
+    return auto_update_settings(owner)
+
+def record_auto_update_status(owner,checked_at,result,app_version='',plugin_version='',message=''):
+    if type(checked_at) not in (int,float) or not math.isfinite(checked_at): raise ValueError('Invalid check time')
+    if result not in {'checking','up_to_date','app_staged','plugin_updated','plugin_update_available','restart_required','consent_required','error'}:
+        raise ValueError('Invalid auto-update result')
+    status={'checked_at':checked_at,'result':result,'app_version':str(app_version)[:64],
+            'plugin_version':str(plugin_version)[:64],'message':str(message)[:240]}
+    key=_auto_update_key('status',owner)
+    with LOCK,connect() as conn:
+        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(key,json.dumps(status,separators=(',',':')).encode()))
+    return status
 
 def call_lock(call_id):
     with LOCK:
