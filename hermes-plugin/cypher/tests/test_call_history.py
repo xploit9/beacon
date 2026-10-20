@@ -170,7 +170,7 @@ def test_stale_call_releases_waiting_invitation_and_history_ends(harness, monkey
 def test_call_history_pages_newest_first_with_a_stable_cursor(harness):
     api, client, _, _, _ = harness
     now = time.time()
-    ids = [add_call(api, conversation=f'chat-{index}', created=now - index, closed=1, status='saved')
+    ids = [add_call(api, created=now - index, conversation=f'chat-{index}', closed=1, status='saved')
            for index in range(1, 4)]
 
     first = history(client, limit=2)

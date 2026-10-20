@@ -1,0 +1,4 @@
+# Gitleaks generic-api-key false positives in test code (the test variable `api` followed by a keyword argument),
+# in two historical commits that cannot change; the current file no longer matches.
+dfd653766485daeef82e7a9dc1d774a82ddae79e:hermes-plugin/cypher/tests/test_call_history.py:generic-api-key:92
+3ea8acca63bb20fad722f50ddd6e5a0c3bd4c44f:hermes-plugin/cypher/tests/test_call_history.py:generic-api-key:92
