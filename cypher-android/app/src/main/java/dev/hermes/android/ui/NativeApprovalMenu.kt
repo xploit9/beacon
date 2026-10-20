@@ -6,12 +6,16 @@ import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.semantics.toggleableState
-import androidx.compose.ui.state.ToggleableState
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.CypherViewModel
 import dev.hermes.android.core.*
@@ -45,6 +49,8 @@ import kotlinx.coroutines.launch
     val yoloKnown = scopedRecord?.optBoolean("session_status_known") == true
     val yolo = (if (yoloKnown) scopedRecord?.optBoolean("session_bypass") == true else lastVerifiedYolo == true) && profileMode != "off"
     val loading = key in refreshing
+    // A per-chat YOLO bypass reports value "off"; the profile's own mode is what the other choices show.
+    val selection = if (yolo) "yolo" else profileMode.ifBlank { current }
     LaunchedEffect(scopedRecord) { if (yoloKnown) lastVerifiedYolo = scopedRecord?.optBoolean("session_bypass") }
     fun refresh() { vm.load(key, path, mapOf("session_id" to capturedScope?.session.orEmpty())) }
     fun apply(mode: String) {
@@ -87,41 +93,39 @@ import kotlinx.coroutines.launch
     }
     Box {
         IconButton(onClick = { open = true; refresh() }, enabled = enabled && capturedClient != null && capturedScope != null && !saving, modifier = Modifier.testTag("composer-approvals")) {
-            Icon(Icons.Rounded.Shield, uiText(if (yolo) "Approvals · YOLO on" else "Approvals"), tint = if (yolo) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant)
+            ApprovalShield(selection, uiText("Approvals") + ": " + approvalChoiceLabel(selection.ifBlank { "manual" }))
         }
         DropdownMenu(open, { open = false }, modifier = Modifier.heightIn(max = 360.dp).testTag("approvals-menu")) {
             DropdownMenuItem({ Text("Approvals · ${profileDisplayLabel(capturedClient?.scope?.profile.orEmpty(), profileRows, profileLoading)}") }, {}, enabled = false)
             if (loading || saving) DropdownMenuItem({ Text(if (saving) "Saving…" else "Refreshing…") }, {}, enabled = false)
             val error = recordError(record)
             if (error.isNotBlank()) DropdownMenuItem({ Text(error, maxLines = 3, color = MaterialTheme.colorScheme.error) }, { refresh() })
-            nativeApprovalModes.forEach { mode ->
-                val description = when (mode) {
-                    "manual" -> "Ask before risky Hermes actions"
-                    "smart" -> "Let Hermes assess risk and ask when needed"
-                    else -> "No Hermes approval prompts"
+            val choicesEnabled = enabled && !loading && !saving && current in nativeApprovalModes && error.isBlank()
+            (nativeApprovalModes + "yolo").forEach { choice ->
+                val yoloLocked = choice == "yolo" && profileMode == "off"
+                val description = when (choice) {
+                    "manual" -> "Ask before risky actions"
+                    "smart" -> "Ask only when it looks risky"
+                    "off" -> "Never ask in this profile"
+                    else -> if (yoloLocked) "Off already skips every prompt" else "Never ask in this chat"
                 }
-                DropdownMenuItem(text = { Column { Text(mode.replaceFirstChar { it.uppercase() }); Text(description, style = MaterialTheme.typography.bodySmall, maxLines = 2) } },
-                    // Tick the profile's own mode: a per-chat YOLO bypass reports value "off" but has its own YOLO tick.
-                    trailingIcon = { if (profileMode.ifBlank { current } == mode) Icon(Icons.Rounded.Check, "Selected") },
-                    enabled = enabled && !loading && !saving && current in nativeApprovalModes && error.isBlank(),
-                    modifier = Modifier.testTag("approval-mode-$mode"), onClick = {
-                        if (mode == "off" && profileMode != "off") { open = false; confirmOff = true } else apply(mode)
+                val isSelected = selection == choice
+                DropdownMenuItem(text = { Column { Text(approvalChoiceLabel(choice)); Text(description, style = MaterialTheme.typography.bodySmall, maxLines = 2) } },
+                    leadingIcon = { ApprovalShield(choice, null) },
+                    trailingIcon = { if (isSelected) Icon(Icons.Rounded.Check, "Selected") },
+                    enabled = choicesEnabled && !yoloLocked,
+                    modifier = Modifier.testTag(if (choice == "yolo") "approval-yolo" else "approval-mode-$choice").semantics { selected = isSelected },
+                    onClick = {
+                        when {
+                            isSelected && choice == "yolo" -> open = false
+                            choice == "yolo" -> { open = false; confirmYolo = true }
+                            // Choosing a mode also clears this chat's YOLO (the native route turns the session bypass off first).
+                            choice == "off" && profileMode != "off" -> { open = false; confirmOff = true }
+                            else -> apply(choice)
+                        }
                     })
             }
             HorizontalDivider()
-            val yoloActionEnabled = enabled && !loading && !saving && current in nativeApprovalModes && error.isBlank() && profileMode != "off"
-            // With profile approvals Off every chat already skips prompts, so the switch shows on and is locked.
-            val yoloOn = yolo || profileMode == "off" && current.isNotBlank()
-            DropdownMenuItem(
-                text = { Column {
-                    Text("YOLO for this chat")
-                    if (profileMode == "off" && current.isNotBlank()) Text("On for every chat while approvals are Off", style = MaterialTheme.typography.bodySmall)
-                } },
-                trailingIcon = { Switch(checked = yoloOn, onCheckedChange = null, enabled = yoloActionEnabled) },
-                enabled = yoloActionEnabled,
-                modifier = Modifier.testTag("approval-yolo").semantics { toggleableState = if (yoloOn) ToggleableState.On else ToggleableState.Off },
-                onClick = { if (yolo) applyYolo(false) else { open = false; confirmYolo = true } },
-            )
             DropdownMenuItem({ Text("Allowed toolsets") }, { open = false; vm.openCatalog("Toolsets") }, enabled = enabled && !saving)
         }
     }
@@ -133,4 +137,26 @@ import kotlinx.coroutines.launch
         text = { Text("Hermes stops asking for approval in this chat until you turn YOLO off.") },
         confirmButton = { TextButton({ confirmYolo = false; applyYolo(true) }) { Text("Enable YOLO") } },
         dismissButton = { TextButton({ confirmYolo = false }) { Text("Cancel") } })
+}
+
+internal fun approvalChoiceLabel(choice: String): String = when (choice) {
+    "smart" -> "Auto"
+    "off" -> "Off"
+    "yolo" -> "YOLO"
+    else -> "Manual"
+}
+
+/** One shield, coloured by the chat's approval choice: Manual blue, Auto green, Off red, YOLO orange with a "Y". */
+@Composable internal fun ApprovalShield(selection: String, description: String?) {
+    val dark = MaterialTheme.colorScheme.surface.luminance() < 0.5f
+    val tint = when (selection) {
+        "smart" -> if (dark) Color(0xFF81C784) else Color(0xFF2E7D32)
+        "off" -> MaterialTheme.colorScheme.error
+        "yolo" -> if (dark) Color(0xFFFFB74D) else Color(0xFFE65100)
+        else -> if (dark) Color(0xFF90CAF9) else Color(0xFF1565C0)
+    }
+    Box(contentAlignment = Alignment.Center) {
+        Icon(Icons.Rounded.Shield, description, tint = tint)
+        if (selection == "yolo") Text("Y", Modifier.padding(bottom = 1.dp), color = if (dark) Color.Black else Color.White, fontSize = 11.sp, fontWeight = FontWeight.Black)
+    }
 }
