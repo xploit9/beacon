@@ -404,6 +404,20 @@ def _validate_request_fields(text, action, signal, night):
     return text
 
 
+JOBS_VERSION = "2.4.0"  # bump whenever _specs changes which jobs exist
+
+
+def upgrade_jobs(mobile, owner, profile):
+    """Once per jobs version: rebuild an enabled profile's managed jobs so an upgrade takes effect."""
+    key = _key(owner, profile, "jobs-version")
+    if _meta_get(mobile, key) == JOBS_VERSION:
+        return False
+    with _SET_ENABLED_LOCK:
+        _sync_request_jobs(mobile, owner, profile, list_requests(mobile, owner, profile))
+    _meta_set(mobile, key, JOBS_VERSION)
+    return True
+
+
 def _sync_request_jobs(mobile, owner, profile, rows):
     if enabled(mobile, owner, profile) and _setup_complete(mobile, owner, profile):
         sources = discover_sources(profile)

@@ -269,12 +269,14 @@ def call_lock(call_id):
             lock=threading.RLock();_CALL_LOCKS[call_id]=lock
         return lock
 
+STALE_CALL_SECONDS=300
+
 def active_calls(conn,owner):
-    return conn.execute('SELECT COUNT(*) FROM calls WHERE owner=? AND closed=0 AND COALESCE(seen,created)>=?',(owner,time.time()-300)).fetchone()[0]
+    return conn.execute('SELECT COUNT(*) FROM calls WHERE owner=? AND closed=0 AND COALESCE(seen,created)>=?',(owner,time.time()-STALE_CALL_SECONDS)).fetchone()[0]
 
 def prune_notices(conn):
     now=time.time()
-    conn.execute("UPDATE calls SET closed=1,ended=COALESCE(ended,?),status='failed' WHERE closed=0 AND COALESCE(seen,created)<?",(now,now-300))
+    conn.execute("UPDATE calls SET closed=1,ended=COALESCE(ended,seen,created),status='failed' WHERE closed=0 AND COALESCE(seen,created)<?",(now-STALE_CALL_SECONDS,))
     prune_call_history(conn)
     # Move legacy answered invitation metadata into its owned call before pruning
     # the delivery outbox; call, timeline and job history use separate retention.

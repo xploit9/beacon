@@ -153,7 +153,7 @@ def _source_error(value, depth=0, budget=None):
         try:
             value = json.loads(value)
         except (TypeError, ValueError):
-            return bool(re.search(r"(?i)^error(?::|\b)", value.lstrip()) or "Traceback" in value)
+            return bool(re.match(r"(?i)\s*(?:error:|traceback \(most recent call last\))", value))
     if isinstance(value, list):
         return any(_source_error(child, depth + 1, budget) for child in value[:64])
     if not isinstance(value, dict):

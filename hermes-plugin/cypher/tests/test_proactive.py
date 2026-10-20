@@ -716,6 +716,9 @@ def test_generalized_evidence_requires_selected_source_same_session_and_matching
                         "error: timed out", "Traceback (most recent call last): ..."):
         assert observer.source_observed(api.mobile, cfg, "default", "watch-session", "email", "mcp:mail",
                                         "mcp__mail__read_message", failed_read, "ok", True) is False
+    # Content that merely mentions a failure (a CI email, an "Error budget" task) is still a real read.
+    for content_read in ("Subject: Deploy failed\nTraceback (most recent call last): build.py", "Error budget review due today"):
+        assert observer._source_error(content_read) is False
     assert observer.source_observed(api.mobile, cfg, "default", "watch-session", "email", "mcp:mail",
                                     "mcp__mail__write_message", {"id": "message-writer"}, "ok", False) is False
     first_read = {"messages": [{"id": "message-a"}]}
@@ -856,3 +859,12 @@ def test_quiet_hours_block_call_unless_request_allows_night_and_fall_back_to_not
     with api.mobile.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM notices WHERE kind='incoming_call'").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM notices WHERE kind='task_result'").fetchone()[0] == 1
+
+
+def test_upgrade_rebuilds_managed_jobs_once_per_jobs_version(harness, monkeypatch):
+    api = harness[0]
+    synced = []
+    monkeypatch.setattr(api.proactive, "_sync_request_jobs", lambda mobile, owner, profile, rows: synced.append((owner, profile)))
+    assert api.proactive.upgrade_jobs(api.mobile, "owner", "default") is True
+    assert api.proactive.upgrade_jobs(api.mobile, "owner", "default") is False
+    assert synced == [("owner", "default")]

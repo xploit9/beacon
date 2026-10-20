@@ -677,7 +677,9 @@ def activate(owner,profile):
             if explicit is False:
                 with mobile.connect() as conn: conn.execute('DELETE FROM deferred WHERE id=?',(row['id'],))
                 continue
-            if explicit is None and (row['reason'] or '').startswith('Request '):
+            request_id=re.match(r'Request ([0-9a-f]{32}): ',row['reason'] or '')
+            request=request_id and next((r for r in proactive.list_requests(mobile,owner,profile) if r.get('id')==request_id.group(1)),None)
+            if explicit is None and request and request.get('night') is not True:
                 if quiet is None:
                     setup=proactive._setup(mobile,owner,profile,{name:[] for name in proactive.SIGNALS})
                     quiet_now=proactive.profile_now(profile)
@@ -842,6 +844,7 @@ async def download(digest:str,request:Request):
     if hashlib.sha256(content).hexdigest()!=digest: raise HTTPException(409,'Artifact changed')
     return StreamingResponse(iter(content[i:i+65536] for i in range(0,len(content),65536)),media_type='application/vnd.android.package-archive',headers={'Content-Length':str(len(content)),'ETag':'"'+digest+'"','Cache-Control':'private, immutable'})
 _watch_task=None
+_jobs_upgraded=set()
 async def start_watcher():
     global _watch_task
     async def loop():
@@ -852,6 +855,10 @@ async def start_watcher():
                     try: await asyncio.to_thread(announce_release,cfg)
                     except Exception: pass  # A missing/invalid release must not stop call/approval delivery.
                     for profile in cfg.get('profiles',[]):
+                        if (cfg['owner_id'],profile) not in _jobs_upgraded:
+                            _jobs_upgraded.add((cfg['owner_id'],profile))  # once per process; a failure retries after restart
+                            try: await asyncio.to_thread(proactive.upgrade_jobs,mobile,cfg['owner_id'],profile)
+                            except Exception: pass
                         await asyncio.to_thread(watch,cfg['owner_id'],cfg['owner_provider'],profile)
                         await asyncio.to_thread(push,cfg['owner_id'],profile)
             except Exception:
