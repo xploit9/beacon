@@ -1,8 +1,12 @@
 package dev.hermes.android.data
 
+import kotlinx.coroutines.CancellationException
 import dev.hermes.android.core.*
 import org.json.JSONArray
 import org.json.JSONObject
+
+/** "high" for an assistant chat whose profile default is slower than that, else null (keep the default). */
+internal fun assistantEffortCap(current: String): String? = if (current in setOf("xhigh", "max", "ultra")) "high" else null
 
 /** Projects existing Compose contracts onto native operations; never proxies the WebUI. */
 private class NativeTurnEnded : Exception()
@@ -44,6 +48,13 @@ internal class NativeOperations(private val c: CypherClient) {
         val config = c.nativeGet("/api/sessions/$id", mapOf("profile" to c.auth.profile)).opt("model_config")
         ((config as? JSONObject) ?: (config as? String)?.takeIf(String::isNotBlank)?.let(::JSONObject) ?: JSONObject()).optBoolean("yolo_mode")
     } catch (e: ApiFailure) { if (e.status == 404) null else throw e }
+    /** The assistant chat answers everyday questions: start it at "high" when the profile default is slower; the owner can raise it per chat. */
+    private suspend fun capAssistantEffort(runtimeSessionId: String) {
+        try {
+            val current = c.nativeRpc("config.get", json("session_id" to runtimeSessionId, "key" to "reasoning")).string("value")
+            assistantEffortCap(current)?.let { c.nativeRpc("config.set", json("session_id" to runtimeSessionId, "key" to "reasoning", "value" to it, "scope" to "session")) }
+        } catch (error: CancellationException) { throw error } catch (_: Exception) { } // the chat still opens at the profile default
+    }
     /** Adapts Hermes Relay's session-scoped GatewayChatClient.setYolo wire contract. */
     private suspend fun setSessionYolo(target: NativeSessionBinding, enabled: Boolean) {
         val value = if (enabled) "1" else "0"
@@ -81,6 +92,7 @@ internal class NativeOperations(private val c: CypherClient) {
                 if (d.optBoolean("thread")) params.put("source", CYPHER_THREAD_SOURCE)
                 val b = c.nativeCreate(params)
                 require(b.storedSessionId.isNotBlank()) { "Native session has no durable identity yet; submit the first prompt before saving selection" }
+                if (path == "/api/cypher/open") capAssistantEffort(b.runtimeSessionId)
                 return sessionProjection(c.nativeSessionSnapshot().put("messages", JSONArray()).put("acknowledged_shell", true), b).put("profile", c.auth.profile).apply {
                     // Hermes holds a create title until the first turn; show it (and the thread lane) from the start.
                     if (string("title").isBlank() && params.string("title").isNotBlank()) put("title", params.string("title"))
