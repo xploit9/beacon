@@ -311,6 +311,9 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
 
     init {
         viewModelScope.launch {
+            app.push.emailAlerts.collect { (scope, card) -> storeData("task-result:${scope.key}", card) }
+        }
+        viewModelScope.launch {
             var previousFinals = emptyList<CallTranscript>()
             var wasActive = false
             app.calls.state.collect { call ->
@@ -505,6 +508,24 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         }
     }
     fun storeData(key: String, value: JSONObject) { _data.update { it + (key to value) } }
+    fun clearTaskResult(scope: Scope, noticeId: String, dismiss: Boolean = false) = viewModelScope.launch {
+        val key = "task-result:${scope.key}"
+        if (noticeId.isBlank()) {
+            if (dismiss && _data.value[key]?.string("notice_id").isNullOrBlank()) storeData(key, JSONObject())
+            return@launch
+        }
+        try {
+            val stored = app.cache.read(scope, "task-result")
+            if (stored != null && runCatching { JSONObject(stored).string("notice_id") }.getOrNull() == noticeId)
+                app.cache.delete(scope, "task-result", stored)
+        } catch (error: Throwable) {
+            if (error is CancellationException) throw error
+            notice("The saved email alert may return when this chat is reopened.")
+        }
+        val current = _data.value[key] ?: return@launch
+        if (current.string("notice_id") == noticeId)
+            storeData(key, if (dismiss) JSONObject() else current.copy().put("feedback_sent", true))
+    }
     fun setKeepConnectedEnabled(enabled: Boolean) {
         runCatching { dev.hermes.android.push.KeepConnectedService.setEnabled(app, client?.auth, enabled) }
             .onFailure { notice(it.message ?: "Could not change Keep connected") }
@@ -2129,8 +2150,23 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     }
     private suspend fun restoreCachedConversation(scope: Scope, generation: Int, preserveActiveInput: Boolean = false): Boolean {
         fun current() = generation == sessionGeneration && sourceScope == scope && (client?.scope ?: cachedOwnerScope) == scope.copy(session = "")
-        val cached = app.cache.readMany(scope, listOf("draft", "side-question", "session", "pending"))
+        val cached = app.cache.readMany(scope, listOf("draft", "side-question", "session", "pending", "task-result"))
         if (!current()) return false
+        cached["task-result"]?.let { raw ->
+            val key = "task-result:${scope.key}"
+            val card = runCatching { JSONObject(raw) }.getOrNull()
+            if (card != null && card.optLong("expires_at") > System.currentTimeMillis() / 1000) {
+                val shown = _data.value[key]
+                val feedbackSent = shown?.let { it.optBoolean("feedback_sent") && it.string("notice_id") == card.string("notice_id") } == true
+                if (!feedbackSent) {
+                    if (shown == null || shown.optLong("expires_at") < card.optLong("expires_at")) storeData(key, card)
+                }
+            } else {
+                optionalLocalSave { app.cache.delete(scope, "task-result", raw) }
+                if (!current()) return false
+                if (card != null && _data.value[key]?.string("notice_id") == card.string("notice_id")) storeData(key, JSONObject())
+            }
+        }
         if (!preserveActiveInput) {
             val localDraft = drafts[scope.key] ?: cached["draft"]?.let(Draft::decode) ?: Draft()
             if (!current()) return false
@@ -3038,11 +3074,14 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             app.updates.authorize(requireNotNull(client)); restoreAppUpdate()
             _data.value = emptyMap()
             _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList()
-            if (route.string("kind") == "task_result" && id.isNotBlank())
-                route.string("reason").takeIf(String::isNotBlank)?.let {
-                    storeData("task-result:${c.scope.session(id).key}", json("reason" to it, "notice_id" to route.string("event_id").ifBlank { event }, "email_alert" to route.optBoolean("email_alert")))
+            if (route.string("kind") == "task_result" && id.isNotBlank()) {
+                val emailAlert = route.optBoolean("email_alert")
+                val expiresAt = route.optLong("expires_at")
+                route.string("reason").takeIf { it.isNotBlank() && (!emailAlert || route.string("conversation_ref") == id && expiresAt > System.currentTimeMillis() / 1000) }?.let {
+                    storeData("task-result:${c.scope.session(id).key}", json("reason" to it, "notice_id" to route.string("event_id").ifBlank { event }, "email_alert" to emailAlert, "expires_at" to expiresAt))
                 }
-            val destination = when { route.string("kind") == "incoming_call" -> "Cypher"; route.string("kind") == "release" -> "More"; route.string("kind") == "task_result" && id.isBlank() -> "Tasks"; else -> "Chat" }
+            }
+            val destination = when { route.string("kind") == "incoming_call" -> "Cypher"; route.string("kind") == "task_result" && id.isNotBlank() && route.string("conversation_ref") == id && readCypherSessionHandle(c.scope) == id -> "Cypher"; route.string("kind") == "release" -> "More"; route.string("kind") == "task_result" && id.isBlank() -> "Tasks"; else -> "Chat" }
             val destinationPage = if (route.string("kind") == "release") "App updates" else ""
             saved["tab"] = destination; saved["more"] = destinationPage
             _ui.update { it.copy(origin = origin, owner = owner, profile = c.auth.profile, cypherOpening = false, cypherError = "", newChatOpening = false, newChatError = "", initialChatReady = false, query = "", authenticated = true, connected = true, restoringSession = false, bootstrap = bootstrap, tab = destination, morePage = destinationPage) }

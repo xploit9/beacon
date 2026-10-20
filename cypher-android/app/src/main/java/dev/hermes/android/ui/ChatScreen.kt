@@ -262,12 +262,13 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
     val transcriptIndex = remember(chatState.messages) { chatState.messages.withIndex().associate { it.value.id to it.index } }
     val latestAssistantMessageId = remember(chatState.messages) { chatState.messages.lastOrNull { it.role == "assistant" && it.text.isNotBlank() }?.id }
     val chat = chatState.copy(messages = messages)
-    val taskResultKey = "task-result:${Scope(ui.origin, ui.owner, ui.profile).session(chat.sessionId).key}"
+    val taskResultScope = Scope(ui.origin, ui.owner, ui.profile).session(chat.sessionId)
+    val taskResultKey = "task-result:${taskResultScope.key}"
     val taskResultData = profileDefaults[taskResultKey]
     val taskResult = taskResultData?.string("reason").orEmpty()
     val taskResultNoticeId = taskResultData?.string("notice_id").orEmpty()
     val taskResultIsEmailAlert = taskResultData?.optBoolean("email_alert") == true && taskResultNoticeId.isNotBlank()
-    var taskFeedbackSent by remember(taskResult, taskResultNoticeId, chat.sessionId) { mutableStateOf(false) }
+    var taskFeedbackSent by remember(taskResult, taskResultNoticeId, chat.sessionId) { mutableStateOf(taskResultData?.optBoolean("feedback_sent") == true) }
     var taskFeedbackSending by remember(taskResult, taskResultNoticeId, chat.sessionId) { mutableStateOf(false) }
     val callMessagesById = remember(chatState.callMessages) { chatState.callMessages.associateBy { "call:${it.eventId}" } }
     val foldedToolResults = remember(chat.raw, chat.messages) { foldToolResults(chat.raw.rows("messages"), chat.messages) }
@@ -324,6 +325,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
         scope.launch {
             try {
                 client.call("$PROACTIVE_SETTINGS_PATH/feedback", mapOf("profile" to ui.profile), method = "POST", data = json("notice_id" to taskResultNoticeId, "verdict" to verdict))
+                vm.clearTaskResult(taskResultScope, taskResultNoticeId)
                 taskFeedbackSent = true
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
@@ -563,12 +565,12 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
                     Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(uiText(if (taskResultIsEmailAlert) "Important email" else "Task result"), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
-                            IconButton(onClick = { vm.storeData(taskResultKey, JSONObject()) }, modifier = Modifier.testTag("task-result-dismiss")) {
+                            IconButton(onClick = { vm.clearTaskResult(taskResultScope, taskResultNoticeId, dismiss = true) }, modifier = Modifier.testTag("task-result-dismiss")) {
                                 Icon(Icons.Rounded.Close, contentDescription = uiText("Dismiss"))
                             }
                         }
                         Column(Modifier.heightIn(max = 240.dp).verticalScroll(rememberScrollState())) {
-                            Markdown(taskResult, vm, Scope(ui.origin, ui.owner, ui.profile).session(chat.sessionId), interactive = false)
+                            Markdown(taskResult, vm, taskResultScope, interactive = false)
                         }
                         if (pluginStatus == "available" && taskResultIsEmailAlert) {
                             if (taskFeedbackSent) Text("Thanks — Cypher will remember.", Modifier.padding(start = 12.dp, bottom = 8.dp).testTag("task-result-feedback-sent"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

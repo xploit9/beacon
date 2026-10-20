@@ -158,6 +158,8 @@ class ProactiveUiTest {
         val reason = "Daniel Reyes moved the client review to Friday."
         runBlocking { app.auth.persist(fixture.client.auth) }
         assertTrue(app.push.bindKeepConnectedSource(fixture.scope, source))
+        val taskScope = fixture.scope.session("chat-a")
+        runBlocking { app.cache.write(taskScope, "task-result", json("reason" to reason, "notice_id" to noticeId, "email_alert" to true, "expires_at" to System.currentTimeMillis() / 1000 + 3600).toString(), protected = true) }
         fixture.incomingNotification = json(
             "seq" to 1,
             "event_id" to noticeId,
@@ -170,6 +172,7 @@ class ProactiveUiTest {
             "session_id" to "chat-a",
             "reason" to reason,
             "email_alert" to true,
+            "expires_at" to System.currentTimeMillis() / 1000 + 3600,
             "preview" to json("title" to "Important email", "body" to reason),
         )
         val previousFactory = KeepConnectedService.clientFactoryForTest
@@ -190,6 +193,135 @@ class ProactiveUiTest {
             assertEquals(noticeId, request.getJSONObject("body").string("notice_id"))
             assertEquals("not_important", request.getJSONObject("body").string("verdict"))
             await { compose.onAllNodesWithText("Thanks — Cypher will remember.").fetchSemanticsNodes().isNotEmpty() }
+            await { runBlocking { app.cache.read(taskScope, "task-result") == null } }
+            val sessionReads = fixture.requests.count { it.string("path") == "/api/session" }
+            compose.runOnIdle { vm.storeData("task-result:${taskScope.key}", JSONObject()); vm.selectSession("chat-a") }
+            await { fixture.requests.count { it.string("path") == "/api/session" } > sessionReads && vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
+            compose.onNodeWithTag("task-result-card").assertDoesNotExist()
+        } finally {
+            vm.client?.closeNative()
+            pushClients.forEach(CypherClient::closeNative)
+            KeepConnectedService.clientFactoryForTest = previousFactory
+            app.getSharedPreferences("push-binding", android.content.Context.MODE_PRIVATE).edit()
+                .remove("source:${source.digest()}").commit()
+            runBlocking { app.auth.remove(fixture.scope.origin) }
+        }
+    }
+
+    @Test fun emailAlertDeliveredWhileCypherChatIsOpenAppearsWithoutPushTap() = withFixture { vm, _ ->
+        compose.runOnIdle { vm.tab("Cypher") }
+        await { vm.ui.value.tab == "Cypher" && vm.chat.value.projectionReady && vm.isCypherConversation() }
+        val scope = requireNotNull(vm.authenticatedScope()).session(vm.chat.value.sessionId)
+        val noticeId = "live-email-notice"
+        val reason = "The client review moved to Friday."
+        await { app.push.emailAlerts.subscriptionCount.value > 0 }
+
+        runBlocking {
+            app.push.emailAlerts.emit(scope to json(
+                "reason" to reason,
+                "notice_id" to noticeId,
+                "email_alert" to true,
+                "expires_at" to System.currentTimeMillis() / 1000 + 3600,
+            ))
+        }
+
+        await { vm.data.value["task-result:${scope.key}"]?.string("notice_id") == noticeId }
+        compose.onNodeWithTag("task-result-card").assertExists()
+        compose.onNodeWithText(reason).assertExists()
+    }
+
+    @Test fun cachedEmailAlertAppearsWhenItsChatOpensWithoutPushExtras() = withFixture { vm, fixture ->
+        val scope = fixture.scope.session("chat-a")
+        val noticeId = "cached-email-notice"
+        val reason = "The client review moved to Friday."
+        runBlocking {
+            app.cache.write(scope, "task-result", json(
+                "reason" to reason,
+                "notice_id" to noticeId,
+                "email_alert" to true,
+                "expires_at" to System.currentTimeMillis() / 1000 + 3600,
+            ).toString(), protected = true)
+        }
+
+        compose.runOnIdle { vm.selectSession("chat-a") }
+
+        await { vm.data.value["task-result:${scope.key}"]?.string("notice_id") == noticeId }
+        compose.onNodeWithTag("task-result-card").assertExists()
+        compose.onNodeWithText(reason).assertExists()
+    }
+
+    @Test fun expiredCachedEmailAlertIsDeletedWhenItsChatOpens() = withFixture { vm, fixture ->
+        val scope = fixture.scope.session("chat-a")
+        val raw = json(
+            "reason" to "Old alert",
+            "notice_id" to "expired-email-notice",
+            "email_alert" to true,
+            "expires_at" to System.currentTimeMillis() / 1000 - 1,
+        ).toString()
+        runBlocking { app.cache.write(scope, "task-result", raw, protected = true) }
+
+        compose.runOnIdle { vm.selectSession("chat-a") }
+
+        await { vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady && runBlocking { app.cache.read(scope, "task-result") == null } }
+        assertTrue(vm.data.value["task-result:${scope.key}"]?.string("reason").isNullOrBlank())
+        compose.onNodeWithTag("task-result-card").assertDoesNotExist()
+    }
+
+    @Test fun dismissingCachedEmailAlertStopsItReturningWhenTheChatReopens() = withFixture { vm, fixture ->
+        val scope = fixture.scope.session("chat-a")
+        val noticeId = "dismissed-email-notice"
+        val reason = "The client review moved to Friday."
+        runBlocking {
+            app.cache.write(scope, "task-result", json(
+                "reason" to reason,
+                "notice_id" to noticeId,
+                "email_alert" to true,
+                "expires_at" to System.currentTimeMillis() / 1000 + 3600,
+            ).toString(), protected = true)
+        }
+        compose.runOnIdle { vm.selectSession("chat-a") }
+        await { vm.data.value["task-result:${scope.key}"]?.string("notice_id") == noticeId }
+        compose.onNodeWithTag("task-result-dismiss").performClick()
+        await { runBlocking { app.cache.read(scope, "task-result") == null } && vm.data.value["task-result:${scope.key}"]?.string("reason").isNullOrBlank() }
+
+        val sessionReads = fixture.requests.count { it.string("path") == "/api/session" }
+        compose.runOnIdle { vm.selectSession("chat-a") }
+        await { fixture.requests.count { it.string("path") == "/api/session" } > sessionReads && vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
+        compose.onNodeWithTag("task-result-card").assertDoesNotExist()
+    }
+
+    @Test fun taskResultForTheBoundCypherSessionOpensTheCypherTab() = withFixture { vm, fixture ->
+        val source = "email-alert-cypher-route"
+        val noticeId = "email-alert-cypher-route-event"
+        val previousFactory = KeepConnectedService.clientFactoryForTest
+        val pushClients = mutableListOf<CypherClient>()
+        runBlocking {
+            app.preferences.edit { it[stringPreferencesKey("assistant_profile")] = "default" }
+            app.auth.persist(fixture.client.auth)
+        }
+        await { vm.preferences.value.assistantProfile == "default" }
+        assertTrue(app.push.bindKeepConnectedSource(fixture.scope, source))
+        fixture.incomingNotification = json(
+            "seq" to 1,
+            "event_id" to noticeId,
+            "owner_id" to fixture.scope.owner,
+            "profile" to fixture.scope.profile,
+            "kind" to "task_result",
+            "state" to "finished",
+            "source_ref" to source,
+            "conversation_ref" to "chat-a",
+            "session_id" to "chat-a",
+            "reason" to "The client review moved to Friday.",
+            "email_alert" to true,
+            "expires_at" to System.currentTimeMillis() / 1000 + 3600,
+            "preview" to json("title" to "Important email", "body" to "The client review moved to Friday."),
+        )
+        KeepConnectedService.clientFactoryForTest = { auth, store -> fixture.freshClientFor(auth, store).also(pushClients::add) }
+        try {
+            val saved = CypherViewModel::class.java.getDeclaredField("saved").apply { isAccessible = true }.get(vm) as SavedStateHandle
+            saved["cypher:${fixture.scope.key}"] = "chat-a"
+            vm.handlePush(source, noticeId)
+            await { vm.ui.value.tab == "Cypher" && vm.isCypherConversation() && vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
         } finally {
             vm.client?.closeNative()
             pushClients.forEach(CypherClient::closeNative)
@@ -239,7 +371,9 @@ class ProactiveUiTest {
             app.auth.remove(fixture.scope.origin)
             profileScopes.forEach { owner ->
                 listOf("cypher-session", "cypher-opening", "bot-mode-return", "new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session").forEach { app.cache.delete(owner, it) }
-                (1..4).forEach { n -> listOf("pending", "draft", "session", "client-created-shell").forEach { app.cache.delete(owner.session("new-$n"), it) } }
+                (listOf("chat-a", "chat-b") + (1..4).map { "new-$it" }).forEach { id ->
+                    listOf("pending", "draft", "session", "client-created-shell", "task-result").forEach { app.cache.delete(owner.session(id), it) }
+                }
             }
         }
         lateinit var vm: CypherViewModel
@@ -292,7 +426,9 @@ class ProactiveUiTest {
                 app.auth.remove(fixture.scope.origin)
                 profileScopes.forEach { owner ->
                     listOf("cypher-session", "cypher-opening", "bot-mode-return", "new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session").forEach { app.cache.delete(owner, it) }
-                    (1..4).forEach { n -> listOf("pending", "draft", "session", "client-created-shell").forEach { app.cache.delete(owner.session("new-$n"), it) } }
+                    (listOf("chat-a", "chat-b") + (1..4).map { "new-$it" }).forEach { id ->
+                        listOf("pending", "draft", "session", "client-created-shell", "task-result").forEach { app.cache.delete(owner.session(id), it) }
+                    }
                 }
                 app.preferences.updateData { prior }
             }

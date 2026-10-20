@@ -62,7 +62,7 @@ suspend fun refreshNotificationPreview(context: Context, source: String, event: 
     val manager = context.getSystemService(NotificationManager::class.java)
     val tag = "$source\u0000$event".digest()
     fun active(id: Int) = manager.activeNotifications.firstOrNull { it.tag == tag && it.id == id }
-    if (!ongoingNativeKind(kind) && active(1) == null || !app.push.permitsIncoming(source)) return
+    if ((!ongoingNativeKind(kind) && kind != "task_result" && active(1) == null) || !app.push.permitsIncoming(source)) return
     val binding = app.push.binding(source) ?: return
     val scope = Scope(trustedOrigin(binding.getString("origin")), binding.getString("owner"), binding.getString("profile"))
     fun authorized() = app.push.binding(source)?.toString() == binding.toString() && app.auth.read(scope.origin).authorizesPushSource(scope)
@@ -72,12 +72,24 @@ suspend fun refreshNotificationPreview(context: Context, source: String, event: 
         client.bootstrap()
         if (client.scope != scope || !authorized()) return@withTimeout
         val route = client.nativeRequest("/api/plugins/cypher/mobile/notifications/events/$event")
-        if (!matchesNotificationRoute(route, source, event, scope, conversation, kind)) return@withTimeout
+        if (!matchesNotificationRoute(route, source, event, scope, conversation, kind) || !authorized()) return@withTimeout
         if (validOpaque(route.string("activity_ref")) && ongoingNativeKind(kind)) {
             if (route.string("state") == "pending" && authorized()) presentNativeActivity(context, source, event, route.string("activity_ref"), kind, route.optLong("expires_at"), route)
             else if(route.string("state") in setOf("settled","expired","answered","declined","ended")&&authorized())
                 presentNativeActivity(context,source,event,route.string("activity_ref"),"activity_end",route.optLong("expires_at"))
             return@withTimeout
+        }
+        val emailAlert = isEmailAlertNotificationRoute(route, source, event, scope, conversation)
+        if (emailAlert) {
+            val session = route.string("session_id")
+            val expiresAt = route.optLong("expires_at")
+            val reason = route.string("reason")
+            if (validOpaque(session) && session == conversation && reason.isNotBlank() && expiresAt > System.currentTimeMillis() / 1000) {
+                val taskScope = scope.session(session)
+                val card = json("reason" to reason, "notice_id" to event, "email_alert" to true, "expires_at" to expiresAt)
+                app.cache.write(taskScope, "task-result", card.toString(), protected = true)
+                app.push.emailAlerts.emit(taskScope to card)
+            }
         }
         val preview = route.optJSONObject("preview") ?: return@withTimeout
         val title = boundedNotificationText(preview.opt("title") as? String ?: "", 120)
@@ -87,7 +99,7 @@ suspend fun refreshNotificationPreview(context: Context, source: String, event: 
         val posted = active(1) ?: return@withTimeout
         val builder = NotificationCompat.Builder(context, posted.notification)
             .setContentTitle(title).setContentText(body).setStyle(NotificationCompat.BigTextStyle().bigText(body)).setOnlyAlertOnce(true)
-        if (isEmailAlertNotificationRoute(route, source, event, scope, conversation)) {
+        if (emailAlert) {
             builder.clearActions()
             builder.addAction(emailFeedbackAction(context, source, event, "important", "Important"))
             builder.addAction(emailFeedbackAction(context, source, event, "not_important", "Not important"))
@@ -116,6 +128,15 @@ private suspend fun sendEmailFeedback(context: Context, source: String, event: S
         // A refused save (for example, full Hermes memory) must not look like success; the buttons stay for a retry.
         val saved = try { client.nativeRequest(EMAIL_FEEDBACK_PATH, "POST", json("notice_id" to event, "verdict" to verdict)); true }
         catch (e: CancellationException) { throw e } catch (_: Exception) { false }
+        if (saved && authorized()) {
+            val session = route.string("session_id")
+            if (validOpaque(session) && session == route.string("conversation_ref")) {
+                val taskScope = scope.session(session)
+                val stored = app.cache.read(taskScope, "task-result")
+                if (stored != null && runCatching { JSONObject(stored).string("notice_id") }.getOrNull() == event)
+                    app.cache.delete(taskScope, "task-result", stored)
+            }
+        }
         val manager = context.getSystemService(NotificationManager::class.java)
         val tag = "$source\u0000$event".digest()
         val posted = manager.activeNotifications.firstOrNull { it.tag == tag && it.id == 1 } ?: return@withTimeout
