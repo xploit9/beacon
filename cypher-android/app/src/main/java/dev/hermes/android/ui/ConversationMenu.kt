@@ -38,13 +38,14 @@ import org.json.JSONObject
 /** The long-press menu of a conversation in history: pin, rename, project, archive, delete. */
 @Composable internal fun ConversationMenuItems(vm: CypherViewModel, row: JSONObject, onDone: () -> Unit, onRename: () -> Unit, onProject: () -> Unit, onDelete: () -> Unit) {
     val id = sessionRowId(row)
-    val profile = row.string("profile", vm.ui.value.profile)
+    val activeProfile = vm.ui.collectAsStateWithLifecycle().value.profile
+    val profile = row.string("profile", activeProfile)
     val pinned = row.optBoolean("pinned")
     val archived = row.optBoolean("archived")
     DropdownMenuItem({ Text(conversationMenuTitle(uiText(if (pinned) "Unpin" else "Pin"))) }, leadingIcon = { Icon(Icons.Rounded.PushPin, null) }, modifier = Modifier.testTag("conversation-pin"),
         onClick = { onDone(); vm.conversationAction(id, "/api/session/pin", json("pinned" to !pinned), if (pinned) "Unpinned" else "Pinned", profile) })
     DropdownMenuItem({ Text(conversationMenuTitle(uiText("Rename"))) }, leadingIcon = { Icon(Icons.Rounded.Edit, null) }, onClick = { onDone(); onRename() })
-    if (profile == vm.ui.value.profile) ConversationProjectItem(vm, id, onAdd = onProject, onDone = onDone)
+    if (profile == activeProfile) ConversationProjectItem(vm, id, onAdd = onProject, onDone = onDone)
     DropdownMenuItem({ Text(conversationMenuTitle(uiText(if (archived) "Unarchive" else "Archive"))) }, leadingIcon = { Icon(if (archived) Icons.Rounded.Unarchive else Icons.Rounded.Archive, null) },
         onClick = { onDone(); vm.conversationAction(id, "/api/session/archive", json("archived" to !archived), if (archived) "Unarchived" else "Archived", profile) })
     DropdownMenuItem({ Text(conversationMenuTitle(uiText("Delete")), color = MaterialTheme.colorScheme.error) }, leadingIcon = { Icon(Icons.Rounded.DeleteOutline, null, tint = MaterialTheme.colorScheme.error) },

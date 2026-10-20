@@ -1,5 +1,6 @@
 package dev.hermes.android
 
+import dev.hermes.android.ui.setupNeedsBackgroundExemption
 import android.content.Intent
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf

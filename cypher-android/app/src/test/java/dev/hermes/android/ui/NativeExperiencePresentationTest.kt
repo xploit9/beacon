@@ -1,5 +1,6 @@
 package dev.hermes.android.ui
 
+import dev.hermes.android.core.copy
 import dev.hermes.android.core.json
 import dev.hermes.android.updatedHistoryRows
 import org.junit.Assert.*

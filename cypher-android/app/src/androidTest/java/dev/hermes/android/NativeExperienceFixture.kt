@@ -704,7 +704,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             "projects.project_sessions" -> json("project" to json("id" to params.getString("project_id"), "label" to "Travel", "sessionIds" to JSONArray().put("chat-a").put("chat-b"), "previewSessions" to JSONArray().put(json("id" to "chat-a", "title" to "Travel planning", "profile" to scope.profile))))
             "session.resume" -> {
                 require(!historyFailure) { "Synthetic history unavailable" }
-                if (profileSessionIds[profile]?.contains(id) == false) throw IllegalArgumentException("Synthetic session missing")
+                if (profileSessionIds[params.string("profile")]?.contains(id) == false) throw IllegalArgumentException("Synthetic session missing")
                 val row = sessions[id] ?: unpromptedShells.remove(id)?.also { sessions[id] = it }
                 row?.copy()?.apply {
                     val runtime = resumeRuntimeSessionIds[id] ?: string("session_id")

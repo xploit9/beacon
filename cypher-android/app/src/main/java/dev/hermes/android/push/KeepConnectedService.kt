@@ -1,5 +1,7 @@
 package dev.hermes.android.push
 
+import dev.hermes.android.core.rows
+import dev.hermes.android.core.string
 import android.annotation.SuppressLint
 import android.app.NotificationChannel
 import android.app.NotificationManager
