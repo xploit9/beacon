@@ -88,7 +88,8 @@ internal object GeminiWire {
         }
     }
     fun setup(model: String, voice: String, resume: String?,context:JSONObject=JSONObject()) = JSONObject().put("setup", JSONObject().apply {
-        val callback = context.optJSONObject("callback")
+        // The plugin sends an empty callback object on calls the owner starts; only a filled one is a callback.
+        val callback = context.optJSONObject("callback")?.takeIf { it.length() > 0 }
         val opening = if (callback != null) {
             "Hi, it's ${dev.hermes.android.data.currentAssistantName}, calling about something you asked me to watch."
         } else "Hi, it's ${dev.hermes.android.data.currentAssistantName}."
