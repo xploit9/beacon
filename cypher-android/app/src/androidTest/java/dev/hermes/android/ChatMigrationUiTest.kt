@@ -79,8 +79,10 @@ class ChatMigrationUiTest {
             MessageActivity("", listOf(tool("read_file")))
             MessageActivity("", listOf(tool("terminal")), status = "Working", streaming = true)
         } } }
-        compose.onAllNodesWithTag("tool-card-details").assertCountEquals(1) // only the live sibling opens by itself
+        compose.onAllNodesWithTag("tool-card-details").assertCountEquals(0) // the live step is one folded row
+        compose.onNodeWithTag("tool-steps").performClick()
         compose.onAllNodesWithTag("tool-card-toggle")[0].performClick()
+        compose.onAllNodesWithTag("tool-card-toggle")[1].performClick()
         val statuses = compose.onAllNodesWithTag("tool-card-status", useUnmergedTree = true)
         statuses.assertCountEquals(2)
         statuses[0].assertTextContains("No result recorded", substring = true)
@@ -105,6 +107,8 @@ class ChatMigrationUiTest {
 
     @Test fun liveToolWithOnlyAPreviewStaysRunningAndLabelsItPartial() {
         compose.setContent { MaterialTheme { MessageActivity("", listOf(tool("terminal", "status" to "running", "preview" to "partial output")), status = "Working", streaming = true) } }
+        compose.onNodeWithTag("tool-steps").performClick()
+        compose.onNodeWithTag("tool-card-toggle").performClick()
         compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertTextContains("Running", substring = true)
         compose.onNodeWithTag("tool-card-preview", useUnmergedTree = true).assertTextEquals("partial output")
         compose.onAllNodesWithTag("tool-card-result", useUnmergedTree = true).assertCountEquals(0)
@@ -132,9 +136,11 @@ class ChatMigrationUiTest {
             MessageActivity("", listOf(tool("terminal")), status = "Working", streaming = true)
         } } }
         compose.onNodeWithTag("message-activity-status").assertTextEquals("Working")
-        // The live sibling opens by itself; the stored one stays folded.
-        compose.onAllNodesWithTag("tool-card-details").assertCountEquals(1)
+        // Both stay folded; the live one sits behind its current-step row.
+        compose.onAllNodesWithTag("tool-card-details").assertCountEquals(0)
+        compose.onNodeWithTag("tool-steps").performClick()
         compose.onAllNodesWithTag("tool-card-toggle")[0].performClick()
+        compose.onAllNodesWithTag("tool-card-toggle")[1].performClick()
         val statuses = compose.onAllNodesWithTag("tool-card-status", useUnmergedTree = true)
         statuses.assertCountEquals(2)
         statuses[0].assertTextContains("No result recorded", substring = true)
@@ -185,7 +191,7 @@ class ChatMigrationUiTest {
         var copied = ""
 
         compose.setContent { MaterialTheme { MessageActivity("", listOf(call), toolResultsByCallId = folded.byCallId, onCopyResult = { copied = it }) } }
-        compose.onNode(hasTestTag("tool-card") and hasContentDescription("terminal, Completed"), useUnmergedTree = true).assertExists()
+        compose.onNode(hasTestTag("tool-card") and hasContentDescription("Terminal, Completed"), useUnmergedTree = true).assertExists()
         compose.onNodeWithTag("tool-card-toggle").performClick()
         compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertTextEquals("Status: Completed")
         compose.onNodeWithTag("tool-card-result", useUnmergedTree = true).assertTextEquals("saved output")
@@ -232,7 +238,7 @@ class ChatMigrationUiTest {
         compose.onNodeWithText("Terminal").assertIsDisplayed()
         compose.onNodeWithText("Read file").assertIsDisplayed()
         compose.onNodeWithText("Web search").assertIsDisplayed()
-        compose.onNodeWithTag("tool-steps").assertContentDescriptionContains("3 steps")
+        compose.onNodeWithTag("tool-steps").assertContentDescriptionContains("3 steps", substring = true)
     }
 
     @Test fun toolCardsFitANarrowPhone() {

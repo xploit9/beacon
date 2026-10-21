@@ -178,7 +178,7 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
     var projectFor by remember { mutableStateOf<String?>(null) }
     val order = HistoryOrder.of(preferences.historyOrder)
     val hidden = preferences.historyHiddenSources
-    LaunchedEffect(searchExpanded) { if (searchExpanded) searchFocusRequester.requestFocus() }
+    var searchFocused by remember { mutableStateOf(false) }
     LaunchedEffect(allProfiles, ui.origin, ui.owner) { if (allProfiles) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     LaunchedEffect(search, archived, view, hidden, order, allProfiles) { kotlinx.coroutines.delay(250); vm.refreshSessions(search, archived, force = false, threads = view == HistoryView.Threads, allProfiles = allProfiles) }
     // One scroll owner keeps destinations, search, projects and history reachable with the IME.
@@ -204,6 +204,8 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                 enter = if (motionEnabled) expandVertically() + fadeIn(tween(180)) else EnterTransition.None,
                 exit = if (motionEnabled) shrinkVertically() + fadeOut(tween(120)) else ExitTransition.None,
             ) {
+                // Opened from the search icon: focus once the field is attached (a restored query keeps the keyboard closed).
+                LaunchedEffect(Unit) { if (search.isBlank()) searchFocusRequester.requestFocus() }
                 OutlinedTextField(
                     search,
                     { search = it },
@@ -212,7 +214,7 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                     placeholder = { Text(uiText("Search conversations")) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp).focusRequester(searchFocusRequester)
-                        .onFocusChanged { if (!it.isFocused && search.isBlank()) searchExpanded = false }
+                        .onFocusChanged { if (it.isFocused) searchFocused = true else if (searchFocused) { searchFocused = false; if (search.isBlank()) searchExpanded = false } }
                         .testTag("history-search"),
                 )
             }

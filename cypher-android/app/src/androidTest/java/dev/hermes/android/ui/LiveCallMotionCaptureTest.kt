@@ -18,7 +18,7 @@ class LiveCallMotionCaptureTest {
     @Test fun controlledFrameClockMotionWithExplicitlyMockedMedia() {
         val images = mutableListOf<Bitmap>()
         val previousAutoAdvance = rule.mainClock.autoAdvance
-        fun frame(): Bitmap = rule.onNodeWithContentDescription("Cypher voice activity").captureToImage().asAndroidBitmap().also(images::add)
+        fun frame(): Bitmap = rule.onNodeWithContentDescription("${dev.hermes.android.data.currentAssistantName} voice activity").captureToImage().asAndroidBitmap().also(images::add)
         try {
             rule.mainClock.autoAdvance = false
             rule.runOnIdle { assertEquals(Lifecycle.State.RESUMED, rule.activity.lifecycle.currentState); rule.activity.motion(true) }

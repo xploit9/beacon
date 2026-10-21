@@ -192,7 +192,7 @@ class SettingsMigrationUiTest {
         shown("Notifications & Keep connected").assertTextContains("Notification delivery")
         assertTrue("Reading a summary must not open a route", host.opened.isEmpty())
         compose.runOnIdle { host.pluginAbsent = true }
-        compose.onNodeWithText("Calls need the Cypher plugin on your Hermes.").assertIsDisplayed()
+        compose.onNodeWithText("Add Cypher to your Hermes").assertIsDisplayed()
         compose.runOnIdle { host.pluginAbsent = false }
         compose.onNodeWithText("Calls need the Cypher plugin on your Hermes.").assertDoesNotExist()
     }

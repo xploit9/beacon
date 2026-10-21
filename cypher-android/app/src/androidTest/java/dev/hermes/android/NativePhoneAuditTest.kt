@@ -103,7 +103,7 @@ class NativePhoneAuditTest {
             navigate("Settings"); click("Profiles")
             waitFor { vm.phoneSettings.bots.value.profiles.isNotEmpty() && !vm.phoneSettings.bots.value.loading }
             capture("profiles")
-            compose.onAllNodesWithText("View profile settings").onFirst().performScrollTo().performClick()
+            compose.onAllNodesWithText("View profile").onFirst().performScrollTo().performClick()
             waitFor { vm.phoneSettings.bots.value.selected != null && !vm.phoneSettings.bots.value.loading }
             click("Change default model")
             waitFor { vm.phoneSettings.botModels.value.isNotEmpty() }

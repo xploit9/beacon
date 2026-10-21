@@ -196,7 +196,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
     // "provider\tmodel" keys; blank = the profile's default. The saved pick stays listed even before the list loads.
     val models = data["picker:models"]?.rows("groups").orEmpty().flatMap { group -> group.rows("models").map { group.string("provider_id") + "\t" + it.string("id") to group.string("provider") + " · " + it.string("label", it.string("id")) } }.toMap()
     val selectedModel = if (prefs.assistantModel.isBlank()) "" else prefs.assistantProvider + "\t" + prefs.assistantModel
-    LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    LazyColumn(Modifier.testTag("assistant-settings"), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
             Glass(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -230,7 +230,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                         )
                     }
                     if (pluginStatus == "absent" || proactive?.optBoolean("_pluginUpdateRequired") == true) {
-                        MissingCypherPluginState(compact = true)
+                        MissingCypherPluginState(compact = true, update = pluginStatus != "absent")
                     } else {
                         val checking = proactive?.optBoolean("_loading") == true || ui.connected && vm.client != null && proactive == null
                         if (checking) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {

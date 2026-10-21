@@ -129,7 +129,7 @@ import kotlinx.coroutines.launch
             DropdownMenuItem({ Text("Allowed toolsets") }, { open = false; vm.openCatalog("Toolsets") }, enabled = enabled && !saving)
         }
     }
-    if (confirmOff) AlertDialog(onDismissRequest = { confirmOff = false }, title = { Text(assistantText("Turn off Cypher approvals?")) },
+    if (confirmOff) AlertDialog(onDismissRequest = { confirmOff = false }, title = { Text(uiText("Turn off approvals?")) },
         text = { Text(assistantText("Cypher will run tools in this profile without asking.")) },
         confirmButton = { TextButton({ confirmOff = false; apply("off") }) { Text("Turn off") } },
         dismissButton = { TextButton({ confirmOff = false }) { Text("Cancel") } })

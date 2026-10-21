@@ -133,7 +133,7 @@ class CallHistoryUiTest {
             fixture.callHistoryRouteMissing = true
             compose.onNodeWithContentDescription("Conversation actions").performClick()
             compose.onNodeWithTag("call-history-open").performClick()
-            compose.waitUntil(10_000) { compose.onAllNodesWithText("Update the Cypher plugin on Hermes to see call history.").fetchSemanticsNodes().isNotEmpty() }
+            compose.waitUntil(10_000) { compose.onAllNodesWithText("Update Cypher on your Hermes").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("Retry").assertDoesNotExist()
             compose.onNodeWithTag("call-history-feedback-not-important:$callId").assertDoesNotExist()
 

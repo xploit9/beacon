@@ -39,7 +39,7 @@ class AdministrationUiTest {
     @Test fun serverCheckAndApplyAreSeparateRealCallbacks() {
         var checked = false
         var applied = false
-        compose.setContent { MaterialTheme { NativeServerSettings("Server updates", NativeServerState(update = JSONObject("""{"current_version":"1","can_apply":true,"update_available":true,"message":null}""")), {}, { checked = true }, { applied = true }, {}, {}) } }
+        compose.setContent { MaterialTheme { NativeServerSettings("Server updates", NativeServerState(update = JSONObject("""{"current_version":"1","can_apply":true,"update_available":true,"message":null}""")), { checked = true }, { applied = true }, {}, {}) } }
         compose.onNodeWithText("An update is available.").assertExists()
         compose.onNodeWithText("null").assertDoesNotExist()
         compose.onNodeWithText("Check now").performClick()

@@ -206,7 +206,8 @@ internal fun SetupWizardScreen(
     var qrScanner by remember { mutableStateOf<BarcodeScanner?>(null) }
     val photoDetected = remember { AtomicBoolean(false) }
     val latestOnStageLink by rememberUpdatedState(onStageLink)
-    DisposableEffect(qrScanner) { onDispose { qrScanner?.close() } }
+    // One scanner serves camera and photo; a qrScanner key would close each new one as soon as it was created.
+    DisposableEffect(Unit) { onDispose { qrScanner?.close() } }
     fun scannerForPhoto(): BarcodeScanner = qrScanner ?: BarcodeScanning.getClient(qrOptions).also { qrScanner = it }
     fun stageQr(value: String): Boolean = stageCypherConnectQr(value) {
         scanning = false

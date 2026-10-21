@@ -173,7 +173,7 @@ internal enum class BeaconMotionMode { Pulse, Sweep, Ripple }
     }
 }
 
-@Composable internal fun MissingCypherPluginState(modifier: Modifier = Modifier, compact: Boolean = false) {
+@Composable internal fun MissingCypherPluginState(modifier: Modifier = Modifier, compact: Boolean = false, update: Boolean = false) {
     val uriHandler = LocalUriHandler.current
     Column(
         modifier.fillMaxWidth().padding(if (compact) 8.dp else 24.dp),
@@ -184,9 +184,9 @@ internal enum class BeaconMotionMode { Pulse, Sweep, Ripple }
             BeaconSignal(BeaconMotionMode.Sweep, size = if (compact) 64.dp else 108.dp)
             BeaconMark(size = if (compact) 36.dp else 60.dp)
         }
-        Text(uiText("Add Cypher to your Hermes"), style = if (compact) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.titleMedium, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+        Text(uiText(if (update) "Update Cypher on your Hermes" else "Add Cypher to your Hermes"), style = if (compact) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.titleMedium, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
         Button(onClick = { uriHandler.openUri(CYPHER_PLUGIN_INSTALL_URL) }, modifier = Modifier.heightIn(min = 48.dp).testTag("missing-plugin-install")) {
-            Text(uiText("Install Cypher"))
+            Text(uiText(if (update) "Update Cypher" else "Install Cypher"))
         }
     }
 }

@@ -66,6 +66,7 @@ class ProactiveUiTest {
         compose.onNodeWithTag("proactive-time-Quiet hours start").performScrollTo().performClick()
         compose.onNodeWithTag("proactive-time-confirm-Quiet hours start").assertExists()
         compose.onNodeWithText("Run a brief now").assertDoesNotExist()
+        compose.onNodeWithTag("assistant-settings").performScrollToNode(hasText("What Cypher learned"))
         compose.onNodeWithText("What Cypher learned").assertExists()
     }
 
@@ -87,6 +88,8 @@ class ProactiveUiTest {
         assertEquals("22:00", settingsWrite.getJSONObject("body").string("quiet_start"))
         assertEquals("07:00", settingsWrite.getJSONObject("body").string("quiet_end"))
 
+        // Rules wait until the saved settings come back.
+        await { runCatching { compose.onNodeWithTag("proactive-add-rule").assertIsEnabled() }.isSuccess }
         compose.onNodeWithTag("proactive-add-rule").performScrollTo().performClick()
         await { vm.form.value?.title == "Add a rule" }
         compose.runOnIdle {
@@ -115,7 +118,8 @@ class ProactiveUiTest {
         compose.runOnIdle { vm.more("Assistant") }
         await { vm.data.value[proactiveKey(fixture)]?.optJSONArray("learned")?.length() == 1 }
 
-        compose.onNodeWithText("What Cypher learned").performScrollTo().assertExists()
+        compose.onNodeWithTag("assistant-settings").performScrollToNode(hasText("What Cypher learned"))
+        compose.onNodeWithText("What Cypher learned").assertExists()
         compose.onNodeWithText("Client moved the review").performScrollTo().assertExists()
         compose.onNodeWithTag("proactive-learned-remove-0").performScrollTo().performClick()
         await { fixture.proactiveLearned["coder"]?.isEmpty() == true && vm.data.value[proactiveKey(fixture)]?.optJSONArray("learned")?.length() == 0 }
@@ -129,7 +133,7 @@ class ProactiveUiTest {
         fixture.proactiveRouteMissing = true
         compose.runOnIdle { vm.more("Assistant") }
         await { vm.data.value[proactiveKey(fixture)]?.optBoolean("_pluginUpdateRequired") == true }
-        compose.onNodeWithText("Update the Cypher plugin on Hermes to use Proactive.").assertExists()
+        compose.onNodeWithText("Update Cypher on your Hermes").assertExists()
         compose.onNodeWithText("Retry").assertDoesNotExist()
 
         fixture.proactiveRouteMissing = false
@@ -386,7 +390,9 @@ class ProactiveUiTest {
 
     @Test fun proactiveControlsStayHiddenWhenOptionalPluginIsAbsent() = withFixture(pluginStatus = "absent") { vm, fixture ->
         compose.runOnIdle { vm.more("Assistant") }
-        await { compose.onAllNodesWithText("Important emails", substring = true).fetchSemanticsNodes().isEmpty() }
+        // The email card offers the plugin install instead of its controls.
+        await { compose.onAllNodesWithTag("missing-plugin-install").fetchSemanticsNodes().isNotEmpty() }
+        compose.onAllNodesWithTag("assistant-proactive-toggle").assertCountEquals(0)
         compose.runOnIdle { vm.tab("Cypher") }
         await { vm.ui.value.tab == "Cypher" && vm.chat.value.projectionReady }
         compose.onAllNodesWithTag("proactive-prompt-card").assertCountEquals(0)

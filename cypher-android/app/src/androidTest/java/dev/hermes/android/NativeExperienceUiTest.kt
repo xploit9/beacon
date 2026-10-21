@@ -246,7 +246,7 @@ class NativeExperienceUiTest {
         await { vm.data.value["native-projects"]?.has("projects") == true }
         assertFalse(vm.data.value.getValue("native-projects").has("_error"))
         val beforeRefresh = fixture.requests.count { it.string("method") == "projects.list" }
-        compose.onNodeWithTag("projects-screen").performTouchInput { swipeDown() }
+        compose.onNodeWithTag("projects-screen").performTouchInput { swipeDown(startY = top + height * 0.3f, endY = bottom) }
         await { fixture.requests.count { it.string("method") == "projects.list" } > beforeRefresh }
         compose.onNodeWithText("Refresh projects").assertDoesNotExist()
         receipts += "Restored Projects reads the installed native client after same-owner reconnect without requiring page re-entry."
@@ -858,7 +858,7 @@ class NativeExperienceUiTest {
         await { fixture.approvalMode == "smart" && compose.onAllNodesWithTag("approvals-menu").fetchSemanticsNodes().isEmpty() }
         assertEquals(1, fixture.requests.count { it.string("method") == "config.set" && it.optJSONObject("params")?.string("key") == "approvals.mode" })
         open();compose.onNodeWithTag("approval-mode-off").performScrollTo().performClick()
-        compose.onNodeWithText("Turn off Hermes approvals?").assertIsDisplayed()
+        compose.onNodeWithText("Turn off approvals?").assertIsDisplayed()
         compose.onNodeWithText("Cancel").performClick()
         assertEquals("smart", fixture.approvalMode)
         open();compose.onNodeWithTag("approval-mode-off").performScrollTo().performClick()
@@ -876,7 +876,7 @@ class NativeExperienceUiTest {
         val before = fixture.requests.count { it.string("method") == "config.set" }
         compose.runOnIdle { vm.selectSession("chat-b") }
         await { vm.chat.value.sessionId == "chat-b" }
-        compose.onNodeWithText("Turn off Hermes approvals?").assertDoesNotExist()
+        compose.onNodeWithText("Turn off approvals?").assertDoesNotExist()
         assertEquals(before, fixture.requests.count { it.string("method") == "config.set" })
         receipts += "Approvals use native Manual/Smart/Off values, Off requires confirmation, failed saves keep the real value, and changing conversation cancels stale confirmation."
     }
@@ -986,6 +986,7 @@ class NativeExperienceUiTest {
             compose.onNodeWithTag("bot-row-coder").performClick()
         }
         compose.runOnIdle { vm.composer(TextFieldValue("Normal chat draft")); vm.toggleSessions(true) }
+        compose.onNodeWithTag("history-search-toggle").performClick()
         compose.onNodeWithText("Search conversations").performTextInput("Travel")
         await { vm.ui.value.query == "Travel" }
         val normalTiles = navigationTiles.associateWith { compose.onNodeWithTag("navigation-${it.lowercase()}").getUnclippedBoundsInRoot() }
@@ -2068,14 +2069,15 @@ class NativeExperienceUiTest {
         assertTrue("The activity strip keeps to the content column and is a comfortable touch target", stripBounds.right - stripBounds.left <= 840.dp && stripBounds.bottom - stripBounds.top >= 47.5.dp)
         reveal(hasTestTag("message-activity-status"), towardOlder = false)
         compose.onNodeWithTag("message-activity-status", useUnmergedTree = true).assertTextEquals("Working")
-        val buildCard = card("build project, Running")
-        // The running tool opens like Relay's (ChatScreen starts a Running card expanded); a folded card is opened with its real toggle.
+        val buildCard = card("Build project, Running")
+        // Live steps sit behind one current-step row; opening it shows each folded card, opened with its real toggle.
+        compose.onAllNodesWithTag("tool-steps", useUnmergedTree = true).onLast().performScrollTo().performClick()
         ensureExpanded(buildCard)
         part(buildCard, "tool-card-status").assertTextEquals("Status: Running")
         part(buildCard, "tool-card-arguments").assertTextEquals("gradle assembleDebug\n--console=plain")
         compose.onAllNodes(hasProgressBarRangeInfo(androidx.compose.ui.semantics.ProgressBarRangeInfo.Indeterminate) and hasAnyAncestor(buildCard), useUnmergedTree = true).assertCountEquals(1)
         // Live tool events carry no clock time, so none is invented for them. A terminal result beats the sibling's stale running status.
-        compose.onNode(card("list files, Completed, 0.3s"), useUnmergedTree = true).assertExists()
+        compose.onNode(card("List files, Completed, 0.3s"), useUnmergedTree = true).assertExists()
         receipts += "A live running preview keeps its spinner and Status: Running, while a live tool with a result is Completed even if its status still says running."
         compose.runOnIdle { vm.composer(TextFieldValue("Then update the notes.")) }
         compose.onNodeWithTag("message-send").assertIsEnabled().assertContentDescriptionEquals("Queue").performClick()
@@ -2812,8 +2814,7 @@ class NativeExperienceUiTest {
         compose.onNodeWithTag("composer-model-effort").performClick()
         compose.onNodeWithText("Reasoning effort").performClick()
         await { vm.data.value["picker:reasoning"]?.optJSONArray("options")?.strings()?.contains("high") == true }
-        compose.onNode(hasText("Reasoning effort:", substring = true) and hasClickAction()).performClick()
-        compose.onNodeWithTag("choice-option:Reasoning effort:low").performClick()
+        compose.onNodeWithTag("reasoning-level:low").performScrollTo().performClick()
         compose.onNodeWithText("Apply to conversation").performClick()
         await { vm.catalog.value.isBlank() && vm.chat.value.raw.string("reasoning_effort") == "low" && vm.chat.value.sessionReasoningEffort == "low" }
         assertEquals("medium", fixture.reasoningEffort)
@@ -3211,7 +3212,7 @@ class NativeExperienceUiTest {
     @Test fun profileAndServerSettingsHaveCompleteNativeNavigationAndConfirmation() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.more("Profiles") }
         await { vm.phoneSettings.bots.value.profiles.isNotEmpty() && !vm.phoneSettings.bots.value.loading }
-        compose.onNodeWithText("View profile settings").performScrollTo().performClick()
+        compose.onNodeWithText("View profile").performScrollTo().performClick()
         await { vm.phoneSettings.bots.value.selected != null && !vm.phoneSettings.bots.value.loading }
         compose.onNodeWithText("Read behavior instructions").performScrollTo().performClick()
         compose.onNodeWithText("Check sources before answering.").performScrollTo().assertExists()

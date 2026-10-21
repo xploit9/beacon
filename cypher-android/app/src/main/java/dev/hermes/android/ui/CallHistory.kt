@@ -143,7 +143,7 @@ internal fun CallHistorySheet(vm: CypherViewModel, onOpenCall: (conversationId: 
                 }
             }
             when {
-                missingPlugin -> MissingCypherPluginState(Modifier.weight(1f), compact = true)
+                missingPlugin -> MissingCypherPluginState(Modifier.weight(1f), compact = true, update = true)
                 error.isNotBlank() -> Column(Modifier.weight(1f).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
                     Text(error, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     if (retryAvailable) TextButton(onClick = { coroutineScope.launch { calls = emptyList(); next = null; load() } }) { Text("Retry") }
