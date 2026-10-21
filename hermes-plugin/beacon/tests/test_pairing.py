@@ -234,17 +234,14 @@ def test_install_prompts_request_pairing_code_and_allow_qr_image():
     readme = (root / "README.md").read_text(encoding="utf-8")
     guide = (root / "docs" / "install-with-agent.md").read_text(encoding="utf-8")
 
-    assert 'hermes -p <profile> plugins install xploit9/beacon/hermes-plugin/beacon --enable' in readme
-    assert 'hermes -p <profile> beacon pair' in readme
+    # The README hands the agent one installer; the guide keeps the manual steps.
+    assert 'raw.githubusercontent.com/xploit9/beacon/main/hermes-plugin/beacon/install/beacon_install.py' in readme
+    assert 'names a flag' in readme and 'pairing block' in readme
+    assert (root / 'hermes-plugin' / 'beacon' / 'install' / 'beacon_install.py').is_file()
     assert '/beacon-pair' in (root / 'hermes-plugin' / 'beacon' / 'README.md').read_text(encoding='utf-8')
-    for instructions in (readme, guide):
-        assert 'plugin named' in instructions
-        assert 'plugin data' in instructions
-        assert 'managed cron jobs' in instructions
-    assert "Each phone gets its own code" in readme
-    assert "Scan the QR, choose a screenshot of it, or type the address and code" in readme
-    assert "Scan the QR, choose a screenshot of it, or type the address and code." in guide
-
+    for phrase in ('plugins/cypher', 'plugin-data/cypher', 'CYPHER_PROACTIVE_JOB', 'beacon pair'):
+        assert phrase in guide, phrase
+    assert 'enter the address and code' in readme and 'choose a screenshot' in readme
 
 def test_cli_and_slash_pair_commands_share_one_copy_friendly_block(harness, monkeypatch):
     plugin = load_private("__init__")

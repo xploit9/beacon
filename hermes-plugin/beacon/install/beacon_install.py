@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import ipaddress
+import csv
 import json
 import os
 from pathlib import Path
@@ -112,7 +113,8 @@ def _choose(label: str, values: list[Path] | list[str]) -> Path | str:
     try:
         choice = input(f"Select {label} (1-{len(values)}): ").strip()
     except (EOFError, KeyboardInterrupt) as exc:
-        raise InstallError(f"No {label} was selected; nothing was changed.") from exc
+        flag = "--home" if label.startswith("Hermes home") or "home" in label else "--profile"
+        raise InstallError(f"No {label} was selected; nothing was changed. Ask which one, then rerun with {flag} <choice>.") from exc
     if not choice.isdigit() or not 1 <= int(choice) <= len(values):
         raise InstallError(f"Invalid {label} selection; nothing was changed.")
     return values[int(choice) - 1]
@@ -408,15 +410,12 @@ def _route_status(url: str) -> int | None:
         return None
 
 
-def _wait_for_beacon_route(port: int, public_url: str | None, process: subprocess.Popen[bytes]) -> bool:
+def _wait_for_beacon_route(port: int, public_url: str | None, process: subprocess.Popen[bytes] | None) -> bool:
     local = f"http://127.0.0.1:{port}{PAIR_ROUTE}"
-    if _is_https_url(public_url):
-        public = public_url.rstrip("/") + PAIR_ROUTE
-    else:
-        public = local
-    deadline = time.monotonic() + 30
+    public = public_url.rstrip("/") + PAIR_ROUTE if _is_https_url(public_url) else local
+    deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
-        if process.poll() is not None:
+        if process is not None and process.poll() is not None:
             return False
         if _route_status(local) in (200, 401) or (public != local and _route_status(public) in (200, 401)):
             return True
@@ -424,15 +423,62 @@ def _wait_for_beacon_route(port: int, public_url: str | None, process: subproces
     return False
 
 
-def _restart_dashboard(hermes: str, home: Path, profile: str, port: int, public_url: str | None) -> None:
-    _run_mutation(hermes, home, profile, "dashboard", "--stop")
-    command = _hermes_argv(hermes, profile, "dashboard", "--no-open")
+def _windows_dashboard_task() -> str | None:
+    """The scheduled task that launches this PC's Hermes dashboard, if one exists."""
     try:
-        process = subprocess.Popen(command, env=_env(home))
-    except OSError as exc:
-        raise InstallError("Hermes could not start the selected dashboard.") from exc
+        result = subprocess.run(["schtasks", "/query", "/fo", "csv", "/v", "/nh"], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=20, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for row in csv.reader(result.stdout.splitlines()):
+        if len(row) > 8 and "hermes" in row[8].casefold() and "dashboard" in (row[1] + " " + row[8]).casefold():
+            return row[1].lstrip("\\")
+    return None
+
+
+def _systemd_dashboard_unit() -> str | None:
+    if not shutil.which("systemctl"):
+        return None
+    result = subprocess.run(["systemctl", "--user", "is-active", "hermes-dashboard"], capture_output=True, text=True, check=False)
+    return "hermes-dashboard" if result.stdout.strip() == "active" else None
+
+
+def _detached(command: list[str], home: Path) -> subprocess.Popen[bytes]:
+    """Start the dashboard so it keeps running after this installer (and the agent's shell) exits."""
+    logs = home / "logs"
+    log = open(logs / "beacon-install-dashboard.log", "ab") if logs.is_dir() else subprocess.DEVNULL
+    options: dict = {"env": _env(home), "stdin": subprocess.DEVNULL, "stdout": log, "stderr": subprocess.STDOUT}
+    if sys.platform == "win32":
+        options["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED_PROCESS | NEW_PROCESS_GROUP | NO_WINDOW
+    else:
+        options["start_new_session"] = True
+    return subprocess.Popen(command, **options)
+
+
+def _restart_dashboard(hermes: str, home: Path, profile: str, port: int, public_url: str | None) -> None:
+    """Restart the way this dashboard is run: its scheduled task or systemd unit, else a detached relaunch."""
+    task = _windows_dashboard_task() if sys.platform == "win32" else None
+    unit = None if task else _systemd_dashboard_unit()
+    process = None
+    if task:
+        subprocess.run(["schtasks", "/end", "/tn", task], capture_output=True, check=False)
+        _run_mutation(hermes, home, profile, "dashboard", "--stop")
+        if subprocess.run(["schtasks", "/run", "/tn", task], capture_output=True, check=False).returncode:
+            raise InstallError(f"Could not start the scheduled task {task!r}; start it from Task Scheduler.")
+        _line(True, f"Restarted the dashboard through its scheduled task {task!r}")
+    elif unit:
+        if subprocess.run(["systemctl", "--user", "restart", unit], check=False).returncode:
+            raise InstallError(f"systemctl could not restart {unit}.")
+        _line(True, f"Restarted the {unit} service")
+    else:
+        _run_mutation(hermes, home, profile, "dashboard", "--stop")
+        try:
+            process = _detached(_hermes_argv(hermes, profile, "dashboard", "--no-open", "--port", str(port)), home)
+        except OSError as exc:
+            raise InstallError("Hermes could not start the selected dashboard.") from exc
+        _line(True, "Restarted the dashboard in the background")
     if not _wait_for_beacon_route(port, public_url, process):
-        raise InstallError("The Beacon dashboard route did not answer 401 or 200 after restart.")
+        raise InstallError(f"The dashboard did not come back with Beacon within a minute. Start it with: hermes -p {profile} dashboard --port {port}")
     _line(True, "Beacon dashboard route is responding (HTTP 401/200).")
 
 
@@ -462,14 +508,14 @@ def _tailscale_url() -> str | None:
         return None
 
 
-def _configure_tailscale(hermes: str, home: Path, profile: str, port: int) -> str | None:
+def _configure_tailscale(hermes: str, home: Path, profile: str, port: int, allow: bool = False) -> str | None:
     tailscale = shutil.which("tailscale")
     if not tailscale:
         _line(False, "Tailscale CLI was not found; configure Hermes with a public HTTPS dashboard URL to pair.")
         return None
     command = f"tailscale serve {port}"
     print(f"No public HTTPS dashboard URL is configured. Tailscale Serve can publish the dashboard to your tailnet: {command}")
-    if not _yes_no("Run that command and save its HTTPS URL as Hermes dashboard.public_url? [y/N] "):
+    if not (allow or _yes_no("Run that command and save its HTTPS URL as Hermes dashboard.public_url? [y/N] ")):
         _line(False, "Pairing skipped; configure a public HTTPS dashboard URL to connect a phone.")
         return None
     try:
@@ -490,11 +536,12 @@ def _configure_tailscale(hermes: str, home: Path, profile: str, port: int) -> st
     return saved
 
 
-def _pair(hermes: str, home: Path, profile: str) -> None:
-    try:
-        name = input("Phone name [My phone]: ").strip() or "My phone"
-    except (EOFError, KeyboardInterrupt):
-        name = "My phone"
+def _pair(hermes: str, home: Path, profile: str, name: str | None = None) -> None:
+    if name is None:
+        try:
+            name = input("Phone name [My phone]: ").strip() or "My phone"
+        except (EOFError, KeyboardInterrupt):
+            name = "My phone"
     if len(name) > 80 or any(ord(char) < 32 or ord(char) == 127 for char in name):
         raise InstallError("Invalid phone name; pairing was not started.")
     result = _quiet(hermes, home, profile, "beacon", "pair", "--name", name)
@@ -511,8 +558,8 @@ def _pair(hermes: str, home: Path, profile: str) -> None:
 def _dry_run_summary(cypher_installed: bool, beacon_installed: bool, jobs: list[str], running: bool,
                      public_url: str | None, port: int) -> None:
     action = "update Beacon" if beacon_installed else "install Beacon"
-    legacy = "back up and remove cypher" if cypher_installed else "no installed cypher plugin"
-    print(f"✓ Dry run: would {legacy}, remove {len(jobs)} managed cron job(s), {action}, and pair a phone.")
+    steps = (["back up and remove the old cypher plugin"] if cypher_installed else []) +         ([f"remove {len(jobs)} of its cron job(s)"] if jobs else []) + [action, "pair a phone"]
+    print(f"✓ Dry run: would {', '.join(steps[:-1])} and {steps[-1]}.")
     print(f"✓ Dashboard running: {'yes (restart would require approval)' if running else 'no'}")
     if _is_https_url(public_url):
         _line(True, "Public HTTPS dashboard URL is configured")
@@ -565,7 +612,7 @@ def _install(args: argparse.Namespace) -> int:
 
     if running:
         print(f"Restart commands for this Hermes profile:\n  hermes -p {profile} dashboard --stop\n  hermes -p {profile} dashboard --no-open")
-        restart = args.yes or _yes_no("Restart the dashboard now? [y/N] ")
+        restart = args.yes or _yes_no("Restart the dashboard now? [y/N] (an agent: ask the owner, then rerun with --yes) ")
         if restart:
             public_url = _public_url(hermes, home, profile)
             _restart_dashboard(hermes, home, profile, _dashboard_port(hermes, home, profile), public_url)
@@ -576,10 +623,10 @@ def _install(args: argparse.Namespace) -> int:
 
     public_url = _public_url(hermes, home, profile)
     if not _is_https_url(public_url):
-        public_url = _configure_tailscale(hermes, home, profile, _dashboard_port(hermes, home, profile))
+        public_url = _configure_tailscale(hermes, home, profile, _dashboard_port(hermes, home, profile), args.tailscale)
     pairing_complete = False
     if _is_https_url(public_url):
-        _pair(hermes, home, profile)
+        _pair(hermes, home, profile, args.phone_name)
         pairing_complete = True
     else:
         _line(False, "Pairing is not complete until Hermes has a public HTTPS dashboard URL.")
@@ -593,6 +640,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profile", help="Hermes profile to use (skips profile selection)")
     parser.add_argument("--yes", action="store_true", help="Answer yes to the dashboard restart prompt only")
     parser.add_argument("--dry-run", action="store_true", help="Show the plan without changing Hermes or the network")
+    parser.add_argument("--phone-name", help="Name for the phone in the device list (default: My phone)")
+    parser.add_argument("--tailscale", action="store_true", help="Allow Tailscale Serve to publish the dashboard over HTTPS when no HTTPS URL exists")
     args = parser.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):

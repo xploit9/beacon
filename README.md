@@ -20,18 +20,14 @@ you can rename it in Settings › Assistant.
 
 ## Install
 
-**On the PC that runs Hermes**, give your coding agent (Codex, Claude Code, or Hermes itself) this prompt:
+**1. On the PC that runs Hermes**, give your coding agent (Codex, Claude Code, or Hermes itself) this prompt:
 
-> Set up Beacon on my Hermes: download and run the installer from https://github.com/xploit9/beacon (`hermes-plugin/beacon/install/beacon_install.py`), relay its questions to me, and show me the pairing block it prints at the end. Never print or store passwords, tokens or API keys, and never modify Hermes core.
+> Set up Beacon on my Hermes: download https://raw.githubusercontent.com/xploit9/beacon/main/hermes-plugin/beacon/install/beacon_install.py and run it with Python. Whenever it stops to ask something, it names a flag — ask me, then rerun it with that flag. Show me the pairing block it prints at the end. Never print or store passwords, tokens or API keys, and never modify Hermes core.
 
-Manual fallback: see [docs/install-with-agent.md](docs/install-with-agent.md).
+You can also run it yourself: `python beacon_install.py`. It finds your Hermes, backs up and removes an older version of the plugin, installs Beacon, restarts the dashboard if you say yes, and prints your pairing code. Manual steps: [docs/install-with-agent.md](docs/install-with-agent.md).
 
-The public repository needs no GitHub login; if Releases cannot be reached, check network access.
-
-**2. On your phone**, download `Beacon-1.1.0.apk` from [Releases](https://github.com/xploit9/beacon/releases) and install
-it. Open it. Scan the QR, choose a screenshot of it, or type the address and code, then follow the setup wizard.
-
-The app is `dev.hermes.android.stable` ("Beacon"). It installs next to any older Beacon build without touching it.
+**2. On your phone**, download `Beacon-1.1.1.apk` from [Releases](https://github.com/xploit9/beacon/releases/latest) and install
+it. Open it, enter the address and code (or scan the QR on the dashboard's **Beacon** tab, or choose a screenshot of it), sign in with Hermes, and follow the setup wizard.
 
 ## Pair or manage phones
 
