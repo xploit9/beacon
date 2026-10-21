@@ -18,7 +18,7 @@ Use `hermes -p <profile>` for every profile-scoped command. Hermes consumes `-p`
 
 ## 2. Install or update the plugin
 
-The repository is private: `xploit9/cypher`. Hermes' native installer accepts owner/repository shorthand, Git URLs, and a repository subdirectory. For the current repository layout, install the `hermes-plugin/cypher` subdirectory:
+The repository is `xploit9/cypher` (it may be private). Hermes' native installer accepts owner/repository shorthand, Git URLs, and a repository subdirectory. For the current repository layout, install the `hermes-plugin/cypher` subdirectory:
 
 ```sh
 hermes -p <profile> plugins install xploit9/cypher/hermes-plugin/cypher --enable
@@ -77,7 +77,7 @@ Do not copy, print, or log the route response. Loopback mode may include a sessi
 
 ## 4. Finish on the phone
 
-Tell the user to download and install the latest stable `Cypher-<version>.apk` from the private repository's [Releases page](https://github.com/xploit9/cypher/releases), open the dashboard's **Cypher** tab, and scan the QR with the Cypher app. App and plugin automatic updates are on by default in Settings **App updates**; app downloads use an unmetered connection and keep package, version, checksum and signer verification, with a tap-to-install notice whenever Android requires confirmation.
+Tell the user to download and install the latest stable `Cypher-<version>.apk` from the repository's [Releases page](https://github.com/xploit9/cypher/releases), open the dashboard's **Cypher** tab, and scan the QR with the Cypher app. App and plugin automatic updates are on by default in Settings **App updates**; app downloads use an unmetered connection and keep package, version, checksum and signer verification, with a tap-to-install notice whenever Android requires confirmation.
 
 Sign-in uses Hermes' normal OAuth browser flow. If the browser is already signed in, one tap completes it. That single sign-in covers chat, history, plugin pages, calls, and Keep connected. If the dashboard has no accounts and is in loopback mode, scanning the QR signs in immediately.
 

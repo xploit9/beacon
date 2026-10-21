@@ -33,15 +33,22 @@ Hermes, and an assistant that watches your email and calls you when something im
 
 ## Install
 
-**1. On the PC that runs Hermes**, give your agent this prompt:
+**1. On the PC that runs Hermes**, give your coding agent (Codex, Claude Code, or Hermes itself) this prompt. It sets
+everything up end to end and asks you before anything that needs your say:
 
-> Install or update the Cypher plugin for my selected Hermes profile by following https://github.com/xploit9/cypher/blob/main/docs/install-with-agent.md. Ask before restarting an active dashboard or changing network settings. Never print or store passwords, tokens, or API keys, and never modify Hermes core.
+> Set up Cypher for my Hermes end to end by following https://github.com/xploit9/cypher/blob/main/docs/install-with-agent.md (if you can't open it, read it with `gh api repos/xploit9/cypher/contents/docs/install-with-agent.md -H "Accept: application/vnd.github.raw"`). Do every step yourself:
+> 1. Check that Hermes is installed and find the profile my dashboard uses; ask me if more than one could be it.
+> 2. Install the Cypher plugin with Hermes' own installer (`hermes -p <profile> plugins install xploit9/cypher/hermes-plugin/cypher --enable`), or update it if it's already installed. Let Hermes' security scan run, and ask me before approving Python dependencies.
+> 3. Restart only that dashboard (ask me first), then confirm it runs the new plugin and shows a **Cypher** tab.
+> 4. Make sure my phone can reach the dashboard over HTTPS. If it can't yet, propose Tailscale Serve and ask before changing any network setting.
+> 5. Then tell me to open the dashboard's **Cypher** tab, tap **Use Cypher with this Hermes account** if it asks, and install the app from https://github.com/xploit9/cypher/releases/latest.
+>
+> Never print or store passwords, tokens or API keys, and never modify Hermes core.
 
-The repository is private, so that PC needs GitHub access first (`gh auth login`). Hermes' own installer checks the plugin
-before it installs. Then open the dashboard's **Cypher** tab once and tap **Use Cypher with this Hermes account**.
+If the repository isn't public for you, that PC needs GitHub access first (`gh auth login`).
 
 **2. On your phone**, download `Cypher-1.0.0.apk` from [Releases](https://github.com/xploit9/cypher/releases) and install
-it. Scan the QR code on the dashboard's **Cypher** tab with Cypher.
+it. Open it, scan the QR code on the dashboard's **Cypher** tab, and follow the setup wizard.
 
 The app is `dev.hermes.android.stable` ("Cypher"). It installs next to any older Cypher build without touching it.
 
