@@ -881,11 +881,11 @@ internal fun acceptsInitialConversationEdit(
                         }, enabled = !callActive && !readOnly, modifier = Modifier.testTag("composer-dictate")) { Icon(Icons.Rounded.Mic, uiText("Dictate message")) }
                         if (voiceAction && streaming) {
                             // The trailing slot morphs to Stop, so the bar never widens during a turn.
-                            OutlinedIconButton(onClick = { vm.cancel() }, shape = CircleShape, border = BorderStroke(1.dp, MaterialTheme.colorScheme.error), modifier = Modifier.size(composerActionSize).testTag("message-stop")) { Icon(Icons.Rounded.Stop, uiText("Stop"), Modifier.size(composerActionIconSize), tint = MaterialTheme.colorScheme.error) }
+                            OutlinedIconButton(onClick = { vm.cancel() }, shape = CircleShape, border = BorderStroke(1.dp, MaterialTheme.colorScheme.error), modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("message-stop")) { Icon(Icons.Rounded.Stop, uiText("Stop"), Modifier.size(composerActionIconSize), tint = MaterialTheme.colorScheme.error) }
                         } else if (voiceAction) {
-                            FilledIconButton(onClick = onCall, shape = CircleShape, modifier = Modifier.size(composerActionSize).testTag("chat-call-cypher"), enabled = callAvailable && canonical && !callActive && !readOnly && chat.streamId.isBlank() && voiceCallsOffered(ui.bootstrap)) { Icon(Icons.Rounded.GraphicEq, assistantText("Talk to Cypher in this conversation"), Modifier.size(composerActionIconSize)) }
+                            FilledIconButton(onClick = onCall, shape = CircleShape, modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("chat-call-cypher"), enabled = callAvailable && canonical && !callActive && !readOnly && chat.streamId.isBlank() && voiceCallsOffered(ui.bootstrap)) { Icon(Icons.Rounded.GraphicEq, assistantText("Talk to Cypher in this conversation"), Modifier.size(composerActionIconSize)) }
                         } else {
-                            FilledIconButton(onClick = submit, shape = CircleShape, modifier = Modifier.size(composerActionSize).testTag("message-send"), enabled = editable && preparing.isEmpty() && chat.uncertain.isBlank() && !callActive && !readOnly) { Icon(Icons.Rounded.ArrowUpward, uiText(if (commandName != null) "Run command" else if (chat.streamId.isNotBlank()) "Queue" else "Send"), Modifier.size(composerActionIconSize)) }
+                            FilledIconButton(onClick = submit, shape = CircleShape, modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("message-send"), enabled = editable && preparing.isEmpty() && chat.uncertain.isBlank() && !callActive && !readOnly) { Icon(Icons.Rounded.ArrowUpward, uiText(if (commandName != null) "Run command" else if (chat.streamId.isNotBlank()) "Queue" else "Send"), Modifier.size(composerActionIconSize)) }
                         }
                     }
                 }
@@ -1390,7 +1390,8 @@ private fun chatActionIcon(title: String): androidx.compose.ui.graphics.vector.I
     else -> Icons.Rounded.MoreHoriz
 }
 
-/** Voice and send share one footprint, so the control does not jump when the draft changes. */
+/** Voice, send and stop share one footprint, so the control does not jump when the draft changes. The circle is
+ * 42dp; minimumInteractiveComponentSize keeps a 48dp tap space so a near miss never lands on Dictate. */
 internal val composerActionSize = 42.dp
 internal val composerActionIconSize = 22.dp
 

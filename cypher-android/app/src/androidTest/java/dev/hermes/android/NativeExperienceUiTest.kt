@@ -1835,6 +1835,9 @@ class NativeExperienceUiTest {
         val sendFootprint = compose.onNodeWithTag("message-send").getUnclippedBoundsInRoot()
         assertEquals("Primary action is 42dp wide", 42f, (sendFootprint.right - sendFootprint.left).value, .75f)
         assertEquals("Primary action is 42dp tall", 42f, (sendFootprint.bottom - sendFootprint.top).value, .75f)
+        // The 42dp circle keeps a 48dp tap space, so Dictate ends at least 3dp before it and a near miss still sends.
+        val dictateFootprint = compose.onNodeWithTag("composer-dictate").getUnclippedBoundsInRoot()
+        assertTrue("Dictate leaves the send tap space", (sendFootprint.left - dictateFootprint.right).value >= 2.25f)
         assertTrue("Primary action is below the text area and above the keyboard", sendBounds.top >= inputBounds.bottom && sendBounds.bottom <= keyboardTop() + 2)
         val attachBounds = compose.onNodeWithTag("composer-attach").fetchSemanticsNode().boundsInWindow
         val permissionBounds = compose.onNodeWithTag("composer-approvals").fetchSemanticsNode().boundsInWindow
@@ -1868,13 +1871,13 @@ class NativeExperienceUiTest {
         assertTrue(vm.composer.value.text.isBlank())
         assertTrue("Queue must not dispatch another prompt", fixture.requests.none { it.string("method") == "prompt.submit" })
         receipts += "Busy primary queues locally; no prompt dispatched."
-        // With the draft now empty and the turn still streaming, the trailing voice slot becomes Stop, in the same 48dp footprint.
+        // With the draft now empty and the turn still streaming, the trailing voice slot becomes Stop, in the same 42dp footprint.
         compose.onNodeWithTag("message-stop").assertIsDisplayed().assertIsEnabled()
         compose.onNodeWithTag("message-send").assertDoesNotExist()
         compose.onNodeWithTag("chat-call-cypher").assertDoesNotExist()
         val stopFootprint = compose.onNodeWithTag("message-stop").getUnclippedBoundsInRoot()
-        assertEquals("Stop is 48dp wide", 48f, (stopFootprint.right - stopFootprint.left).value, .75f)
-        assertEquals("Stop is 48dp tall", 48f, (stopFootprint.bottom - stopFootprint.top).value, .75f)
+        assertEquals("Stop is 42dp wide", 42f, (stopFootprint.right - stopFootprint.left).value, .75f)
+        assertEquals("Stop is 42dp tall", 42f, (stopFootprint.bottom - stopFootprint.top).value, .75f)
         capture("busy-composer")
         compose.onNodeWithTag("message-stop").performClick()
         await { fixture.requests.any { it.string("method") == "session.interrupt" } }
@@ -1882,7 +1885,7 @@ class NativeExperienceUiTest {
         assertEquals("Stop is not a send: the queue is untouched", 1, vm.chat.value.queued.size)
         assertTrue("Stop never submits or creates a conversation", fixture.requests.none { it.string("method") in setOf("prompt.submit", "session.create") })
         compose.runOnIdle { vm.clearMessage() }
-        receipts += "Stop replaces voice when an empty composer streams, keeps the 48dp footprint, and its existing callback sends exactly one native session.interrupt for the runtime id without touching the queue."
+        receipts += "Stop replaces voice when an empty composer streams, keeps the 42dp footprint, and its existing callback sends exactly one native session.interrupt for the runtime id without touching the queue."
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "", liveText = ""); vm.composer(TextFieldValue("/")) }
         await { vm.data.value["slash:catalog"] != null }
         compose.onNodeWithTag("message-input").performClick()
