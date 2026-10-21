@@ -64,7 +64,7 @@ class CypherSettingsTest {
         assertSame(failure, runCatchingCancellable<Unit> { throw failure }.exceptionOrNull())
     }
     @Test fun proactiveNeedsASavedAssistantChatInPlainWords() {
-        assertEquals("Send Cypher a message first, then turn this on.",
+        assertEquals("Send Beacon a message first, then turn this on.",
             proactiveErrorMessage(ApiFailure(409, "Choose an owned assistant conversation before enabling Proactive", plugin = true), "fallback"))
         assertEquals("fallback", proactiveErrorMessage(RuntimeException(""), "fallback"))
     }
