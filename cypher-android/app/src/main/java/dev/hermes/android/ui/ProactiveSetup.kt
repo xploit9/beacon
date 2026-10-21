@@ -189,7 +189,7 @@ internal fun openProactiveRuleForm(vm: CypherViewModel, profile: String, onCreat
         seed = json("action" to "notify", "night" to false),
         explanation = "Describe which emails $currentAssistantName should alert you about.",
         actionLabel = "Add rule",
-        onResult = { form ->
+        onResult = onResult@{ form ->
             val text = form.string("text").trim()
             require(text.isNotBlank() && text.codePointCount(0, text.length) <= 300) { "Add a rule of 300 characters or fewer." }
             val source = vm.client ?: throw IllegalStateException("Reconnect before adding a rule.")

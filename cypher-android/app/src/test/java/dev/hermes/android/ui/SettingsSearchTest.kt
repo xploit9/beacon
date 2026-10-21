@@ -60,7 +60,7 @@ class SettingsSearchTest {
     }
     @Test fun aBlankOrBrokenAssistantNameFallsBackToCypher() {
         assertEquals("Nova", dev.hermes.android.data.assistantNameOf("  Nova "))
-        for (bad in listOf(null, "", "   ", "No\u0000va")) assertEquals("Cypher", dev.hermes.android.data.assistantNameOf(bad))
+        for (bad in listOf(null, "", "   ", "No\u0000va")) assertEquals("Beacon", dev.hermes.android.data.assistantNameOf(bad))
         assertEquals(dev.hermes.android.data.ASSISTANT_NAME_MAX, dev.hermes.android.data.assistantNameOf("x".repeat(80)).length)
     }
     @Test fun retiredModelsAndToolsRoutesResolveToTheCurrentCategory() {

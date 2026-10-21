@@ -58,8 +58,8 @@ import java.net.URLEncoder
         item {
             Row(Modifier.fillMaxWidth(), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                 Text(if (mcp) "Connections let Hermes use your services. Test a connection to check its available tools." else "Choose the tool groups available to this profile. Changes apply to new chats.", Modifier.weight(1f))
-                IconButton(onClick = { refresh() }, enabled = busy.isBlank() && !loading, modifier = Modifier.semantics { contentDescription = uiText(if (mcp) "Refresh connections" else "Refresh tools") }) {
-                    Icon(Icons.Rounded.Refresh, null)
+                IconButton(onClick = { refresh() }, enabled = busy.isBlank() && !loading) {
+                    Icon(Icons.Rounded.Refresh, uiText(if (mcp) "Refresh connections" else "Refresh tools"))
                 }
             }
             OutlinedTextField(search, { search = it }, label = { Text(if (mcp) "Search connections" else "Search tools") }, modifier = Modifier.fillMaxWidth(), singleLine = true)

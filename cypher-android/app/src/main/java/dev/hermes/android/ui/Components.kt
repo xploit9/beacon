@@ -131,7 +131,7 @@ internal enum class BeaconMotionMode { Pulse, Sweep, Ripple }
     val motionEnabled = rememberNativeMotionEnabled()
     val phase = if (motionEnabled && mode != BeaconMotionMode.Ripple) {
         val transition = rememberInfiniteTransition(label = "beacon-${mode.name}")
-        val spec = if (mode == BeaconMotionMode.Pulse)
+        val spec: InfiniteRepeatableSpec<Float> = if (mode == BeaconMotionMode.Pulse)
             infiniteRepeatable(tween(2200, easing = FastOutSlowInEasing), RepeatMode.Reverse)
         else infiniteRepeatable(tween(2400, easing = LinearEasing), RepeatMode.Restart)
         val value by transition.animateFloat(0f, 1f, spec, label = "beacon-phase-${mode.name}")

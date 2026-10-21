@@ -194,8 +194,8 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                             searchExpanded = false
                         } else searchExpanded = true
                     },
-                    modifier = Modifier.testTag("history-search-toggle").semantics { contentDescription = uiText("Search conversations") },
-                ) { Icon(Icons.Rounded.Search, null) }
+                    modifier = Modifier.testTag("history-search-toggle"),
+                ) { Icon(Icons.Rounded.Search, uiText("Search conversations")) }
             }
         }
         item("history-search") {
@@ -234,8 +234,8 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                 Box {
                     IconButton(
                         onClick = { filtersOpen = true },
-                        modifier = Modifier.testTag("history-filter").semantics { selected = filtered; contentDescription = uiText("History filters") },
-                    ) { Icon(Icons.Rounded.FilterList, null) }
+                        modifier = Modifier.testTag("history-filter").semantics { selected = filtered },
+                    ) { Icon(Icons.Rounded.FilterList, uiText("History filters")) }
                     DropdownMenu(filtersOpen, { filtersOpen = false }) {
                         DropdownMenuItem(
                             text = { Text(uiText("New thread")) },
@@ -1528,7 +1528,7 @@ private fun chatAction(vm: CypherViewModel, title: String) {
         "Pin" -> chat.raw.optBoolean("pinned").let { pinned -> vm.conversationAction(chat.sessionId, "/api/session/pin", json("pinned" to !pinned), if (pinned) "Unpinned" else "Pinned") }
         "Branch" -> vm.openForm(ActionForm(title, "/api/session/branch", listOf(Field("title", "Branch title"), Field("keep_count", "Messages to keep", FieldType.INTEGER)), seed.put("keep_count", chat.messages.size), onResult = result))
         "Compress context" -> vm.sessionAction("/api/session/compress") { response ->
-            vm.notice(when (response.string("status")) { "compressed" -> "Context compressed"; "aborted" -> "Compression was not needed or was cancelled."; "pending", "lock_held" -> assistantText("Cypher is still working. Refresh the conversation to check progress."); else -> "Compression result is not confirmed. Refresh the conversation." })
+            vm.notice(when (response.string("status")) { "compressed" -> "Context compressed"; "aborted" -> "Compression was not needed or was cancelled."; "pending", "lock_held" -> "${dev.hermes.android.data.currentAssistantName} is still working. Refresh the conversation to check progress."; else -> "Compression result is not confirmed. Refresh the conversation." })
         }
         "Undo last turn" -> vm.openForm(ActionForm(title, "/api/session/undo", emptyList(), seed, explanation = "Undo the latest conversation turn.", actionLabel = "Undo", onResult = result))
         "Usage" -> { vm.more("Session usage") }
