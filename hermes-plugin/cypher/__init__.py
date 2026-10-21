@@ -256,6 +256,9 @@ _BLOCKED_PROACTIVE_TOOLS={'delegate_task','execute_code','computer_use','kanban'
                           'browser_cdp','browser_exec','web_extract','web_fetch'}
 # Read commands only: the subcommand words before the first option say what runs.
 _HIMALAYA_READS={('envelope','list'),('envelope','search'),('folder','list'),('mailbox','list')}
+_GWS_READ_OPTIONS={'--params','--format','--page-all','--page-limit','--page-delay'}
+_HIMALAYA_READ_OPTIONS={'-a','--account','-f','--folder','-p','--page','-s','--page-size','-o','--output',
+                        '--preview','-h','--header','--raw','--no-headers'}
 _READ_ONLY_MESSAGE='Proactive runs are read-only; this would change something.'
 _READ_ONLY_TERMINAL_MESSAGE=('Proactive runs are read-only. The terminal may run only gws gmail … list/get, '
                              'himalaya envelope list/search, or himalaya message read <id> --preview.')
@@ -308,6 +311,11 @@ def _watch_terminal_read_only(command):
     for word in words[1:]:
         if word.startswith('-'): break
         path.append(word.casefold())
+    # Known options only: gws --sanitize posts responses (and the token) to a host the command names,
+    # himalaya 2.x --log-file appends to any path, and future globals stay out until reviewed.
+    allowed_options=_GWS_READ_OPTIONS if basename=='gws' else _HIMALAYA_READ_OPTIONS
+    if any(word.split('=',1)[0].casefold() not in allowed_options for word in words[1:] if word.startswith('-')):
+        return False
     # Gmail only: its methods answer JSON, while other services' gets can write files (-o).
     if basename=='gws': return len(path)>=2 and path[0]=='gmail' and path[-1] in {'list','get'}
     if basename=='himalaya':
