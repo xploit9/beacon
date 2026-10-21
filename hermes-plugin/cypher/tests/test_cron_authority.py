@@ -35,21 +35,20 @@ def test_current_profile_distinguishes_launch_and_named_profiles(harness, monkey
     launch_home = tmp_path / 'launch'
     work_home = tmp_path / 'work'
     active_home = [launch_home]
+    override = [None]
     server = SimpleNamespace(_profile_home=lambda profile: None if profile == 'default' else work_home)
     # A profile-scoped task sets a home override; with none, the run is the launch profile's.
     monkeypatch.setitem(sys.modules, 'hermes_constants', SimpleNamespace(
-        get_hermes_home=lambda: active_home[0],
-        get_hermes_home_override=lambda: None if active_home[0] == launch_home else str(active_home[0])))
+        get_hermes_home=lambda: active_home[0], get_hermes_home_override=lambda: override[0]))
     monkeypatch.setitem(sys.modules, 'tui_gateway', SimpleNamespace(server=server))
     monkeypatch.setattr(sys.modules['cypher_mobile'], 'home', lambda: launch_home)
     cfg['profiles'] = ['default', 'work']
 
     assert api.proactive.current_profile(cfg) == 'default'
-    active_home[0] = work_home
+    active_home[0] = override[0] = work_home
     assert api.proactive.current_profile(cfg) == 'work'
-    # Hermes repoints HERMES_HOME while it deletes 'work'; an un-overridden launch run stays the launch profile.
-    active_home[0] = launch_home
-    monkeypatch.setenv('HERMES_HOME', str(work_home))
+    # Hermes repoints HERMES_HOME while it deletes 'work': no override, yet the home reads as work's.
+    override[0] = None
     assert api.proactive.current_profile(cfg) == 'default'
 
 
