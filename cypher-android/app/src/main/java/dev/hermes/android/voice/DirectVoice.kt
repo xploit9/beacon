@@ -30,8 +30,8 @@ internal fun outcomeUnknownAtCallEnd(receipt:JSONObject):Boolean {
 }
 /** What the voice agent hears when Hermes accepted a hand-off but returned no row id (it queued behind a running reply). */
 internal fun handoffWithoutRowMessage(status:String):String=
-    if(status in setOf("queued","steered","redirected")) "Hermes queued this behind the reply it is working on; the answer will appear in the chat. Do not send it again."
-    else "Hermes accepted this; the answer will appear in the chat. Do not send it again."
+    if(status in setOf("queued","steered","redirected")) "${dev.hermes.android.data.currentAssistantName} queued this behind the reply it is working on; the answer will appear in the chat. Do not send it again."
+    else "${dev.hermes.android.data.currentAssistantName} accepted this; the answer will appear in the chat. Do not send it again."
 
 internal enum class VoiceProviderTestResult { Success, KeyRejected, Unreachable, ProviderError }
 
@@ -152,7 +152,7 @@ internal class DirectVoice(private val client:CypherClient,private val callId:St
             try { client.nativeEvents { frame ->
                 if(stopped) return@nativeEvents
                 if(frame.has("id")&&frame.optString("method") in setOf("approval","clarify"))
-                    event(JSONObject().put("type","warning").put("message","Hermes needs your approval or answer. Open the attached conversation."))
+                    event(JSONObject().put("type","warning").put("message","${dev.hermes.android.data.currentAssistantName} needs your approval or answer. Open the attached conversation."))
             } } catch(e:CancellationException) { throw e } catch(e:Exception) {
                 if(!stopped) event(JSONObject().put("type","warning").put("message","Native live events disconnected. Job status continues through verified polling."))
             }

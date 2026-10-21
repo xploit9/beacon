@@ -202,7 +202,7 @@ private fun CallHistoryRow(call: CallHistoryEntry, feedbackStatus: String?, onFe
         }
         if (call.emailNoticeId != null) {
             if (feedbackStatus == "saved") {
-                Text(assistantText("Thanks — Cypher will remember."), Modifier.padding(start = 56.dp).testTag("call-history-feedback-sent:${call.id}"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(assistantText("Thanks — Beacon will remember."), Modifier.padding(start = 56.dp).testTag("call-history-feedback-sent:${call.id}"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
                 if (feedbackStatus == "failed") Text("Couldn't save your choice. Try again.", Modifier.padding(start = 56.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {

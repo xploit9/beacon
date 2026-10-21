@@ -9,10 +9,11 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
-import dev.hermes.android.data.CYPHER_THREAD_SOURCE
 import dev.hermes.android.core.string
 import dev.hermes.android.core.sessionRowId
 import dev.hermes.android.core.sessionRowKey
+import dev.hermes.android.data.CYPHER_THREAD_SOURCE
+import dev.hermes.android.data.currentAssistantName
 import org.json.JSONObject
 import java.util.Locale
 
@@ -35,7 +36,7 @@ internal fun historyRowKey(row: JSONObject, currentProfile: String = ""): String
 /** Readable names for Hermes session sources; an unknown platform keeps its own name. */
 internal fun historySourceLabel(source: String): String = when (source.trim().lowercase(Locale.ROOT)) {
     "android" -> "Cypher"
-    CYPHER_THREAD_SOURCE -> "Cypher threads"
+    CYPHER_THREAD_SOURCE -> "$currentAssistantName threads"
     "phone" -> "Relay threads"
     "webui" -> "Web"
     "desktop" -> "Desktop"

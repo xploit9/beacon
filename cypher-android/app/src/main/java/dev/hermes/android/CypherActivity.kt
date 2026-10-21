@@ -245,10 +245,10 @@ internal fun NativeFeedbackEffect(
             Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Icon(Icons.Rounded.Call, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(32.dp))
-                    Text(assistantText("Cypher is calling"), style = MaterialTheme.typography.headlineSmall)
+                    Text(assistantText("Beacon is calling"), style = MaterialTheme.typography.headlineSmall)
                 }
                 Text(uiText("Your microphone stays off until you answer."), style = MaterialTheme.typography.bodyLarge)
-                Text(assistantText("If you miss it, it will be waiting in the Cypher chat."), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
+                Text(assistantText("If you miss it, it will be waiting in the Beacon chat."), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
                 ui.error.ifBlank { call.error }.takeIf { it.isNotBlank() }?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium) }
                 Button(onClick = { onAnswer(pending.source, pending.event) }, enabled = !requestingPermission && !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("cypher-incoming-answer")) { Icon(Icons.Rounded.Call, null); Spacer(Modifier.width(8.dp)); Text(uiText(when { requestingPermission -> "Waiting for microphone permission"; busy -> "Please wait"; else -> "Answer" })) }
                 OutlinedButton(onClick = { vm.declineIncoming(pending.source, pending.event) }, enabled = !requestingPermission && !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("cypher-incoming-decline")) { Icon(Icons.Rounded.CallEnd, null); Spacer(Modifier.width(8.dp)); Text(uiText("Decline")) }
@@ -370,7 +370,7 @@ internal fun NativeFeedbackEffect(
                                 TextButton(enabled = !ui.loading, onClick = { vm.connect(ui.origin) }) { Text(uiText("Reconnect")) }
                             }
                         }
-                        if (call.active && (ui.tab !in setOf("Chat","Cypher") && !botChatVisible || call.conversationScope != vm.authenticatedScope())) Surface(color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.fillMaxWidth()) { Row(Modifier.padding(start = 16.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) { Text("${LocalAssistantName.current} · ${call.state}", Modifier.weight(1f)); TextButton(onClick = { vm.openCurrentCall() }) { Text(uiText("Open call")) }; IconButton(onClick = vm.app.calls::hangup) { Icon(Icons.Rounded.CallEnd, assistantText("Hang up Cypher")) } } }
+                        if (call.active && (ui.tab !in setOf("Chat","Cypher") && !botChatVisible || call.conversationScope != vm.authenticatedScope())) Surface(color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.fillMaxWidth()) { Row(Modifier.padding(start = 16.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) { Text("${LocalAssistantName.current} · ${call.state}", Modifier.weight(1f)); TextButton(onClick = { vm.openCurrentCall() }) { Text(uiText("Open call")) }; IconButton(onClick = vm.app.calls::hangup) { Icon(Icons.Rounded.CallEnd, assistantText("Hang up Beacon")) } } }
                         Box(Modifier.weight(1f).then(modeMotion)) {
                         if (vm.client == null && !ui.loading && ui.tab in setOf("Tasks", "Spaces", "Projects", "Kanban")) {
                             Header(when(ui.tab) { "Tasks" -> "Cron"; "Spaces" -> "Files"; else -> ui.tab }, menu = openMenu)
@@ -397,7 +397,7 @@ internal fun NativeFeedbackEffect(
             text={Column(Modifier.heightIn(max=420.dp).verticalScroll(rememberScrollState()),verticalArrangement=Arrangement.spacedBy(12.dp)) {
                 Text(approval.toolName.substringAfterLast("__").replace('_',' ').replaceFirstChar { it.titlecase() },style=MaterialTheme.typography.titleMedium)
                 if(approval.toolName.startsWith("mcp__")) Text("Connection: "+approval.toolName.removePrefix("mcp__").substringBefore("__").replace('_',' '),style=MaterialTheme.typography.bodySmall)
-                Text(assistantText("Review the details before Cypher runs this action."))
+                Text(assistantText("Review the details before Beacon runs this action."))
                 androidx.compose.foundation.text.selection.SelectionContainer { Text(approval.arguments,style=MaterialTheme.typography.bodySmall.copy(fontFamily=androidx.compose.ui.text.font.FontFamily.Monospace)) }
                 if(approval.error.isNotBlank()) Text(approval.error,color=MaterialTheme.colorScheme.error)
                 if(approval.busy) LinearProgressIndicator(Modifier.fillMaxWidth())

@@ -274,7 +274,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
             item { LabeledToggle("Format your messages", settings.optBoolean("render_user_markdown", true), { vm.nativePreferences(json("render_user_markdown" to it)) }, "Render Markdown while preserving the original source.") }
             item { LabeledToggle("Show thinking", settings.optBoolean("show_thinking", true), { vm.nativePreferences(json("show_thinking" to it)) }, "Show available reasoning disclosures. This does not change model reasoning effort.") }
             item { LabeledToggle("Auto-follow streaming", settings.optBoolean("auto_scroll_follow", true), { vm.nativePreferences(json("auto_scroll_follow" to it)) }, "Keep the latest streaming reply in view.") }
-            item { LabeledToggle("Background animation", settings.optBoolean("animate_background", true), { vm.nativePreferences(json("animate_background" to it)) }, assistantText("Turn it off to pause the Cypher sphere. Reduce motion can also pause it.")) }
+            item { LabeledToggle("Background animation", settings.optBoolean("animate_background", true), { vm.nativePreferences(json("animate_background" to it)) }, uiText("Turn it off to pause the Cypher sphere. Reduce motion can also pause it.")) }
             item { Text("While a reply runs, Queue waits for it and Guide steers it.", style = MaterialTheme.typography.bodyMedium) }
         }
     }
@@ -327,7 +327,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
             Text(if (ui.connected) "Connected privately" else "Connection needs attention", style = MaterialTheme.typography.titleLarge)
             Text("Signed-in account · ${ui.owner.ifBlank { "Not signed in" }}", style = MaterialTheme.typography.bodyLarge)
             Text("Profile · $profileLabel", style = MaterialTheme.typography.bodyLarge)
-            Text("Keep Tailscale connected to reach your private Cypher server.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Keep Tailscale connected to reach your private Hermes server.", color = MaterialTheme.colorScheme.onSurfaceVariant)
         } }
         OutlinedTextField(origin, { origin = it }, label = { Text(uiText("Server address")) }, supportingText = { Text("Your private Hermes address, starting with https://") }, enabled = !ui.loading, modifier = Modifier.fillMaxWidth(), singleLine = true)
         if (ui.error.isNotBlank()) Text(ui.error, color = MaterialTheme.colorScheme.error)

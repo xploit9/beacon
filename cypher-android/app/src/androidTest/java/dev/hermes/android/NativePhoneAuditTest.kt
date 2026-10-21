@@ -172,7 +172,7 @@ class NativePhoneAuditTest {
                 val stored = vm.chat.value.sessionId
                 File(compose.activity.filesDir, "phone-audit-owned.json").writeText(JSONObject().put("session_id", stored).put("prompt", "Reply with the word verified.").toString())
                 try {
-                    compose.onNodeWithText("Message Cypher").performTextInput("Reply with the word verified.")
+                    compose.onNodeWithText("Message ${dev.hermes.android.data.currentAssistantName}").performTextInput("Reply with the word verified.")
                     compose.onNodeWithTag("message-send").performClick()
                     waitFor { vm.chat.value.messages.any { it.role == "user" && it.text == "Reply with the word verified." } }
                     steps.add("Sent user message appears after native acknowledgement")

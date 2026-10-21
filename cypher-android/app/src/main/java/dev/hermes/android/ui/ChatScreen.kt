@@ -382,7 +382,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
     }.collectAsStateWithLifecycle(initialValue = null as Pair<String, String>?)
     val promptText = when {
         !proactiveLoaded || pluginStatus != "available" -> ""
-        !proactiveEnabled -> assistantText("Let Cypher flag important emails")
+        !proactiveEnabled -> assistantText("Let Beacon flag important emails")
         else -> ""
     }
     val promptSignature = when {
@@ -627,7 +627,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
             if (canonical && showSearch) LaunchedEffect(chat.sessionId) { searchFocusRequester.requestFocus() }
             if (canonical && showSearch) OutlinedTextField(search, { search = it }, placeholder = { Text(uiText("Find in conversation")) }, singleLine = true, suffix = if (search.isBlank()) null else ({ Text(visibleMessages.size.toString(), Modifier.testTag("search-count")) }), trailingIcon = { IconButton(onClick = { showSearch = false; search = "" }) { Icon(Icons.Rounded.Close, uiText("Close search")) } }, modifier = Modifier.fillMaxWidth().focusRequester(searchFocusRequester).padding(horizontal = 16.dp))
             if (cypher && !ready) Box(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
-                EmptyState(assistantText(if (ui.cypherOpening) "Opening Cypher’s conversation" else "Cypher’s conversation is unavailable"), ui.cypherError.ifBlank { "Your conversation is opening. Your other chats and drafts are safely saved." }, action = if (ui.cypherOpening) "" else assistantText("Retry Cypher"), onAction = { vm.openCypher() })
+                EmptyState(assistantText(if (ui.cypherOpening) "Opening Beacon’s conversation" else "Beacon’s conversation is unavailable"), ui.cypherError.ifBlank { "Your conversation is opening. Your other chats and drafts are safely saved." }, action = if (ui.cypherOpening) "" else assistantText("Retry Beacon"), onAction = { vm.openCypher() })
             } else if (chat.sessionId.isBlank()) Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
                 Box(Modifier.widthIn(max = 280.dp).fillMaxWidth(.9f).aspectRatio(1f).clipToBounds().testTag("chat-sphere-empty")) { ChatSphere(Modifier.fillMaxSize(), avatarState) }
                 EmptyState(if (ui.newChatOpening) "Opening your conversation" else "Make room for a thought", if (ui.newChatError.isNotBlank()) ui.newChatError else if (ui.newChatOpening) "Keep typing. Your draft stays here while the conversation opens." else "Ask, explore or turn an idea into working progress.", action = if (ui.newChatError.isNotBlank() && !ui.newChatOpening) "Retry" else "", onAction = { vm.retryInitialChat() })
@@ -653,7 +653,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
                             Markdown(taskResult, vm, taskResultScope, interactive = false)
                         }
                         if (pluginStatus == "available" && taskResultIsEmailAlert) {
-                            if (taskFeedbackSent) Text(assistantText("Thanks — Cypher will remember."), Modifier.padding(start = 12.dp, bottom = 8.dp).testTag("task-result-feedback-sent"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            if (taskFeedbackSent) Text(assistantText("Thanks — Beacon will remember."), Modifier.padding(start = 12.dp, bottom = 8.dp).testTag("task-result-feedback-sent"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             else Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                                 TextButton(onClick = { sendTaskFeedback("important") }, enabled = !taskFeedbackSending && ui.connected && vm.client != null, modifier = Modifier.testTag("task-result-feedback-important")) { Text(uiText("Important")) }
                                 TextButton(onClick = { sendTaskFeedback("not_important") }, enabled = !taskFeedbackSending && ui.connected && vm.client != null, modifier = Modifier.testTag("task-result-feedback-not-important")) { Text(uiText("Not important")) }
@@ -686,7 +686,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
                     if (chat.messages.isEmpty() && chat.streamId.isBlank() && !chatSendInFlight(chat)) item("empty-state") {
                         Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
                             Box(Modifier.widthIn(max = 280.dp).fillMaxWidth(.9f).aspectRatio(1f).clipToBounds().testTag("chat-sphere-empty")) { ChatSphere(Modifier.fillMaxSize(), avatarState) }
-                            EmptyState("Where shall we begin?", if (cypher) assistantText("Cypher keeps the same context across text, calls and completed tasks.") else "Your work starts here. Choose a model and send your first message.")
+                            EmptyState("Where shall we begin?", if (cypher) assistantText("Beacon keeps the same context across text, calls and completed tasks.") else "Your work starts here. Choose a model and send your first message.")
                             StarterPrompts { vm.composer(TextFieldValue(it, TextRange(it.length))) }
                         }
                     }
@@ -742,7 +742,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
             Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 if (navigationBack != null) IconButton(onClick = navigationBack, modifier = Modifier.testTag("bot-chat-back")) { Icon(Icons.Rounded.ArrowBack, "Back to bots") }
                 else IconButton(onClick = LocalOpenNavigationMenu.current ?: { vm.toggleSessions(!ui.showSessions) }, modifier = Modifier.testTag("navigation-toggle")) { Icon(Icons.Rounded.Menu, uiText(if (LocalPersistentNavigation.current) "Hide navigation" else "Show navigation")) }
-                if (cypher || activeHere) BeaconMark(size = 26.dp, contentDescription = assistantText("Cypher"))
+                if (cypher || activeHere) BeaconMark(size = 26.dp, contentDescription = assistantText("Beacon"))
                 Column(Modifier.weight(1f).padding(vertical = 8.dp)) { Text(titleOverride ?: if (cypher || activeHere) LocalAssistantName.current else chat.title, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis); Text(if (cypher || activeHere) uiText(if (call.active) "Voice conversation" else "Text and voice, together") else chatModelLabel(chat.raw.string("model"), profileDefaults["profile-defaults"]?.takeIf { it.string("profile") == ui.profile && recordError(it).isBlank() }?.string("model").orEmpty()), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
                 if (!cypher && !permanentBotChat) IconButton(onClick = { vm.newChat() }) { Icon(Icons.Rounded.Edit, uiText("New conversation")) }
                 IconButton(onClick = { showSearch = !showSearch; if (activeHere && showSearch) showCallHistory = true }, enabled = canonical) { Icon(Icons.Rounded.Search, uiText("Search this conversation")) }
@@ -918,7 +918,7 @@ internal fun acceptsInitialConversationEdit(
                     if (streaming && !voiceAction) Text(uiText("Queue next · delivers after this turn"), Modifier.padding(horizontal = 8.dp, vertical = 2.dp).clip(RoundedCornerShape(999.dp)).background(MaterialTheme.colorScheme.secondaryContainer).padding(horizontal = 8.dp, vertical = 3.dp).testTag("composer-queue-caption"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSecondaryContainer)
                     // In flight the transcript shows the message; the draft stays held (not shown twice) until Hermes accepts it.
                     // Edits are ignored rather than the field made read-only: read-only ends the input session and drops the keyboard.
-                    OutlinedTextField(if (sending) TextFieldValue("") else draft, if (sending) { _ -> } else changeDraft, placeholder = { Text(if (sending) uiText("Sending…") else if (callActive) "Finish your call to continue typing" else if (readOnly) "Branch this conversation to reply" else if (streaming) uiText("Correct the response...") else assistantText("Message Cypher")) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp.coerceAtMost(editorHeight), max = editorHeight).testTag("message-input").onPreviewKeyEvent { event -> val key = event.nativeKeyEvent; val sendKey = settings.string("send_key", "enter"); val matched = when (sendKey) { "ctrl_enter", "ctrl+enter" -> key.isCtrlPressed && !key.isShiftPressed; "shift+enter" -> key.isShiftPressed && !key.isCtrlPressed; else -> !key.isShiftPressed && !key.isCtrlPressed && !key.isAltPressed }; if (key.action == android.view.KeyEvent.ACTION_DOWN && key.keyCode == android.view.KeyEvent.KEYCODE_ENTER && matched && !callActive && !readOnly) { if (editable && chat.uncertain.isBlank()) submit(); true } else false }, minLines = 1, maxLines = 6, enabled = editable && !callActive && !readOnly, shape = RoundedCornerShape(18.dp), colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = .5f)))
+                    OutlinedTextField(if (sending) TextFieldValue("") else draft, if (sending) { _ -> } else changeDraft, placeholder = { Text(if (sending) uiText("Sending…") else if (callActive) "Finish your call to continue typing" else if (readOnly) "Branch this conversation to reply" else if (streaming) uiText("Correct the response...") else assistantText("Message Beacon")) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp.coerceAtMost(editorHeight), max = editorHeight).testTag("message-input").onPreviewKeyEvent { event -> val key = event.nativeKeyEvent; val sendKey = settings.string("send_key", "enter"); val matched = when (sendKey) { "ctrl_enter", "ctrl+enter" -> key.isCtrlPressed && !key.isShiftPressed; "shift+enter" -> key.isShiftPressed && !key.isCtrlPressed; else -> !key.isShiftPressed && !key.isCtrlPressed && !key.isAltPressed }; if (key.action == android.view.KeyEvent.ACTION_DOWN && key.keyCode == android.view.KeyEvent.KEYCODE_ENTER && matched && !callActive && !readOnly) { if (editable && chat.uncertain.isBlank()) submit(); true } else false }, minLines = 1, maxLines = 6, enabled = editable && !callActive && !readOnly, shape = RoundedCornerShape(18.dp), colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = .5f)))
                     if (streaming && !voiceAction) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                         TextButton(onClick = { vm.steer() }, enabled = canonical && preparing.isEmpty() && !readOnly && !callActive && draft.text.isNotBlank() && !draft.text.startsWith("/") && chat.uncertain.isBlank() && files.isEmpty(), modifier = Modifier.heightIn(min = 48.dp)) { Text("Guide") }
                         TextButton(onClick = { vm.cancel() }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Stop") }
@@ -967,7 +967,7 @@ internal fun acceptsInitialConversationEdit(
                             // The trailing slot morphs to Stop, so the bar never widens during a turn.
                             OutlinedIconButton(onClick = { vm.cancel() }, shape = CircleShape, border = BorderStroke(1.dp, MaterialTheme.colorScheme.error), modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("message-stop")) { Icon(Icons.Rounded.Stop, uiText("Stop"), Modifier.size(composerActionIconSize), tint = MaterialTheme.colorScheme.error) }
                         } else if (voiceAction) {
-                            FilledIconButton(onClick = onCall, shape = CircleShape, modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("chat-call-cypher"), enabled = callAvailable && canonical && !callActive && !readOnly && chat.streamId.isBlank() && voiceCallsOffered(ui.bootstrap)) { Icon(Icons.Rounded.GraphicEq, assistantText("Talk to Cypher in this conversation"), Modifier.size(composerActionIconSize)) }
+                            FilledIconButton(onClick = onCall, shape = CircleShape, modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("chat-call-cypher"), enabled = callAvailable && canonical && !callActive && !readOnly && chat.streamId.isBlank() && voiceCallsOffered(ui.bootstrap)) { Icon(Icons.Rounded.GraphicEq, assistantText("Talk to Beacon in this conversation"), Modifier.size(composerActionIconSize)) }
                         } else {
                             FilledIconButton(onClick = submit, shape = CircleShape, modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("message-send"), enabled = editable && preparing.isEmpty() && chat.uncertain.isBlank() && !callActive && !readOnly) { Icon(Icons.Rounded.ArrowUpward, uiText(if (commandName != null) "Run command" else if (chat.streamId.isNotBlank()) "Queue" else "Send"), Modifier.size(composerActionIconSize)) }
                         }
@@ -1011,7 +1011,7 @@ internal fun acceptsInitialConversationEdit(
     val context = LocalContext.current
     val origin = vm.authenticatedScope()?.session(message.sessionId.ifBlank { vm.chat.value.sessionId })
     val settings = LocalCypherSettings.current
-    val assistantMessageLabel = assistantText("Cypher message")
+    val assistantMessageLabel = assistantText("Beacon message")
     val presentation = chatPresentation(message.role, message.text, JSONObject().put("name", resultTitle), tools = message.tools)
     val reading by vm.readingAloud.collectAsStateWithLifecycle()
     val currentCall by vm.app.calls.state.collectAsStateWithLifecycle()

@@ -1,6 +1,8 @@
 package dev.hermes.android.ui
 
 import dev.hermes.android.core.json
+import dev.hermes.android.data.CYPHER_THREAD_SOURCE
+import dev.hermes.android.data.currentAssistantName
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -47,6 +49,7 @@ class HistoryFiltersTest {
         val offered = historySources(rows + json("id" to "f", "source" to "cron"), hidden = setOf("discord"))
         assertEquals(listOf("android", "discord", "telegram", "webui"), offered)
         assertEquals("Cypher", historySourceLabel("android"))
+        assertEquals("$currentAssistantName threads", historySourceLabel(CYPHER_THREAD_SOURCE))
         assertEquals("Web", historySourceLabel("webui"))
         assertEquals("Api server", historySourceLabel("api server"))
         assertEquals("Matrix", historySourceLabel("matrix"))

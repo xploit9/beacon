@@ -130,11 +130,11 @@ import kotlinx.coroutines.launch
         }
     }
     if (confirmOff) AlertDialog(onDismissRequest = { confirmOff = false }, title = { Text(uiText("Turn off approvals?")) },
-        text = { Text(assistantText("Cypher will run tools in this profile without asking.")) },
+        text = { Text(assistantText("Beacon will run tools in this profile without asking.")) },
         confirmButton = { TextButton({ confirmOff = false; apply("off") }) { Text("Turn off") } },
         dismissButton = { TextButton({ confirmOff = false }) { Text("Cancel") } })
     if (confirmYolo) AlertDialog(onDismissRequest = { confirmYolo = false }, title = { Text("Enable YOLO for this chat?") },
-        text = { Text(assistantText("Cypher stops asking for approval in this chat until you turn YOLO off.")) },
+        text = { Text(assistantText("Beacon stops asking for approval in this chat until you turn YOLO off.")) },
         confirmButton = { TextButton({ confirmYolo = false; applyYolo(true) }) { Text("Enable YOLO") } },
         dismissButton = { TextButton({ confirmYolo = false }) { Text("Cancel") } })
 }

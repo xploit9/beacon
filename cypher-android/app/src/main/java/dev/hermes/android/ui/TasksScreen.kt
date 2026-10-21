@@ -85,7 +85,7 @@ import kotlinx.coroutines.launch
                 }
             } }
         }
-        if (crons != null && !crons.has("_error") && crons.rows("jobs").isEmpty() && !crons.optBoolean("cron_unavailable")) item { EmptyState("Nothing scheduled yet", assistantText("Choose what Cypher should do and when."), Icons.Rounded.EventNote) }
+        if (crons != null && !crons.has("_error") && crons.rows("jobs").isEmpty() && !crons.optBoolean("cron_unavailable")) item { EmptyState("Nothing scheduled yet", assistantText("Choose what Beacon should do and when."), Icons.Rounded.EventNote) }
     }
 }
 private fun cronForm(vm: CypherViewModel, job: JSONObject?, targets: List<JSONObject>, timezone: String, refresh: () -> Unit) {

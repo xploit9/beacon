@@ -415,7 +415,7 @@ class NativeCallLiveUiTest {
             phase="banner-hangup"
             val bannerService=startRoute()
             withContext(Dispatchers.Main.immediate) { vm.navigate("Memory") }
-            rule.onNodeWithContentDescription("Hang up Cypher").performClick()
+            rule.onNodeWithContentDescription("Hang up ${dev.hermes.android.data.currentAssistantName}").performClick()
             checkEnded(bannerService,"other-page call banner")
             phase="connecting-hangup"
             withContext(Dispatchers.Main.immediate) { app.calls.start(requireNotNull(vm.client),stored);callId=app.calls.state.value.callId;app.calls.hangup() }

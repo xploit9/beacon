@@ -1,5 +1,6 @@
 package dev.hermes.android.voice
 
+import dev.hermes.android.data.currentAssistantName
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -23,9 +24,9 @@ class CallEndReportTest {
 
     @Test fun callEndAndHandOffTextIsPlain() {
         assertEquals("1 request wasn't sent before the call ended.", callEndNotSentText(1))
-        assertEquals("Cypher couldn't confirm 2 requests. Check the chat before asking again.", callEndUnknownText(2))
-        assertTrue(handoffWithoutRowMessage("queued").startsWith("Hermes queued this"))
-        assertTrue(handoffWithoutRowMessage("streaming").startsWith("Hermes accepted this"))
+        assertEquals("$currentAssistantName couldn't confirm 2 requests. Check the chat before asking again.", callEndUnknownText(2))
+        assertTrue(handoffWithoutRowMessage("queued").startsWith("$currentAssistantName queued this"))
+        assertTrue(handoffWithoutRowMessage("streaming").startsWith("$currentAssistantName accepted this"))
         for (text in listOf(callEndNotSentText(3), callEndUnknownText(1), handoffWithoutRowMessage("queued")))
             assertFalse(text, Regex("native|linkage|receipt|resubmit", RegexOption.IGNORE_CASE).containsMatchIn(text))
     }

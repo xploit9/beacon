@@ -70,7 +70,7 @@ class ProductionUpdateJourneyTest {
             await(60_000) { find("Show navigation") != null }
             await { fields().size == 1 }
             val field = fields().single()
-            check(field.text.isNullOrBlank() || field.text.toString() == "Message Cypher") { "Never replace an existing owner's draft as QA" }
+            check(field.text.isNullOrBlank() || field.text.toString() == "Message ${dev.hermes.android.data.currentAssistantName}") { "Never replace an existing owner's draft as QA" }
             text(field, marker)
             await { fields().any { it.text?.toString() == marker } }
             click("Show navigation"); click("Settings"); click("App updates")

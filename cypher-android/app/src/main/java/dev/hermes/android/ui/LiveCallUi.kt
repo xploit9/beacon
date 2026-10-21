@@ -216,7 +216,7 @@ internal data class CallUiActions(val mute: () -> Unit, val camera: () -> Unit, 
             Row(Modifier.fillMaxWidth().background(if(call.cameraSharing) Color(0xff080d15) else Color.Transparent),verticalAlignment=Alignment.CenterVertically) {
 
                 TextButton(onConversation,Modifier.heightIn(min=48.dp)) { Icon(Icons.Rounded.ChatBubbleOutline,null); Spacer(Modifier.width(8.dp));Text(uiText("View conversation")) }
-                BeaconMark(Modifier.testTag("call-beacon-mark"), size=26.dp, contentDescription=assistantText("Cypher"))
+                BeaconMark(Modifier.testTag("call-beacon-mark"), size=26.dp, contentDescription=assistantText("Beacon"))
 
                 Spacer(Modifier.weight(1f))
 
@@ -229,9 +229,9 @@ internal data class CallUiActions(val mute: () -> Unit, val camera: () -> Unit, 
 
                 LiveCallCaptions(call,Modifier.padding(bottom=14.dp))
 
-                if(call.cameraSharing) Text(assistantText(if(call.cameraRear) "Back camera shared with Cypher" else "Front camera shared with Cypher"),color=Color.White,style=MaterialTheme.typography.labelLarge,modifier=Modifier.padding(bottom=10.dp).background(Color(0xff080d15),RoundedCornerShape(12.dp)).padding(horizontal=12.dp,vertical=6.dp))
+                if(call.cameraSharing) Text(assistantText(if(call.cameraRear) "Back camera shared with Beacon" else "Front camera shared with Beacon"),color=Color.White,style=MaterialTheme.typography.labelLarge,modifier=Modifier.padding(bottom=10.dp).background(Color(0xff080d15),RoundedCornerShape(12.dp)).padding(horizontal=12.dp,vertical=6.dp))
 
-                if(call.screenSharing) Text(assistantText("Screen shared with Cypher"),color=Color.White,style=MaterialTheme.typography.labelLarge,modifier=Modifier.padding(bottom=10.dp))
+                if(call.screenSharing) Text(assistantText("Screen shared with Beacon"),color=Color.White,style=MaterialTheme.typography.labelLarge,modifier=Modifier.padding(bottom=10.dp))
 
                 if(call.screenBusy) Text(uiText("Waiting for screen-sharing consent or first frame…"),color=Color.White,style=MaterialTheme.typography.labelLarge,modifier=Modifier.padding(bottom=10.dp))
 

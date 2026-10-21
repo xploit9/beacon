@@ -583,7 +583,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     }
     fun downloadAppUpdate(notificationToken: String? = null) {
         updateCallBlock()?.let { message -> _appUpdate.update { it.copy(status = message) }; return }
-        val captured = client?.detached() ?: run { _appUpdate.update { it.copy(status = "Reconnect to Cypher through Tailscale, then tap Update.") }; return }
+        val captured = client?.detached() ?: run { _appUpdate.update { it.copy(status = "Reconnect to Hermes through Tailscale, then tap Update.") }; return }
         val generation = originGeneration
         val previous = updateJob
         if (notificationToken == null && (_appUpdate.value.busy || installJob?.isActive == true)) return
@@ -1616,20 +1616,20 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private suspend fun resolveCypher(c: CypherClient, fixed: AppPreferences, current: () -> Boolean): String = cypherResolveLock.withLock {
         preparedCypher?.takeIf { it.first == c.scope }?.let { return@withLock it.second }
         val bound = readCypherSession(c.scope)
-        if (!bound.isNullOrBlank()) { require(current()) { "Account changed while preparing Cypher" }; preparedCypher = c.scope to bound; registerAssistantChat(c, bound); return@withLock bound }
-        require(readCypherOpening(c.scope) == null) { "Cypher opening outcome is unknown. Review history before creating another conversation." }
+        if (!bound.isNullOrBlank()) { require(current()) { "Account changed while preparing ${dev.hermes.android.data.currentAssistantName}" }; preparedCypher = c.scope to bound; registerAssistantChat(c, bound); return@withLock bound }
+        require(readCypherOpening(c.scope) == null) { "${dev.hermes.android.data.currentAssistantName} opening outcome is unknown. Review history before creating another conversation." }
         currentCoroutineContext().ensureActive()
-        require(current()) { "Account changed while preparing Cypher" }
+        require(current()) { "Account changed while preparing ${dev.hermes.android.data.currentAssistantName}" }
         app.cache.write(c.scope, "cypher-opening", "unknown", true)
         val result = c.post("/api/cypher/open", JSONObject().apply { if (fixed.assistantModel.isNotBlank()) { put("model", fixed.assistantModel); if (fixed.assistantProvider.isNotBlank()) put("model_provider", fixed.assistantProvider) } })
         val id = result.string("session_id", result.string("conversation_id", result.optJSONObject("session")?.string("session_id").orEmpty()))
-        require(id.isNotBlank()) { "Cypher did not return a conversation" }
+        require(id.isNotBlank()) { "${dev.hermes.android.data.currentAssistantName} did not return a conversation" }
         val sessionScope = c.scope.session(id)
         clientCreatedSessions.add(sessionScope.key)
         // The owned creation already happened; a newer navigation must not discard its identity.
         writeCypherSessionHandle(c.scope, id)
         if (client?.scope == c.scope) preparedCypher = c.scope to id
-        runCatching { app.cache.write(c.scope, "cypher-session", id, protected = true); app.cache.delete(c.scope, "cypher-opening"); app.cache.delete(c.scope, LEGACY_CYPHER_OPENING_CACHE_KIND); app.cache.write(sessionScope, "client-created-shell", "1", protected = true) }.onFailure { if (it is CancellationException) throw it; if (client?.scope == c.scope) notice("Cypher opened; recovery checkpoint failed") }
+        runCatching { app.cache.write(c.scope, "cypher-session", id, protected = true); app.cache.delete(c.scope, "cypher-opening"); app.cache.delete(c.scope, LEGACY_CYPHER_OPENING_CACHE_KIND); app.cache.write(sessionScope, "client-created-shell", "1", protected = true) }.onFailure { if (it is CancellationException) throw it; if (client?.scope == c.scope) notice("${dev.hermes.android.data.currentAssistantName} opened; recovery checkpoint failed") }
         id
     }
     private var indexFetch: Job? = null
@@ -2014,7 +2014,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         return viewModelScope.launch {
             val fixed = app.preferences.data.first().let(AppPreferences::read)
             if (!current()) return@launch
-            if (owner == null || !_ui.value.authenticated) { _ui.update { it.copy(cypherOpening = false, cypherError = "Sign in again to open Cypher's conversation.") }; return@launch }
+            if (owner == null || !_ui.value.authenticated) { _ui.update { it.copy(cypherOpening = false, cypherError = "Sign in again to open ${dev.hermes.android.data.currentAssistantName}'s conversation.") }; return@launch }
             val wanted = fixed.assistantProfile
             if (owner.profile != wanted) {
                 // The assistant keeps its own profile; switching reopens this tab there, and leaving gives the chats' profile back.
@@ -2027,12 +2027,12 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
             try {
                 val id = if (c == null) readCypherSession(owner).orEmpty()
                 else preparedCypher?.takeIf { it.first == owner }?.second ?: resolveCypher(c, fixed) { current() }
-                require(id.isNotBlank()) { "Reconnect to resolve Cypher's conversation. Your other conversation draft is retained." }
+                require(id.isNotBlank()) { "Reconnect to resolve ${dev.hermes.android.data.currentAssistantName}'s conversation. Your other conversation draft is retained." }
                 if (!current()) return@launch
                 selectSession(id, editorDraft = editorDraft, onCachedReady = { if (current()) _ui.update { it.copy(cypherOpening = false) } })
                 selectionJob?.join()
                 if (current()) { _ui.update { it.copy(cypherOpening = false) }; keepAssistantModel(fixed.assistantModel, fixed.assistantProvider) }
-            } catch (e: Throwable) { if (current() && e !is CancellationException) { _ui.update { it.copy(cypherOpening = false, cypherError = e.message ?: "Cypher's conversation could not be opened. Retry to continue.") }; fail(e) } }
+            } catch (e: Throwable) { if (current() && e !is CancellationException) { _ui.update { it.copy(cypherOpening = false, cypherError = e.message ?: "${dev.hermes.android.data.currentAssistantName}'s conversation could not be opened. Retry to continue.") }; fail(e) } }
         }
     }
     fun isCypherConversation(): Boolean {
@@ -2042,7 +2042,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
     private fun admitConversation(): Boolean {
         val owner = client?.scope ?: cachedOwnerScope
         val ready = canonicalConversationReady(owner, sourceScope, _chat.value.sessionId, _ui.value.tab == "Cypher", owner?.let(::readCypherSessionHandle), _ui.value.cypherOpening, _ui.value.cypherError.isNotBlank(), preferences.value.assistantProfile)
-        if (!ready) notice(if (_ui.value.tab == "Cypher") "Open Cypher's conversation before sending or changing it. Your scoped draft is retained." else "Open a conversation before continuing.")
+        if (!ready) notice(if (_ui.value.tab == "Cypher") "Open ${dev.hermes.android.data.currentAssistantName}'s conversation before sending or changing it. Your scoped draft is retained." else "Open a conversation before continuing.")
         return ready
     }
     fun selectSession(id: String, editorDraft: String? = null, preserveInitialDraft: Boolean = false, initialResponse: JSONObject? = null, closeMenu: Boolean = true, onCachedReady: (() -> Unit)? = null) {
@@ -3093,7 +3093,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 openCypher()
                 if (action == "answer" && generation == originGeneration) {
                     stopReadAloud()
-                    require(app.push.authorizeKeepConnectedAction(source, event, "answer")) { "This Cypher invitation has ended" }
+                    require(app.push.authorizeKeepConnectedAction(source, event, "answer")) { "This ${dev.hermes.android.data.currentAssistantName} invitation has ended" }
                     app.calls.answer(source, event)
                 }
                 if (action == "callback" && generation == originGeneration) {

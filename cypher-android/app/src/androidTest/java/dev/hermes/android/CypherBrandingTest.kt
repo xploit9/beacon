@@ -13,7 +13,6 @@ import dev.hermes.android.ui.NativeLocalization
 import dev.hermes.android.ui.NativeSkinTheme
 import dev.hermes.android.ui.LocalAssistantName
 import dev.hermes.android.ui.assistantText
-import dev.hermes.android.ui.uiText
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Rule
@@ -21,13 +20,13 @@ import org.junit.Test
 
 class CypherBrandingTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
-    @Test fun assistantCopyUsesTheChosenNameAfterTheDefaultChanges() {
+    @Test fun assistantCopyStartsFromBeaconAndUsesTheChosenName() {
         compose.setContent {
-            CompositionLocalProvider(LocalAssistantName provides "Beacon") {
-                Text(assistantText("Cypher chat"))
+            CompositionLocalProvider(LocalAssistantName provides "Nova") {
+                Text(assistantText("Beacon chat"))
             }
         }
-        compose.onNodeWithText("Beacon chat").assertExists()
+        compose.onNodeWithText("Nova chat").assertExists()
     }
 
     @Test fun darkSkinGivesPlainTextTheBackgroundForegroundColor() {
@@ -44,13 +43,13 @@ class CypherBrandingTest {
         assertEquals(expected, observed)
     }
 
-    @Test fun launcherAndArabicAssistantUseCypherWithStablePackageAndPrivateFilesAuthority() {
+    @Test fun launcherKeepsCypherAndArabicAssistantUsesChosenNameWithStablePackageAndPrivateFilesAuthority() {
         val app = ApplicationProvider.getApplicationContext<CypherApplication>()
         assertTrue(app.packageName == "dev.hermes.android" || app.packageName == "dev.hermes.android.debug")
         assertEquals(if (app.packageName.endsWith(".debug")) "Cypher Preview" else "Cypher", app.packageManager.getApplicationLabel(app.applicationInfo).toString())
         assertNotNull(app.packageManager.resolveContentProvider("${app.packageName}.files", 0))
-        compose.setContent { NativeLocalization("ar") { Text(uiText("Call Cypher")) } }
-        compose.onNode(hasText("Cypher", substring = true)).assertIsDisplayed()
+        compose.setContent { NativeLocalization("ar") { CompositionLocalProvider(LocalAssistantName provides "Nova") { Text(assistantText("Call Beacon")) } } }
+        compose.onNode(hasText("Call Nova", substring = true)).assertIsDisplayed()
         compose.onNode(hasText("Hermes", substring = true)).assertDoesNotExist()
         compose.onNode(hasText("Xara", substring = true)).assertDoesNotExist()
         val catalogs = app.assets.open("native-locales.json").bufferedReader().use { JSONObject(it.readText()) }

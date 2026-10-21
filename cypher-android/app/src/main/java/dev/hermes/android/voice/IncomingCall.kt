@@ -41,8 +41,8 @@ internal fun incomingRecordMayBePruned(state: String, expiresAtSeconds: Long, no
 
 /** The FCM payload and intent only identify a saved invitation; they cannot authorize a call. */
 suspend fun resolveIncoming(app: CypherApplication, source: String, event: String): Pair<CypherClient, JSONObject> {
-    val invite = app.push.invitation(source, event) ?: run { app.push.discardInvitation(source, event); error("This Cypher invitation has ended. Open Cypher history to view it.") }
-    require(invite.valid()) { "This Cypher invitation has expired" }
+    val invite = app.push.invitation(source, event) ?: run { app.push.discardInvitation(source, event); error("This ${dev.hermes.android.data.currentAssistantName} invitation has ended. Open Cypher history to view it.") }
+    require(invite.valid()) { "This ${dev.hermes.android.data.currentAssistantName} invitation has expired" }
     val binding = app.push.binding(source) ?: error("Sign in to the invitation's owner account")
     val origin = trustedOrigin(binding.getString("origin"))
     val scope = Scope(origin, binding.getString("owner"), binding.getString("profile"))
@@ -56,7 +56,7 @@ suspend fun resolveIncoming(app: CypherApplication, source: String, event: Strin
         val route = c.nativeRequest("/api/plugins/cypher/mobile/notifications/events/$event")
         if (incomingRouteEnded(route, source, c.auth.profile)) app.push.discardInvitation(source, event)
         requireIncomingRoute(route, source, c.auth.profile)
-        require(authorized() && app.push.invitation(source, event) == invite && invite.valid()) { "This Cypher invitation has ended" }
+        require(authorized() && app.push.invitation(source, event) == invite && invite.valid()) { "This ${dev.hermes.android.data.currentAssistantName} invitation has ended" }
         return c to route
     } catch (e: Throwable) {
         if (e !is CancellationException) reconcileIncomingFailure(app, c, source, event, e)
@@ -83,7 +83,7 @@ suspend fun reconcileIncomingFailure(app: CypherApplication, client: CypherClien
 }
 
 fun requireIncomingRoute(route: JSONObject, source: String, profile: String, now: Long = System.currentTimeMillis() / 1000) {
-    require(route.string("source_ref") == source && route.string("profile") == profile && route.string("kind") == "incoming_call" && route.string("state") == "pending" && validOpaque(route.string("callback_id")) && validIncoming(source, route.string("callback_id"), route.optLong("expires_at"), now)) { "This Cypher invitation is no longer available" }
+    require(route.string("source_ref") == source && route.string("profile") == profile && route.string("kind") == "incoming_call" && route.string("state") == "pending" && validOpaque(route.string("callback_id")) && validIncoming(source, route.string("callback_id"), route.optLong("expires_at"), now)) { "This ${dev.hermes.android.data.currentAssistantName} invitation is no longer available" }
 }
 
 internal suspend fun performIncomingDeclineRequest(
@@ -91,13 +91,13 @@ internal suspend fun performIncomingDeclineRequest(
     authorize: () -> Boolean,
     request: suspend () -> Unit,
 ) {
-    require(pending()) { "This Cypher invitation has already been handled" }
-    require(authorize()) { "This Cypher invitation has ended" }
+    require(pending()) { "This ${dev.hermes.android.data.currentAssistantName} invitation has already been handled" }
+    require(authorize()) { "This ${dev.hermes.android.data.currentAssistantName} invitation has ended" }
     request()
 }
 
 suspend fun declineIncoming(app: CypherApplication, source: String, event: String) = withTimeout(8000) {
-    require(app.push.claimInvitation(source, event)) { "This Cypher invitation has ended" }
+    require(app.push.claimInvitation(source, event)) { "This ${dev.hermes.android.data.currentAssistantName} invitation has ended" }
     val (client, _) = resolveIncoming(app, source, event)
     try {
         performIncomingDeclineRequest(

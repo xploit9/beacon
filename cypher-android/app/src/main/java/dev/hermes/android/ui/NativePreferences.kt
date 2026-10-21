@@ -28,9 +28,12 @@ private fun normalized(value: String) = value.lowercase().replace("…", "...").
 /** The assistant's display name from Settings › Assistant (the app itself stays Cypher). */
 val LocalAssistantName = staticCompositionLocalOf { dev.hermes.android.data.DEFAULT_ASSISTANT_NAME }
 /** Fixed words that name the assistant, localized, then carrying the owner's chosen name. */
+internal fun assistantName(value: String, name: String): String =
+    value.replace(dev.hermes.android.data.DEFAULT_ASSISTANT_NAME, name)
+
 @Composable fun assistantText(value: String): String {
     val name = LocalAssistantName.current
-    return uiText(value).replace(dev.hermes.android.data.DEFAULT_ASSISTANT_NAME, name).replace("Cypher", name)
+    return assistantName(uiText(value), name)
 }
 @Composable fun uiText(value: String): String {
     val dictionary = LocalUiStrings.current

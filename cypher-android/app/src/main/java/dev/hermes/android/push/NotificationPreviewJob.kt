@@ -141,7 +141,7 @@ private suspend fun sendEmailFeedback(context: Context, source: String, event: S
         val tag = "$source\u0000$event".digest()
         val posted = manager.activeNotifications.firstOrNull { it.tag == tag && it.id == 1 } ?: return@withTimeout
         if (!authorized() || manager.activeNotifications.firstOrNull { it.tag == tag && it.id == 1 }?.postTime != posted.postTime) return@withTimeout
-        val body = if (saved) "Thanks — Cypher will remember." else "Couldn't save your choice. Try again."
+        val body = if (saved) "Thanks — ${dev.hermes.android.data.currentAssistantName} will remember." else "Couldn't save your choice. Try again."
         val updated = NotificationCompat.Builder(context, posted.notification)
             .apply { if (saved) clearActions() }.setContentText(body).setStyle(NotificationCompat.BigTextStyle().bigText(body)).setOnlyAlertOnce(true).build()
         try { manager.notify(tag, 1, updated) } catch (_: SecurityException) { }

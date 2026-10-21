@@ -42,8 +42,8 @@ data class CallState(val active: Boolean = false, val state: String = "idle", va
 internal fun callEndNotSentText(count: Int): String =
     if (count == 1) "1 request wasn't sent before the call ended." else "$count requests weren't sent before the call ended."
 internal fun callEndUnknownText(count: Int): String =
-    if (count == 1) "Cypher couldn't confirm 1 request. Check the chat before asking again."
-    else "Cypher couldn't confirm $count requests. Check the chat before asking again."
+    if (count == 1) "${dev.hermes.android.data.currentAssistantName} couldn't confirm 1 request. Check the chat before asking again."
+    else "${dev.hermes.android.data.currentAssistantName} couldn't confirm $count requests. Check the chat before asking again."
 
 internal fun CallState.withServerWarning(message: String, eventCallId: String, authorizedCallId: String): CallState {
     if (!active || callId.isBlank() || callId != authorizedCallId || eventCallId.isNotBlank() && eventCallId != callId || message.isBlank() || message.length > 240) return this
@@ -167,16 +167,16 @@ class CallController(private val app: CypherApplication) {
         val keyStore=VoiceKeyStore(app)
         val credentials=withContext(Dispatchers.IO) { keyStore.session() }?:throw MissingVoiceKeyException(keyStore.settings().provider)
         check(ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) { "Allow microphone access to answer ${dev.hermes.android.data.currentAssistantName}" }
-        require(app.push.claimInvitation(source, event)) { "This Cypher invitation has ended" }
+        require(app.push.claimInvitation(source, event)) { "This ${dev.hermes.android.data.currentAssistantName} invitation has ended" }
         val (client, route) = withTimeout(15000) { resolveIncoming(app, source, event) }
         start(client, IncomingCall(source, event, route.getLong("expires_at")),voiceSettings=credentials)
     }
     private suspend fun start(client: CypherClient, incoming: IncomingCall?, conversationId: String? = null, voiceSettings:VoiceSessionCredentials) {
         requireCameraReleasedForNewCall(_state.value)
         check(!_state.value.audioStopPending) { "Microphone release is unconfirmed. Use Android’s Stop app control before another call." }
-        check(!_state.value.active) { "Cypher already has a call" }
+        check(!_state.value.active) { "${dev.hermes.android.data.currentAssistantName} already has a call" }
         check(ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) { "Allow microphone access to call ${dev.hermes.android.data.currentAssistantName}" }
-        check(starting.compareAndSet(false, true)) { "Cypher is already connecting" }
+        check(starting.compareAndSet(false, true)) { "${dev.hermes.android.data.currentAssistantName} is already connecting" }
         val generation = epoch.get()
         val frozen = client.detached()
         var grant: JSONObject? = null
@@ -185,7 +185,7 @@ class CallController(private val app: CypherApplication) {
             check(generation == epoch.get()) { "Call start was cancelled" }
             // Saved-auth restoration must recognize an already admitted local owner during reservation.
             _state.value = CallState(true, "connecting", startedAt = System.currentTimeMillis(), conversationScope = conversationId?.let { frozen.scope.session(it) })
-            if (incoming != null) require(app.push.invitation(incoming.source, incoming.event) != null) { "This Cypher invitation has already ended" }
+            if (incoming != null) require(app.push.invitation(incoming.source, incoming.event) != null) { "This ${dev.hermes.android.data.currentAssistantName} invitation has already ended" }
             grant = if (incoming == null) frozen.nativeRequest("/api/plugins/cypher/mobile/calls", "POST",
                 phoneKeyCallBody(voiceSettings.provider,frozen.auth.profile,conversationId))
                 else frozen.nativeRequest("/api/plugins/cypher/mobile/callbacks/" + incoming.event + "/answer", "POST", phoneKeyAnswerBody(voiceSettings.provider))
