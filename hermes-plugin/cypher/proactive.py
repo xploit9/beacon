@@ -671,7 +671,9 @@ def record_email_check(profile, job_id, args):
     checked = _checked_instant(args["checked_until"])
     now = time.time()
     if checked.timestamp() > now:
-        raise ValueError("checked_until cannot be in the future")
+        # The current UTC time lets the watch correct a local time sent with a Z, which is the usual mistake.
+        raise ValueError("checked_until cannot be in the future; it is now "
+                         + datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
     from hermes_cli.web_server_profiles import _profile_scope
     from cron.notepad import get_note, set_note
     with _profile_scope(profile):
