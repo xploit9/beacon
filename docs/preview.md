@@ -1,10 +1,10 @@
-# Beacon Preview (private)
+# Beacon preview and stable builds
 
-The preview is a private test build of this migration branch. It is **not** a production release and does not replace the installed Beacon app.
+The preview is Beacon's debug build for testing. It installs separately from the stable channel and production app; it does not replace either one.
 
 ## Stable channel
 - The `stable` build type has application ID `dev.hermes.android.stable` and launcher label "Beacon", so it installs beside production and the preview.
-- Stable starts at version code `100` and version `1.0.0`. It inherits release minification and is not debuggable.
+- The current stable version is code `110`, version `1.1.0`. It inherits release minification and is not debuggable.
 - A stable APK is unsigned unless `beaconStableSigning` (or `BEACON_STABLE_SIGNING`) points to an external properties file with the four Android signing fields. Never store that file or its keystore in this repository. The stable signer is separate from production.
 - Release assets are named `Beacon-<version>.apk` and `Beacon-<version>.json`; Settings **App updates** checks the public GitHub release through the owner's Hermes plugin and verifies the APK before installation.
 
@@ -73,20 +73,21 @@ Settings are grouped: Assistant (name, profile and model; voice and calls; notif
 Chat extras from Relay: quote a message into your reply, attach from the camera or paste an image, open the command list from the attach menu, start a new chat from a suggested prompt, share the whole conversation or copy its ID from the ⋮ menu. Messages are grouped under Today, Yesterday or their date, and in-chat search shows how many messages match.
 
 With the Beacon plugin installed:
-- **Proactive.** Choose sources and watch intervals, set urgent delivery, and add requests for notifications or calls; preview results arrive as notifications.
+- **Pairing.** Select **Pair a phone** in the dashboard's **Beacon** tab, or print a single-use code with `hermes -p <profile> beacon pair` / `/beacon-pair` in an owned chat. In Beacon, scan the QR, choose a screenshot of it, or enter the HTTPS dashboard address and code. Manage phones in Settings > Devices.
+- **Proactive.** Add plain-language email rules and choose notifications or calls. Checks use the tools already connected to the selected Hermes profile; the app reports results by notification or call.
 - **Voice & calls.** One-tap realtime calls with Gemini Live, Grok or OpenAI Realtime. The provider key is entered in Beacon, stored encrypted on the phone and sent only to that provider, never to Hermes. Call audio is never stored.
 - **Call history.** Open it from the Beacon chat menu to review call entries and jump to saved transcripts.
 - **Keep connected** (Settings → Notifications & Keep connected). A low-importance foreground service keeps a connection to Hermes for each signed-in profile, so Hermes can ring the phone while Beacon is closed. The page shows the connection state and, when it fails, the reason (for example "Hermes refused profile coder (403)").
 - **Keep call and task history** (same page): Forever (default), 1 year, 90 days or 30 days. This applies only to Beacon's own call transcripts and task history on Hermes. Shortening it asks for confirmation, then deletes older closed calls and finished tasks. Hermes conversations, messages, memories and files are never touched.
 
-Verified on an Android 16 emulator against a live Hermes (19 October 2026):
+Verification recorded on an Android 16 emulator against a live Hermes (19 October 2026):
 - One sign-in, chat, history, Bot Mode and settings; new phone chats are saved under the signed-in owner.
 - Incoming calls: with Keep connected on and Beacon closed, Hermes's `beacon_call_user` rings the phone for 20 seconds as a pop-up call card (full screen when the screen is off), and the caller opens by saying why it is calling; Answer starts the call in that conversation, Decline settles it on Hermes, and an unanswered ring leaves a missed-call notification with Call back.
 - One-tap calls with Gemini Live and Grok, with the key kept on the phone. The call transcript appears in the conversation afterwards.
 
-Not complete in this preview:
-- **Physical phone.** Nothing has run on a real phone yet: lock-screen ringing, battery behaviour, real microphone input and voice-dispatched work (the emulator has no audio input).
-- **OpenAI Realtime** calls are implemented but were not tested (no key was supplied).
+Remaining acceptance recorded for this preview:
+- **Physical phone.** Physical-phone acceptance is still required for lock-screen ringing, battery behaviour, real microphone input and voice-dispatched work.
+- **OpenAI Realtime.** It was not tested in the 19 October run because no key was supplied; this note records that run, not a later test.
 - Production replacement is on hold until physical-phone acceptance passes and the original signer and data preservation are verified.
 
-The coordinator's acceptance checks are serialized `testDebugUnitTest`, `assembleDebug`, `assembleDebugAndroidTest` and `lintDebug`, an independent review, an emulator smoke test and secret scans. Source edits alone do not make a preview ready. Do not treat a preview as accepted until those results are recorded.
+The coordinator serializes `testDebugUnitTest`, `assembleDebug`, `assembleDebugAndroidTest` and `lintDebug`, then records the device acceptance. Before any push, follow the current review, audit, Gitleaks and Strix gates in `AGENTS.md`. Source edits alone do not make a preview ready. Do not treat the preview as accepted until those results are recorded.
