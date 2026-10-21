@@ -295,8 +295,9 @@ def _named_read_only(raw_name):
     words=_tool_words(raw_name)
     return bool(words&_READ_TOOL_WORDS) and not bool(words&_UNSAFE_NAME_WORDS)
 
+# No calendar words: fetch_calendar and fetch_events usually name ICS feed fetchers that take a URL.
 _FETCHED_MAIL_WORDS={'email','emails','mail','mails','gmail','outlook','message','messages','msg','msgs','thread',
-                     'threads','inbox','mailbox','attachment','attachments','calendar','event','events'}
+                     'threads','inbox','mailbox','attachment','attachments'}
 
 def _plain_mail_read(raw_name):
     # 'fetch' also names URL fetchers, so it reads only beside a mail word: GMAIL_FETCH_EMAILS, never fetch or fetch_page.
@@ -323,12 +324,12 @@ def _mcp_read_only(tool_name,profile):
         return False
     return False
 
-def _contains_http_url(value):
+def _contains_url(value):
+    # Watch arguments are ids, queries and dates: any scheme (webcal://, ftp://) or a protocol-relative // is a link out.
     if isinstance(value,str):
-        lowered=value.casefold()
-        return 'http://' in lowered or 'https://' in lowered
-    if isinstance(value,dict): return any(_contains_http_url(item) for item in value.values())
-    if isinstance(value,list): return any(_contains_http_url(item) for item in value)
+        return '://' in value or value.lstrip().startswith('//')
+    if isinstance(value,dict): return any(_contains_url(item) for item in value.values())
+    if isinstance(value,list): return any(_contains_url(item) for item in value)
     return False
 
 def _bash_unquoted(command):
@@ -401,7 +402,7 @@ def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**
         return None
     if tool_name in {'cypher_email_notice','cypher_email_checked'}:
         return None
-    if _contains_http_url(args):
+    if _contains_url(args):
         return {'action':'block','message':_READ_ONLY_MESSAGE}
     if tool_name=='terminal':
         command=args.get('command') if isinstance(args,dict) else None

