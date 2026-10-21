@@ -253,7 +253,25 @@ _WRITE_TOOL_WORDS={'send','create','delete','remove','modify','update','manage',
 # Native tools whose names carry no read word but only read or plan inside the run.
 _PROACTIVE_READ_TOOLS={'todo'}
 _ARG_WRITE_TOOL_WORDS=_WRITE_TOOL_WORDS|{'run','trigger','install','edit','enable','disable','pause','resume','schedule'}
-_UNSAFE_NAME_WORDS=_ARG_WRITE_TOOL_WORDS|{'exec','sql','call','invoke','eval','shell','command','script','http','request'}
+_UNSAFE_NAME_WORDS=_ARG_WRITE_TOOL_WORDS|{'exec','sql','call','invoke','eval','shell','command','script','http','request',
+                                          # a name that chains a second action ('and', 'then') is never a plain read
+                                          'and','then','book','reserve','purchase','buy','checkout','complete','finish',
+                                          'resolve','deliver','dispatch','erase','discard','destroy','wipe','grant','refund',
+                                          'redeem','settle','enrol','enroll','register','unregister','upgrade','downgrade',
+                                          'unfollow','unlink','unlock','detach','disconnect','connect','topup','claim','vote',
+                                          'join','leave','close','switch','begin','boost'}
+# An MCP tool its server does not mark read-only runs only when every word of its name is a read word or plain mail,
+# calendar or task vocabulary: an unknown word may be a verb that changes something (Strix 7d8f96b #3).
+_MAIL_READ_NAME_WORDS=_READ_TOOL_WORDS|{
+    'email','emails','mail','mails','gmail','outlook','message','messages','msg','msgs','thread','threads','inbox',
+    'mailbox','mailboxes','folder','folders','conversation','conversations','labels','important','starred',
+    'sent','drafts','calendar','calendars','event','events','meeting','meetings','agenda','availability','free','busy',
+    'freebusy','task','tasks','todo','todos','reminder','reminders','note','notes','contact','contacts','people',
+    'person','user','users','profile','me','my','recent','new','latest','upcoming','today','history','by','id','ids',
+    'for','from','in','of','on','all','details','detail','content','contents','body','header','headers','attachment',
+    'attachments','info','metadata','item','items','page','summary','count','status','query','filter','date','range',
+    'time','google','googlecalendar','gcal','microsoft','ms','graph','office','workspace','exchange','imap','proton',
+    'fastmail','icloud','zoho','yahoo'}
 _BLOCKED_PROACTIVE_TOOLSETS={'delegation','code_execution','computer_use','kanban','cronjob'}
 # web_extract/web_fetch could carry another email's content out in a URL an injected email asks for.
 _BLOCKED_PROACTIVE_TOOLS={'delegate_task','execute_code','computer_use','kanban','cronjob_manage',
@@ -276,6 +294,10 @@ def _named_read_only(raw_name):
     words=_tool_words(raw_name)
     return bool(words&_READ_TOOL_WORDS) and not bool(words&_UNSAFE_NAME_WORDS)
 
+def _plain_mail_read(raw_name):
+    words=_tool_words(raw_name)
+    return bool(words&_READ_TOOL_WORDS) and words<=_MAIL_READ_NAME_WORDS
+
 def _mcp_read_only(tool_name,profile):
     try:
         from hermes_cli.web_server_profiles import _profile_scope
@@ -289,8 +311,8 @@ def _mcp_read_only(tool_name,profile):
         for raw_name,hint in hints.items():
             if mcp_prefixed_tool_name(server_name,raw_name)==tool_name:
                 # Hermes records a missing and a false readOnlyHint alike, so an unannotated mail reader still runs
-                # when its name plainly reads; anything named like a write or a runner is blocked either way.
-                return not bool(_tool_words(raw_name)&_UNSAFE_NAME_WORDS) and (hint is True or _named_read_only(raw_name))
+                # when its whole name is plain mail reading; anything named like a write or a runner is blocked either way.
+                return not bool(_tool_words(raw_name)&_UNSAFE_NAME_WORDS) and (hint is True or _plain_mail_read(raw_name))
     except Exception:
         return False
     return False

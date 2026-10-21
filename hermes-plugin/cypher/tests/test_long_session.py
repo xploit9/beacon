@@ -317,4 +317,4 @@ def test_live_snapshot_shows_watch_health_and_learned_count(harness, monkeypatch
     context = live.snapshot(api.mobile, "owner", "default", api.proactive)
 
     assert "Proactive important email: ok" in context
-    assert "2 owner importance notes" in context
+    assert "2 alerts the owner marked" in context

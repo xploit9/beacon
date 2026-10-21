@@ -289,10 +289,22 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
                                             "mcp__db__list_tables": "db", "mcp__db__fetch_rows": "db"})
     mcp_tool._tool_read_only_hints["db"] = {"query": False, "run_sql_query": True, "list_tables": False,
                                             "fetch_rows": True}
-    for tool in ("mcp__db__query", "mcp__db__run_sql_query"):
+    # Strix 7d8f96b #3: without the server's read-only hint, every word of the name must be plain mail reading.
+    for tool in ("mcp__db__query", "mcp__db__run_sql_query", "mcp__db__list_tables"):
         assert plugin.native_proactive_read_only_guard(tool_name=tool, args={}, session_id="watch-run") == blocked, tool
-    for tool in ("mcp__db__list_tables", "mcp__db__fetch_rows"):
-        assert plugin.native_proactive_read_only_guard(tool_name=tool, args={}, session_id="watch-run") is None, tool
+    assert plugin.native_proactive_read_only_guard(tool_name="mcp__db__fetch_rows", args={}, session_id="watch-run") is None
+    readers = ("search_inbox", "read_email", "list_calendar_events", "list_tasks", "list-mail-messages",
+               "GMAIL_LIST_THREADS", "getMessageAttachment")
+    chained = ("get_and_complete", "search_and_reserve", "find_and_book", "lookup_then_order", "book_slot")
+    mcp_tool._mcp_tool_server_names.update({"mcp__mail__" + name: "mail" for name in readers + chained})
+    for hint in (False, True):
+        mcp_tool._tool_read_only_hints["mail"] = {name: hint for name in readers + chained}
+        for name in readers:
+            assert plugin.native_proactive_read_only_guard(
+                tool_name="mcp__mail__" + name, args={}, session_id="watch-run") is None, (name, hint)
+        for name in chained:
+            assert plugin.native_proactive_read_only_guard(
+                tool_name="mcp__mail__" + name, args={}, session_id="watch-run") == blocked, (name, hint)
     # Strix cf8a230 #1: a read word never excuses a state change spelled with another verb, hinted read-only or not.
     writes = ("toggle_read_status", "get_message_and_toggle", "read_and_save_attachment", "notify_read_receipt",
               "store_read_flag", "acknowledge_read", "email_toggle_read", "read_note_pin", "getMessageAndClearFlag",

@@ -65,8 +65,8 @@ def _build_snapshot(mobile, owner, profile, proactive, job_scope=False):
         health = proactive.health(mobile, owner, profile, setup)
         checked = _time_label(health.get("checked_at"))
         detail = f"{health['state']}" + (f"; last checked {checked}" if checked else "")
-        notes = proactive.learned_notes(profile)
-        items.append(f"Proactive important email: {detail}; {len(notes)} owner importance notes in Hermes memory")
+        notes = proactive.learned_notes(mobile, owner, profile)
+        items.append(f"Proactive important email: {detail}; {len(notes)} alerts the owner marked")
 
     from hermes_cli.web_server_profiles import _profile_scope
     from tools.registry import registry

@@ -1485,8 +1485,8 @@ async def proactive_feedback(request:Request):
 async def proactive_learned_delete(request:Request):
     value=await body(request,512)
     if set(value)!={'note'}: raise HTTPException(400,'Expected one learned note')
-    _,_,profile,_=identity(request)
-    try: return await feature(proactive.delete_learned,profile,value['note'],timeout=12)
+    owner,_,profile,_=identity(request)
+    try: return await feature(proactive.delete_learned,mobile,owner,profile,value['note'],timeout=12)
     except LookupError as exc: raise HTTPException(404,str(exc)) from None
     except ValueError as exc: raise HTTPException(400,str(exc)) from None
     except RuntimeError: raise HTTPException(503,'Learned email preference could not be removed') from None
