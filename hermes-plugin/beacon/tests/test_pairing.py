@@ -239,7 +239,7 @@ def test_install_prompts_request_pairing_code_and_allow_qr_image():
     assert 'names a flag' in readme and 'pairing block' in readme
     assert (root / 'hermes-plugin' / 'beacon' / 'install' / 'beacon_install.py').is_file()
     assert '/beacon-pair' in (root / 'hermes-plugin' / 'beacon' / 'README.md').read_text(encoding='utf-8')
-    for phrase in ('plugins/cypher', 'plugin-data/cypher', 'CYPHER_PROACTIVE_JOB', 'beacon pair'):
+    for phrase in ('plugins install xploit9/beacon/hermes-plugin/beacon --enable', 'beacon pair', '--dry-run'):
         assert phrase in guide, phrase
     assert 'enter the address and code' in readme and 'choose a screenshot' in readme
 

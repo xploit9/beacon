@@ -42,19 +42,6 @@ elif args == ["config", "get", "dashboard.port", "--json"]:
     print(json.dumps(state.get("dashboard_port", 9119)))
 elif args == ["dashboard", "--status"]:
     print("1 hermes dashboard/serve process(es) running:" if state.get("dashboard_running") else "No hermes dashboard or serve processes running.")
-elif len(args) == 3 and args[:2] == ["cron", "remove"]:
-    if state.get("require_backup_before_remove"):
-        backups = list(profile_home.glob("backups/beacon-install-*/plugins/cypher/legacy.py"))
-        assert backups and backups[0].read_text(encoding="utf-8") == "legacy plugin\n", "plugin backup missing or incomplete before cron removal"
-        data = list(profile_home.glob("backups/beacon-install-*/plugin-data/cypher/legacy.txt"))
-        assert data and data[0].read_text(encoding="utf-8") == "legacy data\n", "plugin data backup missing or incomplete before cron removal"
-elif args == ["plugins", "remove", "cypher"]:
-    if state.get("require_backup_before_remove"):
-        backups = list(profile_home.glob("backups/beacon-install-*/plugins/cypher/legacy.py"))
-        assert backups and backups[0].read_text(encoding="utf-8") == "legacy plugin\n", "plugin backup missing before plugin removal"
-    state["plugins"] = [name for name in state["plugins"] if name != "cypher"]
-    state_path.write_text(json.dumps(state), encoding="utf-8")
-    print("fake plugin removed")
 elif len(args) >= 3 and args[:2] == ["plugins", "install"]:
     assert args[2] == "xploit9/beacon/hermes-plugin/beacon" and "--enable" in args
     state["plugins"] = sorted(set(state["plugins"] + ["beacon"]))
@@ -145,23 +132,6 @@ class InstallerTests(unittest.TestCase):
             return []
         return [(entry[0], entry[1]) for entry in map(json.loads, self.log.read_text(encoding="utf-8").splitlines())]
 
-    def add_legacy_plugin(self) -> None:
-        (self.home / "plugins" / "cypher").mkdir(parents=True)
-        (self.home / "plugins" / "cypher" / "legacy.py").write_text("legacy plugin\n", encoding="utf-8")
-        (self.home / "plugin-data" / "cypher").mkdir(parents=True)
-        (self.home / "plugin-data" / "cypher" / "legacy.txt").write_text("legacy data\n", encoding="utf-8")
-
-    def add_jobs(self) -> None:
-        jobs = self.home / "cron" / "jobs.json"
-        jobs.parent.mkdir(parents=True, exist_ok=True)
-        jobs.write_text(
-            json.dumps({"jobs": [
-                {"id": "keep-job", "prompt": "Leave this scheduled reminder alone."},
-                {"id": "cypher-job", "prompt": "CYPHER_PROACTIVE_JOB: old managed callback"},
-            ]}),
-            encoding="utf-8",
-        )
-
     def test_home_and_profile_prompts_only_when_ambiguous(self) -> None:
         only_default = self.run_installer("--dry-run", HERMES_HOME=None)
         self.assertEqual(only_default.returncode, 0, only_default.stderr)
@@ -186,53 +156,6 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("Select Hermes home", skipped.stdout)
         self.assertNotIn("Select Hermes profile", skipped.stdout)
 
-    def test_backup_is_verified_before_any_removal_and_sqlite_is_backed_up(self) -> None:
-        self.add_legacy_plugin()
-        self.add_jobs()
-        database_path = self.home / "plugin-data" / "cypher" / "state.sqlite"
-        with closing(sqlite3.connect(database_path)) as conn:
-            conn.execute("CREATE TABLE state(value TEXT)")
-            conn.execute("INSERT INTO state VALUES('preserved')")
-            conn.commit()
-        self.write_state(plugins=["cypher"], require_backup_before_remove=True)
-
-        result = self.run_installer("--home", str(self.home), "--profile", "default", input_text="\n")
-
-        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        self.assertIn("Backup verified", result.stdout)
-        backup_dirs = list((self.home / "backups").glob("beacon-install-*"))
-        self.assertEqual(len(backup_dirs), 1)
-        backup_db = backup_dirs[0] / "plugin-data" / "cypher" / "state.sqlite"
-        with closing(sqlite3.connect(backup_db)) as conn:
-            self.assertEqual(conn.execute("SELECT value FROM state").fetchone()[0], "preserved")
-        self.assertLess(result.stdout.index("Backup verified"), result.stdout.index("Removed managed Hermes cron job"))
-        self.assertTrue(any(args[:2] == ["plugins", "remove"] for _, args in self.commands()))
-
-    def test_only_marker_cron_jobs_are_removed(self) -> None:
-        self.add_legacy_plugin()
-        self.add_jobs()
-        self.write_state(plugins=["cypher"])
-
-        result = self.run_installer("--home", str(self.home), "--profile", "default", input_text="\n")
-
-        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        removed = [args[2] for _, args in self.commands() if args[:2] == ["cron", "remove"]]
-        self.assertEqual(removed, ["cypher-job"])
-
-    def test_failed_backup_stops_before_any_removal(self) -> None:
-        self.add_legacy_plugin()
-        self.add_jobs()
-        (self.home / "plugin-data" / "cypher" / "broken.sqlite").write_bytes(b"not a database")
-        self.write_state(plugins=["cypher"])
-
-        result = self.run_installer("--home", str(self.home), "--profile", "default", input_text="\n")
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(any(args[:2] in (["cron", "remove"], ["plugins", "remove"])
-                             for _, args in self.commands()))
-        self.assertTrue((self.home / "plugins" / "cypher" / "legacy.py").is_file())
-        self.assertTrue((self.home / "plugin-data" / "cypher" / "legacy.txt").is_file())
-
     def test_installs_when_missing_and_updates_when_already_installed(self) -> None:
         install = self.run_installer("--home", str(self.home), "--profile", "default", input_text="\n")
         self.assertEqual(install.returncode, 0, install.stderr + install.stdout)
@@ -255,9 +178,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn(["beacon", "pair", "--name", "My phone"], [args for _, args in self.commands()])
 
     def test_dry_run_changes_nothing(self) -> None:
-        self.add_legacy_plugin()
-        self.add_jobs()
-        self.write_state(plugins=["cypher"])
+        self.write_state(plugins=["beacon"])
         before = sorted((str(path.relative_to(self.home)), path.read_bytes() if path.is_file() else None)
                         for path in self.home.rglob("*"))
 
@@ -267,10 +188,8 @@ class InstallerTests(unittest.TestCase):
         after = sorted((str(path.relative_to(self.home)), path.read_bytes() if path.is_file() else None)
                        for path in self.home.rglob("*"))
         self.assertEqual(after, before)
-        mutating = (["cron", "remove"], ["plugins", "remove"], ["plugins", "install"],
-                    ["plugins", "update"], ["beacon", "pair"], ["dashboard", "--stop"])
+        mutating = (["plugins", "install"], ["plugins", "update"], ["beacon", "pair"], ["dashboard", "--stop"])
         self.assertFalse(any(args[:2] in mutating for _, args in self.commands()))
-        self.assertFalse((self.home / "backups").exists())
 
 
 if __name__ == "__main__":

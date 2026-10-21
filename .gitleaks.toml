@@ -1,0 +1,8 @@
+# Gitleaks' default rules, plus one allowlisted historical commit: a test-code false positive
+# (a variable named `api` followed by a keyword argument) that cannot change; the current file no longer matches.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Historical test-code false positive"
+commits = ["73122e660505e9dde08d3955c425ff898ac14afd"]

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import ipaddress
 import csv
 import json
@@ -12,7 +11,6 @@ import os
 from pathlib import Path
 import re
 import shutil
-import sqlite3
 import subprocess
 import sys
 import time
@@ -22,9 +20,7 @@ from urllib.request import Request, urlopen
 
 
 PLUGIN = "beacon"
-OLD_PLUGIN = "cypher"
 INSTALL_SOURCE = "xploit9/beacon/hermes-plugin/beacon"
-CRON_MARKER = "CYPHER_PROACTIVE_JOB"
 PAIR_ROUTE = "/api/plugins/beacon/mobile/bootstrap"
 RELEASE_URL = "https://github.com/xploit9/beacon/releases/latest"
 PROFILE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
@@ -145,10 +141,6 @@ def _select_profile(home: Path, override: str | None) -> str:
     return profile
 
 
-def _profile_home(home: Path, profile: str) -> Path:
-    return home if profile == "default" else home / "profiles" / profile
-
-
 def _env(home: Path) -> dict[str, str]:
     result = os.environ.copy()
     result["HERMES_HOME"] = str(home)
@@ -181,140 +173,6 @@ def _plugin_names(hermes: str, home: Path, profile: str) -> set[str]:
     except (TypeError, ValueError, KeyError) as exc:
         raise InstallError("Hermes returned an unreadable plugin list; nothing was changed.") from exc
     return names
-
-
-def _managed_cron_jobs(profile_home: Path) -> list[str]:
-    jobs_file = profile_home / "cron" / "jobs.json"
-    if not jobs_file.exists():
-        return []
-    try:
-        if jobs_file.stat().st_size > 32 * 1024 * 1024:
-            raise InstallError("Hermes cron data is unexpectedly large; nothing was changed.")
-        data = json.loads(jobs_file.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise InstallError("Could not read Hermes cron data; nothing was changed.") from exc
-    jobs = data.get("jobs") if isinstance(data, dict) else data
-    if isinstance(jobs, dict):
-        jobs = [dict(value, id=value.get("id", key)) for key, value in jobs.items() if isinstance(value, dict)]
-    if not isinstance(jobs, list):
-        raise InstallError("Hermes cron data has an unknown format; nothing was changed.")
-    matches: list[str] = []
-    for job in jobs:
-        if not isinstance(job, dict) or not isinstance(job.get("prompt"), str):
-            continue
-        if CRON_MARKER not in job["prompt"]:
-            continue
-        job_id = job.get("id")
-        if type(job_id) in (str, int) and str(job_id).strip() and not any(ord(c) < 32 for c in str(job_id)):
-            matches.append(str(job_id))
-        else:
-            raise InstallError("A managed Hermes cron job has no safe ID; nothing was changed.")
-    return matches
-
-
-def _tree_files(root: Path) -> dict[str, Path]:
-    if root.is_symlink() or not root.is_dir():
-        raise InstallError(f"Cannot safely back up {root.name}; expected a regular directory.")
-    files: dict[str, Path] = {}
-    for path in root.rglob("*"):
-        if path.is_symlink():
-            raise InstallError(f"Cannot safely back up a symlink in {root.name}; nothing was removed.")
-        if path.is_file():
-            files[path.relative_to(root).as_posix()] = path
-    return files
-
-
-def _copy_directory(source: Path, destination: Path) -> tuple[int, int, int]:
-    source_files = _tree_files(source)
-    destination.mkdir(parents=True)
-    for path in source.rglob("*"):
-        if path.is_symlink():
-            raise InstallError(f"Cannot safely back up a symlink in {source.name}; nothing was removed.")
-        if path.is_dir():
-            (destination / path.relative_to(source)).mkdir(parents=True, exist_ok=True)
-    for relative, source_file in source_files.items():
-        target = destination / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if source_file.suffix.lower() == ".sqlite":
-            uri = source_file.resolve().as_uri() + "?mode=ro"
-            try:
-                src = sqlite3.connect(uri, uri=True)
-                try:
-                    dst = sqlite3.connect(target)
-                    try:
-                        src.backup(dst)
-                    finally:
-                        dst.close()
-                finally:
-                    src.close()
-                check = sqlite3.connect(target)
-                try:
-                    if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                        raise InstallError(f"SQLite backup verification failed for {relative}.")
-                finally:
-                    check.close()
-            except sqlite3.Error as exc:
-                raise InstallError(f"SQLite backup failed for {relative}; nothing was removed.") from exc
-        else:
-            shutil.copy2(source_file, target)
-    copied = {path.relative_to(destination).as_posix(): path for path in destination.rglob("*") if path.is_file()}
-    if copied.keys() != source_files.keys():
-        raise InstallError(f"Backup file count verification failed for {source.name}; nothing was removed.")
-    source_bytes = 0
-    backup_bytes = 0
-    for relative, source_file in source_files.items():
-        target = copied[relative]
-        source_size, target_size = source_file.stat().st_size, target.stat().st_size
-        source_bytes += source_size
-        backup_bytes += target_size
-        if source_file.suffix.lower() == ".sqlite":
-            if target_size == 0:
-                raise InstallError(f"SQLite backup size verification failed for {relative}.")
-        elif source_size != target_size:
-            raise InstallError(f"Backup size verification failed for {relative}; nothing was removed.")
-    return len(source_files), source_bytes, backup_bytes
-
-
-def _backup_legacy(profile_home: Path, installed: bool) -> bool:
-    plugin_dir = profile_home / "plugins" / OLD_PLUGIN
-    data_dir = profile_home / "plugin-data" / OLD_PLUGIN
-    if installed and not plugin_dir.is_dir():
-        raise InstallError("The cypher plugin is listed but its folder is missing; nothing was removed.")
-    sources = []
-    if plugin_dir.exists():
-        sources.append((plugin_dir, Path("plugins") / OLD_PLUGIN))
-    if data_dir.exists():
-        sources.append((data_dir, Path("plugin-data") / OLD_PLUGIN))
-    if not sources:
-        _line(True, "No cypher plugin files or data need backing up")
-        return False
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup_parent = profile_home / "backups"
-    if backup_parent.is_symlink():
-        raise InstallError("Hermes backup directory is a symlink; nothing was removed.")
-    backup = backup_parent / f"beacon-install-{stamp}"
-    try:
-        backup.mkdir(parents=True, exist_ok=False)
-        if os.name != "nt":
-            backup.chmod(0o700)
-        file_count = source_bytes = backup_bytes = 0
-        names: list[str] = []
-        for source, relative in sources:
-            count, before, after = _copy_directory(source, backup / relative)
-            file_count += count
-            source_bytes += before
-            backup_bytes += after
-            names.append(relative.as_posix())
-        if os.name != "nt":
-            for path in backup.rglob("*"):
-                if path.is_dir():
-                    path.chmod(0o700)
-                elif path.is_file():
-                    path.chmod(0o600)
-    except (OSError, InstallError) as exc:
-        raise InstallError(f"Backup at {backup} could not be verified; no removals were performed. Review the incomplete copy before retrying.") from exc
-    _line(True, f"Backed up {', '.join(names)} to {backup} ({file_count} files; {source_bytes} source bytes, {backup_bytes} backup bytes). Backup verified.")
-    return True
 
 
 def _run_mutation(hermes: str, home: Path, profile: str, *args: str) -> None:
@@ -555,11 +413,9 @@ def _pair(hermes: str, home: Path, profile: str, name: str | None = None) -> Non
     _line(True, "Beacon phone pairing is ready.")
 
 
-def _dry_run_summary(cypher_installed: bool, beacon_installed: bool, jobs: list[str], running: bool,
-                     public_url: str | None, port: int) -> None:
+def _dry_run_summary(beacon_installed: bool, running: bool, public_url: str | None, port: int) -> None:
     action = "update Beacon" if beacon_installed else "install Beacon"
-    steps = (["back up and remove the old cypher plugin"] if cypher_installed else []) +         ([f"remove {len(jobs)} of its cron job(s)"] if jobs else []) + [action, "pair a phone"]
-    print(f"✓ Dry run: would {', '.join(steps[:-1])} and {steps[-1]}.")
+    print(f"✓ Dry run: would {action} and pair a phone.")
     print(f"✓ Dashboard running: {'yes (restart would require approval)' if running else 'no'}")
     if _is_https_url(public_url):
         _line(True, "Public HTTPS dashboard URL is configured")
@@ -575,32 +431,13 @@ def _install(args: argparse.Namespace) -> int:
     _line(True, "Hermes CLI found")
     home = _select_home(args.home)
     profile = _select_profile(home, args.profile)
-    profile_home = _profile_home(home, profile)
-    names = _plugin_names(hermes, home, profile)
-    cypher_installed = OLD_PLUGIN in names
-    beacon_installed = PLUGIN in names
-    jobs = _managed_cron_jobs(profile_home)
-    _line(True, f"Found {len(jobs)} managed {OLD_PLUGIN} cron job(s)")
+    beacon_installed = PLUGIN in _plugin_names(hermes, home, profile)
 
     running = _dashboard_running(hermes, home, profile)
 
     if args.dry_run:
-        _dry_run_summary(cypher_installed, beacon_installed, jobs, running,
-                         _public_url(hermes, home, profile), _dashboard_port(hermes, home, profile))
+        _dry_run_summary(beacon_installed, running, _public_url(hermes, home, profile), _dashboard_port(hermes, home, profile))
         return 0
-
-    has_backup = _backup_legacy(profile_home, cypher_installed)
-    if jobs:
-        if has_backup:
-            _line(True, "Legacy plugin backup is verified before cron removal")
-        for job_id in jobs:
-            _run_mutation(hermes, home, profile, "cron", "remove", job_id)
-            _line(True, f"Removed managed Hermes cron job {job_id}")
-    if cypher_installed:
-        _run_mutation(hermes, home, profile, "plugins", "remove", OLD_PLUGIN)
-        _line(True, "Removed the retired cypher plugin with Hermes")
-    else:
-        _line(True, "No installed cypher plugin needs removal")
 
     if beacon_installed:
         _line(True, "Updating Beacon; Hermes installer output follows")
