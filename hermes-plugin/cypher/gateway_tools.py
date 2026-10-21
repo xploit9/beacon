@@ -27,6 +27,7 @@ SLOTS = threading.BoundedSemaphore(4)
 CATALOG_LOCK = threading.RLock()
 CATALOG_CACHE = {}
 CATALOG_WARMING = set()
+CATALOG_FIRST_WARM = {}  # profile -> this process's first warm-up, which runs MCP discovery
 NATIVE_READ_ONLY = frozenset({'read_file','search_files','web_search','skills_list','skill_view'})
 NATIVE_READ_ONLY |= frozenset({'hindsight_recall','hindsight_reflect','hindsight_search_knowledge_pages',
                                'hindsight_read_knowledge_page'})
@@ -442,6 +443,7 @@ class Gateway:
         except Exception:
             with CATALOG_LOCK: CATALOG_WARMING.discard(key)
             return False
+        with CATALOG_LOCK: CATALOG_FIRST_WARM.setdefault(profile,thread)
         return True
 
     def compact_catalogue(self, profile):
@@ -474,6 +476,9 @@ class Gateway:
     def discover(self, profile, query=''):
         if not isinstance(query, str) or len(query)>240: raise HTTPException(400, 'Invalid tool query')
         self.warm_catalogue(profile)
+        # Right after a restart MCP tools are still being discovered; wait once (bounded) so mail tools are not missed.
+        first=CATALOG_FIRST_WARM.get(profile)
+        if first is not None and first is not threading.current_thread(): first.join(30)
         words = set(re.findall(r'[^\W_]+', query.casefold())) - QUERY_FILLER
         words = {word for word in words if not word.isdecimal()}
         rows = self.catalog(profile,discover=False)

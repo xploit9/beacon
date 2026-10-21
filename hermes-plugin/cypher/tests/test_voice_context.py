@@ -159,7 +159,7 @@ def test_tool_catalogue_starts_background_warm_before_reading_cache(harness, mon
     assert calls == [('warm','work'),('compact','work')]
 
 
-def test_context_uses_text_chat_name_and_profile_personality(harness, monkeypatch):
+def test_context_leaves_the_name_to_the_phone_and_keeps_profile_personality(harness, monkeypatch):
     api, _, _, root, _ = harness
     call_id=api.mobile.reserve('owner','default','native-stored')['call_id']
     voice=api.voice_context
@@ -170,12 +170,11 @@ def test_context_uses_text_chat_name_and_profile_personality(harness, monkeypatc
     monkeypatch.setattr(voice,'history',lambda *args:[])
     monkeypatch.setattr(voice,'tool_catalogue',lambda profile:'')
     monkeypatch.setattr(voice,'local_time',lambda profile:'')
-    monkeypatch.setitem(sys.modules,'hermes_cli.skin_engine',SimpleNamespace(
-        get_active_skin=lambda:SimpleNamespace(get_branding=lambda key,default:'Hermes')))
 
     result=voice.context('owner','basic','default','native-stored',call_id)
 
-    assert result['system_instruction'].startswith('You are Hermes,')
+    # The phone already says "You are <the name the owner chose>"; a second name here would contradict it.
+    assert result['system_instruction'].startswith('You are the voice surface of this configured native Hermes profile.')
     assert 'Profile personality:\nProfile-owned SOUL personality' in result['system_instruction']
 
 

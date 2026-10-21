@@ -75,29 +75,6 @@ def current_profile(cfg):
     return proactive.current_profile(cfg)
 
 
-def _optional_module(name):
-    key='cypher_'+name
-    module=sys.modules.get(key)
-    if module is not None: return None if _stale(module) else module
-    path=ROOT/(name+'.py');spec=importlib.util.spec_from_file_location(key,path)
-    module=importlib.util.module_from_spec(spec);module._cypher_mtime=path.stat().st_mtime_ns
-    sys.modules[key]=module
-    try: spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(key,None)
-        raise
-    return module
-
-
-def _warm_catalogue_on_load():
-    try:
-        profile=current_profile({})
-        voice=_optional_module('voice_context')
-        tools=_optional_module('gateway_tools')
-        tools.Gateway(mobile,voice.scoped).warm_catalogue(profile)
-    except Exception:
-        pass
-
 def _cron_row(profile,session_id):
     from tui_gateway import server
     with server._profile_db({'profile':profile}) as db:
@@ -365,7 +342,7 @@ def _mail_provider_read(tool_name,profile):
     providers=_tool_words(server_name)
     return (_plain_mail_read(raw_name) and bool(words&_FETCHED_MAIL_WORDS)
             and bool((words|providers)&_MAIL_PROVIDER_WORDS)
-            and not bool(_tool_words(raw_name)&_UNSAFE_NAME_WORDS))
+            and not bool(words&_UNSAFE_NAME_WORDS))
 
 
 _DESTINATION_FIELDS={'url','uri','urls','link','href','host','hostname','domain','endpoint','server','webhook','feed',
@@ -562,4 +539,3 @@ def register(ctx):
     ctx.register_hook('post_tool_call',native_mailbox_observation)
     ctx.register_hook('pre_tool_call',native_proactive_read_only_guard)
     phone_delivery.register(ctx)
-    _warm_catalogue_on_load()

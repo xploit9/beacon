@@ -787,7 +787,8 @@ def test_warmed_catalogue_is_off_request_path_and_summarizes_each_source_once(tm
     assert calls==[True,False]
 
 
-def test_plugin_registration_starts_native_catalogue_warmup(monkeypatch):
+def test_plugin_registration_never_starts_mcp_discovery(monkeypatch):
+    # register() runs in every Hermes process (CLI, cron, gateway); only the dashboard, which serves calls, warms.
     from test_mobile import load_private
 
     warmed=[]
@@ -800,7 +801,26 @@ def test_plugin_registration_starts_native_catalogue_warmup(monkeypatch):
 
     plugin.register(context)
 
-    assert warmed==['work']
+    assert warmed==[]
+
+
+def test_first_discover_after_a_restart_waits_for_mcp_tools(tmp_path):
+    profile='cold-'+str(time.time_ns());discovered=threading.Event()
+    mail={'name':'mcp__tool_gateway_meeting__google_workspace_search_gmai_f6f8eca1','_raw':'google_workspace_search_gmail',
+          '_server':'tool_gateway_meeting','description':'Search Gmail messages by query','read_only':True,
+          'tool_id':'mail','parameters':{'type':'object','properties':{}}}
+    local={'name':'read_file','_toolset':'file','description':'Read a local file','read_only':True,
+           'tool_id':'file','parameters':{'type':'object','properties':{}}}
+
+    class Backend:
+        def cache_key(self): return 'cold-cache'
+        def catalog(self,discover=True):
+            if discover:
+                time.sleep(0.3);discovered.set()
+            return [local,mail] if discovered.is_set() else [local]
+
+    api=g.Gateway(Mobile(tmp_path/'cold.sqlite'),lambda name,fn:fn(tmp_path),Backend())
+    assert api.discover(profile,'check my emails')['tools'][0]['name']==mail['name']
 
 
 def test_native_tool_receipts_dispatch_in_profile_conversation_and_gate_mutations(tmp_path,monkeypatch):
