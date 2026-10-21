@@ -41,14 +41,15 @@ everything up end to end and asks you before anything that needs your say:
 > 2. Install the Cypher plugin with Hermes' own installer (`hermes -p <profile> plugins install xploit9/cypher/hermes-plugin/cypher --enable`), or update it if it's already installed. Let Hermes' security scan run, and ask me before approving Python dependencies.
 > 3. Restart only that dashboard (ask me first), then confirm it runs the new plugin and shows a **Cypher** tab.
 > 4. Make sure my phone can reach the dashboard over HTTPS. If it can't yet, propose Tailscale Serve and ask before changing any network setting.
-> 5. Then tell me to open the dashboard's **Cypher** tab, tap **Use Cypher with this Hermes account** if it asks, and install the app from https://github.com/xploit9/cypher/releases/latest.
+> 5. Run `hermes cypher pair --name "<my phone>"` and show me the dashboard address and pairing code.
+> 6. Scan the QR, choose a screenshot of it, or type the address and code. Install the app from https://github.com/xploit9/cypher/releases/latest.
 >
 > Never print or store passwords, tokens or API keys, and never modify Hermes core.
 
 If the repository isn't public for you, that PC needs GitHub access first (`gh auth login`).
 
 **2. On your phone**, download `Cypher-1.0.0.apk` from [Releases](https://github.com/xploit9/cypher/releases) and install
-it. Open it, scan the QR code on the dashboard's **Cypher** tab, and follow the setup wizard.
+it. Open it. Scan the QR, choose a screenshot of it, or type the address and code, then follow the setup wizard.
 
 The app is `dev.hermes.android.stable` ("Cypher"). It installs next to any older Cypher build without touching it.
 

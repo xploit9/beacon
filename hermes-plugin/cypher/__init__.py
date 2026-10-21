@@ -507,6 +507,50 @@ def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**
     return {'action':'block','message':_READ_ONLY_MESSAGE}
 
 
+def _pairing_block(profile=None,name=None):
+    if name is None: name='Cypher phone'
+    cfg=mobile.settings(profile)
+    profile=profile or current_profile(cfg)
+    cfg=mobile.settings(profile)
+    owner,provider=cfg.get('owner_id'),cfg.get('owner_provider')
+    profiles=cfg.get('profiles')
+    if not owner or not provider or isinstance(profiles,list) and profile not in profiles:
+        raise ValueError('Use a profile owned by the Hermes account bound to Cypher.')
+    dashboard_url,dashboard_name=mobile.dashboard_connect_info()
+    pairing=mobile.mint_device_pairing(owner,profile,name,dashboard_url,dashboard_name)
+    return f"Dashboard: {pairing['dashboard_url']}\nPairing code: {pairing['code']}\nexpires in 10 min"
+
+
+def _pairing_cli_setup(subparser):
+    actions=subparser.add_subparsers(dest='cypher_action',required=True)
+    pair=actions.add_parser('pair',help='Pair a phone with Cypher')
+    pair.add_argument('--name',default=None,help='Name this phone in the device list')
+    pair.set_defaults(func=_pairing_cli_command)
+
+
+def _pairing_cli_command(args):
+    try: print(_pairing_block(getattr(args,'profile',None),getattr(args,'name',None)))
+    except (LookupError,ValueError,OSError,RuntimeError) as exc:
+        print(f'Could not create a pairing code: {exc}',file=sys.stderr)
+        raise SystemExit(1) from None
+
+
+def _pairing_slash_command(ctx,raw_args=''):
+    if raw_args.strip(): return 'Use `/cypher-pair` without arguments.'
+    try:
+        cfg=mobile.settings()
+        profile=current_profile(cfg)
+        cfg=mobile.settings(profile)
+        owner,provider=cfg.get('owner_id'),cfg.get('owner_provider')
+        session_id=ctx.session_key()
+        if not owner or not provider or not session_id:
+            return 'Pairing is available only in an owned Hermes session.'
+        native.verify(owner,provider,profile,session_id)
+        return _pairing_block(profile)
+    except Exception:
+        return 'Pairing requires an owned Hermes session and a configured HTTPS dashboard address.'
+
+
 def register(ctx):
     ctx.register_tool(name='cypher_call_user',toolset='cypher',description='Ring the owner through Cypher Android using the current saved native conversation. An invitation is pending, not proof of answering. Use only for owner-requested callbacks.',
         schema={'name':'cypher_call_user','description':'Ring an authorized native callback invitation','parameters':{'type':'object','properties':{'reason':{'type':'string','maxLength':240,'description':'Brief owner-requested reason for the call; do not claim unverified work is finished'}},'additionalProperties':False}},handler=call_user)
@@ -539,3 +583,13 @@ def register(ctx):
     ctx.register_hook('post_tool_call',native_mailbox_observation)
     ctx.register_hook('pre_tool_call',native_proactive_read_only_guard)
     phone_delivery.register(ctx)
+    try:
+        ctx.register_cli_command(name='cypher',help='Pair and manage Cypher phones',
+            setup_fn=_pairing_cli_setup,description='Pair a phone with Cypher.')
+    except (AttributeError,TypeError):
+        pass
+    try:
+        ctx.register_command('cypher-pair',handler=lambda raw_args:_pairing_slash_command(ctx,raw_args),
+            description='Create a one-time pairing code for a phone.')
+    except (AttributeError,TypeError):
+        pass

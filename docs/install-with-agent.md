@@ -74,12 +74,13 @@ From the dashboard's authenticated browser session, verify that:
 - If Hermes reports multiple dashboard accounts and Cypher has no owner, the first verified account to use the plugin becomes owner; other accounts receive 403.
 - Loopback-anonymous requests never create an owner. A dashboard without a verified native Hermes identity cannot initialize Cypher until that identity is available.
 - The owner-authorized `GET /api/plugins/cypher/connect-info` succeeds and the tab displays its QR.
+- **Pair a phone** creates a single-use pairing code and QR that expires after 10 minutes.
 
 Do not copy, print, or log the route response. Loopback mode may include a session value in that response. If the route reports that a public HTTPS URL is required, the phone cannot use a loopback or plain-HTTP address. Tailscale Serve over HTTPS is the recommended way to make the dashboard reachable from the phone. Ask before changing network settings; do not enable Serve, open ports, or change firewall/bind settings on your own.
 
 ## 4. Finish on the phone
 
-Tell the user to download and install the latest stable `Cypher-<version>.apk` from the repository's [Releases page](https://github.com/xploit9/cypher/releases), open the dashboard's **Cypher** tab, and scan the QR with the Cypher app. App and plugin automatic updates are on by default in Settings **App updates**; app downloads use an unmetered connection and keep package, version, checksum and signer verification, with a tap-to-install notice whenever Android requires confirmation.
+Tell the user to download and install the latest stable `Cypher-<version>.apk` from the repository's [Releases page](https://github.com/xploit9/cypher/releases), open the dashboard's **Cypher** tab, and select **Pair a phone**. The phone step is: "Scan the QR, choose a screenshot of it, or type the address and code." App and plugin automatic updates are on by default in Settings **App updates**; app downloads use an unmetered connection and keep package, version, checksum and signer verification, with a tap-to-install notice whenever Android requires confirmation.
 
 Phone sign-in uses Hermes' normal OAuth browser flow. The first verified OAuth identity to use a plugin route becomes owner automatically if no owner exists; subsequent identities cannot take over. That sign-in covers chat, history, plugin pages, calls, and Keep connected. Loopback-anonymous access does not establish ownership.
 

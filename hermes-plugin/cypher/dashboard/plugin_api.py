@@ -2,7 +2,6 @@
 import asyncio
 import contextvars
 from concurrent.futures import ThreadPoolExecutor
-import ipaddress
 import math
 import os
 import shutil
@@ -19,7 +18,6 @@ import sys
 import subprocess
 import time
 import uuid
-from urllib.parse import urlsplit
 from fastapi import APIRouter,HTTPException,Request
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
@@ -115,6 +113,12 @@ def _native_profile_names():
         raise HTTPException(503,'Native profiles unavailable')
     return names
 
+def _check_device_request(request,owner,provider,profile,update_seen=True):
+    device_id=request.headers.get('x-cypher-device-id')
+    if device_id is None: return
+    try: mobile.touch_device(owner,provider,profile,device_id,update_seen)
+    except LookupError as exc: raise HTTPException(403,str(exc)) from None
+
 def identity(request,profile=None,owner_only=False,allow_loopback=False):
     enforce_request_policy(request)
     owner,provider=dashboard_identity(request,allow_loopback)
@@ -128,35 +132,20 @@ def identity(request,profile=None,owner_only=False,allow_loopback=False):
     profiles=cfg['profiles'] if 'profiles' in cfg else _native_profile_names()
     if not isinstance(profiles,list) or not 1<=len(profiles)<=64 or any(not isinstance(p,str) or not p.strip() or len(p)>80 for p in profiles) or len(set(profiles))!=len(profiles):
         raise HTTPException(403,'Profile configuration invalid')
-    if owner_only: return owner,provider,None,{**cfg,'profiles':profiles}
+    if owner_only:
+        _check_device_request(request,owner,provider,None)
+        return owner,provider,None,{**cfg,'profiles':profiles}
     if profile is not None and not isinstance(profile,str): raise HTTPException(403,'Profile not authorized')
     profile=profile or request.query_params.get('cypher_profile') or request.query_params.get('profile') or (profiles[0] if len(profiles)==1 else None)
     if not isinstance(profiles,list) or not profile or profile not in profiles:
+        _check_device_request(request,owner,provider,None,False)
         raise HTTPException(403,'Profile not authorized')
+    _check_device_request(request,owner,provider,profile)
     return owner,provider,profile,{**mobile.settings(profile),'profiles':profiles}
 
 def connect_info_url():
-    try:
-        from hermes_cli.dashboard_auth.prefix import resolve_public_url
-        url=resolve_public_url()
-        parsed=urlsplit(url)
-        host=(parsed.hostname or '').rstrip('.').lower()
-        port=parsed.port
-        address=None
-        try: address=ipaddress.ip_address(host)
-        except ValueError: pass
-        numeric_host=bool(re.fullmatch(r'(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))*',host))
-        loopback=(host=='localhost' or host.endswith('.localhost') or
-                  (numeric_host and address is None) or
-                  (address is not None and (address.is_loopback or address.is_unspecified or
-                   bool(getattr(address,'ipv4_mapped',None) and address.ipv4_mapped.is_loopback))))
-        if (not isinstance(url,str) or parsed.scheme.lower()!='https' or not parsed.netloc or not host
-                or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment
-                or port is not None and not 1<=port<=65535 or loopback):
-            raise ValueError()
-        return url,host[:80]
-    except Exception:
-        raise HTTPException(409,'A configured public HTTPS dashboard URL is required to connect a phone.') from None
+    try: return mobile.dashboard_connect_info()
+    except ValueError: raise HTTPException(409,'A configured public HTTPS dashboard URL is required to connect a phone.') from None
 
 def _contains_provider_key(value):
     if isinstance(value,dict):
@@ -211,6 +200,47 @@ async def claim_owner(request:Request):
     if not created:
         raise HTTPException(409,'Cypher owner already configured')
     return {'claimed':True}
+
+@router.post('/pairing')
+async def mint_pairing(request:Request):
+    value=await body(request,2048)
+    if set(value)-{'profile','name'}: raise HTTPException(400,'Invalid pairing fields')
+    owner,_,profile,_=identity(request,value.get('profile'))
+    dashboard_url,dashboard_name=connect_info_url()
+    try: result=mobile.mint_device_pairing(owner,profile,value.get('name'),dashboard_url,dashboard_name)
+    except ValueError as exc: raise HTTPException(400,str(exc)) from None
+    return JSONResponse(result,headers={'Cache-Control':'no-store'})
+
+@router.post('/pairing/redeem')
+async def redeem_pairing(request:Request):
+    enforce_request_policy(request)
+    value=await body(request,2048)
+    if set(value)!={'code','device_name'}: raise HTTPException(400,'Invalid pairing fields')
+    client_host=request.client.host if request.client else 'unknown'
+    try: result=mobile.redeem_device_pairing(value.get('code'),value.get('device_name'),client_host)
+    except mobile.PairingRateLimitError as exc: raise HTTPException(429,str(exc)) from None
+    except ValueError as exc: raise HTTPException(400,str(exc)) from None
+    return JSONResponse(result,headers={'Cache-Control':'no-store'})
+
+@router.post('/devices/link')
+async def link_device(request:Request):
+    value=await body(request,2048)
+    if set(value)!={'device_id','link_ticket'}: raise HTTPException(400,'Invalid device link fields')
+    owner,provider,_,cfg=identity(request,owner_only=True)
+    result=mobile.link_paired_device(value.get('device_id'),value.get('link_ticket'),owner,provider,cfg['profiles'])
+    if result is None: raise HTTPException(400,'That device link could not be completed.')
+    return JSONResponse(result,headers={'Cache-Control':'no-store'})
+
+@router.get('/devices')
+async def devices(request:Request):
+    owner,_,_,cfg=identity(request,owner_only=True)
+    return {'devices':mobile.list_devices(owner),'profiles':cfg['profiles']}
+
+@router.delete('/devices/{device_id}')
+async def remove_device(device_id:str,request:Request):
+    owner,_,_,_=identity(request,owner_only=True)
+    if not mobile.remove_device(owner,device_id): raise HTTPException(404,'Device not found')
+    return {'removed':True,'device_id':device_id}
 
 async def body(request,limit=65536):
     raw=bytearray()

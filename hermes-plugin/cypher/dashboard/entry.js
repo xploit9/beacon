@@ -13,10 +13,22 @@
 
     function ConnectPhone() {
       const canvas = useRef(null);
+      const pairingCanvas = useRef(null);
       const [info, setInfo] = useState(null);
       const [loadError, setLoadError] = useState(false);
       const [qrError, setQrError] = useState(false);
       const [copyStatus, setCopyStatus] = useState('');
+      const [devices, setDevices] = useState([]);
+      const [pendingRemoval, setPendingRemoval] = useState(null);
+      const [removing, setRemoving] = useState(false);
+      const [profiles, setProfiles] = useState([]);
+      const [selectedProfile, setSelectedProfile] = useState('');
+      const [pairing, setPairing] = useState(null);
+      const [pairingSeconds, setPairingSeconds] = useState(0);
+      const [pairingBusy, setPairingBusy] = useState(false);
+      const [pairingError, setPairingError] = useState('');
+      const [devicesError, setDevicesError] = useState('');
+      const [pairingQrError, setPairingQrError] = useState(false);
 
       useEffect(() => {
         let active = true;
@@ -26,26 +38,40 @@
         return () => { active = false; };
       }, []);
 
+      useEffect(() => {
+        let active = true;
+        sdk.fetchJSON('/api/plugins/cypher/devices')
+          .then((value) => {
+            if (!active) return;
+            const nextProfiles = Array.isArray(value.profiles) ? value.profiles : [];
+            setDevices(Array.isArray(value.devices) ? value.devices : []);
+            setProfiles(nextProfiles);
+            setSelectedProfile(nextProfiles[0] || '');
+          })
+          .catch(() => { if (active) setDevicesError('Could not load the paired devices.'); });
+        return () => { active = false; };
+      }, []);
+
       const query = info && info.url && info.name ? new URLSearchParams({ url: info.url, name: info.name }) : null;
       const link = query ? `cypher://connect?${query.toString()}` : '';
       const qrPayload = info && info.session
         ? JSON.stringify({ type: 'cypher-connect', url: info.url, session: info.session })
         : link;
+      const pairingQrPayload = pairing && pairing.qr_link ? pairing.qr_link : '';
 
-      useEffect(() => {
-        if (!qrPayload || !canvas.current) return;
+      function drawQr(target, payload) {
         try {
           if (typeof window.qrcode !== 'function') throw new Error('QR encoder unavailable');
           const qr = window.qrcode(0, 'M');
-          qr.addData(qrPayload);
+          qr.addData(payload);
           qr.make();
           const modules = qr.getModuleCount();
           const border = 4;
           const scale = Math.max(2, Math.floor(256 / (modules + border * 2)));
           const size = (modules + border * 2) * scale;
-          const context = canvas.current.getContext('2d');
-          canvas.current.width = size;
-          canvas.current.height = size;
+          const context = target.getContext('2d');
+          target.width = size;
+          target.height = size;
           context.fillStyle = '#fff';
           context.fillRect(0, 0, size, size);
           context.fillStyle = '#111';
@@ -56,11 +82,33 @@
               }
             }
           }
-          setQrError(false);
+          return true;
         } catch (_) {
-          setQrError(true);
+          return false;
         }
+      }
+
+      useEffect(() => {
+        if (!qrPayload || !canvas.current) return;
+        setQrError(!drawQr(canvas.current, qrPayload));
       }, [qrPayload]);
+
+      useEffect(() => {
+        if (!pairingQrPayload || !pairingCanvas.current) return;
+        setPairingQrError(!drawQr(pairingCanvas.current, pairingQrPayload));
+      }, [pairingQrPayload]);
+
+      useEffect(() => {
+        if (!pairing) return undefined;
+        const update = () => {
+          const remaining = Math.max(0, Math.ceil((Date.parse(pairing.expires_at) - Date.now()) / 1000));
+          setPairingSeconds(remaining);
+          if (remaining === 0) clearInterval(timer);
+        };
+        const timer = setInterval(update, 1000);
+        update();
+        return () => clearInterval(timer);
+      }, [pairing ? pairing.expires_at : null]);
 
       async function copyLink() {
         try {
@@ -71,7 +119,44 @@
         }
       }
 
-      function renderBody() {
+      async function pairPhone() {
+        if (!selectedProfile) {
+          setPairingError('No Hermes profile is available for pairing.');
+          return;
+        }
+        setPairingBusy(true);
+        setPairingError('');
+        try {
+          const value = await sdk.fetchJSON('/api/plugins/cypher/pairing', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ profile: selectedProfile }),
+          });
+          setPairingSeconds(Math.max(0, Math.ceil((Date.parse(value.expires_at) - Date.now()) / 1000)));
+          setPairing(value);
+        } catch (_) {
+          setPairingError('Could not create a pairing code. Check the secure dashboard address and try again.');
+        } finally {
+          setPairingBusy(false);
+        }
+      }
+
+      async function confirmRemoveDevice() {
+        if (!pendingRemoval) return;
+        setDevicesError('');
+        setRemoving(true);
+        try {
+          await sdk.fetchJSON(`/api/plugins/cypher/devices/${encodeURIComponent(pendingRemoval.device_id)}`, { method: 'DELETE' });
+          setDevices(devices.filter((device) => device.device_id !== pendingRemoval.device_id));
+          setPendingRemoval(null);
+        } catch (_) {
+          setDevicesError('Could not remove this phone. Try again.');
+        } finally {
+          setRemoving(false);
+        }
+      }
+
+      function renderConnectBody() {
         if (loadError) return h('p', { className: 'mt-3 text-sm text-destructive', role: 'alert' }, 'A secure public dashboard address is not configured.');
         if (!info) return h('p', { className: 'mt-3 text-sm text-muted-foreground', role: 'status' }, 'Loading connection details…');
         return h('div', { className: 'mt-4 space-y-4' },
@@ -94,11 +179,73 @@
         );
       }
 
+      function renderPairing() {
+        if (!pairing) return null;
+        if (pairingSeconds <= 0) return h('p', { className: 'mt-3 text-sm text-muted-foreground', role: 'status' }, 'Pairing code expired. Select Pair a phone to create another.');
+        const minutes = String(Math.floor(pairingSeconds / 60)).padStart(2, '0');
+        const seconds = String(pairingSeconds % 60).padStart(2, '0');
+        return h('div', { className: 'mt-4 space-y-3', 'aria-live': 'polite' },
+          h('p', { className: 'font-mono text-lg font-semibold', 'aria-label': 'Phone pairing code' }, pairing.code),
+          pairingQrError ? h('p', { className: 'text-sm text-muted-foreground', role: 'status' }, 'QR unavailable; enter the dashboard address and pairing code.') : h('canvas', {
+            ref: pairingCanvas,
+            className: 'block h-auto max-w-full rounded-md bg-white p-2',
+            style: { width: '16rem', imageRendering: 'pixelated' },
+            'aria-label': 'Cypher phone pairing QR code',
+          }),
+          h('p', { className: 'text-sm text-muted-foreground', role: 'status' }, `expires in ${minutes}:${seconds}`),
+        );
+      }
+
+      function renderDevices() {
+        return h('section', { className: 'max-w-2xl rounded-lg border border-border bg-card p-5 shadow-sm', 'aria-labelledby': 'cypher-devices-title' },
+          h('h2', { id: 'cypher-devices-title', className: 'text-lg font-semibold' }, 'Devices'),
+          devicesError ? h('p', { className: 'mt-3 text-sm text-destructive', role: 'alert' }, devicesError) : null,
+          devices.length ? h('ul', { className: 'mt-3 space-y-3' }, devices.map((device) => h('li', {
+            key: device.device_id,
+            className: 'flex items-center justify-between gap-3 rounded-md border border-border p-3',
+          },
+          h('div', { className: 'min-w-0' },
+            h('p', { className: 'truncate text-sm font-medium' }, device.name),
+            h('p', { className: 'text-xs text-muted-foreground' }, `${device.profile} · Last seen ${new Date(device.last_seen * 1000).toLocaleString()}`),
+          ),
+          h('button', {
+            type: 'button',
+            className: 'rounded-md border border-border px-3 py-2 text-sm hover:bg-muted',
+            onClick: () => setPendingRemoval(device),
+            'aria-label': `Remove ${device.name}`,
+          }, 'Remove')))) : h('p', { className: 'mt-3 text-sm text-muted-foreground' }, 'No paired phones.'),
+          pendingRemoval ? h('div', { className: 'mt-4 space-y-3 rounded-md border border-destructive/50 bg-destructive/10 p-3', role: 'alertdialog', 'aria-labelledby': 'cypher-remove-title' },
+            h('p', { id: 'cypher-remove-title', className: 'text-sm' }, `${pendingRemoval.name} will lose Cypher access and must pair again.`),
+            h('div', { className: 'flex justify-end gap-2' },
+              h('button', { type: 'button', className: 'rounded-md border border-border px-3 py-2 text-sm', onClick: () => setPendingRemoval(null) }, 'Cancel'),
+              h('button', { type: 'button', className: 'rounded-md border border-destructive px-3 py-2 text-sm text-destructive disabled:opacity-50', onClick: confirmRemoveDevice, disabled: removing }, 'Remove device'),
+            ),
+          ) : null,
+        );
+      }
+
       return h('main', { className: 'space-y-4 p-4', 'aria-labelledby': 'cypher-connect-title' },
         h('section', { className: 'max-w-2xl rounded-lg border border-border bg-card p-5 shadow-sm' },
           h('h1', { id: 'cypher-connect-title', className: 'text-xl font-semibold' }, 'Connect phone'),
-          renderBody(),
+          renderConnectBody(),
+          profiles.length > 1 ? h('label', { className: 'mt-4 block space-y-1 text-sm' },
+            h('span', null, 'Profile'),
+            h('select', {
+              className: 'block w-full rounded-md border border-border bg-background px-3 py-2',
+              value: selectedProfile,
+              onChange: (event) => setSelectedProfile(event.target.value),
+            }, profiles.map((profile) => h('option', { key: profile, value: profile }, profile))),
+          ) : null,
+          h('button', {
+            type: 'button',
+            className: 'mt-4 rounded-md border border-border px-3 py-2 text-sm hover:bg-muted disabled:opacity-50',
+            onClick: pairPhone,
+            disabled: pairingBusy || !selectedProfile,
+          }, pairingBusy ? 'Creating code…' : 'Pair a phone'),
+          pairingError ? h('p', { className: 'mt-3 text-sm text-destructive', role: 'alert' }, pairingError) : null,
+          renderPairing(),
         ),
+        renderDevices(),
       );
     }
 

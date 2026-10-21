@@ -8,7 +8,7 @@ const { test } = require("node:test");
 
 const entrySource = fs.readFileSync(path.join(__dirname, "../dashboard/entry.js"), "utf8");
 
-function renderConnectPhone(info, fetchJSON = async () => info) {
+function renderConnectPhone(info, fetchJSON = async (request) => request.endsWith("/devices") ? { devices: [], profiles: ["default"] } : info) {
   let component;
   let qrPayload;
   let copied;
@@ -44,7 +44,7 @@ function renderConnectPhone(info, fetchJSON = async () => info) {
       useRef: () => ({ current: canvas }),
       useState: (initial) => {
         const index = stateIndex++;
-        if (stateValues.length <= index) stateValues[index] = initial === null ? info : initial;
+        if (stateValues.length <= index) stateValues[index] = index === 0 && initial === null ? info : initial;
         return [stateValues[index], (value) => { stateValues[index] = value; stateUpdates.push({ index, value }); }];
       },
     },
@@ -68,6 +68,8 @@ function renderConnectPhone(info, fetchJSON = async () => info) {
     document: { currentScript: null, head: { appendChild() {} } },
     navigator,
     URLSearchParams,
+    setInterval: () => 1,
+    clearInterval() {},
     window,
   });
   const render = () => {
@@ -120,11 +122,93 @@ test("a fresh verified dashboard response goes straight to QR and link", () => {
   const page = renderConnectPhone(info);
   const buttons = page.nodes.filter((node) => node.type === "button");
 
-  assert.deepEqual(buttons.map((button) => button.children[0]), ["Copy connection link"]);
+  assert.deepEqual(buttons.map((button) => button.children[0]), ["Copy connection link", "Pair a phone"]);
   assert.ok(page.nodes.some((node) => node.type === "canvas"));
-  assert.deepEqual(page.requests.map(({ path }) => path), ["/api/plugins/cypher/connect-info"]);
+  assert.deepEqual(page.requests.map(({ path }) => path), [
+    "/api/plugins/cypher/connect-info",
+    "/api/plugins/cypher/devices",
+  ]);
   assert.equal(page.qrPayload, "cypher://connect?url=https%3A%2F%2Fhermes.example&name=Hermes");
   assert.equal(JSON.stringify(page.tree).includes("Use Cypher with this Hermes account"), false);
+});
+
+test("pairing button mints a code-bearing QR and shows its expiry", async () => {
+  const pairing = {
+    device_id: "device-1",
+    code: "ABC-723",
+    expires_at: new Date(Date.now() + 600000).toISOString(),
+    dashboard_url: "https://hermes.example",
+    qr_link: "cypher://connect?url=https%3A%2F%2Fhermes.example&name=Hermes&code=ABC-723",
+  };
+  const page = renderConnectPhone({ url: "https://hermes.example", name: "Hermes", session: "" }, async (path, options) => {
+    if (path.endsWith("/devices")) return { devices: [], profiles: ["default"] };
+    if (path.endsWith("/pairing") && options?.method === "POST") return pairing;
+    return { url: "https://hermes.example", name: "Hermes", session: "" };
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const pair = page.render().nodes.find((node) => node.type === "button" && node.children.includes("Pair a phone"));
+
+  assert.ok(pair);
+  await pair.props.onClick();
+  const rendered = page.render();
+
+  const options = page.requests.find(({ path }) => path.endsWith("/pairing")).options;
+  assert.equal(options.method, "POST");
+  assert.equal(options.headers["Content-Type"], "application/json");
+  assert.equal(options.body, JSON.stringify({ profile: "default" }));
+  assert.ok(JSON.stringify(rendered.tree).includes("ABC-723"), JSON.stringify(page.stateUpdates));
+  assert.match(JSON.stringify(rendered.tree), /\d{1,2}:\d{2}/);
+  assert.equal(page.qrPayload, pairing.qr_link);
+});
+
+test("pairing uses the selected Hermes profile when several are available", async () => {
+  let pairingOptions;
+  const page = renderConnectPhone({ url: "https://hermes.example", name: "Hermes", session: "" }, async (path, options) => {
+    if (path.endsWith("/devices")) return { devices: [], profiles: ["default", "work"] };
+    if (path.endsWith("/pairing") && options?.method === "POST") {
+      pairingOptions = options;
+      return {
+        device_id: "device-1",
+        code: "ABC-723",
+        expires_at: new Date(Date.now() + 600000).toISOString(),
+        dashboard_url: "https://hermes.example",
+        qr_link: "cypher://connect?code=ABC-723",
+      };
+    }
+    return { url: "https://hermes.example", name: "Hermes", session: "" };
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const select = page.render().nodes.find((node) => node.type === "select");
+
+  assert.ok(select);
+  select.props.onChange({ target: { value: "work" } });
+  const pair = page.render().nodes.find((node) => node.type === "button" && node.children.includes("Pair a phone"));
+  await pair.props.onClick();
+
+  assert.equal(JSON.parse(pairingOptions.body).profile, "work");
+});
+
+test("devices can be removed from the Cypher dashboard tab", async () => {
+  const requests = [];
+  const page = renderConnectPhone({ url: "https://hermes.example", name: "Hermes", session: "" }, async (path, options) => {
+    requests.push({ path, options });
+    if (path.endsWith("/devices")) return { devices: [{ device_id: "device-1", name: "Pixel", profile: "default", last_seen: 1 }], profiles: ["default"] };
+    return { removed: true, device_id: "device-1" };
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const rendered = page.render();
+  const remove = rendered.nodes.find((node) => node.type === "button" && node.children.includes("Remove"));
+
+  assert.ok(remove);
+  await remove.props.onClick();
+  assert.equal(requests.some(({ path, options }) => path.endsWith("/devices/device-1") && options?.method === "DELETE"), false);
+  const confirmation = page.render();
+  assert.ok(JSON.stringify(confirmation.tree).includes("will lose Cypher access and must pair again"));
+  const confirm = confirmation.nodes.find((node) => node.type === "button" && node.children.includes("Remove device"));
+  assert.ok(confirm);
+  await confirm.props.onClick();
+
+  assert.ok(requests.some(({ path, options }) => path.endsWith("/devices/device-1") && options?.method === "DELETE"));
 });
 
 test("an unowned response never exposes a claim action", () => {

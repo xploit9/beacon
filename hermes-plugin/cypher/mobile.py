@@ -1,17 +1,21 @@
 """Private durable state shared by dashboard and native callback tool."""
 import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import os
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import subprocess
 import threading
 import time
 import uuid
 import weakref
+from datetime import datetime, timezone
+from urllib.parse import urlencode, urlsplit
 
 LOCK = threading.RLock()
 PUSH_LOCK = threading.Lock()
@@ -26,6 +30,19 @@ HISTORY_RETENTION_DAYS = (0,30,90,365)
 HISTORY_RETENTION_EVENTS_PER_BATCH = 1000
 HISTORY_RETENTION_CALLS_PER_BATCH = 100
 AUTO_UPDATE_INTERVAL_SECONDS = 6 * 60 * 60
+PAIRING_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
+PAIRING_CODE_LENGTH = 6
+PAIRING_TTL_SECONDS = 600
+PAIRING_TICKET_TTL_SECONDS = 900
+PAIRING_ATTEMPT_WINDOW_SECONDS = 600
+PAIRING_MAX_CLIENT_ATTEMPTS = 5
+PAIRING_MAX_GLOBAL_ATTEMPTS = 20
+PAIRING_CODE_ERROR = "That code didn't work. Make a new one on your PC."
+PAIRING_RATE_LIMIT_ERROR = 'Too many pairing attempts. Try again later.'
+
+
+class PairingRateLimitError(ValueError):
+    pass
 
 def _yaml_settings():
     from copy import deepcopy
@@ -190,6 +207,9 @@ def _initialize_schema(conn):
     CREATE TABLE IF NOT EXISTS timeline(call_id TEXT,event_id TEXT,digest TEXT,payload TEXT,PRIMARY KEY(call_id,event_id));
     CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,call_id TEXT,owner TEXT,profile TEXT,stored TEXT,runtime TEXT,request TEXT,title TEXT,callback INTEGER,epoch TEXT,seq INTEGER,status TEXT DEFAULT 'watching',UNIQUE(owner,profile,request));
     CREATE TABLE IF NOT EXISTS targets(id TEXT PRIMARY KEY,owner TEXT,profile TEXT,token TEXT,expires REAL,payload TEXT);
+    CREATE TABLE IF NOT EXISTS device_pairings(device_id TEXT PRIMARY KEY,owner TEXT NOT NULL,profile TEXT NOT NULL,name TEXT NOT NULL,dashboard_url TEXT NOT NULL,dashboard_name TEXT NOT NULL,code_hash TEXT NOT NULL,code_expires REAL NOT NULL,ticket_hash TEXT,ticket_expires REAL,redeemed_at REAL,linked_at REAL,created REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS cypher_devices(id TEXT PRIMARY KEY,owner TEXT NOT NULL,provider TEXT NOT NULL,profile TEXT NOT NULL,name TEXT NOT NULL,created REAL NOT NULL,last_seen REAL NOT NULL,removed INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS pairing_attempts(id INTEGER PRIMARY KEY,client_hash TEXT NOT NULL,attempted REAL NOT NULL);
     CREATE TABLE IF NOT EXISTS deferred(id TEXT PRIMARY KEY,owner TEXT,profile TEXT,conversation TEXT,created REAL);
     CREATE TABLE IF NOT EXISTS notices(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE,owner TEXT,profile TEXT,kind TEXT,conversation TEXT,created REAL,expires REAL,state TEXT DEFAULT 'pending',call_id TEXT,push TEXT DEFAULT 'pending');
     CREATE TABLE IF NOT EXISTS notice_deliveries(event TEXT REFERENCES notices(id) ON DELETE CASCADE,target TEXT REFERENCES targets(id) ON DELETE CASCADE,accepted REAL DEFAULT 0,attempts INTEGER DEFAULT 0,next_attempt REAL DEFAULT 0,last_error TEXT DEFAULT '',PRIMARY KEY(event,target));
@@ -197,6 +217,9 @@ def _initialize_schema(conn):
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS owned_voice_calls ON calls(owner,profile,conversation,created DESC)')
     conn.execute('CREATE INDEX IF NOT EXISTS owned_call_log ON call_log(owner,profile,created DESC)')
+    conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS device_pairing_code_hash ON device_pairings(code_hash)')
+    conn.execute('CREATE INDEX IF NOT EXISTS owned_cypher_devices ON cypher_devices(owner,profile,removed,last_seen DESC)')
+    conn.execute('CREATE INDEX IF NOT EXISTS pairing_attempt_window ON pairing_attempts(attempted,client_hash)')
     conn.execute("CREATE INDEX IF NOT EXISTS transcript_versions ON timeline(call_id,json_extract(payload,'$.type'),json_extract(payload,'$.role'),json_extract(payload,'$.turn_id'),json_extract(payload,'$.final'),json_extract(payload,'$.at_ms'))")
     call_columns={r[1] for r in conn.execute('PRAGMA table_info(calls)')}
     if 'voice_config' not in call_columns: conn.execute("ALTER TABLE calls ADD COLUMN voice_config TEXT NOT NULL DEFAULT '{}'")
@@ -266,6 +289,180 @@ def _connect():
 
 def connect():
     with LOCK: return _connect()
+
+
+def dashboard_connect_info():
+    try:
+        from hermes_cli.dashboard_auth.prefix import resolve_public_url
+
+        url = resolve_public_url()
+        parsed = urlsplit(url)
+        host = (parsed.hostname or '').rstrip('.').lower()
+        port = parsed.port
+        try: address = ipaddress.ip_address(host)
+        except ValueError: address = None
+        numeric_host = bool(re.fullmatch(r'(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))*', host))
+        loopback = (host == 'localhost' or host.endswith('.localhost') or (numeric_host and address is None)
+                    or (address is not None and (address.is_loopback or address.is_unspecified
+                        or bool(getattr(address, 'ipv4_mapped', None) and address.ipv4_mapped.is_loopback))))
+        if (not isinstance(url, str) or parsed.scheme.lower() != 'https' or not parsed.netloc or not host
+                or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment
+                or port is not None and not 1 <= port <= 65535 or loopback):
+            raise ValueError()
+        return url, host[:80]
+    except Exception:
+        raise ValueError('A configured public HTTPS dashboard URL is required to connect a phone.') from None
+
+
+def _pairing_name(value, default='Cypher phone'):
+    if value is None:
+        value = default
+    if (not isinstance(value, str) or not (value := value.strip()) or len(value) > 80
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+        raise ValueError('Invalid device name')
+    return value
+
+
+def _pairing_code(value):
+    if not isinstance(value, str):
+        return None
+    value = value.strip().upper()
+    if len(value) == PAIRING_CODE_LENGTH + 1 and value[3:4] == '-':
+        value = value[:3] + value[4:]
+    return value if len(value) == PAIRING_CODE_LENGTH and all(char in PAIRING_ALPHABET for char in value) else None
+
+
+def _pairing_code_hash(value):
+    return hashlib.sha256(b'cypher-pairing-v1:' + value.encode('ascii')).hexdigest()
+
+
+def format_pairing_code(value):
+    return value[:3] + '-' + value[3:]
+
+
+def mint_device_pairing(owner, profile, name, dashboard_url, dashboard_name):
+    if (not isinstance(owner, str) or not owner or len(owner) > 256 or any(ord(c) < 32 for c in owner)
+            or not isinstance(profile, str) or not 1 <= len(profile) <= 80
+            or any(ord(c) < 32 or ord(c) == 127 for c in profile)):
+        raise ValueError('An owned profile is required')
+    name = _pairing_name(name)
+    dashboard_name = _pairing_name(dashboard_name, 'Hermes')
+    if not isinstance(dashboard_url, str) or not dashboard_url.startswith('https://'):
+        raise ValueError('A configured public HTTPS dashboard URL is required to connect a phone.')
+    now = time.time()
+    device_id = uuid.uuid4().hex
+    expires = now + PAIRING_TTL_SECONDS
+    with LOCK, connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        conn.execute('DELETE FROM device_pairings WHERE linked_at IS NOT NULL OR (code_expires<=? AND (ticket_expires IS NULL OR ticket_expires<=?))', (now, now))
+        for _ in range(8):
+            code = ''.join(secrets.choice(PAIRING_ALPHABET) for _ in range(PAIRING_CODE_LENGTH))
+            code_hash = _pairing_code_hash(code)
+            if not conn.execute('SELECT 1 FROM device_pairings WHERE code_hash=?', (code_hash,)).fetchone():
+                break
+        else:
+            raise RuntimeError('Could not create a unique pairing code')
+        conn.execute('INSERT INTO device_pairings(device_id,owner,profile,name,dashboard_url,dashboard_name,code_hash,code_expires,created) VALUES(?,?,?,?,?,?,?,?,?)',
+                     (device_id, owner, profile, name, dashboard_url, dashboard_name, code_hash, expires, now))
+    formatted = format_pairing_code(code)
+    return {'device_id': device_id, 'code': formatted,
+            'expires_at': datetime.fromtimestamp(expires, timezone.utc).isoformat().replace('+00:00', 'Z'),
+            'dashboard_url': dashboard_url,
+            'qr_link': 'cypher://connect?' + urlencode({'url': dashboard_url, 'name': dashboard_name, 'code': formatted})}
+
+
+def redeem_device_pairing(code, device_name, client_host):
+    name = _pairing_name(device_name) if device_name is not None else None
+    normalized = _pairing_code(code)
+    digest = _pairing_code_hash(normalized or 'A' * PAIRING_CODE_LENGTH)
+    client_hash = hashlib.sha256(str(client_host or 'unknown').encode('utf-8', 'replace')[:512]).hexdigest()
+    now = time.time()
+    result = None
+    failure = None
+    with LOCK, connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        conn.execute('DELETE FROM pairing_attempts WHERE attempted<=?', (now - PAIRING_ATTEMPT_WINDOW_SECONDS,))
+        client_attempts = conn.execute('SELECT COUNT(*) FROM pairing_attempts WHERE client_hash=?', (client_hash,)).fetchone()[0]
+        global_attempts = conn.execute('SELECT COUNT(*) FROM pairing_attempts').fetchone()[0]
+        row = conn.execute('SELECT * FROM device_pairings WHERE code_hash=?', (digest,)).fetchone()
+        stored_hash = row['code_hash'] if row else '0' * 64
+        code_matches = bool(normalized) and hmac.compare_digest(digest, stored_hash)
+        if client_attempts >= PAIRING_MAX_CLIENT_ATTEMPTS or global_attempts >= PAIRING_MAX_GLOBAL_ATTEMPTS:
+            failure = PairingRateLimitError(PAIRING_RATE_LIMIT_ERROR)
+        elif not code_matches or row['code_expires'] <= now or row['redeemed_at'] is not None:
+            conn.execute('INSERT INTO pairing_attempts(client_hash,attempted) VALUES(?,?)', (client_hash, now))
+            failure = ValueError(PAIRING_CODE_ERROR)
+        else:
+            ticket = secrets.token_urlsafe(32)
+            ticket_hash = hashlib.sha256(ticket.encode('ascii')).hexdigest()
+            ticket_expires = now + PAIRING_TICKET_TTL_SECONDS
+            changed = conn.execute('UPDATE device_pairings SET redeemed_at=?,ticket_hash=?,ticket_expires=? WHERE device_id=? AND redeemed_at IS NULL AND code_expires>?',
+                                   (now, ticket_hash, ticket_expires, row['device_id'], now)).rowcount
+            if changed != 1:
+                conn.execute('INSERT INTO pairing_attempts(client_hash,attempted) VALUES(?,?)', (client_hash, now))
+                failure = ValueError(PAIRING_CODE_ERROR)
+            else:
+                final_name = row['name'] if row['name'] != 'Cypher phone' or name is None else name
+                conn.execute('UPDATE device_pairings SET name=? WHERE device_id=?', (final_name, row['device_id']))
+                result = {'url': row['dashboard_url'], 'name': row['dashboard_name'],
+                          'device_id': row['device_id'], 'link_ticket': ticket}
+    if failure:
+        raise failure
+    return result
+
+
+def link_paired_device(device_id, ticket, owner, provider, allowed_profiles=None):
+    if (not isinstance(device_id, str) or not ID.fullmatch(device_id) or not isinstance(ticket, str)
+            or not re.fullmatch(r'[A-Za-z0-9_-]{40,64}', ticket)):
+        return None
+    now = time.time()
+    digest = hashlib.sha256(ticket.encode('ascii')).hexdigest()
+    with LOCK, connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT * FROM device_pairings WHERE device_id=? AND owner=?', (device_id, owner)).fetchone()
+        if (not row or allowed_profiles is not None and row['profile'] not in allowed_profiles
+                or not row['ticket_hash'] or row['ticket_expires'] is None or row['ticket_expires'] <= now):
+            return None
+        if not hmac.compare_digest(digest, row['ticket_hash']):
+            return None
+        conn.execute('INSERT INTO cypher_devices(id,owner,provider,profile,name,created,last_seen) VALUES(?,?,?,?,?,?,?)',
+                     (device_id, owner, provider, row['profile'], row['name'], now, now))
+        conn.execute('UPDATE device_pairings SET ticket_hash=NULL,ticket_expires=NULL,linked_at=? WHERE device_id=?', (now, device_id))
+        return {'linked': True, 'device_id': device_id, 'name': row['name'],
+                'profile': row['profile'], 'created_at': now}
+
+
+def list_devices(owner):
+    with LOCK, connect() as conn:
+        rows = conn.execute('SELECT id,name,profile,created,last_seen FROM cypher_devices WHERE owner=? AND removed=0 ORDER BY last_seen DESC,created DESC', (owner,)).fetchall()
+    return [{'device_id': row['id'], 'name': row['name'], 'profile': row['profile'],
+             'created_at': row['created'], 'last_seen': row['last_seen']} for row in rows]
+
+
+def remove_device(owner, device_id):
+    now = time.time()
+    with LOCK, connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT profile FROM cypher_devices WHERE id=? AND owner=? AND removed=0', (device_id, owner)).fetchone()
+        if not row:
+            return False
+        conn.execute('UPDATE cypher_devices SET removed=1,last_seen=? WHERE id=? AND owner=?', (now, device_id, owner))
+        conn.execute('DELETE FROM notice_deliveries WHERE target=?', (device_id,))
+        conn.execute('DELETE FROM targets WHERE id=? AND owner=? AND profile=?', (device_id, owner, row['profile']))
+    return True
+
+
+def touch_device(owner, provider, profile, device_id, update_seen=True):
+    if not isinstance(device_id, str) or not ID.fullmatch(device_id):
+        raise LookupError('device_not_authorized')
+    now = time.time()
+    with LOCK, connect() as conn:
+        row = conn.execute('SELECT owner,provider,profile,removed FROM cypher_devices WHERE id=?', (device_id,)).fetchone()
+        if not row or row['owner'] != owner or row['provider'] != provider or profile is not None and row['profile'] != profile:
+            raise LookupError('device_not_authorized')
+        if row['removed']:
+            raise LookupError('device_removed')
+        if update_seen: conn.execute('UPDATE cypher_devices SET last_seen=? WHERE id=? AND removed=0', (now, device_id))
 
 def enqueue_task_result(owner,profile,conversation,job_id,reason=''):
     if (not isinstance(owner,str) or not owner or len(owner)>256 or any(ord(c)<32 for c in owner)
