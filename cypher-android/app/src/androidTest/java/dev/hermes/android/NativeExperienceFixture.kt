@@ -156,6 +156,12 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var historyFailure = false
     /** When set, every optional `/api/plugins/cypher/` route answers with this status. */
     @Volatile var pluginStatus: Int? = null
+    val pairingRedeemCount = AtomicInteger()
+    val pairingLinkCount = AtomicInteger()
+    val pairedDevices = CopyOnWriteArrayList<JSONObject>()
+    @Volatile var pairingRedeemHadAuthorization = false
+    @Volatile var pairingLinkHadAuthorization = false
+    @Volatile private var pairingDeviceName = "Android phone"
     @Volatile var bootstrapPluginStatus: String? = null
     @Volatile var boardFailure = false
     @Volatile var preferredBoard = "default"
@@ -280,6 +286,8 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             }
             val buffer = okio.Buffer(); request.body?.writeTo(buffer)
             val body = buffer.readUtf8().takeIf(String::isNotBlank)?.let(::JSONObject) ?: JSONObject()
+            if (request.url.encodedPath == "/api/plugins/cypher/pairing/redeem") pairingRedeemHadAuthorization = request.header("Authorization") != null
+            if (request.url.encodedPath == "/api/plugins/cypher/devices/link") pairingLinkHadAuthorization = request.header("Authorization") != null
             val profileQuery = if (request.url.encodedPath.startsWith("/api/plugins/cypher/")) "cypher_profile" else "profile"
             val profile = request.url.queryParameter(profileQuery) ?: "default"
             requests += if (request.url.encodedPath.startsWith("/auth/native/")) json(
@@ -362,6 +370,28 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         if (path == "/api/plugins/cypher/mobile/bot-mode/space/fixture-room" && holdNextRoomRead.getAndSet(false)) { roomReadCaptured.countDown(); check(releaseRoomRead.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
         if (path in setOf("/api/sessions", "/api/sessions/search") && holdNextSessionList.getAndSet(false)) { sessionListCaptured.countDown(); check(releaseSessionList.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
         return when {
+        path == "/api/plugins/cypher/pairing/redeem" && method == "POST" -> {
+            pairingRedeemCount.incrementAndGet()
+            if (body.string("code") != "ABC123") 400 to json("detail" to "invalid_pairing_code")
+            else {
+                pairingDeviceName = body.string("device_name").takeIf(String::isNotBlank) ?: "Android phone"
+                200 to json("dashboard_url" to scope.origin, "display_name" to "Fixture Hermes", "device_id" to "device-123", "link_ticket" to "fixture-link-ticket")
+            }
+        }
+        path == "/api/plugins/cypher/devices/link" && method == "POST" -> {
+            pairingLinkCount.incrementAndGet()
+            if (body.string("device_id") != "device-123" || body.string("link_ticket") != "fixture-link-ticket") 400 to json("detail" to "invalid_link_ticket")
+            else {
+                if (pairedDevices.none { it.string("device_id") == "device-123" }) pairedDevices += json("device_id" to "device-123", "name" to pairingDeviceName, "last_seen" to "2026-10-21T00:00:00Z")
+                200 to json("ok" to true, "device_id" to "device-123")
+            }
+        }
+        path == "/api/plugins/cypher/devices" && method == "GET" -> 200 to json("devices" to JSONArray(pairedDevices.map { it.copy() }))
+        path.startsWith("/api/plugins/cypher/devices/") && method == "DELETE" -> {
+            val id = path.substringAfterLast('/')
+            pairedDevices.removeAll { it.string("device_id") == id }
+            200 to json("ok" to true)
+        }
         path == "/api/profiles" -> 200 to json("profiles" to JSONArray(notificationProfiles.map { id -> json("name" to id).apply { profileDisplayNames[id]?.let { put("display_name", it) } } }))
         path == "/api/profiles/active" -> 200 to json("current" to profile, "active" to profile)
         path == "/api/plugins/cypher/mobile/proactive" -> {

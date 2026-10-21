@@ -12,6 +12,13 @@ import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.PickVisualMediaRequest
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -31,6 +38,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.QrCodeScanner
@@ -52,6 +60,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -74,10 +83,18 @@ import com.google.mlkit.vision.common.InputImage
 import dev.hermes.android.AppState
 import dev.hermes.android.CypherViewModel
 import dev.hermes.android.data.VoiceKeyStore
+import dev.hermes.android.data.NativePairing
+import dev.hermes.android.data.PairingFailure
+import dev.hermes.android.data.PairingGrant
+import dev.hermes.android.data.formatPairingCodeInput
+import dev.hermes.android.data.normalizePairingCode
+import dev.hermes.android.data.parsePairingBlock
 import dev.hermes.android.push.KeepConnectedService
 import dev.hermes.android.core.trustedOrigin
 import dev.hermes.android.data.validLoopbackSessionToken
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -100,8 +117,40 @@ private tailrec fun Context.findActivity(): android.app.Activity? = when (this) 
     else -> null
 }
 
-internal data class CypherConnectInput(val origin: String, val sessionToken: String? = null) {
-    override fun toString() = "CypherConnectInput(origin=$origin, sessionToken=<redacted>)"
+internal data class CypherConnectInput(
+    val origin: String,
+    val sessionToken: String? = null,
+    val pairingCode: String? = null,
+) {
+    override fun toString() = "CypherConnectInput(origin=$origin, sessionToken=<redacted>, pairingCode=<redacted>)"
+}
+
+private enum class SetupPairingStage { Redeeming, Confirm, Probing, SignIn, Linking, Verify }
+private enum class SetupPairingRetry { Redeem, Probe, Link }
+
+private fun pairingSecurityLabel(address: String): String =
+    if (Uri.parse(address).host.orEmpty().endsWith(".ts.net", ignoreCase = true)) "Tailscale · HTTPS" else "HTTPS"
+
+@Composable
+private fun SetupPairingStepIndicator(stage: SetupPairingStage?) {
+    val current = when (stage) {
+        SetupPairingStage.Confirm -> 1
+        SetupPairingStage.Probing, SetupPairingStage.SignIn -> 2
+        SetupPairingStage.Linking, SetupPairingStage.Verify -> 3
+        else -> 0
+    }
+    val labels = listOf("Connect", "Confirm", "Sign in", "Verify")
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+            labels.indices.forEach { index ->
+                Box(
+                    Modifier.weight(1f).height(4.dp).clip(RoundedCornerShape(2.dp))
+                        .background(if (index <= current) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant),
+                )
+            }
+        }
+        Text("Step ${current + 1} of ${labels.size} · ${labels[current]}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
 }
 
 internal fun parseCypherConnectLink(value: String, allowAddress: Boolean = true): CypherConnectInput {
@@ -132,8 +181,15 @@ internal fun parseCypherConnectLink(value: String, allowAddress: Boolean = true)
     require(sessions.size <= 1) { "This Cypher link has an invalid session. Scan the Connect QR again." }
     val session = sessions.singleOrNull()?.takeIf(String::isNotBlank)
     require(session == null || validLoopbackSessionToken(session)) { "This Cypher link has an invalid session. Scan the Connect QR again." }
+    val pairingCodes = when {
+        scannerPayload != null && scannerPayload.has("code") -> listOf(scannerPayload.optString("code"))
+        link -> uri.getQueryParameters("code")
+        else -> emptyList()
+    }
+    require(pairingCodes.size <= 1) { "This Cypher QR has an invalid pairing code. Scan it again." }
+    val pairingCode = pairingCodes.singleOrNull()?.let { dev.hermes.android.data.normalizePairingCode(it) }
     val explicitScheme = Regex("^[A-Za-z][A-Za-z0-9+.-]*://").containsMatchIn(address.trim())
-    return CypherConnectInput(trustedOrigin(if (explicitScheme) address else "https://$address"), session)
+    return CypherConnectInput(trustedOrigin(if (explicitScheme) address else "https://$address"), session, pairingCode)
 }
 
 internal fun parseCypherConnectInput(value: String): String = parseCypherConnectLink(value).origin
@@ -171,6 +227,8 @@ fun SetupWizard(vm: CypherViewModel, modifier: Modifier = Modifier, externalLink
         onReopen = vm::reopenSetupWizard,
         onCancel = { vm.cancelSetupWizard(); onExternalLinkCleared() },
         onStageLink = vm::openSetupLink,
+        onRedeemPairing = { origin, code -> NativePairing.redeem(origin, code) },
+        onLinkPairing = { grant -> NativePairing.link(context, vm.client ?: throw PairingFailure("Sign in with Hermes before linking this phone."), grant) },
         onOpenBackgroundSettings = { if (!requestBackgroundUse(context)) vm.notice("Open Cypher’s app settings in Android and allow background use.") },
     )
 }
@@ -189,8 +247,11 @@ internal fun SetupWizardScreen(
     onStageLink: (String) -> Unit = {},
     onOpenBackgroundSettings: () -> Unit = {},
     externalLinkOrigin: String? = null,
+    onRedeemPairing: suspend (String, String) -> PairingGrant = { _, _ -> throw PairingFailure("Pairing is unavailable.") },
+    onLinkPairing: suspend (PairingGrant) -> Unit = {},
 ) {
     val context = LocalContext.current
+    val motionEnabled = rememberNativeMotionEnabled()
     val powerManager = remember(context) { context.getSystemService(android.os.PowerManager::class.java) }
     var ignoringBatteryOptimizations by remember(context) { mutableStateOf(powerManager.isIgnoringBatteryOptimizations(context.packageName)) }
     androidx.lifecycle.compose.LifecycleResumeEffect(context) {
@@ -202,6 +263,18 @@ internal fun SetupWizardScreen(
     var address by rememberSaveable(initialAddress) { mutableStateOf(initialAddress) }
     var scanning by rememberSaveable { mutableStateOf(false) }
     var photoError by rememberSaveable(initialAddress) { mutableStateOf("") }
+    var pairingMode by rememberSaveable(initialAddress) { mutableStateOf("address") }
+    var pairingInputCode by remember { mutableStateOf("") }
+    var pairingSetupLink by remember { mutableStateOf("") }
+    var pairingOrigin by remember { mutableStateOf("") }
+    var pairingStage by remember { mutableStateOf<SetupPairingStage?>(null) }
+    var pairingGrant by remember { mutableStateOf<PairingGrant?>(null) }
+    var pairingError by remember { mutableStateOf("") }
+    var pairingRetry by remember { mutableStateOf(SetupPairingRetry.Redeem) }
+    var linkAttempt by remember { mutableStateOf(0) }
+    val pairingScope = rememberCoroutineScope()
+    val latestOnRedeemPairing by rememberUpdatedState(onRedeemPairing)
+    val latestOnLinkPairing by rememberUpdatedState(onLinkPairing)
     val qrOptions = remember { BarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build() }
     var qrScanner by remember { mutableStateOf<BarcodeScanner?>(null) }
     val photoDetected = remember { AtomicBoolean(false) }
@@ -209,10 +282,93 @@ internal fun SetupWizardScreen(
     // One scanner serves camera and photo; a qrScanner key would close each new one as soon as it was created.
     DisposableEffect(Unit) { onDispose { qrScanner?.close() } }
     fun scannerForPhoto(): BarcodeScanner = qrScanner ?: BarcodeScanning.getClient(qrOptions).also { qrScanner = it }
+
+    fun beginPairingRedeem(origin: String, code: String, setupLink: String) {
+        val normalized = runCatching { normalizePairingCode(code) }.getOrElse {
+            pairingError = it.message ?: "Enter the six-character code shown on your PC."
+            return
+        }
+        pairingOrigin = origin
+        pairingSetupLink = setupLink
+        pairingError = ""
+        pairingGrant = null
+        pairingRetry = SetupPairingRetry.Redeem
+        latestOnStageLink(setupLink)
+        pairingStage = SetupPairingStage.Redeeming
+        pairingScope.launch {
+            try {
+                pairingGrant = latestOnRedeemPairing(origin, normalized)
+                pairingStage = SetupPairingStage.Confirm
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                pairingError = error.message ?: "Couldn't check that code. Check the address and try again."
+                pairingRetry = SetupPairingRetry.Redeem
+                pairingStage = SetupPairingStage.Verify
+            }
+        }
+    }
+
+    fun updatePairingAddress(value: String) {
+        parsePairingBlock(value)?.let { block ->
+            address = block.address
+            pairingInputCode = formatPairingCodeInput(block.code)
+            pairingMode = "code"
+            pairingSetupLink = ""
+            pairingError = ""
+            photoError = ""
+            return
+        }
+        val qr = runCatching { parseCypherConnectLink(value) }.getOrNull()?.takeIf { it.pairingCode != null }
+        if (qr != null) {
+            address = qr.origin
+            pairingInputCode = formatPairingCodeInput(qr.pairingCode.orEmpty())
+            pairingMode = "code"
+            pairingSetupLink = value
+            pairingError = ""
+            photoError = ""
+            return
+        }
+        address = value.take(4096)
+        pairingSetupLink = ""
+        pairingError = ""
+        photoError = ""
+    }
+
+    fun submitPairingCode() {
+        val origin = runCatching { parseCypherConnectInput(address) }.getOrElse {
+            pairingError = it.message ?: "Enter an HTTPS Hermes address."
+            return
+        }
+        val setupLink = pairingSetupLink.ifBlank { origin }
+        beginPairingRedeem(origin, pairingInputCode, setupLink)
+    }
+
+    fun retryPairing() {
+        when (pairingRetry) {
+            SetupPairingRetry.Redeem -> beginPairingRedeem(pairingOrigin, pairingInputCode, pairingSetupLink.ifBlank { pairingOrigin })
+            SetupPairingRetry.Probe -> pairingGrant?.let {
+                pairingStage = SetupPairingStage.Probing
+                pairingError = ""
+                onProbe(it.dashboardUrl)
+            }
+            SetupPairingRetry.Link -> {
+                pairingStage = SetupPairingStage.Linking
+                pairingError = ""
+                linkAttempt++
+            }
+        }
+    }
+
     fun stageQr(value: String): Boolean = stageCypherConnectQr(value) {
+        val parsed = parseCypherConnectLink(it, allowAddress = false)
         scanning = false
         address = setupAddressForDisplay(it)
-        latestOnStageLink(it)
+        parsed.pairingCode?.let { code ->
+            pairingMode = "code"
+            pairingInputCode = formatPairingCodeInput(code)
+            beginPairingRedeem(parsed.origin, code, it)
+        } ?: latestOnStageLink(it)
     }
     val photoPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         photoError = ""
@@ -296,6 +452,51 @@ internal fun SetupWizardScreen(
         }
     }
 
+    LaunchedEffect(pairingStage, state.setupStep, state.loading, state.authenticated, state.origin) {
+        val grant = pairingGrant
+        when (pairingStage) {
+            SetupPairingStage.Probing -> when {
+                state.authenticated && grant != null && state.origin == grant.dashboardUrl -> pairingStage = SetupPairingStage.Linking
+                !state.loading && state.setupStep == "signin" -> pairingStage = SetupPairingStage.SignIn
+                !state.loading && (state.error.isNotBlank() || state.setupStep in setOf("probe", "unsupported", "connect")) -> {
+                    pairingError = state.error.ifBlank {
+                        if (state.setupStep == "unsupported") "This Hermes needs an update before phones can sign in." else "Couldn't reach Hermes. Check the address and try again."
+                    }
+                    pairingRetry = SetupPairingRetry.Probe
+                    pairingStage = SetupPairingStage.Verify
+                }
+            }
+            SetupPairingStage.SignIn -> if (state.authenticated && grant != null && state.origin == grant.dashboardUrl) {
+                pairingStage = SetupPairingStage.Linking
+            }
+            else -> Unit
+        }
+    }
+
+    LaunchedEffect(pairingStage, linkAttempt, state.authenticated, state.origin) {
+        val grant = pairingGrant ?: return@LaunchedEffect
+        if (pairingStage != SetupPairingStage.Linking) return@LaunchedEffect
+        if (!state.authenticated || state.origin != grant.dashboardUrl) {
+            pairingError = "Sign in with the Hermes dashboard shown above before linking this phone."
+            pairingRetry = SetupPairingRetry.Probe
+            pairingStage = SetupPairingStage.Verify
+            return@LaunchedEffect
+        }
+        try {
+            latestOnLinkPairing(grant)
+            pairingGrant = null
+            pairingStage = null
+            pairingInputCode = ""
+            pairingSetupLink = ""
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            pairingError = error.message ?: "Couldn't link this phone. Retry or choose another method."
+            pairingRetry = SetupPairingRetry.Link
+            pairingStage = SetupPairingStage.Verify
+        }
+    }
+
     if (scanning) {
         QrScanner(
             onResult = ::stageQr,
@@ -337,7 +538,7 @@ internal fun SetupWizardScreen(
         ) {
             Box(Modifier.height(112.dp).width(112.dp), contentAlignment = Alignment.Center) {
                 BeaconSignal(BeaconMotionMode.Pulse, Modifier.testTag("setup-beacon-glow"), 108.dp)
-                BeaconMark(size = 74.dp, contentDescription = assistantText("Cypher"))
+                BeaconMark(size = 74.dp, contentDescription = assistantText("Beacon"))
             }
             Spacer(Modifier.height(4.dp))
             Text("Cypher", style = MaterialTheme.typography.displaySmall)
@@ -352,6 +553,84 @@ internal fun SetupWizardScreen(
                 border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = .28f)),
             ) {
                 Column(Modifier.padding(22.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                if (pairingStage != null) {
+                    SetupPairingStepIndicator(pairingStage)
+                    AnimatedContent(
+                        targetState = pairingStage!!,
+                        transitionSpec = {
+                            if (motionEnabled) fadeIn(tween(200)) togetherWith fadeOut(tween(180))
+                            else EnterTransition.None togetherWith ExitTransition.None
+                        },
+                        label = "setup-pairing-step",
+                    ) { current ->
+                        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            when (current) {
+                                SetupPairingStage.Redeeming -> {
+                                    Text("Checking pairing code", style = MaterialTheme.typography.headlineSmall)
+                                    BeaconSignal(BeaconMotionMode.Sweep, Modifier.align(Alignment.CenterHorizontally), 32.dp)
+                                    Text("Connecting to the Hermes dashboard…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                                SetupPairingStage.Confirm -> pairingGrant?.let { grant ->
+                                    Text("Confirm this dashboard", style = MaterialTheme.typography.headlineSmall)
+                                    Text(grant.displayName, style = MaterialTheme.typography.titleLarge)
+                                    Text(grant.dashboardUrl, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Surface(
+                                        color = MaterialTheme.colorScheme.primaryContainer,
+                                        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                                        shape = RoundedCornerShape(100.dp),
+                                    ) {
+                                        Text(pairingSecurityLabel(grant.dashboardUrl), Modifier.padding(horizontal = 12.dp, vertical = 6.dp), style = MaterialTheme.typography.labelMedium)
+                                    }
+                                    Text("After you confirm, sign in with your Hermes account to link this phone.", style = MaterialTheme.typography.bodyMedium)
+                                    Button(
+                                        onClick = { pairingError = ""; pairingStage = SetupPairingStage.Probing; onProbe(grant.dashboardUrl) },
+                                        enabled = !state.loading,
+                                        modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-pairing-confirm"),
+                                    ) { Text("Continue") }
+                                    TextButton(onClick = { pairingStage = null; pairingGrant = null; pairingError = "" }) { Text("Back") }
+                                } ?: Text("The pairing details couldn't be read. Choose another method.", color = MaterialTheme.colorScheme.error)
+                                SetupPairingStage.Probing -> {
+                                    Text("Checking the secure connection…", style = MaterialTheme.typography.headlineSmall)
+                                    BeaconSignal(BeaconMotionMode.Sweep, Modifier.align(Alignment.CenterHorizontally), 32.dp)
+                                    Text(pairingGrant?.dashboardUrl.orEmpty(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                                SetupPairingStage.SignIn -> {
+                                    Text("Sign in with Hermes", style = MaterialTheme.typography.headlineSmall)
+                                    pairingGrant?.let { Text("${it.displayName} · ${it.dashboardUrl}", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                                    Text("Use your Hermes account for chat, history, plugin pages, and calls.", style = MaterialTheme.typography.bodyMedium)
+                                    state.error.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                                    Button(
+                                        onClick = { onSignIn(context) },
+                                        enabled = !state.loading,
+                                        modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-signin"),
+                                    ) {
+                                        if (state.loading) BeaconSignal(BeaconMotionMode.Sweep, size = 20.dp) else Text("Sign in with Hermes")
+                                    }
+                                    TextButton(onClick = { pairingStage = SetupPairingStage.Confirm }) { Text("Back") }
+                                }
+                                SetupPairingStage.Linking -> {
+                                    Text("Linking this phone", style = MaterialTheme.typography.headlineSmall)
+                                    BeaconSignal(BeaconMotionMode.Sweep, Modifier.align(Alignment.CenterHorizontally), 32.dp)
+                                    Text("Your phone will appear in Hermes Devices.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                                SetupPairingStage.Verify -> {
+                                    Text("Couldn't finish pairing", style = MaterialTheme.typography.headlineSmall)
+                                    Text(pairingError, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.testTag("setup-pairing-error"))
+                                    Button(onClick = ::retryPairing, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-pairing-retry")) { Text("Retry") }
+                                    TextButton(onClick = {
+                                        pairingStage = null
+                                        pairingGrant = null
+                                        pairingError = ""
+                                        pairingMode = "address"
+                                        pairingInputCode = ""
+                                        pairingSetupLink = ""
+                                    }) { Text("Choose another method") }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                if (state.setupStep == "connect" && externalLinkOrigin.isNullOrBlank()) SetupPairingStepIndicator(null)
                 when (state.setupStep) {
                     "probe" -> {
                         Text("Check the server", style = MaterialTheme.typography.headlineSmall)
@@ -461,35 +740,70 @@ internal fun SetupWizardScreen(
                     }
                     else -> {
                         Text("Connect to Hermes", style = MaterialTheme.typography.headlineSmall)
-                        Text("Scan the QR on your Hermes dashboard, or paste its address.", style = MaterialTheme.typography.bodyLarge)
+                        Text("Choose how to connect to Hermes.", style = MaterialTheme.typography.bodyLarge)
                         externalLinkOrigin?.takeIf(String::isNotBlank)?.let {
                             Text("Address from external link: $it", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                         }
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(onClick = { qrScanner = scannerForPhoto(); scanning = true }, modifier = Modifier.weight(1f).heightIn(min = 56.dp).testTag("setup-scan-qr")) {
+                                Icon(Icons.Rounded.QrCodeScanner, contentDescription = null)
+                                Text("Scan QR code")
+                            }
+                            OutlinedButton(onClick = { photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }, modifier = Modifier.weight(1f).heightIn(min = 56.dp).testTag("setup-choose-image")) {
+                                Icon(Icons.Rounded.PhotoLibrary, contentDescription = null)
+                                Text("Choose QR image")
+                            }
+                        }
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            if (pairingMode == "code") Button(onClick = { pairingMode = "code" }, modifier = Modifier.weight(1f).heightIn(min = 52.dp).testTag("setup-method-code")) { Text("Enter pairing code") }
+                            else OutlinedButton(onClick = { pairingMode = "code"; pairingError = "" }, modifier = Modifier.weight(1f).heightIn(min = 52.dp).testTag("setup-method-code")) { Text("Enter pairing code") }
+                            if (pairingMode == "address") Button(onClick = { pairingMode = "address" }, modifier = Modifier.weight(1f).heightIn(min = 52.dp).testTag("setup-method-address")) { Text("Type address") }
+                            else OutlinedButton(onClick = { pairingMode = "address"; pairingError = "" }, modifier = Modifier.weight(1f).heightIn(min = 52.dp).testTag("setup-method-address")) { Text("Type address") }
+                        }
                         OutlinedTextField(
                             value = address,
-                            onValueChange = { address = it; photoError = "" },
+                            onValueChange = ::updatePairingAddress,
                             label = { Text("Paste link or address") },
                             placeholder = { Text("https://your-device.ts.net") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-                            singleLine = true,
+                            minLines = 1,
+                            maxLines = 3,
                             modifier = Modifier.fillMaxWidth().testTag("setup-address"),
                         )
-                        state.error.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-                        state.notice.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                        Button(onClick = { onProbe(address) }, enabled = !state.loading && address.isNotBlank(), modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-connect")) { Text("Continue") }
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            OutlinedButton(onClick = { qrScanner = scannerForPhoto(); scanning = true }, modifier = Modifier.weight(1f).heightIn(min = 52.dp).testTag("setup-scan-qr")) {
-                                Icon(Icons.Rounded.QrCodeScanner, contentDescription = null)
-                                Text("Scan")
-                            }
-                            OutlinedButton(onClick = { photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }, modifier = Modifier.weight(1f).heightIn(min = 52.dp).testTag("setup-choose-image")) {
-                                Icon(Icons.Rounded.PhotoLibrary, contentDescription = null)
-                                Text("Choose image")
-                            }
+                        if (pairingMode == "code") {
+                            OutlinedTextField(
+                                value = pairingInputCode,
+                                onValueChange = { value ->
+                                    val block = parsePairingBlock(value)
+                                    if (block != null) {
+                                        address = block.address
+                                        pairingInputCode = formatPairingCodeInput(block.code)
+                                        pairingSetupLink = ""
+                                    } else pairingInputCode = formatPairingCodeInput(value)
+                                    pairingError = ""
+                                },
+                                label = { Text("Pairing code") },
+                                placeholder = { Text("ABC-123") },
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth().testTag("setup-pairing-code"),
+                            )
+                            Text("Paste the full Hermes pairing block into the address field to fill both fields.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            pairingError.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                            Button(
+                                onClick = ::submitPairingCode,
+                                enabled = !state.loading && runCatching { normalizePairingCode(pairingInputCode) }.isSuccess && address.isNotBlank(),
+                                modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-pairing-redeem"),
+                            ) { Text("Continue") }
+                        } else {
+                            state.error.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                            state.notice.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                            Button(onClick = { onProbe(address) }, enabled = !state.loading && address.isNotBlank(), modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-connect")) { Text("Continue") }
                         }
                         photoError.takeIf(String::isNotBlank)?.let { Text(it, color = if (it == "No QR code found in that image") MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("setup-photo-error")) }
                         if (state.authenticated) TextButton(onClick = onCancel, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text("Close setup") }
                     }
+                }
                 }
                 }
             }

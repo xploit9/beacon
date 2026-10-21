@@ -117,4 +117,16 @@ class NativeOperationPolicyTest {
             "/api/dashboard/agent-plugins/cypher/update/",
         )) assertFalse("POST $other", NativeOperationPolicy.direct(other, "POST"))
     }
+
+    @Test fun pairingRoutesAllowOnlyTheirDeclaredMethods() {
+        assertTrue(NativeOperationPolicy.direct("/api/plugins/cypher/pairing/redeem", "POST"))
+        assertTrue(NativeOperationPolicy.direct("/api/plugins/cypher/devices/link", "POST"))
+        assertTrue(NativeOperationPolicy.direct("/api/plugins/cypher/devices", "GET"))
+        assertTrue(NativeOperationPolicy.direct("/api/plugins/cypher/devices/device-123", "DELETE"))
+
+        assertFalse(NativeOperationPolicy.direct("/api/plugins/cypher/pairing/redeem", "GET"))
+        assertFalse(NativeOperationPolicy.direct("/api/plugins/cypher/devices/link", "GET"))
+        assertFalse(NativeOperationPolicy.direct("/api/plugins/cypher/devices", "DELETE"))
+        assertFalse(NativeOperationPolicy.direct("/api/plugins/cypher/devices/../mobile/bootstrap", "DELETE"))
+    }
 }

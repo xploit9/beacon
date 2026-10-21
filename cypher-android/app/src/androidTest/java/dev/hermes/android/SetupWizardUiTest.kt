@@ -33,8 +33,10 @@ import dev.hermes.android.core.Scope
 import dev.hermes.android.core.string
 import dev.hermes.android.data.AuthContext
 import dev.hermes.android.data.CypherClient
+import dev.hermes.android.data.NativeBearerRecord
 import dev.hermes.android.data.NativeAuthExpiredException
 import dev.hermes.android.data.NativeAuth
+import dev.hermes.android.data.NativePairing
 import okhttp3.CookieJar
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
@@ -44,6 +46,7 @@ import dev.hermes.android.ui.SetupWizardScreen
 import dev.hermes.android.ui.QrScanner
 import dev.hermes.android.ui.INVALID_CYPHER_QR_HINT
 import dev.hermes.android.ui.handleQrScanResult
+import dev.hermes.android.ui.parseCypherConnectLink
 import dev.hermes.android.ui.parseCypherConnectInput
 import dev.hermes.android.ui.stageCypherConnectQr
 import android.net.Uri
@@ -304,6 +307,86 @@ class SetupWizardUiTest {
         assertTrue(stageCypherConnectQr(payload) { staged += it })
 
         assertEquals(listOf(link, payload), staged)
+    }
+
+    @Test fun pairingQrCarriesTheDashboardAndNormalizedCodeIntoSetup() {
+        val link = "cypher://connect?url=https%3A%2F%2Fhermes.example&code=abc-123"
+        val parsed = parseCypherConnectLink(link, allowAddress = false)
+
+        assertEquals("https://hermes.example", parsed.origin)
+        assertEquals("ABC123", parsed.pairingCode)
+        assertFalse(runCatching {
+            parseCypherConnectLink("$link&code=XYZ789", allowAddress = false)
+        }.isSuccess)
+    }
+
+    @Test fun pairingJourneyRedeemsBeforeHermesSignInAndLinksBeforePermissions() {
+        val fixture = NativeExperienceFixture()
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val scope = fixture.scope
+        val signedIn = fixture.clientFor(
+            AuthContext(
+                origin = scope.origin,
+                cookies = emptyList(),
+                owner = scope.owner,
+                profile = scope.profile,
+                backend = "hermes-dashboard",
+                bearer = NativeBearerRecord("fixture-access", "fixture-refresh", Long.MAX_VALUE, scope.origin, scope.owner, scope.profile),
+            ),
+        )
+        NativePairing.clearDeviceId(context, scope)
+        var state by mutableStateOf(AppState(origin = "", setupOrigin = "", setupWizard = true, setupStep = "connect", restoringSession = false))
+        var signInCalls = 0
+        try {
+            compose.setContent { NativeLocalization("en") { CypherTheme(dark = true) {
+                SetupWizardScreen(
+                    state = state,
+                    onProbe = { raw -> state = state.copy(origin = parseCypherConnectInput(raw), setupOrigin = parseCypherConnectInput(raw), setupStep = "signin", loading = false, error = "") },
+                    onSignIn = {
+                        signInCalls++
+                        state = state.copy(authenticated = true, origin = scope.origin, setupStep = "permission-microphone")
+                    },
+                    onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {},
+                    onRedeemPairing = { origin, code ->
+                        val anonymous = fixture.freshClientFor(AuthContext(origin, emptyList()))
+                        try { NativePairing.redeem(anonymous, code) }
+                        finally {
+                            anonymous.closeNative()
+                            anonymous.http.dispatcher.cancelAll()
+                            anonymous.http.connectionPool.evictAll()
+                            anonymous.http.dispatcher.executorService.shutdown()
+                        }
+                    },
+                    onLinkPairing = { grant -> NativePairing.link(context, signedIn, grant) },
+                )
+            } } }
+
+            compose.onNodeWithTag("setup-method-code").performClick()
+            compose.onNodeWithTag("setup-address").performTextInput(scope.origin)
+            compose.onNodeWithTag("setup-pairing-code").performTextInput("abc123")
+            compose.onNodeWithTag("setup-pairing-redeem").performClick()
+            compose.waitUntil(5_000) { fixture.pairingRedeemCount.get() == 1 }
+            compose.onNodeWithText("Fixture Hermes").assertIsDisplayed()
+            assertFalse(fixture.pairingRedeemHadAuthorization)
+
+            compose.onNodeWithTag("setup-pairing-confirm").performClick()
+            compose.waitUntil(5_000) { compose.onAllNodesWithTag("setup-signin").fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithTag("setup-signin").performClick()
+            compose.waitUntil(5_000) { fixture.pairingLinkCount.get() == 1 && state.setupStep == "permission-microphone" }
+
+            val pairingRequests = fixture.requests.filter {
+                it.string("path") == "/api/plugins/cypher/pairing/redeem" || it.string("path") == "/api/plugins/cypher/devices/link"
+            }
+            assertEquals(listOf("/api/plugins/cypher/pairing/redeem", "/api/plugins/cypher/devices/link"), pairingRequests.map { it.string("path") })
+            assertEquals("ABC123", pairingRequests.first().getJSONObject("body").string("code"))
+            assertEquals(1, signInCalls)
+            assertTrue(fixture.pairingLinkHadAuthorization)
+            assertEquals("device-123", NativePairing.deviceId(context, scope))
+            compose.onNodeWithText("Microphone").assertIsDisplayed()
+        } finally {
+            NativePairing.clearDeviceId(context, scope)
+            signedIn.closeNative()
+        }
     }
 
     @Test fun openingExternalLinkStoresPendingOriginAndCancelKeepsTheActiveAccount() = runBlocking {

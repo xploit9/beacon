@@ -220,7 +220,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                         Icon(Icons.Rounded.Email, null, tint = MaterialTheme.colorScheme.primary)
                         Column(Modifier.weight(1f).padding(start = 10.dp, end = 8.dp)) {
                             Text(uiText("Important emails") + " · " + profileLabel, style = MaterialTheme.typography.titleMedium)
-                            Text(assistantText("Cypher checks your email and tells you when something matters. It learns from you."), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(assistantText("Beacon checks your email and tells you when something matters. It learns from you."), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         if (pluginStatus != "absent" && proactive?.optBoolean("_pluginUpdateRequired") != true) Switch(
                             checked = proactiveEnabled,
@@ -297,9 +297,9 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
         if (proactiveLoaded && proactiveEnabled) item {
             Glass(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(assistantText("What Cypher learned"), style = MaterialTheme.typography.titleMedium)
+                    Text(assistantText("What Beacon learned"), style = MaterialTheme.typography.titleMedium)
                     val learned = proactiveLearnedNotes(proactive)
-                    if (learned.isEmpty()) Text(assistantText("Mark alerts as Important or Not important to teach Cypher."), Modifier.testTag("proactive-learned-empty"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (learned.isEmpty()) Text(assistantText("Mark alerts as Important or Not important to teach Beacon."), Modifier.testTag("proactive-learned-empty"), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     learned.forEachIndexed { index, note ->
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(note, Modifier.weight(1f).testTag("proactive-learned-$index"), style = MaterialTheme.typography.bodyMedium)
@@ -321,6 +321,161 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
             VoiceSettingsPluginNote(pluginAbsent)
         }
         item { Glass(Modifier.fillMaxWidth()) { VoiceKeySetupPanel(vm::voiceKeyConfigured) } }
+        item { DevicesSettingsSection(vm, pluginAbsent) }
+    }
+}
+
+@Composable
+private fun DevicesSettingsSection(vm: CypherViewModel, pluginAbsent: Boolean) {
+    val ui by vm.ui.collectAsStateWithLifecycle()
+    val context = LocalContext.current.applicationContext
+    val source = vm.client
+    val scopeKey = source?.scope?.key.orEmpty()
+    var devices by remember(scopeKey) { mutableStateOf<List<PairedDevice>?>(null) }
+    var loading by remember(scopeKey) { mutableStateOf(false) }
+    var removing by remember(scopeKey) { mutableStateOf(false) }
+    var error by remember(scopeKey) { mutableStateOf("") }
+    var removed by remember(scopeKey) { mutableStateOf(false) }
+    var refresh by remember(scopeKey) { mutableIntStateOf(0) }
+    var pendingRemoval by remember(scopeKey) { mutableStateOf<PairedDevice?>(null) }
+    val requests = rememberCoroutineScope()
+
+    LaunchedEffect(scopeKey, refresh, pluginAbsent) {
+        val client = vm.client ?: return@LaunchedEffect
+        if (pluginAbsent || client.auth.owner.isBlank()) return@LaunchedEffect
+        loading = true
+        error = ""
+        try {
+            val result = NativePairing.devices(client)
+            if (vm.client === client) {
+                val thisDevice = NativePairing.deviceId(context, client.scope)
+                if (thisDevice != null && result.none { it.id == thisDevice }) {
+                    NativePairing.clearDeviceId(context, client.scope)
+                    removed = true
+                } else devices = result
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: DeviceRemovedFailure) {
+            if (vm.client === client) {
+                NativePairing.clearDeviceId(context, client.scope)
+                removed = true
+            }
+        } catch (failure: ApiFailure) {
+            if (vm.client === client) error = when {
+                failure.status == 403 -> "Finish setting up Cypher on your Hermes dashboard, then retry."
+                isMissingCypherPluginRoute(failure) -> "Devices are unavailable because the Cypher plugin isn't installed on this Hermes."
+                else -> "Couldn't load devices. Check your connection and try again."
+            }
+        } catch (_: Exception) {
+            if (vm.client === client) error = "Couldn't load devices. Check your connection and try again."
+        } finally {
+            if (vm.client === client) loading = false
+        }
+    }
+
+    val thisDeviceId = source?.let { NativePairing.deviceId(context, it.scope) }
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text("Devices", style = MaterialTheme.typography.titleLarge)
+        when {
+            pluginAbsent -> MissingCypherPluginState(compact = true)
+            source == null || !ui.authenticated -> {
+                Text("Reconnect to Hermes to manage paired devices.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                OutlinedButton(onClick = { vm.connect(ui.origin) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Reconnect") }
+            }
+            removed -> {
+                Text("This phone was removed from Cypher on your PC", Modifier.testTag("devices-removed"), style = MaterialTheme.typography.bodyLarge)
+                Text("Pair this phone again to restore its connection.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Button(onClick = { vm.reopenSetupWizard(ui.origin) }, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("devices-pair-again")) { Text("Pair again") }
+            }
+            loading && devices == null -> {
+                LinearProgressIndicator(Modifier.fillMaxWidth())
+                Text("Loading devices…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            error.isNotBlank() -> {
+                Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+                TextButton(onClick = { refresh++ }, enabled = !loading, modifier = Modifier.heightIn(min = 48.dp).testTag("settings-devices-retry")) { Text("Retry") }
+            }
+            else -> {
+                TextButton(onClick = { refresh++ }, enabled = !loading && !removing, modifier = Modifier.align(Alignment.End).heightIn(min = 48.dp).testTag("settings-devices-refresh")) { Text("Refresh") }
+                val rows = devices.orEmpty()
+                val thisPhone = rows.firstOrNull { it.id == thisDeviceId }
+                if (thisPhone != null) DeviceSettingsRow(thisPhone, current = true) { pendingRemoval = thisPhone }
+                else {
+                    Text("This phone isn't paired yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Button(onClick = { vm.reopenSetupWizard(ui.origin) }, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("devices-pair-this-phone")) { Text("Pair this phone") }
+                }
+                val others = rows.filterNot { it.id == thisDeviceId }
+                if (others.isNotEmpty()) {
+                    Text("Other devices", style = MaterialTheme.typography.titleMedium)
+                    others.forEach { device -> DeviceSettingsRow(device, current = false) { pendingRemoval = device } }
+                } else if (thisPhone != null) {
+                    Text("No other devices are paired.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                if (removing) LinearProgressIndicator(Modifier.fillMaxWidth())
+            }
+        }
+    }
+
+    pendingRemoval?.let { device ->
+        val client = vm.client
+        val isThisPhone = client != null && device.id == NativePairing.deviceId(context, client.scope)
+        AlertDialog(
+            onDismissRequest = { if (!removing) pendingRemoval = null },
+            title = { Text(if (isThisPhone) "Remove this phone?" else "Remove ${device.name}?") },
+            text = { Text("This device will no longer be connected to Cypher on your PC.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val active = vm.client
+                        if (active != null) {
+                            pendingRemoval = null
+                            removing = true
+                            requests.launch {
+                                try {
+                                    NativePairing.remove(active, device.id)
+                                    if (vm.client === active) {
+                                        if (isThisPhone) {
+                                            NativePairing.clearDeviceId(context, active.scope)
+                                            removed = true
+                                        } else refresh++
+                                    }
+                                } catch (cancelled: CancellationException) {
+                                    throw cancelled
+                                } catch (_: Exception) {
+                                    if (vm.client === active) error = "Couldn't remove this device. Try again."
+                                } finally {
+                                    if (vm.client === active) removing = false
+                                }
+                            }
+                        }
+                    },
+                    enabled = !removing,
+                    modifier = Modifier.testTag("settings-device-remove-confirm"),
+                ) { Text("Remove") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingRemoval = null }, enabled = !removing) { Text("Cancel") }
+            },
+        )
+    }
+}
+
+@Composable
+private fun DeviceSettingsRow(device: PairedDevice, current: Boolean, onRemove: () -> Unit) {
+    Column(Modifier.fillMaxWidth().testTag("settings-device-${device.id}"), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                if (current) Text("This phone", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                Text(device.name, style = MaterialTheme.typography.bodyMedium)
+            }
+            TextButton(onClick = onRemove, modifier = Modifier.heightIn(min = 48.dp).testTag("settings-device-remove-${device.id}")) { Text("Remove") }
+        }
+        Text(
+            if (device.lastSeen.isBlank()) "Last seen unavailable" else "Last seen ${device.lastSeen}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

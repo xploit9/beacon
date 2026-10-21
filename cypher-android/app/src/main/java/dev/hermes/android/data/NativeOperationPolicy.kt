@@ -16,6 +16,10 @@ internal object NativeOperationPolicy {
     private val toolPath = Regex("/api/tools/toolsets/[A-Za-z0-9_.%~-]+")
     private val mcpPath = Regex("/api/mcp/servers/[A-Za-z0-9_.%~-]+/(?:test|enabled)")
     private const val cypherPluginUpdatePath = "/api/dashboard/agent-plugins/cypher/update"
+    private const val pairingRedeemPath = "/api/plugins/cypher/pairing/redeem"
+    private const val deviceLinkPath = "/api/plugins/cypher/devices/link"
+    private const val devicesPath = "/api/plugins/cypher/devices"
+    private val devicePath = Regex("/api/plugins/cypher/devices/[A-Za-z0-9_-]{1,128}")
     // Supported upstream history reads only (latest-descendant verifies a compression chain); mutations stay in the native /api/ws RPC surface.
     private val sessionPath = Regex("/api/sessions/[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}(?:/(?:messages|timeline|latest-descendant|mutation-snapshot))?")
     // The one exception: Hermes sets a conversation's pin only through this sidebar PATCH (no RPC exists).
@@ -23,6 +27,11 @@ internal object NativeOperationPolicy {
     // The /api/plugins/cypher/* namespace is the optional extension's own routes, not upstream API.
     fun direct(path: String, method: String): Boolean {
         if (path == cypherPluginUpdatePath) return method == "POST"
+        if (path == pairingRedeemPath) return method == "POST"
+        if (path.startsWith("/api/plugins/cypher/pairing/")) return false
+        if (path == deviceLinkPath) return method == "POST"
+        if (path == devicesPath) return method == "GET"
+        if (path.startsWith("/api/plugins/cypher/devices/")) return method == "DELETE" && path.matches(devicePath)
         if ((path == "/api/sessions" || path.startsWith("/api/sessions/")) && method != "GET") return method == "PATCH" && path.matches(sessionFlagsPath)
         return path.startsWith("/api/plugins/cypher/") || path in paths || path.matches(cronPath) || path.matches(kanbanPath) || path.matches(toolPath) || path.matches(mcpPath) || path.matches(sessionPath)
     }
