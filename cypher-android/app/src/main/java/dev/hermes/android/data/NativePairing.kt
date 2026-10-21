@@ -36,6 +36,11 @@ internal data class PairingGrant(
     override fun toString() = "PairingGrant(deviceId=$deviceId, dashboardUrl=$dashboardUrl, displayName=$displayName, linkTicket=<redacted>)"
 }
 
+/** What setup confirms before sign-in: the dashboard and its code. Hermes answers plugin routes only after sign-in, so the code is redeemed then. */
+internal data class PendingPairing(val dashboardUrl: String, val displayName: String, val code: String) {
+    override fun toString() = "PendingPairing(dashboardUrl=$dashboardUrl, displayName=$displayName, code=<redacted>)"
+}
+
 internal data class PairedDevice(val id: String, val name: String, val lastSeen: String)
 
 internal class PairingFailure(message: String, cause: Throwable? = null) : IOException(message, cause)
@@ -59,16 +64,9 @@ internal object NativePairing {
     private const val MAX_DEVICE_RESPONSE = 1024 * 1024L
     private val deviceIdPattern = Regex("[A-Za-z0-9_-]{1,128}")
 
-    suspend fun redeem(origin: String, code: String): PairingGrant = withContext(Dispatchers.IO) {
-        val client = CypherClient(AuthContext(trustedOrigin(origin), emptyList()))
-        try {
-            redeem(client, code)
-        } finally {
-            client.closeNative()
-            client.http.dispatcher.cancelAll()
-            client.http.connectionPool.evictAll()
-            client.http.dispatcher.executorService.shutdown()
-        }
+    fun prepare(origin: String, code: String): PendingPairing {
+        val url = trustedOrigin(origin)
+        return PendingPairing(url, runCatching { java.net.URI(url).host }.getOrNull().orEmpty().ifBlank { "Hermes" }, normalizePairingCode(code))
     }
 
     internal suspend fun redeem(client: CypherClient, code: String): PairingGrant {

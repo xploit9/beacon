@@ -86,6 +86,7 @@ import dev.hermes.android.data.VoiceKeyStore
 import dev.hermes.android.data.NativePairing
 import dev.hermes.android.data.PairingFailure
 import dev.hermes.android.data.PairingGrant
+import dev.hermes.android.data.PendingPairing
 import dev.hermes.android.data.formatPairingCodeInput
 import dev.hermes.android.data.normalizePairingCode
 import dev.hermes.android.data.parsePairingBlock
@@ -125,7 +126,7 @@ internal data class CypherConnectInput(
     override fun toString() = "CypherConnectInput(origin=$origin, sessionToken=<redacted>, pairingCode=<redacted>)"
 }
 
-private enum class SetupPairingStage { Redeeming, Confirm, Probing, SignIn, Linking, Verify }
+private enum class SetupPairingStage { Confirm, Probing, SignIn, Linking, Verify }
 private enum class SetupPairingRetry { Redeem, Probe, Link }
 
 private fun pairingSecurityLabel(address: String): String =
@@ -227,7 +228,7 @@ fun SetupWizard(vm: CypherViewModel, modifier: Modifier = Modifier, externalLink
         onReopen = vm::reopenSetupWizard,
         onCancel = { vm.cancelSetupWizard(); onExternalLinkCleared() },
         onStageLink = vm::openSetupLink,
-        onRedeemPairing = { origin, code -> NativePairing.redeem(origin, code) },
+        onRedeemPairing = { _, code -> NativePairing.redeem(vm.client ?: throw PairingFailure("Sign in with Hermes before linking this phone."), code) },
         onLinkPairing = { grant -> NativePairing.link(context, vm.client ?: throw PairingFailure("Sign in with Hermes before linking this phone."), grant) },
         onOpenBackgroundSettings = { if (!requestBackgroundUse(context)) vm.notice("Open Cypher’s app settings in Android and allow background use.") },
     )
@@ -268,11 +269,11 @@ internal fun SetupWizardScreen(
     var pairingSetupLink by remember { mutableStateOf("") }
     var pairingOrigin by remember { mutableStateOf("") }
     var pairingStage by remember { mutableStateOf<SetupPairingStage?>(null) }
-    var pairingGrant by remember { mutableStateOf<PairingGrant?>(null) }
+    var pairingPending by remember { mutableStateOf<PendingPairing?>(null) }
+    var pairingRedeemed by remember { mutableStateOf<PairingGrant?>(null) }
     var pairingError by remember { mutableStateOf("") }
     var pairingRetry by remember { mutableStateOf(SetupPairingRetry.Redeem) }
     var linkAttempt by remember { mutableStateOf(0) }
-    val pairingScope = rememberCoroutineScope()
     val latestOnRedeemPairing by rememberUpdatedState(onRedeemPairing)
     val latestOnLinkPairing by rememberUpdatedState(onLinkPairing)
     val qrOptions = remember { BarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build() }
@@ -291,22 +292,14 @@ internal fun SetupWizardScreen(
         pairingOrigin = origin
         pairingSetupLink = setupLink
         pairingError = ""
-        pairingGrant = null
+        pairingRedeemed = null
         pairingRetry = SetupPairingRetry.Redeem
-        latestOnStageLink(setupLink)
-        pairingStage = SetupPairingStage.Redeeming
-        pairingScope.launch {
-            try {
-                pairingGrant = latestOnRedeemPairing(origin, normalized)
-                pairingStage = SetupPairingStage.Confirm
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                pairingError = error.message ?: "Couldn't check that code. Check the address and try again."
-                pairingRetry = SetupPairingRetry.Redeem
-                pairingStage = SetupPairingStage.Verify
-            }
+        pairingPending = runCatching { NativePairing.prepare(origin, normalized) }.getOrElse {
+            pairingError = it.message ?: "Enter an HTTPS Hermes address."
+            return
         }
+        latestOnStageLink(setupLink)
+        pairingStage = SetupPairingStage.Confirm
     }
 
     fun updatePairingAddress(value: String) {
@@ -347,7 +340,7 @@ internal fun SetupWizardScreen(
     fun retryPairing() {
         when (pairingRetry) {
             SetupPairingRetry.Redeem -> beginPairingRedeem(pairingOrigin, pairingInputCode, pairingSetupLink.ifBlank { pairingOrigin })
-            SetupPairingRetry.Probe -> pairingGrant?.let {
+            SetupPairingRetry.Probe -> pairingPending?.let {
                 pairingStage = SetupPairingStage.Probing
                 pairingError = ""
                 onProbe(it.dashboardUrl)
@@ -453,7 +446,7 @@ internal fun SetupWizardScreen(
     }
 
     LaunchedEffect(pairingStage, state.setupStep, state.loading, state.authenticated, state.origin) {
-        val grant = pairingGrant
+        val grant = pairingPending
         when (pairingStage) {
             SetupPairingStage.Probing -> when {
                 state.authenticated && grant != null && state.origin == grant.dashboardUrl -> pairingStage = SetupPairingStage.Linking
@@ -474,7 +467,7 @@ internal fun SetupWizardScreen(
     }
 
     LaunchedEffect(pairingStage, linkAttempt, state.authenticated, state.origin) {
-        val grant = pairingGrant ?: return@LaunchedEffect
+        val grant = pairingPending ?: return@LaunchedEffect
         if (pairingStage != SetupPairingStage.Linking) return@LaunchedEffect
         if (!state.authenticated || state.origin != grant.dashboardUrl) {
             pairingError = "Sign in with the Hermes dashboard shown above before linking this phone."
@@ -483,8 +476,10 @@ internal fun SetupWizardScreen(
             return@LaunchedEffect
         }
         try {
-            latestOnLinkPairing(grant)
-            pairingGrant = null
+            // A redeemed code is single use, so a retry after a failed link reuses its ticket.
+            val redeemed = pairingRedeemed ?: latestOnRedeemPairing(grant.dashboardUrl, grant.code).also { pairingRedeemed = it }
+            latestOnLinkPairing(redeemed)
+            pairingPending = null; pairingRedeemed = null
             pairingStage = null
             pairingInputCode = ""
             pairingSetupLink = ""
@@ -565,12 +560,7 @@ internal fun SetupWizardScreen(
                     ) { current ->
                         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             when (current) {
-                                SetupPairingStage.Redeeming -> {
-                                    Text("Checking pairing code", style = MaterialTheme.typography.headlineSmall)
-                                    BeaconSignal(BeaconMotionMode.Sweep, Modifier.align(Alignment.CenterHorizontally), 32.dp)
-                                    Text("Connecting to the Hermes dashboard…", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                }
-                                SetupPairingStage.Confirm -> pairingGrant?.let { grant ->
+                                SetupPairingStage.Confirm -> pairingPending?.let { grant ->
                                     Text("Confirm this dashboard", style = MaterialTheme.typography.headlineSmall)
                                     Text(grant.displayName, style = MaterialTheme.typography.titleLarge)
                                     Text(grant.dashboardUrl, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -587,16 +577,16 @@ internal fun SetupWizardScreen(
                                         enabled = !state.loading,
                                         modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-pairing-confirm"),
                                     ) { Text("Continue") }
-                                    TextButton(onClick = { pairingStage = null; pairingGrant = null; pairingError = "" }) { Text("Back") }
+                                    TextButton(onClick = { pairingStage = null; pairingPending = null; pairingRedeemed = null; pairingError = "" }) { Text("Back") }
                                 } ?: Text("The pairing details couldn't be read. Choose another method.", color = MaterialTheme.colorScheme.error)
                                 SetupPairingStage.Probing -> {
                                     Text("Checking the secure connection…", style = MaterialTheme.typography.headlineSmall)
                                     BeaconSignal(BeaconMotionMode.Sweep, Modifier.align(Alignment.CenterHorizontally), 32.dp)
-                                    Text(pairingGrant?.dashboardUrl.orEmpty(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text(pairingPending?.dashboardUrl.orEmpty(), color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                                 SetupPairingStage.SignIn -> {
                                     Text("Sign in with Hermes", style = MaterialTheme.typography.headlineSmall)
-                                    pairingGrant?.let { Text("${it.displayName} · ${it.dashboardUrl}", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                                    pairingPending?.let { Text("${it.displayName} · ${it.dashboardUrl}", color = MaterialTheme.colorScheme.onSurfaceVariant) }
                                     Text("Use your Hermes account for chat, history, plugin pages, and calls.", style = MaterialTheme.typography.bodyMedium)
                                     state.error.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                                     Button(
@@ -611,7 +601,7 @@ internal fun SetupWizardScreen(
                                 SetupPairingStage.Linking -> {
                                     Text("Linking this phone", style = MaterialTheme.typography.headlineSmall)
                                     BeaconSignal(BeaconMotionMode.Sweep, Modifier.align(Alignment.CenterHorizontally), 32.dp)
-                                    Text("Your phone will appear in Hermes Devices.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text("Checking your code and adding this phone.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                                 SetupPairingStage.Verify -> {
                                     Text("Couldn't finish pairing", style = MaterialTheme.typography.headlineSmall)
@@ -619,7 +609,7 @@ internal fun SetupWizardScreen(
                                     Button(onClick = ::retryPairing, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-pairing-retry")) { Text("Retry") }
                                     TextButton(onClick = {
                                         pairingStage = null
-                                        pairingGrant = null
+                                        pairingPending = null; pairingRedeemed = null
                                         pairingError = ""
                                         pairingMode = "address"
                                         pairingInputCode = ""

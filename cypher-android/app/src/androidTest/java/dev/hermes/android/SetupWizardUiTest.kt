@@ -321,7 +321,7 @@ class SetupWizardUiTest {
         }.isSuccess)
     }
 
-    @Test fun pairingJourneyRedeemsBeforeHermesSignInAndLinksBeforePermissions() {
+    @Test fun pairingJourneySignsInThenRedeemsAndLinksBeforePermissions() {
         val fixture = NativeExperienceFixture()
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val scope = fixture.scope
@@ -348,16 +348,8 @@ class SetupWizardUiTest {
                         state = state.copy(authenticated = true, origin = scope.origin, setupStep = "permission-microphone")
                     },
                     onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {},
-                    onRedeemPairing = { origin, code ->
-                        val anonymous = fixture.freshClientFor(AuthContext(origin, emptyList()))
-                        try { NativePairing.redeem(anonymous, code) }
-                        finally {
-                            anonymous.closeNative()
-                            anonymous.http.dispatcher.cancelAll()
-                            anonymous.http.connectionPool.evictAll()
-                            anonymous.http.dispatcher.executorService.shutdown()
-                        }
-                    },
+                    // Hermes answers plugin routes only for a signed-in phone, so the code is redeemed after sign-in.
+                    onRedeemPairing = { _, code -> NativePairing.redeem(signedIn, code) },
                     onLinkPairing = { grant -> NativePairing.link(context, signedIn, grant) },
                 )
             } } }
@@ -366,9 +358,8 @@ class SetupWizardUiTest {
             compose.onNodeWithTag("setup-address").performTextInput(scope.origin)
             compose.onNodeWithTag("setup-pairing-code").performTextInput("abc123")
             compose.onNodeWithTag("setup-pairing-redeem").performClick()
-            compose.waitUntil(5_000) { fixture.pairingRedeemCount.get() == 1 }
-            compose.onNodeWithText("Fixture Hermes").assertIsDisplayed()
-            assertFalse(fixture.pairingRedeemHadAuthorization)
+            compose.onNodeWithText(android.net.Uri.parse(scope.origin).host!!).assertIsDisplayed()
+            assertEquals(0, fixture.pairingRedeemCount.get())
 
             compose.onNodeWithTag("setup-pairing-confirm").performClick()
             compose.waitUntil(5_000) { compose.onAllNodesWithTag("setup-signin").fetchSemanticsNodes().isNotEmpty() }
@@ -381,6 +372,7 @@ class SetupWizardUiTest {
             assertEquals(listOf("/api/plugins/cypher/pairing/redeem", "/api/plugins/cypher/devices/link"), pairingRequests.map { it.string("path") })
             assertEquals("ABC123", pairingRequests.first().getJSONObject("body").string("code"))
             assertEquals(1, signInCalls)
+            assertTrue(fixture.pairingRedeemHadAuthorization)
             assertTrue(fixture.pairingLinkHadAuthorization)
             assertEquals("device-123", NativePairing.deviceId(context, scope))
             compose.onNodeWithText("Microphone").assertIsDisplayed()
