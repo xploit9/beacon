@@ -325,9 +325,10 @@ def _mcp_read_only(tool_name,profile):
     return False
 
 def _contains_url(value):
-    # Watch arguments are ids, queries and dates: any scheme (webcal://, ftp://) or a protocol-relative // is a link out.
+    # Watch arguments are ids, queries and dates: any scheme (webcal://, ftp://), a protocol-relative // or a Windows
+    # network path (\\host, \/host) is a link out; Hermes' read_file resolves network paths, leaking SMB credentials.
     if isinstance(value,str):
-        return '://' in value or value.lstrip().startswith('//')
+        return '://' in value or re.match(r'\s*[\\/]{2}',value) is not None
     if isinstance(value,dict): return any(_contains_url(item) for item in value.values())
     if isinstance(value,list): return any(_contains_url(item) for item in value)
     return False

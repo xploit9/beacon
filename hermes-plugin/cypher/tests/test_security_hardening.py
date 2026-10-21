@@ -273,7 +273,8 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
     assert plugin.native_proactive_read_only_guard(
         tool_name=fetcher, args={"request": {"targets": ["https://x.test/?q=mail"]}}, session_id="watch-run") == blocked
     # Any scheme or protocol-relative link is a way out, not only http(s).
-    for link in ("webcal://x.test/f.ics?d=mail", "FTP://x.test/up", "//x.test/x?d=mail"):
+    for link in ("webcal://x.test/f.ics?d=mail", "FTP://x.test/up", "//x.test/x?d=mail", "\\\\x.test\\share\\a.txt",
+                 "\\/x.test/share", "/\\x.test\\share"):
         assert plugin.native_proactive_read_only_guard(
             tool_name=fetcher, args={"feed": link}, session_id="watch-run") == blocked, link
     assert plugin.native_proactive_read_only_guard(
