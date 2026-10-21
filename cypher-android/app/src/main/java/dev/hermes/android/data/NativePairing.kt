@@ -99,7 +99,7 @@ internal object NativePairing {
         val ticket = result.string("link_ticket").takeIf { it.isNotBlank() && it.length <= 4096 && it.none(Char::isISOControl) }
             ?: throw PairingFailure("That code didn't work. Make a new one on your PC.")
         val displayName = result.string("name").filterNot(Char::isISOControl).take(128).ifBlank { "Hermes" }
-        PairingGrant(deviceId, ticket, dashboardUrl, displayName)
+        return PairingGrant(deviceId, ticket, dashboardUrl, displayName)
     }
 
     suspend fun link(context: Context, client: CypherClient, grant: PairingGrant) {
