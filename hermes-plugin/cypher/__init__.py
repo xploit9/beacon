@@ -244,7 +244,10 @@ _WRITE_TOOL_WORDS={'send','create','delete','remove','modify','update','manage',
                    'move','archive','trash','label','post','write','upload','accept','decline','invite',
                    'share','set','add','patch','put','mark','star','unread','snooze','mute','block',
                    'unsubscribe','replace','rename','merge','approve','submit','cancel','execute','run',
-                   'import','restore','copy','insert','append','apply','push','commit','pay','transfer'}
+                   'import','restore','copy','insert','append','apply','push','commit','pay','transfer',
+                   'toggle','save','store','notify','acknowledge','ack','seen','flag','unflag','pin','unpin',
+                   'unstar','download','export','attach','respond','rsvp','confirm','dismiss','clear','reset',
+                   'assign','subscribe','react','sync','publish','change','hide','unhide','purge'}
 # Native tools whose names carry no read word but only read or plan inside the run.
 _PROACTIVE_READ_TOOLS={'todo'}
 _ARG_WRITE_TOOL_WORDS=_WRITE_TOOL_WORDS|{'run','trigger','install','edit','enable','disable','pause','resume','schedule'}

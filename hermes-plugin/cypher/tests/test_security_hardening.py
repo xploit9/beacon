@@ -293,6 +293,15 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
         assert plugin.native_proactive_read_only_guard(tool_name=tool, args={}, session_id="watch-run") == blocked, tool
     for tool in ("mcp__db__list_tables", "mcp__db__fetch_rows"):
         assert plugin.native_proactive_read_only_guard(tool_name=tool, args={}, session_id="watch-run") is None, tool
+    # Strix cf8a230 #1: a read word never excuses a state change spelled with another verb, hinted read-only or not.
+    writes = ("toggle_read_status", "get_message_and_toggle", "read_and_save_attachment", "notify_read_receipt",
+              "store_read_flag", "acknowledge_read", "email_toggle_read", "read_note_pin", "getMessageAndClearFlag")
+    for hint in (False, True):
+        mcp_tool._mcp_tool_server_names.update({"mcp__mail__" + name: "mail" for name in writes})
+        mcp_tool._tool_read_only_hints["mail"] = {name: hint for name in writes}
+        for name in writes:
+            assert plugin.native_proactive_read_only_guard(
+                tool_name="mcp__mail__" + name, args={}, session_id="watch-run") == blocked, (name, hint)
     assert ("pre_tool_call", plugin.native_proactive_read_only_guard) in hooks
 
 
