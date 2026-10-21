@@ -11,6 +11,7 @@ import androidx.compose.material.icons.rounded.SmartToy
 import androidx.compose.material.icons.rounded.Forum
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.selected
@@ -44,7 +45,10 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
         if (state.error.isNotBlank() && !(ui.tab == "More" && ui.morePage == "Bots")) item {
             Column(Modifier.padding(16.dp)) { Text(state.error, color = MaterialTheme.colorScheme.error); TextButton(onClick = { vm.showBotMode() }) { Text("Review Bot Mode") } }
         }
-        item { Text("Bots", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) }
+        item { Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+            Text("Bots", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            IconButton(onClick = { vm.botMode.refresh() }, enabled = !state.loading, modifier = Modifier.testTag("bot-mode-refresh")) { Icon(Icons.Rounded.Refresh, "Refresh Bot Mode") }
+        } }
         if (state.bots.isEmpty() && !state.loading) item { Text("No bots available.", Modifier.padding(16.dp)) }
         items(state.bots, key = { "bot:${it.profile}" }) { bot ->
             val active = state.activeBot?.profile == bot.profile
@@ -63,7 +67,6 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
         }
         if (state.spaces.isEmpty() && !state.loading) item { Text("Create a shared space from the overview.", Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.bodySmall) }
         if (state.moreSpaces) item { Text("Showing the first 100 shared spaces.", Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.bodySmall) }
-        item { TextButton(onClick = { vm.botMode.refresh() }, enabled = !state.loading, modifier = Modifier.padding(horizontal = 8.dp)) { Text("Refresh Bot Mode") } }
     }
 }
 
@@ -151,7 +154,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
         confirmButton = { TextButton(onClick = { submitted = true; controller.renameSpace(draftName) }, enabled = !state.loading && draftName.isNotBlank()) { Text(if (state.loading) "Saving…" else "Save") } },
         dismissButton = { TextButton(onClick = { editing = false }, enabled = !state.loading) { Text("Cancel") } })
     Column(Modifier.fillMaxSize().imePadding().testTag(if (shared) "bot-mode-shared" else "bot-mode-home")) {
-        Header(if (shared) spaceName else if (creating) "New shared space" else "Bot Mode", back = if (creating) ({ creating = false }) else null, menu = if (creating) null else LocalOpenNavigationMenu.current) {
+        Header(if (shared) spaceName else if (creating) "New shared space" else "Bot Mode", back = if (creating) ({ creating = false }) else null, menu = if (creating) null else LocalOpenNavigationMenu.current, actions = {
             if (shared) Box {
                 IconButton(onClick = { menu = true }, enabled = state.pendingChange == null) { Icon(Icons.Rounded.MoreVert, "Shared-space actions") }
                 DropdownMenu(menu, { menu = false }) {
@@ -160,12 +163,14 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
                     HorizontalDivider()
                     DropdownMenuItem({ Text("Delete shared space", color = MaterialTheme.colorScheme.error) }, onClick = { menu = false; deleting = true })
                 }
-            } else if (!creating) IconButton({ creating = true }) { Icon(Icons.Rounded.Add, "New shared space") }
-        }
+            } else if (!creating) {
+                IconButton(onClick = { controller.refresh() }, enabled = !state.loading) { Icon(Icons.Rounded.Refresh, "Refresh Bot Mode") }
+                IconButton(onClick = { creating = true }) { Icon(Icons.Rounded.Add, "New shared space") }
+            }
+        })
         if (state.loading && state.events.isEmpty() && (shared || state.bots.isEmpty())) LinearProgressIndicator(Modifier.fillMaxWidth())
         if (state.error.isNotBlank()) {
             Text(state.error, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(horizontal = 20.dp))
-            TextButton(onClick = { controller.refresh() }, enabled = !state.loading) { Text("Refresh / retry read") }
         }
         LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             if (!shared && !creating) {

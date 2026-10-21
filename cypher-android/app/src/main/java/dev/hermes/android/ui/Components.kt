@@ -5,12 +5,14 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.selection.toggleable
+import androidx.compose.animation.core.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.window.DialogWindowProvider
 import androidx.core.view.WindowCompat
@@ -19,11 +21,13 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.input.*
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.semantics.Role
@@ -31,6 +35,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.liveRegion
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.CypherViewModel
+import dev.hermes.android.R
 import dev.hermes.android.core.*
 import org.json.JSONArray
 import org.json.JSONObject
@@ -113,6 +118,79 @@ val LocalOpenNavigationMenu = staticCompositionLocalOf<(() -> Unit)?> { null }
         if (action.isNotBlank()) Button(onClick = onAction) { Text(action) }
     }
 }
+
+private const val CYPHER_PLUGIN_INSTALL_URL = "https://github.com/xploit9/cypher#install"
+
+internal enum class BeaconMotionMode { Pulse, Sweep, Ripple }
+
+@Composable internal fun BeaconMark(modifier: Modifier = Modifier, size: androidx.compose.ui.unit.Dp = 24.dp, contentDescription: String? = null) {
+    Icon(painterResource(R.drawable.ic_beacon), contentDescription, modifier.size(size), tint = MaterialTheme.colorScheme.primary)
+}
+
+@Composable internal fun BeaconSignal(mode: BeaconMotionMode, modifier: Modifier = Modifier, size: androidx.compose.ui.unit.Dp = 24.dp, trigger: Any? = Unit) {
+    val motionEnabled = rememberNativeMotionEnabled()
+    val phase = if (motionEnabled && mode != BeaconMotionMode.Ripple) {
+        val transition = rememberInfiniteTransition(label = "beacon-${mode.name}")
+        val spec = if (mode == BeaconMotionMode.Pulse)
+            infiniteRepeatable(tween(2200, easing = FastOutSlowInEasing), RepeatMode.Reverse)
+        else infiniteRepeatable(tween(2400, easing = LinearEasing), RepeatMode.Restart)
+        val value by transition.animateFloat(0f, 1f, spec, label = "beacon-phase-${mode.name}")
+        value
+    } else 0f
+    val ripple = remember { Animatable(0f) }
+    LaunchedEffect(mode, trigger, motionEnabled) {
+        if (mode == BeaconMotionMode.Ripple && motionEnabled) {
+            ripple.snapTo(0f)
+            ripple.animateTo(1f, tween(520, easing = FastOutSlowInEasing))
+        } else ripple.snapTo(1f)
+    }
+    val color = MaterialTheme.colorScheme.primary
+    Canvas(modifier.size(size)) {
+        val canvasSize = this.size
+        val center = Offset(canvasSize.width / 2f, canvasSize.height / 2f)
+        val radius = canvasSize.minDimension * .37f
+        val stroke = (canvasSize.minDimension * .055f).coerceAtLeast(1.dp.toPx())
+        when (mode) {
+            BeaconMotionMode.Pulse -> {
+                drawCircle(color.copy(alpha = .12f + .12f * phase), radius * (1.05f + .2f * phase), center)
+                drawCircle(color.copy(alpha = .62f), radius * .72f, center, style = Stroke(stroke))
+                drawCircle(color.copy(alpha = .95f), radius * (.16f + .05f * phase), center)
+            }
+            BeaconMotionMode.Sweep -> {
+                drawCircle(color.copy(alpha = .18f), radius, center, style = Stroke(stroke))
+                val angle = phase * (Math.PI * 2).toFloat() - Math.PI.toFloat() / 2f
+                val end = Offset(center.x + kotlin.math.cos(angle) * radius, center.y + kotlin.math.sin(angle) * radius)
+                drawLine(color.copy(alpha = .34f), center, end, strokeWidth = stroke * 2.5f, cap = StrokeCap.Round)
+                drawCircle(color, stroke * 1.4f, end)
+            }
+            BeaconMotionMode.Ripple -> {
+                val progress = if (motionEnabled) ripple.value else 1f
+                drawCircle(color.copy(alpha = .12f), radius * .48f, center)
+                if (progress < 1f) drawCircle(color.copy(alpha = .62f * (1f - progress)), radius * (.2f + .8f * progress), center, style = Stroke(stroke * (1.5f - progress)))
+                drawCircle(color.copy(alpha = .9f), radius * .16f, center)
+            }
+        }
+    }
+}
+
+@Composable internal fun MissingCypherPluginState(modifier: Modifier = Modifier, compact: Boolean = false) {
+    val uriHandler = LocalUriHandler.current
+    Column(
+        modifier.fillMaxWidth().padding(if (compact) 8.dp else 24.dp),
+        horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 14.dp),
+    ) {
+        Box(Modifier.testTag("missing-plugin-illustration").size(if (compact) 64.dp else 108.dp), contentAlignment = androidx.compose.ui.Alignment.Center) {
+            BeaconSignal(BeaconMotionMode.Sweep, size = if (compact) 64.dp else 108.dp)
+            BeaconMark(size = if (compact) 36.dp else 60.dp)
+        }
+        Text(uiText("Add Cypher to your Hermes"), style = if (compact) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.titleMedium, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+        Button(onClick = { uriHandler.openUri(CYPHER_PLUGIN_INSTALL_URL) }, modifier = Modifier.heightIn(min = 48.dp).testTag("missing-plugin-install")) {
+            Text(uiText("Install Cypher"))
+        }
+    }
+}
+
 @Composable fun ActionRow(label: String, description: String = "", icon: ImageVector = Icons.Rounded.ChevronRight, onClick: () -> Unit) {
     ListItem(headlineContent = { Text(label) }, supportingContent = if (description.isBlank()) null else ({ Text(description) }), trailingContent = { Icon(icon, null) }, modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).heightIn(min = 64.dp), colors = ListItemDefaults.colors(containerColor = Color.Transparent))
 }

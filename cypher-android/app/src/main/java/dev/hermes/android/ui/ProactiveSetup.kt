@@ -1,9 +1,13 @@
 package dev.hermes.android.ui
 
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -12,6 +16,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TimePicker
 import androidx.compose.material3.rememberTimePickerState
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -27,6 +32,7 @@ import dev.hermes.android.core.string
 import dev.hermes.android.data.AppPreferences
 import dev.hermes.android.data.ApiFailure
 import dev.hermes.android.data.CypherClient
+import dev.hermes.android.data.currentAssistantName
 import dev.hermes.android.isMissingCypherPluginRoute
 import org.json.JSONObject
 import kotlinx.coroutines.CancellationException
@@ -82,6 +88,33 @@ internal fun proactiveHealthText(proactive: JSONObject): String {
         }
         "error" -> "Couldn't read your email: ${health.string("message").ifBlank { "Try again." }}"
         else -> "Not checked yet"
+    }
+}
+
+internal enum class ProactiveHealthState { Checking, Ok, NotYet }
+
+internal fun proactiveHealthState(proactive: JSONObject?, checking: Boolean): ProactiveHealthState = when {
+    checking -> ProactiveHealthState.Checking
+    proactive?.optJSONObject("health")?.string("state") == "ok" -> ProactiveHealthState.Ok
+    else -> ProactiveHealthState.NotYet
+}
+
+@Composable internal fun ProactiveHealthChip(state: ProactiveHealthState) {
+    Surface(shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        modifier = Modifier.testTag("proactive-health-${state.name.lowercase()}")) {
+        Row(Modifier.padding(horizontal = 10.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            BeaconSignal(when (state) {
+                ProactiveHealthState.Checking -> BeaconMotionMode.Sweep
+                ProactiveHealthState.Ok -> BeaconMotionMode.Ripple
+                ProactiveHealthState.NotYet -> BeaconMotionMode.Pulse
+            }, size = 18.dp, trigger = state)
+            Text(when (state) {
+                ProactiveHealthState.Checking -> "Checking"
+                ProactiveHealthState.Ok -> "OK"
+                ProactiveHealthState.NotYet -> "Not yet"
+            }, style = MaterialTheme.typography.labelMedium)
+        }
     }
 }
 
@@ -146,7 +179,7 @@ internal suspend fun fetchProactiveSettings(source: CypherClient, profile: Strin
     )
 }
 
-internal fun openProactiveRuleForm(vm: CypherViewModel, profile: String, onCreated: () -> Unit) {
+internal fun openProactiveRuleForm(vm: CypherViewModel, profile: String, onCreated: () -> Unit, onMissingPlugin: () -> Unit = {}) {
     vm.openForm(ActionForm(
         "Add a rule", "", listOf(
             Field("text", "Your rule", FieldType.MULTILINE, required = true),
@@ -154,7 +187,7 @@ internal fun openProactiveRuleForm(vm: CypherViewModel, profile: String, onCreat
             Field("night", "Even at night", FieldType.BOOLEAN),
         ),
         seed = json("action" to "notify", "night" to false),
-        explanation = "Describe which emails Cypher should notify or call you about.",
+        explanation = "Describe which emails $currentAssistantName should alert you about.",
         actionLabel = "Add rule",
         onResult = { form ->
             val text = form.string("text").trim()
@@ -169,6 +202,10 @@ internal fun openProactiveRuleForm(vm: CypherViewModel, profile: String, onCreat
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (error: Throwable) {
+                    if (isMissingCypherPluginRoute(error)) {
+                        onMissingPlugin()
+                        return@onResult
+                    }
                     throw IllegalStateException(proactiveErrorMessage(error, "Couldn't add the rule. Try again."))
                 }
                 vm.notice("Rule added.")

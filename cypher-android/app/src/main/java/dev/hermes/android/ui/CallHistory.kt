@@ -70,6 +70,7 @@ internal fun CallHistorySheet(vm: CypherViewModel, onOpenCall: (conversationId: 
     var loading by remember(activeClient, requestScope) { mutableStateOf(false) }
     var error by remember(activeClient, requestScope) { mutableStateOf("") }
     var retryAvailable by remember(activeClient, requestScope) { mutableStateOf(true) }
+    var missingPlugin by remember(activeClient, requestScope) { mutableStateOf(false) }
     var feedback by remember(activeClient, requestScope) { mutableStateOf(emptyMap<String, String>()) }
     val list = rememberLazyListState()
     val coroutineScope = rememberCoroutineScope()
@@ -79,6 +80,7 @@ internal fun CallHistorySheet(vm: CypherViewModel, onOpenCall: (conversationId: 
         loading = true
         error = ""
         retryAvailable = true
+        missingPlugin = false
         try {
             val query = mutableMapOf("profile" to requestScope.profile, "limit" to "50")
             cursor?.let { query["before"] = it }
@@ -91,8 +93,9 @@ internal fun CallHistorySheet(vm: CypherViewModel, onOpenCall: (conversationId: 
             throw cancelled
         } catch (failure: Exception) {
             val ownerSetup = cypherOwnerSetupMessage(failure)
-            retryAvailable = ownerSetup == null && !isMissingCypherPluginRoute(failure)
-            error = ownerSetup ?: if (retryAvailable) "Call history unavailable" else "Update the Cypher plugin on Hermes to see call history."
+            missingPlugin = ownerSetup == null && isMissingCypherPluginRoute(failure)
+            retryAvailable = ownerSetup == null && !missingPlugin
+            error = ownerSetup ?: if (retryAvailable) "Call history unavailable" else ""
         } finally {
             loading = false
         }
@@ -140,6 +143,7 @@ internal fun CallHistorySheet(vm: CypherViewModel, onOpenCall: (conversationId: 
                 }
             }
             when {
+                missingPlugin -> MissingCypherPluginState(Modifier.weight(1f), compact = true)
                 error.isNotBlank() -> Column(Modifier.weight(1f).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
                     Text(error, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     if (retryAvailable) TextButton(onClick = { coroutineScope.launch { calls = emptyList(); next = null; load() } }) { Text("Retry") }
@@ -198,7 +202,7 @@ private fun CallHistoryRow(call: CallHistoryEntry, feedbackStatus: String?, onFe
         }
         if (call.emailNoticeId != null) {
             if (feedbackStatus == "saved") {
-                Text("Thanks — Cypher will remember.", Modifier.padding(start = 56.dp).testTag("call-history-feedback-sent:${call.id}"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(assistantText("Thanks — Cypher will remember."), Modifier.padding(start = 56.dp).testTag("call-history-feedback-sent:${call.id}"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
                 if (feedbackStatus == "failed") Text("Couldn't save your choice. Try again.", Modifier.padding(start = 56.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {

@@ -11,6 +11,10 @@ import android.os.Build
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -24,25 +28,35 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.QrCodeScanner
 import androidx.compose.material3.Button
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.Switch
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.KeyboardType
@@ -50,6 +64,11 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.app.ActivityCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.google.mlkit.vision.barcode.Barcode
+import com.google.mlkit.vision.barcode.BarcodeScanner
+import com.google.mlkit.vision.barcode.BarcodeScannerOptions
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.common.InputImage
 import dev.hermes.android.AppState
 import dev.hermes.android.CypherViewModel
 import dev.hermes.android.data.VoiceKeyStore
@@ -58,6 +77,7 @@ import dev.hermes.android.core.trustedOrigin
 import dev.hermes.android.data.validLoopbackSessionToken
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
 
 internal fun handleSetupPermissionResult(granted: Boolean, advance: () -> Unit, denied: () -> Unit) {
     if (granted) advance() else denied()
@@ -179,6 +199,31 @@ internal fun SetupWizardScreen(
     val visibleOrigin = setupAddressForDisplay(state.setupOrigin.ifBlank { state.origin })
     var address by rememberSaveable(initialAddress) { mutableStateOf(initialAddress) }
     var scanning by rememberSaveable { mutableStateOf(false) }
+    var photoError by rememberSaveable(initialAddress) { mutableStateOf("") }
+    val qrOptions = remember { BarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build() }
+    var qrScanner by remember { mutableStateOf<BarcodeScanner?>(null) }
+    val photoDetected = remember { AtomicBoolean(false) }
+    val latestOnStageLink by rememberUpdatedState(onStageLink)
+    DisposableEffect(qrScanner) { onDispose { qrScanner?.close() } }
+    fun scannerForPhoto(): BarcodeScanner = qrScanner ?: BarcodeScanning.getClient(qrOptions).also { qrScanner = it }
+    fun stageQr(value: String): Boolean = stageCypherConnectQr(value) {
+        scanning = false
+        address = setupAddressForDisplay(it)
+        latestOnStageLink(it)
+    }
+    val photoPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        photoError = ""
+        photoDetected.set(false)
+        if (uri != null) try {
+            scannerForPhoto().process(InputImage.fromFilePath(context, uri))
+                .addOnSuccessListener { codes ->
+                    val value = codes.firstNotNullOfOrNull { it.rawValue?.takeIf(String::isNotBlank) }
+                    if (value == null) photoError = "No QR code found in that image"
+                    else handleQrScanResult(value, photoDetected, ::stageQr) { photoError = INVALID_CYPHER_QR_HINT }
+                }
+                .addOnFailureListener { photoError = "Couldn't read that image." }
+        } catch (_: Exception) { photoError = "Couldn't read that image." }
+    }
     var permissionDenied by rememberSaveable(state.setupStep) { mutableStateOf(false) }
     var permissionNotice by rememberSaveable(state.setupStep) { mutableStateOf("") }
 
@@ -250,29 +295,66 @@ internal fun SetupWizardScreen(
 
     if (scanning) {
         QrScanner(
-            onResult = { value -> stageCypherConnectQr(value) { scanning = false; address = setupAddressForDisplay(it); onStageLink(it) } },
+            onResult = ::stageQr,
             onClose = { scanning = false },
+            barcodeScanner = qrScanner,
         )
         return
     }
 
-    Column(
-        modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 28.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
-    ) {
-        Text("Cypher", style = MaterialTheme.typography.displaySmall)
-        Spacer(Modifier.height(12.dp))
-        Text("A simple, secure connection to Hermes.", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Spacer(Modifier.height(24.dp))
-        Glass(Modifier.widthIn(max = 560.dp).fillMaxWidth()) {
-            Column(Modifier.padding(22.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+    val baseScheme = MaterialTheme.colorScheme
+    val beaconSea = Color(0xff07151e)
+    val beaconSurface = Color(0xff10232d)
+    val beaconInk = Color(0xfff4f0e3)
+    val beaconMuted = Color(0xffb3c3ca)
+    val beaconScheme = baseScheme.copy(
+        background = beaconSea, onBackground = beaconInk,
+        surface = beaconSurface, onSurface = beaconInk, surfaceVariant = Color(0xff172b35), onSurfaceVariant = beaconMuted,
+        surfaceContainerLowest = Color(0xff0b1d27), surfaceContainerLow = beaconSurface,
+        surfaceContainer = beaconSurface, surfaceContainerHigh = Color(0xff142934), surfaceContainerHighest = Color(0xff1b303b),
+        outline = beaconMuted.copy(alpha = .62f), outlineVariant = beaconMuted.copy(alpha = .3f),
+        onPrimary = beaconSea,
+        primaryContainer = Color(0xff35412c), onPrimaryContainer = beaconInk,
+    )
+    MaterialTheme(colorScheme = beaconScheme, typography = MaterialTheme.typography, shapes = MaterialTheme.shapes) {
+    CompositionLocalProvider(LocalContentColor provides beaconInk) {
+    val beaconGold = MaterialTheme.colorScheme.primary
+    Box(Modifier.fillMaxSize().background(beaconSea)) {
+        Canvas(Modifier.fillMaxSize()) {
+            drawRect(Brush.radialGradient(
+                colors = listOf(beaconGold.copy(alpha = .2f), Color.Transparent),
+                center = Offset(size.width * .5f, size.height * .18f),
+                radius = maxOf(size.width, size.height) * .72f,
+            ))
+        }
+        Column(
+            modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Box(Modifier.height(112.dp).width(112.dp), contentAlignment = Alignment.Center) {
+                BeaconSignal(BeaconMotionMode.Pulse, Modifier.testTag("setup-beacon-glow"), 108.dp)
+                BeaconMark(size = 74.dp, contentDescription = assistantText("Cypher"))
+            }
+            Spacer(Modifier.height(4.dp))
+            Text("Cypher", style = MaterialTheme.typography.displaySmall)
+            Spacer(Modifier.height(8.dp))
+            Text("A simple, secure connection to Hermes.", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(24.dp))
+            Surface(
+                Modifier.widthIn(max = 560.dp).fillMaxWidth(),
+                shape = RoundedCornerShape(26.dp),
+                color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = .96f),
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = .28f)),
+            ) {
+                Column(Modifier.padding(22.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 when (state.setupStep) {
                     "probe" -> {
                         Text("Check the server", style = MaterialTheme.typography.headlineSmall)
                         Text(visibleOrigin, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         if (state.loading) {
-                            CircularProgressIndicator(Modifier.align(Alignment.CenterHorizontally))
+                            BeaconSignal(BeaconMotionMode.Sweep, Modifier.align(Alignment.CenterHorizontally), 40.dp)
                             Text("Checking the secure connection…", style = MaterialTheme.typography.bodyMedium)
                         } else {
                             state.error.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
@@ -290,7 +372,7 @@ internal fun SetupWizardScreen(
                         state.error.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                         state.notice.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                         Button(onClick = { onSignIn(context) }, enabled = !state.loading, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-signin")) {
-                            if (state.loading) CircularProgressIndicator(Modifier.height(20.dp), strokeWidth = 2.dp) else Text("Sign in with Hermes")
+                            if (state.loading) BeaconSignal(BeaconMotionMode.Sweep, size = 20.dp) else Text("Sign in with Hermes")
                         }
                         TextButton(onClick = { onReopen(visibleOrigin) }, enabled = !state.loading, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text("Use another server") }
                         if (state.authenticated && !state.loading) TextButton(onClick = onCancel, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text("Close setup") }
@@ -382,7 +464,7 @@ internal fun SetupWizardScreen(
                         }
                         OutlinedTextField(
                             value = address,
-                            onValueChange = { address = it },
+                            onValueChange = { address = it; photoError = "" },
                             label = { Text("Paste link or address") },
                             placeholder = { Text("https://your-device.ts.net") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
@@ -392,14 +474,24 @@ internal fun SetupWizardScreen(
                         state.error.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                         state.notice.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                         Button(onClick = { onProbe(address) }, enabled = !state.loading && address.isNotBlank(), modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-connect")) { Text("Continue") }
-                        TextButton(onClick = { scanning = true }, modifier = Modifier.align(Alignment.CenterHorizontally).testTag("setup-scan-qr")) {
-                            Icon(Icons.Rounded.QrCodeScanner, contentDescription = null)
-                            Text("Scan QR")
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            OutlinedButton(onClick = { qrScanner = scannerForPhoto(); scanning = true }, modifier = Modifier.weight(1f).heightIn(min = 52.dp).testTag("setup-scan-qr")) {
+                                Icon(Icons.Rounded.QrCodeScanner, contentDescription = null)
+                                Text("Scan")
+                            }
+                            OutlinedButton(onClick = { photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }, modifier = Modifier.weight(1f).heightIn(min = 52.dp).testTag("setup-choose-image")) {
+                                Icon(Icons.Rounded.PhotoLibrary, contentDescription = null)
+                                Text("Choose image")
+                            }
                         }
+                        photoError.takeIf(String::isNotBlank)?.let { Text(it, color = if (it == "No QR code found in that image") MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("setup-photo-error")) }
                         if (state.authenticated) TextButton(onClick = onCancel, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text("Close setup") }
                     }
                 }
+                }
             }
         }
+    }
+    }
     }
 }

@@ -87,6 +87,10 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
     var proactiveCheckMinutes by remember(proactiveVersion) { mutableIntStateOf(proactive?.optInt("check_minutes", 15) ?: 15) }
     var proactiveQuietStart by remember(proactiveVersion) { mutableStateOf(proactive?.string("quiet_start").orEmpty().ifBlank { "22:00" }) }
     var proactiveQuietEnd by remember(proactiveVersion) { mutableStateOf(proactive?.string("quiet_end").orEmpty().ifBlank { "07:00" }) }
+    fun reportProactiveError(error: Throwable, fallback: String) {
+        if (isMissingCypherPluginRoute(error)) vm.storeData(proactiveKey, JSONObject().put("_pluginUpdateRequired", true))
+        else vm.notice(proactiveErrorMessage(error, fallback))
+    }
     val proactiveChoicesChanged = proactive != null && (
         proactiveDelivery != proactive.string("delivery", "notify") ||
             proactiveCheckMinutes != proactive.optInt("check_minutes", 15) ||
@@ -125,7 +129,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                     vm.storeData(proactiveKey, response)
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
-                vm.notice(proactiveErrorMessage(error, "Couldn't update email settings. Try again."))
+                reportProactiveError(error, "Couldn't update email settings. Try again.")
             } finally { client.closeNative(); savingProactive = false }
         }
     }
@@ -140,7 +144,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                     vm.storeData(proactiveKey, response)
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
-                vm.notice(proactiveErrorMessage(error, "Couldn't update email settings. Try again."))
+                reportProactiveError(error, "Couldn't update email settings. Try again.")
             } finally { savingProactive = false }
         }
     }
@@ -155,14 +159,15 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                 if (vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile) proactiveRefresh++
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
-                vm.notice(proactiveErrorMessage(error, "Couldn't update the rule. Try again."))
+                reportProactiveError(error, "Couldn't update the rule. Try again.")
             } finally { client.closeNative(); savingProactive = false }
         }
     }
     fun addProactiveRule() {
-        openProactiveRuleForm(vm, profile) {
-            if (vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile) proactiveRefresh++
-        }
+        openProactiveRuleForm(vm, profile,
+            onCreated = { if (vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile) proactiveRefresh++ },
+            onMissingPlugin = { vm.storeData(proactiveKey, JSONObject().put("_pluginUpdateRequired", true)) },
+        )
     }
     fun removeLearnedNote(note: String) {
         if (savingProactive || proactiveChoicesChanged) return
@@ -175,7 +180,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                 if (vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile) proactiveRefresh++
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
-                vm.notice(proactiveErrorMessage(error, "Couldn't remove this preference. Try again."))
+                reportProactiveError(error, "Couldn't remove this preference. Try again.")
             } finally { client.closeNative(); savingProactive = false }
         }
     }
@@ -188,54 +193,83 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
     // "provider\tmodel" keys; blank = the profile's default. The saved pick stays listed even before the list loads.
     val models = data["picker:models"]?.rows("groups").orEmpty().flatMap { group -> group.rows("models").map { group.string("provider_id") + "\t" + it.string("id") to group.string("provider") + " · " + it.string("label", it.string("id")) } }.toMap()
     val selectedModel = if (prefs.assistantModel.isBlank()) "" else prefs.assistantProvider + "\t" + prefs.assistantModel
-    LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+    LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
-            OutlinedTextField(name, { name = it.take(ASSISTANT_NAME_MAX) }, label = { Text(uiText("Name")) }, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("assistant-name"),
-                trailingIcon = { if (assistantNameOf(name) != prefs.assistantName) TextButton({ vm.setAssistantName(name) }, Modifier.testTag("assistant-name-save")) { Text(uiText("Save")) } })
-        }
-        item {
-            // The saved choice stays listed even before the profile list loads or if it is gone, so it is never silently swapped.
-            AssistantProfileChoice(prefs.assistantProfile, profiles, profileRows, profileLoading, { vm.setAssistantProfile(it) }, Modifier.fillMaxWidth().testTag("assistant-profile"))
-        }
-        item {
-            Choice("Model", selectedModel, voiceOptionsWithSelected(listOf("") + models.keys, selectedModel), { key -> vm.setAssistantModel(key.substringAfter('\t', ""), if (key.isBlank()) "" else key.substringBefore('\t')) },
-                Modifier.fillMaxWidth().testTag("assistant-model"), optionLabels = models + ("" to "Profile default") + (selectedModel to (models[selectedModel] ?: prefs.assistantModel)).takeIf { selectedModel.isNotBlank() }.let { listOfNotNull(it).toMap() })
-            Text(uiText("Its chat always uses this profile and model. Your other chats keep theirs."), Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        if (pluginStatus != "absent") item {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text(uiText("Important emails") + " · " + profileLabel, style = MaterialTheme.typography.titleMedium)
-                        Text(uiText("Cypher checks your email and tells you when something matters. It learns from you."), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Glass(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Icon(Icons.Rounded.SmartToy, null, tint = MaterialTheme.colorScheme.primary)
+                        Text(uiText("Assistant"), style = MaterialTheme.typography.titleMedium)
                     }
-                    Switch(checked = proactiveEnabled, onCheckedChange = ::setProactive, enabled = proactiveLoaded && ui.connected && vm.client != null && !savingProactive && !proactiveChoicesChanged,
-                        modifier = Modifier.testTag("assistant-proactive-toggle"))
+                    OutlinedTextField(name, { name = it.take(ASSISTANT_NAME_MAX) }, label = { Text(uiText("Name")) }, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("assistant-name"),
+                        trailingIcon = { if (assistantNameOf(name) != prefs.assistantName) TextButton({ vm.setAssistantName(name) }, Modifier.testTag("assistant-name-save")) { Text(uiText("Save")) } })
+                    AssistantProfileChoice(prefs.assistantProfile, profiles, profileRows, profileLoading, { vm.setAssistantProfile(it) }, Modifier.fillMaxWidth().testTag("assistant-profile"))
+                    Choice("Model", selectedModel, voiceOptionsWithSelected(listOf("") + models.keys, selectedModel), { key -> vm.setAssistantModel(key.substringAfter('\t', ""), if (key.isBlank()) "" else key.substringBefore('\t')) },
+                        Modifier.fillMaxWidth().testTag("assistant-model"), optionLabels = models + ("" to "Profile default") + (selectedModel to (models[selectedModel] ?: prefs.assistantModel)).takeIf { selectedModel.isNotBlank() }.let { listOfNotNull(it).toMap() })
+                    Text(uiText("Its chat always uses this profile and model. Your other chats keep theirs."), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                if (proactive?.optBoolean("_loading") == true || ui.connected && vm.client != null && proactive == null) LinearProgressIndicator(Modifier.fillMaxWidth())
-                else if (!ui.connected || vm.client == null) Text(uiText("Connect to Hermes to manage email alerts."), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                else if (proactive?.has("_error") == true) {
-                    Text(uiText(proactive.string("_message", "Couldn't load email settings. Try again.")), Modifier.testTag("proactive-load-error"), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    if (!proactive.optBoolean("_pluginUpdateRequired")) TextButton(onClick = { proactiveRefresh++ }) { Text(uiText("Retry")) }
+            }
+        }
+        item {
+            Glass(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Rounded.Email, null, tint = MaterialTheme.colorScheme.primary)
+                        Column(Modifier.weight(1f).padding(start = 10.dp, end = 8.dp)) {
+                            Text(uiText("Important emails") + " · " + profileLabel, style = MaterialTheme.typography.titleMedium)
+                            Text(assistantText("Cypher checks your email and tells you when something matters. It learns from you."), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        if (pluginStatus != "absent" && proactive?.optBoolean("_pluginUpdateRequired") != true) Switch(
+                            checked = proactiveEnabled,
+                            onCheckedChange = ::setProactive,
+                            enabled = proactiveLoaded && ui.connected && vm.client != null && !savingProactive && !proactiveChoicesChanged,
+                            modifier = Modifier.testTag("assistant-proactive-toggle"),
+                        )
+                    }
+                    if (pluginStatus == "absent" || proactive?.optBoolean("_pluginUpdateRequired") == true) {
+                        MissingCypherPluginState(compact = true)
+                    } else {
+                        val checking = proactive?.optBoolean("_loading") == true || ui.connected && vm.client != null && proactive == null
+                        if (checking) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text(uiText("Email status"), Modifier.weight(1f), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            ProactiveHealthChip(ProactiveHealthState.Checking)
+                        }
+                        if (!ui.connected || vm.client == null) Text(uiText("Connect to Hermes to manage email alerts."), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        else if (proactive?.has("_error") == true) {
+                            Text(uiText(proactive.string("_message", "Couldn't load email settings. Try again.")), Modifier.testTag("proactive-load-error"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            if (!proactive.optBoolean("_pluginUpdateRequired")) TextButton(onClick = { proactiveRefresh++ }) { Text(uiText("Retry")) }
+                        }
+                        if (proactiveLoaded && proactiveEnabled) {
+                            val controlsEnabled = ui.connected && vm.client != null && !savingProactive
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Text(uiText("Email status"), Modifier.weight(1f), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                ProactiveHealthChip(proactiveHealthState(proactive, checking))
+                            }
+                            proactive?.takeIf { it.optJSONObject("health")?.string("state") == "error" }?.let {
+                                Text(proactiveHealthText(it), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                            }
+                            Text(uiText("When one arrives"), style = MaterialTheme.typography.titleMedium)
+                            Choice("Delivery", proactiveDelivery, listOf("notify", "call"), { proactiveDelivery = it }, Modifier.testTag("proactive-delivery"), mapOf("notify" to "Notify", "call" to "Call"), controlsEnabled)
+                            if (proactiveCallsUnavailable(proactive, proactiveDelivery, callbacksAvailable))
+                                Text(uiText("Calls are off on this Hermes. You'll get a notification instead."), Modifier.testTag("proactive-calls-off"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Choice("Check every", proactiveCheckMinutes.toString(), listOf("5", "15", "30"), { proactiveCheckMinutes = it.toInt() }, Modifier.testTag("proactive-check-minutes"), mapOf("5" to "5 min", "15" to "15 min", "30" to "30 min"), controlsEnabled)
+                            ProactiveTimePicker("Quiet hours start", proactiveQuietStart, controlsEnabled) { proactiveQuietStart = it }
+                            ProactiveTimePicker("Quiet hours end", proactiveQuietEnd, controlsEnabled) { proactiveQuietEnd = it }
+                            Button(onClick = ::saveProactiveChoices, enabled = proactiveChoicesChanged && controlsEnabled, modifier = Modifier.testTag("proactive-save-settings")) { Text(uiText("Save settings")) }
+                        }
+                    }
                 }
-                if (proactiveLoaded && proactiveEnabled) {
-                    val controlsEnabled = ui.connected && vm.client != null && !savingProactive
-                    Text(uiText("When one arrives"), style = MaterialTheme.typography.titleMedium)
-                    Choice("Delivery", proactiveDelivery, listOf("notify", "call"), { proactiveDelivery = it }, Modifier.testTag("proactive-delivery"), mapOf("notify" to "Notify", "call" to "Call"), controlsEnabled)
-                    if (proactiveCallsUnavailable(proactive, proactiveDelivery, callbacksAvailable))
-                        Text(uiText("Calls are off on this Hermes. You'll get a notification instead."), Modifier.testTag("proactive-calls-off"), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Choice("Check every", proactiveCheckMinutes.toString(), listOf("5", "15", "30"), { proactiveCheckMinutes = it.toInt() }, Modifier.testTag("proactive-check-minutes"), mapOf("5" to "5 min", "15" to "15 min", "30" to "30 min"), controlsEnabled)
-                    ProactiveTimePicker("Quiet hours start", proactiveQuietStart, controlsEnabled) { proactiveQuietStart = it }
-                    ProactiveTimePicker("Quiet hours end", proactiveQuietEnd, controlsEnabled) { proactiveQuietEnd = it }
-                    Text(proactiveHealthText(proactive), Modifier.testTag("proactive-health-email"), style = MaterialTheme.typography.bodySmall,
-                        color = if (proactive.optJSONObject("health")?.string("state") == "error") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
-                    TextButton(onClick = ::saveProactiveChoices, enabled = proactiveChoicesChanged && controlsEnabled, modifier = Modifier.testTag("proactive-save-settings")) { Text(uiText("Save settings")) }
-
+            }
+        }
+        if (proactiveLoaded && proactiveEnabled) item {
+            Glass(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text(uiText("Your rules"), style = MaterialTheme.typography.titleMedium)
                     val rules = proactive.rows("rules")
                     if (rules.isEmpty()) Text(uiText("No rules yet."), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     rules.forEach { rule ->
                         val id = rule.string("id")
+                        val controlsEnabled = ui.connected && vm.client != null && !savingProactive
                         val enabled = controlsEnabled && !proactiveChoicesChanged
                         Column(Modifier.fillMaxWidth().testTag("proactive-rule-$id"), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text(rule.string("text"), Modifier.testTag("proactive-rule-text-$id"), style = MaterialTheme.typography.bodyMedium)
@@ -251,16 +285,22 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                             }
                         }
                     }
+                    val controlsEnabled = ui.connected && vm.client != null && !savingProactive
                     TextButton(onClick = ::addProactiveRule, enabled = controlsEnabled && !proactiveChoicesChanged && rules.size < 20, modifier = Modifier.testTag("proactive-add-rule")) { Text(uiText("Add a rule")) }
                     if (rules.size >= 20) Text(uiText("Delete a rule to add another."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-
-                    Text(uiText("What Cypher learned"), style = MaterialTheme.typography.titleMedium)
+                }
+            }
+        }
+        if (proactiveLoaded && proactiveEnabled) item {
+            Glass(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(assistantText("What Cypher learned"), style = MaterialTheme.typography.titleMedium)
                     val learned = proactiveLearnedNotes(proactive)
-                    if (learned.isEmpty()) Text(uiText("Mark alerts as Important or Not important to teach Cypher."), Modifier.testTag("proactive-learned-empty"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (learned.isEmpty()) Text(assistantText("Mark alerts as Important or Not important to teach Cypher."), Modifier.testTag("proactive-learned-empty"), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     learned.forEachIndexed { index, note ->
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(note, Modifier.weight(1f).testTag("proactive-learned-$index"), style = MaterialTheme.typography.bodyMedium)
-                            TextButton(onClick = { removeLearnedNote(note) }, enabled = controlsEnabled && !proactiveChoicesChanged, modifier = Modifier.testTag("proactive-learned-remove-$index")) { Text(uiText("Remove")) }
+                            TextButton(onClick = { removeLearnedNote(note) }, enabled = ui.connected && vm.client != null && !savingProactive && !proactiveChoicesChanged, modifier = Modifier.testTag("proactive-learned-remove-$index")) { Text(uiText("Remove")) }
                         }
                     }
                 }
@@ -282,7 +322,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
 }
 
 @Composable internal fun VoiceSettingsPluginNote(pluginAbsent: Boolean) {
-    if (pluginAbsent) Text(uiText("Calls need the Cypher plugin on your Hermes."), color=MaterialTheme.colorScheme.onSurfaceVariant)
+    if (pluginAbsent) MissingCypherPluginState(compact = true)
 }
 
 @Composable internal fun VoiceKeySetupPanel(onKeySaved:()->Unit,showTitle:Boolean=true) {

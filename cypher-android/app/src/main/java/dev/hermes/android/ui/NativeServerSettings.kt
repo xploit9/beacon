@@ -13,7 +13,7 @@ import androidx.compose.ui.unit.dp
 import dev.hermes.android.core.string
 import dev.hermes.android.data.NativeServerState
 
-@Composable fun NativeServerSettings(page: String, state: NativeServerState, onRefresh: () -> Unit,
+@Composable fun NativeServerSettings(page: String, state: NativeServerState,
     onCheckUpdate: () -> Unit, onApplyUpdate: () -> Unit, onLogFile: (String) -> Unit, onLogSearch: (String) -> Unit, onReviewUnknown: () -> Unit = {}) {
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         if (state.loading) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
@@ -21,7 +21,7 @@ import dev.hermes.android.data.NativeServerState
         if (state.notice.isNotBlank()) item { Text(state.notice) }
         when (page) {
             "Health" -> {
-                item { Text("Hermes ${state.version.ifBlank { "server" }}", style = MaterialTheme.typography.titleLarge); Text(if (state.overall == "ok") "Server components report healthy" else if (state.overall == "degraded") "Some server components need attention" else "Refresh to read server health"); Text("Gateway: ${state.gatewayState.ifBlank { "Not reported" }} · ${state.activeAgents} active agents"); Text("Checks Hermes's components.", style = MaterialTheme.typography.bodyMedium) }
+                item { Text("Hermes ${state.version.ifBlank { "server" }}", style = MaterialTheme.typography.titleLarge); Text(if (state.overall == "ok") "Server components report healthy" else if (state.overall == "degraded") "Some server components need attention" else "Server health is not available."); Text("Gateway: ${state.gatewayState.ifBlank { "Not reported" }} · ${state.activeAgents} active agents"); Text("Checks Hermes's components.", style = MaterialTheme.typography.bodyMedium) }
                 items(state.components, key = { it.name }) { component -> Column { Text(component.name.replaceFirstChar { it.uppercase() }, style = MaterialTheme.typography.titleMedium); Text("${component.status}${component.detail.takeIf { it.isNotBlank() }?.let { " · $it" }.orEmpty()}"); HorizontalDivider(Modifier.padding(top = 12.dp)) } }
             }
             "Logs" -> {
@@ -55,6 +55,5 @@ import dev.hermes.android.data.NativeServerState
                 items(state.checkpoints, key = { it.session }) { checkpoint -> Column { Text(checkpoint.session, style = MaterialTheme.typography.titleMedium); Text("${checkpoint.files} stored files · ${checkpoint.bytes} bytes"); HorizontalDivider(Modifier.padding(top = 12.dp)) } }
             }
         }
-        item { TextButton(onClick = onRefresh, enabled = !state.loading) { Text(if (page == "Server updates") "Refresh update status" else "Refresh") } }
     }
 }

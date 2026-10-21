@@ -91,17 +91,17 @@ class ChatScreenVoicePreparationTest {
 
     @Test fun toolCallMetaToolShowsTheToolHermesRan() {
         fun call(name: String, arguments: String) = JSONObject().put("type", "function").put("function", JSONObject().put("name", name).put("arguments", arguments))
-        assertEquals("cypher call user", toolDisplayName(call("tool_call", "{\"name\":\"cypher_call_user\",\"arguments\":{}}")))
-        assertEquals("list calendar events · personal", humanToolName("mcp__personal__list_calendar_events"))
-        assertEquals("search emails result · tool gateway meeting", humanToolName("mcp__tool_gateway_meeting__search_emails", " result"))
-        assertEquals("terminal", humanToolName("terminal"))
+        assertEquals("Cypher call user", toolDisplayName(call("tool_call", "{\"name\":\"cypher_call_user\",\"arguments\":{}}")))
+        assertEquals("List calendar events · Personal", humanToolName("mcp__personal__list_calendar_events"))
+        assertEquals("Search emails result", humanToolName("mcp__tool_gateway_meeting__search_emails", " result"))
+        assertEquals("Terminal", humanToolName("terminal"))
         // Hermes reports only its own server-held keys; a phone-held key still allows the call.
         assertTrue(voiceCallsOffered(JSONObject().put("optional_features", JSONObject().put("plugin", "available")).put("voice", JSONObject().put("available", false))))
         assertFalse(voiceCallsOffered(JSONObject().put("optional_features", JSONObject().put("plugin", "absent"))))
-        assertEquals("tool describe", toolDisplayName(call("tool_describe", "{\"names\":[\"cypher_call_user\"]}")))
-        assertEquals("tool call", toolDisplayName(call("tool_call", "not json")))
-        assertEquals("tool call", toolDisplayName(call("tool_call", "{\"name\":\"<script>\"}")))
-        assertEquals("web search", toolDisplayName(JSONObject().put("name", "web_search")))
+        assertEquals("Tool describe", toolDisplayName(call("tool_describe", "{\"names\":[\"cypher_call_user\"]}")))
+        assertEquals("Tool call", toolDisplayName(call("tool_call", "not json")))
+        assertEquals("Tool call", toolDisplayName(call("tool_call", "{\"name\":\"<script>\"}")))
+        assertEquals("Web search", toolDisplayName(JSONObject().put("name", "web_search")))
     }
 
     @Test fun toolResultRowsAreTitledAfterTheStoredToolName() {

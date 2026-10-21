@@ -221,10 +221,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         androidx.activity.compose.BackHandler { vm.backFromSettings() }
         Column(Modifier.fillMaxSize()) {
             Header(uiText(settingsLabel(page)), back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current)
-            Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Needs the Cypher plugin", style = MaterialTheme.typography.titleMedium)
-                Text("Install or update the Cypher plugin on your Hermes server to use this page.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = androidx.compose.ui.Alignment.Center) { MissingCypherPluginState() }
         }
         return
     }
@@ -558,14 +555,12 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
                 when {
                     pluginAutoSettingsAvailable -> Text(pluginAutoUpdateLine(pluginAutoSettings),style=MaterialTheme.typography.bodySmall,
                         color=MaterialTheme.colorScheme.onSurfaceVariant,maxLines=1,overflow=androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-                    pluginAutoSettingsMissing -> Text("Update the Cypher plugin on Hermes to manage automatic plugin updates.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
+                    pluginAutoSettingsMissing -> MissingCypherPluginState(compact = true)
                     pluginAutoSettingsError -> Text("Couldn't load automatic plugin updates. Try again.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.error)
                     !ui.connected || client==null -> Text("Connect to Hermes to change this setting.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 if (pluginAutoSaving) LinearProgressIndicator(Modifier.fillMaxWidth())
-                Button(onClick = { updatePlugin() }, enabled = ui.connected && client != null && pluginRow.canUpdate, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
-                    Text(pluginRow.buttonText)
-                }
+                if (!pluginAutoSettingsMissing) Button(onClick = { updatePlugin() }, enabled = ui.connected && client != null && pluginRow.canUpdate, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text(pluginRow.buttonText) }
             }
         }
         if (!previewBuild) {

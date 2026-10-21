@@ -72,7 +72,7 @@ internal fun handleQrScanResult(
 }
 
 @Composable
-fun QrScanner(onResult: (String) -> Boolean, onClose: () -> Unit, hasCamera: (android.content.Context) -> Boolean = ::cameraGranted) {
+fun QrScanner(onResult: (String) -> Boolean, onClose: () -> Unit, hasCamera: (android.content.Context) -> Boolean = ::cameraGranted, barcodeScanner: com.google.mlkit.vision.barcode.BarcodeScanner? = null) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val latestResult by rememberUpdatedState(onResult)
@@ -102,19 +102,20 @@ fun QrScanner(onResult: (String) -> Boolean, onClose: () -> Unit, hasCamera: (an
             Button(onClick = { permission.launch(Manifest.permission.CAMERA) }, modifier = Modifier.fillMaxWidth().height(52.dp).testTag("setup-camera-permission")) { Text("Allow camera") }
         } else {
             val options = remember { BarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build() }
-            val scanner = remember(options) { BarcodeScanning.getClient(options) }
+            val ownsScanner = barcodeScanner == null
+            val scanner = remember(barcodeScanner, options) { barcodeScanner ?: BarcodeScanning.getClient(options) }
             val boundUseCases = remember { mutableStateOf<Pair<ProcessCameraProvider, Pair<Preview, ImageAnalysis>>?>(null) }
             val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
             val detected = remember { AtomicBoolean(false) }
             val active = remember { AtomicBoolean(false) }
             val mainHandler = remember { Handler(Looper.getMainLooper()) }
-            DisposableEffect(lifecycleOwner, scanner, cameraExecutor) {
+            DisposableEffect(lifecycleOwner, scanner, cameraExecutor, ownsScanner) {
                 active.set(true)
                 onDispose {
                     active.set(false)
                     boundUseCases.value?.let { (provider, useCases) -> provider.unbind(useCases.first, useCases.second) }
                     boundUseCases.value = null
-                    scanner.close()
+                    if (ownsScanner) scanner.close()
                     cameraExecutor.shutdown()
                 }
             }

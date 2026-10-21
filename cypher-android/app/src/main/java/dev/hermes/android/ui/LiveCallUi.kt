@@ -183,12 +183,16 @@ internal data class CallUiActions(val mute: () -> Unit, val camera: () -> Unit, 
 
         }
 
-        Text(uiText(if(call.held) "Call on hold" else if(call.state=="connecting") "Connecting your call…" else if(call.userSpeaking) "Listening" else call.state.replaceFirstChar{it.titlecase()}),style=MaterialTheme.typography.labelLarge,color=Color(0xffdce8fc),modifier=Modifier.padding(bottom=8.dp))
-        if(call.overlayPermissionMissing) {
-            Text(uiText("Allow floating calls to keep the call bubble over other apps."),
-                style=MaterialTheme.typography.bodySmall,color=Color(0xffc3cbd8),modifier=Modifier.widthIn(max=480.dp).padding(horizontal=12.dp).testTag("cypher-overlay-permission-notice"))
-            TextButton(actions.allowBubble,modifier=Modifier.heightIn(min=48.dp).testTag("cypher-allow-bubble")) { Text(uiText("Allow floating call bubble")) }
+        Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(8.dp),modifier=Modifier.padding(bottom=8.dp)) {
+            BeaconSignal(if(call.state=="connecting") BeaconMotionMode.Sweep else BeaconMotionMode.Pulse, size=20.dp)
+            Text(uiText(if(call.held) "Call on hold" else if(call.state=="connecting") "Connecting your call…" else if(call.userSpeaking) "Listening" else call.state.replaceFirstChar{it.titlecase()}),style=MaterialTheme.typography.labelLarge,color=Color(0xffdce8fc))
         }
+        if(call.overlayPermissionMissing) AssistChip(
+            onClick = actions.allowBubble,
+            label = { Text(uiText("Allow call bubble")) },
+            leadingIcon = { Icon(Icons.Rounded.Call, null) },
+            modifier = Modifier.heightIn(min = 48.dp).testTag("cypher-allow-bubble"),
+        )
         if(call.contextNotice.isNotBlank()) Text(call.contextNotice,style=MaterialTheme.typography.bodySmall,color=Color(0xffc3cbd8),modifier=Modifier.widthIn(max=480.dp).heightIn(max=160.dp).verticalScroll(rememberScrollState()).padding(horizontal=12.dp,vertical=8.dp).testTag("cypher-context-notice").semantics { liveRegion = LiveRegionMode.Polite })
 
     }
@@ -212,6 +216,7 @@ internal data class CallUiActions(val mute: () -> Unit, val camera: () -> Unit, 
             Row(Modifier.fillMaxWidth().background(if(call.cameraSharing) Color(0xff080d15) else Color.Transparent),verticalAlignment=Alignment.CenterVertically) {
 
                 TextButton(onConversation,Modifier.heightIn(min=48.dp)) { Icon(Icons.Rounded.ChatBubbleOutline,null); Spacer(Modifier.width(8.dp));Text(uiText("View conversation")) }
+                BeaconMark(Modifier.testTag("call-beacon-mark"), size=26.dp, contentDescription=assistantText("Cypher"))
 
                 Spacer(Modifier.weight(1f))
 

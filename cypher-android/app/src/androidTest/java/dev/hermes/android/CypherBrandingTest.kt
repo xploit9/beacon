@@ -1,11 +1,18 @@
 package dev.hermes.android
 
 import androidx.activity.ComponentActivity
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.test.core.app.ApplicationProvider
 import dev.hermes.android.ui.NativeLocalization
+import dev.hermes.android.ui.NativeSkinTheme
+import dev.hermes.android.ui.LocalAssistantName
+import dev.hermes.android.ui.assistantText
 import dev.hermes.android.ui.uiText
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -14,6 +21,29 @@ import org.junit.Test
 
 class CypherBrandingTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
+    @Test fun assistantCopyUsesTheChosenNameAfterTheDefaultChanges() {
+        compose.setContent {
+            CompositionLocalProvider(LocalAssistantName provides "Beacon") {
+                Text(assistantText("Cypher chat"))
+            }
+        }
+        compose.onNodeWithText("Beacon chat").assertExists()
+    }
+
+    @Test fun darkSkinGivesPlainTextTheBackgroundForegroundColor() {
+        var observed = Color.Unspecified
+        var expected = Color.Unspecified
+        compose.setContent {
+            NativeSkinTheme(dark = true, skin = "default") {
+                observed = LocalContentColor.current
+                expected = MaterialTheme.colorScheme.onBackground
+                Text("Plain text")
+            }
+        }
+        compose.waitForIdle()
+        assertEquals(expected, observed)
+    }
+
     @Test fun launcherAndArabicAssistantUseCypherWithStablePackageAndPrivateFilesAuthority() {
         val app = ApplicationProvider.getApplicationContext<CypherApplication>()
         assertTrue(app.packageName == "dev.hermes.android" || app.packageName == "dev.hermes.android.debug")

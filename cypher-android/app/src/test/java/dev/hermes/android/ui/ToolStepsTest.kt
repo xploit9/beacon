@@ -10,16 +10,22 @@ class ToolStepsTest {
     private fun batch(vararg names: String) = tool("tool_call", JSONObject().put("calls", JSONArray().apply { names.forEach { put(JSONObject().put("name", it).put("arguments", JSONObject())) } }))
 
     @Test fun batchedToolCallIsNamedByTheToolsItRan() {
-        assertEquals("list calendar events · personal", toolDisplayName(batch("mcp__personal__list_calendar_events")))
-        assertEquals("search inbox · personal and 1 more", toolDisplayName(batch("mcp__personal__search_inbox", "mcp__personal__list_tasks")))
-        assertEquals("read file", toolDisplayName(tool("tool_call", JSONObject().put("name", "read_file"))))
-        assertEquals("tool call", toolDisplayName(tool("tool_call")))
+        assertEquals("List calendar events · Personal", toolDisplayName(batch("mcp__personal__list_calendar_events")))
+        assertEquals("Search inbox · Personal and 1 more", toolDisplayName(batch("mcp__personal__search_inbox", "mcp__personal__list_tasks")))
+        assertEquals("Read file", toolDisplayName(tool("tool_call", JSONObject().put("name", "read_file"))))
+        assertEquals("Tool call", toolDisplayName(tool("tool_call")))
+    }
+
+    @Test fun shortenedGoogleToolNamesLoseDiscoveryHashes() {
+        assertEquals("Search Gmail · Google Workspace", toolDisplayName(tool("google_workspace_search_gmai_f6f8eca1")))
+        assertEquals("Get Gmail thread", toolDisplayName(tool("get_gmail_t_3ae9e308")))
+        assertEquals("Search Gmail · Google Workspace", toolDisplayName(tool("mcp__google_workspace__search_gmai_f6f8eca1")))
     }
 
     @Test fun aStepSummaryNamesTheWorkNotHermesLookups() {
         val steps = listOf(tool("skills_list"), tool("tool_search"), tool("tool_describe"),
             batch("mcp__personal__list_calendar_events"), batch("mcp__personal__search_inbox"), batch("mcp__personal__list_tasks"))
-        assertEquals("6 steps · List calendar events · personal, search inbox · personal, list tasks · personal", toolStepsSummary(steps))
+        assertEquals("6 steps · List calendar events · Personal, Search inbox · Personal, List tasks · Personal", toolStepsSummary(steps))
         assertEquals("3 steps", toolStepsSummary(listOf(tool("tool_search"), tool("tool_describe"), tool("skills_list"))))
     }
 

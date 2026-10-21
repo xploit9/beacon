@@ -3,6 +3,8 @@ package dev.hermes.android.ui
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -54,9 +56,13 @@ import java.net.URLEncoder
     }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
-            Text(if (mcp) "Connections let Hermes use your services. Test a connection to check its available tools." else "Choose the tool groups available to this profile. Changes apply to new chats.")
+            Row(Modifier.fillMaxWidth(), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                Text(if (mcp) "Connections let Hermes use your services. Test a connection to check its available tools." else "Choose the tool groups available to this profile. Changes apply to new chats.", Modifier.weight(1f))
+                IconButton(onClick = { refresh() }, enabled = busy.isBlank() && !loading, modifier = Modifier.semantics { contentDescription = uiText(if (mcp) "Refresh connections" else "Refresh tools") }) {
+                    Icon(Icons.Rounded.Refresh, null)
+                }
+            }
             OutlinedTextField(search, { search = it }, label = { Text(if (mcp) "Search connections" else "Search tools") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-            TextButton(onClick = { refresh() }, enabled = busy.isBlank() && !loading) { Text(if (loading) "Refreshing..." else "Refresh") }
         }
         val record = data[key]
         if (record == null) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }

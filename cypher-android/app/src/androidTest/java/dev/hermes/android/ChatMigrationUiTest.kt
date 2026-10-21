@@ -207,26 +207,32 @@ class ChatMigrationUiTest {
         compose.onNodeWithTag("tool-card-meta", useUnmergedTree = true).assertTextContains("3.1s", substring = true)
     }
 
-    @Test fun runningToolStartsOpenAndInspectingItReportsExpansion() {
+    @Test fun runningStepsStayCompactUntilOpenedAndArgumentsStayFolded() {
         val reported = mutableListOf<Boolean>()
-        compose.setContent { MaterialTheme { MessageActivity("", listOf(tool("browser_navigate", "status" to "running")), status = "Working", streaming = true, onToolExpanded = { reported += it }) } }
-        compose.onNodeWithTag("tool-card-details").assertIsDisplayed()
+        compose.setContent { MaterialTheme { MessageActivity("", listOf(tool("browser_navigate", "status" to "running", "arguments" to "{\"url\":\"https://example.test\"}")), status = "Working", streaming = true, onToolExpanded = { reported += it }) } }
+        compose.onNodeWithTag("tool-steps").assertIsDisplayed()
+        compose.onNodeWithTag("tool-card").assertDoesNotExist()
+        compose.onNodeWithTag("tool-card-arguments").assertDoesNotExist()
+        compose.onNodeWithTag("tool-steps").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("tool-card").assertIsDisplayed()
+        compose.onNodeWithTag("tool-card-arguments").assertDoesNotExist()
         compose.onNodeWithTag("tool-card-toggle").performClick()
-        compose.onNodeWithTag("tool-card-toggle").performClick()
-        assertEquals(listOf(false, true), reported)
+        compose.onNodeWithTag("tool-card-arguments").assertIsDisplayed()
+        assertEquals(listOf(true, true), reported)
     }
 
     @Test fun finishedStepsFoldIntoOneRowThatOpensToEachNamedCard() {
         compose.setContent { MaterialTheme { MessageActivity("", listOf(tool("terminal", "result" to "a"), tool("read_file", "result" to "b"), tool("web_search", "result" to "c"))) } }
         // Three or more finished steps fold, so the answer sits under the question.
         compose.onAllNodesWithTag("tool-card").assertCountEquals(0)
-        compose.onNodeWithText("3 steps · Terminal, read file, web search").assertIsDisplayed()
+        compose.onNodeWithText("3 steps · Terminal, Read file, Web search").assertIsDisplayed()
         compose.onNodeWithTag("tool-steps").performClick()
         compose.onAllNodesWithTag("tool-card").assertCountEquals(3)
         compose.onNodeWithText("Terminal").assertIsDisplayed()
         compose.onNodeWithText("Read file").assertIsDisplayed()
         compose.onNodeWithText("Web search").assertIsDisplayed()
-        compose.onNodeWithTag("tool-steps-hide").assertIsDisplayed()
+        compose.onNodeWithTag("tool-steps").assertContentDescriptionContains("3 steps")
     }
 
     @Test fun toolCardsFitANarrowPhone() {

@@ -82,6 +82,16 @@ class SetupWizardUiTest {
         assertFalse(setupNeedsBackgroundExemption(isIgnoringBatteryOptimizations = true))
     }
 
+    @Test fun connectScreenOffersCameraScanAndPhotoPicker() {
+        compose.setContent {
+            MaterialTheme {
+                SetupWizardScreen(AppState(setupStep = "connect"), onProbe = {}, onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {})
+            }
+        }
+        compose.onNodeWithTag("setup-scan-qr").assertIsDisplayed()
+        compose.onNodeWithTag("setup-choose-image").assertIsDisplayed()
+    }
+
     @Test fun setupWizardSuppressedNoticeAndErrorAreClearedWhenItCloses() {
         var setupWizard by mutableStateOf(true)
         var error by mutableStateOf("")

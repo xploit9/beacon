@@ -245,7 +245,10 @@ class NativeExperienceUiTest {
         }
         await { vm.data.value["native-projects"]?.has("projects") == true }
         assertFalse(vm.data.value.getValue("native-projects").has("_error"))
-        compose.onNodeWithText("Refresh projects").performScrollTo().assertIsEnabled()
+        val beforeRefresh = fixture.requests.count { it.string("method") == "projects.list" }
+        compose.onNodeWithTag("projects-screen").performTouchInput { swipeDown() }
+        await { fixture.requests.count { it.string("method") == "projects.list" } > beforeRefresh }
+        compose.onNodeWithText("Refresh projects").assertDoesNotExist()
         receipts += "Restored Projects reads the installed native client after same-owner reconnect without requiring page re-entry."
         capture("audit-reconnect-projects")
     }
@@ -262,9 +265,9 @@ class NativeExperienceUiTest {
                 flow<AppState>(vm, "_ui").value = vm.ui.value.copy(notice = "Connection restored")
             }
             await { "native-tools" !in vm.refreshing.value }
-            compose.onNodeWithText("Refresh").performScrollTo().assertIsEnabled()
+            compose.onNodeWithContentDescription("Refresh tools").assertIsEnabled()
             fixture.releaseToolOperation.countDown()
-            compose.onNodeWithText("Refresh").performClick()
+            compose.onNodeWithContentDescription("Refresh tools").performClick()
             await { "native-tools" !in vm.refreshing.value }
             receipts += "A replacement client resets only its own operation latch; old completion cannot disable the new tool controls."
             capture("audit-reconnect-tools")
@@ -277,7 +280,7 @@ class NativeExperienceUiTest {
         clickText("Browse chat commands")
         await { vm.catalog.value.isBlank() && vm.ui.value.morePage == "Commands" && vm.data.value["slash:catalog"] != null }
         val before = fixture.requests.count { it.string("method") == "commands.catalog" }
-        clickText("Refresh commands")
+        compose.onNodeWithContentDescription("Refresh commands").performClick()
         await { fixture.requests.count { it.string("method") == "commands.catalog" } > before }
         compose.onNodeWithContentDescription("Back").performClick()
         await { vm.ui.value.tab == "Chat" }
@@ -1079,6 +1082,7 @@ class NativeExperienceUiTest {
         await { fixture.requests.any { it.string("path") == "/api/sessions" } && vm.ui.value.sessions.isNotEmpty() && !vm.ui.value.historyLoading }
         fixture.holdNextSessionList.set(true)
         try {
+            compose.onNodeWithTag("history-search-toggle").performClick()
             compose.onNodeWithTag("history-search").performTextReplacement("No matching conversation")
             // waitUntil advances the test clock past the search debounce; a blocking latch wait would not.
             compose.waitUntil(5_000) { fixture.sessionListCaptured.count == 0L }
@@ -1097,7 +1101,8 @@ class NativeExperienceUiTest {
         fixture.addProfileConversation("coder", "coder-chat", "Coder notes")
         compose.runOnIdle { vm.toggleSessions(true) }
         await { vm.ui.value.sessions.any { sessionRowId(it) == "chat-a" } && !vm.ui.value.historyLoading }
-        compose.onNodeWithTag("history-all-profiles").performScrollTo().performClick()
+        compose.onNodeWithTag("history-filter").performScrollTo().performClick()
+        compose.onNodeWithTag("history-all-profiles").performClick()
         await { vm.data.value["navigation-profiles"]?.rows("profiles")?.any { it.string("name") == "coder" && it.string("display_name") == "Code profile" } == true && vm.ui.value.sessions.any { it.string("profile") == "coder" && sessionRowId(it) == "coder-chat" } && !vm.ui.value.historyLoading }
         compose.onNodeWithTag("history-row:coder:coder-chat").assertTextContains("Code profile").performClick()
         await { vm.ui.value.profile == "coder" && vm.chat.value.sessionId == "coder-chat" && vm.chat.value.projectionReady }
@@ -1118,7 +1123,8 @@ class NativeExperienceUiTest {
         compose.runOnIdle { vm.toggleSessions(true) }
         await { fixture.requests.any { it.string("path") == "/api/sessions" && it.string("profile") == "coder" } && !vm.ui.value.historyLoading }
         compose.onNodeWithText("No conversations here").assertExists()
-        compose.onNodeWithTag("history-all-profiles").performScrollTo().performClick()
+        compose.onNodeWithTag("history-filter").performScrollTo().performClick()
+        compose.onNodeWithTag("history-all-profiles").performClick()
         await { vm.ui.value.sessions.count { it.string("profile") == "default" } == 2 && !vm.ui.value.historyLoading }
         compose.onNodeWithTag("history-row:default:chat-a").assertExists()
         assertTrue(vm.ui.value.historyUnreadable.isEmpty())
@@ -1189,7 +1195,8 @@ class NativeExperienceUiTest {
             compose.waitUntil(5_000) { fixture.sessionListQueries.any { it.string("sources") == "android_thread,phone" } }
             compose.waitUntil(5_000) { compose.onAllNodesWithText("No threads yet").fetchSemanticsNodes().isNotEmpty() }
 
-            compose.onNodeWithTag("history-new-thread").performScrollTo().performClick()
+            compose.onNodeWithTag("history-filter").performScrollTo().performClick()
+            compose.onNodeWithTag("history-new-thread").performClick()
             compose.onNodeWithTag("new-thread-name").performTextInput("Trip planning")
             compose.onNodeWithTag("new-thread-start").performClick()
             await { fixture.requests.any { it.string("method") == "session.create" && it.getJSONObject("params").string("source") == "android_thread" } }
@@ -1958,7 +1965,7 @@ class NativeExperienceUiTest {
         fun card(description: String): SemanticsMatcher = hasTestTag("tool-card") and hasContentDescription(description)
         fun part(card: SemanticsMatcher, tag: String) = compose.onNode(hasTestTag(tag) and hasAnyAncestor(card), useUnmergedTree = true)
         fun toggle(card: SemanticsMatcher) = compose.onNode(hasTestTag("tool-card-toggle") and hasAnyAncestor(card), useUnmergedTree = true).performScrollTo().performClick()
-        // Click the real toggle only when the card is folded, so a card that starts open (a running tool) is never closed by the test.
+        // Click the real toggle only when the card is folded.
         fun ensureExpanded(card: SemanticsMatcher) {
             if (compose.onAllNodes(hasTestTag("tool-card-details") and hasAnyAncestor(card), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()) toggle(card)
             part(card, "tool-card-details").assertExists()
@@ -1973,10 +1980,10 @@ class NativeExperienceUiTest {
             }
             target.assertIsDisplayed()
         }
-        val passedCard = card("run tests, Completed, 1.2s · $shown")
-        val failedCard = card("read file, Failed, 0.4s · $shown")
-        val silentCard = card("web search, No result recorded")
-        val staleCard = card("sync notes, No result recorded")
+        val passedCard = card("Run tests, Completed, 1.2s · $shown")
+        val failedCard = card("Read file, Failed, 0.4s · $shown")
+        val silentCard = card("Web search, No result recorded")
+        val staleCard = card("Sync notes, No result recorded")
         await { compose.onAllNodes(silentCard, useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
 
         compose.onNodeWithTag("message-row:tool-result-passed", useUnmergedTree = true).assertDoesNotExist()
@@ -3182,7 +3189,7 @@ class NativeExperienceUiTest {
         androidx.test.espresso.Espresso.closeSoftKeyboard()
         compose.onNodeWithText("Browse chat commands").performScrollTo().performClick()
         await { vm.ui.value.morePage == "Commands" }
-        compose.onNodeWithText("Refresh commands").performScrollTo().performClick()
+        compose.onNodeWithContentDescription("Refresh commands").performClick()
         compose.onNode(hasSetTextAction() and hasText("Search commands")).performTextReplacement("help")
         compose.onNodeWithText("/help").performScrollTo().performClick()
         assertEquals("/help ", vm.composer.value.text)
@@ -3225,7 +3232,7 @@ class NativeExperienceUiTest {
         await { vm.ui.value.morePage == "Skills" }
         compose.runOnIdle { vm.more("Health") }
         await { vm.phoneSettings.server.value.version == "fixture" && !vm.phoneSettings.server.value.loading }
-        compose.onNodeWithText("Refresh").performScrollTo().performClick()
+        compose.onNodeWithContentDescription("Refresh").performClick()
         compose.runOnIdle { vm.more("Logs") }
         await { !vm.phoneSettings.server.value.loading }
         for (file in listOf("errors", "agent", "gateway", "gui", "desktop", "mcp")) {
@@ -3234,7 +3241,7 @@ class NativeExperienceUiTest {
         }
         compose.onNode(hasSetTextAction() and hasText("Search log entries")).performScrollTo().performTextReplacement("none")
         androidx.test.espresso.Espresso.closeSoftKeyboard()
-        compose.onNodeWithText("Refresh").performScrollTo().performClick()
+        compose.onNodeWithContentDescription("Refresh").performClick()
         compose.runOnIdle { vm.more("Session checkpoints") }
         await { !vm.phoneSettings.server.value.loading }
         compose.onNodeWithText("No session checkpoints are stored for this profile.").assertExists()

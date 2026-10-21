@@ -11,6 +11,7 @@ import android.speech.RecognizerIntent
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
@@ -28,6 +29,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
@@ -37,6 +39,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.testTag
@@ -73,6 +76,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.util.Locale
 
 internal suspend fun voiceKeyConfiguredOnIo(store: () -> VoiceKeyStore): Boolean = withContext(Dispatchers.IO) {
     val keyStore = store()
@@ -158,6 +162,10 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
     val profileRows = profileCatalog?.rows("profiles").orEmpty()
     val profileLoading = ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
     var search by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf(ui.query) }
+    var searchExpanded by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf(ui.query.isNotBlank()) }
+    val searchFocusRequester = remember { FocusRequester() }
+    val focusManager = LocalFocusManager.current
+    val motionEnabled = rememberNativeMotionEnabled()
     var archived by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf(false) }
     var allProfiles by rememberSaveable(ui.origin, ui.owner) { mutableStateOf(false) }
     var view by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf(HistoryView.All) }
@@ -170,36 +178,105 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
     var projectFor by remember { mutableStateOf<String?>(null) }
     val order = HistoryOrder.of(preferences.historyOrder)
     val hidden = preferences.historyHiddenSources
+    LaunchedEffect(searchExpanded) { if (searchExpanded) searchFocusRequester.requestFocus() }
     LaunchedEffect(allProfiles, ui.origin, ui.owner) { if (allProfiles) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     LaunchedEffect(search, archived, view, hidden, order, allProfiles) { kotlinx.coroutines.delay(250); vm.refreshSessions(search, archived, force = false, threads = view == HistoryView.Threads, allProfiles = allProfiles) }
     // One scroll owner keeps destinations, search, projects and history reachable with the IME.
     LazyColumn(modifier.background(MaterialTheme.colorScheme.surfaceContainer), contentPadding = PaddingValues(bottom = 16.dp)) {
         item("destinations") { beforeHistory() }
-        item("history-header") { Text(uiText("History"), Modifier.padding(horizontal = 16.dp, vertical = 12.dp), style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-        item("history-search") { OutlinedTextField(search, { search = it }, leadingIcon = { Icon(Icons.Rounded.Search, null) }, placeholder = { Text(uiText("Search conversations")) }, singleLine = true, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp).testTag("history-search")) }
-        item("history-filters") { Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            FilterChip(view == HistoryView.All, { view = HistoryView.All }, { Text(uiText("All")) }, modifier = Modifier.testTag("history-view-all"))
-            FilterChip(view == HistoryView.Pinned, { view = if (view == HistoryView.Pinned) HistoryView.All else HistoryView.Pinned }, { Text(uiText("Pinned")) }, modifier = Modifier.testTag("history-view-pinned"))
-            FilterChip(view == HistoryView.Threads, { view = if (view == HistoryView.Threads) HistoryView.All else HistoryView.Threads }, { Text(uiText("Threads")) }, leadingIcon = { ThreadSpoolGlyph(Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary) }, modifier = Modifier.testTag("history-threads"))
-            IconButton(onClick = { naming = true }, modifier = Modifier.size(48.dp).testTag("history-new-thread")) { Icon(Icons.Rounded.Add, uiText("New thread"), tint = MaterialTheme.colorScheme.primary) }
-            FilterChip(allProfiles, { allProfiles = !allProfiles }, { Text(uiText("All profiles")) }, modifier = Modifier.testTag("history-all-profiles"))
-            FilterChip(archived, { archived = !archived }, { Text(uiText("Archived")) })
-            Box {
-                val filtered = hidden.isNotEmpty() || order != HistoryOrder.Recent
-                FilterChip(filtered, { filtersOpen = true }, { Text(if (hidden.isEmpty()) uiText("Filter") else uiText("Filter") + " · " + hidden.size) }, leadingIcon = { Icon(Icons.Rounded.FilterList, null, Modifier.size(18.dp)) }, modifier = Modifier.testTag("history-filter"))
-                DropdownMenu(filtersOpen, { filtersOpen = false }) {
-                    Text(uiText("Sort by"), Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    HistoryOrder.entries.forEach { option -> DropdownMenuItem(text = { Text(uiText(option.label)) }, leadingIcon = { RadioButton(option == order, null) }, onClick = { vm.setHistoryFilters(hidden, option.key) }, modifier = Modifier.testTag("history-order:" + option.key)) }
-                    val sources = historySources(ui.sessions, hidden)
-                    if (view != HistoryView.Threads && sources.isNotEmpty()) {
-                        HorizontalDivider()
-                        Text(uiText("Show conversations from"), Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        sources.forEach { source -> DropdownMenuItem(text = { Text(uiText(historySourceLabel(source))) }, leadingIcon = { Checkbox(source !in hidden, null) }, onClick = { vm.setHistoryFilters(if (source in hidden) hidden - source else hidden + source, order.key) }, modifier = Modifier.testTag("history-source:" + source)) }
+        item("history-header") {
+            Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(uiText("History"), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                IconButton(
+                    onClick = {
+                        if (searchExpanded && search.isBlank()) {
+                            focusManager.clearFocus()
+                            searchExpanded = false
+                        } else searchExpanded = true
+                    },
+                    modifier = Modifier.testTag("history-search-toggle").semantics { contentDescription = uiText("Search conversations") },
+                ) { Icon(Icons.Rounded.Search, null) }
+            }
+        }
+        item("history-search") {
+            AnimatedVisibility(
+                visible = searchExpanded || search.isNotBlank(),
+                enter = if (motionEnabled) expandVertically() + fadeIn(tween(180)) else EnterTransition.None,
+                exit = if (motionEnabled) shrinkVertically() + fadeOut(tween(120)) else ExitTransition.None,
+            ) {
+                OutlinedTextField(
+                    search,
+                    { search = it },
+                    leadingIcon = { Icon(Icons.Rounded.Search, null) },
+                    trailingIcon = if (search.isBlank()) null else ({ IconButton(onClick = { search = "" }) { Icon(Icons.Rounded.Close, uiText("Clear search")) } }),
+                    placeholder = { Text(uiText("Search conversations")) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp).focusRequester(searchFocusRequester)
+                        .onFocusChanged { if (!it.isFocused && search.isBlank()) searchExpanded = false }
+                        .testTag("history-search"),
+                )
+            }
+        }
+        item("history-filters") {
+            val filtered = allProfiles || archived || hidden.isNotEmpty() || order != HistoryOrder.Recent
+            Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                SingleChoiceSegmentedButtonRow(Modifier.weight(1f)) {
+                    val choices = listOf(HistoryView.All to "All", HistoryView.Pinned to "Pinned", HistoryView.Threads to "Threads")
+                    choices.forEachIndexed { index, (choice, label) ->
+                        SegmentedButton(
+                            selected = view == choice,
+                            onClick = { view = choice },
+                            shape = SegmentedButtonDefaults.itemShape(index, choices.size),
+                            modifier = Modifier.testTag(when (choice) { HistoryView.All -> "history-view-all"; HistoryView.Pinned -> "history-view-pinned"; HistoryView.Threads -> "history-threads" }),
+                        ) { Text(uiText(label), maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
                     }
-                    if (filtered) { HorizontalDivider(); DropdownMenuItem(text = { Text(uiText("Reset filters")) }, onClick = { filtersOpen = false; vm.setHistoryFilters(emptySet(), HistoryOrder.Recent.key) }) }
+                }
+                Box {
+                    IconButton(
+                        onClick = { filtersOpen = true },
+                        modifier = Modifier.testTag("history-filter").semantics { selected = filtered; contentDescription = uiText("History filters") },
+                    ) { Icon(Icons.Rounded.FilterList, null) }
+                    DropdownMenu(filtersOpen, { filtersOpen = false }) {
+                        DropdownMenuItem(
+                            text = { Text(uiText("New thread")) },
+                            leadingIcon = { Icon(Icons.Rounded.Forum, null) },
+                            onClick = { filtersOpen = false; naming = true },
+                            modifier = Modifier.testTag("history-new-thread"),
+                        )
+                        HorizontalDivider()
+                        Text(uiText("Profile scope"), Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        DropdownMenuItem(
+                            text = { Text(uiText("This profile")) },
+                            leadingIcon = { RadioButton(!allProfiles, null) },
+                            onClick = { allProfiles = false; filtersOpen = false },
+                            modifier = Modifier.testTag("history-current-profile"),
+                        )
+                        DropdownMenuItem(
+                            text = { Text(uiText("All profiles")) },
+                            leadingIcon = { RadioButton(allProfiles, null) },
+                            onClick = { allProfiles = true; filtersOpen = false },
+                            modifier = Modifier.testTag("history-all-profiles"),
+                        )
+                        DropdownMenuItem(
+                            text = { Text(uiText("Archived")) },
+                            leadingIcon = { Checkbox(archived, null) },
+                            onClick = { archived = !archived },
+                            modifier = Modifier.testTag("history-archived"),
+                        )
+                        HorizontalDivider()
+                        Text(uiText("Sort by"), Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        HistoryOrder.entries.forEach { option -> DropdownMenuItem(text = { Text(uiText(option.label)) }, leadingIcon = { RadioButton(option == order, null) }, onClick = { vm.setHistoryFilters(hidden, option.key) }, modifier = Modifier.testTag("history-order:" + option.key)) }
+                        val sources = historySources(ui.sessions, hidden)
+                        if (view != HistoryView.Threads && sources.isNotEmpty()) {
+                            HorizontalDivider()
+                            Text(uiText("Show conversations from"), Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            sources.forEach { source -> DropdownMenuItem(text = { Text(uiText(historySourceLabel(source))) }, leadingIcon = { Checkbox(source !in hidden, null) }, onClick = { vm.setHistoryFilters(if (source in hidden) hidden - source else hidden + source, order.key) }, modifier = Modifier.testTag("history-source:" + source)) }
+                        }
+                        if (filtered) { HorizontalDivider(); DropdownMenuItem(text = { Text(uiText("Reset filters")) }, onClick = { filtersOpen = false; allProfiles = false; archived = false; vm.setHistoryFilters(emptySet(), HistoryOrder.Recent.key) }) }
+                    }
                 }
             }
-        } }
+        }
         if (ui.historyLoading && ui.query.isNotBlank()) item("history-searching") {
             ListItem(headlineContent = { Text(uiText("Searching…")) }, leadingContent = { CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) }, colors = ListItemDefaults.colors(containerColor = Color.Transparent), modifier = Modifier.testTag("history-searching"))
         }
@@ -329,7 +406,8 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
                 taskFeedbackSent = true
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
-                vm.notice(proactiveErrorMessage(error, "Couldn't send feedback. Try again."))
+                if (isMissingCypherPluginRoute(error)) vm.storeData(proactiveKey, JSONObject().put("_pluginUpdateRequired", true))
+                else vm.notice(proactiveErrorMessage(error, "Couldn't send feedback. Try again."))
             } finally { client.closeNative(); taskFeedbackSending = false }
         }
     }
@@ -573,7 +651,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
                             Markdown(taskResult, vm, taskResultScope, interactive = false)
                         }
                         if (pluginStatus == "available" && taskResultIsEmailAlert) {
-                            if (taskFeedbackSent) Text("Thanks — Cypher will remember.", Modifier.padding(start = 12.dp, bottom = 8.dp).testTag("task-result-feedback-sent"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            if (taskFeedbackSent) Text(assistantText("Thanks — Cypher will remember."), Modifier.padding(start = 12.dp, bottom = 8.dp).testTag("task-result-feedback-sent"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             else Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                                 TextButton(onClick = { sendTaskFeedback("important") }, enabled = !taskFeedbackSending && ui.connected && vm.client != null, modifier = Modifier.testTag("task-result-feedback-important")) { Text(uiText("Important")) }
                                 TextButton(onClick = { sendTaskFeedback("not_important") }, enabled = !taskFeedbackSending && ui.connected && vm.client != null, modifier = Modifier.testTag("task-result-feedback-not-important")) { Text(uiText("Not important")) }
@@ -600,6 +678,9 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
                     if (chat.messages.isNotEmpty() || chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank() || sphereStreaming)
                         ChatSphere(Modifier.fillMaxSize().alpha(if (sphereStreaming) .5f else .12f).testTag("chat-sphere-background"), transcriptAvatarState)
                     LazyColumn(Modifier.fillMaxSize().nestedScroll(ownerScroll).testTag("conversation-transcript"), state = list, contentPadding = PaddingValues(horizontal = 20.dp, vertical = 20.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) {
+                    if (cypher && (pluginStatus == "absent" || proactive?.optBoolean("_pluginUpdateRequired") == true)) item("missing-cypher-plugin") {
+                        MissingCypherPluginState(Modifier.testTag("cypher-plugin-missing"), compact = true)
+                    }
                     if (chat.messages.isEmpty() && chat.streamId.isBlank() && !chatSendInFlight(chat)) item("empty-state") {
                         Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
                             Box(Modifier.widthIn(max = 280.dp).fillMaxWidth(.9f).aspectRatio(1f).clipToBounds().testTag("chat-sphere-empty")) { ChatSphere(Modifier.fillMaxSize(), avatarState) }
@@ -616,7 +697,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
                             // The blank meta line and the status row hold the places of the stored reply's time and action row.
                             if (chat.liveText.isNotBlank()) AssistantSurface { Markdown(chat.liveText, vm, vm.authenticatedScope(), interactive = false); Text(" ", Modifier.padding(top = 4.dp), style = nativeMetadataStyle()) }
                             Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("live-status"), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                                BeaconSignal(BeaconMotionMode.Pulse, size = 18.dp)
                                 Text(chat.status.ifBlank { "Working" }, Modifier.testTag("message-activity-status"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                             MessageActivity(chat.liveReasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), chat.liveTools, "", streaming = true, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }, vm = vm, scope = vm.authenticatedScope()?.session(chat.sessionId))
@@ -659,6 +740,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
             Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 if (navigationBack != null) IconButton(onClick = navigationBack, modifier = Modifier.testTag("bot-chat-back")) { Icon(Icons.Rounded.ArrowBack, "Back to bots") }
                 else IconButton(onClick = LocalOpenNavigationMenu.current ?: { vm.toggleSessions(!ui.showSessions) }, modifier = Modifier.testTag("navigation-toggle")) { Icon(Icons.Rounded.Menu, uiText(if (LocalPersistentNavigation.current) "Hide navigation" else "Show navigation")) }
+                if (cypher || activeHere) BeaconMark(size = 26.dp, contentDescription = assistantText("Cypher"))
                 Column(Modifier.weight(1f).padding(vertical = 8.dp)) { Text(titleOverride ?: if (cypher || activeHere) LocalAssistantName.current else chat.title, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis); Text(if (cypher || activeHere) uiText(if (call.active) "Voice conversation" else "Text and voice, together") else chatModelLabel(chat.raw.string("model"), profileDefaults["profile-defaults"]?.takeIf { it.string("profile") == ui.profile && recordError(it).isBlank() }?.string("model").orEmpty()), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
                 if (!cypher && !permanentBotChat) IconButton(onClick = { vm.newChat() }) { Icon(Icons.Rounded.Edit, uiText("New conversation")) }
                 IconButton(onClick = { showSearch = !showSearch; if (activeHere && showSearch) showCallHistory = true }, enabled = canonical) { Icon(Icons.Rounded.Search, uiText("Search this conversation")) }
@@ -927,6 +1009,7 @@ internal fun acceptsInitialConversationEdit(
     val context = LocalContext.current
     val origin = vm.authenticatedScope()?.session(message.sessionId.ifBlank { vm.chat.value.sessionId })
     val settings = LocalCypherSettings.current
+    val assistantMessageLabel = assistantText("Cypher message")
     val presentation = chatPresentation(message.role, message.text, JSONObject().put("name", resultTitle), tools = message.tools)
     val reading by vm.readingAloud.collectAsStateWithLifecycle()
     val currentCall by vm.app.calls.state.collectAsStateWithLifecycle()
@@ -935,11 +1018,11 @@ internal fun acceptsInitialConversationEdit(
     var inlineActions by remember(message.id) { mutableStateOf(false) }
     val toggleInlineActions = { inlineActions = !inlineActions }
     val openMessageActions = { haptic.performHapticFeedback(HapticFeedbackType.LongPress); actions = true }
-    val copySource: (String) -> Unit = { text -> runCatching { ensureClipboardFits(text); (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Cypher message", text)) }.onSuccess { vm.notice("Message copied") }.onFailure { vm.notice("Couldn’t copy the whole message. Select a smaller section.") }; Unit }
+    val copySource: (String) -> Unit = { text -> runCatching { ensureClipboardFits(text); (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText(assistantMessageLabel, text)) }.onSuccess { vm.notice("Message copied") }.onFailure { vm.notice("Couldn’t copy the whole message. Select a smaller section.") }; Unit }
     val share = { runCatching { context.startActivity(Intent.createChooser(formattedShareIntent(message.text), "Share message")) }.onFailure { vm.notice(if (it is IllegalArgumentException) it.message.orEmpty() else "No app is available to share this message") }; Unit }
     val renderActions: @Composable () -> Unit = {
             if (callTranscript == null && message.text.isNotBlank() && (inlineActions || actions || isLatestAssistant)) Row(Modifier.horizontalScroll(rememberScrollState()).testTag("message-actions:${message.id}"), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-                IconButton(onClick = { runCatching { val (text, html) = formattedClipboard(message.text); (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newHtmlText("Cypher message", text, html)) }.onSuccess { vm.notice("Formatted message copied") }.onFailure { vm.notice("Couldn’t copy the whole message. Select a smaller section.") } }) { Icon(Icons.Rounded.ContentCopy, uiText("Copy formatted message")) }
+                IconButton(onClick = { runCatching { val (text, html) = formattedClipboard(message.text); (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newHtmlText(assistantMessageLabel, text, html)) }.onSuccess { vm.notice("Formatted message copied") }.onFailure { vm.notice("Couldn’t copy the whole message. Select a smaller section.") } }) { Icon(Icons.Rounded.ContentCopy, uiText("Copy formatted message")) }
                 IconButton(onClick = share) { Icon(Icons.Rounded.Share, uiText("Share text")) }
                 IconButton(onClick = { vm.quoteInReply(presentation.text) }, modifier = Modifier.testTag("message-quote:${message.id}")) { Icon(Icons.Rounded.FormatQuote, uiText("Quote in reply")) }
                 IconButton(onClick = { if (reading) vm.stopReadAloud() else vm.readAloud(presentation.text) }) { Icon(if (reading) Icons.Rounded.Stop else Icons.Rounded.VolumeUp, uiText(if (reading) "Stop read aloud" else "Read aloud")) }
@@ -998,28 +1081,70 @@ internal fun acceptsInitialConversationEdit(
 // MessageBubble, ToolProgressCard, ChatInputBar and GatewayBackgroundProcesses (MIT, see licenses/Hermes-Relay-MIT.txt).
 // Only presentation is adapted; Cypher's own ChatState and callbacks supply every value.
 
-/** Each tool is its own collapsed card; reasoning and live status sit above them. */
+/** Live work stays compact; recorded steps can be opened from the same summary row. */
 @Composable internal fun MessageActivity(reasoning: String, tools: List<JSONObject>, status: String = "", streaming: Boolean = false, messageTime: Long = 0L, toolResultsByCallId: Map<String, FoldedToolResult> = emptyMap(), onToolExpanded: (Boolean) -> Unit = {}, onCopyResult: (String) -> Unit = {}, vm: CypherViewModel? = null, scope: Scope? = null) {
     if (reasoning.isBlank() && tools.isEmpty() && status.isBlank()) return
+    val live = streaming && tools.isNotEmpty()
+    val grouped = tools.size >= 3 && !streaming
+    val motionEnabled = rememberNativeMotionEnabled()
+    var showSteps by rememberSaveable(tools.firstOrNull()?.toolKey(0)) { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().testTag("message-activity"), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (status.isNotBlank()) Text(status, Modifier.testTag("message-activity-status"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         if (reasoning.isNotBlank()) Disclosure("Reasoning", reasoning, renderContent = if (vm == null) null else ({ Markdown(reasoning, vm, scope, interactive = false) }))
-        val grouped = tools.size >= 3 && !streaming
-        var showSteps by rememberSaveable(tools.firstOrNull()?.toolKey(0)) { mutableStateOf(false) }
-        if (grouped && !showSteps) {
-            val failed = tools.count { toolOutcomeOf(it, false, toolResultsByCallId[toolCallResultId(it)]) == ToolOutcome.Failed }
-            Surface(Modifier.fillMaxWidth().testTag("tool-steps"), shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
-                Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(onClickLabel = uiText("Show steps")) { showSteps = true }.padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Rounded.Build, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Spacer(Modifier.width(6.dp))
-                    Text(toolStepsSummary(tools), Modifier.weight(1f), style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-                    if (failed > 0) { Text("$failed failed", style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.error); Spacer(Modifier.width(6.dp)) }
-                    Icon(Icons.Rounded.ExpandMore, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (live || grouped) {
+            ToolStepsHeader(tools, live, showSteps, motionEnabled) {
+                showSteps = !showSteps
+                onToolExpanded(showSteps)
+            }
+            AnimatedVisibility(
+                visible = showSteps,
+                enter = if (motionEnabled) expandVertically() + fadeIn(tween(180)) else EnterTransition.None,
+                exit = if (motionEnabled) shrinkVertically() + fadeOut(tween(120)) else ExitTransition.None,
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    tools.forEachIndexed { index, tool ->
+                        key(tool.toolKey(index)) { ToolCard(tool, streaming, messageTime, onToolExpanded, toolResultsByCallId[toolCallResultId(tool)], onCopyResult) }
+                    }
                 }
             }
         } else {
             tools.forEachIndexed { index, tool -> key(tool.toolKey(index)) { ToolCard(tool, streaming, messageTime, onToolExpanded, toolResultsByCallId[toolCallResultId(tool)], onCopyResult) } }
-            if (grouped) TextButton(onClick = { showSteps = false }, modifier = Modifier.testTag("tool-steps-hide")) { Text(uiText("Hide steps")) }
+        }
+    }
+}
+
+@Composable private fun ToolStepsHeader(tools: List<JSONObject>, live: Boolean, expanded: Boolean, motionEnabled: Boolean, onClick: () -> Unit) {
+    val current = tools.lastOrNull()?.let(::toolDisplayName).orEmpty()
+    val summary = if (live) current else toolStepsSummary(tools)
+    val count = "${tools.size} ${if (tools.size == 1) "step" else "steps"}"
+    val chevronRotation by animateFloatAsState(if (expanded) 180f else 0f, animationSpec = if (motionEnabled) tween(180) else snap(), label = "tool-steps-chevron")
+    Surface(
+        Modifier.fillMaxWidth().testTag("tool-steps").semantics {
+            contentDescription = if (live) "$summary, $count" else summary
+            stateDescription = if (expanded) "Expanded" else "Collapsed"
+        },
+        shape = RoundedCornerShape(20.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+    ) {
+        Row(
+            Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                .clickable(onClickLabel = uiText(if (expanded) "Hide steps" else "Show steps"), onClick = onClick)
+                .padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            if (live) BeaconSignal(BeaconMotionMode.Pulse, size = 20.dp)
+            else Icon(if (live) Icons.Rounded.Schedule else Icons.Rounded.Build, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (live && motionEnabled) {
+                AnimatedContent(
+                    targetState = summary,
+                    transitionSpec = { (slideInVertically { it / 3 } + fadeIn()) togetherWith (slideOutVertically { -it / 3 } + fadeOut()) },
+                    label = "live-tool-step",
+                    modifier = Modifier.weight(1f),
+                ) { label -> Text(label, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
+            } else Text(summary, Modifier.weight(1f), style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+            if (live) Text(count, style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+            Icon(Icons.Rounded.ExpandMore, null, Modifier.size(16.dp).graphicsLayer { rotationZ = chevronRotation }, tint = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -1039,25 +1164,63 @@ private fun JSONObject.innerToolNames(): List<String> {
 }
 internal fun toolDisplayName(tool: JSONObject): String {
     val more = if (tool.string("name", tool.optJSONObject("function")?.string("name") ?: "") == "tool_call") tool.innerToolNames().size - 1 else 0
-    return humanToolName(tool.rawToolName()) + if (more > 0) " and $more more" else ""
+    val server = listOf("server", "server_name", "mcp_server", "tool_server").firstNotNullOfOrNull { key -> tool.string(key).takeIf(String::isNotBlank) }.orEmpty()
+    return readableToolName(tool.rawToolName(), server) + if (more > 0) " and $more more" else ""
 }
 /** Hermes' own lookup steps say nothing about the work; a step summary names the tools that did it. */
 private val toolLookupNames = setOf("tool_search", "tool_describe", "skills_list", "skill_view")
 internal fun toolStepsSummary(tools: List<JSONObject>): String {
-    val names = tools.filterNot { it.rawToolName() in toolLookupNames }.map { humanToolName(it.rawToolName()) }.distinct()
-    val shown = names.take(3).joinToString(", ").replaceFirstChar(Char::titlecase)
+    val names = tools.filterNot { it.rawToolName() in toolLookupNames }.map(::toolDisplayName).distinct()
+    val shown = names.take(3).joinToString(", ")
     return "${tools.size} steps" + if (shown.isNotBlank()) " · " + shown + if (names.size > 3) "…" else "" else ""
 }
 /** Calls use the phone's own provider key; Hermes only needs the Cypher plugin. A missing phone key opens Voice & calls. */
 internal fun voiceCallsOffered(bootstrap: JSONObject): Boolean = bootstrap.optJSONObject("optional_features")?.optString("plugin") == "available"
-/** Hermes names MCP tools `mcp__<server>__<tool>`: show "list calendar events · personal", not the raw id. */
-internal fun humanToolName(raw: String, suffix: String = ""): String {
-    val parts = raw.split("__")
-    val mcp = parts.size >= 3 && parts[0] == "mcp" && parts[1].isNotBlank()
-    fun words(value: String) = value.replace('_', ' ').trim().replace(Regex("\\s+"), " ")
-    val name = words(if (mcp) parts.drop(2).joinToString("_") else raw).ifBlank { raw }
-    return name + suffix + if (mcp) " · " + words(parts[1]) else ""
+/** MCP ids carry a server and sometimes an eight-character discovery hash. */
+private val toolHashSuffix = Regex("(?i)(?:_|-)[0-9a-f]{8}$")
+private val toolServices = listOf(
+    "google_workspace" to "Google Workspace",
+    "google_drive" to "Google Drive",
+    "google_calendar" to "Google Calendar",
+)
+private val genericToolGateways = setOf("toolgateway", "toolgatewaymeeting", "toolgatewaycall")
+
+private fun readableToolName(raw: String, declaredServer: String = "", suffix: String = ""): String {
+    val parts = raw.split("__", limit = 3)
+    var server = declaredServer
+    var name = raw
+    if (parts.size == 3 && parts[0] == "mcp" && parts[1].isNotBlank()) {
+        if (server.isBlank()) server = parts[1]
+        name = parts[2]
+    }
+    name = name.replace(toolHashSuffix, "").removePrefix("mcp__").replace("__", "_")
+    val normalizedServer = server.lowercase(Locale.ROOT).replace(Regex("[^a-z0-9]"), "")
+    val service = toolServices.firstOrNull { (prefix, _) -> name.startsWith("${prefix}_") || normalizedServer == prefix.replace("_", "") }
+    if (service != null) name = name.removePrefix("${service.first}_")
+    val serverLabel = when {
+        service != null -> service.second
+        normalizedServer.isBlank() || normalizedServer in genericToolGateways -> ""
+        else -> displayToolWords(server)
+    }
+    val label = displayToolWords(name).ifBlank { "Tool" }
+    return label + suffix + if (serverLabel.isNotBlank() && !label.contains(serverLabel, ignoreCase = true)) " · $serverLabel" else ""
 }
+
+private fun displayToolWords(value: String): String {
+    val words = value.replace(Regex("([a-z])([A-Z])"), "$1_$2")
+        .split(Regex("[^A-Za-z0-9]+"))
+        .filter(String::isNotBlank)
+    return words.mapIndexed { index, word ->
+            when (word.lowercase(Locale.ROOT)) {
+                "gmai", "gmail" -> "Gmail"
+                "t" -> if (index > 0 && words[index - 1].lowercase(Locale.ROOT) in setOf("gmail", "gmai")) "thread" else "T"
+                else -> word.lowercase(Locale.ROOT).let { if (index == 0) it.replaceFirstChar(Char::titlecase) else it }
+            }
+        }
+        .joinToString(" ")
+}
+
+internal fun humanToolName(raw: String, suffix: String = ""): String = readableToolName(raw, suffix = suffix)
 private fun JSONObject.toolKey(index: Int): String = toolIdentity(this).ifBlank { "${rawToolName()}:$index" }
 /** Native completion carries `result` (possibly empty) and `is_error`; a present key is a recorded fact even when empty. */
 private fun JSONObject.recordedValue(vararg keys: String): Any? = keys.firstNotNullOfOrNull { key -> if (has(key) && !isNull(key)) opt(key) else null }
@@ -1092,7 +1255,7 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
     val preparing = outcome == ToolOutcome.Preparing
     // A running tool opens like Relay's; history and preparing tools start folded.
     val toolKey = tool.toolKey(0)
-    var expanded by rememberSaveable(toolKey) { mutableStateOf(running) }
+    var expanded by rememberSaveable(toolKey) { mutableStateOf(false) }
     val finished = outcome == ToolOutcome.Completed || outcome == ToolOutcome.Failed || outcome == ToolOutcome.Dispatched
     val duration = toolDurationLabel(tool.durationSeconds())
     // Native tool events carry a duration but no clock time; like Relay, a finished call shows its message's recorded time.
@@ -1121,13 +1284,12 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
             Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(onClickLabel = uiText(if (expanded) "Hide details" else "Details")) { expanded = !expanded; onExpandedChange(expanded) }.testTag("tool-card-toggle"), verticalAlignment = Alignment.CenterVertically) {
                 Icon(toolIcon(rawName), null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.width(6.dp))
-                Text(toolDisplayName(tool).replaceFirstChar(Char::titlecase), Modifier.weight(1f), style = MaterialTheme.typography.labelMedium, color = if (preparing) MaterialTheme.colorScheme.onSurfaceVariant else Color.Unspecified, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                Text(toolDisplayName(tool), Modifier.weight(1f), style = MaterialTheme.typography.labelMedium, color = if (preparing) MaterialTheme.colorScheme.onSurfaceVariant else Color.Unspecified, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                 if (meta.isNotBlank()) { Text(meta, Modifier.testTag("tool-card-meta"), style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1); Spacer(Modifier.width(6.dp)) }
                 Icon(statusIcon, label, Modifier.size(16.dp), tint = statusColor)
                 Spacer(Modifier.width(4.dp))
                 Icon(if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            if (preparing) argumentsText?.let { Text(compactToolDetail(it, 80), style = MaterialTheme.typography.bodySmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace), color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .6f), maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
             if (running) LinearProgressIndicator(Modifier.fillMaxWidth().padding(bottom = 6.dp).height(2.dp), color = MaterialTheme.colorScheme.primary)
             if (expanded) SelectionContainer { Column(Modifier.padding(bottom = 12.dp).testTag("tool-card-details"), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text("$statusTitle: $label", Modifier.testTag("tool-card-status"), style = MaterialTheme.typography.labelSmall, color = statusColor)
@@ -1366,7 +1528,7 @@ private fun chatAction(vm: CypherViewModel, title: String) {
         "Pin" -> chat.raw.optBoolean("pinned").let { pinned -> vm.conversationAction(chat.sessionId, "/api/session/pin", json("pinned" to !pinned), if (pinned) "Unpinned" else "Pinned") }
         "Branch" -> vm.openForm(ActionForm(title, "/api/session/branch", listOf(Field("title", "Branch title"), Field("keep_count", "Messages to keep", FieldType.INTEGER)), seed.put("keep_count", chat.messages.size), onResult = result))
         "Compress context" -> vm.sessionAction("/api/session/compress") { response ->
-            vm.notice(when (response.string("status")) { "compressed" -> "Context compressed"; "aborted" -> "Compression was not needed or was cancelled."; "pending", "lock_held" -> "Hermes is still working. Refresh the conversation to check progress."; else -> "Compression result is not confirmed. Refresh the conversation." })
+            vm.notice(when (response.string("status")) { "compressed" -> "Context compressed"; "aborted" -> "Compression was not needed or was cancelled."; "pending", "lock_held" -> assistantText("Cypher is still working. Refresh the conversation to check progress."); else -> "Compression result is not confirmed. Refresh the conversation." })
         }
         "Undo last turn" -> vm.openForm(ActionForm(title, "/api/session/undo", emptyList(), seed, explanation = "Undo the latest conversation turn.", actionLabel = "Undo", onResult = result))
         "Usage" -> { vm.more("Session usage") }

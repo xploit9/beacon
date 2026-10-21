@@ -129,12 +129,12 @@ import kotlinx.coroutines.launch
             DropdownMenuItem({ Text("Allowed toolsets") }, { open = false; vm.openCatalog("Toolsets") }, enabled = enabled && !saving)
         }
     }
-    if (confirmOff) AlertDialog(onDismissRequest = { confirmOff = false }, title = { Text("Turn off Hermes approvals?") },
-        text = { Text("Hermes will run tools in this profile without asking.") },
+    if (confirmOff) AlertDialog(onDismissRequest = { confirmOff = false }, title = { Text(assistantText("Turn off Cypher approvals?")) },
+        text = { Text(assistantText("Cypher will run tools in this profile without asking.")) },
         confirmButton = { TextButton({ confirmOff = false; apply("off") }) { Text("Turn off") } },
         dismissButton = { TextButton({ confirmOff = false }) { Text("Cancel") } })
     if (confirmYolo) AlertDialog(onDismissRequest = { confirmYolo = false }, title = { Text("Enable YOLO for this chat?") },
-        text = { Text("Hermes stops asking for approval in this chat until you turn YOLO off.") },
+        text = { Text(assistantText("Cypher stops asking for approval in this chat until you turn YOLO off.")) },
         confirmButton = { TextButton({ confirmYolo = false; applyYolo(true) }) { Text("Enable YOLO") } },
         dismissButton = { TextButton({ confirmYolo = false }) { Text("Cancel") } })
 }

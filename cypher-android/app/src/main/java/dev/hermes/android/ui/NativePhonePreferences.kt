@@ -64,8 +64,12 @@ import kotlinx.coroutines.launch
     var reviewUnknown by remember { mutableStateOf(false) }
     LaunchedEffect(page, ui.origin, ui.owner, ui.profile, ui.connected, vm.client) { vm.phoneSettings.bind(); vm.phoneSettings.loadServer(page) }
     Column(Modifier.fillMaxSize()) {
-        Header(page, back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current)
-        NativeServerSettings(page, state, { vm.phoneSettings.loadServer(page) }, { vm.phoneSettings.loadServer(page, force = true) },
+        Header(page, back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current, actions = {
+            IconButton(onClick = { vm.phoneSettings.loadServer(page) }, enabled = !state.loading) {
+                Icon(Icons.Rounded.Refresh, uiText(if (page == "Server updates") "Refresh update status" else "Refresh"))
+            }
+        })
+        NativeServerSettings(page, state, { vm.phoneSettings.loadServer(page, force = true) },
             onApplyUpdate = { if (vm.app.calls.state.value.active) vm.notice("End the current call before updating Hermes.") else confirm = true },
             onLogFile = vm.phoneSettings::logFile, onLogSearch = vm.phoneSettings::logSearch, onReviewUnknown = { reviewUnknown = true })
     }

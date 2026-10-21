@@ -8,6 +8,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
@@ -22,6 +23,7 @@ internal fun nativeProjectSessionAllowed(id: String, rowProfile: String, profile
     id.isNotBlank() && id in allowedIds && (rowProfile.isBlank() || rowProfile == profile) && !archived
 internal fun nativeProjectDetailCurrent(requestedId: String, returnedId: String): Boolean = requestedId.isNotBlank() && returnedId == requestedId
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable internal fun NativeProjectsScreen(vm: CypherViewModel) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
@@ -69,18 +71,39 @@ internal fun nativeProjectDetailCurrent(requestedId: String, returnedId: String)
                 }
             }
         }
-        LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            when {
-                record == null || record.optBoolean("_loading") -> item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+        PullToRefreshBox(
+            isRefreshing = key in refreshing || record?.optBoolean("_refreshing") == true,
+            onRefresh = { vm.loadNativeProjects(selected, force = true) },
+            modifier = Modifier.fillMaxSize(),
+        ) {
+            LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                when {
+                record == null || record.optBoolean("_loading") -> item { BeaconSignal(BeaconMotionMode.Sweep, Modifier.fillMaxWidth().wrapContentWidth(), 32.dp) }
                 record.string("_error").isNotBlank() -> item { Text(record.string("_error"), color = MaterialTheme.colorScheme.error); TextButton(onClick = { vm.loadNativeProjects(selected) }) { Text("Retry") } }
                 selected.isBlank() -> {
                     val projects = record.rows("projects").filterNot { it.optBoolean("archived") }
-                    item { Text("Keep related chats and computer folders together.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                    if (projects.isEmpty()) item { EmptyState("Your projects", "Create a project for the work you want to keep together.", Icons.Rounded.FolderOpen, "New project", { edit() }) }
-                    items(projects, key = { it.getString("id") }) { value ->
-                        ActionRow(value.string("name", "Project"), value.string("description").ifBlank { "${value.rows("folders").size} linked folder${if (value.rows("folders").size == 1) "" else "s"}" }, Icons.Rounded.ChevronRight) { selected = value.getString("id") }
+                    if (projects.isEmpty()) item {
+                        Glass(Modifier.fillMaxWidth()) {
+                            Column(Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                BeaconSignal(BeaconMotionMode.Sweep, size = 56.dp)
+                                Text("Your projects", style = MaterialTheme.typography.titleLarge)
+                                Text("Create a project to keep related chats and folders together.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Button(onClick = { edit() }) { Text("New project") }
+                            }
+                        }
                     }
-                    item { TextButton(onClick = { vm.loadNativeProjects(force = true) }, enabled = key !in refreshing && !record.optBoolean("_refreshing")) { Text(if (key in refreshing || record.optBoolean("_refreshing")) "Refreshing projects…" else "Refresh projects") } }
+                    items(projects, key = { it.getString("id") }) { value ->
+                        Glass(Modifier.fillMaxWidth().clickable { selected = value.getString("id") }) {
+                            Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                Icon(Icons.Rounded.FolderOpen, null, tint = MaterialTheme.colorScheme.primary)
+                                Column(Modifier.weight(1f)) {
+                                    Text(value.string("name", "Project"), style = MaterialTheme.typography.titleMedium)
+                                    Text(value.string("description").ifBlank { "${value.rows("folders").size} linked folder${if (value.rows("folders").size == 1) "" else "s"}" }, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                                Icon(Icons.Rounded.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                    }
                 }
                 project == null -> item { EmptyState("Project not found", "It may have been removed on another device.", action = "All projects", onAction = { selected = "" }) }
                 else -> {
@@ -121,6 +144,7 @@ internal fun nativeProjectDetailCurrent(requestedId: String, returnedId: String)
                                 DropdownMenu(actions, { actions = false }) { DropdownMenuItem({ Text("Remove from project") }, { actions = false; detach(row) }) }
                             } })
                     }
+                }
                 }
             }
         }
