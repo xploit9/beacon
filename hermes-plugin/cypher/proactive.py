@@ -6,7 +6,6 @@ from pathlib import Path
 import re
 import stat
 import tempfile
-import textwrap
 import threading
 import time
 import unicodedata
@@ -768,8 +767,8 @@ def _learned_notes(reason):
     from cypher_observers import reason_text
     # A rule-matched call's reason ends with " Rule: <rule>"; the note is about the email only.
     summary = reason_text(reason.split(" Rule: ", 1)[0].rstrip("."), 240)
-    summary = re.sub(r"\S*(?:@|://|www\.)\S*", " ", summary).replace('"', "'")
-    summary = textwrap.shorten(summary, 160, placeholder="...")
+    summary = re.sub(r"\S*(?:@|://|www\.|[^\W\d_]\.[^\W\d_]{2,})\S*", " ", summary, flags=re.I).replace('"', "'")
+    summary = " ".join(summary.split())[:160]
     if not summary.strip(". "):
         raise ValueError("This alert has nothing Cypher can learn from")
     return {verdict: LEARNED_PREFIX + label + f': "{summary}"'

@@ -247,7 +247,9 @@ _WRITE_TOOL_WORDS={'send','create','delete','remove','modify','update','manage',
                    'import','restore','copy','insert','append','apply','push','commit','pay','transfer',
                    'toggle','save','store','notify','acknowledge','ack','seen','flag','unflag','pin','unpin',
                    'unstar','download','export','attach','respond','rsvp','confirm','dismiss','clear','reset',
-                   'assign','subscribe','react','sync','publish','change','hide','unhide','purge'}
+                   'assign','subscribe','react','sync','publish','change','hide','unhide','purge','tag','untag',
+                   'categorize','report','unmark','untrash','unarchive','unlabel','unmute','unsnooze','unblock',
+                   'empty','reschedule','revoke'}
 # Native tools whose names carry no read word but only read or plan inside the run.
 _PROACTIVE_READ_TOOLS={'todo'}
 _ARG_WRITE_TOOL_WORDS=_WRITE_TOOL_WORDS|{'run','trigger','install','edit','enable','disable','pause','resume','schedule'}
