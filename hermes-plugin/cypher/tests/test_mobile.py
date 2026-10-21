@@ -958,7 +958,7 @@ def test_plugin_settings_copy_authority_and_track_replacement(harness,monkeypatc
         replacement=tmp/'replacement.yaml';replacement.write_text(text);replacement.replace(path)
     replace('first');value=module.settings()
     value['owner_id']='mutated';value['profiles'].append('foreign')
-    assert module.settings()=={'owner_id':'first','profiles':['default'],'release_repo':'xploit9/cypher',
+    assert module.settings()=={'owner_id':'first','profiles':['default'],'release_repo':'xploit9/beacon',
                                'android_stable_certificate_sha256':''}
     replace('second',release_repo='owner/other-cypher');assert module.settings()['release_repo']=='owner/other-cypher'
     replace('second',False);assert module.settings()=={}
@@ -1131,7 +1131,7 @@ def test_phone_delivery_uses_owned_assistant_chat_for_cron_owner_rows(harness, m
     monkeypatch.setattr(phone_plugin, '_profile_state', lambda: (api.mobile, cfg, 'default'))
     monkeypatch.setattr(phone_plugin, '_modules', lambda: (api.mobile, real_native, api.proactive))
 
-    monkeypatch.syspath_prepend('C:/Users/XPLoiT999/AppData/Local/hermes/hermes-agent')
+    monkeypatch.syspath_prepend(str(Path(os.environ.get('HERMES_AGENT_SOURCE') or Path.home()/'AppData'/'Local'/'hermes'/'hermes-agent')))
     from agent.secret_scope import (
         reset_multiplex_context, reset_secret_scope, set_multiplex_context, set_secret_scope)
     from cron.scheduler_delivery import _resolve_delivery_targets

@@ -9,7 +9,7 @@ Preserve Cypher's existing tabs, left menu buttons and top-right action, includi
 - Voice provider keys for Gemini Live, Grok and OpenAI Realtime are entered in Cypher and encrypted with Android Keystore AES-GCM. They are never sent to Hermes or logged. One tap in chat starts a realtime call.
 - Keep connected uses an Android foreground service. The preview build does not include Firebase configuration.
 - No audio retention is permitted for Cypher phone calls.
-- Private GitHub `xploit9/cypher` is the only repository for this project; Gitea is reserved for Archon.
+- Private GitHub `xploit9/beacon` is the only repository for this project; Gitea is reserved for Archon.
 - Per-chat YOLO lives in the chat composer's Approvals menu. Enabling always asks for confirmation, and a status Hermes cannot report is shown as unknown, never as off.
 - Cypher's own call and task history on Hermes is pruned only by the user's "Keep call and task history" setting (Forever by default). Hermes conversations, messages, memories and files are never pruned by Cypher.
 - Duplicate-prevention markers are kept only as long as they can prevent a duplicate. Bot Mode stops its room scan at 1,000 rooms and refuses to create a space rather than risk a duplicate.

@@ -1,3 +1,4 @@
+import os
 import importlib.util
 from pathlib import Path
 import pytest
@@ -10,7 +11,7 @@ spec.loader.exec_module(api)
 
 @pytest.fixture
 def native_home(tmp_path, monkeypatch):
-    native = Path('C:/Users/XPLoiT999/AppData/Local/hermes/hermes-agent')
+    native = Path(os.environ.get('HERMES_AGENT_SOURCE') or Path.home()/'AppData'/'Local'/'hermes'/'hermes-agent')
     if not native.is_dir():
         pytest.skip('Installed native Hermes source required')
     monkeypatch.syspath_prepend(str(native))

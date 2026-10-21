@@ -7,10 +7,10 @@ Supported native Hermes user plugin, manifest name `cypher`. Install or update i
 On the Hermes host, use the native installer with the profile that runs the dashboard:
 
 ```sh
-hermes -p <profile> plugins install xploit9/cypher/hermes-plugin/cypher --enable
+hermes -p <profile> plugins install xploit9/beacon/hermes-plugin/cypher --enable
 ```
 
-For an existing Cypher install from this repository, use `hermes -p <profile> plugins update cypher`. If `hermes-relay` is installed in the selected profile, back up its folder outside `plugins`, verify the copy, then disable it before enabling Cypher. The private repository requires existing GitHub CLI or Git credential-helper access; never paste or print a token. Ask before restarting an active dashboard or changing network settings. The phone needs an HTTPS dashboard URL; Tailscale Serve is the recommended route. Then install the latest `Cypher-*.apk` from the private repository's [Releases page](https://github.com/xploit9/cypher/releases), open the dashboard's **Cypher** tab, and scan its QR with the Cypher app. See the full [install-with-agent procedure](../../docs/install-with-agent.md).
+For an existing Cypher install from this repository, use `hermes -p <profile> plugins update cypher`. If `hermes-relay` is installed in the selected profile, back up its folder outside `plugins`, verify the copy, then disable it before enabling Cypher. The private repository requires existing GitHub CLI or Git credential-helper access; never paste or print a token. Ask before restarting an active dashboard or changing network settings. The phone needs an HTTPS dashboard URL; Tailscale Serve is the recommended route. Then install the latest `Cypher-*.apk` from the private repository's [Releases page](https://github.com/xploit9/beacon/releases), open the dashboard's **Cypher** tab, and scan its QR with the Cypher app. See the full [install-with-agent procedure](../../docs/install-with-agent.md).
 
 Runtime settings go under native config.yaml `plugins.entries.cypher.settings`; the CLI above installs and enables the plugin. Settings are read from the native process launch home, consistently across bound tool/profile calls:
 
@@ -24,7 +24,7 @@ plugins:
         profiles: [default]
         model: gemini-3.8-live
         voice: Aoede
-        firebase_credentials: C:/Users/XPLoiT999/AppData/Local/hermes/secrets/hermes-fcm.json
+        firebase_credentials: /path/to/hermes-fcm.json
         callback_tool_enabled: true
         scheduled_callbacks_enabled: true
         scheduled_callback_conversation_id: OWNER_STAMPED_NATIVE_STORED_ID

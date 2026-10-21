@@ -17,7 +17,7 @@ g=importlib.util.module_from_spec(spec);spec.loader.exec_module(g)
 SCOPE=('owner','password','profile','call')
 
 
-DEFAULT_HERMES_AGENT_SOURCE=Path('C:/Users/XPLoiT999/AppData/Local/hermes/hermes-agent')
+DEFAULT_HERMES_AGENT_SOURCE=Path(os.environ.get('HERMES_AGENT_SOURCE') or Path.home()/'AppData'/'Local'/'hermes'/'hermes-agent')
 
 
 def _hermes_agent_source():

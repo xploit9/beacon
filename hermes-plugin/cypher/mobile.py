@@ -105,7 +105,7 @@ def settings(profile=None):
         if profile and 'scheduled_callback_conversation_id' not in result:
             stored=conversations.get(profile)
             if stored: result['scheduled_callback_conversation_id']=stored
-    result.setdefault('release_repo','xploit9/cypher')
+    result.setdefault('release_repo','xploit9/beacon')
     result.setdefault('android_stable_certificate_sha256','')
     return result
 

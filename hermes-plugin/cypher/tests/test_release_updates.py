@@ -35,7 +35,7 @@ def _fake_github(api, monkeypatch, cfg, assets, versions):
     patterns=[]
     def run(args,**kwargs):
         if args[0]=='gh':
-            assert args[1:5]==['release','download','--repo','xploit9/cypher']
+            assert args[1:5]==['release','download','--repo','xploit9/beacon']
             requested=[args[index+1] for index,value in enumerate(args[:-1]) if value=='--pattern']
             patterns.extend(requested)
             assert requested and kwargs['shell'] is False and kwargs['timeout']==120

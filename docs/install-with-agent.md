@@ -18,10 +18,10 @@ Use `hermes -p <profile>` for every profile-scoped command. Hermes consumes `-p`
 
 ## 2. Install or update the plugin
 
-The repository is `xploit9/cypher` (it may be private). Hermes' native installer accepts owner/repository shorthand, Git URLs, and a repository subdirectory. For the current repository layout, install the `hermes-plugin/cypher` subdirectory:
+The repository is `xploit9/beacon` (it may be private). Hermes' native installer accepts owner/repository shorthand, Git URLs, and a repository subdirectory. For the current repository layout, install the `hermes-plugin/cypher` subdirectory:
 
 ```sh
-hermes -p <profile> plugins install xploit9/cypher/hermes-plugin/cypher --enable
+hermes -p <profile> plugins install xploit9/beacon/hermes-plugin/cypher --enable
 ```
 
 If `cypher` is already installed from this same repository, update it with Hermes' native updater instead:
@@ -39,7 +39,7 @@ Hermes supports a subdirectory in the repository identifier above. Its optional 
 If an older Hermes installer rejects the subdirectory identifier, use a sparse checkout and install from a local Git URL. Hermes accepts `file://` URLs with a `#subdirectory` fragment:
 
 ```sh
-git clone --filter=blob:none --sparse https://github.com/xploit9/cypher.git cypher-source
+git clone --filter=blob:none --sparse https://github.com/xploit9/beacon.git cypher-source
 git -C cypher-source sparse-checkout set hermes-plugin/cypher
 hermes -p <profile> plugins install file:///absolute/path/to/cypher-source#hermes-plugin/cypher --enable
 ```
@@ -80,7 +80,7 @@ Do not copy, print, or log the route response. Loopback mode may include a sessi
 
 ## 4. Finish on the phone
 
-Tell the user to download and install the latest stable `Cypher-<version>.apk` from the repository's [Releases page](https://github.com/xploit9/cypher/releases), open the dashboard's **Cypher** tab, and select **Pair a phone**. The phone step is: "Scan the QR, choose a screenshot of it, or type the address and code." App and plugin automatic updates are on by default in Settings **App updates**; app downloads use an unmetered connection and keep package, version, checksum and signer verification, with a tap-to-install notice whenever Android requires confirmation.
+Tell the user to download and install the latest stable `Cypher-<version>.apk` from the repository's [Releases page](https://github.com/xploit9/beacon/releases), open the dashboard's **Cypher** tab, and select **Pair a phone**. The phone step is: "Scan the QR, choose a screenshot of it, or type the address and code." App and plugin automatic updates are on by default in Settings **App updates**; app downloads use an unmetered connection and keep package, version, checksum and signer verification, with a tap-to-install notice whenever Android requires confirmation.
 
 Phone sign-in uses Hermes' normal OAuth browser flow. The first verified OAuth identity to use a plugin route becomes owner automatically if no owner exists; subsequent identities cannot take over. That sign-in covers chat, history, plugin pages, calls, and Keep connected. Loopback-anonymous access does not establish ownership.
 

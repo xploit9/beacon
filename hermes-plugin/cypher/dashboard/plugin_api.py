@@ -1028,7 +1028,7 @@ async def download(digest:str,request:Request):
 class ReleaseCheckError(Exception): pass
 
 def _safe_release_repo(cfg):
-    repo=cfg.get('release_repo','xploit9/cypher')
+    repo=cfg.get('release_repo','xploit9/beacon')
     if not isinstance(repo,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}',repo):
         raise ReleaseCheckError('The configured GitHub release repository is invalid.')
     return repo

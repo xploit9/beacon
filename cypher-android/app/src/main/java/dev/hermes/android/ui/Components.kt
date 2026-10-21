@@ -119,7 +119,7 @@ val LocalOpenNavigationMenu = staticCompositionLocalOf<(() -> Unit)?> { null }
     }
 }
 
-private const val CYPHER_PLUGIN_INSTALL_URL = "https://github.com/xploit9/cypher#install"
+private const val CYPHER_PLUGIN_INSTALL_URL = "https://github.com/xploit9/beacon#install"
 
 internal enum class BeaconMotionMode { Pulse, Sweep, Ripple }
 
