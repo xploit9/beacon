@@ -20,7 +20,9 @@ def scoped(profile,fn):
     from tui_gateway import server
     root=server._profile_home(profile)
     with server._session_profile_runtime_scope({'profile_home':str(root) if root else None}):
-        return fn(Path(root) if root else mobile.home())
+        # None means the launch profile: use the home the resolver compared against, not the live HERMES_HOME,
+        # which Hermes briefly repoints while it deletes another profile (Strix 7d8f96b #4).
+        return fn(Path(root) if root else Path(server._hermes_home))
 
 def config(root):
     import yaml

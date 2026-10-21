@@ -495,3 +495,14 @@ def test_instruction_markers_survive_separators(harness, reason):
         observers.reason_text(reason)
     assert observers.reason_text("Daniel Reyes: client moved the review to 09:00") == \
         "Daniel Reyes: client moved the review to 09:00"
+
+
+def test_launch_profile_scope_uses_the_resolver_home_not_the_live_env(harness, monkeypatch, tmp_path):
+    voice_context = load_private("voice_context")
+    launch = tmp_path / "launch"
+    server = SimpleNamespace(_profile_home=lambda profile: None, _hermes_home=launch,
+                             _session_profile_runtime_scope=lambda scope: nullcontext())
+    monkeypatch.setitem(sys.modules, "tui_gateway", SimpleNamespace(server=server))
+    # Hermes repoints HERMES_HOME while it deletes a profile; the launch profile's notes must not follow it.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-being-deleted"))
+    assert voice_context.scoped("default", lambda root: root) == launch
