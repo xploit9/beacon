@@ -66,7 +66,7 @@ internal fun isMissingCypherPluginRoute(error: Throwable): Boolean =
     (error as? ApiFailure)?.let { it.plugin && (it.status == 404 || it.message.contains("unknown route", ignoreCase = true) || it.message.contains("route not found", ignoreCase = true)) } == true
 internal fun cypherOwnerSetupMessage(error: Throwable): String? =
     (error as? ApiFailure)?.takeIf { it.plugin && it.status == 403 && it.message.equals("Owner not authorized", ignoreCase = true) }
-        ?.let { "Finish setup on your Hermes dashboard: open the Cypher tab." }
+        ?.let { "Finish setup on your Hermes dashboard: open the Beacon tab." }
 internal fun updatedHistoryRows(rows: List<JSONObject>, id: String, path: String, body: JSONObject, result: JSONObject, archivedView: Boolean, query: String, profile: String = ""): List<JSONObject> =
     rows.mapNotNull { row ->
         if (sessionRowId(row) != id || profile.isNotBlank() && row.string("profile", profile) != profile) return@mapNotNull row
@@ -109,7 +109,7 @@ internal fun releaseTerminalChat(chat: ChatState, stream: String, replyConfirmed
 }
 data class EditorState(val scope: Scope? = null, val path: String = "", val text: TextFieldValue = TextFieldValue(), val serverText: String = "", val metadata: JSONObject = JSONObject(), val loading: Boolean = false, val saving: Boolean = false, val error: String = "", val reviewRequired: Boolean = false) { val dirty get() = text.text != serverText }
 data class SideQuestion(val scope: Scope, val question: String, val sessionId: String, val streamId: String, val text: String = "", val status: String = "Responding", val cursor: String = "", val error: String = "")
-data class AppUpdateState(val release: Release? = null, val busy: Boolean = false, val ready: Boolean = false, val status: String = "Cypher checks for updates automatically while connected.")
+data class AppUpdateState(val release: Release? = null, val busy: Boolean = false, val ready: Boolean = false, val status: String = "Beacon checks for updates automatically while connected.")
 data class AppState(val origin: String = BuildConfig.DEFAULT_ORIGIN, val authenticated: Boolean = false, val profile: String = "default", val chatProfile: String = "", val owner: String = "", val tab: String = "Chat", val connected: Boolean = false, val loading: Boolean = false, val error: String = "", val notice: String = "", val bootstrap: JSONObject = JSONObject(), val sessions: List<JSONObject> = emptyList(), val query: String = "", val showSessions: Boolean = false, val morePage: String = "", val cypherOpening: Boolean = false, val cypherError: String = "", val newChatOpening: Boolean = false, val newChatError: String = "", val initialChatReady: Boolean = false, val restoringSession: Boolean = true, val botModeEnabled: Boolean = false, val botModeSwitching: Boolean = false, val setupWizard: Boolean = false, val setupComplete: Boolean = false, val setupStep: String = "connect", val setupPluginMessage: String = "", val setupOrigin: String = "", val historyLoading: Boolean = false, val assistantSessionId: String = "", val historyUnreadable: List<String> = emptyList())
 internal fun voiceKeySetupPage(): String = "Cypher"
 internal data class VoiceCallRequest(val scope:Scope,val conversationId:String)
@@ -569,7 +569,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 val release = app.updates.check(captured, force = !quiet, notify = true)
                 if (generation != originGeneration || client?.scope != captured.scope) return@launch
                 if (quiet && installJob !== installation) return@launch
-                if (!quiet || release != null) _appUpdate.value = AppUpdateState(release = release, ready = app.updates.hasPendingInstall(), status = release?.let { "Cypher ${it.name} is ready for you." } ?: "You're up to date.")
+                if (!quiet || release != null) _appUpdate.value = AppUpdateState(release = release, ready = app.updates.hasPendingInstall(), status = release?.let { "Beacon ${it.name} is ready for you." } ?: "You're up to date.")
             } catch (e: Throwable) {
                 if (e is CancellationException) throw e
                 if (!quiet && generation == originGeneration && client?.scope == captured.scope) _appUpdate.update { it.copy(status = "Couldn’t check for updates. ${e.message.orEmpty()}") }
@@ -577,7 +577,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         }
     }
     private fun updateCallBlock(): String? = when {
-        _incomingBusy.value || app.calls.state.value.active -> "End your call before updating Cypher."
+        _incomingBusy.value || app.calls.state.value.active -> "End your call before updating Beacon."
         app.calls.state.value.state == "ending" || app.calls.service != null || app.calls.spec != null -> "Call cleanup is still finishing. Try the update again in a moment."
         else -> null
     }
@@ -618,7 +618,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         val generation = originGeneration
         _appUpdate.update { it.copy(busy = true) }
         runCatching { app.updates.installPending() }
-            .onSuccess { launched -> if (generation == originGeneration && (client?.scope ?: cachedOwnerScope) == captured) { waitingInstallPermission = !launched; _appUpdate.update { it.copy(ready = true, status = if (launched) "Confirm Update in Android to finish." else "Allow updates from Cypher, then return here to finish.") } } }
+            .onSuccess { launched -> if (generation == originGeneration && (client?.scope ?: cachedOwnerScope) == captured) { waitingInstallPermission = !launched; _appUpdate.update { it.copy(ready = true, status = if (launched) "Confirm Update in Android to finish." else "Allow updates from Beacon, then return here to finish.") } } }
             .onFailure { if (it is CancellationException) throw it; if (generation == originGeneration && (client?.scope ?: cachedOwnerScope) == captured) _appUpdate.update { state -> state.copy(ready = false, status = it.message ?: "Check for the update again.") } }
         if (generation == originGeneration && (client?.scope ?: cachedOwnerScope) == captured) _appUpdate.update { it.copy(busy = false) }
         }
@@ -898,7 +898,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                             persistAuthIfCurrent(retained.auth.copy(cookies = retained.jar.snapshot()), credentialVersion)
                         } catch (saveError: Throwable) {
                             if (saveError is CancellationException) throw saveError
-                            if (generation == originGeneration) notice("The refreshed sign-in could not be retained. Reconnect before leaving Cypher.")
+                            if (generation == originGeneration) notice("The refreshed sign-in could not be retained. Reconnect before leaving Beacon.")
                         }
                     }
                 }
@@ -1539,7 +1539,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
         if (optionalFeaturesPending(_ui.value.bootstrap, owner)) optionalProbe = viewModelScope.launch {
             val optional = try { c.probeOptionalFeatures() } catch (e: Exception) { if (e is CancellationException) throw e; return@launch }
             if (!current() || active.scope != owner) return@launch
-            val pluginMessage = if (optional.string("plugin") == "absent") "Cypher plugin not installed on this Hermes — chat works; calls need the plugin." else ""
+            val pluginMessage = if (optional.string("plugin") == "absent") "Beacon plugin not installed on this Hermes — chat works; calls need the plugin." else ""
             _ui.update { state -> mergeOptionalFeaturesFor(state.bootstrap, owner, optional)?.let { state.copy(bootstrap = it, setupPluginMessage = pluginMessage) } ?: state }
         }
         viewModelScope.launch { try { val prefs = app.cache.read(owner, "chat-preferences")?.let(::JSONObject) ?: json("render_user_markdown" to true, "send_key" to "enter"); if (current()) storeData("profile-settings", prefs) } catch (e: Exception) { if (e is CancellationException) throw e; if (current()) fail(e) } }

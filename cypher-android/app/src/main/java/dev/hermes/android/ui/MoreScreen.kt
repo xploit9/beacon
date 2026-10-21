@@ -274,7 +274,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
             item { LabeledToggle("Format your messages", settings.optBoolean("render_user_markdown", true), { vm.nativePreferences(json("render_user_markdown" to it)) }, "Render Markdown while preserving the original source.") }
             item { LabeledToggle("Show thinking", settings.optBoolean("show_thinking", true), { vm.nativePreferences(json("show_thinking" to it)) }, "Show available reasoning disclosures. This does not change model reasoning effort.") }
             item { LabeledToggle("Auto-follow streaming", settings.optBoolean("auto_scroll_follow", true), { vm.nativePreferences(json("auto_scroll_follow" to it)) }, "Keep the latest streaming reply in view.") }
-            item { LabeledToggle("Background animation", settings.optBoolean("animate_background", true), { vm.nativePreferences(json("animate_background" to it)) }, uiText("Turn it off to pause the Cypher sphere. Reduce motion can also pause it.")) }
+            item { LabeledToggle("Background animation", settings.optBoolean("animate_background", true), { vm.nativePreferences(json("animate_background" to it)) }, uiText("Turn it off to pause the Beacon sphere. Reduce motion can also pause it.")) }
             item { Text("While a reply runs, Queue waits for it and Guide steers it.", style = MaterialTheme.typography.bodyMedium) }
         }
     }
@@ -332,7 +332,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         OutlinedTextField(origin, { origin = it }, label = { Text(uiText("Server address")) }, supportingText = { Text("Your private Hermes address, starting with https://") }, enabled = !ui.loading, modifier = Modifier.fillMaxWidth(), singleLine = true)
         if (ui.error.isNotBlank()) Text(ui.error, color = MaterialTheme.colorScheme.error)
         Button(onClick = { vm.reopenSetupWizard(origin) }, enabled = !ui.loading && origin.isNotBlank(), modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text(uiText("Set up again")) }
-        TextButton(onClick = { vm.openForm(ActionForm("Sign out of Cypher", "", emptyList(), explanation = "Remove the saved Hermes sign-in from this phone. Your encrypted drafts stay here.", actionLabel = "Sign out", onResult = { vm.logout() })) }) { Text(uiText("Sign out")) }
+        TextButton(onClick = { vm.openForm(ActionForm("Sign out of Beacon", "", emptyList(), explanation = "Remove the saved Hermes sign-in from this phone. Your encrypted drafts stay here.", actionLabel = "Sign out", onResult = { vm.logout() })) }) { Text(uiText("Sign out")) }
     }
 }
 @Composable private fun AppUpdates(vm: CypherViewModel) {
@@ -516,7 +516,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         Glass(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 Icon(Icons.Rounded.SystemUpdate, null, Modifier.size(36.dp), tint = MaterialTheme.colorScheme.primary)
-                Text(update.release?.takeIf { !stableBuild || releaseCheckComplete }?.let { "Cypher ${it.name}" } ?: "Cypher", style = MaterialTheme.typography.headlineSmall)
+                Text(update.release?.takeIf { !stableBuild || releaseCheckComplete }?.let { "Beacon ${it.name}" } ?: "Beacon", style = MaterialTheme.typography.headlineSmall)
                 if (!previewBuild) LabeledToggle("Update the app automatically",appAutoUpdates,{ enabled ->
                     appAutoUpdates=enabled
                     app.updates.setAutoUpdateEnabled(enabled)
@@ -528,7 +528,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
                     update.release != null || update.ready -> update.status
                     update.status.contains("up to date", ignoreCase = true) -> "You're up to date."
                     update.status.startsWith("Reconnect to Tailscale") -> "Reconnect to Tailscale to check for updates."
-                    update.status.startsWith("Cypher checks for updates") -> "" // the switch above already says so
+                    update.status.startsWith("Beacon checks for updates") -> "" // the switch above already says so
                     update.busy -> "Checking for an update…"
                     else -> "Check for updates when you're connected to Hermes."
                 }
@@ -546,11 +546,11 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         }
         Glass(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text("Cypher plugin on Hermes", style = MaterialTheme.typography.titleLarge)
+                Text("Beacon plugin on Hermes", style = MaterialTheme.typography.titleLarge)
                 Text(pluginVersions?.summary() ?: pluginRow.message, style = MaterialTheme.typography.bodyLarge)
                 if (pluginVersions?.restartRequired == true || pluginError) Text(pluginRow.message, color = if (pluginError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
                 if (pluginChecking || pluginBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
-                LabeledToggle("Update the Cypher plugin automatically",pluginAutoUpdates,{ enabled -> setPluginAutoUpdates(enabled) },
+                LabeledToggle("Update the Beacon plugin automatically",pluginAutoUpdates,{ enabled -> setPluginAutoUpdates(enabled) },
                     "Update the plugin on Hermes when a new version is ready.",enabled=pluginAutoSettingsAvailable && !pluginAutoSaving)
                 when {
                     pluginAutoSettingsAvailable -> Text(pluginAutoUpdateLine(pluginAutoSettings),style=MaterialTheme.typography.bodySmall,
@@ -564,7 +564,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
             }
         }
         if (!previewBuild) {
-            Text("Cypher verifies each app update before installing it.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Beacon verifies each app update before installing it.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (!alertsAllowed) OutlinedButton(onClick = {
                 context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
             }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Allow update notifications") }
@@ -577,7 +577,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         title = { Text("Review plugin capability changes") },
         text = {
             Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("This update changes what the Cypher plugin can access. Review the changes before continuing.")
+                Text("This update changes what the Beacon plugin can access. Review the changes before continuing.")
                 if (consentLines.isEmpty()) Text("Hermes did not provide a change list. Review the plugin update on your PC before allowing it.")
                 consentLines.forEach { Text("• $it", style = MaterialTheme.typography.bodySmall) }
             }

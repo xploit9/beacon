@@ -1176,7 +1176,7 @@ internal fun toolStepsSummary(tools: List<JSONObject>): String {
     val shown = names.take(3).joinToString(", ")
     return "${tools.size} steps" + if (shown.isNotBlank()) " · " + shown + if (names.size > 3) "…" else "" else ""
 }
-/** Calls use the phone's own provider key; Hermes only needs the Cypher plugin. A missing phone key opens Voice & calls. */
+/** Calls use the phone's own provider key; Hermes only needs the Beacon plugin. A missing phone key opens Voice & calls. */
 internal fun voiceCallsOffered(bootstrap: JSONObject): Boolean = bootstrap.optJSONObject("optional_features")?.optString("plugin") == "available"
 /** MCP ids carry a server and sometimes an eight-character discovery hash. */
 private val toolHashSuffix = Regex("(?i)(?:_|-)[0-9a-f]{8}$")
@@ -1196,6 +1196,7 @@ private fun readableToolName(raw: String, declaredServer: String = "", suffix: S
         name = parts[2]
     }
     name = name.replace(toolHashSuffix, "").removePrefix("mcp__").replace("__", "_")
+    if (name.startsWith("cypher_")) name = "beacon_" + name.removePrefix("cypher_")
     val normalizedServer = server.lowercase(Locale.ROOT).replace(Regex("[^a-z0-9]"), "")
     val service = toolServices.firstOrNull { (prefix, _) -> name.startsWith("${prefix}_") || normalizedServer == prefix.replace("_", "") }
     if (service != null) name = name.removePrefix("${service.first}_")

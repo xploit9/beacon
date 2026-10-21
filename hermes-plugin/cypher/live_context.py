@@ -1,4 +1,4 @@
-"""Small, profile-scoped capability context for Cypher's native turn hook."""
+"""Small, profile-scoped capability context for Beacon's native turn hook."""
 import json
 import math
 import re

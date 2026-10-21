@@ -74,7 +74,7 @@ class ProductionUpdateJourneyTest {
             text(field, marker)
             await { fields().any { it.text?.toString() == marker } }
             click("Show navigation"); click("Settings"); click("App updates")
-            await { find("Update the app automatically")?.isChecked == true && find("Update the Cypher plugin automatically") != null }
+            await { find("Update the app automatically")?.isChecked == true && find("Update the Beacon plugin automatically") != null }
             click("Update the app automatically") // Keep this journey focused on the manual update row.
             shell("input keyevent 3"); SystemClock.sleep(1_000)
             shell("am force-stop $production"); launch()
@@ -92,7 +92,7 @@ class ProductionUpdateJourneyTest {
         click("Show navigation"); click("Settings"); click("App updates")
         await { find("Update the app automatically") != null }
         assertFalse(find("Update the app automatically")?.isChecked ?: true)
-        assertNotNull(find("Update the Cypher plugin automatically"))
+        assertNotNull(find("Update the Beacon plugin automatically"))
         if(find("Check for updates") != null) click("Check for updates")
         capture("update-entry")
         // This is the app's actual authenticated downloader and verified installer action.

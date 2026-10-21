@@ -106,7 +106,7 @@ class LoopbackSetupUiTest {
         compose.onNodeWithText("This Hermes needs an update before phones can sign in.").assertIsDisplayed()
         compose.onNodeWithTag("setup-signin").assertDoesNotExist()
         compose.onNodeWithText("Hermes username").assertDoesNotExist()
-        compose.onNodeWithText("Cypher password").assertDoesNotExist()
+        compose.onNodeWithText("Beacon password").assertDoesNotExist()
     }
 
     @Test fun loopbackSessionRoundTripsOnlyInsideTheEncryptedAuthRecord() {

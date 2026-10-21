@@ -57,7 +57,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 internal fun cameraGranted(context: android.content.Context) = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
 
-internal const val INVALID_CYPHER_QR_HINT = "That isn't a Cypher QR code. Scan the code on your Hermes dashboard's Cypher tab."
+internal const val INVALID_CYPHER_QR_HINT = "That isn't a Beacon QR code. Scan the code on your Hermes dashboard's Beacon tab."
 
 internal fun handleQrScanResult(
     value: String,
@@ -94,7 +94,7 @@ fun QrScanner(onResult: (String) -> Boolean, onClose: () -> Unit, hasCamera: (an
     Column(Modifier.fillMaxSize().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onClose, modifier = Modifier.testTag("setup-scan-close")) { Icon(Icons.Rounded.Close, contentDescription = "Close QR scanner") }
-            Text("Scan Cypher QR", style = MaterialTheme.typography.titleLarge)
+            Text("Scan Beacon QR", style = MaterialTheme.typography.titleLarge)
         }
         Text("Point the camera at the QR code on your Hermes dashboard.", style = MaterialTheme.typography.bodyLarge)
         if (!permitted) {

@@ -52,7 +52,7 @@ def test_unowned_existing_chat_call_error_is_actionable_but_other_lookup_errors_
     })
 
     assert response.status_code == 404
-    assert response.json()['detail'] == 'This chat is not linked to your Hermes sign-in, so Cypher cannot start a call from it. Start a new chat in Cypher.'
+    assert response.json()['detail'] == 'This chat is not linked to your Hermes sign-in, so Beacon cannot start a call from it. Start a new chat in Beacon.'
     rows.clear()
     missing = client.post('/api/plugins/cypher/mobile/calls', json={
         'profile': 'default', 'conversation_id': 'missing', 'voice_provider': 'gemini', 'client_key': True,
@@ -73,7 +73,7 @@ def test_unowned_existing_callback_answer_keeps_404_and_gives_actionable_error(h
     })
 
     assert response.status_code == 404
-    assert response.json()['detail'] == 'This chat is not linked to your Hermes sign-in, so Cypher cannot start a call from it. Start a new chat in Cypher.'
+    assert response.json()['detail'] == 'This chat is not linked to your Hermes sign-in, so Beacon cannot start a call from it. Start a new chat in Beacon.'
     assert verified == []
     with api.mobile.connect() as conn:
         assert conn.execute('SELECT state FROM notices WHERE id=?', (invitation,)).fetchone()['state'] == 'pending'
@@ -110,7 +110,7 @@ def test_call_reservation_rejects_server_key_mode(harness):
     })
 
     assert response.status_code == 400
-    assert response.json()['detail'] == 'Update Cypher: provider keys stay on the phone.'
+    assert response.json()['detail'] == 'Update Beacon: provider keys stay on the phone.'
 
 
 def test_callback_answer_rejects_server_key_mode(harness):
@@ -122,7 +122,7 @@ def test_callback_answer_rejects_server_key_mode(harness):
     })
 
     assert response.status_code == 400
-    assert response.json()['detail'] == 'Update Cypher: provider keys stay on the phone.'
+    assert response.json()['detail'] == 'Update Beacon: provider keys stay on the phone.'
     with api.mobile.connect() as conn:
         assert conn.execute('SELECT state FROM notices WHERE id=?', (invitation,)).fetchone()['state'] == 'pending'
 
@@ -212,4 +212,4 @@ def test_call_reservation_rejects_missing_client_key(harness):
     })
 
     assert response.status_code == 400
-    assert response.json()['detail'] == 'Update Cypher: provider keys stay on the phone.'
+    assert response.json()['detail'] == 'Update Beacon: provider keys stay on the phone.'

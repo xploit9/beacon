@@ -102,7 +102,7 @@ class NativeAuthTest {
             assertFalse(location.orEmpty().contains('?'))
             assertTrue(response.contains("Content-Type: text/html"))
             assertTrue(response.contains("Cache-Control: no-store"))
-            assertTrue(response.contains("Return to Cypher"))
+        assertTrue(response.contains("Return to Beacon"))
         } finally {
             server.close()
             executor.shutdownNow()

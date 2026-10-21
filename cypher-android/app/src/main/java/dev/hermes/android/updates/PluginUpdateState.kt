@@ -17,9 +17,9 @@ internal data class PluginUpdateRowState(
     val error: Boolean = false,
 ) {
     val message: String get() = when {
-        error -> "Couldn't check or update the Cypher plugin. Try again."
+        error -> "Couldn't check or update the Beacon plugin. Try again."
         checking -> "Checking plugin version…"
-        updating -> "Updating the Cypher plugin…"
+        updating -> "Updating the Beacon plugin…"
         consentRequired -> "Review capability changes to continue."
         versions == null -> "Connect to Hermes to check plugin status."
         versions.restartRequired -> "Restart Hermes on your PC to finish."

@@ -56,7 +56,7 @@ fun presentNativeActivity(context: Context, source: String, event: String, activ
     val preview = route?.optJSONObject("preview")
     val content = (preview?.string("title")?.let { boundedNotificationText(it, 120) }?.takeIf { it.isNotBlank() } ?: fallback.first) to
         (preview?.string("body")?.let { boundedNotificationText(it, 640,preserveWhitespace=true) }?.takeIf { it.isNotBlank() } ?: fallback.second)
-    val public = Notification.Builder(context, channel).setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle("Cypher activity").setContentText("Open Cypher to review.").build()
+    val public = Notification.Builder(context, channel).setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle("Beacon activity").setContentText("Open Beacon to review.").build()
     val delete = Intent(context, NativeActivityReceiver::class.java).setAction("dismiss").setData(android.net.Uri.parse("hermes://dismiss/$tag"))
         .putExtra("tag", tag)
     val builder = Notification.Builder(context, channel).setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle(content.first).setContentText(content.second)
@@ -115,9 +115,9 @@ class NativeActivityReceiver : BroadcastReceiver() {
             val tag=activityTag(source,activity)
             val posted=manager.activeNotifications.firstOrNull { it.tag==tag&&it.id==3 }?.notification ?: return
             val open=posted.contentIntent ?: return
-            val review=Notification.Action.Builder(null,"Open Cypher",open)
+            val review=Notification.Action.Builder(null,"Open Beacon",open)
             if(android.os.Build.VERSION.SDK_INT>=31) review.setAuthenticationRequired(true)
-            val message="Android couldn’t queue your response. Open Cypher to review and respond."
+            val message="Android couldn’t queue your response. Open Beacon to review and respond."
             try { manager.notify(tag,3,Notification.Builder.recoverBuilder(context,posted).setContentTitle("Response not sent").setContentText(message)
                 .setStyle(Notification.BigTextStyle().bigText(message)).setActions(review.build()).setOnlyAlertOnce(true).build()) } catch(_:SecurityException) { }
         }

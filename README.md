@@ -1,6 +1,6 @@
-# Cypher
+# Beacon
 
-**Your own Hermes, in your pocket.** Cypher is the Android app for a self-hosted
+**Your own Hermes, in your pocket.** Beacon is the Android app for a self-hosted
 [Hermes Agent](https://github.com/NousResearch/hermes-agent): chat and history, real-time voice calls that use your whole
 Hermes, and an assistant that watches your email and calls you when something important arrives.
 
@@ -21,13 +21,13 @@ Hermes, and an assistant that watches your email and calls you when something im
   your Hermes tools, memory, files, skills and web search, says what it's checking while it works, and greets you by name.
   With Gemini Live it can also see your camera or your screen. Your provider key stays encrypted on the phone and is never
   sent to Hermes. No call audio is kept.
-- **Important emails.** Cypher checks your email with whatever your Hermes already reaches — your own mail MCP server,
+- **Important emails.** Beacon checks your email with whatever your Hermes already reaches — your own mail MCP server,
   Composio, or the `gws` / `himalaya` command line — and tells you, or calls you, when something matters. It learns from your
   **Important / Not important** taps and from what you tell it in chat. Read-only, quiet hours, at most three calls an hour.
-- **Call history** in the Cypher chat, with every transcript.
+- **Call history** in the Beacon chat, with every transcript.
 - **Your whole Hermes.** Profiles (with their names), skills, memory, schedules, files, projects, Kanban, Bot Mode and server
   health — all from the phone. History across every profile, with threads one tap away.
-- **Updates on their own.** Cypher keeps itself and its Hermes plugin up to date from this repository's releases, on by
+- **Updates on their own.** Beacon keeps itself and its Hermes plugin up to date from this repository's releases, on by
   default (Settings › App updates has a switch for each). Every app update is verified before it installs; Android may ask
   for one tap.
 
@@ -36,22 +36,22 @@ Hermes, and an assistant that watches your email and calls you when something im
 **1. On the PC that runs Hermes**, give your coding agent (Codex, Claude Code, or Hermes itself) this prompt. It sets
 everything up end to end and asks you before anything that needs your say:
 
-> Set up Cypher for my Hermes end to end by following https://github.com/xploit9/beacon/blob/main/docs/install-with-agent.md (if you can't open it, read it with `gh api repos/xploit9/beacon/contents/docs/install-with-agent.md -H "Accept: application/vnd.github.raw"`). Do every step yourself:
+> Set up Beacon for my Hermes end to end by following https://github.com/xploit9/beacon/blob/main/docs/install-with-agent.md (if you can't open it, read it with `gh api repos/xploit9/beacon/contents/docs/install-with-agent.md -H "Accept: application/vnd.github.raw"`). Do every step yourself:
 > 1. Check that Hermes is installed and find the profile my dashboard uses; ask me if more than one could be it.
-> 2. Install the Cypher plugin with Hermes' own installer (`hermes -p <profile> plugins install xploit9/beacon/hermes-plugin/cypher --enable`), or update it if it's already installed. Let Hermes' security scan run, and ask me before approving anything it asks about.
-> 3. Restart only that dashboard (ask me first), then confirm it runs the new plugin and shows a **Cypher** tab.
+> 2. Install the Beacon plugin with Hermes' own installer (`hermes -p <profile> plugins install xploit9/beacon/hermes-plugin/cypher --enable`), or update it if it's already installed. Let Hermes' security scan run, and ask me before approving anything it asks about.
+> 3. Restart only that dashboard (ask me first), then confirm it runs the new plugin and shows a **Beacon** tab.
 > 4. Make sure my phone can reach the dashboard over HTTPS. If it can't yet, propose Tailscale Serve and ask before changing any network setting.
-> 5. Run `hermes -p <profile> cypher pair --name "<my phone>"` and show me the dashboard address and pairing code. Each phone gets its own code, and a code lasts 10 minutes, so run it again if it runs out.
-> 6. Then tell me to install the app from https://github.com/xploit9/beacon/releases/latest and, in its setup, enter that address and code (or scan the QR on the dashboard's **Cypher** tab).
+> 5. Run `hermes -p <profile> beacon pair --name "<my phone>"` (or `/beacon-pair` in an owned chat) and show me the dashboard address and pairing code. The old `hermes -p <profile> cypher pair` and `/cypher-pair` commands remain quiet aliases. Each phone gets its own code, and a code lasts 10 minutes, so run it again if it runs out.
+> 6. Then tell me to install the app from https://github.com/xploit9/beacon/releases/latest and, in its setup, enter that address and code (or scan the QR on the dashboard's **Beacon** tab).
 >
 > Never print or store passwords, tokens or API keys, and never modify Hermes core.
 
-If the repository isn't public for you, that PC needs GitHub access first (`gh auth login`).
+The public repository needs no GitHub login; if Releases cannot be reached, check network access.
 
-**2. On your phone**, download `Cypher-1.0.0.apk` from [Releases](https://github.com/xploit9/beacon/releases) and install
+**2. On your phone**, download `Beacon-1.0.0.apk` from [Releases](https://github.com/xploit9/beacon/releases) and install
 it. Open it. Scan the QR, choose a screenshot of it, or type the address and code, then follow the setup wizard.
 
-The app is `dev.hermes.android.stable` ("Cypher"). It installs next to any older Cypher build without touching it.
+The app is `dev.hermes.android.stable` ("Beacon"). It installs next to any older Beacon build without touching it.
 
 ## A first session
 
@@ -63,7 +63,7 @@ The app is `dev.hermes.android.stable` ("Cypher"). It installs next to any older
 </p>
 
 1. **Connect.** Scan the QR code or type your dashboard address. A bare address like `my-pc.tailnet.ts.net:8443` is fine.
-2. **Sign in once** on Hermes' own sign-in page. Cypher returns by itself; there is no second login for the plugin.
+2. **Sign in once** on Hermes' own sign-in page. Beacon returns by itself; there is no second login for the plugin.
 3. **Voice.** Pick Gemini Live, Grok or OpenAI Realtime, paste your key and tap Test. Or skip and add it later.
 4. **Permissions.** Microphone, notifications and background use, one tap each, so calls reach you.
 5. **Chat.** Ask anything — plan your day from your calendar, find the emails that need a reply, draft an answer, compare
@@ -71,7 +71,7 @@ The app is `dev.hermes.android.stable` ("Cypher"). It installs next to any older
 6. **Important emails.** Settings › Assistant › Important emails: switch it on, choose what happens when one arrives (Notify
    or Call) and add a rule like *"call me if a client moves a meeting"*. When it rings, the assistant tells you why.
 7. **Teach it.** Tap Important or Not important on an alert, or just tell it in chat. See and remove what it learned under
-   *What Cypher learned*.
+   *What Beacon learned*.
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/4bccdb85-4ceb-4019-8746-372dda87db1e" width="23%" alt="Which emails need a reply">
@@ -81,26 +81,26 @@ The app is `dev.hermes.android.stable` ("Cypher"). It installs next to any older
 </p>
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/9cc15f65-a568-40b4-bc86-303f505574ae" width="31%" alt="An important email waiting in the Cypher chat">
-  <img src="https://github.com/user-attachments/assets/d57b7861-8617-4988-a814-a2affc8bafab" width="31%" alt="What Cypher learned from an Important tap">
+  <img src="https://github.com/user-attachments/assets/9cc15f65-a568-40b4-bc86-303f505574ae" width="31%" alt="An important email waiting in the Beacon chat">
+  <img src="https://github.com/user-attachments/assets/d57b7861-8617-4988-a814-a2affc8bafab" width="31%" alt="What Beacon learned from an Important tap">
 </p>
 
 ## Voice calls
 
-**You call Cypher** — tomorrow's plan and the inbox, answered from Maya's own calendar and email:
+**You call Beacon** — tomorrow's plan and the inbox, answered from Maya's own calendar and email:
 
 https://github.com/user-attachments/assets/b2a6082b-cdbf-44cb-a4c1-6228603dc029
 
-**Cypher calls you** — a client moved a meeting, the email rule says "call me", and the assistant explains why it's calling:
+**Beacon calls you** — a client moved a meeting, the email rule says "call me", and the assistant explains why it's calling:
 
 https://github.com/user-attachments/assets/e79e6055-e9e0-4669-98e2-086739969481
 
-- **You call.** Tap the call button in the Cypher chat. The assistant answers in a second and works from your Hermes:
+- **You call.** Tap the call button in the Beacon chat. The assistant answers in a second and works from your Hermes:
   calendar, inbox, memory, files, skills, web search and your other tools. Anything that changes something waits for your
   approval in the app.
 - **It calls you.** When an important email arrives and you chose Call, your phone rings like a normal call. The assistant
   tells you why it called, and you can ask follow-ups right away.
-- **Everything lands in the chat.** Both sides of the call are saved as text in the Cypher chat, under Call history.
+- **Everything lands in the chat.** Both sides of the call are saved as text in the Beacon chat, under Call history.
   The audio is never stored.
 - **Your keys stay on the phone.** Gemini, Grok or OpenAI keys are encrypted on the phone, per provider, so switching
   providers never loses a key.
@@ -117,7 +117,7 @@ https://github.com/user-attachments/assets/e79e6055-e9e0-4669-98e2-086739969481
 - A Hermes Agent dashboard reachable over HTTPS from the phone. Tailscale Serve works well.
 - Android 10 or later.
 - For calls: your own Gemini, xAI (Grok) or OpenAI key, entered in the app.
-- The Cypher plugin on Hermes for calls, alerts, call history, Important emails and the plugin pages. Chat and history work
+- The Beacon plugin on Hermes for calls, alerts, call history, Important emails and the plugin pages. Chat and history work
   without it.
 
 ## Privacy and safety
@@ -137,5 +137,5 @@ See [docs/preview.md](docs/preview.md) for the Gradle builds (debug preview and 
 
 ## Licensing
 
-Cypher keeps its GPLv3 license (`LICENSE`). Adapted Hermes Relay code keeps its MIT notice
+Beacon keeps its GPLv3 license (`LICENSE`). Adapted Hermes Relay code keeps its MIT notice
 (`licenses/Hermes-Relay-MIT.txt`). Android library notices are in `cypher-android/THIRD-PARTY-NOTICES.md`.

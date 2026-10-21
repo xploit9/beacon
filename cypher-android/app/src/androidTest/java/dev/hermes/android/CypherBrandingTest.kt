@@ -43,16 +43,23 @@ class CypherBrandingTest {
         assertEquals(expected, observed)
     }
 
-    @Test fun launcherKeepsCypherAndArabicAssistantUsesChosenNameWithStablePackageAndPrivateFilesAuthority() {
+    @Test fun launcherUsesBeaconAndArabicAssistantUsesChosenNameWithStablePackageAndPrivateFilesAuthority() {
         val app = ApplicationProvider.getApplicationContext<CypherApplication>()
         assertTrue(app.packageName == "dev.hermes.android" || app.packageName == "dev.hermes.android.debug")
-        assertEquals(if (app.packageName.endsWith(".debug")) "Cypher Preview" else "Cypher", app.packageManager.getApplicationLabel(app.applicationInfo).toString())
+        assertEquals(if (app.packageName.endsWith(".debug")) "Beacon Preview" else "Beacon", app.packageManager.getApplicationLabel(app.applicationInfo).toString())
         assertNotNull(app.packageManager.resolveContentProvider("${app.packageName}.files", 0))
-        compose.setContent { NativeLocalization("ar") { CompositionLocalProvider(LocalAssistantName provides "Nova") { Text(assistantText("Call Beacon")) } } }
+        compose.setContent { NativeLocalization("ar") { CompositionLocalProvider(LocalAssistantName provides "Nova") { Text(assistantText("Call Beacon")); Text(dev.hermes.android.ui.uiText("Beacon")) } } }
         compose.onNode(hasText("Nova", substring = true)).assertIsDisplayed()
+        compose.onNodeWithText("Beacon").assertIsDisplayed()
         compose.onNode(hasText("Hermes", substring = true)).assertDoesNotExist()
         compose.onNode(hasText("Xara", substring = true)).assertDoesNotExist()
         val catalogs = app.assets.open("native-locales.json").bufferedReader().use { JSONObject(it.readText()) }
+        assertEquals("Open Cypher", catalogs.getJSONObject("en").getString("open cypher"))
+        assertEquals("Open Beacon", catalogs.getJSONObject("en").getString("open beacon"))
+        assertEquals("Cypher", catalogs.getJSONObject("ar").getString("cypher"))
+        assertEquals("Beacon", catalogs.getJSONObject("ar").getString("beacon"))
+        assertTrue(catalogs.getJSONObject("ar").getString("cypher password").contains("Cypher"))
+        assertTrue(catalogs.getJSONObject("ar").getString("beacon password").contains("Beacon"))
         for (language in catalogs.keys()) {
             val values = catalogs.getJSONObject(language)
             for (key in values.keys()) {

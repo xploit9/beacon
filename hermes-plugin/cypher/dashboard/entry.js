@@ -160,12 +160,12 @@
         if (loadError) return h('p', { className: 'mt-3 text-sm text-destructive', role: 'alert' }, 'A secure public dashboard address is not configured.');
         if (!info) return h('p', { className: 'mt-3 text-sm text-muted-foreground', role: 'status' }, 'Loading connection details…');
         return h('div', { className: 'mt-4 space-y-4' },
-          h('p', { className: 'text-sm text-muted-foreground' }, info.session ? 'Scan with Cypher to connect instantly' : 'Install Cypher, tap Scan QR, sign in.'),
+          h('p', { className: 'text-sm text-muted-foreground' }, info.session ? 'Scan with Beacon to connect instantly' : 'Install Beacon, tap Scan QR, sign in.'),
           !qrError ? h('canvas', {
             ref: canvas,
             className: 'block h-auto max-w-full rounded-md bg-white p-2',
             style: { width: '16rem', imageRendering: 'pixelated' },
-            'aria-label': 'Cypher phone connection QR code',
+            'aria-label': 'Beacon phone connection QR code',
           }) : h('p', { className: 'text-sm text-muted-foreground', role: 'status' }, 'QR unavailable; copy the connection link below.'),
           h('div', { className: 'space-y-2' },
             h('div', { className: 'break-all rounded-md bg-muted/40 p-3 font-mono text-xs', tabIndex: 0 }, link),
@@ -190,7 +190,7 @@
             ref: pairingCanvas,
             className: 'block h-auto max-w-full rounded-md bg-white p-2',
             style: { width: '16rem', imageRendering: 'pixelated' },
-            'aria-label': 'Cypher phone pairing QR code',
+            'aria-label': 'Beacon phone pairing QR code',
           }),
           h('p', { className: 'text-sm text-muted-foreground', role: 'status' }, `expires in ${minutes}:${seconds}`),
         );
@@ -215,7 +215,7 @@
             'aria-label': `Remove ${device.name}`,
           }, 'Remove')))) : h('p', { className: 'mt-3 text-sm text-muted-foreground' }, 'No paired phones.'),
           pendingRemoval ? h('div', { className: 'mt-4 space-y-3 rounded-md border border-destructive/50 bg-destructive/10 p-3', role: 'alertdialog', 'aria-labelledby': 'cypher-remove-title' },
-            h('p', { id: 'cypher-remove-title', className: 'text-sm' }, `${pendingRemoval.name} will lose Cypher access and must pair again.`),
+            h('p', { id: 'cypher-remove-title', className: 'text-sm' }, `${pendingRemoval.name} will lose Beacon access and must pair again.`),
             h('div', { className: 'flex justify-end gap-2' },
               h('button', { type: 'button', className: 'rounded-md border border-border px-3 py-2 text-sm', onClick: () => setPendingRemoval(null) }, 'Cancel'),
               h('button', { type: 'button', className: 'rounded-md border border-destructive px-3 py-2 text-sm text-destructive disabled:opacity-50', onClick: confirmRemoveDevice, disabled: removing }, 'Remove device'),

@@ -41,7 +41,7 @@ internal fun incomingRecordMayBePruned(state: String, expiresAtSeconds: Long, no
 
 /** The FCM payload and intent only identify a saved invitation; they cannot authorize a call. */
 suspend fun resolveIncoming(app: CypherApplication, source: String, event: String): Pair<CypherClient, JSONObject> {
-    val invite = app.push.invitation(source, event) ?: run { app.push.discardInvitation(source, event); error("This ${dev.hermes.android.data.currentAssistantName} invitation has ended. Open Cypher history to view it.") }
+    val invite = app.push.invitation(source, event) ?: run { app.push.discardInvitation(source, event); error("This ${dev.hermes.android.data.currentAssistantName} invitation has ended. Open Beacon history to view it.") }
     require(invite.valid()) { "This ${dev.hermes.android.data.currentAssistantName} invitation has expired" }
     val binding = app.push.binding(source) ?: error("Sign in to the invitation's owner account")
     val origin = trustedOrigin(binding.getString("origin"))

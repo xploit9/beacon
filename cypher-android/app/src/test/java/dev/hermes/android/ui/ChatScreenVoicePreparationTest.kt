@@ -91,7 +91,7 @@ class ChatScreenVoicePreparationTest {
 
     @Test fun toolCallMetaToolShowsTheToolHermesRan() {
         fun call(name: String, arguments: String) = JSONObject().put("type", "function").put("function", JSONObject().put("name", name).put("arguments", arguments))
-        assertEquals("Cypher call user", toolDisplayName(call("tool_call", "{\"name\":\"cypher_call_user\",\"arguments\":{}}")))
+        assertEquals("Beacon call user", toolDisplayName(call("tool_call", "{\"name\":\"cypher_call_user\",\"arguments\":{}}")))
         assertEquals("List calendar events · Personal", humanToolName("mcp__personal__list_calendar_events"))
         assertEquals("Search emails result", humanToolName("mcp__tool_gateway_meeting__search_emails", " result"))
         assertEquals("Terminal", humanToolName("terminal"))
@@ -112,7 +112,7 @@ class ChatScreenVoicePreparationTest {
             JSONObject().put("id", 19778).put("role", "assistant").put("tool_name", "ignored"),
         )
         val titles = toolResultTitles(rows)
-        assertEquals("Cypher call user result", titles["19784"])
+        assertEquals("Beacon call user result", titles["19784"])
         assertEquals("Hindsight recall result", titles["19776"])
         assertEquals(setOf("19784", "19776"), titles.keys)
     }

@@ -8,10 +8,10 @@ import pytest
 from test_mobile import harness
 
 
-def _release(version_code=100, version_name='1.0.0', apk_bytes=b'signed stable apk', certificate='a' * 64):
+def _release(version_code=100, version_name='1.0.0', apk_bytes=b'signed stable apk', certificate='a' * 64, prefix='Beacon'):
     digest=hashlib.sha256(apk_bytes).hexdigest()
     return apk_bytes, {
-        'artifact_filename': f'Cypher-{version_name}.apk',
+        'artifact_filename': f'{prefix}-{version_name}.apk',
         'package_name': 'dev.hermes.android.stable',
         'version_code': version_code,
     'version_name': version_name,
@@ -40,8 +40,12 @@ def _fake_github(api, monkeypatch, cfg, assets, versions):
             patterns.extend(requested)
             assert requested and kwargs['shell'] is False and kwargs['timeout']==120
             target=Path(args[args.index('--dir')+1])
+            matched=[]
             for name,content in assets.items():
-                if any(fnmatch.fnmatchcase(name,pattern) for pattern in requested): (target/name).write_bytes(content)
+                if any(fnmatch.fnmatchcase(name,pattern) for pattern in requested):
+                    (target/name).write_bytes(content);matched.append(name)
+            if 'Beacon-*.json' in requested and not matched:
+                return SimpleNamespace(returncode=1,stdout='',stderr='no assets found matching pattern')
             return SimpleNamespace(returncode=0,stdout='',stderr='')
         apk=Path(args[-1]);identity=versions[apk.name]
         version_code,version_name=identity[:2]
@@ -59,7 +63,7 @@ def test_auto_update_and_stable_metadata_work_without_local_android_tools(harnes
     apk,manifest=_release()
     manifest['plugin_version']='1.1.0'
     patterns=_fake_github(api,monkeypatch,cfg,
-        {manifest['artifact_filename']:apk,'Cypher-1.0.0.json':json.dumps(manifest).encode()},
+        {manifest['artifact_filename']:apk,'Beacon-1.0.0.json':json.dumps(manifest).encode()},
         {manifest['artifact_filename']:(100,'1.0.0')})
     installed=['1.0.0'];updates=[]
     monkeypatch.setattr(api,'_installed_plugin_version',lambda:installed[0])
@@ -77,10 +81,45 @@ def test_auto_update_and_stable_metadata_work_without_local_android_tools(harnes
 
     assert updates==['cypher'] and result['result']=='restart_required'
     assert release_checks and release_checks[0]==['cypher']
-    assert patterns==['Cypher-*.json','Cypher-1.0.0.apk']
+    assert patterns==['Beacon-*.json','Beacon-1.0.0.apk']
     assert metadata.status_code==200,metadata.text
     assert metadata.json()['plugin_version']=='1.1.0'
     assert metadata.json()['sha256']==manifest['sha256']
+
+
+def test_beacon_release_assets_take_precedence_over_legacy_cypher_assets(harness,monkeypatch):
+    api,client,cfg,_,_=harness
+    beacon_apk,beacon_manifest=_release()
+    legacy_apk,legacy_manifest=_release(apk_bytes=b'legacy stable apk',prefix='Cypher')
+    assets={
+        'Beacon-1.0.0.json':json.dumps(beacon_manifest).encode(),
+        'Beacon-1.0.0.apk':beacon_apk,
+        'Cypher-1.0.0.json':json.dumps(legacy_manifest).encode(),
+        'Cypher-1.0.0.apk':legacy_apk,
+    }
+    patterns=_fake_github(api,monkeypatch,cfg,assets,
+        {'Beacon-1.0.0.apk':(100,'1.0.0'),'Cypher-1.0.0.apk':(100,'1.0.0')})
+
+    response=client.post('/api/plugins/cypher/mobile/releases/check')
+
+    assert response.status_code==200,response.text
+    assert patterns==['Beacon-*.json','Beacon-1.0.0.apk']
+    assert client.get('/api/plugins/cypher/mobile/releases/latest?package=dev.hermes.android.stable').json()['sha256']==beacon_manifest['sha256']
+
+
+def test_legacy_cypher_release_assets_remain_a_fallback(harness,monkeypatch):
+    api,client,cfg,_,_=harness
+    apk,manifest=_release(prefix='Cypher')
+    patterns=_fake_github(api,monkeypatch,cfg,
+        {'Cypher-1.0.0.json':json.dumps(manifest).encode(),'Cypher-1.0.0.apk':apk},
+        {'Cypher-1.0.0.apk':(100,'1.0.0')})
+
+    response=client.post('/api/plugins/cypher/mobile/releases/check')
+
+    assert response.status_code==200,response.text
+    assert patterns==['Beacon-*.json','Cypher-*.json','Cypher-1.0.0.apk']
+    metadata=client.get('/api/plugins/cypher/mobile/releases/latest?package=dev.hermes.android.stable')
+    assert metadata.status_code==200 and metadata.json()['sha256']==manifest['sha256']
 
 
 def test_release_check_keeps_stable_feed_separate_from_production(harness,monkeypatch):
@@ -96,7 +135,7 @@ def test_release_check_keeps_stable_feed_separate_from_production(harness,monkey
     production_latest=json.dumps(production_manifest).encode()
     (production/'latest.json').write_bytes(production_latest)
     cfg['release_root']=str(production)
-    patterns=_fake_github(api,monkeypatch,cfg,{manifest['artifact_filename']:apk,'Cypher-1.0.0.json':json.dumps(manifest).encode()},
+    patterns=_fake_github(api,monkeypatch,cfg,{manifest['artifact_filename']:apk,'Beacon-1.0.0.json':json.dumps(manifest).encode()},
                           {manifest['artifact_filename']:(100,'1.0.0'),production_manifest['artifact_filename']:(21,'1.0-prod','dev.hermes.android')})
 
     response=client.post('/api/plugins/cypher/mobile/releases/check')
@@ -117,7 +156,7 @@ def test_release_check_keeps_stable_feed_separate_from_production(harness,monkey
     latest=client.get('/api/plugins/cypher/mobile/releases/latest')
     assert latest.status_code==200 and latest.json()['package_name']=='dev.hermes.android'
     assert latest.json()['artifact_path'].endswith('/download')
-    assert patterns[0]=='Cypher-*.json'
+    assert patterns[0]=='Beacon-*.json'
 
 
 def test_new_stable_release_keeps_only_itself_and_the_release_it_replaces(harness,monkeypatch):
@@ -130,14 +169,14 @@ def test_new_stable_release_keeps_only_itself_and_the_release_it_replaces(harnes
         (root/(old['sha256']+'.json')).write_text(json.dumps(old))
     (root/'latest.json').write_text(json.dumps(old))
     apk,manifest=_release()
-    _fake_github(api,monkeypatch,cfg,{manifest['artifact_filename']:apk,'Cypher-1.0.0.json':json.dumps(manifest).encode()},
-                 {manifest['artifact_filename']:(100,'1.0.0'),'Cypher-0.9.5.apk':(95,'0.9.5'),'Cypher-0.9.0.apk':(90,'0.9.0')})
+    _fake_github(api,monkeypatch,cfg,{manifest['artifact_filename']:apk,'Beacon-1.0.0.json':json.dumps(manifest).encode()},
+                 {manifest['artifact_filename']:(100,'1.0.0'),'Beacon-0.9.5.apk':(95,'0.9.5'),'Beacon-0.9.0.apk':(90,'0.9.0')})
 
     response=client.post('/api/plugins/cypher/mobile/releases/check')
 
     assert response.status_code==200 and response.json()['available'] is True,response.text
     assert sorted(path.name for path in root.iterdir())==sorted(
-        ['latest.json','Cypher-1.0.0.apk',manifest['sha256']+'.json','Cypher-0.9.5.apk',old['sha256']+'.json'])
+        ['latest.json','Beacon-1.0.0.apk',manifest['sha256']+'.json','Beacon-0.9.5.apk',old['sha256']+'.json'])
 
 
 @pytest.mark.parametrize(('pin','expected_status'),[(None,200),('b'*64,503)])
@@ -147,7 +186,7 @@ def test_stable_certificate_pin_is_optional_but_enforced_when_set(harness,monkey
     _verification_tools(cfg,tmp)
     cfg.pop('android_stable_certificate_sha256',None)
     if pin is not None: cfg['android_stable_certificate_sha256']=pin
-    _fake_github(api,monkeypatch,cfg,{manifest['artifact_filename']:apk,'Cypher-1.0.0.json':json.dumps(manifest).encode()},
+    _fake_github(api,monkeypatch,cfg,{manifest['artifact_filename']:apk,'Beacon-1.0.0.json':json.dumps(manifest).encode()},
                  {manifest['artifact_filename']:(100,'1.0.0')})
 
     response=client.post('/api/plugins/cypher/mobile/releases/check')
@@ -163,14 +202,14 @@ def test_release_check_skips_apk_download_when_unchanged(harness,monkeypatch):
     (root/manifest['artifact_filename']).write_bytes(apk)
     (root/(manifest['sha256']+'.json')).write_text(json.dumps(manifest))
     (root/'latest.json').write_text(json.dumps(manifest))
-    patterns=_fake_github(api,monkeypatch,cfg,{'Cypher-1.0.0.json':json.dumps(manifest).encode()},
+    patterns=_fake_github(api,monkeypatch,cfg,{'Beacon-1.0.0.json':json.dumps(manifest).encode()},
                           {manifest['artifact_filename']:(100,'1.0.0')})
 
     response=client.post('/api/plugins/cypher/mobile/releases/check')
 
     assert response.status_code==200,response.text
     assert response.json()=={'version_name':'1.0.0','version_code':100,'plugin_version':'1.0.0','available':False}
-    assert patterns==['Cypher-*.json']
+    assert patterns==['Beacon-*.json']
 
 
 def test_release_check_refreshes_plugin_metadata_without_redownloading_same_apk(harness,monkeypatch):
@@ -183,7 +222,7 @@ def test_release_check_refreshes_plugin_metadata_without_redownloading_same_apk(
     (root/(old['sha256']+'.json')).write_text(json.dumps(old))
     (root/'latest.json').write_text(json.dumps(old))
     manifest['plugin_version']='1.1.0'
-    patterns=_fake_github(api,monkeypatch,cfg,{'Cypher-1.0.0.json':json.dumps(manifest).encode()},
+    patterns=_fake_github(api,monkeypatch,cfg,{'Beacon-1.0.0.json':json.dumps(manifest).encode()},
                           {manifest['artifact_filename']:(100,'1.0.0')})
 
     response=client.post('/api/plugins/cypher/mobile/releases/check')
@@ -192,7 +231,7 @@ def test_release_check_refreshes_plugin_metadata_without_redownloading_same_apk(
     assert response.json()['plugin_version']=='1.1.0'
     assert response.json()['available'] is False
     assert json.loads((root/'latest.json').read_text())['plugin_version']=='1.1.0'
-    assert patterns==['Cypher-*.json']
+    assert patterns==['Beacon-*.json']
 
 
 def test_release_check_rejects_metadata_without_plugin_version(harness,monkeypatch):
@@ -200,14 +239,14 @@ def test_release_check_rejects_metadata_without_plugin_version(harness,monkeypat
     apk,manifest=_release()
     _verification_tools(cfg,tmp)
     manifest.pop('plugin_version')
-    patterns=_fake_github(api,monkeypatch,cfg,{'Cypher-1.0.0.json':json.dumps(manifest).encode()},
+    patterns=_fake_github(api,monkeypatch,cfg,{'Beacon-1.0.0.json':json.dumps(manifest).encode()},
                           {manifest['artifact_filename']:(100,'1.0.0')})
 
     response=client.post('/api/plugins/cypher/mobile/releases/check')
 
     assert response.status_code==503
     assert 'plugin version' in response.json()['detail'].lower()
-    assert patterns==['Cypher-*.json']
+    assert patterns==['Beacon-*.json']
 
 
 def test_release_check_reports_missing_github_cli_login_without_exposing_cli_output(harness,monkeypatch):
@@ -233,7 +272,7 @@ def test_release_check_rejects_bad_artifact_before_touching_existing_feed(harnes
     old_latest=json.dumps(old_manifest).encode()
     (root/'latest.json').write_bytes(old_latest)
     manifest['sha256']='0'*64
-    _fake_github(api,monkeypatch,cfg,{manifest['artifact_filename']:apk,'Cypher-1.0.0.json':json.dumps(manifest).encode()},
+    _fake_github(api,monkeypatch,cfg,{manifest['artifact_filename']:apk,'Beacon-1.0.0.json':json.dumps(manifest).encode()},
                  {manifest['artifact_filename']:(100,'1.0.0')})
 
     response=client.post('/api/plugins/cypher/mobile/releases/check')
@@ -253,7 +292,7 @@ def test_release_check_replaces_latest_only_after_all_immutable_files_are_saved(
     (root/'latest.json').write_bytes(old_latest)
     apk,manifest=_release()
     _verification_tools(cfg,tmp)
-    _fake_github(api,monkeypatch,cfg,{manifest['artifact_filename']:apk,'Cypher-1.0.0.json':json.dumps(manifest).encode()},
+    _fake_github(api,monkeypatch,cfg,{manifest['artifact_filename']:apk,'Beacon-1.0.0.json':json.dumps(manifest).encode()},
                  {old_manifest['artifact_filename']:(99,'0.9.0'),manifest['artifact_filename']:(100,'1.0.0')})
     replace=api.os.replace
     def fail_latest(source,destination):
@@ -265,7 +304,7 @@ def test_release_check_replaces_latest_only_after_all_immutable_files_are_saved(
     response=client.post('/api/plugins/cypher/mobile/releases/check')
 
     assert response.status_code==503
-    assert response.json()['detail']=='The verified Cypher release could not be saved on Hermes.'
+    assert response.json()['detail']=='The verified Beacon release could not be saved on Hermes.'
     assert (root/'latest.json').read_bytes()==old_latest
     assert (root/(manifest['sha256']+'.json')).is_file()
     assert (root/manifest['artifact_filename']).read_bytes()==apk

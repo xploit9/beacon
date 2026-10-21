@@ -28,7 +28,7 @@ class CypherSettingsTest {
 
     @Test fun unconfiguredPluginOwnerPointsToHermesDashboardWithoutShowingServerText() {
         assertEquals(
-            "Finish setup on your Hermes dashboard: open the Cypher tab.",
+            "Finish setup on your Hermes dashboard: open the Beacon tab.",
             dev.hermes.android.cypherOwnerSetupMessage(ApiFailure(403, "Owner not authorized", plugin = true)),
         )
         assertNull(dev.hermes.android.cypherOwnerSetupMessage(ApiFailure(403, "Owner not authorized", plugin = false)))

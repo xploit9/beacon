@@ -13,16 +13,16 @@ import dev.hermes.android.data.*
 import kotlinx.coroutines.*
 import org.json.JSONObject
 fun notificationFallback(kind: String): Pair<String, String> = when (kind) {
-    "working" -> "Cypher · Working" to "${dev.hermes.android.data.currentAssistantName} is working on your chat."
-    "failure" -> "Cypher · Work failed" to "Open Cypher to see what went wrong."
-    "completion" -> "Cypher · Reply ready" to "A chat reply is ready. Open Cypher to read it."
-    "approval" -> "Cypher · Approval needed" to "A chat needs your approval before continuing."
-    "clarify" -> "Cypher · Question for you" to "A chat needs your answer before continuing."
-    "task_result" -> "Cypher · Task update" to "A task has an update. Open Cypher to review it."
-    "test" -> "Cypher · Notification test" to "Your notification test reached this device."
-    "incoming_call" -> "Cypher · Callback" to "A Cypher callback is available. Open Cypher to view its history."
-    "release" -> "Cypher · App update" to "An app update is available."
-    else -> "Cypher · Activity" to "Activity is available. Open Cypher to view it."
+    "working" -> "Beacon · Working" to "${dev.hermes.android.data.currentAssistantName} is working on your chat."
+    "failure" -> "Beacon · Work failed" to "Open Beacon to see what went wrong."
+    "completion" -> "Beacon · Reply ready" to "A chat reply is ready. Open Beacon to read it."
+    "approval" -> "Beacon · Approval needed" to "A chat needs your approval before continuing."
+    "clarify" -> "Beacon · Question for you" to "A chat needs your answer before continuing."
+    "task_result" -> "Beacon · Task update" to "A task has an update. Open Beacon to review it."
+    "test" -> "Beacon · Notification test" to "Your notification test reached this device."
+    "incoming_call" -> "Beacon · Callback" to "A Beacon callback is available. Open Beacon to view its history."
+    "release" -> "Beacon · App update" to "An app update is available."
+    else -> "Beacon · Activity" to "Activity is available. Open Beacon to view it."
 }
 fun boundedNotificationText(value: String, limit: Int, preserveWhitespace:Boolean=false): String {
     require(limit >= 2)

@@ -162,7 +162,7 @@ def _client_key_mode(value):
     if _contains_provider_key(value):
         raise HTTPException(400,'Provider keys must remain on the phone')
     if value.get('client_key') is not True:
-        raise HTTPException(400,'Update Cypher: provider keys stay on the phone.')
+        raise HTTPException(400,'Update Beacon: provider keys stay on the phone.')
     if 'voice_provider' not in value:
         raise HTTPException(400,'Choose a voice provider for a phone-key call')
 
@@ -191,14 +191,14 @@ async def claim_owner(request:Request):
     owner,provider=dashboard_identity(request,browser_only=True)
     cfg=mobile.settings()
     if 'owner_id' in cfg or 'owner_provider' in cfg:
-        raise HTTPException(409,'Cypher owner already configured')
+        raise HTTPException(409,'Beacon owner already configured')
     _native_profile_names()
     try:
         created=mobile.claim_owner(owner,provider)
     except ValueError:
         raise HTTPException(403,'Verified dashboard identity invalid') from None
     if not created:
-        raise HTTPException(409,'Cypher owner already configured')
+        raise HTTPException(409,'Beacon owner already configured')
     return {'claimed':True}
 
 @router.post('/pairing')
@@ -286,7 +286,7 @@ def safely(fn,*args):
     except ValueError as exc: raise HTTPException(409,str(exc)) from None
     except (OSError,TypeError): raise HTTPException(503,'Configured resource unavailable') from None
     except RuntimeError: raise HTTPException(503,'Native service unavailable') from None
-_NOT_OWNED_CONVERSATION='This chat is not linked to your Hermes sign-in, so Cypher cannot start a call from it. Start a new chat in Cypher.'
+_NOT_OWNED_CONVERSATION='This chat is not linked to your Hermes sign-in, so Beacon cannot start a call from it. Start a new chat in Beacon.'
 def reject_unowned_conversation(owner,provider,profile,stored):
     try:
         from tui_gateway import server
@@ -345,7 +345,7 @@ async def auto_update_settings(request:Request):
 async def save_auto_update_settings(request:Request):
     owner,_,_,_=identity(request,owner_only=True);value=await body(request,1024)
     enabled=value.get('enabled')
-    if set(value)!={'enabled'} or type(enabled) is not bool: raise HTTPException(400,'Choose whether Cypher updates the plugin automatically')
+    if set(value)!={'enabled'} or type(enabled) is not bool: raise HTTPException(400,'Choose whether Beacon updates the plugin automatically')
     return JSONResponse(await asyncio.to_thread(mobile.set_auto_plugin_updates,owner,enabled),headers={'Cache-Control':'no-store'})
 @router.put('/mobile/voice-settings')
 async def save_voice_settings(request:Request):
@@ -543,7 +543,7 @@ def _install_checkup_task(profile):
     name='Cypher check-ups · 3–4 daily · local 10–22'
     existing=_call_cron_for_profile(profile,'list_jobs',True)
     matches=[job for job in existing if job.get('script')=='cypher-checkups.py']
-    if len(matches)>1: raise RuntimeError('Multiple Cypher check-up tasks require host inspection')
+    if len(matches)>1: raise RuntimeError('Multiple Beacon check-up tasks require host inspection')
     scripts=Path(home)/'scripts'
     scripts.mkdir(parents=True,exist_ok=True)
     if scripts.is_symlink() or getattr(scripts,'is_junction',lambda:False)() or scripts.resolve().parent!=Path(home).resolve(): raise ValueError('Unsafe scripts directory')
@@ -604,7 +604,7 @@ async def target(request:Request):
     value=await body(request,8192);owner,_,profile,_=identity(request,value.get('profile'))
     tok=value.get('token') or value.get('fcm_token')
     package=value.get('package_name',_PRODUCTION_PACKAGE)
-    if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Cypher package')
+    if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Beacon package')
     tid=value.get('id') or value.get('device_id') or hashlib.sha256((owner+':'+profile+':'+package+':'+str(tok)).encode()).hexdigest()
     safely(mobile.ident,tid)
     if not isinstance(tok,str) or not 20<=len(tok)<=4096 or any(ord(c)<32 for c in tok): raise HTTPException(400,'Invalid FCM target')
@@ -631,7 +631,7 @@ async def remove_target_id(target_id:str,request:Request):
 async def notices(request:Request,after:int=0,wait:float=0):
     owner,provider,profile,_=identity(request)
     package=request.query_params.get('package',_PRODUCTION_PACKAGE)
-    if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Cypher package')
+    if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Beacon package')
     if after<0: raise HTTPException(400,'Invalid cursor')
     duration=_bounded_event_wait(wait)
     async def snapshot():
@@ -669,16 +669,16 @@ def _notices_after(owner,profile,after,package=_PRODUCTION_PACKAGE):
     visible=[row for row in rows if row['kind']!='release' or _notice_package(row)==package]
     return visible,reset,cursor
 def notice_preview(kind):
-    if kind=='release': return 'Cypher update available','Open Cypher to install the latest verified update.'
-    if kind=='test': return 'Cypher notification test','Synthetic test. Seeing this notification confirms arrival on this phone.'
-    if kind=='approval': return 'Approval needed','Open Cypher to review the request.'
-    if kind=='clarify': return 'Question for you','Answer here or open Cypher.'
-    if kind=='working': return 'Cypher working','Hermes is working on your chat.'
-    if kind=='activity_end': return 'Activity ended','Open Cypher to review your session.'
+    if kind=='release': return 'Beacon update available','Open Beacon to install the latest verified update.'
+    if kind=='test': return 'Beacon notification test','Synthetic test. Seeing this notification confirms arrival on this phone.'
+    if kind=='approval': return 'Approval needed','Open Beacon to review the request.'
+    if kind=='clarify': return 'Question for you','Answer here or open Beacon.'
+    if kind=='working': return 'Beacon working','Hermes is working on your chat.'
+    if kind=='activity_end': return 'Activity ended','Open Beacon to review your session.'
     if kind=='task_result': return 'Task finished','A task finished.'
-    if kind=='failure': return 'Cypher work failed','Open Cypher to see what went wrong.'
+    if kind=='failure': return 'Beacon work failed','Open Beacon to see what went wrong.'
     if kind=='completion': return 'Reply ready','A reply is ready.'
-    return 'Cypher calling','Open Cypher to hear the saved result.'
+    return 'Beacon calling','Open Beacon to hear the saved result.'
 def reply_preview(messages,limit=300):
     """The newest assistant reply as one plain line for a notification."""
     for message in reversed(messages):
@@ -701,7 +701,7 @@ def notice_wire(row,owner,key=None):
 async def notice_detail(event_id:str,request:Request):
     owner,provider,profile,_=identity(request)
     package=request.query_params.get('package',_PRODUCTION_PACKAGE)
-    if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Cypher package')
+    if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Beacon package')
     with mobile.connect() as conn:
         row=conn.execute('SELECT * FROM notices WHERE id=? AND owner=? AND profile=?',(event_id,owner,profile)).fetchone()
     if not row or row['kind']=='release' and _notice_package(dict(row))!=package: raise HTTPException(404,'Owned notification unavailable')
@@ -885,7 +885,7 @@ def _push_devices(owner,profile):
 _release_failures={}
 def announce_release(cfg,package=_PRODUCTION_PACKAGE):
     """A changed verified feed creates durable hints; clients still verify before installing."""
-    if package not in (_PRODUCTION_PACKAGE,_STABLE_PACKAGE): raise ValueError('Invalid Cypher package')
+    if package not in (_PRODUCTION_PACKAGE,_STABLE_PACKAGE): raise ValueError('Invalid Beacon package')
     owner=cfg.get('owner_id');profiles=cfg.get('profiles')
     if profiles is None:
         try: profiles=_native_profile_names()
@@ -1010,12 +1010,12 @@ def _release(cfg,optional=False,digest=None,package=None,root_path=None):
 @router.get('/mobile/releases/latest')
 async def latest(request:Request):
     _,_,_,cfg=identity(request);package=request.query_params.get('package')
-    if package and package not in (_PRODUCTION_PACKAGE,_STABLE_PACKAGE): raise HTTPException(400,'Unsupported Cypher update package')
+    if package and package not in (_PRODUCTION_PACKAGE,_STABLE_PACKAGE): raise HTTPException(400,'Unsupported Beacon update package')
     return await asyncio.to_thread(safely,release,cfg,False,None,package)
 @router.get('/mobile/releases/{digest}/download')
 async def download(digest:str,request:Request):
     _,_,_,cfg=identity(request);package=request.query_params.get('package')
-    if package and package not in (_PRODUCTION_PACKAGE,_STABLE_PACKAGE): raise HTTPException(400,'Unsupported Cypher update package')
+    if package and package not in (_PRODUCTION_PACKAGE,_STABLE_PACKAGE): raise HTTPException(400,'Unsupported Beacon update package')
     metadata=await asyncio.to_thread(safely,release,cfg,False,digest,package)
     if digest!=metadata['sha256']: raise HTTPException(404,'Immutable artifact unavailable')
     root=_release_root(cfg,stable=package==_STABLE_PACKAGE).resolve();data=json.loads((root/(digest+'.json')).read_text(encoding='utf-8-sig'));path=root/data['artifact_filename']
@@ -1043,12 +1043,12 @@ def _atomic_copy(source,destination,digest):
     if _is_link(destination): raise ReleaseCheckError('The configured release feed contains an unsafe file.')
     if destination.exists():
         if destination.is_file() and _file_sha256(destination)==digest: return
-        raise ReleaseCheckError('A published Cypher APK filename cannot be replaced with different bytes.')
+        raise ReleaseCheckError('A published Beacon APK filename cannot be replaced with different bytes.')
     temporary=destination.with_name('.'+destination.name+'.'+uuid.uuid4().hex+'.tmp')
     try:
         with source.open('rb') as incoming,temporary.open('xb') as outgoing:
             shutil.copyfileobj(incoming,outgoing,1024*1024);outgoing.flush();os.fsync(outgoing.fileno())
-        if _file_sha256(temporary)!=digest: raise ReleaseCheckError('The verified Cypher APK changed while it was being saved.')
+        if _file_sha256(temporary)!=digest: raise ReleaseCheckError('The verified Beacon APK changed while it was being saved.')
         os.replace(temporary,destination)
     finally:
         try: temporary.unlink()
@@ -1058,7 +1058,7 @@ def _atomic_write(destination,content,immutable=False):
     if _is_link(destination): raise ReleaseCheckError('The configured release feed contains an unsafe file.')
     if immutable and destination.exists():
         if destination.is_file() and destination.read_bytes()==content: return
-        raise ReleaseCheckError('A published Cypher release manifest cannot be replaced.')
+        raise ReleaseCheckError('A published Beacon release manifest cannot be replaced.')
     temporary=destination.with_name('.'+destination.name+'.'+uuid.uuid4().hex+'.tmp')
     try:
         with temporary.open('xb') as stream:
@@ -1080,7 +1080,7 @@ def _check_github_release(cfg,before_apk=None):
     flags=subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0
     with tempfile.TemporaryDirectory(prefix='cypher-release-') as temporary:
         download_dir=Path(temporary)
-        def download(pattern):
+        def download(pattern, optional=False):
             try:
                 result=subprocess.run([gh,'release','download','--repo',repo,'--pattern',pattern,'--dir',str(download_dir)],
                                       cwd=str(download_dir),capture_output=True,text=True,check=False,timeout=120,shell=False,creationflags=flags)
@@ -1091,33 +1091,35 @@ def _check_github_release(cfg,before_apk=None):
                 if any(part in detail for part in ('not logged in','not logged into','auth login','authentication required','http 401')):
                     raise ReleaseCheckError('GitHub CLI is not signed in on your PC. Sign in with gh auth login.')
                 if 'release not found' in detail or 'no releases found' in detail:
-                    raise ReleaseCheckError('No stable Cypher release was found in the configured GitHub repository.')
+                    raise ReleaseCheckError('No stable Beacon release was found in the configured GitHub repository.')
                 if 'no assets found' in detail or 'no matching assets' in detail:
-                    raise ReleaseCheckError('The latest GitHub release is missing the Cypher APK or metadata.')
+                    if optional: return []
+                    raise ReleaseCheckError('The latest GitHub release is missing the Beacon APK or metadata.')
                 raise ReleaseCheckError('GitHub CLI cannot access the configured release repository on your PC.')
             return list(download_dir.glob(pattern))
 
-        manifests=download('Cypher-*.json')
-        if len(manifests)!=1: raise ReleaseCheckError('The GitHub release must contain one Cypher metadata file.')
+        manifests=download('Beacon-*.json',optional=True) or download('Cypher-*.json')
+        if len(manifests)!=1: raise ReleaseCheckError('The GitHub release must contain one Beacon metadata file.')
         manifest=manifests[0]
         if _is_link(manifest) or manifest.resolve().parent!=download_dir.resolve():
             raise ReleaseCheckError('The GitHub release contains an unsafe artifact path.')
-        name=re.fullmatch(r'Cypher-([A-Za-z0-9][A-Za-z0-9._-]{0,63})\.json',manifest.name)
+        name=re.fullmatch(r'(Beacon|Cypher)-([A-Za-z0-9][A-Za-z0-9._-]{0,63})\.json',manifest.name)
         if not name or manifest.stat().st_size>16384:
             raise ReleaseCheckError('The GitHub release metadata is outside the supported size limits.')
         try:
             manifest_bytes=manifest.read_bytes();data=json.loads(manifest_bytes.decode('utf-8-sig'))
         except Exception: raise ReleaseCheckError('The GitHub release metadata is invalid.') from None
-        artifact_name=f'Cypher-{name[1]}.apk'
+        version_name=name[2]
+        artifact_name=f'{name[1]}-{version_name}.apk'
         plugin_version=data.get('plugin_version') if isinstance(data,dict) else None
         if _plugin_version_tuple(plugin_version) is None:
-            raise ReleaseCheckError('The GitHub release metadata must include a valid Cypher plugin version.')
+            raise ReleaseCheckError('The GitHub release metadata must include a valid Beacon plugin version.')
         if (not isinstance(data,dict) or data.get('artifact_filename')!=artifact_name or data.get('package_name')!=_STABLE_PACKAGE
-                or data.get('version_name')!=name[1] or type(data.get('version_code')) is not int or data['version_code']<=20
+                or data.get('version_name')!=version_name or type(data.get('version_code')) is not int or data['version_code']<=20
                 or type(data.get('size_bytes')) is not int or not 1<=data['size_bytes']<=256*1024*1024
                 or not isinstance(data.get('sha256'),str) or not re.fullmatch(r'[a-f0-9]{64}',data['sha256'])
                 or not isinstance(data.get('certificate_sha256'),str) or not re.fullmatch(r'[a-fA-F0-9]{64}',data['certificate_sha256'])):
-            raise ReleaseCheckError('The GitHub release metadata does not describe a stable Cypher APK.')
+            raise ReleaseCheckError('The GitHub release metadata does not describe a stable Beacon APK.')
         if before_apk: before_apk(data['version_name'],plugin_version)
         digest=data['sha256']
         previous=None
@@ -1128,13 +1130,13 @@ def _check_github_release(cfg,before_apk=None):
                 return {'version_name':data['version_name'],'version_code':data['version_code'],'plugin_version':plugin_version,'available':False}
             if data['version_code']==previous['version_code']:
                 if digest!=previous['sha256']:
-                    raise ReleaseCheckError('A published Cypher version cannot be replaced with different APK bytes.')
+                    raise ReleaseCheckError('A published Beacon version cannot be replaced with different APK bytes.')
                 if (data['version_name']!=previous['version_name'] or
                         data['certificate_sha256'].lower()!=previous['certificate_sha256'].lower()):
-                    raise ReleaseCheckError('A published Cypher version cannot change its release metadata.')
+                    raise ReleaseCheckError('A published Beacon version cannot change its release metadata.')
                 previous_plugin=previous.get('plugin_version','')
                 if _plugin_version_tuple(previous_plugin) and _plugin_version_tuple(plugin_version)<_plugin_version_tuple(previous_plugin):
-                    raise ReleaseCheckError('A published Cypher release cannot downgrade its plugin version.')
+                    raise ReleaseCheckError('A published Beacon release cannot downgrade its plugin version.')
                 if plugin_version!=previous_plugin:
                     root=_release_root(cfg,create=True,stable=True)
                     _atomic_write(root.resolve()/'latest.json',manifest_bytes)
@@ -1155,7 +1157,7 @@ def _check_github_release(cfg,before_apk=None):
         (stage/(digest+'.json')).write_bytes(manifest_bytes)
         (stage/'latest.json').write_bytes(manifest_bytes)
         try: verified=release(cfg,package=_STABLE_PACKAGE,root_path=stage)
-        except Exception: raise ReleaseCheckError('The downloaded Cypher APK failed signature or metadata verification.') from None
+        except Exception: raise ReleaseCheckError('The downloaded Beacon APK failed signature or metadata verification.') from None
         root=_release_root(cfg,create=True,stable=True)
         if not root.is_dir(): raise ReleaseCheckError('The verified release feed could not be saved on Hermes.')
         root=root.resolve(strict=True)
@@ -1166,9 +1168,10 @@ def _check_github_release(cfg,before_apk=None):
         # Keep this release and the one it replaces (a phone may be mid-download); drop older ones.
         keep={data['artifact_filename'],digest+'.json'}
         if previous and previous.get('package_name')==_STABLE_PACKAGE:
-            keep|={'Cypher-'+previous['version_name']+'.apk',previous['sha256']+'.json'}
+            keep|={prefix+'-'+previous['version_name']+'.apk' for prefix in ('Beacon','Cypher')}
+            keep.add(previous['sha256']+'.json')
         for stale in root.iterdir():
-            if stale.name not in keep and (re.fullmatch(r'Cypher-.+\.apk',stale.name) or re.fullmatch(r'[a-f0-9]{64}\.json',stale.name)):
+            if stale.name not in keep and (re.fullmatch(r'(?:Beacon|Cypher)-.+\.apk',stale.name) or re.fullmatch(r'[a-f0-9]{64}\.json',stale.name)):
                 try: stale.unlink()
                 except OSError: pass
         return {'version_name':verified['version_name'],'version_code':verified['version_code'],'plugin_version':plugin_version,'available':True}
@@ -1184,7 +1187,7 @@ async def check_release_updates(request:Request):
     _,_,_,cfg=identity(request,owner_only=True)
     try: return await asyncio.to_thread(_check_release_and_announce,cfg)
     except ReleaseCheckError as error: raise HTTPException(503,str(error)) from None
-    except Exception: raise HTTPException(503,'The verified Cypher release could not be saved on Hermes.') from None
+    except Exception: raise HTTPException(503,'The verified Beacon release could not be saved on Hermes.') from None
 
 def _installed_plugin_version():
     return _read_plugin_version(ROOT/'plugin.yaml')
@@ -1222,7 +1225,7 @@ def _auto_update_plugin(owner,checked_at,app_version,plugin_version):
     if update.get('consent_required'):
         return mobile.record_auto_update_status(owner,checked_at,'consent_required',app_version,plugin_version,'Review plugin capability changes in Settings.')
     if not update.get('ok'):
-        return mobile.record_auto_update_status(owner,checked_at,'error',app_version,plugin_version,'Could not update the Cypher plugin. Try again later.')
+        return mobile.record_auto_update_status(owner,checked_at,'error',app_version,plugin_version,'Could not update the Beacon plugin. Try again later.')
     installed=_plugin_version_tuple(_installed_plugin_version())
     latest=_plugin_version_tuple(plugin_version)
     if installed is None or latest is None or installed<latest:
@@ -1230,7 +1233,7 @@ def _auto_update_plugin(owner,checked_at,app_version,plugin_version):
     # Git and subfolder installs never report restart_required; this process still runs the old code.
     if update.get('restart_required') or _RUNNING_PLUGIN_VERSION!=_installed_plugin_version():
         return mobile.record_auto_update_status(owner,checked_at,'restart_required',app_version,plugin_version,'Restart Hermes to finish the plugin update.')
-    return mobile.record_auto_update_status(owner,checked_at,'plugin_updated',app_version,plugin_version,'Cypher plugin updated.')
+    return mobile.record_auto_update_status(owner,checked_at,'plugin_updated',app_version,plugin_version,'Beacon plugin updated.')
 
 def auto_update_check(cfg,now=None):
     owner=cfg.get('owner_id')
@@ -1245,9 +1248,9 @@ def auto_update_check(cfg,now=None):
             installed_version=_plugin_version_tuple(_installed_plugin_version())
             if current_state.get('result')=='waiting_for_idle' and pending_version and installed_version and pending_version>installed_version:
                 try: return _auto_update_plugin(owner,last,current_state.get('app_version',''),current_state.get('plugin_version',''))
-                except Exception: return mobile.record_auto_update_status(owner,last,'error',current_state.get('app_version',''),current_state.get('plugin_version',''),'Could not update the Cypher plugin. Try again later.')
+                except Exception: return mobile.record_auto_update_status(owner,last,'error',current_state.get('app_version',''),current_state.get('plugin_version',''),'Could not update the Beacon plugin. Try again later.')
             if current_state.get('result')=='restart_required' and _RUNNING_PLUGIN_VERSION==_installed_plugin_version():
-                return mobile.record_auto_update_status(owner,now,'plugin_updated',current_state.get('app_version',''),current_state.get('plugin_version',''),'Cypher plugin updated.')
+                return mobile.record_auto_update_status(owner,now,'plugin_updated',current_state.get('app_version',''),current_state.get('plugin_version',''),'Beacon plugin updated.')
             return {**current_state,'result':'throttled'}
         mobile.record_auto_update_status(owner,now,'checking',current_state.get('app_version',''),current_state.get('plugin_version',''),'Checking for updates.')
         plugin_update=[]
@@ -1257,7 +1260,7 @@ def auto_update_check(cfg,now=None):
             if latest is None or installed is None or latest<=installed: return
             try: plugin_update.append(_auto_update_plugin(owner,now,app_version,plugin_version))
             except Exception:
-                plugin_update.append(mobile.record_auto_update_status(owner,now,'error',app_version,plugin_version,'Could not update the Cypher plugin. Try again later.'))
+                plugin_update.append(mobile.record_auto_update_status(owner,now,'error',app_version,plugin_version,'Could not update the Beacon plugin. Try again later.'))
         try:
             release_info=_check_release_and_announce(cfg,before_apk=update_plugin_before_apk)
             if plugin_update: return plugin_update[-1]
@@ -1266,7 +1269,7 @@ def auto_update_check(cfg,now=None):
             installed_version=_installed_plugin_version()
             latest=_plugin_version_tuple(plugin_version)
             installed=_plugin_version_tuple(installed_version)
-            if latest is None or installed is None: raise ReleaseCheckError('The Cypher plugin version is unavailable.')
+            if latest is None or installed is None: raise ReleaseCheckError('The Beacon plugin version is unavailable.')
             result='app_staged' if release_info.get('available') else 'up_to_date'
             message='A stable app update is ready.' if release_info.get('available') else 'Up to date.'
             if latest>installed:

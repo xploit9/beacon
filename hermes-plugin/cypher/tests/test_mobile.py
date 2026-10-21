@@ -489,7 +489,7 @@ def test_notification_detail_refs_and_legacy_registration(harness):
     nid=api.mobile.invitation('owner','default','native-stored')
     detail=c.get('/api/plugins/cypher/mobile/notifications/events/'+nid).json()
     assert detail['source_ref']==target['source_ref'] and len(detail['conversation_ref'])==64
-    assert detail['preview']['title']=='Cypher calling'
+    assert detail['preview']['title']=='Beacon calling'
     assert detail['owner_id']=='owner' and detail['kind']=='incoming_call' and detail['state']=='pending'
     assert c.post('/api/plugins/cypher/mobile/callbacks/'+nid+'/decline',json={}).json()['source_ref']==detail['source_ref']
 
@@ -804,7 +804,7 @@ def test_owned_synthetic_notification_status_and_test(harness):
     result=c.post(url+'/test',json={'kind':'fcm'}).json()
     assert result['status']=='queued' and result['device_delivery_confirmed'] is False
     detail=c.get(url+'/events/'+result['event_id']).json()
-    assert detail['kind']=='test' and detail['preview']['title']=='Cypher notification test'
+    assert detail['kind']=='test' and detail['preview']['title']=='Beacon notification test'
     assert c.post(url+'/test',json={'kind':'incoming_call'}).status_code==400
     c.headers['x-fixture-owner']='foreign'
     assert c.get(url+'/status').status_code==403
@@ -1158,7 +1158,7 @@ def test_phone_delivery_uses_owned_assistant_chat_for_cron_owner_rows(harness, m
     assert any(entry['name'] == 'phone' for entry in registrations)
     phone = next(entry for entry in registrations if entry['name'] == 'phone')
     assert phone['cron_deliver_env_var'] == 'PHONE_HOME_CHANNEL'
-    assert phone['env_enablement_fn']() == {'home_channel': {'chat_id': 'phone', 'name': 'Cypher phone'}}
+    assert phone['env_enablement_fn']() == {'home_channel': {'chat_id': 'phone', 'name': 'Beacon phone'}}
     assert callable(phone['standalone_sender_fn'])
     assert callable(phone['adapter_factory'])
 

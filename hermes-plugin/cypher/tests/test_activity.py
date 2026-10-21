@@ -169,7 +169,7 @@ def test_failure_is_standard_private_notification(harness):
     with api.mobile.connect() as conn: row=dict(conn.execute('SELECT * FROM notices').fetchone())
     assert row['kind']=='failure'
     route=api.notice_wire(row,'owner')
-    assert route['session_id']=='owned-chat' and route['preview']['title']=='Cypher work failed'
+    assert route['session_id']=='owned-chat' and route['preview']['title']=='Beacon work failed'
     assert 'actions' not in route and route['activity_ref']==''
 
 

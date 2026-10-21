@@ -1,4 +1,4 @@
-"""Owner-scoped call history from Cypher's existing call and invitation records."""
+"""Owner-scoped call history from Beacon's existing call and invitation records."""
 import asyncio
 import base64
 import json

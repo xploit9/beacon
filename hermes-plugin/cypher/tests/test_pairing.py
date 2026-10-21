@@ -83,6 +83,31 @@ def test_pairing_mints_hashed_code_redeems_once_and_links_owner(harness, monkeyp
     assert reused.status_code == 400
 
 
+@pytest.mark.parametrize("default_name", ["Beacon phone", "Cypher phone"])
+def test_default_pairing_names_accept_the_phone_name(harness, default_name):
+    api, _, _, _, _ = harness
+    mobile = api.mobile
+    pairing = mobile.mint_device_pairing("owner", "default", default_name, "https://hermes.example.test", "hermes.example.test")
+
+    redeemed = mobile.redeem_device_pairing(pairing["code"], "Pixel", "phone")
+
+    assert redeemed["device_id"] == pairing["device_id"]
+    with mobile.connect() as conn:
+        assert conn.execute("SELECT name FROM device_pairings WHERE device_id=?", (pairing["device_id"],)).fetchone()["name"] == "Pixel"
+
+
+def test_legacy_default_phone_label_is_rebranded_without_changing_stored_name(harness):
+    api, _, _, _, _ = harness
+    mobile = api.mobile
+    pairing = mobile.mint_device_pairing("owner", "default", "Cypher phone", "https://hermes.example.test", "hermes.example.test")
+    ticket = mobile.redeem_device_pairing(pairing["code"], None, "phone")["link_ticket"]
+    assert mobile.link_paired_device(pairing["device_id"], ticket, "owner", "basic")
+
+    assert mobile.list_devices("owner")[0]["name"] == "Beacon phone"
+    with mobile.connect() as conn:
+        assert conn.execute("SELECT name FROM cypher_devices WHERE id=?", (pairing["device_id"],)).fetchone()["name"] == "Cypher phone"
+
+
 def test_wrong_expired_and_reused_pairing_codes_share_one_plain_error(harness, monkeypatch):
     api, client, _, _, _ = harness
     set_public_url(monkeypatch, "https://hermes.example.test")
@@ -207,7 +232,10 @@ def test_install_prompts_request_pairing_code_and_allow_qr_image():
     readme = (root / "README.md").read_text(encoding="utf-8")
     guide = (root / "docs" / "install-with-agent.md").read_text(encoding="utf-8")
 
-    assert 'Run `hermes -p <profile> cypher pair --name "<my phone>"` and show me the dashboard address and pairing code.' in readme
+    assert 'Run `hermes -p <profile> beacon pair --name "<my phone>"` (or `/beacon-pair` in an owned chat) and show me the dashboard address and pairing code.' in readme
+    assert 'Use `/beacon-pair`' in readme
+    assert 'hermes -p <profile> cypher pair' in readme or 'hermes -p <profile> cypher pair' in (root / 'hermes-plugin' / 'cypher' / 'README.md').read_text(encoding='utf-8')
+    assert '/cypher-pair' in (root / 'hermes-plugin' / 'cypher' / 'README.md').read_text(encoding='utf-8')
     assert "Each phone gets its own code" in readme
     assert "Scan the QR, choose a screenshot of it, or type the address and code" in readme
     assert "Scan the QR, choose a screenshot of it, or type the address and code." in guide
@@ -242,22 +270,27 @@ def test_cli_and_slash_pair_commands_share_one_copy_friendly_block(harness, monk
 
     plugin.register(ctx)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--profile")
-    cli["cypher"]["setup_fn"](parser)
-    args = parser.parse_args(["-p", "work", "pair", "--name", "Pixel"])
-    with redirect_stdout(io.StringIO()) as output:
-        args.func(args)
-    command_block = output.getvalue()
-    slash_block = slash["cypher-pair"]["handler"]("")
+    blocks=[]
+    for command in ("beacon", "cypher"):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("-p", "--profile")
+        cli[command]["setup_fn"](parser)
+        args = parser.parse_args(["-p", "work", "pair", "--name", "Pixel"])
+        with redirect_stdout(io.StringIO()) as output:
+            args.func(args)
+        blocks.append(output.getvalue())
+        assert "Beacon" in cli[command]["help"]
+    blocks.extend(slash[command]["handler"]("") for command in ("beacon-pair", "cypher-pair"))
 
-    for block in (command_block, slash_block):
+    for block in blocks:
         assert "https://hermes.example.test" in block
         assert "ABC-723" in block
         assert "expires in 10 min" in block
+        assert "deprecated" not in block.lower()
     assert minted[0][:3] == ("owner", "work", "Pixel")
-    assert minted[1][0:2] == ("owner", "work")
-    assert minted[1][2] == "Cypher phone"
+    assert minted[1][:3] == ("owner", "work", "Pixel")
+    assert minted[2][0:2] == ("owner", "work") and minted[2][2] == "Beacon phone"
+    assert minted[3][0:2] == ("owner", "work") and minted[3][2] == "Beacon phone"
 
 
 def test_a_code_made_before_the_first_sign_in_links_to_the_owner_who_signs_in(harness, monkeypatch):

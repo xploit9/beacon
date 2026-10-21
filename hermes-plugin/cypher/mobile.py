@@ -314,7 +314,7 @@ def dashboard_connect_info():
         raise ValueError('A configured public HTTPS dashboard URL is required to connect a phone.') from None
 
 
-def _pairing_name(value, default='Cypher phone'):
+def _pairing_name(value, default='Beacon phone'):
     if value is None:
         value = default
     if (not isinstance(value, str) or not (value := value.strip()) or len(value) > 80
@@ -403,7 +403,7 @@ def redeem_device_pairing(code, device_name, client_host):
                 conn.execute('INSERT INTO pairing_attempts(client_hash,attempted) VALUES(?,?)', (client_hash, now))
                 failure = ValueError(PAIRING_CODE_ERROR)
             else:
-                final_name = row['name'] if row['name'] != 'Cypher phone' or name is None else name
+                final_name = row['name'] if row['name'] not in {'Cypher phone', 'Beacon phone'} or name is None else name
                 conn.execute('UPDATE device_pairings SET name=? WHERE device_id=?', (final_name, row['device_id']))
                 result = {'url': row['dashboard_url'], 'name': row['dashboard_name'],
                           'device_id': row['device_id'], 'link_ticket': ticket}
@@ -436,7 +436,7 @@ def link_paired_device(device_id, ticket, owner, provider, allowed_profiles=None
 def list_devices(owner):
     with LOCK, connect() as conn:
         rows = conn.execute('SELECT id,name,profile,created,last_seen FROM cypher_devices WHERE owner=? AND removed=0 ORDER BY last_seen DESC,created DESC', (owner,)).fetchall()
-    return [{'device_id': row['id'], 'name': row['name'], 'profile': row['profile'],
+    return [{'device_id': row['id'], 'name': 'Beacon phone' if row['name']=='Cypher phone' else row['name'], 'profile': row['profile'],
              'created_at': row['created'], 'last_seen': row['last_seen']} for row in rows]
 
 

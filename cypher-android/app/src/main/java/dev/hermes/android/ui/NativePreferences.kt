@@ -12,7 +12,7 @@ internal fun nativeLanguageFor(locale: java.util.Locale): String {
     return language.takeIf { it in NativeLanguages } ?: "en"
 }
 private val LocalUiStrings = staticCompositionLocalOf { JSONObject() }
-private val nativeAliases = mapOf("Conversations" to "Sessions", "Spaces" to "Workspaces", "Connect securely" to "Sign in", "Cypher password" to "Password", "Model & provider" to "Model", "Providers & models" to "Providers", "Tools & commands" to "Tools", "App updates" to "Updates", "Search conversations" to "Search sessions", "New conversation" to "New chat", "Search this conversation" to "Search in conversation", "Undo last turn" to "Undo", "Retry last turn" to "Retry", "Attach a file" to "Attach file", "Stop response" to "Stop", "Dictate message" to "Dictate", "Toolsets" to "Toolsets")
+private val nativeAliases = mapOf("Conversations" to "Sessions", "Spaces" to "Workspaces", "Connect securely" to "Sign in", "Beacon password" to "Password", "Model & provider" to "Model", "Providers & models" to "Providers", "Tools & commands" to "Tools", "App updates" to "Updates", "Search conversations" to "Search sessions", "New conversation" to "New chat", "Search this conversation" to "Search in conversation", "Undo last turn" to "Undo", "Retry last turn" to "Retry", "Attach a file" to "Attach file", "Stop response" to "Stop", "Dictate message" to "Dictate", "Toolsets" to "Toolsets")
 private val whitespace = Regex("\\s+")
 private fun normalized(value: String) = value.lowercase().replace("…", "...").replace(whitespace, " ").trim()
 
@@ -25,7 +25,7 @@ private fun normalized(value: String) = value.lowercase().replace("…", "...").
     }
     CompositionLocalProvider(LocalUiStrings provides (catalogs?.optJSONObject(language) ?: JSONObject()), content = content)
 }
-/** The assistant's display name from Settings › Assistant (the app itself stays Cypher). */
+/** The assistant's display name from Settings › Assistant (the app itself stays Beacon). */
 val LocalAssistantName = staticCompositionLocalOf { dev.hermes.android.data.DEFAULT_ASSISTANT_NAME }
 /** Fixed words that name the assistant, localized, then carrying the owner's chosen name. */
 internal fun assistantName(value: String, name: String): String =

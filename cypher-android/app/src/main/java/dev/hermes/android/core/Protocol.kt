@@ -31,7 +31,7 @@ data class Scope(val origin: String, val owner: String, val profile: String, val
 fun trustedOrigin(input: String): String {
     val url = input.trim().toHttpUrl()
     require(url.isHttps && url.username.isEmpty() && url.password.isEmpty() && url.encodedPath == "/" && url.query == null && url.fragment == null) {
-        "Enter an HTTPS Cypher origin, without a path, credentials or query."
+        "Enter an HTTPS Beacon origin, without a path, credentials or query."
     }
     return url.toString().trimEnd('/')
 }
@@ -99,7 +99,7 @@ data class Release(val version: Long, val name: String, val packageName: String,
     fun validate(installedPackage: String, installedVersion: Long, installedSigner: String, contract: Int = 2) {
         safeArtifactPath(path)
         require(packageName == installedPackage) { "Update belongs to another app" }
-        require(version > installedVersion) { "Cypher is already up to date" }
+        require(version > installedVersion) { "Beacon is already up to date" }
         require(signer.equals(installedSigner, true)) { "Update signing identity differs" }
         require(sha.matches(Regex("[a-fA-F0-9]{64}")) && size in 1..256L * 1024 * 1024) { "Invalid release manifest" }
         require(contract in minContract..maxContract) { "Update is incompatible with this API contract" }

@@ -27,7 +27,7 @@ class NativeActivityDeviceTest {
         val auth = AuthContext(origin, emptyList(), "synthetic-owner", "default", backend = "hermes-dashboard")
         val prefs = context.getSharedPreferences("push-binding", android.content.Context.MODE_PRIVATE)
         val key = "source:${source.digest()}"
-        val route = json("kind" to kind,"text_reply" to (kind=="clarify"),"preview" to json("complete" to true,"title" to "Cypher needs approval", "body" to "Read the synthetic test folder"),
+        val route = json("kind" to kind,"text_reply" to (kind=="clarify"),"preview" to json("complete" to true,"title" to "Beacon needs approval", "body" to "Read the synthetic test folder"),
             "actions" to JSONArray(listOf("once", "session", "always", "deny").map { json("value" to it, "label" to it) }))
         try {
             presentNativeActivity(context, source, event, activity, kind, System.currentTimeMillis()/1000+120, route)

@@ -15,7 +15,7 @@ class PluginUpdateStateTest {
         val versions = PluginVersions("2.4.0", "2.4.0")
         assertEquals("Checking plugin version…", PluginUpdateRowState(versions, checking = true).message)
         val updating = PluginUpdateRowState(versions, updating = true)
-        assertEquals("Updating the Cypher plugin…", updating.message)
+        assertEquals("Updating the Beacon plugin…", updating.message)
         assertEquals("Updating…", updating.buttonText)
         assertFalse(updating.canUpdate)
     }
@@ -37,13 +37,13 @@ class PluginUpdateStateTest {
 
     @Test fun errorsUseSafeUserLevelCopy() {
         val state = PluginUpdateRowState(PluginVersions("2.4.0", "2.4.0"), error = true)
-        assertEquals("Couldn't check or update the Cypher plugin. Try again.", state.message)
+        assertEquals("Couldn't check or update the Beacon plugin. Try again.", state.message)
         assertTrue(state.canUpdate)
     }
 
     @Test fun anOlderPluginWithoutVersionRouteCanStillBeUpdated() {
         val state = PluginUpdateRowState(error = true)
-        assertEquals("Couldn't check or update the Cypher plugin. Try again.", state.message)
+        assertEquals("Couldn't check or update the Beacon plugin. Try again.", state.message)
         assertEquals("Update plugin", state.buttonText)
         assertTrue(state.canUpdate)
     }

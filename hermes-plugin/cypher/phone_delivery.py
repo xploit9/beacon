@@ -1,4 +1,4 @@
-"""Hermes phone cron target backed by Cypher's durable mobile outbox."""
+"""Hermes phone cron target backed by Beacon's durable mobile outbox."""
 import hashlib
 import os
 import re
@@ -105,7 +105,7 @@ class CypherPhoneAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc)[:240], retryable=True)
 
     async def get_chat_info(self, chat_id):
-        return {"name": "Cypher phone", "type": "dm"}
+        return {"name": "Beacon phone", "type": "dm"}
 
 
 async def standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False):
@@ -126,11 +126,11 @@ def register(ctx):
     if not os.environ.get("PHONE_HOME_CHANNEL", "").strip():
         os.environ["PHONE_HOME_CHANNEL"] = "phone"
     register_platform(
-        name="phone", label="Cypher phone", adapter_factory=CypherPhoneAdapter,
+        name="phone", label="Beacon phone", adapter_factory=CypherPhoneAdapter,
         check_fn=check_requirements, validate_config=validate_config, is_connected=is_connected,
-        required_env=[], install_hint="Cypher queues results for the owned assistant conversation through its durable mobile outbox.",
-        env_enablement_fn=lambda: {"home_channel": {"chat_id": "phone", "name": "Cypher phone"}},
+        required_env=[], install_hint="Beacon queues results for the owned assistant conversation through its durable mobile outbox.",
+        env_enablement_fn=lambda: {"home_channel": {"chat_id": "phone", "name": "Beacon phone"}},
         cron_deliver_env_var="PHONE_HOME_CHANNEL", standalone_sender_fn=standalone_send,
-        platform_hint="Deliver concise task results to the owner's Cypher assistant conversation and phone notification.",
+        platform_hint="Deliver concise task results to the owner's Beacon assistant conversation and phone notification.",
         emoji="📱", pii_safe=True,
     )

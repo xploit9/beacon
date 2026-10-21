@@ -129,6 +129,7 @@ test("a fresh verified dashboard response goes straight to QR and link", () => {
     "/api/plugins/cypher/devices",
   ]);
   assert.equal(page.qrPayload, "cypher://connect?url=https%3A%2F%2Fhermes.example&name=Hermes");
+  assert.equal(JSON.stringify(page.tree).includes("Use Beacon with this Hermes account"), false);
   assert.equal(JSON.stringify(page.tree).includes("Use Cypher with this Hermes account"), false);
 });
 
@@ -188,7 +189,7 @@ test("pairing uses the selected Hermes profile when several are available", asyn
   assert.equal(JSON.parse(pairingOptions.body).profile, "work");
 });
 
-test("devices can be removed from the Cypher dashboard tab", async () => {
+test("devices can be removed from the Beacon dashboard tab", async () => {
   const requests = [];
   const page = renderConnectPhone({ url: "https://hermes.example", name: "Hermes", session: "" }, async (path, options) => {
     requests.push({ path, options });
@@ -203,7 +204,7 @@ test("devices can be removed from the Cypher dashboard tab", async () => {
   await remove.props.onClick();
   assert.equal(requests.some(({ path, options }) => path.endsWith("/devices/device-1") && options?.method === "DELETE"), false);
   const confirmation = page.render();
-  assert.ok(JSON.stringify(confirmation.tree).includes("will lose Cypher access and must pair again"));
+  assert.ok(JSON.stringify(confirmation.tree).includes("will lose Beacon access and must pair again"));
   const confirm = confirmation.nodes.find((node) => node.type === "button" && node.children.includes("Remove device"));
   assert.ok(confirm);
   await confirm.props.onClick();
@@ -214,7 +215,8 @@ test("devices can be removed from the Cypher dashboard tab", async () => {
 test("an unowned response never exposes a claim action", () => {
   const page = renderConnectPhone({ claim_required: true });
 
-  assert.equal(page.nodes.some((node) => node.type === "button" && node.children.includes("Use Cypher with this Hermes account")), false);
+  assert.equal(page.nodes.some((node) => node.type === "button" && node.children.includes("Use Beacon with this Hermes account")), false);
+  assert.equal(JSON.stringify(page.tree).includes("Use Beacon with this Hermes account"), false);
   assert.equal(JSON.stringify(page.tree).includes("Use Cypher with this Hermes account"), false);
   assert.equal(page.requests.some(({ path }) => path.endsWith("/owner/claim")), false);
 });

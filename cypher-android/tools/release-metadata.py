@@ -69,13 +69,13 @@ def _run(args):
 def _plugin_version():
     manifest=Path(__file__).resolve().parents[2]/'hermes-plugin'/'cypher'/'plugin.yaml'
     try: lines=manifest.read_text(encoding='utf-8-sig').splitlines()
-    except OSError: raise ReleaseMetadataError('The Cypher plugin version is unavailable.') from None
+    except OSError: raise ReleaseMetadataError('The Beacon plugin version is unavailable.') from None
     for line in lines:
         if line.startswith('version:'):
             value=line.split(':',1)[1].split('#',1)[0].strip().strip("'\"")
             if re.fullmatch(r'\d+\.\d+\.\d+',value): return value
             break
-    raise ReleaseMetadataError('The Cypher plugin version is invalid.')
+    raise ReleaseMetadataError('The Beacon plugin version is invalid.')
 
 
 def metadata_for_apk(apk_path, aapt, apksigner):
@@ -88,13 +88,13 @@ def metadata_for_apk(apk_path, aapt, apksigner):
     identity=re.search(r"package: name='([^']+)' versionCode='([0-9]+)' versionName='([^']+)'",badging)
     digests=re.findall(r'Signer #[0-9]+ certificate SHA-256 digest: ([a-fA-F0-9]{64})',certificates)
     if not identity or identity[1]!='dev.hermes.android.stable':
-        raise ReleaseMetadataError('The APK is not the Cypher stable package.')
+        raise ReleaseMetadataError('The APK is not the Beacon stable package.')
     version_code=int(identity[2]);version_name=identity[3]
     if version_code<=20 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}',version_name):
         raise ReleaseMetadataError('The stable APK version is invalid.')
     if len(digests)!=1: raise ReleaseMetadataError('The stable APK must have one verified signing identity.')
     return {
-        'artifact_filename':f'Cypher-{version_name}.apk',
+        'artifact_filename':f'Beacon-{version_name}.apk',
         'package_name':identity[1],
         'version_code':version_code,
         'version_name':version_name,
@@ -109,7 +109,7 @@ def _atomic_copy(source, destination, digest):
     if destination.is_symlink(): raise ReleaseMetadataError('The release artifact path is unsafe.')
     if destination.exists():
         if destination.is_file() and _sha256(destination)==digest: return
-        raise ReleaseMetadataError('This Cypher APK filename already contains different bytes.')
+        raise ReleaseMetadataError('This Beacon APK filename already contains different bytes.')
     temporary=destination.with_name('.'+destination.name+'.'+uuid.uuid4().hex+'.tmp')
     try:
         with Path(source).open('rb') as incoming,temporary.open('xb') as outgoing:
@@ -125,7 +125,7 @@ def _atomic_write(destination, content):
     if destination.is_symlink(): raise ReleaseMetadataError('The release metadata path is unsafe.')
     if destination.exists():
         if destination.is_file() and destination.read_bytes()==content: return
-        raise ReleaseMetadataError('This Cypher version already has different release metadata.')
+        raise ReleaseMetadataError('This Beacon version already has different release metadata.')
     temporary=destination.with_name('.'+destination.name+'.'+uuid.uuid4().hex+'.tmp')
     try:
         with temporary.open('xb') as stream:
@@ -144,7 +144,7 @@ def write_release_metadata(apk_path, output_dir=None, *, aapt=None, apksigner=No
     output=Path(output_dir).expanduser() if output_dir else apk.parent
     output.mkdir(parents=True,exist_ok=True)
     artifact=output/metadata['artifact_filename']
-    manifest=output/f"Cypher-{metadata['version_name']}.json"
+    manifest=output/f"Beacon-{metadata['version_name']}.json"
     _atomic_copy(apk,artifact,metadata['sha256'])
     content=(json.dumps(metadata,indent=2,sort_keys=True)+'\n').encode('utf-8')
     _atomic_write(manifest,content)

@@ -99,7 +99,7 @@ class SetupWizardUiTest {
     @Test fun setupWizardSuppressedNoticeAndErrorAreClearedWhenItCloses() {
         var setupWizard by mutableStateOf(true)
         var error by mutableStateOf("")
-        var notice by mutableStateOf("For this dashboard, scan the QR code with Cypher's scanner to sign in.")
+        var notice by mutableStateOf("For this dashboard, scan the QR code with Beacon's scanner to sign in.")
         var cleared = 0
         val snackbar = SnackbarHostState()
         compose.setContent { MaterialTheme {
@@ -168,7 +168,7 @@ class SetupWizardUiTest {
         try {
             app.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
             val activity = monitor.waitForActivityWithTimeout(5_000)
-            assertNotNull("Auth return trampoline should bring Cypher to the foreground", activity)
+        assertNotNull("Auth return trampoline should bring Beacon to the foreground", activity)
             assertTrue(activity is CypherActivity)
             assertTrue(activity?.intent?.data == null)
             instrumentation.runOnMainSync { activity?.finish() }
@@ -186,7 +186,7 @@ class SetupWizardUiTest {
                 SetupWizardScreen(
                     state = state,
                     onProbe = { raw -> reachedOrigin = parseCypherConnectInput(raw); state = state.copy(origin = reachedOrigin, setupStep = "signin", error = "") },
-                    onSignIn = { state = state.copy(authenticated = true, setupStep = "permission-microphone", setupPluginMessage = "Cypher plugin not installed on this Hermes — chat works; calls need the plugin.") },
+                    onSignIn = { state = state.copy(authenticated = true, setupStep = "permission-microphone", setupPluginMessage = "Beacon plugin not installed on this Hermes — chat works; calls need the plugin.") },
                     onAdvancePermission = { state = state.copy(setupStep = when (state.setupStep) { "permission-microphone" -> "permission-notifications"; "permission-notifications" -> "permission-full-screen"; else -> "done" }) },
                     onFinish = { finished = true; state = state.copy(setupWizard = false, setupStep = "done") },
                     onReopen = { state = state.copy(origin = it, setupStep = "connect") },
@@ -196,7 +196,7 @@ class SetupWizardUiTest {
         }
 
         compose.onNodeWithTag("setup-address").performTextInput("cypher://connect?url=https%3A%2F%2Fhermes.example&name=Hermes")
-        compose.onNodeWithText("Cypher password").assertDoesNotExist()
+        compose.onNodeWithText("Beacon password").assertDoesNotExist()
         compose.onNodeWithText("Hermes username").assertDoesNotExist()
         compose.onNodeWithTag("setup-connect").performClick()
         assertEquals("https://hermes.example", reachedOrigin)
@@ -521,7 +521,7 @@ class SetupWizardUiTest {
     }
 
     @Test fun missingPluginMessageIsShownWithoutBlockingSignIn() {
-        val message = "Cypher plugin not installed on this Hermes — chat works; calls need the plugin."
+        val message = "Beacon plugin not installed on this Hermes — chat works; calls need the plugin."
         val state = AppState(origin = "https://hermes.example", authenticated = true, setupWizard = true, setupStep = "done", restoringSession = false, setupPluginMessage = message)
         compose.setContent { NativeLocalization("en") { CypherTheme(dark = true) {
             SetupWizardScreen(state, onProbe = {}, onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {})

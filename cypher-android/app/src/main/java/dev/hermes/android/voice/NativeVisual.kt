@@ -175,7 +175,7 @@ internal class NativeVisual(private val context:Context,private val handler:Hand
             } catch(error:Exception) { fail(epoch,error.message?:"Screen frame unavailable") }
         },handler)
         watch(epoch)
-        try { display=capture.createVirtualDisplay("Cypher screen",640,960,context.resources.displayMetrics.densityDpi,DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,images.surface,null,handler) }
+        try { display=capture.createVirtualDisplay("Beacon screen",640,960,context.resources.displayMetrics.densityDpi,DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,images.surface,null,handler) }
         catch(error:Exception) { startupFailed(epoch);throw error }
     }
     suspend fun stop() {

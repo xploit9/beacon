@@ -319,7 +319,7 @@ class PushManager(private val app: CypherApplication) {
             .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP).putExtra("push_source", source).putExtra("push_event", event)
         val callback = PendingIntent.getActivity(app, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         try { manager.notify(invite.key, 2, NotificationCompat.Builder(app, "hermes-messages").setSmallIcon(R.drawable.ic_cypher_notification)
-            .setContentTitle("Cypher · Missed call").setContentText("Open Cypher to call back or view its history.")
+            .setContentTitle("Beacon · Missed call").setContentText("Open Beacon to call back or view its history.")
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE).setSilent(true).setAutoCancel(true).setContentIntent(callback)
             .addAction(R.drawable.ic_cypher, "Call back", callback).build()) } catch (_: SecurityException) { /* Notification permission was revoked. */ }
     }
@@ -511,7 +511,7 @@ private fun receivePush(context: Context, data: Map<String, String>, localAction
         val intent = Intent(context, CypherActivity::class.java).setData(android.net.Uri.parse("hermes://activity/$routeKey")).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP).putExtra("push_source", source).putExtra("push_event", event)
         val pending = PendingIntent.getActivity(context, "$source:$event".hashCode(), intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val content = notificationFallback(data["kind"].orEmpty())
-        val public = NotificationCompat.Builder(context, activityChannel).setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle(content.first).setContentText("Open Cypher to view private activity.").build()
+        val public = NotificationCompat.Builder(context, activityChannel).setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle(content.first).setContentText("Open Beacon to view private activity.").build()
         if (!incoming) try { manager.notify(routeKey, 1, NotificationCompat.Builder(context, activityChannel).setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle(content.first).setContentText(content.second).setStyle(NotificationCompat.BigTextStyle().bigText(content.second)).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).setPublicVersion(public).setSilent(silentPushNotification(nativeKind, app.calls.uiVisible)).setContentIntent(pending).setAutoCancel(true).build()) } catch (_: SecurityException) { return }
         if (invite != null && ring) {
             val invite = invite!!
@@ -564,10 +564,10 @@ fun incomingCallChannel(manager: NotificationManager): String {
     // Keep the old ID so owner-configured channel settings remain attached during migration.
     val legacy = manager.getNotificationChannel("xara-incoming")
     // Rename the existing channel object, retaining its sound, mute and vibration choices.
-    legacy?.let { it.name = "Cypher incoming calls"; manager.createNotificationChannel(it) }
+    legacy?.let { it.name = "Beacon incoming calls"; manager.createNotificationChannel(it) }
     // Preserve deliberate mute/custom choices; untouched default-ding channels migrate once.
     if (legacy != null && (preserveIncomingChannel(legacy.hasUserSetImportance(), android.os.Build.VERSION.SDK_INT >= 30 && legacy.hasUserSetSound()))) return legacy.id
-    manager.createNotificationChannel(NotificationChannel(CypherMessagingService.INCOMING_CHANNEL, "Cypher incoming calls", NotificationManager.IMPORTANCE_HIGH).apply {
+    manager.createNotificationChannel(NotificationChannel(CypherMessagingService.INCOMING_CHANNEL, "Beacon incoming calls", NotificationManager.IMPORTANCE_HIGH).apply {
         setSound(android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_RINGTONE), android.media.AudioAttributes.Builder().setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION_RINGTONE).setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
         enableVibration(true)
     })
@@ -582,7 +582,7 @@ internal fun notificationChannel(kind: String): String = when(kind) {
 }
 fun ensureActivityChannels(manager: NotificationManager) {
     val legacy = manager.getNotificationChannel(CypherMessagingService.CHANNEL)
-    listOf("hermes-messages" to "Cypher messages", "hermes-tasks" to "Cypher tasks", "hermes-approvals" to "Cypher approvals").forEach { (id, name) ->
+    listOf("hermes-messages" to "Beacon messages", "hermes-tasks" to "Beacon tasks", "hermes-approvals" to "Beacon approvals").forEach { (id, name) ->
         if (manager.getNotificationChannel(id) == null) {
             val channel = NotificationChannel(id, name, legacy?.importance ?: NotificationManager.IMPORTANCE_DEFAULT)
             // Inherit existing mute/sound choices when splitting the legacy activity channel.

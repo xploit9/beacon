@@ -91,13 +91,13 @@ class CypherActivity : ComponentActivity() {
                 if (ui.restoringSession) return@LaunchedEffect
                 val origin = pendingConnectionOrigin
                 if (origin == null) {
-                    model.notice("This Cypher connection link is invalid.")
+                    model.notice("This Beacon connection link is invalid.")
                     pendingConnectionLink = null
                     pendingConnectionSessionNotice = false
                 } else if (!hasKnownOrigin) {
                     externalConnectionLinkOrigin = origin
                     model.openSetupLink(link, confirmed = false)
-                    if (pendingConnectionSessionNotice) model.notice("For this dashboard, scan the QR code with Cypher's scanner to sign in.")
+                    if (pendingConnectionSessionNotice) model.notice("For this dashboard, scan the QR code with Beacon's scanner to sign in.")
                     pendingConnectionLink = null
                     pendingConnectionSessionNotice = false
                 }
@@ -155,7 +155,7 @@ class CypherActivity : ComponentActivity() {
                                 if (link != null && origin != null) {
                                     externalConnectionLinkOrigin = origin
                                     model.openSetupLink(link, confirmed = true)
-                                    if (pendingConnectionSessionNotice) model.notice("For this dashboard, scan the QR code with Cypher's scanner to sign in.")
+                                    if (pendingConnectionSessionNotice) model.notice("For this dashboard, scan the QR code with Beacon's scanner to sign in.")
                                 }
                                 cancelConnectionLink()
                             }) { Text("Connect") }
@@ -297,7 +297,7 @@ internal fun NativeFeedbackEffect(
             Column(Modifier.safeDrawingPadding(), verticalArrangement = Arrangement.Center, horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally) {
                 Icon(androidx.compose.ui.res.painterResource(R.drawable.ic_cypher), null, Modifier.size(64.dp), tint = androidx.compose.ui.graphics.Color.Unspecified)
                 Spacer(Modifier.height(16.dp))
-                Text("Cypher", style = MaterialTheme.typography.displaySmall)
+                Text(uiText("Beacon"), style = MaterialTheme.typography.displaySmall)
             }
         }
     } else if (!ui.authenticated || ui.setupWizard) {

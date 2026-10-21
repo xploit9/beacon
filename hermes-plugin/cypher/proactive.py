@@ -175,10 +175,10 @@ def _soul_content(path, active):
     end = re.compile(r"(?m)^" + re.escape(SOUL_END) + r"(?:\r?\n|$)")
     starts, ends = list(begin.finditer(content)), list(end.finditer(content))
     if len(starts) != len(ends) or len(starts) > 1:
-        raise ValueError("Cypher proactive SOUL.md markers are malformed")
+        raise ValueError("Beacon proactive SOUL.md markers are malformed")
     if starts:
         if starts[0].start() > ends[0].start():
-            raise ValueError("Cypher proactive SOUL.md markers are reversed")
+            raise ValueError("Beacon proactive SOUL.md markers are reversed")
         if not active:
             return content[:starts[0].start()] + content[ends[0].end():]
         newline = "\r\n" if "\r\n" in content else "\n"
@@ -201,7 +201,7 @@ def _write_profile_instructions(home, active):
     if _distribution_owns_soul(home):
         if not active:
             return
-        raise ValueError("This Hermes profile distribution owns SOUL.md; Cypher will not change it")
+        raise ValueError("This Hermes profile distribution owns SOUL.md; Beacon will not change it")
     new_soul = _soul_content(soul, active)
     if new_soul != (soul.read_bytes().decode("utf-8") if soul.exists() else ""):
         _atomic_text(soul, new_soul)
@@ -212,7 +212,7 @@ def _validate_profile_instructions(home, active):
     _check_file(soul)
     if active:
         if _distribution_owns_soul(home):
-            raise ValueError("This Hermes profile distribution owns SOUL.md; Cypher will not change it")
+            raise ValueError("This Hermes profile distribution owns SOUL.md; Beacon will not change it")
     elif _distribution_owns_soul(home):
         return
     _soul_content(soul, active)
@@ -771,7 +771,7 @@ def _store_learned(mobile, owner, profile, notes):
 
 
 def sync_learned(mobile, owner, profile):
-    """Owner verdicts live in Cypher's store and reach only the email watch, through its Hermes notepad: email
+    """Owner verdicts live in Beacon's store and reach only the email watch, through its Hermes notepad: email
     wording never enters Hermes profile memory, which every chat reads (Strix 7d8f96b #2)."""
     from hermes_cli.web_server_profiles import _profile_scope
     from cron.notepad import delete_note, set_note
@@ -790,7 +790,7 @@ def sync_learned(mobile, owner, profile):
 
 
 def _move_legacy_learned(mobile, owner, profile):
-    """Earlier builds kept verdicts as Hermes user-memory entries; move them into Cypher's store."""
+    """Earlier builds kept verdicts as Hermes user-memory entries; move them into Beacon's store."""
     from hermes_cli.web_server_profiles import _profile_scope
     from tools.memory_tool import load_on_disk_store
     # Keep migration on the same profile-before-store order as live notepad sync.
@@ -806,7 +806,7 @@ def _move_legacy_learned(mobile, owner, profile):
         # One at a time: Hermes refuses a single batch that would empty USER.md.
         for entry in legacy:
             if not store.remove("user", entry, matched_entry=entry).get("success"):
-                raise RuntimeError("Hermes user memory could not hand over Cypher's email notes")
+                raise RuntimeError("Hermes user memory could not hand over Beacon's email notes")
 
 
 def _without_links(text):
@@ -835,7 +835,7 @@ def _learned_notes(reason):
     summary = reason_text(reason.split(" Rule: ", 1)[0].rstrip("."), 240)
     summary = _without_links(summary.replace('"', "'"))[:160]
     if not summary.strip(". "):
-        raise ValueError("This alert has nothing Cypher can learn from")
+        raise ValueError("This alert has nothing Beacon can learn from")
     return {verdict: label + f': "{summary}"'
             for verdict, label in (("important", "Important"), ("not_important", "Not important"))}
 

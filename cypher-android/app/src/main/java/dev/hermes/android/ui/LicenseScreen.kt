@@ -22,8 +22,8 @@ internal val licenseDocuments = listOf(
     var selected by remember { mutableStateOf("hermes-LICENSE.txt") }
     val text by produceState("", selected) { value = withContext(Dispatchers.IO) { try { vm.app.assets.open(if (selected.startsWith("rich/")) selected else "licenses/$selected").bufferedReader().use { it.readText() } } catch (_: java.io.IOException) { "License text unavailable" } } }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text(uiText("Cypher and native rendering libraries"), style = MaterialTheme.typography.titleLarge)
-        Text("Cypher Android · GPL-3.0-only. The complete corresponding source and retained upstream source archives accompany this private APK release.", style = MaterialTheme.typography.bodySmall)
+        Text(uiText("Beacon and native rendering libraries"), style = MaterialTheme.typography.titleLarge)
+        Text("Beacon Android · GPL-3.0-only. The complete corresponding source and retained upstream source archives accompany this APK release.", style = MaterialTheme.typography.bodySmall)
         Text("Mermaid 11.17.2 · MIT. Source: https://github.com/mermaid-js/mermaid. Bundled offline diagram grammar and renderer.", style = MaterialTheme.typography.bodySmall)
         Text("jsoup 1.23.2 · MIT. Source: https://jsoup.org. Parses offline HTML before isolated previews.", style = MaterialTheme.typography.bodySmall)
         Text("core-js 3.50.0 · MIT. Source: https://github.com/zloirock/core-js. Selected compatibility functions for the isolated diagram renderer.", style = MaterialTheme.typography.bodySmall)

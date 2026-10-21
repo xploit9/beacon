@@ -44,7 +44,7 @@ internal data class PendingPairing(val dashboardUrl: String, val displayName: St
 internal data class PairedDevice(val id: String, val name: String, val lastSeen: String)
 
 internal class PairingFailure(message: String, cause: Throwable? = null) : IOException(message, cause)
-internal class DeviceRemovedFailure : IOException("This phone was removed from Cypher on your PC.")
+internal class DeviceRemovedFailure : IOException("This phone was removed from Beacon on your PC.")
 
 internal object NativePairing {
     private const val PAIRING_PREFIX = "/api/plugins/cypher/pairing"
@@ -110,7 +110,7 @@ internal object NativePairing {
         withContext(Dispatchers.IO) {
             val saved = context.applicationContext.getSharedPreferences("native-pairing", Context.MODE_PRIVATE)
                 .edit().putString(accountKey(client.scope), grant.deviceId).commit()
-            if (!saved) throw PairingFailure("This phone linked, but Cypher couldn't save its device ID.")
+            if (!saved) throw PairingFailure("This phone linked, but Beacon couldn't save its device ID.")
         }
     }
 

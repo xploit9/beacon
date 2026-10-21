@@ -41,7 +41,7 @@ class NativePhoneSessionTest {
         client.login(credentials.getString("password"), username = credentials.getString("username"))
         var callId=""; var stored=""; var runtime=""
         try {
-            val created = client.post("/api/session/new", json("title" to "Cypher Android voice bridge verification"))
+            val created = client.post("/api/session/new", json("title" to "Beacon Android voice bridge verification"))
             stored = created.getString("session_id")
             val freshRuntime = created.getString("runtime_session_id"); runtime = freshRuntime
             val fresh = client.get("/api/session", mapOf("session_id" to stored))

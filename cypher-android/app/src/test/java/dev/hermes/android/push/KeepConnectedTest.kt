@@ -369,7 +369,7 @@ class KeepConnectedTest {
             val failures = listOf(
                 401 to "Hermes rejected the connection (401)",
                 403 to "Hermes refused profile academic (403)",
-                404 to "Cypher plugin route missing (404)",
+                404 to "Beacon plugin route missing (404)",
                 409 to "Hermes refused the notification request (409)",
                 500 to "Hermes server error (500)",
                 503 to "Hermes server error (503)",

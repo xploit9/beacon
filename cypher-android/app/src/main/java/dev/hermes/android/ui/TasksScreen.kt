@@ -50,7 +50,7 @@ import kotlinx.coroutines.launch
             if (capability != null && recordError(capability).isBlank() && !capability.optBoolean("checkups_ready")) Text("Set up scheduled callbacks on your computer to enable check-up calls.", style = MaterialTheme.typography.bodySmall)
             }
         }
-        if (crons?.optBoolean("cron_unavailable") == true) item { EmptyState("Scheduling is unavailable", "Scheduling is not enabled for your Cypher. Check the connection in Settings & more.", Icons.Rounded.EventBusy) }
+        if (crons?.optBoolean("cron_unavailable") == true) item { EmptyState("Scheduling is unavailable", "Scheduling is not enabled for your Beacon. Check the connection in Settings & more.", Icons.Rounded.EventBusy) }
         if (crons?.has("_error") == true) item { Text(crons.string("_error"), color = MaterialTheme.colorScheme.error) }
         if (crons == null) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
         items(crons?.rows("jobs").orEmpty(), key = { it.string("id") }) { job ->
@@ -70,7 +70,7 @@ import kotlinx.coroutines.launch
                     TextButton(enabled = pending.isBlank(), onClick = { vm.openForm(ActionForm("Run this task", "/api/crons/run", emptyList(), json("job_id" to id), explanation = if(job.optBoolean("no_agent")) "Run the task script once. Check-up tasks consider only an opportunity due this minute; missed slots are skipped." else "Run this task now with its saved tools and delivery.", actionLabel = "Run now", onResult = { refresh() })) }) { Text(uiText("Run now")) }
                     TextButton(enabled = pending.isBlank() && scheduleState(job) != "Completed", onClick = { pending = id; actionScope.launch { vm.action(if (schedulePaused(job)) "/api/crons/resume" else "/api/crons/pause", json("job_id" to id), refresh = false) { _, _ -> refresh() }.join(); pending = "" } }) { Text(if (schedulePaused(job)) "Resume" else "Pause") }
                     TextButton(onClick = { selected = if (selected == id) "" else id }) { Text(uiText("Run history")) }
-                    TextButton(enabled = pending.isBlank(), onClick = { vm.openForm(ActionForm("Delete schedule", "/api/crons/delete", emptyList(), json("job_id" to id), explanation = "Remove this scheduled task from Cypher.", actionLabel = "Delete", onResult = { refresh() })) }) { Text(uiText("Delete")) }
+                    TextButton(enabled = pending.isBlank(), onClick = { vm.openForm(ActionForm("Delete schedule", "/api/crons/delete", emptyList(), json("job_id" to id), explanation = "Remove this scheduled task from Beacon.", actionLabel = "Delete", onResult = { refresh() })) }) { Text(uiText("Delete")) }
                 }
                 if (selected == id) {
                     val history = data["cron-history:$id"]
@@ -98,7 +98,7 @@ private fun cronForm(vm: CypherViewModel, job: JSONObject?, targets: List<JSONOb
         seed.put("schedule", nativeScheduleInput(job))
         seed.put("_original", seed.copy())
     }
-    val labels = mapOf("local" to "Save result in Cypher") + targets.associate { it.string("id") to if(it.string("id") == "local") "Save result in Cypher" else it.string("name") + if(it.optBoolean("home_target_set")) "" else " (not configured)" }
+    val labels = mapOf("local" to "Save result in Beacon") + targets.associate { it.string("id") to if(it.string("id") == "local") "Save result in Beacon" else it.string("name") + if(it.optBoolean("home_target_set")) "" else " (not configured)" }
     val choices = targets.filter { it.string("id") == "local" || it.optBoolean("home_target_set") }.map { it.string("id") }.ifEmpty { listOf("local") }.toMutableList()
     seed.string("deliver").takeIf { it.isNotBlank() && it !in choices }?.let { choices.add(it) }
     val missing = targets.filter { it.string("id") != "local" && !it.optBoolean("home_target_set") }.joinToString { it.string("name") + ": configure " + it.string("home_env_var") }

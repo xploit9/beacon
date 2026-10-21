@@ -62,7 +62,7 @@ def test_call_user_rejects_foreign_owned_cron_and_allows_unowned_cron(harness, m
     })
     monkeypatch.setattr(api.native, 'verify', lambda *args: {})
     not_owned = {
-        'error': 'This chat is not linked to your Hermes sign-in, so Cypher cannot ring from it. Start a new chat in Cypher and ask again.',
+        'error': 'This chat is not linked to your Hermes sign-in, so Beacon cannot ring from it. Start a new chat in Beacon and ask again.',
         'reason': 'conversation_not_owned',
     }
 

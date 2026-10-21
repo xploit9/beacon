@@ -1,4 +1,4 @@
-# Install Cypher with your agent
+# Install Beacon with your agent
 
 This procedure is for an AI agent running on the PC that hosts Hermes.
 
@@ -7,7 +7,7 @@ This procedure is for an AI agent running on the PC that hosts Hermes.
 - Never print, copy into notes, or store passwords, OAuth tokens, `GITHUB_TOKEN`, `GH_TOKEN`, dashboard session values, or provider API keys.
 - Never modify Hermes core files, add startup hooks, or patch Hermes at runtime.
 - Ask the user before restarting a dashboard they are using or changing Tailscale Serve, firewall, bind, or port settings.
-- Keep backups and logs outside the Cypher repository. Do not delete the Hermes Relay backup.
+- Keep backups and logs outside the Beacon repository. Do not delete the Hermes Relay backup.
 - Let Hermes' native installer run its security scan. Ask before approving Python dependency installation or any scan override.
 
 ## 1. Confirm Hermes and the target profile
@@ -18,7 +18,7 @@ Use `hermes -p <profile>` for every profile-scoped command. Hermes consumes `-p`
 
 ## 2. Install or update the plugin
 
-The repository is `xploit9/beacon` (it may be private). Hermes' native installer accepts owner/repository shorthand, Git URLs, and a repository subdirectory. For the current repository layout, install the `hermes-plugin/cypher` subdirectory:
+The repository is public at `xploit9/beacon`. Hermes' native installer accepts owner/repository shorthand, Git URLs, and a repository subdirectory. For the current repository layout, install the `hermes-plugin/cypher` subdirectory:
 
 ```sh
 hermes -p <profile> plugins install xploit9/beacon/hermes-plugin/cypher --enable
@@ -52,13 +52,13 @@ If the target profile has `hermes-relay` enabled, first copy its installed plugi
 hermes -p <profile> plugins disable hermes-relay
 ```
 
-Do not delete the backup. Ensure Cypher is enabled in the selected profile:
+Do not delete the backup. Ensure Beacon is enabled in the selected profile:
 
 ```sh
 hermes -p <profile> plugins enable cypher
 ```
 
-This plugin declares no plugin-only Python dependencies: Hermes already supplies FastAPI, PyYAML, httpx, and jsonschema. Firebase Admin is optional and loaded only when FCM credentials are configured; otherwise Cypher uses its existing Keep connected delivery path. If this release unexpectedly triggers a dependency prompt, stop and check the installed plugin version instead of approving a workaround. Do not bypass the native security scan.
+This plugin declares no plugin-only Python dependencies: Hermes already supplies FastAPI, PyYAML, httpx, and jsonschema. Firebase Admin is optional and loaded only when FCM credentials are configured; otherwise Beacon uses its existing Keep connected delivery path. If this release unexpectedly triggers a dependency prompt, stop and check the installed plugin version instead of approving a workaround. Do not bypass the native security scan.
 
 ## 3. Restart and verify the dashboard
 
@@ -69,10 +69,10 @@ The dashboard serves the plugin's phone routes, and it is often a separate proce
 From the dashboard's authenticated browser session, verify that:
 
 - The dashboard is reachable.
-- The **Cypher** tab is visible.
-- Opening the Cypher tab with a verified Hermes dashboard session binds that account automatically when no owner exists, then displays the QR immediately. There is no separate claim step.
-- If Hermes reports multiple dashboard accounts and Cypher has no owner, the first verified account to use the plugin becomes owner; other accounts receive 403.
-- Loopback-anonymous requests never create an owner. A dashboard without a verified native Hermes identity cannot initialize Cypher until that identity is available.
+- The **Beacon** tab is visible.
+- Opening the Beacon tab with a verified Hermes dashboard session binds that account automatically when no owner exists, then displays the QR immediately. There is no separate claim step.
+- If Hermes reports multiple dashboard accounts and Beacon has no owner, the first verified account to use the plugin becomes owner; other accounts receive 403.
+- Loopback-anonymous requests never create an owner. A dashboard without a verified native Hermes identity cannot initialize Beacon until that identity is available.
 - The owner-authorized `GET /api/plugins/cypher/connect-info` succeeds and the tab displays its QR.
 - **Pair a phone** creates a single-use pairing code and QR that expires after 10 minutes.
 
@@ -80,7 +80,7 @@ Do not copy, print, or log the route response. Loopback mode may include a sessi
 
 ## 4. Finish on the phone
 
-Tell the user to download and install the latest stable `Cypher-<version>.apk` from the repository's [Releases page](https://github.com/xploit9/beacon/releases), open the dashboard's **Cypher** tab, and select **Pair a phone**. The phone step is: "Scan the QR, choose a screenshot of it, or type the address and code." App and plugin automatic updates are on by default in Settings **App updates**; app downloads use an unmetered connection and keep package, version, checksum and signer verification, with a tap-to-install notice whenever Android requires confirmation.
+Tell the user to download and install the latest stable `Beacon-<version>.apk` from the repository's [Releases page](https://github.com/xploit9/beacon/releases), open the dashboard's **Beacon** tab, and select **Pair a phone**. Pair from Hermes CLI with `hermes -p <profile> beacon pair` or from an owned chat with `/beacon-pair`; the older `cypher pair` and `/cypher-pair` commands remain quiet aliases. The phone step is: "Scan the QR, choose a screenshot of it, or type the address and code." App and plugin automatic updates are on by default in Settings **App updates**; app downloads use an unmetered connection and keep package, version, checksum and signer verification, with a tap-to-install notice whenever Android requires confirmation.
 
 Phone sign-in uses Hermes' normal OAuth browser flow. The first verified OAuth identity to use a plugin route becomes owner automatically if no owner exists; subsequent identities cannot take over. That sign-in covers chat, history, plugin pages, calls, and Keep connected. Loopback-anonymous access does not establish ownership.
 

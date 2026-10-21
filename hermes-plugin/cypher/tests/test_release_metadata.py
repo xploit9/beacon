@@ -43,10 +43,10 @@ def test_release_script_writes_canonical_stable_asset_and_feed_fields(tmp_path,m
 
     artifact,manifest,metadata=module.write_release_metadata(apk,tmp_path/'release',aapt=str(aapt),apksigner=str(signer))
 
-    assert artifact.name=='Cypher-1.0.0.apk' and artifact.read_bytes()==contents
-    assert manifest.name=='Cypher-1.0.0.json'
+    assert artifact.name=='Beacon-1.0.0.apk' and artifact.read_bytes()==contents
+    assert manifest.name=='Beacon-1.0.0.json'
     assert json.loads(manifest.read_text())=={
-        'artifact_filename':'Cypher-1.0.0.apk',
+        'artifact_filename':'Beacon-1.0.0.apk',
         'package_name':'dev.hermes.android.stable',
         'version_code':100,
         'version_name':'1.0.0',
@@ -64,7 +64,7 @@ def test_release_script_refuses_a_production_apk(tmp_path,monkeypatch):
     aapt=tmp_path/'aapt.exe';signer=tmp_path/'apksigner.exe';aapt.touch();signer.touch()
     monkeypatch.setattr(module,'_run',lambda args:"package: name='dev.hermes.android' versionCode='100' versionName='1.0.0'" if args[0]==str(aapt) else 'Signer #1 certificate SHA-256 digest: '+'a'*64)
 
-    with pytest.raises(module.ReleaseMetadataError,match='not the Cypher stable package'):
+    with pytest.raises(module.ReleaseMetadataError,match='not the Beacon stable package'):
         module.metadata_for_apk(apk,str(aapt),str(signer))
 
 

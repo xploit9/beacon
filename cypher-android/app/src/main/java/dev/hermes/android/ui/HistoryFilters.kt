@@ -35,7 +35,7 @@ internal fun historyRowKey(row: JSONObject, currentProfile: String = ""): String
 
 /** Readable names for Hermes session sources; an unknown platform keeps its own name. */
 internal fun historySourceLabel(source: String): String = when (source.trim().lowercase(Locale.ROOT)) {
-    "android" -> "Cypher"
+    "android" -> "Beacon"
     CYPHER_THREAD_SOURCE -> "$currentAssistantName threads"
     "phone" -> "Relay threads"
     "webui" -> "Web"

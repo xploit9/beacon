@@ -48,7 +48,7 @@ class HistoryFiltersTest {
     @Test fun sourceFilterOffersListedAndHiddenSourcesButNotThreadsOrCron() {
         val offered = historySources(rows + json("id" to "f", "source" to "cron"), hidden = setOf("discord"))
         assertEquals(listOf("android", "discord", "telegram", "webui"), offered)
-        assertEquals("Cypher", historySourceLabel("android"))
+        assertEquals("Beacon", historySourceLabel("android"))
         assertEquals("$currentAssistantName threads", historySourceLabel(CYPHER_THREAD_SOURCE))
         assertEquals("Web", historySourceLabel("webui"))
         assertEquals("Api server", historySourceLabel("api server"))

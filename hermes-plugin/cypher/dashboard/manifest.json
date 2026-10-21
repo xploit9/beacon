@@ -1,6 +1,6 @@
 {
   "name": "cypher",
-  "label": "Cypher",
+  "label": "Beacon",
   "version": "1.0.0",
   "description": "Native authenticated mobile API",
   "api": "plugin_api.py",

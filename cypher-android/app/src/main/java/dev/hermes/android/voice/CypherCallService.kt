@@ -196,7 +196,7 @@ class CallController(private val app: CypherApplication) {
             if (generation != epoch.get()) { release(CallSpec(frozen, grant)); return }
             if (incoming != null) {
                 require(app.push.permitsIncoming(incoming.source)) { "The invitation's owner signed out" }
-                require(uiVisible) { "Open Cypher to finish answering ${dev.hermes.android.data.currentAssistantName}" }
+                require(uiVisible) { "Open Beacon to finish answering ${dev.hermes.android.data.currentAssistantName}" }
             }
             spec = CallSpec(frozen, grant, incoming != null,voiceSettings)
             _state.update { it.copy(conversationScope = frozen.scope.session(grant.getString("conversation_id")), callId = grant.getString("call_id"), voiceProvider = voiceSettings.provider, visionAvailable = voiceSettings.provider == "gemini").withOverlayPermission(android.provider.Settings.canDrawOverlays(app)) }
@@ -280,7 +280,7 @@ class CypherCallService : Service() {
                 if (spec != null && !closed.get()) foreground(cameraCaptureAttempted, screenCaptureAttempted)
                 else ServiceCompat.startForeground(this, NOTIFICATION, notification(starting = true), ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL)
             } catch (_: RuntimeException) {
-                app.calls.rejectPendingStart("Android could not start the call. Open Cypher and try again.")
+                app.calls.rejectPendingStart("Android could not start the call. Open Beacon and try again.")
                 stopSelf();return START_NOT_STICKY
             }
         }
@@ -318,7 +318,7 @@ class CypherCallService : Service() {
             }
         }
         try { foreground(camera = false) }
-        catch (e: RuntimeException) { app.calls.updateFrom(this@CypherCallService) { it.copy(error = "Open Cypher and allow microphone access to continue the call") }; hangup(); return START_NOT_STICKY }
+        catch (e: RuntimeException) { app.calls.updateFrom(this@CypherCallService) { it.copy(error = "Open Beacon and allow microphone access to continue the call") }; hangup(); return START_NOT_STICKY }
         // Home may precede service binding; reconcile once foreground admission succeeds.
         if (backgroundNeedsBubble(app.calls.state.value,app.calls.uiVisible)) { refreshOverlay(); minimize(app.calls.state.value.callId) }
         telecomJob = scope.launch {
@@ -654,7 +654,7 @@ class CypherCallService : Service() {
                 ended.complete(Unit)
                 val stopped=captureReleased
                 app.calls.cameraTrack(this@CypherCallService,null)
-                app.calls.updateFrom(this@CypherCallService) { it.copy(active=false,state="ending",cameraSharing=false,cameraBusy=false,screenSharing=false,screenBusy=false,cameraStopPending=!stopped,screenStopPending=!stopped,audioStopPending=!audioReleased,minimized=false,error=listOfNotNull(error?:it.error,if(!audioReleased) "The microphone may still be on. Close Cypher if it stays on." else null,if(endDisposition.notSent>0) callEndNotSentText(endDisposition.notSent) else null,if(endDisposition.submissionUnknown>0) callEndUnknownText(endDisposition.submissionUnknown) else null).filter(String::isNotBlank).joinToString(" ")).afterTerminalControls(fenceFailure) }
+                app.calls.updateFrom(this@CypherCallService) { it.copy(active=false,state="ending",cameraSharing=false,cameraBusy=false,screenSharing=false,screenBusy=false,cameraStopPending=!stopped,screenStopPending=!stopped,audioStopPending=!audioReleased,minimized=false,error=listOfNotNull(error?:it.error,if(!audioReleased) "The microphone may still be on. Close Beacon if it stays on." else null,if(endDisposition.notSent>0) callEndNotSentText(endDisposition.notSent) else null,if(endDisposition.submissionUnknown>0) callEndUnknownText(endDisposition.submissionUnknown) else null).filter(String::isNotBlank).joinToString(" ")).afterTerminalControls(fenceFailure) }
                 val transcriptClosed=finishTranscriptSyncForCleanup { transcriptSync?.finish()==true }
                 if(!transcriptClosed) app.calls.updateFrom(this@CypherCallService) { it.copy(transcriptStatus="partial") }
                 spec?.let { pending ->
@@ -687,7 +687,7 @@ class CypherCallService : Service() {
     } }
     private fun notification(starting: Boolean = false): Notification {
         val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(NotificationChannel(CHANNEL, "Cypher calls", NotificationManager.IMPORTANCE_LOW))
+        nm.createNotificationChannel(NotificationChannel(CHANNEL, "Beacon calls", NotificationManager.IMPORTANCE_LOW))
         val state=app.calls.state.value
         val open = openCallIntent(state.callId)
         fun action(name: String, code: Int): PendingIntent {
@@ -697,9 +697,9 @@ class CypherCallService : Service() {
             return PendingIntent.getService(this, code, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         }
         val builder = NotificationCompat.Builder(this, CHANNEL).setSmallIcon(R.drawable.ic_cypher_voice)
-            .setContentTitle(if (retainedCameraWarning) "Cypher call cleanup warning" else "${dev.hermes.android.data.currentAssistantName} call")
+            .setContentTitle(if (retainedCameraWarning) "Beacon call cleanup warning" else "${dev.hermes.android.data.currentAssistantName} call")
             .setContentText(if (starting) { if(app.calls.state.value.active) "Connecting to ${dev.hermes.android.data.currentAssistantName}" else "Call cancelled" } else if (retainedCameraWarning) "Call or capture shutdown unconfirmed; media delivery blocked. Use Android’s Stop app control."
-                else if (app.calls.state.value.toolApprovals.isNotEmpty()) "Action needs approval. Open Cypher to review."
+                else if (app.calls.state.value.toolApprovals.isNotEmpty()) "Action needs approval. Open Beacon to review."
                 else if (app.calls.state.value.screenStopPending) "Screen stop unconfirmed; visual delivery blocked. Tap to retry."
                 else if (app.calls.state.value.screenSharing) "Screen sharing with ${dev.hermes.android.data.currentAssistantName}"
                 else if (app.calls.state.value.cameraStopPending) "Camera stop unconfirmed; video blocked. Tap to retry."
@@ -729,11 +729,11 @@ class CypherCallService : Service() {
         val details="${request.toolName}\n${request.arguments}"
         val open=openCallIntent(state.callId)
         val builder=NotificationCompat.Builder(this,channel).setSmallIcon(R.drawable.ic_cypher_notification)
-            .setContentTitle("Cypher needs permission").setContentText(dev.hermes.android.push.boundedNotificationText(details,640,preserveWhitespace=true))
+            .setContentTitle("Beacon needs permission").setContentText(dev.hermes.android.push.boundedNotificationText(details,640,preserveWhitespace=true))
             .setStyle(NotificationCompat.BigTextStyle().bigText(dev.hermes.android.push.boundedNotificationText(details,640,preserveWhitespace=true)))
             .setContentIntent(open).setOngoing(true).setOnlyAlertOnce(true).setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
             .setCategory(NotificationCompat.CATEGORY_STATUS).setTimeoutAfter(300_000)
-            .setPublicVersion(NotificationCompat.Builder(this,channel).setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle("Cypher needs permission").setContentText("Unlock to review the request").build())
+            .setPublicVersion(NotificationCompat.Builder(this,channel).setSmallIcon(R.drawable.ic_cypher_notification).setContentTitle("Beacon needs permission").setContentText("Unlock to review the request").build())
         if(android.os.Build.VERSION.SDK_INT>=36) builder.setRequestPromotedOngoing(true).setShortCriticalText("Review")
         fun answer(approved:Boolean) {
             val action=if(approved) TOOL_ALLOW else TOOL_DENY

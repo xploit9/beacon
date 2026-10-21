@@ -171,7 +171,7 @@ import org.json.JSONObject
         requestingClient = null
         if (captured != null && vm.client?.scope == captured.scope) {
             if (allowed) register(captured)
-            else if (vm.client?.scope == captured.scope) { busy = false; operationError = "Notification permission is off. Events stay available inside Cypher."; vm.notice(operationError) }
+            else if (vm.client?.scope == captured.scope) { busy = false; operationError = "Notification permission is off. Events stay available inside Beacon."; vm.notice(operationError) }
         }
     }
     Column(Modifier.fillMaxSize().imePadding().verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -187,7 +187,7 @@ import org.json.JSONObject
         } else {
             Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(when { pushStatus == null -> "Checking notification status…"; pushStatus.has("_error") -> "Couldn’t reach Hermes"; !serverReady -> "Server setup needed"; !deviceAllowed -> "Notifications are off on this phone"; !registered -> if (target == null) "Notifications are off for $profileName" else "Registration needs attention"; else -> "Ready for notifications" }, style = MaterialTheme.typography.titleLarge)
-                Text(when { pushStatus == null -> "Connecting to your private server."; pushStatus.has("_error") -> "Reconnect to Tailscale, then retry below."; !serverReady -> "This phone can receive notifications, but your Hermes server still needs its notification sender configured."; !deviceAllowed -> "Allow Cypher notifications in Android settings."; !registered -> if (target == null) "Turn on notifications for native calls and approval requests." else "This profile has a saved registration, but the server has not confirmed it. Retry registration or turn it off."; else -> "Calls and approval requests can reach you while the app is closed. Send a test to check delivery on this phone." }, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(when { pushStatus == null -> "Connecting to your private server."; pushStatus.has("_error") -> "Reconnect to Tailscale, then retry below."; !serverReady -> "This phone can receive notifications, but your Hermes server still needs its notification sender configured."; !deviceAllowed -> "Allow Beacon notifications in Android settings."; !registered -> if (target == null) "Turn on notifications for native calls and approval requests." else "This profile has a saved registration, but the server has not confirmed it. Retry registration or turn it off."; else -> "Calls and approval requests can reach you while the app is closed. Send a test to check delivery on this phone." }, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 if ((delivery?.optInt("pending") ?: 0) > 0) Text("${delivery?.optInt("pending")} notifications waiting to be delivered", style = MaterialTheme.typography.labelMedium)
                 if (!delivery?.string("last_error").isNullOrBlank() && serverReady) Text("The last delivery needs attention. Try a test notification.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
             } }
@@ -218,14 +218,14 @@ import org.json.JSONObject
         }
         if (vm.app.firebaseConfigured) Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
             LabeledToggle("Notifications for $profileName", target != null, { enabled -> if (enabled) enable() else disable() },
-                description = if (target != null) "On for $profileName" else "Off · you can still check activity in Cypher",
+                description = if (target != null) "On for $profileName" else "Off · you can still check activity in Beacon",
                 enabled = !busy && requestingClient == null && (target != null || (serverReady && pushStatus?.has("_error") != true)))
         } }
         Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(horizontal = 20.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("Keep connected", style = MaterialTheme.typography.titleMedium)
-                    Text("Let Hermes reach this phone for incoming calls while Cypher is closed.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("Let Hermes reach this phone for incoming calls while Beacon is closed.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 Switch(checked = keepConnectedEnabled, enabled = ownerScope != null, onCheckedChange = ::setKeepConnected, modifier = Modifier.testTag("keep-connected-toggle"))
             }
@@ -271,12 +271,12 @@ import org.json.JSONObject
         }
         TextButton(onClick = { context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)) }) { Text(uiText("Android notification settings")) }
         Text("Background delivery",style=MaterialTheme.typography.titleMedium)
-        Text(when { restricted -> "Android is restricting Cypher in the background. Open app settings and allow background activity."; optimized -> "Battery optimization is on. If alerts arrive late, allow background activity in your phone’s app or battery settings."; else -> "Android battery optimization is off for Cypher." },color=if(restricted) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
-        if (optimized && !restricted) TextButton(onClick = { if (!requestBackgroundUse(context)) vm.notice("Open Cypher’s app settings in Android and allow background use.") }) { Text("Allow background use") }
+        Text(when { restricted -> "Android is restricting Beacon in the background. Open app settings and allow background activity."; optimized -> "Battery optimization is on. If alerts arrive late, allow background activity in your phone’s app or battery settings."; else -> "Android battery optimization is off for Beacon." },color=if(restricted) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+        if (optimized && !restricted) TextButton(onClick = { if (!requestBackgroundUse(context)) vm.notice("Open Beacon’s app settings in Android and allow background use.") }) { Text("Allow background use") }
         Text("Shows a quiet notification and uses some battery.", style=MaterialTheme.typography.bodySmall, color=MaterialTheme.colorScheme.onSurfaceVariant)
-        Text("Keep Tailscale on. On Honor phones, allow Cypher to run in the background.",style=MaterialTheme.typography.bodySmall)
-        Text("After a force stop, open Cypher once to receive calls again.",style=MaterialTheme.typography.bodySmall)
-        TextButton(onClick={runCatching { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:${context.packageName}"))) }.onFailure { vm.notice("Open Cypher’s app settings in Android") }}) { Text("Open background app settings") }
+        Text("Keep Tailscale on. On Honor phones, allow Beacon to run in the background.",style=MaterialTheme.typography.bodySmall)
+        Text("After a force stop, open Beacon once to receive calls again.",style=MaterialTheme.typography.bodySmall)
+        TextButton(onClick={runCatching { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:${context.packageName}"))) }.onFailure { vm.notice("Open Beacon’s app settings in Android") }}) { Text("Open background app settings") }
     }
 }
 

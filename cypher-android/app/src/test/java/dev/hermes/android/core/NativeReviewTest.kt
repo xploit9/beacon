@@ -156,7 +156,7 @@ class NativeReviewTest {
     }
 
     @Test fun allNativeSkinInkMeetsContrastOnActualContainersSelectionsAndGlassHighlights() {
-        val file = requireNotNull(listOf(File("src/main/assets/native-skins.json"), File("app/src/main/assets/native-skins.json"), File("cypher-android/app/src/main/assets/native-skins.json")).firstOrNull { it.isFile }) { "Run this palette check from the Cypher app, Android project or repository root." }
+        val file = requireNotNull(listOf(File("src/main/assets/native-skins.json"), File("app/src/main/assets/native-skins.json"), File("cypher-android/app/src/main/assets/native-skins.json")).firstOrNull { it.isFile }) { "Run this palette check from the Beacon app, Android project or repository root." }
         val palettes = JSONObject(file.readText(Charsets.UTF_8))
         assertEquals(21, NativeSkins.size)
         NativeSkins.forEach { skin -> listOf(false, true).forEach { dark ->

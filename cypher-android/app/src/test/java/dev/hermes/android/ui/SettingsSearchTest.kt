@@ -109,7 +109,7 @@ class SettingsSearchTest {
         // Two facts at most, so a hub row stays on one line.
         assertEquals("Ctrl + Enter to send · Thinking shown", summary("Chat", known))
         assertEquals("Dark · Graphite", summary("Appearance", known))
-        assertEquals("Follow device · Cypher", summary("Appearance", SettingsSnapshot(theme = "system", colorStyle = "default")))
+        assertEquals("Follow device · Beacon", summary("Appearance", SettingsSnapshot(theme = "system", colorStyle = "default")))
         assertEquals("Installed · 0.4.14", summary("App updates", known))
         assertEquals("Nova · coder", summary("Assistant", known.copy(assistantName = "Nova", assistantProfile = "coder")))
         assertEquals("Version · 0.4.14", summary("About & licenses", known))
@@ -134,7 +134,7 @@ class SettingsSearchTest {
     @Test fun colorStyleTranslatesLikeTheAppearancePicker() {
         // Known skins use the picker's label, which the picker passes through uiText.
         assertEquals(listOf(SettingsSummaryPart("Graphite", true)), settingsSummary("Appearance", SettingsSnapshot(colorStyle = "graphite")))
-        assertEquals(listOf(SettingsSummaryPart("Cypher", true)), settingsSummary("Appearance", SettingsSnapshot(colorStyle = "default")))
+        assertEquals(listOf(SettingsSummaryPart("Beacon", true)), settingsSummary("Appearance", SettingsSnapshot(colorStyle = "default")))
         assertEquals(listOf(SettingsSummaryPart("Neon Soft", true)), settingsSummary("Appearance", SettingsSnapshot(colorStyle = "neon-soft")))
         // An unknown stored key is shown as recorded, like the picker, and is not translated.
         assertEquals(listOf(SettingsSummaryPart("custom-skin", false)), settingsSummary("Appearance", SettingsSnapshot(colorStyle = "custom-skin")))

@@ -1,4 +1,4 @@
-"""Native Cypher callbacks and profile-scoped proactive jobs."""
+"""Native Beacon callbacks and profile-scoped proactive jobs."""
 import importlib.util
 import ipaddress
 import json
@@ -53,7 +53,7 @@ def call_user(args,session_id=None,**kwargs):
         if not row: raise LookupError('Native session unavailable')
         if row.get('user_id')!=provider+':'+owner:
             if not _cron_fallback_allowed(cfg,row):
-                return json.dumps({'error':'This chat is not linked to your Hermes sign-in, so Cypher cannot ring from it. Start a new chat in Cypher and ask again.','reason':'conversation_not_owned'})
+                return json.dumps({'error':'This chat is not linked to your Hermes sign-in, so Beacon cannot ring from it. Start a new chat in Beacon and ask again.','reason':'conversation_not_owned'})
             stored=cfg.get('scheduled_callback_conversation_id')
         native.verify(owner,provider,profile,stored)
         provided_reason=isinstance(args,dict) and args.get('reason') is not None
@@ -442,7 +442,7 @@ def _watch_terminal_read_only(command):
     return False
 
 def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**kwargs):
-    """Veto write-capable tools only in Cypher's email-watch cron session, including a run that
+    """Veto write-capable tools only in Beacon's email-watch cron session, including a run that
     outlives Proactive being turned off or its jobs being rebuilt (Hermes does not stop it)."""
     if not isinstance(tool_name,str) or not session_id:
         return None
@@ -508,7 +508,7 @@ def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**
 
 
 def _pairing_block(profile=None,name=None):
-    if name is None: name='Cypher phone'
+    if name is None: name='Beacon phone'
     cfg=mobile.settings(profile)
     profile=profile or current_profile(cfg)
     cfg=mobile.settings(profile)
@@ -516,7 +516,7 @@ def _pairing_block(profile=None,name=None):
     owner=cfg.get('owner_id') if cfg.get('owner_id') and cfg.get('owner_provider') else ''
     profiles=cfg.get('profiles')
     if isinstance(profiles,list) and profile not in profiles:
-        raise ValueError('Use a profile Cypher serves.')
+        raise ValueError('Use a profile Beacon serves.')
     dashboard_url,dashboard_name=mobile.dashboard_connect_info()
     pairing=mobile.mint_device_pairing(owner,profile,name,dashboard_url,dashboard_name)
     return f"Dashboard: {pairing['dashboard_url']}\nPairing code: {pairing['code']}\nexpires in 10 min"
@@ -524,7 +524,7 @@ def _pairing_block(profile=None,name=None):
 
 def _pairing_cli_setup(subparser):
     actions=subparser.add_subparsers(dest='cypher_action',required=True)
-    pair=actions.add_parser('pair',help='Pair a phone with Cypher')
+    pair=actions.add_parser('pair',help='Pair a phone with Beacon')
     pair.add_argument('--name',default=None,help='Name this phone in the device list')
     pair.set_defaults(func=_pairing_cli_command)
 
@@ -537,7 +537,7 @@ def _pairing_cli_command(args):
 
 
 def _pairing_slash_command(ctx,raw_args=''):
-    if raw_args.strip(): return 'Use `/cypher-pair` without arguments.'
+    if raw_args.strip(): return 'Use `/beacon-pair` without arguments.'
     try:
         cfg=mobile.settings()
         profile=current_profile(cfg)
@@ -553,7 +553,7 @@ def _pairing_slash_command(ctx,raw_args=''):
 
 
 def register(ctx):
-    ctx.register_tool(name='cypher_call_user',toolset='cypher',description='Ring the owner through Cypher Android using the current saved native conversation. An invitation is pending, not proof of answering. Use only for owner-requested callbacks.',
+    ctx.register_tool(name='cypher_call_user',toolset='cypher',description='Ring the owner through Beacon Android using the current saved native conversation. An invitation is pending, not proof of answering. Use only for owner-requested callbacks.',
         schema={'name':'cypher_call_user','description':'Ring an authorized native callback invitation','parameters':{'type':'object','properties':{'reason':{'type':'string','maxLength':240,'description':'Brief owner-requested reason for the call; do not claim unverified work is finished'}},'additionalProperties':False}},handler=call_user)
 
     ctx.register_tool(name='cypher_create_proactive_request',toolset='cypher-interactive',
@@ -584,13 +584,15 @@ def register(ctx):
     ctx.register_hook('post_tool_call',native_mailbox_observation)
     ctx.register_hook('pre_tool_call',native_proactive_read_only_guard)
     phone_delivery.register(ctx)
-    try:
-        ctx.register_cli_command(name='cypher',help='Pair and manage Cypher phones',
-            setup_fn=_pairing_cli_setup,description='Pair a phone with Cypher.')
-    except (AttributeError,TypeError):
-        pass
-    try:
-        ctx.register_command('cypher-pair',handler=lambda raw_args:_pairing_slash_command(ctx,raw_args),
-            description='Create a one-time pairing code for a phone.')
-    except (AttributeError,TypeError):
-        pass
+    for name in ('beacon','cypher'):
+        try:
+            ctx.register_cli_command(name=name,help='Pair and manage Beacon phones',
+                setup_fn=_pairing_cli_setup,description='Pair a phone with Beacon.')
+        except (AttributeError,TypeError):
+            pass
+    for name in ('beacon-pair','cypher-pair'):
+        try:
+            ctx.register_command(name,handler=lambda raw_args:_pairing_slash_command(ctx,raw_args),
+                description='Create a one-time pairing code for a phone.')
+        except (AttributeError,TypeError):
+            pass

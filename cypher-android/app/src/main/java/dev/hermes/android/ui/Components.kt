@@ -184,9 +184,9 @@ internal enum class BeaconMotionMode { Pulse, Sweep, Ripple }
             BeaconSignal(BeaconMotionMode.Sweep, size = if (compact) 64.dp else 108.dp)
             BeaconMark(size = if (compact) 36.dp else 60.dp)
         }
-        Text(uiText(if (update) "Update Cypher on your Hermes" else "Add Cypher to your Hermes"), style = if (compact) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.titleMedium, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+        Text(uiText(if (update) "Update Beacon on your Hermes" else "Add Beacon to your Hermes"), style = if (compact) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.titleMedium, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
         Button(onClick = { uriHandler.openUri(CYPHER_PLUGIN_INSTALL_URL) }, modifier = Modifier.heightIn(min = 48.dp).testTag("missing-plugin-install")) {
-            Text(uiText(if (update) "Update Cypher" else "Install Cypher"))
+            Text(uiText(if (update) "Update Beacon" else "Install Beacon"))
         }
     }
 }

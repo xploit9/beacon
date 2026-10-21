@@ -363,8 +363,8 @@ private fun DevicesSettingsSection(vm: CypherViewModel, pluginAbsent: Boolean) {
             }
         } catch (failure: ApiFailure) {
             if (vm.client === client) error = when {
-                failure.status == 403 -> "Finish setting up Cypher on your Hermes dashboard, then retry."
-                isMissingCypherPluginRoute(failure) -> "Devices are unavailable because the Cypher plugin isn't installed on this Hermes."
+                failure.status == 403 -> "Finish setting up Beacon on your Hermes dashboard, then retry."
+                isMissingCypherPluginRoute(failure) -> "Devices are unavailable because the Beacon plugin isn't installed on this Hermes."
                 else -> "Couldn't load devices. Check your connection and try again."
             }
         } catch (_: Exception) {
@@ -384,7 +384,7 @@ private fun DevicesSettingsSection(vm: CypherViewModel, pluginAbsent: Boolean) {
                 OutlinedButton(onClick = { vm.connect(ui.origin) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Reconnect") }
             }
             removed -> {
-                Text("This phone was removed from Cypher on your PC", Modifier.testTag("devices-removed"), style = MaterialTheme.typography.bodyLarge)
+                Text("This phone was removed from Beacon on your PC", Modifier.testTag("devices-removed"), style = MaterialTheme.typography.bodyLarge)
                 Text("Pair this phone again to restore its connection.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Button(onClick = { vm.reopenSetupWizard(ui.origin) }, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("devices-pair-again")) { Text("Pair again") }
             }
@@ -423,7 +423,7 @@ private fun DevicesSettingsSection(vm: CypherViewModel, pluginAbsent: Boolean) {
         AlertDialog(
             onDismissRequest = { if (!removing) pendingRemoval = null },
             title = { Text(if (isThisPhone) "Remove this phone?" else "Remove ${device.name}?") },
-            text = { Text("This device will no longer be connected to Cypher on your PC.") },
+            text = { Text("This device will no longer be connected to Beacon on your PC.") },
             confirmButton = {
                 TextButton(
                     onClick = {

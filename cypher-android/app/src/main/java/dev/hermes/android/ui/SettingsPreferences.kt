@@ -10,7 +10,7 @@ internal fun privateStructuredKey(key: String): Boolean {
         listOf("password", "authorization", "bearer", "secret", "cookie", "apikey").any(normalized::contains)
 }
 
-internal val skinLabels = NativeSkins.associateWith { key -> if (key == "default") "Cypher" else if (key == "github") "GitHub" else key.split('-').joinToString(" ") { it.replaceFirstChar(Char::titlecase) } }
+internal val skinLabels = NativeSkins.associateWith { key -> if (key == "default") "Beacon" else if (key == "github") "GitHub" else key.split('-').joinToString(" ") { it.replaceFirstChar(Char::titlecase) } }
 
 internal fun displayedBoolean(field: Field, stored: String) = if (field.inverse) !stored.toBoolean() else stored.toBoolean()
 internal fun storedBoolean(field: Field, displayed: Boolean) = (if (field.inverse) !displayed else displayed).toString()

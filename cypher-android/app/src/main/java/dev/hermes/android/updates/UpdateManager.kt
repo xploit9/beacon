@@ -69,7 +69,7 @@ class UpdateManager(private val app: CypherApplication) {
     }
 
     fun schedule(checkNow: Boolean = true) {
-        notifications.createNotificationChannel(NotificationChannel(CHANNEL, "Cypher app updates", NotificationManager.IMPORTANCE_DEFAULT))
+        notifications.createNotificationChannel(NotificationChannel(CHANNEL, "Beacon app updates", NotificationManager.IMPORTANCE_DEFAULT))
         // Android defers this in Doze and while the private server is unreachable.
         val scheduler = app.getSystemService(JobScheduler::class.java)
         if (scheduler.getPendingJob(JOB_ID) == null) scheduler.schedule(JobInfo.Builder(JOB_ID, ComponentName(app, UpdateCheckJob::class.java))
@@ -168,7 +168,7 @@ class UpdateManager(private val app: CypherApplication) {
         client.bootstrap()
         if (!expected.authorizedBy(client.auth)) {
             synchronized(lock) { if (source() == expected) clearAuthorization() }
-            error("Saved Cypher owner changed. Sign in again.")
+            error("Saved Beacon owner changed. Sign in again.")
         }
         synchronized(lock) { requireAuthorized(expected) }
         val release = updater.check(client)
@@ -184,7 +184,7 @@ class UpdateManager(private val app: CypherApplication) {
 
     private fun notifyRelease(expected: UpdateSource, release: Release) {
         if (!updateNotificationDue(release.version, prefs.getLong("notified_version", 0))) return
-        if (postNotification(expected, release.version, "Cypher ${release.name} update available"))
+        if (postNotification(expected, release.version, "Beacon ${release.name} update available"))
             check(prefs.edit().putLong("notified_version", release.version).commit())
     }
 
@@ -194,11 +194,11 @@ class UpdateManager(private val app: CypherApplication) {
         if (expected.origin != origin || expected.owner != owner || !expected.authorizedBy(app.auth.read(expected.origin))) return@synchronized
         if (pushReleaseVersion(versionHint, updater.installedVersion(), prefs.getLong("notified_version", 0)) == null) return@synchronized
         // Do not persist an unverified hint as notified_version or required download version.
-        postNotification(expected, 0, "Cypher update available")
+        postNotification(expected, 0, "Beacon update available")
         if (autoUpdateEnabled()) requestAutomaticCheck()
     }
 
-    private fun postNotification(expected: UpdateSource, version: Long, title: String, message: String = "Update Cypher to the latest verified Android release."): Boolean {
+    private fun postNotification(expected: UpdateSource, version: Long, title: String, message: String = "Update Beacon to the latest verified Android release."): Boolean {
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(app, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return false
         if (!notifications.areNotificationsEnabled() || notifications.getNotificationChannel(CHANNEL)?.importance == NotificationManager.IMPORTANCE_NONE) return false
         requireAuthorized(expected)
@@ -215,15 +215,15 @@ class UpdateManager(private val app: CypherApplication) {
     }
 
     private fun postReadyNotification(expected: UpdateSource, version: Long, name: String) {
-        postNotification(expected, version, "Cypher $name is ready — tap to install", "Tap to finish installing the verified update.")
+        postNotification(expected, version, "Beacon $name is ready — tap to install", "Tap to finish installing the verified update.")
     }
 
     /** Resolves no URL, owner, cookie or version supplied by the caller. */
     suspend fun downloadNotification(token: String): File? {
         var retained: File? = null
         val expected = synchronized(lock) {
-            require(validToken(token) && token == prefs.getString("notification_token", null)) { "This update notification expired. Check for updates in Cypher." }
-            (source() ?: error("Sign in to update Cypher")).also { source ->
+            require(validToken(token) && token == prefs.getString("notification_token", null)) { "This update notification expired. Check for updates in Beacon." }
+            (source() ?: error("Sign in to update Beacon")).also { source ->
                 requireAuthorized(source)
                 val name=prefs.getString("pending_file",null)
                 if (name!=null && prefs.getString("pending_source",null)==source.id &&
@@ -317,7 +317,7 @@ class UpdateManager(private val app: CypherApplication) {
             val expected = source() ?: error("Sign in and download the update again")
             requireAuthorized(expected)
             require(prefs.getString("pending_source", null) == expected.id) { "Update authorization changed" }
-            if (prefs.getLong("pending_version", 0) <= updater.installedVersion()) { clearPending(); error("Cypher is already up to date") }
+            if (prefs.getLong("pending_version", 0) <= updater.installedVersion()) { clearPending(); error("Beacon is already up to date") }
             val file = pendingFile(prefs.getString("pending_file", null) ?: error("Download and verify an update first"))
             val size = prefs.getLong("pending_size", 0)
             Triple(expected, file, Triple(size,prefs.getString("pending_sha", "").orEmpty(),prefs.getString("pending_version_name","").orEmpty()))
@@ -411,7 +411,7 @@ class UpdateManager(private val app: CypherApplication) {
         requireAuthorized(expected)
         val pending=PendingIntent.getActivity(app,sessionId,prompt.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         notifications.notify(NOTIFICATION_ID,NotificationCompat.Builder(app,CHANNEL).setSmallIcon(R.drawable.ic_cypher_notification)
-            .setContentTitle("Cypher $name is ready — tap to install").setContentText("Tap to confirm the update in Android.")
+            .setContentTitle("Beacon $name is ready — tap to install").setContentText("Tap to confirm the update in Android.")
             .setContentIntent(pending).addAction(0,"Install",pending).setAutoCancel(true).build())
     }
 

@@ -94,7 +94,7 @@ class IncomingDeadlineTest {
             val cards=manager.activeNotifications.filter { it.tag==first.key }
             assertEquals(1,cards.size);assertEquals(2,cards.single().id)
             val missed=cards.single().notification
-            assertEquals("Cypher · Missed call",missed.extras.getString(Notification.EXTRA_TITLE))
+        assertEquals("Beacon · Missed call",missed.extras.getString(Notification.EXTRA_TITLE))
             assertEquals(listOf("Call back"),missed.actions.map { it.title.toString() })
             assertTrue(missed.actions.all { it.actionIntent.creatorPackage==app.packageName })
             assertFalse(app.push.claimInvitation(source,event))

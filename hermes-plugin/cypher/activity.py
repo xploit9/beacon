@@ -18,10 +18,10 @@ def request_preview(frame):
     from agent.redact import redact_sensitive_text
     params = frame.get('params', {})
     if frame.get('method') == 'approval':
-        title = 'Cypher needs approval'
+        title = 'Beacon needs approval'
         parts = [params.get('description'), params.get('command')]
     else:
-        title = 'Cypher asks'
+        title = 'Beacon asks'
         parts = [params.get('question')]
     text = '\n'.join(part.strip() for part in parts if isinstance(part, str) and part.strip())
     redacted=redact_sensitive_text(text[:4000],force=True,redact_url_credentials=True)
@@ -31,7 +31,7 @@ def request_preview(frame):
     else:
         choices=params.get('choices') or []
         complete=complete and not params.get('questions') and not params.get('multi_select') and isinstance(choices,list) and len(choices)<=3 and all(isinstance(c,str) and units(c)<=80 for c in choices)
-    body=redacted if complete else (redacted[:560]+'\nOpen Cypher to review the full request.').strip()
+    body=redacted if complete else (redacted[:560]+'\nOpen Beacon to review the full request.').strip()
     return {'title': title, 'body': body, 'complete':bool(complete)}
 
 
@@ -100,7 +100,7 @@ def answer(mobile, native, owner, provider, profile, event, value):
             row = dict(found)
         frame = pending(native, owner, provider, profile, row)
         if not request_preview(frame)['complete'] and not(frame['method']=='approval' and value=='deny'):
-            raise ValueError('Open Cypher to review the full request')
+            raise ValueError('Open Beacon to review the full request')
         params = frame.get('params', {})
         choices = request_actions(frame)
         if params.get('choices') and value not in [c['value'] for c in choices]: raise ValueError('Answer was not offered')

@@ -4,8 +4,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class NativePreferencesTest {
-    @Test fun assistantNameReplacesBeaconButLeavesCypherProductNames() {
+    @Test fun assistantNameReplacesBeaconInAssistantPhrases() {
         assertEquals("Nova's conversation", assistantName("Beacon's conversation", "Nova"))
-        assertEquals("Cypher plugin", assistantName("Cypher plugin", "Nova"))
+        assertEquals("Nova plugin", assistantName("Beacon plugin", "Nova"))
     }
 }

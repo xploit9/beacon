@@ -295,4 +295,4 @@ def test_restart_hint_clears_when_process_runs_the_installed_version(harness,mon
     result=api.auto_update_check(cfg,now=2_000_001)
 
     assert result['result']=='plugin_updated'
-    assert result['message']=='Cypher plugin updated.'
+    assert result['message']=='Beacon plugin updated.'

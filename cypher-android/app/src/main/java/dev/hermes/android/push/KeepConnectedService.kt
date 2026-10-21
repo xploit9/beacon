@@ -92,7 +92,7 @@ internal fun keepConnectedFailureReason(profile: String, error: Throwable, profi
     is ApiFailure -> when {
         error.status == 401 -> "Hermes rejected the connection (401)"
         error.status == 403 -> "Hermes refused profile ${profileLabel.takeIf(String::isNotBlank) ?: profile.takeIf(::validNativeProfile)?.take(32) ?: "current"} (403)"
-        error.status == 404 -> "Cypher plugin route missing (404)"
+        error.status == 404 -> "Beacon plugin route missing (404)"
         error.status == 409 -> "Hermes refused the notification request (409)"
         error.status in 500..599 -> "Hermes server error (${error.status})"
         else -> "Hermes request failed (${error.status})"

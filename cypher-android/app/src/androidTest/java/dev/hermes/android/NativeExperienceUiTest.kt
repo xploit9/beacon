@@ -1304,7 +1304,7 @@ class NativeExperienceUiTest {
             assertEquals("Send after the shell expired", submit.string("text"))
             assertEquals(freshRuntime, submit.string("session_id"))
             assertEquals(1, fixture.requests.count { it.string("method") == "prompt.submit" })
-            receipts += "When Hermes has forgotten an unsent shell, Cypher preserves its draft in a fresh sendable chat and submits once to the new creating runtime."
+            receipts += "When Hermes has forgotten an unsent shell, Beacon preserves its draft in a fresh sendable chat and submits once to the new creating runtime."
         } finally {
             runBlocking {
                 listOf(shellId, freshId).filter(String::isNotBlank).forEach { id ->
@@ -1411,7 +1411,7 @@ class NativeExperienceUiTest {
             await { vm.ui.value.tab == "Chat" && vm.ui.value.profile == target.profile && vm.chat.value.sessionId == target.session && vm.chat.value.projectionReady }
             assertEquals(switchesBefore + 1, fixture.requests.count { it.string("path") == "/api/auth/me" })
             assertTrue(app.calls.state.value.active)
-            receipts += "Opening a call from Cypher returns directly to the call's profile and conversation through one profile switch."
+            receipts += "Opening a call from Beacon returns directly to the call's profile and conversation through one profile switch."
         } finally {
             app.calls.update { CallState() }
             runBlocking {
@@ -1425,13 +1425,13 @@ class NativeExperienceUiTest {
         val callId = "synthetic-cypher-call"
         compose.runOnIdle { vm.tab("Cypher") }
         await { vm.ui.value.tab == "Cypher" && vm.isCypherConversation() && vm.chat.value.projectionReady }
-        val target = (vm.client?.scope ?: error("Cypher client missing")).session(vm.chat.value.sessionId)
+        val target = (vm.client?.scope ?: error("Beacon client missing")).session(vm.chat.value.sessionId)
         app.calls.update { CallState(active = true, state = "listening", callId = callId, conversationScope = target) }
         try {
             compose.runOnIdle { vm.openCurrentCall(callId) }
             await { vm.ui.value.tab == "Cypher" && vm.chat.value.sessionId == target.session && vm.chat.value.projectionReady }
             assertTrue(app.calls.state.value.active)
-            receipts += "Opening a call for Cypher's own conversation keeps the assistant tab selected."
+            receipts += "Opening a call for Beacon's own conversation keeps the assistant tab selected."
         } finally {
             app.calls.update { CallState() }
             runBlocking { app.preferences.edit { it.remove(stringPreferencesKey("assistant_return")) } }
@@ -1565,7 +1565,7 @@ class NativeExperienceUiTest {
 
             compose.runOnIdle { vm.more("Settings"); vm.tab("Cypher") }
             await { vm.ui.value.tab == "Cypher" && vm.ui.value.profile == "coder" && !vm.ui.value.cypherOpening && vm.chat.value.sessionId == assistantSession && vm.chat.value.projectionReady }
-            receipts += "Leaving Cypher through Settings restores the original chat profile and session once; entering Cypher from More keeps its assistant profile."
+            receipts += "Leaving Beacon through Settings restores the original chat profile and session once; entering Cypher from More keeps its assistant profile."
         } finally {
             vm.client?.closeNative()
             profileClients.forEach { it.closeNative() }
@@ -1656,7 +1656,7 @@ class NativeExperienceUiTest {
             compose.runOnIdle { vm.send() }
             await { fixture.requests.count { it.string("method") == "prompt.submit" } == 1 }
             assertEquals("Pinned draft", fixture.requests.single { it.string("method") == "prompt.submit" }.getJSONObject("params").string("text"))
-            receipts += "A pinned Cypher conversation Hermes has forgotten is replaced by a fresh pinned one in place, with its draft, and sends once."
+            receipts += "A pinned Beacon conversation Hermes has forgotten is replaced by a fresh pinned one in place, with its draft, and sends once."
         } finally {
             runBlocking {
                 listOf(pinnedId, freshId).filter(String::isNotBlank).forEach { id ->
@@ -1915,7 +1915,7 @@ class NativeExperienceUiTest {
         await { !vm.ui.value.cypherOpening && vm.chat.value.sessionId.startsWith("new-") }
         assertEquals(1, fixture.requests.count { it.string("method") == "session.create" })
         assertTrue(vm.ui.value.cypherError.isBlank())
-        receipts += "Fifty repeated Cypher opens while create ACK is delayed resolve one durable conversation."
+        receipts += "Fifty repeated Beacon opens while create ACK is delayed resolve one durable conversation."
         capture("stable-cypher")
     }
 
@@ -2154,7 +2154,7 @@ class NativeExperienceUiTest {
         assertTrue(vm.chat.value.queued.isEmpty())
         assertTrue("Reference states never send or stop anything", fixture.requests.none { it.string("method") in setOf("prompt.submit", "session.create", "session.interrupt") })
         assertTrue("Reference states never answer a native server request", fixture.nativeServerResponses.isEmpty())
-        receipts += "Live running/queued/approval/question work appears in the activity strip and read-only sheet from real chat state; the sheet has no stop control, queue removal is the only mutation, and the Cypher shell menus keep working. Nothing was sent."
+        receipts += "Live running/queued/approval/question work appears in the activity strip and read-only sheet from real chat state; the sheet has no stop control, queue removal is the only mutation, and the Beacon shell menus keep working. Nothing was sent."
         capture("migration-chat-settled")
     }
 
@@ -2983,7 +2983,7 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Technical details").assertDoesNotExist()
         compose.onNodeWithText("Account identifier").assertDoesNotExist()
         compose.onNodeWithText("Sign out", ignoreCase = true).performScrollTo().performClick()
-        compose.onNodeWithText("Sign out of Cypher").assertExists()
+        compose.onNodeWithText("Sign out of Beacon").assertExists()
         compose.onNodeWithText("Cancel").performClick()
         assertTrue(vm.ui.value.authenticated)
         compose.onNodeWithText("Sign out", ignoreCase = true).performScrollTo().performClick()

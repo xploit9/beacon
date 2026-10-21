@@ -13,7 +13,7 @@ class ServerTranscriptStatusTest {
     }
     @Test fun warningsStayVisibleAndNonfatalOnlyForTheAuthorizedActiveCall() {
         val current = active.copy(state = "listening", transcriptStatus = "syncing", muted = true)
-        val message = "Cypher cannot work ahead right now. You can continue the call."
+        val message = "Beacon cannot work ahead right now. You can continue the call."
         val warned = current.withServerWarning(message, "", "current")
         assertEquals(current.copy(error = message), warned)
         assertTrue(warned.active)

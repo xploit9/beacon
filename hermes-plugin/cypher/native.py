@@ -159,7 +159,7 @@ def create_project(owner, provider, profile, request_id, name, description=''):
 
 def create(owner,provider,profile):
     from tui_gateway import server
-    result=rpc(owner,provider,'session.create',{'profile':profile,'source':'android','title':'Cypher voice call','close_on_disconnect':False})
+    result=rpc(owner,provider,'session.create',{'profile':profile,'source':'android','title':'Beacon voice call','close_on_disconnect':False})
     sid=result['session_id'];record=None
     try:
         with server._sessions_lock:

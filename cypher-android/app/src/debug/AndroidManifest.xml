@@ -1,6 +1,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
-    <!-- Debug-only preview label; the release manifest keeps "Cypher". -->
-    <application android:label="Cypher Preview" android:networkSecurityConfig="@xml/fixture_network_security" tools:replace="android:label">
+    <!-- Debug-only preview label; the release manifest keeps "Beacon". -->
+    <application android:label="Beacon Preview" android:networkSecurityConfig="@xml/fixture_network_security" tools:replace="android:label">
         <activity android:name="dev.hermes.android.ui.LiveCallShowcaseActivity" android:exported="false" />
         <!-- Sends uncaught crashes to a local Bugsink when debug.bugsinkDsn is set; idle otherwise. -->
         <provider android:name="dev.hermes.android.debug.BugsinkCrashReporter" android:authorities="${applicationId}.bugsink" android:exported="false" android:initOrder="100" />

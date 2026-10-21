@@ -162,32 +162,32 @@ internal fun parseCypherConnectLink(value: String, allowAddress: Boolean = true)
     val link = uri.scheme.equals("cypher", ignoreCase = true)
     val address = when {
         scannerPayload != null -> scannerPayload.opt("url") as? String
-            ?: throw IllegalArgumentException("This Cypher QR has no server address. Scan it again or paste the HTTPS address.")
+            ?: throw IllegalArgumentException("This Beacon QR has no server address. Scan it again or paste the HTTPS address.")
         link -> {
-            require(uri.host.equals("connect", ignoreCase = true) && uri.path.isNullOrEmpty()) { "Scan a Cypher connection QR or paste an HTTPS Hermes address." }
+            require(uri.host.equals("connect", ignoreCase = true) && uri.path.isNullOrEmpty()) { "Scan a Beacon connection QR or paste an HTTPS Hermes address." }
             uri.getQueryParameter("url")?.takeIf(String::isNotBlank)
-                ?: throw IllegalArgumentException("This Cypher link has no server address. Scan the QR again or paste the HTTPS address.")
+                ?: throw IllegalArgumentException("This Beacon link has no server address. Scan the QR again or paste the HTTPS address.")
         }
         else -> {
-            require(allowAddress) { "Scan a Cypher connection QR or paste an HTTPS Hermes address." }
+            require(allowAddress) { "Scan a Beacon connection QR or paste an HTTPS Hermes address." }
             input
         }
     }
     val sessions = when {
         scannerPayload != null -> listOf((scannerPayload.opt("session") as? String)?.takeIf(String::isNotBlank)
-            ?: throw IllegalArgumentException("This Cypher QR has an invalid session. Scan it again."))
+            ?: throw IllegalArgumentException("This Beacon QR has an invalid session. Scan it again."))
         link -> uri.getQueryParameters("session")
         else -> emptyList()
     }
-    require(sessions.size <= 1) { "This Cypher link has an invalid session. Scan the Connect QR again." }
+    require(sessions.size <= 1) { "This Beacon link has an invalid session. Scan the Connect QR again." }
     val session = sessions.singleOrNull()?.takeIf(String::isNotBlank)
-    require(session == null || validLoopbackSessionToken(session)) { "This Cypher link has an invalid session. Scan the Connect QR again." }
+    require(session == null || validLoopbackSessionToken(session)) { "This Beacon link has an invalid session. Scan the Connect QR again." }
     val pairingCodes = when {
         scannerPayload != null && scannerPayload.has("code") -> listOf(scannerPayload.optString("code"))
         link -> uri.getQueryParameters("code")
         else -> emptyList()
     }
-    require(pairingCodes.size <= 1) { "This Cypher QR has an invalid pairing code. Scan it again." }
+    require(pairingCodes.size <= 1) { "This Beacon QR has an invalid pairing code. Scan it again." }
     val pairingCode = pairingCodes.singleOrNull()?.let { dev.hermes.android.data.normalizePairingCode(it) }
     val explicitScheme = Regex("^[A-Za-z][A-Za-z0-9+.-]*://").containsMatchIn(address.trim())
     return CypherConnectInput(trustedOrigin(if (explicitScheme) address else "https://$address"), session, pairingCode)
@@ -230,7 +230,7 @@ fun SetupWizard(vm: CypherViewModel, modifier: Modifier = Modifier, externalLink
         onStageLink = vm::openSetupLink,
         onRedeemPairing = { _, code -> NativePairing.redeem(vm.client ?: throw PairingFailure("Sign in with Hermes before linking this phone."), code) },
         onLinkPairing = { grant -> NativePairing.link(context, vm.client ?: throw PairingFailure("Sign in with Hermes before linking this phone."), grant) },
-        onOpenBackgroundSettings = { if (!requestBackgroundUse(context)) vm.notice("Open Cypher’s app settings in Android and allow background use.") },
+        onOpenBackgroundSettings = { if (!requestBackgroundUse(context)) vm.notice("Open Beacon’s app settings in Android and allow background use.") },
     )
 }
 
@@ -536,7 +536,7 @@ internal fun SetupWizardScreen(
                 BeaconMark(size = 74.dp, contentDescription = assistantText("Beacon"))
             }
             Spacer(Modifier.height(4.dp))
-            Text("Cypher", style = MaterialTheme.typography.displaySmall)
+            Text(uiText("Beacon"), style = MaterialTheme.typography.displaySmall)
             Spacer(Modifier.height(8.dp))
             Text("A simple, secure connection to Hermes.", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(24.dp))
@@ -715,17 +715,17 @@ internal fun SetupWizardScreen(
                     }
                     "done" -> {
                         Text("You're connected", style = MaterialTheme.typography.headlineSmall)
-                        Text("Cypher is ready to use with your Hermes account.", style = MaterialTheme.typography.bodyLarge)
+                        Text("Beacon is ready to use with your Hermes account.", style = MaterialTheme.typography.bodyLarge)
                         state.setupPluginMessage.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                             Column(Modifier.weight(1f)) {
                                 Text("Keep connected", style = MaterialTheme.typography.titleMedium)
-                                Text("Let Hermes reach this phone for incoming calls while Cypher is closed.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text("Let Hermes reach this phone for incoming calls while Beacon is closed.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                             Switch(checked = keepConnected, onCheckedChange = { keepConnected = it; if (it) requestKeepConnectedNotifications() }, modifier = Modifier.testTag("setup-keep-connected"))
                         }
                         if (keepConnected && !notificationAllowed) Text("Allow notifications so incoming call alerts can appear.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                        if (setupNeedsBackgroundExemption(ignoringBatteryOptimizations)) TextButton(onClick = onOpenBackgroundSettings, modifier = Modifier.testTag("setup-background-use")) { Text("Allow Cypher to run in the background") }
+                        if (setupNeedsBackgroundExemption(ignoringBatteryOptimizations)) TextButton(onClick = onOpenBackgroundSettings, modifier = Modifier.testTag("setup-background-use")) { Text("Allow Beacon to run in the background") }
                         Button(onClick = { onFinish(keepConnected) }, enabled = state.authenticated, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-finish")) { Text("Open chat") }
                     }
                     else -> {

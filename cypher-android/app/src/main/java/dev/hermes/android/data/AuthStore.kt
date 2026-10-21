@@ -116,7 +116,7 @@ fun AuthContext.cachedScopeFor(requestedOrigin: String, replacingAccount: Boolea
     if (!bearerMatches && !loopbackMatches && !cookieMatches) return null
     return Scope(requestedOrigin, owner, profile)
 }
-class CachedIdentityMismatch : SecurityException("Saved Cypher identity changed. Sign in again; local drafts are retained.")
+class CachedIdentityMismatch : SecurityException("Saved Beacon identity changed. Sign in again; local drafts are retained.")
 fun AuthContext.requireCachedIdentity(scope: Scope) {
     if (origin != scope.origin || owner != scope.owner || profile != scope.profile ||
         loopbackSession?.let { !it.verified || !it.persisted || it.origin != scope.origin || it.owner != scope.owner } == true) throw CachedIdentityMismatch()

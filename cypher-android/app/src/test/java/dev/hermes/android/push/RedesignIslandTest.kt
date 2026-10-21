@@ -29,7 +29,7 @@ class RedesignIslandTest {
         assertFalse(validNativeAnswer(route,"once"));assertTrue(validNativeAnswer(route,"deny"))
     }
     @Test fun fallbackNeverContainsCommandsOrQuestionContent() {
-        assertEquals("Cypher · Working", notificationFallback("working").first)
+        assertEquals("Beacon · Working", notificationFallback("working").first)
         assertTrue(notificationFallback("approval").second.contains("approval"))
         assertTrue(notificationFallback("clarify").second.contains("answer"))
     }

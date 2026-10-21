@@ -39,7 +39,7 @@ internal val settingsDescriptions = mapOf(
     "Settings" to "Sending and display",
     "Cypher" to "Voice provider for calls",
     "Notifications" to "Notification delivery",
-    "App updates" to "Install the latest Cypher version",
+    "App updates" to "Install the latest Beacon version",
     "Providers & models" to "Models for chats and bots", "Tools & commands" to "Tool groups and commands",
     "Skills" to "Installed skills", "Memory" to "What Hermes knows about you",
     "MCP servers" to "Service connections",

@@ -254,7 +254,7 @@ def test_room_scan_ceiling_fails_closed_before_creation(harness):
     results['groups.list']=page
     response=client.post('/mobile/bot-mode/space',json={'profiles':['default','writer'],'request_id':'bounded-scan'})
     assert response.status_code==409
-    assert response.json()['detail']=='Cypher checked 1,000 group rooms and stopped before creating a duplicate. Archive unused rooms in Hermes, then try again.'
+    assert response.json()['detail']=='Beacon checked 1,000 group rooms and stopped before creating a duplicate. Archive unused rooms in Hermes, then try again.'
     pages=[c[3] for c in calls if c[2]=='groups.list']
     assert len(pages)==10 and all(page['limit']==100 for page in pages)
     assert [page['offset'] for page in pages]==list(range(0,1000,100))
