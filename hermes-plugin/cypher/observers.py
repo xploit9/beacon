@@ -17,6 +17,10 @@ CLAIM_FIELDS = {"id", "message_id", "messageid", "event_id", "eventid", "task_id
                 "url", "uri", "link", "web_url", "subject", "title", "name", "summary"}
 
 
+# An email seen again in a later run is normal; the plain message keeps a watch run from reporting it as a failure.
+DUPLICATE_ALERT = {"status": "duplicate", "message": "The owner already has this alert. Nothing more to do; this is not an error."}
+
+
 INSTRUCTION_MARKERS = ("ignore previous", "ignore all", "system prompt", "override policy", "new instructions",
                        "pre-approved", "preapproved", "send email", "mark as read", "tool_call")
 CALLBACK_REASON_CHARACTERS = re.compile(r"""[\w .,!?'"():;/@#&+$%€-]*\Z""", re.UNICODE)
@@ -249,7 +253,7 @@ def _notice(mobile, owner, profile, conversation, reason, alert_key, now, email_
     with mobile.LOCK, mobile.connect() as conn:
         prune_meta(conn, now.timestamp())
         if conn.execute("SELECT 1 FROM meta WHERE key=?", (alert_key,)).fetchone():
-            return {"status": "duplicate"}
+            return dict(DUPLICATE_ALERT)
         mobile.prune_notices(conn)
         if conn.execute("SELECT COUNT(*) FROM notices").fetchone()[0] >= 10000:
             raise ValueError("Notification capacity reached")
@@ -314,7 +318,7 @@ def email_notice(mobile, native, cfg, profile, session_id, args, now):
             with mobile.connect() as conn:
                 prune_meta(conn, now.timestamp())
                 if conn.execute("SELECT 1 FROM meta WHERE key=?", (dedupe,)).fetchone():
-                    return {"status": "duplicate"}
+                    return dict(DUPLICATE_ALERT)
                 prefix = f"proactive-call:{owner}:{profile}:"
                 count = sum((_number(row[0]) or 0) > now.timestamp() - CALL_WINDOW
                             for row in conn.execute("SELECT value FROM meta WHERE substr(key,1,?)=?",

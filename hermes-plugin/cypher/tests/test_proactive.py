@@ -519,6 +519,10 @@ def test_v4_feedback_reaches_only_the_watch_notepad_never_hermes_memory_and_can_
     alert = observers.email_notice(api.mobile, api.native, cfg, "default", "watch-run",
                                    {"item_id": "message-1", "reason": "Daniel Reyes / Client moved the review"}, now)
     notice_id = alert["event_id"]
+    # A later run that reads the same email again is told plainly that nothing failed.
+    assert observers.email_notice(api.mobile, api.native, cfg, "default", "watch-run",
+                                  {"item_id": "message-1", "reason": "Daniel Reyes / Client moved the review"},
+                                  now) == observers.DUPLICATE_ALERT
 
     learned = client.post("/api/plugins/cypher/mobile/proactive/feedback",
                           json={"notice_id": notice_id, "verdict": "important"})
