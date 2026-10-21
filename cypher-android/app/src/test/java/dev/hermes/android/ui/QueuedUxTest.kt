@@ -11,7 +11,7 @@ class QueuedUxTest {
         assertFalse(composerUsesVoice("hello", 0, 0))
         assertFalse(composerUsesVoice("", 1, 0))
         assertFalse(composerUsesVoice("", 0, 1))
-        assertEquals(48f, composerActionSize.value, 0f)
+        assertEquals(42f, composerActionSize.value, 0f)
         assertEquals("1 message queued — delivers after this turn", queuedHeading(1))
         assertEquals("3 messages queued — delivers after this turn", queuedHeading(3))
     }

@@ -1831,10 +1831,10 @@ class NativeExperienceUiTest {
         receipts += "Android reports the software keyboard visible while the composer stays reachable."
         val inputBounds = compose.onNodeWithTag("message-input").fetchSemanticsNode().boundsInWindow
         val sendBounds = compose.onNodeWithTag("message-send").fetchSemanticsNode().boundsInWindow
-        // The v3 primary action is a fixed 48dp circle that sits in the control row below the editor, never wider than tall.
+        // The primary action is a fixed 42dp circle that sits in the control row below the editor, never wider than tall.
         val sendFootprint = compose.onNodeWithTag("message-send").getUnclippedBoundsInRoot()
-        assertEquals("Primary action is 48dp wide", 48f, (sendFootprint.right - sendFootprint.left).value, .75f)
-        assertEquals("Primary action is 48dp tall", 48f, (sendFootprint.bottom - sendFootprint.top).value, .75f)
+        assertEquals("Primary action is 42dp wide", 42f, (sendFootprint.right - sendFootprint.left).value, .75f)
+        assertEquals("Primary action is 42dp tall", 42f, (sendFootprint.bottom - sendFootprint.top).value, .75f)
         assertTrue("Primary action is below the text area and above the keyboard", sendBounds.top >= inputBounds.bottom && sendBounds.bottom <= keyboardTop() + 2)
         val attachBounds = compose.onNodeWithTag("composer-attach").fetchSemanticsNode().boundsInWindow
         val permissionBounds = compose.onNodeWithTag("composer-approvals").fetchSemanticsNode().boundsInWindow
