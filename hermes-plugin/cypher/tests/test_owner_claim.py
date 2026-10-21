@@ -45,27 +45,67 @@ def _native_profiles(monkeypatch, names):
     return calls
 
 
-def test_unowned_connect_info_offers_claim_only_to_dashboard_browser(harness, monkeypatch):
-    _, client, cfg, _, app = harness
-    cfg.clear()
+def test_fresh_dashboard_open_binds_verified_owner_and_returns_qr(harness, monkeypatch):
+    api, client, _, home, _ = harness
+    _write_config(home, {})
+    _use_real_settings(api, monkeypatch)
+    _native_profiles(monkeypatch, ['default', 'work'])
+    set_public_url(monkeypatch, 'https://hermes.example.test/cypher')
 
     response = client.get('/api/plugins/cypher/connect-info')
-    assert response.status_code == 200
-    assert response.json() == {'claim_required': True}
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {'url': 'https://hermes.example.test/cypher', 'name': 'hermes.example.test'}
     assert response.headers['cache-control'] == 'no-store'
+    assert api.mobile.settings()['owner_id'] == 'owner'
+    assert api.mobile.settings()['owner_provider'] == 'basic'
 
+
+def test_first_verified_phone_request_binds_idempotently_and_refuses_second_identity(harness, monkeypatch):
+    api, client, _, home, _ = harness
+    _write_config(home, {})
+    _use_real_settings(api, monkeypatch)
+    _native_profiles(monkeypatch, ['default'])
+    path = '/api/plugins/cypher/mobile/history-retention?profile=default'
+
+    assert client.get(path).status_code == 200
+    assert client.get(path).status_code == 200
+    client.headers['x-fixture-owner'] = 'foreign'
+    refused = client.get(path)
+
+    assert refused.status_code == 403
+    assert refused.json() == {'detail': 'Owner not authorized'}
+    assert api.mobile.settings()['owner_id'] == 'owner'
+
+
+def test_unauthenticated_first_plugin_request_never_binds_owner(harness, monkeypatch):
+    api, client, _, home, _ = harness
+    _write_config(home, {})
+    _use_real_settings(api, monkeypatch)
     del client.headers['x-fixture-owner']
-    client.headers['authorization'] = 'Bearer phone-access-token'
-    client.headers['x-fixture-bearer'] = 'owner'
-    bearer = client.get('/api/plugins/cypher/connect-info')
-    assert bearer.status_code == 403
-    assert bearer.json() == {'detail': 'Owner not authorized'}
 
-    del client.headers['authorization']
-    del client.headers['x-fixture-bearer']
-    app.state.auth_required = False
-    monkeypatch.setitem(sys.modules, 'hermes_cli.web_server', SimpleNamespace(_has_valid_session_token=lambda request: False))
-    assert client.get('/api/plugins/cypher/connect-info').status_code == 401
+    response = client.get('/api/plugins/cypher/mobile/bootstrap?profile=default')
+
+    assert response.status_code == 401
+    assert api.mobile.settings().get('owner_id') is None
+    assert api.mobile.settings().get('owner_provider') is None
+    with api.mobile.connect() as conn:
+        assert conn.execute("SELECT 1 FROM meta WHERE key='owner_claim'").fetchone() is None
+
+
+def test_two_first_bindings_atomically_choose_one_owner(harness, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    api, _, _, home, _ = harness
+    _write_config(home, {})
+    _use_real_settings(api, monkeypatch)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(api.mobile.claim_owner, owner, 'basic') for owner in ('owner-a', 'owner-b')]
+        created = [future.result() for future in futures]
+
+    assert sorted(created) == [False, True]
+    assert api.mobile.settings()['owner_id'] in {'owner-a', 'owner-b'}
 
 
 def test_claim_refuses_bearer_cross_site_and_loopback_requests(harness):

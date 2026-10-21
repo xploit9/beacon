@@ -46,6 +46,7 @@ def make_request(method='POST', headers=None):
 def invoke_call_user(env, monkeypatch, args, title='Plain conversation'):
     _, mobile, native, cfg, _, tmp_path = env
     plugin = load('__init__')
+    monkeypatch.setattr(plugin, 'current_profile', lambda cfg:'default')
     plugin.mobile = mobile
     plugin.native = native
     cfg.update(callback_tool_enabled=True)
@@ -182,7 +183,9 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
         registry=SimpleNamespace(get_toolset_for_tool=lambda name:
                                  "cronjob" if name == "cronjob" else
                                  "skills" if name in {"skills", "skills_list"} else
-                                 "memory" if name == "memory" else
+                                 "memory" if name in {"memory", "hindsight_recall", "hindsight_reflect",
+                                                       "hindsight_search_knowledge_pages", "hindsight_read_knowledge_page",
+                                                       "hindsight_retain", "hindsight_ingest", "hindsight_capture"} else
                                  "messaging" if name == "send_message" else
                                  "web" if name in {"web_search", "web_extract", "web_fetch"} else
                                  "native" if name in {"api_call", "trigger_job", "gmail_tool", "browser_navigate",
@@ -211,8 +214,15 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
         tool_name="send_message", args={"target": "phone"}, session_id="watch-run")
     memory_read = plugin.native_proactive_read_only_guard(
         tool_name="memory", args={"action": "list"}, session_id="watch-run")
+    hindsight_reads = [plugin.native_proactive_read_only_guard(
+        tool_name=name, args={"query": "important email"}, session_id="watch-run")
+        for name in ("hindsight_recall", "hindsight_reflect", "hindsight_search_knowledge_pages",
+                     "hindsight_read_knowledge_page")]
+    hindsight_writes = [plugin.native_proactive_read_only_guard(
+        tool_name=name, args={"content": "owner memory"}, session_id="watch-run")
+        for name in ("hindsight_retain", "hindsight_ingest", "hindsight_capture")]
     web_read = plugin.native_proactive_read_only_guard(
-        tool_name="web_search", args={"query": "latest release https://example.test"}, session_id="watch-run")
+        tool_name="web_search", args={"query": "latest release"}, session_id="watch-run")
     terminal = plugin.native_proactive_read_only_guard(
         tool_name="terminal", args={"command": "cat inbox"}, session_id="watch-run")
     email_notice_url = plugin.native_proactive_read_only_guard(
@@ -260,6 +270,7 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
     assert send_message == blocked
     assert allowed is None and outside is None and skills_list is None
     assert memory_read is None and web_read is None
+    assert hindsight_reads == [None] * 4 and hindsight_writes == [blocked] * 3
     assert email_notice_url is None and email_checked_url is None
     terminal_blocked = {"action": "block", "message": plugin._READ_ONLY_TERMINAL_MESSAGE}
     assert terminal == terminal_blocked
@@ -330,6 +341,54 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
             assert plugin.native_proactive_read_only_guard(
                 tool_name="mcp__mail__" + name, args={}, session_id="watch-run") == blocked, (name, hint)
     assert ("pre_tool_call", plugin.native_proactive_read_only_guard) in hooks
+
+
+def test_scheme_less_destinations_block_non_mail_tools_but_keep_gmail_queries(harness, monkeypatch):
+    api,_,cfg,_,_=harness
+    plugin=load_private("__init__")
+    plugin.mobile=api.mobile
+    monkeypatch.setattr(api.mobile,"settings",lambda profile=None:cfg)
+    monkeypatch.setattr(plugin,"current_profile",lambda cfg:"default")
+    monkeypatch.setattr(plugin,"_cron_row",lambda profile,session_id:{"source":"cron","cron_job_id":"watch-job"})
+    monkeypatch.setattr(plugin,"_cron_job_id",lambda row,session_id:"watch-job")
+    monkeypatch.setattr(plugin.proactive,"watch_job_ids",lambda *args:{"watch-job"})
+
+    mcp_tool=SimpleNamespace(
+        _mcp_tool_server_names={"mcp__mail__search_inbox":"mail","mcp__research__scrapling_fetch":"research",
+                                "mcp__workspace__list_calendar_events":"google_workspace"},
+        _tool_read_only_hints={"mail":{"search_inbox":True},"research":{"scrapling_fetch":True},
+                               "google_workspace":{"list_calendar_events":True}})
+    import tools
+    monkeypatch.setitem(sys.modules,"tools.mcp_tool",mcp_tool)
+    monkeypatch.setattr(tools,"mcp_tool",mcp_tool,raising=False)
+    monkeypatch.setitem(sys.modules,"tools.mcp_tool_schema",
+                        SimpleNamespace(mcp_prefixed_tool_name=lambda server,raw:f"mcp__{server}__{raw}"))
+    monkeypatch.setitem(sys.modules,"tools.mcp_tool_scope",SimpleNamespace(_resolve_server_key=lambda server:server))
+    monkeypatch.setitem(sys.modules,"tools.registry",SimpleNamespace(registry=SimpleNamespace(
+        get_toolset_for_tool=lambda name:"web" if name=="web_search" else "file" if name=="read_file" else
+        "memory" if name=="hindsight_recall" else
+        "mcp-mail" if name.startswith("mcp__mail__") else "mcp-research")))
+    monkeypatch.setitem(sys.modules,"hermes_cli.web_server_profiles",
+                        SimpleNamespace(_profile_scope=lambda profile:nullcontext()))
+
+    blocked={"action":"block","message":plugin._READ_ONLY_MESSAGE}
+    destinations=({"url":"evil.example/x?d=mail"},{"url":"bob@evil.example"},
+                  {"url":"169.254.169.254/latest/meta-data/"},{"url":"evil.example:8080/f"},
+                  {"url":"http:evil.example/x"},{"url":"evil.example"},
+                  {"request":{"targets":["EVIL.example/x"]}},
+                  {"request":{"targets":["evil.example"]}})
+    for args in destinations:
+        assert plugin.native_proactive_read_only_guard("mcp__research__scrapling_fetch",args,"watch-run")==blocked,args
+    destination="evil.example/x?d=mail"
+    assert plugin.native_proactive_read_only_guard("web_search",{"query":destination},"watch-run")==blocked
+    assert plugin.native_proactive_read_only_guard("hindsight_recall",{"query":destination},"watch-run")==blocked
+    assert plugin.native_proactive_read_only_guard(
+        "mcp__mail__search_inbox",{"query":"from:bank.com newer_than:1d"},"watch-run") is None
+    assert plugin.native_proactive_read_only_guard(
+        "mcp__workspace__list_calendar_events",{"query":"from:bank.com"},"watch-run")==blocked
+    assert plugin.native_proactive_read_only_guard(
+        "terminal",{"command":"gws gmail users messages list --params '{\"q\":\"from:bank.com\"}'"},"watch-run") is None
+    assert plugin.native_proactive_read_only_guard("read_file",{"filename":"report.pdf"},"watch-run") is None
 
 
 @pytest.mark.parametrize(("tool_name", "toolset"), [

@@ -1,6 +1,7 @@
 """Owner-controlled proactive jobs for a single Hermes profile."""
 import json
 from datetime import datetime, timezone
+import ipaddress
 import os
 from pathlib import Path
 import re
@@ -706,6 +707,7 @@ def status(mobile, owner, profile):
 
 
 _SET_ENABLED_LOCK = threading.Lock()
+_SYNC_LEARNED_LOCK = threading.Lock()
 
 
 def _managed_delete_all(mobile, owner, profile, jobs=None):
@@ -771,14 +773,13 @@ def _store_learned(mobile, owner, profile, notes):
 def sync_learned(mobile, owner, profile):
     """Owner verdicts live in Cypher's store and reach only the email watch, through its Hermes notepad: email
     wording never enters Hermes profile memory, which every chat reads (Strix 7d8f96b #2)."""
-    if not _managed_id(mobile, owner, profile, "watch_email"):
-        return
     from hermes_cli.web_server_profiles import _profile_scope
     from cron.notepad import delete_note, set_note
-    # Held across the write, so two taps at once cannot leave the older list in the notepad.
-    with mobile.LOCK, _profile_scope(profile):
-        job_id = _managed_id(mobile, owner, profile, "watch_email")
-        notes = learned_notes(mobile, owner, profile)
+    # Serialize mirrors before the profile scope so concurrent owner taps cannot leave an older list in the notepad.
+    with _SYNC_LEARNED_LOCK, _profile_scope(profile):
+        with mobile.LOCK:
+            job_id = _managed_id(mobile, owner, profile, "watch_email")
+            notes = learned_notes(mobile, owner, profile)
         if not job_id:
             return
         if notes:
@@ -792,15 +793,16 @@ def _move_legacy_learned(mobile, owner, profile):
     """Earlier builds kept verdicts as Hermes user-memory entries; move them into Cypher's store."""
     from hermes_cli.web_server_profiles import _profile_scope
     from tools.memory_tool import load_on_disk_store
-    # Always mobile.LOCK before the profile scope's lock (sync_learned does the same), never the other way round.
-    with mobile.LOCK, _profile_scope(profile):
+    # Keep migration on the same profile-before-store order as live notepad sync.
+    with _SYNC_LEARNED_LOCK, _profile_scope(profile):
         store = load_on_disk_store()
         legacy = [entry for entry in store.user_entries if isinstance(entry, str) and entry.startswith(LEARNED_PREFIX)]
         if not legacy:
             return
-        saved = learned_notes(mobile, owner, profile)
-        moved = [_without_links(entry[len(LEARNED_PREFIX):]) for entry in reversed(legacy)]
-        _store_learned(mobile, owner, profile, saved + [entry for entry in moved if entry and entry not in saved])
+        with mobile.LOCK:
+            saved = learned_notes(mobile, owner, profile)
+            moved = [_without_links(entry[len(LEARNED_PREFIX):]) for entry in reversed(legacy)]
+            _store_learned(mobile, owner, profile, saved + [entry for entry in moved if entry and entry not in saved])
         # One at a time: Hermes refuses a single batch that would empty USER.md.
         for entry in legacy:
             if not store.remove("user", entry, matched_entry=entry).get("success"):
@@ -809,6 +811,19 @@ def _move_legacy_learned(mobile, owner, profile):
 
 def _without_links(text):
     """Drops links, addresses, domains and IP addresses, so a note can never carry a destination."""
+    text = re.sub(r'(?<=\w)(?:\s+dot\s+|\s+\.\s+|\s*\[\s*\.\s*\]\s*|\s*\(\s*dot\s*\)\s*)(?=\w)', '.', text, flags=re.I)
+    text = re.sub(r'\b(?:tel|mailto|sms|callto|whatsapp):\S*|(?<!\w)\*\d{2,}#(?!\w)', ' ', text, flags=re.I)
+    text = re.sub(r'(?<!\w)(?:\+?\d{1,3}[ .-])?(?:\(?\d{3}\)?[ .-]?)\d{4}(?!\w)|(?<!\d)\d{7,}(?!\d)', ' ', text)
+    def drop_ipv6(match):
+        value = match.group(0)
+        if ':' in value:
+            try:
+                if ipaddress.ip_address(value).version == 6:
+                    return ' '
+            except ValueError:
+                pass
+        return value
+    text = re.sub(r'(?<![\w:])[0-9a-f:]{2,}(?![\w:])', drop_ipv6, text, flags=re.I)
     return " ".join(re.sub(r"\S*(?:@|://|www\.|[^\W_]\.[^\W\d_]{2,}|\d+(?:\.\d+){3})\S*", " ", text, flags=re.I).split())
 
 

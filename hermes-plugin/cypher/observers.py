@@ -13,8 +13,11 @@ CALL_WINDOW = 60 * 60
 CALL_LIMIT = 3
 PRUNE_BATCH = 256
 MAX_EVIDENCE_HASHES = 1024
-CLAIM_FIELDS = {"id", "message_id", "messageid", "event_id", "eventid", "task_id", "taskid",
+CLAIM_FIELDS = {"id", "message_id", "messageid", "thread_id", "threadid", "event_id", "eventid", "task_id", "taskid",
                 "url", "uri", "link", "web_url", "subject", "title", "name", "summary"}
+_TEXT_IDENTIFIER = re.compile(r"""(?i)^\s*(?:[-*]\s*)?(?:message[_ -]?id|thread[_ -]?id|event[_ -]?id|\bid\b)\s*[:=]\s*[\"'<]?([A-Za-z0-9._:-]{1,256})[\"'>]?\s*$""")
+_TEXT_BODY_START = re.compile(r"(?i)^\s*(?:(?:message|email)\s+)?(?:body|content)\s*:")
+_TEXT_BODY_FIELDS = frozenset({'body','message_body','email_body','body_text','plain_body','html_body','raw_body'})
 
 
 # An email seen again in a later run is normal; the plain message keeps a watch run from reporting it as a failure.
@@ -121,7 +124,7 @@ def _digest(value):
     return hashlib.sha256(value.strip().casefold().encode("utf-8")).hexdigest()
 
 
-def _claims(value, depth=0, budget=None):
+def _claims(value, depth=0, budget=None, text_ids=False):
     budget = [0] if budget is None else budget
     budget[0] += 1
     if depth > 5 or budget[0] > 512:
@@ -134,25 +137,30 @@ def _claims(value, depth=0, budget=None):
         except (TypeError, ValueError):
             parsed = None
         if isinstance(parsed, (dict, list)):
-            return _claims(parsed, depth + 1, budget)
+            return _claims(parsed, depth + 1, budget, text_ids)
         output = set()
         for line in value.splitlines()[:80]:
+            if text_ids and _TEXT_BODY_START.match(line): break
             line = line.strip()
             if 2 <= len(line) <= 256:
                 output.add(_digest(line))
             output.update(_digest(url) for url in re.findall(r"https?://[^\s<>\"']+", line)[:8])
+            if text_ids and (match:=_TEXT_IDENTIFIER.fullmatch(line)):
+                output.add(_digest(match.group(1)))
         return output
     if isinstance(value, dict):
         output = set()
         for key, child in list(value.items())[:100]:
+            if text_ids and key.casefold() in _TEXT_BODY_FIELDS:
+                continue
             if isinstance(child, str) and key.casefold() in CLAIM_FIELDS and 1 <= len(child.strip()) <= 256:
                 output.add(_digest(child))
-            output.update(_claims(child, depth + 1, budget))
+            output.update(_claims(child, depth + 1, budget, text_ids))
         return output
     if isinstance(value, list):
         output = set()
         for child in value[:100]:
-            output.update(_claims(child, depth + 1, budget))
+            output.update(_claims(child, depth + 1, budget, text_ids))
         return output
     return set()
 
@@ -212,7 +220,8 @@ def source_observed(mobile, cfg, profile, session_id, tool_name, result, status)
             return False
     except (ImportError, LookupError, RuntimeError, ValueError):
         return False
-    claims = sorted(_claims(result))[:128]
+    text_ids = any(token in tool_name.casefold() for token in ("gmail", "google_workspace", "himalaya", "email", "mail"))
+    claims = sorted(_claims(result, text_ids=text_ids))[:128]
     if not claims:
         return False
     now = time.time()

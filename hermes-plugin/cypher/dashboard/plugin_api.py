@@ -119,6 +119,10 @@ def identity(request,profile=None,owner_only=False,allow_loopback=False):
     enforce_request_policy(request)
     owner,provider=dashboard_identity(request,allow_loopback)
     cfg=mobile.settings()
+    if 'owner_id' not in cfg and 'owner_provider' not in cfg and not allow_loopback:
+        try: mobile.claim_owner(owner,provider)
+        except ValueError: raise HTTPException(403,'Verified identity invalid') from None
+        cfg=mobile.settings()
     if not owner or not provider or not cfg.get('owner_id') or owner!=cfg['owner_id'] or provider!=cfg.get('owner_provider'):
         raise HTTPException(403,'Owner not authorized')
     profiles=cfg['profiles'] if 'profiles' in cfg else _native_profile_names()
@@ -182,17 +186,8 @@ def _bounded_event_wait(value):
 @router.get('/connect-info')
 async def connect_info(request:Request):
     enforce_request_policy(request)
-    cfg=mobile.settings()
-    authorization=request.headers.get('authorization','').strip().casefold()
-    if (getattr(request.app.state,'auth_required',False)
-            and 'owner_id' not in cfg and 'owner_provider' not in cfg
-            and getattr(request.state,'session',None) is not None
-            and not authorization.startswith('bearer ')
-            and not getattr(request.state,'native_http_principal',None)
-            and not getattr(request.state,'token_authenticated',False)):
-        dashboard_identity(request,browser_only=True)
-        return JSONResponse({'claim_required':True},headers={'Cache-Control':'no-store'})
     loopback=not bool(getattr(request.app.state,'auth_required',False))
+    if not loopback: dashboard_identity(request,browser_only=True)
     identity(request,owner_only=True,allow_loopback=loopback)
     url,name=connect_info_url()
     result={'url':url,'name':name}

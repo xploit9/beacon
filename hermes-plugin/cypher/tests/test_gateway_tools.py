@@ -72,7 +72,7 @@ class Mobile:
 class Backend:
     def __init__(self):
         self.read_only=True;self.version='a';self.calls=[];self.wait=None;self.started=threading.Event();self.result={'result':'real search result'}
-    def catalog(self):
+    def catalog(self,discover=True):
         return [{'tool_id':self.version*64,'name':'configured_search','description':'search web',
                  'parameters':{'type':'object','properties':{'query':{'type':'string'}},'required':['query'],'additionalProperties':False},
                  'read_only':self.read_only}]
@@ -200,7 +200,7 @@ def test_method_schema_requiring_post_is_write_capable(gateway,monkeypatch):
     assert tools['http_fetch']['_timeout']==10 and '_handler' not in tools['http_fetch']
     assert tools['make_request']['parameters']['properties']['method']['enum']==['GET']
 
-    backend.catalog=lambda:[tools['http_fetch']]
+    backend.catalog=lambda discover=True:[tools['http_fetch']]
     proposal=api.invoke(SCOPE,{'request_id':'post','tool_id':tools['http_fetch']['tool_id'],
         'arguments':{'url':'https://example.invalid','method':'POST'}})
     assert proposal['status']=='needs_approval' and not backend.calls
@@ -212,7 +212,7 @@ def test_get_only_method_default_is_receipted_and_executed(gateway):
         'parameters':{'type':'object','properties':{'url':{'type':'string'},
             'method':{'type':'string','enum':['GET'],'default':'GET'}},
             'required':['url'],'additionalProperties':False},'read_only':False}
-    backend.catalog=lambda:[tool]
+    backend.catalog=lambda discover=True:[tool]
     proposal=api.invoke(SCOPE,{'request_id':'get-default','tool_id':tool['tool_id'],
         'arguments':{'url':'https://example.invalid'}})
     assert proposal['status']=='needs_approval'
@@ -228,7 +228,7 @@ def test_receipt_deadline_covers_native_mcp_tool_timeout(gateway,monkeypatch):
           'parameters':{'type':'object','properties':{'query':{'type':'string'}},
                         'required':['query'],'additionalProperties':False},
           'read_only':True,'_timeout':300}
-    backend.catalog=lambda:[tool]
+    backend.catalog=lambda discover=True:[tool]
     class Slots:
         def acquire(self,blocking=False): return True
         def release(self): pass
@@ -352,12 +352,42 @@ def test_worker_catalog_is_locked_but_rpc_is_not(gateway,monkeypatch):
     api,backend,_=gateway
     lock=threading.RLock();monkeypatch.setattr(g,'CATALOG_LOCK',lock)
     catalog,execute=backend.catalog,backend.execute;calls=[]
-    def checked_catalog():
-        assert lock._is_owned();calls.append('catalog');return catalog()
+    def checked_catalog(discover=True):
+        assert not lock._is_owned();calls.append(discover);return catalog(discover)
     def checked_execute(*args,**kwargs):
         assert not lock._is_owned();return execute(*args,**kwargs)
     backend.catalog=checked_catalog;backend.execute=checked_execute
     invoke(api);assert settled(api)['status']=='completed' and len(calls)==2
+
+
+def test_gateway_lock_order_keeps_mobile_lock_outside_profile_scope(gateway):
+    api,backend,mobile=gateway
+    active=threading.local();inversions=[]
+
+    class MobileLock:
+        def __init__(self): self.lock=threading.RLock()
+        def __enter__(self):
+            if getattr(active,'profile',False): inversions.append('profile->mobile')
+            self.lock.acquire();return self
+        def __exit__(self,*_): self.lock.release()
+
+    mobile.LOCK=MobileLock()
+    def settings(profile=None):
+        with mobile.LOCK:
+            return {'owner_id':'owner','owner_provider':'password','profiles':['profile']}
+    mobile.settings=settings
+
+    def scoped(profile,fn):
+        prior=getattr(active,'profile',False);active.profile=True
+        try: return fn(mobile.path.parent)
+        finally: active.profile=prior
+
+    api.scoped=scoped
+    invoke(api,'lock-order')
+    result=settled(api,'lock-order')
+
+    assert result['status']=='completed' and backend.calls
+    assert inversions==[]
 
 
 def test_post_dispatch_http_exception_preserves_uncertainty_and_code(gateway):
@@ -372,11 +402,11 @@ def test_post_dispatch_http_exception_preserves_uncertainty_and_code(gateway):
 
 def test_generic_pre_dispatch_failure_is_failed_not_uncertain(gateway):
     api,backend,_=gateway;original=backend.catalog;calls=0
-    def fail_worker_catalog():
+    def fail_worker_catalog(discover=True):
         nonlocal calls
         calls+=1
         if calls>1: raise RuntimeError('Private catalog failure')
-        return original()
+        return original(discover)
     backend.catalog=fail_worker_catalog
     invoke(api)
     result=settled(api)
@@ -536,7 +566,7 @@ def test_router_reuses_native_owner_profile_and_closed_call_authority(tmp_path,m
     native_module=sys.modules['cypher_gateway_tools']
     backend=Backend()
     monkeypatch.setattr(native_module,'NativeMcp',lambda:backend)
-    monkeypatch.setattr(native_module.Gateway,'catalog',lambda self,profile:backend.catalog())
+    monkeypatch.setattr(native_module.Gateway,'catalog',lambda self,profile,discover=True:backend.catalog(discover=discover))
     app.include_router(api.build_router(host.call,host.body,lambda p,fn:fn(tmp_path),host.mobile),prefix='/api/plugins/cypher')
     call=reserve(client)
     path=f'/api/plugins/cypher/mobile/calls/{call}/tools'
@@ -584,18 +614,24 @@ def test_gateway_router_passes_the_call_conversation_to_native_dispatch(tmp_path
 
 def test_natural_tool_discovery_finds_mail_and_preserves_write_intent(gateway):
     api,backend,_=gateway
-    def tool(name,description,read_only=True):
+    def tool(name,description,read_only=True,**extra):
         return {'tool_id':name.encode().hex().ljust(64,'0')[:64], 'name':name,
-                'description':description, 'parameters':{'type':'object','properties':{}}, 'read_only':read_only}
-    backend.catalog=lambda:[
+                'description':description, 'parameters':{'type':'object','properties':{}}, 'read_only':read_only,**extra}
+    backend.catalog=lambda discover=True:[
         tool('search_contacts','Search contact names and email addresses'),
+        tool('manage_connections','Manage connected apps including Gmail',False,_kind='hermes',_toolset='connectors',_raw='manage_connections'),
         tool('send_gmail_message','Sends an email using the user Gmail account',False),
-        tool('search_gmail_messages','Searches messages in a Gmail account based on a query'),
+        tool('mcp__tool_gateway_meeting__google_workspace_search_gmai_f6f8eca1',
+             'Searches messages in a Gmail account based on a query',_raw='google_workspace_search_gmail',_server='tool_gateway_meeting'),
+        tool('mcp__tool_gateway_meeting__google_workspace_get_gmail_t_3ae9e308',
+             'Gets a Gmail message thread by id',_raw='google_workspace_get_gmail_thread',_server='tool_gateway_meeting'),
         tool('web_search','Read current web information from a search query'),
     ]
     found=api.discover('profile','Could you pull up my latest five emails?')['tools']
-    assert found and found[0]['name']=='search_gmail_messages'
-    assert api.discover('profile','email')['tools'][0]['name']=='search_gmail_messages'
+    assert found and found[0]['name']=='mcp__tool_gateway_meeting__google_workspace_search_gmai_f6f8eca1'
+    assert api.discover('profile','check my emails')['tools'][0]['name']=='mcp__tool_gateway_meeting__google_workspace_search_gmai_f6f8eca1'
+    assert 'manage_connections' not in {tool['name'] for tool in found}
+    assert api.discover('profile','email')['tools'][0]['name']=='mcp__tool_gateway_meeting__google_workspace_search_gmai_f6f8eca1'
     assert api.discover('profile','send email')['tools'][0]['name']=='send_gmail_message'
     assert api.discover('profile','search the web for current news')['tools'][0]['name']=='web_search'
     assert api.discover('profile','neutron triangulation flux')['tools']==[]
@@ -605,7 +641,7 @@ def test_discovery_does_not_cache_away_new_mcp_tools(gateway):
     api,backend,_=gateway
     assert api.discover('profile','weather')['tools']==[]
     original=backend.catalog
-    backend.catalog=lambda:original()+[{'tool_id':'b'*64,'name':'new_mcp_weather',
+    backend.catalog=lambda discover=True:original(discover)+[{'tool_id':'b'*64,'name':'new_mcp_weather',
         'description':'Current weather forecasts','parameters':{'type':'object'},'read_only':True}]
     assert api.discover('profile','Please get the latest weather forecast')['tools'][0]['name']=='new_mcp_weather'
 
@@ -615,7 +651,7 @@ def test_public_web_discovery_ranks_web_tools_above_mail_web_links(gateway):
     def tool(name,description):
         return {'tool_id':name.encode().hex().ljust(64,'0')[:64],'name':name,
                 'description':description,'parameters':{'type':'object'},'read_only':True}
-    backend.catalog=lambda:[
+    backend.catalog=lambda discover=True:[
         tool('search_gmail_messages','Search Gmail messages and return web interface links'),
         tool('search_contacts','Search contacts with web profile links'),
         tool('scrapling_fetch','Fetch a public web page with search engine referer support'),
@@ -625,7 +661,7 @@ def test_public_web_discovery_ranks_web_tools_above_mail_web_links(gateway):
 
 def test_discovery_preserves_inflected_description_matches(gateway):
     api,backend,_=gateway
-    backend.catalog=lambda:[
+    backend.catalog=lambda discover=True:[
         {'tool_id':'a'*64,'name':'inbox_reader','description':'Searches your inbox','parameters':{'type':'object'},'read_only':True},
         {'tool_id':'b'*64,'name':'page_reader','description':'Fetches public pages','parameters':{'type':'object'},'read_only':True},
         {'tool_id':'c'*64,'name':'people','description':'Lists contact addresses','parameters':{'type':'object'},'read_only':True},
@@ -640,6 +676,10 @@ def test_native_tools_are_discovered_for_the_api_profile_and_exclusions_are_appl
         ('session_search','session_search'),('memory','memory'),('todo_list','todo'),('video_analyze','video'),
         ('clarify','clarify'),('delegate_task','delegation'),('browser_click','browser'),
         ('cypher_create_proactive_request','cypher-interactive'),('cypher_email_notice','cypher-mailbox'),
+        ('hindsight_recall','memory'),('hindsight_reflect','memory'),
+        ('hindsight_search_knowledge_pages','memory'),('hindsight_read_knowledge_page','memory'),
+        ('hindsight_retain','memory'),
+        ('manage_connections','connectors'),('manage_catalog','connectors'),('setup_mcp','connectors'),
         ('mcp-weather','mcp-weather'),('metadata_read','custom'),
     ]
     entries={name:SimpleNamespace(name=name,toolset=toolset,schema={'description':f'{name} purpose'},
@@ -652,7 +692,7 @@ def test_native_tools_are_discovered_for_the_api_profile_and_exclusions_are_appl
     config={'agent':{'disabled_toolsets':['video']}}
     seen={}
     enabled={'file','web','vision','session_search','memory','todo','video','clarify','delegation','browser',
-             'cypher-interactive','cypher-mailbox','mcp-weather','custom'}
+             'cypher-interactive','cypher-mailbox','connectors','mcp-weather','custom'}
     def platform_tools(received,platform):
         assert received is config and platform=='api_server'
         return enabled
@@ -672,9 +712,13 @@ def test_native_tools_are_discovered_for_the_api_profile_and_exclusions_are_appl
 
     catalog={item['name']:item for item in native_catalog}
     assert {'read_file','write_file','web_search','web_extract','vision_analyze','metadata_read'} <= set(catalog)
+    memory_reads={'hindsight_recall','hindsight_reflect','hindsight_search_knowledge_pages','hindsight_read_knowledge_page'}
+    assert memory_reads <= set(catalog)
+    assert all(catalog[name]['read_only'] for name in memory_reads)
+    assert catalog['hindsight_retain']['read_only'] is False
     assert 'session_search' not in catalog
     assert not {'memory','todo_list','clarify','delegate_task','browser_click','cypher_create_proactive_request',
-                'cypher_email_notice','mcp-weather','video_analyze'} & set(catalog)
+                'cypher_email_notice','mcp-weather','video_analyze','manage_connections','manage_catalog','setup_mcp'} & set(catalog)
     assert catalog['read_file']['read_only'] and catalog['web_search']['read_only']
     assert not catalog['web_extract']['read_only'] and not catalog['vision_analyze']['read_only']
     assert not catalog['metadata_read']['read_only']
@@ -683,7 +727,7 @@ def test_native_tools_are_discovered_for_the_api_profile_and_exclusions_are_appl
     assert seen['disabled_toolsets']==['video']
     assert seen['skip_tool_search_assembly'] is True
 
-    backend=SimpleNamespace(catalog=lambda:native_catalog)
+    backend=SimpleNamespace(catalog=lambda discover=True:native_catalog)
     api=g.Gateway(Mobile(tmp_path/'discover.sqlite'),lambda profile,fn:fn(tmp_path),backend,
                   lambda value,limit:str(value)[:limit])
     discovered=api.discover('profile','read_file')['tools']
@@ -694,6 +738,69 @@ def test_native_tools_are_discovered_for_the_api_profile_and_exclusions_are_appl
                                    'arguments':{'url':url}})
         assert proposal['status']=='needs_approval'
         assert proposal['proposal']['arguments']=={'url':url}
+
+
+def test_warmed_catalogue_is_off_request_path_and_summarizes_each_source_once(tmp_path):
+    started=threading.Event();release=threading.Event();finished=threading.Event();calls=[]
+    profile='warm-'+str(time.time_ns())
+    full=[
+        {'name':'mcp__tool_gateway_meeting__google_workspace_search_gmai_f6f8eca1',
+         '_raw':'google_workspace_search_gmail','_server':'tool_gateway_meeting',
+         'description':'Search Gmail messages by query','read_only':True},
+        {'name':'mcp__tool_gateway_meeting__google_workspace_get_gmail_t_3ae9e308',
+         '_raw':'google_workspace_get_gmail_thread','_server':'tool_gateway_meeting',
+         'description':'Get Gmail message threads by id','read_only':True},
+        {'name':'hindsight_recall','_raw':'hindsight_recall','_toolset':'memory',
+         'description':'Recall relevant Hindsight memories','read_only':True},
+    ]
+    partial=[{'name':'read_file','_toolset':'file','description':'Read a local file','read_only':True}]
+
+    class Backend:
+        def cache_key(self): return 'warm-cache'
+        def catalog(self,discover=True):
+            calls.append(discover)
+            if discover:
+                started.set()
+                release.wait(2)
+                finished.set()
+                return full
+            return partial
+
+    api=g.Gateway(Mobile(tmp_path/'warm.sqlite'),lambda name,fn:fn(tmp_path),Backend())
+    begin=time.perf_counter()
+    assert api.warm_catalogue(profile) is True
+    assert (time.perf_counter()-begin)<0.1
+    assert started.wait(1)
+    try:
+        begin=time.perf_counter()
+        while_warming=api.compact_catalogue(profile)
+        assert (time.perf_counter()-begin)<0.5
+        assert 'Read a local file' in while_warming
+    finally:
+        release.set()
+    assert finished.wait(1)
+
+    summary=api.compact_catalogue(profile)
+    assert len(summary.splitlines())==2
+    assert 'Gmail' in summary and 'Search Gmail messages' in summary and 'Get Gmail message threads' in summary
+    assert 'Hindsight' in summary and 'Recall relevant Hindsight memories' in summary
+    assert calls==[True,False]
+
+
+def test_plugin_registration_starts_native_catalogue_warmup(monkeypatch):
+    from test_mobile import load_private
+
+    warmed=[]
+    monkeypatch.setitem(sys.modules,'cypher_gateway_tools',SimpleNamespace(
+        Gateway=lambda mobile,scoped:SimpleNamespace(warm_catalogue=lambda profile:warmed.append(profile))))
+    monkeypatch.setitem(sys.modules,'cypher_voice_context',SimpleNamespace(scoped=lambda profile,fn:fn(None)))
+    plugin=load_private('__init__')
+    monkeypatch.setattr(plugin,'current_profile',lambda cfg:'work')
+    context=SimpleNamespace(register_tool=lambda **kwargs:None,register_hook=lambda *args:None)
+
+    plugin.register(context)
+
+    assert warmed==['work']
 
 
 def test_native_tool_receipts_dispatch_in_profile_conversation_and_gate_mutations(tmp_path,monkeypatch):
@@ -714,7 +821,7 @@ def test_native_tool_receipts_dispatch_in_profile_conversation_and_gate_mutation
 
     native=g.NativeMcp()
     native.cache_key=lambda:None
-    native.catalog=lambda:[
+    native.catalog=lambda discover=True:[
         {'tool_id':'a'*64,'name':'read_file','description':'Read a file',
              'parameters':{'type':'object','properties':{'path':{'type':'string'}},'required':['path'],'additionalProperties':False},
              'read_only':True,'_kind':'hermes','_raw':'read_file','_toolset':'file','_enabled_tools':['read_file','write_file']},
@@ -857,7 +964,8 @@ def test_voice_tool_catalogue_is_bounded_live_and_uncached(tmp_path):
         def __init__(self): self.calls=0;self.discover=[]
         def catalog(self,discover=True):
             self.calls+=1;self.discover.append(discover)
-            return [{'name':f'tool_{i:03}','description':'A useful tool that reads data safely. '*5}
+            return [{'name':f'tool_{i:03}','description':'A useful tool that reads data safely. '*5,
+                     'read_only':True,'_toolset':'file'}
                     for i in range(100)]
     backend=Backend();api=g.Gateway(Mobile(tmp_path/'catalog.sqlite'),lambda profile,fn:fn(tmp_path),backend)
     started=time.perf_counter();first=api.compact_catalogue('profile')
@@ -865,7 +973,7 @@ def test_voice_tool_catalogue_is_bounded_live_and_uncached(tmp_path):
     started=time.perf_counter();again=api.compact_catalogue('profile')
     repeated_ms=(time.perf_counter()-started)*1000
     assert first==again and len(first.encode('utf-8'))<=3072
-    assert 'tool_000:' in first and backend.calls==2 and backend.discover==[False,False]
+    assert 'File:' in first and backend.calls==2 and backend.discover==[False,False]
     api.compact_catalogue('profile')
     api.compact_catalogue('other-profile')
     assert backend.calls==4 and backend.discover==[False]*4

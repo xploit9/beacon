@@ -17,8 +17,6 @@
       const [loadError, setLoadError] = useState(false);
       const [qrError, setQrError] = useState(false);
       const [copyStatus, setCopyStatus] = useState('');
-      const [claiming, setClaiming] = useState(false);
-      const [claimError, setClaimError] = useState(false);
 
       useEffect(() => {
         let active = true;
@@ -73,38 +71,9 @@
         }
       }
 
-      async function claimOwner() {
-        if (claiming) return;
-        setClaiming(true);
-        setClaimError(false);
-        try {
-          await sdk.fetchJSON('/api/plugins/cypher/owner/claim', { method: 'POST' });
-          setInfo(null);
-          setLoadError(false);
-          try {
-            setInfo(await sdk.fetchJSON('/api/plugins/cypher/connect-info'));
-          } catch (_) {
-            setLoadError(true);
-          }
-        } catch (_) {
-          setClaimError(true);
-        } finally {
-          setClaiming(false);
-        }
-      }
-
       function renderBody() {
         if (loadError) return h('p', { className: 'mt-3 text-sm text-destructive', role: 'alert' }, 'A secure public dashboard address is not configured.');
         if (!info) return h('p', { className: 'mt-3 text-sm text-muted-foreground', role: 'status' }, 'Loading connection details…');
-        if (info.claim_required) return h('div', { className: 'mt-3 space-y-2' },
-          h('button', {
-            type: 'button',
-            className: 'rounded-md border border-border px-3 py-2 text-sm hover:bg-muted',
-            disabled: claiming,
-            onClick: claimOwner,
-          }, claiming ? 'Setting up…' : 'Use Cypher with this Hermes account'),
-          claimError ? h('p', { className: 'text-sm text-destructive', role: 'alert' }, 'Could not finish setup. Try again.') : null,
-        );
         return h('div', { className: 'mt-4 space-y-4' },
           h('p', { className: 'text-sm text-muted-foreground' }, info.session ? 'Scan with Cypher to connect instantly' : 'Install Cypher, tap Scan QR, sign in.'),
           !qrError ? h('canvas', {

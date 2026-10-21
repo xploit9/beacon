@@ -26,15 +26,22 @@ POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix='
 SLOTS = threading.BoundedSemaphore(4)
 CATALOG_LOCK = threading.RLock()
 CATALOG_CACHE = {}
+CATALOG_WARMING = set()
 NATIVE_READ_ONLY = frozenset({'read_file','search_files','web_search','skills_list','skill_view'})
+NATIVE_READ_ONLY |= frozenset({'hindsight_recall','hindsight_reflect','hindsight_search_knowledge_pages',
+                               'hindsight_read_knowledge_page'})
 NATIVE_READ_ONLY_ACTIONS = {'cronjob_manage': frozenset({'list'}), 'process_manage': frozenset({'list'})}
+CALL_EXCLUDED_TOOLS = frozenset({'manage_connections','manage_catalog','setup_mcp',
+                                 'connector_search','connector_describe'})
 NATIVE_EXCLUDED_TOOLS = frozenset({'clarify','delegate_task','todo_list','memory','session_search',
-                                   'cypher_create_proactive_request','cypher_email_notice','cypher_email_checked'})
-NATIVE_EXCLUDED_TOOLSETS = frozenset({'browser','cypher-interactive','cypher-mailbox'})
+                                   'cypher_create_proactive_request','cypher_email_notice','cypher_email_checked'}) | CALL_EXCLUDED_TOOLS
+NATIVE_EXCLUDED_TOOLSETS = frozenset({'browser','connectors','cypher-interactive','cypher-mailbox'})
 QUERY_FILLER = set('a an the my me please could can you i would like want get read list find look pull show to for of in on and from up most latest recent current last today now one two three four five six ten tool tools'.split())
 QUERY_ALIASES = {
     'email': {'email', 'mail', 'gmail', 'inbox', 'outlook'},
     'mail': {'email', 'mail', 'gmail', 'inbox', 'outlook'},
+    'check': {'search', 'list'},
+    'pull': {'search', 'list'},
     'web': {'web', 'internet', 'website', 'browser', 'scrapling'},
     'search': {'search', 'find', 'lookup', 'query'},
     'get': {'get', 'read', 'retrieve', 'fetch', 'list'},
@@ -67,8 +74,8 @@ def discovery_rank(tool, words, query):
     if not writing and tool['read_only']:
         weight += 2
         if intent & {'email','mail','gmail','inbox'}:
-            if named & {'message','thread','inbox'}: weight += 2
-            if named & {'search','list'}: weight += 1
+            if named & {'search','list'}: weight += 2
+            if named & {'message','thread','inbox'}: weight += 1
     return (int(query.casefold() in (tool['name'].casefold(), tool.get('_raw', '').casefold())), coverage, weight)
 
 
@@ -371,38 +378,94 @@ class Gateway:
                 PRIMARY KEY(owner,provider,profile,call_id,request_id))''')
             yield conn
 
-    def catalog(self, profile, discover=True):
-        if not discover:
-            return self.scoped(profile,lambda _:self.backend.catalog(discover=False))
+    def _catalog_key(self, profile):
+        key_fn=getattr(self.backend,'cache_key',None)
+        if not callable(key_fn): return None
+        try: value=self.scoped(profile,lambda _:key_fn())
+        except Exception: return None
+        return (profile,value) if value is not None else None
+
+    def _cached_catalog(self, profile):
+        key=self._catalog_key(profile)
+        if key is None: return None
+        now=time.monotonic()
         with CATALOG_LOCK:
-            def load(_):
-                key_fn=getattr(self.backend,'cache_key',None)
-                try: cache_key=(profile,key_fn()) if callable(key_fn) else None
-                except Exception: cache_key=None
-                now=time.monotonic()
-                if cache_key and cache_key[1] is not None:
-                    cached=CATALOG_CACHE.get(cache_key)
-                    if cached and now-cached[0]<CATALOG_TTL: return cached[1]
-                rows=self.backend.catalog()
-                try: final_key=(profile,key_fn()) if callable(key_fn) else None
-                except Exception: final_key=None
-                if final_key and final_key[1] is not None:
-                    now=time.monotonic()
-                    for key,(created,_) in list(CATALOG_CACHE.items()):
-                        if now-created>=CATALOG_TTL: CATALOG_CACHE.pop(key,None)
-                    if len(CATALOG_CACHE)>=16: CATALOG_CACHE.pop(next(iter(CATALOG_CACHE)))
-                    CATALOG_CACHE[final_key]=(now,rows)
-                return rows
-            return self.scoped(profile,load)
+            cached=CATALOG_CACHE.get(key)
+            if cached and now-cached[0]<CATALOG_TTL: return cached[1]
+            if cached: CATALOG_CACHE.pop(key,None)
+        return None
+
+    def _store_catalog(self, profile, rows):
+        key=self._catalog_key(profile)
+        if key is None: return
+        now=time.monotonic()
+        with CATALOG_LOCK:
+            for old,(created,_) in list(CATALOG_CACHE.items()):
+                if now-created>=CATALOG_TTL: CATALOG_CACHE.pop(old,None)
+            if key not in CATALOG_CACHE and len(CATALOG_CACHE)>=16:
+                CATALOG_CACHE.pop(next(iter(CATALOG_CACHE)))
+            CATALOG_CACHE[key]=(now,rows)
+
+    @staticmethod
+    def _call_tools(rows):
+        return [tool for tool in rows if isinstance(tool,dict)
+                and tool.get('name') not in CALL_EXCLUDED_TOOLS
+                and tool.get('_raw') not in CALL_EXCLUDED_TOOLS]
+
+    def catalog(self, profile, discover=True):
+        cached=self._cached_catalog(profile)
+        if cached is not None: return self._call_tools(cached)
+        rows=self.scoped(profile,lambda _:self.backend.catalog() if discover else self.backend.catalog(discover=False))
+        rows=self._call_tools(rows)
+        if discover: self._store_catalog(profile,rows)
+        return rows
+
+    def warm_catalogue(self, profile):
+        key=self._catalog_key(profile)
+        if key is None: return False
+        now=time.monotonic()
+        with CATALOG_LOCK:
+            cached=CATALOG_CACHE.get(key)
+            if cached and now-cached[0]<CATALOG_TTL: return False
+            CATALOG_CACHE.pop(key,None)
+            if key in CATALOG_WARMING: return False
+            CATALOG_WARMING.add(key)
+
+        def refresh():
+            try: self.catalog(profile)
+            except Exception: pass
+            finally:
+                with CATALOG_LOCK: CATALOG_WARMING.discard(key)
+
+        thread=threading.Thread(target=refresh,name='cypher-catalog-warm',daemon=True)
+        try: thread.start()
+        except Exception:
+            with CATALOG_LOCK: CATALOG_WARMING.discard(key)
+            return False
+        return True
 
     def compact_catalogue(self, profile):
-        lines=[];size=0
+        groups={}
         for tool in sorted(self.catalog(profile,discover=False),key=lambda item:str(item.get('name',''))):
-            name=re.sub(r'[^A-Za-z0-9_.:/-]','',str(tool.get('name') or ''))[:120]
-            if not name: continue
+            if not tool.get('read_only'): continue
+            source=tool.get('_server') or tool.get('_toolset') or 'Hermes'
+            source=' '.join(str(source).split())[:80]
+            corpus=' '.join(str(tool.get(key) or '') for key in ('name','_raw','description')).casefold()
+            if 'google_workspace' in corpus or 'google workspace' in corpus: label='Google Workspace'
+            elif 'gmail' in corpus or 'email' in corpus or 'mail' in corpus: label='Gmail'
+            elif 'hindsight' in corpus: label='Hindsight'
+            else: label=re.sub(r'[_-]+',' ',source).title()
             description=safe(tool.get('description',''),1200)
-            description=re.sub(r'\s+',' ',''.join(c for c in description if c.isprintable())).strip()[:56]
-            line=name+(': '+description if description else '')
+            description=re.sub(r'\s+',' ',''.join(c for c in description if c.isprintable())).strip()
+            if not description:
+                description=re.sub(r'[_-]+',' ',str(tool.get('_raw') or tool.get('name') or '')).strip()
+            rows=groups.setdefault(source,[label,[]])[1]
+            if description and description not in rows and len(rows)<3:
+                rows.append(description[:72])
+        lines=[];size=0
+        for label,rows in sorted(groups.values(),key=lambda value:value[0].casefold()):
+            if not rows: continue
+            line=label+': '+'; '.join(rows)
             line_bytes=len(line.encode('utf-8'))+1
             if size+line_bytes>MAX_CATALOGUE_BYTES: break
             lines.append(line);size+=line_bytes
@@ -410,9 +473,10 @@ class Gateway:
 
     def discover(self, profile, query=''):
         if not isinstance(query, str) or len(query)>240: raise HTTPException(400, 'Invalid tool query')
+        self.warm_catalogue(profile)
         words = set(re.findall(r'[^\W_]+', query.casefold())) - QUERY_FILLER
         words = {word for word in words if not word.isdecimal()}
-        rows = self.catalog(profile)
+        rows = self.catalog(profile,discover=False)
         # Task details ("latest five emails") need not occur verbatim in a tool's schema.
         ranked = [(discovery_rank(tool, words, query), tool) for tool in rows] if words else []
         selected = [tool for score,tool in sorted(ranked, key=lambda row:row[0], reverse=True) if score[1]] if words else rows
@@ -468,7 +532,7 @@ class Gateway:
             if previous:
                 if previous['signature']!=signature: raise HTTPException(409, 'Request identity conflicts with its original arguments')
                 return self.status(scope,request)
-        tools=self.catalog(scope[2]);tool=next((t for t in tools if t['tool_id']==value['tool_id']),None)
+        tools=self.catalog(scope[2],discover=False);tool=next((t for t in tools if t['tool_id']==value['tool_id']),None)
         if not tool: raise HTTPException(409, 'Tool changed or is no longer configured; rediscover it')
         arguments=coerce(tool['parameters'], value['arguments'])
         validate(tool['parameters'], arguments)
@@ -530,7 +594,7 @@ class Gateway:
                 if stored['status']=='needs_approval':
                     stored.update(status='denied',reason='Owner denied this operation');self._save(conn,scope,request,stored)
             return self.status(scope,request)
-        tool=next((t for t in self.catalog(scope[2]) if t['tool_id']==current['tool_id']),None)
+        tool=next((t for t in self.catalog(scope[2],discover=False) if t['tool_id']==current['tool_id']),None)
         if not tool:
             with self.db() as conn:
                 stored=json.loads(self._row(conn,scope,request)['payload'])
@@ -593,20 +657,21 @@ class Gateway:
             # Recheck authority and config at the last boundary before the RPC.
             with self.mobile.connect() as conn:
                 self.mobile.owned(conn,scope[3],scope[0],scope[2],True)
-            # Use the same lock->profile order as discover/invoke; never hold it across RPC.
-            current=next((t for t in self.catalog(scope[2]) if t['tool_id']==tool['tool_id']),None)
+            # Catalogue discovery releases its profile scope before the store lock is needed below.
+            current=next((t for t in self.catalog(scope[2],discover=False) if t['tool_id']==tool['tool_id']),None)
             if not current: raise HTTPException(409,'Tool configuration changed')
             current_read_only=tool_read_only(current,arguments)
             if current_read_only!=tool['read_only']: raise HTTPException(409,'Tool access classification changed')
             current={**current,'read_only':current_read_only}
+            # Check the store before entering the profile scope to keep one global lock order.
+            if self.status(scope,request)['status']!='running':
+                raise HTTPException(409,'Tool admission cancelled or expired')
+            cfg=self.mobile.settings()
+            if (cfg.get('owner_id')!=scope[0] or cfg.get('owner_provider')!=scope[1]
+                    or 'profiles' in cfg and scope[2] not in cfg['profiles']):
+                raise HTTPException(403,'Owner authority changed')
             def execute(_):
                 nonlocal dispatched
-                if self.status(scope,request)['status']!='running':
-                    raise HTTPException(409,'Tool admission cancelled or expired')
-                cfg=self.mobile.settings()
-                if (cfg.get('owner_id')!=scope[0] or cfg.get('owner_provider')!=scope[1]
-                        or 'profiles' in cfg and scope[2] not in cfg['profiles']):
-                    raise HTTPException(403,'Owner authority changed')
                 dispatched=True
                 return self.backend.execute(current,arguments,scope,approved,session_id=session_id)
             raw=self.scoped(scope[2],execute)

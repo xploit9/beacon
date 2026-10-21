@@ -58,7 +58,7 @@ Do not delete the backup. Ensure Cypher is enabled in the selected profile:
 hermes -p <profile> plugins enable cypher
 ```
 
-If Hermes asks to install Python dependencies, explain the packages and wait for the user's approval. An agent running without a terminal prompt then repeats the install command with `--yes-deps`; without it Hermes declines and changes nothing. Do not bypass the native security scan.
+This plugin declares no plugin-only Python dependencies: Hermes already supplies FastAPI, PyYAML, httpx, and jsonschema. Firebase Admin is optional and loaded only when FCM credentials are configured; otherwise Cypher uses its existing Keep connected delivery path. If this release unexpectedly triggers a dependency prompt, stop and check the installed plugin version instead of approving a workaround. Do not bypass the native security scan.
 
 ## 3. Restart and verify the dashboard
 
@@ -70,7 +70,9 @@ From the dashboard's authenticated browser session, verify that:
 
 - The dashboard is reachable.
 - The **Cypher** tab is visible.
-- The owner opens the Cypher tab and, if prompted, taps “Use Cypher with this Hermes account” once.
+- Opening the Cypher tab with a verified Hermes dashboard session binds that account automatically when no owner exists, then displays the QR immediately. There is no separate claim step.
+- If Hermes reports multiple dashboard accounts and Cypher has no owner, the first verified account to use the plugin becomes owner; other accounts receive 403.
+- Loopback-anonymous requests never create an owner. A dashboard without a verified native Hermes identity cannot initialize Cypher until that identity is available.
 - The owner-authorized `GET /api/plugins/cypher/connect-info` succeeds and the tab displays its QR.
 
 Do not copy, print, or log the route response. Loopback mode may include a session value in that response. If the route reports that a public HTTPS URL is required, the phone cannot use a loopback or plain-HTTP address. Tailscale Serve over HTTPS is the recommended way to make the dashboard reachable from the phone. Ask before changing network settings; do not enable Serve, open ports, or change firewall/bind settings on your own.
@@ -79,6 +81,6 @@ Do not copy, print, or log the route response. Loopback mode may include a sessi
 
 Tell the user to download and install the latest stable `Cypher-<version>.apk` from the repository's [Releases page](https://github.com/xploit9/cypher/releases), open the dashboard's **Cypher** tab, and scan the QR with the Cypher app. App and plugin automatic updates are on by default in Settings **App updates**; app downloads use an unmetered connection and keep package, version, checksum and signer verification, with a tap-to-install notice whenever Android requires confirmation.
 
-Sign-in uses Hermes' normal OAuth browser flow. If the browser is already signed in, one tap completes it. That single sign-in covers chat, history, plugin pages, calls, and Keep connected. If the dashboard has no accounts and is in loopback mode, scanning the QR signs in immediately.
+Phone sign-in uses Hermes' normal OAuth browser flow. The first verified OAuth identity to use a plugin route becomes owner automatically if no owner exists; subsequent identities cannot take over. That sign-in covers chat, history, plugin pages, calls, and Keep connected. Loopback-anonymous access does not establish ownership.
 
 If restarting or network approval is unavailable, report exactly what remains and wait for the user.

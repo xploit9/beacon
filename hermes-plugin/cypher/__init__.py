@@ -1,5 +1,6 @@
 """Native Cypher callbacks and profile-scoped proactive jobs."""
 import importlib.util
+import ipaddress
 import json
 from pathlib import Path
 import re
@@ -72,6 +73,30 @@ def call_user(args,session_id=None,**kwargs):
 
 def current_profile(cfg):
     return proactive.current_profile(cfg)
+
+
+def _optional_module(name):
+    key='cypher_'+name
+    module=sys.modules.get(key)
+    if module is not None: return None if _stale(module) else module
+    path=ROOT/(name+'.py');spec=importlib.util.spec_from_file_location(key,path)
+    module=importlib.util.module_from_spec(spec);module._cypher_mtime=path.stat().st_mtime_ns
+    sys.modules[key]=module
+    try: spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(key,None)
+        raise
+    return module
+
+
+def _warm_catalogue_on_load():
+    try:
+        profile=current_profile({})
+        voice=_optional_module('voice_context')
+        tools=_optional_module('gateway_tools')
+        tools.Gateway(mobile,voice.scoped).warm_catalogue(profile)
+    except Exception:
+        pass
 
 def _cron_row(profile,session_id):
     from tui_gateway import server
@@ -252,6 +277,8 @@ _WRITE_TOOL_WORDS={'send','create','delete','remove','modify','update','manage',
                    'empty','reschedule','revoke'}
 # Native tools whose names carry no read word but only read or plan inside the run.
 _PROACTIVE_READ_TOOLS={'todo'}
+_PROACTIVE_MEMORY_READ_TOOLS={'hindsight_recall','hindsight_reflect','hindsight_search_knowledge_pages',
+                              'hindsight_read_knowledge_page'}
 _ARG_WRITE_TOOL_WORDS=_WRITE_TOOL_WORDS|{'run','trigger','install','edit','enable','disable','pause','resume','schedule'}
 _UNSAFE_NAME_WORDS=_ARG_WRITE_TOOL_WORDS|{'exec','sql','call','invoke','eval','shell','command','script','http','request',
                                           # a name that chains a second action ('and', 'then') is never a plain read
@@ -305,32 +332,90 @@ def _plain_mail_read(raw_name):
     reads=bool(words&_READ_TOOL_WORDS) or ('fetch' in words and bool(words&_FETCHED_MAIL_WORDS))
     return reads and words<=_MAIL_READ_NAME_WORDS|{'fetch'}
 
-def _mcp_read_only(tool_name,profile):
+def _mcp_tool_entry(tool_name,profile):
     try:
         from hermes_cli.web_server_profiles import _profile_scope
         from tools import mcp_tool
         from tools.mcp_tool_schema import mcp_prefixed_tool_name
         from tools.mcp_tool_scope import _resolve_server_key
         server_name=mcp_tool._mcp_tool_server_names.get(tool_name)
-        if not isinstance(server_name,str) or not server_name: return False
+        if not isinstance(server_name,str) or not server_name: return None
         with _profile_scope(profile):
             hints=mcp_tool._tool_read_only_hints.get(_resolve_server_key(server_name),{}) or {}
         for raw_name,hint in hints.items():
             if mcp_prefixed_tool_name(server_name,raw_name)==tool_name:
-                # Hermes records a missing and a false readOnlyHint alike, so an unannotated mail reader still runs
-                # when its whole name is plain mail reading; anything named like a write or a runner is blocked either way.
-                return not bool(_tool_words(raw_name)&_UNSAFE_NAME_WORDS) and (hint is True or _plain_mail_read(raw_name))
+                return raw_name,hint,server_name
     except Exception:
-        return False
+        return None
+    return None
+
+
+def _mcp_read_only(tool_name,profile):
+    entry=_mcp_tool_entry(tool_name,profile)
+    if not entry: return False
+    raw_name,hint,_=entry
+    # Hermes accepts unannotated mail reads by name, but a read word never excuses a possible write verb.
+    return not bool(_tool_words(raw_name)&_UNSAFE_NAME_WORDS) and (hint is True or _plain_mail_read(raw_name))
+
+def _mail_provider_read(tool_name,profile):
+    entry=_mcp_tool_entry(tool_name,profile)
+    if not entry: return False
+    raw_name,_,server_name=entry
+    words=_tool_words(raw_name)
+    providers=_tool_words(server_name)
+    return (_plain_mail_read(raw_name) and bool(words&_FETCHED_MAIL_WORDS)
+            and bool((words|providers)&_MAIL_PROVIDER_WORDS)
+            and not bool(_tool_words(raw_name)&_UNSAFE_NAME_WORDS))
+
+
+_DESTINATION_FIELDS={'url','uri','urls','link','href','host','hostname','domain','endpoint','server','webhook','feed',
+                     'address','remote','target','targets','fetch_url','callback'}
+_MAIL_PROVIDER_WORDS={'mail','email','gmail','outlook','inbox','mailbox','himalaya','imap','proton','fastmail',
+                      'icloud','zoho','yahoo','exchange'}
+_MAIL_SEARCH_OPERATORS={'from','to','cc','bcc','subject','filename','label','after','before','newer','older',
+                        'has','is','category','larger','smaller','in','deliveredto'}
+
+
+def _host_like(value):
+    value=value.rstrip('.')
+    if not value: return False
+    try:
+        return ipaddress.ip_address(value).version in (4,6)
+    except ValueError:
+        pass
+    labels=value.split('.')
+    return (len(labels)>=2 and all(label and re.fullmatch(r'[A-Za-z0-9-]+',label) for label in labels)
+            and (labels[-1].isalpha() and len(labels[-1])>=2 or all(label.isdecimal() and len(label)<=3 for label in labels)))
+
+
+def _scheme_less_destination(text,field=None,allow_mail_queries=False):
+    for token in re.findall(r'''[^\s"'<>]+''',text):
+        token=token.strip(',;()[]{}')
+        prefix,separator,rest=token.partition(':')
+        if separator and prefix.isalpha():
+            if (allow_mail_queries and prefix.casefold() in _MAIL_SEARCH_OPERATORS
+                    and not re.search(r'[/;?#]|:\d',rest)):
+                continue
+            head=re.split(r'[/;?#]',rest.lstrip('/'),maxsplit=1)[0]
+            hostname=head.rsplit(':',1)[0] if head.count(':')==1 and head.rsplit(':',1)[1].isdecimal() else head
+            if _host_like(hostname): return True
+        head=re.split(r'[/;?#]',token,maxsplit=1)[0]
+        hostname=head.rsplit(':',1)[0] if head.count(':')==1 and head.rsplit(':',1)[1].isdecimal() else head
+        if _host_like(hostname) and (head!=token or ':' in head or isinstance(field,str) and field.casefold() in _DESTINATION_FIELDS):
+            return True
+        if '@' in token and _host_like(token.rsplit('@',1)[1].split('/',1)[0]):
+            return True
     return False
 
-def _contains_url(value):
-    # Watch arguments are ids, queries and dates: any scheme (webcal://, ftp://), a protocol-relative // or a Windows
-    # network path (\\host, \/host) is a link out; Hermes' read_file resolves network paths, leaking SMB credentials.
+
+def _contains_url(value,field=None,allow_mail_queries=False):
+    # In watch arguments, schemes, network paths and scheme-less hosts in destination fields are links out.
     if isinstance(value,str):
-        return '://' in value or re.match(r'\s*[\\/]{2}',value) is not None
-    if isinstance(value,dict): return any(_contains_url(item) for item in value.values())
-    if isinstance(value,list): return any(_contains_url(item) for item in value)
+        text=value.strip()
+        return ('://' in value or re.match(r'\s*[\\/]{2}',value) is not None
+                or _scheme_less_destination(text,field,allow_mail_queries))
+    if isinstance(value,dict): return any(_contains_url(item,key,allow_mail_queries) for key,item in value.items())
+    if isinstance(value,list): return any(_contains_url(item,field,allow_mail_queries) for item in value)
     return False
 
 def _bash_unquoted(command):
@@ -399,17 +484,18 @@ def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**
         # Only cron runs reach here, never ordinary chats; an unreadable ownership check fails closed.
         return {'action':'block','message':_READ_ONLY_MESSAGE}
 
-    if tool_name=='web_search':
-        return None
     if tool_name in {'cypher_email_notice','cypher_email_checked'}:
         return None
-    if _contains_url(args):
-        return {'action':'block','message':_READ_ONLY_MESSAGE}
     if tool_name=='terminal':
         command=args.get('command') if isinstance(args,dict) else None
         if not _watch_terminal_read_only(command):
             return {'action':'block','message':_READ_ONLY_TERMINAL_MESSAGE}
+        if _contains_url(args,allow_mail_queries=True):
+            return {'action':'block','message':_READ_ONLY_MESSAGE}
         return None
+    allow_mail_queries=tool_name.startswith('mcp__') and _mail_provider_read(tool_name,profile)
+    if _contains_url(args,allow_mail_queries=allow_mail_queries):
+        return {'action':'block','message':_READ_ONLY_MESSAGE}
     if tool_name in _BLOCKED_PROACTIVE_TOOLS:
         return {'action':'block','message':_READ_ONLY_MESSAGE}
     args=args if isinstance(args,dict) else {}
@@ -419,6 +505,8 @@ def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**
         if isinstance(value,str): argument_words.update(_tool_words(value))
     if argument_words&_ARG_WRITE_TOOL_WORDS:
         return {'action':'block','message':_READ_ONLY_MESSAGE}
+    if tool_name in _PROACTIVE_MEMORY_READ_TOOLS:
+        return None
     try:
         from hermes_cli.web_server_profiles import _profile_scope
         from tools.registry import registry
@@ -474,3 +562,4 @@ def register(ctx):
     ctx.register_hook('post_tool_call',native_mailbox_observation)
     ctx.register_hook('pre_tool_call',native_proactive_read_only_guard)
     phone_delivery.register(ctx)
+    _warm_catalogue_on_load()

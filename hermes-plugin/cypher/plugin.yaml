@@ -7,9 +7,4 @@ platforms: [windows, linux, macos]
 hooks: [on_session_end, pre_llm_call, post_tool_call, pre_tool_call]
 provides_hooks: [on_session_end, pre_llm_call, post_tool_call, pre_tool_call]
 provides_tools: [cypher_call_user, cypher_create_proactive_request, cypher_email_notice, cypher_email_checked]
-python_dependencies:
-  - fastapi>=0.115,<1
-  - PyYAML>=6,<7
-  - firebase-admin==7.7.0
-  - httpx>=0.28,<1
-  - jsonschema>=4,<5
+python_dependencies: []

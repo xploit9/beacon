@@ -19,11 +19,29 @@ def _install_profile_db(monkeypatch, rows, cron_runs=None):
     monkeypatch.setitem(sys.modules, "tui_gateway", SimpleNamespace(server=server))
 
 
+@pytest.fixture(autouse=True)
+def _native_profile_scope(monkeypatch):
+    scope=lambda profile:nullcontext()
+    monkeypatch.setitem(sys.modules,'hermes_cli.web_server_profiles',
+                        SimpleNamespace(_profile_scope=scope,_config_profile_scope=scope))
+    notepad={}
+    monkeypatch.setitem(sys.modules,'cron.notepad',SimpleNamespace(
+        get_note=lambda job_id,key:notepad.get((job_id,key)),
+        set_note=lambda job_id,key,value:notepad.__setitem__((job_id,key),value),
+        delete_note=lambda job_id,key:notepad.pop((job_id,key),None)))
+
+
 def test_current_profile_uses_native_profiles_when_claim_config_has_none(harness, monkeypatch, tmp_path):
     api, _, _, _, _ = harness
     work_home=tmp_path/'work'
     monkeypatch.setitem(sys.modules, 'hermes_constants', SimpleNamespace(
-        get_hermes_home=lambda:work_home, get_hermes_home_override=lambda:str(work_home)))
+        get_hermes_home=lambda:work_home, get_hermes_home_override=lambda:str(work_home),
+        LOCAL_RUNTIME_ROOT_DIRS=frozenset(), PROFILE_ID_RE=None,
+        clear_named_profile_deleted=lambda *args, **kwargs:None,
+        mark_named_profile_deleted=lambda *args, **kwargs:None,
+        named_profile_has_identity=lambda *args, **kwargs:False,
+        named_profile_is_deleted=lambda *args, **kwargs:False,
+        named_profile_is_live=lambda *args, **kwargs:False))
     monkeypatch.setitem(sys.modules, 'tui_gateway', SimpleNamespace(server=SimpleNamespace(
         _profile_home=lambda profile:tmp_path/profile)))
     from hermes_cli import profiles
@@ -653,6 +671,84 @@ def test_learned_note_quotes_the_alert_without_links_or_addresses(harness, monke
         assert conn.execute("SELECT feedback_verdict FROM call_log WHERE id=?", ("c" * 32,)).fetchone()[0] is None
 
 
+def test_learned_sync_migration_lock_order_is_profile_before_mobile(harness, monkeypatch):
+    api,_,_,_,_=harness
+    proactive=api.proactive;mobile=api.mobile
+    held=set();events=[];inversions=[]
+
+    class Lock:
+        def __init__(self,name): self.name=name
+        def __enter__(self):
+            if self.name=='profile' and 'mobile' in held: inversions.append('mobile->profile')
+            if self.name=='mobile' and 'profile' not in held: inversions.append('mobile-outside-profile')
+            if self.name=='sync' and held: inversions.append('sync-after-other-lock')
+            held.add(self.name);events.append(self.name);return self
+        def __exit__(self,*_):
+            held.remove(self.name);events.append('/'+self.name)
+
+    monkeypatch.setattr(mobile,'LOCK',Lock('mobile'))
+    monkeypatch.setattr(proactive,'_SYNC_LEARNED_LOCK',Lock('sync'),raising=False)
+    monkeypatch.setitem(sys.modules,'hermes_cli.web_server_profiles',SimpleNamespace(
+        _profile_scope=lambda profile:Lock('profile')))
+
+    def job_id(*args):
+        assert {'profile','mobile'}<=held
+        return 'watch-job'
+
+    def notes(*args):
+        assert {'profile','mobile'}<=held
+        return ['Important: "review"']
+
+    def set_note(*args):
+        assert 'profile' in held and 'mobile' not in held
+        events.append('notepad-write')
+
+    monkeypatch.setattr(proactive,'_managed_id',job_id)
+    monkeypatch.setattr(proactive,'learned_notes',notes)
+    monkeypatch.setitem(sys.modules,'cron.notepad',SimpleNamespace(set_note=set_note,delete_note=lambda *args:None))
+    proactive.sync_learned(mobile,'owner','default')
+
+    assert inversions==[]
+    assert events.index('sync')<events.index('profile')<events.index('mobile')<events.index('notepad-write')
+
+    events.clear()
+    class Store:
+        user_entries=[proactive.LEARNED_PREFIX+'review moved']
+        def remove(self,*args,**kwargs):
+            assert 'profile' in held and 'mobile' not in held
+            events.append('legacy-remove');return {'success':True}
+
+    def save_notes(*args):
+        assert {'profile','mobile'}<=held
+        events.append('store-write')
+
+    monkeypatch.setitem(sys.modules,'tools.memory_tool',SimpleNamespace(load_on_disk_store=lambda:Store()))
+    monkeypatch.setattr(proactive,'_store_learned',save_notes)
+    proactive._move_legacy_learned(mobile,'owner','default')
+
+    assert inversions==[]
+    assert events.index('sync')<events.index('profile')<events.index('mobile')<events.index('store-write')<events.index('legacy-remove')
+
+
+def test_defanged_destinations_are_removed_without_erasing_ordinary_numbers(harness):
+    api,_,_,_,_=harness
+    proactive=api.proactive
+    destinations=('evil dot example dot com','evil . example . com','example(dot)com','203 dot 0 dot 113 dot 9',
+                  '2001:db8::1','tel:+15550100','mailto:alerts@example.com','sms:+15550100',
+                  '+1 555 0100','1-555-0100','555 0100','1234567')
+    for destination in destinations:
+        note=proactive._learned_notes(f'Invoice INV-9931 Acme Ltd; portal {destination}; call owner next week')["important"]
+        assert destination.casefold() not in note.casefold(), destination
+        assert 'Invoice INV-9931 Acme Ltd' in note
+    assert 'evil[.]example[.]com' not in proactive._without_links('evil[.]example[.]com')
+    assert '*101#' not in proactive._without_links('*101#')
+
+    ordinary='Invoice 4471; Q3 board pack v2.1 4.5GB $4.99 dated 2026-10-20 at 09:00; invoice 1400.00 EUR'
+    note=proactive._learned_notes(ordinary)["important"]
+    for value in ('4471','Q3','v2.1','4.5GB','$4.99','2026-10-20','09:00','1400.00 EUR'):
+        assert value in note
+
+
 def test_v4_enable_installs_only_native_watch_and_nightly_memory_jobs(harness, monkeypatch):
     api, client, _, home, _ = harness
     unrelated = {"id": "owner-job", "name": "Owner report", "prompt": "keep", "deliver": "local"}
@@ -716,6 +812,27 @@ def test_v4_evidence_from_any_successful_tool_gates_default_email_alert(harness,
     alert = observer.email_notice(api.mobile, api.native, cfg, "default", "watch-session",
                                   {"item_id": "item-1", "reason": "Daniel Reyes / Review moved"}, now)
     assert alert["status"] == "notified"
+    text_id = "gmail-item-0123456789ab"
+    body_id = "body-content-item"
+    assert observer.source_observed(api.mobile, cfg, "default", "watch-session",
+                                    "mcp__tool_gateway_meeting__google_workspace_search_gmai_f6f8eca1",
+                                    "message_id: " + text_id + "\nBody:\n" + body_id + "\nmessage_id: " + body_id, "ok")
+    assert observer.source_observed(api.mobile, cfg, "default", "watch-session",
+                                    "mcp__tool_gateway_meeting__google_workspace_get_gmail_thread_3ae9e308",
+                                    {"message_id": text_id, "body": {"id": body_id}}, "ok")
+    text_alert = observer.email_notice(api.mobile, api.native, cfg, "default", "watch-session",
+                                       {"item_id": text_id, "reason": "A second real message"}, now)
+    assert text_alert["status"] == "notified"
+    with pytest.raises(ValueError, match="same-session"):
+        observer.email_notice(api.mobile, api.native, cfg, "default", "watch-session",
+                              {"item_id": body_id, "reason": "Body text is not the message id"}, now)
+
+    prose_id = "untrusted-prose-item"
+    assert observer.source_observed(api.mobile, cfg, "default", "watch-session", "web_search",
+                                    "Email body mentions message_id: " + prose_id, "success")
+    with pytest.raises(ValueError, match="same-session"):
+        observer.email_notice(api.mobile, api.native, cfg, "default", "watch-session",
+                              {"item_id": prose_id, "reason": "Not a returned mail identifier"}, now)
     with pytest.raises(ValueError, match="same-session"):
         observer.email_notice(api.mobile, api.native, cfg, "default", "other-session",
                               {"item_id": "item-1", "reason": "Review moved"}, now)

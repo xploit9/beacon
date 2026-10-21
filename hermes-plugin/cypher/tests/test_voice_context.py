@@ -147,6 +147,38 @@ def test_context_includes_the_compact_tool_catalogue_and_personal_opening(harnes
     assert result['tool_catalogue'] == 'read_file: Read a local file'
 
 
+def test_tool_catalogue_starts_background_warm_before_reading_cache(harness, monkeypatch):
+    api, _, _, _, _ = harness
+    calls=[]
+    gateway=SimpleNamespace(Gateway=lambda mobile,scoped:SimpleNamespace(
+        warm_catalogue=lambda profile:calls.append(('warm',profile)),
+        compact_catalogue=lambda profile:calls.append(('compact',profile)) or 'Gmail: Search messages'))
+    monkeypatch.setitem(sys.modules,'cypher_gateway_tools',gateway)
+
+    assert api.voice_context.tool_catalogue('work') == 'Gmail: Search messages'
+    assert calls == [('warm','work'),('compact','work')]
+
+
+def test_context_uses_text_chat_name_and_profile_personality(harness, monkeypatch):
+    api, _, _, root, _ = harness
+    call_id=api.mobile.reserve('owner','default','native-stored')['call_id']
+    voice=api.voice_context
+    monkeypatch.setattr(voice,'scoped',lambda profile,fn:fn(root))
+    monkeypatch.setattr(voice,'config',lambda root:{})
+    monkeypatch.setattr(voice,'personality',lambda root:'Profile-owned SOUL personality')
+    monkeypatch.setattr(voice,'builtin_memory',lambda root,cfg:'')
+    monkeypatch.setattr(voice,'history',lambda *args:[])
+    monkeypatch.setattr(voice,'tool_catalogue',lambda profile:'')
+    monkeypatch.setattr(voice,'local_time',lambda profile:'')
+    monkeypatch.setitem(sys.modules,'hermes_cli.skin_engine',SimpleNamespace(
+        get_active_skin=lambda:SimpleNamespace(get_branding=lambda key,default:'Hermes')))
+
+    result=voice.context('owner','basic','default','native-stored',call_id)
+
+    assert result['system_instruction'].startswith('You are Hermes,')
+    assert 'Profile personality:\nProfile-owned SOUL personality' in result['system_instruction']
+
+
 def test_get_context_returns_the_clean_owner_first_name(harness,monkeypatch):
     api,client,_,root,_=harness
     call_id=reserve(client)

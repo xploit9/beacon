@@ -115,43 +115,22 @@ test("token-free dashboard links keep the ordinary QR and copy flow", async () =
   assert.equal(new URL(copied).searchParams.has("session"), false);
 });
 
-test("an unowned dashboard offers one claim action then immediately reloads its QR", async () => {
-  const page = renderConnectPhone({ claim_required: true }, async (path) =>
-    path.endsWith("/owner/claim")
-      ? { claimed: true }
-      : { url: "https://hermes.example", name: "Hermes", session: "" },
-  );
+test("a fresh verified dashboard response goes straight to QR and link", () => {
+  const info = { url: "https://hermes.example", name: "Hermes", session: "" };
+  const page = renderConnectPhone(info);
   const buttons = page.nodes.filter((node) => node.type === "button");
 
-  assert.deepEqual(buttons.map((button) => button.children[0]), ["Use Cypher with this Hermes account"]);
-  assert.equal(page.nodes.some((node) => node.type === "canvas"), false);
-
-  await buttons[0].props.onClick();
-
-  assert.deepEqual(page.requests.map(({ path }) => path), [
-    "/api/plugins/cypher/connect-info",
-    "/api/plugins/cypher/owner/claim",
-    "/api/plugins/cypher/connect-info",
-  ]);
-  assert.equal(page.requests[1].options.method, "POST");
-  assert.ok(page.stateUpdates.some(({ index, value }) => index === 0 && value.url === "https://hermes.example"));
-  assert.ok(page.render().nodes.some((node) => node.type === "canvas"));
+  assert.deepEqual(buttons.map((button) => button.children[0]), ["Copy connection link"]);
+  assert.ok(page.nodes.some((node) => node.type === "canvas"));
+  assert.deepEqual(page.requests.map(({ path }) => path), ["/api/plugins/cypher/connect-info"]);
   assert.equal(page.qrPayload, "cypher://connect?url=https%3A%2F%2Fhermes.example&name=Hermes");
+  assert.equal(JSON.stringify(page.tree).includes("Use Cypher with this Hermes account"), false);
 });
 
-test("a saved claim does not leave the claim button when QR lookup fails", async () => {
-  let connectionReads = 0;
-  const page = renderConnectPhone({ claim_required: true }, async (path) => {
-    if (path.endsWith("/owner/claim")) return { claimed: true };
-    connectionReads += 1;
-    if (connectionReads === 1) return { claim_required: true };
-    throw new Error("public HTTPS URL is not configured");
-  });
-  const claim = page.nodes.find((node) => node.type === "button" && node.children.includes("Use Cypher with this Hermes account"));
+test("an unowned response never exposes a claim action", () => {
+  const page = renderConnectPhone({ claim_required: true });
 
-  await claim.props.onClick();
-
-  const result = page.render();
-  assert.equal(result.nodes.some((node) => node.type === "button" && node.children.includes("Use Cypher with this Hermes account")), false);
-  assert.ok(result.nodes.some((node) => node.children.includes("A secure public dashboard address is not configured.")));
+  assert.equal(page.nodes.some((node) => node.type === "button" && node.children.includes("Use Cypher with this Hermes account")), false);
+  assert.equal(JSON.stringify(page.tree).includes("Use Cypher with this Hermes account"), false);
+  assert.equal(page.requests.some(({ path }) => path.endsWith("/owner/claim")), false);
 });
