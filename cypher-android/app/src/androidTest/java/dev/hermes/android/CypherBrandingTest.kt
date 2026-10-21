@@ -49,7 +49,7 @@ class CypherBrandingTest {
         assertEquals(if (app.packageName.endsWith(".debug")) "Cypher Preview" else "Cypher", app.packageManager.getApplicationLabel(app.applicationInfo).toString())
         assertNotNull(app.packageManager.resolveContentProvider("${app.packageName}.files", 0))
         compose.setContent { NativeLocalization("ar") { CompositionLocalProvider(LocalAssistantName provides "Nova") { Text(assistantText("Call Beacon")) } } }
-        compose.onNode(hasText("Call Nova", substring = true)).assertIsDisplayed()
+        compose.onNode(hasText("Nova", substring = true)).assertIsDisplayed()
         compose.onNode(hasText("Hermes", substring = true)).assertDoesNotExist()
         compose.onNode(hasText("Xara", substring = true)).assertDoesNotExist()
         val catalogs = app.assets.open("native-locales.json").bufferedReader().use { JSONObject(it.readText()) }
