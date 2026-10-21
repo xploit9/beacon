@@ -341,7 +341,8 @@ def format_pairing_code(value):
 
 
 def mint_device_pairing(owner, profile, name, dashboard_url, dashboard_name):
-    if (not isinstance(owner, str) or not owner or len(owner) > 256 or any(ord(c) < 32 for c in owner)
+    # owner '' is a code made on the Hermes computer before anyone signed in; Cypher's owner links it once bound.
+    if (not isinstance(owner, str) or len(owner) > 256 or any(ord(c) < 32 for c in owner)
             or not isinstance(profile, str) or not 1 <= len(profile) <= 80
             or any(ord(c) < 32 or ord(c) == 127 for c in profile)):
         raise ValueError('An owned profile is required')
@@ -419,7 +420,7 @@ def link_paired_device(device_id, ticket, owner, provider, allowed_profiles=None
     digest = hashlib.sha256(ticket.encode('ascii')).hexdigest()
     with LOCK, connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
-        row = conn.execute('SELECT * FROM device_pairings WHERE device_id=? AND owner=?', (device_id, owner)).fetchone()
+        row = conn.execute("SELECT * FROM device_pairings WHERE device_id=? AND owner IN (?, '')", (device_id, owner)).fetchone()
         if (not row or allowed_profiles is not None and row['profile'] not in allowed_profiles
                 or not row['ticket_hash'] or row['ticket_expires'] is None or row['ticket_expires'] <= now):
             return None

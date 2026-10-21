@@ -512,10 +512,11 @@ def _pairing_block(profile=None,name=None):
     cfg=mobile.settings(profile)
     profile=profile or current_profile(cfg)
     cfg=mobile.settings(profile)
-    owner,provider=cfg.get('owner_id'),cfg.get('owner_provider')
+    # Before the first sign-in there is no owner yet: the code goes to whoever signs in first, as Cypher's owner.
+    owner=cfg.get('owner_id') if cfg.get('owner_id') and cfg.get('owner_provider') else ''
     profiles=cfg.get('profiles')
-    if not owner or not provider or isinstance(profiles,list) and profile not in profiles:
-        raise ValueError('Use a profile owned by the Hermes account bound to Cypher.')
+    if isinstance(profiles,list) and profile not in profiles:
+        raise ValueError('Use a profile Cypher serves.')
     dashboard_url,dashboard_name=mobile.dashboard_connect_info()
     pairing=mobile.mint_device_pairing(owner,profile,name,dashboard_url,dashboard_name)
     return f"Dashboard: {pairing['dashboard_url']}\nPairing code: {pairing['code']}\nexpires in 10 min"

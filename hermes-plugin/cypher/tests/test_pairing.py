@@ -257,3 +257,31 @@ def test_cli_and_slash_pair_commands_share_one_copy_friendly_block(harness, monk
     assert minted[0][:3] == ("owner", "work", "Pixel")
     assert minted[1][0:2] == ("owner", "work")
     assert minted[1][2] == "Cypher phone"
+
+
+def test_a_code_made_before_the_first_sign_in_links_to_the_owner_who_signs_in(harness, monkeypatch):
+    api, _, _, _, _ = harness
+    mobile = api.mobile
+    early = mobile.mint_device_pairing("", "default", "Pixel", "https://hermes.example.test", "hermes.example.test")
+    theirs = mobile.mint_device_pairing("someone-else", "default", "Tab", "https://hermes.example.test", "hermes.example.test")
+    for pairing in (early, theirs):
+        pairing["ticket"] = mobile.redeem_device_pairing(pairing["code"], None, "phone")["link_ticket"]
+
+    linked = mobile.link_paired_device(early["device_id"], early["ticket"], "owner", "basic")
+    assert linked and linked["linked"] and linked["device_id"] == early["device_id"]
+    assert [device["device_id"] for device in mobile.list_devices("owner")] == [early["device_id"]]
+    # A code another owner made is never taken over.
+    assert mobile.link_paired_device(theirs["device_id"], theirs["ticket"], "owner", "basic") is None
+
+
+def test_cli_pairs_on_a_fresh_install_before_anyone_signed_in(harness, monkeypatch):
+    plugin = load_private("__init__")
+    minted = []
+    monkeypatch.setattr(plugin.mobile, "settings", lambda profile=None: {})
+    monkeypatch.setattr(plugin, "current_profile", lambda cfg: "default")
+    monkeypatch.setattr(plugin.mobile, "dashboard_connect_info", lambda: ("https://hermes.example.test", "hermes.example.test"))
+    monkeypatch.setattr(plugin.mobile, "mint_device_pairing",
+                        lambda *args: minted.append(args) or {"dashboard_url": args[3], "code": "ABC-723"})
+
+    assert "Pairing code: ABC-723" in plugin._pairing_block(None, "Pixel")
+    assert minted[0][:3] == ("", "default", "Pixel")
