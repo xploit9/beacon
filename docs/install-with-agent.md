@@ -18,16 +18,18 @@ Use `hermes -p <profile>` for every profile-scoped command. Hermes consumes `-p`
 
 ## 2. Install or update the plugin
 
-The repository is public at `xploit9/beacon`. Hermes' native installer accepts owner/repository shorthand, Git URLs, and a repository subdirectory. For the current repository layout, install the `hermes-plugin/cypher` subdirectory:
+The repository is public at `xploit9/beacon`. Hermes' native installer accepts owner/repository shorthand, Git URLs, and a repository subdirectory. For the current repository layout, install the `hermes-plugin/beacon` subdirectory:
+
+If the target profile has a plugin named `cypher`, back up its plugin folder and plugin data to a location outside `plugins`, remove its managed cron jobs, then remove the plugin before installing Beacon.
 
 ```sh
-hermes -p <profile> plugins install xploit9/beacon/hermes-plugin/cypher --enable
+hermes -p <profile> plugins install xploit9/beacon/hermes-plugin/beacon --enable
 ```
 
-If `cypher` is already installed from this same repository, update it with Hermes' native updater instead:
+If `beacon` is already installed from this same repository, update it with Hermes' native updater instead:
 
 ```sh
-hermes -p <profile> plugins update cypher
+hermes -p <profile> plugins update beacon
 ```
 
 Confirm the existing install's recorded source before updating. If it came from another or unclear source, stop and ask before replacing it. Do not use `--force` to overwrite an unknown install.
@@ -39,9 +41,9 @@ Hermes supports a subdirectory in the repository identifier above. Its optional 
 If an older Hermes installer rejects the subdirectory identifier, use a sparse checkout and install from a local Git URL. Hermes accepts `file://` URLs with a `#subdirectory` fragment:
 
 ```sh
-git clone --filter=blob:none --sparse https://github.com/xploit9/beacon.git cypher-source
-git -C cypher-source sparse-checkout set hermes-plugin/cypher
-hermes -p <profile> plugins install file:///absolute/path/to/cypher-source#hermes-plugin/cypher --enable
+git clone --filter=blob:none --sparse https://github.com/xploit9/beacon.git beacon-source
+git -C beacon-source sparse-checkout set hermes-plugin/beacon
+hermes -p <profile> plugins install file:///absolute/path/to/beacon-source#hermes-plugin/beacon --enable
 ```
 
 Replace the final URL with the platform's correctly formed `file://` URL for that local checkout (for example, Windows drive paths use `file:///C:/...`). If that Hermes version does not accept the local Git URL, stop and ask rather than guessing another installer flag.
@@ -55,7 +57,7 @@ hermes -p <profile> plugins disable hermes-relay
 Do not delete the backup. Ensure Beacon is enabled in the selected profile:
 
 ```sh
-hermes -p <profile> plugins enable cypher
+hermes -p <profile> plugins enable beacon
 ```
 
 This plugin declares no plugin-only Python dependencies: Hermes already supplies FastAPI, PyYAML, httpx, and jsonschema. Firebase Admin is optional and loaded only when FCM credentials are configured; otherwise Beacon uses its existing Keep connected delivery path. If this release unexpectedly triggers a dependency prompt, stop and check the installed plugin version instead of approving a workaround. Do not bypass the native security scan.
@@ -73,14 +75,14 @@ From the dashboard's authenticated browser session, verify that:
 - Opening the Beacon tab with a verified Hermes dashboard session binds that account automatically when no owner exists, then displays the QR immediately. There is no separate claim step.
 - If Hermes reports multiple dashboard accounts and Beacon has no owner, the first verified account to use the plugin becomes owner; other accounts receive 403.
 - Loopback-anonymous requests never create an owner. A dashboard without a verified native Hermes identity cannot initialize Beacon until that identity is available.
-- The owner-authorized `GET /api/plugins/cypher/connect-info` succeeds and the tab displays its QR.
+- The owner-authorized `GET /api/plugins/beacon/connect-info` succeeds and the tab displays its QR.
 - **Pair a phone** creates a single-use pairing code and QR that expires after 10 minutes.
 
 Do not copy, print, or log the route response. Loopback mode may include a session value in that response. If the route reports that a public HTTPS URL is required, the phone cannot use a loopback or plain-HTTP address. Tailscale Serve over HTTPS is the recommended way to make the dashboard reachable from the phone. Ask before changing network settings; do not enable Serve, open ports, or change firewall/bind settings on your own.
 
 ## 4. Finish on the phone
 
-Tell the user to download and install the latest stable `Beacon-<version>.apk` from the repository's [Releases page](https://github.com/xploit9/beacon/releases), open the dashboard's **Beacon** tab, and select **Pair a phone**. Pair from Hermes CLI with `hermes -p <profile> beacon pair` or from an owned chat with `/beacon-pair`; the older `cypher pair` and `/cypher-pair` commands remain quiet aliases. The phone step is: "Scan the QR, choose a screenshot of it, or type the address and code." App and plugin automatic updates are on by default in Settings **App updates**; app downloads use an unmetered connection and keep package, version, checksum and signer verification, with a tap-to-install notice whenever Android requires confirmation.
+Tell the user to download and install the latest stable `Beacon-<version>.apk` from the repository's [Releases page](https://github.com/xploit9/beacon/releases), open the dashboard's **Beacon** tab, and select **Pair a phone**. Pair from Hermes CLI with `hermes -p <profile> beacon pair` or from an owned chat with `/beacon-pair`. The phone step is: "Scan the QR, choose a screenshot of it, or type the address and code." App and plugin automatic updates are on by default in Settings **App updates**; app downloads use an unmetered connection and keep package, version, checksum and signer verification, with a tap-to-install notice whenever Android requires confirmation.
 
 Phone sign-in uses Hermes' normal OAuth browser flow. The first verified OAuth identity to use a plugin route becomes owner automatically if no owner exists; subsequent identities cannot take over. That sign-in covers chat, history, plugin pages, calls, and Keep connected. Loopback-anonymous access does not establish ownership.
 

@@ -38,11 +38,12 @@ everything up end to end and asks you before anything that needs your say:
 
 > Set up Beacon for my Hermes end to end by following https://github.com/xploit9/beacon/blob/main/docs/install-with-agent.md (if you can't open it, read it with `gh api repos/xploit9/beacon/contents/docs/install-with-agent.md -H "Accept: application/vnd.github.raw"`). Do every step yourself:
 > 1. Check that Hermes is installed and find the profile my dashboard uses; ask me if more than one could be it.
-> 2. Install the Beacon plugin with Hermes' own installer (`hermes -p <profile> plugins install xploit9/beacon/hermes-plugin/cypher --enable`), or update it if it's already installed. Let Hermes' security scan run, and ask me before approving anything it asks about.
-> 3. Restart only that dashboard (ask me first), then confirm it runs the new plugin and shows a **Beacon** tab.
-> 4. Make sure my phone can reach the dashboard over HTTPS. If it can't yet, propose Tailscale Serve and ask before changing any network setting.
-> 5. Run `hermes -p <profile> beacon pair --name "<my phone>"` (or `/beacon-pair` in an owned chat) and show me the dashboard address and pairing code. The old `hermes -p <profile> cypher pair` and `/cypher-pair` commands remain quiet aliases. Each phone gets its own code, and a code lasts 10 minutes, so run it again if it runs out.
-> 6. Then tell me to install the app from https://github.com/xploit9/beacon/releases/latest and, in its setup, enter that address and code (or scan the QR on the dashboard's **Beacon** tab).
+> 2. If a plugin named `cypher` is installed, back up its folder and plugin data to a location outside `plugins`, remove its managed cron jobs, then remove it.
+> 3. Install the Beacon plugin with Hermes' own installer (`hermes -p <profile> plugins install xploit9/beacon/hermes-plugin/beacon --enable`), or update it with `hermes -p <profile> plugins update beacon` if it's already installed. Let Hermes' security scan run, and ask me before approving anything it asks about.
+> 4. Restart only that dashboard (ask me first), then confirm it runs the new plugin and shows a **Beacon** tab.
+> 5. Make sure my phone can reach the dashboard over HTTPS. If it can't yet, propose Tailscale Serve and ask before changing any network setting.
+> 6. Run `hermes -p <profile> beacon pair` (or `/beacon-pair` in an owned chat) and show me the dashboard address and pairing code. Each phone gets its own code, and a code lasts 10 minutes, so run it again if it runs out.
+> 7. Then tell me to install the app from https://github.com/xploit9/beacon/releases/latest and, in its setup, enter that address and code (or scan the QR on the dashboard's **Beacon** tab).
 >
 > Never print or store passwords, tokens or API keys, and never modify Hermes core.
 
@@ -138,4 +139,4 @@ See [docs/preview.md](docs/preview.md) for the Gradle builds (debug preview and 
 ## Licensing
 
 Beacon keeps its GPLv3 license (`LICENSE`). Adapted Hermes Relay code keeps its MIT notice
-(`licenses/Hermes-Relay-MIT.txt`). Android library notices are in `cypher-android/THIRD-PARTY-NOTICES.md`.
+(`licenses/Hermes-Relay-MIT.txt`). Android library notices are in `beacon-android/THIRD-PARTY-NOTICES.md`.

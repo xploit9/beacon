@@ -1,0 +1,10 @@
+name: beacon
+manifest_version: 1
+version: 1.1.0
+description: Native Beacon Android calls, text conversations and callbacks
+kind: standalone
+platforms: [windows, linux, macos]
+hooks: [on_session_end, pre_llm_call, post_tool_call, pre_tool_call]
+provides_hooks: [on_session_end, pre_llm_call, post_tool_call, pre_tool_call]
+provides_tools: [beacon_call_user, beacon_create_proactive_request, beacon_email_notice, beacon_email_checked]
+python_dependencies: []

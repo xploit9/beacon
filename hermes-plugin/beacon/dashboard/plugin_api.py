@@ -1,0 +1,1556 @@
+"""Supported Hermes dashboard API; no archive/WebUI runtime dependencies."""
+import asyncio
+import contextvars
+from concurrent.futures import ThreadPoolExecutor
+import math
+import os
+import shutil
+import threading
+import tempfile
+from contextlib import asynccontextmanager
+from datetime import datetime,timedelta,timezone
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import re
+import sys
+import subprocess
+import time
+import uuid
+from fastapi import APIRouter,HTTPException,Request
+from fastapi.responses import JSONResponse
+from fastapi.responses import StreamingResponse
+# Hermes loads this file by path rather than as a package. Load private sibling modules
+# under stable plugin-specific names so the native tool and dashboard share durable state.
+ROOT=Path(__file__).resolve().parent.parent
+_RELEASE_CACHE_LOCK=threading.RLock()
+_RELEASE_CACHE_KEY=None
+_RELEASE_CACHE_VALUE=None
+_PRODUCTION_PACKAGE='dev.hermes.android'
+_STABLE_PACKAGE='dev.hermes.android.stable'
+_PREVIEW_PACKAGE='dev.hermes.android.debug'
+_SUPPORTED_PHONE_PACKAGES=(_PRODUCTION_PACKAGE,_STABLE_PACKAGE,_PREVIEW_PACKAGE)
+_RELEASE_CHECK_LOCK=threading.Lock()
+_AUTO_UPDATE_LOCK=threading.Lock()
+def _target_package(payload):
+    try: package=json.loads(payload or '{}').get('package_name')
+    except Exception: package=None
+    return package if package in _SUPPORTED_PHONE_PACKAGES else _PRODUCTION_PACKAGE
+def _notice_package(row):
+    return _STABLE_PACKAGE if str(row.get('conversation','')).startswith('release-stable-') else _PRODUCTION_PACKAGE
+def _read_plugin_version(path):
+    try:
+        import yaml
+        value=yaml.safe_load(Path(path).read_text(encoding='utf-8-sig'))
+        version=value.get('version') if isinstance(value,dict) else None
+        return version.strip() if isinstance(version,str) else ''
+    except Exception: return ''
+_RUNNING_PLUGIN_VERSION=_read_plugin_version(ROOT/'plugin.yaml')
+def _stale(module):
+    seen=getattr(module,'_beacon_mtime',None)
+    try: return seen is not None and seen!=Path(module.__file__).stat().st_mtime_ns
+    except (OSError,TypeError): return True
+_MODULE_NAMES=('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_tools','gateway_api','bot_mode_api','observers','callbacks','callback_api','call_history_api','proactive')
+# Only purge the siblings loaded here; other plugin entry points may still serve live work.
+if any(_stale(sys.modules.get('beacon_'+name)) for name in _MODULE_NAMES):
+    for name in _MODULE_NAMES: sys.modules.pop('beacon_'+name,None)
+for name in _MODULE_NAMES:
+    key='beacon_'+name
+    if key not in sys.modules:
+        path=ROOT/(name+'.py');spec=importlib.util.spec_from_file_location(key,path)
+        module=importlib.util.module_from_spec(spec);module._beacon_mtime=path.stat().st_mtime_ns
+        sys.modules[key]=module;spec.loader.exec_module(module)
+mobile=sys.modules['beacon_mobile'];native=sys.modules['beacon_native'];voice_context=sys.modules['beacon_voice_context']
+activity=sys.modules['beacon_activity']
+voice_models=sys.modules['beacon_voice_models']
+proactive=sys.modules['beacon_proactive']
+@asynccontextmanager
+async def lifespan(app):
+    await start_watcher()
+    try: yield
+    finally: await stop_watcher()
+router=APIRouter(lifespan=lifespan)
+def enforce_request_policy(request):
+    site=request.headers.get('sec-fetch-site')
+    if site is not None and site.strip().casefold() not in ('same-origin','none'):
+        raise HTTPException(403,'Cross-site requests are not allowed')
+    method=request.method.upper()
+    if method=='GET': return
+    content_type=request.headers.get('content-type')
+    has_body=(request.headers.get('content-length') not in (None,'0')
+              or request.headers.get('transfer-encoding') is not None)
+    if not has_body: return
+    if not content_type or content_type.split(';',1)[0].strip().casefold()!='application/json':
+        raise HTTPException(415,'JSON content type required')
+def dashboard_identity(request,allow_loopback=False,browser_only=False):
+    auth_required=bool(getattr(request.app.state,'auth_required',False))
+    session=getattr(request.state,'session',None)
+    if browser_only:
+        authorization=request.headers.get('authorization','').strip().casefold()
+        if (not auth_required or getattr(request.state,'native_http_principal',None)
+                or getattr(request.state,'token_authenticated',False) or authorization.startswith('bearer ')):
+            raise HTTPException(401,'Verified dashboard browser session required')
+    if not auth_required and allow_loopback:
+        from hermes_cli.web_server import _has_valid_session_token
+        if not _has_valid_session_token(request): raise HTTPException(401,'Verified dashboard session required')
+        owner,provider='local','loopback'
+    else:
+        if not auth_required or session is None: raise HTTPException(401,'Verified native session required')
+        owner=str(getattr(session,'user_id','') or '')
+        provider=str(getattr(session,'provider','') or '')
+    if not owner or not provider: raise HTTPException(401,'Verified dashboard identity required')
+    return owner,provider
+
+def _native_profile_names():
+    try:
+        from hermes_cli import profiles as native_profiles
+        names=[getattr(profile,'name',None) for profile in native_profiles.list_profiles(lazy_skill_count=True)]
+    except Exception:
+        raise HTTPException(503,'Native profiles unavailable') from None
+    if (not 1<=len(names)<=64 or any(not isinstance(name,str) or not name.strip() or len(name)>80 for name in names)
+            or len(set(names))!=len(names)):
+        raise HTTPException(503,'Native profiles unavailable')
+    return names
+
+def _check_device_request(request,owner,provider,profile,update_seen=True):
+    device_id=request.headers.get('x-beacon-device-id')
+    if device_id is None: return
+    try: mobile.touch_device(owner,provider,profile,device_id,update_seen)
+    except LookupError as exc: raise HTTPException(403,str(exc)) from None
+
+def identity(request,profile=None,owner_only=False,allow_loopback=False):
+    enforce_request_policy(request)
+    owner,provider=dashboard_identity(request,allow_loopback)
+    cfg=mobile.settings()
+    if 'owner_id' not in cfg and 'owner_provider' not in cfg and not allow_loopback:
+        try: mobile.claim_owner(owner,provider)
+        except ValueError: raise HTTPException(403,'Verified identity invalid') from None
+        cfg=mobile.settings()
+    if not owner or not provider or not cfg.get('owner_id') or owner!=cfg['owner_id'] or provider!=cfg.get('owner_provider'):
+        raise HTTPException(403,'Owner not authorized')
+    profiles=cfg['profiles'] if 'profiles' in cfg else _native_profile_names()
+    if not isinstance(profiles,list) or not 1<=len(profiles)<=64 or any(not isinstance(p,str) or not p.strip() or len(p)>80 for p in profiles) or len(set(profiles))!=len(profiles):
+        raise HTTPException(403,'Profile configuration invalid')
+    if owner_only:
+        _check_device_request(request,owner,provider,None)
+        return owner,provider,None,{**cfg,'profiles':profiles}
+    if profile is not None and not isinstance(profile,str): raise HTTPException(403,'Profile not authorized')
+    profile=profile or request.query_params.get('beacon_profile') or request.query_params.get('profile') or (profiles[0] if len(profiles)==1 else None)
+    if not isinstance(profiles,list) or not profile or profile not in profiles:
+        _check_device_request(request,owner,provider,None,False)
+        raise HTTPException(403,'Profile not authorized')
+    _check_device_request(request,owner,provider,profile)
+    return owner,provider,profile,{**mobile.settings(profile),'profiles':profiles}
+
+def connect_info_url():
+    try: return mobile.dashboard_connect_info()
+    except ValueError: raise HTTPException(409,'A configured public HTTPS dashboard URL is required to connect a phone.') from None
+
+def _contains_provider_key(value):
+    if isinstance(value,dict):
+        for name,item in value.items():
+            normalized=str(name).casefold().replace('-','_')
+            if normalized!='client_key' and any(part in normalized for part in ('key','token','secret','credential','authorization')):
+                return True
+            if _contains_provider_key(item): return True
+    elif isinstance(value,list):
+        return any(_contains_provider_key(item) for item in value)
+    return False
+
+def _client_key_mode(value):
+    if _contains_provider_key(value):
+        raise HTTPException(400,'Provider keys must remain on the phone')
+    if value.get('client_key') is not True:
+        raise HTTPException(400,'Update Beacon: provider keys stay on the phone.')
+    if 'voice_provider' not in value:
+        raise HTTPException(400,'Choose a voice provider for a phone-key call')
+
+def _bounded_event_wait(value):
+    try: value=float(value)
+    except (TypeError,ValueError): return 0.0
+    if not math.isfinite(value): return 0.0
+    return min(25.0,max(0.0,value))
+
+@router.get('/connect-info')
+async def connect_info(request:Request):
+    enforce_request_policy(request)
+    loopback=not bool(getattr(request.app.state,'auth_required',False))
+    if not loopback: dashboard_identity(request,browser_only=True)
+    identity(request,owner_only=True,allow_loopback=loopback)
+    url,name=connect_info_url()
+    result={'url':url,'name':name}
+    if loopback:
+        from hermes_cli.web_server import _SESSION_TOKEN
+        result['session']=_SESSION_TOKEN
+    return JSONResponse(result,headers={'Cache-Control':'no-store'})
+
+@router.post('/owner/claim')
+async def claim_owner(request:Request):
+    enforce_request_policy(request)
+    owner,provider=dashboard_identity(request,browser_only=True)
+    cfg=mobile.settings()
+    if 'owner_id' in cfg or 'owner_provider' in cfg:
+        raise HTTPException(409,'Beacon owner already configured')
+    _native_profile_names()
+    try:
+        created=mobile.claim_owner(owner,provider)
+    except ValueError:
+        raise HTTPException(403,'Verified dashboard identity invalid') from None
+    if not created:
+        raise HTTPException(409,'Beacon owner already configured')
+    return {'claimed':True}
+
+@router.post('/pairing')
+async def mint_pairing(request:Request):
+    value=await body(request,2048)
+    if set(value)-{'profile','name'}: raise HTTPException(400,'Invalid pairing fields')
+    owner,_,profile,_=identity(request,value.get('profile'))
+    dashboard_url,dashboard_name=connect_info_url()
+    try: result=mobile.mint_device_pairing(owner,profile,value.get('name'),dashboard_url,dashboard_name)
+    except ValueError as exc: raise HTTPException(400,str(exc)) from None
+    return JSONResponse(result,headers={'Cache-Control':'no-store'})
+
+@router.post('/pairing/redeem')
+async def redeem_pairing(request:Request):
+    enforce_request_policy(request)
+    value=await body(request,2048)
+    if set(value)!={'code','device_name'}: raise HTTPException(400,'Invalid pairing fields')
+    client_host=request.client.host if request.client else 'unknown'
+    try: result=mobile.redeem_device_pairing(value.get('code'),value.get('device_name'),client_host)
+    except mobile.PairingRateLimitError as exc: raise HTTPException(429,str(exc)) from None
+    except ValueError as exc: raise HTTPException(400,str(exc)) from None
+    return JSONResponse(result,headers={'Cache-Control':'no-store'})
+
+@router.post('/devices/link')
+async def link_device(request:Request):
+    value=await body(request,2048)
+    if set(value)!={'device_id','link_ticket'}: raise HTTPException(400,'Invalid device link fields')
+    owner,provider,_,cfg=identity(request,owner_only=True)
+    result=mobile.link_paired_device(value.get('device_id'),value.get('link_ticket'),owner,provider,cfg['profiles'])
+    if result is None: raise HTTPException(400,'That device link could not be completed.')
+    return JSONResponse(result,headers={'Cache-Control':'no-store'})
+
+@router.get('/devices')
+async def devices(request:Request):
+    owner,_,_,cfg=identity(request,owner_only=True)
+    return {'devices':mobile.list_devices(owner),'profiles':cfg['profiles']}
+
+@router.delete('/devices/{device_id}')
+async def remove_device(device_id:str,request:Request):
+    owner,_,_,_=identity(request,owner_only=True)
+    if not mobile.remove_device(owner,device_id): raise HTTPException(404,'Device not found')
+    return {'removed':True,'device_id':device_id}
+
+async def body(request,limit=65536):
+    raw=bytearray()
+    async for part in request.stream():
+        raw.extend(part)
+        if len(raw)>limit: raise HTTPException(413,'Request too large')
+    try: value=json.loads(raw or b'{}')
+    except Exception: raise HTTPException(400,'Invalid JSON') from None
+    if not isinstance(value,dict): raise HTTPException(400,'Expected object')
+    return value
+
+@router.put('/mobile/assistant-conversation')
+async def register_assistant_conversation(request:Request):
+    value=await body(request,1024)
+    if set(value)!={'profile','session_id'} or not isinstance(value.get('profile'),str) or not isinstance(value.get('session_id'),str):
+        raise HTTPException(400,'Profile and session_id are required')
+    owner,provider,profile,_=identity(request,value['profile'])
+    try: await feature(native.verify,owner,provider,profile,value['session_id'],timeout=8)
+    except HTTPException as exc:
+        if exc.status_code==404: raise HTTPException(404,'Owned assistant conversation unavailable') from None
+        raise
+    conversation_id=mobile.register_assistant_conversation(owner,provider,profile,value['session_id'],native.verify)
+    if not conversation_id:
+        raise HTTPException(409,'Assistant conversation registration unavailable')
+    return {'registered':True,'conversation_id':conversation_id}
+
+def skill_scope(profile,fn):
+    # Skills use import-bound directories; use the native router's shared profile lock.
+    from hermes_cli.web_server_profiles import _profile_scope
+    from hermes_constants import get_hermes_home
+    with _profile_scope(profile):
+        return fn(get_hermes_home())
+
+router.include_router(sys.modules['beacon_memory_api'].build_router(identity,body,voice_context.scoped))
+router.include_router(sys.modules['beacon_skills_api'].build_router(identity,body,skill_scope),prefix='/mobile')
+router.include_router(sys.modules['beacon_admin_api'].build_router(identity,body))
+router.include_router(sys.modules['beacon_files_api'].build_router(identity,body,native))
+router.include_router(sys.modules['beacon_bot_mode_api'].build_router(identity,body,native))
+def safely(fn,*args):
+    try: return fn(*args)
+    except KeyError: raise HTTPException(503,'Configured resource unavailable') from None
+    except LookupError: raise HTTPException(404,'Owned resource unavailable') from None
+    except ValueError as exc: raise HTTPException(409,str(exc)) from None
+    except (OSError,TypeError): raise HTTPException(503,'Configured resource unavailable') from None
+    except RuntimeError: raise HTTPException(503,'Native service unavailable') from None
+_NOT_OWNED_CONVERSATION='This chat is not linked to your Hermes sign-in, so Beacon cannot start a call from it. Start a new chat in Beacon.'
+def reject_unowned_conversation(owner,provider,profile,stored):
+    try:
+        from tui_gateway import server
+        with server._profile_db({'profile':profile}) as db: row=db.get_session(stored) if db else None
+    except Exception:
+        return
+    if row is not None and row.get('user_id')!=provider+':'+owner:
+        raise HTTPException(404,_NOT_OWNED_CONVERSATION) from None
+async def call(request,call_id,writable=False):
+    def authorize():
+        # First authorize owner, then select the call's recorded profile rather than trust input.
+        owner,provider,profile,cfg=identity(request,owner_only=True)
+        with mobile.connect() as conn:
+            row=safely(mobile.owned,conn,call_id,owner,None,writable)
+            if not row['closed']:
+                conn.execute('UPDATE calls SET seen=? WHERE id=? AND owner=? AND profile=? AND closed=0',(time.time(),call_id,owner,row['profile']))
+        selected=request.query_params.get('beacon_profile') or request.query_params.get('profile')
+        if selected and selected!=row['profile']: raise HTTPException(403,'Call profile mismatch')
+        _,_,_,cfg=identity(request,row['profile'])
+        reject_unowned_conversation(owner,provider,row['profile'],row['conversation'])
+        return owner,provider,row,cfg
+    return await asyncio.to_thread(authorize)
+router.include_router(sys.modules['beacon_gateway_api'].build_router(call,body,voice_context.scoped,mobile))
+
+@router.get('/mobile/bootstrap')
+async def bootstrap(request:Request):
+    owner,provider,profile,cfg=identity(request)
+    selection=voice_models.selected(mobile,owner,profile,cfg)
+    return {'contract_version':2,'backend':'hermes-dashboard','owner_id':owner,'profile':profile,
+            'voice':{**selection,'available':True,'configured':True,'availability_scope':'plugin_enabled'},
+            'capabilities':{'native_jobs':True,'pc_recording':False,'callbacks':cfg.get('callback_tool_enabled') is True and cfg.get('scheduled_callbacks_enabled') is True,'push':bool(cfg.get('firebase_credentials')),'permanent_recording_retention':False}}
+@router.get('/mobile/voice-settings')
+async def voice_settings(request:Request):
+    owner,_,profile,cfg=identity(request)
+    return {'selected_provider':voice_models.selected(mobile,owner,profile,cfg)['provider'],
+            'providers':voice_models.choices(cfg,mobile,owner,profile),'applies_to':'next_call'}
+@router.get('/mobile/history-retention')
+async def history_retention(request:Request):
+    owner,_,_,_=identity(request)
+    days=await asyncio.to_thread(mobile.history_retention_days,owner)
+    return JSONResponse({'history_retention_days':days},headers={'Cache-Control':'no-store'})
+@router.put('/mobile/history-retention')
+async def save_history_retention(request:Request):
+    owner,_,_,_=identity(request)
+    value=await body(request,1024)
+    days=value.get('history_retention_days')
+    if set(value)!={'history_retention_days'} or type(days) is not int or days not in mobile.HISTORY_RETENTION_DAYS:
+        raise HTTPException(400,'Choose Forever, 1 year, 90 days, or 30 days')
+    days=await asyncio.to_thread(mobile.set_history_retention_days,owner,days)
+    return JSONResponse({'history_retention_days':days},headers={'Cache-Control':'no-store'})
+@router.get('/mobile/update-settings')
+async def auto_update_settings(request:Request):
+    owner,_,_,_=identity(request,owner_only=True)
+    return JSONResponse(await asyncio.to_thread(mobile.auto_update_settings,owner),headers={'Cache-Control':'no-store'})
+@router.put('/mobile/update-settings')
+async def save_auto_update_settings(request:Request):
+    owner,_,_,_=identity(request,owner_only=True);value=await body(request,1024)
+    enabled=value.get('enabled')
+    if set(value)!={'enabled'} or type(enabled) is not bool: raise HTTPException(400,'Choose whether Beacon updates the plugin automatically')
+    return JSONResponse(await asyncio.to_thread(mobile.set_auto_plugin_updates,owner,enabled),headers={'Cache-Control':'no-store'})
+@router.put('/mobile/voice-settings')
+async def save_voice_settings(request:Request):
+    owner,_,profile,cfg=identity(request);value=await body(request,1024)
+    if 'provider' not in value or set(value)-{'provider','voice','personality'} or value['provider'] not in voice_models.PROVIDERS:
+        raise HTTPException(400,'Choose an available voice model')
+    options=safely(voice_models.validate_options,value['provider'],value)
+    current=voice_models.provider_selection(mobile,owner,profile,cfg,value['provider'])
+    options={k:options.get(k,current[k]) for k in ('voice','personality')}
+    with mobile.LOCK,mobile.connect() as conn:
+        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(voice_models.preference_key(owner,profile),value['provider']))
+        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(voice_models.options_key(owner,profile,value['provider']),json.dumps(options)))
+    return await voice_settings(request)
+@router.post('/mobile/calls')
+async def calls(request:Request):
+    value=await body(request);owner,provider,profile,cfg=identity(request,value.get('profile'))
+    _client_key_mode(value)
+    requested=value['voice_provider']
+    if requested not in voice_models.PROVIDERS: raise HTTPException(400,'Unknown voice model')
+    selection=voice_models.provider_selection(mobile,owner,profile,cfg,requested)
+    conversation=value.get('conversation_id')
+    if conversation:
+        await asyncio.to_thread(reject_unowned_conversation,owner,provider,profile,conversation)
+        await asyncio.to_thread(safely,native.reserve_conversation,owner,provider,profile,conversation)
+    else:
+        with mobile.connect() as conn:
+            if mobile.active_calls(conn,owner)>=mobile.MAX_ACTIVE_CALLS:
+                raise HTTPException(409,'Active call limit reached')
+        conversation=await asyncio.to_thread(safely,native.create,owner,provider,profile)
+    return safely(mobile.reserve,owner,profile,conversation,selection)
+@router.get('/mobile/calls/{call_id}')
+async def get_call(call_id:str,request:Request):
+    owner,provider,row,cfg=await call(request,call_id)
+    await asyncio.to_thread(watch,owner,provider,row['profile'])
+    return call_status(row,owner)
+@router.delete('/mobile/calls/{call_id}')
+async def close_call(call_id:str,request:Request):
+    owner,provider,row,cfg=await call(request,call_id)
+    ended=time.time()
+    with mobile.LOCK,mobile.connect() as conn: conn.execute('UPDATE calls SET closed=1,ended=COALESCE(ended,?) WHERE id=? AND owner=? AND profile=?',(ended,call_id,owner,row['profile']))
+    await asyncio.to_thread(watch,owner,provider,row['profile'])
+    row['closed']=1
+    clear_lookup_counts(call_id)
+    return mobile.status(row)
+@router.post('/mobile/calls/{call_id}/audio')
+async def audio(call_id:str,request:Request):
+    value=await body(request,32768);owner,_,_,_=await call(request,call_id,True)
+    return await asyncio.to_thread(safely,mobile.chunk,call_id,owner,value)
+@router.post('/mobile/calls/{call_id}/events')
+async def events(call_id:str,request:Request):
+    value=await body(request);owner,_,_,_=await call(request,call_id,True)
+    return await asyncio.to_thread(safely,mobile.events,call_id,owner,value)
+@router.post('/mobile/calls/{call_id}/finalize')
+async def finalize(call_id:str,request:Request):
+    value=await body(request,1024);owner,provider,row,_=await call(request,call_id)
+    result=await asyncio.to_thread(safely,mobile.finalize,call_id,owner,value)
+    clear_lookup_counts(call_id)
+    await asyncio.to_thread(watch,owner,provider,row['profile'])
+    return result
+@router.post('/mobile/calls/{call_id}/jobs')
+async def jobs(call_id:str,request:Request):
+    value=await body(request,4096);owner,provider,row,cfg=await call(request,call_id,True)
+    for name in ('stored_session_id','runtime_session_id','request_id'): safely(mobile.ident,value.get(name))
+    history=await asyncio.to_thread(safely,native.verify,owner,provider,row['profile'],value['stored_session_id'],value['runtime_session_id'])
+    user_row_id=value.get('user_row_id')
+    if type(user_row_id) is not int or not any(m.get('role')=='user' and m.get('row_id',m.get('_row_id'))==user_row_id for m in history.get('messages',[])):
+        raise HTTPException(409,'Actual prompt.submit user_row_id required')
+    from tui_gateway import event_replay
+    jid=uuid.uuid4().hex
+    title=value.get('title','Hermes work')
+    if not isinstance(title,str) or len(title)>120: raise HTTPException(400,'Invalid title')
+    with mobile.LOCK,mobile.connect() as conn:
+        existing=conn.execute('SELECT * FROM jobs WHERE owner=? AND profile=? AND request=?',(owner,row['profile'],value['request_id'])).fetchone()
+        if existing:
+            if existing['runtime']!=value['runtime_session_id'] or existing['stored']!=value['stored_session_id'] or existing['call_id']!=call_id: raise HTTPException(409,'Conflicting job registration')
+            return job_status(dict(existing))
+        if conn.execute("SELECT COUNT(*) FROM jobs WHERE owner=? AND profile=? AND status IN ('watching','needs_input')",(owner,row['profile'])).fetchone()[0]>=512: raise HTTPException(409,'Native watch capacity reached')
+        if conn.execute('SELECT COUNT(*) FROM jobs WHERE call_id=?',(call_id,)).fetchone()[0]>=64: raise HTTPException(409,'Job linkage capacity reached')
+        if conn.execute("SELECT 1 FROM jobs WHERE (runtime=? AND status IN ('watching','needs_input')) OR (owner=? AND profile=? AND stored=? AND seq=?)",(value['runtime_session_id'],owner,row['profile'],value['stored_session_id'],user_row_id)).fetchone(): raise HTTPException(409,'One watched prompt per runtime session')
+        conn.execute('INSERT INTO jobs(id,call_id,owner,profile,stored,runtime,request,title,callback,epoch,seq,status,history_updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            (jid,call_id,owner,row['profile'],value['stored_session_id'],value['runtime_session_id'],value['request_id'],title,int(value.get('callback') is True),event_replay.replay_epoch(),user_row_id,'watching',time.time()))
+    return {'job_id':jid,'status':'working','user_row_id':user_row_id,'request_id':value['request_id'],'stored_session_id':value['stored_session_id'],'runtime_session_id':value['runtime_session_id']}
+@router.post('/mobile/calls/{call_id}/callback')
+async def callback(call_id:str,request:Request):
+    value=await body(request,1024);owner,provider,row,_=await call(request,call_id)
+    if value.get('scope','latest') not in ('latest','all'): raise HTTPException(400,'Invalid callback scope')
+    with mobile.LOCK,mobile.connect() as conn:
+        rows=conn.execute('SELECT * FROM jobs WHERE call_id=? AND owner=? ORDER BY rowid DESC',(call_id,owner)).fetchall()
+        if value.get('job_id'): rows=[r for r in rows if r['id']==value['job_id']]
+        elif value.get('scope','latest')=='latest': rows=rows[:1]
+        if not rows: raise HTTPException(404,'Owned native job unavailable')
+        for r in rows: conn.execute('UPDATE jobs SET callback=1,history_updated=? WHERE id=?',(time.time(),r['id']))
+    await asyncio.to_thread(watch,owner,provider,row['profile'])
+    return {'subscribed':True,'job_ids':[r['id'] for r in rows]}
+def job_status(job):
+    mapped={'watching':'working','completed':'done','callback_pending':'done','failed':'failed','cancelled':'cancelled','needs_input':'needs_input'}
+    result={'job_id':job['id'],'request_id':job['request'],'stored_session_id':job['stored'],'runtime_session_id':job['runtime'],'user_row_id':job['seq'],'status':mapped.get(job['status'],'working')}
+    if job.get('result'): result['result']=job['result']
+    if job.get('error'): result['error']=job['error']
+    return result
+def call_status(row,owner):
+    with mobile.connect() as conn:
+        jobs=[job_status(dict(j)) for j in conn.execute('SELECT * FROM jobs WHERE call_id=? AND owner=?',(row['id'],owner))]
+    return {**mobile.status(row),'status':'closed' if row['closed'] else 'active','jobs':jobs}
+def watch(owner,provider,profile):
+    try: activity.sync(mobile,native,owner,provider,profile)
+    except (ImportError,AttributeError): pass  # Native runtime unavailable: never invent or settle activity.
+    with mobile.connect() as conn: rows=[dict(r) for r in conn.execute("SELECT * FROM jobs WHERE owner=? AND profile=? AND (status IN ('watching','needs_input') OR (status='completed' AND callback=1)) ORDER BY rowid LIMIT 512",(owner,profile))]
+    for job in rows:
+        if job['status'] in ('watching','needs_input'):
+            try:
+                native.verify(owner,provider,profile,job['stored'],job['runtime'],False)
+                from tui_gateway import server,event_replay
+                with server._sessions_lock:
+                    record=server._sessions.get(job['runtime'],{})
+                # Native completion includes a persisted_turn receipt anchored to the
+                # actual user row. Older completion and unrelated prompts never match.
+                proof=None
+                if event_replay.replay_epoch()==job['epoch']:
+                    for event in event_replay.events_since(job['runtime'],0):
+                        payload=event.get('payload',{})
+                        if event.get('type')=='message.complete' and payload.get('persisted_turn',{}).get('user_row_id')==job['seq']:
+                            proof=payload
+                if not proof:
+                    try:
+                        from tui_gateway import server_requests
+                        staged=record.get('_submit_user_row') or {}
+                        pending=server_requests.open_requests(job['runtime']) if staged.get('_row_id')==job['seq'] else []
+                    except (ImportError,AttributeError): pending=[]
+                    with mobile.LOCK,mobile.connect() as conn:
+                        conn.execute("UPDATE jobs SET status=?,history_updated=? WHERE id=? AND status IN ('watching','needs_input')",('needs_input' if pending else 'watching',time.time(),job['id']))
+                        mobile.prune_notices(conn)
+                    continue
+                terminal={'complete':'completed','error':'failed','interrupted':'cancelled','cancelled':'cancelled'}.get(proof.get('status'))
+                if not terminal: continue
+                receipt=proof.get('persisted_turn',{})
+                if terminal=='completed':
+                    history=native.verify(owner,provider,profile,job['stored'],job['runtime'],True)
+                    final_id=receipt.get('final_assistant_row_id')
+                    final=next((m for m in history.get('messages',[]) if m.get('row_id',m.get('_row_id'))==final_id and m.get('role')=='assistant'),None)
+                    if type(final_id) is not int or final_id<=0 or not final: continue
+                    text=final.get('text',final.get('content',''))
+                else: text=''
+                with mobile.LOCK,mobile.connect() as conn:
+                    updated=conn.execute("UPDATE jobs SET status=?,result=?,error=?,history_updated=? WHERE id=? AND status IN ('watching','needs_input')",(terminal,text[:65536],('Native Hermes turn failed; review the native session.' if terminal=='failed' else ''),time.time(),job['id']))
+                if not updated.rowcount: continue
+            except LookupError:
+                with mobile.LOCK,mobile.connect() as conn:
+                    conn.execute("UPDATE jobs SET status='failed',error='Native Hermes session no longer exists',history_updated=? WHERE id=? AND status IN ('watching','needs_input')",(time.time(),job['id']))
+                continue
+            except Exception: continue
+        with mobile.LOCK,mobile.connect() as conn:
+            current=conn.execute('SELECT * FROM jobs WHERE id=?',(job['id'],)).fetchone()
+            ended=conn.execute('SELECT closed FROM calls WHERE id=?',(job['call_id'],)).fetchone()
+            mobile.prune_notices(conn)
+            active=mobile.active_calls(conn,owner)
+            capacity=conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]<10000
+            if current['status']=='completed' and current['callback'] and ended and ended[0] and not active and capacity:
+                nid=uuid.uuid4().hex
+                conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,job_id,reason) VALUES(?,?,?,?,?,?,?,?,?)',(nid,owner,profile,'incoming_call',job['stored'],time.time(),time.time()+120,job['id'],job['title']))
+                conn.execute("UPDATE jobs SET status='callback_pending',history_updated=? WHERE id=?",(time.time(),job['id']))
+    activate(owner,profile)
+def task_clock(profile):
+    now=proactive.profile_now(profile)
+    return getattr(now.tzinfo,'key',None) or now.tzname()
+@router.get('/mobile/tasks/capabilities')
+async def task_capabilities(request:Request):
+    owner,provider,profile,cfg=identity(request)
+    zone=await feature(task_clock,profile,timeout=8)
+    ready=cfg.get('scheduled_callbacks_enabled') is True and bool(cfg.get('scheduled_callback_conversation_id')) and bool(zone)
+    return {'timezone':zone,'checkups_ready':ready,'checkups_preview':'3–4 random opportunities daily, 10:00 inclusive to 22:00 exclusive, profile local time; busy and missed opportunities are skipped.'}
+@router.post('/mobile/tasks/checkups')
+async def create_checkups(request:Request):
+    value=await body(request,1024)
+    if value: raise HTTPException(400,'Check-up cadence is fixed to 3–4 daily opportunities in the profile local 10:00–22:00 window')
+    owner,provider,profile,cfg=identity(request)
+    if cfg.get('scheduled_callbacks_enabled') is not True: raise HTTPException(409,'Scheduled callbacks are disabled on the host')
+    stored=cfg.get('scheduled_callback_conversation_id')
+    await feature(native.verify,owner,provider,profile,stored,timeout=8)
+    if not await feature(task_clock,profile,timeout=8): raise HTTPException(409,'The native profile timezone is unavailable')
+    return await task_install(install_checkup_task,profile)
+async def task_install(fn,*args):
+    try: return await feature(fn,*args,timeout=8)
+    except HTTPException as exc:
+        if exc.status_code==504: raise HTTPException(504,'Task creation status is unknown. Refresh Tasks before retrying; the native save may still finish.') from None
+        raise
+
+def install_checkup_task(profile):
+    with mobile.LOCK: return _install_checkup_task(profile)
+
+def _install_checkup_task(profile):
+    from hermes_cli.web_server_cron import _cron_profile_home,_call_cron_for_profile,_create_cron_job_sync
+    from hermes_cli.web_models import CronJobCreate
+    _,home=_cron_profile_home(profile)
+    name='Beacon check-ups · 3–4 daily · local 10–22'
+    existing=_call_cron_for_profile(profile,'list_jobs',True)
+    matches=[job for job in existing if job.get('script')=='beacon-checkups.py']
+    if len(matches)>1: raise RuntimeError('Multiple Beacon check-up tasks require host inspection')
+    scripts=Path(home)/'scripts'
+    scripts.mkdir(parents=True,exist_ok=True)
+    if scripts.is_symlink() or getattr(scripts,'is_junction',lambda:False)() or scripts.resolve().parent!=Path(home).resolve(): raise ValueError('Unsafe scripts directory')
+    target=scripts/'beacon-checkups.py'
+    if target.is_symlink() or getattr(target,'is_junction',lambda:False)(): raise ValueError('Unsafe check-up script')
+    source=("import hermes_time\nhermes_timezone=hermes_time.get_timezone_name()\nhermes_now=hermes_time.now()\nimport os\nos.environ['HERMES_HOME']="+repr(str(mobile.home()))+
+            "\nimport importlib.util\nfrom pathlib import Path\nspec=importlib.util.spec_from_file_location('beacon_checkups',"+repr(str(ROOT/'checkups.py'))+")\nmodule=importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\nmodule.run("+repr(str(ROOT))+","+repr(profile)+",hermes_timezone,hermes_now)\n")
+    legacy=("import importlib.util\nfrom pathlib import Path\nspec=importlib.util.spec_from_file_location('beacon_checkups',"+repr(str(ROOT/'checkups.py'))+")\nmodule=importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\nmodule.run("+repr(str(ROOT))+","+repr(profile)+")\n")
+    if target.exists() and target.read_text(encoding='utf-8') not in (source,legacy): raise ValueError('Existing check-up script differs; review it on the host')
+    target.write_text(source,encoding='utf-8')
+    if matches:
+        if matches[0].get('name')!=name:
+            renamed=_call_cron_for_profile(profile,'update_job',matches[0]['id'],{'name':name})
+            if not isinstance(renamed,dict): raise RuntimeError('Existing check-up task could not be renamed')
+            matches[0]=renamed
+        return {'job':matches[0],'existing':True}
+    return {'job':_create_cron_job_sync(CronJobCreate(name=name,schedule='every 1m',prompt='Owner-requested check-ups: 3–4 random opportunities in the profile local 10:00–22:00 window; missed/busy opportunities skipped.',deliver='local',script='beacon-checkups.py',no_agent=True),profile),'existing':False}
+@router.get('/mobile/notifications/targets')
+async def targets(request:Request):
+    owner,_,profile,_=identity(request)
+    with mobile.connect() as conn: rows=[dict(r) for r in conn.execute('SELECT id,profile,expires FROM targets WHERE owner=? AND profile=?',(owner,profile))]
+    return {'targets':[{**r,'target_id':r['id'],'kind':'fcm','revoked':r['expires']<=time.time(),**mobile.refs(owner,profile)} for r in rows]}
+def firebase_sender_configured(cfg):
+    credentials=cfg.get('firebase_credentials')
+    if isinstance(credentials,dict): configured=credentials.get('type')=='service_account' and all(credentials.get(key) for key in ('project_id','client_email','private_key'))
+    elif isinstance(credentials,str):
+        try: configured=Path(credentials).is_file()
+        except OSError: configured=False
+    else: configured=False
+    try: sdk=importlib.util.find_spec('firebase_admin') is not None
+    except (ImportError,ValueError): sdk=False
+    return bool(configured and sdk)
+
+@router.get('/mobile/notifications/status')
+async def notification_status(request:Request):
+    owner,_,profile,cfg=identity(request)
+    result=await targets(request)
+    with mobile.connect() as conn:
+        pending=conn.execute("SELECT COUNT(*) FROM notices WHERE owner=? AND profile=? AND push='pending' AND state='pending' AND expires>?",(owner,profile,time.time())).fetchone()[0]
+        accepted=conn.execute("SELECT COUNT(*) FROM notices WHERE owner=? AND profile=? AND push='sent'",(owner,profile)).fetchone()[0]
+        failed=conn.execute("SELECT COUNT(*) FROM notice_deliveries d JOIN notices n ON n.id=d.event WHERE n.owner=? AND n.profile=? AND n.state='pending' AND n.expires>? AND d.accepted=0 AND d.last_error!=''",(owner,profile,time.time())).fetchone()[0]
+    return {**result,'android_configured':firebase_sender_configured(cfg),'delivery':{'pending':pending,'sender_accepted':accepted,'device_delivery_confirmed':False,'last_error':'Some device deliveries need a retry.' if failed else ''},'producers':{'calls':True,'approvals':True,'messages':True,'tasks':True},'delivery_note':'Sender acceptance is not confirmation of device arrival.'}
+@router.post('/mobile/notifications/test')
+async def notification_test(request:Request):
+    value=await body(request,1024)
+    owner,provider,profile,cfg=identity(request)
+    if set(value)-{'kind','conversation_id'} or value.get('kind','fcm')!='fcm': raise HTTPException(400,'Only a synthetic FCM test is supported')
+    with mobile.connect() as conn:
+        if not conn.execute('SELECT 1 FROM targets WHERE owner=? AND profile=? AND expires>?',(owner,profile,time.time())).fetchone(): raise HTTPException(409,'Register this phone before testing')
+    # Test has its own opaque reference and never creates a chat/model run or callback.
+    event_id=uuid.uuid4().hex
+    with mobile.LOCK,mobile.connect() as conn:
+        if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: raise HTTPException(409,'Notification capacity reached')
+        conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires) VALUES(?,?,?,?,?,?,?)',(event_id,owner,profile,'test','notification-test',time.time(),time.time()+300))
+    return {'event_id':event_id,'status':'queued','device_delivery_confirmed':False,**mobile.refs(owner,profile,'notification-test')}
+@router.post('/mobile/notifications/targets')
+async def target(request:Request):
+    value=await body(request,8192);owner,_,profile,_=identity(request,value.get('profile'))
+    tok=value.get('token') or value.get('fcm_token')
+    package=value.get('package_name',_PRODUCTION_PACKAGE)
+    if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Beacon package')
+    tid=value.get('id') or value.get('device_id') or hashlib.sha256((owner+':'+profile+':'+package+':'+str(tok)).encode()).hexdigest()
+    safely(mobile.ident,tid)
+    if not isinstance(tok,str) or not 20<=len(tok)<=4096 or any(ord(c)<32 for c in tok): raise HTTPException(400,'Invalid FCM target')
+    with mobile.LOCK,mobile.connect() as conn:
+        conn.execute('DELETE FROM targets WHERE expires<=?',(time.time(),))
+        if conn.execute('SELECT COUNT(*) FROM targets').fetchone()[0]>=32 and not conn.execute('SELECT 1 FROM targets WHERE id=?',(tid,)).fetchone(): raise HTTPException(409,'Target capacity reached')
+        old=conn.execute('SELECT owner,profile,token FROM targets WHERE id=?',(tid,)).fetchone()
+        if old and (old['owner']!=owner or old['profile']!=profile): raise HTTPException(409,'Target already owned')
+        if old and old['token']!=tok: conn.execute('DELETE FROM notice_deliveries WHERE target=?',(tid,))
+        conn.execute('INSERT INTO targets VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET token=excluded.token,expires=excluded.expires,payload=excluded.payload',(tid,owner,profile,tok,time.time()+30*86400,json.dumps({'package_name':package})))
+    return {'id':tid,'target_id':tid,'registered':True,'target':{'id':tid,'target_id':tid,**mobile.refs(owner,profile)},**mobile.refs(owner,profile)}
+@router.delete('/mobile/notifications/targets')
+async def remove_target(request:Request):
+    value=await body(request,1024);owner,_,profile,_=identity(request)
+    with mobile.LOCK,mobile.connect() as conn: conn.execute('DELETE FROM targets WHERE id=? AND owner=? AND profile=?',(value.get('id',value.get('device_id')),owner,profile))
+    return {'revoked':True}
+@router.delete('/mobile/notifications/targets/{target_id}')
+async def remove_target_id(target_id:str,request:Request):
+    owner,_,profile,_=identity(request)
+    with mobile.LOCK,mobile.connect() as conn:
+        conn.execute('DELETE FROM targets WHERE id=? AND owner=? AND profile=?',(target_id,owner,profile))
+    return {'revoked':True,'target_id':target_id}
+@router.get('/mobile/notifications/events')
+async def notices(request:Request,after:int=0,wait:float=0):
+    owner,provider,profile,_=identity(request)
+    package=request.query_params.get('package',_PRODUCTION_PACKAGE)
+    if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Beacon package')
+    if after<0: raise HTTPException(400,'Invalid cursor')
+    duration=_bounded_event_wait(wait)
+    async def snapshot():
+        await asyncio.to_thread(mobile.prune_history,owner)
+        await asyncio.to_thread(sys.modules['beacon_callbacks'].prune_expired,mobile,owner)
+        await asyncio.to_thread(watch,owner,provider,profile)
+        return await asyncio.to_thread(_notices_after,owner,profile,after,package)
+    rows,reset,cursor=await snapshot()
+    if rows or reset or duration<=0:
+        key=mobile.reference_key() if rows else None
+        result={'events':[notice_wire(r,owner,key) for r in rows],'next_cursor':cursor}
+        if reset: result['reset']=True
+        return result
+    loop=asyncio.get_running_loop();deadline=loop.time()+duration
+    while True:
+        remaining=deadline-loop.time()
+        if remaining<=0: break
+        await asyncio.sleep(min(1.0,remaining))
+        rows,reset,cursor=await asyncio.to_thread(_notices_after,owner,profile,after,package)
+        if rows or reset: break
+        after=cursor
+        if await request.is_disconnected(): break
+    key=mobile.reference_key() if rows else None
+    result={'events':[notice_wire(r,owner,key) for r in rows],'next_cursor':cursor}
+    if reset: result['reset']=True
+    return result
+
+def _notices_after(owner,profile,after,package=_PRODUCTION_PACKAGE):
+    with mobile.connect() as conn:
+        sequence=conn.execute("SELECT seq FROM sqlite_sequence WHERE name='notices'").fetchone()
+        max_seq=sequence[0] if sequence else 0
+        reset=after>max_seq
+        rows=[dict(r) for r in conn.execute('SELECT * FROM notices WHERE owner=? AND profile=? AND seq>? ORDER BY seq LIMIT 100',(owner,profile,0 if reset else after))]
+    cursor=rows[-1]['seq'] if rows else max_seq if reset else after
+    visible=[row for row in rows if row['kind']!='release' or _notice_package(row)==package]
+    return visible,reset,cursor
+def notice_preview(kind):
+    if kind=='release': return 'Beacon update available','Open Beacon to install the latest verified update.'
+    if kind=='test': return 'Beacon notification test','Synthetic test. Seeing this notification confirms arrival on this phone.'
+    if kind=='approval': return 'Approval needed','Open Beacon to review the request.'
+    if kind=='clarify': return 'Question for you','Answer here or open Beacon.'
+    if kind=='working': return 'Beacon working','Hermes is working on your chat.'
+    if kind=='activity_end': return 'Activity ended','Open Beacon to review your session.'
+    if kind=='task_result': return 'Task finished','A task finished.'
+    if kind=='failure': return 'Beacon work failed','Open Beacon to see what went wrong.'
+    if kind=='completion': return 'Reply ready','A reply is ready.'
+    return 'Beacon calling','Open Beacon to hear the saved result.'
+def reply_preview(messages,limit=300):
+    """The newest assistant reply as one plain line for a notification."""
+    for message in reversed(messages):
+        if not isinstance(message,dict) or message.get('role')!='assistant': continue
+        content=message.get('content')
+        if isinstance(content,list): content=' '.join(part.get('text','') for part in content if isinstance(part,dict))
+        if not isinstance(content,str) or not content.strip(): continue
+        text=re.sub(r'```.*?```',' ',content,flags=re.S)
+        text=re.sub(r'[*_`#>]+','',text)
+        text=' '.join(text.split())
+        return text[:limit-1]+'…' if len(text)>limit else text
+    return ''
+def notice_wire(row,owner,key=None):
+    state='expired' if row['state']=='pending' and row['expires']<=time.time() else row['state']
+    title,body=notice_preview(row['kind'])
+    if row['kind']=='task_result' and row.get('reason'):
+        body=row['reason'][:240]+('…' if len(row['reason'])>240 else '')
+    return {**row,'event_id':row['id'],'callback_id':row['id'],'owner_id':owner,'conversation_id':row['conversation'],'session_id':row['conversation'] if row['kind']!='test' else '', 'expires_at':int(row['expires']),'state':state,'title':title,'body':body,'activity_ref':row.get('activity_key',''),'preview':{'title':title,'body':body},**mobile.refs(owner,row['profile'],row['conversation'],key)}
+@router.get('/mobile/notifications/events/{event_id}')
+async def notice_detail(event_id:str,request:Request):
+    owner,provider,profile,_=identity(request)
+    package=request.query_params.get('package',_PRODUCTION_PACKAGE)
+    if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Beacon package')
+    with mobile.connect() as conn:
+        row=conn.execute('SELECT * FROM notices WHERE id=? AND owner=? AND profile=?',(event_id,owner,profile)).fetchone()
+    if not row or row['kind']=='release' and _notice_package(dict(row))!=package: raise HTTPException(404,'Owned notification unavailable')
+    result=notice_wire(dict(row),owner)
+    if row['kind']=='completion' and row['conversation']:
+        # The notification shows what the reply says; Android's lock-screen setting still hides it when locked.
+        try:
+            snapshot=await feature(native.conversation_snapshot,owner,provider,profile,row['conversation'],timeout=6)
+            reply=reply_preview(snapshot.get('messages') or [])
+            if reply: result['preview']={'title':str(snapshot.get('title') or 'Reply ready')[:120],'body':reply}
+        except Exception: pass  # the generic text stays
+    if row['kind']=='task_result':
+        with mobile.connect() as conn:
+            email_alert=conn.execute('SELECT 1 FROM meta WHERE key=?',('proactive-email-notice:'+event_id,)).fetchone() is not None
+        phone_job=row['job_id'] if isinstance(row['job_id'],str) else ''
+        if email_alert: result.update(email_alert=True,preview={'title':'Important email','body':result['preview']['body']})
+        elif phone_job.startswith('phone-hermes-'):
+            result['preview']={'title':'Hermes','body':result['preview']['body']}
+    if row['request_id'] and result['state']=='pending':
+        frame=await asyncio.to_thread(safely,activity.pending,native,owner,provider,profile,dict(row))
+        result['actions']=activity.request_actions(frame)
+        result['preview']=activity.request_preview(frame)
+        if not result['preview']['complete']: result['actions']=[a for a in result['actions'] if frame['method']=='approval' and a['value']=='deny']
+        params=frame.get('params',{})
+        result['text_reply']=result['preview']['complete'] and frame['method']=='clarify' and not params.get('choices') and not params.get('questions') and not params.get('multi_select')
+    return result
+
+@router.post('/mobile/notifications/events/{event_id}/answer')
+async def activity_answer(event_id:str,request:Request):
+    value=await body(request,4096);owner,provider,profile,_=identity(request)
+    return await asyncio.to_thread(safely,activity.answer,mobile,native,owner,provider,profile,event_id,value.get('answer'))
+
+@router.post('/mobile/callbacks/{invitation_id}/{action}')
+async def answer(invitation_id:str,action:str,request:Request):
+    value=await body(request,1024);owner,provider,profile,cfg=identity(request)
+    if action not in ('answer','decline'): raise HTTPException(404,'Unknown callback action')
+    if action=='answer': _client_key_mode(value)
+    def peek():
+        with mobile.connect() as conn:
+            row=conn.execute('SELECT * FROM notices WHERE id=? AND owner=? AND profile=?',(invitation_id,owner,profile)).fetchone()
+        if not row or row['kind']!='incoming_call': raise HTTPException(404,'Owned invitation unavailable')
+        if row['state']!='pending' or row['expires']<=time.time(): raise HTTPException(409,'Invitation consumed or expired')
+        return dict(row)
+    initial=await asyncio.to_thread(peek)
+    if action=='answer':
+        await asyncio.to_thread(reject_unowned_conversation,owner,provider,profile,initial['conversation'])
+        await asyncio.to_thread(safely,native.verify,owner,provider,profile,initial['conversation'])
+    source=await asyncio.to_thread(mobile.refs,owner,profile)
+    selection=voice_models.selected(mobile,owner,profile,cfg)
+    if action=='answer':
+        requested=value['voice_provider']
+        if requested not in voice_models.PROVIDERS: raise HTTPException(400,'Unknown voice model')
+        selection=voice_models.provider_selection(mobile,owner,profile,cfg,requested)
+    def consume():
+        with mobile.LOCK,mobile.connect() as conn:
+            row=conn.execute('SELECT * FROM notices WHERE id=? AND owner=? AND profile=?',(invitation_id,owner,profile)).fetchone()
+            if not row or row['kind']!='incoming_call': raise HTTPException(404,'Owned invitation unavailable')
+            if row['state']!='pending' or row['expires']<=time.time() or row['conversation']!=initial['conversation']: raise HTTPException(409,'Invitation consumed or expired')
+            if action=='decline':
+                conn.execute("UPDATE notices SET state='declined' WHERE id=?",(invitation_id,))
+                return {'declined':True,'state':'declined','callback_id':invitation_id,'kind':'incoming_call','profile':profile,**source}
+            if mobile.active_calls(conn,owner)>=mobile.MAX_ACTIVE_CALLS: raise HTTPException(409,'Active call limit reached')
+            cid=uuid.uuid4().hex
+            context={key:row[key] for key in ('id','reason','job_id','conversation')}
+            voice_config={**selection,'client_key':True}
+            conn.execute('INSERT INTO calls(id,owner,profile,conversation,created,callback_context,voice_config) VALUES(?,?,?,?,?,?,?)',(cid,owner,profile,row['conversation'],time.time(),json.dumps(context),json.dumps(voice_config)))
+            conn.execute("UPDATE notices SET state='answered',call_id=? WHERE id=?",(cid,invitation_id))
+        return {'call_id':cid,'conversation_id':row['conversation'],'profile':profile,'recording_status':'disabled','transcript_status':'pending','callback_id':invitation_id,'kind':'incoming_call','state':'answered',**selection,**mobile.refs(owner,profile,row['conversation'])}
+    result=await asyncio.to_thread(consume)
+    return result
+def activate(owner,profile):
+    with mobile.LOCK:
+        with mobile.connect() as conn:
+            mobile.prune_notices(conn)
+            if mobile.active_calls(conn,owner): return
+            deferred=[dict(row) for row in conn.execute('SELECT * FROM deferred WHERE owner=? AND profile=? ORDER BY created LIMIT 32',(owner,profile)).fetchall()]
+        callbacks=sys.modules['beacon_callbacks'];observers=callbacks.observers
+        quiet=None;quiet_now=None
+        for row in deferred:
+            now=datetime.now(timezone.utc)
+            missed=callbacks.missed_reason(mobile,row['id'],now,owner,profile)
+            explicit=callbacks.deferred_allowed(mobile,row['id'],now,owner)
+            if explicit is False:
+                if missed is not None:
+                    try:
+                        observers._notice(mobile,owner,profile,row['conversation'],
+                                          'Missed scheduled callback: '+missed,
+                                          'missed-callback:'+row['id'],now)
+                    except Exception:
+                        continue
+                with mobile.connect() as conn: conn.execute('DELETE FROM deferred WHERE id=?',(row['id'],))
+                continue
+            with mobile.connect() as conn:
+                email_notice=conn.execute('SELECT 1 FROM meta WHERE key=?',
+                                          ('proactive-email-notice:'+row['id'],)).fetchone()
+                email_rule=conn.execute('SELECT value FROM meta WHERE key=?',
+                                         ('proactive-email-rule:'+row['id'],)).fetchone()
+            request=None;proactive_call=email_notice is not None
+            if email_notice:
+                rule_id='default'
+                if email_rule:
+                    try:
+                        value=json.loads(email_rule[0]).get('rule_id')
+                        if isinstance(value,str): rule_id=value
+                    except (AttributeError,TypeError,ValueError): pass
+                if re.fullmatch(r'[0-9a-f]{32}',rule_id):
+                    request=next((r for r in proactive.list_requests(mobile,owner,profile)
+                                  if r.get('id')==rule_id),None)
+            else:
+                request_id=re.match(r'(?:Request|Email rule): ([0-9a-f]{32})[;:] ',row['reason'] or '')
+                request=request_id and next((r for r in proactive.list_requests(mobile,owner,profile)
+                                             if r.get('id')==request_id.group(1)),None)
+                proactive_call=request is not None
+            if explicit is None and proactive_call and not (request and request.get('night') is True):
+                if quiet is None:
+                    setup=proactive._setup(mobile,owner,profile)
+                    quiet_now=proactive.profile_now(profile)
+                    quiet=observers._inside_quiet(quiet_now,setup)
+                if quiet:
+                    with mobile.connect() as conn:
+                        if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: break
+                    observers._notice(mobile,owner,profile,row['conversation'],row['reason'],
+                                      'proactive-alert:deferred:'+row['id'],quiet_now)
+                    with mobile.connect() as conn: conn.execute('DELETE FROM deferred WHERE id=?',(row['id'],))
+                    continue
+            with mobile.connect() as conn:
+                if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: break
+                conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason) VALUES(?,?,?,?,?,?,?,?)',(row['id'],owner,profile,'incoming_call',row['conversation'],time.time(),time.time()+120,row['reason']))
+                if email_notice:
+                    conn.execute('UPDATE call_log SET email_notice_id=? WHERE id=? AND owner=? AND profile=?',
+                                 (row['id'],row['id'],owner,profile))
+                conn.execute('DELETE FROM deferred WHERE id=?',(row['id'],))
+def push(owner,profile):
+    # A successful second device must not consume the first device's failed delivery.
+    if not mobile.PUSH_LOCK.acquire(blocking=False): return
+    try: _push_devices(owner,profile)
+    finally: mobile.PUSH_LOCK.release()
+
+def _push_devices(owner,profile):
+    activate(owner,profile)
+    cfg=mobile.settings();credentials=cfg.get('firebase_credentials')
+    if not credentials: return
+    with mobile.connect() as conn:
+        rows=[dict(r) for r in conn.execute("SELECT * FROM notices WHERE owner=? AND profile=? AND push='pending' AND state='pending' AND expires>? ORDER BY seq LIMIT 64",(owner,profile,time.time()))]
+        targets=[dict(r) for r in conn.execute('SELECT id,token,payload FROM targets WHERE owner=? AND profile=? AND expires>?',(owner,profile,time.time()))]
+    if not targets: return
+    try:
+        import firebase_admin
+        from firebase_admin import credentials as fb_credentials,messaging
+        try: app=firebase_admin.get_app('beacon')
+        except ValueError: app=firebase_admin.initialize_app(fb_credentials.Certificate(credentials),options={'httpTimeout':10},name='beacon')
+        for row in rows:
+            eligible_targets=[target for target in targets if row['kind']!='release' or _target_package(target.get('payload'))==_notice_package(row)]
+            for target in eligible_targets:
+                now=time.time()
+                with mobile.LOCK,mobile.connect() as conn:
+                    current=conn.execute("SELECT 1 FROM notices WHERE id=? AND state='pending' AND expires>?",(row['id'],now)).fetchone()
+                    device=conn.execute('SELECT 1 FROM targets WHERE id=? AND token=? AND expires>?',(target['id'],target['token'],now)).fetchone()
+                    receipt=conn.execute('SELECT * FROM notice_deliveries WHERE event=? AND target=?',(row['id'],target['id'])).fetchone()
+                if not current or not device or receipt and (receipt['accepted'] or receipt['next_attempt']>now): continue
+                attempts=(receipt['attempts'] if receipt else 0)+1
+                accepted=0;error=''
+                try:
+                    data={'type':row['kind'],'kind':row['kind'],'event_id':row['id'],'profile':profile,'owner_id':owner,'expires_at':str(int(row['expires'])),'activity_ref':row.get('activity_key',''),'title':notice_preview(row['kind'])[0],'body':notice_preview(row['kind'])[1],**mobile.refs(owner,profile,row['conversation'])}
+                    if row['kind']=='release': data['release_version']=str(row['release_version'])
+                    messaging.send(messaging.Message(token=target['token'],data=data,android=messaging.AndroidConfig(priority='high',ttl=timedelta(seconds=max(1,row['expires']-time.time())))),app=app)
+                    accepted=time.time()
+                except Exception as exc:
+                    error=type(exc).__name__[:64]
+                with mobile.LOCK,mobile.connect() as conn:
+                    # A revoked/replaced device may disappear while the provider request is in flight.
+                    if conn.execute('SELECT 1 FROM targets WHERE id=? AND token=?',(target['id'],target['token'])).fetchone() and conn.execute('SELECT 1 FROM notices WHERE id=?',(row['id'],)).fetchone():
+                        conn.execute('INSERT OR REPLACE INTO notice_deliveries VALUES(?,?,?,?,?,?)',(row['id'],target['id'],accepted,attempts,0 if accepted else time.time()+min(60,3*2**min(attempts-1,5)),error))
+                        if error=='UnregisteredError': conn.execute('UPDATE targets SET expires=0 WHERE id=?',(target['id'],))
+            with mobile.LOCK,mobile.connect() as conn:
+                remaining=sum(not conn.execute('SELECT 1 FROM notice_deliveries WHERE event=? AND target=? AND accepted>0',(row['id'],target['id'])).fetchone() for target in eligible_targets)
+                accepted=conn.execute('SELECT COUNT(*) FROM notice_deliveries WHERE event=? AND accepted>0',(row['id'],)).fetchone()[0]
+                if not remaining and accepted: conn.execute("UPDATE notices SET push='sent' WHERE id=?",(row['id'],))
+    except Exception: return
+
+_release_failures={}
+def announce_release(cfg,package=_PRODUCTION_PACKAGE):
+    """A changed verified feed creates durable hints; clients still verify before installing."""
+    if package not in (_PRODUCTION_PACKAGE,_STABLE_PACKAGE): raise ValueError('Invalid Beacon package')
+    owner=cfg.get('owner_id');profiles=cfg.get('profiles')
+    if profiles is None:
+        try: profiles=_native_profile_names()
+        except HTTPException: return
+    if not owner or not cfg.get('owner_provider') or not profiles: return
+    stable=package==_STABLE_PACKAGE
+    manifest=_release_root(cfg,stable=stable)/'latest.json'
+    if not manifest.is_file(): return
+    with manifest.open('rb') as stream: raw=stream.read(16385)
+    if len(raw)>16384: return
+    cache_key=str(manifest.resolve());fingerprint=hashlib.sha256(raw).hexdigest()
+    if _release_failures.get(cache_key)==fingerprint: return
+    candidate=json.loads(raw.decode('utf-8-sig')).get('version_code')
+    if type(candidate) is not int or not 20<candidate<=2147483647: return
+    def key(profile): return 'release-announced:'+hashlib.sha256((owner+'\0'+profile+'\0'+package).encode()).hexdigest()
+    with mobile.connect() as conn:
+        wanted=[profile for profile in profiles if any(_target_package(row['payload'])==package for row in conn.execute('SELECT payload FROM targets WHERE owner=? AND profile=? AND expires>?',(owner,profile,time.time())))
+                and int((conn.execute('SELECT value FROM meta WHERE key=?',(key(profile),)).fetchone() or [0])[0])<candidate]
+    if not wanted: return
+    try: verified=release(cfg,package=package)
+    except Exception:
+        _release_failures[cache_key]=fingerprint
+        raise
+    _release_failures.pop(cache_key,None)
+    version=verified['version_code']
+    with mobile.LOCK,mobile.connect() as conn:
+        for profile in wanted:
+            previous=conn.execute('SELECT value FROM meta WHERE key=?',(key(profile),)).fetchone()
+            if previous and int(previous[0])>=version: continue
+            if not any(_target_package(row['payload'])==package for row in conn.execute('SELECT payload FROM targets WHERE owner=? AND profile=? AND expires>?',(owner,profile,time.time()))): continue
+            mobile.prune_notices(conn)
+            if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: raise RuntimeError('Notification capacity reached')
+            event=hashlib.sha256((owner+'\0'+profile+'\0release:'+package+':'+str(version)+':'+verified['sha256']).encode()).hexdigest()
+            conn.execute('INSERT OR IGNORE INTO notices(id,owner,profile,kind,conversation,created,expires,release_version) VALUES(?,?,?,?,?,?,?,?)',
+                         (event,owner,profile,'release',('release-stable-' if stable else 'release-')+str(version),time.time(),time.time()+7*86400,version))
+            conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(key(profile),version))
+def release(cfg,optional=False,digest=None,package=None,root_path=None):
+    with _RELEASE_CACHE_LOCK:
+        return _release(cfg,optional,digest,package,root_path)
+
+def _release_root(cfg,create=False,stable=False):
+    if stable:
+        root=mobile.home()/'plugin-data'/'beacon'/'releases-stable'
+        if create: mobile.protect(root)
+        return root
+    configured=cfg.get('release_root')
+    if isinstance(configured,str) and configured.strip():
+        root=Path(configured).expanduser()
+        if create:
+            if root.is_symlink() or getattr(root,'is_junction',lambda:False)(): raise ValueError('Unsafe release directory')
+            root.mkdir(parents=True,exist_ok=True)
+    else:
+        root=mobile.home()/'plugin-data'/'beacon'/'releases'
+        if create: mobile.protect(root)
+    return root
+
+def _release(cfg,optional=False,digest=None,package=None,root_path=None):
+    global _RELEASE_CACHE_KEY,_RELEASE_CACHE_VALUE
+    stable=package==_STABLE_PACKAGE
+    package_name=_STABLE_PACKAGE if stable else _PRODUCTION_PACKAGE
+    root_path=Path(root_path) if root_path is not None else _release_root(cfg,stable=stable)
+    if not root_path.is_dir():
+        if optional: return {'available':False}
+        raise LookupError('Release unavailable')
+    root=root_path.resolve(strict=True)
+    if digest is not None and not re.fullmatch(r'[a-f0-9]{64}',digest): raise LookupError('Invalid immutable release')
+    manifest=root/((digest+'.json') if digest else 'latest.json')
+    if manifest.is_symlink() or getattr(manifest,'is_junction',lambda:False)(): raise ValueError('Unsafe release manifest')
+    if not manifest.is_file():
+        if optional: return {'available':False}
+        raise LookupError('Release unavailable')
+    manifest_stat=manifest.stat()
+    if manifest_stat.st_size>16384: raise ValueError('Oversized release manifest')
+    data=json.loads(manifest.read_text(encoding='utf-8-sig'))
+    if not isinstance(data,dict): raise ValueError('Invalid release manifest')
+    filename=data.get('artifact_filename','')
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+\.apk',filename): raise ValueError('Invalid artifact name')
+    path=root/filename
+    if path.is_symlink() or getattr(path,'is_junction',lambda:False)() or path.resolve().parent!=root: raise ValueError('Unsafe artifact')
+    if data.get('package_name')!=package_name or type(data.get('version_code')) is not int or data['version_code']<=20 or not re.fullmatch(r'[a-fA-F0-9]{64}',data.get('certificate_sha256','')): raise ValueError('Invalid release identity')
+    artifact_stat=path.stat()
+    if not 1<=artifact_stat.st_size<=256*1024*1024: raise ValueError('APK size outside bounds')
+    if artifact_stat.st_size!=data.get('size_bytes') or not re.fullmatch(r'[a-fA-F0-9]{64}',data.get('sha256','')): raise ValueError('Release artifact changed')
+    expected=cfg.get('android_stable_certificate_sha256') if stable else cfg.get('android_certificate_sha256')
+    if stable and not expected: expected=data['certificate_sha256']
+    if not isinstance(expected,str) or not re.fullmatch(r'[a-fA-F0-9]{64}',expected) or expected.lower()!=data['certificate_sha256'].lower(): raise ValueError('Unexpected signing identity')
+    version_name=data.get('version_name')
+    if not isinstance(version_name,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}',version_name): raise ValueError('Invalid release version')
+    aapt=cfg.get('aapt');signer=cfg.get('apksigner')
+    # The stable phone checks package, version, hash, and signer before install; Android refuses signer changes.
+    verify_apk=not (stable and not aapt and not signer)
+    tools=[]
+    if verify_apk:
+        if not aapt or not signer or not Path(aapt).is_file() or not Path(signer).is_file(): raise RuntimeError('APK verification tools unavailable')
+        for tool in (aapt,signer):
+            tool_path=Path(tool);tool_stat=tool_path.stat()
+            tools.append((str(tool_path.resolve()),tool_stat.st_size,tool_stat.st_mtime_ns))
+    cache_key=(str(manifest.resolve()),manifest_stat.st_size,manifest_stat.st_mtime_ns,
+               str(path.resolve()),artifact_stat.st_size,artifact_stat.st_mtime_ns,
+               digest,package_name,expected.lower(),tuple(tools))
+    if cache_key==_RELEASE_CACHE_KEY:
+        return dict(_RELEASE_CACHE_VALUE)
+    with path.open('rb') as stream: computed=hashlib.file_digest(stream,'sha256').hexdigest()
+    if digest is not None and digest!=computed: raise ValueError('Immutable manifest hash mismatch')
+    digest=computed
+    if digest!=data.get('sha256'): raise ValueError('Release artifact changed')
+    if verify_apk:
+        flags=subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0
+        try:
+            badging=subprocess.run([aapt,'dump','badging',str(path)],capture_output=True,text=True,check=True,timeout=20,creationflags=flags).stdout
+            certificates=subprocess.run([signer,'verify','--print-certs',str(path)],capture_output=True,text=True,check=True,timeout=20,creationflags=flags).stdout
+        except (OSError,subprocess.SubprocessError): raise RuntimeError('APK verification failed') from None
+        package=re.search(r"package: name='([^']+)' versionCode='([0-9]+)' versionName='([^']+)'",badging)
+        digests=re.findall(r'Signer #[0-9]+ certificate SHA-256 digest: ([a-fA-F0-9]{64})',certificates)
+        if not package or package[1]!=data['package_name'] or int(package[2])!=data['version_code'] or package[3]!=version_name or len(digests)!=1 or digests[0].lower()!=expected.lower(): raise ValueError('APK metadata/signature mismatch')
+    # The app sends ?package= on download; a query here fails its artifact-path check.
+    artifact_path='/api/plugins/beacon/mobile/releases/'+digest+'/download'
+    result={k:data[k] for k in ('version_code','version_name','package_name','certificate_sha256','sha256','size_bytes')} | {'available':True,'download_url':artifact_path,'artifact_path':artifact_path,'min_contract_version':2,'max_contract_version':2}
+    if isinstance(data.get('plugin_version'),str): result['plugin_version']=data['plugin_version']
+    _RELEASE_CACHE_KEY=cache_key;_RELEASE_CACHE_VALUE=dict(result)
+    return result
+@router.get('/mobile/releases/latest')
+async def latest(request:Request):
+    _,_,_,cfg=identity(request);package=request.query_params.get('package')
+    if package and package not in (_PRODUCTION_PACKAGE,_STABLE_PACKAGE): raise HTTPException(400,'Unsupported Beacon update package')
+    return await asyncio.to_thread(safely,release,cfg,False,None,package)
+@router.get('/mobile/releases/{digest}/download')
+async def download(digest:str,request:Request):
+    _,_,_,cfg=identity(request);package=request.query_params.get('package')
+    if package and package not in (_PRODUCTION_PACKAGE,_STABLE_PACKAGE): raise HTTPException(400,'Unsupported Beacon update package')
+    metadata=await asyncio.to_thread(safely,release,cfg,False,digest,package)
+    if digest!=metadata['sha256']: raise HTTPException(404,'Immutable artifact unavailable')
+    root=_release_root(cfg,stable=package==_STABLE_PACKAGE).resolve();data=json.loads((root/(digest+'.json')).read_text(encoding='utf-8-sig'));path=root/data['artifact_filename']
+    # Snapshot immutable bytes before any response headers; a concurrent replacement
+    # cannot turn validated metadata into a different delivered package.
+    content=await asyncio.to_thread(path.read_bytes)
+    if hashlib.sha256(content).hexdigest()!=digest: raise HTTPException(409,'Artifact changed')
+    return StreamingResponse(iter(content[i:i+65536] for i in range(0,len(content),65536)),media_type='application/vnd.android.package-archive',headers={'Content-Length':str(len(content)),'ETag':'"'+digest+'"','Cache-Control':'private, immutable'})
+
+class ReleaseCheckError(Exception): pass
+
+def _safe_release_repo(cfg):
+    repo=cfg.get('release_repo','xploit9/beacon')
+    if not isinstance(repo,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}',repo):
+        raise ReleaseCheckError('The configured GitHub release repository is invalid.')
+    return repo
+
+def _is_link(path):
+    return path.is_symlink() or getattr(path,'is_junction',lambda:False)()
+
+def _file_sha256(path):
+    with path.open('rb') as stream: return hashlib.file_digest(stream,'sha256').hexdigest()
+
+def _atomic_copy(source,destination,digest):
+    if _is_link(destination): raise ReleaseCheckError('The configured release feed contains an unsafe file.')
+    if destination.exists():
+        if destination.is_file() and _file_sha256(destination)==digest: return
+        raise ReleaseCheckError('A published Beacon APK filename cannot be replaced with different bytes.')
+    temporary=destination.with_name('.'+destination.name+'.'+uuid.uuid4().hex+'.tmp')
+    try:
+        with source.open('rb') as incoming,temporary.open('xb') as outgoing:
+            shutil.copyfileobj(incoming,outgoing,1024*1024);outgoing.flush();os.fsync(outgoing.fileno())
+        if _file_sha256(temporary)!=digest: raise ReleaseCheckError('The verified Beacon APK changed while it was being saved.')
+        os.replace(temporary,destination)
+    finally:
+        try: temporary.unlink()
+        except FileNotFoundError: pass
+
+def _atomic_write(destination,content,immutable=False):
+    if _is_link(destination): raise ReleaseCheckError('The configured release feed contains an unsafe file.')
+    if immutable and destination.exists():
+        if destination.is_file() and destination.read_bytes()==content: return
+        raise ReleaseCheckError('A published Beacon release manifest cannot be replaced.')
+    temporary=destination.with_name('.'+destination.name+'.'+uuid.uuid4().hex+'.tmp')
+    try:
+        with temporary.open('xb') as stream:
+            stream.write(content);stream.flush();os.fsync(stream.fileno())
+        os.replace(temporary,destination)
+    finally:
+        try: temporary.unlink()
+        except FileNotFoundError: pass
+
+def _plugin_version_tuple(value):
+    match=re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)',value) if isinstance(value,str) else None
+    return tuple(int(part) for part in match.groups()) if match else None
+
+def _check_github_release(cfg,before_apk=None):
+    global _RELEASE_CACHE_KEY,_RELEASE_CACHE_VALUE
+    repo=_safe_release_repo(cfg)
+    gh=shutil.which('gh')
+    if not gh: raise ReleaseCheckError('GitHub CLI is not installed on your PC.')
+    flags=subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0
+    with tempfile.TemporaryDirectory(prefix='beacon-release-') as temporary:
+        download_dir=Path(temporary)
+        def download(pattern):
+            try:
+                result=subprocess.run([gh,'release','download','--repo',repo,'--pattern',pattern,'--dir',str(download_dir)],
+                                      cwd=str(download_dir),capture_output=True,text=True,check=False,timeout=120,shell=False,creationflags=flags)
+            except subprocess.TimeoutExpired: raise ReleaseCheckError('GitHub release check timed out on your PC. Try again.') from None
+            except OSError: raise ReleaseCheckError('GitHub CLI could not start on your PC.') from None
+            if result.returncode:
+                detail=(result.stderr+'\n'+result.stdout).casefold()
+                if any(part in detail for part in ('not logged in','not logged into','auth login','authentication required','http 401')):
+                    raise ReleaseCheckError('GitHub CLI is not signed in on your PC. Sign in with gh auth login.')
+                if 'release not found' in detail or 'no releases found' in detail:
+                    raise ReleaseCheckError('No stable Beacon release was found in the configured GitHub repository.')
+                if 'no assets found' in detail or 'no matching assets' in detail:
+                    raise ReleaseCheckError('The latest GitHub release is missing the Beacon APK or metadata.')
+                raise ReleaseCheckError('GitHub CLI cannot access the configured release repository on your PC.')
+            return list(download_dir.glob(pattern))
+
+        manifests=download('Beacon-*.json')
+        if len(manifests)!=1: raise ReleaseCheckError('The GitHub release must contain one Beacon metadata file.')
+        manifest=manifests[0]
+        if _is_link(manifest) or manifest.resolve().parent!=download_dir.resolve():
+            raise ReleaseCheckError('The GitHub release contains an unsafe artifact path.')
+        name=re.fullmatch(r'Beacon-([A-Za-z0-9][A-Za-z0-9._-]{0,63})\.json',manifest.name)
+        if not name or manifest.stat().st_size>16384:
+            raise ReleaseCheckError('The GitHub release metadata is outside the supported size limits.')
+        try:
+            manifest_bytes=manifest.read_bytes();data=json.loads(manifest_bytes.decode('utf-8-sig'))
+        except Exception: raise ReleaseCheckError('The GitHub release metadata is invalid.') from None
+        version_name=name[1]
+        artifact_name=f'Beacon-{version_name}.apk'
+        plugin_version=data.get('plugin_version') if isinstance(data,dict) else None
+        if _plugin_version_tuple(plugin_version) is None:
+            raise ReleaseCheckError('The GitHub release metadata must include a valid Beacon plugin version.')
+        if (not isinstance(data,dict) or data.get('artifact_filename')!=artifact_name or data.get('package_name')!=_STABLE_PACKAGE
+                or data.get('version_name')!=version_name or type(data.get('version_code')) is not int or data['version_code']<=20
+                or type(data.get('size_bytes')) is not int or not 1<=data['size_bytes']<=256*1024*1024
+                or not isinstance(data.get('sha256'),str) or not re.fullmatch(r'[a-f0-9]{64}',data['sha256'])
+                or not isinstance(data.get('certificate_sha256'),str) or not re.fullmatch(r'[a-fA-F0-9]{64}',data['certificate_sha256'])):
+            raise ReleaseCheckError('The GitHub release metadata does not describe a stable Beacon APK.')
+        if before_apk: before_apk(data['version_name'],plugin_version)
+        digest=data['sha256']
+        previous=None
+        try: previous=release(cfg,optional=True,package=_STABLE_PACKAGE)
+        except Exception: pass
+        if previous and previous.get('package_name')==_STABLE_PACKAGE:
+            if data['version_code']<previous['version_code']:
+                return {'version_name':data['version_name'],'version_code':data['version_code'],'plugin_version':plugin_version,'available':False}
+            if data['version_code']==previous['version_code']:
+                if digest!=previous['sha256']:
+                    raise ReleaseCheckError('A published Beacon version cannot be replaced with different APK bytes.')
+                if (data['version_name']!=previous['version_name'] or
+                        data['certificate_sha256'].lower()!=previous['certificate_sha256'].lower()):
+                    raise ReleaseCheckError('A published Beacon version cannot change its release metadata.')
+                previous_plugin=previous.get('plugin_version','')
+                if _plugin_version_tuple(previous_plugin) and _plugin_version_tuple(plugin_version)<_plugin_version_tuple(previous_plugin):
+                    raise ReleaseCheckError('A published Beacon release cannot downgrade its plugin version.')
+                if plugin_version!=previous_plugin:
+                    root=_release_root(cfg,create=True,stable=True)
+                    _atomic_write(root.resolve()/'latest.json',manifest_bytes)
+                    with _RELEASE_CACHE_LOCK: _RELEASE_CACHE_KEY=None;_RELEASE_CACHE_VALUE=None
+                return {'version_name':data['version_name'],'version_code':data['version_code'],'plugin_version':plugin_version,'available':False}
+
+        apks=download(artifact_name)
+        if len(apks)!=1 or apks[0].name!=artifact_name:
+            raise ReleaseCheckError('The GitHub release must contain the APK named by its metadata.')
+        apk=apks[0]
+        if _is_link(apk) or apk.resolve().parent!=download_dir.resolve():
+            raise ReleaseCheckError('The GitHub release contains an unsafe artifact path.')
+        if not 1<=apk.stat().st_size<=256*1024*1024 or apk.stat().st_size!=data['size_bytes']:
+            raise ReleaseCheckError('The GitHub release artifact is outside the supported size limits.')
+        if _file_sha256(apk)!=digest: raise ReleaseCheckError('The GitHub APK checksum does not match its metadata.')
+        stage=download_dir/'feed';stage.mkdir()
+        shutil.copyfile(apk,stage/apk.name)
+        (stage/(digest+'.json')).write_bytes(manifest_bytes)
+        (stage/'latest.json').write_bytes(manifest_bytes)
+        try: verified=release(cfg,package=_STABLE_PACKAGE,root_path=stage)
+        except Exception: raise ReleaseCheckError('The downloaded Beacon APK failed signature or metadata verification.') from None
+        root=_release_root(cfg,create=True,stable=True)
+        if not root.is_dir(): raise ReleaseCheckError('The verified release feed could not be saved on Hermes.')
+        root=root.resolve(strict=True)
+        _atomic_copy(apk,root/data['artifact_filename'],digest)
+        _atomic_write(root/(digest+'.json'),manifest_bytes,immutable=True)
+        _atomic_write(root/'latest.json',manifest_bytes)
+        with _RELEASE_CACHE_LOCK: _RELEASE_CACHE_KEY=None;_RELEASE_CACHE_VALUE=None
+        # Keep this release and the one it replaces (a phone may be mid-download); drop older ones.
+        keep={data['artifact_filename'],digest+'.json'}
+        if previous and previous.get('package_name')==_STABLE_PACKAGE:
+            keep.add('Beacon-'+previous['version_name']+'.apk')
+            keep.add(previous['sha256']+'.json')
+        for stale in root.iterdir():
+            if stale.name not in keep and (re.fullmatch(r'Beacon-.+\.apk',stale.name) or re.fullmatch(r'[a-f0-9]{64}\.json',stale.name)):
+                try: stale.unlink()
+                except OSError: pass
+        return {'version_name':verified['version_name'],'version_code':verified['version_code'],'plugin_version':plugin_version,'available':True}
+
+def _check_release_and_announce(cfg,before_apk=None):
+    with _RELEASE_CHECK_LOCK:
+        checked=_check_github_release(cfg,before_apk)
+        if checked.get('available'): announce_release(cfg,package=_STABLE_PACKAGE)
+        return checked
+
+@router.post('/mobile/releases/check')
+async def check_release_updates(request:Request):
+    _,_,_,cfg=identity(request,owner_only=True)
+    try: return await asyncio.to_thread(_check_release_and_announce,cfg)
+    except ReleaseCheckError as error: raise HTTPException(503,str(error)) from None
+    except Exception: raise HTTPException(503,'The verified Beacon release could not be saved on Hermes.') from None
+
+def _installed_plugin_version():
+    return _read_plugin_version(ROOT/'plugin.yaml')
+
+def _hermes_busy(owner):
+    try:
+        from gateway.status import get_running_pid,read_runtime_status
+        from hermes_cli.web_server_idle_exit import busy_ledger
+        # A stopped gateway runs nothing; only a live one's state can hold work.
+        if get_running_pid() is not None:
+            runtime=read_runtime_status() or {}
+            if (type(runtime.get('active_agents')) is not int or runtime['active_agents']>0 or runtime.get('active_work')
+                  or runtime.get('gateway_state') not in ('running','degraded')): return True
+        # Dashboard chat turns, delegations and cron runs; None means a ledger was unreadable.
+        if busy_ledger()!='': return True
+        with mobile.connect() as conn:
+            return mobile.active_calls(conn,owner)>0
+    except Exception:
+        return True
+
+def _update_beacon_plugin():
+    from hermes_cli.plugins_cmd import dashboard_update_user_plugin
+    from hermes_cli.web_server_profiles import _config_profile_scope
+    # Hermes' own update route uses this scope; unscoped, a multi-profile Hermes raises UnscopedSecretError.
+    with _config_profile_scope(None):
+        return dashboard_update_user_plugin('beacon')
+
+def _auto_update_plugin(owner,checked_at,app_version,plugin_version):
+    if not mobile.auto_update_settings(owner)['enabled']:
+        return mobile.record_auto_update_status(owner,checked_at,'plugin_update_available',app_version,plugin_version,'Plugin update available.')
+    if _hermes_busy(owner):
+        state=mobile.record_auto_update_status(owner,checked_at,'waiting_for_idle',app_version,plugin_version,'Plugin update waits until Hermes is idle.')
+        return {**state,'_deferred':True}
+    update=_update_beacon_plugin()
+    if update.get('consent_required'):
+        return mobile.record_auto_update_status(owner,checked_at,'consent_required',app_version,plugin_version,'Review plugin capability changes in Settings.')
+    if not update.get('ok'):
+        return mobile.record_auto_update_status(owner,checked_at,'error',app_version,plugin_version,'Could not update the Beacon plugin. Try again later.')
+    installed=_plugin_version_tuple(_installed_plugin_version())
+    latest=_plugin_version_tuple(plugin_version)
+    if installed is None or latest is None or installed<latest:
+        return mobile.record_auto_update_status(owner,checked_at,'error',app_version,plugin_version,'The updated plugin version could not be confirmed.')
+    # Git and subfolder installs never report restart_required; this process still runs the old code.
+    if update.get('restart_required') or _RUNNING_PLUGIN_VERSION!=_installed_plugin_version():
+        return mobile.record_auto_update_status(owner,checked_at,'restart_required',app_version,plugin_version,'Restart Hermes to finish the plugin update.')
+    return mobile.record_auto_update_status(owner,checked_at,'plugin_updated',app_version,plugin_version,'Beacon plugin updated.')
+
+def auto_update_check(cfg,now=None):
+    owner=cfg.get('owner_id')
+    if not owner or not cfg.get('owner_provider'): return None
+    if not _AUTO_UPDATE_LOCK.acquire(blocking=False): return {'result':'in_progress'}
+    try:
+        now=time.time() if now is None else now
+        current_state=mobile.auto_update_settings(owner)
+        last=current_state.get('checked_at',0)
+        if type(last) in (int,float) and last and now>=last and now-last<mobile.AUTO_UPDATE_INTERVAL_SECONDS:
+            pending_version=_plugin_version_tuple(current_state.get('plugin_version',''))
+            installed_version=_plugin_version_tuple(_installed_plugin_version())
+            if current_state.get('result')=='waiting_for_idle' and pending_version and installed_version and pending_version>installed_version:
+                try: return _auto_update_plugin(owner,last,current_state.get('app_version',''),current_state.get('plugin_version',''))
+                except Exception: return mobile.record_auto_update_status(owner,last,'error',current_state.get('app_version',''),current_state.get('plugin_version',''),'Could not update the Beacon plugin. Try again later.')
+            if current_state.get('result')=='restart_required' and _RUNNING_PLUGIN_VERSION==_installed_plugin_version():
+                return mobile.record_auto_update_status(owner,now,'plugin_updated',current_state.get('app_version',''),current_state.get('plugin_version',''),'Beacon plugin updated.')
+            return {**current_state,'result':'throttled'}
+        mobile.record_auto_update_status(owner,now,'checking',current_state.get('app_version',''),current_state.get('plugin_version',''),'Checking for updates.')
+        plugin_update=[]
+        def update_plugin_before_apk(app_version,plugin_version):
+            latest=_plugin_version_tuple(plugin_version)
+            installed=_plugin_version_tuple(_installed_plugin_version())
+            if latest is None or installed is None or latest<=installed: return
+            try: plugin_update.append(_auto_update_plugin(owner,now,app_version,plugin_version))
+            except Exception:
+                plugin_update.append(mobile.record_auto_update_status(owner,now,'error',app_version,plugin_version,'Could not update the Beacon plugin. Try again later.'))
+        try:
+            release_info=_check_release_and_announce(cfg,before_apk=update_plugin_before_apk)
+            if plugin_update: return plugin_update[-1]
+            app_version=release_info.get('version_name','')
+            plugin_version=release_info.get('plugin_version','')
+            installed_version=_installed_plugin_version()
+            latest=_plugin_version_tuple(plugin_version)
+            installed=_plugin_version_tuple(installed_version)
+            if latest is None or installed is None: raise ReleaseCheckError('The Beacon plugin version is unavailable.')
+            result='app_staged' if release_info.get('available') else 'up_to_date'
+            message='A stable app update is ready.' if release_info.get('available') else 'Up to date.'
+            if latest>installed:
+                return _auto_update_plugin(owner,now,app_version,plugin_version)
+            # An installed update this process has not loaded yet still needs a restart, even when nothing newer exists.
+            if _RUNNING_PLUGIN_VERSION!=installed_version:
+                return mobile.record_auto_update_status(owner,now,'restart_required',app_version,plugin_version,'Restart Hermes to finish the plugin update.')
+            return mobile.record_auto_update_status(owner,now,result,app_version,plugin_version,message)
+        except ReleaseCheckError:
+            if plugin_update: return plugin_update[-1]
+            return mobile.record_auto_update_status(owner,now,'error',message='Could not check for updates. Try again later.')
+        except Exception:
+            if plugin_update: return plugin_update[-1]
+            return mobile.record_auto_update_status(owner,now,'error',message='Could not check for updates. Try again later.')
+    finally: _AUTO_UPDATE_LOCK.release()
+
+@router.get('/mobile/plugin/version')
+async def plugin_version(request:Request):
+    identity(request,owner_only=True)
+    return JSONResponse({'running':_RUNNING_PLUGIN_VERSION,'installed':_read_plugin_version(ROOT/'plugin.yaml')},headers={'Cache-Control':'no-store'})
+
+_watch_task=None
+_jobs_upgraded=set()
+_jobs_retry_after={}
+_JOB_WARM_RETRY_SECONDS=600
+def _warm_profile(owner,profile):
+    key=(owner,profile)
+    if time.monotonic()<_jobs_retry_after.get(key,0): return
+    try:
+        proactive.upgrade_jobs(mobile,owner,profile)
+    except Exception:
+        _jobs_upgraded.discard(key)
+        _jobs_retry_after[key]=time.monotonic()+_JOB_WARM_RETRY_SECONDS
+    else:
+        _jobs_upgraded.add(key)
+        _jobs_retry_after.pop(key,None)
+async def start_watcher():
+    global _watch_task
+    async def loop():
+        auto_task=None;auto_owner=None;auto_not_before=0
+        while True:
+            try:
+                cfg=mobile.settings()
+                if cfg.get('owner_id') and cfg.get('owner_provider'):
+                    owner=(cfg['owner_id'],cfg['owner_provider'])
+                    if owner!=auto_owner: auto_owner=owner;auto_not_before=0
+                    if auto_task is not None and auto_task.done():
+                        try: outcome=auto_task.result()
+                        except Exception: outcome=None
+                        auto_task=None;auto_not_before=time.time()+(60 if outcome and outcome.get('_deferred') else mobile.AUTO_UPDATE_INTERVAL_SECONDS)
+                    if auto_task is None and time.time()>=auto_not_before:
+                        async def run_auto_update(snapshot):
+                            try: return await asyncio.to_thread(auto_update_check,snapshot)
+                            except Exception: return None
+                        auto_task=asyncio.create_task(run_auto_update(cfg))
+                    try: await asyncio.to_thread(announce_release,cfg)
+                    except Exception: pass  # A missing/invalid release must not stop call/approval delivery.
+                    profiles=cfg.get('profiles')
+                    if profiles is None: profiles=_native_profile_names()
+                    for profile in profiles:
+                        profile_key=(cfg['owner_id'],profile)
+                        if profile_key not in _jobs_upgraded and time.monotonic()>=_jobs_retry_after.get(profile_key,0):
+                            # Once per process, off the delivery loop: warm the slow source scan, then rebuild jobs after an upgrade.
+                            _jobs_upgraded.add(profile_key)
+                            asyncio.create_task(asyncio.to_thread(_warm_profile,cfg['owner_id'],profile))
+                        try: await asyncio.to_thread(watch,cfg['owner_id'],cfg['owner_provider'],profile)
+                        except Exception: pass
+                        try: await asyncio.to_thread(push,cfg['owner_id'],profile)
+                        except Exception: pass
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+    _watch_task=asyncio.create_task(loop())
+async def stop_watcher():
+    global _watch_task
+    if _watch_task:
+        _watch_task.cancel()
+        try: await _watch_task
+        except asyncio.CancelledError: pass
+        _watch_task=None
+_feature_pool=ThreadPoolExecutor(max_workers=4,thread_name_prefix='beacon-native-lookup')
+_feature_slots=threading.BoundedSemaphore(4)
+_feature_counts={}
+def clear_lookup_counts(call_id):
+    with mobile.LOCK:
+        for key in list(_feature_counts):
+            if key[0]==call_id: _feature_counts.pop(key,None)
+async def feature(fn,*args,timeout=12,value_error_status=409):
+    if not _feature_slots.acquire(blocking=False): raise HTTPException(429,'Native lookup capacity busy')
+    context=contextvars.copy_context()
+    def run():
+        try: return context.run(fn,*args)
+        finally: _feature_slots.release()
+    try: future=_feature_pool.submit(run)
+    except Exception:
+        _feature_slots.release();raise HTTPException(503,'Native lookup unavailable') from None
+    # A queued future cancelled before execution has no wrapper finally.
+    future.add_done_callback(lambda done: _feature_slots.release() if done.cancelled() else None)
+    try: return await asyncio.wait_for(asyncio.wrap_future(future),timeout=timeout)
+    except asyncio.TimeoutError: raise HTTPException(504,'Native lookup timed out') from None
+    except HTTPException: raise
+    except LookupError: raise HTTPException(404,'Owned native context unavailable') from None
+    except ValueError as exc: raise HTTPException(value_error_status,str(exc)) from None
+    except Exception: raise HTTPException(503,'Native lookup unavailable') from None
+def lookup_budget(call_id,kind):
+    key=(call_id,kind)
+    with mobile.LOCK:
+        count=_feature_counts.get(key,0)
+        if count>=60: raise HTTPException(429,'Call lookup limit reached')
+        if len(_feature_counts)>=1024 and key not in _feature_counts: raise HTTPException(429,'Lookup state capacity reached')
+        _feature_counts[key]=count+1
+
+async def query_body(request,call_id,kind):
+    value=await body(request,4096);owner,provider,row,cfg=await call(request,call_id,True)
+    query=value.get('query')
+    if not isinstance(query,str) or len(query)>1024 or not query.strip(): raise HTTPException(400,'A bounded query is required')
+    query=' '.join(query.split())
+    lookup_budget(call_id,kind)
+    # The call's native stored row is reverified before any profile lookup.
+    await feature(native.verify,owner,provider,row['profile'],row['conversation'],timeout=6)
+    return owner,provider,row,query
+@router.get('/mobile/calls/{call_id}/context')
+async def get_context(call_id:str,request:Request):
+    owner,provider,row,cfg=await call(request,call_id)
+    display=getattr(request.state.session,'display_name',None)
+    display=display[:120] if isinstance(display,str) else ''
+    result=await feature(voice_context.context,owner,provider,row['profile'],row['conversation'],call_id,display,timeout=8)
+    callback=result.get('callback')
+    reason=callback.get('reason','') if isinstance(callback,dict) else ''
+    result['reason']=reason if isinstance(reason,str) else ''
+    if not result.get('greeting'): result['greeting']="I'm calling about your saved Hermes update." if callback else "I'm here."
+    if display: result['owner_display_name']=display
+    return result
+@router.post('/mobile/calls/{call_id}/search')
+async def quick_search(call_id:str,request:Request):
+    owner,provider,row,query=await query_body(request,call_id,'search')
+    return await feature(voice_context.search,row['profile'],query,timeout=12)
+@router.post('/mobile/calls/{call_id}/memory')
+async def quick_memory(call_id:str,request:Request):
+    owner,provider,row,query=await query_body(request,call_id,'memory')
+    return await feature(voice_context.recall,owner,provider,row['profile'],row['conversation'],query,timeout=12)
+@router.post('/mobile/calls/{call_id}/skills')
+async def voice_skills(call_id:str,request:Request):
+    value=await body(request,4096)
+    owner,provider,row,cfg=await call(request,call_id,True)
+    query,name=value.get('query',''),value.get('name','')
+    if (set(value)-{'query','name'} or not isinstance(query,str) or len(query)>1024
+            or not isinstance(name,str) or len(name)>160 or any(ord(c)<32 for c in name)):
+        raise HTTPException(400,'A bounded skill name or query is required')
+    lookup_budget(call_id,'skills')
+    await feature(native.verify,owner,provider,row['profile'],row['conversation'],timeout=6)
+    return await feature(voice_context.skills,row['profile'],query,name,skill_scope,timeout=12)
+@router.post('/mobile/calls/{call_id}/profile-context')
+async def current_voice_profile(call_id:str,request:Request):
+    owner,provider,row,query=await query_body(request,call_id,'profile-context')
+    return await feature(voice_context.profile_context,owner,provider,row['profile'],row['conversation'],call_id,timeout=8)
+@router.post('/mobile/projects')
+async def create_mobile_project(request:Request):
+    value=await body(request,16384)
+    owner,provider,profile,cfg=identity(request)
+    if set(value)-{'request_id','name','description'}:
+        raise HTTPException(400,'Unexpected project fields')
+    return await feature(native.create_project,owner,provider,profile,value.get('request_id'),value.get('name'),value.get('description',''),timeout=8)
+@router.post('/mobile/sessions/{stored_id}/reserve')
+async def reserve_chat(stored_id:str,request:Request):
+    value=await body(request,1024)
+    owner,provider,profile,cfg=identity(request)
+    if value or not 1<=len(stored_id)<=256:
+        raise HTTPException(400,'Choose an existing conversation')
+    await feature(native.reserve_conversation,owner,provider,profile,stored_id,timeout=6)
+    return {'reserved':True,'stored_session_id':stored_id,'profile':profile}
+@router.get('/mobile/sessions')
+async def list_mobile_sessions(request:Request):
+    owner,provider,profile,cfg=identity(request)
+    hidden=request.query_params.get('include_archived')=='1'
+    result=await feature(native.conversation_list,owner,provider,profile,hidden,timeout=8)
+    return JSONResponse(result,headers={'Cache-Control':'no-store'})
+@router.get('/mobile/sessions/{stored_id}')
+async def read_mobile_session(stored_id:str,request:Request):
+    owner,provider,profile,cfg=identity(request)
+    if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,256}',stored_id): raise HTTPException(400,'Choose an existing conversation')
+    result=await feature(native.conversation_snapshot,owner,provider,profile,stored_id,timeout=8)
+    return JSONResponse(result,headers={'Cache-Control':'no-store'})
+@router.get('/mobile/sessions/{stored_id}/voice-history')
+async def get_voice_history(stored_id:str,request:Request):
+    owner,provider,profile,cfg=identity(request)
+    await feature(native.verify,owner,provider,profile,stored_id,timeout=6)
+    result=await feature(mobile.voice_history,owner,profile,stored_id,timeout=8)
+    return JSONResponse(result,headers={'Cache-Control':'no-store'})
+
+@router.get('/mobile/proactive')
+async def proactive_status(request:Request):
+    owner,_,profile,_=identity(request)
+    return await feature(proactive.status,mobile,owner,profile,timeout=8)
+
+@router.put('/mobile/proactive')
+async def proactive_enabled(request:Request):
+    value=await body(request,4096)
+    toggle=set(value)=={'enabled'}
+    if toggle:
+        if type(value['enabled']) is not bool: raise HTTPException(400,'enabled must be a boolean')
+    else:
+        allowed={'enabled','delivery','check_minutes','quiet_start','quiet_end','model','provider'}
+        if set(value)-allowed or type(value.get('enabled')) is not bool:
+            raise HTTPException(400,'Invalid Proactive setup fields')
+    owner,provider,profile,cfg=identity(request)
+    if not toggle:
+        try: proactive.validate_setup(value)
+        except ValueError as exc: raise HTTPException(400,str(exc)) from None
+    if value.get('enabled') is True:
+        stored=cfg.get('scheduled_callback_conversation_id')
+        if not isinstance(stored,str) or not stored.strip():
+            raise HTTPException(409,'Choose an owned assistant conversation before enabling Proactive')
+        try: await feature(native.verify,owner,provider,profile,stored,timeout=8)
+        except HTTPException as exc:
+            if exc.status_code==404:
+                raise HTTPException(409,'Choose an owned assistant conversation before enabling Proactive') from None
+            raise
+    function=proactive.set_enabled if toggle else proactive.configure
+    try:
+        args=(mobile,owner,profile,value['enabled']) if toggle else (mobile,owner,profile,value)
+        return await feature(function,*args,
+                             timeout=30)
+    except ValueError as exc:
+        raise HTTPException(400,str(exc)) from None
+    except RuntimeError:
+        raise HTTPException(503,'Proactive setup could not be saved') from None
+
+@router.post('/mobile/proactive/feedback')
+async def proactive_feedback(request:Request):
+    value=await body(request,1024)
+    if set(value)!={'notice_id','verdict'} or value['verdict'] not in ('important','not_important'):
+        raise HTTPException(400,'Expected notice_id and verdict important or not_important')
+    owner,_,profile,_=identity(request)
+    try: return await feature(proactive.add_email_feedback,mobile,owner,profile,value['notice_id'],value['verdict'],timeout=15)
+    except LookupError as exc: raise HTTPException(404,str(exc)) from None
+    except ValueError as exc: raise HTTPException(400,str(exc)) from None
+    except RuntimeError: raise HTTPException(503,'Email importance could not be learned') from None
+
+@router.delete('/mobile/proactive/learned')
+async def proactive_learned_delete(request:Request):
+    value=await body(request,512)
+    if set(value)!={'note'}: raise HTTPException(400,'Expected one learned note')
+    owner,_,profile,_=identity(request)
+    try: return await feature(proactive.delete_learned,mobile,owner,profile,value['note'],timeout=12)
+    except LookupError as exc: raise HTTPException(404,str(exc)) from None
+    except ValueError as exc: raise HTTPException(400,str(exc)) from None
+    except RuntimeError: raise HTTPException(503,'Learned email preference could not be removed') from None
+
+@router.post('/mobile/proactive/requests')
+async def proactive_request_create(request:Request):
+    value=await body(request,2048)
+    if set(value)-{'text','action','signal','night'} or not {'text','action'}<=set(value):
+        raise HTTPException(400,'Expected text and action, with optional email signal and night')
+    text=value.get('text');action=value.get('action');signal=value.get('signal');night=value.get('night',False)
+    if not isinstance(text,str) or len(text)>300 or action not in ('notify','call'):
+        raise HTTPException(400,'Request text and action are invalid')
+    if signal not in (None,'email'):
+        raise HTTPException(400,'signal must be email or null')
+    if type(night) is not bool: raise HTTPException(400,'Request night must be a boolean')
+    owner,_,profile,_=identity(request)
+    try: return await feature(proactive.create_request,mobile,owner,profile,text,action,signal,night,timeout=30,value_error_status=400)
+    except ValueError as exc: raise HTTPException(400,str(exc)) from None
+    except RuntimeError: raise HTTPException(503,'Proactive request could not be saved') from None
+
+@router.patch('/mobile/proactive/requests/{request_id}')
+async def proactive_request_patch(request_id:str,request:Request):
+    value=await body(request,2048)
+    if not value or set(value)-{'enabled','action','night'}: raise HTTPException(400,'Invalid Proactive request fields')
+    owner,_,profile,_=identity(request)
+    try: return await feature(proactive.patch_request,mobile,owner,profile,request_id,value,timeout=30,value_error_status=400)
+    except LookupError as exc: raise HTTPException(404,str(exc)) from None
+    except ValueError as exc: raise HTTPException(400,str(exc)) from None
+    except RuntimeError: raise HTTPException(503,'Proactive request could not be updated') from None
+
+@router.delete('/mobile/proactive/requests/{request_id}')
+async def proactive_request_delete(request_id:str,request:Request):
+    owner,_,profile,_=identity(request)
+    try: return await feature(proactive.delete_request,mobile,owner,profile,request_id,timeout=30)
+    except LookupError as exc: raise HTTPException(404,str(exc)) from None
+    except RuntimeError: raise HTTPException(503,'Proactive request could not be deleted') from None
+
+router.include_router(sys.modules['beacon_callback_api'].build_router(call,body,feature,mobile,native,sys.modules['beacon_callbacks']))
+router.include_router(sys.modules['beacon_call_history_api'].build_router(identity,mobile))
+

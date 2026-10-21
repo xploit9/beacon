@@ -5,8 +5,8 @@ The preview is a private test build of this migration branch. It is **not** a pr
 ## Stable channel
 - The `stable` build type has application ID `dev.hermes.android.stable` and launcher label "Beacon", so it installs beside production and the preview.
 - Stable starts at version code `100` and version `1.0.0`. It inherits release minification and is not debuggable.
-- A stable APK is unsigned unless `cypherStableSigning` (or `CYPHER_STABLE_SIGNING`) points to an external properties file with the four Android signing fields. Never store that file or its keystore in this repository. The stable signer is separate from production.
-- Release assets are named `Beacon-<version>.apk` and `Beacon-<version>.json`; Settings **App updates** checks the public GitHub release through the owner's Hermes plugin and verifies the APK before installation. Existing `Cypher-<version>.json` metadata remains supported as a fallback.
+- A stable APK is unsigned unless `beaconStableSigning` (or `BEACON_STABLE_SIGNING`) points to an external properties file with the four Android signing fields. Never store that file or its keystore in this repository. The stable signer is separate from production.
+- Release assets are named `Beacon-<version>.apk` and `Beacon-<version>.json`; Settings **App updates** checks the public GitHub release through the owner's Hermes plugin and verifies the APK before installation.
 
 Production and stable builds offer default-on app and plugin automatic updates in Settings **App updates**; app downloads use unmetered connections and retain package, version, checksum and signer verification, with a tap-to-install notice whenever Android requires confirmation. The debug preview remains manually installed.
 - The Hermes plugin stores stable releases separately from production and can pin them with `android_stable_certificate_sha256`. If that pin is unset, the app still requires the downloaded APK to have the same signer as the installed stable app.
@@ -17,16 +17,16 @@ Production and stable builds offer default-on app and plugin automatic updates i
 - Application ID `dev.hermes.android.debug`, so it installs **next to** production `dev.hermes.android` and never upgrades it.
 - Version name `1.0.0-preview`. The launcher label is "Beacon Preview" (set only in `app/src/debug/AndroidManifest.xml`); the release label stays "Beacon".
 - It is signed with the local Android debug key, not the production signer. Android will never accept it as an update to production, and production cannot update it.
-- It is a debuggable build. `src/debug/res/xml/fixture_network_security.xml` allows cleartext only to `10.0.2.2` for the local crash reporter, and trusts the bundled test-fixture CA (`cypher_fixture_ca.pem`) through `debug-overrides`. Use the preview only on your own test devices.
+- It is a debuggable build. `src/debug/res/xml/fixture_network_security.xml` allows cleartext only to `10.0.2.2` for the local crash reporter, and trusts the bundled test-fixture CA (`beacon_fixture_ca.pem`) through `debug-overrides`. Use the preview only on your own test devices.
 
 ## Build
-From `cypher-android`, with JDK 21 and Android SDK 36:
+From `beacon-android`, with JDK 21 and Android SDK 36:
 
 ```
 ./gradlew assembleDebug          # Windows: gradlew.bat assembleDebug
 ```
 
-The APK is written to `cypher-android/app/build/outputs/apk/debug/app-debug.apk`.
+The APK is written to `beacon-android/app/build/outputs/apk/debug/app-debug.apk`.
 
 You do not need `owner.local.properties` or any signing material. Without that file:
 - the server address starts blank, so the first screen asks for your Hermes HTTPS address;
@@ -37,7 +37,7 @@ Never commit `owner.local.properties`, `local.properties`, `.signing/` or a keys
 
 ## Install
 ```
-adb install -r cypher-android/app/build/outputs/apk/debug/app-debug.apk
+adb install -r beacon-android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
 - **Do not uninstall production Beacon**, and do not install the preview over it. Each app keeps its own data. Uninstalling production deletes its encrypted sign-in, drafts and cache.
@@ -81,7 +81,7 @@ With the Beacon plugin installed:
 
 Verified on an Android 16 emulator against a live Hermes (19 October 2026):
 - One sign-in, chat, history, Bot Mode and settings; new phone chats are saved under the signed-in owner.
-- Incoming calls: with Keep connected on and Beacon closed, Hermes's `cypher_call_user` rings the phone for 20 seconds as a pop-up call card (full screen when the screen is off), and the caller opens by saying why it is calling; Answer starts the call in that conversation, Decline settles it on Hermes, and an unanswered ring leaves a missed-call notification with Call back.
+- Incoming calls: with Keep connected on and Beacon closed, Hermes's `beacon_call_user` rings the phone for 20 seconds as a pop-up call card (full screen when the screen is off), and the caller opens by saying why it is calling; Answer starts the call in that conversation, Decline settles it on Hermes, and an unanswered ring leaves a missed-call notification with Call back.
 - One-tap calls with Gemini Live and Grok, with the key kept on the phone. The call transcript appears in the conversation afterwards.
 
 Not complete in this preview:
