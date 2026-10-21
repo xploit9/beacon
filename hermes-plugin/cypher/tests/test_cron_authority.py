@@ -36,14 +36,21 @@ def test_current_profile_distinguishes_launch_and_named_profiles(harness, monkey
     work_home = tmp_path / 'work'
     active_home = [launch_home]
     server = SimpleNamespace(_profile_home=lambda profile: None if profile == 'default' else work_home)
+    # A profile-scoped task sets a home override; with none, the run is the launch profile's.
     monkeypatch.setitem(sys.modules, 'hermes_constants', SimpleNamespace(
-        get_hermes_home=lambda: active_home[0], get_process_hermes_home=lambda: launch_home))
+        get_hermes_home=lambda: active_home[0],
+        get_hermes_home_override=lambda: None if active_home[0] == launch_home else str(active_home[0])))
     monkeypatch.setitem(sys.modules, 'tui_gateway', SimpleNamespace(server=server))
+    monkeypatch.setattr(sys.modules['cypher_mobile'], 'home', lambda: launch_home)
     cfg['profiles'] = ['default', 'work']
 
     assert api.proactive.current_profile(cfg) == 'default'
     active_home[0] = work_home
     assert api.proactive.current_profile(cfg) == 'work'
+    # Hermes repoints HERMES_HOME while it deletes 'work'; an un-overridden launch run stays the launch profile.
+    active_home[0] = launch_home
+    monkeypatch.setenv('HERMES_HOME', str(work_home))
+    assert api.proactive.current_profile(cfg) == 'default'
 
 
 def test_call_user_rejects_foreign_owned_cron_and_allows_unowned_cron(harness, monkeypatch):

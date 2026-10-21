@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -100,8 +101,11 @@ def watch_job_ids(mobile, owner, profile):
 def current_profile(cfg):
     import hermes_constants
     from tui_gateway import server
-    get_hermes_home=hermes_constants.get_hermes_home
-    get_process_hermes_home=getattr(hermes_constants,'get_process_hermes_home',get_hermes_home)
+    # Without a task override this is the launch profile: compare with the recorded launch home, never the live
+    # HERMES_HOME, which Hermes briefly repoints while it deletes or renames another profile.
+    launch=sys.modules['cypher_mobile'].home()
+    override=getattr(hermes_constants,'get_hermes_home_override',lambda:None)()
+    current=Path(hermes_constants.get_hermes_home()) if override else launch
 
     profiles=cfg.get('profiles')
     if 'profiles' not in cfg:
@@ -114,8 +118,8 @@ def current_profile(cfg):
     matches = []
     for profile in profiles:
         requested = server._profile_home(profile)
-        target = Path(requested) if requested else Path(get_process_hermes_home())
-        if target.resolve() == Path(get_hermes_home()).resolve():
+        target = Path(requested) if requested else launch
+        if target.resolve() == current.resolve():
             matches.append(profile)
     if len(matches) != 1:
         raise ValueError("Native profile scope unavailable")
@@ -786,15 +790,15 @@ def _move_legacy_learned(mobile, owner, profile):
     """Earlier builds kept verdicts as Hermes user-memory entries; move them into Cypher's store."""
     from hermes_cli.web_server_profiles import _profile_scope
     from tools.memory_tool import load_on_disk_store
-    with _profile_scope(profile):
+    # Always mobile.LOCK before the profile scope's lock (sync_learned does the same), never the other way round.
+    with mobile.LOCK, _profile_scope(profile):
         store = load_on_disk_store()
         legacy = [entry for entry in store.user_entries if isinstance(entry, str) and entry.startswith(LEARNED_PREFIX)]
         if not legacy:
             return
-        with mobile.LOCK:
-            saved = learned_notes(mobile, owner, profile)
-            moved = [_without_links(entry[len(LEARNED_PREFIX):]) for entry in reversed(legacy)]
-            _store_learned(mobile, owner, profile, saved + [entry for entry in moved if entry and entry not in saved])
+        saved = learned_notes(mobile, owner, profile)
+        moved = [_without_links(entry[len(LEARNED_PREFIX):]) for entry in reversed(legacy)]
+        _store_learned(mobile, owner, profile, saved + [entry for entry in moved if entry and entry not in saved])
         # One at a time: Hermes refuses a single batch that would empty USER.md.
         for entry in legacy:
             if not store.remove("user", entry, matched_entry=entry).get("success"):

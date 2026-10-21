@@ -23,7 +23,7 @@ def test_current_profile_uses_native_profiles_when_claim_config_has_none(harness
     api, _, _, _, _ = harness
     work_home=tmp_path/'work'
     monkeypatch.setitem(sys.modules, 'hermes_constants', SimpleNamespace(
-        get_hermes_home=lambda:work_home, get_process_hermes_home=lambda:work_home))
+        get_hermes_home=lambda:work_home, get_hermes_home_override=lambda:str(work_home)))
     monkeypatch.setitem(sys.modules, 'tui_gateway', SimpleNamespace(server=SimpleNamespace(
         _profile_home=lambda profile:tmp_path/profile)))
     from hermes_cli import profiles
