@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import stat
 import tempfile
+import textwrap
 import threading
 import time
 import unicodedata
@@ -761,18 +762,18 @@ def learned_notes(profile):
         return [entry[len(LEARNED_PREFIX):] for entry in reversed(_learned_entries(store)[-20:])]
 
 
-# shortcut: only slash-separated sender/subject summaries match one field; upgrade if notices store structured sender and subject.
-def _same_sender_or_subject(note, summary, verdict):
-    prefix = LEARNED_PREFIX + "Emails like "
-    opposite = " are not important to the owner." if verdict == "important" else " are important to the owner."
-    if not note.startswith(prefix) or not note.endswith(opposite):
-        return False
-    previous = note[len(prefix):-len(opposite)]
-    current_fields = [part.strip().casefold() for part in summary.split(" / ", 1)]
-    previous_fields = [part.strip().casefold() for part in previous.split(" / ", 1)]
-    return (previous.casefold() == summary.casefold() or
-            (len(current_fields) == len(previous_fields) == 2 and
-             (current_fields[0] == previous_fields[0] or current_fields[1] == previous_fields[1])))
+def _learned_notes(reason):
+    """Both verdicts' notes for an alert. The alert is quoted as data, with links and addresses dropped, so an
+    email cannot plant an instruction or a destination in the owner's memory (Strix cf8a230 #2)."""
+    from cypher_observers import reason_text
+    # A rule-matched call's reason ends with " Rule: <rule>"; the note is about the email only.
+    summary = reason_text(reason.split(" Rule: ", 1)[0].rstrip("."), 240)
+    summary = re.sub(r"\S*(?:@|://|www\.)\S*", " ", summary).replace('"', "'")
+    summary = textwrap.shorten(summary, 160, placeholder="...")
+    if not summary.strip(". "):
+        raise ValueError("This alert has nothing Cypher can learn from")
+    return {verdict: LEARNED_PREFIX + label + f': "{summary}"'
+            for verdict, label in (("important", "Important"), ("not_important", "Not important"))}
 
 
 def add_email_feedback(mobile, owner, profile, notice_id, verdict):
@@ -781,6 +782,7 @@ def add_email_feedback(mobile, owner, profile, notice_id, verdict):
     if verdict not in ("important", "not_important"):
         raise ValueError("verdict must be important or not_important")
     call_log_id=None
+    notes=None
     with mobile.LOCK,mobile.connect() as conn:
         email_call=conn.execute("SELECT id,owner,profile,reason,feedback_verdict FROM call_log WHERE email_notice_id=?",
                                 (notice_id,)).fetchone()
@@ -789,22 +791,21 @@ def add_email_feedback(mobile, owner, profile, notice_id, verdict):
                 raise LookupError("Proactive email alert not found")
             if email_call["feedback_verdict"] is not None:
                 return {"ok":True}
+            # Built before the claim, so a refused reason leaves the call open for feedback.
+            notes=_learned_notes(email_call["reason"])
             claimed=conn.execute("UPDATE call_log SET feedback_verdict=? WHERE id=? AND owner=? AND profile=? AND feedback_verdict IS NULL",
                                  (verdict,email_call["id"],owner,profile)).rowcount
             if not claimed:
                 return {"ok":True}
             call_log_id=email_call["id"]
-            notice={"owner":owner,"profile":profile,"kind":"incoming_call","reason":email_call["reason"]}
         else:
             notice = conn.execute("SELECT owner,profile,kind,reason FROM notices WHERE id=? AND kind='task_result'", (notice_id,)).fetchone()
             marker = conn.execute("SELECT 1 FROM meta WHERE key=?", (EMAIL_NOTICE_PREFIX + notice_id,)).fetchone()
     if not call_log_id and (not notice or not marker or notice["owner"] != owner or notice["profile"] != profile):
         raise LookupError("Proactive email alert not found")
-    from cypher_observers import reason_text
-    # A rule-matched call's reason ends with " Rule: <rule>"; the note is about the email only.
-    summary = reason_text(notice["reason"].split(" Rule: ", 1)[0].rstrip("."), 240)
-    note = LEARNED_PREFIX + f"Emails like {summary} are " + (
-        "important to the owner." if verdict == "important" else "not important to the owner.")
+    notes = notes or _learned_notes(notice["reason"])
+    note = notes[verdict]
+    opposite = notes["not_important" if verdict == "important" else "important"]
 
     try:
         from hermes_cli.web_server_profiles import _profile_scope
@@ -814,7 +815,7 @@ def add_email_feedback(mobile, owner, profile, notice_id, verdict):
             store = load_on_disk_store()
             entries = list(store.user_entries)
             learned = _learned_entries(store)
-            remove = [entry for entry in learned if _same_sender_or_subject(entry, summary, verdict)]
+            remove = [entry for entry in learned if entry == opposite]
             if note in entries and not remove and len(learned) <= 20:
                 return {"ok": True}
             add = note not in entries
