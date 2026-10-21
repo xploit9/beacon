@@ -295,7 +295,8 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
     assert plugin.native_proactive_read_only_guard(tool_name="mcp__db__fetch_rows", args={}, session_id="watch-run") is None
     readers = ("search_inbox", "read_email", "list_calendar_events", "list_tasks", "list-mail-messages",
                "GMAIL_LIST_THREADS", "getMessageAttachment", "list_available_accounts",
-               "get_gmail_messages_content_batch", "search_messages_by_sender", "get_unread_emails")
+               "get_gmail_messages_content_batch", "search_messages_by_sender", "get_unread_emails",
+               "GMAIL_FETCH_EMAILS", "GMAIL_FETCH_MESSAGE_BY_THREAD_ID")
     chained = ("get_and_complete", "search_and_reserve", "find_and_book", "lookup_then_order", "book_slot")
     mcp_tool._mcp_tool_server_names.update({"mcp__mail__" + name: "mail" for name in readers + chained})
     for hint in (False, True):
@@ -306,6 +307,13 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
         for name in chained:
             assert plugin.native_proactive_read_only_guard(
                 tool_name="mcp__mail__" + name, args={}, session_id="watch-run") == blocked, (name, hint)
+    # 'fetch' reads only beside plain mail words; an unmarked URL fetcher stays blocked.
+    fetchers = ("fetch", "fetch_url", "web_fetch", "fetch_page")
+    mcp_tool._mcp_tool_server_names.update({"mcp__mail__" + name: "mail" for name in fetchers})
+    mcp_tool._tool_read_only_hints["mail"] = {name: False for name in fetchers}
+    for name in fetchers:
+        assert plugin.native_proactive_read_only_guard(
+            tool_name="mcp__mail__" + name, args={}, session_id="watch-run") == blocked, name
     # Strix cf8a230 #1: a read word never excuses a state change spelled with another verb, hinted read-only or not.
     writes = ("toggle_read_status", "get_message_and_toggle", "read_and_save_attachment", "notify_read_receipt",
               "store_read_flag", "acknowledge_read", "email_toggle_read", "read_note_pin", "getMessageAndClearFlag",

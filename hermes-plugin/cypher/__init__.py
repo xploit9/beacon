@@ -295,9 +295,14 @@ def _named_read_only(raw_name):
     words=_tool_words(raw_name)
     return bool(words&_READ_TOOL_WORDS) and not bool(words&_UNSAFE_NAME_WORDS)
 
+_FETCHED_MAIL_WORDS={'email','emails','mail','mails','gmail','outlook','message','messages','msg','msgs','thread',
+                     'threads','inbox','mailbox','attachment','attachments','calendar','event','events'}
+
 def _plain_mail_read(raw_name):
+    # 'fetch' also names URL fetchers, so it reads only beside a mail word: GMAIL_FETCH_EMAILS, never fetch or fetch_page.
     words=_tool_words(raw_name)
-    return bool(words&_READ_TOOL_WORDS) and words<=_MAIL_READ_NAME_WORDS
+    reads=bool(words&_READ_TOOL_WORDS) or ('fetch' in words and bool(words&_FETCHED_MAIL_WORDS))
+    return reads and words<=_MAIL_READ_NAME_WORDS|{'fetch'}
 
 def _mcp_read_only(tool_name,profile):
     try:
