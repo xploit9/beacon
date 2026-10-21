@@ -38,11 +38,11 @@ everything up end to end and asks you before anything that needs your say:
 
 > Set up Cypher for my Hermes end to end by following https://github.com/xploit9/cypher/blob/main/docs/install-with-agent.md (if you can't open it, read it with `gh api repos/xploit9/cypher/contents/docs/install-with-agent.md -H "Accept: application/vnd.github.raw"`). Do every step yourself:
 > 1. Check that Hermes is installed and find the profile my dashboard uses; ask me if more than one could be it.
-> 2. Install the Cypher plugin with Hermes' own installer (`hermes -p <profile> plugins install xploit9/cypher/hermes-plugin/cypher --enable`), or update it if it's already installed. Let Hermes' security scan run, and ask me before approving Python dependencies.
+> 2. Install the Cypher plugin with Hermes' own installer (`hermes -p <profile> plugins install xploit9/cypher/hermes-plugin/cypher --enable`), or update it if it's already installed. Let Hermes' security scan run, and ask me before approving anything it asks about.
 > 3. Restart only that dashboard (ask me first), then confirm it runs the new plugin and shows a **Cypher** tab.
 > 4. Make sure my phone can reach the dashboard over HTTPS. If it can't yet, propose Tailscale Serve and ask before changing any network setting.
-> 5. Run `hermes cypher pair --name "<my phone>"` and show me the dashboard address and pairing code.
-> 6. Scan the QR, choose a screenshot of it, or type the address and code. Install the app from https://github.com/xploit9/cypher/releases/latest.
+> 5. Run `hermes -p <profile> cypher pair --name "<my phone>"` and show me the dashboard address and pairing code. Each phone gets its own code, and a code lasts 10 minutes, so run it again if it runs out.
+> 6. Then tell me to install the app from https://github.com/xploit9/cypher/releases/latest and, in its setup, enter that address and code (or scan the QR on the dashboard's **Cypher** tab).
 >
 > Never print or store passwords, tokens or API keys, and never modify Hermes core.
 
