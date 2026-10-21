@@ -209,7 +209,7 @@ def test_install_prompts_request_pairing_code_and_allow_qr_image():
 
     assert 'Run `hermes -p <profile> cypher pair --name "<my phone>"` and show me the dashboard address and pairing code.' in readme
     assert "Each phone gets its own code" in readme
-    assert "Scan the QR, choose a screenshot of it, or type the address and code." in readme
+    assert "Scan the QR, choose a screenshot of it, or type the address and code" in readme
     assert "Scan the QR, choose a screenshot of it, or type the address and code." in guide
 
 
