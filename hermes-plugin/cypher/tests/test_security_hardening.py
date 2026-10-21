@@ -233,12 +233,15 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
                         "gws gmail users settings filters create --json '{}'",
                         "gws gmail users drafts create", "gws calendar events update --id 1",
                         "himalaya folder purge INBOX", "himalaya attachment download 42",
-                        "gws --format json gmail users messages list")]
+                        "gws --format json gmail users messages list",
+                        "gws drive +upload report.pdf # get",
+                        "gws drive files get --params '{}' -o out.bin",
+                        "himalaya message read 42", "himalaya message read 42 --preview --seen")]
     allowed_mail_reads = [plugin.native_proactive_read_only_guard(
         tool_name="terminal", args={"command": command}, session_id="watch-run")
         for command in ("gws gmail users messages list --labelIds INBOX",
                         "gws gmail users messages get --id 1", "himalaya envelope list",
-                        "himalaya message read 42",
+                        "himalaya message read 42 --preview",
                         '"C:\\Program Files\\gws.EXE" gmail users messages get --id 1',
                         "gws gmail users messages list --params '{\"q\":\"from:mark\"}'",
                         "himalaya envelope list not flag seen")]
@@ -250,8 +253,9 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
     assert allowed is None and outside is None and skills_list is None
     assert memory_read is None and web_read is None
     assert email_notice_url is None and email_checked_url is None
-    assert terminal == blocked
-    assert blocked_terminal == [blocked] * 19 and allowed_mail_reads == [None] * 7
+    terminal_blocked = {"action": "block", "message": plugin._READ_ONLY_TERMINAL_MESSAGE}
+    assert terminal == terminal_blocked
+    assert blocked_terminal == [terminal_blocked] * 23 and allowed_mail_reads == [None] * 7
     # An injected email could carry other mail out through a fetched URL.
     for fetcher in ("web_extract", "web_fetch"):
         assert plugin.native_proactive_read_only_guard(tool_name=fetcher, args={"url": "https://x.test/?q=mail"}, session_id="watch-run") == blocked

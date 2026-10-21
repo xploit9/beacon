@@ -72,3 +72,5 @@ def test_call_user_rejects_foreign_owned_cron_and_allows_unowned_cron(harness, m
 
     allowed_principal = json.loads(plugin.call_user({'reason': 'ring the owner'}, session_id='cron-owner'))
     assert allowed_principal['status'] == 'pending' and allowed_principal['conversation_id'] == 'owned-chat'
+    # Two cron jobs share the fallback chat but carry their own reasons, so neither swallows the other.
+    assert allowed_principal['event_id'] != allowed['event_id']

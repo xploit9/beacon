@@ -63,7 +63,8 @@ def call_user(args,session_id=None,**kwargs):
         except ValueError as exc:
             if provided_reason: return json.dumps({'error':str(exc)})
             reason=''
-        event_id=mobile.invitation(owner,profile,stored,reason,deduplicate=True)
+        # Only an in-chat call dedupes: cron fallbacks share one conversation but carry different reasons.
+        event_id=mobile.invitation(owner,profile,stored,reason,deduplicate=stored==session_id)
         # The durable outbox is the authority. FCM is asynchronous wake-up only.
         return json.dumps({'event_id':event_id,'status':'pending','expires_in_seconds':120,'conversation_id':stored})
     except Exception:
@@ -254,8 +255,10 @@ _BLOCKED_PROACTIVE_TOOLS={'delegate_task','execute_code','computer_use','kanban'
                           'cypher_call_user','browser_click','browser_type','browser_press',
                           'browser_cdp','browser_exec','web_extract','web_fetch'}
 # Read commands only: the subcommand words before the first option say what runs.
-_HIMALAYA_READS={('envelope','list'),('message','read'),('folder','list')}
+_HIMALAYA_READS={('envelope','list'),('envelope','search'),('folder','list'),('mailbox','list')}
 _READ_ONLY_MESSAGE='Proactive runs are read-only; this would change something.'
+_READ_ONLY_TERMINAL_MESSAGE=('Proactive runs are read-only. The terminal may run only gws gmail … list/get, '
+                             'himalaya envelope list/search, or himalaya message read <id> --preview.')
 
 def _tool_words(name):
     spaced=re.sub(r'([a-z0-9])([A-Z])',r'\1 \2',name or '')
@@ -293,7 +296,8 @@ def _contains_http_url(value):
     return False
 
 def _watch_terminal_read_only(command):
-    if not isinstance(command,str) or not command.strip() or any(char in command for char in ';|&$`<>()\r\n'):
+    # '#' starts a shell comment that shlex keeps as a word, so "write # get" would read as a get.
+    if not isinstance(command,str) or not command.strip() or any(char in command for char in ';|&$`<>()#\r\n'):
         return False
     try: words=[word.strip('\'"') for word in shlex.split(command,posix=False)]
     except ValueError: return False
@@ -304,8 +308,14 @@ def _watch_terminal_read_only(command):
     for word in words[1:]:
         if word.startswith('-'): break
         path.append(word.casefold())
-    if basename=='gws': return len(path)>=2 and path[-1] in {'list','get'}
-    if basename=='himalaya': return tuple(path[:2]) in _HIMALAYA_READS
+    # Gmail only: its methods answer JSON, while other services' gets can write files (-o).
+    if basename=='gws': return len(path)>=2 and path[0]=='gmail' and path[-1] in {'list','get'}
+    if basename=='himalaya':
+        if tuple(path[:2])==('message','read'):
+            # Reading marks the email seen unless previewed (himalaya 1.x); 2.x marks it only with --seen.
+            flags={word.casefold() for word in words}
+            return bool(flags&{'-p','--preview'}) and '--seen' not in flags
+        return tuple(path[:2]) in _HIMALAYA_READS
     return False
 
 def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**kwargs):
@@ -337,7 +347,7 @@ def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**
     if tool_name=='terminal':
         command=args.get('command') if isinstance(args,dict) else None
         if not _watch_terminal_read_only(command):
-            return {'action':'block','message':_READ_ONLY_MESSAGE}
+            return {'action':'block','message':_READ_ONLY_TERMINAL_MESSAGE}
         return None
     if tool_name in _BLOCKED_PROACTIVE_TOOLS:
         return {'action':'block','message':_READ_ONLY_MESSAGE}
