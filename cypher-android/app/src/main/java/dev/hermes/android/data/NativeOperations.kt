@@ -8,6 +8,15 @@ import org.json.JSONObject
 /** "high" for an assistant chat whose profile default is slower than that, else null (keep the default). */
 internal fun assistantEffortCap(current: String): String? = if (current in setOf("xhigh", "max", "ultra")) "high" else null
 
+/** The precondition Hermes requires on a sidebar PATCH, from its `mutation-snapshot` (as its web client sends it). */
+internal fun pinMutationIdentity(snapshot: JSONObject, requestId: String): JSONObject {
+    val revision = snapshot.opt("runtime_revision"); val generation = snapshot.opt("runtime_generation")
+    require(snapshot.opt("exists") == true && revision is Number && revision.toLong() >= 0 && generation is Number && generation.toLong() >= 0) {
+        "This conversation changed. Refresh and try again."
+    }
+    return JSONObject().put("request_id", requestId).put("expected_revision", revision.toLong()).put("expected_generation", generation.toLong())
+}
+
 /** Projects existing Compose contracts onto native operations; never proxies the WebUI. */
 private class NativeTurnEnded : Exception()
 internal class NativeModelConfirmation(message: String) : IllegalStateException(message)
@@ -202,7 +211,10 @@ internal class NativeOperations(private val c: CypherClient) {
             }
             "/api/session/pin" -> {
                 require(method == "POST" && sid().matches(storedSessionId) && d.opt("pinned") is Boolean) { "Choose a conversation to pin" }
-                return c.nativeRequest("/api/sessions/${sid()}", "PATCH", json("pinned" to d.getBoolean("pinned"), "profile" to c.auth.profile))
+                // Hermes accepts a sidebar change only with its revision precondition and a fresh request id, as its own web client sends.
+                val snapshot = c.nativeGet("/api/sessions/${sid()}/mutation-snapshot", mapOf("profile" to c.auth.profile))
+                val identity = pinMutationIdentity(snapshot, java.util.UUID.randomUUID().toString())
+                return c.nativeRequest("/api/sessions/${sid()}", "PATCH", identity.put("pinned", d.getBoolean("pinned")).put("profile", c.auth.profile))
             }
             "/api/session/rename" -> return c.nativeRpc("session.title", json("session_id" to binding().runtimeSessionId, "title" to d.getString("title")))
             "/api/session/archive" -> {

@@ -28,6 +28,7 @@ class NativeOperationPolicyTest {
             "/api/sessions/20261014_125947_0d8269/messages",
             "/api/sessions/20261014_125947_0d8269/timeline",
             "/api/sessions/20261014_125947_0d8269/latest-descendant",
+            "/api/sessions/20261014_125947_0d8269/mutation-snapshot",
             "/api/profiles",
             "/api/profiles/active",
             "/api/auth/me",

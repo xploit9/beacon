@@ -2546,7 +2546,7 @@ class CypherViewModel(application: Application, private val saved: SavedStateHan
                 val ownsBody = historyOwnsLiveBoundary(turn, emptyList(), nextBoundary.closed, nextBoundary.toolIds)
                 s.copy(liveText = if (ownsBody) "" else s.liveText, liveReasoning = if (ownsBody) "" else s.liveReasoning,
                     liveTools = if (toolIdentity(o).isNotBlank() && toolIdentity(o) in historyToolIdentities(turn)) s.liveTools else mergeLiveTool(s.liveTools, o),
-                    status = if (event.type == "tool") "Using ${o.string("name")}" else "Working")
+                    status = if (event.type == "tool") "Using ${dev.hermes.android.ui.toolDisplayName(o)}" else "Working")
             }
             "interim_assistant" -> interimAssistantBody(s.liveText, s.liveReasoning, o).let { body ->
                 val owned = historyOwnsLiveBoundary(currentTurnMessages(s.raw.rows("messages")), emptyList(), nextBoundary.closed, nextBoundary.toolIds)

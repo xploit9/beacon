@@ -17,7 +17,7 @@ internal object NativeOperationPolicy {
     private val mcpPath = Regex("/api/mcp/servers/[A-Za-z0-9_.%~-]+/(?:test|enabled)")
     private const val cypherPluginUpdatePath = "/api/dashboard/agent-plugins/cypher/update"
     // Supported upstream history reads only (latest-descendant verifies a compression chain); mutations stay in the native /api/ws RPC surface.
-    private val sessionPath = Regex("/api/sessions/[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}(?:/(?:messages|timeline|latest-descendant))?")
+    private val sessionPath = Regex("/api/sessions/[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}(?:/(?:messages|timeline|latest-descendant|mutation-snapshot))?")
     // The one exception: Hermes sets a conversation's pin only through this sidebar PATCH (no RPC exists).
     private val sessionFlagsPath = Regex("/api/sessions/(?!search$|owner-backfill$)[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}")
     // The /api/plugins/cypher/* namespace is the optional extension's own routes, not upstream API.

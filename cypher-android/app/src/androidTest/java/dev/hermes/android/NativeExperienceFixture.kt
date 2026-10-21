@@ -501,8 +501,18 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 .map { row -> row.getJSONObject("info").copy().put("id", row.string("stored_session_id")).put("profile", profile).put("message_count", row.getJSONArray("messages").length()) }
                 .drop(offset).take(limit)))
         }
+        // Like Hermes: a sidebar PATCH needs the revision precondition from its mutation snapshot plus a request id.
+        path.startsWith("/api/sessions/") && path.endsWith("/mutation-snapshot") && method == "GET" -> path.removePrefix("/api/sessions/").removeSuffix("/mutation-snapshot").let { id ->
+            val info = sessions[id]?.getJSONObject("info")
+            200 to json("session_id" to id, "exists" to (info != null), "runtime_revision" to (info?.optInt("runtime_revision") ?: 0), "runtime_generation" to if (info != null) 0 else JSONObject.NULL)
+        }
         // Hermes's sidebar PATCH: the only REST mutation Cypher uses (pin).
-        path.startsWith("/api/sessions/") && method == "PATCH" -> path.removePrefix("/api/sessions/").let { id -> sessions.getValue(id).getJSONObject("info").put("pinned", body.getBoolean("pinned")); 200 to json("ok" to true, "session_id" to id) }
+        path.startsWith("/api/sessions/") && method == "PATCH" -> path.removePrefix("/api/sessions/").let { id ->
+            val info = sessions.getValue(id).getJSONObject("info")
+            if (body.string("request_id").isBlank() || !body.has("expected_revision")) 409 to json("detail" to "mutation_identity_required")
+            else if (body.getInt("expected_revision") != info.optInt("runtime_revision")) 409 to json("detail" to "revision_conflict")
+            else { info.put("pinned", body.getBoolean("pinned")).put("runtime_revision", info.optInt("runtime_revision") + 1); 200 to json("ok" to true, "session_id" to id) }
+        }
         path.startsWith("/api/sessions/") -> stockSession(path, profile)
         path == "/api/auth/ws-ticket" -> 200 to json("ticket" to "synthetic-once")
         path == "/auth/native/authorize" -> 200 to json("ready" to true)

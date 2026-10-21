@@ -35,5 +35,10 @@ class NativeExperienceDataTest {
         val validation = JSONArray().put(json("msg" to "Invalid time")).put(json("msg" to "Missing title"))
         assertEquals("Invalid time; Missing title", nativeErrorMessage(json("detail" to validation), 422))
         assertEquals("Server returned 500", nativeErrorMessage(json(), 500))
+        // Bare Hermes machine codes never reach the screen.
+        assertEquals("This chat changed. Refresh and try again.", nativeErrorMessage(json("detail" to "mutation_identity_required"), 409))
+        assertEquals("This chat is busy with a reply. Try again when it finishes.", nativeErrorMessage(json("detail" to "session_busy"), 409))
+        assertEquals("Hermes couldn't do that. Try again.", nativeErrorMessage(json("detail" to "some_new_code"), 409))
+        assertEquals("session not found", nativeErrorMessage(json("detail" to "session not found"), 404))
     }
 }

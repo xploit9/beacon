@@ -609,7 +609,7 @@ class KeepConnectedService : Service() {
         val manager = getSystemService(NotificationManager::class.java)
         if (manager.getNotificationChannel(CHANNEL_ID) == null) {
             manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "Keep connected", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "Keeps Cypher connected so Hermes can deliver incoming calls."
+                description = "Keeps you reachable for incoming calls."
                 setShowBadge(false)
             })
         }
@@ -617,13 +617,7 @@ class KeepConnectedService : Service() {
 
     private fun connectionNotification(context: Context): android.app.Notification {
         val status = status(context)
-        val (title, body) = when (status) {
-            STATUS_RECONNECTING -> "Cypher is reconnecting" to "Hermes can call you when the connection is restored."
-            STATUS_STARTING -> "Cypher is connecting" to "Keep connected is starting."
-            STATUS_SIGNED_OUT -> "Cypher is signed out" to "Sign in again to receive calls."
-            STATUS_OFF -> "Keep connected is off" to "Turn it on in Cypher notification settings to receive calls."
-            else -> "Cypher is connected" to "Hermes can call you."
-        }
+        val (title, body) = keepConnectedText(status, dev.hermes.android.data.currentAssistantName)
         val stop = Intent(context, KeepConnectedService::class.java)
             .setAction(ACTION_STOP)
             .setData(Uri.parse("cypher://keep-connected/stop/${stopToken(context)}"))
@@ -774,4 +768,13 @@ class KeepConnectedService : Service() {
             return PendingIntent.getActivity(context, requestCode, open, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         }
     }
+}
+
+/** The Keep connected notification. Android already shows the app's name above it; the body names the assistant (its rename, or the default). */
+internal fun keepConnectedText(status: String, assistant: String): Pair<String, String> = when (status) {
+    KeepConnectedService.STATUS_RECONNECTING -> "Reconnecting…" to "$assistant can call you again once you're back online."
+    KeepConnectedService.STATUS_STARTING -> "Connecting…" to "Getting ready so $assistant can call you."
+    KeepConnectedService.STATUS_SIGNED_OUT -> "Signed out" to "Sign in again so $assistant can call you."
+    KeepConnectedService.STATUS_OFF -> "Keep connected is off" to "Turn it on in Settings › Notifications so $assistant can call you."
+    else -> "Connected" to "$assistant can call you."
 }

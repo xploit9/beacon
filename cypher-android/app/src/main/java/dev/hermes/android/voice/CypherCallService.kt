@@ -39,6 +39,12 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 data class AudioRoute(val id: String, val name: String)
 data class CallState(val active: Boolean = false, val state: String = "idle", val muted: Boolean = false, val transcript: String = "", val error: String = "", val routes: List<AudioRoute> = emptyList(), val route: String = "", val startedAt: Long = 0, val conversationScope: Scope? = null, val callId: String = "", val transcripts: List<CallTranscript> = emptyList(), val transcriptStatus: String = "", val cameraSharing: Boolean = false, val cameraRear: Boolean = false, val cameraBusy: Boolean = false, val cameraCanFlip: Boolean = false, val cameraStopPending: Boolean = false, val held: Boolean = false, val userSpeaking: Boolean = false, val remoteSpeaking: Boolean = false, val localAudioLevel: Float? = null, val remoteAudioLevel: Float? = null, val minimized: Boolean = false, val screenSharing: Boolean = false, val screenBusy: Boolean = false, val screenStopPending: Boolean = false, val overlayPermissionMissing: Boolean = false, val contextNotice: String = "", val audioStopPending: Boolean = false, val hostCleanupPending: Boolean = false, val toolApprovals: List<CallToolApproval> = emptyList(), val voiceProvider: String = "gemini", val visionAvailable: Boolean = true)
+internal fun callEndNotSentText(count: Int): String =
+    if (count == 1) "1 request wasn't sent before the call ended." else "$count requests weren't sent before the call ended."
+internal fun callEndUnknownText(count: Int): String =
+    if (count == 1) "Cypher couldn't confirm 1 request. Check the chat before asking again."
+    else "Cypher couldn't confirm $count requests. Check the chat before asking again."
+
 internal fun CallState.withServerWarning(message: String, eventCallId: String, authorizedCallId: String): CallState {
     if (!active || callId.isBlank() || callId != authorizedCallId || eventCallId.isNotBlank() && eventCallId != callId || message.isBlank() || message.length > 240) return this
     return copy(error = message)
@@ -648,7 +654,7 @@ class CypherCallService : Service() {
                 ended.complete(Unit)
                 val stopped=captureReleased
                 app.calls.cameraTrack(this@CypherCallService,null)
-                app.calls.updateFrom(this@CypherCallService) { it.copy(active=false,state="ending",cameraSharing=false,cameraBusy=false,screenSharing=false,screenBusy=false,cameraStopPending=!stopped,screenStopPending=!stopped,audioStopPending=!audioReleased,minimized=false,error=listOfNotNull(error?:it.error,if(!audioReleased) "Native microphone release unconfirmed" else null,if(endDisposition.notSent>0) "${endDisposition.notSent} waiting work request(s) were not submitted when the call ended." else null,if(endDisposition.submissionUnknown>0) "${endDisposition.submissionUnknown} native work acceptance/linkage receipt(s) are unconfirmed. Inspect the attached conversation; do not resubmit automatically." else null).filter(String::isNotBlank).joinToString(" ")).afterTerminalControls(fenceFailure) }
+                app.calls.updateFrom(this@CypherCallService) { it.copy(active=false,state="ending",cameraSharing=false,cameraBusy=false,screenSharing=false,screenBusy=false,cameraStopPending=!stopped,screenStopPending=!stopped,audioStopPending=!audioReleased,minimized=false,error=listOfNotNull(error?:it.error,if(!audioReleased) "The microphone may still be on. Close Cypher if it stays on." else null,if(endDisposition.notSent>0) callEndNotSentText(endDisposition.notSent) else null,if(endDisposition.submissionUnknown>0) callEndUnknownText(endDisposition.submissionUnknown) else null).filter(String::isNotBlank).joinToString(" ")).afterTerminalControls(fenceFailure) }
                 val transcriptClosed=finishTranscriptSyncForCleanup { transcriptSync?.finish()==true }
                 if(!transcriptClosed) app.calls.updateFrom(this@CypherCallService) { it.copy(transcriptStatus="partial") }
                 spec?.let { pending ->
