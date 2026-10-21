@@ -13,7 +13,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Hermes `source` for a named Beacon thread (Relay tags its threads `phone`); every other phone chat is `android`. */
-internal const val BEACON_THREAD_SOURCE = "beacon_thread"
+internal const val BEACON_THREAD_SOURCE = "android_thread"
 private val WINDOW_SERVER_REQUESTS = setOf("preview.act", "preview.read", "terminal.read", "window.read", "tour")
 
 private data class ParsedNativeRequestId(val key: String, val text: String)

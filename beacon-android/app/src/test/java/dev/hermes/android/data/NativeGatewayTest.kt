@@ -301,7 +301,7 @@ class NativeGatewayTest {
 
     @Test fun aThreadIsCreatedWithItsOwnSourceAndOnlyThatSourceIsAccepted() = runBlocking<Unit> {
         val fixture = GatewayFixture()
-        assertEquals("beacon_thread", BEACON_THREAD_SOURCE)
+        assertEquals("android_thread", BEACON_THREAD_SOURCE)
         fixture.client.nativeCreate(json("title" to "Trip planning", "source" to BEACON_THREAD_SOURCE))
         val thread = fixture.calls.single { it.first == "session.create" }.second
         assertEquals(BEACON_THREAD_SOURCE, thread.getString("source"))

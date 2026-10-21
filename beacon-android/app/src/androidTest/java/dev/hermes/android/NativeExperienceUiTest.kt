@@ -1194,14 +1194,14 @@ class NativeExperienceUiTest {
         try {
             compose.runOnIdle { vm.toggleSessions(true) }
             compose.onNodeWithTag("history-threads").performScrollTo().performClick()
-            compose.waitUntil(5_000) { fixture.sessionListQueries.any { it.string("sources") == "beacon_thread,phone" } }
+            compose.waitUntil(5_000) { fixture.sessionListQueries.any { it.string("sources") == "android_thread,phone" } }
             compose.waitUntil(5_000) { compose.onAllNodesWithText("No threads yet").fetchSemanticsNodes().isNotEmpty() }
 
             compose.onNodeWithTag("history-filter").performScrollTo().performClick()
             compose.onNodeWithTag("history-new-thread").performClick()
             compose.onNodeWithTag("new-thread-name").performTextInput("Trip planning")
             compose.onNodeWithTag("new-thread-start").performClick()
-            await { fixture.requests.any { it.string("method") == "session.create" && it.getJSONObject("params").string("source") == "beacon_thread" } }
+            await { fixture.requests.any { it.string("method") == "session.create" && it.getJSONObject("params").string("source") == "android_thread" } }
             assertEquals("Trip planning", fixture.requests.last { it.string("method") == "session.create" }.getJSONObject("params").string("title"))
             await { vm.chat.value.sessionId.isNotBlank() && vm.chat.value.title == "Trip planning" }
 

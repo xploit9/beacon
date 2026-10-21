@@ -213,7 +213,7 @@ class NativeStockHistoryTest {
 
         val threads = Stock(); val t = client(threads)
         t.get("/api/sessions", mapOf("profile" to "work", "include_archived" to "0", "view" to "threads", "hidden_sources" to "telegram"))
-        assertTrue("The Threads lane asks Hermes for Beacon and Relay threads only", threads.listPages().all { it.url.queryParameter("sources") == "beacon_thread,phone" && it.url.queryParameter("exclude_sources") == null })
+        assertTrue("The Threads lane asks Hermes for Beacon and Relay threads only", threads.listPages().all { it.url.queryParameter("sources") == "android_thread,phone" && it.url.queryParameter("exclude_sources") == null })
         assertTrue("Recent activity is the default order", threads.listPages().all { it.url.queryParameter("order") == "recent" })
         assertTrue(threads.listPages().all { it.url.queryParameter("min_messages") == "1" })
         assertProfiled(threads)

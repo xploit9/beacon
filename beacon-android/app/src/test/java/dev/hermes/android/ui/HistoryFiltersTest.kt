@@ -12,7 +12,7 @@ class HistoryFiltersTest {
     private val rows = listOf(
         json("id" to "a", "title" to "beta", "source" to "android"),
         json("id" to "b", "title" to "Alpha", "source" to "telegram", "pinned" to true),
-        json("id" to "c", "title" to "gamma", "source" to "beacon_thread"),
+        json("id" to "c", "title" to "gamma", "source" to "android_thread"),
         json("id" to "d", "title" to "Delta", "source" to "phone"),
         json("id" to "e", "title" to "Echo", "source" to "webui"),
     )
