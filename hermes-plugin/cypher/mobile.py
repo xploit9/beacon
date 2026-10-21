@@ -135,9 +135,15 @@ def register_assistant_conversation(owner,provider,profile,session_id,native_ver
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('owner_claim',?)",(value,))
     return session_id
 
+_LAUNCH_HOME=None
+
 def home():
-    from hermes_constants import get_process_hermes_home
-    return Path(get_process_hermes_home())
+    # Hermes briefly repoints HERMES_HOME while it deletes or renames another profile; the launch home never moves.
+    global _LAUNCH_HOME
+    if _LAUNCH_HOME is None:
+        from hermes_constants import get_process_hermes_home
+        _LAUNCH_HOME=Path(get_process_hermes_home())
+    return _LAUNCH_HOME
 
 def protect(path):
     global _OWNER_SID

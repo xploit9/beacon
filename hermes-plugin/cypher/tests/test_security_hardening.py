@@ -294,7 +294,8 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
         assert plugin.native_proactive_read_only_guard(tool_name=tool, args={}, session_id="watch-run") == blocked, tool
     assert plugin.native_proactive_read_only_guard(tool_name="mcp__db__fetch_rows", args={}, session_id="watch-run") is None
     readers = ("search_inbox", "read_email", "list_calendar_events", "list_tasks", "list-mail-messages",
-               "GMAIL_LIST_THREADS", "getMessageAttachment")
+               "GMAIL_LIST_THREADS", "getMessageAttachment", "list_available_accounts",
+               "get_gmail_messages_content_batch", "search_messages_by_sender", "get_unread_emails")
     chained = ("get_and_complete", "search_and_reserve", "find_and_book", "lookup_then_order", "book_slot")
     mcp_tool._mcp_tool_server_names.update({"mcp__mail__" + name: "mail" for name in readers + chained})
     for hint in (False, True):
@@ -506,3 +507,12 @@ def test_launch_profile_scope_uses_the_resolver_home_not_the_live_env(harness, m
     # Hermes repoints HERMES_HOME while it deletes a profile; the launch profile's notes must not follow it.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-being-deleted"))
     assert voice_context.scoped("default", lambda root: root) == launch
+
+
+def test_launch_home_stays_put_while_hermes_repoints_hermes_home(harness, monkeypatch, tmp_path):
+    mobile = load_private("mobile")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "launch"))
+    first = mobile.home()
+    # Hermes repoints HERMES_HOME while it deletes or renames another profile.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-being-deleted"))
+    assert mobile.home() == first and first.name == "launch"

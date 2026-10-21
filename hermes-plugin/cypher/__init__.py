@@ -242,7 +242,7 @@ def native_voice_context(session_id=None, conversation_history=None, **kwargs):
 _READ_TOOL_WORDS={'get','list','search','read','find','view','show','describe','lookup'}
 _WRITE_TOOL_WORDS={'send','create','delete','remove','modify','update','manage','draft','reply','forward',
                    'move','archive','trash','label','post','write','upload','accept','decline','invite',
-                   'share','set','add','patch','put','mark','star','unread','snooze','mute','block',
+                   'share','set','add','patch','put','mark','star','snooze','mute','block',
                    'unsubscribe','replace','rename','merge','approve','submit','cancel','execute','run',
                    'import','restore','copy','insert','append','apply','push','commit','pay','transfer',
                    'toggle','save','store','notify','acknowledge','ack','seen','flag','unflag','pin','unpin',
@@ -264,7 +264,8 @@ _UNSAFE_NAME_WORDS=_ARG_WRITE_TOOL_WORDS|{'exec','sql','call','invoke','eval','s
 # calendar or task vocabulary: an unknown word may be a verb that changes something (Strix 7d8f96b #3).
 _MAIL_READ_NAME_WORDS=_READ_TOOL_WORDS|{
     'email','emails','mail','mails','gmail','outlook','message','messages','msg','msgs','thread','threads','inbox',
-    'mailbox','mailboxes','folder','folders','conversation','conversations','labels','important','starred',
+    'mailbox','mailboxes','folder','folders','conversation','conversations','labels','important','starred','unread',
+    'unseen','sender','subject','account','accounts','available','batch',
     'sent','drafts','calendar','calendars','event','events','meeting','meetings','agenda','availability','free','busy',
     'freebusy','task','tasks','todo','todos','reminder','reminders','note','notes','contact','contacts','people',
     'person','user','users','profile','me','my','recent','new','latest','upcoming','today','history','by','id','ids',
