@@ -25,6 +25,7 @@ class CypherApplication : Application() {
     var firebaseConfigured = false; private set
     override fun onCreate() {
         super.onCreate()
+        dev.hermes.android.data.NativePairing.attach(this)
         updates.schedule()
         val staleBefore = System.currentTimeMillis()
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {

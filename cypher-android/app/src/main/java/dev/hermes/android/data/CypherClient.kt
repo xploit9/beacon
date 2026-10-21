@@ -98,6 +98,7 @@ class CypherClient internal constructor(initial: AuthContext, private val authSt
             val loopback = session.loopbackSession?.takeIf { it.origin == session.origin && it.owner == session.owner && it.owner == "local" && session.backend == "hermes-dashboard" && validLoopbackSessionToken(it.token) }
             if (bearer != null) header("Authorization", "Bearer " + bearer.accessToken)
             else loopback?.let { header(HERMES_LOOPBACK_SESSION_HEADER, it.token) }
+            NativePairing.deviceHeader(path, scope)?.let { header("X-Cypher-Device-ID", it) }
         }
         method(method, body)
     }

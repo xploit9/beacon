@@ -16,7 +16,6 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 import java.util.Locale
 
-// Pairing-code normalization follows Hermes Relay's plugin/pair.py; MIT, see licenses/Hermes-Relay-MIT.txt.
 private const val PAIRING_CODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 private const val PAIRING_CODE_CHARS = "A-Z0-9"
 private val pairingCodePattern = Regex("(?i)[$PAIRING_CODE_CHARS]{3}-?[$PAIRING_CODE_CHARS]{3}")
@@ -43,8 +42,19 @@ internal class PairingFailure(message: String, cause: Throwable? = null) : IOExc
 internal class DeviceRemovedFailure : IOException("This phone was removed from Cypher on your PC.")
 
 internal object NativePairing {
-    private const val REDEEM_PATH = "/api/plugins/cypher/pairing/redeem"
+    private const val PAIRING_PREFIX = "/api/plugins/cypher/pairing"
+    private const val REDEEM_PATH = "$PAIRING_PREFIX/redeem"
     private const val LINK_PATH = "/api/plugins/cypher/devices/link"
+    private const val PLUGIN_PREFIX = "/api/plugins/cypher/"
+    @Volatile private var store: android.content.SharedPreferences? = null
+
+    /** Lets every plugin request name this phone, so Hermes updates "last seen" and can refuse a removed phone. */
+    fun attach(context: Context) { store = context.applicationContext.getSharedPreferences("native-pairing", Context.MODE_PRIVATE) }
+
+    /** The linked device ID to send with [path], or null: pairing and the link itself never carry one. */
+    internal fun deviceHeader(path: String, scope: Scope): String? =
+        if (!path.startsWith(PLUGIN_PREFIX) || path.startsWith(PAIRING_PREFIX) || path == LINK_PATH) null
+        else store?.getString(accountKey(scope), null)?.takeIf(deviceIdPattern::matches)
     private const val DEVICES_PATH = "/api/plugins/cypher/devices"
     private const val MAX_DEVICE_RESPONSE = 1024 * 1024L
     private val deviceIdPattern = Regex("[A-Za-z0-9_-]{1,128}")
@@ -81,14 +91,14 @@ internal object NativePairing {
         } catch (error: Exception) {
             throw PairingFailure("Couldn't reach Hermes. Check the address and try again.", error)
         }
-        val dashboardUrl = try { trustedOrigin(result.string("dashboard_url")) }
+        val dashboardUrl = try { trustedOrigin(result.string("url")) }
         catch (error: Exception) { throw PairingFailure("That code didn't include a valid Hermes address.", error) }
         if (dashboardUrl != client.auth.origin) throw PairingFailure("That code belongs to a different Hermes dashboard.")
         val deviceId = result.string("device_id").takeIf(deviceIdPattern::matches)
             ?: throw PairingFailure("That code didn't return a valid device. Make a new one on your PC.")
         val ticket = result.string("link_ticket").takeIf { it.isNotBlank() && it.length <= 4096 && it.none(Char::isISOControl) }
             ?: throw PairingFailure("That code didn't work. Make a new one on your PC.")
-        val displayName = result.string("display_name").filterNot(Char::isISOControl).take(128).ifBlank { "Hermes" }
+        val displayName = result.string("name").filterNot(Char::isISOControl).take(128).ifBlank { "Hermes" }
         PairingGrant(deviceId, ticket, dashboardUrl, displayName)
     }
 

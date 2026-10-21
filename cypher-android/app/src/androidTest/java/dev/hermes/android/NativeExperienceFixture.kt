@@ -375,7 +375,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             if (body.string("code") != "ABC123") 400 to json("detail" to "invalid_pairing_code")
             else {
                 pairingDeviceName = body.string("device_name").takeIf(String::isNotBlank) ?: "Android phone"
-                200 to json("dashboard_url" to scope.origin, "display_name" to "Fixture Hermes", "device_id" to "device-123", "link_ticket" to "fixture-link-ticket")
+                200 to json("url" to scope.origin, "name" to "Fixture Hermes", "device_id" to "device-123", "link_ticket" to "fixture-link-ticket")
             }
         }
         path == "/api/plugins/cypher/devices/link" && method == "POST" -> {

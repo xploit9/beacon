@@ -10,6 +10,7 @@ internal fun nativeErrorCodeText(detail: String): String? = when (detail) {
     "mutation_identity_required", "revision_conflict", "stale_generation", "retained_receipts" -> "This chat changed. Refresh and try again."
     "session_busy", "admission_conflict", "runtime_coordination_required" -> "This chat is busy with a reply. Try again when it finishes."
     "permission_denied" -> "Hermes didn't allow that."
+    "device_removed" -> "This phone was removed from Cypher on your PC. Pair it again in Settings › Devices."
     "profile_mismatch" -> "That chat belongs to another profile."
     "runtime_draining" -> "Hermes is restarting. Try again in a moment."
     else -> if (Regex("[a-z]+(?:_[a-z]+)+").matches(detail)) "Hermes couldn't do that. Try again." else null
