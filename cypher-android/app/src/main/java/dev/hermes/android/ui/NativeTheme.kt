@@ -4,9 +4,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithCache
-import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
@@ -36,31 +36,44 @@ fun nativeAmbientColors(scheme: ColorScheme): List<Color> = listOf(
     lerp(scheme.background, scheme.onSurfaceVariant, .04f),
 )
 
-// Dotted chat background and metadata style adapted from Hermes Relay ui/theme/RelayRefresh.kt
-// (RelayDottedOverlay, relayMetadataStyle) — MIT, see licenses/Hermes-Relay-MIT.txt. Colors come from the active Cypher scheme.
-internal fun forEachNativeDot(width: Float, height: Float, step: Float, draw: (Rect) -> Unit) {
-    require(width.isFinite() && height.isFinite() && step.isFinite() && width >= 0f && height >= 0f && step > 0f)
-    var y = 0f
-    while (y <= height) {
-        var x = 0f
-        while (x <= width) {
-            draw(Rect(x - .1f, y - .1f, x + 2.1f, y + 2.1f))
-            x += step
-        }
-        y += step
+/** One ember of the chat backdrop: where it sits, how big it is and how much of the beacon's light it catches. */
+internal data class BeaconEmber(val x: Float, val y: Float, val radius: Float, val alpha: Float)
+
+/** A fixed, sparse drift of embers that thins out away from the light at the top; the same size always gives the same field. */
+internal fun beaconEmbers(width: Float, height: Float, spacing: Float, maxRadius: Float): List<BeaconEmber> {
+    require(width.isFinite() && height.isFinite() && spacing.isFinite() && maxRadius.isFinite() && width >= 0f && height >= 0f && spacing > 0f && maxRadius > 0f)
+    val columns = (width / spacing).toInt() + 1
+    val rows = (height / spacing).toInt() + 1
+    var seed = 0x2545F491L
+    fun next(): Float { seed = (seed * 6364136223846793005L + 1442695040888963407L); return ((seed ushr 33) and 0xFFFFFF).toFloat() / 0xFFFFFF }
+    val embers = ArrayList<BeaconEmber>(columns * rows / 3 + 1)
+    for (row in 0 until rows) for (column in 0 until columns) {
+        val keep = next(); val dx = next(); val dy = next(); val size = next(); val glint = next()
+        if (keep > .34f) continue
+        val y = (row + dy) * spacing
+        if (y > height) continue
+        val light = 1f - (y / height.coerceAtLeast(1f)).coerceIn(0f, 1f) * .75f
+        embers += BeaconEmber(((column + dx) * spacing).coerceAtMost(width), y, maxRadius * (.35f + .65f * size), (.05f + .13f * glint) * light)
     }
+    return embers
 }
 
-@Composable fun Modifier.chatDottedBackground(alpha: Float = .14f): Modifier {
-    val dot = MaterialTheme.colorScheme.primary.copy(alpha = alpha)
+/** The chat backdrop: the beacon's light falling from the top, with embers drifting through it. */
+@Composable fun Modifier.chatBeaconBackground(): Modifier {
+    val light = MaterialTheme.colorScheme.primary
     return drawWithCache {
-        val dots = Path()
-        forEachNativeDot(size.width, size.height, 12.dp.toPx()) { dots.addOval(it) }
-        onDrawBehind { drawPath(dots, dot) }
+        val glow = Brush.radialGradient(listOf(light.copy(alpha = .13f), light.copy(alpha = .04f), Color.Transparent),
+            center = Offset(size.width / 2f, -size.height * .04f), radius = maxOf(size.width, size.height) * .72f)
+        val embers = beaconEmbers(size.width, size.height, 34.dp.toPx(), 1.6.dp.toPx())
+        onDrawBehind {
+            drawRect(glow)
+            embers.forEach { drawCircle(light.copy(alpha = it.alpha), it.radius, Offset(it.x, it.y)) }
+        }
     }
 }
 
-@Composable fun nativeMetadataStyle(): TextStyle = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Medium, letterSpacing = 0.sp)
+/** Times, durations and step details: small type with even-width digits so columns of numbers line up. */
+@Composable fun nativeMetadataStyle(): TextStyle = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum", fontWeight = FontWeight.Medium, letterSpacing = .2.sp)
 
 /** Motion follows the phone's "Remove animations" setting and stops while the screen is not started. */
 internal fun nativeMotionAllowed(systemAnimationsEnabled: Boolean, lifecycleStarted: Boolean): Boolean =

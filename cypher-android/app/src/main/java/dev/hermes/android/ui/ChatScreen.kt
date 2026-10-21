@@ -573,7 +573,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
         else conversationEntry.snapTo(1f)
     }
     val conversationContent: @Composable (Modifier) -> Unit = { modifier ->
-        Column(modifier.clipToBounds().chatDottedBackground().graphicsLayer { alpha = conversationEntry.value }) {
+        Column(modifier.clipToBounds().chatBeaconBackground().graphicsLayer { alpha = conversationEntry.value }) {
             LaunchedEffect(ui.origin, ui.owner, ui.profile, chat.sessionId, chat.messages.isNotEmpty(), search, ready) {
                 if (!ready) return@LaunchedEffect
                 if (search.isNotBlank()) {
