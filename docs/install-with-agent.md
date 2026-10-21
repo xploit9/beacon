@@ -1,89 +1,19 @@
 # Install Beacon with your agent
 
-This procedure is for an AI agent running on the PC that hosts Hermes.
-
-## Safety
-
-- Never print, copy into notes, or store passwords, OAuth tokens, `GITHUB_TOKEN`, `GH_TOKEN`, dashboard session values, or provider API keys.
-- Never modify Hermes core files, add startup hooks, or patch Hermes at runtime.
-- Ask the user before restarting a dashboard they are using or changing Tailscale Serve, firewall, bind, or port settings.
-- Keep backups and logs outside the Beacon repository. Do not delete the Hermes Relay backup.
-- Let Hermes' native installer run its security scan. Ask before approving Python dependency installation or any scan override.
-
-## 1. Confirm Hermes and the target profile
-
-Run `hermes --version` and inspect the existing `HERMES_HOME` and active Hermes profile. If Hermes is not installed or the command is unavailable, politely stop and tell the user that nothing was installed. If more than one profile could be the dashboard's profile, ask which one to use; do not guess.
-
-Use `hermes -p <profile>` for every profile-scoped command. Hermes consumes `-p` / `--profile` before the subcommand, so the profile option goes before `plugins`.
-
-## 2. Install or update the plugin
-
-The repository is public at `xploit9/beacon`. Hermes' native installer accepts owner/repository shorthand, Git URLs, and a repository subdirectory. For the current repository layout, install the `hermes-plugin/beacon` subdirectory:
-
-If the target profile has a plugin named `cypher`, back up its plugin folder and plugin data to a location outside `plugins`, remove its managed cron jobs, then remove the plugin before installing Beacon.
+On the PC that runs Hermes, download `hermes-plugin/beacon/install/beacon_install.py` from the public [Beacon repository](https://github.com/xploit9/beacon) and run it with Python 3.10 or newer:
 
 ```sh
-hermes -p <profile> plugins install xploit9/beacon/hermes-plugin/beacon --enable
+python beacon_install.py
 ```
 
-If `beacon` is already installed from this same repository, update it with Hermes' native updater instead:
+The installer selects the Hermes home and profile, verifies a backup of the retired `cypher` plugin before removal, removes only cron jobs whose prompt contains `CYPHER_PROACTIVE_JOB`, then installs or updates Beacon. It asks before restarting the dashboard or configuring Tailscale Serve, and prints the pairing block only when Hermes has a public HTTPS dashboard URL. It does not print or store passwords, tokens, or API keys, and does not modify Hermes core.
 
-```sh
-hermes -p <profile> plugins update beacon
-```
+## Manual fallback
 
-Confirm the existing install's recorded source before updating. If it came from another or unclear source, stop and ask before replacing it. Do not use `--force` to overwrite an unknown install.
+1. Select the Hermes home and profile with `hermes profile list`; do not guess if more than one could own the dashboard.
+2. Back up `<profile-home>/plugins/cypher` and `<profile-home>/plugin-data/cypher` under `<profile-home>/backups/beacon-install-<UTC stamp>/`. Verify file counts and sizes, and use SQLite's backup API for `*.sqlite`, before removal.
+3. Inspect `<profile-home>/cron/jobs.json`; remove only jobs whose `prompt` contains `CYPHER_PROACTIVE_JOB` with `hermes -p <profile> cron remove <id>`, then run `hermes -p <profile> plugins remove cypher`.
+4. Install with `hermes -p <profile> plugins install xploit9/beacon/hermes-plugin/beacon --enable`, or update an existing Beacon with `hermes -p <profile> plugins update beacon`. Let Hermes' native security scan and prompts run unchanged.
+5. Ask before restarting with `hermes -p <profile> dashboard --stop` and `hermes -p <profile> dashboard --no-open`. Pair with `hermes -p <profile> beacon pair --name "My phone"` after a public HTTPS dashboard URL is configured.
 
-The installer can use credentials already available to Hermes: `GITHUB_TOKEN` / `GH_TOKEN`, the user's GitHub CLI login (`gh auth token`), or an existing Git credential helper. Hermes supplies credentials only to the Git process and does not put them in the installed clone. If access is denied, ask the user to sign in with `gh auth login` or authorize the existing credential manager; never ask them to paste a token.
-
-Hermes supports a subdirectory in the repository identifier above. Its optional `--ref` accepts a full 40-character commit SHA, not a branch name; omit it to use the repository's default branch.
-
-If an older Hermes installer rejects the subdirectory identifier, use a sparse checkout and install from a local Git URL. Hermes accepts `file://` URLs with a `#subdirectory` fragment:
-
-```sh
-git clone --filter=blob:none --sparse https://github.com/xploit9/beacon.git beacon-source
-git -C beacon-source sparse-checkout set hermes-plugin/beacon
-hermes -p <profile> plugins install file:///absolute/path/to/beacon-source#hermes-plugin/beacon --enable
-```
-
-Replace the final URL with the platform's correctly formed `file://` URL for that local checkout (for example, Windows drive paths use `file:///C:/...`). If that Hermes version does not accept the local Git URL, stop and ask rather than guessing another installer flag.
-
-If the target profile has `hermes-relay` enabled, first copy its installed plugin directory to a timestamped private backup outside the `plugins` directory and verify the copy. Then disable Relay in that profile:
-
-```sh
-hermes -p <profile> plugins disable hermes-relay
-```
-
-Do not delete the backup. Ensure Beacon is enabled in the selected profile:
-
-```sh
-hermes -p <profile> plugins enable beacon
-```
-
-This plugin declares no plugin-only Python dependencies: Hermes already supplies FastAPI, PyYAML, httpx, and jsonschema. Firebase Admin is optional and loaded only when FCM credentials are configured; otherwise Beacon uses its existing Keep connected delivery path. If this release unexpectedly triggers a dependency prompt, stop and check the installed plugin version instead of approving a workaround. Do not bypass the native security scan.
-
-## 3. Restart and verify the dashboard
-
-Identify how this dashboard instance is running (foreground process, Windows service/task, systemd, launchd, or container). Ask the user before restarting it. After approval, restart only the selected dashboard instance using its existing platform manager or launch command; do not restart unrelated Hermes services.
-
-The dashboard serves the plugin's phone routes, and it is often a separate process from the gateway: `hermes gateway restart` alone leaves the old plugin running there. After restarting, confirm that the process listening on the dashboard port started after the install.
-
-From the dashboard's authenticated browser session, verify that:
-
-- The dashboard is reachable.
-- The **Beacon** tab is visible.
-- Opening the Beacon tab with a verified Hermes dashboard session binds that account automatically when no owner exists, then displays the QR immediately. There is no separate claim step.
-- If Hermes reports multiple dashboard accounts and Beacon has no owner, the first verified account to use the plugin becomes owner; other accounts receive 403.
-- Loopback-anonymous requests never create an owner. A dashboard without a verified native Hermes identity cannot initialize Beacon until that identity is available.
-- The owner-authorized `GET /api/plugins/beacon/connect-info` succeeds and the tab displays its QR.
-- **Pair a phone** creates a single-use pairing code and QR that expires after 10 minutes.
-
-Do not copy, print, or log the route response. Loopback mode may include a session value in that response. If the route reports that a public HTTPS URL is required, the phone cannot use a loopback or plain-HTTP address. Tailscale Serve over HTTPS is the recommended way to make the dashboard reachable from the phone. Ask before changing network settings; do not enable Serve, open ports, or change firewall/bind settings on your own.
-
-## 4. Finish on the phone
-
-Tell the user to download and install the latest stable `Beacon-<version>.apk` from the repository's [Releases page](https://github.com/xploit9/beacon/releases), open the dashboard's **Beacon** tab, and select **Pair a phone**. Pair from Hermes CLI with `hermes -p <profile> beacon pair` or from an owned chat with `/beacon-pair`. The phone step is: "Scan the QR, choose a screenshot of it, or type the address and code." App and plugin automatic updates are on by default in Settings **App updates**; app downloads use an unmetered connection and keep package, version, checksum and signer verification, with a tap-to-install notice whenever Android requires confirmation.
-
-Phone sign-in uses Hermes' normal OAuth browser flow. The first verified OAuth identity to use a plugin route becomes owner automatically if no owner exists; subsequent identities cannot take over. That sign-in covers chat, history, plugin pages, calls, and Keep connected. Loopback-anonymous access does not establish ownership.
-
-If restarting or network approval is unavailable, report exactly what remains and wait for the user.
+Install the latest app from [GitHub Releases](https://github.com/xploit9/beacon/releases/latest) and enter the address and code from the pairing block.
