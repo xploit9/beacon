@@ -52,8 +52,10 @@ internal class NativePcm(private val scope:CoroutineScope,private val input:(Byt
             .setAudioFormat(AudioFormat.Builder().setSampleRate(24000).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
             .setBufferSizeInBytes(maxOf(outputSize,9600)).setTransferMode(AudioTrack.MODE_STREAM).build()
         player=track;check(track.state==AudioTrack.STATE_INITIALIZED)
-        check(track.setBufferSizeInFrames(480)>0)
-        if(Build.VERSION.SDK_INT>=31) track.setStartThresholdInFrames(480)
+        // 120 ms of headroom absorbs network bursts and scheduling hiccups (a 20 ms buffer underran and crackled);
+        // barge-in still stops at once because interrupt() pauses and flushes the track.
+        check(track.setBufferSizeInFrames(PLAYBACK_BUFFER_FRAMES)>0)
+        if(Build.VERSION.SDK_INT>=31) track.setStartThresholdInFrames(PLAYBACK_START_FRAMES)
         playbackEpochNs=System.nanoTime();track.play();rec.startRecording()
         } catch(error:Exception) {
             closed.set(true);capture.set(false)
@@ -154,6 +156,8 @@ internal class NativePcm(private val scope:CoroutineScope,private val input:(Byt
             mute(true);runCatching { interrupt() };output.close();watchdogJob?.cancel()
             // Stop/unblock read first, then join off-main before releasing native objects.
             runCatching { recorder?.stop() };runCatching { player?.pause();player?.flush() }
+            // A count of zero means the call's speech played without gaps.
+            player?.let { runCatching { android.util.Log.i("BeaconAudio","call playback underruns=${it.underrunCount}") } }
             val jobs=listOfNotNull(captureJob,playbackJob,presentationJob)
             jobs.forEach { it.cancel() }
             check(withTimeoutOrNull(2000) { jobs.joinAll();true }==true) { "Native audio threads did not stop; release unconfirmed" }
@@ -193,3 +197,6 @@ internal class Pcm48To24 {
         return if(offset==output.size) output else output.copyOf(offset)
     }
 }
+
+private const val PLAYBACK_BUFFER_FRAMES=2880  // 120 ms at 24 kHz
+private const val PLAYBACK_START_FRAMES=1200   // 50 ms at 24 kHz
