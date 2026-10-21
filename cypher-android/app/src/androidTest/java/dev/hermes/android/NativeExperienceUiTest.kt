@@ -484,7 +484,8 @@ class NativeExperienceUiTest {
         clickText("Delete")
         compose.onAllNodesWithText("Delete", useUnmergedTree = true).onLast().performClick()
         await { fixture.boardTasks.isEmpty() }
-        compose.onAllNodes(hasText("Archived", substring = true)).assertCountEquals(1).onFirst().assertIsNotDisplayed()
+        // The emptied Archived column is hidden, and the board falls back to an existing column.
+        compose.onAllNodes(hasText("Archived", substring = true) and isSelectable()).assertCountEquals(0)
         compose.onNode(hasText("Triage 0") and isSelectable()).assertIsSelected()
         receipts += "Kanban edit and archive use native receipts; deleting the final archived card selects an existing column without a stranded page."
         capture("audit-kanban-lifecycle")

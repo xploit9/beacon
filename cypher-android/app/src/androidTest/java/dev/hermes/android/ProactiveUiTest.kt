@@ -88,7 +88,8 @@ class ProactiveUiTest {
         assertEquals("22:00", settingsWrite.getJSONObject("body").string("quiet_start"))
         assertEquals("07:00", settingsWrite.getJSONObject("body").string("quiet_end"))
 
-        // Rules wait until the saved settings come back.
+        // Rules wait until the saved settings come back; the rules card sits below the email card.
+        compose.onNodeWithTag("assistant-settings").performScrollToNode(hasTestTag("proactive-add-rule"))
         await { runCatching { compose.onNodeWithTag("proactive-add-rule").assertIsEnabled() }.isSuccess }
         compose.onNodeWithTag("proactive-add-rule").performScrollTo().performClick()
         await { vm.form.value?.title == "Add a rule" }
