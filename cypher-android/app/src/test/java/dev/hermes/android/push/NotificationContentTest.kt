@@ -52,11 +52,11 @@ class NotificationContentTest {
         assertFalse(isEmailAlertNotificationRoute(route(kind = "completion"), "source", "event", scope, "chat"))
         assertFalse(isEmailAlertNotificationRoute(route(), "other", "event", scope, "chat"))
     }
-    @Test fun completionNotificationIsSuppressedOnlyWhileCypherIsVisible() {
-        assertFalse(shouldPostPushNotification("completion", true))
-        assertTrue(shouldPostPushNotification("completion", false))
+    @Test fun completionNotificationIsSilentOnlyWhileCypherIsVisible() {
+        assertTrue(silentPushNotification("completion", true))
+        assertFalse(silentPushNotification("completion", false))
         listOf("failure", "approval", "clarify", "task_result", "test", "incoming_call").forEach {
-            assertTrue(it, shouldPostPushNotification(it, true))
+            assertFalse(it, silentPushNotification(it, true))
         }
     }
 }
