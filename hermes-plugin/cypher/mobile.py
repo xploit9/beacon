@@ -454,13 +454,15 @@ def remove_device(owner, device_id):
 
 
 def touch_device(owner, provider, profile, device_id, update_seen=True):
+    """Marks the owner's phone as seen and refuses only a phone the owner removed. The Hermes sign-in authorizes the
+    request; the device ID is not a credential, so an unknown ID (or one pairing on another profile) changes nothing."""
     if not isinstance(device_id, str) or not ID.fullmatch(device_id):
-        raise LookupError('device_not_authorized')
+        return
     now = time.time()
     with LOCK, connect() as conn:
-        row = conn.execute('SELECT owner,provider,profile,removed FROM cypher_devices WHERE id=?', (device_id,)).fetchone()
-        if not row or row['owner'] != owner or row['provider'] != provider or profile is not None and row['profile'] != profile:
-            raise LookupError('device_not_authorized')
+        row = conn.execute('SELECT owner,provider,removed FROM cypher_devices WHERE id=?', (device_id,)).fetchone()
+        if not row or row['owner'] != owner or row['provider'] != provider:
+            return
         if row['removed']:
             raise LookupError('device_removed')
         if update_seen: conn.execute('UPDATE cypher_devices SET last_seen=? WHERE id=? AND removed=0', (now, device_id))

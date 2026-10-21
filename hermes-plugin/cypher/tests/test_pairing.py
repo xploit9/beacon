@@ -285,3 +285,21 @@ def test_cli_pairs_on_a_fresh_install_before_anyone_signed_in(harness, monkeypat
 
     assert "Pairing code: ABC-723" in plugin._pairing_block(None, "Pixel")
     assert minted[0][:3] == ("", "default", "Pixel")
+
+
+def test_a_paired_phone_works_on_every_profile_and_only_removal_refuses_it(harness, monkeypatch):
+    api, _, _, _, _ = harness
+    mobile = api.mobile
+    pairing = mobile.mint_device_pairing("owner", "default", "Pixel", "https://hermes.example.test", "hermes.example.test")
+    ticket = mobile.redeem_device_pairing(pairing["code"], None, "phone")["link_ticket"]
+    assert mobile.link_paired_device(pairing["device_id"], ticket, "owner", "basic")
+    # Paired on "default", the same phone keeps working on the owner's other profiles.
+    mobile.touch_device("owner", "basic", "work", pairing["device_id"])
+    # An ID this Hermes never linked (for example after its plugin data was reset) is ignored, not a lockout.
+    mobile.touch_device("owner", "basic", "default", "f" * 32)
+    assert mobile.remove_device("owner", pairing["device_id"])
+    try:
+        mobile.touch_device("owner", "basic", "work", pairing["device_id"])
+        raise AssertionError("a removed phone must be refused")
+    except LookupError as exc:
+        assert str(exc) == "device_removed"
