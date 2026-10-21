@@ -565,7 +565,7 @@ def test_call_feedback_survives_ringing_and_hides_the_id_after_idempotent_save(h
                          json={"notice_id":notice_id,"verdict":"not_important"})
 
     assert first.status_code==200 and repeated.status_code==200
-    assert len(store.user_entries)==1 and "important to the owner" in store.user_entries[0]
+    assert len(store.user_entries)==1 and store.user_entries[0].endswith(" are important to the owner.")
     row=next(item for item in client.get("/api/plugins/cypher/mobile/calls").json()["calls"]
              if item["id"]==notice_id)
     assert "email_notice_id" not in row

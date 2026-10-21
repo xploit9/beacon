@@ -693,8 +693,6 @@ async def notice_detail(event_id:str,request:Request):
             email_alert=conn.execute('SELECT 1 FROM meta WHERE key=?',('proactive-email-notice:'+event_id,)).fetchone() is not None
         phone_job=row['job_id'] if isinstance(row['job_id'],str) else ''
         if email_alert: result.update(email_alert=True,preview={'title':'Important email','body':result['preview']['body']})
-        elif phone_job.startswith('phone-cron-') or phone_job.startswith('phone-') and not phone_job.startswith('phone-hermes-'):
-            result['preview']={'title':'Task finished','body':result['preview']['body']}
         elif phone_job.startswith('phone-hermes-'):
             result['preview']={'title':'Hermes','body':result['preview']['body']}
     if row['request_id'] and result['state']=='pending':

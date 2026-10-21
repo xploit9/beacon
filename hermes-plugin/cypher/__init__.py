@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import re
+import shlex
 import sys
 
 ROOT=Path(__file__).resolve().parent
@@ -252,8 +253,8 @@ _BLOCKED_PROACTIVE_TOOLSETS={'delegation','code_execution','computer_use','kanba
 _BLOCKED_PROACTIVE_TOOLS={'delegate_task','execute_code','computer_use','kanban','cronjob_manage',
                           'cypher_call_user','browser_click','browser_type','browser_press',
                           'browser_cdp','browser_exec','web_extract','web_fetch'}
-_TERMINAL_WRITE_WORDS={'send','reply','forward','delete','trash','move','archive','modify','flag','copy',
-                       'expunge','insert','import','mark','untrash','batchdelete','batchmodify','draft'}
+# Read commands only: the subcommand words before the first option say what runs.
+_HIMALAYA_READS={('envelope','list'),('message','read'),('folder','list')}
 _READ_ONLY_MESSAGE='Proactive runs are read-only; this would change something.'
 
 def _tool_words(name):
@@ -294,12 +295,18 @@ def _contains_http_url(value):
 def _watch_terminal_read_only(command):
     if not isinstance(command,str) or not command.strip() or any(char in command for char in ';|&$`<>()\r\n'):
         return False
-    match=re.match(r'^\s*(?:"([^"]+)"|\'([^\']+)\'|(\S+))',command)
-    if not match: return False
-    executable=next(value for value in match.groups() if value is not None)
-    basename=re.split(r'[\\/]',executable)[-1].casefold()
+    try: words=[word.strip('\'"') for word in shlex.split(command,posix=False)]
+    except ValueError: return False
+    if not words: return False
+    basename=re.split(r'[\\/]',words[0])[-1].casefold()
     if basename.endswith('.exe'): basename=basename[:-4]
-    return basename in {'gws','himalaya'} and not bool(_tool_words(command)&_TERMINAL_WRITE_WORDS)
+    path=[]
+    for word in words[1:]:
+        if word.startswith('-'): break
+        path.append(word.casefold())
+    if basename=='gws': return len(path)>=2 and path[-1] in {'list','get'}
+    if basename=='himalaya': return tuple(path[:2]) in _HIMALAYA_READS
+    return False
 
 def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**kwargs):
     """Veto write-capable tools only in Cypher's email-watch cron session, including a run that

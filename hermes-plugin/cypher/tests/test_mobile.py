@@ -1288,3 +1288,11 @@ def test_mobile_schema_initializes_once_per_database_in_process(harness, monkeyp
     with api.mobile.connect():
         pass
     assert len(scripts) == 2
+
+
+def test_call_user_invitation_deduplicates_only_within_its_chat(harness):
+    api,c,cfg,tmp,app=harness
+    first=api.mobile.invitation('owner','default','chat-a','Build failed',deduplicate=True)
+    assert api.mobile.invitation('owner','default','chat-a','Build failed again',deduplicate=True)==first
+    # Another chat's ringing call carries another reason, so it gets its own invitation.
+    assert api.mobile.invitation('owner','default','chat-b','Flight moved',deduplicate=True)!=first

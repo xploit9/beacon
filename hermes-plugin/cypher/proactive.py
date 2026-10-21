@@ -801,7 +801,8 @@ def add_email_feedback(mobile, owner, profile, notice_id, verdict):
     if not call_log_id and (not notice or not marker or notice["owner"] != owner or notice["profile"] != profile):
         raise LookupError("Proactive email alert not found")
     from cypher_observers import reason_text
-    summary = reason_text(notice["reason"], 240)
+    # A rule-matched call's reason ends with " Rule: <rule>"; the note is about the email only.
+    summary = reason_text(notice["reason"].split(" Rule: ", 1)[0].rstrip("."), 240)
     note = LEARNED_PREFIX + f"Emails like {summary} are " + (
         "important to the owner." if verdict == "important" else "not important to the owner.")
 

@@ -546,11 +546,12 @@ def invitation(owner,profile,conversation,reason=None,*,deduplicate=False):
     with LOCK,connect() as conn:
         prune_notices(conn)
         if deduplicate:
-            existing=conn.execute("SELECT id FROM notices WHERE owner=? AND profile=? AND kind='incoming_call' AND state='pending' AND expires>? ORDER BY created,id LIMIT 1",
-                                  (owner,profile,time.time())).fetchone()
+            # Same chat only: another chat's ringing call carries another reason.
+            existing=conn.execute("SELECT id FROM notices WHERE owner=? AND profile=? AND conversation=? AND kind='incoming_call' AND state='pending' AND expires>? ORDER BY created,id LIMIT 1",
+                                  (owner,profile,ident(conversation),time.time())).fetchone()
             if existing: return existing['id']
-            existing=conn.execute('SELECT id FROM deferred WHERE owner=? AND profile=? ORDER BY created,id LIMIT 1',
-                                  (owner,profile)).fetchone()
+            existing=conn.execute('SELECT id FROM deferred WHERE owner=? AND profile=? AND conversation=? ORDER BY created,id LIMIT 1',
+                                  (owner,profile,ident(conversation))).fetchone()
             if existing: return existing['id']
         active=active_calls(conn,owner)
         if active:
