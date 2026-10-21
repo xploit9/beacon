@@ -298,9 +298,27 @@ def _contains_http_url(value):
     if isinstance(value,list): return any(_contains_http_url(item) for item in value)
     return False
 
+def _bash_unquoted(command):
+    """The characters bash sees outside quotes (in double quotes a backslash escapes the next one); None if unbalanced."""
+    out=[];quote=None;escaped=False
+    for char in command:
+        if escaped: escaped=False; continue
+        if quote=="'":
+            if char=="'": quote=None
+        elif quote=='"':
+            if char=='\\': escaped=True
+            elif char=='"': quote=None
+        elif char in '\'"': quote=char
+        else: out.append(char)
+    return None if quote else ''.join(out)
+
 def _watch_terminal_read_only(command):
     # '#' starts a shell comment that shlex keeps as a word, so "write # get" would read as a get.
     if not isinstance(command,str) or not command.strip() or any(char in command for char in ';|&$`<>()#\r\n'):
+        return False
+    # Hermes runs `bash -c`: an unquoted \-\-x or {--x,y} reaches the tool as an option shlex never saw.
+    unquoted=_bash_unquoted(command)
+    if unquoted is None or any(char in unquoted for char in '\\{}*?[]~'):
         return False
     try: words=[word.strip('\'"') for word in shlex.split(command,posix=False)]
     except ValueError: return False

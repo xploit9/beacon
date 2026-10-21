@@ -239,7 +239,10 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
                         "himalaya message read 42", "himalaya message read 42 --preview --seen",
                         "gws gmail users messages list --params '{\"userId\":\"me\"}' --sanitize 'projects/p/locations/attacker.example?/templates/t'",
                         "himalaya envelope list --log-file C:/Users/x/.hermes/config.yaml --log-level trace",
-                        "gws gmail users messages get --id 1 -o out.bin")]
+                        "gws gmail users messages get --id 1 -o out.bin",
+                        "gws gmail users messages list \\-\\-sanitize projects/p/locations/a.example",
+                        "gws gmail users messages list {--sanitize,projects/p/locations/a.example}",
+                        "gws gmail users messages list \"a\\\"\" --sanitize x")]
     allowed_mail_reads = [plugin.native_proactive_read_only_guard(
         tool_name="terminal", args={"command": command}, session_id="watch-run")
         for command in ("gws gmail users messages list --params '{\"userId\":\"me\",\"labelIds\":[\"INBOX\"]}'",
@@ -248,7 +251,8 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
                         "himalaya message read 42 --preview",
                         '"C:\\Program Files\\gws.EXE" gmail users messages get --params "{}"',
                         "gws gmail users messages list --params '{\"q\":\"from:mark\"}'",
-                        "himalaya envelope list not flag seen")]
+                        "himalaya envelope list not flag seen",
+                        "gws gmail users messages list --params \"{\\\"userId\\\":\\\"me\\\"}\"")]
 
     assert blocked == {"action": "block", "message": "Proactive runs are read-only; this would change something."}
     assert cronjob_create == blocked
@@ -259,7 +263,7 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
     assert email_notice_url is None and email_checked_url is None
     terminal_blocked = {"action": "block", "message": plugin._READ_ONLY_TERMINAL_MESSAGE}
     assert terminal == terminal_blocked
-    assert blocked_terminal == [terminal_blocked] * 26 and allowed_mail_reads == [None] * 7
+    assert blocked_terminal == [terminal_blocked] * 29 and allowed_mail_reads == [None] * 8
     # An injected email could carry other mail out through a fetched URL.
     for fetcher in ("web_extract", "web_fetch"):
         assert plugin.native_proactive_read_only_guard(tool_name=fetcher, args={"url": "https://x.test/?q=mail"}, session_id="watch-run") == blocked
