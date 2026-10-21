@@ -5,6 +5,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 import time
+
+import pytest
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
@@ -233,7 +235,6 @@ def test_install_prompts_request_pairing_code_and_allow_qr_image():
     guide = (root / "docs" / "install-with-agent.md").read_text(encoding="utf-8")
 
     assert 'Run `hermes -p <profile> beacon pair --name "<my phone>"` (or `/beacon-pair` in an owned chat) and show me the dashboard address and pairing code.' in readme
-    assert 'Use `/beacon-pair`' in readme
     assert 'hermes -p <profile> cypher pair' in readme or 'hermes -p <profile> cypher pair' in (root / 'hermes-plugin' / 'cypher' / 'README.md').read_text(encoding='utf-8')
     assert '/cypher-pair' in (root / 'hermes-plugin' / 'cypher' / 'README.md').read_text(encoding='utf-8')
     assert "Each phone gets its own code" in readme

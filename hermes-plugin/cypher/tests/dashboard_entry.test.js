@@ -13,6 +13,7 @@ function renderConnectPhone(info, fetchJSON = async (request) => request.endsWit
   let qrPayload;
   let copied;
   const requests = [];
+  const intervals = [];
   const stateUpdates = [];
   const stateValues = [];
   const effectDependencies = [];
@@ -68,7 +69,7 @@ function renderConnectPhone(info, fetchJSON = async (request) => request.endsWit
     document: { currentScript: null, head: { appendChild() {} } },
     navigator,
     URLSearchParams,
-    setInterval: () => 1,
+    setInterval: (callback) => intervals.push(callback),
     clearInterval() {},
     window,
   });
@@ -88,7 +89,8 @@ function renderConnectPhone(info, fetchJSON = async (request) => request.endsWit
   };
   const firstRender = render();
   const copy = () => firstRender.nodes.find((node) => node.type === "button" && node.children.includes("Copy connection link")).props.onClick().then(() => copied);
-  return { ...firstRender, render, requests, stateUpdates, get qrPayload() { return qrPayload; }, copy };
+  const tick = async () => { for (const callback of [...intervals]) callback(); await new Promise((resolve) => setTimeout(resolve, 0)); };
+  return { ...firstRender, render, requests, stateUpdates, get qrPayload() { return qrPayload; }, copy, tick };
 }
 
 test("session stays in the scanner QR payload and out of visible or copied links", async () => {
@@ -160,6 +162,30 @@ test("pairing button mints a code-bearing QR and shows its expiry", async () => 
   assert.ok(JSON.stringify(rendered.tree).includes("ABC-723"), JSON.stringify(page.stateUpdates));
   assert.match(JSON.stringify(rendered.tree), /\d{1,2}:\d{2}/);
   assert.equal(page.qrPayload, pairing.qr_link);
+});
+
+test("the code turns into a paired confirmation once the phone links", async () => {
+  const pairing = {
+    device_id: "device-1",
+    code: "ABC-723",
+    expires_at: new Date(Date.now() + 600000).toISOString(),
+    dashboard_url: "https://hermes.example",
+    qr_link: "cypher://connect?url=https%3A%2F%2Fhermes.example&code=ABC-723",
+  };
+  let linked = false;
+  const page = renderConnectPhone({ url: "https://hermes.example", name: "Hermes", session: "" }, async (path, options) => {
+    if (path.endsWith("/devices")) return { devices: linked ? [{ device_id: "device-1", name: "Pixel", profile: "default", created_at: 1, last_seen: 1 }] : [], profiles: ["default"] };
+    if (path.endsWith("/pairing") && options?.method === "POST") return pairing;
+    return { url: "https://hermes.example", name: "Hermes", session: "" };
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await page.render().nodes.find((node) => node.type === "button" && node.children.includes("Pair a phone")).props.onClick();
+  page.render();
+  linked = true;
+  await page.tick();
+  const text = JSON.stringify(page.render().tree);
+  assert.ok(text.includes("Pixel is paired."), text);
+  assert.ok(!text.includes("ABC-723"));
 });
 
 test("pairing uses the selected Hermes profile when several are available", async () => {

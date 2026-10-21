@@ -125,7 +125,7 @@ def build_router(identity, body, native):
                 raise HTTPException(503, 'Shared-space list could not be refreshed; try again')
             offset = following
         else:
-            raise HTTPException(409, f'Cypher checked {SPACE_SCAN_LIMIT:,} group rooms and stopped before creating a duplicate. Archive unused rooms in Hermes, then try again.')
+            raise HTTPException(409, f'Beacon checked {SPACE_SCAN_LIMIT:,} group rooms and stopped before creating a duplicate. Archive unused rooms in Hermes, then try again.')
         members = [{'member_id': p, 'profile': p, 'handle': 'hermes' if p == 'default' else p,
                     'target': {'kind': 'local', 'profile': p}} for p in chosen]
         return await rpc(owner, provider, profile, 'groups.create', room_id=rid, name='Shared space', members=members)

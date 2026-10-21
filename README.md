@@ -48,7 +48,7 @@ everything up end to end and asks you before anything that needs your say:
 
 The public repository needs no GitHub login; if Releases cannot be reached, check network access.
 
-**2. On your phone**, download `Beacon-1.0.0.apk` from [Releases](https://github.com/xploit9/beacon/releases) and install
+**2. On your phone**, download `Beacon-1.1.0.apk` from [Releases](https://github.com/xploit9/beacon/releases) and install
 it. Open it. Scan the QR, choose a screenshot of it, or type the address and code, then follow the setup wizard.
 
 The app is `dev.hermes.android.stable` ("Beacon"). It installs next to any older Beacon build without touching it.

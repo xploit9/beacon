@@ -78,7 +78,7 @@ def test_auto_check_is_six_hour_throttled_across_module_restart(harness,monkeypa
 
 def test_newer_plugin_uses_hermes_native_update_path_when_enabled(harness,monkeypatch):
     api,client,cfg,_,_=harness
-    checked,updated=_auto(api,monkeypatch,plugin_version='1.1.0')
+    checked,updated=_auto(api,monkeypatch,plugin_version='1.2.0')
 
     result=api.auto_update_check(cfg,now=2_000_000)
 
@@ -86,13 +86,13 @@ def test_newer_plugin_uses_hermes_native_update_path_when_enabled(harness,monkey
     # This process still runs 1.0.0 code, so the update finishes only after a restart.
     assert result['result']=='restart_required'
     assert result['message']=='Restart Hermes to finish the plugin update.'
-    assert client.get('/api/plugins/cypher/mobile/update-settings').json()['plugin_version']=='1.1.0'
+    assert client.get('/api/plugins/cypher/mobile/update-settings').json()['plugin_version']=='1.2.0'
 
 
 def test_plugin_update_is_complete_when_running_code_matches_installed(harness,monkeypatch):
     api,_,cfg,_,_=harness
-    _,updated=_auto(api,monkeypatch,plugin_version='1.1.0')
-    monkeypatch.setattr(api,'_RUNNING_PLUGIN_VERSION','1.1.0')
+    _,updated=_auto(api,monkeypatch,plugin_version='1.2.0')
+    monkeypatch.setattr(api,'_RUNNING_PLUGIN_VERSION','1.2.0')
 
     result=api.auto_update_check(cfg,now=2_000_000)
 
@@ -120,7 +120,7 @@ def test_plugin_update_runs_inside_hermes_profile_secret_scope(harness,monkeypat
 def test_disabled_plugin_auto_update_does_not_call_hermes_updater(harness,monkeypatch):
     api,client,cfg,_,_=harness
     client.put('/api/plugins/cypher/mobile/update-settings',json={'enabled':False})
-    checked,updated=_auto(api,monkeypatch,plugin_version='1.1.0')
+    checked,updated=_auto(api,monkeypatch,plugin_version='1.2.0')
 
     api.auto_update_check(cfg,now=2_000_000)
 
@@ -129,7 +129,7 @@ def test_disabled_plugin_auto_update_does_not_call_hermes_updater(harness,monkey
 
 def test_active_hermes_work_defers_reload_and_records_restart_hint(harness,monkeypatch):
     api,client,cfg,_,_=harness
-    checked,updated=_auto(api,monkeypatch,plugin_version='1.1.0',busy=True)
+    checked,updated=_auto(api,monkeypatch,plugin_version='1.2.0',busy=True)
 
     result=api.auto_update_check(cfg,now=2_000_000)
 
@@ -141,7 +141,7 @@ def test_active_hermes_work_defers_reload_and_records_restart_hint(harness,monke
 
 def test_deferred_plugin_update_retries_when_hermes_becomes_idle_without_another_release_check(harness,monkeypatch):
     api,_,cfg,_,_=harness
-    checked,updated=_auto(api,monkeypatch,plugin_version='1.1.0',busy=True)
+    checked,updated=_auto(api,monkeypatch,plugin_version='1.2.0',busy=True)
     first=api.auto_update_check(cfg,now=2_000_000)
     assert first['result']=='waiting_for_idle' and updated==[]
     monkeypatch.setattr(api,'_hermes_busy',lambda owner:False)
@@ -275,7 +275,7 @@ def test_restart_hint_survives_a_later_up_to_date_check(harness,monkeypatch):
     api,_,cfg,_,_=harness
     checked,updated=_auto(api,monkeypatch,plugin_version='1.0.0')
     # 1.1.0 is installed on disk but this process still runs 1.0.0, and the release page has nothing newer.
-    monkeypatch.setattr(api,'_installed_plugin_version',lambda:'1.1.0')
+    monkeypatch.setattr(api,'_installed_plugin_version',lambda:'1.2.0')
     monkeypatch.setattr(api,'_RUNNING_PLUGIN_VERSION','1.0.0')
 
     result=api.auto_update_check(cfg,now=2_000_000)
@@ -287,9 +287,9 @@ def test_restart_hint_survives_a_later_up_to_date_check(harness,monkeypatch):
 def test_restart_hint_clears_when_process_runs_the_installed_version(harness,monkeypatch):
     api,_,cfg,_,_=harness
     owner=cfg['owner_id']
-    api.mobile.record_auto_update_status(owner,2_000_000,'restart_required','1.0.0','1.1.0','Restart Hermes to finish the plugin update.')
-    monkeypatch.setattr(api,'_RUNNING_PLUGIN_VERSION','1.1.0')
-    monkeypatch.setattr(api,'_installed_plugin_version',lambda:'1.1.0')
+    api.mobile.record_auto_update_status(owner,2_000_000,'restart_required','1.0.0','1.2.0','Restart Hermes to finish the plugin update.')
+    monkeypatch.setattr(api,'_RUNNING_PLUGIN_VERSION','1.2.0')
+    monkeypatch.setattr(api,'_installed_plugin_version',lambda:'1.2.0')
     monkeypatch.setattr(api,'_check_release_and_announce',lambda cfg,before_apk=None:pytest.fail('throttled check should not fetch releases'))
 
     result=api.auto_update_check(cfg,now=2_000_001)

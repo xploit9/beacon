@@ -29,6 +29,7 @@
       const [pairingError, setPairingError] = useState('');
       const [devicesError, setDevicesError] = useState('');
       const [pairingQrError, setPairingQrError] = useState(false);
+      const [paired, setPaired] = useState(null);
 
       useEffect(() => {
         let active = true;
@@ -110,6 +111,23 @@
         return () => clearInterval(timer);
       }, [pairing ? pairing.expires_at : null]);
 
+      // While a code is showing, watch for the phone to link (its ticket lasts 15 minutes after the code is used).
+      useEffect(() => {
+        if (!pairing || !pairing.device_id) return undefined;
+        let active = true;
+        const stopAt = Date.parse(pairing.expires_at) + 15 * 60 * 1000;
+        const timer = setInterval(() => {
+          if (Date.now() > stopAt) { clearInterval(timer); return; }
+          sdk.fetchJSON('/api/plugins/cypher/devices').then((value) => {
+            if (!active || !Array.isArray(value.devices)) return;
+            setDevices(value.devices);
+            const linked = value.devices.find((device) => device.device_id === pairing.device_id);
+            if (linked) { setPaired(linked); setPairing(null); }
+          }).catch(() => {});
+        }, 3000);
+        return () => { active = false; clearInterval(timer); };
+      }, [pairing ? pairing.device_id : null]);
+
       async function copyLink() {
         try {
           await navigator.clipboard.writeText(link);
@@ -126,6 +144,7 @@
         }
         setPairingBusy(true);
         setPairingError('');
+        setPaired(null);
         try {
           const value = await sdk.fetchJSON('/api/plugins/cypher/pairing', {
             method: 'POST',
@@ -180,6 +199,7 @@
       }
 
       function renderPairing() {
+        if (paired && !pairing) return h('p', { className: 'mt-4 text-sm font-medium', role: 'status' }, `${paired.name} is paired.`);
         if (!pairing) return null;
         if (pairingSeconds <= 0) return h('p', { className: 'mt-3 text-sm text-muted-foreground', role: 'status' }, 'Pairing code expired. Select Pair a phone to create another.');
         const minutes = String(Math.floor(pairingSeconds / 60)).padStart(2, '0');

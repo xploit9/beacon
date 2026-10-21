@@ -61,14 +61,14 @@ def test_auto_update_and_stable_metadata_work_without_local_android_tools(harnes
     api,client,cfg,tmp,_=harness
     cfg.pop('aapt',None);cfg.pop('apksigner',None)
     apk,manifest=_release()
-    manifest['plugin_version']='1.1.0'
+    manifest['plugin_version']='1.2.0'
     patterns=_fake_github(api,monkeypatch,cfg,
         {manifest['artifact_filename']:apk,'Beacon-1.0.0.json':json.dumps(manifest).encode()},
         {manifest['artifact_filename']:(100,'1.0.0')})
     installed=['1.0.0'];updates=[]
     monkeypatch.setattr(api,'_installed_plugin_version',lambda:installed[0])
     monkeypatch.setattr(api,'_hermes_busy',lambda owner:False)
-    monkeypatch.setattr(api,'_update_cypher_plugin',lambda:updates.append('cypher') or installed.__setitem__(0,'1.1.0') or {'ok':True})
+    monkeypatch.setattr(api,'_update_cypher_plugin',lambda:updates.append('cypher') or installed.__setitem__(0,'1.2.0') or {'ok':True})
     release_checks=[]
     release=api.release
     def track_release(*args,**kwargs):
@@ -83,7 +83,7 @@ def test_auto_update_and_stable_metadata_work_without_local_android_tools(harnes
     assert release_checks and release_checks[0]==['cypher']
     assert patterns==['Beacon-*.json','Beacon-1.0.0.apk']
     assert metadata.status_code==200,metadata.text
-    assert metadata.json()['plugin_version']=='1.1.0'
+    assert metadata.json()['plugin_version']=='1.2.0'
     assert metadata.json()['sha256']==manifest['sha256']
 
 
@@ -221,16 +221,16 @@ def test_release_check_refreshes_plugin_metadata_without_redownloading_same_apk(
     (root/old['artifact_filename']).write_bytes(apk)
     (root/(old['sha256']+'.json')).write_text(json.dumps(old))
     (root/'latest.json').write_text(json.dumps(old))
-    manifest['plugin_version']='1.1.0'
+    manifest['plugin_version']='1.2.0'
     patterns=_fake_github(api,monkeypatch,cfg,{'Beacon-1.0.0.json':json.dumps(manifest).encode()},
                           {manifest['artifact_filename']:(100,'1.0.0')})
 
     response=client.post('/api/plugins/cypher/mobile/releases/check')
 
     assert response.status_code==200,response.text
-    assert response.json()['plugin_version']=='1.1.0'
+    assert response.json()['plugin_version']=='1.2.0'
     assert response.json()['available'] is False
-    assert json.loads((root/'latest.json').read_text())['plugin_version']=='1.1.0'
+    assert json.loads((root/'latest.json').read_text())['plugin_version']=='1.2.0'
     assert patterns==['Beacon-*.json']
 
 

@@ -169,11 +169,13 @@ def _owner_first_name(display_name):
 def greeting_for(display_name,clock,callback):
     name=_owner_first_name(display_name)
     if callback:
-        return (f"Hi, {name}. I'm calling about your saved Hermes update." if name
-                else "I'm calling about your saved Hermes update.")
+        return (f"Hi, {name}. I'm calling with the update you asked for." if name
+                else "I'm calling with the update you asked for.")
     match=re.search(r'\b([01]?\d|2[0-3]):[0-5]\d\b',clock or '')
     if not match: return "I'm here."
     hour=int(match.group(1))
+    # Before 5 a.m. "Good morning" sounds wrong, so a late-night call just says hi.
+    if hour<5: return f"Hi{', '+name if name else ''}. What can I do for you?"
     part='morning' if hour<12 else 'afternoon' if hour<17 else 'evening'
     return f"Good {part}{', '+name if name else ''}. What can I do for you?"
 

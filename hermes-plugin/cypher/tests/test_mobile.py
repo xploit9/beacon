@@ -645,7 +645,7 @@ def test_callback_context_uses_exact_verified_job_binding(harness,monkeypatch):
         conn.execute("INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,state,call_id,job_id,reason) VALUES('notice','owner','default','incoming_call','native-stored',1,9999999999,'answered',?,'verified-job','Stored callback reason')",(cid,))
     context=api.voice_context.context('owner','basic','default','native-stored',cid)
     assert context['callback']=={'reason':'Verified reason','job_id':'verified-job','result':'Verified saved result'}
-    assert context['greeting']=="I'm calling about your saved Hermes update."
+    assert context['greeting']=="I'm calling with the update you asked for."
     assert 'Verified reason' not in context['greeting']
     assert 'Wrong newer result' not in context['context_summary']
 
@@ -787,7 +787,7 @@ def test_context_config_shapes_and_greeting_ascii(harness,monkeypatch):
     with api.mobile.connect() as conn:
         conn.execute("UPDATE calls SET callback_context=? WHERE id=?",(json.dumps({'reason':'fixture callback','job_id':''}),cid))
     result=api.voice_context.context('owner','basic','default','native-stored',cid)
-    assert result['greeting']=="I'm calling about your saved Hermes update." and result['greeting'].isascii()
+    assert result['greeting']=="I'm calling with the update you asked for." and result['greeting'].isascii()
     assert 'fixture callback' not in result['greeting']
 
 
