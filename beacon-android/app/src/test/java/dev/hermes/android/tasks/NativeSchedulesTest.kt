@@ -28,9 +28,15 @@ class NativeSchedulesTest {
     @Test fun statusNeverInfersRunningFromPersistence() {
         assertEquals("Execution unconfirmed",scheduleState(JSONObject()))
         assertEquals("Completed",scheduleState(JSONObject().put("enabled",false).put("state","completed")))
-        assertEquals("Scheduler needs attention",scheduleState(JSONObject().put("scheduler_heartbeat_age_s",200).put("next_run_at","tomorrow")))
+        assertEquals("Waiting",scheduleState(JSONObject().put("scheduler_heartbeat_age_s",200).put("next_run_at","tomorrow")))
         assertEquals("Failed",scheduleState(JSONObject().put("last_status","error")))
         assertEquals("Paused",scheduleState(JSONObject().put("paused",true)))
+    }
+    @Test fun staleSchedulerHeartbeatMovesTheExplanationToTheScreenLevel() {
+        val stale = JSONObject().put("scheduler_heartbeat_age_s", 200).put("next_run_at", "tomorrow")
+        assertTrue(scheduleGatewayNeedsAttention(stale))
+        assertEquals("Waiting", scheduleState(stale))
+        assertFalse(scheduleGatewayNeedsAttention(JSONObject().put("scheduler_heartbeat_age_s", 120)))
     }
     @Test fun pausedFollowsHermesEnabledAndStateOverAStaleLegacyFlag() {
         // Live 2026-10-19: enabled, state "scheduled", still running every 5 min, but a stale "paused": true.

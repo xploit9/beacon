@@ -4,6 +4,8 @@ import dev.hermes.android.core.json
 import dev.hermes.android.core.rows
 import dev.hermes.android.core.sessionRowId
 import dev.hermes.android.core.visibleSessionRows
+import dev.hermes.android.core.resolveAttachmentReference
+import dev.hermes.android.core.NativeReference
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import okhttp3.*
@@ -13,6 +15,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
+import okio.ByteString
 import java.io.IOException
 import java.util.concurrent.CopyOnWriteArrayList
 
@@ -31,11 +34,29 @@ import java.util.concurrent.CopyOnWriteArrayList
  */
 class NativeStockHistoryTest {
     /** Passive browsing must never open the native socket (no session.resume/history just to read). */
-    private class SocketProbe : WebSocket.Factory {
+    private class SocketProbe(private val archiveListing: Boolean = false) : WebSocket.Factory {
         val opened = CopyOnWriteArrayList<Request>()
+        val methods = CopyOnWriteArrayList<String>()
         override fun newWebSocket(request: Request, listener: WebSocketListener): WebSocket {
             opened += request
-            throw IOException("fixture: passive history must not open the native socket")
+            if (!archiveListing) throw IOException("fixture: passive history must not open the native socket")
+            val socket = object : WebSocket {
+                override fun request() = request
+                override fun queueSize() = 0L
+                override fun send(bytes: ByteString) = false
+                override fun close(code: Int, reason: String?) = true
+                override fun cancel() = Unit
+                override fun send(text: String): Boolean {
+                    val frame = JSONObject(text)
+                    val method = frame.getString("method"); methods += method
+                    check(method in setOf("client.capabilities", "session.list")) { "Archive browsing must not resume or create agents" }
+                    val result = if (method == "session.list") json("sessions" to JSONArray()) else json()
+                    listener.onMessage(this, json("jsonrpc" to "2.0", "id" to frame.getString("id"), "result" to result).toString())
+                    return true
+                }
+            }
+            listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Fixture").build())
+            return socket
         }
     }
 
@@ -68,6 +89,7 @@ class NativeStockHistoryTest {
             override(request)?.let { return it }
             val url = request.url
             val path = url.encodedPath
+            if (path == "/api/auth/ws-ticket") return 200 to json("ticket" to "fixture-ticket").toString()
             if (path.startsWith("/api/plugins/")) return pluginStatus to json("detail" to "fixture optional plugin failure").toString()
             val profile = url.queryParameter("profile")
             if (path == "/api/sessions") {
@@ -83,13 +105,13 @@ class NativeStockHistoryTest {
                 val page = rows.drop(offset).take(limit)
                 return 200 to json(listEnvelope to JSONArray(page), "total" to rows.size).toString()
             }
-            val match = Regex("/api/sessions/([^/]+)(/messages|/latest-descendant)?").matchEntire(path) ?: return 404 to json("detail" to "Not Found").toString()
+            val match = Regex("/api/sessions/([^/]+)(/messages(?:/around)?|/latest-descendant)?").matchEntire(path) ?: return 404 to json("detail" to "Not Found").toString()
             val id = match.groupValues[1]
             if ((active + archived).none { it.getString("id") == id } && id != "stored-a" && id != "empty-draft") return 404 to json("detail" to "Session not found").toString()
             val all = if (id == "empty-draft") emptyList() else messages
             val tip = compressedTip?.takeIf { id == "stored-a" }
             if (match.groupValues[2].isEmpty()) {
-                return 200 to json("id" to id, "session_id" to id, "profile" to profile, "title" to "Fixture title", "message_count" to all.size).toString()
+                return 200 to json("id" to id, "session_id" to id, "profile" to profile, "title" to "Fixture title", "message_count" to all.size, "last_active" to all.size).toString()
             }
             if (match.groupValues[2] == "/latest-descendant") {
                 chain?.takeIf { id == "stored-a" }?.let { return 200 to it.toString() }
@@ -101,9 +123,20 @@ class NativeStockHistoryTest {
             val offset = url.queryParameter("offset")?.toIntOrNull() ?: 0
             val order = url.queryParameter("order") ?: "oldest"
             // `latest` is the newest window; this fixture returns that window in chronological order.
-            val window = if (order == "latest") all.dropLast(offset).takeLast(limit) else all.drop(offset).take(limit)
+            val window = if (path.endsWith("/around")) all.filter { it.optLong("id") == url.queryParameter("row_id")?.toLong() }.take(limit)
+                else if (order == "latest") all.dropLast(offset).takeLast(limit) else all.drop(offset).take(limit)
+            val projected = window.map { row ->
+                if (url.queryParameter("inline_images") != "false" || row.opt("content") !is JSONArray) row else {
+                    val content = row.getJSONArray("content")
+                    val text = (0 until content.length()).joinToString("") { i ->
+                        val part = content.getJSONObject(i)
+                        if (part.optString("type") == "text") part.optString("text") else "\n[image]"
+                    }
+                    JSONObject(row.toString()).put("content", text)
+                }
+            }
             return 200 to json(
-                "session_id" to (tip ?: id), "profile" to profile, "messages" to JSONArray(window),
+                "session_id" to (tip ?: id), "profile" to profile, "messages" to JSONArray(projected),
                 "pagination" to json("limit" to limit, "offset" to offset, "order" to order, "returned" to window.size),
             ).toString()
         }
@@ -111,7 +144,7 @@ class NativeStockHistoryTest {
         companion object {
             fun rows(prefix: String, count: Int, profile: String? = "work") = (0 until count).map {
                 json("id" to "$prefix-$it", "title" to "$prefix title $it", "preview" to "secret preview words", "message_count" to 2)
-                    .apply { profile?.let { p -> put("profile", p) } }
+                    .apply { put("archived", prefix == "archived"); profile?.let { p -> put("profile", p) } }
             }
         }
     }
@@ -138,7 +171,7 @@ class NativeStockHistoryTest {
     private fun Stock.listPages() = requests.filter { it.url.encodedPath == "/api/sessions" }
     private fun ids(result: JSONObject) = (0 until result.getJSONArray("sessions").length()).map { result.getJSONArray("sessions").getJSONObject(it).getString("session_id") }
     private fun assertProfiled(stock: Stock) {
-        assertTrue("Every native read is scoped to the verified profile", stock.native().isNotEmpty() && stock.native().all { it.url.queryParameter("profile") == "work" })
+        assertTrue("Every history read is scoped to the verified profile", stock.native().isNotEmpty() && stock.native().filter { it.url.encodedPath.startsWith("/api/sessions") }.all { it.url.queryParameter("profile") == "work" })
     }
     private suspend fun list(c: BeaconClient, archived: Boolean = false, query: String = "") =
         if (query.isBlank()) c.get("/api/sessions", mapOf("profile" to "work", "include_archived" to if (archived) "1" else "0"))
@@ -172,7 +205,7 @@ class NativeStockHistoryTest {
     }
 
     @Test fun archivedListContainsOnlyArchivedConversations() = runBlocking<Unit> {
-        val stock = Stock(); val c = client(stock)
+        val stock = Stock(); val probe = SocketProbe(archiveListing = true); val c = client(stock, probe)
         val result = list(c, archived = true)
         assertEquals(listOf("archived-0", "archived-1"), ids(result))
         for (i in 0 until 2) assertTrue(result.getJSONArray("sessions").getJSONObject(i).getBoolean("archived"))
@@ -180,6 +213,7 @@ class NativeStockHistoryTest {
         assertTrue("Cron runs are excluded from archived recents", stock.listPages().all { it.url.queryParameter("exclude_sources") == "cron" })
         assertTrue("Zero-message sessions are excluded from archived recents", stock.listPages().all { it.url.queryParameter("min_messages") == "1" })
         assertProfiled(stock)
+        assertEquals(2, probe.methods.count { it == "session.list" })
     }
 
     @Test fun windowIsTwoBoundedPagesStopsEarlyAndDeduplicates() = runBlocking<Unit> {
@@ -224,7 +258,7 @@ class NativeStockHistoryTest {
         assertEquals(listOf("active-1"), ids(list(c, query = "ACTIVE TITLE 1")))
         assertEquals(listOf("active-2"), ids(list(c, query = "active-2")))
         assertEquals("Preview/content is not searchable", 0, ids(list(c, query = "secret preview")).size)
-        assertEquals(listOf("archived-0"), ids(list(c, archived = true, query = "archived-0")))
+        assertEquals(listOf("archived-0"), ids(list(client(stock, SocketProbe(archiveListing = true)), archived = true, query = "archived-0")))
         assertTrue(stock.pluginHistory().isEmpty())
         assertTrue(stock.listPages().all { (it.url.queryParameter("limit")?.toInt() ?: 0) in 1..100 })
         assertTrue("List and local-search requests both exclude cron runs", stock.listPages().all { it.url.queryParameter("exclude_sources") == "cron" })
@@ -308,9 +342,180 @@ class NativeStockHistoryTest {
         assertEquals("latest", reads.single().url.queryParameter("order"))
         assertEquals("500", reads.single().url.queryParameter("limit"))
         assertEquals("0", reads.single().url.queryParameter("offset") ?: "0")
+        assertEquals("false", reads.single().url.queryParameter("inline_images"))
         assertTrue(stock.pluginHistory().isEmpty())
         assertProfiled(stock)
         assertTrue("No session.resume/history socket for passive browsing", probe.opened.isEmpty())
+    }
+
+    @Test fun photoHistoryBeyond32MiBKeepsTextCanonicalFilesAndLazyLegacyImages() = runBlocking {
+        val image = "data:image/jpeg;base64," + "A".repeat(12 * 1024 * 1024)
+        val stock = Stock().apply {
+            messages = (1..3).map { i -> json("id" to i, "role" to "user", "content" to JSONArray()
+                .put(json("type" to "text", "text" to "Photo $i\n@image:/workspace/photo-$i.jpg"))
+                .put(json("type" to "image_url", "image_url" to json("url" to image)))) }
+        }
+        assertTrue("The original server page really exceeds the unchanged network cap", JSONArray(stock.messages).toString().toByteArray().size > 32 * 1024 * 1024)
+        val c = client(stock)
+        val history = c.get("/api/session", mapOf("session_id" to "stored-a"))
+        assertTrue(history.toString().length < 10_000)
+        assertEquals(3, history.getJSONArray("messages").length())
+        for (i in 1..3) {
+            val row = history.getJSONArray("messages").getJSONObject(i - 1)
+            assertTrue(row.getString("content").contains("Photo $i"))
+            val attachment = row.getJSONArray("attachments").getJSONObject(0)
+            val saved = resolveAttachmentReference(attachment, c.scope.session("stored-a")) as NativeReference.HistoryImage
+            assertEquals("/workspace/photo-$i.jpg", attachment.getString("path"))
+            assertEquals("stored-a", saved.sessionId)
+            assertEquals(i.toLong(), saved.rowId)
+            assertEquals(0, saved.imageIndex)
+        }
+        stock.messages = listOf(json("id" to 77, "role" to "user", "content" to JSONArray()
+            .put(json("type" to "text", "text" to "Old photo"))
+            .put(json("type" to "image_url", "image_url" to json("url" to image)))))
+        val legacy = c.get("/api/session", mapOf("session_id" to "stored-a"))
+        val receipt = legacy.getJSONArray("messages").getJSONObject(0).getJSONArray("attachments").getJSONObject(0)
+        val ref = resolveAttachmentReference(receipt, c.scope.session("stored-a")) as NativeReference.HistoryImage
+        assertEquals(77L, ref.rowId)
+        val downloaded = c.historyImage(ref)
+        assertEquals("image/jpeg", downloaded.mime)
+        assertEquals(9 * 1024 * 1024, downloaded.bytes.size)
+        val lazy = stock.requests.last()
+        assertEquals("/api/sessions/stored-a/messages/around", lazy.url.encodedPath)
+        assertEquals("77", lazy.url.queryParameter("row_id"))
+        assertEquals("1", lazy.url.queryParameter("limit"))
+        assertEquals("work", lazy.url.queryParameter("profile"))
+    }
+
+    @Test fun savedPhotoBytesWinOverUnchangedChangedOrMissingCanonicalFiles() = runBlocking {
+        for (fileState in listOf("unchanged", "changed", "missing")) {
+            val stock = Stock().apply {
+                messages = listOf(json("id" to 77, "role" to "user", "content" to JSONArray()
+                    .put(json("type" to "text", "text" to "Two photos\n@image:/workspace/first.png\n@image:/workspace/second.png"))
+                    .put(json("type" to "image_url", "image_url" to json("url" to "data:image/png;base64,AQID")))
+                    .put(json("type" to "image_url", "image_url" to json("url" to "data:image/jpeg;base64,BAUG")))))
+                override = { request -> if (request.url.encodedPath == "/api/fs/download")
+                    (if (fileState == "missing") 404 else 200) to (if (fileState == "changed") "replaced bytes" else "original bytes") else null }
+            }
+            val c = client(stock)
+            val row = c.get("/api/session", mapOf("session_id" to "stored-a")).getJSONArray("messages").getJSONObject(0)
+            val attachments = row.getJSONArray("attachments")
+            assertEquals(fileState, 2, attachments.length())
+            assertTrue("Saved bytes are fetched only when opened", stock.requests.none { it.url.encodedPath.endsWith("/around") })
+            repeat(2) { index ->
+                val ref = resolveAttachmentReference(attachments.getJSONObject(index), c.scope.session("stored-a")) as NativeReference.HistoryImage
+                assertEquals(77L, ref.rowId); assertEquals(index, ref.imageIndex)
+                val saved = c.historyImage(ref)
+                assertArrayEquals(fileState, if (index == 0) byteArrayOf(1, 2, 3) else byteArrayOf(4, 5, 6), saved.bytes)
+                assertEquals(if (index == 0) "image/png" else "image/jpeg", saved.mime)
+            }
+            assertTrue("Mutable files must not replace the saved photo: $fileState", stock.requests.none { it.url.encodedPath == "/api/fs/download" })
+            assertProfiled(stock)
+        }
+    }
+
+    @Test fun repeatedCanonicalPathKeepsEachSavedPhotoOccurrence() = runBlocking {
+        val stock = Stock().apply {
+            messages = listOf(json("id" to 77, "role" to "user", "content" to JSONArray()
+                .put(json("type" to "text", "text" to "Two originals\n@image:/workspace/photo.png\n@image:/workspace/photo.png"))
+                .put(json("type" to "image_url", "image_url" to json("url" to "data:image/png;base64,AQID")))
+                .put(json("type" to "image_url", "image_url" to json("url" to "data:image/jpeg;base64,BAUG")))))
+            override = { request -> if (request.url.encodedPath == "/api/fs/download") 200 to "replaced file bytes" else null }
+        }
+        val c = client(stock)
+        val history = c.get("/api/session", mapOf("session_id" to "stored-a"))
+        assertTrue("The transcript stays compact", history.toString().length < 2_000)
+        assertFalse(history.toString().contains("base64"))
+        assertEquals(500, history.getInt("history_limit"))
+        val attachments = history.getJSONArray("messages").getJSONObject(0).getJSONArray("attachments")
+        assertEquals(2, attachments.length())
+        val refs = (0 until attachments.length()).map { index ->
+            val receipt = attachments.getJSONObject(index)
+            assertEquals("/workspace/photo.png", receipt.getString("path"))
+            assertEquals("photo.png", receipt.getString("name"))
+            resolveAttachmentReference(receipt, c.scope.session("stored-a"))
+        }
+        assertEquals(listOf(NativeReference.HistoryImage("stored-a", 77, 0), NativeReference.HistoryImage("stored-a", 77, 1)), refs)
+        assertTrue("Originals load only when opened", stock.requests.none { it.url.encodedPath.endsWith("/around") })
+        refs.filterIsInstance<NativeReference.HistoryImage>().forEachIndexed { index, ref ->
+            val saved = c.historyImage(ref)
+            assertArrayEquals(if (index == 0) byteArrayOf(1, 2, 3) else byteArrayOf(4, 5, 6), saved.bytes)
+            assertEquals(if (index == 0) "image/png" else "image/jpeg", saved.mime)
+        }
+        val compact = stock.requests.single { it.url.encodedPath == "/api/sessions/stored-a/messages" }
+        assertEquals("false", compact.url.queryParameter("inline_images"))
+        assertEquals("500", compact.url.queryParameter("limit"))
+        val opened = stock.requests.filter { it.url.encodedPath.endsWith("/around") }
+        assertEquals(2, opened.size)
+        assertTrue(opened.all { it.url.encodedPath == "/api/sessions/stored-a/messages/around" && it.url.queryParameter("row_id") == "77" && it.url.queryParameter("limit") == "1" })
+        assertTrue("The mutable path never replaces either original", stock.requests.none { it.url.encodedPath in setOf("/api/fs/download", "/api/file/raw", "/api/media") })
+        assertProfiled(stock)
+    }
+
+    @Test fun pathOnlyPhotosKeepNativeFileReferencesAndMixedUnmatchedPathsStayAvailable() = runBlocking {
+        val stock = Stock().apply {
+            messages = listOf(
+                json("id" to 76, "role" to "user", "content" to "@image:/workspace/path-only.png"),
+                json("id" to 77, "role" to "user", "content" to JSONArray()
+                    .put(json("type" to "text", "text" to "@image:/workspace/first.png\n@image:/workspace/second.png"))
+                    .put(json("type" to "image_url", "image_url" to json("url" to "data:image/png;base64,AQID")))))
+        }
+        val c = client(stock)
+        val messages = c.get("/api/session", mapOf("session_id" to "stored-a")).getJSONArray("messages")
+        val path = resolveAttachmentReference(messages.getJSONObject(0).getJSONArray("attachments").getJSONObject(0), c.scope.session("stored-a")) as NativeReference.LocalMedia
+        assertEquals("/workspace/path-only.png", path.path)
+        val mixed = messages.getJSONObject(1).getJSONArray("attachments")
+        val refs = (0 until mixed.length()).map { resolveAttachmentReference(mixed.getJSONObject(it), c.scope.session("stored-a")) }
+        assertEquals(2, refs.filterIsInstance<NativeReference.LocalMedia>().size)
+        assertEquals(listOf(NativeReference.HistoryImage("stored-a", 77, 0)), refs.filterIsInstance<NativeReference.HistoryImage>())
+    }
+
+    @Test fun historyCarriesTheRawDisplayedBaselineEvenWhenANewerRowArrivesBeforeWatching() = runBlocking {
+        val stock = Stock(); val c = client(stock)
+        val initial = c.get("/api/session", mapOf("session_id" to "stored-a"))
+        val baseline = displayedNativeHistoryStamp(initial)
+        assertNotNull(baseline)
+        stock.messages = stock.messages + json("id" to 99, "role" to "assistant", "content" to "Landed before watcher startup")
+        val unread = c.nativeRequest("/api/sessions/stored-a", params = mapOf("profile" to "work"))
+        assertTrue(nativeHistoryNeedsRefresh(baseline, nativeHistoryStamp(unread)))
+        val reconciled = c.get("/api/session", mapOf("session_id" to "stored-a"))
+        assertEquals("Landed before watcher startup", reconciled.getJSONArray("messages").getJSONObject(3).getString("content"))
+        assertFalse(nativeHistoryNeedsRefresh(displayedNativeHistoryStamp(reconciled), nativeHistoryStamp(unread)))
+    }
+
+    @Test fun compressedInlineOnlyImageUsesABoundedFallbackAndRejectsAShiftedRow() = runBlocking {
+        val stock = Stock().apply {
+            compressedTip = "stored-a-tip"
+            messages = listOf(json("id" to 7, "role" to "user", "content" to JSONArray()
+                .put(json("type" to "text", "text" to "Ancestor photo"))
+                .put(json("type" to "image_url", "image_url" to json("url" to "data:image/png;base64,AQID")))))
+            override = { request -> if (request.url.encodedPath.endsWith("/around")) 404 to json("detail" to "Prompt not found").toString() else null }
+        }
+        val c = client(stock)
+        assertArrayEquals(byteArrayOf(1, 2, 3), c.historyImage(NativeReference.HistoryImage("stored-a", 7, 0)).bytes)
+        val raw = stock.requests.single { it.url.queryParameter("inline_images") == "true" }
+        assertEquals("1", raw.url.queryParameter("limit")); assertEquals("0", raw.url.queryParameter("offset"))
+        stock.override = { request -> when {
+            request.url.encodedPath.endsWith("/around") -> 404 to json("detail" to "Prompt not found").toString()
+            request.url.queryParameter("inline_images") == "true" -> 200 to json("profile" to "work", "session_id" to "stored-a-tip", "messages" to JSONArray().put(json("id" to 8, "role" to "user", "content" to JSONArray()))).toString()
+            else -> null
+        } }
+        assertTrue("Never preview a neighbouring row after an offset race", runCatching { c.historyImage(NativeReference.HistoryImage("stored-a", 7, 0)) }.isFailure)
+    }
+
+    @Test fun exactLazyHistoryRouteRejectsOtherIdentitiesAndPolicyExpansions() = runBlocking {
+        assertTrue(NativeOperationPolicy.direct("/api/sessions/stored-a/messages/around", "GET"))
+        for (path in listOf("/api/sessions/../messages/around", "/api/sessions/stored-a/messages/around/other", "/api/sessions/stored-a/messages/evil"))
+            assertFalse(path, NativeOperationPolicy.direct(path, "GET"))
+        assertFalse(NativeOperationPolicy.direct("/api/sessions/stored-a/messages/around", "POST"))
+        for (field in listOf("profile", "session_id")) {
+            val stock = Stock().apply { override = { request -> if (request.url.encodedPath.endsWith("/around"))
+                200 to json("profile" to "work", "session_id" to "stored-a", "messages" to JSONArray().put(json("id" to 77, "role" to "user"))).put(field, "foreign").toString() else null } }
+            assertTrue(runCatching { client(stock).historyImage(NativeReference.HistoryImage("stored-a", 77, 0)) }.isFailure)
+        }
+        val wrongRow = Stock().apply { override = { request -> if (request.url.encodedPath.endsWith("/around"))
+            200 to json("profile" to "work", "session_id" to "stored-a", "messages" to JSONArray().put(json("id" to 78, "role" to "user"))).toString() else null } }
+        assertTrue(runCatching { client(wrongRow).historyImage(NativeReference.HistoryImage("stored-a", 77, 0)) }.isFailure)
     }
 
     @Test fun newestWindowIsBoundedAndSaysSo() = runBlocking<Unit> {

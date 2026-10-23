@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
+import json
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
@@ -27,17 +28,12 @@ def native_file_adapter(tmp_path, monkeypatch):
         return None, target, root
 
     async def read_text(path):
-        return {'text': Path(path).read_text(encoding='utf-8'), 'binary': False, 'truncated': False}
-
-    async def write_text(value):
-        Path(value.path).write_text(value.content, encoding='utf-8')
+        return {'text': Path(path).read_text(encoding='utf-8', errors='replace'), 'binary': False, 'truncated': False}
 
     files = ModuleType('hermes_cli.web_routers.files')
     files._fs_path = lambda path: Path(path)
     files._is_sensitive_path = lambda path: Path(path).name in {'.env', '.env.local', 'credentials.json'}
     files.fs_read_text = read_text
-    files.fs_write_text = write_text
-    files.FsWriteText = lambda path, content: SimpleNamespace(path=path, content=content)
     web_files = ModuleType('hermes_cli.web_server_files')
     web_files._resolve_managed_path = managed_path
     hermes_cli = ModuleType('hermes_cli'); hermes_cli.__path__ = []
@@ -138,3 +134,102 @@ def test_pc_editor_repeated_windows_newline_saves_do_not_add_blank_lines(file_cl
         assert b'\r\r\n' not in target.read_bytes()
         assert target.read_text('utf-8') == content
         expected = content
+
+
+@pytest.mark.parametrize('newline', [b'\n', b'\r\n'])
+@pytest.mark.parametrize('bom', [b'', b'\xef\xbb\xbf'])
+def test_pc_editor_preserves_original_encoding_and_newline_bytes(file_client, tmp_path, newline, bom):
+    target = tmp_path / 'notes.txt'
+    target.write_bytes(bom + b'First' + newline)
+    read = file_client.get('/mobile/files/text', params={'path': str(target)})
+    assert read.json()['content'] == 'First\n'
+    result = file_client.post('/mobile/files/text', json={
+        'path': str(target), 'expected_content': read.json()['content'], 'content': 'First\r\nSecond\r\n'})
+    assert result.status_code == 200, result.text
+    assert target.read_bytes() == bom + b'First' + newline + b'Second' + newline
+    assert result.json()['content'] == 'First\nSecond\n'
+
+
+@pytest.mark.parametrize('bom', [b'', b'\xef\xbb\xbf'])
+def test_pc_editor_unchanged_mixed_newlines_preserve_exact_bytes(file_client, tmp_path, bom):
+    target = tmp_path / 'mixed.txt'
+    original = bom + b'a\r\nb\nc'
+    target.write_bytes(original)
+    text = file_client.get('/mobile/files/text', params={'path': str(target)}).json()['content']
+    saved = file_client.post('/mobile/files/text', json={
+        'path': str(target), 'expected_content': text, 'content': text})
+    assert saved.status_code == 200, saved.text
+    assert target.read_bytes() == original
+
+
+def test_pc_editor_mixed_newlines_do_not_force_crlf_on_edit(file_client, tmp_path):
+    target = tmp_path / 'mixed.txt'
+    target.write_bytes(b'a\r\nb\nc')
+    saved = file_client.post('/mobile/files/text', json={
+        'path': str(target), 'expected_content': 'a\nb\nc', 'content': 'a\nb\nc\nd'})
+    assert saved.status_code == 200, saved.text
+    assert target.read_bytes() == b'a\nb\nc\nd'
+
+
+@pytest.mark.parametrize('original,content', [(b'bad\xff\n', 'bad\ufffd\n'), (b'valid\n', 'bad\ufffd\n')])
+def test_pc_editor_refuses_replacement_characters_without_changing_file(file_client, tmp_path, original, content):
+    target = tmp_path / 'legacy.txt'
+    target.write_bytes(original)
+    read = file_client.get('/mobile/files/text', params={'path': str(target)}).json()
+    result = file_client.post('/mobile/files/text', json={
+        'path': str(target), 'expected_content': read['content'], 'content': content})
+    assert result.status_code == 400
+    assert 'UTF-8' in result.json()['detail']
+    assert target.read_bytes() == original
+
+
+def test_pc_editor_replace_failure_keeps_original_and_removes_staging(file_client, tmp_path, monkeypatch):
+    target = tmp_path / 'notes.txt'
+    target.write_bytes(b'Original\r\n')
+    def fail(*args): raise OSError('private disk path')
+    monkeypatch.setattr(api.os, 'replace', fail)
+    result = file_client.post('/mobile/files/text', json={
+        'path': str(target), 'expected_content': 'Original\n', 'content': 'Reviewed\n'})
+    assert result.status_code == 400
+    assert 'private disk path' not in result.text
+    assert target.read_bytes() == b'Original\r\n'
+    assert list(tmp_path.iterdir()) == [target]
+
+
+def test_pc_editor_rechecks_a_desktop_change_before_atomic_publication(file_client, tmp_path, monkeypatch):
+    target = tmp_path / 'notes.txt'
+    target.write_bytes(b'Original\n')
+    fsync = api.os.fsync
+    def desktop_change(fd):
+        fsync(fd)
+        target.write_bytes(b'Desktop edit\n')
+    monkeypatch.setattr(api.os, 'fsync', desktop_change)
+    response = file_client.post('/mobile/files/text', json={
+        'path': str(target), 'expected_content': 'Original\n', 'content': 'Phone edit\n'})
+    assert response.status_code == 409
+    assert target.read_bytes() == b'Desktop edit\n'
+    assert list(tmp_path.iterdir()) == [target]
+
+
+def test_pc_editor_rejects_unencodable_unicode_without_touching_the_file(file_client, tmp_path):
+    target = tmp_path / 'notes.txt'
+    target.write_bytes(b'Original\n')
+    response = file_client.post('/mobile/files/text', content=json.dumps({
+        'path': str(target), 'expected_content': 'Original\n', 'content': '\ud800'}),
+        headers={'content-type': 'application/json'})
+    assert response.status_code == 400 and 'UTF-8' in response.json()['detail']
+    assert target.read_bytes() == b'Original\n'
+
+
+def test_pc_editor_refuses_read_only_file_without_leaving_a_read_only_temp(file_client, tmp_path):
+    target = tmp_path / 'notes.txt'
+    target.write_bytes(b'Original\n')
+    target.chmod(0o444)
+    try:
+        response = file_client.post('/mobile/files/text', json={
+            'path': str(target), 'expected_content': 'Original\n', 'content': 'Changed\n'})
+        assert response.status_code == 403
+        assert target.read_bytes() == b'Original\n'
+        assert list(tmp_path.iterdir()) == [target]
+    finally:
+        target.chmod(0o600)

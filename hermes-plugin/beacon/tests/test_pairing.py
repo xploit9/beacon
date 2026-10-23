@@ -1,5 +1,5 @@
 import argparse
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 import io
 import json
 from datetime import datetime
@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from test_connect_info import set_public_url
 from test_mobile import harness, load_private
+from test_owner_claim import _native_profiles, _use_real_settings, _write_config
 
 
 PAIRING_ERROR = "That code didn't work. Make a new one on your PC."
@@ -135,6 +136,69 @@ def test_wrong_expired_and_reused_pairing_codes_share_one_plain_error(harness, m
     reused = redeem(client, used)
     assert reused.status_code == 400
     assert reused.json() == {"detail": PAIRING_ERROR}
+
+
+@pytest.mark.parametrize("valid_code", [False, True])
+@pytest.mark.parametrize("request_owner,configured_provider,status", [
+    ("foreign", "basic", 403),
+    (None, "basic", 401),
+    ("owner", "other-provider", 403),
+])
+def test_pairing_redeem_checks_identity_before_attempt_or_code_changes(
+    harness, monkeypatch, valid_code, request_owner, configured_provider, status,
+):
+    api, client, cfg, _, _ = harness
+    cfg["profiles"] = ["default", "work"]
+    set_public_url(monkeypatch, "https://hermes.example.test")
+    pairing = mint(client, profile="work")
+    with closing(api.mobile.connect()) as conn:
+        original = dict(conn.execute("SELECT * FROM device_pairings").fetchone())
+    cfg["owner_provider"] = configured_provider
+    del client.headers["x-fixture-owner"]
+    if request_owner is not None:
+        client.headers["x-fixture-owner"] = request_owner
+
+    refused = client.post(
+        "/api/plugins/beacon/pairing/redeem",
+        json={"code": pairing["code"] if valid_code else "NOT-A-CODE", "device_name": "Tab"},
+    )
+
+    assert refused.status_code == status, refused.text
+    with closing(api.mobile.connect()) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM pairing_attempts").fetchone()[0] == 0
+        assert dict(conn.execute("SELECT * FROM device_pairings").fetchone()) == original
+    cfg["owner_provider"] = "basic"
+    client.headers["x-fixture-owner"] = "owner"
+    owner_result = redeem(client, pairing)
+    assert owner_result.status_code == 200, owner_result.text
+    assert owner_result.json()["device_id"] == pairing["device_id"]
+    assert owner_result.json()["link_ticket"]
+
+
+@pytest.mark.parametrize("client_limit,global_limit", [(2, 10), (10, 2)])
+def test_correct_pairing_code_is_refused_after_attempt_bucket_exhaustion(
+    harness, monkeypatch, client_limit, global_limit,
+):
+    api, client, _, _, _ = harness
+    set_public_url(monkeypatch, "https://hermes.example.test")
+    pairing = mint(client)
+    monkeypatch.setattr(api.mobile, "PAIRING_MAX_CLIENT_ATTEMPTS", client_limit)
+    monkeypatch.setattr(api.mobile, "PAIRING_MAX_GLOBAL_ATTEMPTS", global_limit)
+    for _ in range(2):
+        wrong = client.post(
+            "/api/plugins/beacon/pairing/redeem",
+            json={"code": "NOT-A-CODE", "device_name": "Pixel"},
+        )
+        assert wrong.status_code == 400
+
+    locked = redeem(client, pairing)
+
+    assert locked.status_code == 429
+    assert locked.json() == {"detail": "Too many pairing attempts. Try again later."}
+    with closing(api.mobile.connect()) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM pairing_attempts").fetchone()[0] == 2
+        row = conn.execute("SELECT redeemed_at,ticket_hash FROM device_pairings").fetchone()
+        assert tuple(row) == (None, None)
 
 
 def test_pairing_attempt_limit_locks_client(harness, monkeypatch):
@@ -309,6 +373,29 @@ def test_a_code_made_before_the_first_sign_in_links_to_the_owner_who_signs_in(ha
     assert [device["device_id"] for device in mobile.list_devices("owner")] == [early["device_id"]]
     # A code another owner made is never taken over.
     assert mobile.link_paired_device(theirs["device_id"], theirs["ticket"], "owner", "basic") is None
+
+
+def test_unclaimed_cli_code_redeems_after_native_owner_sign_in(harness, monkeypatch):
+    api, client, _, home, _ = harness
+    _write_config(home, {})
+    _use_real_settings(api, monkeypatch)
+    _native_profiles(monkeypatch, ["default", "work"])
+    pairing = api.mobile.mint_device_pairing(
+        "", "work", "Pixel", "https://hermes.example.test", "hermes.example.test",
+    )
+    assert not api.mobile.settings().get("owner_id")
+
+    redeemed = redeem(client, pairing)
+
+    assert redeemed.status_code == 200, redeemed.text
+    assert api.mobile.settings()["owner_id"] == "owner"
+    assert api.mobile.settings()["owner_provider"] == "basic"
+    linked = client.post(
+        "/api/plugins/beacon/devices/link",
+        json={"device_id": pairing["device_id"], "link_ticket": redeemed.json()["link_ticket"]},
+    )
+    assert linked.status_code == 200, linked.text
+    assert linked.json()["profile"] == "work"
 
 
 def test_cli_pairs_on_a_fresh_install_before_anyone_signed_in(harness, monkeypatch):

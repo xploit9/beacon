@@ -15,6 +15,8 @@ if key not in sys.modules:
 def build_router(call, body, scoped, mobile):
     router=APIRouter()
     gateway=sys.modules[key].Gateway(mobile,scoped)
+    metadata_scope=getattr(getattr(gateway,'backend',None),'scoped_metadata',None)
+    if callable(metadata_scope): gateway.scoped=metadata_scope
     admissions=threading.BoundedSemaphore(4)
 
     async def scope(request,call_id,writable=False):

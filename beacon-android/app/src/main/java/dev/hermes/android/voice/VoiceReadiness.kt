@@ -34,3 +34,15 @@ internal fun callbackDefinitelyRejected(status:Int,message:String)=status in set
     status==409&&message in setOf("Choose delay_seconds or at","Invalid callback delay","Expected timezone-aware ISO callback time",
         "Callback time needs a timezone","Callback must be within the next year","Scheduled callbacks are disabled on the host",
         "Stable callback request_id required","Brief callback reason required","Unknown callback field","Call ended before callback request was accepted")
+
+internal class VoiceProviderRejected(message:String):IllegalStateException(message)
+
+/** A provider refused the call setup (close 1007/1008 before the greeting): say which part to fix. */
+internal fun providerRejectionMessage(provider:String,reason:String):String {
+    val name=when(provider) { "grok" -> "Grok";"openai" -> "OpenAI";else -> "Gemini" }
+    return if(reason.contains("key",ignoreCase=true)) "$name didn't accept the API key. Check it in Settings › Voice & calls."
+    else "$name couldn't start the call. Choose another model in Settings › Voice & calls."
+}
+
+internal fun classifyVoiceProviderClose(code:Int,reason:String):VoiceProviderTestResult =
+    if(code in setOf(1007,1008)&&reason.contains("key",ignoreCase=true)) VoiceProviderTestResult.KeyRejected else VoiceProviderTestResult.ProviderError

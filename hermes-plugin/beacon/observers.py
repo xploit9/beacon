@@ -83,6 +83,10 @@ def prune_meta(conn, now):
                 created = _number(json.loads(value).get("created"))
             except (AttributeError, TypeError, ValueError):
                 created = None
+            # History can outlive its invitation; retain source provenance for its lifetime, including feedback retries.
+            if conn.execute("SELECT 1 FROM call_log WHERE email_notice_id=?",
+                            (key[len("proactive-email-rule:"):],)).fetchone():
+                continue
         retention = CALL_WINDOW if key.startswith("proactive-call:") else ALERT_RETENTION
         if created is None or created > now or now - created > retention:
             conn.execute("DELETE FROM meta WHERE key=?", (key,))
@@ -97,7 +101,8 @@ def prune_meta(conn, now):
             conn.execute("DELETE FROM meta WHERE key=?", (key,))
 
 
-def completion(mobile, native, cfg, profile, session_id, turn_id, completed=False, failed=False,
+# Hermes' on_session_end hook passes no turn_id; that call has no turn to report and returns quietly.
+def completion(mobile, native, cfg, profile, session_id, turn_id=None, completed=False, failed=False,
                interrupted=False, job_id=None, **kwargs):
     if (completed is not True and failed is not True) or interrupted or not session_id or not turn_id:
         return
@@ -206,13 +211,40 @@ def _profile_allowed(cfg,profile):
     return 'profiles' not in cfg or isinstance(cfg['profiles'],list) and profile in cfg['profiles']
 
 
+def _tool_sources(tool_name):
+    from beacon_proactive import source_name
+    names = [tool_name]
+    if tool_name.startswith("mcp__"):
+        names.append(tool_name.split("__", 2)[1])
+    try:
+        from tools.registry import registry
+        toolset = registry.get_toolset_for_tool(tool_name)
+        if toolset:
+            names.append(toolset.removeprefix("mcp-"))
+    except (ImportError, AttributeError, KeyError):
+        pass
+    # Match the existing compact catalogue's mail/Workspace labels as well as native source ids.
+    words = set(re.findall(r"[a-z0-9]+", tool_name.casefold()))
+    if words & {"mail", "email", "gmail", "gmai", "outlook", "himalaya"} or tool_name == "terminal":
+        names.extend(("email", "gmail"))
+    if "google_workspace" in tool_name.casefold():
+        names.append("Google Workspace")
+    output = set()
+    for name in names:
+        try:
+            output.add(source_name(name))
+        except ValueError:
+            continue
+    return sorted(output)
+
+
 def source_observed(mobile, cfg, profile, session_id, tool_name, result, status):
     if (status not in ("ok", "success") or not session_id or not _profile_allowed(cfg,profile)):
         return False
     if _source_error(result):
         return False
     owner = cfg.get("owner_id")
-    if not owner or not isinstance(tool_name, str) or not tool_name:
+    if not owner or not isinstance(tool_name, str) or not tool_name or tool_name.startswith("beacon_"):
         return False
     try:
         from beacon_proactive import _setup_complete, enabled
@@ -229,20 +261,21 @@ def source_observed(mobile, cfg, profile, session_id, tool_name, result, status)
     with mobile.LOCK, mobile.connect() as conn:
         prune_meta(conn, now)
         previous = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        reads = []
         if previous:
             try:
                 old = json.loads(previous[0])
-                observed = old.get("observed_at") if isinstance(old, dict) else None
-                old_hashes = old.get("item_hashes", []) if isinstance(old, dict) else []
-                if (type(observed) in (int, float) and math.isfinite(observed)
-                        and 0 <= now - observed <= EVIDENCE_TTL and isinstance(old_hashes, list)):
-                    claims = list(dict.fromkeys(
-                        [value for value in old_hashes
-                         if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)] + claims
-                    ))[-MAX_EVIDENCE_HASHES:]
+                # Older aggregate hashes mix sources; only individually attributed reads can survive an upgrade.
+                reads = [read for read in old.get("reads", [])
+                         if type(read.get("observed_at")) in (int, float)
+                         and 0 <= now - read["observed_at"] <= EVIDENCE_TTL]
             except (AttributeError, TypeError, ValueError, UnicodeError):
                 pass
-        record = {"tool_name": tool_name, "item_hashes": claims[-MAX_EVIDENCE_HASHES:], "observed_at": now}
+        reads.append({"tool_name": tool_name, "sources": _tool_sources(tool_name),
+                      "item_hashes": claims, "observed_at": now})
+        while len(reads) > 64 or sum(len(read.get("item_hashes", [])) for read in reads) > MAX_EVIDENCE_HASHES:
+            reads.pop(0)
+        record = {"reads": reads, "observed_at": now}
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
                      (key, json.dumps(record, separators=(",", ":")).encode()))
     return True
@@ -258,8 +291,9 @@ def _inside_quiet(now, setup):
     return first <= minute < last if first < last else minute >= first or minute < last
 
 
-def _notice(mobile, owner, profile, conversation, reason, alert_key, now, email_alert=False):
-    with mobile.LOCK, mobile.connect() as conn:
+def _notice(mobile, owner, profile, conversation, reason, alert_key, now, email_alert=False, source="email", *, conn=None):
+    from contextlib import nullcontext
+    with mobile.LOCK, (mobile.connect() if conn is None else nullcontext(conn)) as conn:
         prune_meta(conn, now.timestamp())
         if conn.execute("SELECT 1 FROM meta WHERE key=?", (alert_key,)).fetchone():
             return dict(DUPLICATE_ALERT)
@@ -274,17 +308,27 @@ def _notice(mobile, owner, profile, conversation, reason, alert_key, now, email_
         if email_alert:
             conn.execute("INSERT INTO meta(key,value) VALUES(?,?)",
                          ("proactive-email-notice:" + event, str(now.timestamp()).encode()))
+            conn.execute("INSERT INTO meta(key,value) VALUES(?,?)",
+                         ("proactive-email-rule:" + event,
+                          json.dumps({"created": now.timestamp(), "source": source}).encode()))
     return {"status": "notified", "event_id": event}
 
 
 def email_notice(mobile, native, cfg, profile, session_id, args, now):
-    from beacon_proactive import EMAIL_RULE_PREFIX, _setup, _setup_complete, enabled, list_requests
+    if not isinstance(args, dict) or "source" in args:
+        raise ValueError("Item id and reason are required; request_id is optional")
+    return event_notice(mobile, native, cfg, profile, session_id, {**args, "source": "email"}, now)
+
+
+def event_notice(mobile, native, cfg, profile, session_id, args, now):
+    from beacon_proactive import EMAIL_RULE_PREFIX, _setup, _setup_complete, enabled, list_requests, source_name
 
     owner, provider = cfg.get("owner_id"), cfg.get("owner_provider")
     if not owner or not provider or not _profile_allowed(cfg,profile) or not session_id:
         raise ValueError("Owned proactive session required")
-    if not isinstance(args, dict) or set(args) - {"request_id", "item_id", "reason"} or not {"item_id", "reason"} <= set(args):
-        raise ValueError("Item id and reason are required; request_id is optional")
+    if not isinstance(args, dict) or set(args) - {"request_id", "source", "item_id", "reason"} or not {"source", "item_id", "reason"} <= set(args):
+        raise ValueError("Source, item id and reason are required; request_id is optional")
+    source = source_name(args["source"])
     request_id, item_id, reason = args.get("request_id"), args.get("item_id"), args.get("reason")
     if request_id is not None and (not isinstance(request_id, str) or not mobile.ID.fullmatch(request_id)):
         raise ValueError("Invalid Proactive rule id")
@@ -297,29 +341,38 @@ def email_notice(mobile, native, cfg, profile, session_id, args, now):
     if not enabled(mobile, owner, profile) or not _setup_complete(mobile, owner, profile):
         raise ValueError("Proactive is not enabled")
     request = next((row for row in list_requests(mobile, owner, profile)
-                    if row.get("id") == request_id and row.get("enabled") is True
-                    and row.get("signal") in (None, "email")), None) if request_id else None
+                    if row.get("id") == request_id and row.get("enabled") is True), None) if request_id else None
     if request_id and not request:
-        raise ValueError("No enabled email rule matches this alert")
+        raise ValueError("No enabled source rule matches this alert")
     evidence_key = _evidence_key(owner, profile, session_id)
     with mobile.connect() as conn:
         row = conn.execute("SELECT value FROM meta WHERE key=?", (evidence_key,)).fetchone()
     try:
         proof = json.loads(row[0]) if row else None
-        observed = proof.get("observed_at") if proof else None
+        reads = proof.get("reads", []) if isinstance(proof, dict) else []
+        matched = [read for read in reads if isinstance(read, dict) and type(read.get("observed_at")) in (int, float)
+                      and math.isfinite(read["observed_at"]) and 0 <= now.timestamp() - read["observed_at"] <= EVIDENCE_TTL
+                      and source in read.get("sources", [])
+                      and _digest(item_id) in read.get("item_hashes", [])]
     except (AttributeError, TypeError, ValueError):
-        proof, observed = None, None
-    if (not proof or type(observed) not in (int, float) or not math.isfinite(observed)
-            or not 0 <= now.timestamp() - observed <= EVIDENCE_TTL
-            or _digest(item_id) not in proof.get("item_hashes", [])):
-        raise ValueError("Fresh same-session evidence from a successful tool read is required")
+        matched = False
+    if not matched:
+        raise ValueError("Fresh same-session evidence from a successful tool read of that source is required")
+    if (request and request.get("signal") is not None
+            and not any(source_name(request["signal"]) in read.get("sources", [])
+                        for read in matched)):
+        raise ValueError("No enabled source rule matches this alert")
 
     stored = cfg.get("scheduled_callback_conversation_id")
     if not isinstance(stored, str) or not stored.strip():
         raise ValueError("Choose an owned assistant conversation before enabling Proactive")
     native.verify(owner, provider, profile, stored)
+    if _inside_quiet(now, setup) and not (request and request.get("action") == "call" and request.get("night") is True):
+        return {"status": "quiet", "message": "Quiet hours; only a matching night-call rule may interrupt."}
     delivery = request["action"] if request else setup["delivery"]
     dedupe_rule = request_id or "default"
+    if source != "email":
+        dedupe_rule += ":source:" + _digest(source)
     dedupe = "proactive-alert:" + owner + ":" + profile + ":" + dedupe_rule + ":" + _digest(item_id)
     if delivery == "call":
         from beacon_mobile import invitation
@@ -332,10 +385,9 @@ def email_notice(mobile, native, cfg, profile, session_id, args, now):
                 count = sum((_number(row[0]) or 0) > now.timestamp() - CALL_WINDOW
                             for row in conn.execute("SELECT value FROM meta WHERE substr(key,1,?)=?",
                                                     (len(prefix), prefix)))
-            quiet_blocked = _inside_quiet(now, setup) and not (request and request.get("night") is True)
             callbacks_ready = cfg.get("callback_tool_enabled") is True and cfg.get("scheduled_callbacks_enabled") is True
-            if not quiet_blocked and callbacks_ready and count < CALL_LIMIT:
-                # The email's own reason leads (call history shows it first); the rule follows.
+            if callbacks_ready and count < CALL_LIMIT:
+                # The event's own reason leads (call history shows it first); the rule follows.
                 rule_note = f" Rule: {request['text'][:100]}" if request else ""
                 lead = reason.strip() if not rule_note or reason.strip()[-1:] in ".!?" else reason.strip() + "."
                 try:
@@ -352,8 +404,9 @@ def email_notice(mobile, native, cfg, profile, session_id, args, now):
                                  ("proactive-email-notice:" + event, str(now.timestamp()).encode()))
                     conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
                                  (EMAIL_RULE_PREFIX + event,
-                                  json.dumps({"created": now.timestamp(), "rule_id": request_id or "default"}).encode()))
+                                  json.dumps({"created": now.timestamp(), "rule_id": request_id or "default",
+                                              "source": source}).encode()))
                     conn.execute("UPDATE call_log SET email_notice_id=? WHERE id=? AND owner=? AND profile=?",
                                  (event, event, owner, profile))
                 return {"status": "pending", "event_id": event, "conversation_id": stored}
-    return _notice(mobile, owner, profile, stored, reason.strip(), dedupe, now, email_alert=True)
+    return _notice(mobile, owner, profile, stored, reason.strip(), dedupe, now, email_alert=True, source=source)

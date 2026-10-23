@@ -159,6 +159,26 @@ class NativeAuthTest {
         assertFalse("a callback that arrived during the grace period must win", completed.cancelledOnResume)
     }
 
+    @Test fun closingTheSignInTabEndsTheWaitButALateCodeStillWins() {
+        var closed = false
+        var decision: (() -> Unit)? = null
+        val abandoned = PendingNativeAuthorization(closeListener = { closed = true }, schedule = { _, action -> decision = action })
+        abandoned.onLauncherReturned()
+        assertFalse("the grace period comes first", closed)
+        decision!!.invoke()
+        assertTrue("the spinner must not wait for the five-minute timeout", closed)
+        assertTrue(abandoned.cancelledOnResume)
+
+        var listenerClosedBy = 0
+        var late: (() -> Unit)? = null
+        val finished = PendingNativeAuthorization(closeListener = { listenerClosedBy++ }, schedule = { _, action -> late = action })
+        finished.onLauncherReturned()
+        finished.callbackCaptured()
+        late!!.invoke()
+        assertEquals("only the captured code closes the listener", 1, listenerClosedBy)
+        assertFalse(finished.cancelledOnResume)
+    }
+
     @Test fun tokenExchangeWaitsUntilBeaconResumes() = runBlocking {
         val requests = CopyOnWriteArrayList<Request>()
         val pending = pendingAuthorization(initiallyForeground = false)

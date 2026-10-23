@@ -5,6 +5,7 @@ import androidx.room.*
 import dev.hermes.android.core.Scope
 import dev.hermes.android.core.digest
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -28,11 +29,18 @@ data class ProjectionMetadata(val key: String, val scope: String, val updated: L
 @Database(entities = [Projection::class], version = 1, exportSchema = false)
 abstract class ProjectionDb : RoomDatabase() { abstract fun rows(): ProjectionDao }
 
+internal suspend fun persistSessionProjection(value: String, write: suspend (String) -> Unit) {
+    // shortcut: oversized chats are not cached offline; upgrade by caching a trimmed projection.
+    if (value.toByteArray().size.toLong() + APP_CIPHER_OVERHEAD > MAX_PROJECTION_BYTES) return
+    try { write(value) } catch (e: CancellationException) { throw e } catch (_: Exception) { /* Live history remains authoritative. */ }
+}
+
 class ProjectionCache internal constructor(private val db: ProjectionDb, private val cipher: AppCipher) {
     constructor(context: Context, cipher: AppCipher) : this(Room.databaseBuilder(context, ProjectionDb::class.java, "hermes-projections.db").build(), cipher)
     private val lock = Mutex()
     private fun key(scope: Scope, kind: String) = "${scope.key}:${kind.digest()}"
     private fun legacyKey(scope: Scope, kind: String) = "${scope.key}:$kind"
+    suspend fun writeSession(scope: Scope, value: String) = persistSessionProjection(value) { write(scope, "session", it) }
     suspend fun read(scope: Scope, kind: String): String? = readMany(scope, listOf(kind))[kind]
     suspend fun readMigrating(scope: Scope, kind: String, legacyKind: String): String? = withContext(Dispatchers.IO) {
         require(kind != legacyKind)

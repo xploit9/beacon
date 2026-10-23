@@ -3,10 +3,30 @@ package dev.hermes.android.voice
 import dev.hermes.android.Message
 import dev.hermes.android.core.json
 import dev.hermes.android.core.Scope
+import dev.hermes.android.data.mergeVoiceTranscripts
 import org.junit.Assert.*
 import org.junit.Test
 
 class CallTranscriptTest {
+    @Test fun lateProviderInputTranscriptionStaysBeforeItsReplyByTurnId() {
+        val answer = CallTranscript("call:assistant:7", "assistant", "Here is the answer", turnId = "7")
+        val question = CallTranscript("call:user:provider-item", "user", "What is the question?", turnId = "7")
+
+        val ordered = emptyList<CallTranscript>().acceptTranscript(answer).acceptTranscript(question)
+
+        assertEquals(listOf("user", "assistant"), ordered.map { it.role })
+        assertEquals(listOf("What is the question?", "Here is the answer"), ordered.map { it.text })
+    }
+
+    @Test fun directTurnFlushPlacesUserCaptionBeforeAssistantEvenWhenItArrivedLast() {
+        val captions = linkedMapOf("assistant" to "The reply", "user" to "The prompt")
+        val events = mutableListOf<org.json.JSONObject>()
+
+        finishDirectTranscriptTurn("call", "session", 7, captions, 3000) { events += it }
+
+        assertEquals(listOf("user", "assistant"), events.map { it.getString("role") })
+    }
+
     @Test fun interruptedDirectCaptionStaysVisibleAsFinalAndCannotCompleteOrReplayTwice() {
         val captions=mutableMapOf("user" to "Check this", "assistant" to "I can see the")
         var live=listOf(CallTranscript("call:user:7","user","Check this",false),
@@ -26,9 +46,20 @@ class CallTranscriptTest {
         assertFalse(visible.single { it.role=="user" }.interrupted)
         assertTrue(archived.all { it.getString("turn_id")=="7" })
         assertEquals(setOf("call:user:7","call:assistant:7"),archived.map { it.getString("event_id") }.toSet())
-        assertEquals(next,finishDirectTranscriptTurn("call","session",next,captions,1300) { error("No replay after consumed interruption") })
+        assertEquals(next+1,finishDirectTranscriptTurn("call","session",next,captions,1300) { error("No replay after consumed interruption") })
         assertEquals(2,archived.size)
         assertEquals(live,live.acceptTranscript(assistant.copy(text="Late tokens",final=false,interrupted=false)))
+    }
+    @Test fun hangUpKeepsTheLastUserCaptionWhenNoAssistantReplyHasStarted() {
+        val captions=mutableMapOf("user" to "Remind me at five")
+        val events=mutableListOf<org.json.JSONObject>()
+        finishDirectTranscriptTurn("call","session",7,captions,1200,interrupted=true) { events+=it }
+
+        val merged=mergeVoiceTranscripts(emptyList(),events.mapNotNull { CallTranscript.from(it,"session","call") },emptySet())
+
+        assertEquals("Remind me at five",merged.single().text)
+        assertTrue(merged.single().final)
+        assertFalse(merged.single().interrupted)
     }
     @Test fun speakingFirstInAFreshTurnDoesNotMarkTheComingReplyInterrupted() {
         assertFalse(interruptsReply(true,emptyMap()))
@@ -116,5 +147,54 @@ class CallTranscriptTest {
         assertEquals(tombstone, tombstone.acceptTranscript(canceled.copy(text = "Late tokens", interrupted = false)))
         val committed = canceled.copy(final = true, messageId = "42")
         assertEquals(listOf(committed), tombstone.acceptTranscript(committed).pendingTranscripts(emptyList(), true))
+    }
+
+    @Test fun equalTimestampGeminiLinesKeepTheOwnersQuestionBeforeItsReply() {
+        val answer = CallTranscript("call:assistant:7", "assistant", "Here is the reply", at = 34326, turnId = "7")
+        val question = CallTranscript("call:user:7", "user", "Please check this", at = 34326, turnId = "7")
+
+        assertEquals(listOf("user", "assistant"), orderCallTranscriptLines(listOf(answer, question)).map { it.role })
+    }
+
+    @Test fun callEndRenamesOnlyUntitledChatsFromTheOwnersFirstSpokenRequest() {
+        val transcript = listOf(
+            CallTranscript("call:assistant:1", "assistant", "The answer", at = 20, turnId = "1"),
+            CallTranscript("call:user:1", "user", "  Could you check my calendar?  ", at = 10, turnId = "1"),
+        )
+
+        assertEquals("Could you check my calendar?", deriveCallEndTitle("New conversation", transcript, "Beacon"))
+        assertEquals("Call with Beacon", deriveCallEndTitle("", emptyList(), "Beacon"))
+        assertNull(deriveCallEndTitle("Owner's title", transcript, "Beacon"))
+    }
+
+    @Test fun callTitleStopsAtFortyUnicodeCharactersWithoutSplittingASurrogatePair() {
+        val speech = "a".repeat(39) + "😀" + "b"
+        val title = requireNotNull(deriveCallEndTitle("New conversation", listOf(CallTranscript(
+            "call:user:1", "user", speech, turnId = "1",
+        )), "Beacon"))
+
+        assertEquals(40, title.codePointCount(0, title.length))
+        assertFalse(title.last().isHighSurrogate())
+    }
+
+    @Test fun collapsedCallCardKeepsOnlyTheLastFourLinesButPreservesEverySearchableLine() {
+        val lines = (1..6).map { CallTranscript("call:assistant:$it", "assistant", "Transcript line $it", turnId = it.toString()) }
+
+        assertEquals(listOf("Transcript line 3", "Transcript line 4", "Transcript line 5", "Transcript line 6"),
+            visibleCallTranscriptLines(lines, expanded = false).map { it.text })
+        assertEquals(lines.map { it.text }, visibleCallTranscriptLines(lines, expanded = true).map { it.text })
+    }
+
+    @Test fun transcriptEventsGroupByTheirCallIdentity() {
+        val events = listOf(
+            CallTranscript("call-a:user:1", "user", "First call"),
+            CallTranscript("call-b:user:1", "user", "Second call"),
+            CallTranscript("call-a:assistant:1", "assistant", "Reply"),
+        )
+
+        val groups = dev.hermes.android.ui.groupCallTranscriptEvents(events)
+
+        assertEquals(listOf("call-a", "call-b"), groups.map { it.callId })
+        assertEquals(listOf("First call", "Reply"), groups.first().lines.map { it.text })
     }
 }

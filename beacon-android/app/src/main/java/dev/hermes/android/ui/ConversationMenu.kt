@@ -40,16 +40,20 @@ import org.json.JSONObject
     val id = sessionRowId(row)
     val activeProfile = vm.ui.collectAsStateWithLifecycle().value.profile
     val profile = row.string("profile", activeProfile)
+    val pending by vm.conversationPending.collectAsStateWithLifecycle()
+    val targetKey = vm.client?.scope?.copy(profile = profile, session = id)?.key
+    val busy = pending.any { it.startsWith("$targetKey|") }
     val pinned = row.optBoolean("pinned")
     val archived = row.optBoolean("archived")
     DropdownMenuItem({ Text(conversationMenuTitle(uiText(if (pinned) "Unpin" else "Pin"))) }, leadingIcon = { Icon(Icons.Rounded.PushPin, null) }, modifier = Modifier.testTag("conversation-pin"),
-        onClick = { onDone(); vm.conversationAction(id, "/api/session/pin", json("pinned" to !pinned), if (pinned) "Unpinned" else "Pinned", profile) })
-    DropdownMenuItem({ Text(conversationMenuTitle(uiText("Rename"))) }, leadingIcon = { Icon(Icons.Rounded.Edit, null) }, onClick = { onDone(); onRename() })
-    if (profile == activeProfile) ConversationProjectItem(vm, id, onAdd = onProject, onDone = onDone)
+        enabled = !busy, onClick = { onDone(); vm.conversationAction(id, "/api/session/pin", json("pinned" to !pinned), if (pinned) "Unpinned" else "Pinned", profile) })
+    DropdownMenuItem({ Text(conversationMenuTitle(uiText("Rename"))) }, enabled = !busy, leadingIcon = { Icon(Icons.Rounded.Edit, null) }, onClick = { onDone(); onRename() })
+    if (profile == activeProfile && !busy) ConversationProjectItem(vm, id, onAdd = onProject, onDone = onDone)
     DropdownMenuItem({ Text(conversationMenuTitle(uiText(if (archived) "Unarchive" else "Archive"))) }, leadingIcon = { Icon(if (archived) Icons.Rounded.Unarchive else Icons.Rounded.Archive, null) },
-        onClick = { onDone(); vm.conversationAction(id, "/api/session/archive", json("archived" to !archived), if (archived) "Unarchived" else "Archived", profile) })
+        enabled = !busy, modifier = Modifier.testTag("conversation-archive"), onClick = { onDone(); vm.conversationAction(id, "/api/session/archive", json("archived" to !archived), if (archived) "Unarchived" else "Archived", profile) })
     DropdownMenuItem({ Text(conversationMenuTitle(uiText("Delete")), color = MaterialTheme.colorScheme.error) }, leadingIcon = { Icon(Icons.Rounded.DeleteOutline, null, tint = MaterialTheme.colorScheme.error) },
-        modifier = Modifier.testTag("conversation-delete"), onClick = { onDone(); onDelete() })
+        enabled = !busy, modifier = Modifier.testTag("conversation-delete"), onClick = { onDone(); onDelete() })
+    if (busy) DropdownMenuItem({ Text("Working…") }, {}, enabled = false)
 }
 
 @Composable internal fun RenameConversationDialog(vm: BeaconViewModel, id: String, profile: String, title: String, onDismiss: () -> Unit) {

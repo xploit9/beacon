@@ -18,6 +18,7 @@ class GrokWireTest {
     @Test fun setupReusesExactConsentInstructionsAndToolsWithCompatiblePcm() {
         val setup=GrokWire().outbound(GeminiWire.setup("grok-voice-latest","eve",null)).single().getJSONObject("session")
         assertEquals("eve",setup.getString("voice"));assertTrue(setup.getString("instructions").contains("never approve your own request"))
+        assertTrue(setup.getString("instructions").contains("when the owner asks again, try the relevant tool in this call"))
         assertTrue(setup.getString("instructions").contains("no camera or screen input"))
         assertEquals(16000,setup.getJSONObject("audio").getJSONObject("input").getJSONObject("format").getInt("rate"))
         assertEquals(24000,setup.getJSONObject("audio").getJSONObject("output").getJSONObject("format").getInt("rate"))

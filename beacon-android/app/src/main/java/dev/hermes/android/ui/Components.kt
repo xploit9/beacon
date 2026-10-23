@@ -51,7 +51,7 @@ fun formBody(form: ActionForm): JSONObject {
     val result = form.seed.copy()
     form.fields.forEach { f ->
         val raw = form.values[f.key].orEmpty()
-        require(!f.required || raw.isNotBlank()) { "${f.label} is required" }
+        require(!f.required || raw.isNotBlank()) { "Enter ${f.label}." }
         if (form.path == "/api/profile/create" && f.key == "clone_from" && raw.isBlank()) { result.remove(f.key); return@forEach }
         if (f.type == FieldType.SECRET && (raw.isBlank() || raw.all { it == '•' || it == '*' })) return@forEach
         val value: Any = when (f.type) { FieldType.BOOLEAN -> raw.toBooleanStrictOrNull() ?: false; FieldType.CHOICE -> if (fieldValue(form.seed, f.key) is Number) raw.toLongOrNull() ?: error("${f.label} must be a whole number") else raw; FieldType.INTEGER -> if (raw.isBlank()) { if (f.key.startsWith("advanced.")) "" else JSONObject.NULL } else raw.toLongOrNull() ?: error("${f.label} must be a whole number"); FieldType.DECIMAL -> if (raw.isBlank()) JSONObject.NULL else raw.toDoubleOrNull()?.takeIf { it.isFinite() } ?: error("${f.label} must be a number"); FieldType.LIST -> JSONArray(raw.split('\n').map(String::trim).filter(String::isNotEmpty)); FieldType.MAP -> JSONObject().also { map -> raw.lineSequence().filter(String::isNotBlank).forEach { line -> require(line.contains('=')) { "${f.label}: use one key=value per line" }; val key = line.substringBefore('=').trim(); require(key.isNotBlank() && !map.has(key)) { "${f.label}: keys must be unique and nonempty" }; map.put(key, line.substringAfter('=')) } }; else -> raw }

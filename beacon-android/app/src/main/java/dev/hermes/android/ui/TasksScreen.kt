@@ -18,10 +18,11 @@ import kotlinx.coroutines.launch
 @Composable fun TasksScreen(vm: BeaconViewModel) {
     Column(Modifier.fillMaxSize()) {
         Header("Cron", menu = LocalOpenNavigationMenu.current) { IconButton(onClick = { refreshSchedules(vm) }) { Icon(Icons.Rounded.Refresh, uiText("Refresh tasks")) } }
-        Schedules(vm)
+        Schedules(vm, Modifier.weight(1f).widthIn(max = 720.dp).fillMaxWidth()
+            .align(androidx.compose.ui.Alignment.CenterHorizontally))
     }
 }
-@Composable private fun Schedules(vm: BeaconViewModel) {
+@Composable private fun Schedules(vm: BeaconViewModel, modifier: Modifier) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
     val profileCatalog = data["navigation-profiles"]
@@ -32,29 +33,32 @@ import kotlinx.coroutines.launch
     val actionScope = rememberCoroutineScope()
     var pending by remember(ui.profile) { mutableStateOf("") }
     val crons = data["crons"]
+    val gatewayNeedsAttention = crons?.rows("jobs").orEmpty().any { !schedulePaused(it) && scheduleGatewayNeedsAttention(it) }
     val refresh: () -> Unit = { refreshSchedules(vm) }
     LaunchedEffect(ui.origin, ui.owner, ui.profile) { refresh(); if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     LaunchedEffect(ui.origin, ui.owner, ui.profile, selected, crons) { if (selected.isNotBlank()) vm.load("cron-history:$selected", "/api/crons/history", mapOf("job_id" to selected)) }
     val deliveries = data["cron-delivery"]?.rows("targets").orEmpty()
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        if (gatewayNeedsAttention) item { Text("Scheduled jobs aren't running. Start Hermes on your computer.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error) }
         item { Button(onClick = { cronForm(vm, null, deliveries, data["task-capabilities"]?.string("timezone").orEmpty(), refresh) }) { Icon(Icons.Rounded.Add, null); Text(uiText("Create schedule"), Modifier.padding(start = 8.dp)) } }
         item {
             val capability = data["task-capabilities"]
             capability?.string("timezone")?.takeIf(String::isNotBlank)?.let { Text("Times in $it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-            TextButton(onClick = { showPresets = !showPresets }) { Text("Call tasks"); Icon(if (showPresets) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, null) }
+            TextButton(onClick = { showPresets = !showPresets }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Call tasks"); Icon(if (showPresets) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, null) }
             if (showPresets) {
             if (capability == null) LinearProgressIndicator(Modifier.fillMaxWidth())
-            else if (recordError(capability).isNotBlank()) { Text(recordError(capability), color = MaterialTheme.colorScheme.error); TextButton(onClick = refresh) { Text("Retry task setup status") } }
+            else if (recordError(capability).isNotBlank()) { Text("Scheduled task setup isn't available. Check your connection and try again.", color = MaterialTheme.colorScheme.error); OutlinedButton(onClick = refresh, modifier = Modifier.heightIn(min = 48.dp)) { Text("Retry task setup status") } }
 
             OutlinedButton(enabled = capability?.optBoolean("checkups_ready") == true, onClick = { vm.openForm(ActionForm("Create check-up task", "/api/plugins/beacon/mobile/tasks/checkups", emptyList(), explanation = "Create an ordinary native schedule. 3–4 random opportunities daily from 10:00 to before 22:00 in your local time zone; no missed-slot catch-up. Android call permission, quiet and DND policy still apply.", actionLabel = "Create task", onResult = { refresh() })) }) { Text("Create check-up task") }
             if (capability != null && recordError(capability).isBlank() && !capability.optBoolean("checkups_ready")) Text("Set up scheduled callbacks on your computer to enable check-up calls.", style = MaterialTheme.typography.bodySmall)
             }
         }
         if (crons?.optBoolean("cron_unavailable") == true) item { EmptyState("Scheduling is unavailable", "Scheduling is not enabled for your Beacon. Check the connection in Settings & more.", Icons.Rounded.EventBusy) }
-        if (crons?.has("_error") == true) item { Text(crons.string("_error"), color = MaterialTheme.colorScheme.error) }
-        if (crons == null) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+        if (crons?.has("_error") == true) item { Column { Text("Couldn't load scheduled jobs. Check your connection and try again.", color = MaterialTheme.colorScheme.error); OutlinedButton(onClick = refresh, modifier = Modifier.heightIn(min = 48.dp)) { Text("Retry") } } }
+        if (crons == null) item { Column { LinearProgressIndicator(Modifier.fillMaxWidth()); Text("Loading scheduled jobs…", style = MaterialTheme.typography.bodySmall) } }
         items(crons?.rows("jobs").orEmpty(), key = { it.string("id") }) { job ->
             val id = job.string("id")
+            var actions by remember(id) { mutableStateOf(false) }
             Glass { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(job.string("name", "Scheduled task"), style = MaterialTheme.typography.titleMedium)
                 Text(job.string("prompt"), style = MaterialTheme.typography.bodyMedium, maxLines = if (selected == id) Int.MAX_VALUE else 3)
@@ -63,23 +67,27 @@ import kotlinx.coroutines.launch
                 val timezone = data["task-capabilities"]?.string("timezone").orEmpty()
                 Text("Next: ${scheduleTime(job.string("next_run_at"), timezone, "Not scheduled")}", style = MaterialTheme.typography.bodySmall)
                 Text("Last: ${scheduleTime(job.string("last_run_at"), timezone, "No recorded run")}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                job.string("last_error").takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                 if (pending == id) LinearProgressIndicator(Modifier.fillMaxWidth())
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TextButton(enabled = pending.isBlank(), onClick = { cronForm(vm, job, deliveries, data["task-capabilities"]?.string("timezone").orEmpty(), refresh) }) { Text(uiText("Edit")) }
-                    TextButton(enabled = pending.isBlank(), onClick = { vm.openForm(ActionForm("Run this task", "/api/crons/run", emptyList(), json("job_id" to id), explanation = if(job.optBoolean("no_agent")) "Run the task script once. Check-up tasks consider only an opportunity due this minute; missed slots are skipped." else "Run this task now with its saved tools and delivery.", actionLabel = "Run now", onResult = { refresh() })) }) { Text(uiText("Run now")) }
-                    TextButton(enabled = pending.isBlank() && scheduleState(job) != "Completed", onClick = { pending = id; actionScope.launch { vm.action(if (schedulePaused(job)) "/api/crons/resume" else "/api/crons/pause", json("job_id" to id), refresh = false) { _, _ -> refresh() }.join(); pending = "" } }) { Text(if (schedulePaused(job)) "Resume" else "Pause") }
-                    TextButton(onClick = { selected = if (selected == id) "" else id }) { Text(uiText("Run history")) }
-                    TextButton(enabled = pending.isBlank(), onClick = { vm.openForm(ActionForm("Delete schedule", "/api/crons/delete", emptyList(), json("job_id" to id), explanation = "Remove this scheduled task from Beacon.", actionLabel = "Delete", onResult = { refresh() })) }) { Text(uiText("Delete")) }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Button(enabled = pending.isBlank(), onClick = { vm.openForm(ActionForm("Run this task", "/api/crons/run", emptyList(), json("job_id" to id), explanation = if(job.optBoolean("no_agent")) "Run the task script once. Check-up tasks consider only an opportunity due this minute; missed slots are skipped." else "Run this task now with its saved tools and delivery.", actionLabel = "Run now", onResult = { refresh() })) }, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) { Text(uiText("Run now")) }
+                    OutlinedButton(enabled = pending.isBlank(), onClick = { cronForm(vm, job, deliveries, data["task-capabilities"]?.string("timezone").orEmpty(), refresh) }, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) { Text(uiText("Edit")) }
+                    TextButton(enabled = pending.isBlank() && scheduleState(job) != "Completed", onClick = { pending = id; actionScope.launch { vm.action(if (schedulePaused(job)) "/api/crons/resume" else "/api/crons/pause", json("job_id" to id), refresh = false) { _, _ -> refresh() }.join(); pending = "" } }, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) { Text(if (schedulePaused(job)) "Resume" else "Pause") }
+                    Box {
+                        IconButton(onClick = { actions = true }, enabled = pending.isBlank(), modifier = Modifier.heightIn(min = 48.dp)) { Icon(Icons.Rounded.MoreVert, "More schedule actions") }
+                        DropdownMenu(actions, { actions = false }) {
+                            DropdownMenuItem(text = { Text(uiText("Run history")) }, onClick = { actions = false; selected = if (selected == id) "" else id })
+                            DropdownMenuItem(text = { Text(uiText("Delete"), color = MaterialTheme.colorScheme.error) }, onClick = { actions = false; vm.openForm(ActionForm("Delete schedule", "/api/crons/delete", emptyList(), json("job_id" to id), explanation = "Remove this scheduled task from Beacon.", actionLabel = "Delete", onResult = { refresh() })) })
+                        }
+                    }
                 }
                 if (selected == id) {
                     val history = data["cron-history:$id"]
                     if (history == null) LinearProgressIndicator(Modifier.fillMaxWidth())
-                    else if (history.has("_error")) Text(history.string("_error"), color = MaterialTheme.colorScheme.error)
+                    else if (history.has("_error")) Text("Run history isn't available. Check your connection and try again.", color = MaterialTheme.colorScheme.error)
                     else if (history.rows("runs").isEmpty()) Text("No recorded runs yet.")
                     else history.rows("runs").forEach { run ->
                         val session = run.string("session_id", run.string("id"))
-                        TextButton(enabled = session.isNotBlank(), onClick = { vm.tab("Chat"); vm.selectSession(session) }) { Text(run.string("title", "Open result conversation") + if (run.optBoolean("is_active")) " · Running" else "") }
+                        TextButton(enabled = session.isNotBlank(), onClick = { vm.tab("Chat"); vm.selectSession(session) }, modifier = Modifier.heightIn(min = 48.dp)) { Text(run.string("title", "Open result conversation") + if (run.optBoolean("is_active")) " · Running" else "") }
                     }
                     if (job.optBoolean("no_agent")) Text("Script tasks don't create a chat per run.", style = MaterialTheme.typography.bodySmall)
                 }

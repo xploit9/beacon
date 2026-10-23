@@ -125,7 +125,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                 val result = block(NativeSkills(c))
                 if (client() === active && scopeKey == c.scope.key) { _skills.value = result.copy(loading = false, saving = false); draftChanged() }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (client() === active) _skills.update { it.copy(loading = false, saving = false, error = e.message ?: "Couldn't load skills. Try again.") } }
+            catch (e: Exception) { if (client() === active) _skills.update { it.copy(loading = false, saving = false, error = appErrorText(e)) } }
             finally { c.closeNative() }
         }
     }
@@ -198,7 +198,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                 }
                 cacheAttempt { cache?.write(c.scope, "settings:memory", json("status" to status, "notes" to notes).toString()) }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (client() === active) _memory.update { it.copy(loading = false, error = e.message ?: "Couldn't load memory. Try again.") } }
+            catch (e: Exception) { if (client() === active) _memory.update { it.copy(loading = false, error = appErrorText(e)) } }
             finally { c.closeNative() }
         }
     }
@@ -229,7 +229,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                 cacheAttempt { cache?.delete(c.scope, "settings:memory") }
                 if (client() === active) { memoryAt = System.currentTimeMillis(); _memory.update { it.copy(documents = it.documents.map { old -> if (old.target == confirmed.target) confirmed else old }, saving = false, editing = "", draft = "", message = "Notes saved. New chats use this change.") }; draftChanged() }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (client() === active) _memory.update { it.copy(saving = false, error = e.message ?: "Couldn't save notes. Your draft is kept.") } }
+            catch (e: Exception) { if (client() === active) _memory.update { it.copy(saving = false, error = appErrorText(e)) } }
             finally { c.closeNative() }
         }
     }
@@ -256,7 +256,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                 }
                 if (client() === active) _server.value = result.copy(loading = false)
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (client() === active) _server.update { it.copy(loading = false, error = e.message ?: "Couldn't reach the server. Retry after reconnecting.") } }
+            catch (e: Exception) { if (client() === active) _server.update { it.copy(loading = false, error = appErrorText(e)) } }
             finally { c.closeNative() }
         }
     }
@@ -329,7 +329,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                 val profiles = rows.map { NativeBotSummary(it.getString("profile"), it.string("title", it.getString("profile")), it.string("purpose")) }
                 if (client() === active) _bots.update { it.copy(profiles = profiles, loading = false) }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (client() === active) _bots.update { it.copy(loading = false, error = e.message ?: "Couldn't load bots.") } }
+            catch (e: Exception) { if (client() === active) _bots.update { it.copy(loading = false, error = appErrorText(e)) } }
             finally { c.closeNative() }
         }
     }
@@ -348,7 +348,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                 val choices = options.rows("providers").flatMap { row -> row.optJSONArray("models")?.strings().orEmpty().map { row.string("slug") to it } }.distinct()
                 if (client() === active && _bots.value.selected?.profile == profile) { _botModels.value = choices; _bots.update { it.copy(loading = false) } }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (client() === active) _bots.update { it.copy(loading = false, error = e.message ?: "Couldn't read this bot.") } }
+            catch (e: Exception) { if (client() === active) _bots.update { it.copy(loading = false, error = appErrorText(e)) } }
             finally { c.closeNative() }
         }
     }
@@ -370,7 +370,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                 require(confirmed.profile == bot.profile) { "Saved bot belongs to another profile" }
                 if (client() === active) { _bots.update { it.copy(selected = confirmed, saving = false, editing = false, notice = "Default model saved for new chats.") }; draftChanged() }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (client() === active) _bots.update { it.copy(saving = false, error = e.message ?: "Couldn't save. Your selection is kept.") } }
+            catch (e: Exception) { if (client() === active) _bots.update { it.copy(saving = false, error = appErrorText(e)) } }
             finally { c.closeNative() }
         }
     }

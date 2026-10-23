@@ -54,6 +54,9 @@
         <service android:name=".push.KeepConnectedService" android:exported="false" android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Maintains an HTTPS notification event connection to the signed-in Hermes account so incoming Beacon calls can reach the phone while the user enables Keep connected." />
         </service>
+        <service android:name=".data.NativeSignInService" android:exported="false" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Keeps the local callback reachable during a user-started browser sign-in to the user's Hermes, bounded by a five-minute callback timeout and the token exchange." />
+        </service>
         <receiver android:name=".voice.IncomingCallReceiver" android:exported="false" />
         <receiver android:name=".updates.UpdateInstallReceiver" android:exported="false" />
         <receiver android:name=".push.DeviceRestartReceiver" android:exported="false">

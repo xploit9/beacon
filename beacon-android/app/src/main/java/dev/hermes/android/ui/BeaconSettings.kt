@@ -9,8 +9,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Email
 import androidx.compose.material.icons.rounded.SmartToy
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
@@ -39,6 +40,19 @@ import java.util.concurrent.TimeUnit
 
 internal fun voiceOptionsWithSelected(options: List<String>, selected: String): List<String> = (listOf(selected) + options).distinct()
 internal fun voiceChoiceLabel(voice: String): String = voice.replaceFirstChar(Char::titlecase)
+internal fun voiceProviderTestMessage(result: dev.hermes.android.voice.VoiceProviderTestResult): String = when (result) {
+    dev.hermes.android.voice.VoiceProviderTestResult.Success -> "Connection succeeded. The key is stored on this phone."
+    dev.hermes.android.voice.VoiceProviderTestResult.KeyRejected -> "That key wasn't accepted. Check it and try again."
+    dev.hermes.android.voice.VoiceProviderTestResult.Unreachable -> "The provider could not be reached. Check your connection and try again."
+    dev.hermes.android.voice.VoiceProviderTestResult.ProviderError -> "The provider responded with an error. Check the selected model or try again."
+}
+internal fun voiceModelDisplayName(model: String): String = model.substringAfterLast('/')
+    .split(Regex("[-_]"))
+    .filter(String::isNotBlank)
+    .joinToString(" ") { part ->
+        if (part.all(Char::isLetter) && part.length <= 3) part.uppercase()
+        else part.replaceFirstChar(Char::uppercase)
+    }
 /** The plugin's capabilities sit at the top of the merged bootstrap (mergeOptionalFeatures), not under optional_features. */
 internal fun callbacksAvailable(bootstrap: org.json.JSONObject): Boolean = bootstrap.optJSONObject("capabilities")?.optBoolean("callbacks") == true
 internal const val PROACTIVE_SETTINGS_PATH = "/api/plugins/beacon/mobile/proactive"
@@ -75,6 +89,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
     val data by vm.data.collectAsStateWithLifecycle()
     val ui by vm.ui.collectAsStateWithLifecycle()
     var name by remember(prefs.assistantName) { mutableStateOf(prefs.assistantName) }
+    var ownerName by remember(prefs.ownerName) { mutableStateOf(prefs.ownerName) }
     val profile = prefs.assistantProfile
     val proactiveKey = proactiveSettingsKey(Scope(ui.origin, ui.owner, profile))
     val proactive = data[proactiveKey]
@@ -113,7 +128,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
             if (vm.client === source && vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile)
                 vm.storeData(proactiveKey, JSONObject().put("_error", true)
                     .put("_pluginUpdateRequired", isMissingBeaconPluginRoute(error))
-                    .put("_message", proactiveErrorMessage(error, "Couldn't load email settings. Try again.")))
+                    .put("_message", proactiveErrorMessage(error, "Couldn't load Proactive settings. Try again.")))
         }
     }
     fun setProactive(enabled: Boolean) {
@@ -121,7 +136,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
         val source = vm.client
         if (source == null || !ui.connected || pluginStatus == "absent") return
         val client = try { source.forAuthorizedProfile(profile) } catch (_: Throwable) {
-            vm.notice("Couldn't update email settings. Try again.")
+            vm.notice("Couldn't update Proactive settings. Try again.")
             return
         }
         savingProactive = true
@@ -132,7 +147,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                     vm.storeData(proactiveKey, response)
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
-                reportProactiveError(error, "Couldn't update email settings. Try again.")
+                reportProactiveError(error, "Couldn't update Proactive settings. Try again.")
             } finally { client.closeNative(); savingProactive = false }
         }
     }
@@ -147,7 +162,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                     vm.storeData(proactiveKey, response)
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
-                reportProactiveError(error, "Couldn't update email settings. Try again.")
+                reportProactiveError(error, "Couldn't update Proactive settings. Try again.")
             } finally { savingProactive = false }
         }
     }
@@ -170,6 +185,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
         openProactiveRuleForm(vm, profile,
             onCreated = { if (vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile) proactiveRefresh++ },
             onMissingPlugin = { vm.storeData(proactiveKey, JSONObject().put("_pluginUpdateRequired", true)) },
+            sources = proactive?.let(::proactiveSources).orEmpty(),
         )
     }
     fun removeLearnedNote(note: String) {
@@ -200,12 +216,10 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
         item {
             Glass(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Icon(Icons.Rounded.SmartToy, null, tint = MaterialTheme.colorScheme.primary)
-                        Text(uiText("Assistant"), style = MaterialTheme.typography.titleMedium)
-                    }
                     OutlinedTextField(name, { name = it.take(ASSISTANT_NAME_MAX) }, label = { Text(uiText("Name")) }, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("assistant-name"),
-                        trailingIcon = { if (assistantNameOf(name) != prefs.assistantName) TextButton({ vm.setAssistantName(name) }, Modifier.testTag("assistant-name-save")) { Text(uiText("Save")) } })
+                        trailingIcon = { if (assistantNameOf(name) != prefs.assistantName) FilledTonalButton(onClick = { vm.setAssistantName(name) }, modifier = Modifier.testTag("assistant-name-save"), contentPadding = PaddingValues(horizontal = 8.dp)) { Text(uiText("Save")) } })
+                    OutlinedTextField(ownerName, { ownerName = ownerNameOf(it) }, label = { Text("What should Beacon call you?") }, supportingText = { Text("Optional") }, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("owner-name"),
+                        trailingIcon = { if (ownerName != prefs.ownerName) FilledTonalButton(onClick = { vm.setOwnerName(ownerName) }, modifier = Modifier.testTag("owner-name-save"), contentPadding = PaddingValues(horizontal = 8.dp)) { Text(uiText("Save")) } })
                     AssistantProfileChoice(prefs.assistantProfile, profiles, profileRows, profileLoading, { vm.setAssistantProfile(it) }, Modifier.fillMaxWidth().testTag("assistant-profile"))
                     Choice("Model", selectedModel, voiceOptionsWithSelected(listOf("") + models.keys, selectedModel), { key -> vm.setAssistantModel(key.substringAfter('\t', ""), if (key.isBlank()) "" else key.substringBefore('\t')) },
                         Modifier.fillMaxWidth().testTag("assistant-model"), optionLabels = models + ("" to "Profile default") + (selectedModel to (models[selectedModel] ?: prefs.assistantModel)).takeIf { selectedModel.isNotBlank() }.let { listOfNotNull(it).toMap() })
@@ -217,10 +231,10 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
             Glass(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Rounded.Email, null, tint = MaterialTheme.colorScheme.primary)
+                        Icon(Icons.Rounded.SmartToy, null, tint = MaterialTheme.colorScheme.primary)
                         Column(Modifier.weight(1f).padding(start = 10.dp, end = 8.dp)) {
-                            Text(uiText("Important emails") + " · " + profileLabel, style = MaterialTheme.typography.titleMedium)
-                            Text(assistantText("Beacon checks your email and tells you when something matters. It learns from you."), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(uiText("What needs you") + " · " + profileLabel, style = MaterialTheme.typography.titleMedium)
+                            Text(assistantText("Beacon tells you what needs your attention."), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         if (pluginStatus != "absent" && proactive?.optBoolean("_pluginUpdateRequired") != true) Switch(
                             checked = proactiveEnabled,
@@ -229,29 +243,35 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                             modifier = Modifier.testTag("assistant-proactive-toggle"),
                         )
                     }
+                    if (proactiveLoaded) {
+                        val sources = proactive?.let(::proactiveSources).orEmpty()
+                        Text(if (sources.isEmpty()) uiText("Sources not available yet.") else uiText("Can watch") + ": " + sources.joinToString(", "),
+                            Modifier.testTag("proactive-sources"), style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                     if (pluginStatus == "absent" || proactive?.optBoolean("_pluginUpdateRequired") == true) {
                         MissingBeaconPluginState(compact = true, update = pluginStatus != "absent")
                     } else {
                         val checking = proactive?.optBoolean("_loading") == true || ui.connected && vm.client != null && proactive == null
                         if (checking) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Text(uiText("Email status"), Modifier.weight(1f), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(uiText("Watch status"), Modifier.weight(1f), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             ProactiveHealthChip(ProactiveHealthState.Checking)
                         }
-                        if (!ui.connected || vm.client == null) Text(uiText("Connect to Hermes to manage email alerts."), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (!ui.connected || vm.client == null) Text(uiText("Connect to Hermes to manage alerts."), color = MaterialTheme.colorScheme.onSurfaceVariant)
                         else if (proactive?.has("_error") == true) {
-                            Text(uiText(proactive.string("_message", "Couldn't load email settings. Try again.")), Modifier.testTag("proactive-load-error"), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            if (!proactive.optBoolean("_pluginUpdateRequired")) TextButton(onClick = { proactiveRefresh++ }) { Text(uiText("Retry")) }
+                            Text(uiText(proactive.string("_message", "Couldn't load Proactive settings. Try again.")), Modifier.testTag("proactive-load-error"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            if (!proactive.optBoolean("_pluginUpdateRequired")) OutlinedButton(onClick = { proactiveRefresh++ }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Retry")) }
                         }
                         if (proactiveLoaded && proactiveEnabled) {
                             val controlsEnabled = ui.connected && vm.client != null && !savingProactive
                             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                                Text(uiText("Email status"), Modifier.weight(1f), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(uiText("Watch status"), Modifier.weight(1f), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 ProactiveHealthChip(proactiveHealthState(proactive, checking))
                             }
                             proactive?.takeIf { it.optJSONObject("health")?.string("state") == "error" }?.let {
                                 Text(proactiveHealthText(it), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                             }
-                            Text(uiText("When one arrives"), style = MaterialTheme.typography.titleMedium)
+                            Text(uiText("When something matters"), style = MaterialTheme.typography.titleMedium)
                             Choice("Delivery", proactiveDelivery, listOf("notify", "call"), { proactiveDelivery = it }, Modifier.testTag("proactive-delivery"), mapOf("notify" to "Notify", "call" to "Call"), controlsEnabled)
                             if (proactiveCallsUnavailable(proactive, proactiveDelivery, callbacksAvailable))
                                 Text(uiText("Calls are off on this Hermes. You'll get a notification instead."), Modifier.testTag("proactive-calls-off"), color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -276,6 +296,9 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                         val enabled = controlsEnabled && !proactiveChoicesChanged
                         Column(Modifier.fillMaxWidth().testTag("proactive-rule-$id"), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text(rule.string("text"), Modifier.testTag("proactive-rule-text-$id"), style = MaterialTheme.typography.bodyMedium)
+                            Text(uiText("Source") + ": " + ((rule.opt("signal") as? String)?.takeIf(String::isNotBlank) ?: uiText("Anything")),
+                                Modifier.testTag("proactive-rule-source-$id"), style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
                             Choice("When it matches", rule.string("action", "notify"), listOf("notify", "call"), { updateProactiveRule(id, "PATCH", json("action" to it)) }, Modifier.testTag("proactive-rule-action-$id"), mapOf("notify" to "Notify", "call" to "Call"), enabled)
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(uiText("Even at night"), Modifier.weight(1f))
@@ -284,12 +307,12 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(uiText(if (rule.optBoolean("enabled")) "On" else "Off").replaceFirstChar(Char::titlecase), Modifier.weight(1f).testTag("proactive-rule-status-$id"))
                                 Switch(rule.optBoolean("enabled"), { updateProactiveRule(id, "PATCH", json("enabled" to it)) }, enabled = enabled, modifier = Modifier.testTag("proactive-rule-enabled-$id"))
-                                TextButton(onClick = { updateProactiveRule(id, "DELETE") }, enabled = enabled, modifier = Modifier.testTag("proactive-rule-delete-$id")) { Text(uiText("Delete")) }
+                                OutlinedButton(onClick = { updateProactiveRule(id, "DELETE") }, enabled = enabled, modifier = Modifier.heightIn(min = 48.dp).testTag("proactive-rule-delete-$id"), colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text(uiText("Delete")) }
                             }
                         }
                     }
                     val controlsEnabled = ui.connected && vm.client != null && !savingProactive
-                    TextButton(onClick = ::addProactiveRule, enabled = controlsEnabled && !proactiveChoicesChanged && rules.size < 20, modifier = Modifier.testTag("proactive-add-rule")) { Text(uiText("Add a rule")) }
+                    Button(onClick = ::addProactiveRule, enabled = controlsEnabled && !proactiveChoicesChanged && rules.size < 20, modifier = Modifier.heightIn(min = 48.dp).testTag("proactive-add-rule")) { Text(uiText("Add a rule")) }
                     if (rules.size >= 20) Text(uiText("Delete a rule to add another."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
@@ -303,7 +326,7 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
                     learned.forEachIndexed { index, note ->
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(note, Modifier.weight(1f).testTag("proactive-learned-$index"), style = MaterialTheme.typography.bodyMedium)
-                            TextButton(onClick = { removeLearnedNote(note) }, enabled = ui.connected && vm.client != null && !savingProactive && !proactiveChoicesChanged, modifier = Modifier.testTag("proactive-learned-remove-$index")) { Text(uiText("Remove")) }
+                            OutlinedButton(onClick = { removeLearnedNote(note) }, enabled = ui.connected && vm.client != null && !savingProactive && !proactiveChoicesChanged, modifier = Modifier.heightIn(min = 48.dp).testTag("proactive-learned-remove-$index"), colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text(uiText("Remove")) }
                         }
                     }
                 }
@@ -315,18 +338,16 @@ private data class VoiceCatalog(val models: List<String> = emptyList(), val voic
 @Composable internal fun BeaconSettings(vm: BeaconViewModel, pluginAbsent: Boolean) {
     LazyColumn(contentPadding=PaddingValues(16.dp),verticalArrangement=Arrangement.spacedBy(16.dp)) {
         item {
-            Text("Voice & calls",style=MaterialTheme.typography.titleLarge)
             Text("Provider for one-tap calls. Keys stay on this phone.",
                 style=MaterialTheme.typography.bodyMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)
             VoiceSettingsPluginNote(pluginAbsent)
         }
         item { Glass(Modifier.fillMaxWidth()) { VoiceKeySetupPanel(vm::voiceKeyConfigured) } }
-        item { DevicesSettingsSection(vm, pluginAbsent) }
     }
 }
 
 @Composable
-private fun DevicesSettingsSection(vm: BeaconViewModel, pluginAbsent: Boolean) {
+internal fun DevicesSettingsSection(vm: BeaconViewModel, pluginAbsent: Boolean) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val context = LocalContext.current.applicationContext
     val source = vm.client
@@ -394,10 +415,10 @@ private fun DevicesSettingsSection(vm: BeaconViewModel, pluginAbsent: Boolean) {
             }
             error.isNotBlank() -> {
                 Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
-                TextButton(onClick = { refresh++ }, enabled = !loading, modifier = Modifier.heightIn(min = 48.dp).testTag("settings-devices-retry")) { Text("Retry") }
+                OutlinedButton(onClick = { refresh++ }, enabled = !loading, modifier = Modifier.heightIn(min = 48.dp).testTag("settings-devices-retry")) { Text("Retry") }
             }
             else -> {
-                TextButton(onClick = { refresh++ }, enabled = !loading && !removing, modifier = Modifier.align(Alignment.End).heightIn(min = 48.dp).testTag("settings-devices-refresh")) { Text("Refresh") }
+                OutlinedButton(onClick = { refresh++ }, enabled = !loading && !removing, modifier = Modifier.align(Alignment.End).heightIn(min = 48.dp).testTag("settings-devices-refresh")) { Text("Refresh") }
                 val rows = devices.orEmpty()
                 val thisPhone = rows.firstOrNull { it.id == thisDeviceId }
                 if (thisPhone != null) DeviceSettingsRow(thisPhone, current = true) { pendingRemoval = thisPhone }
@@ -469,7 +490,7 @@ private fun DeviceSettingsRow(device: PairedDevice, current: Boolean, onRemove: 
                 if (current) Text("This phone", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
                 Text(device.name, style = MaterialTheme.typography.bodyMedium)
             }
-            TextButton(onClick = onRemove, modifier = Modifier.heightIn(min = 48.dp).testTag("settings-device-remove-${device.id}")) { Text("Remove") }
+            OutlinedButton(onClick = onRemove, modifier = Modifier.heightIn(min = 48.dp).testTag("settings-device-remove-${device.id}"), colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("Remove") }
         }
         Text(
             if (device.lastSeen.isBlank()) "Last seen unavailable" else "Last seen ${device.lastSeen}",
@@ -483,30 +504,35 @@ private fun DeviceSettingsRow(device: PairedDevice, current: Boolean, onRemove: 
     if (pluginAbsent) MissingBeaconPluginState(compact = true)
 }
 
-@Composable internal fun VoiceKeySetupPanel(onKeySaved:()->Unit,showTitle:Boolean=true) {
+@Composable internal fun VoiceKeySetupPanel(
+    onKeySaved: () -> Unit,
+    showTitle: Boolean = true,
+    onKeyAvailabilityChanged: (Boolean) -> Unit = {},
+    showCustomization: Boolean = true,
+) {
     val context=LocalContext.current.applicationContext
     val store=remember(context) { VoiceKeyStore(context) }
     var selection by remember { mutableStateOf(store.settings()) }
     var draft by remember(selection.provider) { mutableStateOf("") }
-    var keyMask by remember(selection.provider) { mutableStateOf("") }
+    var keySaved by remember(selection.provider) { mutableStateOf(false) }
+    val keyFieldRequester = remember { FocusRequester() }
     var models by remember(selection.provider) { mutableStateOf(listOf(defaultVoiceModel(selection.provider))) }
     var voices by remember(selection.provider) { mutableStateOf(defaultVoiceChoices(selection.provider)) }
     var catalogLoading by remember(selection.provider) { mutableStateOf(false) }
     var catalogRefresh by remember(selection.provider) { mutableIntStateOf(0) }
     var busy by remember { mutableStateOf(false) }
-    var modelMenu by remember(selection.provider) { mutableStateOf(false) }
-    var voiceMenu by remember(selection.provider) { mutableStateOf(false) }
-    var personalityMenu by remember(selection.provider) { mutableStateOf(false) }
     var status by remember { mutableStateOf("") }
     val scope=rememberCoroutineScope()
 
     LaunchedEffect(selection.provider) {
-        keyMask=withContext(Dispatchers.IO) { store.maskedKey(selection.provider).orEmpty() }
+        keySaved = withContext(Dispatchers.IO) { store.hasKey(selection.provider) }
+        onKeyAvailabilityChanged(keySaved)
     }
     // A key typed here is never lost: it is saved (encrypted, per provider) on switch, Test or leaving the screen.
     DisposableEffect(selection.provider) { onDispose { if(draft.isNotBlank()) runCatching { store.saveKey(selection.provider,draft) } } }
 
-    LaunchedEffect(selection.provider,catalogRefresh) {
+    LaunchedEffect(selection.provider,catalogRefresh,showCustomization) {
+        if (!showCustomization) return@LaunchedEffect
         val apiKey=withContext(Dispatchers.IO) { store.key(selection.provider) }
         if(apiKey==null) {
             models=voiceOptionsWithSelected(emptyList(),selection.model)
@@ -569,9 +595,10 @@ private fun DeviceSettingsRow(device: PairedDevice, current: Boolean, onRemove: 
         OutlinedTextField(
             value=draft,
             onValueChange={draft=it.take(8192);status=""},
-            modifier=Modifier.fillMaxWidth().testTag("voice-provider-key"),
+            modifier=Modifier.fillMaxWidth().focusRequester(keyFieldRequester).testTag("voice-provider-key"),
             label={Text("Provider API key")},
-            placeholder={Text(if(keyMask.isBlank()) "Enter an API key" else "Saved key ••••" + keyMask.takeLast(4))},
+            placeholder={Text(if(keySaved) "Enter a replacement key" else "Enter an API key")},
+            supportingText={if(keySaved) Text("Key saved")},
             visualTransformation=PasswordVisualTransformation(),
             keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Password),
             singleLine=true,
@@ -591,71 +618,145 @@ private fun DeviceSettingsRow(device: PairedDevice, current: Boolean, onRemove: 
                         if(entered.isNotBlank()&&!newlySaved) { status="That key couldn't be saved. Check it and try again.";busy=false;return@launch }
                         if(newlySaved) {
                             draft=""
-                            keyMask=withContext(Dispatchers.IO) { store.maskedKey(provider).orEmpty() }
+                            keySaved=true
+                            onKeyAvailabilityChanged(true)
                             catalogRefresh++
                         }
                         val saved=if(newlySaved) "Key saved. " else ""
-                        when(testVoiceProvider(provider,apiKey,model)) {
-                            dev.hermes.android.voice.VoiceProviderTestResult.Success -> {
-                                status="Connection succeeded. The key is stored on this phone."
-                                onKeySaved()
-                            }
-                            dev.hermes.android.voice.VoiceProviderTestResult.KeyRejected -> status=saved+"The provider rejected this key. Check the key and account access."
-                            dev.hermes.android.voice.VoiceProviderTestResult.Unreachable -> status=saved+"The provider could not be reached. Check your connection and try again."
-                            dev.hermes.android.voice.VoiceProviderTestResult.ProviderError -> status=saved+"The provider responded with an error. Check the selected model or try again."
+                        val result=testVoiceProvider(provider,apiKey,model)
+                        status=when(result) {
+                            dev.hermes.android.voice.VoiceProviderTestResult.Success -> { onKeySaved();voiceProviderTestMessage(result) }
+                            dev.hermes.android.voice.VoiceProviderTestResult.KeyRejected -> voiceProviderTestMessage(result)
+                            else -> saved+voiceProviderTestMessage(result)
                         }
                         busy=false
                     }
                 },
-                enabled=!busy&&(draft.isNotBlank()||keyMask.isNotBlank()),
+                enabled=!busy&&(draft.isNotBlank()||keySaved),
             ) { if(busy) CircularProgressIndicator(Modifier.size(18.dp),strokeWidth=2.dp) else Text("Test") }
-            if(keyMask.isNotBlank()) TextButton(onClick={
+            if(keySaved) OutlinedButton(onClick={ keyFieldRequester.requestFocus() },enabled=!busy, modifier=Modifier.heightIn(min=48.dp)) { Text("Replace") }
+        }
+        if(keySaved) TextButton(onClick={
                 val provider=selection.provider
                 busy=true
                 scope.launch {
                     val removed=runCatchingCancellable { withContext(Dispatchers.IO) { store.removeKey(provider) } }.isSuccess
-                    if(removed) { keyMask="";draft="";catalogRefresh++;status="Key removed from this phone." }
+                    if(removed) { keySaved=false;draft="";catalogRefresh++;status="Key removed from this phone.";onKeyAvailabilityChanged(false) }
                     else status="The key could not be removed."
                     busy=false
                 }
-            },enabled=!busy) { Text("Remove key") }
-        }
+            },enabled=!busy, modifier=Modifier.align(Alignment.End).heightIn(min=48.dp), colors=ButtonDefaults.textButtonColors(contentColor=MaterialTheme.colorScheme.error)) { Text("Remove") }
 
-        Box {
-            TextButton(onClick={modelMenu=true},enabled=!busy) { Text("Model: " + selection.model) }
-            DropdownMenu(expanded=modelMenu,onDismissRequest={modelMenu=false}) {
-                models.distinct().forEach { model ->
-                    DropdownMenuItem(text={Text(model)},onClick={
-                        modelMenu=false
-                        saveSelection(selection.copy(model=model))
-                    })
-                }
-            }
+        if (showCustomization) {
+            Text("Make it yours", style = MaterialTheme.typography.titleMedium)
+            VoiceCustomizationChoices(
+                selection = selection,
+                models = models,
+                voices = voices,
+                catalogLoading = catalogLoading,
+                busy = busy,
+                onModelSelected = { saveSelection(selection.copy(model = it)) },
+                onVoiceSelected = { saveSelection(selection.copy(voice = it)) },
+                onPersonalitySelected = { saveSelection(selection.copy(personality = it)) },
+            )
         }
-        Box {
-            TextButton(onClick={voiceMenu=true},enabled=!busy) { Text("Voice: " + voiceChoiceLabel(selection.voice)) }
-            DropdownMenu(expanded=voiceMenu,onDismissRequest={voiceMenu=false}) {
-                voices.distinct().forEach { voice ->
-                    DropdownMenuItem(text={Text(voiceChoiceLabel(voice))},onClick={
-                        voiceMenu=false
-                        saveSelection(selection.copy(voice=voice))
-                    })
-                }
-            }
-        }
-        Box {
-            TextButton(onClick={personalityMenu=true},enabled=!busy) { Text("Personality: " + selection.personality.replaceFirstChar { it.uppercase() }) }
-            DropdownMenu(expanded=personalityMenu,onDismissRequest={personalityMenu=false}) {
-                listOf("balanced","concise","warm").forEach { personality ->
-                    DropdownMenuItem(text={Text(personality.replaceFirstChar { it.uppercase() })},onClick={
-                        personalityMenu=false
-                        saveSelection(selection.copy(personality=personality))
-                    })
-                }
-            }
-        }
-        if(catalogLoading) LinearProgressIndicator(Modifier.fillMaxWidth())
         status.takeIf(String::isNotBlank)?.let { Text(it,style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant) }
+    }
+}
+
+@Composable internal fun VoiceCustomizationPanel(ownerName: String, onOwnerNameChange: (String) -> Unit, onContinue: () -> Unit, onSkip: () -> Unit) {
+    val context = LocalContext.current.applicationContext
+    val store = remember(context) { VoiceKeyStore(context) }
+    var selection by remember { mutableStateOf(store.settings()) }
+    var models by remember(selection.provider) { mutableStateOf(listOf(defaultVoiceModel(selection.provider))) }
+    var voices by remember(selection.provider) { mutableStateOf(defaultVoiceChoices(selection.provider)) }
+    var catalogLoading by remember(selection.provider) { mutableStateOf(false) }
+    var busy by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf("") }
+    var ownerNameDraft by remember(ownerName) { mutableStateOf(ownerName) }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(selection.provider) {
+        val apiKey = withContext(Dispatchers.IO) { store.key(selection.provider) }
+        if (apiKey == null) {
+            models = voiceOptionsWithSelected(emptyList(), selection.model)
+            voices = voiceOptionsWithSelected(defaultVoiceChoices(selection.provider), selection.voice)
+            return@LaunchedEffect
+        }
+        catalogLoading = true
+        try {
+            val catalog = loadVoiceCatalog(selection.provider, apiKey)
+            models = voiceOptionsWithSelected(catalog.models, selection.model)
+            voices = voiceOptionsWithSelected(catalog.voices.ifEmpty { defaultVoiceChoices(selection.provider) }, selection.voice)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            models = voiceOptionsWithSelected(emptyList(), selection.model)
+            voices = voiceOptionsWithSelected(defaultVoiceChoices(selection.provider), selection.voice)
+        } finally {
+            catalogLoading = false
+        }
+    }
+
+    fun saveSelection(next: VoicePreferences) {
+        if (busy) return
+        busy = true
+        scope.launch {
+            val saved = runCatchingCancellable { withContext(Dispatchers.IO) { store.setSelection(next) } }.isSuccess
+            if (saved) { selection = next; status = "Saved for the next call." }
+            else status = "Voice preferences could not be saved."
+            busy = false
+        }
+    }
+
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text("Make it yours", style = MaterialTheme.typography.headlineSmall)
+        Text("Choose a voice and personality for calls.", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        OutlinedTextField(ownerNameDraft, { ownerNameDraft = ownerNameOf(it); onOwnerNameChange(ownerNameDraft) },
+            label = { Text("What should Beacon call you?") }, supportingText = { Text("Optional") }, singleLine = true,
+            modifier = Modifier.fillMaxWidth().testTag("setup-owner-name"))
+        VoiceCustomizationChoices(
+            selection = selection,
+            models = models,
+            voices = voices,
+            catalogLoading = catalogLoading,
+            busy = busy,
+            onModelSelected = { saveSelection(selection.copy(model = it)) },
+            onVoiceSelected = { saveSelection(selection.copy(voice = it)) },
+            onPersonalitySelected = { saveSelection(selection.copy(personality = it)) },
+        )
+        status.takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        Button(onClick = onContinue, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("setup-voice-customize-continue")) { Text("Continue") }
+        TextButton(onClick = onSkip, enabled = !busy, modifier = Modifier.align(Alignment.CenterHorizontally).heightIn(min = 48.dp).testTag("setup-voice-customize-skip")) { Text("Skip for now") }
+    }
+}
+
+@Composable internal fun VoiceCustomizationChoices(
+    selection: VoicePreferences,
+    models: List<String>,
+    voices: List<String>,
+    catalogLoading: Boolean,
+    busy: Boolean,
+    onModelSelected: (String) -> Unit,
+    onVoiceSelected: (String) -> Unit,
+    onPersonalitySelected: (String) -> Unit,
+) {
+    val modelOptions = voiceOptionsWithSelected(models, selection.model)
+    val voiceOptions = voiceOptionsWithSelected(voices, selection.voice)
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Choice("Model", selection.model, modelOptions, onModelSelected,
+            modifier = Modifier.fillMaxWidth(),
+            optionLabels = modelOptions.associateWith(::voiceModelDisplayName), enabled = !busy)
+        Choice("Voice", selection.voice, voiceOptions, onVoiceSelected,
+            modifier = Modifier.fillMaxWidth(),
+            optionLabels = voiceOptions.associateWith(::voiceChoiceLabel), enabled = !busy)
+        if (catalogLoading) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            BeaconSignal(BeaconMotionMode.Sweep, size = 18.dp)
+            Text("Loading voice options", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Choice("Personality", selection.personality, listOf("balanced", "concise", "warm"), onPersonalitySelected,
+            modifier = Modifier.fillMaxWidth(),
+            optionLabels = mapOf("balanced" to "Balanced", "concise" to "Concise", "warm" to "Warm"), enabled = !busy)
     }
 }
 

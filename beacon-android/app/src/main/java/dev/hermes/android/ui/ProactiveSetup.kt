@@ -86,7 +86,7 @@ internal fun proactiveHealthText(proactive: JSONObject): String {
                 "Checked ${Instant.ofEpochSecond(checkedAt).atZone(timezone).format(proactiveHealthTime)}"
             }
         }
-        "error" -> "Couldn't read your email: ${health.string("message").ifBlank { "Try again." }}"
+        "error" -> "Couldn't check: ${health.string("message").ifBlank { "Try again." }}"
         else -> "Not checked yet"
     }
 }
@@ -128,6 +128,13 @@ internal fun proactiveErrorMessage(error: Throwable, fallback: String): String =
 internal fun proactiveLearnedNotes(proactive: JSONObject): List<String> {
     val notes = proactive.optJSONArray("learned") ?: return emptyList()
     return List(notes.length()) { notes.optString(it) }.filter(String::isNotBlank)
+}
+
+internal fun proactiveSources(proactive: JSONObject): List<String> {
+    val sources = proactive.optJSONArray("sources") ?: return emptyList()
+    return (0 until sources.length()).mapNotNull { index ->
+        (sources.opt(index) as? String)?.trim()?.takeIf(String::isNotBlank)
+    }.distinct()
 }
 
 internal suspend fun saveProactiveSettings(vm: BeaconViewModel, profile: String, body: JSONObject): JSONObject {
@@ -179,15 +186,17 @@ internal suspend fun fetchProactiveSettings(source: BeaconClient, profile: Strin
     )
 }
 
-internal fun openProactiveRuleForm(vm: BeaconViewModel, profile: String, onCreated: () -> Unit, onMissingPlugin: () -> Unit = {}) {
+internal fun openProactiveRuleForm(vm: BeaconViewModel, profile: String, onCreated: () -> Unit, onMissingPlugin: () -> Unit = {}, sources: List<String> = emptyList()) {
     vm.openForm(ActionForm(
         "Add a rule", "", listOf(
             Field("text", "Your rule", FieldType.MULTILINE, required = true),
+            Field("signal", "Source", FieldType.CHOICE, options = listOf("anything") + sources,
+                optionLabels = mapOf("anything" to "Anything")),
             Field("action", "When it happens", FieldType.CHOICE, options = listOf("notify", "call"), optionLabels = mapOf("notify" to "Notify", "call" to "Call")),
             Field("night", "Even at night", FieldType.BOOLEAN),
         ),
-        seed = json("action" to "notify", "night" to false),
-        explanation = "Describe which emails $currentAssistantName should alert you about.",
+        seed = json("signal" to "anything", "action" to "notify", "night" to false),
+        explanation = "Tell $currentAssistantName what needs your attention.",
         actionLabel = "Add rule",
         onResult = onResult@{ form ->
             val text = form.string("text").trim()
@@ -197,7 +206,8 @@ internal fun openProactiveRuleForm(vm: BeaconViewModel, profile: String, onCreat
             try {
                 try {
                     client.call("$PROACTIVE_SETTINGS_PATH/requests", mapOf("profile" to profile), method = "POST", data = json(
-                        "text" to text, "action" to form.string("action"), "night" to form.optBoolean("night"), "signal" to "email",
+                        "text" to text, "action" to form.string("action"), "night" to form.optBoolean("night"),
+                        "signal" to form.string("signal").takeUnless { it.isBlank() || it == "anything" },
                     ))
                 } catch (cancelled: CancellationException) {
                     throw cancelled

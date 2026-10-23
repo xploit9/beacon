@@ -263,9 +263,9 @@ class Usability19Test {
         saved = null; open(required = true); compose.onNodeWithText("Service tier: Priority tier").performClick()
         selectBlank(); assertEquals("", vm.form.value!!.values[field.key]); compose.onNodeWithText("Save").performClick()
         await("Required choice validation appeared", 25_000, { formState() }) {
-            vm.form.value?.error?.contains("Service tier is required") == true
+            vm.form.value?.error == "Enter Service tier."
         }
-        compose.onNodeWithText("Service tier is required").assertIsDisplayed(); assertNull(saved); capture("blank-required-error")
+        compose.onNodeWithText("Enter Service tier.").assertIsDisplayed(); assertNull(saved); capture("blank-required-error")
         compose.onNodeWithText("Cancel").performClick()
         await("Required choice form closed after cancel", 25_000, { formState() }) { vm.form.value == null }
         println("LABELS18_ACTUAL_BLANK_SAVE_CANCEL_REQUIRED_VALIDATION_OK")

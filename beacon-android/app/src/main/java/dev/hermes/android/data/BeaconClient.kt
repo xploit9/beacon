@@ -12,6 +12,7 @@ import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.RequestBody.Companion.asRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -21,11 +22,16 @@ import java.io.OutputStream
 import java.util.concurrent.TimeUnit
 
 /** [plugin]: the failure came from the optional Beacon plugin, whose 401 is a plugin answer, never a native sign-out. */
-class ApiFailure(val status: Int, override val message: String, val plugin: Boolean = false) : IOException(message)
+class ApiFailure(val status: Int, override val message: String, val plugin: Boolean = false) : IOException(message) {
+    internal val detail = message
+}
 internal class LoopbackSessionRefreshFailed : IOException("Hermes restarted. Scan the Connect QR again.")
 internal const val HERMES_LOOPBACK_SESSION_HEADER = "X-Hermes-Session-Token"
 private const val MAX_LOOPBACK_ROOT_BYTES = 256L * 1024L
 private const val BEACON_PLUGIN_PATH = "/api/plugins/beacon/"
+internal object NativeDeviceRemoval {
+    @Volatile var onRemoved: ((Scope) -> Unit)? = null
+}
 private val LOOPBACK_SESSION_ASSIGNMENT = Regex("""window\.__HERMES_SESSION_TOKEN__\s*=\s*("(?:\\.|[^"\\])*")\s*;""")
 
 // Hermes reserves `profile` for plugin routing; Beacon uses its own key for the selected data profile.
@@ -119,16 +125,20 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         require(NativeOperationPolicy.direct(path, method)) { "Unsupported native endpoint" }
         if (body?.has("profile") == true) require(body.string("profile") == auth.profile) { "Native request belongs to another profile" }
         val query = if (path.startsWith(BEACON_PLUGIN_PATH)) beaconPluginProfileQuery(params, auth.profile) else params
-        return rawCall(path, query = query, method = method, data = body)
+        val deviceId = NativePairing.deviceHeader(path, scope)
+        val result = rawCall(path, query = query, method = method, data = body)
+        if (method == "DELETE" && deviceId != null && path == "/api/plugins/beacon/devices/$deviceId") NativeDeviceRemoval.onRemoved?.invoke(scope)
+        return result
     }
-    suspend fun nativeCallContext(callId: String): JSONObject = kotlinx.coroutines.withTimeout(20_000) {
+    suspend fun nativeCallContext(callId: String, ownerName: String = ""): JSONObject = kotlinx.coroutines.withTimeout(20_000) {
         val path = "/api/plugins/beacon/mobile/calls/$callId/context"
-        try { nativeRequest(path) }
+        val params = mapOf("owner_name" to ownerName)
+        try { nativeRequest(path, params = params) }
         catch (error: ApiFailure) {
             if (error.status !in setOf(429, 502, 503, 504)) throw error
             // Retry only this read: a cold native lookup can outlast its server deadline.
             kotlinx.coroutines.delay(300)
-            nativeRequest(path)
+            nativeRequest(path, params = params)
         }
     }
     internal suspend fun nativeReplay(lastId: String = "", beforePrompt: Boolean = false) = native.prepareReplay(lastId, beforePrompt)
@@ -236,8 +246,9 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         response.close()
         chain.proceed(request.newBuilder().header("Authorization", "Bearer ${refreshed.accessToken}").build())
     }
-    private suspend fun <T> execute(request: Request, read: suspend (Response) -> T): T {
+    private suspend fun <T> execute(request: Request, timeoutMillis: Long? = null, read: suspend (Response) -> T): T {
         val call = http.newCall(request)
+        timeoutMillis?.let { call.timeout().timeout(it, TimeUnit.MILLISECONDS) }
         // Cancellation must close a stalled body too, after response headers have arrived.
         val watcher = kotlinx.coroutines.CoroutineScope(currentCoroutineContext()).launchCancel(call)
         try { return call.execute().use { read(it) } }
@@ -246,16 +257,17 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
     }
     suspend fun get(path: String, query: Map<String, String> = emptyMap(), maxBytes: Int = 32 * 1024 * 1024): JSONObject = call(path, query, maxBytes = maxBytes)
     suspend fun post(path: String, body: JSONObject = JSONObject()): JSONObject = call(path, method = "POST", data = body)
-    private suspend fun rawCall(path: String, query: Map<String, String> = emptyMap(), method: String = "GET", data: JSONObject? = null, maxBytes: Int = 32 * 1024 * 1024, persistAuth: Boolean = true): JSONObject = withContext(Dispatchers.IO) {
+    private suspend fun rawCall(path: String, query: Map<String, String> = emptyMap(), method: String = "GET", data: JSONObject? = null, maxBytes: Int = 32 * 1024 * 1024, persistAuth: Boolean = true, timeoutMillis: Long? = null): JSONObject = withContext(Dispatchers.IO) {
         require(maxBytes in 1..32 * 1024 * 1024) { "Invalid response size limit" }
         val body = data?.toString()?.toRequestBody("application/json; charset=utf-8".toMediaType())
-        execute(request(path, query, method, body).build()) { response ->
+        execute(request(path, query, method, body).build(), timeoutMillis) { response ->
             val input = response.body?.source()
             val payload = java.io.ByteArrayOutputStream()
             val chunk = ByteArray(32768)
             if (input != null) while (true) { currentCoroutineContext().ensureActive(); val n = input.read(chunk); if (n < 0) break; require(payload.size().toLong() + n <= maxBytes) { "Server response exceeds the size limit" }; payload.write(chunk, 0, n) }
             val raw = payload.toString("UTF-8")
             val result = runCatching { JSONObject(raw) }.getOrElse { if (raw.trim().startsWith('[')) json("items" to org.json.JSONArray(raw)) else json("message" to raw.take(2048)) }
+            if (response.code == 403 && path.startsWith(BEACON_PLUGIN_PATH) && listOf("code", "error", "detail").any { result.string(it) == "device_removed" }) NativeDeviceRemoval.onRemoved?.invoke(scope)
             if (!response.isSuccessful || result.has("error") && !result.isNull("error") && result.string("error").isNotBlank()) throw ApiFailure(response.code, nativeErrorMessage(result, response.code), plugin = path.startsWith(BEACON_PLUGIN_PATH))
             // An optional probe must not rewrite the verified native auth context or its persisted cookies.
             if (persistAuth && !detachedView && auth.loopbackSession?.verified != false) {
@@ -280,13 +292,14 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         authorizedProfiles: List<String>,
         query: Map<String, String> = emptyMap(),
         maxBytes: Int = 32 * 1024 * 1024,
+        timeoutMillis: Long? = null,
     ): JSONObject {
         require(NativeOperationPolicy.direct(path, "GET") && validNativeProfile(profile) && profile in authorizedProfiles) {
             "Native request belongs to an unauthorized profile"
         }
         val scoped = if (path.startsWith(BEACON_PLUGIN_PATH)) beaconPluginProfileQuery(query, profile)
         else (query - "beacon_profile") + ("profile" to profile)
-        return rawCall(path, scoped, maxBytes = maxBytes, persistAuth = false)
+        return rawCall(path, scoped, maxBytes = maxBytes, persistAuth = false, timeoutMillis = timeoutMillis)
     }
     /** Retained for existing direct native-protocol callers; the app's sign-in UI uses NativeAuth OAuth. */
     @Deprecated("The app's sign-in flow uses Hermes OAuth")
@@ -459,30 +472,46 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
                 require(file.length() <= 32L * 1024 * 1024) { "Attachment exceeds 32 MiB" }
                 require(path in setOf("/api/upload", "/api/workspace/upload")) { "This upload capability is unavailable in native Hermes" }
                 require(validUploadName(name)) { "Choose a filename without quotes, slashes, dollar signs, percent signs or control characters." }
-                val encoded = android.util.Base64.encodeToString(file.readBytes(), android.util.Base64.NO_WRAP)
                 if (path == "/api/upload") {
+                    val encoded = android.util.Base64.encodeToString(file.readBytes(), android.util.Base64.NO_WRAP)
                     json("file" to json("id" to java.util.UUID.randomUUID().toString(), "state" to "ready", "scope_key" to scope.session(sessionId).key, "staged_base64" to encoded, "name" to name, "mime" to mime))
                 } else {
                     require(path == "/api/workspace/upload") { "Native chat attachments currently support images; upload other files in Spaces" }
                     val nativePath = NativeOperations(this@BeaconClient).workspacePath(sessionId, directory.trimEnd('/') + "/" + name)
-                    nativeRequest("/api/files/upload", "POST", json("path" to nativePath, "data_url" to "data:$mime;base64,$encoded", "overwrite" to false))
+                    val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                        .addFormDataPart("path", nativePath).addFormDataPart("overwrite", "false")
+                        .addFormDataPart("file", name, file.asRequestBody(mime.toMediaType())).build()
+                    execute(request("/api/files/upload-stream", mapOf("profile" to auth.profile), "POST", body).build()) { response ->
+                        val raw = response.peekBody(1024 * 1024L + 1).string()
+                        if (!response.isSuccessful) throw ApiFailure(response.code,
+                            runCatching { nativeErrorMessage(JSONObject(raw), response.code) }.getOrDefault("Upload failed (${response.code})"))
+                        require(raw.toByteArray(Charsets.UTF_8).size <= 1024 * 1024) { "Upload response is too large" }
+                        val result = runCatching { JSONObject(raw) }.getOrElse { throw IOException("Hermes couldn't confirm the upload.", it) }
+                        result
+                    }
                 }
             } finally { closeNative() }
         }
     }
+    internal suspend fun historyImage(reference: NativeReference.HistoryImage): NativeMediaBytes =
+        NativeOperations(this).historyImage(reference.sessionId, reference.rowId, reference.imageIndex)
+
     suspend fun copyTo(path: String, output: OutputStream, query: Map<String, String> = emptyMap(), data: JSONObject? = null, limit: Long = 32L * 1024 * 1024): Long = withContext(Dispatchers.IO) {
-        val mapped = if (path == "/api/file/raw") "/api/fs/download" else path
+        val mapped = if (path in setOf("/api/file/raw", "/api/media")) "/api/fs/download" else path
         require(NativeOperationPolicy.direct(mapped, if (data == null) "GET" else "POST")) { "This download capability is unavailable in native Hermes" }
         if (query.containsKey("profile")) require(query["profile"] == auth.profile) { "Native download belongs to another profile" }
         if (data?.has("profile") == true) require(data.string("profile") == auth.profile) { "Native download belongs to another profile" }
-        val scopedQuery = (query - "session_id").let {
-            if (mapped.startsWith(BEACON_PLUGIN_PATH)) beaconPluginProfileQuery(it, auth.profile) else it
-        }
+        val scopedQuery = if (mapped.startsWith(BEACON_PLUGIN_PATH)) beaconPluginProfileQuery(query - "session_id", auth.profile)
+            else query + ("profile" to auth.profile)
+        val snapshot = query["snap"]?.takeIf { mapped == "/api/fs/download" }?.also { require(validMediaSnapshot(it)) { "Invalid file snapshot" } }
         execute(request(mapped, scopedQuery, if (data == null) "GET" else "POST", data?.toString()?.toRequestBody("application/json".toMediaType())).build()) { response ->
             if (!response.isSuccessful) throw ApiFailure(response.code, "Download failed (${response.code})")
             val body = response.body ?: error("Missing file")
             require(body.contentLength() <= limit) { "Download exceeds permitted size" }
-            copyDownload(body.byteStream(), output, limit)
+            val digest = snapshot?.let { java.security.MessageDigest.getInstance("SHA-256") }
+            val count = copyDownload(body.byteStream(), digest?.let { java.security.DigestOutputStream(output, it) } ?: output, limit)
+            require(snapshot == null || digest!!.digest().joinToString("") { "%02x".format(it) }.equals(snapshot, true)) { "The file changed since this message. Refresh before previewing it." }
+            count
         }
     }
 

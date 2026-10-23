@@ -65,7 +65,7 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
     var profilesOpen by remember(ui.origin, ui.owner, ui.profile) { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         if (ui.botModeEnabled) {
-            TextButton(onClick = vm::showBotMode, enabled = !ui.botModeSwitching, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp).testTag("navigation-bot-mode-home")) {
+            OutlinedButton(onClick = vm::showBotMode, enabled = !ui.botModeSwitching, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp).testTag("navigation-bot-mode-home")) {
                 Icon(Icons.Rounded.SmartToy, null, Modifier.size(28.dp))
                 Spacer(Modifier.width(10.dp))
                 Column(Modifier.weight(1f), horizontalAlignment = Alignment.Start) {
@@ -74,13 +74,13 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
                 }
                 Icon(Icons.Rounded.ChevronRight, null)
             }
-            TextButton(onClick = vm::toggleBotMode, enabled = !ui.botModeSwitching, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("navigation-leave-bot-mode")) {
+            OutlinedButton(onClick = vm::toggleBotMode, enabled = !ui.botModeSwitching, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("navigation-leave-bot-mode")) {
                 Text(uiText("Leave Bot Mode"))
             }
         } else {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.weight(1f)) {
-                    TextButton(onClick = { profilesOpen = true; vm.load("navigation-profiles", "/api/profiles", force = false) }, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp).testTag("navigation-profile")) {
+                    OutlinedButton(onClick = { profilesOpen = true; vm.load("navigation-profiles", "/api/profiles", force = false) }, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp).testTag("navigation-profile")) {
                         Icon(Icons.Rounded.AccountCircle, null, Modifier.size(28.dp))
                         Spacer(Modifier.width(8.dp))
                         Column(Modifier.weight(1f), horizontalAlignment = Alignment.Start) {
@@ -126,7 +126,6 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
                                 }
                             }
                         }
-                        repeat(columns - row.size) { Spacer(Modifier.weight(1f)) }
                     }
                 }
             }

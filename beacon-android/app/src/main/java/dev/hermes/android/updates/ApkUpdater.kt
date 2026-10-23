@@ -17,6 +17,10 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import java.io.File
 
+internal fun prunePartialUpdates(dir: File, now: Long = System.currentTimeMillis()) {
+    dir.listFiles()?.filter { it.isFile && it.name.endsWith(".part") && it.lastModified() < now - 3_600_000 }?.forEach { it.delete() }
+}
+
 class ApkUpdater(private val context: Context) {
     private fun installed() = context.packageManager.getPackageInfo(context.packageName, PackageManager.GET_SIGNING_CERTIFICATES)
     fun installedVersion(): Long = installed().longVersionCode
@@ -33,6 +37,7 @@ class ApkUpdater(private val context: Context) {
     suspend fun download(client: BeaconClient, release: Release): File = withContext(Dispatchers.IO) {
         release.validate(context.packageName, installed().longVersionCode, signer())
         val dir = File(context.filesDir, "updates").apply { mkdirs() }
+        prunePartialUpdates(dir)
         val part = File(dir, "${client.scope.key}-${java.util.UUID.randomUUID()}.part")
         try {
             val size = part.outputStream().use { client.copyTo(safeArtifactPath(release.path), it, query = mapOf("package" to context.packageName), limit = release.size) }

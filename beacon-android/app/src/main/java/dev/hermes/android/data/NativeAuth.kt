@@ -79,7 +79,9 @@ class NativeAuth internal constructor(
 ) {
     private val baseUrl = trustedOrigin(baseUrl)
 
-    suspend fun authorize(context: Context): NativeBearerRecord = withContext(Dispatchers.IO) {
+    suspend fun authorize(context: Context): NativeBearerRecord = withNativeSignInForeground(context) { authorizeInBrowser(context) }
+
+    private suspend fun authorizeInBrowser(context: Context): NativeBearerRecord = withContext(Dispatchers.IO) {
         val verifier = urlSafeRandom(32)
         val state = urlSafeRandom(24)
         val challenge = pkceChallenge(verifier)
@@ -447,6 +449,15 @@ internal class PendingNativeAuthorization(
         }
     }
 
+    /** The activity that opened the sign-in tab is back on top, so the tab was closed. Another app's launch
+     *  opens a new activity above the tab instead, so it can't end a sign-in this way. */
+    fun onLauncherReturned() {
+        schedule(RESUME_GRACE_MS) {
+            val abandoned = synchronized(lock) { (!codeCaptured).also { if (it) cancelledOnResume = true } }
+            if (abandoned) runCatching(closeListener)
+        }
+    }
+
     companion object {
         const val RESUME_GRACE_MS = 1_500L
     }
@@ -456,12 +467,14 @@ private class NativeAuthActivityLifecycleCallbacks(
     initialActivity: Activity?,
     private val pending: PendingNativeAuthorization,
 ) : Application.ActivityLifecycleCallbacks {
+    private val launcher = initialActivity
     private val resumedActivities = mutableSetOf<Activity>().apply { initialActivity?.let(::add) }
 
     override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
     override fun onActivityStarted(activity: Activity) = Unit
     override fun onActivityResumed(activity: Activity) {
         resumedActivities += activity
+        if (activity === launcher) pending.onLauncherReturned()
     }
     override fun onActivityPaused(activity: Activity) {
         resumedActivities -= activity

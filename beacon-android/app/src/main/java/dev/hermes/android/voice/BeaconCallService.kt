@@ -38,7 +38,9 @@ import androidx.core.app.ServiceCompat
 import java.util.concurrent.atomic.AtomicBoolean
 
 data class AudioRoute(val id: String, val name: String)
-data class CallState(val active: Boolean = false, val state: String = "idle", val muted: Boolean = false, val transcript: String = "", val error: String = "", val routes: List<AudioRoute> = emptyList(), val route: String = "", val startedAt: Long = 0, val conversationScope: Scope? = null, val callId: String = "", val transcripts: List<CallTranscript> = emptyList(), val transcriptStatus: String = "", val cameraSharing: Boolean = false, val cameraRear: Boolean = false, val cameraBusy: Boolean = false, val cameraCanFlip: Boolean = false, val cameraStopPending: Boolean = false, val held: Boolean = false, val userSpeaking: Boolean = false, val remoteSpeaking: Boolean = false, val localAudioLevel: Float? = null, val remoteAudioLevel: Float? = null, val minimized: Boolean = false, val screenSharing: Boolean = false, val screenBusy: Boolean = false, val screenStopPending: Boolean = false, val overlayPermissionMissing: Boolean = false, val contextNotice: String = "", val audioStopPending: Boolean = false, val hostCleanupPending: Boolean = false, val toolApprovals: List<CallToolApproval> = emptyList(), val voiceProvider: String = "gemini", val visionAvailable: Boolean = true)
+data class CallState(val active: Boolean = false, val state: String = "idle", val muted: Boolean = false, val transcript: String = "", val error: String = "", val routes: List<AudioRoute> = emptyList(), val route: String = "", val startedAt: Long = 0, val conversationScope: Scope? = null, val callId: String = "", val transcripts: List<CallTranscript> = emptyList(), val transcriptStatus: String = "", val cameraSharing: Boolean = false, val cameraRear: Boolean = false, val cameraBusy: Boolean = false, val cameraCanFlip: Boolean = false, val cameraStopPending: Boolean = false, val held: Boolean = false, val userSpeaking: Boolean = false, val remoteSpeaking: Boolean = false, val localAudioLevel: Float? = null, val remoteAudioLevel: Float? = null, val minimized: Boolean = false, val screenSharing: Boolean = false, val screenBusy: Boolean = false, val screenStopPending: Boolean = false, val overlayPermissionMissing: Boolean = false, val contextNotice: String = "", val audioStopPending: Boolean = false, val hostCleanupPending: Boolean = false, val toolApprovals: List<CallToolApproval> = emptyList(), val voiceProvider: String = "gemini", val visionAvailable: Boolean = true, val failureReason: String = "", val toolReceipts: List<CallToolReceipt> = emptyList())
+internal fun CallState.failedCallConversation(expectedId: String): Scope? =
+    conversationScope.takeIf { !active && callId == expectedId && failureReason.isNotBlank() }
 internal fun callEndNotSentText(count: Int): String =
     if (count == 1) "1 request wasn't sent before the call ended." else "$count requests weren't sent before the call ended."
 internal fun callEndUnknownText(count: Int): String =
@@ -73,7 +75,7 @@ internal fun CallState.afterOwnedCleanupFailure(error: Throwable, ownsCall: Bool
     if (ownsCall) afterCleanupFailure(error) else this
 internal fun CallState.afterTerminalControls(fenceFailure: Throwable?): CallState = copy(
     held=false,muted=false,userSpeaking=false,remoteSpeaking=false,localAudioLevel=null,remoteAudioLevel=null,
-    routes=emptyList(),route="",cameraRear=false,cameraCanFlip=false,overlayPermissionMissing=false,contextNotice="",toolApprovals=emptyList(),
+    routes=emptyList(),route="",cameraRear=false,cameraCanFlip=false,overlayPermissionMissing=false,contextNotice="",toolApprovals=emptyList(),toolReceipts=emptyList(),
     error=listOf(error,if(fenceFailure!=null) "Call stop fence failed; capture or transcript finalization was unconfirmed" else "")
         .filter(String::isNotBlank).distinct().joinToString(" "))
 internal fun cameraMayShare(requested: Boolean, visible: Boolean, held: Boolean, closed: Boolean): Boolean =
@@ -119,7 +121,7 @@ class CallController(private val app: BeaconApplication) {
     }
     internal fun cameraTrack(owner: BeaconCallService, track: android.graphics.Bitmap?) { if (service === owner) _cameraTrack.value = track }
     fun camera(value: Boolean) { service?.camera(value) }
-    fun decideTool(callId: String, requestId: String, proposalId: String, approve: Boolean) { if (state.value.callId == callId) service?.decideTool(requestId, proposalId, approve) }
+    fun decideTool(callId: String, requestId: String, proposalId: String, decision: String) { if (state.value.callId == callId && decision in setOf("approve", "approve_call", "deny")) service?.decideTool(requestId, proposalId, decision) }
     fun flipCamera() { service?.flipCamera() }
     fun beginScreenConsent(expectedId: String): Long = service?.beginScreenConsent(expectedId) ?: 0L
     fun screenConsent(expectedId: String, token: Long, consent: Intent?) { service?.screenConsent(expectedId,token,consent) }
@@ -168,7 +170,7 @@ class CallController(private val app: BeaconApplication) {
         val credentials=withContext(Dispatchers.IO) { keyStore.session() }?:throw MissingVoiceKeyException(keyStore.settings().provider)
         check(ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) { "Allow microphone access to answer ${dev.hermes.android.data.currentAssistantName}" }
         require(app.push.claimInvitation(source, event)) { "This ${dev.hermes.android.data.currentAssistantName} invitation has ended" }
-        val (client, route) = withTimeout(15000) { resolveIncoming(app, source, event) }
+        val (client, route) = callLookup { resolveIncoming(app, source, event) }
         start(client, IncomingCall(source, event, route.getLong("expires_at")),voiceSettings=credentials)
     }
     private suspend fun start(client: BeaconClient, incoming: IncomingCall?, conversationId: String? = null, voiceSettings:VoiceSessionCredentials) {
@@ -216,6 +218,12 @@ class CallController(private val app: BeaconApplication) {
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch { release(pending) }
     }
     fun hangup() { epoch.incrementAndGet(); service?.hangup() ?: run { val pending = spec; spec = null; _state.update { it.copy(active = false, state = "idle") }; if (pending != null) CoroutineScope(SupervisorJob() + Dispatchers.IO).launch { release(pending) } } }
+    fun dismissFailure(expectedId: String) {
+        _state.update { call ->
+            if (call.failedCallConversation(expectedId) == null) call
+            else call.copy(failureReason = "", error = call.error.removePrefix(call.failureReason).trim())
+        }
+    }
     fun mute() { service?.mute(!_state.value.muted) }
     fun route(id: String) { service?.route(id) }
     internal fun update(change: (CallState) -> CallState) { _state.update(change) }
@@ -292,7 +300,7 @@ class BeaconCallService : Service() {
         if (intent?.action == STOP_SCREEN) { stopScreen(); return START_NOT_STICKY }
         if (intent?.action == MUTE) { mute(!muted); return START_NOT_STICKY }
         if (intent?.action == TOOL_ALLOW || intent?.action == TOOL_DENY) {
-            decideTool(intent.getStringExtra("request").orEmpty(),intent.getStringExtra("proposal").orEmpty(),intent.action==TOOL_ALLOW,fromNotification=true)
+            decideTool(intent.getStringExtra("request").orEmpty(),intent.getStringExtra("proposal").orEmpty(),if(intent.action==TOOL_ALLOW) "approve" else "deny",fromNotification=true)
             return START_NOT_STICKY
         }
         if (spec != null || closed.get()) {
@@ -366,6 +374,9 @@ class BeaconCallService : Service() {
     }
     private fun openTransport(spec: CallSpec) {
         connectionJob = scope.launch(mediaDispatcher, start=CoroutineStart.LAZY) {
+            // Read before admission: the admitted block is not a coroutine body.
+            val ownerName=try { withContext(Dispatchers.IO) { app.preferences.data.first().let(dev.hermes.android.data.AppPreferences::read).ownerName } }
+                catch(error:CancellationException) { throw error } catch(_:Exception) { "" }
             admitCallTransport(mediaLock,closed,{app.calls.service===this@BeaconCallService}) {
             try {
                 transcriptSync = NativeCallTranscriptSync(spec.client::nativeRequest,spec.grant.getString("call_id"),scope) { status -> app.calls.updateFrom(this@BeaconCallService) { it.copy(transcriptStatus=status) } }
@@ -391,7 +402,7 @@ class BeaconCallService : Service() {
                 },{ stopScreen() })
                 directVoice=DirectVoice(spec.client,spec.grant.getString("call_id"),spec.grant.getString("conversation_id"),scope,{bytes ->
                     if(!held&&!closed.get()) { if(!audio.enqueue(bytes)&&!closed.get()) { audio.interrupt();app.calls.updateFrom(this@BeaconCallService) { it.copy(error="Playback queue overflow; current speech was interrupted") } } }
-                },::directEvent,::failure,{ app.calls.state.value.transcripts.takeLast(10).joinToString("\n") { "${it.role}: ${it.text}" }.takeLast(6000) },voiceSettings).also { it.start() }
+                },::directEvent,::failure,{ app.calls.state.value.transcripts.takeLast(10).joinToString("\n") { "${it.role}: ${it.text}" }.takeLast(6000) },voiceSettings,ownerName=ownerName).also { it.start() }
             } catch(e:Exception) { if(!closed.get()) failure("Native audio initialization failed") }
             }
         }
@@ -406,14 +417,13 @@ class BeaconCallService : Service() {
             }
             "transcript" -> {
                 val pendingItem=spec?:return
-                providerTranscript(value,pendingItem.grant.string("call_id"),pendingItem.grant.string("conversation_id"),pcm?.clock()?:0)?.let { item ->
+                providerTranscript(JSONObject(value.toString()).put("turn_id",transcriptTurn.toString()),pendingItem.grant.string("call_id"),pendingItem.grant.string("conversation_id"),pcm?.clock()?:0)?.let { item ->
                     transcriptSync?.event(item);handleControl(item);return
                 }
                 val role=value.string("role");val text=accumulatedCaption(transcriptText[role].orEmpty(),value.string("text"));transcriptText[role]=text
                 val pending=spec?:return
-                val id="${pending.grant.string("call_id")}:$role:$transcriptTurn"
-                val transcript=value.put("event_id",id).put("session_id",pending.grant.string("conversation_id")).put("text",text)
-                transcriptSync?.event(JSONObject(transcript.toString()).put("turn_id",transcriptTurn.toString()).put("at_ms",pcm?.clock()?:0))
+                val transcript=directCaption(value,pending.grant.string("call_id"),pending.grant.string("conversation_id"),transcriptTurn,text)
+                transcriptSync?.event(JSONObject(transcript.toString()).put("at_ms",pcm?.clock()?:0))
                 handleControl(transcript)
             }
             "turn_complete" -> {
@@ -422,8 +432,8 @@ class BeaconCallService : Service() {
             "state" -> app.calls.updateFrom(this) { it.copy(state=value.string("state")) }
             "warning" -> handleControl(value)
             "tool_approval" -> {
-                val approval=runCatching { CallToolApproval.from(value) }.getOrNull() ?: return
-                app.calls.updateFrom(this) { it.copy(toolApprovals=(it.toolApprovals.filterNot { p -> p.requestId==approval.requestId }+approval).take(8)) }
+                runCatching { CallToolApproval.from(value) }.getOrNull() ?: return
+                app.calls.updateFrom(this) { it.copy(toolApprovals=pendingCallToolApprovals(it.toolApprovals,value)) }
                 getSystemService(NotificationManager::class.java).notify(NOTIFICATION,notification())
                 updateToolNotification()
             }
@@ -433,7 +443,10 @@ class BeaconCallService : Service() {
                 transcriptSync?.event(receipt)
             }
             "tool_receipt" -> {
-                if(value.string("status")!="needs_approval") app.calls.updateFrom(this) { it.copy(toolApprovals=it.toolApprovals.filterNot { p -> p.requestId==value.string("request_id") }) }
+                CallToolReceipt.from(value)?.let { receipt -> app.calls.updateFrom(this) { call ->
+                    call.copy(toolReceipts=(call.toolReceipts.filterNot { it.requestId==receipt.requestId }+receipt).takeLast(8))
+                } }
+                app.calls.updateFrom(this) { it.copy(toolApprovals=pendingCallToolApprovals(it.toolApprovals,value)) }
                 getSystemService(NotificationManager::class.java).notify(NOTIFICATION,notification())
                 updateToolNotification()
                 val receipt=JSONObject().put("type","tool_receipt").put("event_id",java.util.UUID.randomUUID().toString()).put("turn_id","tools").put("at_ms",pcm?.clock()?:0)
@@ -447,11 +460,11 @@ class BeaconCallService : Service() {
             }
         }
     }
-    internal fun decideTool(requestId:String,proposalId:String,approve:Boolean,fromNotification:Boolean=false) {
+    internal fun decideTool(requestId:String,proposalId:String,decision:String,fromNotification:Boolean=false) {
         val pending=spec ?: return
         val state=app.calls.state.value
         fun visibleOrUnlockedNotification()=if(fromNotification) !getSystemService(KeyguardManager::class.java).isDeviceLocked else app.calls.uiVisible
-        if(closed.get()||!visibleOrUnlockedNotification()||app.calls.ownerScope?.let { it.origin==pending.client.scope.origin&&it.owner==pending.client.scope.owner&&it.profile==pending.client.scope.profile }!=true) return
+        if(decision !in setOf("approve", "approve_call", "deny")||closed.get()||!visibleOrUnlockedNotification()||app.calls.ownerScope?.let { it.origin==pending.client.scope.origin&&it.owner==pending.client.scope.owner&&it.profile==pending.client.scope.profile }!=true) return
         if(!app.auth.read(pending.client.scope.origin).authorizesPushSource(pending.client.scope)) return
         if(state.toolApprovals.none { it.requestId==requestId&&it.proposalId==proposalId&&!it.busy }) return
         app.calls.updateFrom(this) { it.copy(toolApprovals=it.toolApprovals.map { p -> if(p.requestId==requestId) p.copy(busy=true,error="") else p }) }
@@ -461,18 +474,18 @@ class BeaconCallService : Service() {
                 check(!closed.get()&&spec===pending&&app.calls.service===this@BeaconCallService&&visibleOrUnlockedNotification())
                 check(app.calls.ownerScope?.let { it.origin==pending.client.scope.origin&&it.owner==pending.client.scope.owner&&it.profile==pending.client.scope.profile }==true)
                 check(app.auth.read(pending.client.scope.origin).authorizesPushSource(pending.client.scope))
-                checkNotNull(directVoice).decideTool(requestId,proposalId,approve)
+                checkNotNull(directVoice).decideTool(requestId,proposalId,decision)
             }
             catch(error:CancellationException) { throw error }
-            catch(error:Exception) { app.calls.updateFrom(this@BeaconCallService) { it.copy(toolApprovals=it.toolApprovals.map { p -> if(p.requestId==requestId) p.copy(busy=false,error="Could not confirm the response. Retry checks the same request.") else p }) };updateToolNotification() }
+            catch(error:Exception) { app.calls.updateFrom(this@BeaconCallService) { it.copy(toolApprovals=it.toolApprovals.map { p -> if(p.requestId==requestId) p.copy(busy=false,error=callToolApprovalErrorMessage(error.message.orEmpty()).ifBlank { "Could not confirm the response. Retry checks the same request." }) else p }) };updateToolNotification() }
         }
     }
-    private fun finishDirectTurn(interrupted:Boolean=false) {
+    private fun finishDirectTurn(interrupted:Boolean=false,deliver:(JSONObject)->Unit=::handleControl) {
         val pending=spec?:return
         val turn=transcriptTurn
         val cut=interruptsReply(interrupted,transcriptText)
         transcriptTurn=finishDirectTranscriptTurn(pending.grant.string("call_id"),pending.grant.string("conversation_id"),turn,transcriptText,pcm?.clock()?:0,cut) {
-            handleControl(it);transcriptSync?.event(it)
+            deliver(it);transcriptSync?.event(it)
         }
         if(cut) transcriptSync?.event(json("event_id" to "${pending.grant.string("call_id")}:assistant:interrupt:$turn","turn_id" to turn.toString(),"type" to "interrupted","interrupted" to true,"at_ms" to (pcm?.clock()?:0)))
     }
@@ -599,12 +612,8 @@ class BeaconCallService : Service() {
                 }
             }
             "transcript" -> {
-                val event = CallTranscript.from(value, spec?.grant?.string("conversation_id").orEmpty(), spec?.grant?.string("call_id").orEmpty())
-                // Older final events lacked session/final fields; only their scalar call-stage text is compatible.
-                if (event == null && (value.has("session_id") || !value.optBoolean("final", true))) return
                 app.calls.updateFrom(this@BeaconCallService) {
-                    val next = if (event == null) it.transcripts else it.transcripts.acceptTranscript(event)
-                    if (closed.get() || event != null && next === it.transcripts) it else it.copy(transcript = if (event != null && event.interrupted && !event.final) "" else value.string("text", value.string("transcript")), transcripts = next)
+                    if (closed.get()) it else it.withTranscript(value, spec?.grant?.string("conversation_id").orEmpty(), spec?.grant?.string("call_id").orEmpty())
                 }
             }
             "interrupted" -> {
@@ -628,14 +637,16 @@ class BeaconCallService : Service() {
         app.calls.updateFrom(this) { it.copy(muted=intent.muted,held=intent.held,userSpeaking=false) }
     }
     fun route(id: String) { val endpoint = endpoints.find { it.identifier.toString() == id } ?: return; scope.launch { val result = control?.requestEndpointChange(endpoint); if (result is CallControlResult.Error) app.calls.updateFrom(this@BeaconCallService) { it.copy(error = "Audio route could not change: $result") } } }
-    private fun failure(message: String) { endCall(message) }
+    private fun failure(message: String) { endCall(message, failedConnection = true) }
     fun hangup() { endCall(null) }
     @Synchronized private fun syncRemainingTranscript() {
         val pending=spec?:return
-        transcriptText.forEach { (role,text) -> transcriptSync?.event(json("event_id" to "${pending.grant.string("call_id")}:$role:$transcriptTurn","session_id" to pending.grant.string("conversation_id"),"turn_id" to transcriptTurn.toString(),"type" to "transcript","role" to role,"text" to text,"final" to false,"interrupted" to true,"at_ms" to (pcm?.clock()?:0))) }
-        transcriptText.clear()
+        if (transcriptText.isNotEmpty()) finishDirectTurn(interrupted=true) { value ->
+            // The stop fence owns these final lines after closing; ordinary late events stay blocked.
+            app.calls.updateFrom(this) { it.withTranscript(value,pending.grant.string("conversation_id"),pending.grant.string("call_id")) }
+        }
     }
-    private fun endCall(error:String?) { finishCallOnce(closed,{ pcm?.mute(true);syncRemainingTranscript() }) { fenceFailure ->
+    private fun endCall(error:String?,failedConnection:Boolean=false) { finishCallOnce(closed,{ pcm?.mute(true);syncRemainingTranscript() }) { fenceFailure ->
         getSystemService(NotificationManager::class.java).cancel(TOOL_NOTIFICATION)
         overlayAuthority.close();overlayAuthorityJob?.cancel();connectionJob?.cancel();cameraRequested=false;screenRequested=false;cameraGate.invalidate();screenGate.invalidate()
         val endingGemini=directVoice
@@ -654,7 +665,7 @@ class BeaconCallService : Service() {
                 ended.complete(Unit)
                 val stopped=captureReleased
                 app.calls.cameraTrack(this@BeaconCallService,null)
-                app.calls.updateFrom(this@BeaconCallService) { it.copy(active=false,state="ending",cameraSharing=false,cameraBusy=false,screenSharing=false,screenBusy=false,cameraStopPending=!stopped,screenStopPending=!stopped,audioStopPending=!audioReleased,minimized=false,error=listOfNotNull(error?:it.error,if(!audioReleased) "The microphone may still be on. Close Beacon if it stays on." else null,if(endDisposition.notSent>0) callEndNotSentText(endDisposition.notSent) else null,if(endDisposition.submissionUnknown>0) callEndUnknownText(endDisposition.submissionUnknown) else null).filter(String::isNotBlank).joinToString(" ")).afterTerminalControls(fenceFailure) }
+                app.calls.updateFrom(this@BeaconCallService) { it.copy(active=false,state="ending",cameraSharing=false,cameraBusy=false,screenSharing=false,screenBusy=false,cameraStopPending=!stopped,screenStopPending=!stopped,audioStopPending=!audioReleased,minimized=false,error=listOfNotNull(error?:it.error,if(!audioReleased) "The microphone may still be on. Close Beacon if it stays on." else null,if(endDisposition.notSent>0) callEndNotSentText(endDisposition.notSent) else null,if(endDisposition.submissionUnknown>0) callEndUnknownText(endDisposition.submissionUnknown) else null).filter(String::isNotBlank).joinToString(" "),failureReason=if(failedConnection) error.orEmpty() else it.failureReason).afterTerminalControls(fenceFailure) }
                 val transcriptClosed=finishTranscriptSyncForCleanup { transcriptSync?.finish()==true }
                 if(!transcriptClosed) app.calls.updateFrom(this@BeaconCallService) { it.copy(transcriptStatus="partial") }
                 spec?.let { pending ->

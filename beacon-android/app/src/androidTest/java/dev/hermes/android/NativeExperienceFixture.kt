@@ -27,6 +27,9 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     val jobs = ConcurrentHashMap<String, JSONObject>()
     val boardTasks = ConcurrentHashMap<String, JSONObject>()
     val projects = ConcurrentHashMap<String, JSONObject>()
+    @Volatile var holdNextProjectDetail = false
+    val projectDetailCaptured = java.util.concurrent.CountDownLatch(1)
+    val releaseProjectDetail = java.util.concurrent.CountDownLatch(1)
     val closedSessions = ConcurrentHashMap.newKeySet<String>()
     @Volatile var deleteMissingAfterClose = false
     @Volatile var skillEnabled = true
@@ -169,6 +172,12 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var fileWrites = 0
     @Volatile var holdCreateAcknowledgement = false
     @Volatile var holdPromptAcknowledgement = false
+    @Volatile var holdConfigAcknowledgement = false
+    @Volatile var holdBranchAcknowledgement = false
+    @Volatile var afterNextHistoryPage: (() -> Unit)? = null
+    val holdNextHistoryList = java.util.concurrent.atomic.AtomicBoolean(false)
+    val historyListCaptured = java.util.concurrent.CountDownLatch(1)
+    val releaseHistoryList = java.util.concurrent.CountDownLatch(1)
     /** Like Hermes when another conversation already holds the requested title: the create-time title is dropped. */
     @Volatile var dropCreateTitle = false
     @Volatile var renameFailure: String? = null
@@ -196,7 +205,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     private val nativeEventSequence = AtomicInteger()
     fun releasePromptAcknowledgement() = releaseCreateAcknowledgement()
     fun releaseCreateAcknowledgement() {
-        val queued = synchronized(delayedCreates) { holdCreateAcknowledgement = false; holdPromptAcknowledgement = false; delayedCreates.toList().also { delayedCreates.clear() } }
+        val queued = synchronized(delayedCreates) { holdCreateAcknowledgement = false; holdPromptAcknowledgement = false; holdConfigAcknowledgement = false; holdBranchAcknowledgement = false; delayedCreates.toList().also { delayedCreates.clear() } }
         queued.forEach { it() }
     }
     fun installCustomTabSeam() {
@@ -284,8 +293,18 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 return@addInterceptor Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if (bytes == null) 404 else 200).message("Synthetic download")
                     .body((bytes ?: ByteArray(0)).toResponseBody("application/octet-stream".toMediaType())).build()
             }
-            val buffer = okio.Buffer(); request.body?.writeTo(buffer)
-            val body = buffer.readUtf8().takeIf(String::isNotBlank)?.let(::JSONObject) ?: JSONObject()
+            val body = if (request.url.encodedPath == "/api/files/upload-stream") {
+                check(request.method == "POST")
+                val multipart = requireNotNull(request.body as? MultipartBody)
+                fun part(name: String): okio.Buffer = okio.Buffer().also { buffer ->
+                    multipart.parts.single { it.headers?.get("Content-Disposition")?.substringBefore("; filename=") == "form-data; name=\"$name\"" }.body.writeTo(buffer)
+                }
+                check(part("overwrite").readUtf8() == "false")
+                json("path" to part("path").readUtf8(), "data_url" to android.util.Base64.encodeToString(part("file").readByteArray(), android.util.Base64.NO_WRAP))
+            } else {
+                val buffer = okio.Buffer(); request.body?.writeTo(buffer)
+                buffer.readUtf8().takeIf(String::isNotBlank)?.let(::JSONObject) ?: JSONObject()
+            }
             if (request.url.encodedPath == "/api/plugins/beacon/pairing/redeem") pairingRedeemHadAuthorization = request.header("Authorization") != null
             if (request.url.encodedPath == "/api/plugins/beacon/devices/link") pairingLinkHadAuthorization = request.header("Authorization") != null
             val profileQuery = if (request.url.encodedPath.startsWith("/api/plugins/beacon/")) "beacon_profile" else "profile"
@@ -337,18 +356,41 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         val info = getJSONObject("info"); info.keys().forEach { put(it, info.opt(it)) }
         put("runtime_session_id", getString("session_id")); put("session_id", id)
     }
+    private fun nativeDisplayText(message: JSONObject, inlineImages: Boolean): String {
+        val content = message.optJSONArray("content") ?: return message.string("content", message.string("text"))
+        return (0 until content.length()).joinToString("") { index -> content.getJSONObject(index).let { part ->
+            if (part.string("type") == "text") part.string("text") else "\n" + if (inlineImages) part.getJSONObject("image_url").getString("url") else "[image]"
+        } }
+    }
     /** Synthetic stock dashboard history: metadata and the newest message window. */
-    private fun stockSession(path: String, profile: String): Pair<Int, JSONObject> {
+    private fun stockSession(path: String, profile: String, url: HttpUrl?): Pair<Int, JSONObject> {
         val parts = path.removePrefix("/api/sessions/").split('/')
         val id = parts.first()
         val row = sessions[id]
         if (historyFailure || row == null || profileSessionIds[profile]?.contains(id) == false) return 404 to json("detail" to "Session not found")
         val messages = row.getJSONArray("messages")
         return when (parts.getOrNull(1)) {
-            null -> 200 to row.getJSONObject("info").copy().put("id", id).put("profile", profile).put("message_count", messages.length()).put("model_config", row.optString("model_config").ifBlank { "{}" })
+            null -> 200 to row.getJSONObject("info").copy().put("id", id).put("profile", profile).put("message_count", messages.length()).put("last_active", messages.length()).put("model_config", row.optString("model_config").ifBlank { "{}" })
             "messages" -> {
-                val window = JSONArray((maxOf(0, messages.length() - 500) until messages.length()).map(messages::get))
-                200 to json("session_id" to id, "profile" to profile, "messages" to window, "pagination" to json("limit" to 500, "offset" to 0, "order" to "latest", "returned" to window.length()))
+                val limit = url?.queryParameter("limit")?.toIntOrNull() ?: 500
+                val offset = url?.queryParameter("offset")?.toIntOrNull() ?: 0
+                val order = url?.queryParameter("order") ?: "latest"
+                if (limit !in 1..500 || offset < 0) return 422 to json("detail" to "Invalid history page")
+                val around = parts.getOrNull(2) == "around"
+                val target = url?.queryParameter("row_id")?.toLongOrNull()
+                val anchor = (0 until messages.length()).firstOrNull { messages.getJSONObject(it).optLong("id", messages.getJSONObject(it).optLong("row_id")) == target }
+                if (around && anchor == null) return 404 to json("detail" to "Prompt not found")
+                val end = if (around) anchor!! + 1 else if (order == "latest") (messages.length() - offset).coerceAtLeast(0) else (offset + limit).coerceAtMost(messages.length())
+                val start = if (around) anchor!! else if (order == "latest") (end - limit).coerceAtLeast(0) else offset.coerceAtMost(end)
+                val window = JSONArray((start until end).map { index ->
+                    val message = messages.getJSONObject(index)
+                    val content = message.optJSONArray("content")
+                    if (url?.queryParameter("inline_images") != "false" || content == null) message else {
+                        message.copy().put("content", nativeDisplayText(message, false))
+                    }
+                })
+                if (!around) afterNextHistoryPage?.also { afterNextHistoryPage = null }?.invoke()
+                200 to json("session_id" to id, "profile" to profile, "messages" to window, "pagination" to json("limit" to limit, "offset" to offset, "order" to order, "returned" to window.length()))
             }
             "latest-descendant" -> 200 to json("requested_session_id" to id, "session_id" to id, "path" to JSONArray().put(id), "changed" to false)
             else -> 404 to json("detail" to "Not Found")
@@ -417,9 +459,10 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             require(requestText.isNotBlank() && requestText.codePointCount(0, requestText.length) <= 300 && body.getString("action") in setOf("notify", "call"))
             val requests = proactiveRequests.computeIfAbsent(profile) { CopyOnWriteArrayList() }
             require(requests.size < 20)
-            require(body.optString("signal") in setOf("", "email"))
+            // R6P uses null for Anything and preserves an optional connected-source name.
+            require(body.isNull("signal") || body.getString("signal").let { it.isNotBlank() && it.length <= 80 })
             val request = json("id" to "request-${java.util.UUID.randomUUID()}", "text" to body.getString("text"), "action" to body.getString("action"),
-                "signal" to "email", "night" to body.optBoolean("night"), "enabled" to true, "created_at" to 1792400000)
+                "signal" to body.opt("signal"), "night" to body.optBoolean("night"), "enabled" to true, "created_at" to 1792400000)
             requests += request
             200 to request.copy()
         }
@@ -525,11 +568,22 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             val failure = sessionListFailures[profile]
             if (failure != null) failure.first to json("detail" to failure.second)
             else if (limit !in 1..100) 422 to json("detail" to "limit must be at most 100")
-            else 200 to json("sessions" to JSONArray(sessions.values.filter { profileSessionIds[profile]?.contains(it.string("stored_session_id")) != false && it.getJSONObject("info").optBoolean("hidden") == archived }
+            else {
+                if (holdNextHistoryList.getAndSet(false)) { historyListCaptured.countDown(); check(releaseHistoryList.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
+                200 to json("sessions" to JSONArray(sessions.values.filter { profileSessionIds[profile]?.contains(it.string("stored_session_id")) != false &&
+                    (if (archived) it.getJSONObject("info").optBoolean("archived") else !it.getJSONObject("info").optBoolean("hidden") && !it.getJSONObject("info").optBoolean("archived")) }
                 .filter { search.isBlank() || it.getJSONObject("info").string("title").contains(search, ignoreCase = true) }
                 .filter { row -> val source = row.getJSONObject("info").string("source"); (only == null || source in only) && source !in excluded }
                 .map { row -> row.getJSONObject("info").copy().put("id", row.string("stored_session_id")).put("profile", profile).put("message_count", row.getJSONArray("messages").length()) }
                 .drop(offset).take(limit)))
+            }
+        }
+        path == "/api/plugins/beacon/sessions/pin" && method == "POST" -> {
+            val info = sessions[body.string("session_id")]?.getJSONObject("info")
+            if (info == null) 404 to json("detail" to "Conversation not found.") else {
+                info.put("pinned", body.getBoolean("pinned")).put("hidden", false)
+                200 to json("session_id" to body.string("session_id"), "pinned" to body.getBoolean("pinned"))
+            }
         }
         // Like Hermes: a sidebar PATCH needs the revision precondition from its mutation snapshot plus a request id.
         path.startsWith("/api/sessions/") && path.endsWith("/mutation-snapshot") && method == "GET" -> path.removePrefix("/api/sessions/").removeSuffix("/mutation-snapshot").let { id ->
@@ -543,7 +597,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             else if (body.getInt("expected_revision") != info.optInt("runtime_revision")) 409 to json("detail" to "revision_conflict")
             else { info.put("pinned", body.getBoolean("pinned")).put("runtime_revision", info.optInt("runtime_revision") + 1); 200 to json("ok" to true, "session_id" to id) }
         }
-        path.startsWith("/api/sessions/") -> stockSession(path, profile)
+        path.startsWith("/api/sessions/") -> stockSession(path, profile, url)
         path == "/api/auth/ws-ticket" -> 200 to json("ticket" to "synthetic-once")
         path == "/auth/native/authorize" -> 200 to json("ready" to true)
         path == "/auth/native/token" -> if (body.string("code").isBlank() || body.string("code_verifier").isBlank()) 400 to json("detail" to "Invalid code or verifier") else { currentRefreshToken = "synthetic-refresh"; 200 to json("access_token" to "synthetic-access", "refresh_token" to currentRefreshToken, "expires_at" to 2_000_000_000L, "token_type" to "Bearer", "provider" to "fixture", "user_id" to scope.owner) }
@@ -641,7 +695,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 downloads[body.getString("path")] = content.toByteArray(); 200 to json("ok" to true)
             }
         }
-        path == "/api/files/upload" && method == "POST" -> {
+        path in setOf("/api/files/upload", "/api/files/upload-stream") && method == "POST" -> {
             workspaceFiles[body.getString("path").replace('\\', '/').substringAfterLast('/')] = body.getString("data_url")
             200 to json("ok" to true)
         }
@@ -721,8 +775,19 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                     }
                     val result = rpc(method, params)
                     val response = json("jsonrpc" to "2.0", "id" to frame.getString("id"), "result" to result).toString()
+                    if (method == "projects.get" && holdNextProjectDetail) {
+                        holdNextProjectDetail = false
+                        projectDetailCaptured.countDown()
+                        // Real WebSocket.send enqueues; a held response must not block the Compose thread.
+                        Thread {
+                            val released = releaseProjectDetail.await(10, java.util.concurrent.TimeUnit.SECONDS)
+                            listener.onMessage(this, if (released) response else json("jsonrpc" to "2.0", "id" to frame.getString("id"), "error" to json("code" to 500, "message" to "Synthetic project detail was not released")).toString())
+                        }.apply { isDaemon = true; name = "beacon-project-test-response"; start() }
+                        return true
+                    }
                     val deferred = synchronized(delayedCreates) {
-                        if (holdCreateAcknowledgement && method == "session.create" || holdPromptAcknowledgement && method == "prompt.submit") { delayedCreates += { listener.onMessage(this, response) }; true } else false
+                        if (holdCreateAcknowledgement && method == "session.create" || holdPromptAcknowledgement && method == "prompt.submit" ||
+                            holdConfigAcknowledgement && method == "config.set" || holdBranchAcknowledgement && method == "session.branch") { delayedCreates += { listener.onMessage(this, response) }; true } else false
                     }
                     if (!deferred) listener.onMessage(this, response)
                     if (!deferred && method == "session.events.since") {
@@ -754,7 +819,10 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         check(params.string("profile") in setOf("default", "coder"))
         val id = params.string("session_id").let { runtimeStoredSessionIds[it] ?: it.removePrefix("runtime-") }
         return when (method) {
-            "session.list" -> json("sessions" to JSONArray(sessions.values.filter { params.optBoolean("include_hidden") || !it.getJSONObject("info").optBoolean("hidden") }.map { row -> row.getJSONObject("info").copy().put("id", row.string("stored_session_id")).put("stored_session_id", row.string("stored_session_id")) }))
+            "subagent.list" -> json("subagents" to JSONArray())
+            "delegation.status" -> json("active" to JSONArray())
+            "process.list" -> json("processes" to JSONArray())
+            "session.list" -> json("sessions" to JSONArray(sessions.values.filter { !it.getJSONObject("info").optBoolean("archived") && (params.optBoolean("include_hidden") || !it.getJSONObject("info").optBoolean("hidden")) }.map { row -> row.getJSONObject("info").copy().put("id", row.string("stored_session_id")).put("stored_session_id", row.string("stored_session_id")) }))
             "projects.list" -> json("projects" to JSONArray(projects.values.toList()))
             // Like Hermes: the project owning a folder; no cwd means the profile's own (project-free) folder.
             "projects.for_cwd" -> params.string("cwd").ifBlank { "C:/synthetic-home" }.let { cwd -> json("cwd" to cwd, "project" to (projects.values.filter { project -> project.rows("folders").any { cwd.startsWith(it.string("path")) } }.maxByOrNull { project -> project.rows("folders").maxOfOrNull { it.string("path").length } ?: 0 } ?: JSONObject.NULL)) }
@@ -785,12 +853,18 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                     runtimeStoredSessionIds[runtime] = id
                     currentRuntimeSessionIds[id] = runtime
                     put("session_key", id); remove("stored_session_id"); getJSONObject("info").put("stored_session_id", id); if (omitResumeYolo) getJSONObject("info").remove("yolo")
+                    put("messages_omitted", params.optBoolean("omit_messages"))
+                    put("messages", JSONArray(if (params.optBoolean("omit_messages")) emptyList<JSONObject>() else rows("messages").map { message -> message.copy().apply {
+                        put("text", nativeDisplayText(message, params.optBoolean("inline_images", true)))
+                        remove("content"); remove("attachments")
+                        if (has("id")) put("row_id", remove("id"))
+                    } }))
                 }
                     ?: throw IllegalArgumentException("Synthetic session missing")
             }
             "session.history" -> { require(!historyFailure) { "Synthetic history unavailable" }; sessions[id]?.copy()?.apply { put("session_key", id); remove("stored_session_id"); getJSONObject("info").put("stored_session_id", id) } ?: throw IllegalArgumentException("Synthetic session missing") }
             "session.create" -> { val key = "new-${sequence.incrementAndGet()}"; history(key, if (dropCreateTitle) "" else params.string("title", "New conversation"), JSONArray()).also { row ->
-                row.getJSONObject("info").put("source", params.string("source"))
+                row.getJSONObject("info").put("source", params.string("source")).put("model", params.string("model", profileModel))
                 runtimeStoredSessionIds[row.string("session_id")] = key
                 currentRuntimeSessionIds[key] = row.string("session_id")
                 sessions[key] = row
@@ -818,6 +892,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 sessions.getValue(id).getJSONObject("info").put("title", params.getString("title")); json("ok" to true)
             }
             "session.set_hidden" -> { val hidden = params.getBoolean("hidden"); sessions.getValue(id).getJSONObject("info").put("hidden", hidden); json("hidden" to hidden, "session_key" to id) }
+            "session.archive" -> { val archived = params.getBoolean("archived"); sessions.getValue(id).getJSONObject("info").put("archived", archived); json("archived" to archived, "session_key" to id) }
             "session.close" -> { closedSessions.add(id); json("closed" to true) }
             "session.delete" -> {
                 require(id in closedSessions) { "cannot delete an active session" }
@@ -841,6 +916,10 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 }
                 if (key == "reasoning") {
                     if (params.string("session_id").isBlank()) reasoningEffort = value else sessionReasoning[id] = value
+                    if (params.string("session_id").isNotBlank()) {
+                        sessions.getValue(id).getJSONObject("info").put("reasoning_effort", value)
+                        sessions.getValue(id).put("model_config", JSONObject(sessions.getValue(id).optString("model_config").ifBlank { "{}" }).put("reasoning_config", json("enabled" to (value != "none"), "effort" to value)).toString())
+                    }
                 }
                 check(value !in setOf("show", "hide"))
                 if (key == "approvals.mode") {

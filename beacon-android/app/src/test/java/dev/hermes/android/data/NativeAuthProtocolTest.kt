@@ -327,7 +327,8 @@ class NativeAuthProtocolTest {
         assertEquals(1, requests.size)
         c.bytes("/api/file/raw", mapOf("path" to "C:/workspace/file.txt", "session_id" to "stored-a"))
         assertEquals("/api/fs/download", requests.last().url.encodedPath)
-        assertNull(requests.last().url.queryParameter("session_id"))
+        assertEquals("stored-a", requests.last().url.queryParameter("session_id"))
+        assertEquals("work", requests.last().url.queryParameter("profile"))
         assertEquals(2, requests.size)
     }
 }

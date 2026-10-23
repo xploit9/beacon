@@ -24,6 +24,18 @@ class HistoryFiltersTest {
         assertFalse(isThreadSource(null))
     }
 
+    @Test fun loadedTitlesFilterImmediatelyAndEmptyServerMatchesNeverRestoreUnfilteredRows() {
+        assertEquals(listOf("b"), historySearchRows(rows, "ALP").map { it.getString("id") })
+        assertTrue(historySearchRows(rows, "no such title", emptyList()).isEmpty())
+        assertEquals(rows, historySearchRows(rows, ""))
+    }
+
+    @Test fun matchingServerRowsSupplementLocalTitlesWithoutDuplicatingProfileIdentity() {
+        val local = json("id" to "shared", "title" to "Trip", "profile" to "default")
+        val otherProfile = json("id" to "shared", "title" to "Server match", "profile" to "coder")
+        assertEquals(listOf(local, otherProfile), historySearchRows(listOf(local), "Trip", listOf(local, otherProfile), "default"))
+    }
+
     @Test fun pinnedViewAndTitleOrderKeepPinnedFirst() {
         assertEquals(listOf("b"), historyRows(rows, HistoryView.Pinned, HistoryOrder.Recent).map { it.getString("id") })
         assertEquals("Server order is kept for recent/created", rows, historyRows(rows, HistoryView.All, HistoryOrder.Created))

@@ -33,7 +33,6 @@ import kotlinx.coroutines.delay
             item {
                 ProfileEntrance(0, motionEnabled) {
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text("Profiles", style = MaterialTheme.typography.titleLarge)
                         Text("Purpose, model and behavior for each profile.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
@@ -75,7 +74,7 @@ import kotlinx.coroutines.delay
                                     Text(profileLabel(bot.profile), style = MaterialTheme.typography.titleLarge)
                                     Text("Profile settings", color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
-                                TextButton(onClick = onBack, enabled = !state.saving && !state.editing) { Text("All profiles") }
+                                TextButton(onClick = onBack, enabled = !state.saving && !state.editing, modifier = Modifier.heightIn(min = 48.dp)) { Text("All profiles") }
                             }
                         }
                     }
@@ -108,27 +107,27 @@ import kotlinx.coroutines.delay
                     val visible = models.distinct().filter { modelSearch.isBlank() || "${it.first} ${it.second}".contains(modelSearch, ignoreCase = true) }
                     if (visible.isEmpty()) item { Text(if (models.isEmpty()) "No configured model choices are available." else "No models match this search.") }
                     itemsIndexed(visible, key = { _, model -> "${model.first}:${model.second}" }) { _, (provider, model) ->
-                        TextButton(onClick = { onModelDraft(provider, model) }, enabled = !state.saving, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+                        OutlinedButton(onClick = { onModelDraft(provider, model) }, enabled = !state.saving, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
                             Column(Modifier.fillMaxWidth()) { Text(model); Text(provider + if (provider == state.draftProvider && model == state.draftModel) " · selected" else "", style = MaterialTheme.typography.bodyMedium) }
                         }
                     }
                     item {
                         ProfileCard(Icons.Rounded.Edit, "Configured model ID") {
-                            TextButton(onClick = { customModel = !customModel }, enabled = !state.saving) { Text(if (customModel) "Hide custom model entry" else "Enter a configured model ID") }
+                            OutlinedButton(onClick = { customModel = !customModel }, enabled = !state.saving, modifier = Modifier.heightIn(min = 48.dp)) { Text(if (customModel) "Hide custom model entry" else "Enter a configured model ID") }
                             if (customModel) {
                                 OutlinedTextField(state.draftProvider, { onModelDraft(it, state.draftModel) }, label = { Text("Configured provider ID") }, modifier = Modifier.fillMaxWidth(), singleLine = true, enabled = !state.saving)
                                 OutlinedTextField(state.draftModel, { onModelDraft(state.draftProvider, it) }, label = { Text("Model ID") }, modifier = Modifier.fillMaxWidth(), singleLine = true, enabled = !state.saving)
                             }
                             Text("The server checks this profile's configured providers.", style = MaterialTheme.typography.bodyMedium)
                             Button(onClick = onSaveModel, enabled = !state.saving && state.draftModel.isNotBlank() && state.draftProvider.isNotBlank() && (state.draftModel != bot.model || state.draftProvider != bot.provider)) { Text("Save default model") }
-                            TextButton(onClick = onCancel, enabled = !state.saving) { Text("Cancel edit") }
+                            TextButton(onClick = onCancel, enabled = !state.saving, modifier = Modifier.heightIn(min = 48.dp)) { Text("Cancel edit") }
                         }
                     }
                 }
                 item {
                     ProfileEntrance(4, motionEnabled) {
                         ProfileCard(Icons.Rounded.Description, "Behavior instructions") {
-                            TextButton(onClick = { showBehavior = !showBehavior }) { Text(if (showBehavior) "Hide behavior instructions" else "Read behavior instructions") }
+                            TextButton(onClick = { showBehavior = !showBehavior }, modifier = Modifier.heightIn(min = 48.dp)) { Text(if (showBehavior) "Hide behavior instructions" else "Read behavior instructions") }
                             if (showBehavior) {
                                 renderBehavior(bot.soul.ifBlank { "No behavior instructions are set." })
                                 Text("Read-only profile instructions.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -170,7 +169,7 @@ import kotlinx.coroutines.delay
 }
 
 @Composable private fun ProfileAction(label: String, icon: ImageVector, onClick: () -> Unit) {
-    TextButton(onClick = onClick, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+    OutlinedButton(onClick = onClick, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
         Icon(icon, null); Spacer(Modifier.width(10.dp)); Text(label, Modifier.weight(1f)); Icon(Icons.Rounded.ChevronRight, null)
     }
 }

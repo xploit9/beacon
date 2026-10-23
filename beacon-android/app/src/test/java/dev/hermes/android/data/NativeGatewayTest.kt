@@ -432,14 +432,21 @@ class NativeGatewayTest {
                 val path = chain.request().url.encodedPath
                 httpPaths += path
                 if(path in setOf("/api/mcp/servers","/api/tools/toolsets")) assertEquals("default",chain.request().url.queryParameter("profile"))
-                val status=if(path.endsWith("/files/create")) 409 else 200
-                val body = if(path=="/api/fs/read-text") json("text" to fileText,"path" to "C:/test/file.txt","byteSize" to fileText.toByteArray().size,"truncated" to false,"binary" to false)
-                else if(path=="/api/fs/write-text") {
-                    nativeWrites++
-                    val sink=okio.Buffer();chain.request().body!!.writeTo(sink)
-                    savedText=JSONObject(sink.readUtf8()).getString("content")
-                    fileText=savedText.replace("\n","\r\n")
-                    json("ok" to true)
+                var status=if(path.endsWith("/files/create")) 409 else 200
+                fun preview() = json("content" to fileText.replace("\r\n", "\n"), "text" to fileText, "path" to "C:/test/file.txt", "byteSize" to fileText.toByteArray().size, "truncated" to false, "binary" to false, "ok" to true)
+                val body = if(path=="/api/plugins/beacon/mobile/files/text") {
+                    if (chain.request().method == "POST") {
+                        val sink=okio.Buffer();chain.request().body!!.writeTo(sink)
+                        val fields = JSONObject(sink.readUtf8())
+                        if (fields.getString("expected_content") != fileText.replace("\r\n", "\n")) {
+                            status = 409; json("detail" to "File changed. Reopen and review your draft.")
+                        } else {
+                            nativeWrites++
+                            savedText=fields.getString("content")
+                            fileText=savedText.replace("\r\n", "\n").replace("\n","\r\n")
+                            preview()
+                        }
+                    } else preview()
                 } else if (path.endsWith("/voice-history")) {
                     archivePaths += path
                     json("session_id" to stored, "profile" to "default", "events" to JSONArray())
@@ -483,9 +490,10 @@ class NativeGatewayTest {
         }
         assertEquals("Reading history in any agent state never adds a resume", resumesBeforePassiveStatusReads, resumes)
         resumeStatus = "idle"
-        val saved=client.post("/api/file/save",json("session_id" to stored,"path" to "C:/test/file.txt","content" to "after\r\n","expected_content" to "before\r\n"))
-        assertEquals("after\n",savedText)
-        assertEquals("after\r\n",saved.getString("content"))
+        val preview = client.get("/api/file", mapOf("session_id" to stored, "path" to "C:/test/file.txt"))
+        val saved=client.post("/api/file/save",json("session_id" to stored,"path" to "C:/test/file.txt","content" to "after\r\n","expected_content" to preview.getString("content")))
+        assertEquals("after\r\n",savedText)
+        assertEquals("after\n",saved.getString("content"))
         assertEquals(1,nativeWrites)
         assertTrue(runCatching { client.post("/api/file/save",json("session_id" to stored,"path" to "C:/test/file.txt","content" to "lost","expected_content" to "before\r\n")) }.isFailure)
         assertTrue(runCatching { client.post("/api/file/create",json("session_id" to stored,"path" to "C:/test/file.txt","content" to "overwrite")) }.isFailure)

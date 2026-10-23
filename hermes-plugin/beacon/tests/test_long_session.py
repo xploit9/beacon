@@ -37,7 +37,7 @@ def test_nightly_memory_upkeep_corrects_stale_capabilities_and_preserves_owner_f
 
     assert "missing capability" in prompt
     assert "stale tool/account state" in prompt
-    assert "important email notes" in prompt
+    assert "source-specific importance" in prompt
     assert "never save transcripts" in prompt
 
 
@@ -158,10 +158,10 @@ def test_live_snapshot_uses_registered_mcp_toolsets_without_discovery(harness, m
     context = live.snapshot(api.mobile, "owner", "default", api.proactive, job_scope=True,
                             session_id="snapshot-session")
 
-    assert "Proactive important email" in context and "Other MCP" in context
+    assert "Proactive connected sources" in context and "Other MCP" in context
     assert "unknown" in context and "tools and skills available in this turn" in context
     assert "try it again once" in context
-    assert "Proactive email watch is read-only" in context
+    assert "Proactive watch is read-only" in context
     assert "Private message body" not in context
     assert "Private event body" not in context
     assert "private-token" not in context and "[redacted]" in context
@@ -259,7 +259,7 @@ def test_live_snapshot_uses_saved_selection_without_status_probe(harness, monkey
 
     context = live.snapshot(api.mobile, "owner", "default", api.proactive)
 
-    assert "Proactive important email: unknown" in context
+    assert "Proactive connected sources: unknown" in context
     assert "2023-11-14 22:13Z" not in context
 
 
@@ -290,7 +290,7 @@ def test_live_snapshot_caps_large_catalogs_and_keeps_retry_rule(harness, monkeyp
     context = live.snapshot(api.mobile, "owner", "default", api.proactive, job_scope=True)
 
     assert len(context) <= 600
-    assert context.endswith(live._RULE + " This Proactive email watch is read-only; use only this profile's tools and its email notice/check tools.")
+    assert context.endswith(live._RULE + " This Proactive watch is read-only; use only this profile's tools and beacon_event_notice/beacon_events_checked.")
     assert "…" in context
 
 
@@ -316,5 +316,5 @@ def test_live_snapshot_shows_watch_health_and_learned_count(harness, monkeypatch
 
     context = live.snapshot(api.mobile, "owner", "default", api.proactive)
 
-    assert "Proactive important email: ok" in context
+    assert "Proactive connected sources: ok" in context
     assert "2 alerts the owner marked" in context

@@ -6,6 +6,18 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SettingsSearchTest {
+    @Test fun commonNamesFindTheirSettingsPagesWithoutChangingVisibleDescriptions() {
+        fun matches(route: String, query: String) = settingsSearchMatches(
+            settingsLabel(route), settingsDescriptions.getValue(route), query,
+        )
+        for (query in listOf("proactive", "alerts", "watch", "What needs you")) assertTrue(matches("Assistant", query))
+        assertTrue(matches("Voice & calls", "API key"))
+        assertTrue(matches("Devices", "pairing"))
+        assertEquals("Name and profile", settingsDescriptions.getValue("Assistant"))
+        assertEquals("Voice provider and calls", settingsDescriptions.getValue("Voice & calls"))
+        assertEquals("Connection", settingsRoute("Devices"))
+    }
+
     @Test fun searchesVisibleLabelAndDescriptionWithoutChangingRoute() {
         assertEquals("Chat", settingsLabel("Settings"))
         assertEquals("Voice & calls", settingsLabel("Beacon"))
@@ -20,6 +32,9 @@ class SettingsSearchTest {
         assertTrue(settingsSearchMatches("Appearance", "Theme and color style", " appearance "))
         assertTrue(modelSearchMatches("provider", "model", "Configured model", " model "))
     }
+    @Test fun connectionSearchFindsPairedDevices() {
+        assertTrue(settingsSearchMatches(settingsLabel("Connection"), settingsDescriptions.getValue("Connection"), "paired devices"))
+    }
     @Test fun unicodeWhitespaceSeparatesSearchTerms() {
         val label = settingsLabel("Chat"); val description = settingsDescriptions.getValue("Chat")
         for (space in listOf(" ", "　", " ", " ", " ", "\t ")) {
@@ -29,10 +44,10 @@ class SettingsSearchTest {
         }
         assertTrue(modelSearchMatches("provider", "model", "Configured model", "configured provider"))
     }
-    @Test fun everyIncumbentDestinationStaysSearchableInOrder() {
+    @Test fun everyDestinationAndSearchAliasStaysSearchableInOrder() {
         assertEquals(
             listOf("Connection", "Assistant", "Voice & calls", "Notifications & Keep connected", "Chat", "Profiles & model", "Skills", "Memory", "Tools & MCP", "Server", "Appearance", "App updates", "About & licenses",
-                "Profiles", "Providers & models", "Tools & commands", "MCP servers", "Health", "Logs", "Server updates", "Session checkpoints"),
+                "Profiles", "Providers & models", "Tools & commands", "MCP servers", "Health", "Logs", "Server updates", "Session checkpoints", "Devices"),
             settingsSearchRoutes,
         )
         for (route in settingsSearchRoutes) {
@@ -42,7 +57,8 @@ class SettingsSearchTest {
             assertTrue("$route is not found by its description", settingsSearchMatches(settingsLabel(route), description, description))
         }
         assertEquals("Each destination appears once", settingsSearchRoutes.size, settingsSearchRoutes.toSet().size)
-        assertEquals("Each destination opens a distinct route", settingsSearchRoutes.size, settingsSearchRoutes.map(::settingsRoute).toSet().size)
+        assertEquals("Devices is a search shortcut to Connection", "Connection", settingsRoute("Devices"))
+        assertEquals(settingsSearchRoutes.size - 1, settingsSearchRoutes.map(::settingsRoute).toSet().size)
         // Description-only words still find the row whose label does not contain them.
         assertTrue(settingsSearchMatches(settingsLabel("Session checkpoints"), settingsDescriptions.getValue("Session checkpoints"), "recovery"))
         assertTrue(settingsSearchMatches(settingsLabel("Chat"), settingsDescriptions.getValue("Chat"), "sending"))

@@ -26,7 +26,7 @@ class IncomingDeadlineTest {
         val wall = System.currentTimeMillis()
         val elapsed = SystemClock.elapsedRealtime()
         val invite = IncomingCall("qa-source", "qa-deadline", wall / 1000 + 120,
-            arrivedAt = wall - 19900, arrivedElapsed = elapsed - 19900, boot = 7)
+            arrivedAt = wall - 44900, arrivedElapsed = elapsed - 44900, boot = 7)
         val before = invite.ringDurationMillis(wall, elapsed, 7)
         assertEquals(100L, before)
         SystemClock.sleep(150)
@@ -77,10 +77,10 @@ class IncomingDeadlineTest {
             assertEquals(first,dev.hermes.android.push.PushManager(app).deadlineInvitation(source,event))
             ContextCompat.startForegroundService(app,Intent(app,IncomingRingtoneService::class.java)
                 .putExtra("push_source",source).putExtra("push_event",event).putExtra("notification",original))
-            await(2000) { manager.activeNotifications.firstOrNull { it.id==42 }?.notification?.timeoutAfter?.let { it in 1..16000 }==true }
+            await(2000) { manager.activeNotifications.firstOrNull { it.id==42 }?.notification?.timeoutAfter?.let { it in 1..41000 }==true }
             val remaining=manager.activeNotifications.single { it.id==42 }.notification.timeoutAfter
-            assertTrue("A restarted foreground card cannot receive a new twenty-second timeout",remaining in 1..16000)
-            waitUntil(arrival+19000)
+            assertTrue("A restarted foreground card cannot receive a new forty-five-second timeout",remaining in 1..41000)
+            waitUntil(arrival+44000)
             receivePush(app,data)
             assertEquals(first,app.push.deadlineInvitation(source,event))
             var missedAt=0L
@@ -88,8 +88,8 @@ class IncomingDeadlineTest {
                 if(app.push.missedInvitation(source,event)!=null) { missedAt=SystemClock.elapsedRealtime();true } else false
             }
             val measured=missedAt-arrival
-            assertTrue("Must observe a real twenty-second transition, not a pre-expired fixture",measured>=19500)
-            assertTrue("Missed state must not be postponed by duplicate delivery or restart: $measured ms",measured<=21000)
+            assertTrue("Must observe a real forty-five-second transition, not a pre-expired fixture",measured>=44500)
+            assertTrue("Missed state must not be postponed by duplicate delivery or restart: $measured ms",measured<=46000)
             await(1000) { manager.activeNotifications.none { it.id==42 } }
             val cards=manager.activeNotifications.filter { it.tag==first.key }
             assertEquals(1,cards.size);assertEquals(2,cards.single().id)
@@ -118,7 +118,7 @@ class IncomingDeadlineTest {
                 val encoded=checkNotNull(prefs.getString(key,null))
                 val state=org.json.JSONObject(String(app.cipher.decrypt(android.util.Base64.decode(encoded,android.util.Base64.NO_WRAP),key)))
                 assertEquals("dismissed",state.getString("state"))
-                state.put("arrived_at",System.currentTimeMillis()-21000).put("arrived_elapsed",SystemClock.elapsedRealtime()-21000)
+                state.put("arrived_at",System.currentTimeMillis()-46000).put("arrived_elapsed",SystemClock.elapsedRealtime()-46000)
                 persist(app,key,state)
                 app.push.expireInvitation(source,id)
                 assertNull(app.push.missedInvitation(source,id))

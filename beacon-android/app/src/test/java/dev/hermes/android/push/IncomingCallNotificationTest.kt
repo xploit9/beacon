@@ -8,7 +8,7 @@ import org.junit.Test
 
 class IncomingCallNotificationTest {
     @Test fun normalRingUsesAnAlertingCallStyleCardUntilItsDeadline() {
-        val card = incomingCallCardOptions(20_000, silent = false)
+        val card = incomingCallCardOptions(45_000, silent = false)
 
         assertEquals(NotificationCompat.CATEGORY_CALL, card.category)
         assertTrue(card.callStyle)
@@ -16,11 +16,11 @@ class IncomingCallNotificationTest {
         assertFalse("setSilent(true) groups the card and suppresses interruption", card.silent)
         assertTrue(card.insistent)
         assertTrue(card.onlyAlertOnce)
-        assertEquals(20_000L, card.timeoutAfterMillis)
+        assertEquals(45_000L, card.timeoutAfterMillis)
     }
 
     @Test fun suppressedRingCardHasNoPopupOrInsistentAlert() {
-        val card = incomingCallCardOptions(20_000, silent = true)
+        val card = incomingCallCardOptions(45_000, silent = true)
 
         assertEquals(NotificationCompat.CATEGORY_CALL, card.category)
         assertTrue(card.callStyle)
@@ -28,6 +28,6 @@ class IncomingCallNotificationTest {
         assertTrue(card.silent)
         assertFalse(card.insistent)
         assertTrue(card.onlyAlertOnce)
-        assertEquals(20_000L, card.timeoutAfterMillis)
+        assertEquals(45_000L, card.timeoutAfterMillis)
     }
 }

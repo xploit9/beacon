@@ -50,7 +50,7 @@ def _catalog_names(rows, key, kind):
 
 def _format(items, job_scope=False):
     prefix = "Live capabilities: "
-    rule = _RULE + (" This Proactive email watch is read-only; use only this profile's tools and its email notice/check tools." if job_scope else "")
+    rule = _RULE + (" This Proactive watch is read-only; use only this profile's tools and beacon_event_notice/beacon_events_checked." if job_scope else "")
     details = "; ".join(items) or "No sources are selected."
     room = MAX_CONTEXT_CHARS - len(prefix) - len(rule) - 1
     if len(details) > room:
@@ -66,7 +66,7 @@ def _build_snapshot(mobile, owner, profile, proactive, job_scope=False):
         checked = _time_label(health.get("checked_at"))
         detail = f"{health['state']}" + (f"; last checked {checked}" if checked else "")
         notes = proactive.learned_notes(mobile, owner, profile)
-        items.append(f"Proactive important email: {detail}; {len(notes)} alerts the owner marked")
+        items.append(f"Proactive connected sources: {detail}; {len(notes)} alerts the owner marked")
 
     from hermes_cli.web_server_profiles import _profile_scope
     from tools.registry import registry

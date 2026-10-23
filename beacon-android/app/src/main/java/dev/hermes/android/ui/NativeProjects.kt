@@ -17,11 +17,15 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.core.*
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 
 internal fun nativeProjectSessionAllowed(id: String, rowProfile: String, profile: String, allowedIds: Set<String>, archived: Boolean): Boolean =
     id.isNotBlank() && id in allowedIds && (rowProfile.isBlank() || rowProfile == profile) && !archived
 internal fun nativeProjectDetailCurrent(requestedId: String, returnedId: String): Boolean = requestedId.isNotBlank() && returnedId == requestedId
+private data class ProjectEditDraft(val id: String, val originalName: String, val originalDescription: String, val name: String, val description: String) : java.io.Serializable {
+    val dirty get() = name != originalName || description != originalDescription
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable internal fun NativeProjectsScreen(vm: BeaconViewModel) {
@@ -31,18 +35,62 @@ internal fun nativeProjectDetailCurrent(requestedId: String, returnedId: String)
     var selected by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf("") }
     var folderPicker by rememberSaveable(ui.origin, ui.owner, ui.profile, selected) { mutableStateOf(false) }
     var menu by remember(selected) { mutableStateOf(false) }
+    var editDraft by rememberSaveable { mutableStateOf<ProjectEditDraft?>(null) }
+    var discardEdit by rememberSaveable { mutableStateOf(false) }
+    var editSaving by remember { mutableStateOf(false) }
+    var updatedHeader by rememberSaveable { mutableStateOf<Pair<String, String>?>(null) }
+    val editScope = rememberCoroutineScope()
     LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, vm.client, selected) { vm.loadNativeProjects(selected) }
     BackHandler(selected.isNotBlank()) { selected = "" }
     val key = if (selected.isBlank()) "native-projects" else "native-project:$selected"
     val record = data[key]
     val project = record?.optJSONObject("project")?.takeIf { nativeProjectDetailCurrent(selected, it.string("id")) }
+    val headerName = updatedHeader?.takeIf { it.first == selected }?.second ?: project?.string("name") ?: "Projects"
+    LaunchedEffect(selected, project?.string("name"), updatedHeader) {
+        val override = updatedHeader
+        if (override != null && (override.first != selected || project?.string("name") == override.second)) updatedHeader = null
+    }
     fun edit(value: JSONObject? = null) {
         val id = value?.string("id").orEmpty()
-        vm.openForm(ActionForm(if (id.isBlank()) "New project" else "Edit project", if (id.isBlank()) "/api/projects/create" else "/api/projects/update",
+        if (id.isNotBlank()) {
+            val name = value?.string("name").orEmpty()
+            val description = value?.string("description").orEmpty()
+            editDraft = ProjectEditDraft(id, name, description, name, description)
+            return
+        }
+        vm.openForm(ActionForm("New project", "/api/projects/create",
             listOf(Field("name", "Name", required = true), Field("description", "Description", FieldType.MULTILINE)),
-            seed = value?.let { json("id" to id, "name" to it.string("name"), "description" to it.string("description")) } ?: json("request_id" to java.util.UUID.randomUUID().toString()),
-            explanation = if (id.isBlank()) "Organize chats around a project, then link its folders on your computer." else "Saved in this Hermes profile.",
+            seed = json("request_id" to java.util.UUID.randomUUID().toString()),
+            explanation = "Organize chats around a project, then link its folders on your computer.",
             onResult = { result -> selected = result.getJSONObject("project").getString("id"); vm.loadNativeProjects(selected) }))
+    }
+    fun requestEditDismiss() {
+        if (editSaving) return
+        if (editDraft?.dirty == true) discardEdit = true else editDraft = null
+    }
+    fun saveEdit() {
+        val draft = editDraft ?: return
+        if (editSaving || !draft.dirty || draft.name.isBlank() || vm.client == null) return
+        editSaving = true
+        val job = vm.action(
+            "/api/projects/update",
+            json("id" to draft.id, "name" to draft.name.trim(), "description" to draft.description.trim()),
+            refresh = false,
+            successNotice = "Project updated",
+            onSuccess = { _, result ->
+                val updated = result.getJSONObject("project")
+                val id = updated.getString("id")
+                updatedHeader = id to updated.getString("name")
+                selected = id
+                editDraft = null
+                discardEdit = false
+                vm.loadNativeProjects(id)
+            },
+        )
+        editScope.launch {
+            job.join()
+            editSaving = false
+        }
     }
     fun detach(row: JSONObject) {
         val id = row.string("session_id", row.string("id"))
@@ -51,12 +99,17 @@ internal fun nativeProjectDetailCurrent(requestedId: String, returnedId: String)
             seed = json("id" to selected, "session_id" to id, "scope_key" to owner.session(id).key, "event_id" to java.util.UUID.randomUUID().toString()),
             explanation = "The chat stays in your history.", actionLabel = "Remove from project", onResult = { vm.loadNativeProjects(selected) }))
     }
+    BackHandler(editDraft != null) {
+        if (!editSaving) {
+            if (discardEdit) discardEdit = false else requestEditDismiss()
+        }
+    }
     if (folderPicker && project != null) PcFolderPicker(vm, "Link PC folder", onDismiss = { folderPicker = false }, onChoose = { path ->
         folderPicker = false
         vm.action("/api/projects/folders/add", json("id" to selected, "path" to path), refresh = false, successNotice = "Folder linked", onSuccess = { _, _ -> vm.loadNativeProjects(selected) })
     })
     Column(Modifier.fillMaxSize().testTag("projects-screen")) {
-        Header(project?.string("name") ?: "Projects", back = if (selected.isBlank()) null else ({ selected = "" }), menu = LocalOpenNavigationMenu.current) {
+        Header(headerName, back = if (selected.isBlank()) null else ({ selected = "" }), menu = LocalOpenNavigationMenu.current) {
             if (selected.isBlank()) IconButton(onClick = { edit() }) { Icon(Icons.Rounded.Add, "New project") }
             else if (project != null) Box {
                 IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "Project actions") }
@@ -74,12 +127,13 @@ internal fun nativeProjectDetailCurrent(requestedId: String, returnedId: String)
         PullToRefreshBox(
             isRefreshing = key in refreshing || record?.optBoolean("_refreshing") == true,
             onRefresh = { vm.loadNativeProjects(selected, force = true) },
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier.weight(1f).widthIn(max = 720.dp).fillMaxWidth()
+                .align(androidx.compose.ui.Alignment.CenterHorizontally),
         ) {
             LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 when {
                 record == null || record.optBoolean("_loading") -> item { BeaconSignal(BeaconMotionMode.Sweep, Modifier.fillMaxWidth().wrapContentWidth(), 32.dp) }
-                record.string("_error").isNotBlank() -> item { Text(record.string("_error"), color = MaterialTheme.colorScheme.error); TextButton(onClick = { vm.loadNativeProjects(selected) }) { Text("Retry") } }
+                record.string("_error").isNotBlank() -> item { Text(record.string("_error"), color = MaterialTheme.colorScheme.error); OutlinedButton(onClick = { vm.loadNativeProjects(selected) }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Retry") } }
                 selected.isBlank() -> {
                     val projects = record.rows("projects").filterNot { it.optBoolean("archived") }
                     if (projects.isEmpty()) item {
@@ -149,6 +203,47 @@ internal fun nativeProjectDetailCurrent(requestedId: String, returnedId: String)
             }
         }
     }
+    if (discardEdit) AlertDialog(
+        onDismissRequest = { discardEdit = false },
+        title = { Text("Discard changes?") },
+        text = { Text("Your unsaved project edits will be lost.") },
+        confirmButton = { TextButton(onClick = { editDraft = null; discardEdit = false }) { Text("Discard") } },
+        dismissButton = { TextButton(onClick = { discardEdit = false }) { Text("Keep editing") } },
+    ) else editDraft?.let { draft ->
+        AlertDialog(
+            onDismissRequest = ::requestEditDismiss,
+            title = { Text("Edit project") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = draft.name,
+                        onValueChange = { editDraft = draft.copy(name = it) },
+                        label = { Text("Name *") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth().testTag("project-edit-name"),
+                    )
+                    OutlinedTextField(
+                        value = draft.description,
+                        onValueChange = { editDraft = draft.copy(description = it) },
+                        label = { Text("Description") },
+                        minLines = 3,
+                        maxLines = 6,
+                        modifier = Modifier.fillMaxWidth().testTag("project-edit-description"),
+                    )
+                    if (vm.client == null) Text("Reconnect to save this project.", color = MaterialTheme.colorScheme.error)
+                    else if (ui.error.isNotBlank()) Text(ui.error, color = MaterialTheme.colorScheme.error)
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = ::saveEdit,
+                    enabled = draft.name.isNotBlank() && draft.dirty && !editSaving && vm.client != null,
+                    modifier = Modifier.testTag("project-edit-save"),
+                ) { Text(if (editSaving) "Saving…" else "Save") }
+            },
+            dismissButton = { TextButton(onClick = ::requestEditDismiss, enabled = !editSaving) { Text("Cancel") } },
+        )
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -157,30 +252,36 @@ internal fun nativeProjectDetailCurrent(requestedId: String, returnedId: String)
     val data by vm.data.collectAsStateWithLifecycle()
     var directory by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf("") }
     var address by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf("") }
+    var showHidden by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf(false) }
     val record = data["project-folder"]?.takeIf { it.string("_requested_path") == directory || it.has("_error") }
     LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, vm.client, directory) { vm.load("project-folder", "/api/pc/files", mapOf("path" to directory)) }
     ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(Modifier.fillMaxWidth().fillMaxHeight(.85f).padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(Modifier.fillMaxWidth().imePadding().fillMaxHeight(.85f).padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(title, style = MaterialTheme.typography.titleLarge)
             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                OutlinedTextField(address, { address = it }, label = { Text("PC folder path") }, singleLine = true, modifier = Modifier.weight(1f))
+                OutlinedTextField(address, { address = it }, label = { Text("PC folder path") }, singleLine = true, modifier = Modifier.weight(1f).testTag("pc-folder-address"))
                 TextButton(onClick = { val target = address.trim(); if (target == directory) vm.load("project-folder", "/api/pc/files", mapOf("path" to target)) else directory = target }) { Text("Go") }
             }
             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                 IconButton(onClick = { directory = ""; address = "" }) { Icon(Icons.Rounded.Home, "Home folder") }
                 IconButton(onClick = { directory = record?.string("parent").orEmpty(); address = directory }, enabled = !record?.string("parent").isNullOrBlank()) { Icon(Icons.Rounded.ArrowUpward, "Parent folder") }
                 Text(record?.string("path").orEmpty(), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+                IconButton(onClick = { showHidden = !showHidden }, modifier = Modifier.testTag("project-folders-show-hidden")) {
+                    Icon(if (showHidden) Icons.Rounded.Visibility else Icons.Rounded.VisibilityOff, if (showHidden) "Hide hidden folders" else "Show hidden folders")
+                }
             }
+            Button(onClick = { record?.getString("path")?.let(onChoose) }, enabled = record != null && !record.has("_error") && record.string("path").isNotBlank(), modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp)) { Text("Use this folder") }
             LazyColumn(Modifier.weight(1f)) {
                 if (record == null) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
                 else if (record.has("_error")) item { Text(record.string("_error"), color = MaterialTheme.colorScheme.error); TextButton(onClick = { vm.load("project-folder", "/api/pc/files", mapOf("path" to directory)) }) { Text("Retry") } }
                 else {
-                    val folders = record.rows("entries").filter { it.optBoolean("is_directory") }
-                    if (folders.isEmpty()) item { Text("No subfolders", Modifier.padding(vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    val allFolders = record.rows("entries").filter { it.optBoolean("is_directory") }
+                    val folders = if (showHidden) allFolders else allFolders.filterNot { it.string("name").startsWith(".") }
+                    if (allFolders.isEmpty()) item { Text("No subfolders", Modifier.padding(vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    else if (folders.isEmpty()) item { Text("Only hidden folders here. Show hidden folders to see them.", Modifier.padding(vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     items(folders, key = { it.getString("path") }) { row -> ActionRow(row.getString("name"), icon = Icons.Rounded.Folder) { directory = row.getString("path"); address = directory } }
                 }
             }
-            Button(onClick = { record?.getString("path")?.let(onChoose) }, enabled = record != null && !record.has("_error") && record.string("path").isNotBlank(), modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp)) { Text("Use this folder") }
         }
     }
 }
@@ -190,24 +291,31 @@ internal fun nativeProjectDetailCurrent(requestedId: String, returnedId: String)
     val ui by vm.ui.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
     val scope = vm.client?.scope?.session(sessionId)
+    val coroutine = rememberCoroutineScope()
+    var saving by remember(scope) { mutableStateOf(false) }
     var selected by remember(ui.origin, ui.owner, ui.profile, sessionId) { mutableStateOf<JSONObject?>(null) }
     LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, vm.client) { vm.loadNativeProjects() }
     LaunchedEffect(sessionId) { vm.loadConversationProject(sessionId) }
     fun assign(project: JSONObject, path: String) {
+        if (saving) return
         if (scope == null) vm.notice("Reconnect to choose a project.") else {
-            onDismiss()
-            vm.conversationAction(sessionId, "/api/projects/assign", json("id" to project.getString("id"), "path" to path), "Added to ${project.string("name")}")
+            saving = true
+            val job = vm.conversationAction(sessionId, "/api/projects/assign", json("id" to project.getString("id"), "path" to path), "Added to ${project.string("name")}")
+            coroutine.launch {
+                try { job.join(); if (vm.ui.value.error.isBlank()) onDismiss() } finally { saving = false }
+            }
         }
     }
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp).heightIn(max = 520.dp)) {
             val current = data["project-of:$sessionId"]?.takeIf { it.string("session_id") == sessionId }?.optJSONObject("project")
             Text(if (current != null) "Move to project" else "Add to project", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(bottom = 12.dp))
+            if (saving) { LinearProgressIndicator(Modifier.fillMaxWidth()); Text("Moving chat…", Modifier.testTag("project-chat-saving")) }
             if (scope == null) Text("Reconnect to choose a project.", color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(bottom = 12.dp))
             if (scope != null && current != null) TextButton({
                 onDismiss()
                 vm.conversationAction(sessionId, "/api/projects/detach", json("id" to current.string("id")), "Removed from ${current.string("name")}")
-            }) { Icon(Icons.Rounded.FolderOff, null); Text("Remove from ${current.string("name")}", Modifier.padding(start = 8.dp)) }
+            }, enabled = !saving) { Icon(Icons.Rounded.FolderOff, null); Text("Remove from ${current.string("name")}", Modifier.padding(start = 8.dp)) }
             LazyColumn(Modifier.weight(1f, fill = false)) {
                 val record = data["native-projects"]
                 if (record == null || record.optBoolean("_loading")) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }

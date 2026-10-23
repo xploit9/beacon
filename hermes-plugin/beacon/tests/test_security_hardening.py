@@ -19,6 +19,190 @@ from test_mobile import harness, load_private
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _guard_native_identity(monkeypatch, identity, profile='default'):
+    monkeypatch.setitem(sys.modules, 'hermes_cli.profiles', SimpleNamespace(current_profile_name=lambda: profile))
+    db = SimpleNamespace(cron_run_identity=lambda session_id: identity)
+    scopes = []
+    server = SimpleNamespace(_profile_db=lambda scope: scopes.append(scope) or nullcontext(db))
+    monkeypatch.setitem(sys.modules, 'tui_gateway', SimpleNamespace(server=server))
+    return server, scopes
+
+
+@pytest.mark.parametrize('row', [{'source': 'cron'}, {'source': 'cron', 'cron_job_id': 'orphan'}])
+def test_watch_guard_blocks_unresolved_or_orphaned_runs(harness, monkeypatch, row):
+    plugin = load_private('__init__')
+    monkeypatch.setattr(plugin, 'current_profile', lambda cfg: 'default')
+    monkeypatch.setattr(plugin, '_cron_row', lambda *args: row)
+    assert plugin.native_proactive_read_only_guard('read_file', {}, 'unknown-run') == {
+        'action': 'block', 'message': plugin._READ_ONLY_MESSAGE}
+
+
+@pytest.mark.parametrize('failure_at,cron', [
+    (failure, cron) for failure in ('settings', 'profile', 'session') for cron in (False, True)
+] + [('tool', True)])
+def test_watch_guard_blocks_when_identity_or_tool_classification_raises(harness, monkeypatch, failure_at, cron):
+    plugin = load_private('__init__')
+    _guard_native_identity(monkeypatch, {'cron_job_id': 'watch'} if cron else None)
+    def fail(*args): raise OSError('unavailable')
+    if failure_at == 'settings': monkeypatch.setattr(plugin.mobile, 'settings', fail)
+    monkeypatch.setattr(plugin, 'current_profile', fail if failure_at == 'profile' else lambda cfg: 'default')
+    monkeypatch.setattr(plugin, '_cron_row', fail if failure_at == 'session' else
+                        lambda *args: {'source': 'cron', 'cron_job_id': 'watch'})
+    monkeypatch.setattr(plugin.proactive, 'watch_job_ids', lambda *args: {'watch'})
+    monkeypatch.setattr(plugin, '_mail_provider_read', fail if failure_at == 'tool' else lambda *args: False)
+    result = plugin.native_proactive_read_only_guard('mcp__mail__search', {}, 'watch-run')
+    assert result == ({'action': 'block', 'message': plugin._READ_ONLY_MESSAGE} if cron else None)
+
+
+@pytest.mark.parametrize('row', [None, {}])
+@pytest.mark.parametrize('cron', [False, True])
+def test_watch_guard_checks_native_identity_when_session_row_is_missing(harness, monkeypatch, row, cron):
+    plugin = load_private('__init__')
+    _, scopes = _guard_native_identity(monkeypatch, {'cron_job_id': 'watch'} if cron else None)
+    monkeypatch.setattr(plugin, 'current_profile', lambda cfg: 'default')
+    monkeypatch.setattr(plugin, '_cron_row', lambda *args: row)
+    result = plugin.native_proactive_read_only_guard('write_file', {}, 'local-' + 'a' * 64)
+    assert result == ({'action': 'block', 'message': plugin._READ_ONLY_MESSAGE} if cron else None)
+    assert scopes == [{'profile': 'default'}]
+
+
+@pytest.mark.parametrize('cron', [False, True])
+def test_watch_guard_uses_native_identity_in_an_unserved_profile(harness, monkeypatch, cron):
+    plugin = load_private('__init__')
+    home = harness[3]
+    server, scopes = _guard_native_identity(monkeypatch, {'cron_job_id': 'watch'} if cron else None, 'work')
+    server._profile_home = lambda profile: home if profile == 'default' else home / profile
+    monkeypatch.setitem(sys.modules, 'hermes_constants', SimpleNamespace(
+        get_hermes_home=lambda: home / 'work', get_hermes_home_override=lambda: str(home / 'work')))
+    with pytest.raises(ValueError, match='Native profile scope unavailable'):
+        plugin.current_profile(harness[2])
+    result = plugin.native_proactive_read_only_guard('write_file', {}, 'work-session')
+    assert result == ({'action': 'block', 'message': plugin._READ_ONLY_MESSAGE} if cron else None)
+    assert scopes == [{'profile': 'work'}]
+
+
+@pytest.mark.parametrize('job,blocked', [
+    ({'id': 'digest', 'name': 'Daily digest', 'prompt': 'Summarise the news'}, False),
+    ({'id': 'digest', 'name': 'Beacon: important emails', 'prompt': 'watch'}, True),
+])
+def test_unserved_profile_cron_keeps_owner_jobs_and_guards_beacon_jobs(harness, monkeypatch, job, blocked):
+    plugin = load_private('__init__')
+    _guard_native_identity(monkeypatch, {'cron_job_id': 'digest'}, 'work')
+    monkeypatch.setattr(plugin, 'current_profile', lambda cfg: (_ for _ in ()).throw(ValueError('Native profile scope unavailable')))
+    monkeypatch.setattr(plugin.proactive, '_cron_helpers', lambda: (lambda profile, op, *args: [job], None, None, None))
+    result = plugin.native_proactive_read_only_guard('write_file', {'path': 'x', 'content': 'y'}, 'work-cron-run')
+    assert (result is not None) is blocked
+    if not blocked:
+        assert plugin.native_proactive_read_only_guard('read_file', {'path': 'x'}, 'work-cron-run') is None
+
+
+def test_watch_guard_cannot_block_without_a_session_id(harness):
+    assert load_private('__init__').native_proactive_read_only_guard('write_file', {}) is None
+
+
+def test_watch_guard_keeps_known_cron_blocked_when_identity_read_fails(harness, monkeypatch):
+    plugin = load_private('__init__')
+    def fail(*args): raise OSError('identity unavailable')
+    db = SimpleNamespace(get_conversation_root=lambda session_id: session_id,
+                         get_session=lambda session_id: {'id': session_id, 'source': 'cron'}, cron_run_identity=fail)
+    monkeypatch.setitem(sys.modules, 'tui_gateway', SimpleNamespace(
+        server=SimpleNamespace(_profile_db=lambda scope: nullcontext(db))))
+    monkeypatch.setattr(plugin, 'current_profile', lambda cfg: 'default')
+    assert plugin.native_proactive_read_only_guard('write_file', {}, 'local-unknown-job') == {
+        'action': 'block', 'message': plugin._READ_ONLY_MESSAGE}
+
+
+def test_watch_guard_marker_is_fresh_scoped_and_absent_when_verification_fails(harness, monkeypatch):
+    plugin = load_private('__init__')
+    monkeypatch.setattr(plugin, 'current_profile', lambda cfg: 'default')
+    monkeypatch.setattr(plugin, '_watch_context', lambda *args: {'job_id': 'watch'})
+    monkeypatch.setattr(plugin.proactive, 'watch_window', lambda *args: ('lower', 'upper'), raising=False)
+    context = plugin.native_watch_guard_context(session_id='watch-run')['context']
+    assert 'BEACON_READ_ONLY_GUARD_V1' in context
+    assert all(value in context for value in ('default', 'watch', 'watch-run', 'lower', 'upper'))
+    def refuse(*args): raise LookupError('not a watch')
+    monkeypatch.setattr(plugin, '_watch_context', refuse)
+    assert plugin.native_watch_guard_context(session_id='owner-chat') is None
+    prompt = plugin.proactive._specs(plugin.proactive.default_setup())[0]['prompt']
+    assert 'BEACON_READ_ONLY_GUARD_V1' in prompt and 'Without that guard marker, return [SILENT]' in prompt
+
+
+def test_plugin_unload_on_disable_pauses_only_its_managed_jobs(harness, monkeypatch):
+    api = harness[0]
+    plugin = load_private('__init__')
+    hooks, cleanups, paused = [], [], []
+    for owner in ('owner', 'previous-owner'):
+        for profile in ('default', 'work'):
+            for kind in ('watch_email', 'nightly_memory'):
+                api.proactive._set_managed_id(api.mobile, owner, profile, kind, owner + '-' + profile + '-' + kind)
+    monkeypatch.setattr(plugin.proactive, '_cron_helpers', lambda: (
+        lambda profile, *args: [{'id': owner + '-' + profile + '-' + kind}
+            for owner in ('owner', 'previous-owner') for kind in ('watch_email', 'nightly_memory')] + [{'id': 'unrelated'}],
+        None, lambda profile, action, job: paused.append((profile, action, job)) or True, None))
+    plugin.register(SimpleNamespace(register_tool=lambda **kwargs: None,
+        register_hook=lambda name, handler: hooks.append((name, handler)), on_unload=cleanups.append))
+    assert ('pre_llm_call', plugin.native_watch_guard_context) in hooks
+    assert len(cleanups) == 1
+    harness[2].clear()  # Native settings no longer expose the owner after disabling the plugin.
+    cleanups[0]()
+    assert set(paused) == {(profile, 'pause_job', owner + '-' + profile + '-' + kind)
+        for owner in ('owner', 'previous-owner') for profile in ('default', 'work')
+        for kind in ('watch_email', 'nightly_memory')}
+
+
+def test_disable_pauses_every_profile_past_a_deleted_one_and_reenable_upgrades_again(harness, monkeypatch):
+    api = harness[0]
+    proactive = api.proactive
+    for profile in ('gone', 'default'):
+        proactive._set_managed_id(api.mobile, 'owner', profile, 'watch_email', profile + '-watch')
+        proactive._meta_set(api.mobile, proactive._key('owner', profile, 'jobs-version'), proactive.JOBS_VERSION)
+    paused = []
+    def call(profile, *args):
+        if profile == 'gone': raise LookupError('profile not found')
+        return [{'id': profile + '-watch'}]
+    monkeypatch.setattr(proactive, '_cron_helpers', lambda: (call, None, lambda profile, action, job: paused.append(job) or True, None))
+    with pytest.raises(RuntimeError):
+        proactive.pause_managed_jobs(api.mobile)
+    assert paused == ['default-watch']
+    assert proactive._meta_get(api.mobile, proactive._key('owner', 'default', 'jobs-version')) is None
+
+
+def test_plugin_unload_while_enabled_leaves_jobs_running(harness, monkeypatch):
+    plugin = load_private('__init__')
+    plugin.proactive._set_managed_id(plugin.mobile, 'owner', 'default', 'watch_email', 'watch')
+    job = {'id': 'watch', 'enabled': True}
+    def mutate(*args):
+        job['enabled'] = False
+        return True
+    monkeypatch.setattr(plugin.proactive, '_cron_helpers', lambda: (lambda *args: [job], None, mutate, None))
+    plugin.pause_proactive_jobs()
+    assert job['enabled'] is True
+
+
+def test_unpaired_beacon_does_not_gate_a_verified_interactive_chat(harness, monkeypatch):
+    harness[2].pop('owner_id')
+    plugin = load_private('__init__')
+    monkeypatch.setattr(plugin, 'current_profile', lambda cfg: 'default')
+    monkeypatch.setattr(plugin, '_cron_row', lambda *args: {'source': 'tui'})
+    assert plugin.native_proactive_read_only_guard('write_file', {}, 'owner-chat') is None
+
+
+@pytest.mark.parametrize('name,prompt,blocked', [
+    ('Owner reminder', 'Check the forecast', False),
+    ('Beacon: what needs you', 'Read sources', True),
+    ('Renamed watch', 'BEACON_PROACTIVE_JOB:watch_email', True),
+])
+def test_unpaired_beacon_only_guards_its_own_cron_jobs(harness, monkeypatch, name, prompt, blocked):
+    harness[2].pop('owner_id')
+    plugin = load_private('__init__')
+    monkeypatch.setattr(plugin, 'current_profile', lambda cfg: 'default')
+    monkeypatch.setattr(plugin, '_cron_row', lambda *args: {'source': 'cron', 'cron_job_id': 'job'})
+    monkeypatch.setattr(plugin.proactive, '_cron_helpers', lambda: (
+        lambda *args: [{'id': 'job', 'name': name, 'prompt': prompt}], None, None, None))
+    result = plugin.native_proactive_read_only_guard('write_file', {}, 'cron-run')
+    assert result == ({'action': 'block', 'message': plugin._READ_ONLY_MESSAGE} if blocked else None)
+
+
 @pytest.fixture
 def api(tmp_path, monkeypatch):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
@@ -229,6 +413,10 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
         tool_name="beacon_email_notice", args={"item_id": "https://mail.example/messages/123"}, session_id="watch-run")
     email_checked_url = plugin.native_proactive_read_only_guard(
         tool_name="beacon_email_checked", args={"item_id": "https://mail.example/messages/123"}, session_id="watch-run")
+    event_notice_url = plugin.native_proactive_read_only_guard(
+        tool_name="beacon_event_notice", args={"source": "github", "item_id": "https://github.example/issue/123"}, session_id="watch-run")
+    events_checked = plugin.native_proactive_read_only_guard(
+        tool_name="beacon_events_checked", args={"ok": True}, session_id="watch-run")
     blocked_terminal = [plugin.native_proactive_read_only_guard(
         tool_name="terminal", args={"command": command}, session_id="watch-run")
         for command in ("nslookup x.attacker", "ping x.attacker",
@@ -272,6 +460,11 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
     assert memory_read is None and web_read is None
     assert hindsight_reads == [None] * 4 and hindsight_writes == [blocked] * 3
     assert email_notice_url is None and email_checked_url is None
+    assert event_notice_url is None and events_checked is None
+    mcp_tool._mcp_tool_server_names.update({"mcp__github__get_issue": "github", "mcp__github__create_issue": "github"})
+    mcp_tool._tool_read_only_hints["github"] = {"get_issue": True, "create_issue": False}
+    assert plugin.native_proactive_read_only_guard(tool_name="mcp__github__get_issue", args={}, session_id="watch-run") is None
+    assert plugin.native_proactive_read_only_guard(tool_name="mcp__github__create_issue", args={}, session_id="watch-run") == blocked
     terminal_blocked = {"action": "block", "message": plugin._READ_ONLY_TERMINAL_MESSAGE}
     assert terminal == terminal_blocked
     assert blocked_terminal == [terminal_blocked] * 29 and allowed_mail_reads == [None] * 8

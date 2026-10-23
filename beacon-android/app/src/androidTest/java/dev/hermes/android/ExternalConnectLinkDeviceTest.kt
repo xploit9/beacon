@@ -2,8 +2,10 @@ package dev.hermes.android
 
 import android.content.Intent
 import android.net.Uri
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.datastore.preferences.core.booleanPreferencesKey
@@ -49,6 +51,16 @@ class ExternalConnectLinkDeviceTest {
         compose.runOnUiThread { activity.startActivity(link(origin).setPackage(activity.packageName)) }
         compose.waitUntil(5_000) { compose.runOnUiThread { activity.intent !== launch } }
         compose.runOnUiThread { activity.intent = launch }
+    }
+
+    @Test fun theWizardStaysOnScreenWhileSignInConnects() {
+        val vm = activityViewModel()
+        compose.waitUntil(5_000) { !vm.ui.value.restoringSession }
+        // signIn() keeps setupWizard on, then connect() raises restoringSession while it loads the account.
+        compose.runOnUiThread { ui(vm).value = AppState(setupWizard = true, setupStep = "signin", loading = true, restoringSession = true) }
+        compose.waitForIdle()
+        compose.onAllNodesWithTag("session-restore-logo").assertCountEquals(0)
+        compose.onAllNodesWithTag("setup-signin").assertCountEquals(1)
     }
 
     @Test fun setUpLinkRequiresConfirmationBeforeEnteringOrPersistingSetup() = runBlocking {

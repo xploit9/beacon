@@ -39,7 +39,7 @@ class ProactiveUiTest {
     private val app get() = ApplicationProvider.getApplicationContext<BeaconApplication>()
     private fun proactiveKey(fixture: NativeExperienceFixture) = proactiveSettingsKey(fixture.scope.copy(profile = "coder"))
 
-    @Test fun importantEmailToggleEnablesImmediatelyWithTheEmailOnlyDefaults() = withFixture { vm, fixture ->
+    @Test fun proactiveToggleEnablesImmediatelyWithTheExistingDefaults() = withFixture { vm, fixture ->
         fixture.profileDisplayNames = mapOf("default" to "Personal profile", "coder" to "Code profile")
         compose.runOnIdle { vm.load("navigation-profiles", "/api/profiles", force = true); vm.more("Assistant") }
         await { vm.data.value[proactiveKey(fixture)]?.has("enabled") == true }
@@ -47,8 +47,8 @@ class ProactiveUiTest {
         await { compose.onAllNodesWithText("Profile: Code profile").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("coder", substring = false).assertDoesNotExist()
 
-        compose.onNodeWithText("Important emails · Code profile").assertExists()
-        compose.onNodeWithText("Beacon checks your email and tells you when something matters. It learns from you.").assertExists()
+        compose.onNodeWithText("What needs you · Code profile").assertExists()
+        compose.onNodeWithText("Beacon tells you what needs your attention.").assertExists()
         compose.onNodeWithTag("assistant-proactive-toggle").performScrollTo().performClick()
         await { fixture.proactiveEnabled["coder"] == true && vm.data.value[proactiveKey(fixture)]?.optBoolean("enabled") == true }
 
@@ -60,7 +60,8 @@ class ProactiveUiTest {
         assertEquals("coder", write.string("profile"))
         assertEquals(setOf("enabled"), write.getJSONObject("body").keys().asSequence().toSet())
         assertTrue(write.getJSONObject("body").getBoolean("enabled"))
-        compose.onNodeWithText("When one arrives").assertExists()
+        // R6P watches every connected source, not only incoming email.
+        compose.onNodeWithText("When something matters").assertExists()
         compose.onNodeWithText("Delivery: Notify").assertExists()
         compose.onNodeWithText("Check every: 15 min").assertExists()
         compose.onNodeWithTag("proactive-time-Quiet hours start").performScrollTo().performClick()
@@ -88,7 +89,7 @@ class ProactiveUiTest {
         assertEquals("22:00", settingsWrite.getJSONObject("body").string("quiet_start"))
         assertEquals("07:00", settingsWrite.getJSONObject("body").string("quiet_end"))
 
-        // Rules wait until the saved settings come back; the rules card sits below the email card.
+        // Rules wait until the saved settings come back; the rules card sits below the watch card.
         compose.onNodeWithTag("assistant-settings").performScrollToNode(hasTestTag("proactive-add-rule"))
         await { runCatching { compose.onNodeWithTag("proactive-add-rule").assertIsEnabled() }.isSuccess }
         compose.onNodeWithTag("proactive-add-rule").performScrollTo().performClick()
@@ -99,16 +100,36 @@ class ProactiveUiTest {
             vm.formValue("night", "true")
         }
         compose.onNodeWithText("Add rule", useUnmergedTree = true).performClick()
-        await { fixture.proactiveRequests["coder"]?.size == 1 && vm.data.value[proactiveKey(fixture)]?.rows("rules")?.size == 1 }
+        await {
+            fixture.proactiveRequests["coder"]?.size == 1 && vm.data.value[proactiveKey(fixture)]?.rows("rules")?.size == 1 &&
+                vm.form.value == null && compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty()
+        }
         val create = fixture.requests.last { it.string("path") == "$PROACTIVE_SETTINGS_PATH/requests" && it.string("method") == "POST" }
         assertEquals("coder", create.string("profile"))
-        assertEquals("email", create.getJSONObject("body").string("signal"))
+        assertTrue(create.getJSONObject("body").isNull("signal"))
+        assertTrue(fixture.proactiveRequests.getValue("coder").single().isNull("signal"))
         assertTrue(create.getJSONObject("body").getBoolean("night"))
         val ruleId = fixture.proactiveRequests.getValue("coder").single().string("id")
         compose.onNodeWithTag("proactive-rule-text-$ruleId").performScrollTo().assertTextContains("client moves a review", substring = true)
-        compose.onNodeWithTag("proactive-rule-enabled-$ruleId").performScrollTo().performClick()
-        await { !fixture.proactiveRequests.getValue("coder").single().optBoolean("enabled") }
-        compose.onNodeWithTag("proactive-rule-delete-$ruleId").performScrollTo().performClick()
+        val ruleToggle = compose.onNodeWithTag("proactive-rule-enabled-$ruleId")
+        // Refresh can leave enabled rule semantics in an unplaced lazy item.
+        await { runCatching {
+            compose.onNodeWithTag("assistant-settings").performScrollToNode(hasTestTag("proactive-rule-enabled-$ruleId"))
+            ruleToggle.performScrollTo().assertIsDisplayed().assertIsEnabled().assertIsOn()
+        }.isSuccess }
+        ruleToggle.assertIsDisplayed().assertIsEnabled().assertIsOn().performClick()
+        val ruleDelete = compose.onNodeWithTag("proactive-rule-delete-$ruleId")
+        // The fixture mutates before the PATCH response and settings refresh reach the UI.
+        await {
+            val projectedRule = vm.data.value[proactiveKey(fixture)]?.rows("rules")?.singleOrNull()
+            !fixture.proactiveRequests.getValue("coder").single().optBoolean("enabled") &&
+                projectedRule?.let { it.string("id") == ruleId && !it.optBoolean("enabled") } == true &&
+                runCatching {
+                    compose.onNodeWithTag("assistant-settings").performScrollToNode(hasTestTag("proactive-rule-delete-$ruleId"))
+                    ruleDelete.performScrollTo().assertIsDisplayed().assertIsEnabled()
+                }.isSuccess
+        }
+        ruleDelete.assertIsDisplayed().assertIsEnabled().performClick()
         await { fixture.proactiveRequests.getValue("coder").isEmpty() && vm.data.value[proactiveKey(fixture)]?.rows("rules")?.isEmpty() == true }
         assertTrue(fixture.requests.filter { it.string("path").contains("/proactive/") }.all { it.string("profile") == "coder" })
     }
@@ -151,11 +172,11 @@ class ProactiveUiTest {
         compose.runOnIdle { vm.tab("Beacon") }
         await { vm.ui.value.tab == "Beacon" && vm.ui.value.profile == "coder" && vm.chat.value.projectionReady }
         await { vm.data.value[proactiveKey(fixture)]?.has("enabled") == true }
-        await { compose.onAllNodesWithText("Let Beacon flag important emails").fetchSemanticsNodes().isNotEmpty() }
+        await { compose.onAllNodesWithText("Let Beacon tell you what needs you").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithTag("proactive-prompt-settings").performClick()
         await { vm.ui.value.tab == "More" && vm.ui.value.morePage == "Assistant" }
-        // The profile label depends on cached display names; this test only checks it lands on the email settings.
-        await { compose.onAllNodesWithText("Important emails · ", substring = true).fetchSemanticsNodes().isNotEmpty() }
+        // The profile label depends on cached display names; check that this opens Proactive settings.
+        await { compose.onAllNodesWithText("What needs you · ", substring = true).fetchSemanticsNodes().isNotEmpty() }
         assertFalse(fixture.proactiveEnabled["coder"] == true)
     }
 
@@ -189,7 +210,7 @@ class ProactiveUiTest {
             vm.handlePush(source, noticeId)
             await { vm.ui.value.tab == "Chat" && vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
             // The chat was already open, so wait for the notification's card itself.
-            await { compose.onAllNodesWithText("Important email").fetchSemanticsNodes().isNotEmpty() }
+            await { compose.onAllNodesWithText("Important update").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText(reason).assertExists()
             compose.onNodeWithTag("task-result-feedback-important").assertExists()
             compose.onNodeWithTag("task-result-feedback-not-important").performClick()
@@ -390,12 +411,16 @@ class ProactiveUiTest {
     }
 
     @Test fun proactiveControlsStayHiddenWhenOptionalPluginIsAbsent() = withFixture(pluginStatus = "absent") { vm, fixture ->
+        fixture.jobs.getValue("task-a").put("state", "running")
         compose.runOnIdle { vm.more("Assistant") }
         // The email card offers the plugin install instead of its controls.
         await { compose.onAllNodesWithTag("missing-plugin-install").fetchSemanticsNodes().isNotEmpty() }
         compose.onAllNodesWithTag("assistant-proactive-toggle").assertCountEquals(0)
         compose.runOnIdle { vm.tab("Beacon") }
-        await { vm.ui.value.tab == "Beacon" && vm.chat.value.projectionReady }
+        await { vm.ui.value.tab == "Beacon" && vm.ui.value.profile == "coder" && vm.chat.value.projectionReady }
+        // The native summary appears only after the background poll has completed.
+        await { compose.onAllNodesWithTag("chat-activity-strip").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("chat-activity-strip").assertIsDisplayed().assertContentDescriptionEquals("Background activity, 1 cron job")
         compose.onAllNodesWithTag("proactive-prompt-card").assertCountEquals(0)
         assertFalse(fixture.requests.any { it.string("path") == PROACTIVE_SETTINGS_PATH })
     }

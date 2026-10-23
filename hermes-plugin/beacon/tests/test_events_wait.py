@@ -167,6 +167,31 @@ def test_missed_scheduled_callback_posts_notice_before_delete(harness, monkeypat
         assert notice['reason'] == notices[0]
 
 
+def test_event_poll_recovers_skipped_callback_in_its_original_profile(harness,monkeypatch):
+    from datetime import timezone
+    api,client,cfg,_,_=harness
+    cfg.update(scheduled_callbacks_enabled=True,profiles=['default','work'])
+    target=datetime.now(timezone.utc)-timedelta(seconds=180)
+    record={'owner':'owner','provider':'basic','profile':'work','conversation':'work-owned-chat',
+            'scheduled_at':target.isoformat(),'reason':'Requested reminder','status':'scheduled'}
+    with api.mobile.connect() as conn:
+        conn.execute('INSERT INTO meta(key,value) VALUES(?,?)',('scheduled-callback:'+'e'*64,json.dumps(record).encode()))
+    verified=[]
+    monkeypatch.setattr(api.native,'verify',lambda *args:verified.append(args) or {})
+    monkeypatch.setattr(api,'watch',lambda *args:None)
+
+    default=client.get(EVENTS,params={'profile':'default'})
+    work=client.get(EVENTS,params={'profile':'work'})
+
+    assert default.status_code==work.status_code==200
+    assert default.json()['events']==[]
+    notices=work.json()['events']
+    assert len(notices)==1 and notices[0]['kind']=='task_result'
+    assert (notices[0]['owner_id'],notices[0]['profile'],notices[0]['conversation_id'])==('owner','work','work-owned-chat')
+    assert notices[0]['body']=='Missed scheduled callback: Requested reminder'
+    assert verified==[('owner','basic','work','work-owned-chat')]
+
+
 def test_event_long_poll_does_not_rescan_native_activity(harness, monkeypatch):
     api, client, _, _, _ = harness
     watch_calls, history_prunes, callback_prunes, after_calls, disconnect_calls = [], [], [], [], []

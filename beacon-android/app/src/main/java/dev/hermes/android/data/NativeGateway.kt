@@ -141,7 +141,8 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         try {
             mine.failure?.let { throw unknown(it) }
             val wireParams = params.copy().put("profile", client.auth.profile)
-            if (method == "session.resume") wireParams.put("source", "android")
+            // Keep required history, without retransmitting legacy inline photos beyond the frame cap.
+            if (method == "session.resume") wireParams.put("source", "android").put("inline_images", false)
             if (mine.socket?.send(json("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to wireParams).toString()) != true) throw unknown(IOException("Native connection unavailable"))
             val response = try { withTimeout(rpcTimeoutMs) { result.await() } } catch (e: TimeoutCancellationException) { currentCoroutineContext().ensureActive(); throw unknown(e) }
             response.optJSONObject("error")?.let { throw ApiFailure(it.optInt("code", 500), it.optString("message", "Native operation failed")) }
@@ -330,6 +331,13 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         synchronized(cursorLock) { cursor?.binding }?.takeIf { connection?.failure == null && connection?.ready?.isCompleted == true && it.scope == client.scope && (stored == it.storedSessionId || stored == it.runtimeSessionId) }?.let { return@withLock it }
         bind(rpc(if (stored.isNullOrBlank()) "session.create" else "session.resume", if (stored.isNullOrBlank()) json("source" to "android", "close_on_disconnect" to false) else json("session_id" to stored, "close_on_disconnect" to false, "omit_messages" to false).apply { if (lazy && !stored.isNullOrBlank()) put("lazy", true) }))
     }
+    private suspend fun reconciliationHistory(binding: NativeSessionBinding): JSONObject {
+        require(binding.scope == client.scope) { "Conversation scope changed" }
+        // session.history has no compact-image option; reuse the scoped, bounded REST projection.
+        return NativeOperations(client).passiveHistory(binding.storedSessionId).also {
+            require(binding.scope == client.scope) { "Conversation scope changed" }
+        }
+    }
     suspend fun prepareReplay(lastId: String = "", beforePrompt: Boolean = false) = sessionLock.withLock {
         val snapshot = synchronized(cursorLock) { cursor } ?: return@withLock
         check(!consuming.get()) { "Prepare replay before starting the native event collector" }
@@ -356,7 +364,7 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
                 val nextEpoch = replay.string("epoch")
                 val reconcile = synchronized(cursorLock) { cursor === snapshot && (replay.optBoolean("truncated") || snapshot.epoch.isNotBlank() && nextEpoch != snapshot.epoch) }
                 if (reconcile) {
-                    val history = rpc("session.history", json("session_id" to b.runtimeSessionId))
+                    val history = reconciliationHistory(b)
                     if (synchronized(cursorLock) { cursor === snapshot }) onEvent(json("method" to "reconciliation.required", "params" to json("session_id" to b.runtimeSessionId, "history" to history, "epoch" to nextEpoch)))
                 }
                 synchronized(cursorLock) { if (cursor === snapshot) { if (reconcile) snapshot.sequence = replay.optLong("latest_seq", 0); snapshot.epoch = nextEpoch } }
@@ -390,7 +398,7 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         val seen = synchronized(cursorLock) { snapshot?.sequence ?: 0 }
         if (b != null && seq > 0 && seq <= seen) return
         if (b != null && seq > 0 && seen > 0 && seq != seen + 1) {
-            val history = rpc("session.history", json("session_id" to b.runtimeSessionId))
+            val history = reconciliationHistory(b)
             if (synchronized(cursorLock) { cursor !== snapshot }) return
             callback(json("method" to "reconciliation.required", "params" to json("session_id" to b.runtimeSessionId, "gap" to true, "history" to history)))
         }

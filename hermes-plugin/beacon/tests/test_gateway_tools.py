@@ -676,6 +676,7 @@ def test_native_tools_are_discovered_for_the_api_profile_and_exclusions_are_appl
         ('session_search','session_search'),('memory','memory'),('todo_list','todo'),('video_analyze','video'),
         ('clarify','clarify'),('delegate_task','delegation'),('browser_click','browser'),
         ('beacon_create_proactive_request','beacon-interactive'),('beacon_email_notice','beacon-mailbox'),
+        ('beacon_event_notice','beacon-mailbox'),('beacon_events_checked','beacon-mailbox'),
         ('hindsight_recall','memory'),('hindsight_reflect','memory'),
         ('hindsight_search_knowledge_pages','memory'),('hindsight_read_knowledge_page','memory'),
         ('hindsight_retain','memory'),
@@ -718,7 +719,8 @@ def test_native_tools_are_discovered_for_the_api_profile_and_exclusions_are_appl
     assert catalog['hindsight_retain']['read_only'] is False
     assert 'session_search' not in catalog
     assert not {'memory','todo_list','clarify','delegate_task','browser_click','beacon_create_proactive_request',
-                'beacon_email_notice','mcp-weather','video_analyze','manage_connections','manage_catalog','setup_mcp'} & set(catalog)
+                'beacon_email_notice','beacon_event_notice','beacon_events_checked',
+                'mcp-weather','video_analyze','manage_connections','manage_catalog','setup_mcp'} & set(catalog)
     assert catalog['read_file']['read_only'] and catalog['web_search']['read_only']
     assert not catalog['web_extract']['read_only'] and not catalog['vision_analyze']['read_only']
     assert not catalog['metadata_read']['read_only']

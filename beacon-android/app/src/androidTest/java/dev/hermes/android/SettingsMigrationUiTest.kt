@@ -3,6 +3,7 @@ package dev.hermes.android
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -110,6 +111,17 @@ class SettingsMigrationUiTest {
         compose.onNodeWithTag("settings-group:Assistant & server").assertDoesNotExist()
     }
 
+    @Test fun pairedDevicesAreReachableFromConnectionInHubAndSearch() {
+        val host = show(widthDp = PhoneWidthDp)
+        tap("Connection")
+        assertEquals(listOf("Connection"), host.opened)
+
+        search("paired devices")
+        compose.onNodeWithTag("settings-row:Connection").assertIsDisplayed()
+        tapSearch("Connection")
+        assertEquals(listOf("Connection", "Connection"), host.opened)
+    }
+
     @Test fun tabletKeepsTheSameSingleOrderedList() {
         show(widthDp = TabletWidthDp)
         val positions = settingsHubRoutes.map { shown(it).fetchSemanticsNode().positionInRoot }
@@ -180,7 +192,7 @@ class SettingsMigrationUiTest {
         val host = show(widthDp = PhoneWidthDp, snapshot = null)
         shown("Appearance").assertTextContains("Theme and color style")
         shown("Chat").assertTextContains("Sending and display")
-        shown("Connection").assertTextContains("Server and signed-in account")
+        shown("Connection").assertTextContains("Server, signed-in account, and paired devices")
         compose.runOnIdle { host.snapshot = known }
         shown("Appearance").assertTextContains("Dark · Graphite")
         shown("Chat").assertTextContains("Ctrl + Enter to send · Thinking shown")
@@ -219,6 +231,35 @@ class SettingsMigrationUiTest {
         shown("Chat").assertTextContains("Enter to send")
         shown("Voice & calls").assertTextContains("Grok · Add key")
         assertTrue(host.opened.isEmpty())
+    }
+
+    @Test fun settingsPagesShowTheirTitleOnlyInTheTopBar() {
+        val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
+        val priorPreferences = runBlocking { app.preferences.data.first() }
+        val store = ViewModelStore()
+        try {
+            runBlocking { app.preferences.edit { it[stringPreferencesKey("origin")] = "" } }
+            val vm = ViewModelProvider(store, viewModelFactory { initializer { BeaconViewModel(app, SavedStateHandle()) } })[BeaconViewModel::class.java]
+            var page by mutableStateOf("Assistant")
+            compose.setContent {
+                BeaconTheme(dark = true) {
+                    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                        if (page == "Assistant") Column {
+                            Header(page, back = {}, menu = null); AssistantSettings(vm)
+                        } else NativeProfilesPage(vm)
+                    }
+                }
+            }
+
+            compose.onAllNodesWithText("Assistant").assertCountEquals(1)
+            compose.onNodeWithTag("owner-name").assertIsDisplayed()
+            compose.runOnIdle { page = "Profiles" }
+            compose.waitForIdle()
+            compose.onAllNodesWithText("Profiles").assertCountEquals(1)
+        } finally {
+            compose.runOnUiThread { store.clear() }
+            runBlocking { app.preferences.updateData { priorPreferences } }
+        }
     }
 
     @Test fun everyHubRowNavigatesAndBackReturnsToTheHub() {

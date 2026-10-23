@@ -5,6 +5,7 @@ import android.content.Intent
 import android.provider.Settings
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -26,6 +27,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.hermes.android.AppState
 import dev.hermes.android.BuildConfig
 import dev.hermes.android.BeaconApplication
 import dev.hermes.android.BeaconViewModel
@@ -103,16 +105,18 @@ internal val SettingsRowMinHeight = 78.dp
     settingsSearchRoutes.associateWith { route -> settingsSummary(route, snapshot).map { if (it.translate) uiText(it.text) else it.text }.joinSummary() }
 
 /** [summary] is the row's current value, already localized; a row without one keeps its static description. */
-@Composable private fun SettingsRow(name: String, summary: String = "", compatibilityTag: String? = null, onClick: () -> Unit) {
+@Composable private fun SettingsRow(name: String, summary: String = "", compatibilityTag: String? = null, selected: Boolean? = null, onClick: () -> Unit) {
     val detail = summary.ifBlank { uiText(settingsDescriptions[name].orEmpty()) }
+    val rowModifier = if (selected == null) Modifier.clickable(role = Role.Button, onClick = onClick)
+    else Modifier.selectable(selected = selected, role = Role.Button, onClick = onClick)
     // One clickable node: ListItem merges its own text, so a wrapping clickable would be an unlabeled button for TalkBack.
     ListItem(
         headlineContent = { Text(uiText(settingsLabel(name)), style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium) },
         supportingContent = if (detail.isBlank()) null else ({ Text(detail, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }),
         leadingContent = { Surface(shape = RoundedCornerShape(13.dp), color = MaterialTheme.colorScheme.primary.copy(alpha = .09f)) { Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) { Icon(settingsIcon(name), null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(21.dp)) } } },
         trailingContent = { Icon(Icons.Rounded.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp)) },
-        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-        modifier = Modifier.clickable(role = Role.Button, onClick = onClick).fillMaxWidth().heightIn(min = SettingsRowMinHeight).testTag(compatibilityTag ?: "settings-row:$name"),
+        colors = ListItemDefaults.colors(containerColor = if (selected == true) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent),
+        modifier = rowModifier.fillMaxWidth().heightIn(min = SettingsRowMinHeight).testTag(compatibilityTag ?: "settings-row:$name"),
     )
 }
 /** Tags older tests and saved routes rely on for renamed hub rows. */
@@ -124,12 +128,12 @@ private fun hubCompatibilityTag(name: String): String? = when (name) {
     "Profiles & model" -> "settings-row:Profiles"
     else -> null
 }
-@Composable private fun SettingsGroup(title: String, names: List<String>, summaries: Map<String, String>, modifier: Modifier = Modifier, onOpen: (String) -> Unit) {
+@Composable private fun SettingsGroup(title: String, names: List<String>, summaries: Map<String, String>, modifier: Modifier = Modifier, selectedPage: String? = null, onOpen: (String) -> Unit) {
     Column(modifier.testTag("settings-group:$title"), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         if (title.isNotBlank()) Text(uiText(title), Modifier.padding(start = 4.dp), style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Glass { Column { names.forEachIndexed { index, name ->
             if (index > 0) HorizontalDivider(Modifier.padding(start = 72.dp, end = 16.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f))
-            SettingsRow(name, summaries[name].orEmpty(), hubCompatibilityTag(name)) { onOpen(settingsRoute(name)) }
+            SettingsRow(name, summaries[name].orEmpty(), hubCompatibilityTag(name), selected = selectedPage?.let { settingsRoute(name) == it }) { onOpen(settingsRoute(name)) }
         } } }
     }
 }
@@ -137,20 +141,20 @@ private fun hubCompatibilityTag(name: String): String? = when (name) {
  * Stateless Settings overview: current values at a glance, one tap to the focused page. [onOpen] receives the exact
  * `BeaconViewModel.more` argument, [summaries] maps a row name to its localized current value (absent = no summary).
  */
-@Composable internal fun SettingsOverview(summaries: Map<String, String>, onOpen: (String) -> Unit, category: String = "") {
+@Composable internal fun SettingsOverview(summaries: Map<String, String>, onOpen: (String) -> Unit, category: String = "", selectedPage: String? = null) {
     var query by rememberSaveable(category) { mutableStateOf("") }
     val matches = settingsSearchRoutes.filter { settingsSearchMatches(uiText(settingsLabel(it)), uiText(settingsDescriptions[it].orEmpty()), query) }
     LazyColumn(Modifier.fillMaxSize().testTag("settings-overview"), contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 32.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
         item { OutlinedTextField(query, { query = it }, singleLine = true, placeholder = { Text(uiText("Search settings")) }, leadingIcon = { Icon(Icons.Rounded.Search, null) }, shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth().testTag("settings-search")) }
         if (query.isNotBlank()) {
-            item { if (matches.isEmpty()) Text(uiText("No matching settings"), style = MaterialTheme.typography.bodyLarge) else Glass { Column { matches.forEach { name -> SettingsRow(name, summaries[name].orEmpty()) { onOpen(settingsRoute(name)) } } } } }
+            item { if (matches.isEmpty()) Text(uiText("No matching settings"), style = MaterialTheme.typography.bodyLarge) else Glass { Column { matches.forEach { name -> SettingsRow(name, summaries[name].orEmpty(), selected = selectedPage?.let { settingsRoute(name) == it }) { onOpen(settingsRoute(name)) } } } } }
         } else if (category == "Advanced") {
-            item { SettingsGroup("Tools and services", settingsCategories.keys.toList(), summaries, onOpen = onOpen) }
+            item { SettingsGroup("Tools and services", settingsCategories.keys.toList(), summaries, selectedPage = selectedPage, onOpen = onOpen) }
         } else if (category.isNotBlank()) {
-            item { Glass { Column { settingsCategories[category].orEmpty().forEachIndexed { index, name -> if (index > 0) HorizontalDivider(Modifier.padding(start = 72.dp, end = 16.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f)); SettingsRow(name, summaries[name].orEmpty()) { onOpen(settingsRoute(name)) } } } } }
+            item { Glass { Column { settingsCategories[category].orEmpty().forEachIndexed { index, name -> if (index > 0) HorizontalDivider(Modifier.padding(start = 72.dp, end = 16.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f)); SettingsRow(name, summaries[name].orEmpty(), selected = selectedPage?.let { settingsRoute(name) == it }) { onOpen(settingsRoute(name)) } } } } }
         } else {
             // One item: every hub row stays composed, so scroll-to and screen readers reach all of them.
-            item { Column(verticalArrangement = Arrangement.spacedBy(20.dp)) { settingsHubSections.forEach { (title, names) -> SettingsGroup(title, names, summaries, onOpen = onOpen) } } }
+            item { Column(verticalArrangement = Arrangement.spacedBy(20.dp)) { settingsHubSections.forEach { (title, names) -> SettingsGroup(title, names, summaries, selectedPage = selectedPage, onOpen = onOpen) } } }
         }
     }
 }
@@ -173,7 +177,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
 }
 
 /** Reads the same local state as the focused pages, so a summary never claims more than the page it opens will show. */
-@Composable private fun SettingsHome(vm: BeaconViewModel, category: String = "") {
+@Composable private fun SettingsHome(vm: BeaconViewModel, category: String = "", selectedPage: String? = null) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val prefs by vm.preferences.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
@@ -210,13 +214,39 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         assistantName = prefs.assistantName, assistantProfile = profileDisplayLabel(prefs.assistantProfile, profileRows, profileLoading),
     ).withLoaded(data["profile-settings"])
     val summaries = localizedSettingsSummaries(snapshot)
-    SettingsOverview(summaries, { vm.more(it) }, category)
+    SettingsOverview(summaries, { vm.more(it) }, category, selectedPage)
 }
 
 @Composable fun MoreScreen(vm: BeaconViewModel) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val page = normalizeSettingsPage(ui.morePage)
     val pluginStatus = ui.bootstrap.optJSONObject("optional_features")?.optString("plugin").orEmpty()
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        if (maxWidth >= 840.dp) {
+            Row(Modifier.fillMaxSize()) {
+                Column(Modifier.width(360.dp).fillMaxHeight().testTag("settings-wide-list")) {
+                    Header("Settings", menu = LocalOpenNavigationMenu.current)
+                    Box(Modifier.weight(1f).fillMaxWidth()) { SettingsHome(vm, selectedPage = page) }
+                }
+                VerticalDivider()
+                Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.TopCenter) {
+                    Box(Modifier.widthIn(max = 640.dp).fillMaxWidth().fillMaxHeight().testTag("settings-wide-detail")) {
+                        if (page.isBlank()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text("Choose a setting", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        } else MoreSettingsRoute(vm, ui, page, pluginStatus)
+                    }
+                }
+            }
+        } else Box(Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+            Box(Modifier.widthIn(max = 640.dp).fillMaxWidth().fillMaxHeight()) {
+                MoreSettingsRoute(vm, ui, page, pluginStatus)
+            }
+        }
+    }
+    NativeCatalog(vm, containedActions = true)
+}
+
+@Composable private fun MoreSettingsRoute(vm: BeaconViewModel, ui: AppState, page: String, pluginStatus: String) {
     if (settingsNeedsBeaconPlugin(page, pluginStatus)) {
         androidx.activity.compose.BackHandler { vm.backFromSettings() }
         Column(Modifier.fillMaxSize()) {
@@ -252,7 +282,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
                 "Beacon" -> BeaconSettings(vm, pluginStatus == "absent")
                 "Assistant" -> AssistantSettings(vm)
                 "Appearance" -> AppearanceSettings(vm)
-                "Connection" -> ConnectionSettings(vm)
+                "Connection" -> ConnectionSettings(vm, pluginStatus == "absent")
                 "Notifications" -> NotificationSettings(vm)
                 "App updates" -> AppUpdates(vm)
                 "Licenses" -> LicenseScreen(vm)
@@ -260,7 +290,6 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         }
         else -> NativeAdministration(vm, page)
     }
-    NativeCatalog(vm)
 }
 
 @Composable private fun NativeChatPreferences(vm: BeaconViewModel) {
@@ -269,13 +298,11 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
     Column(Modifier.fillMaxSize()) {
         Header(uiText(settingsLabel("Settings")), back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current)
         LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            item { Text("Saved on this phone for the connected account and profile.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
             item { Choice("Send shortcut", settings.string("send_key", "enter"), listOf("enter", "ctrl_enter"), { vm.nativePreferences(json("send_key" to it)) }, optionLabels = mapOf("enter" to "Enter", "ctrl_enter" to "Ctrl + Enter")) }
-            item { LabeledToggle("Format your messages", settings.optBoolean("render_user_markdown", true), { vm.nativePreferences(json("render_user_markdown" to it)) }, "Render Markdown while preserving the original source.") }
-            item { LabeledToggle("Show thinking", settings.optBoolean("show_thinking", true), { vm.nativePreferences(json("show_thinking" to it)) }, "Show available reasoning disclosures. This does not change model reasoning effort.") }
-            item { LabeledToggle("Auto-follow streaming", settings.optBoolean("auto_scroll_follow", true), { vm.nativePreferences(json("auto_scroll_follow" to it)) }, "Keep the latest streaming reply in view.") }
-            item { LabeledToggle("Background animation", settings.optBoolean("animate_background", true), { vm.nativePreferences(json("animate_background" to it)) }, uiText("Turn it off to pause the Beacon sphere. Reduce motion can also pause it.")) }
-            item { Text("While a reply runs, Queue waits for it and Guide steers it.", style = MaterialTheme.typography.bodyMedium) }
+            item { LabeledToggle("Format your messages", settings.optBoolean("render_user_markdown", true), { vm.nativePreferences(json("render_user_markdown" to it)) }) }
+            item { LabeledToggle("Show thinking", settings.optBoolean("show_thinking", true), { vm.nativePreferences(json("show_thinking" to it)) }) }
+            item { LabeledToggle("Auto-follow streaming", settings.optBoolean("auto_scroll_follow", true), { vm.nativePreferences(json("auto_scroll_follow" to it)) }) }
+            item { LabeledToggle("Background animation", settings.optBoolean("animate_background", true), { vm.nativePreferences(json("animate_background" to it)) }) }
         }
     }
 }
@@ -291,7 +318,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
                 StructuredReadValue(item, depth + 1)
             }
         }
-        if (visible < keys.size) TextButton(onClick = { visible += 24 }) { Text("Show next 24 fields · ${keys.size} total") }
+        if (visible < keys.size) TextButton(onClick = { visible += 24 }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Show next 24 fields · ${keys.size} total") }
     }
 }
 @Composable private fun StructuredReadValue(value: Any, depth: Int = 0) {
@@ -300,7 +327,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         value is JSONObject -> {
             var expanded by remember(value) { mutableStateOf(depth <= 1) }
             Column {
-                TextButton(onClick = { expanded = !expanded }) { Text(if (expanded) "Hide details · ${value.length()} fields" else "Show details · ${value.length()} fields") }
+                TextButton(onClick = { expanded = !expanded }, modifier = Modifier.heightIn(min = 48.dp)) { Text(if (expanded) "Hide details · ${value.length()} fields" else "Show details · ${value.length()} fields") }
                 if (expanded) StructuredRead(value, depth)
             }
         }
@@ -308,13 +335,13 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
             var visible by remember(value) { mutableIntStateOf(24) }
             if (value.length() == 0) Text("No entries", style = MaterialTheme.typography.bodySmall)
             (0 until minOf(value.length(), visible)).forEach { index -> StructuredReadValue(value.opt(index) ?: "", depth + 1) }
-            if (visible < value.length()) TextButton(onClick = { visible += 24 }) { Text("Show next 24 · ${value.length()} total") }
+            if (visible < value.length()) TextButton(onClick = { visible += 24 }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Show next 24 · ${value.length()} total") }
         }
         else -> SelectionContainer { Text(value.toString(), style = MaterialTheme.typography.bodyMedium) }
     }
 }
 
-@Composable private fun ConnectionSettings(vm: BeaconViewModel) {
+@Composable private fun ConnectionSettings(vm: BeaconViewModel, pluginAbsent: Boolean) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
     val profileCatalog = data["navigation-profiles"]
@@ -331,8 +358,9 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         } }
         OutlinedTextField(origin, { origin = it }, label = { Text(uiText("Server address")) }, supportingText = { Text("Your private Hermes address, starting with https://") }, enabled = !ui.loading, modifier = Modifier.fillMaxWidth(), singleLine = true)
         if (ui.error.isNotBlank()) Text(ui.error, color = MaterialTheme.colorScheme.error)
-        Button(onClick = { vm.reopenSetupWizard(origin) }, enabled = !ui.loading && origin.isNotBlank(), modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text(uiText("Set up again")) }
-        TextButton(onClick = { vm.openForm(ActionForm("Sign out of Beacon", "", emptyList(), explanation = "Remove the saved Hermes sign-in from this phone. Your encrypted drafts stay here.", actionLabel = "Sign out", onResult = { vm.logout() })) }) { Text(uiText("Sign out")) }
+        OutlinedButton(onClick = { vm.reopenSetupWizard(origin) }, enabled = !ui.loading && origin.isNotBlank(), modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text(uiText("Set up again")) }
+        OutlinedButton(onClick = { vm.openForm(ActionForm("Sign out of Beacon", "", emptyList(), explanation = "Remove the saved Hermes sign-in from this phone. Your encrypted drafts stay here.", actionLabel = "Sign out", onResult = { vm.logout() })) }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Sign out")) }
+        DevicesSettingsSection(vm, pluginAbsent)
     }
 }
 @Composable private fun AppUpdates(vm: BeaconViewModel) {

@@ -6,6 +6,7 @@ import java.net.URI
 import java.net.URLDecoder
 import java.util.Base64
 import java.util.Locale
+import org.json.JSONObject
 
 sealed interface NativeReference {
     data class LocalMedia(val path: String, val sessionId: String, val snapshot: String?, val endpoint: String = "/api/media") : NativeReference {
@@ -21,11 +22,42 @@ sealed interface NativeReference {
         }
     }
     data class ExternalMedia(val url: HttpUrl) : NativeReference
+    data class HistoryImage(val sessionId: String, val rowId: Long, val imageIndex: Int) : NativeReference
     data class Conversation(val sessionId: String) : NativeReference
     data class Workspace(val path: String, val sessionId: String) : NativeReference
     data class ExternalLink(val url: String) : NativeReference
     data class Unsupported(val source: String, val reason: String) : NativeReference
 }
+
+/** Typed attachment receipts contain server filesystem paths, never origin-relative public URLs. */
+internal fun resolveAttachmentReference(attachment: JSONObject, scope: Scope, snapshots: Map<String, String> = emptyMap()): NativeReference {
+    if (attachment.has("history_row_id")) {
+        val row = attachment.optLong("history_row_id")
+        val index = attachment.optInt("history_image_index", -1)
+        return if (scope.session.isNotBlank() && row > 0 && index in 0..499) NativeReference.HistoryImage(scope.session, row, index)
+            else NativeReference.Unsupported("", "This historical image has no valid message identity")
+    }
+    val path = attachment.optString("path")
+    if (path.isBlank()) return resolveNativeReference(attachment.optJSONObject("image_url")?.optString("url")
+        ?: attachment.optString("image_url", attachment.optString("url")), scope, snapshots)
+    return if (validReferenceText(path, 8192) && scope.session.isNotBlank()) {
+        val snapshot = snapshots[path]?.takeIf(::validMediaSnapshot)
+        NativeReference.LocalMedia(path, scope.session, snapshot?.lowercase(), "/api/file/raw")
+    } else NativeReference.Unsupported(path, "This attachment has no valid originating conversation or file path")
+}
+
+/** Adapt Relay PersistedImageReferenceParser's canonical full-line, absolute user image references. */
+internal fun persistedImagePaths(content: String): List<String> = content.lineSequence().mapNotNull { line ->
+    if (!line.startsWith("@image:")) return@mapNotNull null
+    val value = line.removePrefix("@image:")
+    val path = if (value.firstOrNull() in listOf('`', '"', '\'')) {
+        val quote = value.first()
+        if (value.length < 3 || value.last() != quote || quote in value.substring(1, value.lastIndex)) return@mapNotNull null
+        value.substring(1, value.lastIndex)
+    } else value.takeIf { it.none(Char::isWhitespace) } ?: return@mapNotNull null
+    path.takeIf { validReferenceText(it, 8192) && (it.startsWith('/') || Regex("^[A-Za-z]:[/\\\\]").containsMatchIn(it)) &&
+        it.substringAfterLast('.').lowercase(Locale.ROOT) in setOf("avif", "bmp", "gif", "heic", "heif", "jpeg", "jpg", "png", "webp") }
+}.toList()
 const val DATA_IMAGE_LIMIT = 2 * 1024 * 1024
 private val digestPattern = Regex("[0-9a-fA-F]{64}")
 fun validMediaSnapshot(value: String): Boolean = digestPattern.matches(value)

@@ -34,19 +34,22 @@ class NativePresentationTest {
         assertEquals("native raw wrapper", row.getString("content"))
         assertEquals("Literal <memory>unchanged</memory>", Message.from(json("role" to "user", "content" to "Literal <memory>unchanged</memory>"), 0).text)
     }
-    @Test fun nativeFilePreviewAndStaleEditCheckUseRealFsRoutes() = runBlocking<Unit> {
+    @Test fun nativeFilePreviewAndStaleEditCheckUsePluginTextRoute() = runBlocking<Unit> {
         val requests = mutableListOf<String>()
         val c = BeaconClient(AuthContext("https://native.example", emptyList(), "owner", backend = "hermes-dashboard"), null) { builder ->
             builder.addInterceptor { chain ->
                 val req = chain.request(); requests.add(req.url.encodedPath)
-                Response.Builder().request(req).protocol(Protocol.HTTP_1_1).code(200).message("OK").body("""{"text":"new remote text","truncated":true,"path":"C:/workspace/file.txt"}""".toResponseBody("application/json".toMediaType())).build()
+                val status = if (req.method == "POST") 409 else 200
+                val body = if (req.method == "POST") """{"detail":"File changed. Reopen and review your draft."}"""
+                    else """{"content":"new remote text","text":"new remote text","truncated":true,"edit_blocked_reason":"Download the complete file to edit it.","path":"C:/workspace/file.txt"}"""
+                Response.Builder().request(req).protocol(Protocol.HTTP_1_1).code(status).message("OK").body(body.toResponseBody("application/json".toMediaType())).build()
             }
         }
         val preview = c.get("/api/file", mapOf("session_id" to "stored", "path" to "C:/workspace/file.txt"))
         assertEquals("new remote text", preview.getString("content"))
         assertTrue(preview.getString("edit_blocked_reason").isNotBlank())
         assertTrue(runCatching { c.post("/api/file/save", json("session_id" to "stored", "path" to "C:/workspace/file.txt", "content" to "local draft", "expected_content" to "old remote text")) }.isFailure)
-        assertEquals(listOf("/api/fs/read-text", "/api/fs/read-text"), requests)
+        assertEquals(listOf("/api/plugins/beacon/mobile/files/text", "/api/plugins/beacon/mobile/files/text"), requests)
     }
     @Test fun scheduleOutputDoesNotInventAnEmptyNativeResult() = runBlocking<Unit> {
         val c = BeaconClient(AuthContext("https://native.example", emptyList(), "owner", backend = "hermes-dashboard"))

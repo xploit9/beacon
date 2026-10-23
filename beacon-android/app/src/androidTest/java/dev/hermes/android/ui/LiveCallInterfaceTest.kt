@@ -1,6 +1,9 @@
 package dev.hermes.android.ui
 
 import android.Manifest
+import android.content.pm.ActivityInfo
+import androidx.activity.compose.setContent
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -15,6 +18,10 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import dev.hermes.android.CallToolApprovalDialog
+import dev.hermes.android.voice.CallToolApproval
+import dev.hermes.android.voice.CallToolReceipt
+import dev.hermes.android.voice.CallTranscript
 
 @RunWith(AndroidJUnit4::class)
 class LiveCallInterfaceTest {
@@ -30,6 +37,7 @@ class LiveCallInterfaceTest {
     }
     private fun shell(command: String) { device.executeShellCommand(command) }
     @After fun restoreDeviceDisplay() {
+        rule.activityRule.scenario.onActivity { it.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED }
         shell("wm size reset")
         shell("wm density reset")
         shell("settings put system font_scale 1.0")
@@ -66,8 +74,12 @@ class LiveCallInterfaceTest {
         assertEquals(id,LiveCallShowcaseActivity.source.value.callId);assertEquals(scope,LiveCallShowcaseActivity.source.value.conversationScope)
         assertEquals(1,LiveCallShowcaseActivity.mediaStarts)
         rule.onNodeWithTag("beacon-camera").performClick();rule.waitForIdle();capture("camera-front")
+        rule.onNodeWithTag("beacon-camera-sharing-status").assertIsDisplayed()
+        rule.onNodeWithText("Front camera shared with Beacon").assertIsDisplayed()
         rule.onNodeWithTag("beacon-camera-flip").performClick();rule.waitForIdle()
         assertTrue(LiveCallShowcaseActivity.source.value.cameraRear);capture("camera-back")
+        rule.onNodeWithTag("beacon-camera-sharing-status").assertIsDisplayed()
+        rule.onNodeWithText("Back camera shared with Beacon").assertIsDisplayed()
         rule.onNodeWithTag("beacon-camera").performClick();rule.waitForIdle()
         shell("settings put system font_scale 1.5");device.waitForIdle();Thread.sleep(800);capture("large-text")
         rule.activityRule.scenario.onActivity{it.motion(true)};rule.waitForIdle();capture("reduced-motion")
@@ -202,5 +214,64 @@ class LiveCallInterfaceTest {
         rule.onNodeWithTag("beacon-call-bubble").assertDoesNotExist()
         assertFalse(LiveCallShowcaseActivity.source.value.active)
         capture("ended")
+    }
+
+    @Test fun approvalDialogShowsReadableFileDetailsAndSendsAllThreeChoices() {
+        val decisions = mutableListOf<String>()
+        val args = org.json.JSONObject().put("path", "C:\\Users\\Owner\\Documents\\Notes\\plan.md")
+            .put("content", "Use the current branch and keep the rollback note.")
+        val approval = CallToolApproval("request-1", "p".repeat(32), "write_file", args.toString(2))
+        rule.runOnUiThread { rule.activity.setContent { MaterialTheme { CallToolApprovalDialog(approval) { decisions += it } } } }
+
+        rule.onNodeWithText("Write a file").assertIsDisplayed()
+        rule.onNodeWithText("plan.md · Notes").assertIsDisplayed()
+        rule.onNodeWithText("Use the current branch and keep the rollback note.").assertIsDisplayed()
+        rule.onNodeWithText("Details").performClick()
+        rule.onNodeWithText(args.toString(2)).assertIsDisplayed()
+        rule.onNodeWithTag("beacon-tool-deny").performClick()
+        rule.onNodeWithTag("beacon-tool-allow").performClick()
+        rule.onNodeWithTag("beacon-tool-allow-call").performClick()
+
+        assertEquals(listOf("deny", "approve", "approve_call"), decisions)
+    }
+
+    @Test fun automaticToolReceiptShowsItsQuietApprovalCaptionWithoutAnApprovalDialog() {
+        val receipt = requireNotNull(CallToolReceipt.from(org.json.JSONObject()
+            .put("request_id", "request-1").put("tool_name", "mcp__gmail__search_messages")
+            .put("status", "running").put("approved_by", "chat_yolo")))
+        rule.runOnUiThread { rule.activity.setContent { MaterialTheme { CallToolChip(receipt) } } }
+
+        rule.onNodeWithText("Checking Gmail…").assertIsDisplayed()
+        rule.onNodeWithText("Allowed by chat YOLO").assertIsDisplayed()
+        rule.onNodeWithText("Allow this action?").assertDoesNotExist()
+    }
+
+    @Test fun callCardGroupsLinesAndExpandsTheLastFourLinePreview() {
+        val lines = (1..6).map { CallTranscript("call-1:assistant:$it", "assistant", "Transcript line $it", turnId = it.toString()) }
+        rule.runOnUiThread { rule.activity.setContent { MaterialTheme { CallTranscriptCard("call-1", lines, durationSeconds = 240, provider = "gemini", assistantName = "Beacon") } } }
+
+        rule.onNodeWithText("Call · 4 min · Gemini").assertIsDisplayed()
+        rule.onNodeWithContentDescription("Call transcript").assertExists()
+        rule.onNodeWithText("Transcript line 2").assertDoesNotExist()
+        rule.onNodeWithText("Transcript line 3").assertIsDisplayed()
+        rule.onNodeWithText("Show all").performClick()
+        rule.onNodeWithText("Transcript line 1").assertIsDisplayed()
+    }
+
+    @Test fun callSurfaceFitsUnfoldedAndLandscapeAt130PercentText() {
+        shell("wm size 2172x2352")
+        shell("wm density 440")
+        shell("settings put system font_scale 1.3")
+        rule.waitForIdle()
+        for (label in listOf("Camera", "Mute", "Speaker", "Share screen", "Hang up")) rule.onNodeWithText(label).assertExists()
+        rule.onNodeWithTag("beacon-call-status").assertExists()
+        capture("call-unfolded-large-text")
+
+        shell("wm size 2352x1080")
+        rule.activityRule.scenario.onActivity { it.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE }
+        rule.waitForIdle()
+        for (label in listOf("Camera", "Mute", "Speaker", "Share screen", "Hang up")) rule.onNodeWithText(label).assertExists()
+        rule.onNodeWithTag("beacon-call-status").assertExists()
+        capture("call-landscape-large-text")
     }
 }

@@ -10,18 +10,19 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
 PLUGIN = "beacon"
 INSTALL_SOURCE = "xploit9/beacon/hermes-plugin/beacon"
-PAIR_ROUTE = "/api/plugins/beacon/mobile/bootstrap"
+PROBE_ROUTE = "/dashboard-plugins/beacon/manifest.json"
 RELEASE_URL = "https://github.com/xploit9/beacon/releases/latest"
 PROFILE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
 
@@ -75,7 +76,9 @@ def _candidate_homes() -> list[Path]:
     configured = os.environ.get("HERMES_HOME")
     if configured:
         candidates.append(_home_root(configured))
-    default = (Path.home() / ".hermes").resolve()
+    suffix = os.environ.get('HERMES_DATA_DIR_SUFFIX', '')
+    default = ((Path(os.environ.get('LOCALAPPDATA', '').strip() or Path.home() / 'AppData' / 'Local') / ('hermes' + suffix))
+               if sys.platform == 'win32' else Path.home() / ('.hermes' + suffix)).resolve()
     if default.is_dir() or not candidates:
         candidates.append(default)
     candidates.extend(_dashboard_homes())
@@ -261,6 +264,12 @@ def _route_status(url: str) -> int | None:
     request = Request(url, headers={"Accept": "application/json"})
     try:
         with urlopen(request, timeout=2) as response:
+            if response.status == 200:
+                raw = response.read(4097)
+                if len(raw) > 4096: return None
+                value = json.loads(raw)
+                if not isinstance(value, dict) or value.get('name') != PLUGIN or value.get('api') != 'plugin_api.py':
+                    return None
             return response.status
     except HTTPError as exc:
         return exc.code
@@ -268,37 +277,114 @@ def _route_status(url: str) -> int | None:
         return None
 
 
-def _wait_for_beacon_route(port: int, public_url: str | None, process: subprocess.Popen[bytes] | None) -> bool:
-    local = f"http://127.0.0.1:{port}{PAIR_ROUTE}"
-    public = public_url.rstrip("/") + PAIR_ROUTE if _is_https_url(public_url) else local
-    deadline = time.monotonic() + 60
+def _dashboard_pids(hermes: str, home: Path, profile: str, port: int) -> set[int]:
+    result = _quiet(hermes, home, profile, 'dashboard', '--status')
+    if result.returncode: raise InstallError('Hermes could not verify the restarted dashboard process.')
+    pids = set()
+    for line in (result.stdout or '').splitlines():
+        row = re.match(r'\s*PID\s+(\d+)\s+\[[^]]+\]:\s*(.*)', line)
+        if not row: continue
+        command = row[2]
+        selected = re.search(r'(?:^|\s)(?:-p|--profile)(?:\s+|=)["\']?([A-Za-z0-9_.-]+)', command)
+        bound = re.search(r'(?:^|\s)--port(?:\s+|=)["\']?(\d+)', command)
+        launched = selected[1] if selected else 'default'
+        multiplexed = launched == 'default' and not re.search(r'(?:^|\s)--isolated(?:\s|$)', command)
+        if (launched == profile or multiplexed) and int(bound[1] if bound else 9119) == port:
+            pids.add(int(row[1]))
+    return pids
+
+
+def _wait_for_beacon_route(port: int, public_url: str | None, process: subprocess.Popen[bytes] | None,
+                           seconds: float = 60, *, profile: str = 'default', hermes: str | None = None,
+                           home: Path | None = None, previous_pids: set[int] | None = None) -> bool:
+    route = PROBE_ROUTE + '?' + urlencode({'profile': profile})
+    local = f"http://127.0.0.1:{port}{route}"
+    public = public_url.rstrip("/") + route if _is_https_url(public_url) else local
+    deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if process is not None and process.poll() is not None:
             return False
-        if _route_status(local) in (200, 401) or (public != local and _route_status(public) in (200, 401)):
-            return True
+        if _route_status(local) == 200 or (public != local and _route_status(public) == 200):
+            if previous_pids is None or _dashboard_pids(hermes, home, profile, port) - previous_pids:
+                return True
         time.sleep(1)
     return False
 
 
-def _windows_dashboard_task() -> str | None:
-    """The scheduled task that launches this PC's Hermes dashboard, if one exists."""
+def _windows_dashboard_task(home: Path, profile: str) -> str | None:
+    """Reuse only a task whose action explicitly binds the selected home and profile."""
     try:
         result = subprocess.run(["schtasks", "/query", "/fo", "csv", "/v", "/nh"], capture_output=True, text=True,
                                 encoding="utf-8", errors="replace", timeout=20, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return None
+    matches = []
     for row in csv.reader(result.stdout.splitlines()):
-        if len(row) > 8 and "hermes" in row[8].casefold() and "dashboard" in (row[1] + " " + row[8]).casefold():
-            return row[1].lstrip("\\")
-    return None
+        if len(row) <= 8: continue
+        action = row[8]
+        home_match = re.search(r'\bHERMES_HOME\s*=\s*"?' + re.escape(str(home)) + r'"?(?=\s*(?:&&|[";]|$))', action, re.I)
+        profile_match = re.search(r'(?:^|\s)(?:-p|--profile)(?:\s+|=)"?' + re.escape(profile) + r'"?(?=\s|$)', action, re.I)
+        if home_match and profile_match and re.search(r'\bhermes\b.*\bdashboard\b', action, re.I):
+            matches.append(row[1].lstrip('\\'))
+    return matches[0] if len(matches) == 1 else None
 
 
-def _systemd_dashboard_unit() -> str | None:
-    if not shutil.which("systemctl"):
+def _systemd_dashboard_unit(home: Path, profile: str, port: int, pids: set[int]) -> str | None:
+    """Accept only a direct, home-bound service for the selected listening dashboard."""
+    if not sys.platform.startswith('linux') or not shutil.which("systemctl"):
         return None
-    result = subprocess.run(["systemctl", "--user", "is-active", "hermes-dashboard"], capture_output=True, text=True, check=False)
-    return "hermes-dashboard" if result.stdout.strip() == "active" else None
+    guidance = (f"Manual restart required for Hermes home '{home}', profile {profile!r}, port {port}: "
+                "inspect systemctl --user show hermes-dashboard -p Environment -p ExecStart -p MainPID "
+                "and restart only the verified owning service. No dashboard was stopped.")
+    try:
+        result = subprocess.run(['systemctl','--user','show','hermes-dashboard','--all',
+            '--property=LoadState,ActiveState,MainPID,Environment,EnvironmentFiles,UnsetEnvironment,ExecStart'],
+            capture_output=True,text=True,timeout=10,check=False)
+        shown = dict(line.split('=',1) for line in result.stdout.splitlines() if '=' in line)
+        if shown.get('LoadState') == 'not-found': return None
+        if result.returncode or shown.get('LoadState') != 'loaded' or shown.get('ActiveState') != 'active':
+            raise ValueError('Service status is unproven')
+        pid = int(shown.get('MainPID','0'))
+        if pid<=0 or pid not in pids or shown.get('EnvironmentFiles'):
+            raise ValueError('Service process or environment is unproven')
+        environment = shlex.split(shown.get('Environment',''))
+        homes = [item.partition('=')[2] for item in environment if item.startswith('HERMES_HOME=')]
+        if len(homes) != 1 or not Path(homes[0]).is_absolute() or _home_root(homes[0]) != home.resolve():
+            raise ValueError('Service home differs or is unproven')
+        # A unit edited since launch must not authorize stopping a process on its old, foreign home.
+        live = (Path('/proc')/str(pid)/'environ').read_bytes().split(b'\0')
+        live_homes = [item.partition(b'=')[2].decode('utf-8') for item in live if item.startswith(b'HERMES_HOME=')]
+        if len(live_homes)!=1 or not Path(live_homes[0]).is_absolute() or _home_root(live_homes[0])!=home.resolve():
+            raise ValueError('Running service home differs or is unproven')
+        if any(item.partition('=')[0] == 'HERMES_HOME' for item in shlex.split(shown.get('UnsetEnvironment',''))):
+            raise ValueError('Service home is unset')
+        starts = re.findall(r'\{ path=([^;]+); argv\[\]=(.+?) ;',shown.get('ExecStart',''))
+        if len(starts) != 1: raise ValueError('Service launch is ambiguous')
+        executable, command = starts[0]
+        argv = shlex.split(command)
+        if not argv or executable.strip() != argv[0]: raise ValueError('Service executable is unproven')
+        if re.fullmatch(r'python(?:\d+(?:\.\d+)*)?',Path(argv[0]).name):
+            if argv[1:3] == ['-m','hermes_cli.main']: argv = argv[3:]
+            elif len(argv)>1 and Path(argv[1]).name == 'hermes': argv = argv[2:]
+            else: raise ValueError('Service does not launch Hermes directly')
+        elif Path(argv[0]).name == 'hermes': argv = argv[1:]
+        else: raise ValueError('Service does not launch Hermes directly')
+        launched = Path(homes[0]).name if Path(homes[0]).parent.name == 'profiles' else 'default'
+        if argv[:1] in (['-p'],['--profile']):
+            launched,argv = argv[1],argv[2:]
+        elif argv and argv[0].startswith('--profile='):
+            launched,argv = argv[0].partition('=')[2],argv[1:]
+        if not argv or argv[0] not in ('dashboard','serve'): raise ValueError('Not a dashboard launch')
+        isolated = '--isolated' in argv or 'HERMES_DESKTOP=1' in environment or b'HERMES_DESKTOP=1' in live
+        # Native non-isolated launches route named profiles through the default machine dashboard.
+        if launched != (profile if isolated else 'default'): raise ValueError('Service profile differs')
+        ports = [argv[index+1] if item == '--port' else item.partition('=')[2]
+                 for index,item in enumerate(argv) if item == '--port' or item.startswith('--port=')]
+        if len(ports)>1 or int(ports[0] if ports else 9119) != port or port<=0:
+            raise ValueError('Service port differs or is unproven')
+    except (OSError,subprocess.TimeoutExpired,ValueError,IndexError,RuntimeError) as exc:
+        raise InstallError(guidance) from exc
+    return 'hermes-dashboard'
 
 
 def _detached(command: list[str], home: Path) -> subprocess.Popen[bytes]:
@@ -315,16 +401,23 @@ def _detached(command: list[str], home: Path) -> subprocess.Popen[bytes]:
 
 def _restart_dashboard(hermes: str, home: Path, profile: str, port: int, public_url: str | None) -> None:
     """Restart the way this dashboard is run: its scheduled task or systemd unit, else a detached relaunch."""
-    task = _windows_dashboard_task() if sys.platform == "win32" else None
-    unit = None if task else _systemd_dashboard_unit()
+    previous_pids = _dashboard_pids(hermes, home, profile, port)
+    task = _windows_dashboard_task(home, profile) if sys.platform == "win32" else None
+    unit = None if task else _systemd_dashboard_unit(home,profile,port,previous_pids)
     process = None
     if task:
         subprocess.run(["schtasks", "/end", "/tn", task], capture_output=True, check=False)
         _run_mutation(hermes, home, profile, "dashboard", "--stop")
-        if subprocess.run(["schtasks", "/run", "/tn", task], capture_output=True, check=False).returncode:
-            raise InstallError(f"Could not start the scheduled task {task!r}; start it from Task Scheduler.")
-        _line(True, f"Restarted the dashboard through its scheduled task {task!r}")
-    elif unit:
+        started = not subprocess.run(["schtasks", "/run", "/tn", task], capture_output=True, check=False).returncode
+        # Custom tasks vary (some are supervisor scripts that can hang or exit 1), so a task that
+        # doesn't bring Beacon back falls through to the detached relaunch below.
+        if started and _wait_for_beacon_route(port, public_url, None, 45, profile=profile,
+                                            hermes=hermes, home=home, previous_pids=previous_pids):
+            _line(True, f"Restarted the dashboard through its scheduled task {task!r}")
+            _line(True, "Beacon's public dashboard manifest is responding (HTTP 200).")
+            return
+        _line(False, f"The scheduled task {task!r} did not bring the dashboard back; starting it in the background")
+    if unit:
         if subprocess.run(["systemctl", "--user", "restart", unit], check=False).returncode:
             raise InstallError(f"systemctl could not restart {unit}.")
         _line(True, f"Restarted the {unit} service")
@@ -335,9 +428,10 @@ def _restart_dashboard(hermes: str, home: Path, profile: str, port: int, public_
         except OSError as exc:
             raise InstallError("Hermes could not start the selected dashboard.") from exc
         _line(True, "Restarted the dashboard in the background")
-    if not _wait_for_beacon_route(port, public_url, process):
+    if not _wait_for_beacon_route(port, public_url, process, profile=profile,
+                                hermes=hermes, home=home, previous_pids=previous_pids):
         raise InstallError(f"The dashboard did not come back with Beacon within a minute. Start it with: hermes -p {profile} dashboard --port {port}")
-    _line(True, "Beacon dashboard route is responding (HTTP 401/200).")
+    _line(True, "Beacon's public dashboard manifest is responding (HTTP 200).")
 
 
 def _yes_no(question: str) -> bool:
@@ -371,14 +465,14 @@ def _configure_tailscale(hermes: str, home: Path, profile: str, port: int, allow
     if not tailscale:
         _line(False, "Tailscale CLI was not found; configure Hermes with a public HTTPS dashboard URL to pair.")
         return None
-    command = f"tailscale serve {port}"
+    command = f"tailscale serve --bg {port}"
     print(f"No public HTTPS dashboard URL is configured. Tailscale Serve can publish the dashboard to your tailnet: {command}")
     if not (allow or _yes_no("Run that command and save its HTTPS URL as Hermes dashboard.public_url? [y/N] ")):
         _line(False, "Pairing skipped; configure a public HTTPS dashboard URL to connect a phone.")
         return None
     try:
-        result = subprocess.run([tailscale, "serve", str(port)], env=_env(home), check=False)
-    except OSError as exc:
+        result = subprocess.run([tailscale, "serve", "--bg", str(port)], env=_env(home), timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
         raise InstallError("Could not start Tailscale Serve.") from exc
     if result.returncode:
         raise InstallError(f"Tailscale Serve failed (exit {result.returncode}).")
@@ -405,7 +499,8 @@ def _pair(hermes: str, home: Path, profile: str, name: str | None = None) -> Non
     result = _quiet(hermes, home, profile, "beacon", "pair", "--name", name)
     if result.returncode:
         raise InstallError("Hermes could not create a Beacon pairing block.")
-    lines = result.stdout.splitlines()
+    # Hermes reroutes plugin stdout to stderr once its gateway module loads, so read both streams.
+    lines = (result.stdout + "\n" + result.stderr).splitlines()
     block = [line for line in lines if line.startswith("Dashboard: ") or line.startswith("Pairing code: ") or line.startswith("expires in ")]
     if len(block) != 3:
         raise InstallError("Hermes returned an unexpected pairing block; raw output was hidden.")

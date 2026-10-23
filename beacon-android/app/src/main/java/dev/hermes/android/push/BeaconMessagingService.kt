@@ -14,6 +14,8 @@ import dev.hermes.android.*
 import dev.hermes.android.core.*
 import dev.hermes.android.data.AppPreferences
 import dev.hermes.android.data.BeaconClient
+import dev.hermes.android.data.NativePairing
+import dev.hermes.android.data.NativeDeviceRemoval
 import dev.hermes.android.data.authorizesPushSource
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -43,6 +45,8 @@ internal fun canAuthorizeWithoutKeepConnectedReceipt(receiptRequired: Boolean, a
 internal fun nativePushBindingAuthorized(binding: JSONObject, auth: dev.hermes.android.data.AuthContext): Boolean =
     binding.string("backend") == "hermes-dashboard" && binding.string("profile").isNotBlank() &&
         auth.authorizesPushSource(Scope(binding.string("origin"), binding.string("owner"), binding.string("profile")))
+internal fun pushDeviceAuthorized(removed: Boolean, registeredDevice: String, currentDevice: String?): Boolean =
+    !removed && (registeredDevice.isBlank() || registeredDevice == currentDevice)
 /** A failed commit may still mutate SharedPreferences memory; restore the prior transaction before reporting failure. */
 internal fun persistPushBindings(prefs:android.content.SharedPreferences,values:Map<String,String?>) {
     val previous=values.keys.associateWith { prefs.getString(it,null) }
@@ -58,6 +62,20 @@ class PushManager(private val app: BeaconApplication) {
     private val privatePrefs = app.getSharedPreferences("push-binding", Context.MODE_PRIVATE)
     private val lock = Any()
     private val registration=Mutex()
+    private val cleanup = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val pairingPrefs = app.getSharedPreferences("native-pairing", Context.MODE_PRIVATE)
+    private fun removedKey(scope: Scope) = "removed:${"${scope.origin}\u0000${scope.owner}".digest()}"
+    private val pairingListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
+        if (key?.startsWith("device:") == true) {
+            if (prefs.getString(key, null) != null) {
+                check(privatePrefs.edit().remove("removed:${key.removePrefix("device:")}").commit()) { "Could not save phone notification authorization" }
+            } else {
+                bindings().map { Scope(it.string("origin"), it.string("owner"), it.string("profile")) }
+                    .distinctBy(::removedKey).filter { "device:${"${it.origin}\u0000${it.owner}".digest()}" == key }
+                    .forEach(::deviceRemoved)
+            }
+        }
+    }
     private data class KeepConnectedReceipt(val source: String, val event: String, val prepared: PreparedKeepConnectedCall)
     private val keepConnectedReceipts = mutableMapOf<String, KeepConnectedReceipt>()
     @Volatile private var newestToken:String?=null
@@ -67,6 +85,30 @@ class PushManager(private val app: BeaconApplication) {
     private fun encoded(key:String,value:JSONObject):String = android.util.Base64.encodeToString(app.cipher.encrypt(value.toString().toByteArray(),key),android.util.Base64.NO_WRAP)
     private fun save(key: String, value: JSONObject) { check(privatePrefs.edit().putString(key,encoded(key,value)).commit()) }
     private fun read(key: String): JSONObject? = privatePrefs.getString(key, null)?.let { JSONObject(String(app.cipher.decrypt(android.util.Base64.decode(it, android.util.Base64.NO_WRAP), key))) }
+    init {
+        NativeDeviceRemoval.onRemoved = ::deviceRemoved
+        pairingPrefs.registerOnSharedPreferenceChangeListener(pairingListener)
+    }
+    private fun deviceRemoved(scope: Scope) {
+        synchronized(lock) {
+            check(privatePrefs.edit().putBoolean(removedKey(scope), true).commit()) { "Could not stop removed-device notifications" }
+            revokeLocalOwner(scope)
+        }
+        NativePairing.clearDeviceId(app, scope)
+        if (app.auth.read(scope.origin).owner == scope.owner) KeepConnectedService.onUserSignedOut(app, scope.origin)
+        cleanup.launch { runCatching { deleteUnusedFirebaseToken() }.onFailure { android.util.Log.w("BeaconPush", "Firebase token cleanup could not be confirmed") } }
+    }
+    private suspend fun deleteUnusedFirebaseToken() = registration.withLock {
+        if (!app.firebaseConfigured || fcmBindings().isNotEmpty()) return@withLock
+        withTimeout(5_000) {
+            suspendCancellableCoroutine<Unit> { continuation ->
+                FirebaseMessaging.getInstance().deleteToken()
+                    .addOnSuccessListener { if (continuation.isActive) continuation.resume(Unit) }
+                    .addOnFailureListener { if (continuation.isActive) continuation.resumeWithException(it) }
+            }
+        }
+        newestToken = null
+    }
     fun reconcileIncomingDeadlines() = synchronized(lock) {
         val now = System.currentTimeMillis()
         privatePrefs.all.keys.filter { it.startsWith("incoming:") }.forEach { key ->
@@ -88,6 +130,8 @@ class PushManager(private val app: BeaconApplication) {
     private suspend fun registerCurrent(client: BeaconClient, rotatedToken: String?): String {
         require(app.firebaseConfigured) { "Firebase is not configured in this build. Set the owner Firebase project before enabling background push." }
         require(app.auth.read(client.auth.origin).authorizesPushSource(client.scope)) { "Sign in to this owner account before registering notifications" }
+        val deviceId = NativePairing.deviceId(app, client.scope)
+        require(!privatePrefs.getBoolean(removedKey(client.scope), false) || deviceId != null) { "Pair this phone again before enabling notifications" }
         val token = rotatedToken ?: suspendCancellableCoroutine<String> { c -> FirebaseMessaging.getInstance().token.addOnSuccessListener { if (c.isActive) c.resume(it) }.addOnFailureListener { if (c.isActive) c.resumeWithException(it) } }
         require(token.isNotBlank()) { "Firebase did not return a device token" }
         val previous = synchronized(lock) {
@@ -101,14 +145,16 @@ class PushManager(private val app: BeaconApplication) {
             require(validOpaque(source) && validOpaque(target) && client.auth.backend == "hermes-dashboard") { "Server did not return an authorized push source binding" }
             synchronized(lock) {
                 require(app.auth.read(client.auth.origin).authorizesPushSource(client.scope)) { "The owner signed out while notifications were registering" }
+                require(deviceId == NativePairing.deviceId(app, client.scope)) { "This phone's pairing changed while notifications were registering" }
                 val sourceKey="source:${source.digest()}";val activeKey="active:${client.scope.key}"
                 // Encrypt both values before touching either binding, then commit them together.
                 val replacedSource=previous?.string("source")?.takeIf { validOpaque(it)&&it!=source }
                 val values=linkedMapOf<String,String?>(
-                    sourceKey to encoded(sourceKey,json("origin" to client.auth.origin,"owner" to client.auth.owner,"profile" to client.auth.profile,"backend" to client.auth.backend,"target" to target,"source" to source)),
+                    sourceKey to encoded(sourceKey,json("origin" to client.auth.origin,"owner" to client.auth.owner,"profile" to client.auth.profile,"backend" to client.auth.backend,"target" to target,"source" to source,"device_id" to deviceId.orEmpty())),
                     activeKey to encoded(activeKey,json("source" to source,"target" to target)))
                 if(replacedSource!=null) values["source:${replacedSource.digest()}"]=null
                 persistPushBindings(privatePrefs,values)
+                check(privatePrefs.edit().remove(removedKey(client.scope)).commit()) { "Could not save phone notification authorization" }
             }
         } catch (e: Throwable) {
             // The host upserts a deterministic target for the same token; a failed local refresh must not revoke the prior valid target.
@@ -145,21 +191,26 @@ class PushManager(private val app: BeaconApplication) {
         targets.forEach { target -> client.nativeRequest("/api/plugins/beacon/mobile/notifications/targets/$target","DELETE") }
     } }
     fun binding(source: String): JSONObject? { if (!validOpaque(source)) return null; return synchronized(lock) { runCatching { read("source:${source.digest()}") }.getOrNull() } }
+    private fun deviceAuthorized(binding: JSONObject): Boolean {
+        val scope = Scope(binding.getString("origin"), binding.getString("owner"), binding.getString("profile"))
+        return pushDeviceAuthorized(privatePrefs.getBoolean(removedKey(scope), false), binding.string("device_id"), NativePairing.deviceId(app, scope))
+    }
     private fun receiptStillAuthorized(source: String, call: PreparedKeepConnectedCall): Boolean {
         val stored = binding(source) ?: return false
         val scope = Scope(call.binding.origin, call.binding.owner, call.binding.profile)
         return stored.string("source") == source && stored.string("origin") == scope.origin &&
             stored.string("owner") == scope.owner && stored.string("profile") == scope.profile &&
-            nativePushBindingAuthorized(stored, app.auth.read(scope.origin))
+            nativePushBindingAuthorized(stored, app.auth.read(scope.origin)) && deviceAuthorized(stored)
     }
     fun permitsIncoming(source: String): Boolean = binding(source)?.let { b -> runCatching {
         nativePushBindingAuthorized(b, app.auth.read(b.getString("origin"))) &&
+            deviceAuthorized(b) &&
             (!b.optBoolean("keep_connected") || KeepConnectedService.isEnabledFor(app, Scope(b.getString("origin"), b.getString("owner"), b.getString("profile"))))
     }.getOrDefault(false) } == true
     fun clientFor(binding: JSONObject): BeaconClient {
         val origin = trustedOrigin(binding.getString("origin"))
         val current = app.auth.read(origin)
-        require(nativePushBindingAuthorized(binding, current)) { "Sign in to the invitation's native Hermes account" }
+        require(nativePushBindingAuthorized(binding, current) && deviceAuthorized(binding)) { "Sign in to the invitation's native Hermes account" }
         return KeepConnectedService.createClient(app, current).forAuthorizedProfile(binding.getString("profile"))
     }
     fun bindKeepConnectedSource(scope: Scope, source: String): Boolean {
@@ -367,21 +418,25 @@ class PushManager(private val app: BeaconApplication) {
         }
         check(!failed) { "Notification registration needs a retry" }
     } }
-    suspend fun revokeOwner(client: BeaconClient) {
-        val owned = bindings().filter { it.string("origin") == client.auth.origin && it.string("owner") == client.auth.owner }
+    private fun revokeLocalOwner(scope: Scope): List<JSONObject> = synchronized(lock) {
+        val owned = bindings().filter { it.string("origin") == scope.origin && it.string("owner") == scope.owner }
         val ownedSources = owned.map { it.string("source") }.toSet()
-        val remotelyOwned = owned.filter { validOpaque(it.string("target")) }
         // Local revocation precedes network IO, so an offline sign-out cannot be revived by a tap.
-        synchronized(lock) {
-            val edit = privatePrefs.edit()
-            val removed = removeIncoming(ownedSources, edit)
-            owned.forEach { binding -> edit.remove("source:${binding.string("source").digest()}").remove("active:${Scope(client.auth.origin, client.auth.owner, binding.string("profile")).key}") }
-            check(edit.commit()) { "Could not remove local notification authorization" }
-            keepConnectedReceipts.entries.removeAll { it.value.source in ownedSources }
-            owned.forEach { cancelNativeActivities(app, it.string("source")) }
-            removed.forEach { (source, event) -> dismissInvitation(source, event) }
-        }
+        val edit = privatePrefs.edit()
+        val removed = removeIncoming(ownedSources, edit)
+        owned.forEach { binding -> edit.remove("source:${binding.string("source").digest()}").remove("active:${Scope(scope.origin, scope.owner, binding.string("profile")).key}") }
+        check(edit.commit()) { "Could not remove local notification authorization" }
+        keepConnectedReceipts.entries.removeAll { it.value.source in ownedSources }
+        owned.forEach { cancelNativeActivities(app, it.string("source")) }
+        removed.forEach { (source, event) -> dismissInvitation(source, event) }
+        owned
+    }
+    suspend fun revokeOwner(client: BeaconClient) {
+        val remotelyOwned = revokeLocalOwner(client.scope).filter { validOpaque(it.string("target")) }
         var failure: Throwable? = null
+        try { deleteUnusedFirebaseToken() }
+        catch (error: CancellationException) { currentCoroutineContext().ensureActive(); failure = error }
+        catch (error: Exception) { failure = error }
         remotelyOwned.forEach { binding ->
             runCatching {
                 require(binding.string("backend")=="hermes-dashboard"&&binding.string("profile").isNotBlank()&&validOpaque(binding.string("target")))

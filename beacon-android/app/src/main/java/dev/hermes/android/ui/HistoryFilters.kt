@@ -33,6 +33,13 @@ internal enum class HistoryOrder(val key: String, val label: String) {
 internal fun isThreadSource(source: String?): Boolean = source?.trim()?.lowercase(Locale.ROOT) in setOf(BEACON_THREAD_SOURCE, "phone")
 internal fun historyRowKey(row: JSONObject, currentProfile: String = ""): String = sessionRowKey(row, currentProfile)
 
+/** Loaded titles answer each keystroke; only results for that exact query may supplement them. */
+internal fun historySearchRows(loaded: List<JSONObject>, query: String, serverMatches: List<JSONObject>? = null, currentProfile: String = ""): List<JSONObject> {
+    if (query.isBlank()) return loaded
+    val local = loaded.filter { it.string("title").contains(query.trim(), ignoreCase = true) }
+    return (local + serverMatches.orEmpty()).distinctBy { historyRowKey(it, currentProfile) }
+}
+
 /** Readable names for Hermes session sources; an unknown platform keeps its own name. */
 internal fun historySourceLabel(source: String): String = when (source.trim().lowercase(Locale.ROOT)) {
     "android" -> "Beacon"

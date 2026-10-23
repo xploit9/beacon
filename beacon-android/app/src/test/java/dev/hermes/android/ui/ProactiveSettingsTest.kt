@@ -3,11 +3,12 @@ package dev.hermes.android.ui
 import dev.hermes.android.core.json
 import dev.hermes.android.data.AppPreferences
 import org.json.JSONArray
+import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
 
 class ProactiveSettingsTest {
-    @Test fun settingsBodyUsesOnlyTheEmailWatchContractAndKeepsTheAssistantModelPin() {
+    @Test fun settingsBodyKeepsTheWatchContractAndAssistantModelPin() {
         val body = proactiveSettingsBody(true, "call", 5, "22:15", "06:45", AppPreferences(assistantModel = "model", assistantProvider = "provider"))
 
         assertEquals(true, body.getBoolean("enabled"))
@@ -32,11 +33,11 @@ class ProactiveSettingsTest {
         assertFalse(valid(end = "7:00"))
     }
 
-    @Test fun healthUsesTheSingleEmailCheckStatusAndPlainWords() {
+    @Test fun healthUsesTheSingleWatchCheckStatusAndPlainWords() {
         assertEquals("Checked 16:00", proactiveHealthText(json(
             "timezone" to "Asia/Dubai", "health" to json("state" to "ok", "checked_at" to 1792497600L),
         )))
-        assertEquals("Couldn't read your email: Sign in expired", proactiveHealthText(json(
+        assertEquals("Couldn't check: Sign in expired", proactiveHealthText(json(
             "health" to json("state" to "error", "message" to "Sign in expired"),
         )))
         assertEquals("Not checked yet", proactiveHealthText(json("health" to json("state" to "unknown"))))
@@ -50,5 +51,13 @@ class ProactiveSettingsTest {
             "learned" to JSONArray(listOf("Client moved the review", "", "  ")),
         )))
         assertTrue(proactiveLearnedNotes(json()).isEmpty())
+    }
+
+    @Test fun sourceLabelsIgnoreInvalidEntriesAndPreserveCatalogueOrder() {
+        assertEquals(listOf("Gmail", "Calendar", "GitHub"), proactiveSources(json(
+            "sources" to JSONArray(listOf("Gmail", " Calendar ", "GitHub", "Gmail", "", "  ", 12, JSONObject.NULL)),
+        )))
+        assertTrue(proactiveSources(json()).isEmpty())
+        assertTrue(proactiveSources(json("sources" to "Gmail")).isEmpty())
     }
 }

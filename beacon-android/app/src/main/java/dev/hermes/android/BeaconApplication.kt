@@ -70,4 +70,5 @@ private val CURRENT_NOTIFICATION_CHANNEL_IDS = setOf(
     "xara-calls",
     "hermes-updates",
     "beacon_keep_connected",
+    "beacon_sign_in",
 )

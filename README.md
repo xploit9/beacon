@@ -22,11 +22,11 @@ you can rename it in Settings › Assistant.
 
 **1. On the PC that runs Hermes**, give your coding agent (Codex, Claude Code, or Hermes itself) this prompt:
 
-> Set up Beacon on my Hermes: download https://raw.githubusercontent.com/xploit9/beacon/main/hermes-plugin/beacon/install/beacon_install.py and run it with Python. Whenever it stops to ask something, it names a flag — ask me, then rerun it with that flag. Show me the pairing block it prints at the end. Never print or store passwords, tokens or API keys, and never modify Hermes core.
+> Set up Beacon on my Hermes. First follow the predecessor-removal prerequisite in https://github.com/xploit9/beacon/blob/main/docs/install-with-agent.md: verify an external backup, then use supported native operations to remove only positively identified predecessor-managed cron jobs and the predecessor plugin. Stop and ask me if ownership is uncertain. Then download https://raw.githubusercontent.com/xploit9/beacon/main/hermes-plugin/beacon/install/beacon_install.py and run it with Python. Whenever it stops to ask something, it names a flag — ask me, then rerun it with that flag. Show me the pairing block it prints at the end. Never print or store passwords, tokens or API keys, and never modify Hermes core.
 
-You can also run it yourself: `python beacon_install.py`. It finds your Hermes, backs up and removes an older version of the plugin, installs Beacon, restarts the dashboard if you say yes, and prints your pairing code. Manual steps: [docs/install-with-agent.md](docs/install-with-agent.md).
+Before running it yourself, complete the [predecessor-removal prerequisite](docs/install-with-agent.md#before-installing-beacon). Then run `python beacon_install.py`: it selects your Hermes home/profile, installs or updates Beacon, restarts the dashboard if you say yes, and prints your pairing code. The installer does not back up or remove a predecessor plugin or its jobs. Manual steps: [docs/install-with-agent.md](docs/install-with-agent.md).
 
-**2. On your phone**, download `Beacon-1.1.1.apk` from [Releases](https://github.com/xploit9/beacon/releases/latest) and install
+**2. On your phone**, download `Beacon-1.1.2.apk` from [Releases](https://github.com/xploit9/beacon/releases/latest) and install
 it. Open it, enter the address and code (or scan the QR on the dashboard's **Beacon** tab, or choose a screenshot of it), sign in with Hermes, and follow the setup wizard.
 
 ## Pair or manage phones

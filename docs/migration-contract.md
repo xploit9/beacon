@@ -10,7 +10,7 @@ Preserve Beacon's existing tabs, drawer, profiles, Bot Mode and settings, includ
 - Keep connected uses an Android foreground service. Firebase push is optional; incoming calls do not depend on it.
 - No audio retention is permitted for Beacon phone calls.
 - Public GitHub `xploit9/beacon` is the only repository for this project; Gitea is reserved for Archon.
-- Per-chat YOLO lives in the chat composer's Approvals menu. Enabling always asks for confirmation, and a status Hermes cannot report is shown as unknown, never as off.
+- The chat composer's Approvals menu offers Ask first (follow the profile's Manual or Auto policy) and YOLO in this chat. Enabling YOLO always asks for confirmation, and a status Hermes cannot report is shown as unknown, never as off. Manual and Auto are changed only in profile Settings; an existing profile Off mode is reported honestly there and in chat.
 - Beacon's own call and task history on Hermes is pruned only by the user's "Keep call and task history" setting (Forever by default). Hermes conversations, messages, memories and files are never pruned by Beacon.
 - Duplicate-prevention markers are kept only as long as they can prevent a duplicate. Bot Mode stops its room scan at 1,000 rooms and refuses to create a space rather than risk a duplicate.
 
@@ -28,7 +28,7 @@ This is a clean break for the Hermes plugin identity. Do not keep compatibility 
 - Native Hermes sign-in authenticates via OAuth and `/api/auth/me`, resolves the authorized profile with supported upstream routes, and stores an encrypted OAuth Bearer plus refresh record. Legacy cookie records remain readable. Refresh is silent on 401 and the original request is retried once. Hermes has no native bearer-revoke route: signing out clears the phone only, and the server refresh token expires on its own TTL. Standard auth/chat/history cannot call or depend on `/api/plugins/beacon/mobile/bootstrap`.
 - Use HTTPS for HTTP routes and WSS for sockets. Preserve owner, profile and conversation authority, plus canonical session identity, typed interactive requests, terminal tool outcomes and reconnect replay. No availability-driven fallback into another session store.
 - Voice provider credentials remain on the phone, outside Hermes requests, backups, logs and conversation state. Voice transport stays HTTPS/WSS; call teardown must not persist audio.
-- Callback wire uses Hermes's `proactive` channel: `phone.call.invite/action/state/error`, `call_id`, trusted `device_id`, profile, original session_id, epoch-ms created/expires, max 20 seconds ringing. Explicit Answer only; no mic on invite/decline/timeout. Reject stale/foreign/replayed terminal actions. Reuse existing foreground voice teardown; no audio persistence.
+- Callback wire uses Hermes's `proactive` channel: `phone.call.invite/action/state/error`, `call_id`, trusted `device_id`, profile, original session_id, epoch-ms created/expires. Beacon's local incoming ringtone lasts at most 45 seconds, bounded by the invitation's expiry; the separate Relay callback wire window remains 20 seconds. Explicit Answer only; no mic on invite/decline/timeout. Reject stale/foreign/replayed terminal actions. Reuse existing foreground voice teardown; no audio persistence.
 - Native cron is the only scheduling mechanism. Keep connected uses the foreground service; no Firebase prerequisite. WSS cannot wake a force-stopped Android app.
 
 ## Current product boundary

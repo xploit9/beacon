@@ -29,9 +29,11 @@ class SkillsPhoneUiTest {
             }
         }
         compose.onNodeWithText("2 installed · 1 enabled · 1 need setup").assertExists()
-        compose.onNodeWithText("Needs setup").performScrollTo().performClick()
+        compose.onNode(hasText("Needs setup") and isSelectable()).performScrollTo().performClick()
         compose.onNodeWithText("needs-skill").assertExists()
         compose.onNodeWithText("ready-skill").assertDoesNotExist()
+        compose.onNodeWithTag("skill-row-needs-skill").performScrollTo().assertTextContains("Needs setup")
+        compose.onNodeWithText("Enabled · Setup ready").assertDoesNotExist()
         compose.runOnIdle {
             state = state.copy(selected = needs, content = NativeSkillContent(needs.name, "Original"), editing = true, draft = (1..1000).joinToString("\n") { "Instruction $it" })
         }
@@ -57,7 +59,10 @@ class SkillsPhoneUiTest {
         }
         compose.onNodeWithContentDescription("Enable inbox").performClick()
         compose.runOnIdle { assertTrue(toggled) }
-        compose.onNodeWithText("Read & adjust").performClick()
+        compose.onNodeWithTag("skill-row-inbox").assertExists()
+        compose.onNodeWithText("Enabled · Setup ready").assertDoesNotExist()
+        compose.onNodeWithText("Read & adjust").assertDoesNotExist()
+        compose.onNodeWithText("inbox").performClick()
         compose.onNodeWithText("Sign in to the work inbox first.").assertExists()
         compose.onNodeWithText("Adjust instructions").performScrollTo().performClick()
         compose.onNodeWithText("Skill instructions").performScrollTo().performTextReplacement("Use the shared work inbox.")

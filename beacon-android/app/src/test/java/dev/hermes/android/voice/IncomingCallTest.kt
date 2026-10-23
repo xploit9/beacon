@@ -102,9 +102,9 @@ class IncomingCallTest {
     }
     @Test fun localDeadlineSurvivesCopiesAndFailsClosedOnClockOrBootChanges() {
         val invite = IncomingCall("source-1", "event-1", 1120, arrivedAt = 1000000, arrivedElapsed = 50000, boot = 7)
-        assertEquals(20000L, invite.ringDurationMillis(1000000, 50000, 7))
-        assertEquals(1L, invite.copy().ringDurationMillis(1019999, 69999, 7))
-        assertEquals(0L, invite.ringDurationMillis(1020000, 70000, 7))
+        assertEquals(45000L, invite.ringDurationMillis(1000000, 50000, 7))
+        assertEquals(1L, invite.copy().ringDurationMillis(1044999, 94999, 7))
+        assertEquals(0L, invite.ringDurationMillis(1045000, 95000, 7))
         assertEquals(0L, invite.ringDurationMillis(999999, 50001, 7))
         assertEquals(0L, invite.ringDurationMillis(1000001, 49999, 7))
         assertEquals(0L, invite.ringDurationMillis(1000001, 50001, 8))
@@ -112,8 +112,8 @@ class IncomingCallTest {
         assertEquals(0L, invite.copy(state = "missed").ringDurationMillis(1000001, 50001, 7))
         assertEquals(0L, invite.copy(expiresAt = 1000).ringDurationMillis(1000000, 50000, 7))
         assertEquals(0L, invite.copy(arrivedAt = 0).ringDurationMillis(1000000, 50000, 7))
-        assertEquals(15000L, invite.ringDurationMillis(1000100, 55000, 7))
-        assertEquals(10000L, invite.ringDurationMillis(1010000, 50100, 7))
+        assertEquals(15000L, invite.ringDurationMillis(1030000, 80000, 7))
+        assertEquals(10000L, invite.ringDurationMillis(1035000, 85000, 7))
     }
     @Test fun bindingPairCommitsTogetherAndFailedCommitRestoresExistingAuthority() {
         for(fail in listOf(false,true)) {

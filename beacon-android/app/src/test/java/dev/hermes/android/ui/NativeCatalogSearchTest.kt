@@ -4,6 +4,13 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class NativeCatalogSearchTest {
+    @Test fun duplicateModelIdsHaveNoSubtitleAndLongReasoningLevelsHaveSpecificCopy() {
+        assertEquals("", modelSubtitle("model-1", "model-1"))
+        assertEquals("model-1", modelSubtitle("Friendly model", "model-1"))
+        assertEquals("Extra high", reasoningLevelLabel("xhigh"))
+        assertTrue(reasoningLevelDescription("xhigh").contains("difficult"))
+        assertTrue(reasoningLevelDescription("max").contains("maximum"))
+    }
     @Test fun providerAndVisibleModelFieldsDefineResultsAndEmptyState() {
         val rows = listOf(Triple("Configured provider", "model-1", "Friendly model"))
         fun matches(query: String) = rows.filter { modelSearchMatches(it.first, it.second, it.third, query) }

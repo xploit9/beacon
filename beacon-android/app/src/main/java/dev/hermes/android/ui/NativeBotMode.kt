@@ -43,7 +43,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
         item("destinations") { beforeRoster() }
         if (state.loading && state.bots.isEmpty() && state.spaces.isEmpty()) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
         if (state.error.isNotBlank() && !(ui.tab == "More" && ui.morePage == "Bots")) item {
-            Column(Modifier.padding(16.dp)) { Text(state.error, color = MaterialTheme.colorScheme.error); TextButton(onClick = { vm.showBotMode() }) { Text("Review Bot Mode") } }
+            Column(Modifier.padding(16.dp)) { Text(state.error, color = MaterialTheme.colorScheme.error); OutlinedButton(onClick = { vm.showBotMode() }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Review Bot Mode") } }
         }
         item { Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
             Text("Bots", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -99,7 +99,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
                 Text("Opening Bot Chat…", Modifier.padding(20.dp))
             } else {
                 Text(state.error.ifBlank { "This Bot Chat could not be opened." }, Modifier.padding(20.dp), color = MaterialTheme.colorScheme.error)
-                TextButton({ controller.openBot(bot) }, Modifier.padding(horizontal = 12.dp)) { Text("Retry") }
+                OutlinedButton({ controller.openBot(bot) }, Modifier.padding(horizontal = 12.dp).heightIn(min = 48.dp)) { Text("Retry") }
             }
         }
         return
@@ -148,7 +148,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
             OutlinedTextField(draftName, { draftName = it.take(120) }, label = { Text("Name") }, singleLine = true, enabled = !state.loading, modifier = Modifier.testTag("shared-space-name"))
             Text("Bots", style = MaterialTheme.typography.titleSmall)
             Text(state.members.map { profile -> profileDisplayLabel(profile, profileRows, profileLoading) }.joinToString(", "))
-            TextButton({ editing = false; members = state.members.toSet(); membersSubmitted = false; choosingMembers = true }) { Text("Change bots") }
+            OutlinedButton({ editing = false; members = state.members.toSet(); membersSubmitted = false; choosingMembers = true }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Change bots") }
             if (state.error.isNotBlank()) Text(state.error, color = MaterialTheme.colorScheme.error)
         } },
         confirmButton = { TextButton(onClick = { submitted = true; controller.renameSpace(draftName) }, enabled = !state.loading && draftName.isNotBlank()) { Text(if (state.loading) "Saving…" else "Save") } },
@@ -181,7 +181,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
                 }
                 item { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                     Text("Shared spaces", style = MaterialTheme.typography.titleLarge)
-                    TextButton({ creating = true }) { Icon(Icons.Rounded.Add, null); Text("New") }
+                    Button({ creating = true }, modifier = Modifier.heightIn(min = 48.dp)) { Icon(Icons.Rounded.Add, null); Text("New", Modifier.padding(start = 8.dp)) }
                 } }
                 if (state.spaces.isEmpty() && !state.loading) item { Text("Give a team of bots a task in one shared conversation.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
                 items(state.spaces, key = { "overview-space:${it.id}" }) { space ->
@@ -200,9 +200,9 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
                 item {
                     if (state.pendingChange != null) {
                         Text("Your change is waiting for the bots’ current work to stop.")
-                        TextButton(controller::retryChange, enabled = !state.loading) { Text("Retry pending change") }
+                        OutlinedButton(controller::retryChange, enabled = !state.loading, modifier = Modifier.heightIn(min = 48.dp)) { Text("Retry pending change") }
                     } else Text(state.status, style = MaterialTheme.typography.bodyMedium)
-                    if (state.events.any { it.failed }) TextButton(onClick = { vm.more("Profiles") }) { Text("Review bot profiles") }
+                    if (state.events.any { it.failed }) OutlinedButton(onClick = { vm.more("Profiles") }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Review bot profiles") }
                     if (state.earlierEventsOmitted) Text("Showing the latest 200 shared-space events.", style = MaterialTheme.typography.bodySmall)
                     if (state.events.isEmpty() && !state.loading) Text("Send the bots a task to start the discussion.")
                 }
@@ -238,12 +238,12 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
                 Text("${action.member} needs permission", style = MaterialTheme.typography.titleMedium)
                 SelectionContainer { Text(action.description.ifBlank { "Native tool approval requested" }) }
                 Row {
-                    if ("once" in action.choices) TextButton(onClick = { resolve(action, "once") }, enabled = !loading && action.description.isNotBlank()) { Text("Allow once") }
-                    if ("deny" in action.choices) TextButton(onClick = { resolve(action, "deny") }, enabled = !loading) { Text("Deny") }
+                    if ("once" in action.choices) Button(onClick = { resolve(action, "once") }, enabled = !loading && action.description.isNotBlank(), modifier = Modifier.heightIn(min = 48.dp)) { Text("Allow once") }
+                    if ("deny" in action.choices) OutlinedButton(onClick = { resolve(action, "deny") }, enabled = !loading, modifier = Modifier.heightIn(min = 48.dp), colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("Deny") }
                 }
             } else {
                 Text("A bot task needs review before retrying. Its earlier outcome may be unknown.")
-                TextButton(onClick = { resolve(action, "") }, enabled = !loading) { Text("Retry bot task") }
+                OutlinedButton(onClick = { resolve(action, "") }, enabled = !loading, modifier = Modifier.heightIn(min = 48.dp)) { Text("Retry bot task") }
             }
         }
     }

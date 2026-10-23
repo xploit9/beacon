@@ -162,6 +162,7 @@ test("pairing button mints a code-bearing QR and shows its expiry", async () => 
   assert.ok(JSON.stringify(rendered.tree).includes("ABC-723"), JSON.stringify(page.stateUpdates));
   assert.match(JSON.stringify(rendered.tree), /\d{1,2}:\d{2}/);
   assert.equal(page.qrPayload, pairing.qr_link);
+  assert.ok(!JSON.stringify(rendered.tree).includes("Beacon phone connection QR code"), "only the pairing QR shows while a code is live");
 });
 
 test("the code turns into a paired confirmation once the phone links", async () => {

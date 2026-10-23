@@ -213,7 +213,7 @@ async def mint_pairing(request:Request):
 
 @router.post('/pairing/redeem')
 async def redeem_pairing(request:Request):
-    enforce_request_policy(request)
+    identity(request,owner_only=True)
     value=await body(request,2048)
     if set(value)!={'code','device_name'}: raise HTTPException(400,'Invalid pairing fields')
     client_host=request.client.host if request.client else 'unknown'
@@ -239,7 +239,7 @@ async def devices(request:Request):
 @router.delete('/devices/{device_id}')
 async def remove_device(device_id:str,request:Request):
     owner,_,_,_=identity(request,owner_only=True)
-    if not mobile.remove_device(owner,device_id): raise HTTPException(404,'Device not found')
+    if not await asyncio.to_thread(mobile.remove_device,owner,device_id): raise HTTPException(404,'Device not found')
     return {'removed':True,'device_id':device_id}
 
 async def body(request,limit=65536):
@@ -601,7 +601,9 @@ async def notification_test(request:Request):
     return {'event_id':event_id,'status':'queued','device_delivery_confirmed':False,**mobile.refs(owner,profile,'notification-test')}
 @router.post('/mobile/notifications/targets')
 async def target(request:Request):
-    value=await body(request,8192);owner,_,profile,_=identity(request,value.get('profile'))
+    value=await body(request,8192);owner,provider,profile,_=identity(request,value.get('profile'))
+    device_id=request.headers.get('x-beacon-device-id')
+    if device_id is not None: safely(mobile.ident,device_id)
     tok=value.get('token') or value.get('fcm_token')
     package=value.get('package_name',_PRODUCTION_PACKAGE)
     if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Beacon package')
@@ -609,12 +611,16 @@ async def target(request:Request):
     safely(mobile.ident,tid)
     if not isinstance(tok,str) or not 20<=len(tok)<=4096 or any(ord(c)<32 for c in tok): raise HTTPException(400,'Invalid FCM target')
     with mobile.LOCK,mobile.connect() as conn:
+        # Recheck inside the registration lock so a concurrent removal cannot restore its token.
+        if device_id:
+            try: mobile.touch_device(owner,provider,profile,device_id,False)
+            except LookupError: raise HTTPException(403,'device_removed') from None
         conn.execute('DELETE FROM targets WHERE expires<=?',(time.time(),))
         if conn.execute('SELECT COUNT(*) FROM targets').fetchone()[0]>=32 and not conn.execute('SELECT 1 FROM targets WHERE id=?',(tid,)).fetchone(): raise HTTPException(409,'Target capacity reached')
         old=conn.execute('SELECT owner,profile,token FROM targets WHERE id=?',(tid,)).fetchone()
         if old and (old['owner']!=owner or old['profile']!=profile): raise HTTPException(409,'Target already owned')
         if old and old['token']!=tok: conn.execute('DELETE FROM notice_deliveries WHERE target=?',(tid,))
-        conn.execute('INSERT INTO targets VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET token=excluded.token,expires=excluded.expires,payload=excluded.payload',(tid,owner,profile,tok,time.time()+30*86400,json.dumps({'package_name':package})))
+        conn.execute('INSERT INTO targets VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET token=excluded.token,expires=excluded.expires,payload=excluded.payload',(tid,owner,profile,tok,time.time()+30*86400,json.dumps({'package_name':package,'device_id':device_id})))
     return {'id':tid,'target_id':tid,'registered':True,'target':{'id':tid,'target_id':tid,**mobile.refs(owner,profile)},**mobile.refs(owner,profile)}
 @router.delete('/mobile/notifications/targets')
 async def remove_target(request:Request):
@@ -636,7 +642,7 @@ async def notices(request:Request,after:int=0,wait:float=0):
     duration=_bounded_event_wait(wait)
     async def snapshot():
         await asyncio.to_thread(mobile.prune_history,owner)
-        await asyncio.to_thread(sys.modules['beacon_callbacks'].prune_expired,mobile,owner)
+        await asyncio.to_thread(sys.modules['beacon_callbacks'].prune_expired,mobile,native,owner)
         await asyncio.to_thread(watch,owner,provider,profile)
         return await asyncio.to_thread(_notices_after,owner,profile,after,package)
     rows,reset,cursor=await snapshot()
@@ -716,8 +722,12 @@ async def notice_detail(event_id:str,request:Request):
     if row['kind']=='task_result':
         with mobile.connect() as conn:
             email_alert=conn.execute('SELECT 1 FROM meta WHERE key=?',('proactive-email-notice:'+event_id,)).fetchone() is not None
+            source_row=conn.execute('SELECT value FROM meta WHERE key=?',('proactive-email-rule:'+event_id,)).fetchone() if email_alert else None
         phone_job=row['job_id'] if isinstance(row['job_id'],str) else ''
-        if email_alert: result.update(email_alert=True,preview={'title':'Important email','body':result['preview']['body']})
+        if email_alert:
+            try: source=proactive.source_name(json.loads(source_row[0]).get('source')).title() if source_row else ''
+            except (AttributeError,TypeError,ValueError): source=''
+            result.update(email_alert=True,preview={'title':'Important from '+source if source else 'Important update','body':result['preview']['body']})
         elif phone_job.startswith('phone-hermes-'):
             result['preview']={'title':'Hermes','body':result['preview']['body']}
     if row['request_id'] and result['state']=='pending':
@@ -1291,20 +1301,20 @@ async def plugin_version(request:Request):
     return JSONResponse({'running':_RUNNING_PLUGIN_VERSION,'installed':_read_plugin_version(ROOT/'plugin.yaml')},headers={'Cache-Control':'no-store'})
 
 _watch_task=None
-_jobs_upgraded=set()
+_jobs_warming=set()
 _jobs_retry_after={}
 _JOB_WARM_RETRY_SECONDS=600
 def _warm_profile(owner,profile):
     key=(owner,profile)
-    if time.monotonic()<_jobs_retry_after.get(key,0): return
     try:
+        if time.monotonic()<_jobs_retry_after.get(key,0): return
         proactive.upgrade_jobs(mobile,owner,profile)
     except Exception:
-        _jobs_upgraded.discard(key)
         _jobs_retry_after[key]=time.monotonic()+_JOB_WARM_RETRY_SECONDS
     else:
-        _jobs_upgraded.add(key)
         _jobs_retry_after.pop(key,None)
+    finally:
+        _jobs_warming.discard(key)
 async def start_watcher():
     global _watch_task
     async def loop():
@@ -1330,9 +1340,10 @@ async def start_watcher():
                     if profiles is None: profiles=_native_profile_names()
                     for profile in profiles:
                         profile_key=(cfg['owner_id'],profile)
-                        if profile_key not in _jobs_upgraded and time.monotonic()>=_jobs_retry_after.get(profile_key,0):
-                            # Once per process, off the delivery loop: warm the slow source scan, then rebuild jobs after an upgrade.
-                            _jobs_upgraded.add(profile_key)
+                        if (profile_key not in _jobs_warming and time.monotonic()>=_jobs_retry_after.get(profile_key,0)
+                                and proactive._meta_get(mobile,proactive._key(*profile_key,'jobs-version'))!=proactive.JOBS_VERSION):
+                            # Native disable invalidates the durable version even while this dashboard stays alive.
+                            _jobs_warming.add(profile_key)
                             asyncio.create_task(asyncio.to_thread(_warm_profile,cfg['owner_id'],profile))
                         try: await asyncio.to_thread(watch,cfg['owner_id'],cfg['owner_provider'],profile)
                         except Exception: pass
@@ -1356,7 +1367,7 @@ def clear_lookup_counts(call_id):
     with mobile.LOCK:
         for key in list(_feature_counts):
             if key[0]==call_id: _feature_counts.pop(key,None)
-async def feature(fn,*args,timeout=12,value_error_status=409):
+async def feature(fn,*args,timeout=12,value_error_status=409,lookup_message='Owned native context unavailable'):
     if not _feature_slots.acquire(blocking=False): raise HTTPException(429,'Native lookup capacity busy')
     context=contextvars.copy_context()
     def run():
@@ -1370,7 +1381,7 @@ async def feature(fn,*args,timeout=12,value_error_status=409):
     try: return await asyncio.wait_for(asyncio.wrap_future(future),timeout=timeout)
     except asyncio.TimeoutError: raise HTTPException(504,'Native lookup timed out') from None
     except HTTPException: raise
-    except LookupError: raise HTTPException(404,'Owned native context unavailable') from None
+    except LookupError: raise HTTPException(404,lookup_message) from None
     except ValueError as exc: raise HTTPException(value_error_status,str(exc)) from None
     except Exception: raise HTTPException(503,'Native lookup unavailable') from None
 def lookup_budget(call_id,kind):
@@ -1378,7 +1389,8 @@ def lookup_budget(call_id,kind):
     with mobile.LOCK:
         count=_feature_counts.get(key,0)
         if count>=60: raise HTTPException(429,'Call lookup limit reached')
-        if len(_feature_counts)>=1024 and key not in _feature_counts: raise HTTPException(429,'Lookup state capacity reached')
+        if len(_feature_counts)>=1024 and key not in _feature_counts:
+            _feature_counts.pop(next(iter(_feature_counts)))
         _feature_counts[key]=count+1
 
 async def query_body(request,call_id,kind):
@@ -1395,7 +1407,9 @@ async def get_context(call_id:str,request:Request):
     owner,provider,row,cfg=await call(request,call_id)
     display=getattr(request.state.session,'display_name',None)
     display=display[:120] if isinstance(display,str) else ''
-    result=await feature(voice_context.context,owner,provider,row['profile'],row['conversation'],call_id,display,timeout=8)
+    owner_name=getattr(request,'query_params',{}).get('owner_name','')
+    if not voice_context.valid_owner_name(owner_name): raise HTTPException(400,'Invalid owner name')
+    result=await feature(voice_context.context,owner,provider,row['profile'],row['conversation'],call_id,display,owner_name.strip(),timeout=8)
     callback=result.get('callback')
     reason=callback.get('reason','') if isinstance(callback,dict) else ''
     result['reason']=reason if isinstance(reason,str) else ''
@@ -1446,6 +1460,31 @@ async def list_mobile_sessions(request:Request):
     hidden=request.query_params.get('include_archived')=='1'
     result=await feature(native.conversation_list,owner,provider,profile,hidden,timeout=8)
     return JSONResponse(result,headers={'Cache-Control':'no-store'})
+@router.post('/sessions/pin')
+async def pin_session(request:Request):
+    value=await body(request,4096)
+    owner,provider,profile,_=identity(request,value.get('profile'))
+    if set(value)!={'session_id','pinned','profile'} or type(value.get('pinned')) is not bool:
+        raise HTTPException(400,'Choose a conversation and pin state')
+    session_id=value.get('session_id')
+    if not isinstance(session_id,str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,256}',session_id):
+        raise HTTPException(400,'Choose an existing conversation')
+    def update():
+        # Use the gateway's registry writer, as session.set_hidden does; REST maintenance conflicts with a running gateway.
+        from tui_gateway import server
+        with server._profile_db({'profile':profile},writer=True) as db:
+            if db is None: raise HTTPException(503,'Conversation is unavailable. Try again.')
+            key=db.resolve_session_id(session_id)
+            row=db.get_session(key) if key else None
+            if not row or row.get('user_id')!=provider+':'+owner:
+                raise HTTPException(404,'Conversation not found.')
+            if not db.set_session_pinned(key,value['pinned']):
+                raise HTTPException(404,'Conversation not found.')
+            return {'session_id':key,'pinned':value['pinned']}
+    try: return await asyncio.to_thread(update)
+    except HTTPException: raise
+    except Exception: raise HTTPException(503,'Conversation is unavailable. Try again.') from None
+
 @router.get('/mobile/sessions/{stored_id}')
 async def read_mobile_session(stored_id:str,request:Request):
     owner,provider,profile,cfg=identity(request)
@@ -1459,10 +1498,18 @@ async def get_voice_history(stored_id:str,request:Request):
     result=await feature(mobile.voice_history,owner,profile,stored_id,timeout=8)
     return JSONResponse(result,headers={'Cache-Control':'no-store'})
 
+async def _proactive_source_labels(profile):
+    # Settings can wait for a cold discovery longer than a call's opening can (6 s of the 8 s budget).
+    try: catalogue=await feature(voice_context.tool_catalogue,profile,6.0,timeout=8)
+    except (HTTPException,TimeoutError): return []
+    return list(dict.fromkeys(line.partition(':')[0].strip() for line in catalogue.splitlines() if ':' in line))
+
 @router.get('/mobile/proactive')
 async def proactive_status(request:Request):
     owner,_,profile,_=identity(request)
-    return await feature(proactive.status,mobile,owner,profile,timeout=8)
+    result=await feature(proactive.status,mobile,owner,profile,timeout=8,lookup_message='This item is no longer available.')
+    result['sources']=await _proactive_source_labels(profile)
+    return result
 
 @router.put('/mobile/proactive')
 async def proactive_enabled(request:Request):
@@ -1488,14 +1535,10 @@ async def proactive_enabled(request:Request):
                 raise HTTPException(409,'Choose an owned assistant conversation before enabling Proactive') from None
             raise
     function=proactive.set_enabled if toggle else proactive.configure
-    try:
-        args=(mobile,owner,profile,value['enabled']) if toggle else (mobile,owner,profile,value)
-        return await feature(function,*args,
-                             timeout=30)
-    except ValueError as exc:
-        raise HTTPException(400,str(exc)) from None
-    except RuntimeError:
-        raise HTTPException(503,'Proactive setup could not be saved') from None
+    args=(mobile,owner,profile,value['enabled']) if toggle else (mobile,owner,profile,value)
+    result=await feature(function,*args,timeout=30,value_error_status=400,lookup_message='This item is no longer available.')
+    result['sources']=await _proactive_source_labels(profile)
+    return result
 
 @router.post('/mobile/proactive/feedback')
 async def proactive_feedback(request:Request):
@@ -1503,53 +1546,38 @@ async def proactive_feedback(request:Request):
     if set(value)!={'notice_id','verdict'} or value['verdict'] not in ('important','not_important'):
         raise HTTPException(400,'Expected notice_id and verdict important or not_important')
     owner,_,profile,_=identity(request)
-    try: return await feature(proactive.add_email_feedback,mobile,owner,profile,value['notice_id'],value['verdict'],timeout=15)
-    except LookupError as exc: raise HTTPException(404,str(exc)) from None
-    except ValueError as exc: raise HTTPException(400,str(exc)) from None
-    except RuntimeError: raise HTTPException(503,'Email importance could not be learned') from None
+    return await feature(proactive.add_email_feedback,mobile,owner,profile,value['notice_id'],value['verdict'],timeout=15,value_error_status=400,lookup_message='This item is no longer available.')
 
 @router.delete('/mobile/proactive/learned')
 async def proactive_learned_delete(request:Request):
-    value=await body(request,512)
+    value=await body(request,2048)
     if set(value)!={'note'}: raise HTTPException(400,'Expected one learned note')
     owner,_,profile,_=identity(request)
-    try: return await feature(proactive.delete_learned,mobile,owner,profile,value['note'],timeout=12)
-    except LookupError as exc: raise HTTPException(404,str(exc)) from None
-    except ValueError as exc: raise HTTPException(400,str(exc)) from None
-    except RuntimeError: raise HTTPException(503,'Learned email preference could not be removed') from None
+    return await feature(proactive.delete_learned,mobile,owner,profile,value['note'],timeout=12,value_error_status=400,lookup_message='This item is no longer available.')
 
 @router.post('/mobile/proactive/requests')
 async def proactive_request_create(request:Request):
     value=await body(request,2048)
     if set(value)-{'text','action','signal','night'} or not {'text','action'}<=set(value):
-        raise HTTPException(400,'Expected text and action, with optional email signal and night')
+        raise HTTPException(400,'Expected text and action, with optional source and night')
     text=value.get('text');action=value.get('action');signal=value.get('signal');night=value.get('night',False)
     if not isinstance(text,str) or len(text)>300 or action not in ('notify','call'):
         raise HTTPException(400,'Request text and action are invalid')
-    if signal not in (None,'email'):
-        raise HTTPException(400,'signal must be email or null')
     if type(night) is not bool: raise HTTPException(400,'Request night must be a boolean')
     owner,_,profile,_=identity(request)
-    try: return await feature(proactive.create_request,mobile,owner,profile,text,action,signal,night,timeout=30,value_error_status=400)
-    except ValueError as exc: raise HTTPException(400,str(exc)) from None
-    except RuntimeError: raise HTTPException(503,'Proactive request could not be saved') from None
+    return await feature(proactive.create_request,mobile,owner,profile,text,action,signal,night,timeout=30,value_error_status=400,lookup_message='This item is no longer available.')
 
 @router.patch('/mobile/proactive/requests/{request_id}')
 async def proactive_request_patch(request_id:str,request:Request):
     value=await body(request,2048)
     if not value or set(value)-{'enabled','action','night'}: raise HTTPException(400,'Invalid Proactive request fields')
     owner,_,profile,_=identity(request)
-    try: return await feature(proactive.patch_request,mobile,owner,profile,request_id,value,timeout=30,value_error_status=400)
-    except LookupError as exc: raise HTTPException(404,str(exc)) from None
-    except ValueError as exc: raise HTTPException(400,str(exc)) from None
-    except RuntimeError: raise HTTPException(503,'Proactive request could not be updated') from None
+    return await feature(proactive.patch_request,mobile,owner,profile,request_id,value,timeout=30,value_error_status=400,lookup_message='This item is no longer available.')
 
 @router.delete('/mobile/proactive/requests/{request_id}')
 async def proactive_request_delete(request_id:str,request:Request):
     owner,_,profile,_=identity(request)
-    try: return await feature(proactive.delete_request,mobile,owner,profile,request_id,timeout=30)
-    except LookupError as exc: raise HTTPException(404,str(exc)) from None
-    except RuntimeError: raise HTTPException(503,'Proactive request could not be deleted') from None
+    return await feature(proactive.delete_request,mobile,owner,profile,request_id,timeout=30,lookup_message='This item is no longer available.')
 
 router.include_router(sys.modules['beacon_callback_api'].build_router(call,body,feature,mobile,native,sys.modules['beacon_callbacks']))
 router.include_router(sys.modules['beacon_call_history_api'].build_router(identity,mobile))

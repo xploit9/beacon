@@ -10,7 +10,7 @@ import dev.hermes.android.push.validOpaque
 import kotlinx.coroutines.*
 import org.json.JSONObject
 
-internal const val INCOMING_RING_SECONDS = 20L
+internal const val INCOMING_RING_SECONDS = 45L
 private const val INCOMING_INVITATION_SECONDS = 120L
 private const val INCOMING_CLOCK_SKEW_SECONDS = 30L
 
@@ -30,6 +30,9 @@ data class IncomingCall(val source: String, val event: String, val expiresAt: Lo
         return minOf(wallRemaining, monotonicRemaining, serverRemaining).coerceAtLeast(0)
     }
 }
+
+internal fun isMissedCallbackAction(action: String?, invitation: IncomingCall?): Boolean =
+    invitation?.let { it.state == "missed" && action == it.callbackAction } == true
 
 fun validIncoming(source: String, event: String, expiresAt: Long, now: Long): Boolean =
     validOpaque(source) && validOpaque(event) && now >= 0 && expiresAt > now && expiresAt - now <= INCOMING_INVITATION_SECONDS + INCOMING_CLOCK_SKEW_SECONDS

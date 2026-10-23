@@ -33,12 +33,13 @@ internal fun schedulePaused(job: JSONObject): Boolean = when {
     job.has("enabled") || job.has("state") -> job.string("state") == "paused" || (job.has("enabled") && !job.optBoolean("enabled"))
     else -> job.optBoolean("paused")
 }
+internal fun scheduleGatewayNeedsAttention(job: JSONObject): Boolean = job.optDouble("scheduler_heartbeat_age_s", 0.0) > 120
 internal fun scheduleState(job: JSONObject): String = when {
     schedulePaused(job) -> "Paused"
     job.string("state") in setOf("completed", "finished") -> "Completed"
     job.string("state") in setOf("running", "claimed") -> "Running"
     job.string("last_status") in setOf("error", "failed") || job.string("state") == "error" -> "Failed"
-    job.optDouble("scheduler_heartbeat_age_s", 0.0) > 120 -> "Scheduler needs attention"
+    scheduleGatewayNeedsAttention(job) -> "Waiting"
     job.string("next_run_at").isNotBlank() -> "Waiting"
     else -> "Execution unconfirmed"
 }

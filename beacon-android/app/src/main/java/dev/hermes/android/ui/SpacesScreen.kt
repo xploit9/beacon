@@ -12,6 +12,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
@@ -56,7 +57,7 @@ import dev.hermes.android.data.BeaconClient
     if (chooseFolder) PcFolderPicker(vm, "Browse PC folders", onDismiss = { chooseFolder = false }, onChoose = { chooseFolder = false; changeDirectory(it) })
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val wide = maxWidth >= 720.dp * LocalDensity.current.fontScale.coerceAtLeast(1f)
-        Column(Modifier.fillMaxSize()) {
+        Column(Modifier.widthIn(max = 720.dp).fillMaxWidth().fillMaxHeight().align(Alignment.TopCenter).testTag("files-content")) {
             if (wide || editor.path.isBlank() || editor.scope?.copy(session = "") != scope) Header("Files", "Your computer", menu = LocalOpenNavigationMenu.current) {
                 IconButton(onClick = refresh) { Icon(Icons.Rounded.Refresh, uiText("Refresh files")) }
                 IconButton(onClick = { chooseFolder = true }) { Icon(Icons.Rounded.FolderOpen, "Choose PC folder") }
@@ -65,17 +66,19 @@ import dev.hermes.android.data.BeaconClient
                 var showHidden by rememberSaveable { mutableStateOf(false) }
                 val tree: @Composable (Modifier) -> Unit = { modifier ->
                     Column(modifier) {
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                            Text(actual.ifBlank { "Home" }, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).testTag("files-path"), style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.StartEllipsis)
+                        }
                         Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                             IconButton(onClick = { changeDirectory("") }) { Icon(Icons.Rounded.Home, "Home folder") }
                             IconButton(onClick = { changeDirectory(record?.string("parent").orEmpty()) }, enabled = !record?.string("parent").isNullOrBlank()) { Icon(Icons.Rounded.ArrowUpward, "Parent folder") }
-                            Text(actual.ifBlank { "Home" }, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                             IconButton(onClick = { showHidden = !showHidden }, modifier = Modifier.testTag("files-show-hidden")) { Icon(if (showHidden) Icons.Rounded.Visibility else Icons.Rounded.VisibilityOff, if (showHidden) "Hide hidden files" else "Show hidden files") }
                             IconButton(onClick = { vm.client?.let { uploadRequest = Triple(it, scope, actual); upload.launch(arrayOf("*/*")) } }, enabled = actual.isNotBlank()) { Icon(Icons.Rounded.Upload, "Upload to this folder") }
                             IconButton(onClick = { vm.openForm(ActionForm("Create file", "/api/pc/file/create", listOf(Field("path", "PC file path", required = true), Field("content", "Initial content", FieldType.MULTILINE)), json("path" to actual.trimEnd('/', '\\') + "/"), onResult = { refresh() })) }, enabled = actual.isNotBlank()) { Icon(Icons.Rounded.NoteAdd, "Create file") }
                         }
                         LazyColumn(Modifier.weight(1f)) {
                             if (record == null) item { LinearProgressIndicator(Modifier.fillMaxWidth().padding(16.dp)) }
-                            else if (record.has("_error")) item { Text(record.string("_error"), Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error); TextButton(onClick = refresh) { Text("Retry") } }
+                            else if (record.has("_error")) item { Text("Couldn't load this folder. Check your connection and try again.", Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error); OutlinedButton(onClick = refresh, modifier = Modifier.heightIn(min = 48.dp)) { Text("Retry") } }
                             else {
                                 val allEntries = record.rows("entries")
                                 // Dot files and folders (settings, caches) stay out of the way unless asked for, like a desktop file manager.
@@ -87,7 +90,7 @@ import dev.hermes.android.data.BeaconClient
                                     val folder = file.optBoolean("is_directory")
                                     var actions by remember(path) { mutableStateOf(false) }
                                     ListItem(headlineContent = { Text(file.getString("name")) },
-                                        supportingContent = { Text(if (folder) "Folder" else android.text.format.Formatter.formatShortFileSize(LocalContext.current, file.optLong("size")), style = MaterialTheme.typography.bodySmall) },
+                                        supportingContent = if (folder) null else ({ Text(android.text.format.Formatter.formatShortFileSize(LocalContext.current, file.optLong("size")), style = MaterialTheme.typography.bodySmall) }),
                                         leadingContent = { Icon(if (folder) Icons.Rounded.Folder else Icons.Rounded.Description, null) },
                                         trailingContent = if (folder) null else ({ Box {
                                             IconButton(onClick = { actions = true }) { Icon(Icons.Rounded.MoreVert, "File actions") }
@@ -120,16 +123,16 @@ import dev.hermes.android.data.BeaconClient
     Column(modifier.fillMaxHeight()) {
         Header(editor.path.replace('\\', '/').substringAfterLast('/'), if (editor.reviewRequired) "Review restored changes" else if (editor.dirty) "Unsaved changes" else if (editable) "Edit file" else "Preview", back) {
             if (!media) IconButton(onClick = { preview = !preview }, enabled = !editor.loading) { Icon(if (preview) Icons.Rounded.Edit else Icons.Rounded.Visibility, if (preview) "Edit source" else "Preview") }
-            if (editable) TextButton(onClick = { vm.saveEditor() }, enabled = editor.dirty && !editor.saving && !editor.reviewRequired) { Text(if (editor.saving) "Saving" else "Save") }
+            if (editable) Button(onClick = { vm.saveEditor() }, enabled = editor.dirty && !editor.saving && !editor.reviewRequired, modifier = Modifier.heightIn(min = 48.dp)) { Text(if (editor.saving) "Saving" else "Save") }
         }
         if (editor.error.isNotBlank()) Text(editor.error, Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error)
         if (editor.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
         if (editor.metadata.string("edit_blocked_reason").isNotBlank()) Text(editor.metadata.string("edit_blocked_reason"), Modifier.padding(16.dp), style = MaterialTheme.typography.bodySmall)
         if (editor.reviewRequired) {
             Text("The file changed since your draft. Compare before saving.", Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.bodyMedium)
-            TextButton(onClick = { review = true }, enabled = !editor.saving) { Text("Review changes") }
+            OutlinedButton(onClick = { review = true }, enabled = !editor.saving, modifier = Modifier.heightIn(min = 48.dp)) { Text("Review changes") }
         }
-        if (editor.dirty || editor.reviewRequired) TextButton(enabled = !editor.saving && !editor.loading, onClick = { vm.openForm(ActionForm("Discard local changes", "", emptyList(), explanation = "Discard the retained edits and reload the last confirmed server content.", actionLabel = "Discard", onResult = { vm.discardEditor() })) }) { Text(uiText("Discard changes")) }
+        if (editor.dirty || editor.reviewRequired) OutlinedButton(enabled = !editor.saving && !editor.loading, onClick = { vm.openForm(ActionForm("Discard local changes", "", emptyList(), explanation = "Discard the retained edits and reload the last confirmed server content.", actionLabel = "Discard", onResult = { vm.discardEditor() })) }, modifier = Modifier.heightIn(min = 48.dp), colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text(uiText("Discard changes")) }
         if (media) Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(16.dp)) { MediaPreview(vm, editor.path, endpoint = if (editor.metadata.optBoolean("_pc")) "/api/files/download" else "/api/file/raw", origin = editor.scope) }
         else if (extension == "xlsx") LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(16.dp)) { editor.text.text.split(Regex("(?m)(?=^Sheet: )")).forEach { sheet -> item { Text(sheet.lineSequence().firstOrNull().orEmpty(), style = MaterialTheme.typography.titleMedium); NativeTable(sheet.lineSequence().drop(1).filter(String::isNotBlank).map { it.split('\t') }.toList()) } } }
         else if (extension == "pptx") LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) { editor.text.text.split(Regex("(?m)(?=^Slide )")).forEach { slide -> item { Surface(color = MaterialTheme.colorScheme.surfaceContainer) { Text(slide, Modifier.padding(24.dp), style = MaterialTheme.typography.bodyLarge) } } } }

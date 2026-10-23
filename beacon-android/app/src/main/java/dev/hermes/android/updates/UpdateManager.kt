@@ -150,6 +150,10 @@ class UpdateManager(private val app: BeaconApplication) {
 
     private suspend fun automaticUpdate(client: BeaconClient, expected: UpdateSource, release: Release) {
         if (!autoUpdateEnabled() || !supportsAutomaticAppUpdates()) return
+        synchronized(lock) {
+            requireAuthorized(expected)
+            if (retainPendingUpdate(hasPendingInstall(), prefs.getLong("pending_version", 0), release.version)) return
+        }
         if (!autoUpdateInstallAllowed(autoUpdateEnabled(),unmeteredNetwork(),callActive())) {
             synchronized(lock) { requireAuthorized(expected); notifyRelease(expected,release) }
             return
@@ -256,14 +260,26 @@ class UpdateManager(private val app: BeaconApplication) {
     }
 
     private suspend fun downloadOwned(client: BeaconClient, release: Release, expected: UpdateSource): File {
+        synchronized(lock) {
+            requireAuthorized(expected)
+            if (retainPendingUpdate(hasPendingInstall(), prefs.getLong("pending_version", 0), release.version)) {
+                return pendingFile(requireNotNull(prefs.getString("pending_file", null)))
+            }
+        }
         val file = updater.download(client, release)
         try {
             synchronized(lock) {
                 requireAuthorized(expected)
+                prefs.getInt("pending_session_id", -1).takeIf { it >= 0 }?.let { session ->
+                    try { app.packageManager.packageInstaller.abandonSession(session) }
+                    catch (_: IllegalArgumentException) { /* Android already removed this session. */ }
+                }
+                val previous = prefs.getString("pending_file", null)?.takeIf { it != file.name }?.let(::pendingFile)
                 check(prefs.edit().putString("pending_file", file.name).putString("pending_source", expected.id)
                     .putString("pending_sha", release.sha).putLong("pending_size", release.size).putLong("pending_version", release.version)
                     .putString("pending_version_name",release.name)
                     .remove("pending_session_id").putBoolean("continue_install", true).putBoolean("awaiting_permission", false).commit())
+                previous?.delete()
                 notifications.cancel(NOTIFICATION_ID)
             }
         } catch (e: Throwable) { file.delete(); throw e }
@@ -426,3 +442,6 @@ class UpdateManager(private val app: BeaconApplication) {
         fun validToken(token: String): Boolean = validUpdateToken(token)
     }
 }
+
+internal fun retainPendingUpdate(pendingFileExists: Boolean, pendingVersion: Long, releaseVersion: Long): Boolean =
+    pendingFileExists && pendingVersion >= releaseVersion

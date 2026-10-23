@@ -1,5 +1,10 @@
 package dev.hermes.android.ui
 
+import android.app.Activity
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.compose.ui.platform.LocalView
+import kotlinx.coroutines.delay
+
 
 
 import androidx.compose.animation.core.*
@@ -8,6 +13,7 @@ import androidx.compose.foundation.*
 
 import androidx.compose.foundation.layout.*
 
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 
 import androidx.compose.material.icons.Icons
@@ -21,6 +27,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 
 import androidx.compose.ui.draw.clip
 
@@ -35,8 +42,6 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 
 import androidx.compose.ui.semantics.*
-
-import androidx.compose.ui.text.font.FontStyle
 
 import androidx.compose.ui.unit.dp
 
@@ -63,7 +68,7 @@ val LocalPersistentNavigation = staticCompositionLocalOf { false }
             }) {
                 Row(Modifier.fillMaxSize().testTag("beacon-adaptive-navigation")) {
                     if (persistent) {
-                        Surface(Modifier.width((280f * scale.coerceIn(1f, 1.2f)).dp).fillMaxHeight().testTag("beacon-persistent-navigation"), color = MaterialTheme.colorScheme.surfaceContainer) {
+                        Surface(Modifier.width(persistentCallNavigationWidthDp.dp).fillMaxHeight().testTag("beacon-persistent-navigation"), color = MaterialTheme.colorScheme.surfaceContainer) {
                             Box(Modifier.windowInsetsPadding(WindowInsets.safeDrawing)) { navigation(true) }
                         }
                         VerticalDivider()
@@ -76,180 +81,419 @@ val LocalPersistentNavigation = staticCompositionLocalOf { false }
 }
 
 @Composable internal fun VoiceWave(call: CallState, modifier: Modifier, motionEnabled: Boolean, circular: Boolean = false) {
-
     val lifecycle = LocalLifecycleOwner.current.lifecycle
-
     val lifecycleState by lifecycle.currentStateFlow.collectAsState()
-
     val motionAllowed = motionEnabled && call.active && lifecycleState.isAtLeast(Lifecycle.State.STARTED)
-    val amplitude by animateFloatAsState(call.voiceAmplitude(), if(motionAllowed) tween(110,easing=FastOutSlowInEasing) else snap(),label="Voice activity")
-    val activeMotion = voiceMotionActive(amplitude,motionAllowed,true)
-
-    val phase = if(activeMotion) {
-
-        val transition=rememberInfiniteTransition(label="Continuous voice activity")
-
-        val progress by transition.animateFloat(0f,(Math.PI*2).toFloat(),infiniteRepeatable(tween(1600,easing=LinearEasing)),label="Blue wave phase")
-
+    val amplitude by animateFloatAsState(call.voiceAmplitude(), if (motionAllowed) tween(110, easing = FastOutSlowInEasing) else snap(), label = "Call voice activity")
+    val activeMotion = voiceMotionActive(amplitude, motionAllowed, true)
+    val phase = if (activeMotion) {
+        val transition = rememberInfiniteTransition(label = "Call voice activity")
+        val progress by transition.animateFloat(0f, (Math.PI * 2).toFloat(),
+            infiniteRepeatable(tween(1600, easing = LinearEasing)), label = "Gold wave phase")
         progress
-
     } else 0f
+    val shape = if (circular) RoundedCornerShape(50) else RoundedCornerShape(48.dp)
 
-
-
-    val shape=if(circular) RoundedCornerShape(50) else RoundedCornerShape(48.dp)
-
-    Canvas(modifier.clip(shape).background(Color(0xff0a1225)).testTag("beacon-blue-wave")
-
-        .semantics { contentDescription="${dev.hermes.android.data.currentAssistantName} voice activity"; stateDescription=if(call.held) "Call on hold" else call.state }) {
-
-        drawRect(Brush.verticalGradient(listOf(Color(0xff102142),Color(0xff16315b),Color(0xff4c86db))))
-
-        for(layer in 2 downTo 0) {
-
-            val path=Path(); path.moveTo(0f,size.height)
-
-            for(i in 0..56) { val x=i/56f; path.lineTo(x*size.width,voiceWaveY(x,phase,amplitude,layer)*size.height) }
-
-            path.lineTo(size.width,size.height); path.close()
-
-            drawPath(path,Brush.verticalGradient(listOf(Color(0xff9fd1ff).copy(alpha=.78f-layer*.15f),Color(0xff4684ec).copy(alpha=.85f)),startY=size.height*.28f,endY=size.height))
-
+    Canvas(modifier.clip(shape).background(CallBackground).testTag("beacon-blue-wave")
+        .semantics { contentDescription = dev.hermes.android.data.currentAssistantName + " voice activity"; stateDescription = callStatusLabel(call) }) {
+        drawRect(Brush.verticalGradient(listOf(Color(0xff101827), Color(0xff30271a), Color(0xff72552b))))
+        for (layer in 2 downTo 0) {
+            val path = Path()
+            path.moveTo(0f, size.height)
+            for (i in 0..56) {
+                val x = i / 56f
+                path.lineTo(x * size.width, voiceWaveY(x, phase, amplitude, layer) * size.height)
+            }
+            path.lineTo(size.width, size.height)
+            path.close()
+            drawPath(path, Brush.verticalGradient(
+                listOf(Color(0xffffe7a1).copy(alpha = .78f - layer * .15f), Color(0xffd39a32).copy(alpha = .92f)),
+                startY = size.height * .28f, endY = size.height,
+            ))
         }
-
-        drawOval(Brush.radialGradient(listOf(Color(0xffc7e8ff).copy(alpha=.38f),Color.Transparent)),topLeft=Offset(size.width*.15f,size.height*.60f),size=Size(size.width*.7f,size.height*.45f))
-
+        drawOval(Brush.radialGradient(listOf(Color(0xffffe9b2).copy(alpha = .34f), Color.Transparent)),
+            topLeft = Offset(size.width * .15f, size.height * .60f), size = Size(size.width * .7f, size.height * .45f))
     }
-
 }
-
-
 
 @Composable internal fun LiveCallCaptions(call: CallState, modifier: Modifier = Modifier, compact: Boolean = false) {
-
-    val user=call.latestCaption("user"); val assistant=call.latestCaption("assistant")
-
-    if (user.isBlank() && assistant.isBlank()) return
-
-    Surface(modifier.widthIn(max=620.dp).fillMaxWidth().testTag("beacon-live-captions"),shape=RoundedCornerShape(24.dp),color=Color(0xff0b0e13).copy(alpha=.95f),contentColor=Color(0xfff4f7fc)) {
-
-        Column(Modifier.padding(horizontal=20.dp,vertical=16.dp).semantics { if (call.transcripts.lastOrNull()?.final == true) liveRegion = LiveRegionMode.Polite },verticalArrangement=Arrangement.spacedBy(10.dp)) {
-
-            if(user.isNotBlank()) Text(user,fontStyle=FontStyle.Italic,style=MaterialTheme.typography.bodyLarge,maxLines=if(compact) 3 else 5,overflow=androidx.compose.ui.text.style.TextOverflow.Ellipsis,modifier=Modifier.testTag("beacon-user-caption"))
-
-            if(assistant.isNotBlank()) Text(assistant,style=MaterialTheme.typography.bodyLarge,maxLines=if(compact) 4 else 7,overflow=androidx.compose.ui.text.style.TextOverflow.Ellipsis,modifier=Modifier.testTag("beacon-assistant-caption"))
-
+    val lines = if (call.active) orderCallTranscriptLines(call.transcripts.filter { it.text.isNotBlank() && !it.interrupted }).takeLast(if (compact) 2 else 4) else emptyList()
+    if (lines.isEmpty()) return
+    val transcriptDescription = uiText("Call transcript")
+    Surface(
+        modifier.widthIn(max = 680.dp).fillMaxWidth().testTag("beacon-live-captions"),
+        shape = RoundedCornerShape(24.dp),
+        color = CallSurface,
+        contentColor = CallText,
+    ) {
+        Column(
+            Modifier.padding(horizontal = 20.dp, vertical = 16.dp).heightIn(max = if (compact) 128.dp else 236.dp)
+                .verticalScroll(rememberScrollState()).semantics {
+                    if (lines.last().final) liveRegion = LiveRegionMode.Polite
+                    contentDescription = transcriptDescription
+                },
+            verticalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 12.dp),
+        ) {
+            lines.forEachIndexed { index, line ->
+                val latest = index == lines.lastIndex
+                val latestForRole = index == lines.indexOfLast { it.role == line.role }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = if (line.role == "user") Arrangement.End else Arrangement.Start) {
+                    Column(Modifier.widthIn(max = 620.dp).fillMaxWidth(.94f).alpha(if (latest) 1f else .52f)) {
+                        Text(
+                            uiText(if (line.role == "user") "You" else dev.hermes.android.data.currentAssistantName),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (latest) CallGoldBright else CallMuted,
+                        )
+                        Text(
+                            line.text,
+                            color = if (latest) CallText else CallMuted,
+                            style = if (latest) MaterialTheme.typography.bodyLarge else MaterialTheme.typography.bodyMedium,
+                            maxLines = if (compact) 2 else 6,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            modifier = if (latestForRole && line.role == "user") Modifier.testTag("beacon-user-caption")
+                                else if (latestForRole) Modifier.testTag("beacon-assistant-caption") else Modifier,
+                        )
+                    }
+                }
+            }
         }
-
     }
-
 }
 
-internal data class CallUiActions(val mute: () -> Unit, val camera: () -> Unit, val flip: () -> Unit, val allowBubble: () -> Unit, val end: () -> Unit, val route: (String) -> Unit, val screen: () -> Unit = {})
+internal data class CallUiActions(
+    val mute: () -> Unit,
+    val camera: () -> Unit,
+    val flip: () -> Unit,
+    val allowBubble: () -> Unit,
+    val end: () -> Unit,
+    val route: (String) -> Unit,
+    val screen: () -> Unit = {},
+)
+
+@Composable internal fun CallFailurePanel(reason: String, onRetry: () -> Unit, onClose: () -> Unit, modifier: Modifier = Modifier) {
+    Box(modifier.fillMaxSize().background(CallBackground).testTag("beacon-call-failure-screen"), contentAlignment = Alignment.Center) {
+        Surface(Modifier.widthIn(max = 480.dp).fillMaxWidth().padding(24.dp).testTag("beacon-call-failure-panel"),
+            shape = RoundedCornerShape(28.dp), color = CallSurface) {
+            Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(reason, Modifier.testTag("beacon-call-failure-reason").semantics { liveRegion = LiveRegionMode.Polite },
+                    color = Color(0xffffb4ab), style = MaterialTheme.typography.bodyLarge)
+                Button(onRetry, Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("beacon-call-failure-retry")) { Text("Retry") }
+                OutlinedButton(onClose, Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("beacon-call-failure-close")) { Text("Close") }
+            }
+        }
+    }
+}
+
+@Composable internal fun CallToolChip(receipt: CallToolReceipt, modifier: Modifier = Modifier) {
+    val activity = receipt.chipLabel() ?: return
+    Surface(
+        modifier.widthIn(max = 620.dp).fillMaxWidth().testTag("beacon-call-tool-chip"),
+        shape = RoundedCornerShape(18.dp),
+        color = CallSurfaceRaised,
+        contentColor = CallText,
+    ) {
+        Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Icon(Icons.Rounded.Build, null, tint = CallGoldBright)
+                Text(uiText(activity), Modifier.testTag("beacon-call-tool-status"), style = MaterialTheme.typography.labelLarge)
+            }
+            receipt.approvalCaption()?.let { caption ->
+                Text(uiText(caption), Modifier.padding(start = 32.dp).testTag("beacon-tool-approval-caption"),
+                    style = MaterialTheme.typography.labelSmall, color = CallMuted)
+            }
+        }
+    }
+}
+
+@Composable private fun CallControl(
+    label: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    tag: String,
+    enabled: Boolean,
+    selected: Boolean,
+    stateDescription: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    hangup: Boolean = false,
+    iconLabel: String = label,
+) {
+    val accessibleLabel = uiText(iconLabel)
+    val accessibleState = uiText(stateDescription)
+    Column(modifier, horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        FilledIconButton(
+            onClick,
+            Modifier.size(48.dp).testTag(tag).semantics { this.selected = selected; this.stateDescription = accessibleState },
+            enabled = enabled,
+            colors = IconButtonDefaults.filledIconButtonColors(
+                containerColor = if (hangup) Color(0xff9f3d3d) else CallControl,
+                contentColor = CallText,
+                disabledContainerColor = CallControl.copy(alpha = .55f),
+                disabledContentColor = CallMuted,
+            ),
+        ) { Icon(icon, accessibleLabel) }
+        Text(uiText(label), color = CallText, style = MaterialTheme.typography.labelSmall,
+            maxLines = 2, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+    }
+}
+
+@Composable private fun CallSpeakerControl(call: CallState, actions: CallUiActions, modifier: Modifier = Modifier) {
+    var routes by remember(call.callId) { mutableStateOf(false) }
+    val speakerLabel = uiText("Speaker")
+    val routeLabel = uiText(call.routes.firstOrNull { it.id == call.route }?.name ?: "Audio output")
+    Column(modifier, horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Box {
+            FilledIconButton(
+                { routes = true },
+                Modifier.size(48.dp).testTag("beacon-speaker").semantics {
+                    contentDescription = speakerLabel
+                    stateDescription = routeLabel
+                },
+                enabled = call.routes.isNotEmpty(),
+                colors = IconButtonDefaults.filledIconButtonColors(containerColor = CallControl, contentColor = CallText),
+            ) { Icon(Icons.Rounded.VolumeUp, uiText("Speaker")) }
+            DropdownMenu(routes, { routes = false }) {
+                call.routes.forEach { route ->
+                    DropdownMenuItem(
+                        text = { Text(route.name) },
+                        onClick = { routes = false; actions.route(route.id) },
+                        leadingIcon = { if (call.route == route.id) Icon(Icons.Rounded.Check, null) },
+                    )
+                }
+            }
+        }
+        Text(uiText("Speaker"), color = CallText, style = MaterialTheme.typography.labelSmall,
+            maxLines = 2, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+    }
+}
 
 @Composable internal fun LiveCallDock(call: CallState, actions: CallUiActions, motionEnabled: Boolean, modifier: Modifier = Modifier) {
-
-    var routes by remember { mutableStateOf(false) }
-
-    val buttonColors=IconButtonDefaults.filledIconButtonColors(containerColor=Color(0xff172131),contentColor=Color(0xfff2f6ff),disabledContainerColor=Color(0xff151b24),disabledContentColor=Color(0xff7c8798))
-
-    Column(modifier.fillMaxWidth(),horizontalAlignment=Alignment.CenterHorizontally) {
-
-        Row(Modifier.widthIn(max=480.dp).fillMaxWidth().padding(8.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(6.dp)) {
-
-            FilledIconButton(actions.camera,Modifier.size(52.dp).testTag("beacon-camera").semantics { selected = call.cameraSharing; stateDescription = if (call.cameraStopPending) "Camera stop unconfirmed. Retry stopping." else if (call.cameraBusy) "Camera changing" else if (call.cameraSharing) "Camera sharing" else "Camera stopped" },enabled=call.active&&(call.cameraSharing||call.cameraBusy||call.cameraStopPending||!call.held&&call.state!="connecting")&&!call.screenSharing&&!call.screenBusy&&!call.screenStopPending,colors=buttonColors) { Icon(if(call.cameraSharing||call.cameraBusy||call.cameraStopPending) Icons.Rounded.VideocamOff else Icons.Rounded.Videocam,uiText(if(call.cameraSharing||call.cameraBusy||call.cameraStopPending) if(call.cameraStopPending) "Retry stop camera" else "Camera off" else "Camera")) }
-
-            FilledIconButton(actions.mute,Modifier.size(52.dp).testTag("beacon-mute").semantics { selected = call.muted; stateDescription = if (call.muted) "Microphone muted" else "Microphone active" },enabled=call.active,colors=buttonColors) { Icon(if(call.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic,uiText(if(call.muted) "Unmute" else "Mute")) }
-
-            Box(Modifier.weight(1f),contentAlignment=Alignment.Center) { VoiceWave(call,Modifier.widthIn(max=168.dp).fillMaxWidth().height(72.dp),motionEnabled) }
-
-            Box {
-
-                FilledIconButton({routes=true},Modifier.size(52.dp),enabled=call.routes.isNotEmpty(),colors=buttonColors) { Icon(Icons.Rounded.VolumeUp,uiText("Audio output")) }
-
-                DropdownMenu(routes,{routes=false}) { call.routes.forEach { route -> DropdownMenuItem(text={Text(route.name)},onClick={routes=false;actions.route(route.id)},leadingIcon={if(call.route==route.id) Icon(Icons.Rounded.Check,null)}) } }
-
-            }
-
-            FilledIconButton(actions.end,Modifier.size(52.dp).testTag("beacon-hang-up"),colors=IconButtonDefaults.filledIconButtonColors(containerColor=MaterialTheme.colorScheme.error,contentColor=MaterialTheme.colorScheme.onError)) { Icon(Icons.Rounded.CallEnd,uiText("Hang up")) }
-
+    Column(
+        modifier.background(CallSurface.copy(alpha = .98f), RoundedCornerShape(26.dp)).padding(horizontal = 10.dp, vertical = 12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.Top) {
+            CallControl(
+                "Camera",
+                if (call.cameraSharing || call.cameraBusy || call.cameraStopPending) Icons.Rounded.VideocamOff else Icons.Rounded.Videocam,
+                "beacon-camera",
+                call.active && (call.cameraSharing || call.cameraBusy || call.cameraStopPending || !call.held && call.state != "connecting") && !call.screenSharing && !call.screenBusy && !call.screenStopPending,
+                call.cameraSharing,
+                if (call.cameraStopPending) "Camera stop unconfirmed. Retry stopping." else if (call.cameraBusy) "Camera changing" else if (call.cameraSharing) "Camera sharing" else "Camera stopped",
+                actions.camera,
+                Modifier.weight(1f),
+                iconLabel = if (call.cameraSharing || call.cameraBusy || call.cameraStopPending) "Turn camera off" else "Camera",
+            )
+            CallControl(
+                "Mute",
+                if (call.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic,
+                "beacon-mute",
+                call.active,
+                call.muted,
+                if (call.muted) "Microphone muted" else "Microphone active",
+                actions.mute,
+                Modifier.weight(1f),
+                iconLabel = if (call.muted) "Unmute" else "Mute",
+            )
+            CallSpeakerControl(call, actions, Modifier.weight(1f))
+            CallControl(
+                if (call.screenSharing || call.screenBusy || call.screenStopPending) "Stop sharing" else "Share screen",
+                if (call.screenSharing || call.screenBusy || call.screenStopPending) Icons.Rounded.StopScreenShare else Icons.Rounded.ScreenShare,
+                "beacon-share-screen",
+                call.active && (call.screenSharing || call.screenBusy || call.screenStopPending || !call.held && call.state != "connecting" && !call.cameraStopPending),
+                call.screenSharing,
+                if (call.screenStopPending) "Screen stop unconfirmed. Retry stopping." else if (call.screenSharing) "Screen sharing" else "Screen stopped",
+                actions.screen,
+                Modifier.weight(1f),
+                iconLabel = if (call.screenSharing || call.screenBusy || call.screenStopPending) "Stop sharing screen" else "Share screen",
+            )
+            CallControl(
+                "Hang up",
+                Icons.Rounded.CallEnd,
+                "beacon-hang-up",
+                call.active,
+                false,
+                "End call",
+                actions.end,
+                Modifier.weight(1f),
+                hangup = true,
+            )
         }
-
-        TextButton(actions.screen,enabled=call.active&&(call.screenSharing||call.screenBusy||call.screenStopPending||!call.held&&call.state!="connecting"&&!call.cameraStopPending),modifier=Modifier.heightIn(min=48.dp).testTag("beacon-share-screen").semantics { selected = call.screenSharing; stateDescription = if (call.screenStopPending) "Screen stop unconfirmed. Retry stopping." else if (call.screenSharing) "Screen sharing" else "Screen stopped" }) {
-
-            Icon(if(call.screenSharing||call.screenBusy||call.screenStopPending) Icons.Rounded.StopScreenShare else Icons.Rounded.ScreenShare,null)
-
-            Spacer(Modifier.width(8.dp));Text(uiText(if(call.screenStopPending) "Retry stop screen" else if(call.screenSharing||call.screenBusy) "Stop sharing screen" else "Share screen"))
-
-        }
-
-        Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(8.dp),modifier=Modifier.padding(bottom=8.dp)) {
-            BeaconSignal(if(call.state=="connecting") BeaconMotionMode.Sweep else BeaconMotionMode.Pulse, size=20.dp)
-            Text(uiText(if(call.held) "Call on hold" else if(call.state=="connecting") "Connecting your call…" else if(call.userSpeaking) "Listening" else call.state.replaceFirstChar{it.titlecase()}),style=MaterialTheme.typography.labelLarge,color=Color(0xffdce8fc))
-        }
-        if(call.overlayPermissionMissing) AssistChip(
+        if (call.overlayPermissionMissing) AssistChip(
             onClick = actions.allowBubble,
             label = { Text(uiText("Allow call bubble")) },
             leadingIcon = { Icon(Icons.Rounded.Call, null) },
             modifier = Modifier.heightIn(min = 48.dp).testTag("beacon-allow-bubble"),
+            colors = AssistChipDefaults.assistChipColors(
+                containerColor = CallSurfaceRaised,
+                labelColor = CallGoldBright,
+                leadingIconContentColor = CallGoldBright,
+            ),
         )
-        if(call.contextNotice.isNotBlank()) Text(call.contextNotice,style=MaterialTheme.typography.bodySmall,color=Color(0xffc3cbd8),modifier=Modifier.widthIn(max=480.dp).heightIn(max=160.dp).verticalScroll(rememberScrollState()).padding(horizontal=12.dp,vertical=8.dp).testTag("beacon-context-notice").semantics { liveRegion = LiveRegionMode.Polite })
-
+        if (call.contextNotice.isNotBlank()) Text(
+            call.contextNotice, style = MaterialTheme.typography.bodySmall, color = CallMuted,
+            modifier = Modifier.widthIn(max = 520.dp).heightIn(max = 120.dp).verticalScroll(rememberScrollState())
+                .padding(horizontal = 12.dp, vertical = 8.dp).testTag("beacon-context-notice").semantics { liveRegion = LiveRegionMode.Polite },
+        )
     }
-
 }
 
-
-
-@Composable internal fun LiveCallSurface(call: CallState, actions: CallUiActions, motionEnabled: Boolean, modifier: Modifier = Modifier, onConversation: () -> Unit,
-
-    cameraPreview: @Composable (Modifier) -> Unit) {
-
-    Box(modifier.fillMaxSize().background(Color(0xff080d15)).testTag("beacon-live-call-surface")) {
-
-        if(call.cameraSharing || call.cameraBusy) cameraPreview(Modifier.fillMaxSize())
-
-
-
-        Column(Modifier.fillMaxSize().padding(horizontal=12.dp),verticalArrangement=Arrangement.SpaceBetween) {
-
-            Row(Modifier.fillMaxWidth().background(if(call.cameraSharing) Color(0xff080d15) else Color.Transparent),verticalAlignment=Alignment.CenterVertically) {
-
-                TextButton(onConversation,Modifier.heightIn(min=48.dp)) { Icon(Icons.Rounded.ChatBubbleOutline,null); Spacer(Modifier.width(8.dp));Text(uiText("View conversation")) }
-                BeaconMark(Modifier.testTag("call-beacon-mark"), size=26.dp, contentDescription=assistantText("Beacon"))
-
-                Spacer(Modifier.weight(1f))
-
-                if(call.cameraSharing&&call.cameraCanFlip) IconButton(actions.flip,enabled=!call.cameraBusy,modifier=Modifier.size(48.dp).testTag("beacon-camera-flip")) { Icon(Icons.Rounded.Cameraswitch,uiText(if(call.cameraRear) "Switch to front camera" else "Switch to back camera"),tint=Color.White) }
-
-
-            }
-
-            Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).weight(1f),verticalArrangement=Arrangement.Bottom,horizontalAlignment=Alignment.CenterHorizontally) {
-
-                LiveCallCaptions(call,Modifier.padding(bottom=14.dp))
-
-                if(call.cameraSharing) Text(assistantText(if(call.cameraRear) "Back camera shared with Beacon" else "Front camera shared with Beacon"),color=Color.White,style=MaterialTheme.typography.labelLarge,modifier=Modifier.padding(bottom=10.dp).background(Color(0xff080d15),RoundedCornerShape(12.dp)).padding(horizontal=12.dp,vertical=6.dp))
-
-                if(call.screenSharing) Text(assistantText("Screen shared with Beacon"),color=Color.White,style=MaterialTheme.typography.labelLarge,modifier=Modifier.padding(bottom=10.dp))
-
-                if(call.screenBusy) Text(uiText("Waiting for screen-sharing consent or first frame…"),color=Color.White,style=MaterialTheme.typography.labelLarge,modifier=Modifier.padding(bottom=10.dp))
-
-                if(call.cameraBusy) Text(uiText("Starting camera…"),color=Color.White,style=MaterialTheme.typography.labelLarge,modifier=Modifier.padding(bottom=10.dp).testTag("beacon-camera-starting"))
-
-
-
-                if(call.error.isNotBlank()) Text(call.error,color=Color(0xffffb4ab),style=MaterialTheme.typography.bodyMedium,modifier=Modifier.padding(bottom=10.dp).semantics { liveRegion = LiveRegionMode.Polite })
-
-            }
-
-            LiveCallDock(call,actions,motionEnabled,Modifier.background(if(call.cameraSharing) Color(0xff080d15) else Color.Transparent,RoundedCornerShape(topStart=24.dp,topEnd=24.dp)))
-
-            if(call.transcriptLabel().isNotBlank()) Text(uiText(call.transcriptLabel()),style=MaterialTheme.typography.labelSmall,color=androidx.compose.ui.graphics.Color(0xffc3cbd8),modifier=Modifier.align(Alignment.CenterHorizontally).background(Color(0xff080d15)).padding(horizontal=12.dp,vertical=8.dp).semantics { liveRegion = LiveRegionMode.Polite })
-
+@Composable private fun CallHeader(call: CallState, onConversation: () -> Unit, modifier: Modifier = Modifier) {
+    var now by remember(call.callId) { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(call.callId, call.active, call.startedAt) {
+        if (!call.active) return@LaunchedEffect
+        while (true) {
+            now = System.currentTimeMillis()
+            delay(1000)
         }
-
     }
-
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Box(Modifier.size(48.dp).clip(CircleShape).background(CallGold.copy(alpha = .16f))
+                .border(1.dp, CallGold.copy(alpha = .52f), CircleShape), contentAlignment = Alignment.Center) {
+                BeaconMark(Modifier.testTag("call-beacon-mark"), size = 36.dp, contentDescription = assistantText("Beacon"))
+            }
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(dev.hermes.android.data.currentAssistantName, color = CallText, style = MaterialTheme.typography.titleLarge, maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                    Box(Modifier.size(8.dp).clip(CircleShape).background(CallGoldBright))
+                    Text(uiText(callStatusLabel(call)), Modifier.testTag("beacon-call-status"), color = CallGoldBright, style = MaterialTheme.typography.labelMedium,
+                        maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                }
+            }
+            Column(horizontalAlignment = Alignment.End) {
+                Text(callTimerLabel(call.startedAt, now), Modifier.testTag("beacon-call-timer"), color = CallText,
+                    style = MaterialTheme.typography.titleMedium)
+                Text(uiText("CALL TIME"), style = MaterialTheme.typography.labelSmall, color = CallMuted)
+            }
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            FilledTonalButton(
+                onConversation,
+                Modifier.heightIn(min = 48.dp).testTag("beacon-view-conversation"),
+                colors = ButtonDefaults.filledTonalButtonColors(containerColor = CallSurfaceRaised, contentColor = CallGoldBright),
+            ) {
+                Icon(Icons.Rounded.ChatBubbleOutline, null)
+                Spacer(Modifier.width(8.dp))
+                Text(uiText("View conversation"))
+            }
+        }
+    }
 }
 
+@Composable internal fun LiveCallSurface(
+    call: CallState,
+    actions: CallUiActions,
+    motionEnabled: Boolean,
+    modifier: Modifier = Modifier,
+    onConversation: () -> Unit,
+    cameraPreview: @Composable (Modifier) -> Unit,
+) {
+    val view = LocalView.current
+    val window = (view.context as? Activity)?.window
+    DisposableEffect(window, view) {
+        val bars = window?.let { WindowInsetsControllerCompat(it, view) }
+        val oldStatusColor = window?.statusBarColor
+        val oldNavigationColor = window?.navigationBarColor
+        val oldLightStatus = bars?.isAppearanceLightStatusBars
+        val oldLightNavigation = bars?.isAppearanceLightNavigationBars
+        if (window != null) {
+            window.statusBarColor = CallBackground.toArgb()
+            window.navigationBarColor = CallBackground.toArgb()
+            bars?.isAppearanceLightStatusBars = false
+            bars?.isAppearanceLightNavigationBars = false
+        }
+        onDispose {
+            if (window != null) {
+                if (oldStatusColor != null) window.statusBarColor = oldStatusColor
+                if (oldNavigationColor != null) window.navigationBarColor = oldNavigationColor
+                if (oldLightStatus != null) bars?.isAppearanceLightStatusBars = oldLightStatus
+                if (oldLightNavigation != null) bars?.isAppearanceLightNavigationBars = oldLightNavigation
+            }
+        }
+    }
+    Box(modifier.fillMaxSize().background(CallBackground).testTag("beacon-live-call-surface")) {
+        if (call.cameraSharing || call.cameraBusy) cameraPreview(Modifier.fillMaxSize())
+        BoxWithConstraints(Modifier.fillMaxSize()) {
+            val landscape = maxWidth > maxHeight
+            if (landscape) {
+                val heroSize = minOf(200.dp, maxHeight * .48f, maxWidth * .34f)
+                Row(
+                    Modifier.align(Alignment.Center).widthIn(max = 1240.dp).fillMaxWidth().fillMaxHeight()
+                        .padding(horizontal = 24.dp, vertical = 12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(24.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f).fillMaxHeight().verticalScroll(rememberScrollState()),
+                        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                        CallHeader(call, onConversation, Modifier.fillMaxWidth())
+                        Spacer(Modifier.height(8.dp))
+                        VoiceWave(call, Modifier.size(heroSize).testTag("beacon-call-hero"), motionEnabled, circular = true)
+                    }
+                    Column(Modifier.weight(1.2f).fillMaxHeight().verticalScroll(rememberScrollState()),
+                        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                        call.toolReceipts.lastOrNull { it.chipLabel() != null }?.let { CallToolChip(it, Modifier.padding(bottom = 12.dp)) }
+                        LiveCallCaptions(call, Modifier.padding(bottom = 12.dp))
+                        if (call.screenSharing) Text(uiText("Screen shared with Beacon"), color = CallText, style = MaterialTheme.typography.labelLarge)
+                        if (call.screenBusy) Text(uiText("Waiting for screen-sharing consent or first frame…"), color = CallMuted, style = MaterialTheme.typography.labelLarge)
+                        if (call.cameraBusy) Text(uiText("Starting camera…"), color = CallMuted, style = MaterialTheme.typography.labelLarge, modifier = Modifier.testTag("beacon-camera-starting"))
+                        if (call.error.isNotBlank()) Text(call.error, color = Color(0xffffb4ab), style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.padding(bottom = 10.dp).semantics { liveRegion = LiveRegionMode.Polite })
+                        LiveCallDock(call, actions, motionEnabled, Modifier.widthIn(max = 640.dp).fillMaxWidth().padding(top = 8.dp))
+                        if (call.transcriptLabel().isNotBlank()) Text(uiText(call.transcriptLabel()), color = CallMuted, style = MaterialTheme.typography.labelSmall,
+                            modifier = Modifier.padding(top = 4.dp).semantics { liveRegion = LiveRegionMode.Polite })
+                    }
+                }
+            } else {
+                val heroSize = when {
+                    maxHeight < 600.dp -> 132.dp
+                    maxHeight < 760.dp -> 196.dp
+                    else -> 260.dp
+                }.coerceAtMost(maxWidth - 32.dp)
+                Column(
+                    Modifier.align(Alignment.Center).widthIn(max = 920.dp).fillMaxWidth().fillMaxHeight()
+                        .verticalScroll(rememberScrollState()).padding(horizontal = if (maxWidth >= 720.dp) 32.dp else 16.dp, vertical = 8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    CallHeader(call, onConversation, Modifier.fillMaxWidth())
+                    Box(Modifier.fillMaxWidth().height(heroSize), contentAlignment = Alignment.Center) {
+                        VoiceWave(call, Modifier.size(heroSize).testTag("beacon-call-hero"), motionEnabled, circular = true)
+                    }
+                    call.toolReceipts.lastOrNull { it.chipLabel() != null }?.let { CallToolChip(it) }
+                    if (call.screenSharing) Text(assistantText("Screen shared with Beacon"), color = CallText, style = MaterialTheme.typography.labelLarge)
+                    if (call.screenBusy) Text(uiText("Waiting for screen-sharing consent or first frame…"), color = CallMuted, style = MaterialTheme.typography.labelLarge)
+                    if (call.cameraBusy) Text(uiText("Starting camera…"), color = CallMuted, style = MaterialTheme.typography.labelLarge, modifier = Modifier.testTag("beacon-camera-starting"))
+                    if (call.error.isNotBlank()) Text(call.error, color = Color(0xffffb4ab), style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+                    LiveCallCaptions(call, Modifier.padding(top = 2.dp))
+                    LiveCallDock(call, actions, motionEnabled, Modifier.widthIn(max = 640.dp).fillMaxWidth().align(Alignment.CenterHorizontally))
+                    if (call.transcriptLabel().isNotBlank()) Text(uiText(call.transcriptLabel()), color = CallMuted, style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.padding(vertical = 4.dp).semantics { liveRegion = LiveRegionMode.Polite })
+                }
+            }
+        }
+        if (call.cameraSharing) Surface(
+            modifier = Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 8.dp).testTag("beacon-camera-sharing-status"),
+            shape = RoundedCornerShape(50), color = CallSurface.copy(alpha = .96f), contentColor = CallText,
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(assistantText(if (call.cameraRear) "Back camera shared with Beacon" else "Front camera shared with Beacon"),
+                    style = MaterialTheme.typography.labelSmall, modifier = Modifier.weight(1f, fill = false).padding(horizontal = 10.dp, vertical = 5.dp))
+                if (call.cameraCanFlip) IconButton(onClick = actions.flip, modifier = Modifier.testTag("beacon-camera-flip")) {
+                    Icon(Icons.Rounded.FlipCameraAndroid, uiText("Flip camera"))
+                }
+            }
+        }
+    }
+}
+
+private val CallBackground = Color(0xff080d15)
+private val CallSurface = Color(0xff101a2b)
+private val CallSurfaceRaised = Color(0xff1b2940)
+private val CallControl = Color(0xff202e45)
+private val CallText = Color(0xfff5f4f0)
+private val CallMuted = Color(0xffc4cede)
+private val CallGold = Color(0xffd5a64a)
+private val CallGoldBright = Color(0xffffe2a0)

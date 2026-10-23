@@ -1,6 +1,11 @@
 package dev.hermes.android.data
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import dev.hermes.android.core.*
 import org.json.JSONArray
 import org.json.JSONObject
@@ -21,6 +26,30 @@ internal fun pinMutationIdentity(snapshot: JSONObject, requestId: String): JSONO
 private class NativeTurnEnded : Exception()
 internal class NativeModelConfirmation(message: String) : IllegalStateException(message)
 internal val nativeApprovalModes = listOf("manual", "smart", "off")
+/** Session detail keeps SQLite 0/1 flags; session lists expose booleans. */
+internal fun nativeSessionFlag(row: JSONObject, key: String): Boolean = row.optBoolean(key) || (row.opt(key) as? Number)?.toDouble() == 1.0
+internal fun nativeHistoryStamp(row: JSONObject): List<String>? =
+    if (row.opt("message_count") !is Number || row.opt("last_active") !is Number) null else
+        listOf("message_count", "last_active", "title", "model", "provider", "model_config", "cwd", "hidden", "archived", "ended_at")
+            .map { row.opt(it)?.toString().orEmpty() }
+internal fun nativeHistoryNeedsRefresh(observed: List<String>?, stamp: List<String>?): Boolean =
+    observed == null || stamp == null || stamp != observed
+internal fun displayedNativeHistoryStamp(projection: JSONObject): List<String>? =
+    projection.optJSONArray("_history_metadata_stamp")?.strings()?.takeIf { it.size == 10 }
+
+internal fun storedSessionSettings(snapshot: JSONObject): JSONObject {
+    val raw = snapshot.opt("model_config")
+    val config = (raw as? JSONObject) ?: (raw as? String)?.takeIf(String::isNotBlank)?.let { runCatching { JSONObject(it) }.getOrNull() } ?: JSONObject()
+    return snapshot.copy().apply {
+        if (has("hidden") || has("archived")) put("archived", nativeSessionFlag(snapshot, "archived") || nativeSessionFlag(snapshot, "hidden"))
+        if (has("hidden")) put("hidden", nativeSessionFlag(snapshot, "hidden"))
+        if (string("model").isBlank()) config.string("model").takeIf(String::isNotBlank)?.let { put("model", it) }
+        if (string("model_provider").isBlank()) config.string("provider").takeIf(String::isNotBlank)?.let { put("model_provider", it) }
+        if (string("reasoning_effort").isBlank()) config.optJSONObject("reasoning_config")?.let { reasoning ->
+            put("reasoning_effort", if (reasoning.opt("enabled") == false) "none" else reasoning.string("effort", "medium"))
+        }
+    }
+}
 private val storedSessionId = Regex("[A-Za-z0-9_.:-]{1,256}")
 // Stock dashboard bounds: /api/sessions pages reject limit > 100; Beacon keeps its 200-row drawer window.
 private const val SESSION_PAGE_LIMIT = 100
@@ -81,10 +110,40 @@ internal class NativeOperations(private val c: BeaconClient) {
         when (path) {
             "/api/mobile/bootstrap" -> return c.bootstrap()
             "/api/commands", "/api/commands/catalog" -> { val result = c.nativeRpc("commands.catalog"); val pairs = result.optJSONArray("pairs") ?: JSONArray(); val commands = JSONArray(); for (i in 0 until pairs.length()) { val pair = pairs.optJSONArray(i) ?: continue; commands.put(json("name" to pair.optString(0).removePrefix("/"), "description" to pair.optString(1))) }; return json("commands" to commands, "available" to true, "warning" to result.string("warning")) }
-            "/api/commands/exec" -> { val b = binding(); return c.nativeRpc("command.dispatch", json("session_id" to b.runtimeSessionId, "name" to d.getString("name"), "arg" to d.string("argument"))) }
+            "/api/commands/exec" -> {
+                val name = d.getString("name").removePrefix("/").lowercase()
+                val argument = d.string("argument").trim()
+                require(!chatCommandChangesProfile(name, argument)) { "Change this for all chats in Settings." }
+                require(name != "yolo") { "Use Approvals beside the composer to change YOLO." }
+                if (name == "model") {
+                    val (model, provider) = chatModelChoice(argument)
+                    return dispatch("/api/session/update", emptyMap(), "POST", json("session_id" to sid(), "model" to model, "model_provider" to provider,
+                        "confirm_expensive_model" to d.optBoolean("confirm_expensive_model")), maxBytes).put("type", "local").put("output", "Model updated for this chat")
+                }
+                if (name in setOf("reasoning", "fast")) {
+                    require(when (name) {
+                        "reasoning" -> argument in setOf("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+                        else -> argument in setOf("normal", "fast", "auto", "cold", "ultrafast")
+                    }) { "Use the chat's settings picker for this choice." }
+                    val result = c.nativeRpc("config.set", json("session_id" to binding().runtimeSessionId, "key" to name, "value" to argument, "scope" to "session"))
+                    return result.put("type", "local").put("output", "Updated for this chat")
+                }
+                return c.nativeRpc("command.dispatch", json("session_id" to binding().runtimeSessionId, "name" to name, "arg" to argument))
+            }
             // What Hermes starts a new chat with in this profile, for the composer of a chat with no messages yet.
-            "/api/profile/defaults" -> return json("profile" to c.auth.profile, "model" to c.nativeRpc("config.get", json("key" to "provider")).string("model"),
+            "/api/profile/defaults" -> return json("profile" to c.auth.profile, "scope_key" to c.scope.key, "session_id" to sid(), "model" to c.nativeRpc("config.get", json("key" to "provider")).string("model"),
                 "reasoning_effort" to c.nativeRpc("config.get", json("key" to "reasoning")).string("value"))
+            "/api/profile/approval-mode" -> {
+                require(method in setOf("GET", "POST")) { "Unsupported profile approval operation" }
+                if (method == "POST") {
+                    require(d.keys().asSequence().all { it in setOf("mode", "scope_key") } && d.string("scope_key") == c.scope.key && d.string("mode") in setOf("manual", "smart")) { "Choose Manual or Auto in this profile's Settings." }
+                    val applied = c.nativeRpc("config.set", json("key" to "approvals.mode", "value" to d.getString("mode")))
+                    require(applied.string("value") == d.string("mode")) { "Approval change was not confirmed. Refresh and try again." }
+                }
+                val result = c.nativeRpc("config.get", json("key" to "approvals.mode"))
+                require(result.string("value") in nativeApprovalModes && (method == "GET" || result.string("value") == d.string("mode"))) { "Approval change was not confirmed. Refresh and try again." }
+                return result.put("scope_key", c.scope.key)
+            }
             "/api/profile/switch" -> {
                 val name = d.getString("name")
                 val profiles = c.nativeGet("/api/profiles").rows("profiles")
@@ -163,41 +222,42 @@ internal class NativeOperations(private val c: BeaconClient) {
             }
             "/api/approval/mode" -> {
                 require(method in setOf("GET", "POST")) { "Unsupported approval setting operation" }
-                val yoloWrite = method == "POST" && d.has("yolo")
+                require(sid().matches(storedSessionId)) { "Choose a conversation first" }
+                if (method == "GET" && q["passive"] == "1") {
+                    // A browsed chat has no runtime: read the profile's mode and the chat's saved YOLO without resuming it.
+                    val profileMode = c.nativeRpc("config.get", json("key" to "approvals.mode")).string("value")
+                    require(profileMode in nativeApprovalModes) { "Approvals are unavailable. Refresh and try again." }
+                    val saved = storedYolo(sid()) == true
+                    return json("value" to if (saved) "off" else profileMode, "profile_mode" to profileMode, "session_status_known" to saved,
+                        "session_bypass" to (saved && profileMode != "off"), "session_id" to sid(), "scope_key" to c.scope.key)
+                }
+                val yoloWrite = method == "POST"
                 if (method == "POST") {
-                    val allowed = if (yoloWrite) setOf("session_id", "yolo", "scope_key") else setOf("session_id", "mode", "scope_key")
-                    require(d.keys().asSequence().all { it in allowed } && (if (yoloWrite) d.opt("yolo") is Boolean else d.string("mode") in nativeApprovalModes)) { "Choose a native approval mode or chat YOLO state" }
+                    require(d.keys().asSequence().all { it in setOf("session_id", "yolo", "scope_key") } && d.opt("yolo") is Boolean) { "Choose Ask first or YOLO for this chat." }
                     require(d.string("scope_key") == c.scope.session(sid()).key) { "Reopen Approvals in the original account and profile" }
                     val target = binding()
                     require(d.string("scope_key") == c.scope.session(target.storedSessionId).key) { "Refresh the resolved conversation before changing approvals" }
-                    if (yoloWrite) {
-                        if (d.getBoolean("yolo")) {
-                            val profileMode = c.nativeRpc("config.get", json("key" to "approvals.mode")).string("value")
-                            require(profileMode in nativeApprovalModes) { "Hermes returned an unrecognized approval mode" }
-                            require(profileMode != "off") { "Approvals are Off for this profile, so every chat already skips prompts." }
-                        }
-                        setSessionYolo(target, d.getBoolean("yolo"))
-                    } else {
-                        val selected = d.getString("mode")
-                        // A deliberate mode choice makes this chat follow its profile instead of a session bypass.
-                        val bypass = c.nativeRpc("config.set", json("session_id" to target.runtimeSessionId, "key" to "yolo", "value" to "off", "scope" to "session"))
-                        require(bypass.string("value") == "0") { "The conversation still has an independent approval bypass. Refresh before trying again." }
-                        val applied = c.nativeRpc("config.set", json("key" to "approvals.mode", "value" to selected))
-                        require(applied.string("value") == selected) { "Hermes did not confirm the approval mode. Refresh before trying again." }
+                    if (d.getBoolean("yolo")) {
+                        val profileMode = c.nativeRpc("config.get", json("key" to "approvals.mode")).string("value")
+                        require(profileMode in nativeApprovalModes) { "Approvals are unavailable. Refresh and try again." }
+                        require(profileMode != "off") { "Approvals are off for this profile." }
                     }
+                    setSessionYolo(target, d.getBoolean("yolo"))
                 }
                 val result = c.nativeRpc("config.get", json("key" to "approvals.mode"))
-                require(result.string("value") in nativeApprovalModes) { "Hermes returned an unrecognized approval mode" }
-                if (!yoloWrite) require(method == "GET" || result.string("value") == d.string("mode")) { "Hermes did not activate the selected approval mode. Refresh to check for an override or another change." }
-                val target = binding()
-                val fresh = c.nativeRpc("session.resume", json("session_id" to target.storedSessionId, "omit_messages" to true, "close_on_disconnect" to false))
-                require(nativeSessionBinding(c.scope, fresh).storedSessionId == target.storedSessionId) { "Approval status belongs to another conversation" }
-                val bypass = fresh.optJSONObject("info")?.opt("yolo") as? Boolean ?: storedYolo(target.storedSessionId)
-                val profileMode = result.getString("value")
-                if (yoloWrite && bypass is Boolean) require(bypass == d.getBoolean("yolo")) { "Hermes did not confirm the chat YOLO state. Refresh before trying again." }
-                else require(method == "GET" || d.string("mode") == "off" || bypass != true) { "A host approval bypass remains enabled. Check Hermes before continuing." }
+                require(result.string("value") in nativeApprovalModes) { "Approvals are unavailable. Refresh and try again." }
+                // Lazy reads never construct an agent merely to paint the shield in a browsed conversation.
+                val fresh = c.nativeRpc("session.resume", json("session_id" to sid(), "omit_messages" to true, "lazy" to true, "close_on_disconnect" to false))
+                require(nativeSessionBinding(c.scope, fresh).storedSessionId == sid()) { "Approval status belongs to another conversation" }
+                val reported = fresh.optJSONObject("info")?.opt("yolo") as? Boolean
+                val savedBypass = if (reported == null) storedYolo(sid()) else null
+                // Saved true proves a bypass. Saved false cannot rule out process-wide --yolo.
+                val bypass = reported ?: savedBypass?.takeIf { it }
+                val reportedMode = fresh.optJSONObject("info")?.string("approval_mode").orEmpty()
+                val profileMode = if (result.string("value") == "off" || reportedMode == "off") "off" else reportedMode.takeIf { it in nativeApprovalModes } ?: result.getString("value")
+                if (yoloWrite) require(bypass == d.getBoolean("yolo")) { "Approvals could not be verified. Refresh before continuing." }
                 val sessionBypass = if (bypass is Boolean) bypass == true && profileMode != "off" else JSONObject.NULL
-                return result.put("profile_mode", profileMode).put("value", if (bypass == true) "off" else profileMode).put("session_status_known", bypass is Boolean).put("session_bypass", sessionBypass).put("session_id", target.storedSessionId).put("scope_key", c.scope.key)
+                return result.put("profile_mode", profileMode).put("value", if (bypass == true || profileMode == "off") "off" else profileMode).put("session_status_known", bypass is Boolean).put("session_bypass", sessionBypass).put("session_id", sid()).put("scope_key", c.scope.key)
             }
             "/api/approval/respond", "/api/clarify/respond" -> {
                 require(d.string("scope_key") == c.scope.session(sid()).key) { "Reopen this request in its original conversation." }
@@ -211,6 +271,14 @@ internal class NativeOperations(private val c: BeaconClient) {
             }
             "/api/session/pin" -> {
                 require(method == "POST" && sid().matches(storedSessionId) && d.opt("pinned") is Boolean) { "Choose a conversation to pin" }
+                try {
+                    return c.nativeRequest("/api/plugins/beacon/sessions/pin", "POST", json("session_id" to sid(), "pinned" to d.getBoolean("pinned"), "profile" to c.auth.profile)).also {
+                        require(it.string("session_id") == sid() && it.opt("pinned") == d.getBoolean("pinned")) { "Pin change was not confirmed. Try again." }
+                    }
+                } catch (error: ApiFailure) {
+                    // Missing or unpaired plugins use native authority; explicit owner/session refusals stay final.
+                    if (!(error.plugin && error.status == 401 || error.status in setOf(405, 501) || error.status == 404 && error.detail.equals("Not Found", true))) throw error
+                }
                 // Hermes accepts a sidebar change only with its revision precondition and a fresh request id, as its own web client sends.
                 val snapshot = c.nativeGet("/api/sessions/${sid()}/mutation-snapshot", mapOf("profile" to c.auth.profile))
                 val identity = pinMutationIdentity(snapshot, java.util.UUID.randomUUID().toString())
@@ -218,9 +286,16 @@ internal class NativeOperations(private val c: BeaconClient) {
             }
             "/api/session/rename" -> return c.nativeRpc("session.title", json("session_id" to binding().runtimeSessionId, "title" to d.getString("title")))
             "/api/session/archive" -> {
-                val target = binding(); val hidden = d.optBoolean("archived", true)
-                return c.nativeRpc("session.set_hidden", json("session_id" to target.runtimeSessionId, "hidden" to hidden)).also {
-                    require(it.string("session_key") == target.storedSessionId && it.opt("hidden") == hidden) { "Archive change was not confirmed. Refresh before trying again." }
+                require(sid().matches(storedSessionId) && d.opt("archived") is Boolean) { "Choose a conversation to archive" }
+                val hidden = d.getBoolean("archived")
+                if (!hidden) {
+                    val meta = c.nativeGet("/api/sessions/${sid()}", mapOf("profile" to c.auth.profile))
+                    if (nativeSessionFlag(meta, "archived")) c.nativeRpc("session.archive", json("session_id" to sid(), "archived" to false)).also {
+                        require(it.string("session_key") == sid() && it.opt("archived") == false) { "Unarchive was not confirmed. Try again." }
+                    }
+                }
+                return c.nativeRpc("session.set_hidden", json("session_id" to sid(), "hidden" to hidden)).also {
+                    require(it.string("session_key") == sid() && it.opt("hidden") == hidden) { "Archive change was not confirmed. Refresh before trying again." }
                 }
             }
             "/api/session/delete" -> {
@@ -255,7 +330,10 @@ internal class NativeOperations(private val c: BeaconClient) {
                     val fresh = c.nativeRpc("session.resume", json("session_id" to b.storedSessionId, "close_on_disconnect" to false, "omit_messages" to false))
                     val updated = nativeSessionBinding(c.scope, fresh)
                     require(updated.scope == b.scope && updated.storedSessionId == b.storedSessionId) { "Model change returned another conversation. Refresh before sending." }
-                    return json("session" to withVoiceHistory(sessionProjection(fresh, updated), updated.storedSessionId), "deferred" to result.optBoolean("deferred"))
+                    val history = passiveHistory(updated.storedSessionId, fresh)
+                    // REST owns saved image receipts; the confirmed live snapshot owns model and run state.
+                    sessionProjection(fresh, updated).let { live -> live.keys().forEach { key -> if (key != "messages") history.put(key, live.opt(key)) } }
+                    return json("session" to history, "deferred" to result.optBoolean("deferred"))
                 }
                 if (d.has("workspace")) return c.nativeRpc("session.cwd.set", json("session_id" to b.runtimeSessionId, "cwd" to d.getString("workspace")))
                 throw ApiFailure(501, "These conversation settings are unavailable in native Hermes")
@@ -291,30 +369,54 @@ internal class NativeOperations(private val c: BeaconClient) {
                 return c.nativeGet("/api/files", d.string("path").takeIf(String::isNotBlank)?.let { mapOf("path" to it) } ?: emptyMap())
                     .put("_requested_path", d.string("path"))
             }
-            "/api/pc/file" -> { require(method == "GET"); return c.nativeGet("/api/plugins/beacon/mobile/files/text", mapOf("path" to d.getString("path"))).put("_pc", true) }
-            "/api/pc/file/save" -> { require(method == "POST"); return c.nativeRequest("/api/plugins/beacon/mobile/files/text", "POST", d) }
+            "/api/pc/file" -> { require(method == "GET"); return readTextFile(d.getString("path")).put("_pc", true) }
+            "/api/pc/file/save" -> { require(method == "POST"); return saveTextFile(d) }
             "/api/pc/file/create" -> { require(method == "POST"); return c.nativeRequest("/api/plugins/beacon/mobile/files/create", "POST", d) }
             "/api/list" -> return c.nativeGet("/api/fs/list", mapOf("path" to workspacePath(sid(), d.string("path", "."))))
-            "/api/file" -> return c.nativeGet("/api/fs/read-text", mapOf("path" to workspacePath(sid(), d.getString("path")))).apply { put("content", if (optBoolean("binary")) "" else opt("text")); if (optBoolean("binary")) put("edit_blocked_reason", "Binary preview is unavailable; download this file to view it"); if (optBoolean("truncated")) put("edit_blocked_reason", "File preview is truncated; download the complete file before editing") }
+            "/api/file" -> return readTextFile(workspacePath(sid(), d.getString("path")))
             "/api/file/create" -> return c.nativeRequest("/api/plugins/beacon/mobile/files/create", "POST", json("session_id" to sid(), "path" to workspacePath(sid(), d.getString("path")), "content" to d.string("content")))
             "/api/file/save" -> {
                 val path = workspacePath(sid(), d.getString("path"))
-                require(d.has("expected_content")) { "Reopen this file before saving; its disk revision is required." }
-                val text = d.string("content").replace("\r\n", "\n")
-                // Native previews stop at 512 KiB; include Windows newline expansion before committing.
-                require(text.toByteArray(Charsets.UTF_8).size.toLong() + text.count { it == '\n' } <= 512 * 1024 && '\u0000' !in text) { "The phone editor supports text files up to 512 KiB without binary characters. Your draft is kept." }
-                val latest = c.nativeGet("/api/fs/read-text", mapOf("path" to path))
-                require(!latest.optBoolean("truncated") && !latest.optBoolean("binary") && latest.string("text") == d.getString("expected_content")) { "This file changed on the computer. Reopen it before saving; your edits are retained." }
-                val result = c.nativeGet("/api/fs/write-text", method = "POST", data = json("path" to path, "content" to text))
-                val actual = c.nativeGet("/api/fs/read-text", mapOf("path" to path))
-                require(!actual.optBoolean("truncated") && !actual.optBoolean("binary")) { "Saved file preview is unavailable; reopen or download it before editing again." }
-                return result.put("content", actual.string("text")).put("byteSize", actual.optLong("byteSize")).put("path", actual.string("path", path))
+                return saveTextFile(d.copy().put("path", path))
             }
         }
         if (path.startsWith("/api/mobile/receipts/")) throw ApiFailure(501, "Native Hermes has no prompt receipt lookup. Refresh conversation history before deciding whether to resend; your draft is retained.")
         if (NativeOperationPolicy.direct(path, method)) return c.nativeGet(path, q + ("profile" to c.auth.profile), method, body, maxBytes)
         throw ApiFailure(501, "This operation is unavailable in native Hermes: ${path.removePrefix("/api/")}")
     }
+
+    private suspend fun nativeTextFile(path: String): JSONObject =
+        c.nativeGet("/api/fs/read-text", mapOf("path" to path, "profile" to c.auth.profile)).apply {
+            require(opt("text") is String) { "Reopen this file before editing it." }
+            put("content", if (optBoolean("binary")) "" else opt("text"))
+            if (optBoolean("binary") || '\uFFFD' in string("text")) put("edit_blocked_reason", "This file can't be edited here.")
+            else if (optBoolean("truncated")) put("edit_blocked_reason", "File preview is truncated; download the complete file before editing")
+        }
+
+    private suspend fun readTextFile(path: String): JSONObject = try {
+        c.nativeGet("/api/plugins/beacon/mobile/files/text", mapOf("path" to path))
+    } catch (error: ApiFailure) {
+        if (error.status != 404 && !(error.plugin && error.status == 401)) throw error
+        nativeTextFile(path)
+    }
+
+    private suspend fun saveTextFile(fields: JSONObject): JSONObject {
+        require(fields.opt("content") is String && fields.opt("expected_content") is String) { "Reopen this file before saving; its disk revision is required." }
+        val text = fields.string("content")
+        require(text.toByteArray(Charsets.UTF_8).size.toLong() + text.count { it == '\n' } <= 512 * 1024 && '\u0000' !in text) { "The phone editor supports text files up to 512 KiB without binary characters. Your draft is kept." }
+        try { return c.nativeRequest("/api/plugins/beacon/mobile/files/text", "POST", fields) }
+        catch (error: ApiFailure) { if (error.status != 404 && !(error.plugin && error.status == 401)) throw error }
+        val path = fields.getString("path")
+        val latest = nativeTextFile(path)
+        require('\uFFFD' !in latest.string("text") && '\uFFFD' !in fields.getString("expected_content")) { "This file can't be edited here." }
+        require(!latest.optBoolean("truncated") && !latest.optBoolean("binary") && latest.string("text") == fields.getString("expected_content")) { "This file changed on the computer. Reopen it before saving; your edits are retained." }
+        // Stock Hermes chooses platform newlines; preserving disk formatting requires the optional plugin.
+        val result = c.nativeGet("/api/fs/write-text", mapOf("profile" to c.auth.profile), "POST", json("path" to path, "content" to text.replace("\r\n", "\n")))
+        val actual = nativeTextFile(path)
+        require(!actual.optBoolean("truncated") && !actual.optBoolean("binary") && '\uFFFD' !in actual.string("text")) { "Saved file preview is unavailable; reopen or download it before editing again." }
+        return result.put("content", actual.string("text")).put("byteSize", actual.optLong("byteSize")).put("path", actual.string("path", path))
+    }
+
     /** The optional plugin's voice archive. Any failure, including its own 401, only marks voice history unavailable. */
     private suspend fun withVoiceHistory(snapshot: JSONObject, id: String): JSONObject {
         require(id.matches(storedSessionId)) { "Invalid native stored session identity" }
@@ -360,21 +462,54 @@ internal class NativeOperations(private val c: BeaconClient) {
             if (items.length() < limit) break
             offset += limit
         }
-        val listed = rows.filter { (id, row) -> query.isBlank() || row.string("title").contains(query, true) || id.contains(query, true) }
-        return json("sessions" to JSONArray(listed.map { (id, row) -> row.copy().put("session_id", id).put("profile", c.auth.profile).put("archived", archived) }),
+        // REST has no include_hidden option. Gateway session.list is read-only and does not resume an agent.
+        if (archived) {
+            rows.entries.removeAll { !nativeSessionFlag(it.value, "archived") }
+            val params = json("profile" to c.auth.profile, "limit" to SESSION_INDEX_WINDOW)
+            val visibleIds = c.nativeRpc("session.list", params).rows("sessions").map(::sessionRowId).toSet()
+            val candidates = c.nativeRpc("session.list", params.copy().put("include_hidden", true)).rows("sessions")
+                .filter { sessionRowId(it) !in visibleIds }.distinctBy(::sessionRowId)
+            val verified = coroutineScope {
+                val permits = Semaphore(6)
+                candidates.map { candidate -> async { permits.withPermit {
+                    val id = sessionRowId(candidate)
+                    require(id.matches(storedSessionId)) { "Conversation list is unavailable. Try again." }
+                    // Verify the flag, including when the two bounded list windows moved during the read.
+                    val row = try { c.nativeGet("/api/sessions/$id", mapOf("profile" to c.auth.profile)) }
+                        catch (error: ApiFailure) { if (error.status == 404) return@withPermit null else throw error }
+                    require(ownedByProfile(row) && row.string("id", row.string("session_id")) == id) { "Conversation list belongs to another profile" }
+                    val source = row.string("source").lowercase()
+                    if (nativeSessionFlag(row, "hidden") && candidate.optInt("message_count", row.optInt("message_count")) > 0 && source != "cron" &&
+                        (if (threads) source in setOf(BEACON_THREAD_SOURCE, "phone") else source !in hiddenSources)) id to row else null
+                } } }.awaitAll().filterNotNull()
+            }
+            verified.forEach { (id, row) -> rows[id] = row }
+        } else rows.entries.removeAll { nativeSessionFlag(it.value, "hidden") || nativeSessionFlag(it.value, "archived") }
+        val window = if (archived) rows.entries.sortedByDescending { (_, row) -> row.optDouble(if (order == "created") "started_at" else "last_active", row.optDouble("started_at", 0.0)) } else rows.entries.toList()
+        val listed = window.take(SESSION_INDEX_WINDOW).filter { (id, row) -> query.isBlank() || row.string("title").contains(query, true) || id.contains(query, true) }
+        return json("sessions" to JSONArray(listed.map { (id, row) -> row.copy().put("session_id", id).put("profile", c.auth.profile).put("archived", nativeSessionFlag(row, "archived") || nativeSessionFlag(row, "hidden")) }),
             "search_scope" to "Newest 200 conversation titles and identities", "limit" to SESSION_INDEX_WINDOW)
     }
 
     /**
      * Read-only transcript: stock metadata plus the newest [HISTORY_WINDOW] messages (Relay getSessionMessages, LATEST).
-     * No socket, resume or live identity: `runtime_session_id` and `active_stream_id` stay blank. The UI keeps the
-     * requested id; a compressed history is accepted only with a verified descendant chain to the returned id.
+     * Browsing creates no socket, resume or live identity. Model confirmation may supply an unprompted native shell
+     * before its first saved row. The UI keeps the requested id; compression still requires a verified descendant chain.
      */
-    private suspend fun passiveHistory(requested: String): JSONObject {
+    internal suspend fun passiveHistory(requested: String, liveShell: JSONObject? = null): JSONObject {
+        require(requested.matches(storedSessionId)) { "Invalid native stored session identity" }
         val scoped = mapOf("profile" to c.auth.profile)
-        val meta = c.nativeGet("/api/sessions/$requested", scoped)
+        val meta = try { c.nativeGet("/api/sessions/$requested", scoped) } catch (error: ApiFailure) {
+            val messages = liveShell?.optJSONArray("messages")
+            // Native unpersisted resumes name stored_session_id; only runtime pivots may precede the first prompt.
+            if (error.status != 404 || liveShell == null || liveShell.has("session_key") || liveShell.string("stored_session_id") != requested ||
+                messages == null || liveShell.opt("message_count") !is Number || liveShell.optDouble("message_count") != messages.length().toDouble() ||
+                messages.objects().size != messages.length() || messages.objects().any { it.string("display_kind") != "model_switch" } ||
+                liveShell.optBoolean("running") || liveShell.opt("inflight") !in listOf(null, JSONObject.NULL)) throw error
+            return withVoiceHistory(sessionProjection(liveShell, nativeSessionBinding(c.scope, liveShell)), requested)
+        }
         require(meta.string("id", meta.string("session_id")) == requested && ownedByProfile(meta)) { "Conversation scope changed" }
-        val page = c.nativeGet("/api/sessions/$requested/messages", scoped + mapOf("order" to "latest", "limit" to "$HISTORY_WINDOW", "offset" to "0"))
+        val page = c.nativeGet("/api/sessions/$requested/messages", scoped + mapOf("order" to "latest", "limit" to "$HISTORY_WINDOW", "offset" to "0", "inline_images" to "false"))
         val messages = page.opt("messages") as? JSONArray ?: error("Hermes returned an unreadable conversation history")
         require(ownedByProfile(page)) { "Conversation scope changed" }
         val resolved = page.string("session_id")
@@ -386,13 +521,61 @@ internal class NativeOperations(private val c: BeaconClient) {
             // Dashboard rows carry the SQLite row id as numeric `id`; gateway rows name it `row_id` (Relay MessageItem.resolvedRowId).
             val rowId = row.opt("id")
             if (!row.has("row_id") && (rowId is Number || rowId is String && rowId.toLongOrNull() != null)) row.put("row_id", rowId)
+            if (row.string("role") == "user") {
+                val content = row.string("content")
+                val paths = persistedImagePaths(content)
+                val attachments = row.optJSONArray("attachments") ?: JSONArray()
+                paths.filterNot { path -> attachments.objects().any { it.string("path") == path } }.forEach { path ->
+                    attachments.put(json("path" to path, "name" to path.substringAfterLast('/').substringAfterLast('\\')))
+                }
+                // Saved inline bytes stay authoritative even if the original file changes or disappears.
+                val images = Regex("(?m)^\\[image]$").findAll(content).toList()
+                if (row.optLong("row_id") > 0) images.forEachIndexed { imageIndex, _ ->
+                    val canonical = if (paths.size == images.size) attachments.objects().firstOrNull { it.string("path") == paths[imageIndex] && !it.has("history_image_index") } else null
+                    (canonical ?: json("name" to "Image ${imageIndex + 1}").also(attachments::put))
+                        .put("history_row_id", row.optLong("row_id")).put("history_image_index", imageIndex)
+                }
+                if (attachments.length() > 0) row.put("attachments", attachments)
+            }
             rows.put(row)
         }
         val returned = page.optJSONObject("pagination")?.optInt("returned", messages.length()) ?: messages.length()
         val projection = meta.copy().apply { remove("id"); remove("runtime_session_id"); remove("active_stream_id"); if (has("provider")) put("model_provider", opt("provider")); if (has("cwd")) put("workspace", opt("cwd")) }
             .put("session_id", requested).put("stored_session_id", resolved).put("profile", c.auth.profile)
+            .put("_history_metadata_stamp", nativeHistoryStamp(meta)?.let(::JSONArray))
             .put("messages", rows).put("history_limit", HISTORY_WINDOW).put("history_truncated", returned >= HISTORY_WINDOW)
-        return withVoiceHistory(projection, requested)
+        return withVoiceHistory(storedSessionSettings(projection), requested)
+    }
+
+    internal suspend fun historyImage(requested: String, rowId: Long, imageIndex: Int): NativeMediaBytes {
+        require(requested.matches(storedSessionId) && rowId > 0 && imageIndex in 0..499) { "Invalid historical image identity" }
+        val scoped = mapOf("profile" to c.auth.profile)
+        val page = try { c.nativeGet("/api/sessions/$requested/messages/around", scoped + mapOf("row_id" to "$rowId", "limit" to "1")) }
+        catch (error: ApiFailure) {
+            if (error.status != 404) throw error
+            // Around addresses current-session prompts; a compression ancestor can still be in the displayed newest window.
+            val compact = c.nativeGet("/api/sessions/$requested/messages", scoped + mapOf("order" to "latest", "limit" to "$HISTORY_WINDOW", "inline_images" to "false"))
+            require(ownedByProfile(compact)) { "Historical image belongs to another profile" }
+            val rows = compact.rows("messages")
+            val index = rows.indexOfFirst { it.optLong("id", it.optLong("row_id")) == rowId }
+            require(index >= 0) { "This image is outside the loaded history window. Reopen the conversation." }
+            c.nativeGet("/api/sessions/$requested/messages", scoped + mapOf("order" to "latest", "limit" to "1", "offset" to "${rows.size - index - 1}", "inline_images" to "true"))
+        }
+        require(ownedByProfile(page)) { "Historical image belongs to another profile" }
+        val resolved = page.string("session_id")
+        require(resolved.matches(storedSessionId)) { "Invalid historical conversation identity" }
+        if (resolved != requested) requireDescendant(requested, resolved, scoped)
+        val row = page.rows("messages").single()
+        require(row.optLong("id", row.optLong("row_id")) == rowId && row.string("role") == "user") { "Historical image message changed. Reopen it before previewing." }
+        val content = row.opt("content")
+        val parts = (content as? JSONArray)?.objects() ?: listOfNotNull(content as? JSONObject)
+        val part = parts.filter { it.string("type") in setOf("image_url", "input_image", "image") }.getOrNull(imageIndex) ?: error("Historical image is unavailable")
+        val source = part.optJSONObject("image_url")?.string("url") ?: part.string("image_url")
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+            val header = source.substringBefore(',').lowercase(java.util.Locale.ROOT)
+            require(source.length <= 32 * 1024 * 1024 && source.contains(',') && header.matches(Regex("data:image/(?:png|jpg|jpeg|gif|webp|avif|svg\\+xml);base64"))) { "Historical image exceeds the native preview limit or has an unsupported MIME type" }
+            NativeMediaBytes(java.util.Base64.getDecoder().decode(source.substringAfter(',')), header.removePrefix("data:").removeSuffix(";base64"))
+        }
     }
 
     /** A different returned id is a compression descendant only if the native chain runs from [requested] to [resolved]. */

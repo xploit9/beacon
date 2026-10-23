@@ -2,8 +2,10 @@ import importlib.util,json,sys
 from pathlib import Path
 from datetime import datetime,timedelta,timezone
 import threading
+import sqlite3
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor
 import pytest
 ROOT=Path(__file__).resolve().parents[1]
 def load(name):
@@ -11,6 +13,7 @@ def load(name):
 @pytest.fixture
 def env(tmp_path,monkeypatch):
     m=load('mobile');monkeypatch.setattr(m,'home',lambda:tmp_path)
+    monkeypatch.setattr(m,'time',SimpleNamespace(time=lambda:NOW.timestamp()))
     cfg={'owner_id':'owner','owner_provider':'basic','profiles':['default'],'scheduled_callbacks_enabled':True}
     monkeypatch.setattr(m,'settings',lambda profile=None:cfg)
     jobs=[]
@@ -73,9 +76,12 @@ def test_stale_or_changed_authority_does_not_ring(env):
     cb,m,n,cfg,jobs,tmp=env;cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
     with m.connect() as c:key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]
     assert cb.deliver(m,n,key,NOW+timedelta(seconds=180))['status']=='skipped_expired'
+    cb.schedule(m,n,'owner','basic',ROW,cfg,{**VALUE,'request_id':'changed-authority'},NOW)
+    with m.connect() as c:key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%' AND key!=?",(key,)).fetchone()[0]
     cfg['scheduled_callbacks_enabled']=False
     with pytest.raises(ValueError):cb.deliver(m,n,key,NOW+timedelta(seconds=60))
-    with m.connect() as c:assert c.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==0
+    with m.connect() as c:
+        assert c.execute("SELECT COUNT(*) FROM notices WHERE kind='incoming_call'").fetchone()[0]==0
 
 def test_expired_callback_replay_is_rejected_before_and_after_marker_pruning(env):
     cb,m,n,cfg,jobs,tmp=env
@@ -183,8 +189,193 @@ def test_prune_expired_uses_age_for_foreign_markers_and_keeps_unreadable_rows(en
         'scheduled-callback:'+('d'*64):b'not-json',
     }
     with m.connect() as c:c.executemany('INSERT INTO meta(key,value) VALUES(?,?)',rows.items())
-    cb.prune_expired(m,'owner',now)
+    cb.prune_expired(m,n,'owner',now)
     with m.connect() as c:
         remaining={key for (key,) in c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchall()}
     assert set(rows)-remaining==set(list(rows)[:2])
     assert set(list(rows)[2:])<=remaining
+
+
+@pytest.mark.parametrize('profile',['default','work'])
+def test_late_script_records_one_owned_missed_callback_without_ringing(env,profile):
+    cb,m,n,cfg,_,_=env
+    cfg['profiles']=['default','work']
+    cb.schedule(m,n,'owner','basic',{**ROW,'profile':profile},cfg,VALUE,NOW)
+    with m.connect() as c:key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]
+    late=NOW+timedelta(seconds=180)
+    assert cb.deliver(m,n,key,late)['status']=='skipped_expired'
+    assert cb.deliver(m,n,key,late)['status']=='skipped_expired'
+    with m.connect() as c:
+        rows=[dict(row) for row in c.execute('SELECT * FROM notices')]
+        record=json.loads(c.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()[0])
+    assert len(rows)==1 and rows[0]['kind']=='task_result'
+    assert (rows[0]['owner'],rows[0]['profile'],rows[0]['conversation'])==('owner',profile,'owned')
+    assert rows[0]['reason']=='Missed scheduled callback: Requested reminder'
+    assert record['status']=='missed' and not record.get('delivered')
+    assert cb.deliver(m,n,key,NOW+timedelta(seconds=60))['status']=='skipped_expired'
+
+
+@pytest.mark.parametrize('elapsed,status,kind',[(60,'scheduled','incoming_call'),(180,'missed','task_result')])
+def test_native_save_acknowledgment_preserves_an_already_settled_callback(env,elapsed,status,kind):
+    cb,m,n,cfg,_,_=env
+    cron=sys.modules['hermes_cli.web_server_cron'];create=cron._create_cron_job_sync
+    def late_save(model,profile):
+        with m.connect() as c:key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]
+        assert cb.deliver(m,n,key,NOW+timedelta(seconds=elapsed))['status']==('pending' if elapsed==60 else 'skipped_expired')
+        return create(model,profile)
+    cron._create_cron_job_sync=late_save
+    result=cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
+    assert result['status']==status
+    with m.connect() as c:
+        assert [row['kind'] for row in c.execute('SELECT kind FROM notices')]==[kind]
+        record=json.loads(c.execute("SELECT value FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0])
+    assert bool(record.get('delivered'))==(elapsed==60)
+
+
+@pytest.mark.parametrize('elapsed,kind',[(60,'incoming_call'),(180,'task_result')])
+def test_native_save_acknowledgment_excludes_a_concurrent_cron_writer(env,monkeypatch,elapsed,kind):
+    cb,m,n,cfg,jobs,home=env
+    other=load('mobile')
+    monkeypatch.setattr(other,'home',lambda:home)
+    monkeypatch.setattr(other,'time',SimpleNamespace(time=lambda:NOW.timestamp()))
+    monkeypatch.setattr(other,'settings',lambda profile=None:cfg)
+    with m.connect():pass
+    with other.connect():pass
+    assert other.LOCK is not m.LOCK
+    cron=sys.modules['hermes_cli.web_server_cron'];create=cron._create_cron_job_sync
+    saved=threading.Event();updating=threading.Event();release=threading.Event();timed_out=threading.Event()
+    def save(model,profile):
+        job=create(model,profile);saved.set();return job
+    cron._create_cron_job_sync=save
+    def trace(statement):
+        if saved.is_set() and not updating.is_set() and statement.startswith('UPDATE meta SET value='):
+            # SQLite tracing pauses the actual acknowledgment after its read, before its update.
+            updating.set()
+            if not release.wait(5):timed_out.set()
+    connect=m.connect;other_connect=other.connect
+    def receipt_connection():
+        conn=connect();conn.set_trace_callback(trace);return conn
+    def cron_connection():
+        conn=other_connect();conn.execute('PRAGMA busy_timeout=0');return conn
+    monkeypatch.setattr(m,'connect',receipt_connection)
+    monkeypatch.setattr(other,'connect',cron_connection)
+    blocked=None;concurrent=None
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        receipt=pool.submit(cb.schedule,m,n,'owner','basic',ROW,cfg,VALUE,NOW)
+        try:
+            assert updating.wait(5)
+            with other.connect() as c:key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]
+            try:concurrent=cb.deliver(other,n,key,NOW+timedelta(seconds=elapsed))
+            except sqlite3.OperationalError as exc:blocked=exc
+        finally:release.set()
+        result=receipt.result(timeout=5)
+    assert not timed_out.is_set()
+    with other.connect() as c:record=json.loads(c.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()[0])
+    assert blocked is not None and blocked.sqlite_errorcode==sqlite3.SQLITE_BUSY,(concurrent,record)
+    assert result['status']=='scheduled' and result['job_id']==jobs[0]['id'] and len(jobs)==1
+    assert cb.deliver(other,n,key,NOW+timedelta(seconds=elapsed))['status']==('pending' if elapsed==60 else 'skipped_expired')
+    assert cb.deliver(other,n,key,NOW+timedelta(seconds=elapsed))['status']==('duplicate' if elapsed==60 else 'skipped_expired')
+    assert cb.prune_expired(m,n,'owner',(NOW+timedelta(seconds=180)).timestamp())==0
+    with other.connect() as c:
+        record=json.loads(c.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()[0])
+        notices=[dict(row) for row in c.execute('SELECT * FROM notices')]
+    assert record['status']==('scheduled' if elapsed==60 else 'missed')
+    assert record.get('delivered')==(key.split(':')[1] if elapsed==60 else None)
+    assert [(row['kind'],row['owner'],row['profile'],row['conversation']) for row in notices]==[(kind,'owner','default','owned')]
+
+
+def test_poll_cleanup_recovers_skipped_native_oneshot_inside_the_prune_throttle(env):
+    cb,m,n,cfg,_,_=env
+    cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
+    cb.prune_expired(m,n,'owner',NOW.timestamp())
+    late=NOW+timedelta(seconds=180)
+    cb.prune_expired(m,n,'foreign',late.timestamp())
+    with m.connect() as c:assert c.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==0
+    cb.prune_expired(m,n,'owner',late.timestamp())
+    cb.prune_expired(m,n,'owner',late.timestamp())
+    with m.connect() as c:
+        assert c.execute("SELECT COUNT(*) FROM notices WHERE kind='incoming_call'").fetchone()[0]==0
+        assert c.execute("SELECT COUNT(*) FROM notices WHERE kind='task_result'").fetchone()[0]==1
+
+
+@pytest.mark.parametrize('changed',['owner','provider','profile','disabled','conversation'])
+def test_overdue_callback_cleanup_preserves_authority(env,changed):
+    cb,m,n,cfg,_,_=env
+    cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
+    with m.connect() as c:key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]
+    if changed=='owner':cfg['owner_id']='foreign'
+    if changed=='provider':cfg['owner_provider']='foreign'
+    if changed=='profile':cfg['profiles']=['other']
+    if changed=='disabled':cfg['scheduled_callbacks_enabled']=False
+    if changed=='conversation':n.verify=lambda *args:(_ for _ in ()).throw(LookupError('conversation no longer owned'))
+    late=NOW+timedelta(seconds=180)
+    cb.prune_expired(m,n,'owner',late.timestamp())
+    assert cb.deliver(m,n,key,late)['status']=='skipped_expired'
+    with m.connect() as c:
+        assert c.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==0
+        record=json.loads(c.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()[0])
+    assert record['status']=='scheduled' and not record.get('delivered')
+
+
+def test_concurrent_late_delivery_and_poll_cleanup_share_one_terminal_notice(env,monkeypatch):
+    cb,m,n,cfg,_,home=env
+    cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
+    other=load('mobile')
+    monkeypatch.setattr(other,'home',lambda:home)
+    monkeypatch.setattr(other,'time',SimpleNamespace(time=lambda:NOW.timestamp()))
+    monkeypatch.setattr(other,'settings',lambda profile=None:cfg)
+    with other.connect():pass
+    with m.connect() as c:key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]
+    late=NOW+timedelta(seconds=180);start=threading.Barrier(4)
+    def settle(index):
+        start.wait(timeout=3)
+        mobile=m if index%2 else other
+        if index<2:return cb.deliver(mobile,n,key,late)
+        return cb.prune_expired(mobile,n,'owner',late.timestamp())
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(settle,range(4)))
+    with m.connect() as c:
+        assert c.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==1
+        assert c.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'missed-callback:%'").fetchone()[0]==1
+        assert json.loads(c.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()[0])['status']=='missed'
+
+
+def test_missed_notice_and_terminal_marker_roll_back_together(env,monkeypatch):
+    cb,m,n,cfg,_,_=env
+    cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
+    with m.connect() as c:key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]
+    notice=cb.observers._notice
+    def fail_after_notice(*args,**kwargs):
+        notice(*args,**kwargs)
+        raise RuntimeError('fixture transaction failure after notice insertion')
+    monkeypatch.setattr(cb.observers,'_notice',fail_after_notice)
+    late=NOW+timedelta(seconds=180)
+    with pytest.raises(RuntimeError,match='fixture transaction failure'):
+        cb.deliver(m,n,key,late)
+    with m.connect() as c:
+        assert c.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==0
+        assert c.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'missed-callback:%'").fetchone()[0]==0
+        assert json.loads(c.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()[0])['status']=='scheduled'
+    monkeypatch.setattr(cb.observers,'_notice',notice)
+    assert cb.deliver(m,n,key,late)['status']=='skipped_expired'
+    with m.connect() as c:assert c.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==1
+
+
+def test_poll_callback_recovery_is_bounded_and_retains_marker_lifetime(env):
+    cb,m,n,cfg,_,_=env
+    target=NOW+timedelta(seconds=60)
+    records=[('scheduled-callback:'+f'{index:064x}',json.dumps({
+        'owner':'owner','provider':'basic','profile':'default','conversation':'owned',
+        'scheduled_at':target.isoformat(),'reason':'Requested reminder','status':'scheduled',
+    }).encode()) for index in range(cb.CALLBACK_MARKER_PRUNE_BATCH+1)]
+    with m.connect() as c:c.executemany('INSERT INTO meta(key,value) VALUES(?,?)',records)
+    late=target+timedelta(seconds=120)
+    cb.prune_expired(m,n,'owner',late.timestamp())
+    with m.connect() as c:assert c.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==cb.CALLBACK_MARKER_PRUNE_BATCH
+    cb.prune_expired(m,n,'owner',late.timestamp())
+    with m.connect() as c:assert c.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==len(records)
+    expiry=target+timedelta(seconds=cb.CALLBACK_MARKER_RETENTION_SECONDS+2)
+    cb.prune_expired(m,n,'owner',expiry.timestamp())
+    with m.connect() as c:
+        assert c.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]==1
+        assert c.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'missed-callback:%'").fetchone()[0]==1

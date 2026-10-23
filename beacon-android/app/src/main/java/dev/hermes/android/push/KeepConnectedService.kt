@@ -11,6 +11,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.Uri
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
@@ -61,6 +63,7 @@ internal class KeepConnectedPageException : IOException()
 private class KeepConnectedProfilesException : IOException()
 
 internal const val KEEP_CONNECTED_LONG_POLL_SECONDS = 25
+internal const val KEEP_CONNECTED_POLL_TIMEOUT_MILLIS = 35_000L
 internal const val KEEP_CONNECTED_MAX_PROFILE_POLLS = 8
 
 internal fun parseKeepConnectedPage(response: JSONObject, after: Long): KeepConnectedPage {
@@ -202,6 +205,7 @@ internal class KeepConnectedPoller(
             val retryAt = profileFailures[primaryProfile]?.retryAtMillis ?: cycleNow
             return KeepConnectedCycle.Reconnecting((retryAt - cycleNow).coerceAtLeast(1L))
         }
+        var anySucceeded = false
         try {
             coroutineScope {
                 // Eight keeps the normal five-profile owner concurrent while bounding larger accounts.
@@ -225,6 +229,7 @@ internal class KeepConnectedPoller(
                 try {
                     while (completedProfiles.size < due.size) {
                         val result = channel.receive()
+                        if (result.failure == null) anySucceeded = true
                         recordProfileResult(result)
                         if (completedProfiles.add(result.profile) && result.failure == null && completedProfiles.size < due.size) {
                             firstPollAcks.getValue(result.profile).complete(Unit)
@@ -235,6 +240,7 @@ internal class KeepConnectedPoller(
                     withContext(NonCancellable) { workers.joinAll() }
                     while (true) {
                         val queued = channel.tryReceive().getOrNull() ?: break
+                        if (queued.failure == null) anySucceeded = true
                         recordProfileResult(queued)
                     }
                     channel.close()
@@ -249,7 +255,7 @@ internal class KeepConnectedPoller(
         }
         val primaryFailure = profileFailures[primaryProfile]
         return if (primaryFailure == null) KeepConnectedCycle.Connected
-        else KeepConnectedCycle.Reconnecting((primaryFailure.retryAtMillis - nowMillis()).coerceAtLeast(1L))
+        else KeepConnectedCycle.Reconnecting(if (anySucceeded) KEEP_CONNECTED_MIN_CYCLE_MILLIS else (primaryFailure.retryAtMillis - nowMillis()).coerceAtLeast(1L))
     }
 
     private suspend fun pollProfile(profile: String, permits: Semaphore): ProfilePollResult {
@@ -396,10 +402,38 @@ class KeepConnectedService : Service() {
     private var pollOrigin: String? = null
     private var pollOwner: String? = null
     private var promoted = false
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    private fun restartPoll(origin: String, owner: String) {
+        val previous = pollJob
+        previous?.cancel()
+        pollOrigin = origin
+        pollOwner = owner
+        pollJob = serviceScope.launch {
+            previous?.join()
+            runLoop(origin, owner)
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         activeInstance = this
+        val connectivity = getSystemService(ConnectivityManager::class.java) ?: return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) = networkChanged()
+            override fun onLost(network: Network) = networkChanged()
+            private fun networkChanged() {
+                android.os.Handler(mainLooper).post {
+                    if (activeInstance === this@KeepConnectedService && isEnabled(this@KeepConnectedService)) {
+                        val origin = pollOrigin
+                        val owner = pollOwner
+                        if (origin != null && owner != null) restartPoll(origin, owner)
+                    }
+                }
+            }
+        }
+        try { connectivity.registerDefaultNetworkCallback(callback); networkCallback = callback }
+        catch (_: Exception) { /* Poll timeout still bounds recovery if Android refuses the callback. */ }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -429,16 +463,15 @@ class KeepConnectedService : Service() {
         val origin = prefs.getString(KEY_ORIGIN, "").orEmpty()
         val owner = prefs.getString(KEY_OWNER, "").orEmpty()
         if (keepConnectedLoopNeedsRestart(pollJob?.isActive == true, pollOrigin, pollOwner, origin, owner)) {
-            pollJob?.cancel()
-            pollOrigin = origin
-            pollOwner = owner
-            pollJob = serviceScope.launch { runLoop(origin, owner) }
+            restartPoll(origin, owner)
         }
         return START_STICKY
     }
 
     override fun onDestroy() {
         pollJob?.cancel()
+        networkCallback?.let { runCatching { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(it) } }
+        networkCallback = null
         pollOrigin = null
         pollOwner = null
         serviceScope.cancel()
@@ -476,11 +509,12 @@ class KeepConnectedService : Service() {
         var client: BeaconClient? = null
         var authorizedProfiles = emptyList<String>()
         var profileDisplayNames = emptyMap<String, String>()
+        var profilesReadAt = 0L
         val poller = KeepConnectedPoller(
             origin = origin,
             owner = owner,
             cursors = cursors,
-            profiles = {
+            profiles = profiles@ {
                 val auth = app.auth.read(origin)
                 val cached = auth.cachedScopeFor(origin, replacingAccount = false)
                 if (cached == null || cached.owner != owner) throw NativeAuthExpiredException()
@@ -488,8 +522,10 @@ class KeepConnectedService : Service() {
                 if (current == null || current.auth.profile != auth.profile || current.auth.bearer != auth.bearer) {
                     current?.closeNative()
                     client = createClient(app, auth)
+                    profilesReadAt = 0L
                 }
                 val profileClient = requireNotNull(client)
+                if (profilesReadAt > 0 && SystemClock.elapsedRealtime() - profilesReadAt < 300_000L) return@profiles authorizedProfiles
                 val profiles = try { profileClient.nativeGet("/api/profiles").rows("profiles") }
                 catch (error: NativeAuthExpiredException) { throw error }
                 catch (error: CancellationException) { throw error }
@@ -502,6 +538,7 @@ class KeepConnectedService : Service() {
                     val id = row.string("name").trim()
                     id to (row.string("display_name").trim().takeIf(String::isNotBlank) ?: id)
                 }
+                if (profiles != null && authorizedProfiles.isNotEmpty()) profilesReadAt = SystemClock.elapsedRealtime()
                 authorizedProfiles
             },
                 poll = { profile, after ->
@@ -511,6 +548,7 @@ class KeepConnectedService : Service() {
                         authorizedProfiles,
                         query = mapOf("after" to after.toString(), "wait" to KEEP_CONNECTED_LONG_POLL_SECONDS.toString(), "package" to BuildConfig.APPLICATION_ID),
                         maxBytes = 1_048_576,
+                        timeoutMillis = KEEP_CONNECTED_POLL_TIMEOUT_MILLIS,
                     )
                     parseKeepConnectedPage(response, after)
                 },
@@ -733,7 +771,9 @@ class KeepConnectedService : Service() {
         }
 
         private fun setStatus(context: Context, status: String, reason: String = "") {
-            preferences(context).edit().putString(KEY_STATUS, status).putString(KEY_REASON, reason).apply()
+            val prefs = preferences(context)
+            if (prefs.getString(KEY_STATUS, null) == status && prefs.getString(KEY_REASON, "") == reason) return
+            prefs.edit().putString(KEY_STATUS, status).putString(KEY_REASON, reason).apply()
             activeInstance?.updateNotification()
         }
 

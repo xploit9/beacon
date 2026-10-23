@@ -8,12 +8,15 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.ui.platform.testTag
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -24,13 +27,18 @@ import dev.hermes.android.core.*
 import org.json.JSONArray
 import org.json.JSONObject
 
-@Composable fun NativeCatalog(vm: BeaconViewModel) {
+@Composable fun NativeCatalog(vm: BeaconViewModel, containedActions: Boolean = false) {
     val kind by vm.catalog.collectAsStateWithLifecycle()
     if (kind.isBlank()) return
     val data by vm.data.collectAsStateWithLifecycle()
     val refreshing by vm.refreshing.collectAsStateWithLifecycle()
     val chat by vm.chat.collectAsStateWithLifecycle()
     val reasoningSaving by vm.reasoningSaving.collectAsStateWithLifecycle()
+    val modelSaving by vm.modelSaving.collectAsStateWithLifecycle()
+    val pending by vm.conversationPending.collectAsStateWithLifecycle()
+    val scopeKey = vm.client?.scope?.session(chat.sessionId)?.key
+    val modelPending = modelSaving.isNotBlank() || "$scopeKey|/api/session/update" in pending
+    val reasoningPending = reasoningSaving || "$scopeKey|/api/reasoning" in pending
     var query by rememberSaveable(kind, chat.sessionId) { mutableStateOf("") }
     Dialog(vm::closeCatalog, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface(Modifier.widthIn(max = 900.dp).fillMaxWidth().fillMaxHeight(.92f).padding(12.dp), shape = MaterialTheme.shapes.extraLarge, color = MaterialTheme.colorScheme.surface.copy(alpha = 1f)) {
@@ -38,7 +46,7 @@ import org.json.JSONObject
                 Header(kind, chat.title, actions = {
                     if (kind == "Reasoning" || kind == "Model & provider") IconButton(
                         onClick = { vm.openCatalog(kind) },
-                        enabled = if (kind == "Reasoning") !reasoningSaving && "picker:reasoning" !in refreshing else "picker:models" !in refreshing,
+                        enabled = if (kind == "Reasoning") !reasoningPending && "picker:reasoning" !in refreshing else !modelPending && "picker:models" !in refreshing,
                     ) {
                         Icon(Icons.Rounded.Refresh, uiText(if (kind == "Reasoning") "Reload reasoning choices" else "Refresh models"))
                     }
@@ -47,13 +55,19 @@ import org.json.JSONObject
                 when (kind) {
                     "Model & provider" -> {
                         val catalog = data["picker:models"]
-                        val loading = "picker:models" in refreshing
-                        val groups = remember(catalog, query) { catalog?.rows("groups").orEmpty().map { group ->
+                        val loading = catalog == null || "picker:models" in refreshing
+                        // Hermes may omit the session's provider; then the group holding the current model is the current one.
+                        val currentProvider = chat.raw.string("model_provider").ifBlank {
+                            catalog?.rows("groups").orEmpty().firstOrNull { g -> (g.rows("models") + g.rows("extra_models")).any { it.string("id") == chat.raw.string("model") } }?.string("provider_id").orEmpty()
+                        }
+                        val groups = remember(catalog, query, currentProvider) { catalog?.rows("groups").orEmpty().map { group ->
                             val provider = group.string("provider", group.string("label", group.string("provider_id")))
                             group to (group.rows("models") + group.rows("extra_models")).distinctBy { it.string("id") }.filter { modelSearchMatches(provider, it.string("id"), it.string("label"), query) }
-                        }.filter { it.second.isNotEmpty() } }
+                        }.filter { it.second.isNotEmpty() }.sortedBy { it.first.string("provider_id") != currentProvider } }
                         OutlinedTextField(query, { query = it }, label = { Text(uiText("Search model or provider")) }, singleLine = true, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp))
                         LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(16.dp)) {
+                            if (loading) item { Column(Modifier.testTag("models-loading")) { LinearProgressIndicator(Modifier.fillMaxWidth()); Text("Loading models…", Modifier.padding(vertical = 12.dp)) } }
+                            if (modelPending && modelSaving.isBlank()) item { LinearProgressIndicator(Modifier.fillMaxWidth()); Text("Applying model…") }
                             groups.forEach { (group, models) ->
                                 val provider = group.string("provider_id")
                                 val label = group.string("provider", group.string("label", provider))
@@ -61,14 +75,43 @@ import org.json.JSONObject
                                     item { Text(label, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(vertical = 12.dp)) }
                                     items(models, key = { provider to it.string("id") }) { model ->
                                         val id = model.string("id")
-                                        ListItem(headlineContent = { Text(model.string("label", id)) }, supportingContent = { Text(id, style = MaterialTheme.typography.bodySmall) }, trailingContent = { if (chat.raw.string("model") == id && chat.raw.string("model_provider") == provider) Text(uiText("Selected"), color = MaterialTheme.colorScheme.primary) }, modifier = Modifier.clickable { vm.pickModel(id, provider) }.heightIn(min = 64.dp))
+                                        val title = model.string("label", id)
+                                        val selected = chat.raw.string("model") == id && currentProvider == provider
+                                        ListItem(headlineContent = { Text(title) },
+                                            supportingContent = if (modelSubtitle(title, id).isNotBlank()) ({ Text(id, style = MaterialTheme.typography.bodySmall) }) else null,
+                                            trailingContent = { when {
+                                                modelSaving == "$provider:$id" -> CircularProgressIndicator(Modifier.size(24.dp).testTag("model-applying"), strokeWidth = 2.dp)
+                                                selected -> Icon(Icons.Rounded.Check, "Selected", tint = MaterialTheme.colorScheme.primary)
+                                            } },
+                                            modifier = Modifier.testTag("model:$provider:$id").semantics { this.selected = selected }.clickable(enabled = !loading && !modelPending) { vm.pickModel(id, provider) }.heightIn(min = 64.dp))
                                     }
                                 }
                             }
-                            item { if (catalog == null || loading) LinearProgressIndicator(Modifier.fillMaxWidth()); if (catalog != null && !loading && recordError(catalog).isBlank() && groups.isEmpty()) Text("No matching models. Try another search."); recordError(catalog).takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.error) }; TextButton(onClick = { vm.closeCatalog(); vm.openForm(ActionForm("Custom model", "/api/session/update", listOf(Field("model", required = true), Field("model_provider", "Provider ID")), json("session_id" to chat.sessionId))) }) { Text(uiText("Enter a configured model ID")) } }
+                            item {
+                                if (catalog != null && !loading && recordError(catalog).isBlank() && groups.isEmpty()) Text("No matching models. Try another search.")
+                                if (recordError(catalog).isNotBlank()) Text("Couldn't load models. Tap refresh to try again.", color = MaterialTheme.colorScheme.error)
+                                val enterCustomModel = { vm.closeCatalog(); vm.openForm(ActionForm("Custom model", "/api/session/update", listOf(Field("model", required = true), Field("model_provider", "Provider ID")), json("session_id" to chat.sessionId))) }
+                                if (!loading) {
+                                    if (containedActions) OutlinedButton(onClick = enterCustomModel, enabled = !modelPending, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Enter a configured model ID")) }
+                                    else TextButton(onClick = enterCustomModel, enabled = !modelPending) { Text(uiText("Enter a configured model ID")) }
+                                }
+                            }
                         }
                     }
-                    "Toolsets" -> NativeToolSettings(vm)
+                    "Toolsets" -> {
+                        val record = data["picker:toolsets"]
+                        Column(Modifier.fillMaxSize().padding(20.dp).testTag("chat-toolsets")) {
+                            Text("Toolsets are shared by all chats in this profile.")
+                            TextButton(onClick = { vm.closeCatalog(); vm.more("Tools & commands") }, modifier = Modifier.testTag("toolsets-profile-settings")) { Text("Change for all chats") }
+                            if (record == null || "picker:toolsets" in refreshing) LinearProgressIndicator(Modifier.fillMaxWidth())
+                            if (recordError(record).isNotBlank()) Text("Couldn't load toolsets. Reopen to try again.", color = MaterialTheme.colorScheme.error)
+                            LazyColumn(Modifier.weight(1f)) {
+                                items(record?.rows("items").orEmpty(), key = { it.string("name") }) { row ->
+                                    ListItem(headlineContent = { Text(row.string("label", row.string("name"))) }, supportingContent = { Text(if (row.optBoolean("enabled")) "Enabled for this profile" else "Disabled for this profile") })
+                                }
+                            }
+                        }
+                    }
                     "Reasoning" -> {
                         val value = data["picker:reasoning"]
                         val options = value?.optJSONArray("options")?.strings().orEmpty()
@@ -78,9 +121,9 @@ import org.json.JSONObject
                             if (value == null || "picker:reasoning" in refreshing) ReasoningSkeleton()
                             else if (recordError(value).isNotBlank()) Text("Reasoning options are unavailable. Your current setting is unchanged.", color = MaterialTheme.colorScheme.error)
                             else if (options.isNotEmpty()) {
-                                value.string("value").takeIf(String::isNotBlank)?.let { Text("Current: ${it.replaceFirstChar(Char::uppercase)}", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                                options.forEach { option -> ReasoningLevelOption(option, level == option, enabled = !reasoningSaving) { level = option } }
-                                Button(onClick = { vm.setReasoning(level) }, enabled = !reasoningSaving && level in options, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text(if (reasoningSaving) "Applying…" else "Apply to conversation") }
+                                value.string("value").takeIf(String::isNotBlank)?.let { Text("Current: ${reasoningLevelLabel(it)}", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                                options.forEach { option -> ReasoningLevelOption(option, level == option, enabled = !reasoningPending) { level = option } }
+                                Button(onClick = { vm.setReasoning(level) }, enabled = !reasoningPending && level in options, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text(if (reasoningPending) "Applying…" else "Apply to conversation") }
                             } else if (value.optBoolean("known")) Text("This model manages reasoning automatically.")
                             else Text("No reasoning choices are available.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
@@ -89,6 +132,20 @@ import org.json.JSONObject
             }
         }
     }
+}
+
+internal fun modelSubtitle(title: String, id: String): String = id.takeUnless { it == title }.orEmpty()
+internal fun reasoningLevelLabel(level: String): String = if (level == "xhigh") "Extra high" else level.replaceFirstChar(Char::uppercase)
+internal fun reasoningLevelDescription(level: String): String = when (level.lowercase()) {
+    "none" -> "Respond without a separate reasoning step"
+    "minimal" -> "Use the least reasoning for quick replies"
+    "low" -> "Faster, lighter responses"
+    "medium" -> "Balanced detail"
+    "high" -> "More detailed reasoning"
+    "xhigh" -> "Spend more time on difficult problems"
+    "max" -> "Use the model's maximum reasoning budget"
+    "ultra" -> "Use extended reasoning when the provider supports it"
+    else -> "Use the model's default reasoning"
 }
 
 @Composable private fun ReasoningLevelOption(level: String, selected: Boolean, enabled: Boolean, onSelect: () -> Unit) {
@@ -103,8 +160,8 @@ import org.json.JSONObject
         Row(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
             RadioButton(selected, onClick = null, enabled = enabled)
             Column(Modifier.padding(start = 8.dp)) {
-                Text(level.replaceFirstChar(Char::uppercase), style = MaterialTheme.typography.titleSmall)
-                Text(when (level.lowercase()) { "low" -> "Faster, lighter responses"; "medium" -> "Balanced detail"; "high" -> "More detailed reasoning"; else -> "Reasoning level for this chat" }, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(reasoningLevelLabel(level), style = MaterialTheme.typography.titleSmall)
+                Text(reasoningLevelDescription(level), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
@@ -141,8 +198,8 @@ import org.json.JSONObject
             if (page == "Session usage") IconButton(onClick = { vm.load("native-usage:${ui.profile}:${chat.sessionId}", "/api/session/usage", mapOf("session_id" to chat.sessionId)) }, enabled = "native-usage:${ui.profile}:${chat.sessionId}" !in refreshing) { Icon(Icons.Rounded.Refresh, uiText("Refresh usage")) }
         })
         when (page) {
-            "Tools & commands" -> NativeToolSettings(vm)
-            "MCP servers" -> NativeToolSettings(vm, mcp = true)
+            "Tools & commands" -> NativeToolSettings(vm, containedActions = true)
+            "MCP servers" -> NativeToolSettings(vm, mcp = true, containedActions = true)
             "Providers & models" -> Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 Text("Model for this chat.")
                 Text(chat.title, style = MaterialTheme.typography.titleMedium)

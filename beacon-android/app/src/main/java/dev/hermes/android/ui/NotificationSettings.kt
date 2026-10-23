@@ -243,10 +243,17 @@ import org.json.JSONObject
                 modifier = Modifier.testTag("keep-connected-reason"),
             )
             if (keepConnectedEnabled && !deviceAllowed) Text("Android notifications are off; incoming call alerts may be hidden.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            if (optimized && !restricted) OutlinedButton(
+                onClick = { if (!requestBackgroundUse(context)) vm.notice("Open Beacon’s app settings in Android and allow background use.") },
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            ) {
+                Icon(Icons.Rounded.OpenInNew, null)
+                Text("Allow background use", Modifier.padding(start = 8.dp))
+            }
         } }
         if (vm.app.firebaseConfigured) {
-            if (pushStatus?.has("_error") == true) TextButton(enabled = !busy, onClick = { vm.load("push-status", "/api/plugins/beacon/mobile/notifications/status") }) { Text("Retry notification status") }
-            else if (target != null && !registered && serverReady && deviceAllowed) TextButton(enabled = !busy, onClick = { enable() }) { Text("Retry registration") }
+            if (pushStatus?.has("_error") == true) OutlinedButton(enabled = !busy, onClick = { vm.load("push-status", "/api/plugins/beacon/mobile/notifications/status") }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Retry notification status") }
+            else if (target != null && !registered && serverReady && deviceAllowed) OutlinedButton(enabled = !busy, onClick = { enable() }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Retry registration") }
             OutlinedButton(onClick = { busy = true; operationError = ""; val owner = vm.client?.scope; scope.launch { var accepted = false; vm.action("/api/plugins/beacon/mobile/notifications/test", json("kind" to "fcm"), refresh = false) { _, _ -> accepted = true; vm.notice("Test sent.") }.join(); if (vm.client?.scope == owner) { if (!accepted) operationError = vm.ui.value.error.ifBlank { "Couldn’t queue a test. Try again." }; busy = false; vm.load("push-status", "/api/plugins/beacon/mobile/notifications/status") } } }, enabled = !busy && serverReady && registered && deviceAllowed) { Text(uiText("Send a test notification")) }
         }
         Glass(Modifier.fillMaxWidth()) {
@@ -256,27 +263,38 @@ import org.json.JSONObject
                 }
             }
         }
-        TextButton(onClick = { vm.tab("Tasks") }) { Text("Check-up calls and schedules") }
+        OutlinedButton(onClick = { vm.tab("Tasks") }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Check-up calls and schedules") }
         if (liveUpdatesSettings != null) {
             Text("Live Updates", style = MaterialTheme.typography.titleMedium)
             Text(if (liveUpdatesAllowed) "Calls, ongoing work and requests can appear in your phone’s status chip. Tap to return or respond." else "Enable Live Updates in Android to keep calls, work and requests in the status bar.", style = MaterialTheme.typography.bodyMedium)
-            TextButton(onClick = { runCatching { context.startActivity(liveUpdatesSettings) }.onFailure { vm.notice("Open Android notification settings to manage Live Updates") } }) { Text("Manage Live Updates") }
+            OutlinedButton(onClick = { runCatching { context.startActivity(liveUpdatesSettings) }.onFailure { vm.notice("Open Android notification settings to manage Live Updates") } }, modifier = Modifier.heightIn(min = 48.dp)) {
+                Icon(Icons.Rounded.OpenInNew, null)
+                Text("Manage Live Updates", Modifier.padding(start = 8.dp))
+            }
         }
         val manager = context.getSystemService(android.app.NotificationManager::class.java)
         dev.hermes.android.push.ensureActivityChannels(manager)
         Text("Notification types", style = MaterialTheme.typography.titleMedium)
         Text("Choose sound, vibration and visibility in Android settings.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         listOf("Messages" to "hermes-messages", "Calls" to dev.hermes.android.push.incomingCallChannel(manager), "Tasks" to "hermes-tasks", "Questions and permissions" to dev.hermes.android.push.promptNotificationChannel(manager), "Updates" to "hermes-updates").forEach { (label, channel) ->
-            TextButton(onClick = { context.startActivity(Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName).putExtra(Settings.EXTRA_CHANNEL_ID, channel)) }, modifier = Modifier.fillMaxWidth()) { Text(label, Modifier.weight(1f)); Icon(Icons.Rounded.OpenInNew, null) }
+            OutlinedButton(onClick = { context.startActivity(Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName).putExtra(Settings.EXTRA_CHANNEL_ID, channel)) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+                Icon(Icons.Rounded.OpenInNew, null)
+                Text(label, Modifier.weight(1f).padding(start = 8.dp))
+            }
         }
-        TextButton(onClick = { context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)) }) { Text(uiText("Android notification settings")) }
+        OutlinedButton(onClick = { context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)) }, modifier = Modifier.heightIn(min = 48.dp)) {
+            Icon(Icons.Rounded.OpenInNew, null)
+            Text(uiText("Android notification settings"), Modifier.padding(start = 8.dp))
+        }
         Text("Background delivery",style=MaterialTheme.typography.titleMedium)
         Text(when { restricted -> "Android is restricting Beacon in the background. Open app settings and allow background activity."; optimized -> "Battery optimization is on. If alerts arrive late, allow background activity in your phone’s app or battery settings."; else -> "Android battery optimization is off for Beacon." },color=if(restricted) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
-        if (optimized && !restricted) TextButton(onClick = { if (!requestBackgroundUse(context)) vm.notice("Open Beacon’s app settings in Android and allow background use.") }) { Text("Allow background use") }
         Text("Shows a quiet notification and uses some battery.", style=MaterialTheme.typography.bodySmall, color=MaterialTheme.colorScheme.onSurfaceVariant)
         Text("Keep Tailscale on. On Honor phones, allow Beacon to run in the background.",style=MaterialTheme.typography.bodySmall)
         Text("After a force stop, open Beacon once to receive calls again.",style=MaterialTheme.typography.bodySmall)
-        TextButton(onClick={runCatching { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:${context.packageName}"))) }.onFailure { vm.notice("Open Beacon’s app settings in Android") }}) { Text("Open background app settings") }
+        OutlinedButton(onClick={runCatching { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:${context.packageName}"))) }.onFailure { vm.notice("Open Beacon’s app settings in Android") } }, modifier = Modifier.heightIn(min = 48.dp)) {
+            Icon(Icons.Rounded.OpenInNew, null)
+            Text("Open background app settings", Modifier.padding(start = 8.dp))
+        }
     }
 }
 

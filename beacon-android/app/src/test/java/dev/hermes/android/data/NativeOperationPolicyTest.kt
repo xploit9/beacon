@@ -70,10 +70,15 @@ class NativeOperationPolicyTest {
     }
 
     @Test fun onlyAConversationsOwnSidebarPatchIsAllowed() {
-        // Hermes sets a pin only through PATCH /api/sessions/{id}; nothing else on those routes may change data.
+        // Stock Hermes keeps the revision-checked pin fallback.
         assertTrue(NativeOperationPolicy.direct("/api/sessions/session-a", "PATCH"))
         for (path in listOf("/api/sessions", "/api/sessions/search", "/api/sessions/owner-backfill", "/api/sessions/session-a/messages", "/api/sessions/session-a/timeline"))
             assertFalse("PATCH " + path, NativeOperationPolicy.direct(path, "PATCH"))
+    }
+
+    @Test fun gatewaySafePinRouteOnlyAcceptsPost() {
+        assertTrue(NativeOperationPolicy.direct("/api/plugins/beacon/sessions/pin", "POST"))
+        for (method in listOf("GET", "PUT", "PATCH", "DELETE")) assertFalse(NativeOperationPolicy.direct("/api/plugins/beacon/sessions/pin", method))
     }
 
     @Test fun clientBoundariesRejectSessionMutationsBeforeTransport() = runBlocking<Unit> {

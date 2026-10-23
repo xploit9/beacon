@@ -4,7 +4,7 @@ The preview is Beacon's debug build for testing. It installs separately from the
 
 ## Stable channel
 - The `stable` build type has application ID `dev.hermes.android.stable` and launcher label "Beacon", so it installs beside production and the preview.
-- The current stable version is code `110`, version `1.1.0`. It inherits release minification and is not debuggable.
+- The current source builds stable version code `112`, version `1.1.2`. It inherits release minification and is not debuggable; this identifies the source configuration, not a newly accepted or published binary.
 - A stable APK is unsigned unless `beaconStableSigning` (or `BEACON_STABLE_SIGNING`) points to an external properties file with the four Android signing fields. Never store that file or its keystore in this repository. The stable signer is separate from production.
 - Release assets are named `Beacon-<version>.apk` and `Beacon-<version>.json`; Settings **App updates** checks the public GitHub release through the owner's Hermes plugin and verifies the APK before installation.
 
@@ -15,7 +15,7 @@ Production and stable builds offer default-on app and plugin automatic updates i
 ## What the preview is
 - It is the existing `debug` build type. Nothing else is added (no product flavors, no new dependencies).
 - Application ID `dev.hermes.android.debug`, so it installs **next to** production `dev.hermes.android` and never upgrades it.
-- Version name `1.0.0-preview`. The launcher label is "Beacon Preview" (set only in `app/src/debug/AndroidManifest.xml`); the release label stays "Beacon".
+- The current source version name is `1.1.2-preview`. The launcher label is "Beacon Preview" (set only in `app/src/debug/AndroidManifest.xml`); the release label stays "Beacon".
 - It is signed with the local Android debug key, not the production signer. Android will never accept it as an update to production, and production cannot update it.
 - It is a debuggable build. `src/debug/res/xml/fixture_network_security.xml` allows cleartext only to `10.0.2.2` for the local crash reporter, and trusts the bundled test-fixture CA (`beacon_fixture_ca.pem`) through `debug-overrides`. Use the preview only on your own test devices.
 
@@ -54,7 +54,7 @@ History bounds (stock Hermes routes, no plugin needed):
 - After an in-app send, a dropped stream replays from its last event cursor. Partial output and queued prompts stay visible while the outcome is unknown. The queue advances only after a terminal event or a native `idle` status with matching runtime and stored session identities; missing, malformed or transitional status keeps the turn uncertain and reconnecting.
 - This is bounded native recovery behavior, not full live-backend or physical-device acceptance.
 
-Session deletion and project reservation still require the optional Beacon plugin. Standard sign-in, chat and bounded history do not.
+Deleting a conversation uses native Hermes. Project reservation still requires the optional Beacon plugin. Standard sign-in, chat and bounded history use native Hermes.
 
 Threads and filters (drawer, under Search; native Hermes, no plugin needed):
 - **Threads** are named conversations you come back to, as in Hermes Relay. "New thread" asks for a name; the thread is an ordinary Hermes chat created with its own source (`android_thread`) and your title, which Hermes keeps instead of its automatic title. A repeated name gets a number, because Hermes does not allow two conversations with the same title. The Threads lane also lists your Hermes Relay threads.
@@ -62,7 +62,7 @@ Threads and filters (drawer, under Search; native Hermes, no plugin needed):
 
 Display: Beacon follows the phone for text size, language, text direction and animations (Android's font size, app language and "Remove animations" settings). Settings → Appearance keeps only Theme and Color style.
 
-Approvals (composer shield, native Hermes): Manual, Smart and Off set the profile's approval mode. **YOLO for this chat** is a switch: turning it on asks for confirmation, and it stays on for that chat until you turn it off (Hermes saves it with the conversation). While the profile's approvals are Off, the switch shows on and is locked.
+Approvals (composer shield, native Hermes): **Profile default** follows the profile's Manual (Ask first) or Auto policy; **YOLO in this chat** skips prompts only in that conversation. Enabling YOLO always asks for confirmation, and Hermes saves that choice until you turn it off. **Change for all chats** opens profile Settings, where Manual and Auto are changed. An existing Off policy is displayed honestly in Settings and chat, with chat choices disabled; unavailable approval status is shown as unknown with a retry action.
 
 Conversation actions: long-press any conversation in History (or use the chat's ⋮ menu) to pin or unpin, rename, add it to a project or remove it from its project, archive or delete it. Removing a chat from a project moves it to the profile's own folder; its messages stay.
 
@@ -82,7 +82,7 @@ With the Beacon plugin installed:
 
 Verification recorded on an Android 16 emulator against a live Hermes (19 October 2026):
 - One sign-in, chat, history, Bot Mode and settings; new phone chats are saved under the signed-in owner.
-- Incoming calls: with Keep connected on and Beacon closed, Hermes's `beacon_call_user` rings the phone for 20 seconds as a pop-up call card (full screen when the screen is off), and the caller opens by saying why it is calling; Answer starts the call in that conversation, Decline settles it on Hermes, and an unanswered ring leaves a missed-call notification with Call back.
+- Incoming calls: with Keep connected on and Beacon closed, Hermes's `beacon_call_user` rings the phone for up to 45 seconds as a pop-up call card (full screen when the screen is off), bounded by the invitation's expiry, and the caller opens by saying why it is calling; Answer starts the call in that conversation, Decline settles it on Hermes, and an unanswered ring leaves a missed-call notification with Call back.
 - One-tap calls with Gemini Live and Grok, with the key kept on the phone. The call transcript appears in the conversation afterwards.
 
 Remaining acceptance recorded for this preview:

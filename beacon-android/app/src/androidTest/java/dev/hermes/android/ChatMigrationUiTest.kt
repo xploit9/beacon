@@ -255,47 +255,49 @@ class ChatMigrationUiTest {
         assertTrue("toggle row is not 48dp tall", toggle.bottom - toggle.top >= 48.dp)
     }
 
-    private fun snap(name: String, outcome: ToolOutcome) = ToolSnapshot(name, name, outcome)
-
-    @Test fun activityStripOpensTheSheetWithOnlyRealWork() {
-        val activity = chatActivity(listOf(snap("terminal", ToolOutcome.Running), snap("read_file", ToolOutcome.Completed)), queued = 1, approval = true, question = false)
+    @Test fun backgroundStripOpensACompactSheetWithSafeCategoryCounts() {
+        val activity = BackgroundActivitySummary(agents = 2, processes = 1, cronJobs = 1, watches = 1)
         var open by mutableStateOf(false)
-        var removed = -1
         compose.setContent { MaterialTheme {
             ChatActivityStrip(activity) { open = true }
-            if (open) ChatActivitySheet(activity, listOf("next message"), onRemoveQueued = { removed = it }, onDismiss = { open = false })
+            if (open) ChatActivitySheet(activity, onDismiss = { open = false })
         } }
-        compose.waitForIdle() // no ticking clock: the screen must settle with running work shown
-        compose.onNodeWithTag("chat-activity-strip").assertHeightIsAtLeast(48.dp).assertTextContains("1 running · 1 queued · Waiting for you", substring = true)
+        compose.waitForIdle()
+        compose.onNodeWithTag("chat-activity-strip").assertTextContains("2 agents · 1 process · 1 cron job · 1 watch")
+        val stripBounds = compose.onNodeWithTag("chat-activity-strip").getUnclippedBoundsInRoot()
+        assertTrue("The background strip stays compact", stripBounds.bottom - stripBounds.top <= 48.dp)
         compose.onNodeWithTag("chat-activity-sheet").assertDoesNotExist()
         compose.onNodeWithTag("chat-activity-strip").performClick()
         compose.onNodeWithTag("chat-activity-sheet").assertIsDisplayed()
         expandModalSheet()
-        compose.onNodeWithText("Read-only live details from this chat").assertIsDisplayed()
-        // The sheet scrolls, so bring each section into view before asserting on it.
-        compose.onNodeWithText("Terminal").performScrollTo().assertIsDisplayed()
-        compose.onNodeWithText("Approval needed").performScrollTo().assertIsDisplayed()
-        compose.onNodeWithText("next message").performScrollTo().assertIsDisplayed()
-        compose.onNodeWithTag("activity-process-unavailable").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Read-only status from this profile").assertIsDisplayed()
+        compose.onNodeWithText("2 background agents").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("1 background process").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("1 running cron job").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("1 active watch").performScrollTo().assertIsDisplayed()
+        compose.onAllNodesWithText("sa-current").assertCountEquals(0)
+        compose.onAllNodesWithText("C:\\SyntheticOwner", substring = true).assertCountEquals(0)
         compose.onAllNodesWithText("Stop").assertCountEquals(0)
-        compose.onNodeWithContentDescription("Remove queued message").performScrollTo().performClick()
-        assertEquals(0, removed)
         compose.onNodeWithTag("chat-activity-close").assertHeightIsAtLeast(48.dp).performClick()
         compose.onNodeWithTag("chat-activity-sheet").assertDoesNotExist()
     }
 
-    @Test fun idleSheetSaysNothingIsActiveAndStillNamesTheMissingProcessList() {
-        compose.setContent { MaterialTheme { ChatActivitySheet(chatActivity(emptyList(), 0, false, false), emptyList(), onRemoveQueued = {}, onDismiss = {}) } }
+    @Test fun idleBackgroundSheetSaysNothingIsActive() {
+        compose.setContent { MaterialTheme { ChatActivitySheet(BackgroundActivitySummary(), onDismiss = {}) } }
         compose.onNodeWithTag("chat-activity-empty").performScrollTo().assertIsDisplayed()
-        compose.onNodeWithTag("activity-process-unavailable").performScrollTo().assertIsDisplayed()
     }
 
-    @Test fun clarificationAloneOpensTheSheetAndNeverShowsFinishedToolsAsRunning() {
-        val activity = chatActivity(listOf(snap("read_file", ToolOutcome.Completed), snap("terminal", ToolOutcome.NoResult)), queued = -2, approval = false, question = true)
-        compose.setContent { MaterialTheme { ChatActivitySheet(activity, emptyList(), onRemoveQueued = {}, onDismiss = {}) } }
-        compose.onNodeWithText("Question waiting").performScrollTo().assertIsDisplayed()
-        compose.onAllNodesWithText("Running", substring = true).assertCountEquals(0)
-        compose.onNodeWithText("No result recorded", substring = true).performScrollTo().assertIsDisplayed()
+    @Test fun idleBackgroundStripIsNotComposed() {
+        compose.setContent { MaterialTheme { ChatActivityStrip(BackgroundActivitySummary()) {} } }
+        compose.onAllNodesWithTag("chat-activity-strip").assertCountEquals(0)
+    }
+
+    @Test fun backgroundStatusDoesNotIncludeForegroundToolsOrQueuedMessages() {
+        val activity = BackgroundActivitySummary(agents = 1)
+        compose.setContent { MaterialTheme { ChatActivityStrip(activity) {} } }
+        compose.onNodeWithTag("chat-activity-strip").assertTextContains("1 agent")
+        compose.onAllNodesWithText("terminal", substring = true, ignoreCase = true).assertCountEquals(0)
+        compose.onAllNodesWithText("queued", substring = true, ignoreCase = true).assertCountEquals(0)
     }
 
     @Test fun sphereBackdropSitsUnderContentAndDoesNotConsumeClicks() {

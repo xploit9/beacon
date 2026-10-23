@@ -29,7 +29,7 @@ def test_completion_notice_detail_carries_the_reply(harness, monkeypatch):
     assert detail["preview"] == {"title": "Weekend in Lisbon", "body": "Here is a two-day plan."}
 
 
-def test_email_alert_notice_detail_says_important_email(harness):
+def test_legacy_alert_notice_detail_uses_generic_title_and_keeps_feedback_marker(harness):
     import time
     api, client, _, _, _ = harness
     event = "e" * 32
@@ -40,7 +40,7 @@ def test_email_alert_notice_detail_says_important_email(harness):
         conn.execute("INSERT INTO meta(key,value) VALUES(?,?)", ("proactive-email-notice:" + event, b"1"))
     detail = client.get(f"/api/plugins/beacon/mobile/notifications/events/{event}").json()
     assert detail["email_alert"] is True
-    assert detail["preview"] == {"title": "Important email", "body": "Daniel moved the client review to 09:00 tomorrow"}
+    assert detail["preview"] == {"title": "Important update", "body": "Daniel moved the client review to 09:00 tomorrow"}
 
 
 @pytest.mark.asyncio

@@ -44,7 +44,7 @@ import dev.hermes.android.data.NativeMemoryState
                     OutlinedTextField(state.draft, onDraft, modifier = Modifier.fillMaxWidth(), label = { Text("Edit ${document.title.lowercase()}") }, minLines = 6, maxLines = 12, enabled = !state.saving,
                         supportingText = { Text("${state.draft.length} / ${document.limit} characters") }, isError = state.draft.length > document.limit)
                     Button(onClick = onSave, enabled = !state.saving && state.draft != document.content && state.draft.length <= document.limit) { Text(if (state.saving) "Saving…" else "Save notes") }
-                    TextButton(onClick = onCancel, enabled = !state.saving) { Text("Cancel edit") }
+                    TextButton(onClick = onCancel, enabled = !state.saving, modifier = Modifier.heightIn(min = 48.dp)) { Text("Cancel edit") }
                 } else {
                     OutlinedButton(onClick = { onEdit(document.target) }, enabled = state.editing.isBlank() && !state.loading && !state.saving) { Text("Edit ${document.title.lowercase()}") }
                     // Reading decoration never changes the source sent to the editor.
@@ -57,7 +57,7 @@ import dev.hermes.android.data.NativeMemoryState
         item {
             HorizontalDivider(Modifier.padding(vertical = 8.dp))
             Text("Memory service · ${state.activeLabel}", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            TextButton(onClick = { explanation = !explanation }) { Text(if (explanation) "Hide how memory works" else "How memory works") }
+            TextButton(onClick = { explanation = !explanation }, modifier = Modifier.heightIn(min = 48.dp)) { Text(if (explanation) "Hide how memory works" else "How memory works") }
             if (explanation) {
                 if (state.provider.isNotBlank()) Text("${state.activeLabel} stores additional recall separately. These profile notes are not its full knowledge, and editing them does not erase its stored recall.", style = MaterialTheme.typography.bodyMedium)
                 Text("Used by new chats.", style = MaterialTheme.typography.bodyMedium)

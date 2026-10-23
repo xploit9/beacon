@@ -81,7 +81,8 @@ def _cron_row(profile,session_id):
         root_id=db.get_conversation_root(session_id) if db else None
         row=db.get_session(root_id) if db and root_id else None
         if row and row.get('source')=='cron':
-            identity=db.cron_run_identity(root_id)
+            try: identity=db.cron_run_identity(root_id)
+            except Exception: identity=None  # Preserve the confirmed cron source when enrichment fails.
             if identity and identity.get('cron_job_id'):
                 row={**row,'cron_job_id':identity['cron_job_id']}
         return row
@@ -139,7 +140,7 @@ def _watch_context(cfg,profile,session_id):
     job_id=_cron_job_id(row,session_id)
     if (not job_id or not _owned_proactive_run(owner,profile,session_id)
             or job_id!=proactive._managed_id(mobile,owner,profile,'watch_email')):
-        raise LookupError('Session is not an owned Proactive email watch')
+        raise LookupError('Session is not an owned Proactive watch')
     stored=cfg.get('scheduled_callback_conversation_id')
     native.verify(owner,provider,profile,stored)
     return {'id':'watch_email','job_id':job_id}
@@ -155,22 +156,48 @@ def native_mailbox_observation(tool_name=None,result=None,status=None,session_id
         return
 
 def email_notice(args,session_id=None,**kwargs):
+    if not isinstance(args,dict) or 'source' in args:
+        return json.dumps({'error':'Item id and reason are required; request_id is optional'})
+    return event_notice({**args,'source':'email'},session_id,**kwargs)
+
+
+def event_notice(args,session_id=None,**kwargs):
     try:
         cfg=mobile.settings();profile=current_profile(cfg)
         cfg=mobile.settings(profile)
         _watch_context(cfg,profile,session_id)
-        return json.dumps(observers.email_notice(mobile,native,cfg,profile,session_id,args,proactive.profile_now(profile)))
+        return json.dumps(observers.event_notice(mobile,native,cfg,profile,session_id,args,proactive.profile_now(profile)))
     except (LookupError,ValueError,RuntimeError) as exc:
         return json.dumps({'error':str(exc)})
+
+def native_watch_guard_context(session_id=None,**kwargs):
+    try:
+        cfg=mobile.settings();profile=current_profile(cfg);cfg=mobile.settings(profile)
+        spec=_watch_context(cfg,profile,session_id)
+        lower,upper=proactive.watch_window(profile,spec['job_id'])
+        return {'context':f"BEACON_READ_ONLY_GUARD_V1 profile={profile} job={spec['job_id']} session={session_id}. "
+                f"Beacon's pre_tool_call read-only guard is active this turn. Check only {lower} through {upper}."}
+    except Exception:
+        return None
+
+
+def pause_proactive_jobs():
+    if mobile.settings(): return  # Native rediscovery unloads enabled plugins too.
+    proactive.pause_managed_jobs(mobile)
+
 
 def email_checked(args,session_id=None,**kwargs):
     try:
         cfg=mobile.settings();profile=current_profile(cfg)
         cfg=mobile.settings(profile)
         spec=_watch_context(cfg,profile,session_id)
-        return json.dumps(proactive.record_email_check(profile,spec['job_id'],args))
+        return json.dumps(proactive.record_email_check(profile,spec['job_id'],args,
+                          setup=proactive._setup(mobile,cfg['owner_id'],profile)))
     except (LookupError,ValueError,RuntimeError) as exc:
         return json.dumps({'error':str(exc)})
+
+
+events_checked=email_checked
 
 def create_proactive_request(args,session_id=None,**kwargs):
     try:
@@ -441,27 +468,66 @@ def _watch_terminal_read_only(command):
         return tuple(path[:2]) in _HIMALAYA_READS
     return False
 
+def _beacon_job(job):
+    return str(job.get('name','')).startswith('Beacon') or 'BEACON_PROACTIVE_JOB:' in str(job.get('prompt',''))
+
 def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**kwargs):
-    """Veto write-capable tools only in Beacon's email-watch cron session, including a run that
+    """Veto write-capable tools only in Beacon's watch cron session, including a run that
     outlives Proactive being turned off or its jobs being rebuilt (Hermes does not stop it)."""
-    if not isinstance(tool_name,str) or not session_id:
-        return None
+    blocked={'action':'block','message':_READ_ONLY_MESSAGE}
+    if not session_id: return None
+    cfg={};profile=None;row=None
     try:
-        cfg=mobile.settings();owner=cfg.get('owner_id');profile=current_profile(cfg)
-        row=_cron_row(profile,session_id) if owner else None
+        cfg=mobile.settings();profile=current_profile(cfg)
+        row=_cron_row(profile,session_id)
     except Exception:
+        pass
+    if not isinstance(row,dict) or not row.get('source'):
+        # Beacon's served profiles and session-row timing must never gate ordinary Hermes tools.
+        try:
+            from hermes_cli.profiles import current_profile_name
+            from tui_gateway import server
+            profile=profile or current_profile_name()
+            with server._profile_db({'profile':profile}) as db:
+                identity=db.cron_run_identity(session_id) if db else None
+        except Exception:
+            return None
+        job_id=identity.get('cron_job_id') if isinstance(identity,dict) else None
+        if not job_id: return None
+        # A cron run Beacon can't place: the owner's own jobs keep their tools, anything else stays read-only.
+        try:
+            call,_,_,_=proactive._cron_helpers()
+            job=next((job for job in call(profile,'list_jobs',True) if job.get('id')==job_id),None)
+        except Exception:
+            return blocked
+        if job and not _beacon_job(job): return None
+        if not isinstance(tool_name,str): return blocked
+        try: return _watch_tool_guard(tool_name,args,profile)
+        except Exception: return blocked
+    if row.get('source')!='cron':
         return None
-    if not row or row.get('source')!='cron':
-        return None
+    if not isinstance(tool_name,str): return blocked
+    owner=cfg.get('owner_id')
     try:
         job_id=_cron_job_id(row,session_id)
-        if not job_id or job_id not in proactive.watch_job_ids(mobile,owner,profile):
-            return None
+        if not owner or not job_id or job_id not in proactive.watch_job_ids(mobile,owner,profile):
+            if owner and job_id and job_id==proactive._managed_id(mobile,owner,profile,'nightly_memory'):
+                return None
+            call,_,_,_=proactive._cron_helpers()
+            job=next((job for job in call(profile,'list_jobs',True) if job.get('id')==job_id),None)
+            if job and not _beacon_job(job):
+                return None
+            return blocked
     except Exception:
         # Only cron runs reach here, never ordinary chats; an unreadable ownership check fails closed.
         return {'action':'block','message':_READ_ONLY_MESSAGE}
 
-    if tool_name in {'beacon_email_notice','beacon_email_checked'}:
+    try: return _watch_tool_guard(tool_name,args,profile)
+    except Exception: return blocked
+
+
+def _watch_tool_guard(tool_name,args,profile):
+    if tool_name in {'beacon_event_notice','beacon_events_checked','beacon_email_notice','beacon_email_checked'}:
         return None
     if tool_name=='terminal':
         command=args.get('command') if isinstance(args,dict) else None
@@ -557,14 +623,29 @@ def register(ctx):
         schema={'name':'beacon_call_user','description':'Ring an authorized native callback invitation','parameters':{'type':'object','properties':{'reason':{'type':'string','maxLength':240,'description':'Brief owner-requested reason for the call; do not claim unverified work is finished'}},'additionalProperties':False}},handler=call_user)
 
     ctx.register_tool(name='beacon_create_proactive_request',toolset='beacon-interactive',
-        description='Save an owner-approved plain-language rule for important email in this interactive owner chat. Never call from scheduled work; confirm the saved rule to the owner.',
+        description='Save an owner-approved plain-language rule for this profile in the interactive owner chat. An optional source limits the rule; null means anything. Never call from scheduled work; confirm the saved rule.',
         schema={'name':'beacon_create_proactive_request','parameters':{'type':'object','properties':{
             'text':{'type':'string','maxLength':300},'action':{'type':'string','enum':['notify','call']},
-            'signal':{'type':['string','null'],'enum':['email',None]},
+            'signal':{'type':['string','null'],'maxLength':80},
             'night':{'type':'boolean'}},'required':['text'],'additionalProperties':False}},
         handler=create_proactive_request)
+    ctx.register_tool(name='beacon_event_notice',toolset='beacon-mailbox',
+        description='Notify or ring for an important event backed by a fresh successful same-session read of that source. Include request_id only for a matching enabled source rule; otherwise use the saved default delivery.',
+        schema={'name':'beacon_event_notice','parameters':{'type':'object','properties':{
+            'source':{'type':'string','maxLength':80,'description':'MCP server name or native toolset from discovery; email for mail'},
+            'request_id':{'type':'string','pattern':'^[a-f0-9]{32}$'},
+            'item_id':{'type':'string','maxLength':256,'description':'Exact source-returned item identifier'},
+            'reason':{'type':'string','maxLength':240}},
+            'required':['source','item_id','reason'],'additionalProperties':False}},
+        handler=event_notice)
+    ctx.register_tool(name='beacon_events_checked',toolset='beacon-mailbox',
+        description='Record how far the owned read-only Proactive watch checked all connected sources. A failed check never advances its cursor.',
+        schema={'name':'beacon_events_checked','parameters':{'type':'object','properties':{
+            'checked_until':{'type':['string','number']},'ok':{'type':'boolean'},'note':{'type':'string','maxLength':120}},
+            'required':['checked_until','ok','note'],'additionalProperties':False}},
+        handler=events_checked)
     ctx.register_tool(name='beacon_email_notice',toolset='beacon-mailbox',
-        description='Notify or ring for an important email backed by a successful same-session tool read. Include request_id only when an enabled email rule matches; otherwise use the saved default delivery.',
+        description='Compatibility alias for beacon_event_notice with source=email. Requires a fresh successful same-session mail read.',
         schema={'name':'beacon_email_notice','parameters':{'type':'object','properties':{
             'request_id':{'type':'string','pattern':'^[a-f0-9]{32}$'},
             'item_id':{'type':'string','maxLength':256,'description':'Exact source-returned item id, title, or URL'},
@@ -572,7 +653,7 @@ def register(ctx):
             'required':['item_id','reason'],'additionalProperties':False}},
         handler=email_notice)
     ctx.register_tool(name='beacon_email_checked',toolset='beacon-mailbox',
-        description='Record how far the owned Proactive email watch checked and its short result. Only effective in that watch session.',
+        description='Compatibility alias for beacon_events_checked. Only effective in the owned Proactive watch session.',
         schema={'name':'beacon_email_checked','parameters':{'type':'object','properties':{
             'checked_until':{'type':['string','number']},'ok':{'type':'boolean'},'note':{'type':'string','maxLength':120}},
             'required':['checked_until','ok','note'],'additionalProperties':False}},
@@ -580,9 +661,12 @@ def register(ctx):
 
     ctx.register_hook('pre_llm_call',native_voice_context)
     ctx.register_hook('pre_llm_call',native_live_context)
+    ctx.register_hook('pre_llm_call',native_watch_guard_context)
     ctx.register_hook('on_session_end',native_completion)
     ctx.register_hook('post_tool_call',native_mailbox_observation)
     ctx.register_hook('pre_tool_call',native_proactive_read_only_guard)
+    # Cleanup runs before the guard is removed because native registrations unwind in reverse order.
+    if callable(getattr(ctx,'on_unload',None)): ctx.on_unload(pause_proactive_jobs)
     phone_delivery.register(ctx)
     try:
         ctx.register_cli_command(name='beacon',help='Pair and manage Beacon phones',

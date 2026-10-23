@@ -1,6 +1,7 @@
 package dev.hermes.android.ui
 
 import dev.hermes.android.data.ApiFailure
+import dev.hermes.android.data.ownerNameOf
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
@@ -13,10 +14,30 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class BeaconSettingsTest {
+    @Test fun providerKeyRejectionUsesTheShortKeySpecificMessage() {
+        assertEquals("That key wasn't accepted. Check it and try again.",
+            voiceProviderTestMessage(dev.hermes.android.voice.VoiceProviderTestResult.KeyRejected))
+        assertEquals("The provider responded with an error. Check the selected model or try again.",
+            voiceProviderTestMessage(dev.hermes.android.voice.VoiceProviderTestResult.ProviderError))
+    }
+
+    @Test fun ownerNameIsTrimmedBoundedAndContainsOnlyAllowedNameCharacters() {
+        assertEquals("Maya O'Neil", ownerNameOf(" Maya O'Neil "))
+        assertEquals("Maya Smith", ownerNameOf("Maya! Smith2"))
+        assertEquals(40, ownerNameOf("A".repeat(45)).length)
+        assertEquals("", ownerNameOf("---"))
+        assertEquals("", ownerNameOf("!!!"))
+    }
+
     @Test fun voiceLabelsCapitalizeDisplayNamesWithoutChangingStoredValues() {
         assertEquals("Eve", voiceChoiceLabel("eve"))
         assertEquals("Aoede", voiceChoiceLabel("Aoede"))
         assertEquals("", voiceChoiceLabel(""))
+    }
+
+    @Test fun voiceModelIdsUseFriendlyNames() {
+        assertEquals("Gemini 3.8 Live", voiceModelDisplayName("models/gemini-3.8-live"))
+        assertEquals("GPT Realtime 2.1", voiceModelDisplayName("gpt-realtime-2.1"))
     }
 
     @Test fun missingBeaconPluginRoutesAreDistinguishedFromOtherFailures() {

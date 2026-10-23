@@ -50,10 +50,11 @@ internal class NativePcm(private val scope:CoroutineScope,private val input:(Byt
         if(NoiseSuppressor.isAvailable()) noise=NoiseSuppressor.create(rec.audioSessionId)?.apply { enabled=true }
         track=AudioTrack.Builder().setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
             .setAudioFormat(AudioFormat.Builder().setSampleRate(24000).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
-            .setBufferSizeInBytes(maxOf(outputSize,9600)).setTransferMode(AudioTrack.MODE_STREAM).build()
+            .setBufferSizeInBytes(maxOf(outputSize,PLAYBACK_CAPACITY_BYTES)).setTransferMode(AudioTrack.MODE_STREAM).build()
         player=track;check(track.state==AudioTrack.STATE_INITIALIZED)
-        // 120 ms of headroom absorbs network bursts and scheduling hiccups (a 20 ms buffer underran and crackled);
-        // barge-in still stops at once because interrupt() pauses and flushes the track.
+        // A jitter buffer: speech starts, and resumes after a gap, only with 200 ms queued, so bursty delivery plays
+        // smoothly (120 ms with a 50 ms restart still underran 15 times in a live Gemini call). Barge-in still stops at
+        // once because interrupt() pauses and flushes the track.
         check(track.setBufferSizeInFrames(PLAYBACK_BUFFER_FRAMES)>0)
         if(Build.VERSION.SDK_INT>=31) track.setStartThresholdInFrames(PLAYBACK_START_FRAMES)
         playbackEpochNs=System.nanoTime();track.play();rec.startRecording()
@@ -198,5 +199,6 @@ internal class Pcm48To24 {
     }
 }
 
-private const val PLAYBACK_BUFFER_FRAMES=2880  // 120 ms at 24 kHz
-private const val PLAYBACK_START_FRAMES=1200   // 50 ms at 24 kHz
+private const val PLAYBACK_CAPACITY_BYTES=24000 // 500 ms at 24 kHz mono 16-bit
+private const val PLAYBACK_BUFFER_FRAMES=9600   // 400 ms at 24 kHz
+private const val PLAYBACK_START_FRAMES=4800    // 200 ms at 24 kHz

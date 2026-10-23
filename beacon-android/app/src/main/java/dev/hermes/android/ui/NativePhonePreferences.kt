@@ -103,6 +103,7 @@ import kotlinx.coroutines.launch
     LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, vm.client) { vm.phoneSettings.bind(); vm.phoneSettings.loadBots(); if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     Column(Modifier.fillMaxSize()) {
         Header("Profiles", back = back, menu = LocalOpenNavigationMenu.current)
+        ProfileApprovalSettings(vm)
         NativeBotSettings(state, vm.phoneSettings::openBot, { leave(vm.phoneSettings::closeBot) }, { vm.phoneSettings.editBot(true) },
             vm.phoneSettings::botDraft, vm.phoneSettings::saveBot, { leave { vm.phoneSettings.editBot(false) } },
             onSettings = { profile, page -> vm.viewModelScope.launch {

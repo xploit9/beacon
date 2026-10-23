@@ -2,6 +2,7 @@ package dev.hermes.android.voice
 
 import dev.hermes.android.core.Scope
 import kotlin.math.*
+import java.util.Locale
 
 internal fun overlayOwnsCall(call: CallState, expectedId: String, owner: Scope?, authenticated: Boolean, unlocked: Boolean): Boolean =
     call.active && expectedId.isNotBlank() && call.callId == expectedId && authenticated && unlocked &&
@@ -16,6 +17,24 @@ internal fun CallState.chipLabel(): String = when {
     remoteSpeaking || state == "speaking" -> "Speak"
     muted -> "Muted"
     else -> "Listen"
+}
+internal fun callStatusLabel(call: CallState): String {
+    val toolStatus = call.toolReceipts.lastOrNull { it.statusLabel() != null }?.statusLabel()
+    return when {
+        call.held -> "Call on hold"
+        call.state == "connecting" || call.state == "reconnecting" -> "Connecting"
+        toolStatus != null -> toolStatus
+        call.state == "thinking" -> "Thinking"
+        call.remoteSpeaking || call.state == "speaking" -> "Speaking"
+        call.muted -> "Muted"
+        call.userSpeaking && !call.muted -> "Listening"
+        call.state == "listening" -> "Listening"
+        else -> call.state.replaceFirstChar { it.titlecase() }
+    }
+}
+internal fun callTimerLabel(startedAtMillis: Long, nowMillis: Long): String {
+    val elapsedSeconds = if (startedAtMillis > 0) ((nowMillis - startedAtMillis).coerceAtLeast(0) / 1000) else 0
+    return String.format(Locale.ROOT, "%02d:%02d", elapsedSeconds / 60, elapsedSeconds % 60)
 }
 internal fun CallState.voiceAmplitude(): Float {
     if (!active || held || state == "connecting") return 0f
@@ -39,8 +58,17 @@ internal class VoiceLevelCadence {
 }
 internal fun CallState.latestCaption(role: String): String = if (!active) "" else
     transcripts.lastOrNull { it.role == role }?.takeIf { !it.interrupted }?.text?.take(1400).orEmpty()
+internal class FailedCallRedirect {
+    private var handledId = ""
+    fun claim(call: CallState): Boolean {
+        if (call.callId.isBlank() || call.callId == handledId || call.failedCallConversation(call.callId) == null) return false
+        handledId = call.callId
+        return true
+    }
+}
+internal const val persistentCallNavigationWidthDp = 336f
 internal fun persistentCallNavigation(widthDp: Float, fontScale: Float): Boolean =
-    widthDp >= 720f && widthDp - 280f * fontScale.coerceIn(1f, 1.2f) >= 420f * fontScale.coerceIn(1f, 1.4f)
+    widthDp >= 720f && widthDp - persistentCallNavigationWidthDp >= 420f * fontScale.coerceIn(1f, 1.4f)
 internal fun clampBubblePosition(x: Int, y: Int, width: Int, height: Int, screenWidth: Int, screenHeight: Int, top: Int, bottom: Int): Pair<Int, Int> =
     x.coerceIn(0, (screenWidth-width).coerceAtLeast(0)) to y.coerceIn(top.coerceAtLeast(0), (screenHeight-height-bottom).coerceAtLeast(top.coerceAtLeast(0)))
 /** Abstract activity indicator geometry, not an acoustic waveform or playback measurement. */

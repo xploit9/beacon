@@ -10,11 +10,16 @@ internal fun settingsLabel(route: String): String = when (route) {
 
 // \p{Z} adds Unicode separators (no-break, ideographic, line/paragraph) that \s alone misses on the JVM.
 private val searchWhitespace = Regex("[\\s\\p{Z}]+")
+private val settingsSearchKeywords = mapOf(
+    "Assistant" to "What needs you proactive alerts watch",
+    "Voice & calls" to "API key",
+    "Devices" to "pairing",
+)
 private fun searchTermsMatch(text: String, query: String): Boolean =
     query.splitToSequence(searchWhitespace).filter(String::isNotBlank).all { text.contains(it, ignoreCase = true) }
 
 internal fun settingsSearchMatches(visibleLabel: String, description: String, query: String): Boolean =
-    searchTermsMatch("$visibleLabel $description", query)
+    searchTermsMatch("$visibleLabel $description ${settingsSearchKeywords[visibleLabel].orEmpty()}", query)
 
 internal fun modelSearchMatches(provider: String, id: String, label: String, query: String): Boolean =
     searchTermsMatch("$provider $id $label", query)
@@ -25,7 +30,8 @@ internal val settingsCategories = linkedMapOf(
     "Server" to listOf("Health", "Logs", "Server updates", "Session checkpoints"),
 )
 internal val settingsDescriptions = mapOf(
-    "Connection" to "Server and signed-in account",
+    "Connection" to "Server, signed-in account, and paired devices",
+    "Devices" to "Manage paired phones",
     "Assistant" to "Name and profile",
     "Chat" to "Sending and display",
     "Voice & calls" to "Voice provider and calls",
@@ -56,7 +62,7 @@ internal val settingsHubSections = linkedMapOf(
 )
 internal val settingsHubRoutes = settingsHubSections.values.flatten()
 /** Search includes both the hub and its focused destinations. */
-internal val settingsSearchRoutes = settingsHubRoutes + settingsCategories.values.flatten()
+internal val settingsSearchRoutes = settingsHubRoutes + settingsCategories.values.flatten() + "Devices"
 // Skills, Memory and Server updates are native Hermes routes; only plugin-backed pages are gated.
 private val pluginSettingsRoutes = setOf("Notifications", "Bots")
 internal fun settingsNeedsBeaconPlugin(page: String, pluginStatus: String): Boolean = pluginStatus == "absent" && page in pluginSettingsRoutes
@@ -66,6 +72,7 @@ internal fun settingsRoute(name: String): String = when (name) {
     "Chat" -> "Settings"
     "Voice & calls" -> "Beacon"
     "Notifications & Keep connected" -> "Notifications"
+    "Devices" -> "Connection"
     "About & licenses" -> "Licenses"
     "Models & tools" -> "category:Profiles & model"
     else -> if (name in settingsCategories) "category:$name" else name

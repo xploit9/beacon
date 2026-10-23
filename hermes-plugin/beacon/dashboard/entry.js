@@ -59,6 +59,8 @@
         ? JSON.stringify({ type: 'beacon-connect', url: info.url, session: info.session })
         : link;
       const pairingQrPayload = pairing && pairing.qr_link ? pairing.qr_link : '';
+      // One QR at a time: a live pairing code replaces the plain connect QR so nobody scans the wrong one.
+      const pairingActive = Boolean(pairing) && pairingSeconds > 0;
 
       function drawQr(target, payload) {
         try {
@@ -92,7 +94,7 @@
       useEffect(() => {
         if (!qrPayload || !canvas.current) return;
         setQrError(!drawQr(canvas.current, qrPayload));
-      }, [qrPayload]);
+      }, [qrPayload, pairingActive]);
 
       useEffect(() => {
         if (!pairingQrPayload || !pairingCanvas.current) return;
@@ -247,7 +249,7 @@
       return h('main', { className: 'space-y-4 p-4', 'aria-labelledby': 'beacon-connect-title' },
         h('section', { className: 'max-w-2xl rounded-lg border border-border bg-card p-5 shadow-sm' },
           h('h1', { id: 'beacon-connect-title', className: 'text-xl font-semibold' }, 'Connect phone'),
-          renderConnectBody(),
+          pairingActive ? null : renderConnectBody(),
           profiles.length > 1 ? h('label', { className: 'mt-4 block space-y-1 text-sm' },
             h('span', null, 'Profile'),
             h('select', {

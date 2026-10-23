@@ -214,6 +214,12 @@ def _initialize_schema(conn):
     CREATE TABLE IF NOT EXISTS notices(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE,owner TEXT,profile TEXT,kind TEXT,conversation TEXT,created REAL,expires REAL,state TEXT DEFAULT 'pending',call_id TEXT,push TEXT DEFAULT 'pending');
     CREATE TABLE IF NOT EXISTS notice_deliveries(event TEXT REFERENCES notices(id) ON DELETE CASCADE,target TEXT REFERENCES targets(id) ON DELETE CASCADE,accepted REAL DEFAULT 0,attempts INTEGER DEFAULT 0,next_attempt REAL DEFAULT 0,last_error TEXT DEFAULT '',PRIMARY KEY(event,target));
     CREATE TABLE IF NOT EXISTS tool_receipts(owner TEXT,provider TEXT,profile TEXT,call_id TEXT,request_id TEXT,signature TEXT NOT NULL,payload TEXT NOT NULL,updated REAL NOT NULL,PRIMARY KEY(owner,provider,profile,call_id,request_id));
+    CREATE TABLE IF NOT EXISTS call_tool_allowances(owner TEXT,provider TEXT,profile TEXT,call_id TEXT,tool_id TEXT,tool_name TEXT,created REAL NOT NULL,PRIMARY KEY(owner,provider,profile,call_id,tool_name));
+    CREATE TRIGGER IF NOT EXISTS close_call_tool_allowances AFTER UPDATE OF closed,status ON calls
+      WHEN NEW.closed=1 OR NEW.status IN ('saved','partial','failed')
+      BEGIN DELETE FROM call_tool_allowances WHERE call_id=NEW.id AND owner=NEW.owner AND profile=NEW.profile; END;
+    CREATE TRIGGER IF NOT EXISTS delete_call_tool_allowances AFTER DELETE ON calls
+      BEGIN DELETE FROM call_tool_allowances WHERE call_id=OLD.id AND owner=OLD.owner AND profile=OLD.profile; END;
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS owned_voice_calls ON calls(owner,profile,conversation,created DESC)')
     conn.execute('CREATE INDEX IF NOT EXISTS owned_call_log ON call_log(owner,profile,created DESC)')
@@ -442,14 +448,17 @@ def list_devices(owner):
 
 def remove_device(owner, device_id):
     now = time.time()
-    with LOCK, connect() as conn:
+    with PUSH_LOCK, LOCK, connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
         row = conn.execute('SELECT profile FROM beacon_devices WHERE id=? AND owner=? AND removed=0', (device_id, owner)).fetchone()
         if not row:
             return False
         conn.execute('UPDATE beacon_devices SET removed=1,last_seen=? WHERE id=? AND owner=?', (now, device_id, owner))
-        conn.execute('DELETE FROM notice_deliveries WHERE target=?', (device_id,))
-        conn.execute('DELETE FROM targets WHERE id=? AND owner=? AND profile=?', (device_id, owner, row['profile']))
+        # Old registrations have no device binding; revoke those too rather than leave a lost phone reachable.
+        conn.execute("DELETE FROM targets WHERE owner=? AND (id=? OR json_extract(payload,'$.device_id')=? "
+                     "OR json_extract(payload,'$.device_id') IS NULL OR token IN "
+                     "(SELECT token FROM targets WHERE owner=? AND json_extract(payload,'$.device_id')=?))",
+                     (owner, device_id, device_id, owner, device_id))
     return True
 
 
@@ -538,6 +547,7 @@ def _prune_history(conn,owner,days,now):
             AND NOT EXISTS (SELECT 1 FROM jobs WHERE call_id=?)""",(call_id,owner,profile,cutoff,call_id)).rowcount
         if not deleted: break
         conn.execute('DELETE FROM tool_receipts WHERE call_id=? AND owner=? AND profile=?',(call_id,owner,profile))
+        conn.execute('DELETE FROM call_tool_allowances WHERE call_id=? AND owner=? AND profile=?',(call_id,owner,profile))
         removed_calls+=deleted
     return removed_events+removed_calls+removed_logs
 
@@ -619,6 +629,9 @@ def active_calls(conn,owner):
 def prune_notices(conn):
     now=time.time()
     conn.execute("UPDATE calls SET closed=1,ended=COALESCE(ended,seen,created),status='failed' WHERE closed=0 AND COALESCE(seen,created)<?",(now-STALE_CALL_SECONDS,))
+    conn.execute('''DELETE FROM call_tool_allowances WHERE NOT EXISTS
+        (SELECT 1 FROM calls c WHERE c.id=call_id AND c.owner=call_tool_allowances.owner
+         AND c.profile=call_tool_allowances.profile AND c.closed=0 AND c.created>?)''',(now-4*3600,))
     prune_call_history(conn)
     # Move legacy answered invitation metadata into its owned call before pruning
     # the delivery outbox; call, timeline and job history use separate retention.
@@ -793,7 +806,9 @@ def voice_history(owner,profile,stored,limit=200,text_budget=1024*1024):
         calls=conn.execute("SELECT id,created FROM calls c WHERE owner=? AND profile=? AND conversation=? AND EXISTS(SELECT 1 FROM timeline t WHERE t.call_id=c.id AND json_extract(t.payload,'$.type')='transcript') ORDER BY created DESC,id DESC LIMIT ?",(owner,profile,stored,limit+1)).fetchall()
         for call_index,call in enumerate(calls):
             # A turn sits where it began: speech transcription can finalize after the reply has started.
-            groups=conn.execute("SELECT json_extract(payload,'$.role') AS role,json_extract(payload,'$.turn_id') AS turn,MIN(json_extract(payload,'$.at_ms')) AS first_at FROM timeline WHERE call_id=? AND json_extract(payload,'$.type')='transcript' GROUP BY role,turn ORDER BY first_at DESC,role,turn LIMIT ?",(call['id'],limit+1)).fetchall()
+            groups=conn.execute("SELECT json_extract(payload,'$.role') AS role,json_extract(payload,'$.turn_id') AS turn,MIN(json_extract(payload,'$.at_ms')) AS first_at FROM timeline WHERE call_id=? AND json_extract(payload,'$.type')='transcript' GROUP BY role,turn ORDER BY CASE WHEN CAST(turn AS TEXT)!='' AND CAST(turn AS TEXT) NOT GLOB '*[^0-9]*' THEN CAST(turn AS INTEGER) ELSE first_at END DESC,CASE role WHEN 'user' THEN 0 ELSE 1 END,turn DESC LIMIT ?",(call['id'],limit+1)).fetchall()
+            numeric_turns=bool(groups) and all(str(group['turn'] or '').isdigit() for group in groups)
+            role_order=lambda group: 0 if group['role']=='user' else 1
             for group in groups:
                 if len(output)>=limit: truncated=True;break
                 params=(call['id'],group['role'],group['turn'])
@@ -815,10 +830,12 @@ def voice_history(owner,profile,stored,limit=200,text_budget=1024*1024):
                 interrupted=bool(event.get('interrupted'))
                 if group['role']=='assistant' and not interrupted:
                     interrupted=bool(conn.execute("SELECT 1 FROM timeline WHERE call_id=? AND json_extract(payload,'$.type')='interruption' AND json_extract(payload,'$.turn_id') IS ? LIMIT 1",(call['id'],group['turn'])).fetchone())
-                output.append({'call_id':call['id'],'event_id':call['id']+':'+group['role']+':'+str(group['turn'] or 'none'),'session_id':stored,'role':group['role'],'text':text,'final':is_final,'interrupted':interrupted,'at_ms':event['at_ms'],'created_at':call['created']+(group['first_at'] or 0)/1000})
+                turn_order=int(group['turn']) if numeric_turns else group['first_at'] or 0
+                output.append({'call_id':call['id'],'event_id':call['id']+':'+group['role']+':'+str(group['turn'] or 'none'),'session_id':stored,'turn_id':str(group['turn'] or ''),'role':group['role'],'text':text,'final':is_final,'interrupted':interrupted,'at_ms':event['at_ms'],'created_at':call['created']+(group['first_at'] or 0)/1000,'_order':(call['created'],0 if numeric_turns else 1,turn_order,role_order(group),str(group['turn'] or ''),call['id'])})
                 if remaining<=0: truncated=True;break
             if len(output)>=limit or remaining<=0:
                 if call_index+1<len(calls): truncated=True
                 break
-    output.sort(key=lambda row:(row['created_at'],row['event_id']))
+    output.sort(key=lambda row:row['_order'])
+    for row in output: row.pop('_order',None)
     return {'session_id':stored,'profile':profile,'events':output,'truncated':truncated}

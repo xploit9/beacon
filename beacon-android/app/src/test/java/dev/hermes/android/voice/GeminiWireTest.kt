@@ -35,6 +35,13 @@ class GeminiWireTest {
         assertEquals(key,request.rawRequest().header("x-goog-api-key"));assertNull(request.rawRequest().url.queryParameter("key"))
         assertFalse(request.toString().contains(key))
     }
+    @Test fun aCallWithoutTheOwnersNameNeverInventsOne() {
+        fun instruction(context: org.json.JSONObject) = GeminiWire.setup("model","",null,context).getJSONObject("setup")
+            .getJSONObject("systemInstruction").getJSONArray("parts").getJSONObject(0).getString("text")
+        assertTrue(instruction(org.json.JSONObject()).contains("don't address them by any name"))
+        val named = instruction(org.json.JSONObject().put("owner_first_name","Maya"))
+        assertTrue(named.contains("authenticated owner Maya.")); assertFalse(named.contains("don't address them by any name"))
+    }
     @Test fun setupCarriesResumeTranscriptionAndNonblockingNativeWork() {
         val setup=GeminiWire.setup("test-model","Aoede","resume").getJSONObject("setup")
         assertEquals("models/test-model",setup.getString("model"))
@@ -146,6 +153,9 @@ class GeminiWireTest {
         assertTrue(prompt(org.json.JSONObject().put("owner_first_name","Maya").put("owner_display_name","Riley Example")).contains("authenticated owner Maya"))
         assertTrue(prompt(org.json.JSONObject().put("owner_display_name","maya example")).contains("authenticated owner Maya"))
         assertTrue(prompt(org.json.JSONObject().put("owner_display_name","deShawn Lee")).contains("authenticated owner deShawn"))
+        val genericLogin = prompt(org.json.JSONObject().put("owner_first_name", "").put("owner_display_name", "hermes"))
+        assertTrue(genericLogin.contains("authenticated owner the owner"))
+        assertFalse(genericLogin.contains("authenticated owner Hermes"))
     }
 
     @Test fun discoveredToolNameMustHaveOneExactCatalogMatch() {
@@ -165,5 +175,13 @@ class GeminiWireTest {
         assertEquals("mcp__personal__list_calendar_events", refused.getString("tool_name"))
         assertEquals("uncertain", directInvokeFailure("r2", "a".repeat(64), java.io.IOException("reset")).getString("status"))
         assertEquals("uncertain", directInvokeFailure("r3", "a".repeat(64), dev.hermes.android.data.ApiFailure(429, "Busy")).getString("status"))
+    }
+
+    @Test fun earlierConversationFailuresDoNotBlockARequestedFreshToolAttempt() {
+        val prompt = GeminiWire.setup("model", "", null).getJSONObject("setup")
+            .getJSONObject("systemInstruction").getJSONArray("parts").getJSONObject(0).getString("text")
+
+        assertTrue(prompt.contains("A previous assistant failure message is not proof the operation will fail now"))
+        assertTrue(prompt.contains("when the owner asks again, try the relevant tool in this call"))
     }
 }

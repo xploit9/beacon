@@ -19,7 +19,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import java.net.URLEncoder
 
-@Composable internal fun NativeToolSettings(vm: BeaconViewModel, mcp: Boolean = false) {
+@Composable internal fun NativeToolSettings(vm: BeaconViewModel, mcp: Boolean = false, containedActions: Boolean = false) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
     val refreshing by vm.refreshing.collectAsStateWithLifecycle()
@@ -86,12 +86,16 @@ import java.net.URLEncoder
                 if (mcp) OutlinedButton(onClick = { operate(name) }, enabled = busy.isBlank() && !loading) { Text("Test connection") }
                 val tools = if (mcp) data["mcp-test:$name"]?.takeIf { row.optBoolean("enabled") }?.rows("tools")?.map { it.string("name") }.orEmpty() else row.optJSONArray("tools")?.strings().orEmpty()
                 if (tools.isNotEmpty()) {
-                    TextButton(onClick = { opened = if (opened == name) "" else name }) { Text(if (opened == name) "Hide tools" else "View ${tools.size} tools") }
+                    TextButton(onClick = { opened = if (opened == name) "" else name }, modifier = if (containedActions) Modifier.heightIn(min = 48.dp) else Modifier) { Text(if (opened == name) "Hide tools" else "View ${tools.size} tools") }
                     if (opened == name) Text(tools.joinToString("\n"), style = MaterialTheme.typography.bodyMedium)
                 }
                 HorizontalDivider()
             }
         }
-        if (!mcp) item { TextButton(onClick = { vm.closeCatalog(); vm.loadSlashCatalog(); vm.more("Commands") }) { Text("Browse chat commands") } }
+        if (!mcp) item {
+            val browseCommands = { vm.closeCatalog(); vm.loadSlashCatalog(); vm.more("Commands") }
+            if (containedActions) OutlinedButton(onClick = browseCommands, modifier = Modifier.heightIn(min = 48.dp)) { Text("Browse chat commands") }
+            else TextButton(onClick = browseCommands) { Text("Browse chat commands") }
+        }
     }
 }

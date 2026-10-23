@@ -20,6 +20,7 @@ class BeaconClientProfileRoutingTest {
         server.enqueue(MockResponse().setBody("{}"))
         server.enqueue(MockResponse().setBody("apk"))
         server.enqueue(MockResponse().setBody("""{"profiles":[]}"""))
+        server.enqueue(MockResponse().setBody("{}"))
         server.start()
         val client = BeaconClient(AuthContext("https://native.example", emptyList(), "owner", "academic", backend = "hermes-dashboard"), null) { builder ->
             builder.addInterceptor { chain ->
@@ -43,8 +44,9 @@ class BeaconClientProfileRoutingTest {
             client.nativeGetForProfile(
                 "/api/profiles", "coder", listOf("coder"), mapOf("page" to "1", "beacon_profile" to "academic"),
             )
+            client.nativeCallContext("owned-call", "Maya O'Neil")
 
-            val requests = List(6) { server.takeRequest(3, TimeUnit.SECONDS) ?: error("Missing request $it") }
+            val requests = List(7) { server.takeRequest(3, TimeUnit.SECONDS) ?: error("Missing request $it") }
             assertPluginProfile(requests[0], "academic")
             assertPluginProfile(requests[1], "academic")
             assertPluginProfile(requests[2], "academic")
@@ -56,6 +58,9 @@ class BeaconClientProfileRoutingTest {
             assertEquals("/api/plugins/beacon/mobile/releases/current/download", requests[4].requestUrl!!.encodedPath)
             assertNull(requests[4].requestUrl!!.queryParameter("session_id"))
             assertNativeProfile(requests[5], "coder")
+            assertEquals("/api/plugins/beacon/mobile/calls/owned-call/context", requests[6].requestUrl!!.encodedPath)
+            assertPluginProfile(requests[6], "academic")
+            assertEquals("Maya O'Neil", requests[6].requestUrl!!.queryParameter("owner_name"))
         } finally {
             client.closeNative()
             client.http.connectionPool.evictAll()

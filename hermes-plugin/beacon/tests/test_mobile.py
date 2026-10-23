@@ -53,6 +53,30 @@ def reserve(client):
     return result.json()['call_id']
 
 
+def test_removed_phone_revokes_automatic_push_ids_across_profiles(harness):
+    api, client, cfg, _, _ = harness
+    cfg['profiles'] = ['default', 'work']
+    now = time.time()
+    with api.mobile.connect() as conn:
+        conn.execute('INSERT INTO beacon_devices(id,owner,provider,profile,name,created,last_seen) VALUES(?,?,?,?,?,?,?)',
+                     ('phone-lost', 'owner', 'basic', 'default', 'Phone', now, now))
+    tokens = []
+    for profile, device in [('default', 'phone-lost'), ('work', 'phone-lost'), ('work', 'phone-kept')]:
+        token = 'synthetic-' + profile + '-' + device + '-token-12345'
+        result = client.post('/api/plugins/beacon/mobile/notifications/targets?beacon_profile=' + profile,
+            json={'token': token, 'package_name': 'dev.hermes.android'},
+            headers={'x-beacon-device-id': device})
+        assert result.status_code == 200, result.text
+        if device == 'phone-lost': tokens.append(token)
+    assert client.delete('/api/plugins/beacon/devices/phone-lost').status_code == 200
+    with api.mobile.connect() as conn:
+        rows = conn.execute('SELECT token,payload FROM targets').fetchall()
+    assert len(rows) == 1 and all(row['token'] not in tokens for row in rows)
+    assert json.loads(rows[0]['payload'])['device_id'] == 'phone-kept'
+    assert client.post('/api/plugins/beacon/mobile/notifications/targets?beacon_profile=work',
+        json={'token': tokens[1]}, headers={'x-beacon-device-id': 'phone-lost'}).status_code == 403
+
+
 @pytest.mark.parametrize('configured_timezone',['','Unknown/Timezone'])
 def test_task_capabilities_use_hermes_clock_timezone_fallback(harness,monkeypatch,configured_timezone):
     api,client,cfg,_,_=harness
@@ -581,7 +605,7 @@ def test_context_query_routes_are_owned_bounded_and_explicit(harness,monkeypatch
     response=c.get(path+'/context').json()
     assert response['selected_session_id']=='native-stored'
     assert response['greeting']==context['greeting'] and response['owner_display_name']=='Maya Example'
-    assert received[0][-1]=='Maya Example'
+    assert received[0][-2:]==('Maya Example','')
     assert c.post(path+'/search',json={'query':'fresh lookup'}).json()['sources'][0]['title']=='Primary source'
     assert c.post(path+'/search',json={'query':'x'*1025}).status_code==400
     monkeypatch.setattr(api.voice_context,'recall',lambda *args: (_ for _ in ()).throw(LookupError('unsupported')))
@@ -726,13 +750,12 @@ def test_owned_voice_history_reopens_dedupes_and_scopes(harness):
     assert c.get(url).json()==result.json()
     c.headers['x-fixture-owner']='foreign';assert c.get(url).status_code==403
 
-def test_voice_history_orders_turns_by_when_they_began(harness):
+def test_voice_history_orders_late_user_transcription_by_provider_turn(harness):
     api,c,cfg,tmp,app=harness;cid=reserve(c)
-    # The question starts first, but its transcript finalizes after the assistant's "Checking..." filler.
+    # The provider's final user transcription arrives after the reply starts; both belong to turn 3.
     api.mobile.events(cid,'owner',{'events':[
-        {'event_id':'q1','turn_id':'u1','type':'transcript','role':'user','text':'What is on','final':False,'at_ms':1000},
-        {'event_id':'f1','turn_id':'a1','type':'transcript','role':'assistant','text':'Checking your calendar.','final':True,'at_ms':2500},
-        {'event_id':'q2','turn_id':'u1','type':'transcript','role':'user','text':'What is on my calendar?','final':True,'at_ms':3000}]})
+        {'event_id':'answer','turn_id':'3','type':'transcript','role':'assistant','text':'Checking your calendar.','final':True,'at_ms':2500},
+        {'event_id':'question','turn_id':'3','type':'transcript','role':'user','text':'What is on my calendar?','final':True,'at_ms':3000}]})
     rows=api.mobile.voice_history('owner','default','native-stored')['events']
     assert [r['text'] for r in rows]==['What is on my calendar?','Checking your calendar.']
 
@@ -862,6 +885,13 @@ def test_native_completion_is_owned_completed_and_deduplicated(harness,monkeypat
     with pytest.raises(LookupError): observer.completion(api.mobile,api.native,cfg,'default','foreign-chat','turn2',completed=True)
     with api.mobile.connect() as conn: assert conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==1
 
+def test_session_end_completion_without_turn_id_is_quiet(harness):
+    api,c,cfg,tmp,app=harness
+    observer=load_private('observers')
+    # Hermes' on_session_end hook provides completed, interrupted, model, platform, session_id, telemetry_schema_version.
+    observer.completion(api.mobile,api.native,cfg,'default',session_id='owned-chat',completed=True,interrupted=False,model='m',platform='android',telemetry_schema_version=1)
+    with api.mobile.connect() as conn: assert conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==0
+
 def test_task_presets_fail_closed_and_never_install_from_unverified_capabilities(harness,monkeypatch):
     api,c,cfg,tmp,app=harness
     monkeypatch.setattr(api,'task_clock',lambda profile:'UTC')
@@ -921,7 +951,8 @@ def test_registered_native_completion_and_callback_tools_are_real(harness):
     ctx=SimpleNamespace(register_tool=lambda **kwargs:tools.append(kwargs),register_hook=lambda name,handler:hooks.append((name,handler)))
     plugin.register(ctx)
     assert {name for name,handler in hooks}=={'on_session_end','pre_llm_call','post_tool_call','pre_tool_call'}
-    assert {tool['name'] for tool in tools}=={'beacon_call_user','beacon_create_proactive_request','beacon_email_notice','beacon_email_checked'}
+    assert {tool['name'] for tool in tools}=={'beacon_call_user','beacon_create_proactive_request',
+                                            'beacon_event_notice','beacon_events_checked','beacon_email_notice','beacon_email_checked'}
     assert all(callable(handler) for name,handler in hooks)
 
 
@@ -1000,17 +1031,15 @@ def test_voice_skill_reads_are_current_enabled_scoped_and_bounded(harness, monke
     assert set(seen) == {'coder'}
 
 
-def test_voice_memory_does_not_initialize_a_missing_external_provider(harness, monkeypatch):
+def test_voice_memory_reports_a_missing_external_provider_as_failed(harness, monkeypatch):
     api, _, _, tmp, _ = harness
-    (tmp / 'config.yaml').write_text('memory:\n  provider: hindsight\n', encoding='utf-8')
-    calls = []
+    (tmp / 'config.yaml').write_text('memory:\n  provider: mnemosyne-bridge\n', encoding='utf-8')
     monkeypatch.setattr(api.voice_context, 'scoped', lambda profile, fn: fn(tmp))
-    monkeypatch.setattr(api.voice_context, 'external_provider', lambda *args: (None, 'hindsight'))
-    monkeypatch.setattr(api.voice_context, 'lookup_provider', lambda *args: calls.append(args) or pytest.fail('A missing provider must not be initialized'), raising=False)
+    monkeypatch.setattr(api.voice_context, 'external_provider', lambda *args: (None, 'mnemosyne-bridge'))
     monkeypatch.setattr(api.voice_context, 'builtin_memory', lambda *args: '')
-    with pytest.raises(LookupError, match='Native memory recall unavailable'):
-        api.voice_context.recall('owner', 'basic', 'default', 'native-stored', 'current question')
-    assert calls == []
+    result = api.voice_context.recall('owner', 'basic', 'default', 'native-stored', 'current question')
+    assert result['status'] == 'unavailable'
+    assert result['summary'] == 'Memory lookup failed.' and result['sources'] == []
 
 
 def test_project_assignment_can_reserve_only_an_owned_existing_draft(harness, monkeypatch):

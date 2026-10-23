@@ -272,16 +272,15 @@ internal fun imagePanOffset(scale: Float, offset: androidx.compose.ui.geometry.O
 @Composable fun SecureAttachment(vm: BeaconViewModel, attachment: JSONObject, origin: Scope? = vm.authenticatedScope(), snapshots: Map<String, String> = emptyMap()) {
     var open by remember(attachment, origin?.key) { mutableStateOf(false) }
     val name = attachment.string("name", attachment.string("filename", "Attachment"))
-    val path = attachment.string("path").ifBlank { attachment.optJSONObject("image_url")?.string("url") ?: attachment.string("image_url", attachment.string("url")) }
     OutlinedButton(onClick = { open = !open }) { Icon(Icons.Rounded.AttachFile, null); Text(name, Modifier.padding(start = 8.dp)) }
-    if (open) { if (origin != null && path.isNotBlank()) NativeReferencePreview(vm, resolveNativeReference(path, origin, snapshots), name, origin) else Text(uiText("No authorized file reference was supplied by the server"), color = MaterialTheme.colorScheme.error) }
+    if (open) { if (origin != null) NativeReferencePreview(vm, resolveAttachmentReference(attachment, origin, snapshots), name, origin) else Text(uiText("No authorized file reference was supplied by the server"), color = MaterialTheme.colorScheme.error) }
 }
 @Composable fun MediaPreview(vm: BeaconViewModel, path: String, name: String = path, endpoint: String = "/api/file/raw", origin: Scope? = vm.authenticatedScope()) {
     if (origin != null) NativeReferencePreview(vm, NativeReference.LocalMedia(path, origin.session, null, endpoint), name, origin)
 }
 @Composable private fun NativeReferencePreview(vm: BeaconViewModel, reference: NativeReference, name: String, origin: Scope) {
     val active = vm.client
-    val resultClient = active.takeIf { reference is NativeReference.LocalMedia }
+    val resultClient = active.takeIf { reference is NativeReference.LocalMedia || reference is NativeReference.HistoryImage }
     val client = remember(origin.key, active) { active?.takeIf { it.scope == origin.copy(session = "") }?.detached() }
     var error by remember(reference, origin.key, resultClient) { mutableStateOf("") }
     var retry by remember(reference, origin.key, resultClient) { mutableIntStateOf(0) }
@@ -289,6 +288,7 @@ internal fun imagePanOffset(scale: Float, offset: androidx.compose.ui.geometry.O
         value = null; error = ""
         try { val payload = when (reference) {
             is NativeReference.LocalMedia -> { require(client != null) { "Sign in to the originating profile to preview this file" }; NativeMediaBytes(client.bytes(reference.endpoint, reference.query())) }
+            is NativeReference.HistoryImage -> { require(client != null) { "Sign in to the originating profile to preview this image" }; client.historyImage(reference) }
             is NativeReference.DataImage -> withContext(Dispatchers.Default) { NativeMediaBytes(reference.bytes(), reference.mime) }
             is NativeReference.ExternalMedia -> externalMediaBytes(reference)
             is NativeReference.Unsupported -> kotlin.error(reference.reason)

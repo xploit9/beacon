@@ -36,18 +36,51 @@ def _prune_expired(conn,now):
             CAST(strftime('%s',json_extract(CAST(value AS TEXT),'$.scheduled_at')) AS REAL)
           END
         END<=? ORDER BY rowid LIMIT ?""",(cutoff,CALLBACK_MARKER_PRUNE_BATCH)).fetchall()
-    conn.executemany('DELETE FROM meta WHERE key=?',keys)
+    conn.executemany('DELETE FROM meta WHERE key=?',
+                     [(key,) for row in keys for key in (row[0],'missed-callback:'+row[0].split(':',1)[1])])
 
-def prune_expired(mobile,owner,now=None):
+def _authority(cfg,row):
+    return (cfg.get('scheduled_callbacks_enabled') is True and cfg.get('owner_id')==row['owner']
+            and cfg.get('owner_provider')==row['provider']
+            and ('profiles' not in cfg or isinstance(cfg['profiles'],list) and row['profile'] in cfg['profiles']))
+
+def _missed(mobile,native,conn,key,row,now):
+    event=key.split(':',1)[1]
+    if (not _CALLBACK_EVENT.fullmatch(event) or row.get('delivered')
+            or row.get('status') not in ('scheduled','creating')): return False
+    try:
+        target=datetime.fromisoformat(row['scheduled_at'])
+        if (now-target).total_seconds()<CALLBACK_WINDOW_SECONDS or not _authority(mobile.settings(row['profile']),row): return False
+        native.verify(row['owner'],row['provider'],row['profile'],row['conversation'])
+        reason=observers.reason_text(row['reason'])
+    except (KeyError,TypeError,ValueError,LookupError): return False
+    observers._notice(mobile,row['owner'],row['profile'],row['conversation'],
+                      'Missed scheduled callback: '+reason,'missed-callback:'+event,now,conn=conn)
+    row['status']='missed'
+    conn.execute('UPDATE meta SET value=? WHERE key=?',(json.dumps(row).encode(),key))
+    return True
+
+def prune_expired(mobile,native,owner,now=None):
     now=now if now is not None else datetime.now(timezone.utc).timestamp()
+    instant=datetime.fromtimestamp(now,timezone.utc)
     key='scheduled-callback-prune:'+hashlib.sha256(owner.encode('utf-8')).hexdigest()
     with mobile.LOCK,mobile.connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        candidates=conn.execute("""SELECT key,value FROM meta WHERE key LIKE 'scheduled-callback:%'
+            AND CASE WHEN json_valid(CAST(value AS TEXT)) THEN
+              json_extract(CAST(value AS TEXT),'$.owner')=?
+              AND json_extract(CAST(value AS TEXT),'$.status') IN ('scheduled','creating')
+              AND json_extract(CAST(value AS TEXT),'$.delivered') IS NULL
+              AND CAST(strftime('%s',json_extract(CAST(value AS TEXT),'$.scheduled_at')) AS REAL)<=?
+            END ORDER BY rowid LIMIT ?""",(owner,now-CALLBACK_WINDOW_SECONDS,CALLBACK_MARKER_PRUNE_BATCH)).fetchall()
+        missed=sum(_missed(mobile,native,conn,row[0],json.loads(row[1]),instant) for row in candidates)
         row=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
         try: last=float(row[0].decode() if isinstance(row[0],bytes) else row[0]) if row else None
         except (TypeError,ValueError,OverflowError): last=None
-        if last is not None and math.isfinite(last) and now-last<3600: return 0
+        if last is not None and math.isfinite(last) and now-last<3600: return missed
         conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(key,str(now).encode()))
-        return _prune_expired(conn,now)
+        _prune_expired(conn,now)
+        return missed
 
 def target_time(value, now):
     if set(value) - {'request_id','reason','delay_seconds','at'}: raise ValueError('Unknown callback field')
@@ -148,23 +181,27 @@ def schedule(mobile,native,owner,provider,row,cfg,value,now=None):
     record.update(status='scheduled',job_id=job['id'])
     with mobile.LOCK:
         with mobile.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
             current=json.loads(conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()[0])
             if current.get('delivered'): record['delivered']=current['delivered']
+            if current.get('status')=='missed': record['status']='missed'
             conn.execute('UPDATE meta SET value=? WHERE key=?',(json.dumps(record).encode(),key))
     return {k:record[k] for k in ('status','request_id','job_id','scheduled_at')} | {'timezone':timezone_name,'conversation_id':stored}
 
 def deliver(mobile,native,key,now):
     with mobile.LOCK,mobile.connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
         _prune_expired(conn,now.timestamp())
         found=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
         if not found: raise ValueError('Callback intent unavailable')
         row=json.loads(found[0]);cfg=mobile.settings(row['profile']);target=datetime.fromisoformat(row['scheduled_at'])
         age=(now-target).total_seconds()
-        if not -CALLBACK_EARLY_TOLERANCE_SECONDS<=age<CALLBACK_WINDOW_SECONDS: return {'status':'skipped_expired'}
+        if age>=CALLBACK_WINDOW_SECONDS:
+            _missed(mobile,native,conn,key,row,now)
+            return {'status':'skipped_expired'}
+        if age < -CALLBACK_EARLY_TOLERANCE_SECONDS or row.get('status')=='missed': return {'status':'skipped_expired'}
         if row.get('delivered'): return {'status':'duplicate'}
-        if (cfg.get('scheduled_callbacks_enabled') is not True or cfg.get('owner_id')!=row['owner']
-                or cfg.get('owner_provider')!=row['provider']
-                or 'profiles' in cfg and (not isinstance(cfg['profiles'],list) or row['profile'] not in cfg['profiles'])): raise ValueError('Callback authority changed')
+        if not _authority(cfg,row): raise ValueError('Callback authority changed')
         native.verify(row['owner'],row['provider'],row['profile'],row['conversation'])
         # Exact deterministic notice id makes retry atomic with its delivery marker.
         event=key.split(':')[1]

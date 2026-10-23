@@ -77,19 +77,20 @@ def test_search_source_urls_fit_the_android_evidence_limit(harness, monkeypatch)
 def test_recall_uses_only_the_matching_initialized_provider(harness, monkeypatch):
     api, _, _, root, _ = harness
     voice = api.voice_context
-    matching = object()
     calls = []
-    manager = SimpleNamespace(_prefetch_provider=lambda provider, query, session_id: calls.append((provider, query, session_id)) or 'Verified existing memory')
+    matching = SimpleNamespace(prefetch=lambda query, session_id: calls.append((query, session_id)) or 'Verified existing memory')
+    manager = object()
     monkeypatch.setattr(voice.native, 'verify', lambda *args: None)
     monkeypatch.setattr(voice, 'scoped', lambda profile, fn: fn(root))
-    monkeypatch.setattr(voice, 'config', lambda root: {'memory': {'provider': 'hindsight'}})
-    monkeypatch.setattr(voice, 'external_provider', lambda *args: ((manager, matching), 'hindsight'))
+    monkeypatch.setattr(voice, 'config', lambda root: {'memory': {'provider': 'mnemosyne-bridge'}})
+    monkeypatch.setattr(voice, 'external_provider', lambda *args: ((manager, matching), 'mnemosyne-bridge'))
     monkeypatch.setitem(sys.modules, 'agent.memory_manager', SimpleNamespace(sanitize_context=lambda text: text))
     monkeypatch.setattr(voice, 'builtin_memory', lambda *args: pytest.fail('Existing provider evidence must not be replaced'))
     result = voice.recall('owner', 'basic', 'default', 'native-stored', 'current question')
+    assert result['status'] == 'completed'
     assert result['summary'] == 'Verified existing memory'
-    assert result['sources'][0]['ref'] == 'native-memory:hindsight'
-    assert calls == [(matching, 'current question', 'native-stored')]
+    assert result['sources'][0]['ref'] == 'native-memory:mnemosyne-bridge'
+    assert calls == [('current question', 'native-stored')]
 
 
 def test_instruction_carries_the_owners_local_time(harness, monkeypatch):
@@ -178,6 +179,7 @@ def test_context_leaves_the_name_to_the_phone_and_keeps_profile_personality(harn
     # The phone already says "You are <the name the owner chose>"; a second name here would contradict it.
     assert result['system_instruction'].startswith('You are the voice surface of this configured native Hermes profile.')
     assert 'Profile personality:\nProfile-owned SOUL personality' in result['system_instruction']
+    assert 'Create or edit files with file tools (write_file/patch), not shell redirection; use forward slashes in shell paths.' in result['system_instruction']
 
 
 def test_get_context_returns_the_clean_owner_first_name(harness,monkeypatch):
@@ -192,10 +194,20 @@ def test_get_context_returns_the_clean_owner_first_name(harness,monkeypatch):
     monkeypatch.setattr(voice,'tool_catalogue',lambda profile:'')
 
     response=client.get(f'/api/plugins/beacon/mobile/calls/{call_id}/context',
-                        headers={'x-fixture-display-name':'Maya Example'})
+                        params={'owner_name':"Maya O'Neil"},
+                        headers={'x-fixture-display-name':'hermes'})
 
     assert response.status_code==200,response.text
     assert response.json()['owner_first_name']=='Maya'
+    assert 'Maya' in response.json()['greeting']
+
+
+@pytest.mark.parametrize('owner_name',['Maya!','---','A'*41])
+def test_get_context_rejects_invalid_preferred_owner_names(harness,owner_name):
+    _,client,_,_,_=harness
+    call_id=reserve(client)
+    response=client.get(f'/api/plugins/beacon/mobile/calls/{call_id}/context',params={'owner_name':owner_name})
+    assert response.status_code==400
 
 
 def test_greeting_capitalises_a_lowercase_login_name(harness):
@@ -203,4 +215,11 @@ def test_greeting_capitalises_a_lowercase_login_name(harness):
     greet = api.voice_context.greeting_for
     assert greet('maya', 'Tuesday 20 October 2026, 21:38 (Europe/Lisbon)', {}) == 'Good evening, Maya. What can I do for you?'
     assert greet('deShawn Lee', 'Tuesday 20 October 2026, 09:05', {}) == 'Good morning, deShawn. What can I do for you?'
+
+
+@pytest.mark.parametrize('login',['hermes','admin','root','user','owner','default','beacon','test'])
+def test_generic_login_names_are_not_used_in_greetings(harness,login):
+    api,_,_,_,_=harness
+    assert api.voice_context.greeting_for(login,'Tuesday 20 October 2026, 09:15 (Asia/Dubai)',False)== \
+        'Good morning. What can I do for you?'
 

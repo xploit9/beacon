@@ -2,12 +2,23 @@ package dev.hermes.android.voice
 
 import dev.hermes.android.voiceKeySetupPage
 import dev.hermes.android.data.voiceProviderSupported
+import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
 
 class RealtimeProvidersTest {
+    @Test fun malformedProviderKeyIsReportedAsRejected() = runBlocking {
+        listOf(
+            "gemini" to "models/gemini-3.8-live",
+            "grok" to "grok-voice-latest",
+            "openai" to "gpt-realtime-2.1",
+        ).forEach { (provider, model) ->
+            assertEquals(VoiceProviderTestResult.KeyRejected, testVoiceProvider(provider, "bad key", model))
+        }
+    }
+
     @Test fun providerRequestsKeepKeysInHeadersAndUseSelectedModels() {
         val googleKey = "google-fixture-secret"
         val gemini = GeminiWire.request(googleKey)
@@ -101,6 +112,7 @@ class RealtimeProvidersTest {
         assertEquals(24000, output.getJSONObject("format").getInt("rate"))
         assertEquals("marin", output.getString("voice"))
         assertEquals("auto", session.getString("tool_choice"))
+        assertTrue(session.getString("instructions").contains("when the owner asks again, try the relevant tool in this call"))
         assertTrue((0 until session.getJSONArray("tools").length()).any {
             session.getJSONArray("tools").getJSONObject(it).getString("name") == "hermes_work"
         })
@@ -184,9 +196,22 @@ class RealtimeProvidersTest {
 
     @Test fun providerCheckDistinguishesSuccessRejectionUnreachableAndProviderErrors() {
         assertEquals(VoiceProviderTestResult.Success, classifyVoiceProviderTestResponse(101))
+        assertEquals(VoiceProviderTestResult.KeyRejected, classifyVoiceProviderTestResponse(400))
         assertEquals(VoiceProviderTestResult.KeyRejected, classifyVoiceProviderTestResponse(401))
         assertEquals(VoiceProviderTestResult.KeyRejected, classifyVoiceProviderTestResponse(403))
         assertEquals(VoiceProviderTestResult.Unreachable, classifyVoiceProviderTestResponse(null))
         assertEquals(VoiceProviderTestResult.ProviderError, classifyVoiceProviderTestResponse(503))
+    }
+
+    @Test fun aSetupRejectionNamesTheKeyOrTheModel() {
+        // Gemini upgrades any key, then can close 1007 or 1008 at setup when the key is rejected.
+        assertEquals(VoiceProviderTestResult.KeyRejected, classifyVoiceProviderClose(1007, "API key not valid."))
+        assertEquals(VoiceProviderTestResult.KeyRejected, classifyVoiceProviderClose(1008, "API key not valid. Please pass a valid API key."))
+        assertEquals(VoiceProviderTestResult.ProviderError, classifyVoiceProviderClose(1007, "invalid request"))
+        assertEquals(VoiceProviderTestResult.ProviderError, classifyVoiceProviderClose(1008, "models/gemini-x is not found"))
+        assertEquals("Gemini didn't accept the API key. Check it in Settings › Voice & calls.",
+            providerRejectionMessage("gemini", "API key not valid. Please pass a valid API key."))
+        assertEquals("Grok couldn't start the call. Choose another model in Settings › Voice & calls.",
+            providerRejectionMessage("grok", "unknown model"))
     }
 }

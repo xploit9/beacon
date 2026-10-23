@@ -30,9 +30,10 @@ class NativeToolGateway(private val client: BeaconClient, private val callId: St
         return client.nativeRequest("$path/requests/$requestId/cancel", "POST", JSONObject())
     }
     /** Called only by the owner's confirmation UI; never expose this as a Gemini function. */
-    suspend fun decide(requestId: String, proposalId: String, approve: Boolean): JSONObject {
+    suspend fun decide(requestId: String, proposalId: String, decision: String): JSONObject {
         bound(); requireRequestId(requestId); require(proposalId.matches(Regex("[A-Za-z0-9_-]{32,80}")))
-        return client.nativeRequest("$path/requests/$requestId/decision", "POST", json("proposal_id" to proposalId, "decision" to if (approve) "approve" else "deny"))
+        require(decision in setOf("approve", "approve_call", "deny")) { "Invalid tool approval decision" }
+        return client.nativeRequest("$path/requests/$requestId/decision", "POST", json("proposal_id" to proposalId, "decision" to decision))
     }
     companion object {
         internal fun requireRequestId(value: String) { require(value.matches(Regex("[A-Za-z0-9_-]{1,160}"))) { "Invalid tool request identity" } }

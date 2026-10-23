@@ -45,6 +45,9 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.data.NativeAuth
 import dev.hermes.android.ui.*
+import dev.hermes.android.voice.CallToolApproval
+import dev.hermes.android.voice.callToolApprovalErrorMessage
+import dev.hermes.android.voice.callToolApprovalSummary
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -105,16 +108,18 @@ class BeaconActivity : ComponentActivity() {
             var permissionSource by rememberSaveable { mutableStateOf("") }
             var permissionEvent by rememberSaveable { mutableStateOf("") }
             var permissionAction by rememberSaveable { mutableStateOf("answer") }
-            val answerPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
+            val callPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
                 val source = permissionSource; val event = permissionEvent
+                val action = permissionAction
                 permissionSource = ""; permissionEvent = ""
-                if (allowed && source.isNotBlank() && event.isNotBlank()) model.handlePush(source, event, permissionAction)
-                else if (!allowed) model.notice("Allow the microphone to answer.")
+                permissionAction = "answer"
+                if (allowed && source.isNotBlank() && event.isNotBlank()) model.handlePush(source, event, action)
+                else if (!allowed) model.notice(if (action == "callback") "Allow microphone access to call back." else "Allow the microphone to answer.")
             }
             val callFromNotification: (String, String, String) -> Unit = { source, event, action ->
                 if (permissionSource.isBlank()) {
                     permissionSource = source; permissionEvent = event; permissionAction = action
-                    answerPermission.launch(Manifest.permission.RECORD_AUDIO)
+                    callPermission.launch(Manifest.permission.RECORD_AUDIO)
                 }
             }
             val answer: (String,String) -> Unit = { source,event -> callFromNotification(source,event,"answer") }
@@ -192,8 +197,8 @@ class BeaconActivity : ComponentActivity() {
         if (dev.hermes.android.push.validOpaque(source) && dev.hermes.android.push.validOpaque(event)) {
             val invite = (application as BeaconApplication).push.ringingInvitation(source, event)
             val answer = invite != null && intent?.action == invite.answerAction
-            val missed = (application as BeaconApplication).push.missedInvitation(source,event)
-            val callback = missed != null && intent?.action == missed.callbackAction
+            val callbackInvite = (application as BeaconApplication).push.deadlineInvitation(source,event)
+            val callback = dev.hermes.android.voice.isMissedCallbackAction(intent?.action, callbackInvite)
             initialPush = Triple(source, event, if (answer) "answer" else if(callback) "callback" else "")
             intent?.removeExtra("push_source"); intent?.removeExtra("push_event"); intent?.removeExtra("source_ref"); intent?.removeExtra("event_id")
         }
@@ -205,14 +210,18 @@ internal fun NativeFeedbackEffect(
     notice: String,
     setupWizard: Boolean,
     snackbar: SnackbarHostState,
+    actionLabel: String? = null,
+    onAction: () -> Unit = {},
     clearMessage: () -> Unit,
 ) {
     val message = rememberUpdatedState(if (setupWizard) "" else error.ifBlank { notice })
     val wizardOpen = rememberUpdatedState(setupWizard)
     val clear = rememberUpdatedState(clearMessage)
+    val label = rememberUpdatedState(actionLabel)
+    val action = rememberUpdatedState(onAction)
     LaunchedEffect(snackbar) {
         var wasWizardOpen = wizardOpen.value
-        snapshotFlow { wizardOpen.value to message.value }.distinctUntilChanged().collectLatest { (inWizard, text) ->
+        snapshotFlow { Triple(wizardOpen.value, message.value, label.value) }.distinctUntilChanged().collectLatest { (inWizard, text, button) ->
             if (wasWizardOpen && !inWizard) {
                 wasWizardOpen = false
                 clear.value()
@@ -220,8 +229,8 @@ internal fun NativeFeedbackEffect(
             }
             if (inWizard) wasWizardOpen = true
             if (text.isNotBlank()) {
-                snackbar.showSnackbar(text, withDismissAction = true, duration = SnackbarDuration.Long)
-                clear.value()
+                val result = snackbar.showSnackbar(text, actionLabel = button, withDismissAction = true, duration = SnackbarDuration.Long)
+                if (result == SnackbarResult.ActionPerformed) action.value() else clear.value()
             }
         }
     }
@@ -247,8 +256,6 @@ internal fun NativeFeedbackEffect(
                     Icon(Icons.Rounded.Call, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(32.dp))
                     Text(assistantText("Beacon is calling"), style = MaterialTheme.typography.headlineSmall)
                 }
-                Text(uiText("Your microphone stays off until you answer."), style = MaterialTheme.typography.bodyLarge)
-                Text(assistantText("If you miss it, it will be waiting in the Beacon chat."), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
                 ui.error.ifBlank { call.error }.takeIf { it.isNotBlank() }?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium) }
                 Button(onClick = { onAnswer(pending.source, pending.event) }, enabled = !requestingPermission && !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("beacon-incoming-answer")) { Icon(Icons.Rounded.Call, null); Spacer(Modifier.width(8.dp)); Text(uiText(when { requestingPermission -> "Waiting for microphone permission"; busy -> "Please wait"; else -> "Answer" })) }
                 OutlinedButton(onClick = { vm.declineIncoming(pending.source, pending.event) }, enabled = !requestingPermission && !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("beacon-incoming-decline")) { Icon(Icons.Rounded.CallEnd, null); Spacer(Modifier.width(8.dp)); Text(uiText("Decline")) }
@@ -291,8 +298,11 @@ internal fun NativeFeedbackEffect(
     BackHandler(ui.authenticated && !ui.showSessions && ui.tab !in setOf("Chat", "Beacon") && (ui.tab != "More" || ui.morePage.isBlank())) {
         if (ui.tab == "More") vm.backFromSettings() else if (ui.tab == "Spaces" && vm.editor.value.path.isNotBlank()) vm.closeEditor() else if (ui.botModeEnabled) vm.showBotMode() else vm.tab("Chat")
     }
-    NativeFeedbackEffect(ui.error, ui.notice, ui.setupWizard, snackbar, vm::clearMessage)
-    if (ui.restoringSession) {
+    val archiveUndo by vm.archiveUndo.collectAsStateWithLifecycle()
+    NativeFeedbackEffect(ui.error, ui.notice, ui.setupWizard, snackbar,
+        actionLabel = "Undo".takeIf { archiveUndo != null && ui.error.isBlank() && ui.notice == "Archived" }, onAction = vm::undoArchive, clearMessage = vm::clearMessage)
+    // The wizard stays composed while it connects after sign-in: swapping in the logo would drop its pairing code.
+    if (ui.restoringSession && !ui.setupWizard) {
         Surface(Modifier.fillMaxSize().testTag("session-restore-logo"), color = MaterialTheme.colorScheme.background) {
             Column(Modifier.safeDrawingPadding(), verticalArrangement = Arrangement.Center, horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally) {
                 Icon(androidx.compose.ui.res.painterResource(R.drawable.ic_beacon_logo), null, Modifier.size(64.dp), tint = androidx.compose.ui.graphics.Color.Unspecified)
@@ -345,6 +355,10 @@ internal fun NativeFeedbackEffect(
         }
         val swipeCloseDistance = with(LocalDensity.current) { 90.dp.toPx() }
         val drawerDirection = if (LocalLayoutDirection.current == LayoutDirection.Rtl) 1 else -1
+        val hasComposer = ui.tab in setOf("Chat", "Beacon") && !(call.active && call.conversationScope == vm.authenticatedScope())
+        val snackbarBottom = with(LocalDensity.current) { if (hasComposer) composerHeightPx.toDp() else 0.dp }
+        val feedbackReserve = with(LocalDensity.current) { if (hasComposer) 0.dp else feedbackHeightPx.toDp() }
+        Box(Modifier.fillMaxSize()) {
         AdaptiveCallNavigation(drawer, ui.showSessions, navigation = { persistent ->
                 val swipe = if (persistent) Modifier.pointerInput(swipeCloseDistance, drawerDirection) {
                     var distance = 0f
@@ -357,10 +371,7 @@ internal fun NativeFeedbackEffect(
                     else SessionList(vm, navigationModifier.testTag("navigation-menu"), beforeHistory = { SidebarNavigation(vm) })
                 }
         }) {
-            val hasComposer = ui.tab in setOf("Chat", "Beacon") && !(call.active && call.conversationScope == vm.authenticatedScope())
-            val snackbarBottom = with(LocalDensity.current) { if (hasComposer) composerHeightPx.toDp() else 0.dp }
-            val feedbackReserve = with(LocalDensity.current) { if (hasComposer) 0.dp else feedbackHeightPx.toDp() }
-            Scaffold(modifier = Modifier.imePadding(), contentWindowInsets = WindowInsets.safeDrawing, snackbarHost = { Box(Modifier.padding(bottom = snackbarBottom)) { feedbackHost() } }) { padding ->
+            Scaffold(modifier = Modifier.imePadding(), contentWindowInsets = WindowInsets.safeDrawing) { padding ->
                 // The shell owns system/IME space; descendants receive already-consumed insets.
                 CompositionLocalProvider(LocalOpenNavigationMenu provides openMenu) {
                     Column(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Brush.linearGradient(nativeAmbientColors(MaterialTheme.colorScheme))).padding(padding).padding(bottom = feedbackReserve).consumeWindowInsets(padding)) {
@@ -381,6 +392,8 @@ internal fun NativeFeedbackEffect(
                 }
             }
         }
+        Box(Modifier.fillMaxSize().imePadding().navigationBarsPadding().padding(bottom = snackbarBottom), contentAlignment = androidx.compose.ui.Alignment.BottomCenter) { feedbackHost() }
+        }
     }
     // Register after destination Back handlers so an open drawer always closes first.
     BackHandler(!ui.showSessions && ui.tab == "More" && ui.morePage.isNotBlank() && ui.morePage !in setOf("Skills", "Memory", "Bots", "Profiles")) { vm.backFromSettings() }
@@ -391,19 +404,53 @@ internal fun NativeFeedbackEffect(
     form?.let { NativeForm(vm, it) }
     val approval=call.toolApprovals.firstOrNull()?.takeIf { ui.authenticated && call.active && call.conversationScope?.let { s -> s.owner==ui.owner&&s.profile==ui.profile&&s.origin==ui.origin }==true }
     if(approval!=null&&form==null) {
-        val decide: (Boolean) -> Unit = { allow -> vm.app.calls.decideTool(call.callId,approval.requestId,approval.proposalId,allow) }
-        AlertDialog(onDismissRequest={if(!approval.busy) decide(false)},
-            icon={Icon(Icons.Rounded.VerifiedUser,null)}, title={Text("Allow this action?")},
-            text={Column(Modifier.heightIn(max=420.dp).verticalScroll(rememberScrollState()),verticalArrangement=Arrangement.spacedBy(12.dp)) {
-                Text(approval.toolName.substringAfterLast("__").replace('_',' ').replaceFirstChar { it.titlecase() },style=MaterialTheme.typography.titleMedium)
-                if(approval.toolName.startsWith("mcp__")) Text("Connection: "+approval.toolName.removePrefix("mcp__").substringBefore("__").replace('_',' '),style=MaterialTheme.typography.bodySmall)
-                Text(assistantText("Review the details before Beacon runs this action."))
-                androidx.compose.foundation.text.selection.SelectionContainer { Text(approval.arguments,style=MaterialTheme.typography.bodySmall.copy(fontFamily=androidx.compose.ui.text.font.FontFamily.Monospace)) }
-                if(approval.error.isNotBlank()) Text(approval.error,color=MaterialTheme.colorScheme.error)
-                if(approval.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-            }},
-            confirmButton={TextButton(onClick={decide(true)},enabled=!approval.busy,modifier=Modifier.testTag("beacon-tool-allow")) {Text("Allow once")}},
-            dismissButton={TextButton(onClick={decide(false)},enabled=!approval.busy,modifier=Modifier.testTag("beacon-tool-deny")) {Text("Deny")}},
-            modifier=Modifier.testTag("beacon-tool-approval"))
+        CallToolApprovalDialog(approval, onDecision = { decision ->
+            vm.app.calls.decideTool(call.callId,approval.requestId,approval.proposalId,decision)
+        })
     }
+}
+
+@Composable
+internal fun CallToolApprovalDialog(approval: CallToolApproval, onDecision: (String) -> Unit) {
+    var details by rememberSaveable(approval.requestId) { mutableStateOf(false) }
+    val summary = remember(approval.toolName, approval.arguments) { callToolApprovalSummary(approval) }
+    AlertDialog(
+        onDismissRequest = { if (!approval.busy) onDecision("deny") },
+        icon = { Icon(Icons.Rounded.VerifiedUser, null) },
+        title = { Text("Allow this action?") },
+        text = {
+            Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(summary.action, style = MaterialTheme.typography.titleMedium)
+                if (summary.service.isNotBlank()) Text(summary.service, style = MaterialTheme.typography.bodySmall)
+                if (summary.target.isNotBlank()) Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text("Target", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(summary.target, style = MaterialTheme.typography.bodyLarge)
+                }
+                if (summary.fields.isNotBlank()) Text(summary.fields, style = MaterialTheme.typography.bodyMedium)
+                if (summary.preview.isNotBlank()) Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text("Content preview", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Surface(shape = MaterialTheme.shapes.medium, color = MaterialTheme.colorScheme.surfaceContainerLow) {
+                        Text(summary.preview, Modifier.fillMaxWidth().padding(12.dp), style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+                Text(assistantText("Review the details before Beacon runs this action."))
+                TextButton(onClick = { details = !details }, modifier = Modifier.heightIn(min = 48.dp).testTag("beacon-tool-approval-details-toggle")) {
+                    Text(if (details) "Hide details" else "Details")
+                }
+                if (details) androidx.compose.foundation.text.selection.SelectionContainer {
+                    Text(approval.arguments, Modifier.testTag("beacon-tool-approval-details"), style = MaterialTheme.typography.bodySmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace))
+                }
+                if (approval.error.isNotBlank()) Text(callToolApprovalErrorMessage(approval.error), color = MaterialTheme.colorScheme.error)
+                if (approval.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+            }
+        },
+        confirmButton = {
+            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                TextButton(onClick = { onDecision("deny") }, enabled = !approval.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("beacon-tool-deny")) { Text("Deny") }
+                TextButton(onClick = { onDecision("approve") }, enabled = !approval.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("beacon-tool-allow")) { Text("Allow once") }
+                Button(onClick = { onDecision("approve_call") }, enabled = !approval.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("beacon-tool-allow-call")) { Text("Always allow during this call") }
+            }
+        },
+        modifier = Modifier.testTag("beacon-tool-approval"),
+    )
 }

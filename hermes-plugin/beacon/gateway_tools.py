@@ -4,12 +4,14 @@ import contextvars
 import hashlib
 import inspect
 import json
+import logging
+from pathlib import Path
 import re
 import secrets
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 
 from fastapi import HTTPException
 
@@ -19,6 +21,8 @@ MAX_TOOLS = 12
 MAX_CATALOGUE_BYTES = 3072
 # Eight active calls at 128 receipts each; old closed or expired receipts make room.
 MAX_RECEIPTS = 1024
+MAX_CALL_ALLOWANCES = 32
+MAX_ALLOWANCES = 1024
 DEADLINE = 90
 CATALOG_TTL = 15
 BOOT = uuid.uuid4().hex
@@ -35,7 +39,8 @@ NATIVE_READ_ONLY_ACTIONS = {'cronjob_manage': frozenset({'list'}), 'process_mana
 CALL_EXCLUDED_TOOLS = frozenset({'manage_connections','manage_catalog','setup_mcp',
                                  'connector_search','connector_describe'})
 NATIVE_EXCLUDED_TOOLS = frozenset({'clarify','delegate_task','todo_list','memory','session_search',
-                                   'beacon_create_proactive_request','beacon_email_notice','beacon_email_checked'}) | CALL_EXCLUDED_TOOLS
+                                   'beacon_create_proactive_request','beacon_event_notice','beacon_events_checked',
+                                   'beacon_email_notice','beacon_email_checked'}) | CALL_EXCLUDED_TOOLS
 NATIVE_EXCLUDED_TOOLSETS = frozenset({'browser','connectors','beacon-interactive','beacon-mailbox'})
 QUERY_FILLER = set('a an the my me please could can you i would like want get read list find look pull show to for of in on and from up most latest recent current last today now one two three four five six ten tool tools'.split())
 QUERY_ALIASES = {
@@ -47,6 +52,7 @@ QUERY_ALIASES = {
     'search': {'search', 'find', 'lookup', 'query'},
     'get': {'get', 'read', 'retrieve', 'fetch', 'list'},
 }
+logger = logging.getLogger(__name__)
 
 
 def query_words(text):
@@ -230,6 +236,45 @@ def tool_read_only(tool, arguments):
 
 class NativeMcp:
     """Direct MCP and Hermes registry tool catalog and dispatch for the active profile."""
+    def scoped_metadata(self, profile, fn):
+        from tui_gateway import server
+        root=server._profile_home(profile)
+        # Metadata needs the profile binding, not external secret commands and their global lock.
+        with server._session_profile_runtime_scope({'profile_home':str(root) if root else None}, hydrate_secrets=False):
+            return fn(Path(root) if root else Path(server._hermes_home))
+
+    def approval_source(self, tool, arguments, scope, session_id, root):
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.web_server_sessions import _open_session_db_at_path
+        from tools.approval_context import _normalize_approval_mode
+        with closing(_open_session_db_at_path(Path(root)/'state.db',read_only=True)) as db:
+            row=db.get_session(session_id)
+        if not row or row.get('user_id')!=scope[1]+':'+scope[0]: return None
+        config=row.get('model_config') or {}
+        if isinstance(config,str): config=json.loads(config)
+        if not isinstance(config,dict): return None
+        yolo=config.get('yolo_mode',False)
+        if type(yolo) is not bool: return None
+        if yolo: return 'chat_yolo'
+        approvals=load_config_readonly().get('approvals') or {}
+        if not isinstance(approvals,dict): return None
+        mode=_normalize_approval_mode(approvals.get('mode','manual'))
+        if mode=='off': return 'profile_off'
+        # Hermes' guardian evaluates shell commands; arbitrary MCP/file arguments are not shell input.
+        if mode=='smart' and tool.get('_kind')=='hermes' and tool.get('_raw')=='terminal':
+            command=arguments.get('command')
+            if not isinstance(command,str): return None
+            from gateway import session_context
+            from tools.approval_smart import _smart_verdict
+            key='beacon-call/'+digest(scope)
+            tokens=session_context.set_session_vars(platform='api_server',source='beacon',
+                user_id=scope[1]+':'+scope[0],profile=scope[2],session_key=key,session_id=session_id)
+            try:
+                pattern='beacon-call:terminal'
+                if _smart_verdict(command,'Call terminal action',pattern,[pattern],key)=='approve': return 'smart'
+            finally: session_context.clear_session_vars(tokens)
+        return None
+
     def cache_key(self):
         try:
             from hermes_cli.config import load_config_readonly
@@ -300,8 +345,10 @@ class NativeMcp:
         from gateway import session_context
         session_id=session_id or scope[3]
         key = 'beacon-tool/' + uuid.uuid4().hex
+        # Reuse Hermes' environment within this call; approval callbacks still get a unique one-shot key.
+        session_key='beacon-call/'+digest(scope)
         session_tokens = session_context.set_session_vars(platform='api_server', source='beacon',
-            user_id=scope[1]+':'+scope[0], profile=scope[2], session_key=key, session_id=session_id)
+            user_id=scope[1]+':'+scope[0], profile=scope[2], session_key=session_key, session_id=session_id)
         if tool.get('_kind')=='hermes':
             terminal=tool.get('_raw')=='terminal'
             registered=False
@@ -310,7 +357,7 @@ class NativeMcp:
                 if not tool.get('read_only') and not approved:
                     raise HTTPException(403,'Hermes tool requires owner approval')
                 if terminal:
-                    # The call proposal displays the exact command, so it can satisfy Hermes' one-shot guard only on an exact match.
+                    # Only the exact authorized command can satisfy Hermes' one-shot guard.
                     from tools import approval, approval_context
                     token=approval_context.set_current_session_key(key)
                     used=False
@@ -366,8 +413,10 @@ class NativeMcp:
 
 class Gateway:
     def __init__(self, mobile, scoped, backend=None, sanitizer=safe):
-        self.mobile, self.scoped = mobile, scoped
+        self.mobile = mobile
         self.backend = backend or NativeMcp()
+        self.scoped = scoped
+        self.execution_scoped = scoped
         self.sanitize = sanitizer
 
     @contextmanager
@@ -377,6 +426,9 @@ class Gateway:
                 owner TEXT, provider TEXT, profile TEXT, call_id TEXT, request_id TEXT,
                 signature TEXT NOT NULL, payload TEXT NOT NULL, updated REAL NOT NULL,
                 PRIMARY KEY(owner,provider,profile,call_id,request_id))''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS call_tool_allowances (
+                owner TEXT, provider TEXT, profile TEXT, call_id TEXT, tool_id TEXT, tool_name TEXT,
+                created REAL NOT NULL, PRIMARY KEY(owner,provider,profile,call_id,tool_name))''')
             yield conn
 
     def _catalog_key(self, profile):
@@ -513,6 +565,7 @@ class Gateway:
             row = self._row(conn,scope,request)
             if not row: raise HTTPException(404, 'Tool request unavailable')
             value = json.loads(row['payload'])
+            value.setdefault('approved_by',None)
             if value['status']=='running' and (value.get('_boot')!=BOOT or
                     time.time()-value['_started']>value.get('_deadline_seconds',DEADLINE)):
                 value.update(status='uncertain', reason='Execution may have completed; do not retry automatically')
@@ -524,6 +577,19 @@ class Gateway:
                 value.update(status='failed',reason='Admission interrupted before execution; operation was not started')
                 self._save(conn,scope,request,value)
         return {k:v for k,v in value.items() if not k.startswith('_')}
+
+    def _approval_source(self, scope, tool, arguments, session_id):
+        with self.db() as conn:
+            if conn.execute('''SELECT 1 FROM call_tool_allowances
+                WHERE owner=? AND provider=? AND profile=? AND call_id=? AND (tool_id=? OR tool_name=?)''',
+                (*scope,tool['tool_id'],tool['name'])).fetchone(): return 'call_allowance'
+        policy=getattr(self.backend,'approval_source',None)
+        if not callable(policy): return None
+        try:
+            result=self.scoped(scope[2],lambda root:policy(tool,arguments,scope,session_id,root))
+            return result if result in ('chat_yolo','profile_off','smart') else None
+        except Exception:
+            return None  # Missing/malformed state or a failed guardian always asks the phone.
 
     def invoke(self, scope, value, session_id=None):
         if set(value)!={'request_id','tool_id','arguments'}: raise HTTPException(400, 'Invalid tool request fields')
@@ -547,13 +613,16 @@ class Gateway:
             validate(tool['parameters'],arguments)
         read_only=tool_read_only(tool,arguments)
         tool={**tool,'read_only':read_only}
+        session_id=session_id or scope[3]
+        approved_by=None if read_only else self._approval_source(scope,tool,arguments,session_id)
+        needs_approval=not read_only and approved_by is None
         result={'request_id':request,'tool_id':tool['tool_id'],'tool_name':tool['name'],
-                'status':'ready' if read_only else 'needs_approval',
-                '_arguments':arguments,'_read_only':read_only,'_session_id':session_id or scope[3],
+                'status':'needs_approval' if needs_approval else 'ready','approved_by':approved_by,
+                '_arguments':arguments,'_read_only':read_only,'_session_id':session_id,
                 '_expires':time.time()+120}
         if '_timeout' in tool:
             result['_deadline_seconds']=max(DEADLINE,float(tool['_timeout'])+30)
-        if not read_only:
+        if needs_approval:
             serialized=encoded(arguments)
             try:
                 displayed=json.loads(self.sanitize(serialized,MAX_ARGUMENTS))
@@ -583,11 +652,11 @@ class Gateway:
                     if expired: conn.commit()
                     raise HTTPException(429,'Tool receipt capacity reached')
             conn.execute('INSERT INTO tool_receipts VALUES(?,?,?,?,?,?,?,?)',(*scope,request,signature,encoded(result),time.time()))
-        if read_only: self._start(scope,request,tool,False)
+        if not needs_approval: self._start(scope,request,tool,False)
         return self.status(scope,request)
 
     def decide(self, scope, request, value):
-        if set(value)!={'proposal_id','decision'} or value['decision'] not in ('approve','deny'):
+        if set(value)!={'proposal_id','decision'} or value['decision'] not in ('approve','approve_call','deny'):
             raise HTTPException(400,'Invalid approval decision')
         current=self.status(scope,request)
         if not current.get('proposal') or not isinstance(value['proposal_id'],str) or not value['proposal_id'].isascii() or not secrets.compare_digest(current['proposal']['id'],value['proposal_id']):
@@ -606,7 +675,7 @@ class Gateway:
                 if stored['status']=='needs_approval':
                     stored.update(status='failed',reason='Tool changed; rediscover before a new proposal');self._save(conn,scope,request,stored)
             return self.status(scope,request)
-        self._start(scope,request,tool,True)
+        self._start(scope,request,tool,True,allow_call=value['decision']=='approve_call')
         return self.status(scope,request)
 
     def cancel(self, scope, request):
@@ -620,7 +689,7 @@ class Gateway:
             self._save(conn,scope,request,value)
         return self.status(scope,request)
 
-    def _start(self, scope, request, tool, approved):
+    def _start(self, scope, request, tool, approved, allow_call=False):
         if not SLOTS.acquire(blocking=False):
             with self.db() as conn:
                 value=json.loads(self._row(conn,scope,request)['payload'])
@@ -636,13 +705,31 @@ class Gateway:
                 if value['status']!=expected: return
                 if approved and time.time()>value['_expires']:
                     value['status']='expired';self._save(conn,scope,request,value);return
+                if allow_call:
+                    try: self.mobile.owned(conn,scope[3],scope[0],scope[2],True)
+                    except (LookupError,ValueError):
+                        raise HTTPException(409,'Call is closed or unavailable; no allowance was granted') from None
+                    conn.execute('''DELETE FROM call_tool_allowances WHERE NOT EXISTS
+                        (SELECT 1 FROM calls c WHERE c.id=call_id AND c.owner=call_tool_allowances.owner
+                         AND c.profile=call_tool_allowances.profile AND c.closed=0 AND c.created>?)''',
+                        (time.time()-4*3600,))
+                    existing=conn.execute('''SELECT 1 FROM call_tool_allowances
+                        WHERE owner=? AND provider=? AND profile=? AND call_id=? AND tool_name=?''',(*scope,tool['name'])).fetchone()
+                    if not existing:
+                        count=conn.execute('SELECT COUNT(*) FROM call_tool_allowances WHERE owner=? AND provider=? AND profile=? AND call_id=?',scope).fetchone()[0]
+                        if count>=MAX_CALL_ALLOWANCES: raise HTTPException(429,'Call tool allowance capacity reached')
+                        if conn.execute('SELECT COUNT(*) FROM call_tool_allowances').fetchone()[0]>=MAX_ALLOWANCES:
+                            raise HTTPException(429,'Tool allowance capacity reached')
+                    conn.execute('INSERT OR REPLACE INTO call_tool_allowances VALUES(?,?,?,?,?,?,?)',
+                        (*scope,tool['tool_id'],tool['name'],time.time()))
+                if approved: value['approved_by']='owner'
                 value.update(status='running',_started=time.time(),_boot=BOOT)
                 self._save(conn,scope,request,value)
             context=contextvars.copy_context()
             try:
                 operation={**tool,'read_only':value.get('_read_only',tool.get('read_only',False))}
-                POOL.submit(context.run,self._run,scope,request,operation,value['_arguments'],approved,
-                            value.get('_session_id',scope[3]))
+                POOL.submit(context.run,self._run,scope,request,operation,value['_arguments'],bool(value.get('approved_by')),
+                            value.get('_session_id',scope[3]),time.monotonic())
             except Exception:
                 with self.db() as conn:
                     row=self._row(conn,scope,request)
@@ -656,18 +743,25 @@ class Gateway:
         finally:
             if not submitted: SLOTS.release()
 
-    def _run(self, scope, request, tool, arguments, approved, session_id):
+    def _run(self, scope, request, tool, arguments, approved, session_id, queued_at=None):
+        started=time.monotonic()
+        queued_at=started if queued_at is None else queued_at
+        timing={'queue':(started-queued_at)*1000,'authority':0,'catalogue':0,'profile':0,'execute':0}
         dispatched=False
         try:
             # Recheck authority and config at the last boundary before the RPC.
             with self.mobile.connect() as conn:
                 self.mobile.owned(conn,scope[3],scope[0],scope[2],True)
+            timing['authority']=(time.monotonic()-started)*1000
             # Catalogue discovery releases its profile scope before the store lock is needed below.
-            current=next((t for t in self.catalog(scope[2],discover=False) if t['tool_id']==tool['tool_id']),None)
+            phase=time.monotonic()
+            try: current=next((t for t in self.catalog(scope[2],discover=False) if t['tool_id']==tool['tool_id']),None)
+            finally: timing['catalogue']=(time.monotonic()-phase)*1000
             if not current: raise HTTPException(409,'Tool configuration changed')
             current_read_only=tool_read_only(current,arguments)
             if current_read_only!=tool['read_only']: raise HTTPException(409,'Tool access classification changed')
             current={**current,'read_only':current_read_only}
+            phase=time.monotonic()
             # Check the store before entering the profile scope to keep one global lock order.
             if self.status(scope,request)['status']!='running':
                 raise HTTPException(409,'Tool admission cancelled or expired')
@@ -675,11 +769,18 @@ class Gateway:
             if (cfg.get('owner_id')!=scope[0] or cfg.get('owner_provider')!=scope[1]
                     or 'profiles' in cfg and scope[2] not in cfg['profiles']):
                 raise HTTPException(403,'Owner authority changed')
+            timing['authority']+=(time.monotonic()-phase)*1000
+            phase=time.monotonic()
             def execute(_):
                 nonlocal dispatched
+                timing['profile']=(time.monotonic()-phase)*1000
                 dispatched=True
-                return self.backend.execute(current,arguments,scope,approved,session_id=session_id)
-            raw=self.scoped(scope[2],execute)
+                execution=time.monotonic()
+                try: return self.backend.execute(current,arguments,scope,approved,session_id=session_id)
+                finally: timing['execute']=(time.monotonic()-execution)*1000
+            try: raw=self.execution_scoped(scope[2],execute)
+            finally:
+                if not dispatched: timing['profile']=(time.monotonic()-phase)*1000
             if not isinstance(raw,str): raw=encoded(raw)
             state=outcome(raw,tool['read_only'])
             text=self.sanitize(raw,MAX_RESULT)
@@ -698,9 +799,13 @@ class Gateway:
                     'reason':'Tool outcome unavailable; inspect external state before retrying' if uncertain else
                             'Read-only tool failed' if dispatched else 'Tool failed before execution'}
         finally:
+            timing['total']=(time.monotonic()-queued_at)*1000
+            timing={name:round(value,3) for name,value in timing.items()}
+            logger.info('Beacon call tool timing queue_ms=%s authority_ms=%s catalogue_ms=%s profile_ms=%s execute_ms=%s total_ms=%s',
+                *(timing[name] for name in ('queue','authority','catalogue','profile','execute','total')))
             try:
                 with self.db() as conn:
                     value=json.loads(self._row(conn,scope,request)['payload'])
                     # A timeout is terminal: a late return cannot manufacture certainty.
-                    if value['status']=='running': value.update(update);self._save(conn,scope,request,value)
+                    if value['status']=='running': value.update(update,_timings_ms=timing);self._save(conn,scope,request,value)
             finally: SLOTS.release()

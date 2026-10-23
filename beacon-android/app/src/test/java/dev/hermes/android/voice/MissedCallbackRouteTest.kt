@@ -15,4 +15,11 @@ class MissedCallbackRouteTest {
             assertTrue(field,runCatching { requireMissedCallbackRoute(route().put(field,value),missed,scope) }.isFailure)
         assertTrue(runCatching { requireMissedCallbackRoute(route(),missed.copy(state="ringing"),scope) }.isFailure)
     }
+
+    @Test fun expiredMissedInvitationStillRecognizesItsSavedCallbackAction() {
+        val expired = missed.copy(expiresAt = 1)
+        assertTrue(isMissedCallbackAction(expired.callbackAction, expired))
+        assertFalse(isMissedCallbackAction(expired.answerAction, expired))
+        assertFalse(isMissedCallbackAction(expired.callbackAction, expired.copy(state = "ended")))
+    }
 }
