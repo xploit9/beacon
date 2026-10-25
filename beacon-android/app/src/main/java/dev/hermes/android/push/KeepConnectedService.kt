@@ -120,6 +120,7 @@ internal sealed interface KeepConnectedCycle {
 internal class KeepConnectedCursors(
     private val read: (String) -> String?,
     private val write: (String, String) -> Boolean,
+    private val nativeProvider: String = "",
 ) {
     fun readIfPresent(origin: String, owner: String, profile: String): Long? =
         read(key(origin, owner, profile))?.toLongOrNull()?.takeIf { it >= 0 }
@@ -137,7 +138,7 @@ internal class KeepConnectedCursors(
     }
 
     private fun key(origin: String, owner: String, profile: String) =
-        "cursor:${"$origin\u0000$owner\u0000$profile".digest()}"
+        "cursor:${if (nativeProvider.isEmpty()) "$origin\u0000$owner\u0000$profile".digest() else Scope(origin, owner, profile, nativeProvider = nativeProvider).key}"
 }
 
 internal fun keepConnectedBackoffMs(failures: Int): Long =
@@ -331,6 +332,16 @@ internal data class PreparedKeepConnectedCall(
     val binding: RelayCallbackBinding,
     val preferences: RelayCallbackPreferences,
     val protocol: RelayCallbackProtocol,
+    val scope: Scope,
+)
+
+internal fun keepConnectedCallData(event: JSONObject, now: Long): Map<String, String> = mapOf(
+    "source_ref" to event.optString("source_ref"),
+    "event_id" to event.optString("event_id"),
+    "conversation_ref" to event.optString("conversation_ref"),
+    "kind" to "incoming_call",
+    // Whole seconds round down so the local card cannot outlive the Relay action receipt.
+    "expires_at" to minOf(event.getLong("expires_at"), (now + RelayCallback.RING_WINDOW_MS) / 1_000L).toString(),
 )
 
 internal fun keepConnectedLoopNeedsRestart(
@@ -339,7 +350,17 @@ internal fun keepConnectedLoopNeedsRestart(
     runningOwner: String?,
     requestedOrigin: String,
     requestedOwner: String,
-): Boolean = !jobActive || runningOrigin != requestedOrigin || runningOwner != requestedOwner
+    runningProvider: String? = null,
+    requestedProvider: String? = null,
+): Boolean = !jobActive || runningOrigin != requestedOrigin || runningOwner != requestedOwner || runningProvider != requestedProvider
+
+/** A 1.1.1 switch whose owner is still signed in but not yet verified by this version; a signed-out phone keeps the plain stop. */
+internal fun keepConnectedAwaitsVerification(savedProvider: String?, origin: String, owner: String, verified: Scope?, storedOwner: String): Boolean =
+    savedProvider.isNullOrEmpty() && origin.isNotBlank() && owner.isNotBlank() && verified == null && storedOwner == owner
+
+/** 1.1.1 saved the switch without a provider; only the verified sign-in of the same origin and owner may supply it, once. */
+internal fun keepConnectedProviderToStamp(savedProvider: String?, savedOrigin: String, savedOwner: String, verified: Scope): String? =
+    verified.nativeProvider.takeIf { savedProvider.isNullOrEmpty() && it.isNotBlank() && savedOrigin == verified.origin && savedOwner == verified.owner }
 
 /** Translate only the plugin's event fields into the reviewed local Relay reducer envelope. */
 internal fun prepareKeepConnectedCall(
@@ -371,7 +392,7 @@ internal fun prepareKeepConnectedCall(
     val created = expires - RelayCallback.RING_WINDOW_MS
     if (created < 0) return null
 
-    val connectionId = "${scope.origin}\u0000${scope.owner}\u0000${scope.profile}".digest()
+    val connectionId = if (scope.nativeProvider.isEmpty()) "${scope.origin}\u0000${scope.owner}\u0000${scope.profile}".digest() else scope.copy(session = "").key
     val binding = RelayCallbackBinding(connectionId, source, profile, session, scope.origin, scope.owner)
     val preferences = RelayCallbackPreferences(connectionId, calls = true, keepConnected = enabled)
     val payload = JSONObject()
@@ -393,7 +414,7 @@ internal fun prepareKeepConnectedCall(
         elapsed,
     ) ?: return null
     return transition.takeIf { it.call.phase == RelayCallbackPhase.Ringing }
-        ?.let { PreparedKeepConnectedCall(it.call, binding, preferences, protocol) }
+        ?.let { PreparedKeepConnectedCall(it.call, binding, preferences, protocol, scope) }
 }
 
 class KeepConnectedService : Service() {
@@ -401,17 +422,19 @@ class KeepConnectedService : Service() {
     private var pollJob: kotlinx.coroutines.Job? = null
     private var pollOrigin: String? = null
     private var pollOwner: String? = null
+    private var pollProvider: String? = null
     private var promoted = false
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
-    private fun restartPoll(origin: String, owner: String) {
+    private fun restartPoll(origin: String, owner: String, nativeProvider: String) {
         val previous = pollJob
         previous?.cancel()
         pollOrigin = origin
         pollOwner = owner
+        pollProvider = nativeProvider
         pollJob = serviceScope.launch {
             previous?.join()
-            runLoop(origin, owner)
+            runLoop(origin, owner, nativeProvider)
         }
     }
 
@@ -427,7 +450,8 @@ class KeepConnectedService : Service() {
                     if (activeInstance === this@KeepConnectedService && isEnabled(this@KeepConnectedService)) {
                         val origin = pollOrigin
                         val owner = pollOwner
-                        if (origin != null && owner != null) restartPoll(origin, owner)
+                        val provider = pollProvider
+                        if (origin != null && owner != null && provider != null) restartPoll(origin, owner, provider)
                     }
                 }
             }
@@ -462,8 +486,9 @@ class KeepConnectedService : Service() {
         val prefs = preferences(this)
         val origin = prefs.getString(KEY_ORIGIN, "").orEmpty()
         val owner = prefs.getString(KEY_OWNER, "").orEmpty()
-        if (keepConnectedLoopNeedsRestart(pollJob?.isActive == true, pollOrigin, pollOwner, origin, owner)) {
-            restartPoll(origin, owner)
+        val provider = prefs.getString(KEY_NATIVE_PROVIDER, "").orEmpty()
+        if (keepConnectedLoopNeedsRestart(pollJob?.isActive == true, pollOrigin, pollOwner, origin, owner, pollProvider, provider)) {
+            restartPoll(origin, owner, provider)
         }
         return START_STICKY
     }
@@ -474,6 +499,7 @@ class KeepConnectedService : Service() {
         networkCallback = null
         pollOrigin = null
         pollOwner = null
+        pollProvider = null
         serviceScope.cancel()
         if (activeInstance === this) activeInstance = null
         super.onDestroy()
@@ -494,10 +520,10 @@ class KeepConnectedService : Service() {
         false
     }
 
-    private suspend fun runLoop(origin: String, owner: String) {
+    private suspend fun runLoop(origin: String, owner: String, nativeProvider: String) {
         val app = application as BeaconApplication
         val prefs = preferences(this)
-        if (origin.isBlank() || owner.isBlank()) {
+        if (origin.isBlank() || owner.isBlank() || nativeProvider.isBlank()) {
             setStatus(this, STATUS_SIGNED_OUT)
             stopSelf()
             return
@@ -505,6 +531,7 @@ class KeepConnectedService : Service() {
         val cursors = KeepConnectedCursors(
             read = { key -> prefs.getString(key, null) },
             write = { key, value -> prefs.edit().putString(key, value).commit() },
+            nativeProvider = nativeProvider,
         )
         var client: BeaconClient? = null
         var authorizedProfiles = emptyList<String>()
@@ -517,7 +544,7 @@ class KeepConnectedService : Service() {
             profiles = profiles@ {
                 val auth = app.auth.read(origin)
                 val cached = auth.cachedScopeFor(origin, replacingAccount = false)
-                if (cached == null || cached.owner != owner) throw NativeAuthExpiredException()
+                if (cached == null || cached.owner != owner || cached.nativeProvider != nativeProvider) throw NativeAuthExpiredException()
                 val current = client
                 if (current == null || current.auth.profile != auth.profile || current.auth.bearer != auth.bearer) {
                     current?.closeNative()
@@ -564,18 +591,18 @@ class KeepConnectedService : Service() {
                 },
                 signedInProfile = { client?.auth?.profile.orEmpty() },
                 onEvent = { profile, event ->
-                    if (event.optString("kind") == "incoming_call") deliverIncomingCall(app, origin, owner, profile, event)
-                    else if (app.push.bindKeepConnectedSource(Scope(origin, owner, profile), event.optString("source_ref"))) {
+                    if (event.optString("kind") == "incoming_call") deliverIncomingCall(app, origin, owner, profile, nativeProvider, event)
+                    else if (app.push.bindKeepConnectedSource(Scope(origin, owner, profile, nativeProvider = nativeProvider), event.optString("source_ref"))) {
                         receivePush(this, keepConnectedPushData(event))
                     }
                 },
                 profileLabel = { profile -> profileDisplayNames[profile] ?: profile },
             )
         try {
-            while (currentCoroutineContext().isActive && isEnabledFor(this, Scope(origin, owner, "default"))) {
+            while (currentCoroutineContext().isActive && isEnabledFor(this, Scope(origin, owner, "default", nativeProvider = nativeProvider))) {
                 val current = app.auth.read(origin)
                 val cached = current.cachedScopeFor(origin, replacingAccount = false)
-                if (cached == null || cached.owner != owner) {
+                if (cached == null || cached.owner != owner || cached.nativeProvider != nativeProvider) {
                     setStatus(this, STATUS_SIGNED_OUT)
                     stopSelf()
                     return
@@ -607,51 +634,22 @@ class KeepConnectedService : Service() {
         }
     }
 
-    private fun deliverIncomingCall(app: BeaconApplication, origin: String, owner: String, profile: String, event: JSONObject) {
-        val scope = Scope(origin, owner, profile)
+    private fun deliverIncomingCall(app: BeaconApplication, origin: String, owner: String, profile: String, nativeProvider: String, event: JSONObject) {
+        val scope = Scope(origin, owner, profile, nativeProvider = nativeProvider)
         if (!app.auth.read(origin).authorizesPushSource(scope)) return
         val source = event.optString("source_ref")
         val eventId = event.optString("event_id")
-        val token = app.push.prepareKeepConnectedCall(scope, event, System.currentTimeMillis(), SystemClock.elapsedRealtime()) ?: return
-        receiveKeepConnectedCall(this, mapOf(
-            "source_ref" to source,
-            "event_id" to eventId,
-            "conversation_ref" to event.optString("conversation_ref"),
-            "kind" to "incoming_call",
-            "expires_at" to event.optString("expires_at"),
-        ), token)
+        val now = System.currentTimeMillis()
+        val token = app.push.prepareKeepConnectedCall(scope, event, now, SystemClock.elapsedRealtime()) ?: return
+        receiveKeepConnectedCall(this, keepConnectedCallData(event, now), token)
         if (!app.push.hasKeepConnectedInvitation(source, eventId, token)) {
             app.push.removeKeepConnectedCallback(source, eventId, token)
         }
     }
 
-    private fun postSignInNotification() {
-        try {
-            ensureChannel()
-            val pending = openAppPendingIntent(this, 2)
-            val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-                .setSmallIcon(R.drawable.ic_beacon_notification)
-                .setContentTitle("Sign in again")
-                .setContentText("Your Hermes session expired. Sign in to keep receiving calls.")
-                .setContentIntent(pending)
-                .setAutoCancel(true)
-                .setPriority(NotificationCompat.PRIORITY_LOW)
-                .addAction(0, "Sign in again", pending)
-                .build()
-            getSystemService(NotificationManager::class.java).notify(SIGN_IN_NOTIFICATION_ID, notification)
-        } catch (_: SecurityException) { }
-    }
+    private fun postSignInNotification() = postSignInNotification(this, "Sign in again", "Your Hermes session expired. Sign in to keep receiving calls.", "Sign in again")
 
-    private fun ensureChannel() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        val manager = getSystemService(NotificationManager::class.java)
-        if (manager.getNotificationChannel(CHANNEL_ID) == null) {
-            manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "Keep connected", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "Keeps you reachable for incoming calls."
-                setShowBadge(false)
-            })
-        }
-    }
+    private fun ensureChannel() = ensureChannel(this)
 
     private fun connectionNotification(context: Context): android.app.Notification {
         val status = status(context)
@@ -685,6 +683,7 @@ class KeepConnectedService : Service() {
         const val KEY_ENABLED = "enabled"
         const val KEY_ORIGIN = "origin"
         const val KEY_OWNER = "owner"
+        const val KEY_NATIVE_PROVIDER = "native_provider"
         const val KEY_STATUS = "status"
         const val KEY_REASON = "reason"
         private const val KEY_STOP_TOKEN = "stop_token"
@@ -710,7 +709,8 @@ class KeepConnectedService : Service() {
         fun isEnabledFor(context: Context, scope: Scope): Boolean {
             val prefs = preferences(context)
             return prefs.getBoolean(KEY_ENABLED, false) && prefs.getString(KEY_ORIGIN, null) == scope.origin &&
-                prefs.getString(KEY_OWNER, null) == scope.owner
+                prefs.getString(KEY_OWNER, null) == scope.owner && scope.nativeProvider.isNotBlank() &&
+                prefs.getString(KEY_NATIVE_PROVIDER, null) == scope.nativeProvider
         }
 
         fun setEnabled(context: Context, auth: AuthContext?, enabled: Boolean) {
@@ -725,7 +725,7 @@ class KeepConnectedService : Service() {
             require(authorized != null && authorized.owner == current.owner) { "Sign in with Hermes before enabling Keep connected" }
             val prefs = preferences(context)
             check(prefs.edit().putBoolean(KEY_ENABLED, true).putString(KEY_ORIGIN, current.origin)
-                .putString(KEY_OWNER, current.owner).putString(KEY_STATUS, STATUS_STARTING).putString(KEY_REASON, "")
+                .putString(KEY_OWNER, current.owner).putString(KEY_NATIVE_PROVIDER, current.nativeProvider).putString(KEY_STATUS, STATUS_STARTING).putString(KEY_REASON, "")
                 .putString(KEY_STOP_TOKEN, UUID.randomUUID().toString()).commit()) { "Could not enable Keep connected" }
             start(context)
         }
@@ -738,10 +738,16 @@ class KeepConnectedService : Service() {
             val app = context.applicationContext as? BeaconApplication ?: return
             val auth = app.auth.read(origin)
             val scope = auth.cachedScopeFor(origin, replacingAccount = false)
-            if (origin.isBlank() || owner.isBlank() || scope?.owner != owner) {
+            val savedProvider = prefs.getString(KEY_NATIVE_PROVIDER, null)
+            scope?.let { keepConnectedProviderToStamp(savedProvider, origin, owner, it) }
+                ?.let { prefs.edit().putString(KEY_NATIVE_PROVIDER, it).apply() }
+            if (origin.isBlank() || owner.isBlank() || scope == null || !isEnabledFor(context, scope)) {
                 setStatus(context, STATUS_SIGNED_OUT)
                 app.push.invalidateKeepConnectedInvitations()
-                cancelSignInNotification(context)
+                // A 1.1.1 switch waits for Beacon to verify the saved owner's sign-in once; say so instead of going quiet.
+                if (keepConnectedAwaitsVerification(savedProvider, origin, owner, scope, auth.owner)) {
+                    postSignInNotification(context, "Open Beacon", "Open Beacon once to keep receiving calls.", "Open Beacon")
+                } else cancelSignInNotification(context)
                 context.applicationContext.stopService(Intent(context.applicationContext, KeepConnectedService::class.java))
                 return
             }
@@ -801,6 +807,34 @@ class KeepConnectedService : Service() {
             if (token.isNullOrBlank() || prefs.getString(KEY_STOP_TOKEN, null) != token || !prefs.getBoolean(KEY_ENABLED, false)) return false
             disablePreference(context)
             return true
+        }
+
+        private fun postSignInNotification(context: Context, title: String, text: String, action: String) {
+            try {
+                ensureChannel(context)
+                val pending = openAppPendingIntent(context, 2)
+                val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+                    .setSmallIcon(R.drawable.ic_beacon_notification)
+                    .setContentTitle(title)
+                    .setContentText(text)
+                    .setContentIntent(pending)
+                    .setAutoCancel(true)
+                    .setPriority(NotificationCompat.PRIORITY_LOW)
+                    .addAction(0, action, pending)
+                    .build()
+                context.applicationContext.getSystemService(NotificationManager::class.java).notify(SIGN_IN_NOTIFICATION_ID, notification)
+            } catch (_: SecurityException) { }
+        }
+
+        private fun ensureChannel(context: Context) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+            val manager = context.applicationContext.getSystemService(NotificationManager::class.java)
+            if (manager.getNotificationChannel(CHANNEL_ID) == null) {
+                manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "Keep connected", NotificationManager.IMPORTANCE_LOW).apply {
+                    description = "Keeps you reachable for incoming calls."
+                    setShowBadge(false)
+                })
+            }
         }
 
         private fun openAppPendingIntent(context: Context, requestCode: Int): PendingIntent {

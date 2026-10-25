@@ -138,7 +138,9 @@ def test_missed_scheduled_callback_posts_notice_before_delete(harness, monkeypat
         conn.execute('INSERT INTO meta(key,value) VALUES(?,?)', (key, json.dumps(record).encode()))
     active_call = reserve(client)
     callbacks = api.sys.modules['beacon_callbacks']
-    assert callbacks.deliver(api.mobile, api.native, key, target)['status'] == 'pending'
+    delivered = callbacks.deliver(api.mobile, api.native, key, target)
+    assert delivered['status'] == 'pending'
+    event = delivered['event_id']
     activate = api.activate
     monkeypatch.setattr(api, 'activate', lambda *args: None)
     assert client.delete(f'/api/plugins/beacon/mobile/calls/{active_call}').status_code == 200

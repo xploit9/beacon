@@ -1,9 +1,7 @@
 package dev.hermes.android
 
-import android.content.Context
 import androidx.activity.ComponentActivity
 import androidx.compose.ui.test.*
-import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.datastore.preferences.core.edit
@@ -16,22 +14,14 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.hermes.android.core.*
-import dev.hermes.android.data.AuthContext
-import dev.hermes.android.data.BeaconClient
-import dev.hermes.android.data.NativeBearerRecord
-import dev.hermes.android.data.NativePairing
 import dev.hermes.android.ui.KanbanScreen
 import dev.hermes.android.ui.NativeLocalization
-import dev.hermes.android.ui.SetupWizard
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 
 /** Run only in the coordinator's isolated synthetic UI installation. */
 class AuditR8aUiTest {
@@ -44,6 +34,7 @@ class AuditR8aUiTest {
         val priorPreferences = runBlocking { app.preferences.data.first() }
         runBlocking { app.preferences.edit { it[stringPreferencesKey("origin")] = "" } }
         val fixture = NativeExperienceFixture()
+        runBlocking { app.auth.persist(fixture.client.auth) }
         val draftKind = "kanban-draft:default"
         val priorDraft = runBlocking { app.cache.read(fixture.scope, draftKind) }
         runBlocking { app.cache.delete(fixture.scope, draftKind) }
@@ -63,6 +54,7 @@ class AuditR8aUiTest {
         } finally {
             compose.runOnUiThread { store.clear(); vm.client?.closeNative(); fixture.client.closeNative() }
             runBlocking {
+                app.auth.remove(fixture.scope.origin)
                 app.preferences.updateData { priorPreferences }
                 if (priorDraft == null) app.cache.delete(fixture.scope, draftKind) else app.cache.write(fixture.scope, draftKind, priorDraft, true)
             }
@@ -100,58 +92,5 @@ class AuditR8aUiTest {
         compose.waitUntil(5_000) { compose.onAllNodesWithTag("kanban-title").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithTag("kanban-title").assertTextContains("Second task")
         compose.onNodeWithText("Cancel").performClick()
-    }
-
-    @Test fun pairingRedeemContinuesAcrossSavedStateRestoration() = pairingSurvivesRestoration("/pairing/redeem")
-
-    @Test fun redeemedTicketIsNotSpentAgainAfterSavedStateRestoration() = pairingSurvivesRestoration("/devices/link")
-
-    private fun pairingSurvivesRestoration(pausedPath: String) = withVm { vm, fixture ->
-        val entered = CountDownLatch(1)
-        val release = CountDownLatch(1)
-        val redemptionRequests = AtomicInteger()
-        val scope = fixture.scope
-        val auth = AuthContext(scope.origin, emptyList(), scope.owner, scope.profile, backend = "hermes-dashboard",
-            bearer = NativeBearerRecord("fixture-access", "fixture-refresh", Long.MAX_VALUE, scope.origin, scope.owner, scope.profile))
-        val client = BeaconClient(auth, null, fixture, persistContext = false) { builder ->
-            builder.addInterceptor { chain ->
-                if (chain.request().url.encodedPath.endsWith("/pairing/redeem")) {
-                    redemptionRequests.incrementAndGet()
-                }
-                if (chain.request().url.encodedPath.endsWith(pausedPath)) {
-                    entered.countDown()
-                    check(release.await(10, TimeUnit.SECONDS))
-                }
-                chain.proceed(chain.request())
-            }
-            fixture.configureHttp(builder)
-        }
-        val pairingPreferences = app.getSharedPreferences("native-pairing", Context.MODE_PRIVATE)
-        val deviceKey = "device:${"${scope.origin}\u0000${scope.owner}".digest()}"
-        val priorDevice = pairingPreferences.getString(deviceKey, null)
-        try {
-            compose.runOnIdle { BeaconViewModel::class.java.getDeclaredField("client").apply { isAccessible = true }.set(vm, client) }
-            val restoration = StateRestorationTester(compose)
-            restoration.setContent { NativeLocalization("en") { BeaconTheme(dark = true) { SetupWizard(vm) } } }
-            compose.onNodeWithTag("setup-method-code").performClick()
-            compose.onNodeWithTag("setup-pairing-code").performTextInput("abc123")
-            compose.onNodeWithTag("setup-pairing-redeem").performClick()
-            compose.onNodeWithTag("setup-pairing-confirm").performClick()
-            // Advance Compose's test clock so the click's launched pairing work can enter the request.
-            compose.waitUntil(5_000) { entered.count == 0L }
-            restoration.emulateSavedInstanceStateRestore()
-            compose.onNodeWithText("Linking this phone").assertIsDisplayed()
-            assertEquals(1, redemptionRequests.get())
-            release.countDown()
-            compose.waitUntil(5_000) { compose.onAllNodesWithText("Linked").fetchSemanticsNodes().isNotEmpty() }
-            assertEquals(1, redemptionRequests.get())
-            assertEquals(1, fixture.pairingRedeemCount.get())
-            assertEquals(1, fixture.pairingLinkCount.get())
-            assertEquals("device-123", NativePairing.deviceId(app, scope))
-        } finally {
-            release.countDown()
-            client.closeNative()
-            if (priorDevice == null) pairingPreferences.edit().remove(deviceKey).commit() else pairingPreferences.edit().putString(deviceKey, priorDevice).commit()
-        }
     }
 }

@@ -18,7 +18,7 @@ On the PC that runs Hermes, download [`beacon_install.py`](https://raw.githubuse
 python beacon_install.py
 ```
 
-The installer selects the Hermes home and profile (it asks when more than one could be yours), installs or updates Beacon with Hermes' own installer, restarts the dashboard if you say yes, and prints your pairing block. When it can't ask you directly, it stops and names the flag to rerun with: `--home`, `--profile`, `--yes` (restart), `--tailscale`, `--phone-name`. `--dry-run` shows the plan and changes nothing.
+The installer selects the Hermes home and profile (it asks when more than one could be yours), installs or updates Beacon with Hermes' own installer, restarts the dashboard if you say yes, and prints the link to paste into Beacon. When it can't ask you directly, it stops and names the flag to rerun with: `--home`, `--profile`, `--yes` (restart), `--tailscale`. `--dry-run` shows the plan and changes nothing.
 
 ## Manual fallback
 
@@ -26,6 +26,6 @@ The installer selects the Hermes home and profile (it asks when more than one co
 2. Complete **Before installing Beacon** above: verify the external backup and use native operations to remove only the identified predecessor-managed jobs and plugin.
 3. Install with `hermes -p <profile> plugins install xploit9/beacon/hermes-plugin/beacon --enable`, or update with `hermes -p <profile> plugins update beacon`. Let Hermes' security scan and prompts run unchanged.
 4. Ask before restarting the dashboard, then restart it the way it runs (its scheduled task or service, or `hermes -p <profile> dashboard`).
-5. With a public HTTPS dashboard address configured, run `hermes -p <profile> beacon pair --name "My phone"`.
+5. Configure a public HTTPS dashboard address; that address is the link you paste into Beacon.
 
-Install the latest app from [GitHub Releases](https://github.com/xploit9/beacon/releases/latest) and enter the address and code from the pairing block.
+Install the latest app from [GitHub Releases](https://github.com/xploit9/beacon/releases/latest), paste the link and sign in with Hermes. Signing in links the phone.

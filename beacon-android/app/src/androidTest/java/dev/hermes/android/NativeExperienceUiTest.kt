@@ -39,8 +39,8 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.hermes.android.core.*
+import dev.hermes.android.data.NativePairing
 import dev.hermes.android.data.VoiceKeyStore
-import dev.hermes.android.data.startupReads
 import dev.hermes.android.ui.*
 import dev.hermes.android.voice.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -107,8 +107,10 @@ class NativeExperienceUiTest {
         shellRun("settings put global animator_duration_scale 0")
         val store = ViewModelStore()
         val fixture = NativeExperienceFixture()
+        runBlocking { app.auth.persist(fixture.client.auth) }
         runBlocking {
-            for (key in startupReads.map { "read:${it.path}" } + listOf("read-invalidated-at", "settings:skills", "settings:memory")) app.cache.delete(fixture.scope, key)
+            for (key in listOf("read-invalidated-at", "settings:skills", "settings:memory")) app.cache.delete(fixture.scope, key)
+            app.cache.delete(fixture.scope.copy(profile = "", session = ""), "screens")
         }
         val priorChatPreferences = runBlocking { app.cache.read(fixture.scope, "chat-preferences") }
         runBlocking { app.cache.write(fixture.scope, "chat-preferences", json("render_user_markdown" to true, "show_thinking" to true, "send_key" to "enter").toString(), true) }
@@ -162,6 +164,7 @@ class NativeExperienceUiTest {
         }
     }
     private fun clickText(text: String) = compose.onNodeWithText(text, useUnmergedTree = true).performScrollTo().performClick()
+    private fun clickLabel(label: String) = compose.onNodeWithContentDescription(label, useUnmergedTree = true).performScrollTo().performClick()
     private fun await(condition: () -> Boolean) = compose.waitUntil(15_000, condition)
     /** Hermes reports display names on its first profile read; a case that adds them after the UI loaded the catalog reloads it. */
     private fun showProfileDisplayNames(vm: BeaconViewModel, fixture: NativeExperienceFixture) {
@@ -454,20 +457,19 @@ class NativeExperienceUiTest {
     @Test fun scheduleControlsCreatePauseResumeRunOpenHistoryAndDelete() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.tab("Tasks") }
         await { vm.data.value["crons"] != null }
-        clickText("Pause"); await { fixture.jobs.getValue("task-a").optBoolean("paused") }
-        compose.waitForIdle(); clickText("Resume"); await { !fixture.jobs.getValue("task-a").optBoolean("paused") }
-        clickText("Run now"); await { vm.form.value != null }
+        clickLabel("Pause"); await { fixture.jobs.getValue("task-a").optBoolean("paused") }
+        compose.waitForIdle(); clickLabel("Resume"); await { !fixture.jobs.getValue("task-a").optBoolean("paused") }
+        assertTrue(compose.onAllNodesWithText("Run now", useUnmergedTree = true).fetchSemanticsNodes().isEmpty())
+        clickLabel("Run"); await { vm.form.value != null }
         compose.onNodeWithText("Cancel").performClick()
         assertFalse(fixture.requests.any { it.string("path").endsWith("/trigger") })
-        clickText("Run now"); await { vm.form.value != null }
-        compose.onAllNodesWithText("Run now", useUnmergedTree = true).onLast().performClick()
+        clickLabel("Run"); await { vm.form.value != null }
+        compose.onAllNodesWithText("Run", useUnmergedTree = true).onLast().performClick()
         await { vm.form.value == null && fixture.requests.any { it.string("path").endsWith("/trigger") } }
-        compose.onNodeWithContentDescription("More schedule actions").performScrollTo().performClick()
-        clickText("Run history"); await { vm.data.value["cron-history:task-a"] != null }
+        clickLabel("Run history"); await { vm.data.value["cron-history:task-a"] != null }
         clickText("Synthetic completed run"); await { vm.chat.value.sessionId == "chat-b" }
         compose.runOnIdle { vm.tab("Tasks") }
-        compose.onNodeWithContentDescription("More schedule actions").performScrollTo().performClick()
-        clickText("Delete"); await { vm.form.value != null }
+        clickLabel("Delete"); await { vm.form.value != null }
         compose.onAllNodesWithText("Delete", useUnmergedTree = true).onLast().performClick()
         await { fixture.jobs.isEmpty() && vm.form.value == null }
         clickText("Create schedule"); await { vm.form.value != null }
@@ -559,7 +561,7 @@ class NativeExperienceUiTest {
         capture("audit-kanban-retry")
     }
 
-    @Test fun sharedSpaceCreationSendRetryApprovalAndTaskRecoveryKeepTheirIdentity() = withFixture { vm, fixture ->
+    @Test fun sharedSpaceCreationSendRetryApprovalAndUnsupportedRecoveryKeepTheirIdentity() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.navigate("Bots") }
         await { vm.ui.value.botModeEnabled && !vm.ui.value.botModeSwitching && vm.botMode.state.value.bots.size == 2 && !vm.botMode.state.value.loading }
         compose.onNodeWithContentDescription("New shared space").performClick()
@@ -595,10 +597,11 @@ class NativeExperienceUiTest {
         fixture.roomActions += json("kind" to "retry", "task_id" to "task-retry")
         compose.runOnIdle { vm.botMode.refresh() }
         await { vm.botMode.state.value.actions.isNotEmpty() && !vm.botMode.state.value.loading }
-        compose.onNodeWithText("Retry bot task").performScrollTo().performClick()
-        await { fixture.roomActions.isEmpty() && !vm.botMode.state.value.loading }
-        assertEquals("retry", fixture.requests.last { it.string("path").endsWith("/action") }.getJSONObject("body").string("kind"))
-        receipts += "Shared-space creation and messages use stable identity across a failed attempt; allow/deny and explicit task retry bind to the displayed native request."
+        compose.onNodeWithText("This Hermes version cannot safely resolve work", substring = true).performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Retry bot task").assertDoesNotExist()
+        assertEquals(1, fixture.roomActions.size)
+        assertFalse(fixture.requests.any { it.string("path").endsWith("/action") && it.getJSONObject("body").string("kind") == "retry" })
+        receipts += "Shared-space send retry keeps its event identity; supported allow/deny bind to the displayed request while ambiguous task recovery remains unavailable without replay."
         capture("audit-shared-space-actions")
     }
 
@@ -959,6 +962,43 @@ class NativeExperienceUiTest {
         } finally { runBlocking { app.cache.delete(scope, "pending") } }
     }
 
+    @Test fun aReopenedFilesPageShowsTheSavedListingAtOnceThenTheFreshOne() {
+        val restoration = StateRestorationTester(compose)
+        withFixture(restoration = restoration) { vm, fixture ->
+            compose.runOnIdle { vm.navigate("Files") }
+            await { vm.data.value["files"] != null && "files" !in vm.refreshing.value }
+            compose.onNodeWithText("notes.md").assertExists()
+            runBlocking { vm.screens.flush(fixture.scope) }
+            assertNotNull("the listing is kept on the phone", runBlocking { app.cache.read(fixture.scope.copy(profile = "", session = ""), "screens") })
+            compose.runOnIdle { vm.tab("Chat") }
+            // A restart keeps only what is saved: nothing in memory, a fresh cache object reading the stored row, a new composition.
+            compose.runOnIdle {
+                field(vm, "screens", dev.hermes.android.data.ScreenCache(read = { app.cache.read(it, "screens") }, write = { scope, value -> app.cache.write(scope, "screens", value) },
+                    drop = { app.cache.delete(it, "screens") }, jobs = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob())))
+                flow<Map<String, JSONObject>>(vm, "_data").value = vm.data.value - "files"
+                (BeaconViewModel::class.java.getDeclaredField("loadedAt").apply { isAccessible = true }.get(vm) as MutableMap<*, *>).clear()
+                BeaconViewModel::class.java.getDeclaredMethod("hydrateScreens", fixture.scope.javaClass).apply { isAccessible = true }.invoke(vm, fixture.scope)
+            }
+            await { vm.data.value["files"] != null }
+            fixture.workspaceFiles["fresh.txt"] = "new on the server"
+            fixture.holdNextFileList.set(true)
+            try {
+                compose.runOnIdle { vm.navigate("Files") }
+                restoration.emulateSavedInstanceStateRestore()
+                assertTrue("The reopened page asks for a fresh listing",
+                    fixture.fileListCaptured.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                // The fresh listing is still on its way: the saved one is already on screen, with no loading bar.
+                compose.onNodeWithText("notes.md").assertExists()
+                compose.onAllNodes(hasProgressBarRangeInfo(androidx.compose.ui.semantics.ProgressBarRangeInfo.Indeterminate) and hasAnyAncestor(hasTestTag("files-content"))).assertCountEquals(0)
+                compose.onNodeWithText("fresh.txt").assertDoesNotExist()
+            } finally { fixture.releaseFileList.countDown() }
+            await { vm.data.value["files"]?.rows("entries")?.any { it.string("name") == "fresh.txt" } == true }
+            compose.onNodeWithText("fresh.txt").assertExists()
+            receipts += "A reopened Files page renders its saved listing at once, then replaces it with the fresh one."
+            capture("precache-files-reopen")
+        }
+    }
+
     @Test fun workspaceMultiPickerRefreshesAfterAnOlderListingFinishes() {
         val picker = PickerRegistry(app)
         withFixture(picker) { vm, fixture ->
@@ -1136,7 +1176,9 @@ class NativeExperienceUiTest {
         }
         receipts += "Normal and Bot Mode tile widths, left alignment and relative rows match."
         compose.onNodeWithTag("navigation-bots").assertIsOn()
-        compose.onNodeWithText("On").assertExists()
+        // The light is the visible state; the row's state description still tells TalkBack, and no "On" text stretches the tile.
+        compose.onNodeWithText("On").assertDoesNotExist()
+        compose.onNodeWithTag("navigation-bots").assert(SemanticsMatcher.expectValue(androidx.compose.ui.semantics.SemanticsProperties.StateDescription, "On"))
         compose.onNodeWithTag("navigation-leave-bot-mode").assertTextContains("Leave Bot Mode")
         compose.onNodeWithTag("bot-mode-sidebar").performScrollToNode(hasTestTag("bot-row-coder"))
         compose.onNodeWithTag("bot-row-coder").assertTextContains("Code profile")
@@ -1422,11 +1464,18 @@ class NativeExperienceUiTest {
             shellId = vm.chat.value.sessionId
             fixture.markUnpromptedShell(shellId)
             fixture.forgetUnpromptedShell(shellId)
-            fixture.client.closeNative()
             runBlocking { app.cache.delete(fixture.scope.session(shellId), "session") }
             compose.runOnIdle { vm.composer(TextFieldValue("Send after the shell expired")); vm.selectSession(shellId) }
 
-            await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId != shellId && !vm.ui.value.newChatOpening && vm.chat.value.projectionReady }
+            try { await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId != shellId && !vm.ui.value.newChatOpening && vm.chat.value.projectionReady } }
+            catch (timeout: androidx.compose.ui.test.ComposeTimeoutException) {
+                // This case only times out under full-suite load; keep the state that shows where the fallback stopped.
+                val chat = vm.chat.value; val ui = vm.ui.value
+                throw AssertionError("No fresh chat: shell=${chat.sessionId == shellId} session=${chat.sessionId.take(12)} ready=${chat.projectionReady} " +
+                    "status=${chat.status} opening=${ui.newChatOpening} newChatError=${ui.newChatError} error=${ui.error} notice=${ui.notice} " +
+                    "resumeSent=${fixture.requests.any { it.string("method") == "session.resume" && it.getJSONObject("params").string("session_id") == shellId }} " +
+                    "requests=${fixture.requests.takeLast(10).map { it.string("method") + " " + it.string("path") }}", timeout)
+            }
             freshId = vm.chat.value.sessionId
             // The fixture names the runtime it creates for a chat runtime-<id>; the REST projection carries no runtime id.
             val freshRuntime = "runtime-" + freshId
@@ -1508,28 +1557,6 @@ class NativeExperienceUiTest {
                 receipts += "A return record saved before a restart is loaded with the settings, so opening the assistant tab early cannot replace it."
             }
         } finally { runBlocking { app.preferences.edit { it.remove(key) } } }
-    }
-
-    @Test fun savedUpdateSignInKeepsTheRotatedBearer() = withFixture { _, fixture ->
-        val now = System.currentTimeMillis() / 1000
-        val bearer = dev.hermes.android.data.NativeBearerRecord("update-access", "update-refresh", now + 3600, fixture.scope.origin, fixture.scope.owner, "default", "fixture", now - 60)
-        val auth = dev.hermes.android.data.AuthContext(fixture.scope.origin, emptyList(), fixture.scope.owner, "default", backend = "hermes-dashboard", bearer = bearer)
-        fixture.currentRefreshToken = bearer.refreshToken
-        runBlocking { app.auth.persist(auth) }
-        try {
-            app.updates.clearAuthorization(); app.updates.authorize(fixture.freshClientFor(auth, app.auth))
-            app.updates.transportForTest = fixture.configureHttp
-            fixture.forceExpiredAccessToken = bearer.accessToken
-            // Arrange an already-posted notification; this auth regression does not depend on notification permission.
-            val token = java.util.UUID.randomUUID().toString().replace("-", "")
-            assertTrue(app.getSharedPreferences("android-updates", Context.MODE_PRIVATE).edit()
-                .putString("notification_token", token).putLong("notification_version", 0).commit())
-            // The release feed is absent from the fixture; the check fails after its bootstrap refreshed the sign-in.
-            runBlocking { runCatching { app.updates.downloadNotification(token) } }
-            assertEquals(listOf(bearer.refreshToken), fixture.refreshTokensUsed.toList())
-            assertEquals(fixture.currentRefreshToken, app.auth.read(fixture.scope.origin).bearer?.refreshToken)
-            receipts += "An update recheck through the saved sign-in stores the refreshed bearer, so the next check does not reuse a spent refresh token."
-        } finally { app.updates.transportForTest = null; app.updates.clearAuthorization() }
     }
 
     @Test fun openingANonAssistantCallFromBeaconReturnsToItsProfileAndChatOnce() = withFixture { vm, fixture ->
@@ -1838,13 +1865,15 @@ class NativeExperienceUiTest {
             assertEquals(pinnedId, runBlocking { app.cache.read(fixture.scope, "beacon-session") })
             fixture.markUnpromptedShell(pinnedId)
             fixture.forgetUnpromptedShell(pinnedId)
-            fixture.client.closeNative()
             runBlocking { app.cache.delete(fixture.scope.session(pinnedId), "session") }
             compose.runOnIdle { vm.composer(TextFieldValue("Pinned draft")); vm.selectSession(pinnedId) }
 
             await { vm.ui.value.tab == "Beacon" && vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId != pinnedId && !vm.ui.value.beaconOpening && vm.chat.value.projectionReady }
             freshId = vm.chat.value.sessionId
             assertEquals(freshId, runBlocking { app.cache.read(fixture.scope, "beacon-session") })
+            assertTrue("The forgotten pinned shell was resumed", fixture.requests.any {
+                it.string("method") == "session.resume" && it.getJSONObject("params").string("session_id") == pinnedId
+            })
             assertEquals("Pinned draft", vm.composer.value.text)
             compose.runOnIdle { vm.send() }
             await { fixture.requests.count { it.string("method") == "prompt.submit" } == 1 }
@@ -2391,7 +2420,7 @@ class NativeExperienceUiTest {
         await { vm.data.value["crons"] != null }
         compose.onNodeWithText("Morning summary").assertExists()
         capture("tasks")
-        clickText("Edit")
+        clickLabel("Edit")
         await { vm.form.value != null }
         fixture.cronFailure = "Choose a single interval or a cron expression for this schedule."
         compose.runOnIdle { vm.formValue("name", "A revised summary"); vm.formValue("schedule", "every hour to two hours") }
@@ -2410,10 +2439,10 @@ class NativeExperienceUiTest {
         assertFalse(payload.has("id")); assertFalse(payload.has("next_run_at")); assertFalse(payload.has("last_status"))
         receipts += "Production task form keeps validation draft; native update excludes immutable/runtime fields."
         capture("schedule-saved")
-        clickText("Edit")
+        clickLabel("Edit")
         await { vm.form.value != null }
         compose.runOnIdle { vm.formValue("name", "An unsaved draft"); vm.dismissForm() }
-        clickText("Edit")
+        clickLabel("Edit")
         await { vm.form.value?.values?.get("name") == "An unsaved draft" }
         compose.onNodeWithContentDescription("Discard draft").performClick()
         compose.onNodeWithText("Discard", useUnmergedTree = true).performClick()
@@ -2623,8 +2652,10 @@ class NativeExperienceUiTest {
         voiceStore.removeKey(provider)
         try {
             compose.runOnIdle { vm.more("Beacon") }
+            // Without a key the page offers "Add key"; the key page opens from there.
+            compose.onNodeWithTag("voice-add-key").performClick()
             compose.onNodeWithTag("voice-provider-key").performTextInput("not-a-real-provider-key")
-            compose.onNodeWithText("Test").assertIsEnabled()
+            compose.onNodeWithText("Test key").assertIsEnabled()
             compose.runOnIdle { vm.more("App updates") }
             compose.onNodeWithText("Preview builds are installed manually.").assertIsDisplayed()
             compose.onNodeWithText("Check for updates").assertDoesNotExist()
@@ -2636,16 +2667,7 @@ class NativeExperienceUiTest {
             compose.onAllNodesWithText("Reconnect").fetchSemanticsNodes().also { assertTrue(it.isNotEmpty()) }
         }
         compose.runOnIdle { field(vm,"client",fixture.client) }
-        @Suppress("UNCHECKED_CAST")
-        val state=CallController::class.java.getDeclaredField("_state").apply { isAccessible=true }.get(app.calls) as MutableStateFlow<CallState>
-        val before=state.value
-        try {
-            compose.runOnIdle { state.value=CallState(active=true,callId="synthetic-update-guard");vm.installAppUpdate() }
-            assertTrue(vm.appUpdate.value.status.contains("End your call"))
-            compose.runOnIdle { vm.downloadAppUpdate() }
-            assertTrue(vm.appUpdate.value.status.contains("End your call"))
-        } finally { compose.runOnIdle { state.value=before } }
-        receipts += "Settings Back returns to chat; file Back closes the editor; seven offline destinations explain reconnect; both update entry points reject an active call."
+        receipts += "Settings Back returns to chat; file Back closes the editor; seven offline destinations explain reconnect."
     }
 
     @Test fun readAloudStopsAndSystemDictationCancelsWithoutSending() = withFixture { vm, _ ->
@@ -3242,6 +3264,39 @@ class NativeExperienceUiTest {
         receipts += "Connection details disclose only on request; cancel keeps the account, and confirmed sign-out clears native authority."
     }
 
+    @Test fun connectionListsThisPhoneAndOtherPhonesAndRemovesOnlyAnotherPhoneAfterConfirming() = withFixture { vm, fixture ->
+        val pairing = app.getSharedPreferences("native-pairing", android.content.Context.MODE_PRIVATE)
+        val key = NativePairing.accountKey(fixture.scope)
+        val prior = pairing.getString(key, null)
+        fixture.pairedDevices += json("device_id" to "device-123", "name" to "Pixel 9", "last_seen" to "2026-10-24T10:00:00Z")
+        fixture.pairedDevices += json("device_id" to "device-other", "name" to "Galaxy Fold", "last_seen" to "2026-10-23T09:00:00Z")
+        pairing.edit().putString(key, "device-123").commit()
+        try {
+            compose.runOnIdle { vm.more("Connection") }
+            await { compose.onAllNodesWithText("Galaxy Fold").fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithText("This phone").performScrollTo().assertIsDisplayed()
+            compose.onNodeWithText("Pixel 9").assertIsDisplayed()
+            compose.onNodeWithText("Other phones").assertIsDisplayed()
+            // Each phone keeps its own id; this phone leaves with Sign out, so it has no Remove.
+            compose.onNodeWithTag("settings-device-device-123").assertExists()
+            compose.onNodeWithTag("settings-device-device-other").assertExists()
+            compose.onNodeWithTag("settings-device-remove-device-123").assertDoesNotExist()
+            compose.onNodeWithTag("settings-device-remove-device-other").performScrollTo().performClick()
+            compose.onNodeWithText("Remove Galaxy Fold?").assertIsDisplayed()
+            compose.onNodeWithText("It stops getting calls and alerts from Beacon.").assertIsDisplayed()
+            compose.onNodeWithText("Cancel").performClick()
+            assertEquals(2, fixture.pairedDevices.size)
+            compose.onNodeWithTag("settings-device-remove-device-other").performScrollTo().performClick()
+            compose.onNodeWithTag("settings-device-remove-confirm").performClick()
+            await { fixture.pairedDevices.none { it.string("device_id") == "device-other" } }
+            await { compose.onAllNodesWithText("Galaxy Fold").fetchSemanticsNodes().isEmpty() }
+            compose.onNodeWithText("Pixel 9").assertExists()
+            receipts += "Connection lists this phone and each other linked phone by its own id; only another phone can be removed, and only after the confirm dialog."
+        } finally {
+            if (prior == null) pairing.edit().remove(key).commit() else pairing.edit().putString(key, prior).commit()
+        }
+    }
+
     @Test fun appearanceChatAndLicenseControlsHaveWorkingChoicesAndRetainStoredPreferences() = withFixture { vm, _ ->
         compose.runOnIdle { vm.more("Appearance") }
         fun choice(label: String, value: String) {
@@ -3259,7 +3314,7 @@ class NativeExperienceUiTest {
         for (label in listOf("Format your messages", "Show thinking")) compose.onNode(hasText(label) and isToggleable()).performScrollTo().performClick()
         await { vm.data.value["profile-settings"]?.optBoolean("render_user_markdown") == false && vm.data.value["profile-settings"]?.optBoolean("show_thinking") == false }
         compose.runOnIdle { vm.more("Licenses") }
-        for (document in listOf("hermes-LICENSE.txt", "termux-LICENSE.txt", "conduit-LICENSE.txt", "androidsvg-LICENSE.txt", "androidsvg-NOTICE.txt", "jlatexmath-LICENSE.txt", "jlatexmath-COPYING.txt", "rich/MERMAID-LICENSE", "rich/JSOUP-LICENSE", "rich/CORE-JS-LICENSE", "hermes-mobile-app-LICENSE.txt")) {
+        for (document in listOf("hermes-LICENSE.txt", "conduit-LICENSE.txt", "androidsvg-LICENSE.txt", "androidsvg-NOTICE.txt", "jlatexmath-LICENSE.txt", "jlatexmath-COPYING.txt", "rich/MERMAID-LICENSE", "rich/JSOUP-LICENSE", "rich/CORE-JS-LICENSE", "hermes-mobile-app-LICENSE.txt")) {
             choice("Document", document)
             val expected = app.assets.open(if (document.startsWith("rich/")) document else "licenses/$document").bufferedReader().use { it.readText().take(80) }
             await { compose.onAllNodes(hasText(expected, substring = true)).fetchSemanticsNodes().isNotEmpty() }
@@ -3274,30 +3329,33 @@ class NativeExperienceUiTest {
         val previousProvider = store.settings().provider
         val previousSelections = providers.associateWith { store.settings(it) }
         val previousKeys = providers.associateWith { store.key(it) }
+        val previousLoader = VoiceCatalogCache.loader
         try {
-            providers.forEach(store::removeKey)
+            // Offline: the built-in lists stand in for the provider catalogs.
+            VoiceCatalogCache.loader = { _, _ -> VoiceCatalog() }
+            providers.forEach { store.saveKey(it, "fixture-$it-key") }
             compose.runOnIdle { vm.more("Beacon") }
-            compose.onNodeWithText("Gemini prebuilt voices per docs (2026-10-18)").assertDoesNotExist()
-            compose.onNodeWithText("Grok voices per provider API (2026-10-18)").assertDoesNotExist()
-            compose.onNodeWithText("OpenAI voices per docs (2026-10-18)").assertDoesNotExist()
             for (provider in listOf("grok", "gemini")) {
+                // Change opens the provider list; Continue commits the choice because its key is saved.
+                compose.onNodeWithTag("voice-provider-change").performScrollTo().performClick()
                 compose.onNodeWithTag("voice-model-$provider").performScrollTo().performClick()
+                compose.onNodeWithTag("setup-voice-continue").performScrollTo().performClick()
                 await { store.settings().provider == provider }
                 val before = store.settings(provider)
-                // Labels are capitalised; the stored and requested voice id keeps the provider's spelling.
-                compose.onNodeWithText("Voice: ${before.voice.replaceFirstChar(Char::titlecase)}").performScrollTo().performClick()
+                // The stored and requested voice id keeps the provider's spelling.
                 val choices = if (provider == "grok") listOf("eve", "ara", "rex", "sal", "leo") else listOf("Puck", "Charon", "Kore", "Fenrir", "Aoede", "Leda", "Orus", "Zephyr")
                 val voice = choices.first { it != before.voice }
-                compose.onNodeWithText(voice.replaceFirstChar(Char::titlecase)).performClick()
+                compose.onNodeWithTag("voice-option-voice-$voice").performScrollTo().performClick()
                 await { store.settings(provider).voice == voice }
+                compose.onNodeWithTag("voice-option-voice-$voice").assertIsSelected()
                 val currentPersonality = store.settings(provider).personality
                 val personality = if (currentPersonality == "concise") "warm" else "concise"
-                compose.onNodeWithText("Personality: ${currentPersonality.replaceFirstChar(Char::titlecase)}").performScrollTo().performClick()
-                compose.onNodeWithText(personality.replaceFirstChar(Char::titlecase)).performClick()
+                compose.onNodeWithTag("voice-option-personality-$personality").performScrollTo().performClick()
                 await { store.settings(provider).personality == personality }
             }
             assertFalse(fixture.requests.any { it.string("path").endsWith("/voice-settings") && it.string("method") != "GET" })
         } finally {
+            VoiceCatalogCache.loader = previousLoader
             providers.forEach { provider -> previousKeys[provider]?.let { store.saveKey(provider, it) } ?: store.removeKey(provider) }
             previousSelections.values.forEach(store::setSelection)
             store.setSelection(previousSelections.getValue(previousProvider))
@@ -3543,11 +3601,11 @@ class NativeExperienceUiTest {
         // R6M moved policy changes to profile Settings; this menu describes the chat's bypass.
         compose.onNodeWithText("Approvals in this chat").assertExists()
         await { vm.data.value["picker:approvals"]?.let { it.string("scope_key") == fixture.scope.key && it.string("session_id") == vm.chat.value.sessionId } == true && "picker:approvals" !in vm.refreshing.value }
-        compose.onNodeWithContentDescription("Approvals: Unknown").assertExists()
-        compose.onNodeWithTag("approval-ask").assertTextContains("Profile default").assertTextContains("Ask first").assertIsNotSelected()
+        compose.onNodeWithContentDescription("Approvals: Manual").assertExists()
+        compose.onNodeWithTag("approval-ask").assertTextContains("Manual").assertTextContains("Ask before actions").assertIsSelected()
     }
 
-    @Test fun botOverviewIsNavigationAndMembershipDeletionAreExplicitActions() = withFixture { vm, fixture ->
+    @Test fun botOverviewKeepsUnsupportedMembershipAndConfirmedDeletionExplicit() = withFixture { vm, fixture ->
         fixture.botProfiles = listOf("default", "coder", "academic")
         compose.runOnIdle { vm.navigate("Bots") }
         await { vm.botMode.state.value.bots.size == 3 && !vm.ui.value.botModeSwitching }
@@ -3556,13 +3614,14 @@ class NativeExperienceUiTest {
         await { vm.botMode.state.value.selectedSpace == "fixture-room" && !vm.botMode.state.value.loading }
         compose.runOnIdle { vm.botMode.draft("Keep this team draft") }
         compose.onNodeWithContentDescription("Shared-space actions").performClick()
-        compose.onNodeWithText("Choose bots").performClick()
-        compose.onNode(hasText("coder") and isToggleable()).performClick()
-        compose.onNode(hasText("academic") and isToggleable()).performClick()
-        compose.onNodeWithText("Save bots").performClick()
-        await { !vm.botMode.state.value.loading && vm.botMode.state.value.members.toSet() == setOf("default", "academic") }
+        compose.onNodeWithText("Change bots unavailable").assertIsNotEnabled()
+        compose.onNodeWithText("Edit shared space").performClick()
+        compose.onNodeWithText("Change bots unavailable").assertIsNotEnabled()
+        compose.onNode(hasText("Create another space") and hasAnyAncestor(isDialog())).assertExists()
+        compose.onNodeWithText("Cancel").performClick()
+        assertEquals(setOf("default", "coder"), vm.botMode.state.value.members.toSet())
         assertEquals("Keep this team draft", vm.botMode.state.value.draft)
-        assertEquals(1, fixture.requests.count { it.string("path").endsWith("/members") })
+        assertFalse(fixture.requests.any { it.string("path").endsWith("/members") })
         compose.onNodeWithContentDescription("Shared-space actions").performClick()
         compose.onNodeWithText("Delete shared space").performClick()
         compose.onNodeWithText("Cancel").performClick()
@@ -3572,8 +3631,30 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Delete space").performClick()
         await { fixture.roomDeleted && vm.botMode.state.value.selectedSpace.isBlank() }
         assertEquals(1, fixture.requests.count { it.string("path").endsWith("/fixture-room/delete") })
-        receipts += "Bot overview navigates directly; explicit roster save retains draft, cancel does not delete, confirmed deletion removes only the selected room."
+        receipts += "Bot overview navigates directly; unsupported roster edits retain members/draft with no mutation, cancel does not delete, and native disband confirmation removes only the selected room."
         capture("flow-bot-overview")
+    }
+
+    @Test fun absentNativeBotCapabilitiesDisableApprovalRenameAndDeletion() = withFixture { vm, fixture ->
+        fixture.roomCapabilitiesAvailable = false
+        fixture.roomActions += json("kind" to "approval", "task_id" to "task-once", "member_id" to "coder",
+            "request_id" to "request-once", "execution_generation" to 1,
+            "approval" to json("description" to "Inspect a synthetic file", "choices" to JSONArray(listOf("once", "deny"))))
+        compose.runOnIdle { vm.navigate("Bots") }
+        await { vm.ui.value.botModeEnabled && !vm.ui.value.botModeSwitching && !vm.botMode.state.value.loading }
+        compose.runOnIdle { vm.openBotSpace("fixture-room") }
+        await { vm.botMode.state.value.selectedSpace == "fixture-room" && !vm.botMode.state.value.loading }
+        compose.onNodeWithText("Native approval support could not be confirmed.", substring = true).performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Allow once").assertDoesNotExist()
+        compose.onNodeWithText("Deny").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Shared-space actions").performClick()
+        compose.onNodeWithText("Deletion unavailable").assertIsNotEnabled()
+        compose.onNodeWithText("Edit shared space").performClick()
+        compose.onNodeWithText("Save").assertIsNotEnabled()
+        compose.onNodeWithText("Cancel").performClick()
+        assertFalse(fixture.requests.any { row -> listOf("/action", "/members", "/rename", "/delete").any { row.string("path").endsWith(it) } })
+        assertFalse(fixture.roomDeleted)
+        assertEquals(1, fixture.roomActions.size)
     }
 
     @Test fun reopeningSavedChatDoesNotResumeAnAgentAndShowsTailImmediately() = withFixture { vm, fixture ->

@@ -2,6 +2,7 @@ import hashlib
 import fnmatch
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 import pytest
 
@@ -57,7 +58,7 @@ def _fake_github(api, monkeypatch, cfg, assets, versions):
     return patterns
 
 
-def test_auto_update_and_stable_metadata_work_without_local_android_tools(harness,monkeypatch):
+def test_auto_check_stages_the_apk_and_records_the_plugin_update_without_installing_it(harness,monkeypatch):
     api,client,cfg,tmp,_=harness
     cfg.pop('aapt',None);cfg.pop('apksigner',None)
     apk,manifest=_release()
@@ -65,22 +66,14 @@ def test_auto_update_and_stable_metadata_work_without_local_android_tools(harnes
     patterns=_fake_github(api,monkeypatch,cfg,
         {manifest['artifact_filename']:apk,'Beacon-1.0.0.json':json.dumps(manifest).encode()},
         {manifest['artifact_filename']:(100,'1.0.0')})
-    installed=['1.0.0'];updates=[]
-    monkeypatch.setattr(api,'_installed_plugin_version',lambda:installed[0])
-    monkeypatch.setattr(api,'_hermes_busy',lambda owner:False)
-    monkeypatch.setattr(api,'_update_beacon_plugin',lambda:updates.append('beacon') or installed.__setitem__(0,'1.2.0') or {'ok':True})
-    release_checks=[]
-    release=api.release
-    def track_release(*args,**kwargs):
-        release_checks.append(list(updates))
-        return release(*args,**kwargs)
-    monkeypatch.setattr(api,'release',track_release)
+    monkeypatch.setattr(api,'_installed_plugin_version',lambda:'1.0.0')
+    def installed_itself(name): pytest.fail('The plugin must never install its own update')
+    monkeypatch.setitem(sys.modules,'hermes_cli.plugins_cmd',SimpleNamespace(dashboard_update_user_plugin=installed_itself))
 
     result=api.auto_update_check(cfg,now=2_000_000)
     metadata=client.get('/api/plugins/beacon/mobile/releases/latest?package=dev.hermes.android.stable')
 
-    assert updates==['beacon'] and result['result']=='restart_required'
-    assert release_checks and release_checks[0]==['beacon']
+    assert result['result']=='plugin_update_available' and result['plugin_version']=='1.2.0'
     assert patterns==['Beacon-*.json','Beacon-1.0.0.apk']
     assert metadata.status_code==200,metadata.text
     assert metadata.json()['plugin_version']=='1.2.0'

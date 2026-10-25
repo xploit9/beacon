@@ -438,7 +438,7 @@ internal fun callTranscriptGroupsMatchingSearch(groups: List<CallTranscriptGroup
     val transcriptIndex = remember(chatState.messages) { chatState.messages.withIndex().associate { it.value.id to it.index } }
     val latestAssistantMessageId = remember(chatState.messages) { chatState.messages.lastOrNull { it.role == "assistant" && it.text.isNotBlank() }?.id }
     val chat = chatState.copy(messages = messages)
-    val taskResultScope = Scope(ui.origin, ui.owner, ui.profile).session(chat.sessionId)
+    val taskResultScope = (vm.pcScope() ?: Scope(ui.origin, ui.owner, ui.profile)).session(chat.sessionId)
     val taskResultKey = "task-result:${taskResultScope.key}"
     val taskResultData = profileDefaults[taskResultKey]
     val taskResult = taskResultData?.string("reason").orEmpty()
@@ -469,7 +469,8 @@ internal fun callTranscriptGroupsMatchingSearch(groups: List<CallTranscriptGroup
     val side by vm.side.collectAsStateWithLifecycle()
     val settings = LocalBeaconSettings.current
     val ready = !beacon || vm.isBeaconConversation()
-    val proactiveKey = proactiveSettingsKey(Scope(ui.origin, ui.owner, preferences.assistantProfile))
+    val proactiveScope = (vm.pcScope() ?: Scope(ui.origin, ui.owner, ui.profile)).copy(profile = preferences.assistantProfile, session = "")
+    val proactiveKey = proactiveSettingsKey(proactiveScope)
     val proactive = profileDefaults[proactiveKey]
     val proactiveLoaded = proactive != null && proactive.has("enabled") && !proactive.has("_error")
     val proactiveEnabled = proactiveLoaded && proactive?.optBoolean("enabled") == true
@@ -488,8 +489,8 @@ internal fun callTranscriptGroupsMatchingSearch(groups: List<CallTranscriptGroup
     }
     val promptSignature = when {
         !proactiveLoaded -> ""
-        !proactiveEnabled -> "${Scope(ui.origin, ui.owner, preferences.assistantProfile).key}|off"
-        else -> "${Scope(ui.origin, ui.owner, preferences.assistantProfile).key}|on"
+        !proactiveEnabled -> "${proactiveScope.key}|off"
+        else -> "${proactiveScope.key}|on"
     }
     val promptDismissed = promptMemory?.let { it.first == promptSignature && it.second == promptSignature } == true
     val showProactivePrompt = beacon && ui.tab == "Beacon" && pluginStatus == "available" && promptMemory != null && promptText.isNotBlank() && !promptDismissed

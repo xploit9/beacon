@@ -281,8 +281,6 @@ _WRITE_TOOL_WORDS={'send','create','delete','remove','modify','update','manage',
                    'empty','reschedule','revoke'}
 # Native tools whose names carry no read word but only read or plan inside the run.
 _PROACTIVE_READ_TOOLS={'todo'}
-_PROACTIVE_MEMORY_READ_TOOLS={'hindsight_recall','hindsight_reflect','hindsight_search_knowledge_pages',
-                              'hindsight_read_knowledge_page'}
 _ARG_WRITE_TOOL_WORDS=_WRITE_TOOL_WORDS|{'run','trigger','install','edit','enable','disable','pause','resume','schedule'}
 _UNSAFE_NAME_WORDS=_ARG_WRITE_TOOL_WORDS|{'exec','sql','call','invoke','eval','shell','command','script','http','request',
                                           # a name that chains a second action ('and', 'then') is never a plain read
@@ -360,6 +358,16 @@ def _mcp_read_only(tool_name,profile):
     raw_name,hint,_=entry
     # Hermes accepts unannotated mail reads by name, but a read word never excuses a possible write verb.
     return not bool(_tool_words(raw_name)&_UNSAFE_NAME_WORDS) and (hint is True or _plain_mail_read(raw_name))
+
+def _reads_by_method(args,schema):
+    # One rule with the call gateway, loaded here when the agent process has not and again after a plugin update. A load failure blocks the tool.
+    path=ROOT/'gateway_tools.py';module=sys.modules.get('beacon_gateway_tools')
+    seen=getattr(module,'_beacon_mtime',None)
+    if module is None or seen is not None and seen!=path.stat().st_mtime_ns:
+        spec=importlib.util.spec_from_file_location('beacon_gateway_tools',path)
+        module=importlib.util.module_from_spec(spec);module._beacon_mtime=path.stat().st_mtime_ns
+        spec.loader.exec_module(module);sys.modules['beacon_gateway_tools']=module
+    return module.reads_by_method(args,schema)
 
 def _mail_provider_read(tool_name,profile):
     entry=_mcp_tool_entry(tool_name,profile)
@@ -471,14 +479,23 @@ def _watch_terminal_read_only(command):
 def _beacon_job(job):
     return str(job.get('name','')).startswith('Beacon') or 'BEACON_PROACTIVE_JOB:' in str(job.get('prompt',''))
 
+_ctx=None  # the plugin context from register(), for ctx.current_cron_execution()
+
+def _in_cron_run(session_id):
+    # Current Hermes names a cron run's session local-<hash>; the cron_ prefix is only the legacy form.
+    if str(session_id).startswith('cron_'): return True
+    try: return _ctx.current_cron_execution() is not None
+    except Exception: return False
+
 def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**kwargs):
     """Veto write-capable tools only in Beacon's watch cron session, including a run that
     outlives Proactive being turned off or its jobs being rebuilt (Hermes does not stop it)."""
     blocked={'action':'block','message':_READ_ONLY_MESSAGE}
     if not session_id: return None
-    cfg={};profile=None;row=None
+    cfg={};profile=None;row=None;configured=True  # an unreadable config counts as configured
     try:
-        cfg=mobile.settings();profile=current_profile(cfg)
+        cfg=mobile.settings();configured=bool(cfg.get('owner_id'))
+        profile=current_profile(cfg)
         row=_cron_row(profile,session_id)
     except Exception:
         pass
@@ -489,11 +506,18 @@ def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**
             from tui_gateway import server
             profile=profile or current_profile_name()
             with server._profile_db({'profile':profile}) as db:
-                identity=db.cron_run_identity(session_id) if db else None
+                if db is None: raise LookupError('Session store unavailable')
+                identity=db.cron_run_identity(session_id)
         except Exception:
-            return None
+            # Beacon cannot tell whether this cron run is its watch run, so it stays read-only while Beacon is set up.
+            # Ordinary chats keep their tools: a Hermes update that moves these internals must not block every chat.
+            return blocked if configured and _in_cron_run(session_id) else None
         job_id=identity.get('cron_job_id') if isinstance(identity,dict) else None
-        if not job_id: return None
+        if not job_id:
+            # No ledger row: Hermes' own cron context still names the job, so it is placed instead of trusted blind.
+            try: job_id=str(getattr(_ctx.current_cron_execution(),'job_id','') or '')
+            except Exception: job_id=''
+            if not job_id: return None
         # A cron run Beacon can't place: the owner's own jobs keep their tools, anything else stays read-only.
         try:
             call,_,_,_=proactive._cron_helpers()
@@ -548,23 +572,24 @@ def _watch_tool_guard(tool_name,args,profile):
         if isinstance(value,str): argument_words.update(_tool_words(value))
     if argument_words&_ARG_WRITE_TOOL_WORDS:
         return {'action':'block','message':_READ_ONLY_MESSAGE}
-    if tool_name in _PROACTIVE_MEMORY_READ_TOOLS:
-        return None
+    schema=None
     try:
         from hermes_cli.web_server_profiles import _profile_scope
         from tools.registry import registry
         with _profile_scope(profile):
             toolset=registry.get_toolset_for_tool(tool_name) or ''
+            get_schema=getattr(registry,'get_schema',None)
+            schema=get_schema(tool_name) if callable(get_schema) else None
     except Exception:
         toolset=''
     if toolset in _BLOCKED_PROACTIVE_TOOLSETS:
         return {'action':'block','message':_READ_ONLY_MESSAGE}
     if toolset.startswith('mcp-') or tool_name.startswith('mcp__'):
-        if _mcp_read_only(tool_name,profile): return None
+        if _mcp_read_only(tool_name,profile) and _reads_by_method(args,schema): return None
         return {'action':'block','message':_READ_ONLY_MESSAGE}
     if toolset=='memory':
-        action=args.get('action')
-        if action in {'read','search','get','list','query'}: return None
+        # Only the native memory tool's own action says what it does; provider tools in this toolset are never vouched for by an argument.
+        if tool_name=='memory' and args.get('action') in {'read','search','get','list','query'}: return None
         return {'action':'block','message':_READ_ONLY_MESSAGE}
     # Deny by default: any other tool runs only when its own name clearly reads (skill_view, session_search,
     # read_file); a read-sounding action argument never vouches for the tool's other arguments.
@@ -573,52 +598,9 @@ def _watch_tool_guard(tool_name,args,profile):
     return {'action':'block','message':_READ_ONLY_MESSAGE}
 
 
-def _pairing_block(profile=None,name=None):
-    if name is None: name='Beacon phone'
-    cfg=mobile.settings(profile)
-    profile=profile or current_profile(cfg)
-    cfg=mobile.settings(profile)
-    # Before the first sign-in there is no owner yet: the code goes to whoever signs in first, as Beacon's owner.
-    owner=cfg.get('owner_id') if cfg.get('owner_id') and cfg.get('owner_provider') else ''
-    profiles=cfg.get('profiles')
-    if isinstance(profiles,list) and profile not in profiles:
-        raise ValueError('Use a profile Beacon serves.')
-    dashboard_url,dashboard_name=mobile.dashboard_connect_info()
-    pairing=mobile.mint_device_pairing(owner,profile,name,dashboard_url,dashboard_name)
-    return f"Dashboard: {pairing['dashboard_url']}\nPairing code: {pairing['code']}\nexpires in 10 min"
-
-
-def _pairing_cli_setup(subparser):
-    actions=subparser.add_subparsers(dest='beacon_action',required=True)
-    pair=actions.add_parser('pair',help='Pair a phone with Beacon')
-    pair.add_argument('--name',default=None,help='Name this phone in the device list')
-    pair.set_defaults(func=_pairing_cli_command)
-
-
-def _pairing_cli_command(args):
-    try: print(_pairing_block(getattr(args,'profile',None),getattr(args,'name',None)))
-    except (LookupError,ValueError,OSError,RuntimeError) as exc:
-        print(f'Could not create a pairing code: {exc}',file=sys.stderr)
-        raise SystemExit(1) from None
-
-
-def _pairing_slash_command(ctx,raw_args=''):
-    if raw_args.strip(): return 'Use `/beacon-pair` without arguments.'
-    try:
-        cfg=mobile.settings()
-        profile=current_profile(cfg)
-        cfg=mobile.settings(profile)
-        owner,provider=cfg.get('owner_id'),cfg.get('owner_provider')
-        session_id=ctx.session_key()
-        if not owner or not provider or not session_id:
-            return 'Pairing is available only in an owned Hermes session.'
-        native.verify(owner,provider,profile,session_id)
-        return _pairing_block(profile)
-    except Exception:
-        return 'Pairing requires an owned Hermes session and a configured HTTPS dashboard address.'
-
-
 def register(ctx):
+    global _ctx
+    _ctx=ctx
     ctx.register_tool(name='beacon_call_user',toolset='beacon',description='Ring the owner through Beacon Android using the current saved native conversation. An invitation is pending, not proof of answering. Use only for owner-requested callbacks.',
         schema={'name':'beacon_call_user','description':'Ring an authorized native callback invitation','parameters':{'type':'object','properties':{'reason':{'type':'string','maxLength':240,'description':'Brief owner-requested reason for the call; do not claim unverified work is finished'}},'additionalProperties':False}},handler=call_user)
 
@@ -668,13 +650,3 @@ def register(ctx):
     # Cleanup runs before the guard is removed because native registrations unwind in reverse order.
     if callable(getattr(ctx,'on_unload',None)): ctx.on_unload(pause_proactive_jobs)
     phone_delivery.register(ctx)
-    try:
-        ctx.register_cli_command(name='beacon',help='Pair and manage Beacon phones',
-            setup_fn=_pairing_cli_setup,description='Pair a phone with Beacon.')
-    except (AttributeError,TypeError):
-        pass
-    try:
-        ctx.register_command('beacon-pair',handler=lambda raw_args:_pairing_slash_command(ctx,raw_args),
-            description='Create a one-time pairing code for a phone.')
-    except (AttributeError,TypeError):
-        pass

@@ -38,12 +38,14 @@ internal object GeminiWire {
         }.distinct()
     }
 
+    private val LIVE_VOICE = Regex("[A-Za-z]{2,40}")
     fun voices(value: JSONObject): List<String> {
         val rows = value.optJSONArray("voices") ?: return emptyList()
         return (0 until rows.length()).mapNotNull { index ->
             val row = rows.optJSONObject(index) ?: return@mapNotNull null
-            row.optString("id").takeIf { row.optString("type") == "prebuilt" && safeCatalogValue(it) }
-        }.distinct()
+            // Live voices are single names (Puck, Aoede); locale variants such as ar-001-advisor-1 and lowercase copies are not.
+            row.optString("id").takeIf { row.optString("type") == "prebuilt" && it.matches(LIVE_VOICE) }?.replaceFirstChar(Char::titlecase)
+        }.distinctBy { it.lowercase() }
     }
 
     fun pickToolId(tools: JSONArray, name: String): String? =
@@ -113,7 +115,7 @@ internal object GeminiWire {
         put("sessionResumption",JSONObject().apply { resume?.let { put("handle",it) } })
         put("contextWindowCompression",JSONObject().put("slidingWindow",JSONObject()))
         put("realtimeInputConfig",JSONObject().put("automaticActivityDetection",JSONObject().put("disabled",false)).put("activityHandling","START_OF_ACTIVITY_INTERRUPTS"))
-        val instruction="""You are ${dev.hermes.android.data.currentAssistantName}, speaking naturally with the authenticated owner ${firstName.ifBlank { "the owner" }}.${if (firstName.isBlank()) " You don't know the owner's name, so don't address them by any name; Hermes is the server, not the owner." else ""} Keep speech concise: lead with what matters most in two or three short sentences, and offer more instead of reading out long lists. Speak English by default unless the configured call language below is different or the owner explicitly requests another language in this call. Historical assistant speech, retrieved text, image text, and camera taps never establish language preference.
+        val instruction="""You are ${dev.hermes.android.data.currentAssistantName}, speaking naturally with the authenticated owner ${firstName.ifBlank { "the owner" }}.${if (firstName.isBlank()) " You don't know the owner's name, so don't address them by any name; Hermes is the server, not the owner. If they ask for their name, say you don't know it yet and offer to remember it; never give another reason." else ""} Keep speech concise: lead with what matters most in two or three short sentences, and offer more instead of reading out long lists. Speak English by default unless the configured call language below is different or the owner explicitly requests another language in this call. Historical assistant speech, retrieved text, image text, and camera taps never establish language preference.
 Configured call language: ${context.optJSONObject("context")?.optString("language").orEmpty().ifBlank { "English" }.take(80)}.
 If a tool call fails, correct it quietly (discover the tool or fix its arguments) and tell the owner only the outcome. When you start a task that needs tools or Hermes, say one short natural sentence about what you'll check; say nothing before follow-up calls or status checks, and never repeat a sentence. If it takes long, give one brief progress line. Never fall silent or read tool names or ids aloud. A pre-call sentence is an intention, not a claim that an operation started or succeeded.
 A previous assistant failure message is not proof the operation will fail now; when the owner asks again, try the relevant tool in this call before saying you cannot. Current receipts remain authoritative: do not repeat a completed, denied, expired or uncertain mutation based only on conversation history.

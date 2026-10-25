@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import json
+import math
 from fastapi import APIRouter, HTTPException, Request
 
 CANONICAL_TITLE = 'Bot Chat'
@@ -30,11 +31,26 @@ def build_router(identity, body, native):
 
     async def rpc(owner, provider, profile, method, **params):
         try:
-            return await asyncio.to_thread(native.rpc, owner, provider, method, dict(params, profile=profile))
+            result = await asyncio.to_thread(native.rpc, owner, provider, method, dict(params, profile=profile))
         except LookupError:
             raise HTTPException(409, 'Native Bot Mode operation unavailable or forbidden; refresh before retrying') from None
         except (RuntimeError, OSError):
             raise HTTPException(503, 'Native Bot Mode service unavailable; refresh before retrying') from None
+        if not isinstance(result, dict):
+            raise HTTPException(503, 'Native Bot Mode returned an invalid result; refresh before retrying')
+        return result
+
+    async def capabilities(owner, provider, profile):
+        try:
+            result = await rpc(owner, provider, profile, 'groups.capabilities')
+        except HTTPException:
+            result = {}
+        methods = result.get('methods')
+        if not isinstance(methods, list) or not all(isinstance(m, str) for m in methods):
+            methods = []
+        # TUI has no member setter; its retry rows cannot distinguish unknown work from deferred work.
+        return {'rename': 'groups.rename' in methods, 'delete': 'groups.disband' in methods,
+                'approval': 'groups.approve' in methods, 'change_members': False, 'retry': False}
 
     async def roster(request):
         owner, provider, profile, cfg = identity(request)
@@ -57,6 +73,8 @@ def build_router(identity, body, native):
             raise HTTPException(400, "Choose a native shared space")
         result = await rpc(owner, provider, profile, 'groups.state', room_id=rid)
         value = result.get('room') or {}
+        if not isinstance(value, dict) or value.get('room_id') != rid:
+            raise HTTPException(503, 'Native shared-space identity was not confirmed; refresh')
         members = value.get('members') or []
         # Revoking profile access also revokes old shared-space access.
         if not authorized_members(members, cfg['profiles']):
@@ -72,7 +90,8 @@ def build_router(identity, body, native):
             members = row.get('members') or []
             return authorized_members(members, cfg['profiles'])
         return {'bots': bots, 'spaces': [row for row in rooms.get('rooms', []) if authorized(row)],
-                'has_more_spaces': rooms.get('next_offset') is not None}
+                'has_more_spaces': rooms.get('next_offset') is not None,
+                'capabilities': await capabilities(owner, provider, profile)}
 
     @router.get('/space/{rid}')
     async def read_space(rid: str, request: Request):
@@ -90,7 +109,7 @@ def build_router(identity, body, native):
                 break
         log['events'] = events
         log['earlier_events_omitted'] = since > 0
-        return dict(state, **log)
+        return dict(state, **log, capabilities=await capabilities(owner, provider, profile))
 
     @router.post('/space')
     async def create_space(request: Request):
@@ -146,6 +165,8 @@ def build_router(identity, body, native):
             current = state['room'].get('name')
             if current not in (expected, name.strip()):
                 raise HTTPException(409, 'The name changed elsewhere. Refresh before saving again.')
+            if not (await capabilities(owner, provider, profile))['rename']:
+                raise HTTPException(409, 'Native shared-space renaming is unavailable; refresh')
             result = await rpc(owner, provider, profile, 'groups.rename', room_id=rid, event_id=event, name=name.strip())
             if (result.get('room') or {}).get('name') != name.strip():
                 raise HTTPException(503, 'The new name was not confirmed. Refresh before retrying.')
@@ -153,33 +174,8 @@ def build_router(identity, body, native):
 
     @router.post('/space/{rid}/members')
     async def set_members(rid: str, request: Request):
-        owner, provider, profile, bots = await roster(request)
-        value = await body(request, 4096)
-        chosen, expected, event = value.get('profiles'), value.get('expected_profiles'), value.get('event_id')
-        allowed = {row['profile'] for row in bots}
-        def valid(rows):
-            return (isinstance(rows, list) and 2 <= len(rows) <= 6
-                    and all(isinstance(p, str) and p in allowed for p in rows) and len(set(rows)) == len(rows))
-        if (set(value) != {'profiles', 'expected_profiles', 'event_id'} or not valid(chosen) or not valid(expected)
-                or not isinstance(event, str) or not 1 <= len(event) <= 100
-                or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in event)):
-            raise HTTPException(400, 'Choose two to six authorized bots and a stable edit identity')
-        owner, provider, profile, rid, state = await room(request, rid)
-        current = sorted(m['profile'] for m in state['room']['members'])
-        if current not in (sorted(expected), sorted(chosen)):
-            raise HTTPException(409, 'The bots changed elsewhere. Refresh before saving again.')
-        current_members = {m['profile']: m for m in state['room']['members']}
-        members = [current_members.get(p) or {'member_id': p, 'profile': p,
-                   'handle': 'hermes' if p == 'default' else p, 'target': {'kind': 'local', 'profile': p}}
-                   for p in sorted(chosen)]
-        result = await rpc(owner, provider, profile, 'groups.members.set', room_id=rid,
-                           members=members, expected_profiles=sorted(expected), event_id=event)
-        confirmed = (result.get('room') or {}).get('members')
-        if (not authorized_members(confirmed, allowed)
-                or sorted(m['profile'] for m in confirmed) != sorted(chosen)
-                or (result.get('event') or {}).get('event_id') != event):
-            raise HTTPException(503, 'The bot changes were not confirmed. Refresh before retrying.')
-        return result
+        await room(request, rid)
+        raise HTTPException(409, 'This Hermes version cannot change bots in an existing space. Create another space with the bots you need; this space and its history are kept.')
 
     @router.post('/space/{rid}/delete')
     async def delete_space(rid: str, request: Request):
@@ -192,17 +188,38 @@ def build_router(identity, body, native):
             raise HTTPException(400, 'A confirmed shared-space name and stable deletion identity are required')
         if not isinstance(rid, str) or not rid or len(rid) > 128:
             raise HTTPException(400, 'Choose a native shared space')
-        state = await rpc(owner, provider, profile, 'groups.state', room_id=rid, include_disbanded=True)
-        current = state.get('room') or {}
-        if not authorized_members(current.get('members'), cfg['profiles']):
-            raise HTTPException(403, 'Shared space contains an unauthorized bot')
-        if current.get('name') != expected:
-            raise HTTPException(409, 'The name changed elsewhere. Refresh before deleting.')
-        result = await rpc(owner, provider, profile, 'groups.delete', room_id=rid, event_id=event, expected_name=expected)
-        receipt = result.get('tombstone') or {}
-        if receipt.get('room_id') != rid or receipt.get('event_id') != event:
-            raise HTTPException(503, 'Deletion was not confirmed. Refresh before retrying.')
-        return result
+        async with CHAT_LOCK:
+            state = await rpc(owner, provider, profile, 'groups.state', room_id=rid, include_disbanded=True)
+            current = state.get('room') or {}
+            if not isinstance(current, dict) or current.get('room_id') != rid:
+                raise HTTPException(503, 'Native shared-space identity was not confirmed; refresh')
+            if not authorized_members(current.get('members'), cfg['profiles']):
+                raise HTTPException(403, 'Shared space contains an unauthorized bot')
+            if current.get('name') != expected:
+                raise HTTPException(409, 'The name changed elsewhere. Refresh before deleting.')
+            if not (await capabilities(owner, provider, profile))['delete']:
+                raise HTTPException(409, 'Native shared-space deletion is unavailable. Refresh before trying again.')
+            try:
+                # The HTTP event identity is a Stop correlation, never a native deletion-event ID.
+                result = await rpc(owner, provider, profile, 'groups.disband', room_id=rid, cancel_id=event)
+            except HTTPException as exc:
+                raise HTTPException(exc.status_code, 'Deletion is unconfirmed; Hermes may have started stopping the bots. Refresh this space before retrying.') from None
+            receipt = result.get('tombstone')
+            receipt = receipt if isinstance(receipt, dict) else {}
+            stamp, native_event = receipt.get('disbanded_at'), receipt.get('event')
+            if (receipt.get('room_id') != rid or type(stamp) not in (int, float) or not math.isfinite(stamp) or stamp <= 0
+                    or type(receipt.get('idempotent')) is not bool or not isinstance(native_event, dict)
+                    or native_event.get('room_id') != rid or native_event.get('kind') != 'room.disbanded'
+                    or native_event.get('event_id') != 'system:room-disbanded'):
+                raise HTTPException(503, 'Deletion was not confirmed. Refresh this space before retrying.')
+            reread = await rpc(owner, provider, profile, 'groups.state', room_id=rid, include_disbanded=True)
+            retired = reread.get('room') or {}
+            if (not isinstance(retired, dict) or retired.get('room_id') != rid
+                    or type(retired.get('disbanded_at')) not in (int, float) or retired.get('disbanded_at') != stamp):
+                raise HTTPException(503, 'Deletion was not confirmed by native state. Refresh before retrying.')
+            if not authorized_members(retired.get('members'), cfg['profiles']):
+                raise HTTPException(403, 'Shared space contains an unauthorized bot')
+            return result
 
     @router.post('/space/{rid}/messages')
     async def send_space(rid: str, request: Request):
@@ -219,14 +236,27 @@ def build_router(identity, body, native):
         value = await body(request, 4096)
         pending = (state.get('driver_status') or {}).get('pending_actions') or []
         kind = value.get('kind')
-        fields = {'kind', 'task_id'} if kind == 'retry' else {'kind', 'task_id', 'member_id', 'request_id', 'execution_generation', 'choice'}
-        if set(value) != fields or kind not in ('retry', 'approval') or (kind == 'approval' and value.get('choice') not in ('once', 'deny')):
+        if kind in ('retry', 'discard'):
+            raise HTTPException(409, 'This Hermes version cannot safely resolve work whose outcome may be unknown in Beacon. Review it in Hermes; do not replay it blindly.')
+        fields = {'kind', 'task_id', 'member_id', 'request_id', 'execution_generation', 'choice'}
+        if (set(value) != fields or kind != 'approval' or value.get('choice') not in ('once', 'deny')
+                or any(not isinstance(value.get(k), str) or not value[k] for k in ('task_id', 'member_id', 'request_id'))
+                or type(value.get('execution_generation')) is not int or value['execution_generation'] < 1):
             raise HTTPException(400, 'Choose an exact pending native action')
         coordinates = fields - {'choice'}
-        if not any(all(action.get(k) == value.get(k) for k in coordinates) for action in pending):
+        if not any(isinstance(action, dict) and all(action.get(k) == value.get(k) for k in coordinates)
+                   and type(action.get('execution_generation')) is int
+                   and isinstance(action.get('approval'), dict) and isinstance(action['approval'].get('choices'), list)
+                   and value['choice'] in action['approval']['choices'] for action in pending):
             raise HTTPException(409, 'This native action is no longer pending; refresh')
-        params = {k: v for k, v in value.items() if k != 'kind'}
-        return await rpc(owner, provider, profile, 'groups.retry' if kind == 'retry' else 'groups.approve', room_id=rid, **params)
+        if not (await capabilities(owner, provider, profile))['approval']:
+            raise HTTPException(409, 'Native shared-space approval is unavailable; refresh')
+        result = await rpc(owner, provider, profile, 'groups.approve', room_id=rid, task_id=value['task_id'],
+                           member_id=value['member_id'], request_id=value['request_id'],
+                           execution_generation=value['execution_generation'], choice=value['choice'])
+        if result.get('approved') is not True or not isinstance(result.get('result'), dict):
+            raise HTTPException(503, 'Approval was not confirmed. Refresh before trying again.')
+        return result
 
     @router.post('/chat')
     async def open_chat(request: Request):

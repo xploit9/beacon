@@ -27,7 +27,7 @@ class IncomingCallTest {
         listOf(ApiFailure(503, "Engine unavailable"), ApiFailure(500, "Engine failed"), ApiFailure(409, "Call lease busy"), ApiFailure(400, "Unknown callback failure"), IOException("Response lost")).forEach { assertFalse(incomingFailureTerminal(it)) }
         listOf(401, 403, 404, 410).forEach { assertTrue(incomingFailureTerminal(ApiFailure(it, "Invitation authorization ended"))) }
         assertFalse(incomingRouteEnded(route(), "source-1", "default"))
-        listOf("answered", "declined", "expired").forEach { state ->
+        listOf("answered", "declined", "expired", "missed").forEach { state ->
             val ended = route().put("state", state)
             assertTrue(incomingRouteEnded(ended, "source-1", "default"))
             assertFalse(incomingRouteEnded(ended, "other-source", "default"))
@@ -93,8 +93,9 @@ class IncomingCallTest {
         assertFalse(validIncoming("source-1", "event-1", 0, 993))
         assertThrows(IllegalArgumentException::class.java) { requireIncomingRoute(route(), "foreign-source", "default", 993) }
         assertThrows(IllegalArgumentException::class.java) { requireIncomingRoute(route(), "source-1", "foreign-profile", 993) }
-        val scope = Scope("https://hermes.example", "owner-1", "default")
-        assertTrue(AuthContext(scope.origin, emptyList(), scope.owner,backend="hermes-dashboard").authorizesPushSource(scope))
+        val scope = Scope("https://hermes.example", "owner-1", "default", nativeProvider = "basic")
+        assertTrue(AuthContext(scope.origin, emptyList(), scope.owner,backend="hermes-dashboard", nativeProvider = "basic").authorizesPushSource(scope))
+        assertFalse(AuthContext(scope.origin, emptyList(), scope.owner,backend="hermes-dashboard", nativeProvider = "oidc").authorizesPushSource(scope))
         assertFalse(AuthContext(scope.origin, emptyList(), scope.owner).authorizesPushSource(scope))
         assertFalse(AuthContext(scope.origin, emptyList()).authorizesPushSource(scope))
         assertFalse(AuthContext(scope.origin, emptyList(), "foreign-owner",backend="hermes-dashboard").authorizesPushSource(scope))
@@ -114,6 +115,20 @@ class IncomingCallTest {
         assertEquals(0L, invite.copy(arrivedAt = 0).ringDurationMillis(1000000, 50000, 7))
         assertEquals(15000L, invite.ringDurationMillis(1030000, 80000, 7))
         assertEquals(10000L, invite.ringDurationMillis(1035000, 85000, 7))
+    }
+    @Test fun silentRetryKeepsTheOriginalActionDeadlineWithoutRestoringRingtoneEligibility() {
+        val retry = IncomingCall("source-1", "event-1", 1120, arrivedAt = 1000000, arrivedElapsed = 50000, boot = 7, state = "retryable")
+        assertEquals(0L, retry.ringDurationMillis(1030000, 80000, 7))
+        assertEquals(15000L, retry.actionDurationMillis(1030000, 80000, 7))
+        assertEquals(1L, retry.actionDurationMillis(1044999, 94999, 7))
+        assertEquals(0L, retry.actionDurationMillis(1045000, 95000, 7))
+        assertEquals(0L, retry.actionDurationMillis(999999, 50001, 7))
+        assertEquals(0L, retry.actionDurationMillis(1000001, 49999, 7))
+        assertEquals(0L, retry.actionDurationMillis(1000001, 50001, 8))
+        assertEquals(0L, retry.copy(expiresAt = 1030).actionDurationMillis(1030000, 80000, 7))
+        listOf("dismissed", "missed", "ended").forEach { state ->
+            assertEquals(0L, retry.copy(state = state).actionDurationMillis(1000000, 50000, 7))
+        }
     }
     @Test fun bindingPairCommitsTogetherAndFailedCommitRestoresExistingAuthority() {
         for(fail in listOf(false,true)) {

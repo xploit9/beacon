@@ -24,7 +24,7 @@ class NativeActivityDeviceTest {
         val activity = "synthetic-activity-${System.currentTimeMillis()}"
         val origin = "https://notification-fixture.invalid"
         val previousAuth = context.auth.read(origin)
-        val auth = AuthContext(origin, emptyList(), "synthetic-owner", "default", backend = "hermes-dashboard")
+        val auth = AuthContext(origin, emptyList(), "synthetic-owner", "default", backend = "hermes-dashboard", nativeProvider = "fixture")
         val prefs = context.getSharedPreferences("push-binding", android.content.Context.MODE_PRIVATE)
         val key = "source:${source.digest()}"
         val route = json("kind" to kind,"text_reply" to (kind=="clarify"),"preview" to json("complete" to true,"title" to "Beacon needs approval", "body" to "Read the synthetic test folder"),
@@ -33,7 +33,7 @@ class NativeActivityDeviceTest {
             presentNativeActivity(context, source, event, activity, kind, System.currentTimeMillis()/1000+120, route)
             assertTrue("An unregistered source cannot post", manager.activeNotifications.none { it.notification.extras.getString("native_source") == source })
             context.auth.write(auth)
-            val binding = json("source" to source, "origin" to origin, "owner" to auth.owner, "profile" to auth.profile, "backend" to "hermes-dashboard")
+            val binding = json("source" to source, "origin" to origin, "owner" to auth.owner, "profile" to auth.profile, "native_provider" to auth.nativeProvider, "backend" to "hermes-dashboard")
             assertTrue(prefs.edit().putString(key, android.util.Base64.encodeToString(context.cipher.encrypt(binding.toString().toByteArray(), key), android.util.Base64.NO_WRAP)).commit())
             presentNativeActivity(context, source, event, activity, kind, System.currentTimeMillis()/1000+120, route)
             val deadline = System.currentTimeMillis()+3000

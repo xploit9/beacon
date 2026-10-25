@@ -39,6 +39,7 @@ class GeminiWireTest {
         fun instruction(context: org.json.JSONObject) = GeminiWire.setup("model","",null,context).getJSONObject("setup")
             .getJSONObject("systemInstruction").getJSONArray("parts").getJSONObject(0).getString("text")
         assertTrue(instruction(org.json.JSONObject()).contains("don't address them by any name"))
+        assertTrue(instruction(org.json.JSONObject()).contains("say you don't know it yet and offer to remember it"))
         val named = instruction(org.json.JSONObject().put("owner_first_name","Maya"))
         assertTrue(named.contains("authenticated owner Maya.")); assertFalse(named.contains("don't address them by any name"))
     }

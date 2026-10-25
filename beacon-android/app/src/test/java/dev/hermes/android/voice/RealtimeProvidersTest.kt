@@ -83,6 +83,13 @@ class RealtimeProvidersTest {
               {"id":"voice_custom","type":"prompted","display_name":"Custom"}
             ]}
         """)))
+        // The prebuilt list also carries locale variants and lowercase copies that Live does not take as voice names.
+        assertEquals(listOf("Puck", "Aoede"), GeminiWire.voices(JSONObject("""
+            {"voices":[
+              {"id":"Puck","type":"prebuilt"}, {"id":"aoede","type":"prebuilt"}, {"id":"Aoede","type":"prebuilt"},
+              {"id":"ar-001-advisor-1","type":"prebuilt"}, {"id":"puck","type":"prebuilt"}
+            ]}
+        """)))
         assertEquals(listOf("grok-voice-latest", "grok-voice-think-fast-2.0"), GrokWire.models(JSONObject("""
             {"data":[{"id":"grok-voice-latest"},{"id":"grok-voice-think-fast-2.0"},{"id":"grok-4.7"}]}
         """)))

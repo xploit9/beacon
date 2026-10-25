@@ -23,9 +23,11 @@ fun sha256(file: java.io.File): String {
 }
 fun String.digest(): String = sha256(toByteArray())
 
-data class Scope(val origin: String, val owner: String, val profile: String, val session: String = "") {
-    val key: String get() = listOf(origin, owner, profile, session).joinToString("\u0000").digest()
+data class Scope(val origin: String, val owner: String, val profile: String, val session: String = "", val nativeProvider: String = "") {
+    val key: String get() = if (nativeProvider.isEmpty()) listOf(origin, owner, profile, session).joinToString("\u0000").digest()
+        else JSONArray(listOf(origin, nativeProvider, owner, profile, session)).toString().digest()
     fun session(id: String) = copy(session = id)
+    fun sameAccount(other: Scope): Boolean = origin == other.origin && owner == other.owner && nativeProvider == other.nativeProvider
 }
 
 fun trustedOrigin(input: String): String {
@@ -34,13 +36,6 @@ fun trustedOrigin(input: String): String {
         "Enter an HTTPS Beacon origin, without a path, credentials or query."
     }
     return url.toString().trimEnd('/')
-}
-
-fun safeArtifactPath(path: String): String {
-    require(path.startsWith("/api/") && !path.startsWith("//") && !path.contains('\\') && !path.contains('#') && !path.contains('?')) { "Invalid artifact path" }
-    val decoded = java.net.URLDecoder.decode(path, "UTF-8")
-    require(decoded.split('/').none { it == ".." || it == "." } && !decoded.contains('\\') && !decoded.contains('%') && decoded.none { it <= ' ' || it == '?' || it == '#' }) { "Invalid artifact path" }
-    return path
 }
 
 data class SseEvent(val type: String, val data: String, val id: String = "") {
@@ -95,14 +90,26 @@ data class PendingSend(val id: String, val scope: Scope, val draft: Draft, val s
     companion object { fun create(scope: Scope, draft: Draft) = PendingSend(UUID.randomUUID().toString(), scope, draft) }
 }
 
-data class Release(val version: Long, val name: String, val packageName: String, val path: String, val sha: String, val size: Long, val signer: String, val minContract: Int, val maxContract: Int) {
-    fun validate(installedPackage: String, installedVersion: Long, installedSigner: String, contract: Int = 2) {
-        safeArtifactPath(path)
+const val MAX_UPDATE_APK_BYTES = 256L * 1024 * 1024
+/** The plugin's own release-version rule (hermes-plugin dashboard/plugin_api.py `_plugin_version_tuple`), bounded so each part fits an Int. */
+val PLUGIN_VERSION_PATTERN = Regex("(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})")
+
+/** One public GitHub release: this app version and the Hermes plugin version it ships with. [url] is the APK asset's download address. */
+data class Release(val version: Long, val name: String, val packageName: String, val url: String, val sha: String, val size: Long, val signer: String, val pluginVersion: String, val notes: String = "", val published: String = "") {
+    fun validate(installedPackage: String, installedVersion: Long, installedSigner: String) {
+        require(url.isNotBlank()) { "Invalid release manifest" }
         require(packageName == installedPackage) { "Update belongs to another app" }
         require(version > installedVersion) { "Beacon is already up to date" }
         require(signer.equals(installedSigner, true)) { "Update signing identity differs" }
-        require(sha.matches(Regex("[a-fA-F0-9]{64}")) && size in 1..256L * 1024 * 1024) { "Invalid release manifest" }
-        require(contract in minContract..maxContract) { "Update is incompatible with this API contract" }
+        require(sha.matches(Regex("[a-fA-F0-9]{64}")) && size in 1..MAX_UPDATE_APK_BYTES) { "Invalid release manifest" }
+        require(pluginVersion.matches(PLUGIN_VERSION_PATTERN)) { "Invalid release manifest" }
     }
-    companion object { fun from(o: JSONObject) = Release(o.getLong("version_code"), o.getString("version_name"), o.getString("package_name"), o.getString("artifact_path"), o.getString("sha256"), o.getLong("size_bytes"), o.getString("certificate_sha256"), o.getInt("min_contract_version"), o.getInt("max_contract_version")) }
+    /** Phone-local copy, so a 304 from GitHub can still show the release. */
+    fun encode(): String = json("version_code" to version, "version_name" to name, "package_name" to packageName, "download_url" to url, "sha256" to sha,
+        "size_bytes" to size, "certificate_sha256" to signer, "plugin_version" to pluginVersion, "notes" to notes, "published_at" to published).toString()
+    companion object {
+        fun from(metadata: JSONObject, url: String, notes: String, published: String) = Release(metadata.getLong("version_code"), metadata.getString("version_name"), metadata.getString("package_name"), url,
+            metadata.getString("sha256"), metadata.getLong("size_bytes"), metadata.getString("certificate_sha256"), metadata.getString("plugin_version"), notes, published)
+        fun decode(raw: String?): Release? = runCatching { JSONObject(raw!!).let { from(it, it.getString("download_url"), it.string("notes"), it.string("published_at")) } }.getOrNull()
+    }
 }

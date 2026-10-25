@@ -157,6 +157,113 @@ def test_call_history_duration_is_recorded_when_transcript_finalizes(harness):
     assert row['duration_s'] >= 3
 
 
+@pytest.mark.parametrize('incomplete',[False,True])
+@pytest.mark.parametrize('close_first',[False,True])
+def test_never_connected_failure_survives_finalize_close_and_history(harness,incomplete,close_first):
+    api,client,_,_,_=harness
+    call_id=add_call(api)
+    path=f'{PATH}/{call_id}'
+    if close_first:
+        assert client.delete(path).status_code==200
+    body={'incomplete':incomplete,'failed':True,'error':'Synthetic provider response must not be retained'}
+    finalized=client.post(path+'/finalize',json=body)
+    assert finalized.status_code==200,finalized.text
+    receipt=finalized.json()
+    # An empty, never-connected call can have a complete text archive and still have failed.
+    assert receipt.get('failed') is True and receipt['complete'] is (not incomplete)
+    assert receipt['transcript_status']==('partial' if incomplete else 'saved')
+    assert receipt['transcript_events']==0 and receipt['unfinalized_transcripts']==0
+    assert receipt['audio_available'] is False
+    for late_body in (body,{}, {'failed':False}, {'failed':False,'incomplete':True}):
+        duplicate=client.post(path+'/finalize',json=late_body)
+        assert duplicate.status_code==200 and duplicate.json()['failed'] is True
+        assert client.delete(path).status_code==200
+        row=next(row for row in history(client)['calls'] if row['id']==call_id)
+        assert row['state']=='failed' and row['has_transcript'] is False
+    with api.mobile.connect() as conn:
+        stored=json.loads(conn.execute('SELECT receipt FROM calls WHERE id=?',(call_id,)).fetchone()[0])
+        assert stored['failed'] is True
+        assert conn.execute('SELECT COUNT(*) FROM timeline WHERE call_id=?',(call_id,)).fetchone()[0]==0
+    assert set(stored)=={'audio_available','transcript_available','transcript_events',
+                         'unfinalized_transcripts','incomplete','complete','failed'}
+
+
+def test_failed_close_survives_lost_finalization_without_inventing_complete_text(harness):
+    api,client,_,_,_=harness
+    call_id=add_call(api);path=f'{PATH}/{call_id}'
+    # No finalize reaches the server: only the independent terminal cleanup is acknowledged.
+    response=client.request('DELETE',path,json={'failed':True})
+    assert response.status_code==200 and response.json()['failed'] is True
+    assert response.json()['closed'] is True and response.json().get('complete') is not True
+    assert response.json().get('transcript_available') is not True
+    for payload in (None,{}, {'failed':False}):
+        late=client.delete(path) if payload is None else client.request('DELETE',path,json=payload)
+        assert late.status_code==200 and late.json()['failed'] is True
+        assert next(row for row in history(client)['calls'] if row['id']==call_id)['state']=='failed'
+    assert client.post(path+'/finalize',json={}).json()['failed'] is True
+    with api.mobile.connect() as conn:
+        receipt=json.loads(conn.execute('SELECT receipt FROM calls WHERE id=?',(call_id,)).fetchone()[0])
+        assert receipt['failed'] is True
+        assert conn.execute('SELECT COUNT(*) FROM timeline WHERE call_id=?',(call_id,)).fetchone()[0]==0
+
+
+@pytest.mark.parametrize('payload',[{'failed':None},{'failed':1},{'failed':'true'},{'failed':[]},{'other':True}])
+def test_failed_close_rejects_invalid_flags_without_changing_call(harness,payload):
+    api,client,_,_,_=harness
+    call_id=add_call(api)
+    assert client.request('DELETE',f'{PATH}/{call_id}',json=payload).status_code==400
+    with api.mobile.connect() as conn:
+        row=conn.execute('SELECT closed,receipt FROM calls WHERE id=?',(call_id,)).fetchone()
+        assert row['closed']==0 and json.loads(row['receipt'])=={}
+
+
+@pytest.mark.parametrize('body',[{}, {'incomplete':True}, {'failed':False}, {'failed':False,'incomplete':True}])
+def test_legacy_normal_or_cancelled_call_is_not_reclassified_as_failure(harness,body):
+    api,client,_,_,_=harness
+    call_id=add_call(api)
+    path=f'{PATH}/{call_id}'
+    # Normal hangup/cancellation sends no terminal failure; interrupted speech is still not a call failure.
+    events=[{'event_id':'caption','turn_id':'1','type':'transcript','role':'assistant',
+             'text':'Interrupted fixture words','at_ms':1,'final':True,'interrupted':True}]
+    assert client.post(path+'/events',json={'events':events}).status_code==200
+    finalized=client.post(path+'/finalize',json=body)
+    assert finalized.status_code==200 and finalized.json().get('failed',False) is False
+    assert client.delete(path).status_code==200
+    assert next(row for row in history(client)['calls'] if row['id']==call_id)['state']=='completed'
+
+
+def test_late_finalization_never_upgrades_a_preexisting_stale_failure(harness):
+    api,client,_,_,_=harness
+    call_id=add_call(api,closed=1,status='failed')
+    response=client.post(f'{PATH}/{call_id}/finalize',json={})
+    assert response.status_code==200,response.text
+    assert next(row for row in history(client)['calls'] if row['id']==call_id)['state']=='failed'
+
+
+@pytest.mark.parametrize('incomplete',[False,True])
+def test_terminal_failure_preserves_an_earlier_text_completeness_receipt(harness,incomplete):
+    api,client,_,_,_=harness
+    call_id=add_call(api)
+    path=f'{PATH}/{call_id}/finalize'
+    assert client.post(path,json={'incomplete':incomplete}).json()['complete'] is (not incomplete)
+    failed=client.post(path,json={'failed':True})
+    assert failed.status_code==200 and failed.json().get('failed') is True
+    assert failed.json()['complete'] is (not incomplete) and failed.json()['incomplete'] is incomplete
+    assert failed.json()['transcript_status']==('partial' if incomplete else 'saved')
+    assert next(row for row in history(client)['calls'] if row['id']==call_id)['state']=='failed'
+
+
+@pytest.mark.parametrize('value',[None,0,1,'failed',{},[]])
+def test_terminal_failure_accepts_only_a_boolean(harness,value):
+    api,client,_,_,_=harness
+    call_id=add_call(api)
+    response=client.post(f'{PATH}/{call_id}/finalize',json={'failed':value})
+    assert response.status_code==409
+    with api.mobile.connect() as conn:
+        row=conn.execute('SELECT closed,receipt FROM calls WHERE id=?',(call_id,)).fetchone()
+    assert row['closed']==0 and json.loads(row['receipt'])=={}
+
+
 def test_stale_call_releases_waiting_invitation_and_history_ends(harness, monkeypatch):
     api, client, _, _, _ = harness
     monkeypatch.setattr(api, 'watch', lambda *args: None)

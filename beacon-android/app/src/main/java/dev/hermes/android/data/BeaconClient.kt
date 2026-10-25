@@ -25,12 +25,16 @@ import java.util.concurrent.TimeUnit
 class ApiFailure(val status: Int, override val message: String, val plugin: Boolean = false) : IOException(message) {
     internal val detail = message
 }
-internal class LoopbackSessionRefreshFailed : IOException("Hermes restarted. Scan the Connect QR again.")
+internal class LoopbackSessionRefreshFailed : IOException("Hermes restarted. Paste the link again.")
 internal const val HERMES_LOOPBACK_SESSION_HEADER = "X-Hermes-Session-Token"
 private const val MAX_LOOPBACK_ROOT_BYTES = 256L * 1024L
 private const val BEACON_PLUGIN_PATH = "/api/plugins/beacon/"
+private const val OPTIONAL_BOOTSTRAP_PATH = BEACON_PLUGIN_PATH + "mobile/bootstrap"
 internal object NativeDeviceRemoval {
     @Volatile var onRemoved: ((Scope) -> Unit)? = null
+    /** Set by the ViewModel: a removed phone keeps none of its account's saved screen answers. */
+    @Volatile var onForgetScreens: ((Scope) -> Unit)? = null
+    fun removed(scope: Scope) { onRemoved?.invoke(scope); onForgetScreens?.invoke(scope) }
 }
 private val LOOPBACK_SESSION_ASSIGNMENT = Regex("""window\.__HERMES_SESSION_TOKEN__\s*=\s*("(?:\\.|[^"\\])*")\s*;""")
 
@@ -54,32 +58,76 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
     private val origin = trustedOrigin(initial.origin).toHttpUrl()
     val jar = ScopedCookies(origin, initial.cookies) { auth.bearer != null || auth.loopbackSession != null }
     @Volatile var auth: AuthContext = initial; private set
-    val scope get() = Scope(auth.origin, auth.owner, auth.profile)
+    // Detached jars normalize cookie text; retain the exact CAS baseline and its admission.
+    @Volatile private var expectedCookies = initial.cookies
+    @Volatile private var cookieVersion = authStore?.authorityEpoch?.readVersion()
+    val scope get() = auth.scope()
     // A coroutine Mutex: the refresh suspends (network read with timeout) while holding the lock.
     private val loopbackRefreshLock = kotlinx.coroutines.sync.Mutex()
-    val http: OkHttpClient = (sharedHttp?.newBuilder() ?: OkHttpClient.Builder()).cookieJar(jar).followRedirects(false).followSslRedirects(false).retryOnConnectionFailure(false).connectTimeout(15, TimeUnit.SECONDS).readTimeout(60, TimeUnit.SECONDS).apply {
+    val http: OkHttpClient = (sharedHttp?.newBuilder() ?: OkHttpClient.Builder()).cookieJar(object : CookieJar {
+        override fun loadForRequest(url: HttpUrl): List<Cookie> {
+            adoptCookieRotation()
+            return jar.loadForRequest(url)
+        }
+        override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+            // The in-process probe may rotate native credentials, but cannot plant other cookies.
+            jar.saveFromResponse(url, if (url.encodedPath == OPTIONAL_BOOTSTRAP_PATH) cookies.filter { nativeSessionCookie(it.name) } else cookies)
+        }
+    }).followRedirects(false).followSslRedirects(false).retryOnConnectionFailure(false).connectTimeout(15, TimeUnit.SECONDS).readTimeout(60, TimeUnit.SECONDS).apply {
         if (sharedHttp == null) { addInterceptor(bearerAuthInterceptor()); configureHttp(this) }
     }.build()
     private val nativeAuth = NativeAuth(auth.origin, http.newBuilder().cookieJar(CookieJar.NO_COOKIES).build())
     private val operationLock = kotlinx.coroutines.sync.Mutex()
     internal suspend fun bindProfile(profile: String) {
         closeNative(); auth = auth.copy(profile = profile, bearer = auth.bearer?.copy(profile = profile))
-        authStore?.takeIf { !detachedView }?.let { it.persist(auth); markLoopbackSessionPersisted() }
+        authStore?.takeIf { !detachedView }?.let {
+            if (it.persistIfUnchanged(auth, cookieVersion, snapshot = true, selectProfileIf = { true })) markAuthPersisted()
+        }
     }
-    internal fun markLoopbackSessionPersisted() {
+    internal fun markAuthPersisted() {
+        cookieVersion = authStore?.authorityEpoch?.readVersion()
+        expectedCookies = auth.cookies
         auth.loopbackSession?.takeIf { it.verified }?.let { auth = auth.copy(loopbackSession = it.copy(persisted = true)) }
     }
-    fun detached(): BeaconClient = BeaconClient(auth.copy(cookies = jar.snapshot()), authStore, socketFactory, http, detachedView = true, persistContext = persistContext, configureHttp = configureHttp, credentialSource = credentialSource)
+    private fun adoptCookieRotation() {
+        // Only cookie sessions rotate cookies; a bearer or loopback request never needs the store read.
+        if (auth.bearer != null || auth.loopbackSession != null) return
+        synchronized(this) {
+            val store = authStore ?: return
+            val version = cookieVersion ?: return
+            if (!store.authorityEpoch.current(version)) return
+            val stored = store.read(auth.origin)
+            if (!store.authorityEpoch.current(version) || !stored.sameCookieAuthority(auth) || stored.cookies == expectedCookies) return
+            // Keep a response's not-yet-retained rotation; only an unchanged jar can adopt a sibling's.
+            if (jar.replaceIfUnchanged(expectedCookies, stored.cookies)) {
+                expectedCookies = stored.cookies
+                auth = auth.copy(cookies = stored.cookies)
+            }
+        }
+    }
+    internal suspend fun retainCookieRotation() = withContext(Dispatchers.IO) {
+        synchronized(this@BeaconClient) {
+            val cookies = jar.snapshot()
+            if (cookies != expectedCookies) authStore?.replaceCookies(auth.copy(cookies = expectedCookies), cookies, cookieVersion)
+            expectedCookies = cookies
+            auth = auth.copy(cookies = cookies)
+        }
+    }
+    fun detached(): BeaconClient = BeaconClient(auth.copy(cookies = jar.snapshot()), authStore, socketFactory, http, detachedView = true, persistContext = persistContext, configureHttp = configureHttp, credentialSource = credentialSource).also {
+        it.expectedCookies = expectedCookies; it.cookieVersion = cookieVersion
+    }
+    /** Cleanup owns its captured credential; it cannot adopt or persist a later phone sign-in. */
+    internal fun detachedForLogout(): BeaconClient = BeaconClient(auth.copy(cookies = jar.snapshot()), null, socketFactory, detachedView = true, persistContext = false, configureHttp = configureHttp)
     /** A short-lived profile view shares the signed-in account's refresh owner without persisting a profile switch. */
     internal fun forAuthorizedProfile(profile: String): BeaconClient {
         require(validNativeProfile(profile) && auth.owner.isNotBlank()) { "Invalid native profile scope" }
         val source = credentialSource ?: this
-        require(source.auth.origin == auth.origin && source.auth.owner == auth.owner) { "Native profile belongs to another account" }
+        require(source.scope.sameAccount(scope)) { "Native profile belongs to another account" }
         return BeaconClient(
             auth.copy(profile = profile, bearer = source.auth.bearer?.copy(profile = profile), loopbackSession = source.auth.loopbackSession, cookies = jar.snapshot()),
             authStore, socketFactory, source.http, detachedView = true, persistContext = false,
             configureHttp = configureHttp, credentialSource = source,
-        )
+        ).also { it.expectedCookies = expectedCookies; it.cookieVersion = cookieVersion }
     }
     fun url(path: String, query: Map<String, String> = emptyMap()): HttpUrl {
         require(path.startsWith('/') && !path.startsWith("//") && !path.contains('\\')) { "Invalid API path" }
@@ -91,7 +139,7 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
     }
     private fun requestAuth(): AuthContext {
         val source = credentialSource?.auth ?: return auth
-        if (source.origin != auth.origin || source.owner != auth.owner) return auth
+        if (!source.scope().sameAccount(scope)) return auth
         return auth.copy(bearer = source.bearer?.copy(profile = auth.profile), loopbackSession = source.loopbackSession, cookies = jar.snapshot())
     }
     fun request(path: String, query: Map<String, String> = emptyMap(), method: String = "GET", body: RequestBody? = null): Request.Builder = Request.Builder().url(url(path, query)).apply {
@@ -100,7 +148,7 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
     }.header("Accept", "application/json").apply {
         val session = requestAuth()
         if (path != "/api/ws") {
-            val bearer = session.bearer?.takeIf { it.accessToken.isNotBlank() && it.accessToken.none { ch -> ch.isWhitespace() || ch.isISOControl() } && it.origin == session.origin && it.owner == session.owner && it.profile == session.profile }
+            val bearer = session.bearer?.takeIf { it.accessToken.isNotBlank() && it.accessToken.none { ch -> ch.isWhitespace() || ch.isISOControl() } && it.origin == session.origin && it.owner == session.owner && it.profile == session.profile && it.provider == session.nativeProvider }
             val loopback = session.loopbackSession?.takeIf { it.origin == session.origin && it.owner == session.owner && it.owner == "local" && session.backend == "hermes-dashboard" && validLoopbackSessionToken(it.token) }
             if (bearer != null) header("Authorization", "Bearer " + bearer.accessToken)
             else loopback?.let { header(HERMES_LOOPBACK_SESSION_HEADER, it.token) }
@@ -127,7 +175,7 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         val query = if (path.startsWith(BEACON_PLUGIN_PATH)) beaconPluginProfileQuery(params, auth.profile) else params
         val deviceId = NativePairing.deviceHeader(path, scope)
         val result = rawCall(path, query = query, method = method, data = body)
-        if (method == "DELETE" && deviceId != null && path == "/api/plugins/beacon/devices/$deviceId") NativeDeviceRemoval.onRemoved?.invoke(scope)
+        if (method == "DELETE" && deviceId != null && path == "/api/plugins/beacon/devices/$deviceId") NativeDeviceRemoval.removed(scope)
         return result
     }
     suspend fun nativeCallContext(callId: String, ownerName: String = ""): JSONObject = kotlinx.coroutines.withTimeout(20_000) {
@@ -214,7 +262,7 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         if (bearer == null || !authorization.orEmpty().startsWith("Bearer ")) return@Interceptor response
         if (pluginRequest && !response.isExpiredSessionEnvelope()) return@Interceptor response
         val stored = if (authStore == null) bearer else authStore.read(bearer.origin).bearer
-        val current = stored?.takeIf { it.origin == bearer.origin && it.owner == bearer.owner && it.profile == bearer.profile }
+        val current = stored?.takeIf { it.origin == bearer.origin && it.owner == bearer.owner && it.provider == bearer.provider }?.copy(profile = bearer.profile)
         if (current != null && authorization != "Bearer ${current.accessToken}") {
             auth = auth.copy(bearer = current)
             response.close()
@@ -228,10 +276,10 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
                     latest = { if (authStore == null) auth.bearer else authStore.read(bearer.origin).bearer },
                     persist = { expected, updated ->
                         if (authStore == null) {
-                            if (auth.bearer != expected) false else { auth = auth.copy(bearer = updated); true }
+                            if (auth.bearer != expected) false else { auth = auth.copy(bearer = updated, nativeProvider = updated.provider); true }
                         } else {
                             val saved = authStore.replaceBearer(expected, updated)
-                            if (saved) auth = auth.copy(bearer = updated)
+                            if (saved) auth = auth.copy(bearer = updated, nativeProvider = updated.provider)
                             saved
                         }
                     },
@@ -243,37 +291,41 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
             if (authStore?.removeIfBearerUnchanged(bearer) != false) auth = auth.copy(bearer = null, cookies = emptyList())
             throw NativeAuthExpiredException()
         }
+        auth = auth.copy(bearer = refreshed.copy(profile = auth.profile), nativeProvider = refreshed.provider)
         response.close()
         chain.proceed(request.newBuilder().header("Authorization", "Bearer ${refreshed.accessToken}").build())
     }
-    private suspend fun <T> execute(request: Request, timeoutMillis: Long? = null, read: suspend (Response) -> T): T {
+    private suspend fun <T> execute(request: Request, timeoutMillis: Long? = null, retainCookies: Boolean = false, read: suspend (Response) -> T): T {
         val call = http.newCall(request)
         timeoutMillis?.let { call.timeout().timeout(it, TimeUnit.MILLISECONDS) }
         // Cancellation must close a stalled body too, after response headers have arrived.
         val watcher = kotlinx.coroutines.CoroutineScope(currentCoroutineContext()).launchCancel(call)
-        try { return call.execute().use { read(it) } }
+        try { return call.execute().use { response ->
+            // Retain native rotations before any status/body failure, after loopback verification.
+            if (retainCookies && auth.loopbackSession?.verified != false) retainCookieRotation()
+            read(response)
+        } }
         catch (error: IOException) { currentCoroutineContext().ensureActive(); throw error }
         finally { watcher.cancel(); call.cancel() }
     }
+    /** A caller-parsed native response that still keeps Hermes' cookie rotation. */
+    internal suspend fun <T> nativeResponse(request: Request, timeoutMillis: Long? = null, read: suspend (Response) -> T): T =
+        withContext(Dispatchers.IO) { execute(request, timeoutMillis, retainCookies = true, read) }
     suspend fun get(path: String, query: Map<String, String> = emptyMap(), maxBytes: Int = 32 * 1024 * 1024): JSONObject = call(path, query, maxBytes = maxBytes)
     suspend fun post(path: String, body: JSONObject = JSONObject()): JSONObject = call(path, method = "POST", data = body)
     private suspend fun rawCall(path: String, query: Map<String, String> = emptyMap(), method: String = "GET", data: JSONObject? = null, maxBytes: Int = 32 * 1024 * 1024, persistAuth: Boolean = true, timeoutMillis: Long? = null): JSONObject = withContext(Dispatchers.IO) {
         require(maxBytes in 1..32 * 1024 * 1024) { "Invalid response size limit" }
         val body = data?.toString()?.toRequestBody("application/json; charset=utf-8".toMediaType())
-        execute(request(path, query, method, body).build(), timeoutMillis) { response ->
+        // /auth/me credentials are retained by bootstrap only after identity verification.
+        execute(request(path, query, method, body).build(), timeoutMillis, retainCookies = persistAuth || path != "/api/auth/me") { response ->
             val input = response.body?.source()
             val payload = java.io.ByteArrayOutputStream()
             val chunk = ByteArray(32768)
             if (input != null) while (true) { currentCoroutineContext().ensureActive(); val n = input.read(chunk); if (n < 0) break; require(payload.size().toLong() + n <= maxBytes) { "Server response exceeds the size limit" }; payload.write(chunk, 0, n) }
             val raw = payload.toString("UTF-8")
             val result = runCatching { JSONObject(raw) }.getOrElse { if (raw.trim().startsWith('[')) json("items" to org.json.JSONArray(raw)) else json("message" to raw.take(2048)) }
-            if (response.code == 403 && path.startsWith(BEACON_PLUGIN_PATH) && listOf("code", "error", "detail").any { result.string(it) == "device_removed" }) NativeDeviceRemoval.onRemoved?.invoke(scope)
+            if (response.code == 403 && path.startsWith(BEACON_PLUGIN_PATH) && listOf("code", "error", "detail").any { result.string(it) == "device_removed" }) NativeDeviceRemoval.removed(scope)
             if (!response.isSuccessful || result.has("error") && !result.isNull("error") && result.string("error").isNotBlank()) throw ApiFailure(response.code, nativeErrorMessage(result, response.code), plugin = path.startsWith(BEACON_PLUGIN_PATH))
-            // An optional probe must not rewrite the verified native auth context or its persisted cookies.
-            if (persistAuth && !detachedView && auth.loopbackSession?.verified != false) {
-                auth = auth.copy(cookies = jar.snapshot())
-                if (persistContext) authStore?.let { it.persist(auth); markLoopbackSessionPersisted() }
-            }
             result
         }
     }
@@ -310,24 +362,32 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         val selected = provider.ifBlank { passwordProviders.singleOrNull()?.let { it.optString("name").ifBlank { it.optString("id") } }.orEmpty() }
         require(selected.isNotBlank() && username.isNotBlank()) { "Native sign-in requires your provider and username" }
         nativeGet("/auth/password-login", method = "POST", data = json("provider" to selected, "username" to username, "password" to password, "next" to "/"))
-        auth = auth.copy(owner = "", csrf = "", backend = "", bearer = null, cookies = jar.snapshot())
+        auth = auth.copy(owner = "", csrf = "", backend = "", bearer = null, cookies = jar.snapshot(), nativeProvider = "")
         return bootstrap()
     }
     /** Native dashboard verification only. This deliberately makes no optional-plugin request. */
     suspend fun bootstrap(): JSONObject {
-        val identity = nativeGet("/api/auth/me")
+        val identity = nativeGet("/api/auth/me", persistAuth = false)
         val owner = identity.string("user_id").trim()
+        val provider = identity.string("provider")
         require(owner.isNotBlank()) { "This server did not return a verified native identity" }
         if (auth.loopbackSession != null && (owner != "local" || identity.optString("provider") != "loopback")) throw LoopbackSessionRefreshFailed()
         if (auth.bearer?.owner?.let { it.isNotBlank() && it != owner } == true) throw CachedIdentityMismatch()
+        if (auth.bearer?.provider?.let { it.isNotBlank() && it != identity.string("provider") } == true) throw CachedIdentityMismatch()
+        if (auth.nativeProvider.isNotBlank() && auth.nativeProvider != provider) throw CachedIdentityMismatch()
         // A vault belongs to one native account. A different verified user must authenticate again.
         if (auth.owner.isNotBlank() && auth.owner != owner) throw CachedIdentityMismatch()
+        require(provider.isNotBlank()) { "This server did not return a verified native identity" }
+        retainCookieRotation()
         val profile = resolveNativeProfile(nativeProfileCatalog())
         // Keep the /api/auth/me cookie rotation in the verified native context.
-        auth = auth.copy(owner = owner, profile = profile, csrf = "", cookies = jar.snapshot(), backend = "hermes-dashboard", bearer = auth.bearer?.copy(owner = owner, profile = profile), loopbackSession = auth.loopbackSession?.copy(verified = true))
+        auth = auth.copy(owner = owner, profile = profile, nativeProvider = provider, csrf = "", cookies = jar.snapshot(), backend = "hermes-dashboard", bearer = auth.bearer?.copy(owner = owner, profile = profile, provider = provider), loopbackSession = auth.loopbackSession?.copy(verified = true))
         if (persistContext && !detachedView && authStore != null) {
-            authStore.persist(auth)
-            markLoopbackSessionPersisted()
+            val saved = withContext(Dispatchers.IO) {
+                val snapshot = authStore.read(auth.origin).scope().sameAccount(auth.scope())
+                authStore.persistIfUnchanged(auth, cookieVersion, snapshot = snapshot, selectProfileIf = { true })
+            }
+            if (saved) markAuthPersisted()
         }
         return nativeProjection(identity, owner, profile)
     }
@@ -375,11 +435,11 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
     }
 
     /** The plugin is optional. Every failure becomes an unavailable projection, never an auth decision.
-     * The probe is read-only with respect to the verified native auth context. */
+     * Its payload cannot change verified native identity; middleware may rotate native cookies. */
     private suspend fun optionalExtension(profile: String): OptionalExtension {
         val payload = try {
             withTimeoutOrNull(OPTIONAL_EXTENSION_TIMEOUT_MS) {
-                nativeGet("/api/plugins/beacon/mobile/bootstrap", mapOf("beacon_profile" to profile), persistAuth = false)
+                nativeGet(OPTIONAL_BOOTSTRAP_PATH, mapOf("beacon_profile" to profile), persistAuth = false)
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
@@ -448,19 +508,18 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
     }
 
     suspend fun logout() {
-        try {
-            closeNative()
-            // Hermes has no native bearer revoke route.
-            if (auth.bearer == null) try {
-                val body = JSONObject().toString().toRequestBody("application/json; charset=utf-8".toMediaType())
-                withContext(Dispatchers.IO) {
-                    execute(request("/auth/logout", method = "POST", body = body).build()) { response ->
-                        if (response.code !in 200..399) throw ApiFailure(response.code, "Hermes sign-out could not be confirmed")
-                    }
+        closeNative()
+        // Hermes has no native bearer revoke route.
+        if (auth.bearer == null) try {
+            val body = JSONObject().toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+            withContext(Dispatchers.IO) {
+                execute(request("/auth/logout", method = "POST", body = body).build()) { response ->
+                    if (response.code !in 200..399) throw ApiFailure(response.code, "Hermes sign-out could not be confirmed")
                 }
-            } catch (error: kotlinx.coroutines.CancellationException) { throw error }
-            catch (_: IOException) { }
-        } finally { authStore?.remove(auth.origin) }
+            }
+        } catch (error: kotlinx.coroutines.CancellationException) { throw error }
+        catch (_: IOException) { }
+        // The ViewModel removed local authority before push cleanup; this old client must not erase a newer sign-in.
     }
     suspend fun stream(path: String, query: Map<String, String>, lastId: String = "", onEvent: suspend (SseEvent) -> Unit) {
         require(path in setOf("/api/chat/stream", "/api/session/stream")) { "Streaming this capability is unavailable in native Hermes" }
@@ -481,7 +540,7 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
                     val body = MultipartBody.Builder().setType(MultipartBody.FORM)
                         .addFormDataPart("path", nativePath).addFormDataPart("overwrite", "false")
                         .addFormDataPart("file", name, file.asRequestBody(mime.toMediaType())).build()
-                    execute(request("/api/files/upload-stream", mapOf("profile" to auth.profile), "POST", body).build()) { response ->
+                    execute(request("/api/files/upload-stream", mapOf("profile" to auth.profile), "POST", body).build(), retainCookies = true) { response ->
                         val raw = response.peekBody(1024 * 1024L + 1).string()
                         if (!response.isSuccessful) throw ApiFailure(response.code,
                             runCatching { nativeErrorMessage(JSONObject(raw), response.code) }.getOrDefault("Upload failed (${response.code})"))
@@ -504,7 +563,7 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         val scopedQuery = if (mapped.startsWith(BEACON_PLUGIN_PATH)) beaconPluginProfileQuery(query - "session_id", auth.profile)
             else query + ("profile" to auth.profile)
         val snapshot = query["snap"]?.takeIf { mapped == "/api/fs/download" }?.also { require(validMediaSnapshot(it)) { "Invalid file snapshot" } }
-        execute(request(mapped, scopedQuery, if (data == null) "GET" else "POST", data?.toString()?.toRequestBody("application/json".toMediaType())).build()) { response ->
+        execute(request(mapped, scopedQuery, if (data == null) "GET" else "POST", data?.toString()?.toRequestBody("application/json".toMediaType())).build(), retainCookies = true) { response ->
             if (!response.isSuccessful) throw ApiFailure(response.code, "Download failed (${response.code})")
             val body = response.body ?: error("Missing file")
             require(body.contentLength() <= limit) { "Download exceeds permitted size" }
@@ -568,6 +627,7 @@ fun mergeOptionalFeaturesFor(projection: JSONObject, scope: Scope, optional: JSO
 
 private fun nativeProjectionFor(projection: JSONObject, scope: Scope): Boolean =
     projection.optString("backend") == "hermes-dashboard" && scope.owner.isNotBlank() &&
+        scope.nativeProvider.isNotBlank() && projection.optJSONObject("identity")?.optString("provider") == scope.nativeProvider &&
         projection.optString("owner_id") == scope.owner && projection.optString("profile") == scope.profile
 
 internal suspend fun copyDownload(input: InputStream, output: OutputStream, limit: Long): Long {

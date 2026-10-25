@@ -22,8 +22,10 @@ data class IncomingCall(val source: String, val event: String, val expiresAt: Lo
     val callbackAction get() = "hermes.call.CALLBACK.$actionToken"
     val deadlineAction get() = "hermes.call.DEADLINE.$actionToken"
     fun valid(now: Long = System.currentTimeMillis() / 1000): Boolean = validIncoming(source, event, expiresAt, now)
-    fun ringDurationMillis(nowMillis: Long = System.currentTimeMillis(), elapsed: Long = android.os.SystemClock.elapsedRealtime(), currentBoot: Int = boot): Long {
-        if (state != "ringing" || arrivedAt <= 0 || nowMillis < arrivedAt || elapsed < arrivedElapsed || currentBoot != boot) return 0
+    fun ringDurationMillis(nowMillis: Long = System.currentTimeMillis(), elapsed: Long = android.os.SystemClock.elapsedRealtime(), currentBoot: Int = boot): Long =
+        if (state == "ringing") actionDurationMillis(nowMillis, elapsed, currentBoot) else 0
+    fun actionDurationMillis(nowMillis: Long = System.currentTimeMillis(), elapsed: Long = android.os.SystemClock.elapsedRealtime(), currentBoot: Int = boot): Long {
+        if (state !in setOf("ringing", "claimed", "retryable") || arrivedAt <= 0 || nowMillis < arrivedAt || elapsed < arrivedElapsed || currentBoot != boot) return 0
         val wallRemaining = INCOMING_RING_SECONDS * 1000 - (nowMillis - arrivedAt)
         val monotonicRemaining = INCOMING_RING_SECONDS * 1000 - (elapsed - arrivedElapsed)
         val serverRemaining = if (expiresAt <= nowMillis / 1000) 0 else (expiresAt - nowMillis / 1000).coerceAtMost(INCOMING_INVITATION_SECONDS + 1) * 1000 - nowMillis % 1000
@@ -48,7 +50,7 @@ suspend fun resolveIncoming(app: BeaconApplication, source: String, event: Strin
     require(invite.valid()) { "This ${dev.hermes.android.data.currentAssistantName} invitation has expired" }
     val binding = app.push.binding(source) ?: error("Sign in to the invitation's owner account")
     val origin = trustedOrigin(binding.getString("origin"))
-    val scope = Scope(origin, binding.getString("owner"), binding.getString("profile"))
+    val scope = Scope(origin, binding.getString("owner"), binding.getString("profile"), nativeProvider = binding.string("native_provider"))
     fun authorized() = app.push.permitsIncoming(source) && app.auth.read(origin).authorizesPushSource(scope)
     require(authorized()) { "Sign in to the invitation's owner account" }
     val c = app.push.clientFor(binding)
@@ -68,7 +70,7 @@ suspend fun resolveIncoming(app: BeaconApplication, source: String, event: Strin
 }
 
 fun incomingRouteEnded(route: JSONObject, source: String, profile: String): Boolean =
-    route.string("source_ref") == source && route.string("profile") == profile && route.string("kind") == "incoming_call" && route.string("state") in setOf("answered", "declined", "expired")
+    route.string("source_ref") == source && route.string("profile") == profile && route.string("kind") == "incoming_call" && route.string("state") in setOf("answered", "declined", "expired", "missed")
 
 fun incomingFailureTerminal(error: Throwable): Boolean = error is ApiFailure && error.status in setOf(401, 403, 404, 410)
 
@@ -101,18 +103,20 @@ internal suspend fun performIncomingDeclineRequest(
 
 suspend fun declineIncoming(app: BeaconApplication, source: String, event: String) = withTimeout(8000) {
     require(app.push.claimInvitation(source, event)) { "This ${dev.hermes.android.data.currentAssistantName} invitation has ended" }
-    val (client, _) = resolveIncoming(app, source, event)
     try {
-        performIncomingDeclineRequest(
-            pending = { app.push.invitation(source, event) != null },
-            authorize = { app.push.authorizeKeepConnectedAction(source, event, "decline") },
-            request = { client.nativeRequest("/api/plugins/beacon/mobile/callbacks/$event/decline", "POST", org.json.JSONObject()) },
-        )
-        app.push.discardInvitation(source, event)
-    } catch (e: Throwable) {
-        if (e !is CancellationException) reconcileIncomingFailure(app, client, source, event, e)
-        throw e
-    }
+        val (client, _) = resolveIncoming(app, source, event)
+        try {
+            performIncomingDeclineRequest(
+                pending = { app.push.invitation(source, event) != null },
+                authorize = { app.push.authorizeKeepConnectedAction(source, event, "decline") },
+                request = { client.nativeRequest("/api/plugins/beacon/mobile/callbacks/$event/decline", "POST", org.json.JSONObject()) },
+            )
+            app.push.discardInvitation(source, event)
+        } catch (e: Throwable) {
+            if (e !is CancellationException) reconcileIncomingFailure(app, client, source, event, e)
+            throw e
+        }
+    } finally { app.push.retryInvitation(source, event) }
 }
 
 class IncomingCallReceiver : BroadcastReceiver() {

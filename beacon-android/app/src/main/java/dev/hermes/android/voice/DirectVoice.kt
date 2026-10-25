@@ -24,6 +24,16 @@ internal const val VOICE_OPENING_PROMPT = "Open naturally using the trusted gree
 internal data class DirectCallEnd(val notSent:Int=0,val submissionUnknown:Int=0)
 internal suspend fun <T:Any> callLookup(block:suspend ()->T):T =
     withTimeoutOrNull(15000) { block() } ?: throw java.net.SocketTimeoutException("Lookup timed out. Try again.")
+
+/** UI receipts confirm a bounded read without copying its private contents. */
+internal fun directLookupReceipt(requestId:String,name:String,retained:JSONObject):JSONObject {
+    val returned=if(name=="discover_tools") retained.optJSONArray("tools")!=null else retained.opt("summary") is String
+    val completed=returned&&retained.optString("status") in setOf("","completed","empty")
+    return JSONObject().put("type","tool_receipt").put("request_id",requestId).put("tool_name",name)
+        .put("status",if(completed) "completed" else "failed").put("result_present",completed)
+        .apply { retained.optString("error_code").takeIf { it.isNotBlank() }?.let { put("error_code",it) } }
+}
+
 internal suspend fun awaitNativeVoiceAgent(client:BeaconClient,binding:NativeSessionBinding) {
     suspend fun resume():JSONObject {
         require(binding.scope==client.scope) { "Native conversation scope changed" }
@@ -430,8 +440,7 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
         val toolName=verified.optString("tool_name").ifBlank { "MCP tool request" }.take(200)
         event(JSONObject(verified.toString()).put("type","tool_receipt").put("tool_name",toolName))
         if(proposal!=null) {
-            event(JSONObject().put("type","tool_approval").put("request_id",requestId).put("proposal_id",proposal.getString("id"))
-                .put("tool_name",toolName).put("arguments",JSONObject(proposal.getJSONObject("arguments").toString())))
+            event(callToolApprovalEvent(requestId,toolName,proposal))
         }
         val functionId=gatewayReceipts.functionId(requestId)?:return@withLock
         synchronized(toolReceipts) { toolReceipts[functionId]=JSONObject(verified.toString()).put("function_name","invoke_tool") }
@@ -588,9 +597,7 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
         }
         if(!callOwned()) return
         val retained=if(readOnly&&result.toString().toByteArray(Charsets.UTF_8).size>65536) JSONObject().put("status","unavailable").put("message","This lookup exceeded the call result limit. No bounded result was verified.") else result
-        if(lookup) event(JSONObject().put("type","tool_receipt").put("request_id",requestId).put("tool_name",name)
-            .put("status",if(retained.optString("status")=="unavailable") "failed" else "completed")
-            .apply { retained.optString("error_code").takeIf { it.isNotBlank() }?.let { put("error_code",it) } })
+        if(lookup) event(directLookupReceipt(requestId,name,retained))
         synchronized(toolReceipts) { toolReceipts[id]=JSONObject(retained.toString()).put("function_name",name).put("read_only",readOnly) }
         if(name!="invoke_tool"||gatewayReceipts.receipt(requestId)==null) toolResponse(id,name,retained)
     }

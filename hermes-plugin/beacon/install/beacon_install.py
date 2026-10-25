@@ -463,12 +463,12 @@ def _tailscale_url() -> str | None:
 def _configure_tailscale(hermes: str, home: Path, profile: str, port: int, allow: bool = False) -> str | None:
     tailscale = shutil.which("tailscale")
     if not tailscale:
-        _line(False, "Tailscale CLI was not found; configure Hermes with a public HTTPS dashboard URL to pair.")
+        _line(False, "Tailscale CLI was not found; configure Hermes with a public HTTPS dashboard URL to connect a phone.")
         return None
     command = f"tailscale serve --bg {port}"
     print(f"No public HTTPS dashboard URL is configured. Tailscale Serve can publish the dashboard to your tailnet: {command}")
     if not (allow or _yes_no("Run that command and save its HTTPS URL as Hermes dashboard.public_url? [y/N] ")):
-        _line(False, "Pairing skipped; configure a public HTTPS dashboard URL to connect a phone.")
+        _line(False, "Skipped; configure a public HTTPS dashboard URL to connect a phone.")
         return None
     try:
         result = subprocess.run([tailscale, "serve", "--bg", str(port)], env=_env(home), timeout=60, check=False)
@@ -484,33 +484,13 @@ def _configure_tailscale(hermes: str, home: Path, profile: str, port: int, allow
     saved = _public_url(hermes, home, profile)
     if not _is_https_url(saved):
         raise InstallError("Hermes did not retain the Tailscale HTTPS dashboard URL.")
-    _line(True, "Configured the Hermes public HTTPS dashboard URL for tailnet pairing.")
+    _line(True, "Configured the Hermes public HTTPS dashboard URL for your tailnet.")
     return saved
-
-
-def _pair(hermes: str, home: Path, profile: str, name: str | None = None) -> None:
-    if name is None:
-        try:
-            name = input("Phone name [My phone]: ").strip() or "My phone"
-        except (EOFError, KeyboardInterrupt):
-            name = "My phone"
-    if len(name) > 80 or any(ord(char) < 32 or ord(char) == 127 for char in name):
-        raise InstallError("Invalid phone name; pairing was not started.")
-    result = _quiet(hermes, home, profile, "beacon", "pair", "--name", name)
-    if result.returncode:
-        raise InstallError("Hermes could not create a Beacon pairing block.")
-    # Hermes reroutes plugin stdout to stderr once its gateway module loads, so read both streams.
-    lines = (result.stdout + "\n" + result.stderr).splitlines()
-    block = [line for line in lines if line.startswith("Dashboard: ") or line.startswith("Pairing code: ") or line.startswith("expires in ")]
-    if len(block) != 3:
-        raise InstallError("Hermes returned an unexpected pairing block; raw output was hidden.")
-    print("\n".join(block))
-    _line(True, "Beacon phone pairing is ready.")
 
 
 def _dry_run_summary(beacon_installed: bool, running: bool, public_url: str | None, port: int) -> None:
     action = "update Beacon" if beacon_installed else "install Beacon"
-    print(f"✓ Dry run: would {action} and pair a phone.")
+    print(f"✓ Dry run: would {action}.")
     print(f"✓ Dashboard running: {'yes (restart would require approval)' if running else 'no'}")
     if _is_https_url(public_url):
         _line(True, "Public HTTPS dashboard URL is configured")
@@ -556,14 +536,13 @@ def _install(args: argparse.Namespace) -> int:
     public_url = _public_url(hermes, home, profile)
     if not _is_https_url(public_url):
         public_url = _configure_tailscale(hermes, home, profile, _dashboard_port(hermes, home, profile), args.tailscale)
-    pairing_complete = False
-    if _is_https_url(public_url):
-        _pair(hermes, home, profile, args.phone_name)
-        pairing_complete = True
+    ready = _is_https_url(public_url)
+    if ready:
+        print(f"Paste this link into Beacon: {public_url}")
     else:
-        _line(False, "Pairing is not complete until Hermes has a public HTTPS dashboard URL.")
+        _line(False, "Beacon can't connect a phone until Hermes has a public HTTPS dashboard URL.")
     _line(True, f"Install the Beacon app from {RELEASE_URL}")
-    return 0 if pairing_complete else 1
+    return 0 if ready else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -572,7 +551,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profile", help="Hermes profile to use (skips profile selection)")
     parser.add_argument("--yes", action="store_true", help="Answer yes to the dashboard restart prompt only")
     parser.add_argument("--dry-run", action="store_true", help="Show the plan without changing Hermes or the network")
-    parser.add_argument("--phone-name", help="Name for the phone in the device list (default: My phone)")
     parser.add_argument("--tailscale", action="store_true", help="Allow Tailscale Serve to publish the dashboard over HTTPS when no HTTPS URL exists")
     args = parser.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):

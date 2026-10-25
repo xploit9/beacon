@@ -14,11 +14,22 @@ internal fun archivedVoiceTranscripts(scope: Scope, archive: JSONObject): List<C
 
 internal fun mergeVoiceTranscripts(archived: List<CallTranscript>, live: List<CallTranscript>, messageIds: Set<String>): List<CallTranscript> {
     val merged = linkedMapOf<String, CallTranscript>()
+    val archivedIds = archived.map { it.eventId }.toSet()
     for (event in archived + live) {
-        val previous = merged[event.eventId]
+        // History uses call/role/turn; a live provider item keeps its own ID in that archive slot.
+        val archiveId = if (event.turnId.isBlank()) event.eventId else "${event.eventId.substringBeforeLast(':')}:${event.turnId}"
+        val slot = merged[archiveId]
+        val key = when {
+            event.eventId in merged -> event.eventId
+            archiveId in archivedIds && (slot?.eventId == archiveId || slot?.eventId == event.eventId) -> archiveId
+            else -> event.eventId
+        }
+        val previous = merged[key]
         if (previous?.final == true && !event.final) continue
-        val timed = event.copy(at = event.at.takeIf { it > 0 } ?: previous?.at ?: 0)
-        merged[event.eventId] = if (timed.interrupted && !timed.final) timed.copy(text = "", final = true) else timed
+        val saved = previous?.takeIf { key in archivedIds }
+        val timed = event.copy(at = saved?.at?.takeIf { it > 0 } ?: event.at.takeIf { it > 0 } ?: previous?.at ?: 0,
+            turnId = saved?.turnId?.takeIf { it.isNotBlank() } ?: event.turnId)
+        merged[key] = if (timed.interrupted && !timed.final) timed.copy(text = "", final = true) else timed
     }
-    return merged.values.filter { it.text.isNotBlank() && it.eventId !in messageIds && (it.messageId.isBlank() || it.messageId !in messageIds) }
+    return merged.filter { (key, event) -> event.text.isNotBlank() && key !in messageIds && event.eventId !in messageIds && (event.messageId.isBlank() || event.messageId !in messageIds) }.values.toList()
 }

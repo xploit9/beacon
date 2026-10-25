@@ -77,10 +77,12 @@ private fun kanbanProfileLabel(profile: String, profiles: List<JSONObject>, load
     val profileCatalog = data["navigation-profiles"]
     val profileRows = profileCatalog?.rows("profiles").orEmpty()
     val profileLoading = ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
-    val repo = remember(client, origin?.key) { client?.let(::NativeBoards) }
-    var boards by remember(origin?.key) { mutableStateOf(emptyList<NativeBoardChoice>()) }
-    var board by rememberSaveable(origin?.key) { mutableStateOf("") }
-    var cards by remember(origin?.key, board) { mutableStateOf(emptyList<NativeBoardCard>()) }
+    val repo = remember(client, origin?.key) { client?.let { active -> NativeBoards(active) { key, document -> vm.keepScreen(active.scope, key, document) } } }
+    // The last boards and cards seen for this account open at once; the refresh below replaces them.
+    val cachedChoices = remember(origin?.key) { vm.data.value[KANBAN_BOARDS_KEY]?.let { runCatching { nativeBoardChoices(it) }.getOrNull() } }
+    var boards by remember(origin?.key) { mutableStateOf(cachedChoices?.first.orEmpty()) }
+    var board by rememberSaveable(origin?.key) { mutableStateOf(cachedChoices?.let { (list, current) -> current.takeIf { slug -> list.any { it.slug == slug } } ?: list.firstOrNull()?.slug }.orEmpty()) }
+    var cards by remember(origin?.key, board) { mutableStateOf(vm.data.value[kanbanBoardKey(board)]?.let { runCatching { nativeBoardCards(it) }.getOrNull() }.orEmpty()) }
     var loading by remember(origin?.key, board) { mutableStateOf(true) }
     var busy by remember(origin?.key, board) { mutableStateOf(false) }
     var error by remember(origin?.key, board) { mutableStateOf("") }
@@ -186,7 +188,7 @@ private fun kanbanProfileLabel(profile: String, profiles: List<JSONObject>, load
         }
         if (records.length() > 0 && !editing) OutlinedButton(onClick = { if (!records.has(draftTaskKey)) draftTaskKey = records.keys().next(); editing = true }, enabled = !busy && !loading, modifier = Modifier.padding(horizontal = 16.dp).heightIn(min = 48.dp)) { Icon(Icons.Rounded.EditNote, null); Text("Continue saved task draft", Modifier.padding(start = 8.dp)) }
         if (error.isNotBlank()) Column(Modifier.padding(16.dp)) { Text(error, color = MaterialTheme.colorScheme.error); OutlinedButton(onClick = { scope.launch { refresh() } }, enabled = !loading && !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("Retry") } }
-        if (loading || busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+        if (loading && cards.isEmpty() || busy) LinearProgressIndicator(Modifier.fillMaxWidth())
         if (!loading && board.isBlank() && error.isBlank()) EmptyState("No boards yet", "Create a Kanban board in your Hermes dashboard, then refresh it here.", Icons.Rounded.ViewKanban)
         val shownStatuses = boardStatuses.keys.filter { it != "archived" || cards.any { card -> card.status == "archived" } }
         val visibleColumn = selectedColumn.takeIf { it in shownStatuses } ?: cards.firstOrNull { it.status in shownStatuses }?.status ?: "todo"

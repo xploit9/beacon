@@ -15,32 +15,31 @@ you can rename it in Settings › Assistant.
   Write rules for a notification or call, and teach it with Important / Not important feedback.
 - **Approvals.** Beacon follows the approval settings in your Hermes profile and lets you review
   and answer requests in the app.
-- **Updates.** Manage automatic app and plugin updates in Settings › App updates. Beacon
-  verifies app updates before installation; Android may ask you to confirm.
+- **Updates.** Beacon tells you when a new release is on GitHub. Tap Update to install the
+  app and, when needed, the Hermes plugin; both are verified first and Android may ask you to confirm.
 
 ## Install
 
 **1. On the PC that runs Hermes**, give your coding agent (Codex, Claude Code, or Hermes itself) this prompt:
 
-> Set up Beacon on my Hermes. First follow the predecessor-removal prerequisite in https://github.com/xploit9/beacon/blob/main/docs/install-with-agent.md: verify an external backup, then use supported native operations to remove only positively identified predecessor-managed cron jobs and the predecessor plugin. Stop and ask me if ownership is uncertain. Then download https://raw.githubusercontent.com/xploit9/beacon/main/hermes-plugin/beacon/install/beacon_install.py and run it with Python. Whenever it stops to ask something, it names a flag — ask me, then rerun it with that flag. Show me the pairing block it prints at the end. Never print or store passwords, tokens or API keys, and never modify Hermes core.
+> Set up Beacon on my Hermes. First follow the predecessor-removal prerequisite in https://github.com/xploit9/beacon/blob/main/docs/install-with-agent.md: verify an external backup, then use supported native operations to remove only positively identified predecessor-managed cron jobs and the predecessor plugin. Stop and ask me if ownership is uncertain. Then download https://raw.githubusercontent.com/xploit9/beacon/main/hermes-plugin/beacon/install/beacon_install.py and run it with Python. Whenever it stops to ask something, it names a flag — ask me, then rerun it with that flag. Show me the link it prints at the end. Never print or store passwords, tokens or API keys, and never modify Hermes core.
 
-Before running it yourself, complete the [predecessor-removal prerequisite](docs/install-with-agent.md#before-installing-beacon). Then run `python beacon_install.py`: it selects your Hermes home/profile, installs or updates Beacon, restarts the dashboard if you say yes, and prints your pairing code. The installer does not back up or remove a predecessor plugin or its jobs. Manual steps: [docs/install-with-agent.md](docs/install-with-agent.md).
+Before running it yourself, complete the [predecessor-removal prerequisite](docs/install-with-agent.md#before-installing-beacon). Then run `python beacon_install.py`: it selects your Hermes home/profile, installs or updates Beacon, restarts the dashboard if you say yes, and prints the link to paste into Beacon. The installer does not back up or remove a predecessor plugin or its jobs. Manual steps: [docs/install-with-agent.md](docs/install-with-agent.md).
 
 **2. On your phone**, download `Beacon-1.1.2.apk` from [Releases](https://github.com/xploit9/beacon/releases/latest) and install
-it. Open it, enter the address and code (or scan the QR on the dashboard's **Beacon** tab, or choose a screenshot of it), sign in with Hermes, and follow the setup wizard.
+it. Open it, paste your Hermes link (also shown on the dashboard's **Beacon** tab), sign in with Hermes, and follow the setup wizard.
 
-## Pair or manage phones
+## Connect or manage phones
 
-Your AI installer can run `hermes -p <profile> beacon pair` or `/beacon-pair` in an owned chat
-to print a single-use pairing code. You can also open the Hermes dashboard's **Beacon** tab and
-select **Pair a phone**. In Beacon, scan the QR, choose a screenshot of it, or enter the HTTPS
-dashboard address and code. Manage linked phones in Settings › Devices.
+Paste your Hermes link into Beacon and sign in with Hermes; that links the phone. There is no
+separate code or QR step. See and remove linked phones in Settings › Connection, or on the
+dashboard's **Beacon** tab.
 
 ## Requirements
 
 - Android 10 or later.
 - A Hermes Agent dashboard reachable from the phone over HTTPS.
-- The Beacon plugin enabled for phone pairing and Beacon features. Native chat and conversation history work without it.
+- The Beacon plugin enabled for the device list and Beacon features. Native chat and conversation history work without it.
 - A Gemini, xAI (Grok) or OpenAI key if you want voice calls.
 
 ## Privacy and security
@@ -48,8 +47,10 @@ dashboard address and code. Manage linked phones in Settings › Devices.
 - Beacon requires an HTTPS dashboard and uses secure WebSockets for live sessions.
 - The plugin checks your signed-in Hermes owner and profile before acting.
 - Voice provider keys are encrypted on the phone and sent only to the selected provider.
+- During a call, Beacon sends your assistant's instructions, memory notes, recent chat, tool results and any camera or screen you share to the voice provider you choose.
 - Call audio is not retained. Call history is saved as text.
 - Beacon's call and task retention setting does not remove Hermes conversations, memories or files.
+- Beacon checks the public GitHub release for updates on its own, without signing in, so GitHub sees the phone's address.
 
 ## Building from source
 

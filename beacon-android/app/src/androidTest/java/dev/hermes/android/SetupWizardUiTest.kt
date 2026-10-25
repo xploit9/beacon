@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.width
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.assert
@@ -27,6 +28,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
 import androidx.activity.ComponentActivity
@@ -34,6 +36,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.height
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.datastore.preferences.core.edit
@@ -56,21 +59,35 @@ import dev.hermes.android.data.NativeAuth
 import dev.hermes.android.data.NativePairing
 import dev.hermes.android.data.VoiceKeyStore
 import dev.hermes.android.data.VoicePreferences
+import dev.hermes.android.push.KeepConnectedService
 import okhttp3.CookieJar
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.flow.first
+import dev.hermes.android.data.PairedDevice
 import dev.hermes.android.ui.NativeLocalization
 import dev.hermes.android.ui.SetupWizardScreen
-import dev.hermes.android.ui.VoiceCustomizationChoices
 import dev.hermes.android.ui.CallFailurePanel
+import dev.hermes.android.ui.DevicesList
 import dev.hermes.android.ui.KeepConnectedSetupGroup
-import dev.hermes.android.ui.QrScanner
-import dev.hermes.android.ui.INVALID_BEACON_QR_HINT
-import dev.hermes.android.ui.handleQrScanResult
-import dev.hermes.android.ui.parseBeaconConnectLink
+import dev.hermes.android.ui.SetupSea
+import dev.hermes.android.ui.VoiceCatalog
+import dev.hermes.android.ui.VoiceCatalogCache
+import dev.hermes.android.ui.defaultVoiceChoices
+import dev.hermes.android.ui.nativeContrast
 import dev.hermes.android.ui.parseBeaconConnectInput
-import dev.hermes.android.ui.stageBeaconConnectQr
+import dev.hermes.android.ui.setupColorScheme
+import dev.hermes.android.ui.setupStepNumber
+import dev.hermes.android.ui.voiceProviderInfo
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsNotSelected
+import androidx.compose.ui.test.assertIsSelected
+import androidx.compose.ui.test.getUnclippedBoundsInRoot
+import androidx.compose.ui.test.onNodeWithContentDescription
 import android.net.Uri
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -132,19 +149,24 @@ class SetupWizardUiTest {
         assertTrue(openedSettings)
     }
 
-    @Test fun connectScreenOffersCameraScanAndPhotoPicker() {
+    @Test fun connectIsOnlyAPasteFieldAndContinue() {
         compose.setContent {
-            MaterialTheme {
+            NativeLocalization("en") { BeaconTheme(dark = true) {
                 SetupWizardScreen(AppState(setupStep = "connect"), onProbe = {}, onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {})
-            }
+            } }
         }
-        compose.onNodeWithTag("setup-scan-qr").assertIsDisplayed()
-        compose.onNodeWithTag("setup-choose-image").assertIsDisplayed()
+        compose.onNodeWithText("Connect to Hermes").assertIsDisplayed()
+        compose.onNodeWithText("Paste the link from your Hermes dashboard.").assertIsDisplayed()
+        compose.onNodeWithText("Step 1 of 4").assertIsDisplayed()
         compose.onNodeWithTag("setup-address").assertIsDisplayed()
-        compose.onNodeWithTag("setup-method-code").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Paste link").assertIsDisplayed()
+        compose.onNodeWithTag("setup-connect").assertIsDisplayed()
+        // Signing in is what links this phone: no QR, image, code or "other ways" step is offered.
+        for (gone in listOf("setup-scan-qr", "setup-choose-image", "setup-method-code", "setup-pairing-code", "setup-pairing-redeem")) compose.onNodeWithTag(gone).assertDoesNotExist()
+        for (text in listOf("Scan QR code", "Choose QR image", "Enter pairing code", "Other ways", "Pairing code")) compose.onNodeWithText(text).assertDoesNotExist()
     }
 
-    @Test fun connectMethodTilesStayOnOneLineAtLargeFontScale() {
+    @Test fun connectStepFitsA360dpPhoneAtLargeFontScale() {
         compose.setContent {
             val density = LocalDensity.current
             CompositionLocalProvider(LocalDensity provides Density(density.density, 1.3f)) {
@@ -155,55 +177,73 @@ class SetupWizardUiTest {
                 }
             }
         }
-        listOf("setup-method-label-scan", "setup-method-label-image", "setup-method-label-code").forEach { tag ->
-            compose.onNodeWithTag(tag, useUnmergedTree = true).assertIsDisplayed()
-            val layouts = mutableListOf<TextLayoutResult>()
-            compose.onNodeWithTag(tag, useUnmergedTree = true).fetchSemanticsNode()
-                .config[androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult].action?.invoke(layouts)
-            assertEquals("$tag should render on one line", 1, layouts.single().lineCount)
-            // A clipped single line reports its box as the full constraint, so compare the label's natural width instead.
-            val node = compose.onNodeWithTag(tag, useUnmergedTree = true).fetchSemanticsNode()
-            val natural = layouts.single().multiParagraph.intrinsics.maxIntrinsicWidth
-            assertTrue("$tag should fit its tile ($natural px in ${node.size.width} px)", natural <= node.size.width + 1)
-        }
+        for (text in listOf("Connect to Hermes", "Paste the link from your Hermes dashboard.")) compose.onNodeWithText(text).assertIsDisplayed()
+        compose.onNodeWithTag("setup-address").assertIsDisplayed()
+        compose.onNodeWithTag("setup-connect").assertIsDisplayed()
+        val continueBounds = compose.onNodeWithTag("setup-connect").getUnclippedBoundsInRoot()
+        assertTrue("Continue stays inside the 360 dp width", continueBounds.left >= 0.dp && continueBounds.right <= 360.dp)
+        assertTrue("Continue keeps its 52 dp target", continueBounds.height >= 52.dp)
+        val layouts = mutableListOf<TextLayoutResult>()
+        compose.onNodeWithText("Connect to Hermes").fetchSemanticsNode().config[androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult].action?.invoke(layouts)
+        assertTrue("The title wraps instead of clipping", layouts.single().lineCount <= 2)
     }
 
-    @Test fun voiceModelVoiceAndPersonalityChoicesRemainReadableAndSelectableAtLargeFontScale() {
-        val longVoice = "A longer provider voice name that wraps cleanly"
-        val selected = mutableStateOf(VoicePreferences(model = "models/gemini-3.8-live", voice = "Fenrir", personality = "balanced"))
-        compose.setContent {
-            val density = LocalDensity.current
-            CompositionLocalProvider(LocalDensity provides Density(density.density, 1.3f)) {
-                Box(Modifier.width(320.dp)) {
-                    NativeLocalization("en") {
-                        BeaconTheme(dark = true) {
-                            VoiceCustomizationChoices(
-                                selection = selected.value,
-                                models = listOf("models/gemini-3.8-live", "gpt-realtime-2.1"),
-                                voices = listOf("Fenrir", longVoice),
-                                catalogLoading = false,
-                                busy = false,
-                                onModelSelected = { selected.value = selected.value.copy(model = it) },
-                                onVoiceSelected = { selected.value = selected.value.copy(voice = it) },
-                                onPersonalitySelected = { selected.value = selected.value.copy(personality = it) },
-                            )
-                        }
+    @Test fun voiceChoicesAreSelectableListsThatKeepTheirOrderAtLargeFontScale() {
+        val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
+        val store = VoiceKeyStore(app)
+        val previousProvider = store.settings().provider
+        val previous = store.settings("gemini")
+        val previousKey = store.key("gemini")
+        val previousLoader = VoiceCatalogCache.loader
+        val longVoice = "AVeryLongProviderVoiceNameThatWrapsCleanlyInsideItsRow"
+        val extended = "models/gemini-3.8-live-extended-thinking"
+        try {
+            store.saveKey("gemini", "r5u-fixture-key")
+            store.setSelection(VoicePreferences(provider = "gemini", voice = "Fenrir"))
+            VoiceCatalogCache.clear("gemini")
+            // Offline: this stands in for the provider catalog.
+            VoiceCatalogCache.loader = { _, _ -> VoiceCatalog(listOf("models/gemini-3.8-live", extended), defaultVoiceChoices("gemini") + longVoice) }
+            compose.setContent {
+                val density = LocalDensity.current
+                CompositionLocalProvider(LocalDensity provides Density(density.density, 1.3f)) {
+                    Box(Modifier.width(320.dp)) {
+                        NativeLocalization("en") { BeaconTheme(dark = true) {
+                            SetupWizardScreen(AppState(setupStep = "voice-customize", authenticated = true), onProbe = {}, onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {})
+                        } }
                     }
                 }
             }
+            compose.waitUntil(15_000) { compose.onAllNodesWithTag("voice-option-voice-Fenrir").fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithTag("voice-option-voice-Fenrir").assertIsSelected()
+            val fenrirTop = compose.onNodeWithTag("voice-option-voice-Fenrir").fetchSemanticsNode().positionInRoot.y
+
+            compose.onNodeWithTag("voice-option-voice-Puck").performScrollTo().performClick()
+            compose.onNodeWithTag("voice-option-voice-Puck").assertIsSelected()
+            compose.onNodeWithTag("voice-option-voice-Fenrir").assertIsNotSelected()
+            compose.waitUntil(5_000) { store.settings("gemini").voice == "Puck" }
+            compose.onNodeWithTag("voice-option-voice-Fenrir").performScrollTo()
+            assertEquals("Choosing a voice never moves the list", fenrirTop, compose.onNodeWithTag("voice-option-voice-Fenrir").fetchSemanticsNode().positionInRoot.y, 1f)
+
+            // The rest of the catalog sits behind "More voices", and a long name wraps inside its row.
+            compose.onNodeWithTag("voice-more-voices").performScrollTo().performClick()
+            compose.onNodeWithTag("voice-option-voice-$longVoice").performScrollTo().performClick()
+            compose.onNodeWithTag("voice-option-voice-$longVoice").assertIsSelected()
+            compose.waitUntil(5_000) { store.settings("gemini").voice == longVoice }
+
+            compose.onNodeWithTag("voice-option-personality-warm").performScrollTo().performClick()
+            compose.onNodeWithTag("voice-option-personality-warm").assertIsSelected()
+            compose.waitUntil(5_000) { store.settings("gemini").personality == "warm" }
+
+            compose.onNodeWithTag("voice-option-model-$extended").performScrollTo().performClick()
+            compose.onNodeWithTag("voice-option-model-$extended").assertIsSelected()
+            compose.waitUntil(5_000) { store.settings("gemini").model == extended }
+        } finally {
+            VoiceCatalogCache.loader = previousLoader
+            VoiceCatalogCache.clear("gemini")
+            if (previousKey == null) store.removeKey("gemini") else store.saveKey("gemini", previousKey)
+            store.setSelection(previous)
+            store.setSelection(store.settings(previousProvider))
         }
-
-        compose.onNodeWithText("Model: Gemini 3.8 Live").assertIsDisplayed().performClick()
-        compose.onNodeWithTag("choice-option:Model:gpt-realtime-2.1").assertIsDisplayed().performClick()
-        compose.onNodeWithText("Model: GPT Realtime 2.1").assertIsDisplayed()
-
-        compose.onNodeWithText("Voice: Fenrir").assertIsDisplayed().performClick()
-        compose.onNodeWithTag("choice-option:Voice:$longVoice").assertIsDisplayed().performClick()
-        compose.onNodeWithText("Voice: $longVoice").assertIsDisplayed()
-
-        compose.onNodeWithText("Personality: Balanced").assertIsDisplayed().performClick()
-        compose.onNodeWithTag("choice-option:Personality:warm").assertIsDisplayed().performClick()
-        compose.onNodeWithText("Personality: Warm").assertIsDisplayed()
     }
 
     @Test fun failedCallPanelKeepsTheReasonVisibleAndOffersRetryAndClose() {
@@ -225,12 +265,13 @@ class SetupWizardUiTest {
         assertTrue(closed)
     }
 
-    @Test fun savedVoiceKeyOpensCustomizationAndSkipContinuesToMicrophone() {
+    @Test fun savedVoiceKeyOpensCustomizationAndContinueGoesToMicrophone() {
         val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
         val before = runBlocking { app.preferences.data.first() }
         val voiceKeys = VoiceKeyStore(app)
         val provider = voiceKeys.settings().provider
         val previousKey = voiceKeys.key(provider)
+        val previousLoader = VoiceCatalogCache.loader
         val setupStepKey = stringPreferencesKey("setup_step")
         val setupCompleteKey = booleanPreferencesKey("setup_complete")
         val setupActiveKey = booleanPreferencesKey("setup_active")
@@ -243,6 +284,8 @@ class SetupWizardUiTest {
         var viewModel: BeaconViewModel? = null
         try {
             voiceKeys.saveKey(provider, "r5u-fixture-key")
+            // Keep this UI test offline; the choices fall back to the built-in lists.
+            VoiceCatalogCache.loader = { _, _ -> VoiceCatalog() }
             compose.runOnUiThread { viewModel = ViewModelProvider(store, viewModelFactory { initializer { BeaconViewModel(app, SavedStateHandle()) } })[BeaconViewModel::class.java] }
             compose.waitUntil(5_000) { viewModel?.ui?.value?.restoringSession == false }
             val vm = requireNotNull(viewModel)
@@ -257,26 +300,29 @@ class SetupWizardUiTest {
                 )
                 vm.advanceSetupPermission()
             }
+            // A provider that already has a key skips the key page.
             compose.waitUntil(5_000) { vm.ui.value.setupStep == "voice-customize" }
-            // Keep this UI test offline; the customizer falls back to its built-in catalogue.
-            voiceKeys.removeKey(provider)
             compose.setContent {
                 val state by vm.ui.collectAsState()
                 NativeLocalization("en") { BeaconTheme(dark = true) {
                     SetupWizardScreen(
                         state = state,
                         onProbe = {}, onSignIn = {}, onAdvancePermission = vm::advanceSetupPermission,
-                        onFinish = {}, onReopen = {}, onCancel = {}, onVoiceKeySaved = vm::voiceKeyConfigured,
+                        onFinish = {}, onReopen = {}, onCancel = {}, onVoiceKeySaved = vm::voiceKeyConfigured, onVoicePage = vm::showVoiceSetupPage,
                         ownerName = "Maya", onOwnerNameChange = {},
                     )
                 } }
             }
             compose.onNodeWithText("Make it yours").assertIsDisplayed()
-            compose.onNodeWithTag("setup-owner-name").assertIsDisplayed().assertTextContains("Maya")
-            compose.onNodeWithTag("setup-voice-customize-skip").performClick()
+            compose.waitUntil(15_000) { compose.onAllNodesWithTag("setup-owner-name").fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithTag("setup-owner-name").performScrollTo().assertIsDisplayed().assertTextContains("Maya")
+            // One Continue, no duplicate Skip.
+            compose.onNodeWithTag("setup-voice-customize-skip").assertDoesNotExist()
+            compose.onNodeWithTag("setup-voice-customize-continue").performClick()
             compose.waitUntil(5_000) { vm.ui.value.setupStep == "permission-microphone" }
             compose.onNodeWithText("Microphone").assertIsDisplayed()
         } finally {
+            VoiceCatalogCache.loader = previousLoader
             viewModel?.let { compose.runOnUiThread { store.clear() } }
             if (previousKey == null) voiceKeys.removeKey(provider) else voiceKeys.saveKey(provider, previousKey)
             runBlocking { app.preferences.edit { values ->
@@ -292,7 +338,7 @@ class SetupWizardUiTest {
     @Test fun setupWizardSuppressedNoticeAndErrorAreClearedWhenItCloses() {
         var setupWizard by mutableStateOf(true)
         var error by mutableStateOf("")
-        var notice by mutableStateOf("For this dashboard, scan the QR code with Beacon's scanner to sign in.")
+        var notice by mutableStateOf("Hermes restarted. Paste the link again.")
         var cleared = 0
         val snackbar = SnackbarHostState()
         compose.setContent { MaterialTheme {
@@ -323,6 +369,97 @@ class SetupWizardUiTest {
         BeaconViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.get(vm) as MutableStateFlow<T>
     private fun field(vm: BeaconViewModel, name: String, value: Any?) {
         BeaconViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.set(vm, value)
+    }
+
+    @Test fun openChatAfterFirstSetupAndSettingsRerunKeepsTheNativeConversationAndDraft() {
+        val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
+        check(!app.calls.state.value.active && app.calls.service == null && app.push.incoming.value == null)
+        check(!KeepConnectedService.isEnabled(app)) { "Run setup routing checks with Keep connected off" }
+        val keepPrefs = app.getSharedPreferences(KeepConnectedService.PREFS, android.content.Context.MODE_PRIVATE)
+        val keepBefore = keepPrefs.all
+        val stringKeys = listOf("origin", "setup_step", "setup_origin").map(::stringPreferencesKey)
+        val booleanKeys = listOf("setup_complete", "setup_active").map(::booleanPreferencesKey)
+        val before = runBlocking { app.preferences.data.first() }
+        val fixture = NativeExperienceFixture().apply { pluginStatus = 404; bootstrapPluginStatus = "absent" }
+        val chatScope = fixture.scope.session("chat-a")
+        val priorDraft = runBlocking { app.cache.read(chatScope, "draft") }
+        val saved = SavedStateHandle(mapOf("tab" to "Chat", "more" to ""))
+        val store = ViewModelStore()
+        lateinit var vm: BeaconViewModel
+        try {
+            runBlocking { app.preferences.edit { it[stringPreferencesKey("origin")] = "" } }
+            compose.runOnUiThread { vm = ViewModelProvider(store, viewModelFactory { initializer { BeaconViewModel(app, saved) } })[BeaconViewModel::class.java] }
+            compose.waitUntil(5_000) { !vm.ui.value.restoringSession }
+            compose.runOnIdle {
+                field(vm, "originGeneration", 100)
+                field(vm, "client", fixture.client)
+                field(vm, "sourceScope", chatScope)
+                field(vm, "assistantReturnValue", null)
+                flow<AppState>(vm, "_ui").value = AppState(
+                    origin = fixture.scope.origin, owner = fixture.scope.owner, profile = fixture.scope.profile,
+                    authenticated = true, connected = true, restoringSession = false, setupWizard = true, setupStep = "done",
+                    bootstrap = dev.hermes.android.core.json("optional_features" to dev.hermes.android.core.json("plugin" to "absent")),
+                )
+                flow<ChatState>(vm, "_chat").value = ChatState(sessionId = "chat-a", raw = fixture.snapshot("chat-a"), messages = listOf(Message("saved", "assistant", "Earlier native answer")))
+                flow<TextFieldValue>(vm, "_composer").value = TextFieldValue("Keep this unfinished message")
+            }
+            compose.setContent { NativeLocalization("en") { BeaconTheme(dark = true) { BeaconRoot(vm) } } }
+
+            for (rerun in listOf(false, true)) {
+                if (rerun) {
+                    compose.runOnIdle { vm.more("Connection") }
+                    compose.onNodeWithText("Set up again").performScrollTo().performClick()
+                    // Seed completed auth/voice prerequisites; keep the real completion callback and root routing.
+                    compose.runOnIdle { flow<AppState>(vm, "_ui").value = vm.ui.value.copy(setupStep = "done") }
+                } else {
+                    compose.onNodeWithTag("setup-keep-connected").performScrollTo().performClick()
+                }
+                compose.onNodeWithTag("setup-keep-connected").assertIsOff()
+                compose.onNodeWithTag("setup-finish").performClick()
+                compose.waitUntil(5_000) { !vm.ui.value.setupWizard }
+                compose.runOnIdle {
+                    assertEquals("Open chat must leave Connection settings", "Chat", vm.ui.value.tab)
+                    assertEquals("", vm.ui.value.morePage)
+                    assertEquals("Chat", saved.get<String>("tab"))
+                    assertEquals("", saved.get<String>("more"))
+                    assertNull(saved.get<String>("settings-navigation"))
+                    assertTrue(vm.ui.value.authenticated && vm.ui.value.setupComplete)
+                    assertEquals(fixture.scope.origin, vm.ui.value.origin)
+                    assertEquals(fixture.scope.owner, vm.ui.value.owner)
+                    assertEquals(fixture.scope.profile, vm.ui.value.profile)
+                    assertSame(fixture.client, vm.client)
+                    assertEquals(chatScope, vm.authenticatedScope())
+                    assertEquals("chat-a", vm.chat.value.sessionId)
+                    assertEquals("Earlier native answer", vm.chat.value.messages.single().text)
+                    assertEquals("Keep this unfinished message", vm.composer.value.text)
+                    assertFalse(KeepConnectedService.isEnabled(app))
+                }
+                compose.onNodeWithTag("setup-finish").assertDoesNotExist()
+                compose.onNodeWithTag("message-input").assertIsDisplayed().assertTextContains("Keep this unfinished message")
+                compose.onNodeWithText("Earlier native answer").assertIsDisplayed()
+            }
+            compose.waitUntil(5_000) { runBlocking { app.preferences.data.first()[booleanPreferencesKey("setup_active")] == false } }
+        } finally {
+            compose.runOnUiThread { store.clear(); fixture.client.closeNative() }
+            runBlocking {
+                if (priorDraft == null) app.cache.delete(chatScope, "draft") else app.cache.write(chatScope, "draft", priorDraft, true)
+                app.auth.remove(fixture.scope.origin)
+                app.preferences.edit { values ->
+                    stringKeys.forEach { key -> before[key]?.let { values[key] = it } ?: values.remove(key) }
+                    booleanKeys.forEach { key -> before[key]?.let { values[key] = it } ?: values.remove(key) }
+                }
+            }
+            assertTrue(keepPrefs.edit().apply {
+                listOf(KeepConnectedService.KEY_ENABLED, KeepConnectedService.KEY_STATUS, KeepConnectedService.KEY_REASON).forEach { key ->
+                    when (val value = keepBefore[key]) {
+                        is Boolean -> putBoolean(key, value)
+                        is String -> putString(key, value)
+                        null -> remove(key)
+                        else -> error("Unexpected Keep connected preference type")
+                    }
+                }
+            }.commit())
+        }
     }
 
     @Test fun returningToTheAppWhileSignedOutNeverStartsAConnection() {
@@ -436,42 +573,36 @@ class SetupWizardUiTest {
         val input = Uri.parse("beacon://connect?url=https%3A%2F%2Fhermes.example&name=Hermes&session=$token&session=duplicate&SESSION=uppercase")
 
         val external = sanitizeExternalConnectLink(input)
-        val safeUri = Uri.parse(external.link)
+        val safeUri = Uri.parse(external)
 
-        assertTrue(external.sessionRemoved)
         assertEquals("https://hermes.example", safeUri.getQueryParameter("url"))
         assertNull(safeUri.getQueryParameter("session"))
-        assertFalse(external.link.contains(token))
-        assertFalse(external.link.contains("duplicate"))
-        assertFalse(external.link.contains("uppercase"))
+        assertFalse(external.contains(token))
+        assertFalse(external.contains("duplicate"))
+        assertFalse(external.contains("uppercase"))
 
         val plain = sanitizeExternalConnectLink(Uri.parse("beacon://connect?url=https%3A%2F%2Fhermes.example"))
-        assertFalse(plain.sessionRemoved)
-        assertEquals("https://hermes.example", Uri.parse(plain.link).getQueryParameter("url"))
+        assertEquals("https://hermes.example", Uri.parse(plain).getQueryParameter("url"))
     }
 
     @Test fun malformedAndTypedConnectLinksStayVisibleUntilContinue() {
-        var staged = ""
         var probed = ""
         val state = AppState(setupWizard = true, setupStep = "connect", restoringSession = false)
         compose.setContent { NativeLocalization("en") { BeaconTheme(dark = true) {
             SetupWizardScreen(
                 state = state,
                 onProbe = { probed = it }, onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {},
-                onStageLink = { staged = it },
             )
         } } }
 
         val malformed = "beacon://connect?session=private-token"
         compose.onNodeWithTag("setup-address").performTextInput(malformed)
         compose.onNodeWithTag("setup-address").assertTextEquals("Paste link or address", malformed)
-        assertEquals("", staged)
 
         compose.onNodeWithTag("setup-address").performTextClearance()
         compose.onNodeWithTag("setup-address").performTextInput("beacon://connect?url=https%3A%2F%2Fhermes.example&name=Hermes")
         val typed = "beacon://connect?url=https%3A%2F%2Fhermes.example&name=Hermes"
         compose.onNodeWithTag("setup-address").assertTextEquals("Paste link or address", typed)
-        assertEquals("", staged)
         compose.onNodeWithTag("setup-connect").performClick()
         assertEquals(typed, probed)
 
@@ -482,191 +613,258 @@ class SetupWizardUiTest {
         assertEquals(address, probed)
     }
 
-    @Test fun scannerStagesOnlyDashboardBeaconQrPayloadsWhileTypedAddressesStaySupported() {
-        val staged = mutableListOf<String>()
-        val link = "beacon://connect?url=https%3A%2F%2Fhermes.example&name=Hermes"
-        val payload = """{"type":"beacon-connect","url":"https://hermes.example","session":"session-token"}"""
-        val detected = AtomicBoolean(true)
-        var hint = ""
-
-        assertFalse(stageBeaconConnectQr("https://poster.example") { staged += it })
-        assertFalse(stageBeaconConnectQr("WIFI:T:WPA;S:guest;P:password;;") { staged += it })
-        assertFalse(handleQrScanResult("https://poster.example", detected,
-            { value -> stageBeaconConnectQr(value) { staged += it } },
-            { hint = INVALID_BEACON_QR_HINT },
-        ))
-        assertFalse(detected.get())
-        assertEquals(INVALID_BEACON_QR_HINT, hint)
-        assertTrue(stageBeaconConnectQr(link) { staged += it })
-        assertTrue(stageBeaconConnectQr(payload) { staged += it })
-
-        assertEquals(listOf(link, payload), staged)
+    @Test fun anOldPairingBlockPastedInTheAddressFieldKeepsOnlyTheAddress() {
+        var probed = ""
+        compose.setContent { NativeLocalization("en") { BeaconTheme(dark = true) {
+            SetupWizardScreen(AppState(setupStep = "connect"), onProbe = { probed = it }, onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {})
+        } } }
+        compose.onNodeWithTag("setup-address").performTextInput("Dashboard address: https://hermes.example\nPairing code: abc-123\nExpires: 10 minutes")
+        compose.onNodeWithTag("setup-address").assertTextEquals("Paste link or address", "https://hermes.example")
+        compose.onNodeWithTag("setup-pairing-code").assertDoesNotExist()
+        compose.onNodeWithTag("setup-connect").performClick()
+        assertEquals("https://hermes.example", probed)
+        // A link or block that still carries a code is reduced to its address too.
+        assertEquals("https://hermes.example", parseBeaconConnectInput("beacon://connect?url=https%3A%2F%2Fhermes.example&code=abc-123"))
+        assertEquals("https://hermes.example", parseBeaconConnectInput("Dashboard: https://hermes.example\nPairing code: K7Q-4ZP"))
     }
 
-    @Test fun pairingQrCarriesTheDashboardAndNormalizedCodeIntoSetup() {
-        val link = "beacon://connect?url=https%3A%2F%2Fhermes.example&code=abc-123"
-        val parsed = parseBeaconConnectLink(link, allowAddress = false)
-
-        assertEquals("https://hermes.example", parsed.origin)
-        assertEquals("ABC123", parsed.pairingCode)
-        assertFalse(runCatching {
-            parseBeaconConnectLink("$link&code=XYZ789", allowAddress = false)
-        }.isSuccess)
-    }
-
-    @Test fun pairingJourneySignsInThenRedeemsAndLinksBeforePermissions() {
-        val fixture = NativeExperienceFixture()
-        val context = InstrumentationRegistry.getInstrumentation().targetContext
-        val scope = fixture.scope
-        val signedIn = fixture.clientFor(
-            AuthContext(
-                origin = scope.origin,
-                cookies = emptyList(),
-                owner = scope.owner,
-                profile = scope.profile,
-                backend = "hermes-dashboard",
-                bearer = NativeBearerRecord("fixture-access", "fixture-refresh", Long.MAX_VALUE, scope.origin, scope.owner, scope.profile),
-            ),
+    @Test fun primaryAndErrorColorsReadOnTheWizardSurfaceInLightAndDark() {
+        val bases = listOf(
+            lightColorScheme(primary = Color(0xFF80511D), error = Color(0xFFA93128)),
+            darkColorScheme(primary = Color(0xFFE7B579), error = Color(0xFFFFB4AB)),
         )
-        NativePairing.clearDeviceId(context, scope)
-        var state by mutableStateOf(AppState(origin = "", setupOrigin = "", setupWizard = true, setupStep = "connect", restoringSession = false))
-        var signInCalls = 0
+        // The light-mode brown and red failed 4.5:1 on the sea background before the fix.
+        assertTrue(nativeContrast(bases[0].primary, SetupSea) < 4.5f)
+        for (base in bases) {
+            val scheme = setupColorScheme(base)
+            for (surface in listOf(SetupSea, scheme.surface, scheme.surfaceContainer, scheme.surfaceContainerHigh, scheme.surfaceContainerHighest)) {
+                assertTrue("primary on $surface", nativeContrast(scheme.primary, surface) >= 4.5f)
+                assertTrue("error on $surface", nativeContrast(scheme.error, surface) >= 4.5f)
+            }
+            assertTrue("label on the filled button", nativeContrast(scheme.onPrimary, scheme.primary) >= 4.5f)
+            assertTrue("body text", nativeContrast(scheme.onBackground, scheme.background) >= 4.5f)
+        }
+        // A colour that already reads is left alone.
+        assertEquals(bases[1].primary, setupColorScheme(bases[1]).primary)
+    }
+
+    @Test fun everyRouteCountsTheSameFourSteps() {
+        assertEquals(listOf(1, 1, 1), listOf("connect", "probe", "unsupported").map(::setupStepNumber))
+        assertEquals(2, setupStepNumber("signin"))
+        assertEquals(listOf(3, 3, 3, 3, 3, 3), listOf("voice-provider", "voice-key", "voice-customize", "permission-microphone", "permission-notifications", "permission-full-screen").map(::setupStepNumber))
+        assertEquals(4, setupStepNumber("done"))
+    }
+
+    @Test fun voiceSetupMovesProviderToKeyToChoicesAndBack() {
+        val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
+        val store = VoiceKeyStore(app)
+        val providers = listOf("gemini", "grok", "openai")
+        val previousProvider = store.settings().provider
+        val previousSelections = providers.associateWith { store.settings(it) }
+        val previousKeys = providers.associateWith { store.key(it) }
+        val previousLoader = VoiceCatalogCache.loader
+        var state by mutableStateOf(AppState(origin = "https://hermes.example", authenticated = true, setupWizard = true, setupStep = "voice-provider", restoringSession = false))
         try {
+            providers.forEach(store::removeKey)
+            store.setSelection(VoicePreferences(provider = "gemini"))
+            VoiceCatalogCache.loader = { _, _ -> VoiceCatalog() }
             compose.setContent { NativeLocalization("en") { BeaconTheme(dark = true) {
                 SetupWizardScreen(
-                    state = state,
-                    onProbe = { raw -> state = state.copy(origin = parseBeaconConnectInput(raw), setupOrigin = parseBeaconConnectInput(raw), setupStep = "signin", loading = false, error = "") },
-                    onSignIn = {
-                        signInCalls++
-                        state = state.copy(authenticated = true, origin = scope.origin, owner = scope.owner, profile = scope.profile, setupStep = "permission-microphone")
-                    },
-                    onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {},
-                    onCurrentSessionMatches = { origin -> state.authenticated && state.origin == origin && state.owner == scope.owner && state.profile == scope.profile },
-                    // Hermes answers plugin routes only for a signed-in phone, so the code is redeemed after sign-in.
-                    onRedeemPairing = { _, code -> NativePairing.redeem(signedIn, code) },
-                    onLinkPairing = { grant -> NativePairing.link(context, signedIn, grant) },
+                    state = state, onProbe = {}, onSignIn = {}, onFinish = {}, onReopen = {}, onCancel = {},
+                    // The ViewModel's rule: a provider with a key goes to the choices, one without goes to the key page.
+                    onAdvancePermission = { state = state.copy(setupStep = when (state.setupStep) {
+                        "voice-provider" -> if (store.hasKey(store.settings().provider)) "voice-customize" else "voice-key"
+                        "voice-key" -> "voice-customize"
+                        else -> "permission-microphone"
+                    }) },
+                    onVoicePage = { state = state.copy(setupStep = it) },
                 )
             } } }
+            // Provider: the saved provider is preselected and Continue is always on.
+            compose.onNodeWithText("Choose a voice provider").assertIsDisplayed()
+            compose.onNodeWithText("Step 3 of 4").assertIsDisplayed()
+            compose.onNodeWithTag("voice-model-gemini").assertIsSelected()
+            compose.onNodeWithTag("voice-model-grok").performClick()
+            compose.onNodeWithTag("voice-model-grok").assertIsSelected()
+            compose.onNodeWithTag("setup-voice-continue").performClick()
 
-            compose.onNodeWithTag("setup-method-code").performClick()
-            compose.onNodeWithTag("setup-address").performTextInput(scope.origin)
-            compose.onNodeWithTag("setup-pairing-code").performTextInput("abc123")
-            compose.onNodeWithTag("setup-pairing-redeem").performClick()
-            compose.onNodeWithText(android.net.Uri.parse(scope.origin).host!!).assertIsDisplayed()
-            assertEquals(0, fixture.pairingRedeemCount.get())
+            // Key: a provider without a key asks for it, and nothing was committed yet.
+            compose.waitUntil(5_000) { state.setupStep == "voice-key" }
+            compose.onNodeWithText("Add your Grok key").assertIsDisplayed()
+            compose.onNodeWithTag("voice-provider-key").assertIsDisplayed()
+            assertEquals("gemini", store.settings().provider)
+            // Back returns to the providers with the choice kept in the store, not changed.
+            compose.onNodeWithTag("voice-page-back").performClick()
+            compose.waitUntil(5_000) { state.setupStep == "voice-provider" }
+            compose.onNodeWithTag("voice-model-gemini").assertIsSelected()
 
-            compose.onNodeWithTag("setup-pairing-confirm").performClick()
-            compose.waitUntil(5_000) { compose.onAllNodesWithTag("setup-signin").fetchSemanticsNodes().isNotEmpty() }
-            compose.onNodeWithTag("setup-signin").performClick()
-            compose.waitUntil(5_000) { fixture.pairingLinkCount.get() == 1 && compose.onAllNodesWithText("Linked").fetchSemanticsNodes().isNotEmpty() }
-
-            val pairingRequests = fixture.requests.filter {
-                it.string("path") == "/api/plugins/beacon/pairing/redeem" || it.string("path") == "/api/plugins/beacon/devices/link"
-            }
-            assertEquals(listOf("/api/plugins/beacon/pairing/redeem", "/api/plugins/beacon/devices/link"), pairingRequests.map { it.string("path") })
-            assertEquals("ABC123", pairingRequests.first().getJSONObject("body").string("code"))
-            assertEquals(1, signInCalls)
-            assertTrue(fixture.pairingRedeemHadAuthorization)
-            assertTrue(fixture.pairingLinkHadAuthorization)
-            assertEquals("device-123", NativePairing.deviceId(context, scope))
-            compose.onNodeWithTag("setup-pairing-linked-done").performClick()
-            assertEquals("permission-microphone", state.setupStep)
-            compose.onNodeWithText("Microphone").assertIsDisplayed()
+            // A provider that already has a key goes straight to the choices and is committed.
+            store.saveKey("grok", "r5u-fixture-key")
+            compose.onNodeWithTag("voice-model-grok").performClick()
+            compose.onNodeWithTag("setup-voice-continue").performClick()
+            compose.waitUntil(5_000) { state.setupStep == "voice-customize" }
+            compose.onNodeWithText("Make it yours").assertIsDisplayed()
+            assertEquals("grok", store.settings().provider)
+            // Back from the choices returns to the providers; Continue again skips the key page.
+            compose.onNodeWithTag("voice-page-back").performClick()
+            compose.waitUntil(5_000) { state.setupStep == "voice-provider" }
+            compose.onNodeWithTag("voice-model-grok").assertIsSelected()
+            compose.onNodeWithTag("voice-key-test").assertDoesNotExist()
+            compose.onNodeWithTag("setup-voice-continue").performClick()
+            compose.waitUntil(5_000) { state.setupStep == "voice-customize" }
         } finally {
-            NativePairing.clearDeviceId(context, scope)
-            signedIn.closeNative()
+            VoiceCatalogCache.loader = previousLoader
+            providers.forEach { provider -> previousKeys[provider]?.let { store.saveKey(provider, it) } ?: store.removeKey(provider) }
+            previousSelections.values.forEach(store::setSelection)
+            store.setSelection(previousSelections.getValue(previousProvider))
         }
     }
 
-    @Test fun pairingUsesTheExistingMatchingSessionWithoutAnotherSignIn() {
-        val fixture = NativeExperienceFixture()
-        val context = InstrumentationRegistry.getInstrumentation().targetContext
-        val scope = fixture.scope
-        val signedIn = fixture.clientFor(
-            AuthContext(
-                origin = scope.origin,
-                cookies = emptyList(),
-                owner = scope.owner,
-                profile = scope.profile,
-                backend = "hermes-dashboard",
-                bearer = NativeBearerRecord("fixture-access", "fixture-refresh", Long.MAX_VALUE, scope.origin, scope.owner, scope.profile),
-            ),
-        )
-        NativePairing.clearDeviceId(context, scope)
-        var state by mutableStateOf(AppState(
-            origin = scope.origin, setupOrigin = scope.origin, authenticated = true, owner = scope.owner,
-            profile = scope.profile, connected = true, setupWizard = true, setupStep = "connect", restoringSession = false,
-        ))
-        var probeCalls = 0
-        var signInCalls = 0
+    @Test fun theKeyPageEnablesTestOnceAKeyIsTypedAndNeverCallsTheProviderByItself() {
+        val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
+        val store = VoiceKeyStore(app)
+        val provider = store.settings().provider
+        val previousKey = store.key(provider)
+        val short = voiceProviderInfo(provider).short
         try {
+            store.removeKey(provider)
             compose.setContent { NativeLocalization("en") { BeaconTheme(dark = true) {
-                SetupWizardScreen(
-                    state = state,
-                    onProbe = { raw -> probeCalls++; state = state.copy(origin = parseBeaconConnectInput(raw), setupOrigin = parseBeaconConnectInput(raw), setupStep = "signin", loading = false) },
-                    onSignIn = { signInCalls++ },
-                    onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {},
-                    onCurrentSessionMatches = { origin -> state.authenticated && state.origin == origin && state.owner == scope.owner && state.profile == scope.profile },
-                    onRedeemPairing = { _, code -> NativePairing.redeem(signedIn, code) },
-                    onLinkPairing = { grant -> NativePairing.link(context, signedIn, grant) },
-                )
+                SetupWizardScreen(AppState(origin = "https://hermes.example", authenticated = true, setupWizard = true, setupStep = "voice-key", restoringSession = false),
+                    onProbe = {}, onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {})
             } } }
-
-            compose.onNodeWithTag("setup-method-code").performClick()
-            compose.onNodeWithTag("setup-pairing-code").performTextInput("abc123")
-            compose.onNodeWithTag("setup-pairing-redeem").performClick()
-            compose.onNodeWithTag("setup-pairing-confirm").assertIsDisplayed()
-            assertEquals(0, fixture.pairingRedeemCount.get())
-
-            compose.onNodeWithTag("setup-pairing-confirm").performClick()
-            compose.waitUntil(5_000) {
-                fixture.pairingLinkCount.get() == 1 && compose.onAllNodesWithText("Linked").fetchSemanticsNodes().isNotEmpty()
-            }
-
-            assertEquals(0, probeCalls)
-            assertEquals(0, signInCalls)
-            compose.onNodeWithTag("setup-signin").assertDoesNotExist()
-            assertTrue(fixture.pairingRedeemHadAuthorization)
-            assertTrue(fixture.pairingLinkHadAuthorization)
-            assertEquals("device-123", NativePairing.deviceId(context, scope))
+            compose.onNodeWithText("Calls use your $short account.").assertIsDisplayed()
+            compose.onNodeWithTag("voice-key-test").assertIsNotEnabled()
+            compose.onNodeWithTag("voice-key-get").assertIsDisplayed()
+            // The call-sharing note sits on the page where the key is handed over.
+            compose.onNodeWithText("During a call, Beacon sends your assistant's instructions", substring = true).assertIsDisplayed()
+            compose.onNodeWithTag("voice-provider-key").performTextInput("not-a-real-key")
+            compose.onNodeWithTag("voice-key-test").assertIsEnabled()
+            compose.onNodeWithTag("voice-page-back").assertIsDisplayed()
+            compose.onNodeWithTag("setup-voice-skip").assertIsDisplayed()
+            // Leaving the page saves what is typed, so clear it before this test restores the real key.
+            compose.onNodeWithTag("voice-provider-key").performTextClearance()
         } finally {
-            NativePairing.clearDeviceId(context, scope)
-            signedIn.closeNative()
+            previousKey?.let { store.saveKey(provider, it) } ?: store.removeKey(provider)
         }
     }
 
-    @Test fun typingACodeOneKeyAtATimeKeepsItsOrder() {
-        compose.setContent { NativeLocalization("en") { BeaconTheme(dark = true) {
-            SetupWizardScreen(AppState(setupStep = "connect"), onProbe = {}, onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {})
-        } } }
-        compose.onNodeWithTag("setup-method-code").performClick()
-        "m9hefb".forEach { compose.onNodeWithTag("setup-pairing-code").performTextInput(it.toString()) }
-        compose.onNodeWithTag("setup-pairing-code").assertTextContains("M9H-EFB")
+    @Test fun leavingTheKeyPageSavesAFirstKeyButNeverReplacesASavedOne() {
+        val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
+        val store = VoiceKeyStore(app)
+        val provider = store.settings().provider
+        val previousKey = store.key(provider)
+        var shown by mutableStateOf(true)
+        try {
+            store.saveKey(provider, "saved-original-key")
+            compose.setContent { NativeLocalization("en") { BeaconTheme(dark = true) {
+                if (shown) SetupWizardScreen(AppState(origin = "https://hermes.example", authenticated = true, setupWizard = true, setupStep = "voice-key", restoringSession = false),
+                    onProbe = {}, onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {})
+            } } }
+            // A stray paste over a working key is not saved when the page closes; Test key is what replaces it.
+            compose.waitUntil(5_000) { compose.onAllNodesWithText("Paste a new key to replace it.", substring = true).fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithTag("voice-provider-key").performTextInput("stray-clipboard-text")
+            compose.runOnUiThread { shown = false }
+            compose.waitForIdle()
+            assertEquals("saved-original-key", store.key(provider))
+            // With no key saved yet, what was typed is kept.
+            store.removeKey(provider)
+            compose.runOnUiThread { shown = true }
+            compose.onNodeWithTag("voice-provider-key").performTextInput("first-typed-key")
+            compose.runOnUiThread { shown = false }
+            compose.waitForIdle()
+            assertEquals("first-typed-key", store.key(provider))
+        } finally {
+            previousKey?.let { store.saveKey(provider, it) } ?: store.removeKey(provider)
+        }
     }
 
-    @Test fun backFromConfirmReturnsToStepOneAfterASignInAttempt() {
-        var state by mutableStateOf(AppState(origin = "", setupOrigin = "", setupWizard = true, setupStep = "connect", restoringSession = false))
+    @Test fun devicesListShowsThisPhoneAndEachOtherPhoneWithRemoveOnlyForOthers() {
+        val removed = mutableListOf<String>()
         compose.setContent { NativeLocalization("en") { BeaconTheme(dark = true) {
-            SetupWizardScreen(
-                state = state,
-                onProbe = { raw -> state = state.copy(origin = parseBeaconConnectInput(raw), setupStep = "signin") },
-                onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onCancel = {},
-                onReopen = { state = state.copy(setupOrigin = it, setupStep = "connect", error = "") },
-            )
+            DevicesList(
+                listOf(PairedDevice("this-1", "Pixel 9", "2026-10-24T10:00:00Z"), PairedDevice("other-2", "Galaxy Fold", "2026-10-23T09:00:00Z")),
+                thisDeviceId = "this-1",
+            ) { removed += it.id }
         } } }
-        compose.onNodeWithTag("setup-method-code").performClick()
-        compose.onNodeWithTag("setup-address").performTextInput("https://hermes.example")
-        compose.onNodeWithTag("setup-pairing-code").performTextInput("abc123")
-        compose.onNodeWithTag("setup-pairing-redeem").performClick()
-        compose.onNodeWithTag("setup-pairing-confirm").performClick()
-        compose.waitUntil(5_000) { compose.onAllNodesWithTag("setup-signin").fetchSemanticsNodes().isNotEmpty() }
-        // The owner closed the sign-in tab, then walks back: Sign in › Confirm › step 1.
-        state = state.copy(error = "Sign-in wasn't finished. Tap Sign in with Hermes to try again.")
-        compose.onNodeWithText("Back").performClick()
-        compose.onNodeWithTag("setup-pairing-confirm").assertIsDisplayed()
-        compose.onNodeWithText("Back").performClick()
-        compose.waitUntil(5_000) { compose.onAllNodesWithTag("setup-method-code").fetchSemanticsNodes().isNotEmpty() }
-        assertEquals("connect", state.setupStep)
+        compose.onNodeWithText("This phone").assertIsDisplayed()
+        compose.onNodeWithText("Pixel 9").assertIsDisplayed()
+        compose.onNodeWithText("Linked", substring = true).assertIsDisplayed()
+        compose.onNodeWithText("Other phones").assertIsDisplayed()
+        compose.onNodeWithText("Galaxy Fold").assertIsDisplayed()
+        compose.onNodeWithTag("settings-device-remove-this-1").assertDoesNotExist()
+        compose.onNodeWithTag("settings-device-remove-other-2").assertIsDisplayed().performClick()
+        assertEquals(listOf("other-2"), removed)
+    }
+
+    private fun withConnectedFixture(pluginFree: Boolean, block: (BeaconViewModel, NativeExperienceFixture, BeaconApplication) -> Unit) {
+        val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
+        check(!app.calls.state.value.active && app.calls.service == null)
+        val stringKeys = listOf("origin", "setup_step", "setup_origin").map(::stringPreferencesKey)
+        val booleanKeys = listOf("setup_complete", "setup_active").map(::booleanPreferencesKey)
+        val before = runBlocking { app.preferences.data.first() }
+        runBlocking { app.preferences.edit { it[stringPreferencesKey("origin")] = "" } }
+        val fixture = NativeExperienceFixture().apply { if (pluginFree) { pluginStatus = 404; bootstrapPluginStatus = "absent" } }
+        val pairingPrefs = app.getSharedPreferences("native-pairing", android.content.Context.MODE_PRIVATE)
+        fun forgetLink() { pairingPrefs.edit().remove(NativePairing.accountKey(fixture.scope)).remove("unlinked:" + NativePairing.accountKey(fixture.scope).removePrefix("device:")).commit() }
+        forgetLink()
+        runBlocking { app.auth.persist(fixture.client.auth) }
+        val store = ViewModelStore()
+        lateinit var vm: BeaconViewModel
+        try {
+            compose.runOnUiThread { vm = ViewModelProvider(store, viewModelFactory { initializer { BeaconViewModel(app, SavedStateHandle()) } })[BeaconViewModel::class.java] }
+            compose.waitUntil(5_000) { !vm.ui.value.restoringSession }
+            compose.runOnIdle { vm.profileSwitchClientFactoryForTest = { auth -> fixture.freshClientFor(auth, app.auth) } }
+            block(vm, fixture, app)
+        } finally {
+            compose.runOnUiThread { store.clear(); fixture.client.closeNative() }
+            forgetLink()
+            runBlocking {
+                app.auth.remove(fixture.scope.origin)
+                app.preferences.edit { values ->
+                    stringKeys.forEach { key -> before[key]?.let { values[key] = it } ?: values.remove(key) }
+                    booleanKeys.forEach { key -> before[key]?.let { values[key] = it } ?: values.remove(key) }
+                }
+            }
+        }
+    }
+
+    @Test fun startupLinksThisPhoneAfterSignInAndKeepsOneIdForTheAccount() = withConnectedFixture(pluginFree = false) { vm, fixture, app ->
+        compose.runOnIdle { vm.connect(fixture.scope.origin) }
+        compose.waitUntil(15_000) { fixture.deviceLinkCount.get() == 1 }
+        val first = fixture.deviceLinkBodies.single()
+        assertTrue(first.string("device_name").isNotBlank())
+        assertFalse("the first link lets Hermes create the record", first.has("device_id"))
+        compose.waitUntil(5_000) { NativePairing.deviceId(app, fixture.scope) == "device-123" }
+        // The next start sends the stored id and refreshes the same record: one id per account.
+        compose.runOnIdle { vm.connect(fixture.scope.origin) }
+        compose.waitUntil(15_000) { fixture.deviceLinkCount.get() == 2 }
+        assertEquals("device-123", fixture.deviceLinkBodies.last().string("device_id"))
+        assertEquals(1, fixture.pairedDevices.size)
+        assertTrue(fixture.requests.none { it.string("path").contains("/pairing") })
+    }
+
+    @Test fun aHermesWithoutThePluginIsNeverAskedToLinkThisPhone() = withConnectedFixture(pluginFree = true) { vm, fixture, app ->
+        compose.runOnIdle { vm.connect(fixture.scope.origin) }
+        compose.waitUntil(15_000) { vm.ui.value.authenticated && vm.ui.value.setupPluginMessage.isNotBlank() }
+        compose.waitForIdle()
+        assertEquals(0, fixture.deviceLinkCount.get())
+        assertNull(NativePairing.deviceId(app, fixture.scope))
+        assertTrue("chat stays usable without the plugin", vm.ui.value.authenticated)
+    }
+
+    @Test fun aPhoneRemovedOnThePcIsOnlyLinkedAgainByASignInOrAddThisPhone() = withConnectedFixture(pluginFree = false) { _, fixture, app ->
+        runBlocking {
+            assertEquals("device-123", NativePairing.link(app, fixture.client))
+            // Removed on the PC: an automatic link (app start) leaves it removed.
+            NativePairing.clearDeviceId(app, fixture.scope)
+            assertNull(NativePairing.link(app, fixture.client, explicit = false))
+            assertEquals(1, fixture.deviceLinkCount.get())
+            assertNull(NativePairing.deviceId(app, fixture.scope))
+            // Signing in again, or "Add this phone", links it.
+            assertEquals("device-123", NativePairing.link(app, fixture.client, explicit = true))
+            assertEquals("device-123", NativePairing.deviceId(app, fixture.scope))
+            assertEquals("device-123", NativePairing.link(app, fixture.client, explicit = false))
+        }
     }
 
     @Test fun openingExternalLinkStoresPendingOriginAndCancelKeepsTheActiveAccount() = runBlocking {
@@ -791,22 +989,6 @@ class SetupWizardUiTest {
         compose.onNodeWithText(error).assertIsDisplayed()
     }
 
-    @Test fun qrScannerRefreshesCameraPermissionAfterResume() {
-        // Revoking a granted runtime permission kills the app process (and this test), so the check is simulated:
-        // the user grants camera access in system Settings while the scanner is in the background.
-        var granted = false
-        compose.setContent { QrScanner(onResult = { true }, onClose = {}, hasCamera = { granted }) }
-        compose.onNodeWithTag("setup-camera-permission").assertIsDisplayed()
-
-        granted = true
-        compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.CREATED)
-        compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.RESUMED)
-        compose.waitUntil(5_000) {
-            runCatching { compose.onNodeWithTag("setup-camera-permission").assertDoesNotExist() }.isSuccess
-        }
-        compose.onNodeWithTag("setup-camera-permission").assertDoesNotExist()
-    }
-
     @Test fun missingPluginMessageIsShownWithoutBlockingSignIn() {
         val message = "Beacon plugin not installed on this Hermes — chat works; calls need the plugin."
         val state = AppState(origin = "https://hermes.example", authenticated = true, setupWizard = true, setupStep = "done", restoringSession = false, setupPluginMessage = message)
@@ -826,7 +1008,7 @@ class SetupWizardUiTest {
         compose.onNodeWithTag("setup-permission-primary").assertIsDisplayed()
     }
 
-    @Test fun expiredRefreshOffersOneTapSignInAndRetainsTheComposerAndChat() {
+    @Test fun expiredRefreshOffersOneTapSignInHidesPrivateStateAndRetainsTheScopedDraft() {
         check(!ApplicationProvider.getApplicationContext<BeaconApplication>().calls.state.value.active)
         val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
         val originKey = stringPreferencesKey("origin")
@@ -837,8 +1019,8 @@ class SetupWizardUiTest {
         runBlocking { app.preferences.edit { it[originKey] = "" } }
         val store = ViewModelStore()
         val origin = "https://expired-${java.util.UUID.randomUUID()}.example"
-        val scope = Scope(origin, "fixture-owner", "work")
-        val client = BeaconClient(AuthContext(origin, emptyList(), scope.owner, scope.profile, backend = "hermes-dashboard"))
+        val scope = Scope(origin, "fixture-owner", "work", nativeProvider = "fixture")
+        val client = BeaconClient(AuthContext(origin, emptyList(), scope.owner, scope.profile, backend = "hermes-dashboard", nativeProvider = scope.nativeProvider))
         lateinit var vm: BeaconViewModel
         try {
             compose.runOnUiThread {
@@ -857,8 +1039,12 @@ class SetupWizardUiTest {
             val fail = BeaconViewModel::class.java.getDeclaredMethod("fail", Throwable::class.java).apply { isAccessible = true }
             compose.runOnIdle { fail.invoke(vm, NativeAuthExpiredException()) }
             compose.waitUntil(5_000) { vm.ui.value.setupWizard && vm.ui.value.setupStep == "signin" }
-            assertEquals("Keep this unfinished answer", vm.composer.value.text)
-            assertEquals("Earlier answer", vm.chat.value.messages.single().text)
+            assertEquals("", vm.composer.value.text)
+            assertTrue(vm.chat.value.messages.isEmpty())
+            compose.waitUntil(5_000) { runBlocking { app.cache.read(scope.session("chat-a"), "draft") != null } }
+            val retained = runBlocking { app.cache.read(scope.session("chat-a"), "draft") }
+            assertEquals("Keep this unfinished answer", dev.hermes.android.core.Draft.decode(checkNotNull(retained)).text)
+            assertNull(runBlocking { app.cache.read(scope.copy(nativeProvider = "other").session("chat-a"), "draft") })
 
             var signInTaps = 0
             compose.setContent { val state by vm.ui.collectAsState(); NativeLocalization("en") { BeaconTheme(dark = true) {
@@ -866,9 +1052,9 @@ class SetupWizardUiTest {
             } } }
             compose.onNodeWithTag("setup-signin").performClick()
             assertEquals(1, signInTaps)
-            assertEquals("Keep this unfinished answer", vm.composer.value.text)
-            assertEquals("Earlier answer", vm.chat.value.messages.single().text)
-            compose.waitUntil(5_000) { runBlocking { app.cache.read(scope.session("chat-a"), "draft") != null } }
+            assertEquals("", vm.composer.value.text)
+            assertTrue(vm.chat.value.messages.isEmpty())
+            assertEquals(retained, runBlocking { app.cache.read(scope.session("chat-a"), "draft") })
         } finally {
             compose.runOnUiThread { store.clear(); client.closeNative(); app.calls.ownerScope = null }
             runBlocking {

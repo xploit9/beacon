@@ -62,6 +62,9 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var botProfiles = listOf("default", "coder")
     @Volatile var roomMembers = listOf("default", "coder")
     @Volatile var roomDeleted = false
+    @Volatile var roomCapabilitiesAvailable = true
+    private fun roomCapabilities() = if (roomCapabilitiesAvailable)
+        json("rename" to true, "delete" to true, "approval" to true, "change_members" to false, "retry" to false) else json()
     @Volatile var rejectRoomSend = false
     val roomEvents = CopyOnWriteArrayList<JSONObject>()
     val roomActions = CopyOnWriteArrayList<JSONObject>()
@@ -113,6 +116,8 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     }
     fun forgetUnpromptedShell(id: String) {
         check(unpromptedShells.remove(id) != null) { "Synthetic unprompted shell missing" }
+        // The phone's gateway keeps its last binding and a background read can reopen its socket, so a bound shell would resume without asking Hermes; bind another chat.
+        kotlinx.coroutines.runBlocking { client.nativeSession("chat-a") }
     }
     fun emitIncomingCall(profile: String = "default", conversationId: String = "chat-a", expiresInSeconds: Long = 120): JSONObject {
         require(profile in notificationProfiles)
@@ -159,12 +164,11 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var historyFailure = false
     /** When set, every optional `/api/plugins/beacon/` route answers with this status. */
     @Volatile var pluginStatus: Int? = null
-    val pairingRedeemCount = AtomicInteger()
-    val pairingLinkCount = AtomicInteger()
+    /** `devices/link` calls and their bodies; a phone is linked by signing in, with no code. */
+    val deviceLinkCount = AtomicInteger()
+    val deviceLinkBodies = CopyOnWriteArrayList<JSONObject>()
     val pairedDevices = CopyOnWriteArrayList<JSONObject>()
-    @Volatile var pairingRedeemHadAuthorization = false
-    @Volatile var pairingLinkHadAuthorization = false
-    @Volatile private var pairingDeviceName = "Android phone"
+    @Volatile var deviceLinkHadAuthorization = false
     @Volatile var bootstrapPluginStatus: String? = null
     @Volatile var boardFailure = false
     @Volatile var preferredBoard = "default"
@@ -281,7 +285,17 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         activeNativeSessionId = null
         listener.onFailure(socket, java.io.IOException("Synthetic native WebSocket interruption"), null)
     }
-    val scope = Scope("https://ui-fixture.invalid", "synthetic-owner", "default")
+    val scope = Scope("https://ui-fixture.invalid", "synthetic-owner", "default", nativeProvider = "fixture")
+    // Saved screen answers outlive a case; each case starts from what its own fixture serves.
+    init {
+        val app = androidx.test.core.app.ApplicationProvider.getApplicationContext<BeaconApplication>()
+        kotlinx.coroutines.runBlocking { app.cache.delete(scope.copy(profile = "", session = ""), "screens") }
+        // A device list without an earlier case's phone id reads as "removed on the PC"; that mark must not reach the next case.
+        androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+        val account = NativePairing.accountKey(scope).removePrefix("device:")
+        app.getSharedPreferences("native-pairing", android.content.Context.MODE_PRIVATE).edit().remove("unlinked:$account").commit()
+        app.getSharedPreferences("push-binding", android.content.Context.MODE_PRIVATE).edit().remove("removed:$account").commit()
+    }
     val configureHttp: (OkHttpClient.Builder) -> Unit = { builder ->
         builder.addInterceptor { chain ->
             val request = chain.request()
@@ -305,8 +319,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 val buffer = okio.Buffer(); request.body?.writeTo(buffer)
                 buffer.readUtf8().takeIf(String::isNotBlank)?.let(::JSONObject) ?: JSONObject()
             }
-            if (request.url.encodedPath == "/api/plugins/beacon/pairing/redeem") pairingRedeemHadAuthorization = request.header("Authorization") != null
-            if (request.url.encodedPath == "/api/plugins/beacon/devices/link") pairingLinkHadAuthorization = request.header("Authorization") != null
+            if (request.url.encodedPath == "/api/plugins/beacon/devices/link") deviceLinkHadAuthorization = request.header("Authorization") != null
             val profileQuery = if (request.url.encodedPath.startsWith("/api/plugins/beacon/")) "beacon_profile" else "profile"
             val profile = request.url.queryParameter(profileQuery) ?: "default"
             requests += if (request.url.encodedPath.startsWith("/auth/native/")) json(
@@ -324,7 +337,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 .body(result.toString().toResponseBody("application/json".toMediaType())).build()
         }
     }
-    val client = BeaconClient(AuthContext(scope.origin, emptyList(), scope.owner, scope.profile, backend = "hermes-dashboard"), null, this, configureHttp = configureHttp)
+    val client = BeaconClient(AuthContext(scope.origin, emptyList(), scope.owner, scope.profile, backend = "hermes-dashboard", nativeProvider = scope.nativeProvider), null, this, configureHttp = configureHttp)
     fun clientFor(auth: AuthContext, authStore: AuthStore? = null) = BeaconClient(
         initial = auth,
         authStore = authStore,
@@ -412,21 +425,15 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         if (path == "/api/plugins/beacon/mobile/bot-mode/space/fixture-room" && holdNextRoomRead.getAndSet(false)) { roomReadCaptured.countDown(); check(releaseRoomRead.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
         if (path in setOf("/api/sessions", "/api/sessions/search") && holdNextSessionList.getAndSet(false)) { sessionListCaptured.countDown(); check(releaseSessionList.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
         return when {
-        path == "/api/plugins/beacon/pairing/redeem" && method == "POST" -> {
-            pairingRedeemCount.incrementAndGet()
-            if (body.string("code") != "ABC123") 400 to json("detail" to "invalid_pairing_code")
-            else {
-                pairingDeviceName = body.string("device_name").takeIf(String::isNotBlank) ?: "Android phone"
-                200 to json("url" to scope.origin, "name" to "Fixture Hermes", "device_id" to "device-123", "link_ticket" to "fixture-link-ticket")
-            }
-        }
         path == "/api/plugins/beacon/devices/link" && method == "POST" -> {
-            pairingLinkCount.incrementAndGet()
-            if (body.string("device_id") != "device-123" || body.string("link_ticket") != "fixture-link-ticket") 400 to json("detail" to "invalid_link_ticket")
-            else {
-                if (pairedDevices.none { it.string("device_id") == "device-123" }) pairedDevices += json("device_id" to "device-123", "name" to pairingDeviceName, "last_seen" to "2026-10-21T00:00:00Z")
-                200 to json("ok" to true, "device_id" to "device-123")
-            }
+            deviceLinkCount.incrementAndGet()
+            deviceLinkBodies += body.copy()
+            // Like the plugin: a known id is refreshed, anything else gets a new record.
+            val id = body.string("device_id").takeIf { known -> pairedDevices.any { it.string("device_id") == known } } ?: "device-123"
+            val name = body.string("device_name").takeIf(String::isNotBlank) ?: "Beacon phone"
+            pairedDevices.removeAll { it.string("device_id") == id }
+            pairedDevices += json("device_id" to id, "name" to name, "last_seen" to "2026-10-21T00:00:00Z")
+            200 to json("device_id" to id, "name" to name, "profiles" to JSONArray(listOf(scope.profile)))
         }
         path == "/api/plugins/beacon/devices" && method == "GET" -> 200 to json("devices" to JSONArray(pairedDevices.map { it.copy() }))
         path.startsWith("/api/plugins/beacon/devices/") && method == "DELETE" -> {
@@ -527,7 +534,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                     "voices" to JSONArray(if (id == "gemini") listOf("Kore", "Puck") else listOf("ara", "eve")), "personalities" to JSONArray(listOf("balanced", "concise", "warm").map { json("id" to it, "label" to it.replaceFirstChar(Char::titlecase)) }))
             }))
         }
-        path == "/api/plugins/beacon/mobile/bot-mode" -> 200 to json("bots" to JSONArray(botProfiles.map { json("profile" to it, "title" to it, "description" to "Synthetic bot") }), "spaces" to JSONArray().apply { if(!roomDeleted) put(json("room_id" to "fixture-room", "name" to roomName)) })
+        path == "/api/plugins/beacon/mobile/bot-mode" -> 200 to json("bots" to JSONArray(botProfiles.map { json("profile" to it, "title" to it, "description" to "Synthetic bot") }), "spaces" to JSONArray().apply { if(!roomDeleted) put(json("room_id" to "fixture-room", "name" to roomName)) }, "capabilities" to roomCapabilities())
         path == "/api/plugins/beacon/mobile/bot-mode/chat" && method == "POST" -> {
             val bot = body.getString("bot"); check(bot in setOf("default", "coder"))
             val id = "bot-$bot"
@@ -542,20 +549,25 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             }
         }
         path == "/api/plugins/beacon/mobile/bot-mode/space/fixture-room/action" -> {
-            roomActions.removeAll { it.string("task_id") == body.string("task_id") && it.string("kind") == body.string("kind") }
-            200 to json("accepted" to true)
+            val pending = roomActions.singleOrNull { action ->
+                body.string("kind") == "approval" && action.string("kind") == "approval" &&
+                    listOf("task_id", "member_id", "request_id").all { action.string(it) == body.string(it) } &&
+                    action.optInt("execution_generation") == body.optInt("execution_generation") &&
+                    body.string("choice") in action.getJSONObject("approval").getJSONArray("choices").strings()
+            }
+            if (roomCapabilitiesAvailable && pending != null) {
+                roomActions.remove(pending)
+                200 to json("accepted" to true)
+            } else 409 to json("detail" to "Native approval was not confirmed")
         }
-        path == "/api/plugins/beacon/mobile/bot-mode/space/fixture-room/members" -> {
-            check(body.getJSONArray("expected_profiles").strings().toSet() == roomMembers.toSet())
-            roomMembers = body.getJSONArray("profiles").strings()
-            200 to json("room" to json("room_id" to "fixture-room", "name" to roomName, "members" to JSONArray(roomMembers.map { json("profile" to it) })))
-        }
+        path == "/api/plugins/beacon/mobile/bot-mode/space/fixture-room/members" -> 409 to json("detail" to "Native Hermes cannot change bots in an existing space")
         path == "/api/plugins/beacon/mobile/bot-mode/space/fixture-room/delete" -> {
             check(body.getString("expected_name") == roomName); roomDeleted = true
-            200 to json("tombstone" to json("room_id" to "fixture-room", "event_id" to body.getString("event_id")))
+            200 to json("tombstone" to json("room_id" to "fixture-room", "disbanded_at" to 1_800_000_000L,
+                "idempotent" to false, "event" to json("room_id" to "fixture-room", "kind" to "room.disbanded", "event_id" to "system:room-disbanded")))
         }
         path == "/api/plugins/beacon/mobile/bot-mode/space/fixture-room/rename" -> { roomName = body.getString("name"); 200 to json("room" to json("room_id" to "fixture-room", "name" to roomName)) }
-        path == "/api/plugins/beacon/mobile/bot-mode/space/fixture-room" -> 200 to json("room" to json("room_id" to "fixture-room", "name" to roomName, "members" to JSONArray(roomMembers.map { json("profile" to it) })), "events" to JSONArray(roomEvents.toList()), "driver_status" to json("running" to true, "pending_actions" to JSONArray(roomActions.toList())))
+        path == "/api/plugins/beacon/mobile/bot-mode/space/fixture-room" -> 200 to json("room" to json("room_id" to "fixture-room", "name" to roomName, "members" to JSONArray(roomMembers.map { json("profile" to it) })), "events" to JSONArray(roomEvents.toList()), "driver_status" to json("running" to true, "pending_actions" to JSONArray(roomActions.toList())), "capabilities" to roomCapabilities())
         path in setOf("/api/sessions", "/api/sessions/search") -> {
             // Stock dashboard index: profile-scoped pages of at most 100, archived=exclude|only.
             val limit = url?.queryParameter("limit")?.toIntOrNull() ?: 20
@@ -613,7 +625,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 200 to json("access_token" to "synthetic-access-$number", "refresh_token" to currentRefreshToken, "expires_at" to (System.currentTimeMillis() / 1000 + 3600), "token_type" to "Bearer", "provider" to "fixture", "user_id" to scope.owner)
             }
         }
-        path == "/api/auth/me" -> 200 to json("user_id" to scope.owner)
+        path == "/api/auth/me" -> 200 to json("user_id" to scope.owner, "provider" to scope.nativeProvider)
         path == "/auth/logout" -> 200 to json("ok" to true)
         path == "/api/model/options" -> 200 to json("providers" to JSONArray().put(json("slug" to "fixture", "name" to "Configured provider", "models" to JSONArray(listOf("synthetic-model", "other-model", "confirm-model")))))
         path == "/api/plugins/beacon/admin/model-capabilities" -> 200 to json("reasoning_known" to true, "reasoning_options" to JSONArray(listOf("low", "medium", "high")))

@@ -65,6 +65,7 @@ class NativeApprovalMenuUiTest {
         runBlocking { app.preferences.edit { it[originKey] = "" } }
         val store = ViewModelStore()
         val fixture = NativeExperienceFixture()
+        runBlocking { app.auth.persist(fixture.client.auth) }
         lateinit var vm: BeaconViewModel
         try {
             compose.runOnUiThread {
@@ -115,8 +116,12 @@ class NativeApprovalMenuUiTest {
 
     @Test fun yoloRequiresConfirmationAndAskFirstOnlyClearsThisChatsBypass() = withFixture { vm, fixture ->
         open(vm)
-        compose.onNodeWithText("Profile default", useUnmergedTree = true).assertIsDisplayed()
-        compose.onNodeWithText("Ask first", useUnmergedTree = true).assertIsDisplayed()
+        compose.onNodeWithText("Manual", useUnmergedTree = true).assertIsDisplayed()
+        compose.onNodeWithText("Ask before actions", useUnmergedTree = true).assertIsDisplayed()
+        // The chat menu only changes this chat: no profile-wide shortcuts in it.
+        compose.onNodeWithText("Profile default", useUnmergedTree = true).assertDoesNotExist()
+        compose.onNodeWithText("Change for all chats").assertDoesNotExist()
+        compose.onNodeWithText("Allowed toolsets").assertDoesNotExist()
         compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
         compose.onNodeWithText("Enable YOLO for this chat?").assertIsDisplayed()
         compose.onNodeWithText("Cancel").performClick()
@@ -139,12 +144,10 @@ class NativeApprovalMenuUiTest {
 
     @Test fun profileOffIsHonestAndHasNoChatOffChoice() = withFixture(prepare = { _, fixture -> fixture.approvalMode = "off" }) { vm, fixture ->
         open(vm)
-        compose.onNodeWithText("Approvals are off for this profile").assertIsDisplayed()
-        compose.onNodeWithTag("approval-yolo").assertIsNotEnabled()
-        compose.onNodeWithTag("approval-ask").assertIsNotEnabled()
+        compose.onNodeWithText("Approvals are off").assertIsDisplayed()
+        compose.onNodeWithTag("approval-yolo").assertDoesNotExist()
+        compose.onNodeWithTag("approval-ask").assertDoesNotExist()
         compose.onNodeWithTag("approval-mode-off").assertDoesNotExist()
-        compose.onNodeWithTag("approval-profile-settings").performClick()
-        assertEquals("Profiles", vm.ui.value.morePage)
         assertTrue(fixture.requests.none { it.string("method") == "config.set" })
     }
 
@@ -152,8 +155,8 @@ class NativeApprovalMenuUiTest {
         await { vm.data.value["picker:approvals"]?.string("profile_mode") == "smart" }
         compose.onNodeWithContentDescription("Approvals: Auto").assertIsDisplayed()
         open(vm)
-        compose.onNodeWithText("Profile default", useUnmergedTree = true).assertIsDisplayed()
         compose.onNodeWithText("Auto", useUnmergedTree = true).assertIsDisplayed()
+        compose.onNodeWithText("Ask only for risky actions", useUnmergedTree = true).assertIsDisplayed()
         val resumes = fixture.requests.filter { it.string("method") == "session.resume" }
         assertTrue(resumes.isNotEmpty() && resumes.all { it.getJSONObject("params").optBoolean("lazy") && it.getJSONObject("params").optBoolean("omit_messages") })
     }
@@ -161,9 +164,9 @@ class NativeApprovalMenuUiTest {
     @Test fun passiveHistoryDoesNotResumeToPaintTheApprovalShield() = withFixture(prepare = { vm, _ ->
         flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(raw = vm.chat.value.raw.copy().apply { remove("runtime_session_id") })
     }) { vm, fixture ->
-        // Profile policy is known, but a saved false cannot exclude a runtime bypass.
+        // A browsed chat shows its own saved choice (not YOLO), so the shield shows the profile's mode instead of Unknown.
         await { vm.data.value["picker:approvals"]?.string("profile_mode") == "manual" }
-        compose.onNodeWithContentDescription("Approvals: Unknown").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Manual").assertIsDisplayed()
         assertTrue("Browsing never resumes, creates or sends", fixture.requests.none {
             it.string("method") in setOf("session.resume", "session.history", "session.create", "prompt.submit")
         })
@@ -234,6 +237,7 @@ class NativeApprovalMenuUiTest {
                 val photoName = if (cachedUpload) "Original camera.png" else "camera.png"
                 val cacheKeys = listOf(
                     fixture.scope to listOf("selected-session", "read-invalidated-at", "conversation-index", "phone-editors"),
+                    fixture.scope.copy(profile = "", session = "") to listOf("screens"),
                     fixture.scope.session("chat-a") to listOf("session", "draft", "side-question", "pending", "task-result", "client-created-shell"),
                     scope to listOf("session", "draft", "side-question", "pending", "task-result", "client-created-shell", "attachments:201", "attachments:202", "attachments:203"),
                 )
@@ -354,7 +358,7 @@ class NativeApprovalMenuUiTest {
         open(vm)
         compose.onNodeWithTag("approval-ask").assert(isNotSelected())
         compose.onNodeWithTag("approval-yolo").assert(isNotSelected())
-        compose.onNodeWithText("Ask first", useUnmergedTree = true).assertIsDisplayed()
+        compose.onNodeWithText("Ask before actions", useUnmergedTree = true).assertIsDisplayed()
         fixture.omitResumeYolo = false
         compose.onNodeWithTag("approval-ask").performClick()
         await { fixture.requests.any { it.string("method") == "config.set" && it.getJSONObject("params").string("key") == "yolo" } }
@@ -385,10 +389,10 @@ class NativeApprovalMenuUiTest {
         await { vm.data.value["picker:approvals"]?.optBoolean("session_bypass") == true && vm.conversationPending.value.isEmpty() && "picker:approvals" !in vm.refreshing.value }
         fixture.sessions.getValue("chat-b").getJSONObject("info").put("model", "chat-b-model").put("reasoning_effort", "low").put("yolo", false)
         compose.runOnIdle { vm.selectSession("chat-b") }
-        await { vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady && vm.data.value["picker:approvals"]?.string("session_id") == "chat-b" }
-        assertEquals("chat-b-model", vm.chat.value.raw.string("model"))
+        // A cached chat B also sets projectionReady; wait for its live read.
+        await { vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady && vm.data.value["picker:approvals"]?.string("session_id") == "chat-b" && vm.chat.value.raw.string("model") == "chat-b-model" }
         assertEquals("low", vm.chat.value.sessionReasoningEffort)
-        compose.onNodeWithContentDescription("Approvals: Unknown").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Manual").assertIsDisplayed()  // chat B keeps its own setting: not YOLO
         val writes = fixture.requests.filter { it.string("method") == "config.set" }.map { it.getJSONObject("params") }
         assertEquals(setOf("model", "reasoning", "yolo"), writes.map { it.string("key") }.toSet())
         assertTrue(writes.all { it.string("scope") == "session" && it.string("session_id") == "runtime-chat-a" })

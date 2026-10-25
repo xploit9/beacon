@@ -5,6 +5,30 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CallToolApprovalTest {
+    @Test fun fixedReadPresenceMustBeAnExplicitBooleanOnACompletedLookup() {
+        val event=directLookupReceipt("lookup","hermes_memory",GeminiWire.evidence(JSONObject()
+            .put("summary","Fixture evidence").put("sources",org.json.JSONArray()).put("observed_at",123),false))
+        for(value in listOf(false,"true",1,JSONObject.NULL)) {
+            val parsed=CallToolReceipt.from(JSONObject(event.toString()).put("result_present",value))!!
+            assertFalse(parsed.hasResult);assertEquals("Completion not confirmed",parsed.chipLabel())
+        }
+        assertFalse(CallToolReceipt.from(JSONObject(event.toString()).apply { remove("result_present") })!!.hasResult)
+        for(status in listOf("running","failed","uncertain","needs_approval","cancelled"))
+            assertFalse(CallToolReceipt.from(JSONObject(event.toString()).put("status",status))!!.hasResult)
+        for(name in listOf("write_file","hermes_work","mcp__native__hermes_memory","other_lookup")) {
+            val parsed=CallToolReceipt.from(JSONObject(event.toString()).put("tool_name",name))!!
+            assertFalse(parsed.hasResult);assertEquals("Completion not confirmed",parsed.chipLabel())
+        }
+    }
+
+    @Test fun actualGatewayResultPresenceKeepsItsExistingMeaningIncludingEmptyResults() {
+        val event=JSONObject().put("request_id","request").put("tool_name","write_file").put("status","completed")
+        for(result in listOf(JSONObject(),org.json.JSONArray(),"",0,false))
+            assertTrue(CallToolReceipt.from(JSONObject(event.toString()).put("result",result))!!.hasResult)
+        assertFalse(CallToolReceipt.from(JSONObject(event.toString()).put("result",JSONObject.NULL))!!.hasResult)
+        assertFalse(CallToolReceipt.from(event)!!.hasResult)
+    }
+
     @Test fun ninthProposalRemainsDecidableAfterTheFirstEightSettle() {
         val receipts = DirectGatewayReceipts()
         var pending = emptyList<CallToolApproval>()
@@ -82,6 +106,36 @@ class CallToolApprovalTest {
             assertTrue(error is IllegalArgumentException || error is org.json.JSONException)
         }
         CallToolApproval.from(proposal().put("request_id","r".repeat(160)).put("proposal_id","p".repeat(80)).put("tool_name","n".repeat(200)))
+    }
+
+    @Test fun callLongAllowanceIsOfferedUnlessTheProposalForbidsIt() {
+        assertTrue("An older plugin omits the field", CallToolApproval.from(proposal()).allowCall)
+        assertTrue(CallToolApproval.from(proposal().put("allow_call", true)).allowCall)
+        for (value in listOf(false, "true", 1, JSONObject.NULL)) assertFalse(CallToolApproval.from(proposal().put("allow_call", value)).allowCall)
+        val pending = pendingCallToolApprovals(emptyList(), proposal().put("type", "tool_approval").put("allow_call", false))
+        assertFalse(pending.single().allowCall)
+        assertFalse(pending.single().copy(busy = true).allowCall)
+    }
+
+    @Test fun approvalEventCarriesAllowCallOnlyWhenTheProposalStatesIt() {
+        val stored = JSONObject().put("id", "p".repeat(32)).put("tool_name", "terminal").put("arguments", JSONObject().put("command", "ls"))
+        val older = callToolApprovalEvent("request-1", "terminal", stored)
+        assertFalse(older.has("allow_call"))
+        assertTrue(CallToolApproval.from(older).allowCall)
+        val forbidden = callToolApprovalEvent("request-1", "terminal", JSONObject(stored.toString()).put("allow_call", false))
+        assertEquals(false, forbidden.get("allow_call"))
+        assertFalse(CallToolApproval.from(forbidden).allowCall)
+        assertEquals("ls", JSONObject(CallToolApproval.from(forbidden).arguments).getString("command"))
+    }
+
+    @Test fun summaryFieldsCutAtOneHundredCharactersEndWithAnEllipsis() {
+        val recipients = (1..12).joinToString(", ") { "person$it@example.invalid" }
+        val summary = callToolApprovalSummary(CallToolApproval("request", "p".repeat(32), "send_email", JSONObject()
+            .put("to", recipients).put("cc", "y".repeat(101)).put("subject", "s".repeat(100)).toString()))
+        val (to, cc, subject) = summary.fields.split(" · ").map { it.substringAfter(": ") }
+        assertEquals(100, to.length); assertTrue(to.endsWith("…")); assertEquals(recipients.take(99), to.dropLast(1))
+        assertEquals("y".repeat(99) + "…", cc)
+        assertEquals("s".repeat(100), subject)
     }
 
     @Test fun fileWriteSummaryShowsActionShortTargetAndContentPreview() {

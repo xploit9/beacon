@@ -180,23 +180,24 @@ def test_timed_out_provider_keeps_capacity_until_it_exits(recall_env, monkeypatc
         assert finished.wait(2)
 
 
-def test_retired_provider_is_never_loaded(recall_env, monkeypatch):
+def test_a_provider_named_hindsight_is_asked_like_any_other(recall_env, monkeypatch):
     voice, _, _, _, _ = recall_env
     provider = FakeProvider()
+    provider.name = 'hindsight'
     loads = configured_provider(monkeypatch, voice, provider)
-    monkeypatch.setattr(voice, 'config', lambda root: {'memory': {'provider': 'hindsight'}})
     result = voice.recall('owner', 'basic', 'default', 'chat', 'anything')
-    assert result['status'] == 'unavailable'
-    assert loads == [] and provider.initialized == []
+    assert result['status'] == 'completed' and result['summary'] == 'Saved: favorite color is green'
+    assert loads == [('hindsight', False)]
 
 
 @pytest.mark.parametrize('text', ['', '   ', 'Mnemosyne retrieval failed for this turn. Disclose this and verify current source files; do not invent memory.'])
-def test_external_empty_and_failed_results_are_honest(recall_env, monkeypatch, text):
+def test_external_empty_and_failed_results_are_never_returned_as_memories(recall_env, monkeypatch, text):
     voice, _, _, _, _ = recall_env
-    configured_provider(monkeypatch, voice, FakeProvider(text))
+    provider = FakeProvider(text)
+    provider.recall_status = lambda: SimpleNamespace(count=0)  # how Mnemosyne reports an empty or failed recall
+    configured_provider(monkeypatch, voice, provider)
     result = voice.recall('owner', 'basic', 'default', 'chat', 'anything')
-    assert result['status'] == ('empty' if not text.strip() else 'unavailable')
-    assert result['summary'] == ('No saved memories matched.' if not text.strip() else 'Memory lookup failed.')
+    assert result['status'] == 'empty' and result['summary'] == 'Nothing came back from memory.'
     assert result['sources'] == []
 
 
@@ -206,7 +207,7 @@ def test_mnemosyne_envelope_without_memories_is_empty(recall_env, monkeypatch):
     provider.recall_status = lambda: SimpleNamespace(count=0)
     configured_provider(monkeypatch, voice, provider)
     result = voice.recall('owner', 'basic', 'default', 'chat', 'anything')
-    assert result['status'] == 'empty' and result['summary'] == 'No saved memories matched.'
+    assert result['status'] == 'empty' and result['summary'] == 'Nothing came back from memory.'
     assert result['sources'] == []
 
 
@@ -303,3 +304,18 @@ def test_call_memory_route_preserves_empty_and_failed_evidence(recall_env, monke
     assert result['status'] == ('unavailable' if failed else 'empty')
     assert result['summary'] == ('Memory lookup failed.' if failed else 'No saved memories matched.')
     assert result['sources'] == [] and isinstance(result['observed_at'], int)
+
+
+def test_a_built_in_store_beacon_refuses_to_read_is_unavailable_not_empty(harness, monkeypatch):
+    # Strix afd1b07 S2: an oversized store used to read as "No saved memories matched."
+    api, _, _, root, _ = harness
+    monkeypatch.setitem(sys.modules, 'tools.memory_tool', SimpleNamespace(
+        MemoryStore=None, get_builtin_memory_config=lambda cfg: {}, get_builtin_memory_store_flags=lambda cfg: (True, True)))
+    voice = api.voice_context
+    assert voice.builtin_memory(root, {}) == ''  # no memories directory yet: genuinely empty
+    memories = root / 'memories'
+    memories.mkdir()
+    (memories / 'USER.md').write_text('x' * (128 * 1024 + 1), encoding='utf-8')
+
+    with pytest.raises(OSError, match='unreadable'):
+        voice.builtin_memory(root, {})

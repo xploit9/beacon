@@ -3,6 +3,7 @@ import hashlib
 import os
 import re
 import sys
+import threading
 import time
 
 try:
@@ -24,6 +25,10 @@ except ImportError:  # The functions below remain importable in offline plugin t
     class SendResult:
         def __init__(self, success, message_id=None, error=None, retryable=False):
             self.success, self.message_id, self.error, self.retryable = success, message_id, error, retryable
+
+
+NO_CONVERSATION = "No owned assistant conversation is configured for phone delivery"
+_PROVISION_LOCK = threading.Lock()
 
 
 def _modules():
@@ -53,31 +58,52 @@ def is_connected(config):
         return False
 
 
-def _queue_standalone_result(message, is_cron=False):
+def _provision_conversation(mobile, native, owner, provider, profile):
+    """An owner who never opened the Beacon chat still gets a saved chat for scheduled results; their own chat replaces it once saved."""
+    with _PROVISION_LOCK:
+        stored = mobile.settings(profile).get("scheduled_callback_conversation_id")
+        if isinstance(stored, str):
+            return stored
+        try:
+            created = native.provision(owner, provider, profile)
+        except Exception:  # shortcut: any Hermes failure keeps today's error; add logging if support needs the cause.
+            raise LookupError(NO_CONVERSATION) from None
+        registered = mobile.register_assistant_conversation(owner, provider, profile, created, native.verify, provisional=True)
+        if not registered:
+            raise LookupError(NO_CONVERSATION)
+        return registered
+
+
+def _queue_standalone_result(message, native_job_id):
     mobile, cfg, profile = _profile_state()
     _, native, _ = _modules()
     owner, provider = cfg.get("owner_id"), cfg.get("owner_provider")
+    if not owner or not provider:
+        raise LookupError(NO_CONVERSATION)
     conversation = cfg.get("scheduled_callback_conversation_id")
-    if not owner or not provider or not isinstance(conversation, str):
-        raise LookupError("No owned assistant conversation is configured for phone delivery")
+    if not isinstance(conversation, str):
+        conversation = _provision_conversation(mobile, native, owner, provider, profile)
     native.verify(owner, provider, profile, conversation)
     bucket = int(time.time() // 300)
-    digest = hashlib.sha256((str(message) + ":" + str(bucket)).encode("utf-8")).hexdigest()[:32]
-    job_id = ("phone-cron-" if is_cron else "phone-hermes-") + digest
+    # shortcut: no upstream run ID; keep the five-minute window until both send paths carry run identity.
+    identity = native_job_id + ":" + str(message) + ":" + str(bucket)
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+    job_id = "phone-cron-" + digest
     return mobile.enqueue_task_result(owner, profile, conversation, job_id, str(message)[:4000])
 
 
 def _strip_cron_header(message):
-    header = re.match(r"(?s)^Cronjob Response: [^\r\n]{1,240}\r?\n\(job_id: [A-Za-z0-9_-]{1,160}\)\r?\n", message)
+    header = re.match(r"(?s)^Cronjob Response: [^\r\n]+\r?\n\(job_id: ([A-Za-z0-9_-]{1,160})\)\r?\n", message)
     if not header:
-        return message, False
+        raise ValueError("Beacon phone delivery accepts scheduled job results only (Hermes needs cron.wrap_response: true)")
     body = message[header.end():]
     body = re.sub(r"^-{3,}\r?\n(?:\r?\n)?", "", body, count=1)
-    return re.sub(r'\n\nTo stop or manage this job, send me a new message \(e\.g\. "stop reminder [^\n]*"\)\.\s*\Z', "", body), True
+    return re.sub(r'\n\nTo stop or manage this job, send me a new message \(e\.g\. "stop reminder [^\n]*"\)\.\s*\Z', "", body), header.group(1)
 
 
 class BeaconPhoneAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = 4000
+    splits_long_messages = True  # Preserve full result identity before bounding the queued notice preview.
 
     def __init__(self, config):
         if Platform is None:
@@ -98,8 +124,11 @@ class BeaconPhoneAdapter(BasePlatformAdapter):
         if not isinstance(content, str) or not content.strip():
             return SendResult(success=False, error="Refusing to queue an empty phone result")
         try:
-            message,is_cron=_strip_cron_header(content)
-            event = _queue_standalone_result(message,is_cron)
+            message,job_id=_strip_cron_header(content)
+        except ValueError as exc:
+            return SendResult(success=False, error=str(exc), retryable=False)  # a retry can never pass
+        try:
+            event = _queue_standalone_result(message,job_id)
             return SendResult(success=True, message_id=event)
         except Exception as exc:
             return SendResult(success=False, error=str(exc)[:240], retryable=True)
@@ -112,8 +141,8 @@ async def standalone_send(pconfig, chat_id, message, *, thread_id=None, media_fi
     if not isinstance(message, str) or not message.strip():
         return {"error": "Refusing to queue an empty phone result"}
     try:
-        message,is_cron=_strip_cron_header(message)
-        event = _queue_standalone_result(message,is_cron)
+        message,job_id=_strip_cron_header(message)
+        event = _queue_standalone_result(message,job_id)
         return {"success": True, "platform": "phone", "chat_id": chat_id or "phone", "message_id": event}
     except Exception as exc:
         return {"error": str(exc)[:240]}

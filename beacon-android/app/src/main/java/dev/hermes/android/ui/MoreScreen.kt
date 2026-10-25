@@ -1,8 +1,6 @@
 @file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 package dev.hermes.android.ui
 
-import android.content.Intent
-import android.provider.Settings
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.selection.selectable
@@ -29,28 +27,16 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.AppState
 import dev.hermes.android.BuildConfig
-import dev.hermes.android.BeaconApplication
 import dev.hermes.android.BeaconViewModel
-import dev.hermes.android.isMissingBeaconPluginRoute
 import dev.hermes.android.core.*
-import dev.hermes.android.data.BeaconClient
 import dev.hermes.android.data.VoiceKeyStore
 import dev.hermes.android.push.KeepConnectedService
-import dev.hermes.android.updates.HermesPluginUpdater
-import dev.hermes.android.updates.PluginUpdateRowState
-import dev.hermes.android.updates.PluginVersions
-import kotlinx.coroutines.CancellationException
+import dev.hermes.android.updates.AppUpdateScreen
+import dev.hermes.android.updates.UpdatePhase
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-import java.time.Instant
-import java.time.LocalDate
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
-import java.util.Locale
 
 fun settingsParent(page: String): String = when {
     page.startsWith("category:") -> ""
@@ -72,29 +58,6 @@ private fun settingsIcon(name: String): ImageVector = when (name) {
     "Skills" -> Icons.Rounded.Extension
     "Memory" -> Icons.Rounded.Psychology
     else -> Icons.Rounded.FolderOpen
-}
-
-private fun pluginAutoUpdateLine(status: JSONObject): String {
-    val message=status.optString("message").ifBlank {
-        if (status.optString("result")=="never") {
-            if (status.optBoolean("enabled",true)) "Automatic updates are on." else "Automatic updates are off."
-        } else "Up to date."
-    }
-    val versions=listOfNotNull(
-        status.optString("app_version").takeIf(String::isNotBlank)?.let { "App $it" },
-        status.optString("plugin_version").takeIf(String::isNotBlank)?.let { "Plugin $it" },
-    ).joinToString(" · ")
-    val checked=status.optDouble("checked_at",0.0)
-    val whenText=runCatching {
-        if (checked<=0) "" else {
-            val zone=ZoneId.systemDefault()
-            val value=Instant.ofEpochMilli((checked*1000).toLong()).atZone(zone)
-            val time=value.format(DateTimeFormatter.ofPattern("HH:mm",Locale.getDefault()))
-            if (value.toLocalDate()==LocalDate.now(zone)) "Checked today $time"
-            else "Checked ${value.format(DateTimeFormatter.ofPattern("MMM d HH:mm",Locale.getDefault()))}"
-        }
-    }.getOrDefault("")
-    return listOf(whenText,versions,message).filter(String::isNotBlank).joinToString(" · ")
 }
 
 /** Touch floor of every Settings row; UI tests assert against this same value. */
@@ -181,7 +144,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val prefs by vm.preferences.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
-    val update by vm.appUpdate.collectAsStateWithLifecycle()
+    val update by vm.app.updates.state.collectAsStateWithLifecycle()
     val profileCatalog = data["navigation-profiles"]
     val profileRows = profileCatalog?.rows("profiles").orEmpty()
     val profileLoading = ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
@@ -196,19 +159,26 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         preferences.registerOnSharedPreferenceChangeListener(listener)
         onDispose { preferences.unregisterOnSharedPreferenceChangeListener(listener) }
     }
-    val phoneVoice by produceState<Pair<String, Boolean>?>(null, context) {
+    var voicePreferencesVersion by remember(context) { mutableIntStateOf(0) }
+    DisposableEffect(context) {
+        val preferences = context.getSharedPreferences(VoiceKeyStore.PREFS, android.content.Context.MODE_PRIVATE)
+        val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> voicePreferencesVersion++ }
+        preferences.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { preferences.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
+    val phoneVoice by produceState<Pair<String, Boolean>?>(null, context, voicePreferencesVersion) {
         value = withContext(Dispatchers.IO) {
             runCatching {
                 val store = VoiceKeyStore(context)
                 val provider = store.settings().provider
-                provider to (store.maskedKey(provider) != null)
+                provider to store.hasKey(provider)
             }.getOrNull()
         }
     }
     val snapshot = SettingsSnapshot(
         connected = ui.connected, profile = profileDisplayLabel(ui.profile, profileRows, profileLoading),
         theme = prefs.theme, colorStyle = prefs.skin,
-        installedVersion = BuildConfig.VERSION_NAME, updateName = update.release?.name.orEmpty(), updateReady = update.ready,
+        installedVersion = BuildConfig.VERSION_NAME, updateName = update.release?.name.orEmpty(), updateReady = update.phase == UpdatePhase.NeedsPermission || update.phase == UpdatePhase.Installing,
         voiceProviderId = phoneVoice?.first.orEmpty(), voiceKeySaved = phoneVoice?.second,
         keepConnectedEnabled = keepConnectedEnabled,
         assistantName = prefs.assistantName, assistantProfile = profileDisplayLabel(prefs.assistantProfile, profileRows, profileLoading),
@@ -363,256 +333,13 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         DevicesSettingsSection(vm, pluginAbsent)
     }
 }
+/** Settings > App updates. The state lives in [dev.hermes.android.updates.UpdateManager], so a download goes on while this page is closed. */
 @Composable private fun AppUpdates(vm: BeaconViewModel) {
-    val update by vm.appUpdate.collectAsStateWithLifecycle()
     val ui by vm.ui.collectAsStateWithLifecycle()
     val call by vm.app.calls.state.collectAsStateWithLifecycle()
     val incoming by vm.incomingBusy.collectAsStateWithLifecycle()
-    val callBusy = call.active || incoming || call.state == "ending"
-    val context = LocalContext.current
-    val app=context.applicationContext as BeaconApplication
-    val previewBuild = BuildConfig.APPLICATION_ID.endsWith(".debug")
-    val stableBuild = BuildConfig.APPLICATION_ID.endsWith(".stable")
-    val client = vm.client
-    val scope = rememberCoroutineScope()
-    var appAutoUpdates by remember(context) { mutableStateOf(app.updates.autoUpdateEnabled()) }
-    var releaseCheckComplete by remember(client, ui.origin, ui.owner) { mutableStateOf(false) }
-    var releaseCheckBusy by remember { mutableStateOf(false) }
-    var releaseCheckError by remember { mutableStateOf(false) }
-    var pluginVersions by remember(client, ui.origin, ui.owner) { mutableStateOf<PluginVersions?>(null) }
-    var pluginChecking by remember(client, ui.origin, ui.owner) { mutableStateOf(false) }
-    var pluginBusy by remember(client, ui.origin, ui.owner) { mutableStateOf(false) }
-    var pluginError by remember(client, ui.origin, ui.owner) { mutableStateOf(false) }
-    var consentRequired by remember(client, ui.origin, ui.owner) { mutableStateOf(false) }
-    var consentLines by remember(client, ui.origin, ui.owner) { mutableStateOf(emptyList<String>()) }
-    var pluginAutoUpdates by remember(client,ui.origin,ui.owner) { mutableStateOf(true) }
-    var pluginAutoSettings by remember(client,ui.origin,ui.owner) { mutableStateOf(JSONObject()) }
-    var pluginAutoSettingsAvailable by remember(client,ui.origin,ui.owner) { mutableStateOf(false) }
-    var pluginAutoSettingsMissing by remember(client,ui.origin,ui.owner) { mutableStateOf(false) }
-    var pluginAutoSettingsError by remember(client,ui.origin,ui.owner) { mutableStateOf(false) }
-    var pluginAutoSaving by remember { mutableStateOf(false) }
-    val pluginRow = PluginUpdateRowState(pluginVersions, pluginChecking, pluginBusy, consentRequired, pluginError)
-    suspend fun refreshPluginVersion(active: BeaconClient) {
-        if (vm.client !== active) return
-        pluginChecking = true
-        pluginError = false
-        val detached = active.detached()
-        try {
-            val versions = HermesPluginUpdater(detached).version()
-            if (vm.client === active) pluginVersions = versions
-        } catch (error: CancellationException) { throw error }
-        catch (_: Exception) { if (vm.client === active) pluginError = true }
-        finally { detached.closeNative(); if (vm.client === active) pluginChecking = false }
-    }
-    suspend fun refreshPluginAutoUpdates(active: BeaconClient) {
-        if (vm.client !== active) return
-        val detached=active.detached()
-        try {
-            val state=detached.nativeRequest("/api/plugins/beacon/mobile/update-settings")
-            if (vm.client===active) {
-                pluginAutoSettings=state
-                pluginAutoUpdates=state.optBoolean("enabled",true)
-                pluginAutoSettingsAvailable=true
-                pluginAutoSettingsMissing=false
-                pluginAutoSettingsError=false
-            }
-        } catch (error: CancellationException) { throw error }
-        catch (error: Exception) {
-            if (vm.client===active) {
-                pluginAutoSettingsAvailable=false
-                pluginAutoSettingsMissing=isMissingBeaconPluginRoute(error)
-                pluginAutoSettingsError=!pluginAutoSettingsMissing
-            }
-        } finally { detached.closeNative() }
-    }
-    fun setPluginAutoUpdates(enabled: Boolean) {
-        val active=vm.client ?: return
-        val previous=pluginAutoUpdates
-        pluginAutoUpdates=enabled
-        scope.launch {
-            if (vm.client!==active) return@launch
-            pluginAutoSaving=true
-            val detached=active.detached()
-            try {
-                val state=detached.nativeRequest("/api/plugins/beacon/mobile/update-settings","PUT",JSONObject().put("enabled",enabled))
-                if (vm.client===active) {
-                    pluginAutoSettings=state
-                    pluginAutoUpdates=state.optBoolean("enabled",enabled)
-                    pluginAutoSettingsAvailable=true
-                    pluginAutoSettingsMissing=false
-                    pluginAutoSettingsError=false
-                }
-            } catch (error: CancellationException) { throw error }
-            catch (error: Exception) {
-                if (vm.client===active) {
-                    pluginAutoUpdates=previous
-                    pluginAutoSettingsMissing=isMissingBeaconPluginRoute(error)
-                    pluginAutoSettingsAvailable=false
-                    pluginAutoSettingsError=!pluginAutoSettingsMissing
-                }
-            } finally { detached.closeNative(); if (vm.client===active) pluginAutoSaving=false }
-        }
-    }
-    fun updatePlugin(acceptCapabilities: Boolean = false) {
-        val active = vm.client ?: return
-        if (!ui.connected) return
-        scope.launch {
-            if (vm.client !== active) return@launch
-            pluginBusy = true
-            pluginError = false
-            val detached = active.detached()
-            try {
-                val updater = HermesPluginUpdater(detached)
-                val current = runCatching { updater.version() }.getOrNull()
-                if (vm.client !== active) return@launch
-                if (current != null) {
-                    pluginVersions = current
-                    if (current.restartRequired) return@launch
-                }
-                val response = updater.update(acceptCapabilities)
-                if (vm.client !== active) return@launch
-                if (response.optBoolean("consent_required")) {
-                    val changes = response.optJSONArray("delta_lines")
-                    consentLines = changes?.let { rows -> (0 until rows.length()).mapNotNull { index -> rows.optString(index).takeIf { it.isNotBlank() && it != "null" } } }.orEmpty()
-                    consentRequired = true
-                    return@launch
-                }
-                if (!response.optBoolean("ok")) throw IllegalStateException()
-                var latest = runCatching { updater.version() }.getOrNull()
-                if (!response.optBoolean("unchanged")) {
-                    for (attempt in 0 until 10) {
-                        if (latest != null && latest != current) break
-                        delay(1000)
-                        latest = runCatching { updater.version() }.getOrNull() ?: latest
-                    }
-                }
-                if (vm.client === active) {
-                    pluginVersions = latest
-                    if (latest == null) pluginError = true
-                }
-            } catch (error: CancellationException) { throw error }
-            catch (_: Exception) { if (vm.client === active) pluginError = true }
-            finally { detached.closeNative(); if (vm.client === active) pluginBusy = false }
-        }
-    }
-    fun checkAppUpdate() {
-        val active = vm.client
-        if (!stableBuild || active == null) { vm.checkForAppUpdate(); return }
-        scope.launch {
-            releaseCheckBusy = true
-            releaseCheckError = false
-            releaseCheckComplete = false
-            val detached = active.detached()
-            try {
-                detached.nativeRequest("/api/plugins/beacon/mobile/releases/check", "POST", JSONObject())
-                if (vm.client === active) {
-                    vm.checkForAppUpdate()
-                    releaseCheckComplete = true
-                }
-            } catch (error: CancellationException) { throw error }
-            catch (_: Exception) { if (vm.client === active) releaseCheckError = true }
-            finally { detached.closeNative(); releaseCheckBusy = false }
-        }
-    }
-    LaunchedEffect(client, ui.origin, ui.owner, ui.connected) {
-        pluginVersions = null
-        pluginError = false
-        consentRequired = false
-        consentLines = emptyList()
-        pluginAutoSettings=JSONObject()
-        pluginAutoUpdates=true
-        pluginAutoSettingsAvailable=false
-        pluginAutoSettingsMissing=false
-        pluginAutoSettingsError=false
-        if (ui.connected && client != null) {
-            refreshPluginVersion(client)
-            refreshPluginAutoUpdates(client)
-        }
-    }
-    fun alertsEnabled(): Boolean = androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled() &&
-        context.getSystemService(android.app.NotificationManager::class.java).getNotificationChannel(dev.hermes.android.updates.UpdateManager.CHANNEL)?.importance != android.app.NotificationManager.IMPORTANCE_NONE
-    var alertsAllowed by remember { mutableStateOf(alertsEnabled()) }
-    androidx.lifecycle.compose.LifecycleResumeEffect(context) {
-        val allowed = alertsEnabled()
-        val enabledOnReturn = allowed && !alertsAllowed
-        alertsAllowed = allowed
-        if (enabledOnReturn) vm.checkForAppUpdate()
-        onPauseOrDispose { }
-    }
-    Box(Modifier.fillMaxSize(), contentAlignment = androidx.compose.ui.Alignment.TopCenter) {
-    Column(Modifier.widthIn(max = 720.dp).fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) {
-        Glass(Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                Icon(Icons.Rounded.SystemUpdate, null, Modifier.size(36.dp), tint = MaterialTheme.colorScheme.primary)
-                Text(update.release?.takeIf { !stableBuild || releaseCheckComplete }?.let { "Beacon ${it.name}" } ?: "Beacon", style = MaterialTheme.typography.headlineSmall)
-                if (!previewBuild) LabeledToggle("Update the app automatically",appAutoUpdates,{ enabled ->
-                    appAutoUpdates=enabled
-                    app.updates.setAutoUpdateEnabled(enabled)
-                },"Install verified app updates when your connection allows.")
-                val appMessage = when {
-                    previewBuild -> "Preview builds are installed manually."
-                    releaseCheckBusy -> "Checking for updates through Hermes…"
-                    releaseCheckError -> "Couldn't check for updates. Check your Hermes connection and try again."
-                    update.release != null || update.ready -> update.status
-                    update.status.contains("up to date", ignoreCase = true) -> "You're up to date."
-                    update.status.startsWith("Reconnect to Tailscale") -> "Reconnect to Tailscale to check for updates."
-                    update.status.startsWith("Beacon checks for updates") -> "" // the switch above already says so
-                    update.busy -> "Checking for an update…"
-                    else -> "Check for updates when you're connected to Hermes."
-                }
-                if (appMessage.isNotBlank()) Text(appMessage, style = MaterialTheme.typography.bodyLarge)
-                if (!previewBuild) {
-                    if (update.busy || releaseCheckBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
-                    val installing = update.ready || update.release != null && (!stableBuild || releaseCheckComplete)
-                    Button(onClick = { if (!installing) checkAppUpdate() else vm.downloadAppUpdate() }, enabled = !update.busy && !releaseCheckBusy && !(callBusy && installing), modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
-                        Text(when { releaseCheckBusy || update.busy -> "Checking…"; update.ready -> "Install update"; update.release != null && (!stableBuild || releaseCheckComplete) -> "Update"; else -> "Check for updates" })
-                    }
-                    if (callBusy && (update.release != null || update.ready)) Text(if(call.state=="ending") "Call cleanup is finishing. The update will be available shortly." else "Finish your call before installing the update.", style = MaterialTheme.typography.bodyMedium)
-                }
-                Text("Current version · ${BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
-        Glass(Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text("Beacon plugin on Hermes", style = MaterialTheme.typography.titleLarge)
-                Text(pluginVersions?.summary() ?: pluginRow.message, style = MaterialTheme.typography.bodyLarge)
-                if (pluginVersions?.restartRequired == true || pluginError) Text(pluginRow.message, color = if (pluginError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
-                if (pluginChecking || pluginBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
-                LabeledToggle("Update the Beacon plugin automatically",pluginAutoUpdates,{ enabled -> setPluginAutoUpdates(enabled) },
-                    "Update the plugin on Hermes when a new version is ready.",enabled=pluginAutoSettingsAvailable && !pluginAutoSaving)
-                when {
-                    pluginAutoSettingsAvailable -> Text(pluginAutoUpdateLine(pluginAutoSettings),style=MaterialTheme.typography.bodySmall,
-                        color=MaterialTheme.colorScheme.onSurfaceVariant,maxLines=1,overflow=androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-                    pluginAutoSettingsMissing -> Text("Update the plugin to turn this on.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
-                    pluginAutoSettingsError -> Text("Couldn't load automatic plugin updates. Try again.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.error)
-                    !ui.connected || client==null -> Text("Connect to Hermes to change this setting.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                if (pluginAutoSaving) LinearProgressIndicator(Modifier.fillMaxWidth())
-                Button(onClick = { updatePlugin() }, enabled = ui.connected && client != null && pluginRow.canUpdate, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text(pluginRow.buttonText) }
-            }
-        }
-        if (!previewBuild) {
-            Text("Beacon verifies each app update before installing it.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (!alertsAllowed) OutlinedButton(onClick = {
-                context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
-            }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Allow update notifications") }
-            Text("Automatic app updates need a connection to Hermes.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-    }
-    }
-    if (consentRequired) AlertDialog(
-        onDismissRequest = { consentRequired = false; consentLines = emptyList() },
-        title = { Text("Review plugin capability changes") },
-        text = {
-            Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("This update changes what the Beacon plugin can access. Review the changes before continuing.")
-                if (consentLines.isEmpty()) Text("Hermes did not provide a change list. Review the plugin update on your PC before allowing it.")
-                consentLines.forEach { Text("• $it", style = MaterialTheme.typography.bodySmall) }
-            }
-        },
-        confirmButton = { TextButton(onClick = { consentRequired = false; updatePlugin(acceptCapabilities = true) }) { Text("Allow and update") } },
-        dismissButton = { TextButton(onClick = { consentRequired = false; consentLines = emptyList() }) { Text("Cancel") } },
-    )
+    val pluginAbsent = ui.bootstrap.optJSONObject("optional_features")?.optString("plugin") == "absent"
+    AppUpdateScreen(vm.app.updates, vm.client, ui.connected, pluginAbsent, callBusy = call.active || incoming || call.state == "ending")
 }
 
 @Composable private fun AppearanceSettings(vm: BeaconViewModel) {

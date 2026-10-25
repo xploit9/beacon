@@ -1,7 +1,10 @@
 package dev.hermes.android.updates
 
 import android.Manifest
-import android.app.*
+import android.app.ActivityManager
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.job.JobInfo
 import android.app.job.JobScheduler
 import android.content.ComponentName
@@ -9,281 +12,329 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
 import android.net.Uri
+import android.provider.Settings
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import dev.hermes.android.BeaconApplication
 import dev.hermes.android.BeaconActivity
+import dev.hermes.android.BeaconApplication
+import dev.hermes.android.BuildConfig
 import dev.hermes.android.R
-import dev.hermes.android.core.*
+import dev.hermes.android.core.Release
+import dev.hermes.android.core.sha256
 import dev.hermes.android.data.BeaconClient
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.io.File
 import java.util.UUID
 
-/** One locally authorized owner/origin; intents carry only a revocable random handle. */
-class UpdateManager(private val app: BeaconApplication) {
+internal enum class UpdatePhase { Idle, Checking, Available, Downloading, NeedsPermission, Installing, Failed }
+
+/** Each failure is one short sentence; [retriesCheck] says whether "Try again" asks GitHub again or repeats the update. */
+internal enum class UpdateFailure(val text: String, val retriesCheck: Boolean = false) {
+    Check("Couldn't check for updates. Check your connection.", true),
+    CheckVerification("The update didn't pass verification.", true),
+    Download("Couldn't download the update. Check your connection."),
+    Verification("The update didn't pass verification."),
+    Install("Android couldn't install the update. Try again."),
+    Call("End your call before updating Beacon."),
+}
+
+/** Shown once, on the first launch after the update this phone asked for. */
+internal data class UpdatedNotice(val name: String, val notes: String)
+
+/**
+ * What the update screen shows. [release] is the newer app release (null when the app is current); [latest] is the newest
+ * verified release either way, because its plugin version is the plugin's target.
+ */
+internal data class AppUpdateUi(
+    val phase: UpdatePhase = UpdatePhase.Idle,
+    val release: Release? = null,
+    val latest: Release? = null,
+    val checkedAt: Long = 0,
+    val downloaded: Long = 0,
+    val failure: UpdateFailure? = null,
+    val plugin: PluginRow = PluginRow(),
+    val updated: UpdatedNotice? = null,
+    val supported: Boolean = true,
+)
+
+/**
+ * Beacon updates itself from the public GitHub latest release, with no Hermes and no sign-in. A newer release posts one
+ * notification; nothing downloads or installs until the user taps Update. When this phone is signed in to a Hermes that runs
+ * the Beacon plugin, the same tap updates the plugin first through Hermes' own updater; a plugin that cannot update never blocks the app.
+ */
+class UpdateManager internal constructor(private val app: BeaconApplication, private val releases: GitHubReleases, private val selfUpdates: Boolean) {
+    // Debug, preview and candidate builds never check, notify or install.
+    constructor(app: BeaconApplication) : this(app, GitHubReleases(userAgent = "Beacon-Android/${BuildConfig.VERSION_NAME}"),
+        app.packageName == "dev.hermes.android" || app.packageName == "dev.hermes.android.stable")
+
     private val prefs = app.getSharedPreferences("android-updates", Context.MODE_PRIVATE)
     private val lock = Any()
     private val updater = ApkUpdater(app)
-    private val automatic = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val notifications get() = app.getSystemService(NotificationManager::class.java)
-    /** Device tests route the saved client through their synthetic transport. */
-    internal var transportForTest: ((okhttp3.OkHttpClient.Builder) -> Unit)? = null
-    private fun source(): UpdateSource? = prefs.getString("id", null)?.let {
-        UpdateSource(prefs.getString("origin", "").orEmpty(), prefs.getString("owner", "").orEmpty(), it)
-    }
-    private fun requireAuthorized(expected: UpdateSource) {
-        require(source() == expected && expected.authorizedBy(app.auth.read(expected.origin))) { "Update authorization changed. Sign in and check again." }
+    private val _state = MutableStateFlow(AppUpdateUi(supported = selfUpdates))
+    internal val state: StateFlow<AppUpdateUi> = _state.asStateFlow()
+    private var job: Job? = null
+    private var checking = false
+    @Volatile private var probe: PluginProbe = PluginProbe.None
+    @Volatile private var pluginResult: PluginRow? = null
+
+    init { migrate(); restore() }
+
+    /** Settles Idle/Available from what is known, so a caller only states what changed. */
+    private fun publish(change: AppUpdateUi.() -> AppUpdateUi) {
+        _state.update { current ->
+            val next = current.change()
+            val row = pluginResult ?: pluginRowFor(probe, next.latest?.pluginVersion.orEmpty())
+            val shown = next.copy(plugin = row)
+            if (shown.phase == UpdatePhase.Idle || shown.phase == UpdatePhase.Available) shown.copy(phase = if (shown.release != null || row.actionable) UpdatePhase.Available else UpdatePhase.Idle) else shown
+        }
     }
 
-    fun autoUpdateEnabled(): Boolean = prefs.getBoolean(AUTO_APP_UPDATES, true)
-
-    fun setAutoUpdateEnabled(enabled: Boolean) {
-        check(prefs.edit().putBoolean(AUTO_APP_UPDATES, enabled).commit()) { "Could not save automatic app updates" }
-        if (enabled) requestAutomaticCheck()
+    private fun fail(failure: UpdateFailure) {
+        // A failed update may have nothing on screen to show it (signed out); the next check posts the notice again.
+        if (!failure.retriesCheck) synchronized(lock) { prefs.edit().remove("notified_version").commit() }
+        publish { copy(phase = UpdatePhase.Failed, failure = failure) }
     }
 
-    fun requestAutomaticCheck() {
-        automatic.launch { runCatching { backgroundCheck() } }
+    /** Updates from Hermes-staged builds (1.1.x) kept bytes and ids this flow never trusts; discard them, the update downloads again from GitHub. */
+    private fun migrate() {
+        if (prefs.getInt(FORMAT, 0) >= FORMAT_VERSION) return
+        prefs.getInt("pending_session_id", -1).takeIf { it >= 0 }?.let { runCatching { app.packageManager.packageInstaller.abandonSession(it) } }
+        File(app.filesDir, "updates").listFiles()?.forEach { it.delete() }
+        notifications.cancel(NOTIFICATION_ID)
+        prefs.edit().clear().putInt(FORMAT, FORMAT_VERSION).commit()
     }
 
-    private fun supportsAutomaticAppUpdates() = app.packageName == "dev.hermes.android" || app.packageName == "dev.hermes.android.stable"
+    /** Local facts only: the last verified release, a retained download, and whether this process was started by an update. */
+    private fun restore() {
+        val installed = runCatching { updater.installedVersion() }.getOrDefault(0L)
+        synchronized(lock) {
+            val pending = prefs.getLong("pending_version", 0)
+            if (pending in 1..installed) {
+                prefs.edit().putString("updated_name", prefs.getString("pending_version_name", "")).putString("updated_notes", prefs.getString("pending_notes", "")).commit()
+                clearPending()
+            }
+        }
+        val latest = Release.decode(prefs.getString("release", null))?.takeIf { it.packageName == app.packageName }
+        val updated = prefs.getString("updated_name", null)?.takeIf(String::isNotBlank)?.let { UpdatedNotice(it, prefs.getString("updated_notes", "").orEmpty()) }
+        publish { copy(latest = latest, release = latest?.takeIf { it.version > installed }, checkedAt = prefs.getLong("last_check", 0), updated = updated) }
+    }
+
     private fun callActive() = app.calls.state.value.active || app.calls.state.value.state == "ending" ||
         app.calls.service != null || app.calls.spec != null || app.push.incoming.value != null
-    private fun canInstallSilently() = silentInstallAllowed(Build.VERSION.SDK_INT, app.packageManager.canRequestPackageInstalls(), callActive(),
-        ActivityManager.RunningAppProcessInfo().also(ActivityManager::getMyMemoryState).importance)
-    private fun unmeteredNetwork(): Boolean {
-        val connectivity = app.getSystemService(ConnectivityManager::class.java) ?: return false
-        val network = connectivity.activeNetwork ?: return false
-        return connectivity.getNetworkCapabilities(network)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == true
-    }
+    private fun onScreen() = beaconVisible(ActivityManager.RunningAppProcessInfo().also(ActivityManager::getMyMemoryState).importance)
+    private fun ensureChannel() = notifications.createNotificationChannel(NotificationChannel(CHANNEL, "Beacon app updates", NotificationManager.IMPORTANCE_DEFAULT))
 
+    /** Called at launch and after a restart; Android defers the periodic job in Doze and while offline. */
     fun schedule(checkNow: Boolean = true) {
-        notifications.createNotificationChannel(NotificationChannel(CHANNEL, "Beacon app updates", NotificationManager.IMPORTANCE_DEFAULT))
-        // Android defers this in Doze and while the private server is unreachable.
+        // Every build lists the category in its notification settings; only stable builds post to it.
+        ensureChannel()
+        if (!selfUpdates) return
         val scheduler = app.getSystemService(JobScheduler::class.java)
         if (scheduler.getPendingJob(JOB_ID) == null) scheduler.schedule(JobInfo.Builder(JOB_ID, ComponentName(app, UpdateCheckJob::class.java))
-            .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY).setPersisted(true).setPeriodic(6 * 60 * 60_000L).build())
-        if (checkNow) requestAutomaticCheck()
+            .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY).setPersisted(true).setPeriodic(UPDATE_CHECK_INTERVAL_MS).build())
+        if (checkNow) scope.launch { runCheck(force = false, visible = false) }
     }
 
-    /** Call only after the UI's successful bootstrap has been saved to AuthStore. */
-    fun authorize(client: BeaconClient) = synchronized(lock) {
-        val auth = client.auth
-        require(auth.owner.isNotBlank() && UpdateSource(auth.origin, auth.owner, "").authorizedBy(app.auth.read(auth.origin))) { "Sign in before enabling update checks" }
-        val previous = source()
-        if (previous?.origin != auth.origin || previous?.owner != auth.owner) {
-            clearAuthorization()
-            check(prefs.edit().putString("origin", auth.origin).putString("owner", auth.owner).putString("id", UUID.randomUUID().toString()).commit())
-        }
-        schedule(checkNow = false)
-    }
+    /** The periodic job. */
+    suspend fun backgroundCheck() { if (selfUpdates) runCheck(force = false, visible = false) }
+    /** Beacon came to the foreground; checks only when the last check is older than 6 hours. */
+    internal fun checkIfDue() { if (selfUpdates) scope.launch { runCheck(force = false, visible = true) } }
+    /** "Check for updates": always asks GitHub. */
+    internal fun checkNow() { if (selfUpdates) scope.launch { runCheck(force = true, visible = true) } }
 
-    /** Local revocation must precede logout/account replacement network requests. */
-    fun clearAuthorization() = synchronized(lock) {
-        val autoUpdates=autoUpdateEnabled()
-        prefs.getInt("pending_session_id",-1).takeIf { it>=0 }?.let { session ->
-            runCatching { app.packageManager.packageInstaller.abandonSession(session) }
-        }
-        prefs.getString("pending_file", null)?.let { name -> runCatching { pendingFile(name).delete() } }
-        check(prefs.edit().clear().putBoolean(AUTO_APP_UPDATES,autoUpdates).commit()) { "Could not revoke update authorization" }
-        notifications.cancel(NOTIFICATION_ID)
-    }
-
-    /** A throttled foreground check; force=true preserves manual retry. */
-    suspend fun check(client: BeaconClient, force: Boolean = false, notify: Boolean = true): Release? {
-        val expected = synchronized(lock) {
-            val current = source() ?: error("Sign in before checking updates")
-            require(current.authorizedBy(client.auth)) { "Update belongs to another owner or server" }
-            current.takeIf { beginCheck(it, force) }
-        } ?: return null
-        val detached=client.detached()
-        return try {
-            val release=checkAuthenticated(detached, expected, notify)
-            if (!force && release!=null) automaticUpdate(detached,expected,release)
-            release
-        } finally { detached.closeNative() }
-    }
-
-    private fun beginCheck(expected: UpdateSource, force: Boolean): Boolean {
-        requireAuthorized(expected)
+    private suspend fun runCheck(force: Boolean, visible: Boolean) {
         val now = System.currentTimeMillis()
-        if (!updateCheckDue(prefs.getLong("last_check", 0), now, force)) return false
-        check(prefs.edit().putLong("last_check", now).commit())
-        return true
-    }
-
-    private fun beginAutomaticCheck(expected: UpdateSource): Boolean {
-        requireAuthorized(expected)
-        val now = System.currentTimeMillis()
-        if (!updateCheckDue(prefs.getLong("last_check", 0), now, false)) return false
-        check(prefs.edit().putLong("last_check", now).commit())
-        return true
-    }
-
-    suspend fun backgroundCheck() {
-        if (!supportsAutomaticAppUpdates()) return
-        val expected = synchronized(lock) {
-            val current = source() ?: return
-            if (!current.authorizedBy(app.auth.read(current.origin))) { clearAuthorization(); return }
-            if (!beginAutomaticCheck(current)) return
-            current
+        synchronized(lock) {
+            if (checking || job?.isActive == true) return
+            if (!updateCheckDue(prefs.getLong("last_check", 0), now, force, prefs.getLong("last_attempt", 0))) return
+            checking = true
+            prefs.edit().putLong("last_attempt", now).commit()
         }
-        val client = savedClient(expected)
+        // An install waiting on Android keeps its own state on screen.
+        if (visible) publish { if (phase == UpdatePhase.Idle || phase == UpdatePhase.Available || phase == UpdatePhase.Failed) copy(phase = UpdatePhase.Checking, failure = null) else this }
         try {
-            val release = checkAuthenticated(client, expected, false) ?: return
-            // With automatic updates off, a newer release is only announced, never downloaded.
-            if (autoUpdateEnabled()) automaticUpdate(client,expected,release)
-            else synchronized(lock) { requireAuthorized(expected); notifyRelease(expected,release) }
-        } finally { client.closeNative() }
+            val installed = updater.installedVersion()
+            // A 304 is only useful while the release it vouches for is still stored.
+            val stored = Release.decode(prefs.getString("release", null))
+            val found = releases.latest(prefs.getString("etag", null)?.takeIf { stored != null })
+            val latest = when (found) {
+                is LatestRelease.NotModified -> stored
+                is LatestRelease.Found -> found.release
+            }
+            val vetted = latest?.let { vet(it) }
+            val release = vetted?.takeIf { it.version > installed }
+            synchronized(lock) {
+                val edit = prefs.edit().putLong("last_check", now)
+                if (found is LatestRelease.Found) {
+                    edit.putString("etag", found.etag.orEmpty())
+                    if (latest != null) edit.putString("release", latest.encode()) else edit.remove("release")
+                }
+                edit.commit()
+            }
+            publish { copy(latest = vetted, release = release, checkedAt = now, failure = null, phase = if (visible && (phase == UpdatePhase.Checking || phase == UpdatePhase.Failed)) UpdatePhase.Idle else phase) }
+            if (release != null) notifyRelease(release)
+            else synchronized(lock) { notifications.cancel(NOTIFICATION_ID); prefs.edit().remove("notification_token").commit() }
+        } catch (error: CancellationException) { throw error }
+        catch (error: Exception) {
+            val network = error is UpdateException && error.kind == UpdateException.Kind.Network
+            if (visible) fail(if (error is UpdateException && !network || error is IllegalArgumentException || error is IllegalStateException) UpdateFailure.CheckVerification else UpdateFailure.Check)
+        } finally { synchronized(lock) { checking = false } }
     }
 
-    private suspend fun automaticUpdate(client: BeaconClient, expected: UpdateSource, release: Release) {
-        if (!autoUpdateEnabled() || !supportsAutomaticAppUpdates()) return
+    /** Fails closed: returns the release for this build, null when it is for another package, and throws when it is not trustworthy. */
+    private fun vet(candidate: Release): Release? {
+        if (candidate.packageName != app.packageName) return null
+        try { newerRelease(candidate, app.packageName, updater.installedVersion(), updater.signer()) }
+        catch (error: IllegalArgumentException) { throw UpdateException(UpdateException.Kind.Verification, error.message.orEmpty(), error) }
         synchronized(lock) {
-            requireAuthorized(expected)
-            if (retainPendingUpdate(hasPendingInstall(), prefs.getLong("pending_version", 0), release.version)) return
+            if (sameCodeDifferentBytes(prefs.getLong("seen_code", 0), prefs.getString("seen_sha", "").orEmpty(), candidate))
+                throw UpdateException(UpdateException.Kind.Verification, "A published Beacon version cannot be replaced with different APK bytes.")
+            if (candidate.version >= prefs.getLong("seen_code", 0)) prefs.edit().putLong("seen_code", candidate.version).putString("seen_sha", candidate.sha).commit()
         }
-        if (!autoUpdateInstallAllowed(autoUpdateEnabled(),unmeteredNetwork(),callActive())) {
-            synchronized(lock) { requireAuthorized(expected); notifyRelease(expected,release) }
-            return
-        }
-        downloadOwned(client,release,expected)
-        if (!canInstallSilently()) postReadyNotification(expected,release.version,release.name)
-        else installPending(automatic=true)
+        return candidate
     }
 
-    private fun savedClient(expected: UpdateSource): BeaconClient = synchronized(lock) {
-        requireAuthorized(expected)
-        BeaconClient(app.auth.read(expected.origin), app.auth, persistContext = false, configureHttp = transportForTest ?: {})
-    }
-
-    private suspend fun checkAuthenticated(client: BeaconClient, expected: UpdateSource, notify: Boolean): Release? {
-        client.bootstrap()
-        if (!expected.authorizedBy(client.auth)) {
-            synchronized(lock) { if (source() == expected) clearAuthorization() }
-            error("Saved Beacon owner changed. Sign in again.")
-        }
-        synchronized(lock) { requireAuthorized(expected) }
-        val release = updater.check(client)
-        synchronized(lock) {
-            requireAuthorized(expected)
-            if (release == null) {
-                notifications.cancel(NOTIFICATION_ID)
-                check(prefs.edit().remove("notification_token").commit())
-            } else if (notify) notifyRelease(expected, release)
-        }
-        return release
-    }
-
-    private fun notifyRelease(expected: UpdateSource, release: Release) {
+    private fun notifyRelease(release: Release) {
         if (!updateNotificationDue(release.version, prefs.getLong("notified_version", 0))) return
-        if (postNotification(expected, release.version, "Beacon ${release.name} update available"))
-            check(prefs.edit().putLong("notified_version", release.version).commit())
+        if (postNotification(release)) prefs.edit().putLong("notified_version", release.version).commit()
     }
 
-    /** FCM wakes a closed app even without tailnet access. Tap rechecks the trusted feed. */
-    fun notifyPush(origin: String, owner: String, versionHint: String?) = synchronized(lock) {
-        val expected = source() ?: return@synchronized
-        if (expected.origin != origin || expected.owner != owner || !expected.authorizedBy(app.auth.read(expected.origin))) return@synchronized
-        if (pushReleaseVersion(versionHint, updater.installedVersion(), prefs.getLong("notified_version", 0)) == null) return@synchronized
-        // Do not persist an unverified hint as notified_version or required download version.
-        postNotification(expected, 0, "Beacon update available")
-        if (autoUpdateEnabled()) requestAutomaticCheck()
-    }
-
-    private fun postNotification(expected: UpdateSource, version: Long, title: String, message: String = "Update Beacon to the latest verified Android release."): Boolean {
+    /** A notification can be shown now: Android 13's permission, notifications on, and the update channel not muted. */
+    private fun canNotify(): Boolean {
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(app, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return false
-        if (!notifications.areNotificationsEnabled() || notifications.getNotificationChannel(CHANNEL)?.importance == NotificationManager.IMPORTANCE_NONE) return false
-        requireAuthorized(expected)
+        ensureChannel()
+        return notifications.areNotificationsEnabled() && notifications.getNotificationChannel(CHANNEL)?.importance != NotificationManager.IMPORTANCE_NONE
+    }
+
+    private fun postNotification(release: Release): Boolean {
+        if (!canNotify()) return false
         val token = UUID.randomUUID().toString().replace("-", "")
         val intent = Intent(app, BeaconActivity::class.java).setData(Uri.parse("hermes://update/$token"))
             .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP).putExtra(EXTRA_TOKEN, token)
         val pending = PendingIntent.getActivity(app, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         // Retain before posting so the immediately actionable handle already resolves.
-        check(prefs.edit().putString("notification_token", token).putLong("notification_version", version).commit())
+        synchronized(lock) { check(prefs.edit().putString("notification_token", token).putLong("notification_version", release.version).commit()) }
         notifications.notify(NOTIFICATION_ID, NotificationCompat.Builder(app, CHANNEL).setSmallIcon(R.drawable.ic_beacon_notification)
-            .setContentTitle(title).setContentText(message)
+            .setContentTitle("Beacon ${release.name} is ready").setContentText("Tap to update.")
             .setContentIntent(pending).addAction(0, "Update", pending).setAutoCancel(true).build())
         return true
     }
 
-    private fun postReadyNotification(expected: UpdateSource, version: Long, name: String) {
-        postNotification(expected, version, "Beacon $name is ready — tap to install", "Tap to finish installing the verified update.")
-    }
-
-    /** Resolves no URL, owner, cookie or version supplied by the caller. */
-    suspend fun downloadNotification(token: String): File? {
-        var retained: File? = null
-        val expected = synchronized(lock) {
-            require(validToken(token) && token == prefs.getString("notification_token", null)) { "This update notification expired. Check for updates in Beacon." }
-            (source() ?: error("Sign in to update Beacon")).also { source ->
-                requireAuthorized(source)
-                val name=prefs.getString("pending_file",null)
-                if (name!=null && prefs.getString("pending_source",null)==source.id &&
-                    prefs.getLong("pending_version",0)>=prefs.getLong("notification_version",0) && hasPendingInstall()) {
-                    retained=pendingFile(name)
-                }
-            }
+    /** The plugin row of the update screen: read what Hermes runs. [absent] is the sign-in's own word that the plugin is not installed. */
+    internal fun refreshPlugin(client: BeaconClient?, absent: Boolean) {
+        scope.launch {
+            if (job?.isActive == true) return@launch
+            pluginResult = null
+            if (client == null || absent || !selfUpdates) { probe = PluginProbe.None; publish { this }; return@launch }
+            probe = PluginProbe.Checking
+            publish { this }
+            val detached = client.detached()
+            try { probe = probePlugin(HermesPluginUpdater(detached)) }
+            finally { detached.closeNative(); if (probe == PluginProbe.Checking) probe = PluginProbe.None; publish { this } }
         }
-        if (retained!=null) return retained
-        val client = savedClient(expected)
-        try {
-            val release = checkAuthenticated(client, expected, false) ?: return null
-            synchronized(lock) {
-                requireAuthorized(expected)
-                require(token == prefs.getString("notification_token", null) && release.version >= prefs.getLong("notification_version", 0)) { "The advertised update changed. Check again." }
-            }
-            return downloadOwned(client, release, expected)
-        } finally { client.closeNative() }
     }
 
-    suspend fun download(client: BeaconClient, release: Release): File {
-        val expected = synchronized(lock) {
-            (source() ?: error("Sign in before downloading updates")).also {
-                requireAuthorized(it)
-                require(it.authorizedBy(client.auth)) { "Update belongs to another owner or server" }
-            }
-        }
-        val detached=client.detached()
-        return try { downloadOwned(detached, release, expected) } finally { detached.closeNative() }
-    }
-
-    private suspend fun downloadOwned(client: BeaconClient, release: Release, expected: UpdateSource): File {
+    /** The Update button: plugin first when Hermes has one to update, then download, check and hand the app to Android. */
+    internal fun startUpdate(client: BeaconClient?, pluginAbsent: Boolean = false) {
+        if (!selfUpdates) return
+        val detached = client?.detached()
         synchronized(lock) {
-            requireAuthorized(expected)
-            if (retainPendingUpdate(hasPendingInstall(), prefs.getLong("pending_version", 0), release.version)) {
-                return pendingFile(requireNotNull(prefs.getString("pending_file", null)))
-            }
+            if (job?.isActive == true) { detached?.closeNative(); return }
+            pluginResult = null
+            job = scope.launch { try { runUpdate(detached, pluginAbsent) } finally { detached?.closeNative() } }
         }
-        val file = updater.download(client, release)
+    }
+
+    /** A notification tap: only the notification this phone posted last may start an update. */
+    internal fun updateFromNotification(token: String, client: BeaconClient?) {
+        val ours = synchronized(lock) { validUpdateToken(token) && token == prefs.getString("notification_token", null) }
+        if (!ours) { checkNow(); return }
+        updateNow(client)
+    }
+
+    private fun updateNow(client: BeaconClient?) {
+        scope.launch {
+            if (_state.value.release == null) runCheck(force = true, visible = true)
+            startUpdate(client)
+        }
+    }
+
+    internal fun cancel() { job?.cancel() }
+
+    /** A verified download is waiting for the user's Update, or for Android's prompt. */
+    fun hasPendingInstall(): Boolean = synchronized(lock) {
+        val name = prefs.getString("pending_file", null) ?: return false
+        runCatching { pendingFile(name).isFile }.getOrDefault(false)
+    }
+
+    /** Beacon is back on screen: finish an install that waited for Android's permission, or check if due. */
+    internal fun resume() {
+        // Android may restart Beacon when the permission changes, so the waiting install is kept on disk, not only in state.
+        val waiting = _state.value.phase == UpdatePhase.NeedsPermission || prefs.getBoolean("install_after_permission", false)
+        if (waiting && app.packageManager.canRequestPackageInstalls()) {
+            synchronized(lock) { prefs.edit().remove("install_after_permission").commit() }
+            updateNow(null)
+        } else checkIfDue()
+    }
+
+    /** "Review changes" accepted: runs the plugin update once more with the owner's consent. */
+    internal fun reviewPlugin(client: BeaconClient?) {
+        val detached = client?.detached() ?: return
+        scope.launch { try { pluginStep(detached, accept = true) } finally { detached.closeNative() } }
+    }
+
+    internal fun dismissUpdated() {
+        synchronized(lock) { prefs.edit().remove("updated_name").remove("updated_notes").commit() }
+        publish { copy(updated = null) }
+    }
+
+    private suspend fun runUpdate(client: BeaconClient?, pluginAbsent: Boolean) {
+        if (callActive()) return fail(UpdateFailure.Call)
+        // Coming back from Android's permission page the verified file is already here: no download to show.
+        if (_state.value.phase != UpdatePhase.NeedsPermission) publish { copy(phase = UpdatePhase.Downloading, downloaded = 0, failure = null) }
         try {
-            synchronized(lock) {
-                requireAuthorized(expected)
-                prefs.getInt("pending_session_id", -1).takeIf { it >= 0 }?.let { session ->
-                    try { app.packageManager.packageInstaller.abandonSession(session) }
-                    catch (_: IllegalArgumentException) { /* Android already removed this session. */ }
-                }
-                val previous = prefs.getString("pending_file", null)?.takeIf { it != file.name }?.let(::pendingFile)
-                check(prefs.edit().putString("pending_file", file.name).putString("pending_source", expected.id)
-                    .putString("pending_sha", release.sha).putLong("pending_size", release.size).putLong("pending_version", release.version)
-                    .putString("pending_version_name",release.name)
-                    .remove("pending_session_id").putBoolean("continue_install", true).putBoolean("awaiting_permission", false).commit())
-                previous?.delete()
-                notifications.cancel(NOTIFICATION_ID)
+            if (client != null && !pluginAbsent && selfUpdates) {
+                probe = probePlugin(HermesPluginUpdater(client))
+                publish { this }
+                if (_state.value.plugin.status == PluginStatus.Available) pluginStep(client, accept = false)
             }
-        } catch (e: Throwable) { file.delete(); throw e }
-        return file
+            val release = _state.value.release
+            if (release == null) { publish { copy(phase = UpdatePhase.Idle) }; return }
+            install(pendingFor(release) ?: download(release))
+        } catch (error: CancellationException) {
+            publish { copy(phase = UpdatePhase.Idle, downloaded = 0) }
+            throw error
+        } catch (error: UpdateException) {
+            fail(if (error.kind == UpdateException.Kind.Verification) UpdateFailure.Verification else UpdateFailure.Download)
+        } catch (error: Exception) {
+            fail(UpdateFailure.Download)
+        }
+    }
+
+    /** Hermes' own updater; whatever it answers lands on the plugin row, and the app update goes on. */
+    private suspend fun pluginStep(client: BeaconClient, accept: Boolean) {
+        val target = _state.value.latest?.pluginVersion.orEmpty()
+        pluginResult = PluginRow(PluginStatus.Updating, _state.value.plugin.installed, target)
+        publish { this }
+        val row = runPluginUpdate(HermesPluginUpdater(client), target, accept)
+        pluginResult = row.takeIf { it.status != PluginStatus.Hidden }
+        if (row.status == PluginStatus.Hidden) probe = PluginProbe.None
+        publish { this }
     }
 
     private fun pendingFile(name: String): File {
@@ -293,155 +344,118 @@ class UpdateManager(private val app: BeaconApplication) {
         }
     }
 
-    fun hasPendingInstall(): Boolean = synchronized(lock) {
-        val expected = source() ?: return false
-        runCatching {
-            requireAuthorized(expected)
-            if (prefs.contains("pending_file") && prefs.getLong("pending_version", 0) <= updater.installedVersion()) { clearPending(); return false }
-            prefs.getString("pending_source", null) == expected.id && prefs.getString("pending_file", null)?.let { pendingFile(it).isFile } == true
-        }.getOrDefault(false)
-    }
-
     private fun clearPending() {
         val obsolete = prefs.getString("pending_file", null)?.let { runCatching { pendingFile(it) }.getOrNull() }
-        check(prefs.edit().remove("pending_file").remove("pending_source").remove("pending_sha").remove("pending_size").remove("pending_version")
-            .remove("pending_version_name").remove("pending_session_id")
-            .remove("awaiting_permission").remove("continue_install").commit())
+        prefs.edit().remove("pending_file").remove("pending_sha").remove("pending_size").remove("pending_version")
+            .remove("pending_version_name").remove("pending_notes").remove("pending_session_id").remove("install_after_permission").commit()
         obsolete?.delete()
     }
 
-    fun awaitingInstallPermission(): Boolean = synchronized(lock) {
-        prefs.getBoolean("awaiting_permission", false) && hasPendingInstall()
+    /** A verified download kept from an earlier tap (a cancelled Android prompt, or a permission detour), if it is still exactly this release. */
+    private fun pendingFor(release: Release): File? = synchronized(lock) {
+        val name = prefs.getString("pending_file", null) ?: return null
+        val file = runCatching { pendingFile(name) }.getOrNull()
+        if (file != null && file.isFile && prefs.getLong("pending_version", 0) == release.version && file.length() == release.size && sha256(file).equals(release.sha, true)) file
+        else { clearPending(); null }
     }
 
-    fun shouldContinueInstall(): Boolean = synchronized(lock) {
-        prefs.getBoolean("continue_install", false) && hasPendingInstall()
-    }
-
-    /** Run again after Android settings returns; automatic sessions ask Android to skip its prompt when allowed. */
-    suspend fun installPending(automatic: Boolean = false): Boolean = withContext(Dispatchers.IO) {
-        synchronized(lock) {
-            val session = prefs.getInt("pending_session_id",-1)
-            if (session>=0) {
-                if (automatic) return@withContext true
-                // A manual tap replaces a leftover silent session with Android's installer.
-                runCatching { app.packageManager.packageInstaller.abandonSession(session) }
-                check(prefs.edit().remove("pending_session_id").commit())
-            }
-        }
-        val pending = synchronized(lock) {
-            val expected = source() ?: error("Sign in and download the update again")
-            requireAuthorized(expected)
-            require(prefs.getString("pending_source", null) == expected.id) { "Update authorization changed" }
-            if (prefs.getLong("pending_version", 0) <= updater.installedVersion()) { clearPending(); error("Beacon is already up to date") }
-            val file = pendingFile(prefs.getString("pending_file", null) ?: error("Download and verify an update first"))
-            val size = prefs.getLong("pending_size", 0)
-            Triple(expected, file, Triple(size,prefs.getString("pending_sha", "").orEmpty(),prefs.getString("pending_version_name","").orEmpty()))
-        }
-        val (expected, file, bytes) = pending
+    private suspend fun download(release: Release): File {
+        val dir = File(app.filesDir, "updates").apply { mkdirs() }
+        prunePartialUpdates(dir)
+        val part = File(dir, "${UUID.randomUUID()}.part")
+        var lastPublished = 0L
         try {
-            require(bytes.first in 1..256L * 1024 * 1024 && file.length() == bytes.first && sha256(file).equals(bytes.second, true)) { "The retained update changed. Tap Update to download and verify it again." }
-            updater.validateInstall(file)
-        } catch (e: Exception) {
-            synchronized(lock) { if (source() == expected && prefs.getString("pending_file", null) == file.name) { clearPending(); file.delete() } }
-            throw e
-        }
-        val coroutine = currentCoroutineContext()
-        if (automatic && (!autoUpdateEnabled() || !canInstallSilently())) {
-            postReadyNotification(expected,prefs.getLong("pending_version",0),bytes.third)
-            return@withContext false
-        }
-        if (callActive()) error("Finish your call before installing the update.")
-        coroutine.ensureActive()
-        if (automatic) {
-            var stored = -1
-            try {
-                updater.installWithoutUserAction(file,::installResultPendingIntent) { sessionId ->
-                    synchronized(lock) {
-                        require(prefs.getInt("pending_session_id",-1)<0) { "An app update is already being installed." }
-                        requireAuthorized(expected)
-                        require(prefs.getString("pending_file",null)==file.name && prefs.getString("pending_sha",null)==bytes.second) { "The pending update changed. Try again." }
-                        require(canInstallSilently() && autoUpdateEnabled()) { "The automatic update is paused. Finish your call or turn automatic updates back on." }
-                        check(prefs.edit().putInt("pending_session_id",sessionId).putBoolean("awaiting_permission",false).putBoolean("continue_install",false).commit())
-                        stored = sessionId
-                    }
-                }
-            } catch (error: Throwable) {
-                // Only this attempt's session id; another attempt's stays tracked.
-                synchronized(lock) { if (stored>=0 && prefs.getInt("pending_session_id",-1)==stored) prefs.edit().remove("pending_session_id").commit() }
-                if (!canInstallSilently() || !autoUpdateEnabled()) postReadyNotification(expected,prefs.getLong("pending_version",0),bytes.third)
-                throw error
+            releases.download(release, part) { bytes ->
+                val now = System.currentTimeMillis()
+                if (bytes == release.size || now - lastPublished >= 120) { lastPublished = now; _state.update { it.copy(downloaded = bytes) } }
             }
-            return@withContext true
+            updater.verifyDownloaded(part, release)
+            currentCoroutineContext().ensureActive()
+            val artifact = File(dir, "Beacon-${release.version}-${release.sha.take(16)}.apk")
+            artifact.delete()
+            check(part.renameTo(artifact)) { "Could not retain the verified update" }
+            synchronized(lock) {
+                dir.listFiles()?.filter { it.isFile && it.name.endsWith(".apk") && it != artifact }?.forEach { it.delete() }
+                check(prefs.edit().putString("pending_file", artifact.name).putString("pending_sha", release.sha).putLong("pending_size", release.size)
+                    .putLong("pending_version", release.version).putString("pending_version_name", release.name).putString("pending_notes", release.notes)
+                    .remove("pending_session_id").commit())
+            }
+            return artifact
+        } finally { part.delete() }
+    }
+
+    private fun install(file: File) {
+        if (callActive()) return fail(UpdateFailure.Call)
+        if (!app.packageManager.canRequestPackageInstalls()) {
+            synchronized(lock) { prefs.edit().putBoolean("install_after_permission", true).commit() }
+            publish { copy(phase = UpdatePhase.NeedsPermission, failure = null) }
+            // Signed out there is no update page with Allow; the tap that started this opens Android's page, and resume() installs on return.
+            // Off screen it cannot open, so the notice comes back and its tap reuses the verified download.
+            if (onScreen()) runCatching { app.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${app.packageName}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+            else _state.value.release?.let(::postNotification)
+            return
         }
-        synchronized(lock) {
-            requireAuthorized(expected)
-            require(prefs.getString("pending_file", null) == file.name && prefs.getString("pending_sha", null) == bytes.second) { "The pending update changed. Try again." }
-            // Consume continuation before leaving this process for Android confirmation.
-            val needsPermission = !app.packageManager.canRequestPackageInstalls()
-            check(prefs.edit().putBoolean("awaiting_permission", needsPermission).putBoolean("continue_install", needsPermission).commit())
-            updater.launchInstaller(file)
+        publish { copy(phase = UpdatePhase.Installing, failure = null) }
+        try {
+            updater.installSession(file, ::resultIntent) { id -> synchronized(lock) { prefs.edit().putInt("pending_session_id", id).commit() } }
+        } catch (error: IllegalArgumentException) {
+            synchronized(lock) { clearPending() }
+            fail(UpdateFailure.Verification)
+        } catch (error: Exception) {
+            synchronized(lock) { prefs.edit().remove("pending_session_id").commit() }
+            fail(UpdateFailure.Install)
         }
     }
 
-    private fun installResultPendingIntent(sessionId: Int): PendingIntent {
-        val intent=Intent(app,UpdateInstallReceiver::class.java).setAction(ACTION_INSTALL_RESULT).putExtra(EXTRA_SESSION_ID,sessionId)
-        return PendingIntent.getBroadcast(app,sessionId,intent,PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE)
+    private fun resultIntent(sessionId: Int): PendingIntent {
+        val intent = Intent(app, UpdateInstallReceiver::class.java).setAction(ACTION_INSTALL_RESULT)
+        return PendingIntent.getBroadcast(app, sessionId, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE)
     }
 
+    /** Android's answer to the install session: its confirmation prompt, the user's yes or no, or a failure. */
     internal fun handleInstallResult(result: Intent) {
-        val sessionId=result.getIntExtra(PackageInstaller.EXTRA_SESSION_ID,-1)
-        val expected=synchronized(lock) {
-            if (sessionId<0 || prefs.getInt("pending_session_id",-1)!=sessionId) return
-            val current=source() ?: return
-            if (runCatching { requireAuthorized(current) }.isFailure) return
-            current
-        }
-        when (result.getIntExtra(PackageInstaller.EXTRA_STATUS,PackageInstaller.STATUS_FAILURE)) {
-            PackageInstaller.STATUS_SUCCESS -> synchronized(lock) {
-                if (prefs.getInt("pending_session_id",-1)==sessionId) clearPending()
-                notifications.cancel(NOTIFICATION_ID)
-            }
+        val sessionId = result.getIntExtra(PackageInstaller.EXTRA_SESSION_ID, -1)
+        synchronized(lock) { if (sessionId < 0 || prefs.getInt("pending_session_id", -1) != sessionId) return }
+        fun forgetSession() = synchronized(lock) { prefs.edit().remove("pending_session_id").commit() }
+        fun giveUp(failure: UpdateFailure) { runCatching { app.packageManager.packageInstaller.abandonSession(sessionId) }; forgetSession(); fail(failure) }
+        when (result.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)) {
+            PackageInstaller.STATUS_SUCCESS -> { notifications.cancel(NOTIFICATION_ID); restore() }
             PackageInstaller.STATUS_PENDING_USER_ACTION -> {
-                val prompt=installPrompt(result)
-                if (callActive() || prompt==null) {
-                    runCatching { app.packageManager.packageInstaller.abandonSession(sessionId) }
-                    synchronized(lock) { prefs.edit().remove("pending_session_id").commit() }
-                    postReadyNotification(expected,prefs.getLong("pending_version",0),prefs.getString("pending_version_name","").orEmpty())
-                } else postInstallerPrompt(expected,sessionId,prompt,prefs.getString("pending_version_name","").orEmpty())
+                val prompt = installPrompt(result)
+                when {
+                    prompt == null -> giveUp(UpdateFailure.Install)
+                    callActive() -> giveUp(UpdateFailure.Call)
+                    onScreen() -> app.startActivity(prompt.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                    // In the background with notifications off nothing can show Android's prompt; do not wait on "Installing…".
+                    canNotify() -> postInstallerPrompt(sessionId, prompt)
+                    else -> giveUp(UpdateFailure.Install)
+                }
             }
-            else -> {
-                synchronized(lock) { prefs.edit().remove("pending_session_id").commit() }
-                postReadyNotification(expected,prefs.getLong("pending_version",0),prefs.getString("pending_version_name","").orEmpty())
-            }
+            // The user said no in Android's prompt: the verified file stays, Update offers it again.
+            PackageInstaller.STATUS_FAILURE_ABORTED -> { forgetSession(); publish { copy(phase = UpdatePhase.Idle) } }
+            else -> { forgetSession(); fail(UpdateFailure.Install) }
         }
     }
 
     @Suppress("DEPRECATION")
     private fun installPrompt(result: Intent): Intent? = if (Build.VERSION.SDK_INT >= 33)
-        result.getParcelableExtra(Intent.EXTRA_INTENT,Intent::class.java) else result.getParcelableExtra(Intent.EXTRA_INTENT)
+        result.getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java) else result.getParcelableExtra(Intent.EXTRA_INTENT)
 
-    private fun postInstallerPrompt(expected: UpdateSource,sessionId: Int,prompt: Intent,name: String) {
-        if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(app,Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED) return
-        if (!notifications.areNotificationsEnabled() || notifications.getNotificationChannel(CHANNEL)?.importance==NotificationManager.IMPORTANCE_NONE) return
-        requireAuthorized(expected)
-        val pending=PendingIntent.getActivity(app,sessionId,prompt.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        notifications.notify(NOTIFICATION_ID,NotificationCompat.Builder(app,CHANNEL).setSmallIcon(R.drawable.ic_beacon_notification)
-            .setContentTitle("Beacon $name is ready — tap to install").setContentText("Tap to confirm the update in Android.")
-            .setContentIntent(pending).addAction(0,"Install",pending).setAutoCancel(true).build())
+    private fun postInstallerPrompt(sessionId: Int, prompt: Intent) {
+        val pending = PendingIntent.getActivity(app, sessionId, prompt.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        notifications.notify(NOTIFICATION_ID, NotificationCompat.Builder(app, CHANNEL).setSmallIcon(R.drawable.ic_beacon_notification)
+            .setContentTitle("Beacon ${prefs.getString("pending_version_name", "").orEmpty()} is ready").setContentText("Tap to confirm the update in Android.")
+            .setContentIntent(pending).addAction(0, "Install", pending).setAutoCancel(true).build())
     }
 
     companion object {
         const val EXTRA_TOKEN = "update_token"
-        const val EXTRA_SESSION_ID = "update_session_id"
         const val CHANNEL = "hermes-updates"
         const val ACTION_INSTALL_RESULT = "dev.hermes.android.updates.INSTALL_RESULT"
-        private const val AUTO_APP_UPDATES = "auto_app_updates"
         private const val JOB_ID = 4202
         private const val NOTIFICATION_ID = 4202
+        private const val FORMAT = "format"
+        private const val FORMAT_VERSION = 2
         fun validToken(token: String): Boolean = validUpdateToken(token)
     }
 }
-
-internal fun retainPendingUpdate(pendingFileExists: Boolean, pendingVersion: Long, releaseVersion: Long): Boolean =
-    pendingFileExists && pendingVersion >= releaseVersion

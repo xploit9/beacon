@@ -21,7 +21,6 @@ fun notificationFallback(kind: String): Pair<String, String> = when (kind) {
     "task_result" -> "Beacon · Task update" to "A task has an update. Open Beacon to review it."
     "test" -> "Beacon · Notification test" to "Your notification test reached this device."
     "incoming_call" -> "Beacon · Callback" to "A Beacon callback is available. Open Beacon to view its history."
-    "release" -> "Beacon · App update" to "An app update is available."
     else -> "Beacon · Activity" to "Activity is available. Open Beacon to view it."
 }
 fun boundedNotificationText(value: String, limit: Int, preserveWhitespace:Boolean=false): String {
@@ -64,7 +63,7 @@ suspend fun refreshNotificationPreview(context: Context, source: String, event: 
     fun active(id: Int) = manager.activeNotifications.firstOrNull { it.tag == tag && it.id == id }
     if ((!ongoingNativeKind(kind) && kind != "task_result" && active(1) == null) || !app.push.permitsIncoming(source)) return
     val binding = app.push.binding(source) ?: return
-    val scope = Scope(trustedOrigin(binding.getString("origin")), binding.getString("owner"), binding.getString("profile"))
+    val scope = Scope(trustedOrigin(binding.getString("origin")), binding.getString("owner"), binding.getString("profile"), nativeProvider = binding.string("native_provider"))
     fun authorized() = app.push.binding(source)?.toString() == binding.toString() && app.auth.read(scope.origin).authorizesPushSource(scope)
     if (!authorized()) return
     val client = app.push.clientFor(binding)
@@ -115,7 +114,7 @@ private suspend fun sendEmailFeedback(context: Context, source: String, event: S
     val app = context.applicationContext as BeaconApplication
     if (!app.push.permitsIncoming(source)) return
     val binding = app.push.binding(source) ?: return
-    val scope = Scope(trustedOrigin(binding.getString("origin")), binding.getString("owner"), binding.getString("profile"))
+    val scope = Scope(trustedOrigin(binding.getString("origin")), binding.getString("owner"), binding.getString("profile"), nativeProvider = binding.string("native_provider"))
     fun authorized() = app.push.binding(source)?.toString() == binding.toString() && app.auth.read(scope.origin).authorizesPushSource(scope)
     if (!authorized()) return
     val client = app.push.clientFor(binding)

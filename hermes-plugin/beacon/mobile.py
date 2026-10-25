@@ -7,15 +7,13 @@ import math
 import os
 from pathlib import Path
 import re
-import secrets
 import sqlite3
 import subprocess
 import threading
 import time
 import uuid
 import weakref
-from datetime import datetime, timezone
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlsplit
 
 LOCK = threading.RLock()
 PUSH_LOCK = threading.Lock()
@@ -30,18 +28,12 @@ HISTORY_RETENTION_DAYS = (0,30,90,365)
 HISTORY_RETENTION_EVENTS_PER_BATCH = 1000
 HISTORY_RETENTION_CALLS_PER_BATCH = 100
 AUTO_UPDATE_INTERVAL_SECONDS = 6 * 60 * 60
-PAIRING_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
-PAIRING_CODE_LENGTH = 6
-PAIRING_TTL_SECONDS = 600
-PAIRING_TICKET_TTL_SECONDS = 900
-PAIRING_ATTEMPT_WINDOW_SECONDS = 600
-PAIRING_MAX_CLIENT_ATTEMPTS = 5
-PAIRING_MAX_GLOBAL_ATTEMPTS = 20
-PAIRING_CODE_ERROR = "That code didn't work. Make a new one on your PC."
-PAIRING_RATE_LIMIT_ERROR = 'Too many pairing attempts. Try again later.'
+AUTO_UPDATE_RESULTS = frozenset({'checking','up_to_date','app_staged','plugin_updated','plugin_update_available','restart_required','error'})
+MAX_DEVICES = 32
+DEVICE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 
 
-class PairingRateLimitError(ValueError):
+class DeviceLimitError(ValueError):
     pass
 
 def _yaml_settings():
@@ -119,7 +111,7 @@ def claim_owner(owner,provider):
         created=conn.execute('INSERT OR IGNORE INTO meta(key,value) VALUES(?,?)',('owner_claim',value)).rowcount==1
     return created
 
-def register_assistant_conversation(owner,provider,profile,session_id,native_verify):
+def register_assistant_conversation(owner,provider,profile,session_id,native_verify,provisional=False):
     if (not _valid_owner_identity(owner,provider) or not isinstance(profile,str) or not 1<=len(profile)<=80
             or any(ord(c)<32 or ord(c)==127 for c in profile)
             or not isinstance(session_id,str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,256}',session_id)):
@@ -129,6 +121,8 @@ def register_assistant_conversation(owner,provider,profile,session_id,native_ver
             configured.get('owner_id')!=owner or configured.get('owner_provider')!=provider):
         return False
     with LOCK,connect() as conn:
+        # The cron process saves a delivery chat here too; read and write under one write lock so neither loses the other's.
+        conn.execute('BEGIN IMMEDIATE')
         row=conn.execute("SELECT value FROM meta WHERE key='owner_claim'").fetchone()
         try: claim=json.loads(row['value']) if row else {'owner_id':owner,'owner_provider':provider}
         except (TypeError,ValueError): return False
@@ -140,13 +134,20 @@ def register_assistant_conversation(owner,provider,profile,session_id,native_ver
         if not isinstance(conversations,dict) or len(conversations)>64: return False
         if profile not in conversations and len(conversations)>=64: return False
         stored=conversations.get(profile)
-        if isinstance(stored,str) and stored:
+        drafts=claim.get('provisional_conversations')
+        if not isinstance(drafts,dict): drafts={}
+        # A chat made only to hold scheduled results gives way to the owner's own saved Beacon chat.
+        if isinstance(stored,str) and stored and (provisional or drafts.get(profile)!=stored):
             if stored==session_id: return stored
             try: native_verify(owner,provider,profile,stored)
             except LookupError: pass
             else: return stored
         conversations[profile]=session_id
         claim['scheduled_callback_conversations']=conversations
+        if provisional: drafts[profile]=session_id
+        else: drafts.pop(profile,None)
+        if drafts: claim['provisional_conversations']=drafts
+        else: claim.pop('provisional_conversations',None)
         value=json.dumps(claim,separators=(',',':'))
         if len(value)>32768: return False
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('owner_claim',?)",(value,))
@@ -207,9 +208,7 @@ def _initialize_schema(conn):
     CREATE TABLE IF NOT EXISTS timeline(call_id TEXT,event_id TEXT,digest TEXT,payload TEXT,PRIMARY KEY(call_id,event_id));
     CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,call_id TEXT,owner TEXT,profile TEXT,stored TEXT,runtime TEXT,request TEXT,title TEXT,callback INTEGER,epoch TEXT,seq INTEGER,status TEXT DEFAULT 'watching',UNIQUE(owner,profile,request));
     CREATE TABLE IF NOT EXISTS targets(id TEXT PRIMARY KEY,owner TEXT,profile TEXT,token TEXT,expires REAL,payload TEXT);
-    CREATE TABLE IF NOT EXISTS device_pairings(device_id TEXT PRIMARY KEY,owner TEXT NOT NULL,profile TEXT NOT NULL,name TEXT NOT NULL,dashboard_url TEXT NOT NULL,dashboard_name TEXT NOT NULL,code_hash TEXT NOT NULL,code_expires REAL NOT NULL,ticket_hash TEXT,ticket_expires REAL,redeemed_at REAL,linked_at REAL,created REAL NOT NULL);
     CREATE TABLE IF NOT EXISTS beacon_devices(id TEXT PRIMARY KEY,owner TEXT NOT NULL,provider TEXT NOT NULL,profile TEXT NOT NULL,name TEXT NOT NULL,created REAL NOT NULL,last_seen REAL NOT NULL,removed INTEGER NOT NULL DEFAULT 0);
-    CREATE TABLE IF NOT EXISTS pairing_attempts(id INTEGER PRIMARY KEY,client_hash TEXT NOT NULL,attempted REAL NOT NULL);
     CREATE TABLE IF NOT EXISTS deferred(id TEXT PRIMARY KEY,owner TEXT,profile TEXT,conversation TEXT,created REAL);
     CREATE TABLE IF NOT EXISTS notices(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE,owner TEXT,profile TEXT,kind TEXT,conversation TEXT,created REAL,expires REAL,state TEXT DEFAULT 'pending',call_id TEXT,push TEXT DEFAULT 'pending');
     CREATE TABLE IF NOT EXISTS notice_deliveries(event TEXT REFERENCES notices(id) ON DELETE CASCADE,target TEXT REFERENCES targets(id) ON DELETE CASCADE,accepted REAL DEFAULT 0,attempts INTEGER DEFAULT 0,next_attempt REAL DEFAULT 0,last_error TEXT DEFAULT '',PRIMARY KEY(event,target));
@@ -223,9 +222,7 @@ def _initialize_schema(conn):
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS owned_voice_calls ON calls(owner,profile,conversation,created DESC)')
     conn.execute('CREATE INDEX IF NOT EXISTS owned_call_log ON call_log(owner,profile,created DESC)')
-    conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS device_pairing_code_hash ON device_pairings(code_hash)')
     conn.execute('CREATE INDEX IF NOT EXISTS owned_beacon_devices ON beacon_devices(owner,profile,removed,last_seen DESC)')
-    conn.execute('CREATE INDEX IF NOT EXISTS pairing_attempt_window ON pairing_attempts(attempted,client_hash)')
     conn.execute("CREATE INDEX IF NOT EXISTS transcript_versions ON timeline(call_id,json_extract(payload,'$.type'),json_extract(payload,'$.role'),json_extract(payload,'$.turn_id'),json_extract(payload,'$.final'),json_extract(payload,'$.at_ms'))")
     call_columns={r[1] for r in conn.execute('PRAGMA table_info(calls)')}
     if 'voice_config' not in call_columns: conn.execute("ALTER TABLE calls ADD COLUMN voice_config TEXT NOT NULL DEFAULT '{}'")
@@ -320,7 +317,7 @@ def dashboard_connect_info():
         raise ValueError('A configured public HTTPS dashboard URL is required to connect a phone.') from None
 
 
-def _pairing_name(value, default='Beacon phone'):
+def _device_name(value, default='Beacon phone'):
     if value is None:
         value = default
     if (not isinstance(value, str) or not (value := value.strip()) or len(value) > 80
@@ -329,114 +326,26 @@ def _pairing_name(value, default='Beacon phone'):
     return value
 
 
-def _pairing_code(value):
-    if not isinstance(value, str):
-        return None
-    value = value.strip().upper()
-    if len(value) == PAIRING_CODE_LENGTH + 1 and value[3:4] == '-':
-        value = value[:3] + value[4:]
-    return value if len(value) == PAIRING_CODE_LENGTH and all(char in PAIRING_ALPHABET for char in value) else None
-
-
-def _pairing_code_hash(value):
-    return hashlib.sha256(b'beacon-pairing-v1:' + value.encode('ascii')).hexdigest()
-
-
-def format_pairing_code(value):
-    return value[:3] + '-' + value[3:]
-
-
-def mint_device_pairing(owner, profile, name, dashboard_url, dashboard_name):
-    # owner '' is a code made on the Hermes computer before anyone signed in; Beacon's owner links it once bound.
-    if (not isinstance(owner, str) or len(owner) > 256 or any(ord(c) < 32 for c in owner)
-            or not isinstance(profile, str) or not 1 <= len(profile) <= 80
-            or any(ord(c) < 32 or ord(c) == 127 for c in profile)):
-        raise ValueError('An owned profile is required')
-    name = _pairing_name(name)
-    dashboard_name = _pairing_name(dashboard_name, 'Hermes')
-    if not isinstance(dashboard_url, str) or not dashboard_url.startswith('https://'):
-        raise ValueError('A configured public HTTPS dashboard URL is required to connect a phone.')
+def link_device(owner, provider, name, device_id=None):
+    """Creates the owner's phone record, or refreshes the named one when it is theirs and not removed. The caller's
+    Hermes sign-in is the only credential; a removed or foreign ID is never reused."""
+    name = _device_name(name)
+    if device_id is not None and (not isinstance(device_id, str) or not DEVICE_ID.fullmatch(device_id)):
+        raise ValueError('Invalid device id')
     now = time.time()
-    device_id = uuid.uuid4().hex
-    expires = now + PAIRING_TTL_SECONDS
     with LOCK, connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
-        conn.execute('DELETE FROM device_pairings WHERE linked_at IS NOT NULL OR (code_expires<=? AND (ticket_expires IS NULL OR ticket_expires<=?))', (now, now))
-        for _ in range(8):
-            code = ''.join(secrets.choice(PAIRING_ALPHABET) for _ in range(PAIRING_CODE_LENGTH))
-            code_hash = _pairing_code_hash(code)
-            if not conn.execute('SELECT 1 FROM device_pairings WHERE code_hash=?', (code_hash,)).fetchone():
-                break
-        else:
-            raise RuntimeError('Could not create a unique pairing code')
-        conn.execute('INSERT INTO device_pairings(device_id,owner,profile,name,dashboard_url,dashboard_name,code_hash,code_expires,created) VALUES(?,?,?,?,?,?,?,?,?)',
-                     (device_id, owner, profile, name, dashboard_url, dashboard_name, code_hash, expires, now))
-    formatted = format_pairing_code(code)
-    return {'device_id': device_id, 'code': formatted,
-            'expires_at': datetime.fromtimestamp(expires, timezone.utc).isoformat().replace('+00:00', 'Z'),
-            'dashboard_url': dashboard_url,
-            'qr_link': 'beacon://connect?' + urlencode({'url': dashboard_url, 'name': dashboard_name, 'code': formatted})}
-
-
-def redeem_device_pairing(code, device_name, client_host):
-    name = _pairing_name(device_name) if device_name is not None else None
-    normalized = _pairing_code(code)
-    digest = _pairing_code_hash(normalized or 'A' * PAIRING_CODE_LENGTH)
-    client_hash = hashlib.sha256(str(client_host or 'unknown').encode('utf-8', 'replace')[:512]).hexdigest()
-    now = time.time()
-    result = None
-    failure = None
-    with LOCK, connect() as conn:
-        conn.execute('BEGIN IMMEDIATE')
-        conn.execute('DELETE FROM pairing_attempts WHERE attempted<=?', (now - PAIRING_ATTEMPT_WINDOW_SECONDS,))
-        client_attempts = conn.execute('SELECT COUNT(*) FROM pairing_attempts WHERE client_hash=?', (client_hash,)).fetchone()[0]
-        global_attempts = conn.execute('SELECT COUNT(*) FROM pairing_attempts').fetchone()[0]
-        row = conn.execute('SELECT * FROM device_pairings WHERE code_hash=?', (digest,)).fetchone()
-        stored_hash = row['code_hash'] if row else '0' * 64
-        code_matches = bool(normalized) and hmac.compare_digest(digest, stored_hash)
-        if client_attempts >= PAIRING_MAX_CLIENT_ATTEMPTS or global_attempts >= PAIRING_MAX_GLOBAL_ATTEMPTS:
-            failure = PairingRateLimitError(PAIRING_RATE_LIMIT_ERROR)
-        elif not code_matches or row['code_expires'] <= now or row['redeemed_at'] is not None:
-            conn.execute('INSERT INTO pairing_attempts(client_hash,attempted) VALUES(?,?)', (client_hash, now))
-            failure = ValueError(PAIRING_CODE_ERROR)
-        else:
-            ticket = secrets.token_urlsafe(32)
-            ticket_hash = hashlib.sha256(ticket.encode('ascii')).hexdigest()
-            ticket_expires = now + PAIRING_TICKET_TTL_SECONDS
-            changed = conn.execute('UPDATE device_pairings SET redeemed_at=?,ticket_hash=?,ticket_expires=? WHERE device_id=? AND redeemed_at IS NULL AND code_expires>?',
-                                   (now, ticket_hash, ticket_expires, row['device_id'], now)).rowcount
-            if changed != 1:
-                conn.execute('INSERT INTO pairing_attempts(client_hash,attempted) VALUES(?,?)', (client_hash, now))
-                failure = ValueError(PAIRING_CODE_ERROR)
-            else:
-                final_name = row['name'] if row['name'] != 'Beacon phone' or name is None else name
-                conn.execute('UPDATE device_pairings SET name=? WHERE device_id=?', (final_name, row['device_id']))
-                result = {'url': row['dashboard_url'], 'name': row['dashboard_name'],
-                          'device_id': row['device_id'], 'link_ticket': ticket}
-    if failure:
-        raise failure
-    return result
-
-
-def link_paired_device(device_id, ticket, owner, provider, allowed_profiles=None):
-    if (not isinstance(device_id, str) or not ID.fullmatch(device_id) or not isinstance(ticket, str)
-            or not re.fullmatch(r'[A-Za-z0-9_-]{40,64}', ticket)):
-        return None
-    now = time.time()
-    digest = hashlib.sha256(ticket.encode('ascii')).hexdigest()
-    with LOCK, connect() as conn:
-        conn.execute('BEGIN IMMEDIATE')
-        row = conn.execute("SELECT * FROM device_pairings WHERE device_id=? AND owner IN (?, '')", (device_id, owner)).fetchone()
-        if (not row or allowed_profiles is not None and row['profile'] not in allowed_profiles
-                or not row['ticket_hash'] or row['ticket_expires'] is None or row['ticket_expires'] <= now):
-            return None
-        if not hmac.compare_digest(digest, row['ticket_hash']):
-            return None
+        row = conn.execute('SELECT owner,provider,removed FROM beacon_devices WHERE id=?', (device_id,)).fetchone() if device_id else None
+        if row and row['owner'] == owner and row['provider'] == provider and not row['removed']:
+            conn.execute('UPDATE beacon_devices SET name=?,last_seen=? WHERE id=?', (name, now, device_id))
+            return {'device_id': device_id, 'name': name}
+        if conn.execute('SELECT COUNT(*) FROM beacon_devices WHERE owner=? AND removed=0', (owner,)).fetchone()[0] >= MAX_DEVICES:
+            raise DeviceLimitError('Too many phones. Remove one in Devices.')
+        device_id = uuid.uuid4().hex
+        # The phone works across all of the owner's profiles, so the record carries no profile.
         conn.execute('INSERT INTO beacon_devices(id,owner,provider,profile,name,created,last_seen) VALUES(?,?,?,?,?,?,?)',
-                     (device_id, owner, provider, row['profile'], row['name'], now, now))
-        conn.execute('UPDATE device_pairings SET ticket_hash=NULL,ticket_expires=NULL,linked_at=? WHERE device_id=?', (now, device_id))
-        return {'linked': True, 'device_id': device_id, 'name': row['name'],
-                'profile': row['profile'], 'created_at': now}
+                     (device_id, owner, provider, '', name, now, now))
+    return {'device_id': device_id, 'name': name}
 
 
 def list_devices(owner):
@@ -450,21 +359,23 @@ def remove_device(owner, device_id):
     now = time.time()
     with PUSH_LOCK, LOCK, connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
-        row = conn.execute('SELECT profile FROM beacon_devices WHERE id=? AND owner=? AND removed=0', (device_id, owner)).fetchone()
+        row = conn.execute('SELECT removed FROM beacon_devices WHERE id=? AND owner=?', (device_id, owner)).fetchone()
         if not row:
             return False
-        conn.execute('UPDATE beacon_devices SET removed=1,last_seen=? WHERE id=? AND owner=?', (now, device_id, owner))
-        # Old registrations have no device binding; revoke those too rather than leave a lost phone reachable.
-        conn.execute("DELETE FROM targets WHERE owner=? AND (id=? OR json_extract(payload,'$.device_id')=? "
-                     "OR json_extract(payload,'$.device_id') IS NULL OR token IN "
-                     "(SELECT token FROM targets WHERE owner=? AND json_extract(payload,'$.device_id')=?))",
+        conn.execute('UPDATE beacon_devices SET removed=1,last_seen=? WHERE id=? AND owner=? AND removed=0', (now, device_id, owner))
+        # Removing a phone again still revokes its tokens, including any it re-registered without its device ID.
+        # Old registrations have no device binding, and an unreadable payload has none either; revoke those too
+        # rather than leave a lost phone reachable (or abort on one malformed row).
+        bound = "(CASE WHEN json_valid(payload) THEN json_extract(payload,'$.device_id') END)"
+        conn.execute("DELETE FROM targets WHERE owner=? AND (id=? OR " + bound + "=? OR " + bound + " IS NULL OR token IN "
+                     "(SELECT token FROM targets WHERE owner=? AND " + bound + "=?))",
                      (owner, device_id, device_id, owner, device_id))
     return True
 
 
 def touch_device(owner, provider, profile, device_id, update_seen=True):
     """Marks the owner's phone as seen and refuses only a phone the owner removed. The Hermes sign-in authorizes the
-    request; the device ID is not a credential, so an unknown ID (or one pairing on another profile) changes nothing."""
+    request; the device ID is not a credential, so an unknown ID (or another owner's) changes nothing."""
     if not isinstance(device_id, str) or not ID.fullmatch(device_id):
         return
     now = time.time()
@@ -582,36 +493,24 @@ def _auto_update_key(kind,owner):
     return 'auto-update:'+kind+':'+hashlib.sha256(owner.encode('utf-8')).hexdigest()
 
 def auto_update_settings(owner):
-    enabled_key=_auto_update_key('plugin-enabled',owner)
-    status_key=_auto_update_key('status',owner)
     with LOCK,connect() as conn:
-        enabled_row=conn.execute('SELECT value FROM meta WHERE key=?',(enabled_key,)).fetchone()
-        status_row=conn.execute('SELECT value FROM meta WHERE key=?',(status_key,)).fetchone()
-    stored=enabled_row[0].decode() if enabled_row and isinstance(enabled_row[0],bytes) else str(enabled_row[0]) if enabled_row else None
+        status_row=conn.execute('SELECT value FROM meta WHERE key=?',(_auto_update_key('status',owner),)).fetchone()
     result={'checked_at':0,'result':'never','app_version':'','plugin_version':'','message':''}
     if status_row:
         try:
             saved=json.loads(status_row[0].decode() if isinstance(status_row[0],bytes) else status_row[0])
             if isinstance(saved,dict): result.update(saved)
         except Exception: pass
-    return {'enabled':stored!='0',**result}
-
-def set_auto_plugin_updates(owner,enabled):
-    if type(enabled) is not bool: raise ValueError('Invalid auto-update setting')
-    key=_auto_update_key('plugin-enabled',owner)
-    with LOCK,connect() as conn:
-        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(key,b'1' if enabled else b'0'))
-    return auto_update_settings(owner)
+    # shortcut: 1.1.x phones still show an automatic-update switch read from "enabled"; the plugin never installs itself, so it is always off. Drop in 1.1.3, once the owner's phones run 1.1.2.
+    return {'enabled':False,**result}
 
 def record_auto_update_status(owner,checked_at,result,app_version='',plugin_version='',message=''):
     if type(checked_at) not in (int,float) or not math.isfinite(checked_at): raise ValueError('Invalid check time')
-    if result not in {'checking','up_to_date','app_staged','plugin_updated','plugin_update_available','waiting_for_idle','restart_required','consent_required','error'}:
-        raise ValueError('Invalid auto-update result')
+    if result not in AUTO_UPDATE_RESULTS: raise ValueError('Invalid auto-update result')
     status={'checked_at':checked_at,'result':result,'app_version':str(app_version)[:64],
             'plugin_version':str(plugin_version)[:64],'message':str(message)[:240]}
-    key=_auto_update_key('status',owner)
     with LOCK,connect() as conn:
-        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(key,json.dumps(status,separators=(',',':')).encode()))
+        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(_auto_update_key('status',owner),json.dumps(status,separators=(',',':')).encode()))
     return status
 
 def call_lock(call_id):
@@ -691,7 +590,7 @@ def events(call_id,owner,body):
     clean=[]
     for item in rows:
         if not isinstance(item,dict) or item.get('type') not in EVENT_TYPES: raise ValueError('Unsupported event')
-        row={k:item[k] for k in ('event_id','turn_id','type','role','text','final','interrupted','at_ms','stream','sequence','state','stage','elapsed_ms','count','total_corrected_ms','source','frames_sent','request_id','tool_name','status','error_code','provider','attempt','close_code','cause_class') if k in item}
+        row={k:item[k] for k in ('event_id','display_event_id','turn_id','type','role','text','final','interrupted','at_ms','stream','sequence','state','stage','elapsed_ms','count','total_corrected_ms','source','frames_sent','request_id','tool_name','status','error_code','provider','attempt','close_code','cause_class') if k in item}
         ident(row.get('event_id')); ident(row.get('turn_id','none')); finite(row.get('at_ms'))
         if any(k in row for k in ('provider','attempt','close_code','cause_class')):
             if row['type']!='media_diagnostic': raise ValueError('Unexpected transport diagnostic')
@@ -704,6 +603,11 @@ def events(call_id,owner,body):
         for k in ('final','interrupted'):
             if k in row and type(row[k]) is not bool: raise ValueError('Invalid event flag')
         if row['type']=='transcript' and ('role' not in row or 'text' not in row): raise ValueError('Transcript needs role and text')
+        if 'display_event_id' in row:
+            display_id=row['display_event_id'];prefix=call_id+':'+row.get('role','')+':'
+            if row['type']!='transcript' or not isinstance(display_id,str) or len(display_id)>256 or not display_id.startswith(prefix):
+                raise ValueError('Invalid transcript display identity')
+            ident(display_id[len(prefix):])
         if 'stream' in row and row['stream'] not in ('user','assistant'): raise ValueError('Invalid stream')
         if 'sequence' in row and (type(row['sequence']) is not int or not 0<=row['sequence']<72000): raise ValueError('Invalid sequence')
         if row['type']=='visual_state':
@@ -719,7 +623,7 @@ def events(call_id,owner,body):
         if 'stage' in row and row['stage'] not in ('capture_started','capture_stopped','playout_started','playout_stopped','capture_error','playout_error','media_timeout','timestamp_overlap_corrected','voice_connecting','context_ready','token_ready','token_error','provider_key_ready','provider_ready','provider_error','voice_error'): raise ValueError('Invalid stage')
         if 'error_code' in row:
             codes=r'http_[45][0-9]{2}|timeout|dns|tls|network|invalid_response'
-            if row['type']=='tool_receipt': codes+='|tool_http_failure|admission_rejected'
+            if row['type']=='tool_receipt': codes+='|tool_http_failure|admission_rejected|memory_lookup_busy|memory_lookup_timeout|memory_lookup_failed'
             if row['type'] not in ('tool_receipt','media_diagnostic') or not isinstance(row['error_code'],str) or not re.fullmatch(codes,row['error_code']): raise ValueError('Invalid diagnostic code')
         if 'elapsed_ms' in row: finite(row['elapsed_ms'])
         for field,limit in (('count',1000000),('total_corrected_ms',9007199254740991)):
@@ -739,30 +643,39 @@ def events(call_id,owner,body):
 def finalize(call_id,owner,body):
     incomplete=body.get('incomplete',False)
     if type(incomplete) is not bool: raise ValueError('Invalid transcript completeness flag')
+    failed=body.get('failed',False)
+    if type(failed) is not bool: raise ValueError('Invalid call failure flag')
     with call_lock(call_id), LOCK, connect() as conn:
         call=owned(conn,call_id,owner)
         prior=json.loads(call['receipt'])
-        if call['closed'] and prior.get('transcript_available') and (not incomplete or prior.get('incomplete')):
+        failed=failed or prior.get('failed') is True or call['status']=='failed'
+        incomplete=incomplete or prior.get('incomplete') is True
+        if call['closed'] and prior.get('transcript_available') and prior.get('failed',False)==failed and (not incomplete or prior.get('incomplete')):
             return status(call)
         rows=[json.loads(r[0]) for r in conn.execute('SELECT payload FROM timeline WHERE call_id=?',(call_id,))]
         groups={}
         for row in rows:
-            if row['type']=='transcript': groups.setdefault((row.get('turn_id','none'),row['role']),[]).append(row)
+            if row['type']=='transcript':
+                display_id=row.get('display_event_id') or call_id+':'+row['role']+':'+str(row.get('turn_id') or 'none')
+                groups.setdefault(display_id,[]).append(row)
         receipt={'audio_available':False,'transcript_available':True,
                  'transcript_events':sum(r['type']=='transcript' and bool(r.get('final')) for r in rows),
                  'unfinalized_transcripts':sum(not any(r.get('final') for r in group) for group in groups.values())}
         receipt['incomplete']=incomplete or any(r['type']=='upload_gap' for r in rows)
         receipt['complete']=not receipt['unfinalized_transcripts'] and not receipt['incomplete']
-        state='saved' if receipt['complete'] else 'partial'
+        receipt['failed']=failed
+        state='failed' if call['status']=='failed' else 'saved' if receipt['complete'] else 'partial'
         ended=time.time()
         conn.execute('UPDATE calls SET status=?,closed=1,ended=COALESCE(ended,?),receipt=? WHERE id=?',(state,ended,json.dumps(receipt),call_id))
         call.update(status=state,closed=1,ended=call['ended'] or ended,receipt=json.dumps(receipt))
         return status(call)
 
-def invitation(owner,profile,conversation,reason=None,*,deduplicate=False):
+def invitation(owner,profile,conversation,reason=None,*,deduplicate=False,conn=None):
+    from contextlib import nullcontext
     nid=uuid.uuid4().hex
     reason=str(reason or '')[:240]
-    with LOCK,connect() as conn:
+    # Producer markers and enqueue must share the supplied connection's transaction.
+    with LOCK,(connect() if conn is None else nullcontext(conn)) as conn:
         prune_notices(conn)
         if deduplicate:
             # Same chat only: another chat's ringing call carries another reason.
@@ -802,22 +715,34 @@ def refs(owner,profile,conversation=None,key=None):
 def voice_history(owner,profile,stored,limit=200,text_budget=1024*1024):
     limit=max(1,min(int(limit),200));remaining=max(1,min(int(text_budget),1024*1024))
     output=[];truncated=False
+    identity="COALESCE(json_extract(payload,'$.display_event_id'),call_id||':'||json_extract(payload,'$.role')||':'||COALESCE(json_extract(payload,'$.turn_id'),'none'))"
     with connect() as conn:
+        # Keep metadata and rowid payload reads in one WAL snapshot while retention can delete/reuse rows.
+        conn.execute('BEGIN')
         calls=conn.execute("SELECT id,created FROM calls c WHERE owner=? AND profile=? AND conversation=? AND EXISTS(SELECT 1 FROM timeline t WHERE t.call_id=c.id AND json_extract(t.payload,'$.type')='transcript') ORDER BY created DESC,id DESC LIMIT ?",(owner,profile,stored,limit+1)).fetchall()
         for call_index,call in enumerate(calls):
-            # A turn sits where it began: speech transcription can finalize after the reply has started.
-            groups=conn.execute("SELECT json_extract(payload,'$.role') AS role,json_extract(payload,'$.turn_id') AS turn,MIN(json_extract(payload,'$.at_ms')) AS first_at FROM timeline WHERE call_id=? AND json_extract(payload,'$.type')='transcript' GROUP BY role,turn ORDER BY CASE WHEN CAST(turn AS TEXT)!='' AND CAST(turn AS TEXT) NOT GLOB '*[^0-9]*' THEN CAST(turn AS INTEGER) ELSE first_at END DESC,CASE role WHEN 'user' THEN 0 ELSE 1 END,turn DESC LIMIT ?",(call['id'],limit+1)).fetchall()
+            # Item updates retain their original turn/time, even when a late correction arrives in a new turn.
+            # Rank metadata only; fetch bounded selected payloads by rowid instead of rescanning every item.
+            groups=conn.execute(f"""WITH versions AS (
+                SELECT rowid AS version_row,json_extract(payload,'$.role') AS role,{identity} AS display_id,
+                    FIRST_VALUE(json_extract(payload,'$.turn_id')) OVER original AS turn,
+                    FIRST_VALUE(json_extract(payload,'$.at_ms')) OVER original AS first_at,
+                    FIRST_VALUE(rowid) OVER original AS first_ordinal,
+                    ROW_NUMBER() OVER (PARTITION BY {identity} ORDER BY
+                        CASE WHEN json_extract(payload,'$.final')=1 THEN 1 ELSE 0 END DESC,
+                        json_extract(payload,'$.at_ms') DESC,rowid DESC) AS latest
+                FROM timeline WHERE call_id=? AND json_extract(payload,'$.type')='transcript'
+                WINDOW original AS (PARTITION BY {identity} ORDER BY json_extract(payload,'$.at_ms'),rowid)
+            ) SELECT role,turn,display_id,first_at,first_ordinal,version_row FROM versions WHERE latest=1
+                ORDER BY CASE WHEN CAST(turn AS TEXT)!='' AND CAST(turn AS TEXT) NOT GLOB '*[^0-9]*'
+                    THEN CAST(turn AS INTEGER) ELSE first_at END DESC,
+                    CASE role WHEN 'user' THEN 0 ELSE 1 END,first_at DESC,first_ordinal DESC,display_id DESC LIMIT ?""",(call['id'],limit+1)).fetchall()
             numeric_turns=bool(groups) and all(str(group['turn'] or '').isdigit() for group in groups)
             role_order=lambda group: 0 if group['role']=='user' else 1
             for group in groups:
                 if len(output)>=limit: truncated=True;break
-                params=(call['id'],group['role'],group['turn'])
-                final=conn.execute("SELECT payload FROM timeline WHERE call_id=? AND json_extract(payload,'$.type')='transcript' AND json_extract(payload,'$.role')=? AND json_extract(payload,'$.turn_id') IS ? AND json_extract(payload,'$.final')=1 ORDER BY json_extract(payload,'$.at_ms') DESC,rowid DESC LIMIT 1",params).fetchone()
-                if final:
-                    event=json.loads(final[0]);text=event['text'];is_final=True
-                else:
-                    versions=conn.execute("SELECT payload FROM timeline WHERE call_id=? AND json_extract(payload,'$.type')='transcript' AND json_extract(payload,'$.role')=? AND json_extract(payload,'$.turn_id') IS ? ORDER BY json_extract(payload,'$.at_ms') DESC,rowid DESC LIMIT 1",params).fetchall()
-                    event=json.loads(versions[0][0]);text=event['text']+' [unfinalized transcript]';is_final=False
+                event=json.loads(conn.execute('SELECT payload FROM timeline WHERE rowid=?',(group['version_row'],)).fetchone()[0])
+                is_final=bool(event.get('final'));text=event['text']+('' if is_final else ' [unfinalized transcript]')
                 encoded=text.encode('utf-8')
                 if len(encoded)>remaining:
                     truncated=True
@@ -831,7 +756,7 @@ def voice_history(owner,profile,stored,limit=200,text_budget=1024*1024):
                 if group['role']=='assistant' and not interrupted:
                     interrupted=bool(conn.execute("SELECT 1 FROM timeline WHERE call_id=? AND json_extract(payload,'$.type')='interruption' AND json_extract(payload,'$.turn_id') IS ? LIMIT 1",(call['id'],group['turn'])).fetchone())
                 turn_order=int(group['turn']) if numeric_turns else group['first_at'] or 0
-                output.append({'call_id':call['id'],'event_id':call['id']+':'+group['role']+':'+str(group['turn'] or 'none'),'session_id':stored,'turn_id':str(group['turn'] or ''),'role':group['role'],'text':text,'final':is_final,'interrupted':interrupted,'at_ms':event['at_ms'],'created_at':call['created']+(group['first_at'] or 0)/1000,'_order':(call['created'],0 if numeric_turns else 1,turn_order,role_order(group),str(group['turn'] or ''),call['id'])})
+                output.append({'call_id':call['id'],'event_id':group['display_id'],'session_id':stored,'turn_id':str(group['turn'] or ''),'role':group['role'],'text':text,'final':is_final,'interrupted':interrupted,'at_ms':event['at_ms'],'created_at':call['created']+(group['first_at'] or 0)/1000,'_order':(call['created'],0 if numeric_turns else 1,turn_order,role_order(group),group['first_at'] or 0,group['first_ordinal'],group['display_id'],call['id'])})
                 if remaining<=0: truncated=True;break
             if len(output)>=limit or remaining<=0:
                 if call_index+1<len(calls): truncated=True

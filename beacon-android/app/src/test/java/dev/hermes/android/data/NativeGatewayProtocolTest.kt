@@ -152,6 +152,7 @@ class NativeGatewayProtocolTest {
                     .put(json("id" to "hidden", "title" to "Archived title", "profile" to "work", "archived" to true))
                     .put(json("id" to "pin-only", "title" to "Pinned title", "profile" to "work", "pinned" to true, "archived" to false))
                     else JSONArray().put(json("id" to "visible", "title" to "Visible title", "profile" to "work", "secret_metadata" to "not-searchable")))
+                path == "/api/fs/list" -> json("entries" to JSONArray().put(json("name" to "notes.md", "path" to "/workspace/notes.md", "isDirectory" to false)))
                 path.startsWith("/api/plugins/beacon/mobile/sessions") -> error("Native history must not use the optional plugin: $path")
                 else -> json("ticket" to "fixture-single-use-ticket")
             }
@@ -733,6 +734,55 @@ class NativeGatewayProtocolTest {
         assertEquals("done", types.last())
     }
 
+    @Test(timeout = 5_000) fun nativeStatusTextReachesChatWarningsWithLegacyFallbacks() = runBlocking<Unit> {
+        val cases = listOf(
+            json("kind" to "status", "text" to "Native status") to "Native status",
+            json("kind" to "lifecycle", "text" to "Retrying with another model.", "message" to "Legacy message", "error" to "Legacy error") to "Retrying with another model.",
+            json("message" to "Legacy message", "error" to "Legacy error") to "Legacy message",
+            json("error" to "Legacy error") to "Legacy error",
+            json("text" to "", "message" to "Legacy message") to "Legacy message",
+            json("text" to "  ", "error" to "Legacy error") to "Legacy error",
+            json("text" to null, "error" to "Legacy error") to "Legacy error",
+            JSONObject() to "Hermes needs your attention.",
+        )
+        val wire = Wire(); val c = client(wire)
+        val statuses = mutableListOf<String>()
+        val collector = async {
+            c.stream("/api/chat/stream", mapOf("session_id" to "stored-a")) { event ->
+                if (event.type == "warning") {
+                    val payload = event.payload()
+                    assertEquals("stored-a", payload.getString("session_id"))
+                    statuses.add(payload.string("message", payload.string("error", "Hermes needs your attention.")))
+                }
+            }
+        }
+        try {
+            withTimeout(2_000) { while (wire.sent.count { it.string("method") == "session.events.since" } < 2) yield() }
+            cases.forEachIndexed { index, (payload, _) ->
+                wire.listener.onMessage(wire.ws, json("method" to "event", "params" to json("session_id" to "runtime-a", "seq" to index + 3,
+                    "type" to "status.update", "payload" to payload)).toString())
+            }
+            wire.listener.onMessage(wire.ws, json("method" to "message.complete", "params" to json("text" to "complete")).toString())
+            withTimeout(2_000) { collector.await() }
+            assertEquals(cases.map { it.second }, statuses)
+        } finally { collector.cancelAndJoin(); c.closeNative() }
+    }
+
+    @Test fun workspaceFileListUsesTheAuthorizedProfileAndRejectsAnotherProfile() = runBlocking {
+        val wire = Wire(); val c = client(wire)
+        try {
+            val result = c.get("/api/list", mapOf("session_id" to "stored-a", "path" to "/workspace"))
+            assertEquals("notes.md", result.getJSONArray("entries").getJSONObject(0).getString("name"))
+            val request = wire.httpRequests.single()
+            assertEquals("/api/fs/list", request.url.encodedPath)
+            assertEquals("/workspace", request.url.queryParameter("path"))
+            assertEquals("work", request.url.queryParameter("profile"))
+            assertTrue(runCatching { c.get("/api/list", mapOf("session_id" to "stored-a", "path" to "/workspace", "profile" to "other")) }.isFailure)
+            assertEquals(1, wire.httpRequests.size)
+            assertTrue(wire.sent.isEmpty())
+        } finally { c.closeNative() }
+    }
+
     @Test fun bootstrapWithoutPluginStillMintsATicket() = runBlocking<Unit> {
         val wire = Wire()
         val httpRequests = mutableListOf<Request>()
@@ -741,7 +791,7 @@ class NativeGatewayProtocolTest {
                 httpRequests += chain.request()
                 val path = chain.request().url.encodedPath
                 val payload = when (path) {
-                    "/api/auth/me" -> json("user_id" to "owner")
+                    "/api/auth/me" -> json("user_id" to "owner", "provider" to "basic")
                     "/api/profiles" -> json("profiles" to JSONArray().put(json("name" to "work")))
                     "/api/auth/ws-ticket" -> json("ticket" to "fixture-single-use-ticket")
                     else -> null

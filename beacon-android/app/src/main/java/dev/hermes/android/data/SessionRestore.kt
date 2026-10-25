@@ -9,4 +9,4 @@ internal fun nativeSessionCookie(name: String): Boolean =
 // Calls own a detached session. Recreating the UI must not stop the same owner's call.
 internal fun keepsRestoredCall(call: Scope?, restored: Scope?, replacingAccount: Boolean): Boolean =
     !replacingAccount && call != null && restored != null &&
-        call.origin == restored.origin && call.owner.isNotBlank() && call.owner == restored.owner
+        call.nativeProvider.isNotBlank() && call.owner.isNotBlank() && call.sameAccount(restored)

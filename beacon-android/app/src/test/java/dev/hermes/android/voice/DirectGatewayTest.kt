@@ -16,6 +16,50 @@ class DirectGatewayTest {
         if(status=="needs_approval") put("proposal",JSONObject().put("id",proposalId).put("tool_name","send_email").put("arguments",JSONObject().put("to","fixture@example.test").put("body","fixture")))
     }
     private fun registered():DirectGatewayReceipts=DirectGatewayReceipts().apply { reserve("request","function-id",toolId,JSONObject().put("body","fixture").put("to","fixture@example.test")) }
+    @Test fun fixedLookupProducerConfirmsTheReadWithoutPublishingItsContents() {
+        for(name in listOf("hermes_search","hermes_memory","hermes_skills","hermes_context","discover_tools")) {
+            val result=if(name=="discover_tools") JSONObject().put("tools",org.json.JSONArray()) else GeminiWire.evidence(JSONObject()
+                .put("summary","Fixture lookup contents").put("observed_at",123).put("sources",org.json.JSONArray().put(JSONObject()
+                    .put("title","Fixture source").put(if(name=="hermes_search") "url" else "ref",if(name=="hermes_search") "https://example.test/source" else "native:fixture"))),name=="hermes_search")
+            if(name=="hermes_memory") result.put("status","completed")
+            val original=result.toString()
+            val event=directLookupReceipt("lookup-$name",name,result)
+            val parsed=CallToolReceipt.from(event)!!
+            assertEquals("tool_receipt",event.getString("type"))
+            assertEquals("lookup-$name",parsed.requestId);assertEquals(name,parsed.toolName)
+            assertEquals("completed",parsed.status);assertTrue(parsed.hasResult)
+            assertTrue(parsed.chipLabel()!!.endsWith(" complete"))
+            assertEquals(setOf("type","request_id","tool_name","status","result_present"),event.keys().asSequence().toSet())
+            assertEquals(original,result.toString())
+            // The original production event omitted presence, despite returning valid lookup evidence to speech.
+            event.remove("result_present")
+            assertEquals("Completion not confirmed",CallToolReceipt.from(event)!!.chipLabel())
+        }
+    }
+    @Test fun emptyReadIsAResultButUnavailableAndFailedLookupsNeverConfirmCompletion() {
+        val empty=GeminiWire.evidence(JSONObject().put("status","empty").put("summary","")
+            .put("sources",org.json.JSONArray()).put("observed_at",123),false)
+        assertTrue(CallToolReceipt.from(directLookupReceipt("empty","hermes_memory",empty))!!.hasResult)
+        for(name in listOf("hermes_memory","discover_tools")) {
+            val missing=CallToolReceipt.from(directLookupReceipt("missing",name,JSONObject().put("status","completed")))!!
+            assertEquals("failed",missing.status);assertFalse(missing.hasResult)
+        }
+        for(status in listOf("unavailable","failed","uncertain")) {
+            val event=directLookupReceipt("failed-$status","hermes_memory",GeminiWire.evidence(JSONObject().put("status",status).put("error_code","fixture_failure")
+                .put("summary","Memory lookup failed.").put("sources",org.json.JSONArray()).put("observed_at",123),false))
+            val parsed=CallToolReceipt.from(event)!!
+            assertEquals("failed",parsed.status);assertFalse(parsed.hasResult)
+            assertTrue(parsed.chipLabel()!!.endsWith(" failed"))
+            assertEquals("fixture_failure",event.getString("error_code"))
+        }
+    }
+    @Test fun gatewayCompletionStillRequiresTheActualResultEvenForAFixedLookupName() {
+        for(name in listOf("send_email","hermes_memory")) {
+            val completed=registered().record("request",receipt("completed").put("tool_name",name).put("result_present",true))
+            assertFalse(CallToolReceipt.from(completed)!!.hasResult)
+            assertEquals("Completion not confirmed",CallToolReceipt.from(completed)!!.chipLabel())
+        }
+    }
     @Test fun ownerDecisionNeedsAnExactKnownProposalAndArguments() {
         val ledger=registered()
         assertThrows(IllegalArgumentException::class.java) { ledger.decision("request",proposalId) }

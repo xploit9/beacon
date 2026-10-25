@@ -40,6 +40,30 @@ class ProjectionCache internal constructor(private val db: ProjectionDb, private
     private val lock = Mutex()
     private fun key(scope: Scope, kind: String) = "${scope.key}:${kind.digest()}"
     private fun legacyKey(scope: Scope, kind: String) = "${scope.key}:$kind"
+    /** A creator stamp can restore a selection, never attribute unstamped private drafts in a shared session. */
+    private suspend fun legacySelectionMatchesNativeCreator(client: BeaconClient, sessionId: String): Boolean = withContext(Dispatchers.IO) {
+        require(sessionId.matches(Regex("[A-Za-z0-9_.:-]{1,256}")) && sessionId !in setOf(".", "..")) { "Invalid stored conversation identity" }
+        val target = client.scope.session(sessionId)
+        if (target.nativeProvider.isBlank() || target.owner.isBlank()) return@withContext false
+        val identity = client.nativeGet("/api/auth/me", persistAuth = false)
+        if (identity.optString("user_id") != target.owner || identity.optString("provider") != target.nativeProvider) throw CachedIdentityMismatch()
+        if (client.scope.session(sessionId) != target) return@withContext false
+        val metadata = client.nativeGet("/api/sessions/$sessionId", mapOf("profile" to target.profile), persistAuth = false)
+        metadata.optString("id") == sessionId && metadata.optString("profile") == target.profile &&
+            metadata.optString("user_id") == "${target.nativeProvider}:${target.owner}"
+    }
+
+    internal suspend fun authorizedLegacySelection(client: BeaconClient): String? {
+        val legacy = client.scope.copy(nativeProvider = "")
+        val id = withContext(Dispatchers.IO) { lock.withLock { db.withTransaction {
+            val rows = db.rows()
+            val row = rows.get(key(legacy, "selected-session")) ?: rows.get(legacyKey(legacy, "selected-session")) ?: return@withTransaction null
+            require(row.scope == legacy.key) { "Checkpoint belongs to another scope; saved state was retained" }
+            val encrypted = readProjectionBlob(row) { start, count -> rows.encryptedChunk(row.key, start, count) }
+            String(cipher.decrypt(encrypted, row.key), Charsets.UTF_8)
+        } } } ?: return null
+        return if (legacySelectionMatchesNativeCreator(client, id)) id else null
+    }
     suspend fun writeSession(scope: Scope, value: String) = persistSessionProjection(value) { write(scope, "session", it) }
     suspend fun read(scope: Scope, kind: String): String? = readMany(scope, listOf(kind))[kind]
     suspend fun readMigrating(scope: Scope, kind: String, legacyKind: String): String? = withContext(Dispatchers.IO) {

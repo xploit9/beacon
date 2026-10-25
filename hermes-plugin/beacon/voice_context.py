@@ -53,10 +53,12 @@ def personality(root):
 def builtin_memory(root,cfg):
     from tools.memory_tool import MemoryStore,get_builtin_memory_config,get_builtin_memory_store_flags
     directory=root/'memories'
-    if not directory.is_dir() or directory.is_symlink() or getattr(directory,'is_junction',lambda:False)(): return ''
+    if not directory.is_dir(): return ''
+    # A store Beacon refuses to read is unavailable, never an empty one.
+    if directory.is_symlink() or getattr(directory,'is_junction',lambda:False)(): raise OSError('Built-in memory is unreadable')
     for name in ('MEMORY.md','USER.md'):
         path=directory/name
-        if path.exists() and (path.is_symlink() or path.stat().st_size>128*1024): return ''
+        if path.exists() and (path.is_symlink() or path.stat().st_size>128*1024): raise OSError('Built-in memory is unreadable')
     memory_on,user_on=get_builtin_memory_store_flags(cfg)
     section=get_builtin_memory_config(cfg)
     store=MemoryStore(min(int(section.get('memory_char_limit',2200)),12000),min(int(section.get('user_char_limit',1375)),8000),memory_enabled=memory_on,user_profile_enabled=user_on)
@@ -114,7 +116,6 @@ def external_provider(owner,provider,profile,stored,cfg):
     section=cfg.get('memory') if isinstance(cfg,dict) else None
     name=str(section.get('provider') or '').strip() if isinstance(section,dict) else ''
     if not external_memory_configured(cfg): return None,name
-    if name.lower()=='hindsight': raise LookupError('Retired memory provider unavailable')
     from tui_gateway import server
     target=server._profile_home(profile)
     with server._sessions_lock:
@@ -339,17 +340,17 @@ def recall(owner,provider,profile,stored,query):
     native.verify(owner,provider,profile,stored)
     def run(root):
         cfg=config(root);external,name=external_provider(owner,provider,profile,stored,cfg)
+        unsure=False  # count 0 cannot tell an empty lookup from a failed one
         if external:
             manager,matching=external
             try:
                 # Direct prefetch avoids the manager's empty-on-timeout and optional disk spill.
                 text=matching.prefetch(private_text(query,1024),session_id=stored)
                 if text is not None and not isinstance(text,str): raise ValueError('Invalid memory result')
-                if name=='mnemosyne-bridge':
-                    if text=='Mnemosyne retrieval failed for this turn. Disclose this and verify current source files; do not invent memory.':
-                        raise LookupError('Memory provider retrieval failed')
-                    status=matching.recall_status() if callable(getattr(matching,'recall_status',None)) else None
-                    if status is not None and status.count==0: text=''
+                # shortcut: status count 0 reads as "nothing recalled" (an empty or failed lookup, as Mnemosyne reports it); Hermes also uses 0 for a synthesized reflect answer, which this drops. Upgrade once providers return '' or raise instead.
+                try: status=matching.recall_status() if callable(getattr(matching,'recall_status',None)) else None
+                except Exception: status=None  # Hermes reads this status non-fatally too
+                if getattr(status,'count',None)==0: text='';unsure=True
                 from agent.memory_manager import sanitize_context
                 summary=private_text(sanitize_context(text or ''),8000).strip()
             finally:
@@ -363,7 +364,7 @@ def recall(owner,provider,profile,stored,query):
             lines=[line for line in memory.splitlines() if words.intersection(re.findall(r'\w+',line.lower()))]
             summary=clip('\n'.join(lines) if lines and not general else memory,8000).strip()
             source={'title':'Native curated memory','ref':'native-memory:builtin'}
-        return {'status':'completed' if summary else 'empty','summary':summary or 'No saved memories matched.',
+        return {'status':'completed' if summary else 'empty','summary':summary or ('Nothing came back from memory.' if unsure else 'No saved memories matched.'),
                 'sources':[source] if summary else [],'observed_at':int(time.time())}
     try:
         return bounded_memory_lookup(profile,run)

@@ -45,7 +45,7 @@ def _native_profiles(monkeypatch, names):
     return calls
 
 
-def test_fresh_dashboard_open_binds_verified_owner_and_returns_qr(harness, monkeypatch):
+def test_fresh_dashboard_open_binds_verified_owner_and_returns_connect_info(harness, monkeypatch):
     api, client, _, home, _ = harness
     _write_config(home, {})
     _use_real_settings(api, monkeypatch)
@@ -147,9 +147,9 @@ def test_claim_persists_owner_and_authorizes_native_profiles_including_new_ones(
     assert client.get('/api/plugins/beacon/mobile/bootstrap?profile=work').json()['capabilities']['callbacks'] is True
 
     set_public_url(monkeypatch, 'https://hermes.example.test/beacon')
-    qr = client.get('/api/plugins/beacon/connect-info')
-    assert qr.status_code == 200
-    assert qr.json() == {'url': 'https://hermes.example.test/beacon', 'name': 'hermes.example.test'}
+    info = client.get('/api/plugins/beacon/connect-info')
+    assert info.status_code == 200
+    assert info.json() == {'url': 'https://hermes.example.test/beacon', 'name': 'hermes.example.test'}
 
     path = '/api/plugins/beacon/mobile/history-retention'
     assert client.get(path + '?profile=default').status_code == 200

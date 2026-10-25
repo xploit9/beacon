@@ -44,7 +44,7 @@ class AuditR8aDataTest {
         assertFalse(missingNativeConversation(ApiFailure(4007, "another failure")))
         assertEquals("This chat changed. Refresh and try again.", appErrorText(ApiFailure(409, "revision_conflict")))
         assertEquals("Finish setup on your Hermes dashboard: open the Beacon tab.", appErrorText(ApiFailure(403, "Owner not authorized", true)))
-        assertTrue(appErrorText(ApiFailure(403, "device_removed", true)).contains("Pair it again"))
+        assertTrue(appErrorText(ApiFailure(403, "device_removed", true)).contains("Add it again"))
         assertEquals("Hermes is busy. Wait a moment and try again.", appErrorText(ApiFailure(429, "private quota state")))
     }
 

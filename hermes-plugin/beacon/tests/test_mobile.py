@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -7,6 +8,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+import uuid
 from types import SimpleNamespace
 from datetime import datetime,timezone
 
@@ -328,6 +330,61 @@ def test_gateway_tool_error_codes_are_admitted(harness,code,status):
         rejected=c.post(url,json={'events':[{'event_id':'bad-gateway-diagnostic','turn_id':'tools','type':'media_diagnostic',
             'at_ms':200,'stage':'provider_error','error_code':code}]})
         assert rejected.status_code==409
+
+
+@pytest.mark.parametrize('failure,code',[
+    (BlockingIOError,'memory_lookup_busy'),
+    (TimeoutError,'memory_lookup_timeout'),
+    (RuntimeError,'memory_lookup_failed'),
+])
+def test_native_memory_failures_roundtrip_terminal_receipts_without_partial_history(harness,monkeypatch,failure,code):
+    api,c,_,_,_=harness;cid=reserve(c)
+    private_detail='Synthetic provider detail that must not enter the timeline'
+    def unavailable(*args): raise failure(private_detail)
+    monkeypatch.setattr(api.voice_context,'bounded_memory_lookup',unavailable)
+    # Exercise the real native adapter's exception-to-code producer, not a canned lookup result.
+    result=api.voice_context.recall('owner','basic','default','native-stored','fixture query')
+    assert result['status']=='unavailable' and result['error_code']==code
+    assert private_detail not in json.dumps(result)
+    path=f'/api/plugins/beacon/mobile/calls/{cid}'
+    running={'event_id':'memory-running','turn_id':'tools','type':'tool_receipt','at_ms':1,
+             'request_id':'memory-request','tool_name':'recall_memory','status':'running'}
+    failed={**running,'event_id':'memory-failed','at_ms':2,'status':'failed','error_code':result['error_code']}
+    text={'event_id':'caption','turn_id':'1','type':'transcript','role':'user','text':'Fixture words','final':True,'at_ms':3}
+    for event in (running,failed,failed,text):
+        admitted=c.post(path+'/events',json={'events':[event]})
+        assert admitted.status_code==200,admitted.text
+    with api.mobile.connect() as conn:
+        rows=[json.loads(row[0]) for row in conn.execute('SELECT payload FROM timeline WHERE call_id=? ORDER BY rowid',(cid,))]
+    assert rows==[running,failed,text]
+    assert all('summary' not in row and 'sources' not in row and 'result' not in row for row in rows)
+    finalized=c.post(path+'/finalize',json={})
+    assert finalized.status_code==200,finalized.text
+    assert finalized.json()['transcript_status']=='saved' and finalized.json()['complete'] is True
+    assert finalized.json()['incomplete'] is False
+    archived=c.get('/api/plugins/beacon/mobile/sessions/native-stored/voice-history?profile=default')
+    assert archived.status_code==200 and [row['text'] for row in archived.json()['events']]==['Fixture words']
+    calls=c.get('/api/plugins/beacon/mobile/calls?profile=default')
+    assert calls.status_code==200 and next(row for row in calls.json()['calls'] if row['id']==cid)['state']=='completed'
+
+
+@pytest.mark.parametrize('code',['memory_lookup_unknown','memory_lookup_failed: secret','memory_lookup_failed\n',
+                                 'arbitrary_provider_error','MEMORY_LOOKUP_FAILED'])
+def test_memory_receipts_keep_a_closed_diagnostic_allowlist(harness,code):
+    api,c,_,_,_=harness;cid=reserve(c)
+    event={'event_id':'rejected','turn_id':'tools','type':'tool_receipt','at_ms':1,
+           'request_id':'request','tool_name':'recall_memory','status':'failed','error_code':code}
+    assert c.post(f'/api/plugins/beacon/mobile/calls/{cid}/events',json={'events':[event]}).status_code==409
+    with api.mobile.connect() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM timeline WHERE call_id=?',(cid,)).fetchone()[0]==0
+
+
+@pytest.mark.parametrize('code',['memory_lookup_busy','memory_lookup_timeout','memory_lookup_failed'])
+def test_memory_failure_codes_are_not_transport_diagnostics(harness,code):
+    _,c,_,_,_=harness;cid=reserve(c)
+    event={'event_id':'rejected','turn_id':'connection','type':'media_diagnostic','at_ms':1,
+           'stage':'provider_error','error_code':code}
+    assert c.post(f'/api/plugins/beacon/mobile/calls/{cid}/events',json={'events':[event]}).status_code==409
 
 def test_auth_insecure_owner_and_profiles(harness):
     api,c,cfg,tmp,app=harness
@@ -750,6 +807,257 @@ def test_owned_voice_history_reopens_dedupes_and_scopes(harness):
     assert c.get(url).json()==result.json()
     c.headers['x-fixture-owner']='foreign';assert c.get(url).status_code==403
 
+
+@pytest.mark.parametrize('replacement_scope',[None,('foreign','default','native-stored'),
+                                             ('owner','work','native-stored'),('owner','default','another-chat')])
+def test_voice_history_snapshot_survives_real_retention_and_rowid_reuse(harness,monkeypatch,replacement_scope):
+    api,c,_,_,_=harness;mobile=api.mobile
+    mobile.set_history_retention_days('owner',30)
+    replacement=mobile.reserve(*(replacement_scope or ('foreign','work','another-chat')))['call_id']
+    cid=reserve(c)
+    original={'event_id':'original','turn_id':'1','type':'transcript','role':'user',
+              'text':'Original scoped words','final':True,'at_ms':10}
+    mobile.events(cid,'owner',{'events':[original]})
+    mobile.finalize(cid,'owner',{})
+    original_connect=mobile.connect
+    with original_connect() as conn:
+        assert conn.execute('PRAGMA journal_mode').fetchone()[0].lower()=='wal'
+        schema=conn.execute("SELECT sql FROM sqlite_master WHERE name='timeline'").fetchone()[0]
+        assert 'AUTOINCREMENT' not in schema.upper() and 'WITHOUT ROWID' not in schema.upper()
+        original_rowid=conn.execute('SELECT rowid FROM timeline WHERE call_id=?',(cid,)).fetchone()[0]
+        assert conn.execute('SELECT MAX(rowid) FROM timeline').fetchone()[0]==original_rowid
+        conn.execute('UPDATE calls SET created=? WHERE id=?',(time.time()-31*86400,cid))
+        key='history_retention_last_run:'+hashlib.sha256(b'owner').hexdigest()
+        conn.execute('DELETE FROM meta WHERE key=?',(key,))
+    interleaved=[]
+
+    def prune_and_replace():
+        # Two real SQLite connections; all metadata rows have been consumed before the writer commits.
+        assert mobile.prune_history('owner')>=2
+        with original_connect() as conn:
+            assert conn.execute('SELECT 1 FROM timeline WHERE call_id=?',(cid,)).fetchone() is None
+        if replacement_scope is not None:
+            mobile.events(replacement,replacement_scope[0],{'events':[{**original,'event_id':'foreign','text':'Foreign scoped words'}]})
+            with original_connect() as conn:
+                # This proves the exact ordinary-rowid reuse prerequisite rather than assuming it.
+                assert conn.execute('SELECT rowid FROM timeline WHERE call_id=?',(replacement,)).fetchone()[0]==original_rowid
+        interleaved.append(True)
+
+    class MetadataCursor:
+        def __init__(self,cursor): self.cursor=cursor
+        def fetchall(self):
+            rows=self.cursor.fetchall()
+            prune_and_replace()
+            return rows
+
+    class ReadConnection:
+        def __init__(self,conn): self.conn=conn
+        def __enter__(self): self.conn.__enter__();return self
+        def __exit__(self,*args):
+            try: return self.conn.__exit__(*args)
+            finally: self.conn.close()
+        def execute(self,sql,args=()):
+            cursor=self.conn.execute(sql,args)
+            return MetadataCursor(cursor) if sql.lstrip().startswith('WITH versions AS') else cursor
+
+    # Only the first (history) connection is wrapped; the writer uses the real factory.
+    first_connection=True
+    def connect():
+        nonlocal first_connection
+        conn=original_connect()
+        if first_connection:
+            first_connection=False
+            return ReadConnection(conn)
+        return conn
+    monkeypatch.setattr(mobile,'connect',connect)
+
+    result=mobile.voice_history('owner','default','native-stored')
+    monkeypatch.setattr(mobile,'connect',original_connect)
+    assert interleaved==[True]
+    assert [row['text'] for row in result['events']]==['Original scoped words']
+    assert result['events'][0]['call_id']==cid and result['events'][0]['session_id']=='native-stored'
+    assert mobile.voice_history('owner','default','native-stored')['events']==[]
+    with original_connect() as conn:
+        remaining=[json.loads(row[0]) for row in conn.execute('SELECT payload FROM timeline')]
+    expected=[] if replacement_scope is None else [{**original,'event_id':'foreign','text':'Foreign scoped words'}]
+    assert remaining==expected  # Projection never rewrites timeline contents.
+
+def transcript_item_delivery(call_id,item,text,at,version,turn='3',final=True,index=0):
+    # Java nameUUIDFromBytes used by providerTranscript and NativeCallTranscriptSync.
+    def name_uuid(value): return str(uuid.UUID(bytes=hashlib.md5(value.encode()).digest(),version=3))
+    display_id=call_id+':user:provider-'+name_uuid(item+':'+str(index))
+    return {'event_id':name_uuid(display_id+':'+str(version)),'display_event_id':display_id,
+            'turn_id':turn,'type':'transcript','role':'user','text':text,'final':final,'at_ms':at,
+            'session_id':'native-stored'}
+
+
+def test_provider_items_roundtrip_real_timeline_and_cold_history_without_folding(harness):
+    api,c,_,_,_=harness;cid=reserve(c)
+    # Kotlin's actual GrokWire/providerTranscript/sync regression checks this delivery envelope.
+    rows=[transcript_item_delivery(cid,'one','yes',10,1),
+          transcript_item_delivery(cid,'two','yes',20,2),
+          transcript_item_delivery(cid,'one','yes please',30,3,turn='4')]
+    url=f'/api/plugins/beacon/mobile/calls/{cid}'
+    history_url='/api/plugins/beacon/mobile/sessions/native-stored/voice-history?profile=default'
+    for event in rows[:2]:
+        response=c.post(url+'/events',json={'events':[event]})
+        assert response.status_code==200,response.text
+    active=c.get(history_url)
+    assert active.status_code==200,active.text
+    assert len(active.json()['events'])==2
+    assert [row['text'] for row in active.json()['events']]==['yes','yes']
+    assert c.post(url+'/events',json={'events':[rows[2]]}).status_code==200
+    assert c.post(url+'/events',json={'events':[rows[0]]}).status_code==200
+    with api.mobile.connect() as conn:
+        stored=[tuple(row) for row in conn.execute('SELECT event_id,payload FROM timeline WHERE call_id=? ORDER BY rowid',(cid,))]
+        created=conn.execute('SELECT created FROM calls WHERE id=?',(cid,)).fetchone()[0]
+    assert len(stored)==3 and len({row[0] for row in stored})==3
+    assert [json.loads(row[1]).get('display_event_id') for row in stored]==[row['display_event_id'] for row in rows]
+    closed=c.post(url+'/finalize',json={})
+    assert closed.status_code==200 and closed.json()['transcript_status']=='saved'
+    result=c.get(history_url)
+    assert result.status_code==200,result.text
+    archived=result.json()['events']
+    assert [row['event_id'] for row in archived]==[rows[0]['display_event_id'],rows[1]['display_event_id']]
+    assert [row['text'] for row in archived]==['yes please','yes']
+    assert [row['turn_id'] for row in archived]==['3','3']
+    assert [row['created_at'] for row in archived]==pytest.approx([created+.010,created+.020],rel=0,abs=1e-6)
+    assert [row['at_ms'] for row in archived]==[30,20]
+    assert c.get(history_url).json()==result.json()
+    with api.mobile.connect() as conn:
+        assert [tuple(row) for row in conn.execute('SELECT event_id,payload FROM timeline WHERE call_id=? ORDER BY rowid',(cid,))]==stored
+
+    # Negative control: old clients/plugins erase item metadata; the old turn bucket is still visible.
+    legacy=reserve(c)
+    legacy_rows=[{k:v for k,v in transcript_item_delivery(legacy,item,'yes',at,version).items()
+                  if k!='display_event_id'} for item,at,version in [('one',10,1),('two',20,2)]]
+    api.mobile.events(legacy,'owner',{'events':legacy_rows})
+    legacy_history=[row for row in api.mobile.voice_history('owner','default','native-stored')['events'] if row['call_id']==legacy]
+    assert len(legacy_history)==1 and legacy_history[0]['event_id']==legacy+':user:3'
+
+
+def test_independent_pending_items_remain_partial_beside_a_final_in_the_same_turn(harness):
+    api,c,_,_,_=harness;cid=reserve(c)
+    rows=[transcript_item_delivery(cid,'done','complete',10,1),
+          transcript_item_delivery(cid,'pending','unfinished',20,2,final=False),
+          transcript_item_delivery(cid,'pending','unfinished correction',30,3,final=False),
+          transcript_item_delivery(cid,'another','another unfinished',40,4,final=False),
+          transcript_item_delivery(cid,'done','stale partial',50,5,final=False),
+          {'event_id':'assistant-tail','display_event_id':cid+':assistant:3','turn_id':'3','type':'transcript',
+           'role':'assistant','text':'cut off reply','final':False,'at_ms':5},
+          {'event_id':'interrupted','turn_id':'3','type':'interruption','at_ms':35}]
+    response=c.post(f'/api/plugins/beacon/mobile/calls/{cid}/events',json={'events':rows})
+    assert response.status_code==200,response.text
+    finalized=c.post(f'/api/plugins/beacon/mobile/calls/{cid}/finalize',json={})
+    assert finalized.status_code==200,finalized.text
+    receipt=finalized.json()
+    assert receipt['closed'] and receipt['transcript_status']=='partial'
+    assert receipt['unfinalized_transcripts']==3 and receipt['complete'] is False
+    archived=c.get('/api/plugins/beacon/mobile/sessions/native-stored/voice-history?profile=default').json()['events']
+    assert [row['event_id'] for row in archived]==[rows[0]['display_event_id'],rows[1]['display_event_id'],rows[3]['display_event_id'],cid+':assistant:3']
+    assert archived[0]['text']=='complete' and archived[0]['final']
+    assert [row['text'] for row in archived[1:3]]==['unfinished correction [unfinalized transcript]','another unfinished [unfinalized transcript]']
+    assert all(not row['final'] for row in archived[1:])
+    assert archived[3]['interrupted'] and archived[3]['text'].startswith('cut off reply')
+
+
+def test_legacy_versions_and_new_canonical_identity_share_one_original_turn(harness):
+    api,c,_,_,_=harness;cid=reserve(c)
+    api.mobile.events(cid,'owner',{'events':[
+        {'event_id':'old-partial','turn_id':'5','type':'transcript','role':'user','text':'old','final':False,'at_ms':1},
+        {'event_id':'new-final','display_event_id':cid+':user:5','turn_id':'5','type':'transcript','role':'user','text':'finished','final':True,'at_ms':2}]})
+    rows=api.mobile.voice_history('owner','default','native-stored')['events']
+    assert len(rows)==1 and rows[0]['event_id']==cid+':user:5' and rows[0]['text']=='finished'
+    assert api.mobile.finalize(cid,'owner',{})['transcript_status']=='saved'
+
+
+def test_equal_time_versions_keep_first_item_order_and_last_final_snapshot(harness):
+    api,c,_,_,_=harness;cid=reserve(c)
+    first=transcript_item_delivery(cid,'first','yes',0,1)
+    second=transcript_item_delivery(cid,'first','yes',0,2,index=1)
+    corrected=transcript_item_delivery(cid,'first','yes please',0,3,turn='4')
+    api.mobile.events(cid,'owner',{'events':[first,second,corrected]})
+    rows=api.mobile.voice_history('owner','default','native-stored')['events']
+    assert [row['event_id'] for row in rows]==[first['display_event_id'],second['display_event_id']]
+    assert [row['text'] for row in rows]==['yes please','yes']
+    assert [row['turn_id'] for row in rows]==['3','3']
+    other=api.mobile.reserve('owner','default','native-stored')['call_id']
+    repeated=transcript_item_delivery(other,'first','yes please',0,1)
+    api.mobile.events(other,'owner',{'events':[repeated]})
+    reopened=api.mobile.voice_history('owner','default','native-stored')['events']
+    assert len(reopened)==3 and reopened[-1]['event_id']==repeated['display_event_id']
+
+
+@pytest.mark.parametrize('display_id',[None,{},[],True,42,'','foreign:user:one','{call}:assistant:one',
+    '{call}:user:bad:key','{call}:user:line\nbreak','{call}:user:عربي','{call}:user:'+'x'*161])
+def test_transcript_display_identity_rejects_foreign_role_call_or_unsafe_text(harness,display_id):
+    api,c,_,_,_=harness;cid=reserve(c)
+    if isinstance(display_id,str): display_id=display_id.replace('{call}',cid)
+    event=transcript_item_delivery(cid,'one','yes',10,1)
+    event['display_event_id']=display_id
+    response=c.post(f'/api/plugins/beacon/mobile/calls/{cid}/events',json={'events':[event]})
+    assert response.status_code in (400,409),response.text
+    with api.mobile.connect() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM timeline WHERE call_id=?',(cid,)).fetchone()[0]==0
+
+
+def test_display_identity_is_transcript_only_allowlisted_and_keeps_delivery_conflicts(harness):
+    api,c,_,_,_=harness;cid=reserve(c);url=f'/api/plugins/beacon/mobile/calls/{cid}/events'
+    event=transcript_item_delivery(cid,'one','yes',10,1)
+    supplied={**event,'provider_item':'not-retained','content_index':0,'api_key':'synthetic-not-a-key',
+              'audio':'synthetic-not-a-recording','provider_payload':{'ignored':True}}
+    assert c.post(url,json={'events':[supplied]}).status_code==200
+    assert c.post(url,json={'events':[supplied]}).status_code==200
+    with api.mobile.connect() as conn:
+        stored=json.loads(conn.execute('SELECT payload FROM timeline WHERE call_id=?',(cid,)).fetchone()[0])
+        assert stored['display_event_id']==event['display_event_id']
+        assert not any(key in stored for key in ('provider_item','content_index','api_key','audio','provider_payload','session_id'))
+        assert conn.execute('SELECT COUNT(*) FROM timeline WHERE call_id=?',(cid,)).fetchone()[0]==1
+    conflict={**event,'display_event_id':cid+':user:another-item'}
+    assert c.post(url,json={'events':[conflict]}).status_code in (400,409)
+    non_transcript={'event_id':'state','type':'state','state':'listening','at_ms':0,'display_event_id':event['display_event_id']}
+    assert c.post(url,json={'events':[non_transcript]}).status_code in (400,409)
+    c.headers['x-fixture-owner']='foreign'
+    assert c.post(url,json={'events':[event]}).status_code==403
+    assert c.get('/api/plugins/beacon/mobile/sessions/native-stored/voice-history?profile=default').status_code==403
+
+
+def test_item_history_keeps_profile_conversation_and_call_authority(harness):
+    api,c,cfg,_,_=harness;cid=reserve(c)
+    event=transcript_item_delivery(cid,'one','same words',10,1)
+    api.mobile.events(cid,'owner',{'events':[event]})
+    cfg['profiles']=['default','second']
+    for owner,profile,conversation in [('foreign','default','native-stored'),('owner','second','native-stored'),('owner','default','other-stored')]:
+        other=api.mobile.reserve(owner,profile,conversation)['call_id']
+        api.mobile.events(other,owner,{'events':[transcript_item_delivery(other,'one','same words',10,1)]})
+    rows=c.get('/api/plugins/beacon/mobile/sessions/native-stored/voice-history?profile=default').json()['events']
+    assert len(rows)==1 and rows[0]['event_id']==event['display_event_id'] and rows[0]['session_id']=='native-stored'
+    with pytest.raises(LookupError): api.mobile.events(cid,'foreign',{'events':[event]})
+    # Even an authorized call cannot borrow another call's display identity.
+    another=api.mobile.reserve('owner','default','native-stored')['call_id']
+    with pytest.raises(ValueError): api.mobile.events(another,'owner',{'events':[event]})
+
+
+def test_distinct_item_history_keeps_latest_bounded_groups_and_utf8_partial_markers(harness):
+    api,c,_,_,_=harness;cid=reserve(c)
+    for offset in range(0,205,64):
+        api.mobile.events(cid,'owner',{'events':[transcript_item_delivery(cid,'item-'+str(i),'x'*8192,i,i+1)
+            for i in range(offset,min(offset+64,205))]})
+    latest=api.mobile.voice_history('owner','default','native-stored',limit=3)
+    assert latest['truncated'] and len(latest['events'])==3
+    assert [row['at_ms'] for row in latest['events']]==[202,203,204]
+    result=api.mobile.voice_history('owner','default','native-stored')
+    assert result['truncated'] and len(result['events'])<=200
+    assert sum(len(row['text'].encode()) for row in result['events'])<=1024*1024
+    assert result['events'][-1]['event_id']==transcript_item_delivery(cid,'item-204','',204,205)['display_event_id']
+    partial=api.mobile.reserve('owner','default','partial-chat')['call_id']
+    api.mobile.events(partial,'owner',{'events':[transcript_item_delivery(partial,'tail','界'*20,10,1,final=False)]})
+    marker=' [unfinalized transcript]';budget=len(marker.encode())+7
+    bounded=api.mobile.voice_history('owner','default','partial-chat',text_budget=budget)
+    assert bounded['truncated'] and bounded['events'][0]['text']=='界界'+marker
+    assert len(bounded['events'][0]['text'].encode())<=budget
+
+
 def test_voice_history_orders_late_user_transcription_by_provider_turn(harness):
     api,c,cfg,tmp,app=harness;cid=reserve(c)
     # The provider's final user transcription arrives after the reply starts; both belong to turn 3.
@@ -1122,7 +1430,14 @@ def test_proactive_soul_section_is_blank_line_idempotent(harness, monkeypatch):
     assert soul.read_text(encoding='utf-8') == original
 
 
-def test_phone_delivery_uses_owned_assistant_chat_for_cron_owner_rows(harness, monkeypatch):
+@pytest.mark.parametrize('title_length,oversized_result', [
+    pytest.param(7, False, id='short'),
+    pytest.param(240, False, id='title-240'),
+    pytest.param(241, False, id='title-241'),
+    pytest.param(8192, False, id='long-title'),
+    pytest.param(7, True, id='long-result'),
+])
+def test_phone_delivery_uses_owned_assistant_chat_for_cron_owner_rows(harness, monkeypatch, title_length, oversized_result):
     import asyncio
     from contextlib import nullcontext
 
@@ -1150,8 +1465,28 @@ def test_phone_delivery_uses_owned_assistant_chat_for_cron_owner_rows(harness, m
     server = SimpleNamespace(_profile_db=lambda scope: nullcontext(ProfileDb()))
     monkeypatch.setitem(sys.modules, 'tui_gateway', SimpleNamespace(server=server))
     monkeypatch.setattr(api.proactive, 'current_profile', lambda cfg: 'default')
+    monkeypatch.syspath_prepend(str(Path(os.environ.get('HERMES_AGENT_SOURCE') or Path.home()/'AppData'/'Local'/'hermes'/'hermes-agent')))
+    from agent.secret_scope import (
+        reset_multiplex_context, reset_secret_scope, set_multiplex_context, set_secret_scope)
+    from cron import scheduler_delivery
+    from cron.scheduler_delivery import _resolve_delivery_targets
+    from tools import send_message_tool
+    import gateway.config as gateway_config
+    import gateway.delivery as native_delivery
+    import hermes_cli.plugins as native_plugins
+    from gateway.config import GatewayConfig, Platform
+    from gateway.config_env import _enable_plugin_platform
+    from gateway.dead_targets import DeadTargetRegistry
+    registry_module = importlib.import_module('gateway.platform_registry')
+    from gateway.platform_registry import PlatformEntry, PlatformRegistry
+    platform_registry = PlatformRegistry()
+    monkeypatch.setattr(registry_module, 'platform_registry', platform_registry)
+    monkeypatch.setattr(native_plugins, 'discover_plugins', lambda: None)
+    monkeypatch.setattr(send_message_tool, '_live_adapter', lambda platform: (None, None))
+    monkeypatch.setattr(native_delivery, 'get_hermes_home', lambda: tmp)
     plugin = load_private('__init__')
-    phone_plugin = plugin.phone_delivery
+    phone_plugin = load_private('phone_delivery')
+    monkeypatch.setattr(plugin, 'phone_delivery', phone_plugin)
     real_native = load_private('native')
     with pytest.raises(LookupError, match='Native stored conversation not owned'):
         real_native.verify('owner', 'basic', 'default', 'cron-run')
@@ -1159,18 +1494,6 @@ def test_phone_delivery_uses_owned_assistant_chat_for_cron_owner_rows(harness, m
     reads.clear()
     monkeypatch.setattr(phone_plugin, '_profile_state', lambda: (api.mobile, cfg, 'default'))
     monkeypatch.setattr(phone_plugin, '_modules', lambda: (api.mobile, real_native, api.proactive))
-
-    monkeypatch.syspath_prepend(str(Path(os.environ.get('HERMES_AGENT_SOURCE') or Path.home()/'AppData'/'Local'/'hermes'/'hermes-agent')))
-    from agent.secret_scope import (
-        reset_multiplex_context, reset_secret_scope, set_multiplex_context, set_secret_scope)
-    from cron.scheduler_delivery import _resolve_delivery_targets
-    import gateway.config as gateway_config
-    from gateway.config import GatewayConfig, Platform
-    from gateway.config_env import _enable_plugin_platform
-    registry_module = importlib.import_module('gateway.platform_registry')
-    from gateway.platform_registry import PlatformEntry, PlatformRegistry
-    platform_registry = PlatformRegistry()
-    monkeypatch.setattr(registry_module, 'platform_registry', platform_registry)
 
     def register_platform(**kwargs):
         registrations.append(kwargs)
@@ -1190,6 +1513,7 @@ def test_phone_delivery_uses_owned_assistant_chat_for_cron_owner_rows(harness, m
     assert phone['env_enablement_fn']() == {'home_channel': {'chat_id': 'phone', 'name': 'Beacon phone'}}
     assert callable(phone['standalone_sender_fn'])
     assert callable(phone['adapter_factory'])
+    assert platform_registry.get('phone').max_message_length == 0
 
     platform = Platform('phone')
     gateway = GatewayConfig()
@@ -1207,22 +1531,127 @@ def test_phone_delivery_uses_owned_assistant_chat_for_cron_owner_rows(harness, m
         ('phone', 'phone', None)]
 
     adapter = phone['adapter_factory'](SimpleNamespace(extra={}))
-    result = 'A useful proactive result.'
-    cron_message = (
-        'Cronjob Response: Example\n(job_id: cron-job)\n-------------\n\n'
-        + result
-        + '\n\nTo stop or manage this job, send me a new message '
-        '(e.g. "stop reminder Beacon: important emails").')
-    first = asyncio.run(adapter.send('phone', cron_message, metadata={'job_id': 'cron-job'}))
-    second = asyncio.run(phone['standalone_sender_fn'](None, 'phone', cron_message))
+    router = native_delivery.DeliveryRouter(gateway, {platform: adapter},
+        dead_targets=DeadTargetRegistry(tmp / 'dead-targets.json'))
+    delivery_time=1_800_000_000
+    monkeypatch.setattr(phone_plugin,'time',SimpleNamespace(time=lambda:delivery_time))
+    monkeypatch.setattr(scheduler_delivery, '_get_standalone_send_timeout', lambda: 5)
+    monkeypatch.setattr(scheduler_delivery._sched, '_interpreter_shutting_down', lambda *args: False)
+    standalone_calls = []
+
+    async def send_plugin(pconfig, chat_id, message, **kwargs):
+        standalone_calls.append((message, kwargs))
+        return await phone['standalone_sender_fn'](pconfig, chat_id, message, **kwargs)
+
+    monkeypatch.setattr(platform_registry.get('phone'), 'standalone_sender_fn', send_plugin)
+
+    def native_live(job_id, message):
+        target = native_delivery.DeliveryTarget(platform=platform, chat_id='phone', is_explicit=True)
+        return asyncio.run(router._deliver_to_platform(target, message, {'job_id': job_id}))
+
+    def native_standalone(job_id, message):
+        target = SimpleNamespace(job={'id': job_id}, where='phone:phone', platform=platform,
+                                 pconfig=None, chat_id='phone', thread_id=None)
+        sent, error = scheduler_delivery._standalone_send(target, message, [])
+        assert error is None
+        return sent
+
+    task_name = 'N' * title_length
+    result = 'A useful proactive result.' + ('x' * 8000 if oversized_result else '')
+
+    def cron_envelope(job_id, body, name=task_name):
+        return (f'Cronjob Response: {name}\n(job_id: {job_id})\n-------------\n\n'
+                + body + '\n\nTo stop or manage this job, send me a new message '
+                + f'(e.g. "stop reminder {name}").')
+
+    cron_message = cron_envelope('cron-job', result)
+    first = native_live('cron-job', cron_message)
+    second = native_standalone('cron-job', cron_message)
     assert first.success is True
     assert second['success'] is True and second['message_id'] == first.message_id
     assert reads == ['assistant-chat', 'assistant-chat', 'assistant-chat', 'assistant-chat']
     with api.mobile.connect() as conn:
         row = conn.execute('SELECT * FROM notices').fetchone()
         assert row['conversation'] == 'assistant-chat' and row['kind'] == 'task_result'
-        assert row['reason'] == result
+        assert row['reason'] == result[:4000]
         assert conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0] == 1
+    assert standalone_calls[0][0] == cron_message
+    if len(cron_message) > native_delivery.MAX_PLATFORM_OUTPUT:
+        audit_copies = list((tmp / 'cron' / 'output').glob('cron-job_*.txt'))
+        assert audit_copies and audit_copies[-1].read_text(encoding='utf-8') == cron_message
+    assert native_live('cron-job', cron_message).message_id == first.message_id
+
+    # A second real native envelope has its own identity even when every result byte is identical.
+    another_job = 'j' * 160
+    another_message = cron_envelope(another_job, result)
+    another = native_standalone(another_job, another_message)
+    retried = native_live(another_job, another_message)
+    assert another['success'] and another['message_id']!=first.message_id
+    assert retried.success and retried.message_id==another['message_id']
+    if oversized_result:
+        # Identical previews must still distinguish different full results from the same job.
+        changed_message = cron_envelope('cron-job', result + ' Different tail.')
+        changed = native_standalone('cron-job', changed_message)
+        assert changed['success'] and changed['message_id'] not in (first.message_id, another['message_id'])
+        assert native_live('cron-job', changed_message).message_id == changed['message_id']
+    # Native standalone receives no job ID: two unwrapped jobs must fail rather than share a receipt.
+    reads_before = list(reads)
+    for job_id in ('unwrapped-one', 'unwrapped-two'):
+        rejected = native_standalone(job_id, result)
+        with pytest.raises(RuntimeError, match='scheduled job results only'):
+            native_live(job_id, result)
+        fallback = native_standalone(job_id, result)
+        assert 'error' in rejected and not rejected.get('success') and 'message_id' not in rejected
+        assert 'scheduled job results only' in rejected['error']
+        assert fallback == rejected
+        # A retry can never pass, so Hermes is told not to repeat it.
+        sent = asyncio.run(adapter.send('phone', result))
+        assert sent.success is False and sent.retryable is False
+        assert sent.error == 'Beacon phone delivery accepts scheduled job results only (Hermes needs cron.wrap_response: true)'
+    for invalid in (None, True, 'invalid:job', 'x' * 161):
+        with pytest.raises(RuntimeError, match='scheduled job results only'):
+            native_live(invalid, result)
+    malformed = [cron_envelope(job_id, result) for job_id in ('', 'invalid:job', 'x' * 161)]
+    malformed += ['prefix\n' + cron_message, cron_envelope('cron-job', result, ''),
+                  cron_envelope('cron-job', result, 'two\nlines'), cron_envelope('cron-job', result, 'two\rlines')]
+    for message in malformed:
+        rejected = native_standalone('cron-job', message)
+        assert rejected.get('error') and not rejected.get('success') and 'message_id' not in rejected
+        with pytest.raises(RuntimeError, match='scheduled job results only'):
+            native_live('cron-job', message)
+    assert reads == reads_before
+    assert standalone_calls and all(set(kwargs) == {'thread_id', 'media_files', 'force_document'}
+                                    for _, kwargs in standalone_calls)
+    with api.mobile.connect() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0] == 2 + int(oversized_result)
+
+    # A lost live receipt after a real enqueue falls back to the same wrapped job identity.
+    enqueue = api.mobile.enqueue_task_result
+    lost = []
+
+    def enqueue_then_lose_receipt(*args):
+        event = enqueue(*args)
+        if not lost:
+            lost.append(event)
+            raise OSError('Live receipt lost after enqueue')
+        return event
+
+    monkeypatch.setattr(api.mobile, 'enqueue_task_result', enqueue_then_lose_receipt)
+    lost_message = cron_envelope('lost-receipt-job', result)
+    with pytest.raises(RuntimeError, match='Live receipt lost after enqueue'):
+        native_live('lost-receipt-job', lost_message)
+    assert len(lost) == 1
+    recovered = native_standalone('lost-receipt-job', lost_message)
+    assert recovered['success'] and recovered['message_id'] == lost[0]
+    assert lost[0] not in (first.message_id, another['message_id'])
+    monkeypatch.setattr(api.mobile, 'enqueue_task_result', enqueue)
+    delivery_time+=300
+    repeated=native_standalone('cron-job',cron_message)
+    assert repeated['success'] and repeated['message_id']!=first.message_id
+    with api.mobile.connect() as conn:
+        rows=conn.execute("SELECT conversation,reason FROM notices WHERE kind='task_result'").fetchall()
+    assert len(rows)==4 + int(oversized_result)
+    assert all(row['conversation']=='assistant-chat' and row['reason']==result[:4000] for row in rows)
 
 
 def test_release_verification_cache_hits_unchanged_files_and_misses_stat_changes(harness, monkeypatch):
@@ -1319,9 +1748,37 @@ def test_mobile_schema_initializes_once_per_database_in_process(harness, monkeyp
     assert len(scripts) == 2
 
 
-def test_call_user_invitation_deduplicates_only_within_its_chat(harness):
+@pytest.mark.parametrize('deferred',[False,True])
+def test_call_user_invitation_deduplicates_only_within_its_chat(harness,deferred):
     api,c,cfg,tmp,app=harness
+    if deferred:
+        with api.mobile.connect() as conn:
+            conn.execute('INSERT INTO calls(id,owner,profile,conversation,created) VALUES(?,?,?,?,?)',
+                         ('active-call','owner','default','chat-a',time.time()))
     first=api.mobile.invitation('owner','default','chat-a','Build failed',deduplicate=True)
     assert api.mobile.invitation('owner','default','chat-a','Build failed again',deduplicate=True)==first
     # Another chat's ringing call carries another reason, so it gets its own invitation.
     assert api.mobile.invitation('owner','default','chat-b','Flight moved',deduplicate=True)!=first
+
+
+@pytest.mark.parametrize('deferred',[False,True])
+def test_invitation_supplied_connection_leaves_commit_and_close_to_caller(harness,deferred):
+    api,_,_,_,_=harness
+    if deferred:
+        with api.mobile.connect() as conn:
+            conn.execute('INSERT INTO calls(id,owner,profile,conversation,created) VALUES(?,?,?,?,?)',
+                         ('active-call','owner','default','chat-a',time.time()))
+    table='deferred' if deferred else 'notices'
+    with api.mobile.connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        event=api.mobile.invitation('owner','default','chat-a','Build failed',conn=conn)
+        assert conn.in_transaction
+        assert conn.execute('SELECT id FROM '+table).fetchone()[0]==event
+        assert conn.execute('SELECT COUNT(*) FROM call_log').fetchone()[0]==(0 if deferred else 1)
+        conn.rollback()
+        assert conn.execute('SELECT COUNT(*) FROM '+table).fetchone()[0]==0
+        assert conn.execute('SELECT COUNT(*) FROM call_log').fetchone()[0]==0
+    # Existing standalone callers still own a durable invitation when the helper returns.
+    standalone=api.mobile.invitation('owner','default','chat-a','Build failed')
+    with api.mobile.connect() as conn:
+        assert conn.execute('SELECT id FROM '+table).fetchone()[0]==standalone

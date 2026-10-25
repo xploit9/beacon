@@ -70,11 +70,13 @@ data class AuthContext(
     val backend: String = "",
     val bearer: NativeBearerRecord? = null,
     val loopbackSession: LoopbackSessionRecord? = null,
+    val nativeProvider: String = bearer?.provider.orEmpty().ifBlank { if (loopbackSession?.verified == true) "loopback" else "" },
 ) {
-    override fun toString() = "AuthContext(origin=$origin, cookies=${cookies.size}, owner=$owner, profile=$profile, csrf=<redacted>, backend=$backend, bearer=$bearer, loopbackSession=$loopbackSession)"
+    fun scope() = Scope(origin, owner, profile, nativeProvider = nativeProvider)
+    override fun toString() = "AuthContext(origin=$origin, cookies=${cookies.size}, owner=$owner, profile=$profile, nativeProvider=$nativeProvider, csrf=<redacted>, backend=$backend, bearer=$bearer, loopbackSession=$loopbackSession)"
 }
 
-// Issued-time ties keep stored on ordinary writes but incoming on epoch-checked persistence; legacy expiry ties still prefer incoming.
+// Issued-time ties keep stored on snapshot writes; checked sign-in can prefer incoming. Legacy expiry ties prefer incoming.
 internal fun chooseNewestBearer(incoming: NativeBearerRecord?, stored: NativeBearerRecord?, preferIncomingOnIssueTimeTie: Boolean): NativeBearerRecord? = when {
     stored == null -> incoming
     incoming == null -> stored
@@ -91,43 +93,83 @@ internal fun chooseNewestBearer(incoming: NativeBearerRecord?, stored: NativeBea
 }
 
 internal fun AuthContext.withNewestBearer(stored: NativeBearerRecord?, preferIncomingOnIssueTimeTie: Boolean = false): AuthContext {
-    val sameOwner = stored?.takeIf { loopbackSession == null && it.origin == origin && it.owner == owner }
+    val sameOwner = stored?.takeIf { loopbackSession == null && bearer != null && it.origin == origin && it.owner == owner && it.provider == bearer.provider }
     return copy(bearer = chooseNewestBearer(bearer, sameOwner, preferIncomingOnIssueTimeTie)?.copy(profile = profile))
 }
 
+// OAuth rotates account credentials; compare every token field while retaining the current UI profile.
 internal fun AuthContext.compareAndSetBearer(expected: NativeBearerRecord, replacement: NativeBearerRecord): AuthContext? {
-    if (replacement.origin != expected.origin || replacement.owner != expected.owner || replacement.profile != expected.profile || bearer != expected) return null
-    return copy(bearer = replacement)
+    if (origin != expected.origin || owner != expected.owner || replacement.origin != expected.origin || replacement.owner != expected.owner ||
+        expected.provider.isNotBlank() && replacement.provider != expected.provider || replacement.profile != expected.profile || bearer?.copy(profile = expected.profile) != expected) return null
+    if (nativeProvider.isNotBlank() && replacement.provider != nativeProvider) return null
+    return copy(bearer = replacement.copy(profile = profile), nativeProvider = replacement.provider)
+}
+
+// Cookie refresh belongs to the account, not the profile or an ordinary context snapshot.
+internal fun AuthContext.sameCookieAuthority(expected: AuthContext): Boolean =
+    expected.owner.isNotBlank() && expected.nativeProvider.isNotBlank() && expected.backend == "hermes-dashboard" &&
+        scope().sameAccount(expected.scope()) && backend == expected.backend &&
+        bearer?.copy(profile = expected.profile) == expected.bearer && loopbackSession == expected.loopbackSession
+
+internal fun AuthContext.compareAndSetCookies(expected: AuthContext, replacement: List<String>): AuthContext? {
+    if (!sameCookieAuthority(expected) || cookies != expected.cookies) return null
+    return copy(cookies = replacement)
 }
 
 /** Only an encrypted context from a previous successful bootstrap may open its local vault.
  * A password replacement starts with an empty cookie jar and never previews that old owner. */
 fun AuthContext.cachedScopeFor(requestedOrigin: String, replacingAccount: Boolean, now: Long = System.currentTimeMillis()): Scope? {
-    if (replacingAccount || origin != requestedOrigin || owner.isBlank() || profile.isBlank() || backend != "hermes-dashboard") return null
-    val url = runCatching { trustedOrigin(origin).toHttpUrl() }.getOrNull() ?: return null
+    return scope().takeIf { !replacingAccount && nativeProvider.isNotBlank() && canReconnectNative(requestedOrigin, now) }
+}
+/** Unstamped legacy credentials may ask native Hermes for identity, never preview an unassigned vault. */
+internal fun AuthContext.canReconnectNative(requestedOrigin: String, now: Long = System.currentTimeMillis()): Boolean {
+    if (origin != requestedOrigin || owner.isBlank() || profile.isBlank() || backend != "hermes-dashboard") return false
+    val url = runCatching { trustedOrigin(origin).toHttpUrl() }.getOrNull() ?: return false
     val bearerMatches = bearer?.let {
-        it.origin == requestedOrigin && it.owner == owner && it.profile == profile &&
+        it.origin == requestedOrigin && it.owner == owner && it.profile == profile && it.provider == nativeProvider &&
             it.accessToken.isNotBlank() && it.refreshToken.isNotBlank()
     } == true
     val loopbackMatches = loopbackSession?.let {
-        it.origin == requestedOrigin && it.owner == owner && owner == "local" && it.verified && it.persisted && validLoopbackSessionToken(it.token)
+        nativeProvider == "loopback" && it.origin == requestedOrigin && it.owner == owner && owner == "local" && it.verified && it.persisted && validLoopbackSessionToken(it.token)
     } == true
-    val cookieMatches = loopbackSession == null && cookies.any { raw -> Cookie.parse(url, raw)?.let { nativeSessionCookie(it.name) && it.value.isNotBlank() && it.secure && it.httpOnly && it.expiresAt > now && it.matches(url) } == true }
-    if (!bearerMatches && !loopbackMatches && !cookieMatches) return null
-    return Scope(requestedOrigin, owner, profile)
+    val cookieMatches = bearer == null && loopbackSession == null && cookies.any { raw -> Cookie.parse(url, raw)?.let { nativeSessionCookie(it.name) && it.value.isNotBlank() && it.secure && it.httpOnly && it.expiresAt > now && it.matches(url) } == true }
+    return bearerMatches || loopbackMatches || cookieMatches
 }
 class CachedIdentityMismatch : SecurityException("Saved Beacon identity changed. Sign in again; local drafts are retained.")
 fun AuthContext.requireCachedIdentity(scope: Scope) {
-    if (origin != scope.origin || owner != scope.owner || profile != scope.profile ||
+    if (nativeProvider.isBlank() || !this.scope().sameAccount(scope) || profile != scope.profile ||
         loopbackSession?.let { !it.verified || !it.persisted || it.origin != scope.origin || it.owner != scope.owner } == true) throw CachedIdentityMismatch()
 }
 /** AuthStore is empty after local sign-out. A profile switch preserves the owner's consent;
  * changing accounts or clearing local sign-in cannot authorize an old pending push callback. */
-fun AuthContext.authorizesPushSource(scope: Scope): Boolean = backend == "hermes-dashboard" && origin == scope.origin && owner.isNotBlank() && owner == scope.owner
+fun AuthContext.authorizesPushSource(scope: Scope): Boolean = backend == "hermes-dashboard" && nativeProvider.isNotBlank() && owner.isNotBlank() && this.scope().sameAccount(scope)
+
+/** The caller holds the store monitor across the authority check, read and write. */
+internal fun persistAuthContextIfUnchanged(
+    auth: AuthContext, version: Long?, snapshot: Boolean, epoch: CredentialEpoch,
+    read: () -> AuthContext, write: (AuthContext) -> Unit,
+    selectProfileIf: (() -> Boolean)? = null,
+): Boolean {
+    if (version == null || !epoch.current(version) || selectProfileIf?.invoke() == false) return false
+    val incoming = if (snapshot) {
+        val stored = read()
+        if (!stored.scope().sameAccount(auth.scope())) return false
+        val profile = if (selectProfileIf != null) auth.profile else stored.profile
+        // Exact refresh CAS can rotate without advancing this epoch, even if the clock moves back.
+        auth.copy(profile = profile, bearer = stored.bearer?.copy(profile = profile), cookies = stored.cookies)
+    } else auth
+    val retained = incoming.copy(loopbackSession = incoming.loopbackSession?.takeIf { incoming.bearer == null })
+    // Context snapshots keep the admission epoch; only new authority invalidates its readers.
+    if (snapshot) write(retained)
+    else epoch.mutate { write(retained.withNewestBearer(read().bearer, preferIncomingOnIssueTimeTie = true)) }
+    return true
+}
 
 class AuthStore(context: Context, private val cipher: AppCipher) {
     private val prefs = context.getSharedPreferences("auth-private", Context.MODE_PRIVATE)
     internal val authorityEpoch = CredentialEpoch()
+    // Allows a regression to hold the actual disk write after the caller's authority check.
+    @Volatile internal var ioDispatcher: kotlinx.coroutines.CoroutineDispatcher = kotlinx.coroutines.Dispatchers.IO
     @Synchronized fun read(origin: String): AuthContext {
         return try {
             val raw = prefs.getString(origin.digest(), null) ?: return AuthContext(origin, emptyList())
@@ -149,16 +191,16 @@ class AuthStore(context: Context, private val cipher: AppCipher) {
                 bearer == null && backend == "hermes-dashboard" && session.owner == "local" && session.verified &&
                     session.origin == origin && session.owner == owner && validLoopbackSessionToken(session.token)
             }
-            AuthContext(origin, (0 until arr.length()).map { arr.getString(it) }, owner, profile, o.optString("csrf"), backend, bearer, loopbackSession)
+            val provider = o.optString("native_provider").ifBlank { bearer?.provider.orEmpty().ifBlank { if (loopbackSession != null) "loopback" else "" } }
+            require(bearer == null || bearer.provider.isBlank() || bearer.provider == provider)
+            require(loopbackSession == null || provider == "loopback")
+            AuthContext(origin, (0 until arr.length()).map { arr.getString(it) }, owner, profile, o.optString("csrf"), backend, bearer, loopbackSession, provider)
         } catch (_: Exception) { AuthContext(origin, emptyList()) }
     }
-    suspend fun persist(auth: AuthContext) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { write(auth) }
-    internal suspend fun persistIfUnchanged(auth: AuthContext, version: Long?) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    suspend fun persist(auth: AuthContext) = kotlinx.coroutines.withContext(ioDispatcher) { write(auth) }
+    internal suspend fun persistIfUnchanged(auth: AuthContext, version: Long?, snapshot: Boolean = false, selectProfileIf: (() -> Boolean)? = null) = kotlinx.coroutines.withContext(ioDispatcher) {
         synchronized(this@AuthStore) {
-            if (version != null && authorityEpoch.current(version)) {
-                write(auth.copy(loopbackSession = auth.loopbackSession?.takeIf { auth.bearer == null }), preferIncomingOnIssueTimeTie = true)
-                true
-            } else false
+            persistAuthContextIfUnchanged(auth, version, snapshot, authorityEpoch, read = { read(auth.origin) }, write = ::writeRecord, selectProfileIf = selectProfileIf)
         }
     }
     internal suspend fun removeIfUnchanged(origin: String, version: Long?) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
@@ -167,13 +209,13 @@ class AuthStore(context: Context, private val cipher: AppCipher) {
         }
     }
     suspend fun remove(origin: String) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { clear(origin) }
-    fun write(auth: AuthContext) = write(auth, preferIncomingOnIssueTimeTie = false)
-    private fun write(auth: AuthContext, preferIncomingOnIssueTimeTie: Boolean) = authorityEpoch.mutate { synchronized(this) { writeRecord(auth.withNewestBearer(read(auth.origin).bearer, preferIncomingOnIssueTimeTie)) } }
+    fun write(auth: AuthContext) = authorityEpoch.mutate { synchronized(this) { writeRecord(auth.withNewestBearer(read(auth.origin).bearer)) } }
     private fun writeRecord(auth: AuthContext) {
-        val o = JSONObject().put("cookies", JSONArray(auth.cookies)).put("owner", auth.owner).put("profile", auth.profile).put("csrf", auth.csrf).put("backend", auth.backend)
+        val o = JSONObject().put("cookies", JSONArray(auth.cookies)).put("owner", auth.owner).put("profile", auth.profile).put("csrf", auth.csrf).put("backend", auth.backend).put("native_provider", auth.nativeProvider)
         auth.bearer?.let { token ->
             require(token.accessToken.isNotBlank() && token.accessToken.none { it.isWhitespace() || it.isISOControl() } && token.refreshToken.isNotBlank()) { "Bearer credentials are incomplete" }
             require(token.origin == auth.origin && token.owner == auth.owner && token.profile == auth.profile) { "Bearer authority does not match the saved account" }
+            require(token.provider == auth.nativeProvider) { "Bearer provider does not match the saved account" }
             val stored = JSONObject().put("access_token", token.accessToken).put("refresh_token", token.refreshToken).put("expires_at", token.expiresAt).put("origin", token.origin).put("owner", token.owner).put("profile", token.profile).put("provider", token.provider)
             if (token.issuedAt > 0) stored.put("issued_at", token.issuedAt)
             o.put("bearer", stored)
@@ -187,11 +229,17 @@ class AuthStore(context: Context, private val cipher: AppCipher) {
     }
     internal fun replaceBearer(expected: NativeBearerRecord, replacement: NativeBearerRecord): Boolean = synchronized(this) {
         val replacementContext = read(expected.origin).compareAndSetBearer(expected, replacement) ?: return@synchronized false
+        if (expected.provider != replacement.provider) authorityEpoch.mutate { writeRecord(replacementContext) } else writeRecord(replacementContext)
+        true
+    }
+    internal fun replaceCookies(expected: AuthContext, replacement: List<String>, version: Long?): Boolean = synchronized(this) {
+        if (version == null || !authorityEpoch.current(version)) return@synchronized false
+        val replacementContext = read(expected.origin).compareAndSetCookies(expected, replacement) ?: return@synchronized false
         writeRecord(replacementContext)
         true
     }
     internal fun removeIfBearerUnchanged(expected: NativeBearerRecord): Boolean = synchronized(this) {
-        if (read(expected.origin).bearer != expected) return@synchronized false
+        if (read(expected.origin).bearer?.copy(profile = expected.profile) != expected) return@synchronized false
         clear(expected.origin)
         true
     }
@@ -205,7 +253,7 @@ class AuthStore(context: Context, private val cipher: AppCipher) {
     fun clear(origin: String) = authorityEpoch.mutate { synchronized(this) { check(prefs.edit().remove(origin.digest()).commit()) } }
 }
 
-/** One jar belongs to one client. A call gets a detached copy so UI profile switches cannot rebind it. */
+/** Each client keeps its profile view; same-admission clients adopt retained account cookies before requests. */
 class ScopedCookies(private val origin: HttpUrl, values: List<String>, private val bearerActive: () -> Boolean = { false }) : CookieJar {
     private val cookies = values.mapNotNull { Cookie.parse(origin, it) }.toMutableList()
     @Synchronized override fun saveFromResponse(url: HttpUrl, received: List<Cookie>) {
@@ -216,5 +264,12 @@ class ScopedCookies(private val origin: HttpUrl, values: List<String>, private v
         }
     }
     @Synchronized override fun loadForRequest(url: HttpUrl): List<Cookie> = if (!bearerActive() && url.host == origin.host && url.port == origin.port && url.scheme == origin.scheme) cookies.filter { it.expiresAt > System.currentTimeMillis() && it.matches(url) } else emptyList()
+    @Synchronized internal fun replaceIfUnchanged(expected: List<String>, replacement: List<String>): Boolean {
+        // Serialized expiry is second-precision; response cookies may still hold milliseconds.
+        if (cookies.map { it.toString() } != expected.mapNotNull { Cookie.parse(origin, it)?.toString() }) return false
+        cookies.clear()
+        cookies.addAll(replacement.mapNotNull { Cookie.parse(origin, it) })
+        return true
+    }
     @Synchronized fun snapshot(): List<String> = cookies.map { it.toString() }
 }

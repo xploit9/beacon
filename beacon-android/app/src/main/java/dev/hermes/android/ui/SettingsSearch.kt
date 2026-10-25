@@ -13,7 +13,7 @@ private val searchWhitespace = Regex("[\\s\\p{Z}]+")
 private val settingsSearchKeywords = mapOf(
     "Assistant" to "What needs you proactive alerts watch",
     "Voice & calls" to "API key",
-    "Devices" to "pairing",
+    "Devices" to "phones linked",
 )
 private fun searchTermsMatch(text: String, query: String): Boolean =
     query.splitToSequence(searchWhitespace).filter(String::isNotBlank).all { text.contains(it, ignoreCase = true) }
@@ -30,8 +30,8 @@ internal val settingsCategories = linkedMapOf(
     "Server" to listOf("Health", "Logs", "Server updates", "Session checkpoints"),
 )
 internal val settingsDescriptions = mapOf(
-    "Connection" to "Server, signed-in account, and paired devices",
-    "Devices" to "Manage paired phones",
+    "Connection" to "Server, signed-in account, and phones",
+    "Devices" to "Manage linked phones",
     "Assistant" to "Name and profile",
     "Chat" to "Sending and display",
     "Voice & calls" to "Voice provider and calls",

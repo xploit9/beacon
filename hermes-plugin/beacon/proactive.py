@@ -24,6 +24,7 @@ LEARNED_PREFIX = "Beacon email importance: "
 IMPORTANCE_PREFIX = "Beacon importance: "
 EMAIL_NOTICE_PREFIX = "proactive-email-notice:"
 EMAIL_RULE_PREFIX = "proactive-email-rule:"
+ENABLE_UNSETTLED = "Proactive setup cleanup is incomplete. Managed jobs may still run; check them in Hermes before retrying."
 PROFILE_PROMPT = (
     "Use this profile's Hermes memory to learn what the owner considers important per source. "
     "Read both 'Beacon importance: <source>: ' and legacy 'Beacon email importance: ' notes (email). "
@@ -220,6 +221,18 @@ def _validate_profile_instructions(home, active):
     _soul_content(soul, active)
 
 
+def _restore_profile_instructions(soul, prior_soul, written_soul):
+    _check_file(soul)
+    current_soul = soul.read_bytes() if soul.exists() else None
+    if current_soul != prior_soul:
+        if current_soul != written_soul:
+            raise RuntimeError("Profile instructions were edited during Proactive setup")
+        if prior_soul is None:
+            soul.unlink()
+        else:
+            _atomic_text(soul, prior_soul.decode("utf-8"))
+
+
 def _cron_helpers():
     from hermes_cli.web_server_cron import _call_cron_for_profile, _create_cron_job_sync, _mutate_cron_for_profile
     from hermes_cli.web_models import CronJobCreate
@@ -354,55 +367,111 @@ def upgrade_jobs(mobile, owner, profile):
     if _meta_get(mobile, key) == JOBS_VERSION:
         return False
     with _SET_ENABLED_LOCK:
-        if _meta_get(mobile, key) == JOBS_VERSION:
+        previous_version = _meta_get(mobile, key)
+        if previous_version == JOBS_VERSION:
             return False
-        _move_legacy_learned(mobile, owner, profile)
-        # Keep a recovery copy if the owned job is missing and reconciliation must replace it.
-        previous = _managed_id(mobile, owner, profile, "watch_email")
+        is_enabled = enabled(mobile, owner, profile)
+        active = is_enabled and _setup_complete(mobile, owner, profile)
+        previous_ids = _managed_ids(mobile, owner, profile)
+        error_key = _key(owner, profile, "enable-error")
+        previous_error = _meta_get(mobile, error_key)
         cursor_key = _key(owner, profile, "checked_until")
-        checked_until = _meta_get(mobile, cursor_key)
-        if previous:
-            from hermes_cli.web_server_profiles import _profile_scope
-            from cron.notepad import get_note
-            with _profile_scope(profile):
-                checked_until = get_note(previous, "checked_until") or checked_until
-        if checked_until:
-            _meta_set(mobile, cursor_key, checked_until)
-        if enabled(mobile, owner, profile):
-            _write_profile_instructions(_home(profile), True)
-        if not enabled(mobile, owner, profile):
-            _managed_delete_all(mobile, owner, profile)
-        _sync_request_jobs(mobile, owner, profile, list_requests(mobile, owner, profile))
-        rebuilt = _managed_id(mobile, owner, profile, "watch_email")
-        if checked_until and rebuilt:
-            from hermes_cli.web_server_profiles import _profile_scope
-            from cron.notepad import set_note
-            with _profile_scope(profile):
-                set_note(rebuilt, "checked_until", checked_until)
-            _meta_set(mobile, cursor_key, None)
-        _meta_set(mobile, key, JOBS_VERSION)
+        undo = []
+        instructions_started = False
+        _meta_set(mobile, error_key, "1")
+        try:
+            _move_legacy_learned(mobile, owner, profile)
+            # Keep a recovery copy until the replacement's notepad and all other writes succeed.
+            previous = previous_ids.get("watch_email")
+            checked_until = _meta_get(mobile, cursor_key)
+            if previous:
+                from hermes_cli.web_server_profiles import _profile_scope
+                from cron.notepad import get_note
+                with _profile_scope(profile):
+                    checked_until = get_note(previous, "checked_until") or checked_until
+            if checked_until:
+                _meta_set(mobile, cursor_key, checked_until)
+            if is_enabled:
+                home = _home(profile)
+                _validate_profile_instructions(home, True)
+                soul = home / "SOUL.md"
+                prior_soul = soul.read_bytes() if soul.exists() else None
+                written_soul = _soul_content(soul, True).encode("utf-8")
+                instructions_started = True
+                _write_profile_instructions(home, True)
+            else:
+                _managed_delete_all(mobile, owner, profile)
+            _sync_request_jobs(mobile, owner, profile, list_requests(mobile, owner, profile), undo)
+            rebuilt = _managed_id(mobile, owner, profile, "watch_email")
+            if checked_until and rebuilt:
+                from hermes_cli.web_server_profiles import _profile_scope
+                from cron.notepad import get_note, set_note
+                with _profile_scope(profile):
+                    # A retained job or a newly resumed run may already have advanced its cursor.
+                    if not get_note(rebuilt, "checked_until"):
+                        set_note(rebuilt, "checked_until", checked_until)
+                        if get_note(rebuilt, "checked_until") != checked_until:
+                            raise RuntimeError("Could not verify the Proactive cursor handoff")
+        except Exception:
+            failed = _rollback_enable_jobs(mobile, owner, profile, undo, previous_ids)
+            if instructions_started:
+                try:
+                    _restore_profile_instructions(soul, prior_soul, written_soul)
+                except Exception:
+                    failed = True
+            # Only a successful upgrade may clear its durable warning, even after a verified rollback.
+            if failed:
+                raise RuntimeError(ENABLE_UNSETTLED)
+            raise
+        try:
+            if active:
+                call, _, _, _ = _cron_helpers()
+                _retire_obsolete_jobs(mobile, owner, profile, call(profile, "list_jobs", True),
+                                      _specs(_setup(mobile, owner, profile), list_requests(mobile, owner, profile)))
+            if checked_until and rebuilt:
+                _meta_set(mobile, cursor_key, None)
+            _meta_set(mobile, error_key, previous_error if is_enabled and not active else None)
+            _meta_set(mobile, key, JOBS_VERSION)
+        except Exception:
+            _meta_set(mobile, error_key, "1")
+            if _meta_get(mobile, key) == JOBS_VERSION:
+                _meta_set(mobile, key, previous_version)
+            raise
     return True
 
 
-def _sync_request_jobs(mobile, owner, profile, rows):
+def _sync_request_jobs(mobile, owner, profile, rows, undo=None):
     if enabled(mobile, owner, profile) and _setup_complete(mobile, owner, profile):
-        _reconcile_jobs(mobile, owner, profile, _setup(mobile, owner, profile), rows)
+        _reconcile_jobs(mobile, owner, profile, _setup(mobile, owner, profile), rows, undo=undo)
 
 
 def _save_requests(mobile, owner, profile, rows):
     key = _key(owner, profile, "requests")
     previous = _meta_get(mobile, key)
-    previous_rows = json.loads(previous) if previous else []
-    _meta_set(mobile, key, json.dumps(rows, separators=(",", ":")) if rows else None)
+    error_key = _key(owner, profile, "enable-error")
+    previous_error = _meta_get(mobile, error_key)
+    previous_ids = _managed_ids(mobile, owner, profile)
+    active = enabled(mobile, owner, profile) and _setup_complete(mobile, owner, profile)
+    undo = []
+    _meta_set(mobile, error_key, "1")
     try:
-        _sync_request_jobs(mobile, owner, profile, rows)
+        _meta_set(mobile, key, json.dumps(rows, separators=(",", ":")) if rows else None)
+        _sync_request_jobs(mobile, owner, profile, rows, undo)
     except Exception:
-        _meta_set(mobile, key, previous)
+        failed = _rollback_enable_jobs(mobile, owner, profile, undo, previous_ids)
         try:
-            _sync_request_jobs(mobile, owner, profile, previous_rows)
+            _meta_set(mobile, key, previous)
         except Exception:
-            pass
+            failed = True
+        if failed:
+            raise RuntimeError(ENABLE_UNSETTLED)
+        _meta_set(mobile, error_key, previous_error)
         raise
+    if active:
+        call, _, _, _ = _cron_helpers()
+        _retire_obsolete_jobs(mobile, owner, profile, call(profile, "list_jobs", True),
+                              _specs(_setup(mobile, owner, profile), rows))
+    _meta_set(mobile, error_key, None if active else previous_error)
     return rows
 
 
@@ -587,37 +656,73 @@ def _job_fields(spec, update=False):
     return fields
 
 
-def _reconcile_jobs(mobile, owner, profile, setup, requests=None):
-    call, create, mutate, model = _cron_helpers()
-    jobs = call(profile, "list_jobs", True)
-    specs = _specs(setup, list_requests(mobile, owner, profile) if requests is None else requests)
+def _retire_obsolete_jobs(mobile, owner, profile, jobs, specs, undo=None):
+    _, _, mutate, _ = _cron_helpers()
     desired = {spec["id"] for spec in specs}
     for job_key, job_id in _managed_ids(mobile, owner, profile).items():
         if job_key in desired:
             continue
-        if any(job.get("id") == job_id for job in jobs):
+        job = next((row for row in jobs if row.get("id") == job_id), None)
+        if undo is not None:
+            # Native removal destroys notepads; keep retirement reversible until enable commits.
+            if job and job.get("enabled", True):
+                entry = [job_key, job_id, dict(job), None]
+                undo.append(entry)
+                paused = mutate(profile, "pause_job", job_id)
+                if paused is None:
+                    raise RuntimeError(f"Could not pause obsolete Beacon proactive job {job_key}")
+                entry[3] = dict(paused)
+            continue
+        if job:
             if not mutate(profile, "remove_job", job_id):
                 raise RuntimeError(f"Could not remove obsolete Beacon proactive job {job_key}")
         _delete_managed_id(mobile, owner, profile, job_key)
-        jobs = [job for job in jobs if job.get("id") != job_id]
+        jobs = [row for row in jobs if row.get("id") != job_id]
+    return jobs
+
+
+def _reconcile_jobs(mobile, owner, profile, setup, requests=None, undo=None):
+    call, create, mutate, model = _cron_helpers()
+    jobs = call(profile, "list_jobs", True)
+    specs = _specs(setup, list_requests(mobile, owner, profile) if requests is None else requests)
+    jobs = _retire_obsolete_jobs(mobile, owner, profile, jobs, specs, undo)
     for spec in specs:
         owned = _owned_jobs(mobile, owner, profile, spec, jobs)
         if not owned:
             if any(job.get("name") == spec["name"] for job in jobs):
                 raise ValueError(f"A job named {spec['name']} already exists and is not owned by Beacon")
-            job = create(model(**_job_fields(spec)), profile)
+            fields = _job_fields(spec)
+            if undo is not None:
+                fields["paused"] = True  # Acquire the ownership receipt before native work can start.
+            try:
+                job = create(model(**fields), profile)
+            except Exception:
+                if undo is not None:
+                    # An unreceipted addition cannot be adopted by name, even after a lost create response.
+                    undo.append([spec["id"], None, {row["id"] for row in jobs}, None])
+                raise
+            entry = [spec["id"], job["id"], None, dict(job)]
+            if undo is not None:
+                undo.append(entry)
             _set_managed_id(mobile, owner, profile, spec["id"], job["id"])
             jobs.append(job)
-            continue
-        job = owned[0]
+        else:
+            job = owned[0]
+            entry = [spec["id"], job["id"], dict(job), dict(job)]
+            if undo is not None:
+                undo.append(entry)
         if not _job_definition_matches(job, spec):
+            entry[3] = None
             job = mutate(profile, "update_job", job["id"], _job_fields(spec, update=True))
             if job is None:
                 raise RuntimeError(f"Could not update Beacon proactive job {spec['id']}")
+            entry[3] = dict(job)
         if not job.get("enabled", True):
+            entry[3] = None
             job = mutate(profile, "resume_job", job["id"])
             if job is None:
                 raise RuntimeError(f"Could not resume Beacon proactive job {spec['id']}")
+            entry[3] = dict(job)
     if learned_notes(mobile, owner, profile):  # a new job's notepad starts empty
         sync_learned(mobile, owner, profile)
     return _job_status(mobile, owner, profile, call(profile, "list_jobs", True), specs)
@@ -639,6 +744,8 @@ def _setup_complete(mobile, owner, profile):
 
 
 def health(mobile, owner, profile, setup, now=None):
+    if _meta_get(mobile, _key(owner, profile, "enable-error")):
+        return {"state": "error", "checked_at": None, "message": ENABLE_UNSETTLED}
     job_id = _managed_id(mobile, owner, profile, "watch_email")
     if not job_id:
         return {"state": "unknown", "checked_at": None, "message": "Not checked yet"}
@@ -730,13 +837,16 @@ def status(mobile, owner, profile):
     specs = _specs(setup, rules)
     call, _, _, _ = _cron_helpers()
     jobs = call(profile, "list_jobs", True)
-    return {"enabled": enabled(mobile, owner, profile),
+    result = {"enabled": enabled(mobile, owner, profile),
             "setup_complete": _setup_complete(mobile, owner, profile),
             "timezone": _profile_timezone(profile), "delivery": setup["delivery"],
             "check_minutes": setup["check_minutes"], "quiet_start": setup["quiet_start"],
             "quiet_end": setup["quiet_end"], "health": health(mobile, owner, profile, setup),
             "rules": rules, "learned": learned_notes(mobile, owner, profile),
             "jobs": _job_status(mobile, owner, profile, jobs, specs)}
+    if _meta_get(mobile, _key(owner, profile, "enable-error")):
+        result.update(_error=True, _message=ENABLE_UNSETTLED)
+    return result
 
 
 _SET_ENABLED_LOCK = threading.Lock()
@@ -780,18 +890,119 @@ def _disable_locked(mobile, owner, profile):
     _managed_delete_all(mobile, owner, profile)
     _meta_set(mobile, _key(owner, profile, "enabled"), None)
     _write_profile_instructions(_home(profile), False)
+    _meta_set(mobile, _key(owner, profile, "enable-error"), None)
+
+
+def _rollback_enable_jobs(mobile, owner, profile, undo, previous_ids):
+    if not undo:
+        return False
+    try:
+        call, _, mutate, _ = _cron_helpers()
+    except Exception:
+        return True
+    failed = False
+    fields = ("name", "schedule", "schedule_display", "prompt", "deliver", "model", "provider", "skills",
+              "enabled_toolsets", "enabled", "state", "paused_at", "paused_reason", "next_run_at", "repeat",
+              "pending_slot", "quota_hold_until", "quota_hold_cron_expr")
+    for job_key, job_id, before, after in reversed(undo):
+        try:
+            jobs = call(profile, "list_jobs", True)
+            if job_id is None:
+                if any(row["id"] not in before for row in jobs):
+                    raise RuntimeError("Could not verify a failed native create")
+                continue
+            job = next((row for row in jobs if row.get("id") == job_id), None)
+            if before is None:
+                if after is None:
+                    raise RuntimeError("Could not verify a new managed job mutation")
+                receipt = _managed_id(mobile, owner, profile, job_key)
+                if receipt not in (None, job_id, previous_ids.get(job_key)):
+                    raise RuntimeError("Managed job ownership changed during enable")
+                if job and any(job.get(key) != after.get(key)
+                        for key in (job.keys() | after.keys()) - {"scheduler_heartbeat_age_s"}):
+                    raise RuntimeError("New managed job was edited during enable")
+                if job and not mutate(profile, "remove_job", job_id):
+                    raise RuntimeError("Could not remove a newly created Beacon job")
+                if receipt == job_id:
+                    _delete_managed_id(mobile, owner, profile, job_key)
+                if job_key in previous_ids:
+                    _set_managed_id(mobile, owner, profile, job_key, previous_ids[job_key])
+                continue
+            if job is None or after is None:
+                if job is not None and all(job.get(key) == before.get(key) for key in fields):
+                    continue
+                raise RuntimeError("Could not verify a managed job mutation")
+            changes = {key: before.get(key) for key in fields if before.get(key) != after.get(key)}
+            if not changes or all(job.get(key) == value for key, value in changes.items()):
+                continue
+            if _managed_id(mobile, owner, profile, job_key) != job_id:
+                raise RuntimeError("Managed job ownership changed during enable")
+            if any(job.get(key) != after.get(key) for key in changes):
+                raise RuntimeError("Managed job was edited during enable")
+            if set(changes) == {"enabled"}:
+                restored = mutate(profile, "resume_job" if changes["enabled"] else "pause_job", job_id)
+            else:
+                restored = mutate(profile, "update_job", job_id, changes)
+            if restored is None:
+                raise RuntimeError("Could not restore a managed Beacon job")
+            # Native schedule/lifecycle edits rederive timing and drop pending slots; restore those last.
+            remaining = {key: value for key, value in changes.items()
+                         if key != "pending_slot" and restored.get(key) != value}
+            if remaining:
+                restored = mutate(profile, "update_job", job_id, remaining)
+            if restored is not None and "pending_slot" in changes and restored.get("pending_slot") != changes["pending_slot"]:
+                restored = mutate(profile, "update_job", job_id, {"pending_slot": changes["pending_slot"]})
+            if restored is None or any(restored.get(key) != value for key, value in changes.items()):
+                raise RuntimeError("Could not verify managed job restoration")
+        except Exception:
+            failed = True
+    return failed
 
 
 def _enable_locked(mobile, owner, profile, setup, save_setup=False):
     setup = validate_setup({"enabled": True, **setup})
     home = _home(profile)
     _validate_profile_instructions(home, True)
-    _reconcile_jobs(mobile, owner, profile, setup)
-    _write_profile_instructions(home, True)
-    _meta_set(mobile, _key(owner, profile, "enabled"), "1")
-    if save_setup:
-        _meta_set(mobile, _key(owner, profile, "setup"), json.dumps(setup, separators=(",", ":")))
-        _meta_set(mobile, _key(owner, profile, "setup_complete"), "1")
+    previous = {suffix: _meta_get(mobile, _key(owner, profile, suffix))
+                for suffix in ("enabled", "setup", "setup_complete", "enable-error")}
+    previous_ids = _managed_ids(mobile, owner, profile)
+    error_key = _key(owner, profile, "enable-error")
+    _meta_set(mobile, error_key, "1")
+    undo = []
+    soul = home / "SOUL.md"
+    instructions_started = False
+    try:
+        _reconcile_jobs(mobile, owner, profile, setup, undo=undo)
+        _check_file(soul)
+        prior_soul = soul.read_bytes() if soul.exists() else None
+        written_soul = _soul_content(soul, True).encode("utf-8")
+        instructions_started = True
+        _write_profile_instructions(home, True)
+        _meta_set(mobile, _key(owner, profile, "enabled"), "1")
+        if save_setup:
+            _meta_set(mobile, _key(owner, profile, "setup"), json.dumps(setup, separators=(",", ":")))
+            _meta_set(mobile, _key(owner, profile, "setup_complete"), "1")
+    except Exception:
+        failed = _rollback_enable_jobs(mobile, owner, profile, undo, previous_ids)
+        if instructions_started:
+            try:
+                _restore_profile_instructions(soul, prior_soul, written_soul)
+            except Exception:
+                failed = True
+        for suffix in ("enabled", "setup", "setup_complete"):
+            try:
+                _meta_set(mobile, _key(owner, profile, suffix), previous[suffix])
+            except Exception:
+                failed = True
+        if failed:
+            raise RuntimeError(ENABLE_UNSETTLED)
+        _meta_set(mobile, error_key, previous["enable-error"])
+        raise
+    # Destructive legacy cleanup happens only after the new enabled state is durable.
+    call, _, _, _ = _cron_helpers()
+    _retire_obsolete_jobs(mobile, owner, profile, call(profile, "list_jobs", True),
+                          _specs(setup, list_requests(mobile, owner, profile)))
+    _meta_set(mobile, error_key, None)
 
 
 def set_enabled(mobile, owner, profile, value):

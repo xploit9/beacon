@@ -247,6 +247,7 @@ class ProactiveUiTest {
         // A plain push binding (not Keep connected), as an FCM-delivered alert has.
         val bindingKey = "source:${source.digest()}"
         val binding = JSONObject().put("source", source).put("origin", fixture.scope.origin).put("owner", fixture.scope.owner)
+            .put("native_provider", fixture.scope.nativeProvider)
             .put("profile", fixture.scope.profile).put("backend", "hermes-dashboard").put("target", "fixture-target")
         persistPushBindings(app.getSharedPreferences("push-binding", android.content.Context.MODE_PRIVATE), mapOf(bindingKey to
             android.util.Base64.encodeToString(app.cipher.encrypt(binding.toString().toByteArray(), bindingKey), android.util.Base64.NO_WRAP)))
@@ -452,7 +453,7 @@ class ProactiveUiTest {
         val fixture = NativeExperienceFixture().apply { bootstrapPluginStatus = pluginStatus; if (pluginStatus == "absent") this.pluginStatus = 404 }
         val profileScopes = listOf(fixture.scope, fixture.scope.copy(profile = "coder"))
         runBlocking {
-            app.auth.remove(fixture.scope.origin)
+            app.auth.persist(fixture.client.auth)
             profileScopes.forEach { owner ->
                 listOf("beacon-session", "beacon-opening", "bot-mode-return", "new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session").forEach { app.cache.delete(owner, it) }
                 (listOf("chat-a", "chat-b") + (1..4).map { "new-$it" }).forEach { id ->

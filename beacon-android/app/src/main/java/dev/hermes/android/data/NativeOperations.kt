@@ -224,11 +224,12 @@ internal class NativeOperations(private val c: BeaconClient) {
                 require(method in setOf("GET", "POST")) { "Unsupported approval setting operation" }
                 require(sid().matches(storedSessionId)) { "Choose a conversation first" }
                 if (method == "GET" && q["passive"] == "1") {
-                    // A browsed chat has no runtime: read the profile's mode and the chat's saved YOLO without resuming it.
+                    // A browsed chat has no runtime: show its own saved YOLO choice without resuming it. A bypass held only by
+                    // another live runtime shows once this chat runs here (its live read replaces this one).
                     val profileMode = c.nativeRpc("config.get", json("key" to "approvals.mode")).string("value")
                     require(profileMode in nativeApprovalModes) { "Approvals are unavailable. Refresh and try again." }
                     val saved = storedYolo(sid()) == true
-                    return json("value" to if (saved) "off" else profileMode, "profile_mode" to profileMode, "session_status_known" to saved,
+                    return json("value" to if (saved) "off" else profileMode, "profile_mode" to profileMode, "session_status_known" to true,
                         "session_bypass" to (saved && profileMode != "off"), "session_id" to sid(), "scope_key" to c.scope.key)
                 }
                 val yoloWrite = method == "POST"
@@ -372,7 +373,7 @@ internal class NativeOperations(private val c: BeaconClient) {
             "/api/pc/file" -> { require(method == "GET"); return readTextFile(d.getString("path")).put("_pc", true) }
             "/api/pc/file/save" -> { require(method == "POST"); return saveTextFile(d) }
             "/api/pc/file/create" -> { require(method == "POST"); return c.nativeRequest("/api/plugins/beacon/mobile/files/create", "POST", d) }
-            "/api/list" -> return c.nativeGet("/api/fs/list", mapOf("path" to workspacePath(sid(), d.string("path", "."))))
+            "/api/list" -> return c.nativeGet("/api/fs/list", mapOf("path" to workspacePath(sid(), d.string("path", ".")), "profile" to c.auth.profile))
             "/api/file" -> return readTextFile(workspacePath(sid(), d.getString("path")))
             "/api/file/create" -> return c.nativeRequest("/api/plugins/beacon/mobile/files/create", "POST", json("session_id" to sid(), "path" to workspacePath(sid(), d.getString("path")), "content" to d.string("content")))
             "/api/file/save" -> {
@@ -411,6 +412,7 @@ internal class NativeOperations(private val c: BeaconClient) {
         require('\uFFFD' !in latest.string("text") && '\uFFFD' !in fields.getString("expected_content")) { "This file can't be edited here." }
         require(!latest.optBoolean("truncated") && !latest.optBoolean("binary") && latest.string("text") == fields.getString("expected_content")) { "This file changed on the computer. Reopen it before saving; your edits are retained." }
         // Stock Hermes chooses platform newlines; preserving disk formatting requires the optional plugin.
+        // shortcut: stock write-text has no compare-and-write, so two devices saving in the same instant are last-writer-wins; use the plugin's revision-locked save if native Hermes adds a precondition.
         val result = c.nativeGet("/api/fs/write-text", mapOf("profile" to c.auth.profile), "POST", json("path" to path, "content" to text.replace("\r\n", "\n")))
         val actual = nativeTextFile(path)
         require(!actual.optBoolean("truncated") && !actual.optBoolean("binary") && '\uFFFD' !in actual.string("text")) { "Saved file preview is unavailable; reopen or download it before editing again." }
@@ -622,7 +624,10 @@ internal class NativeOperations(private val c: BeaconClient) {
                 "approval" -> "approval"
                 "clarify" -> "clarify"
                 "request.cancel" -> "request_cancel"
-                "status.update" -> "warning"
+                "status.update" -> {
+                    payload.string("text").takeIf(String::isNotBlank)?.let { payload.put("message", it) }
+                    "warning"
+                }
                 else -> "native_event"
             }
             if (raw.has("id")) {

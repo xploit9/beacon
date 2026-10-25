@@ -3,6 +3,7 @@ import json
 import pytest
 import time
 from contextlib import nullcontext
+from copy import deepcopy
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -153,7 +154,7 @@ def test_email_call_falls_back_to_valid_alert_reason(harness, monkeypatch):
                                      {"id": "message-1"}, "ok")
     relayed = []
     monkeypatch.setattr(api.mobile, "invitation",
-                        lambda owner, profile, stored, reason: relayed.append(reason) or "b" * 32)
+                        lambda owner, profile, stored, reason, *, conn: relayed.append(reason) or "b" * 32)
 
     result = observers.email_notice(api.mobile, api.native, cfg, "default", "watch-run", {
         "request_id": request_id, "item_id": "message-1", "reason": "Client moved the review",
@@ -181,7 +182,7 @@ def _fake_cron(api, monkeypatch, home, initial=()):
     def create(model, profile):
         calls["create"] += 1
         job = {**model.__dict__, "id": f"fixture-job-{calls['create']}",
-               "schedule_display": model.schedule, "enabled": True}
+               "schedule_display": model.schedule, "enabled": not getattr(model, "paused", False)}
         jobs.append(job)
         return job
 
@@ -202,6 +203,8 @@ def _fake_cron(api, monkeypatch, home, initial=()):
         elif action == "resume_job":
             calls["resume"] += 1
             job["enabled"] = True
+        elif action == "pause_job":
+            job["enabled"] = False
         return job
 
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server_cron", SimpleNamespace(
@@ -218,6 +221,482 @@ def _fake_cron(api, monkeypatch, home, initial=()):
         load_on_disk_store=lambda: SimpleNamespace(user_entries=[])))
     monkeypatch.setattr(api.proactive, "_home", lambda profile: home)
     return jobs, calls
+
+
+@pytest.mark.parametrize("prior_watch", ["absent", "paused", "active", "missing"])
+def test_failed_enable_restores_owned_jobs_setup_and_instructions(harness, monkeypatch, prior_watch):
+    api, _, _, home, _ = harness
+    proactive = api.proactive
+    key = lambda suffix: proactive._key("owner", "default", suffix)
+    original = {"id": "old-watch", "name": "Old watch", "prompt": "Prior watch instructions",
+                "schedule": "*/30 8-20 * * *", "schedule_display": "*/30 8-20 * * *",
+                "deliver": "local", "enabled": prior_watch == "active",
+                "model": "old-model", "provider": "old-provider", "skills": None, "enabled_toolsets": None}
+    legacy = {"id": "old-brief", "name": "Old brief", "enabled": True}
+    unrelated = {"id": "owner-job", "name": "Owner report", "prompt": "Keep", "enabled": True}
+    initial = [legacy, unrelated] + ([original] if prior_watch in ("paused", "active") else [])
+    jobs, _ = _fake_cron(api, monkeypatch, home, initial)
+    proactive._set_managed_id(api.mobile, "owner", "default", "brief_email", "old-brief")
+    if prior_watch != "absent":
+        proactive._set_managed_id(api.mobile, "owner", "default", "watch_email", "old-watch")
+    setup = {"delivery": "call", "check_minutes": 30, "quiet_start": "21:30", "quiet_end": "08:00",
+             "model": "old-model", "provider": "old-provider"}
+    rules = [{"id": "a" * 32, "text": "A release is blocked", "action": "notify",
+              "signal": "github", "night": False, "enabled": True}]
+    for suffix, value in (("enabled", "0"), ("setup", json.dumps(setup)), ("setup_complete", "1"),
+                          ("requests", json.dumps(rules)), ("jobs-version", proactive.JOBS_VERSION)):
+        proactive._meta_set(api.mobile, key(suffix), value)
+    before = {suffix: proactive._meta_get(api.mobile, key(suffix)) for suffix in
+              ("enabled", "setup", "setup_complete", "requests", "jobs-version")}
+    soul = home / "SOUL.md"
+    soul.write_bytes(b"Owner instructions\r\n")
+    cron = sys.modules["hermes_cli.web_server_cron"]
+    create = cron._create_cron_job_sync
+
+    def fail_nightly(model, profile):
+        if model.name == "Beacon proactive: Nightly memory upkeep":
+            raise RuntimeError("Second create failed")
+        return create(model, profile)
+
+    monkeypatch.setattr(cron, "_create_cron_job_sync", fail_nightly)
+    with pytest.raises(RuntimeError, match="Second create failed"):
+        proactive.configure(api.mobile, "owner", "default", {"enabled": True, **proactive.default_setup()})
+
+    assert jobs == initial
+    assert {suffix: proactive._meta_get(api.mobile, key(suffix)) for suffix in before} == before
+    assert soul.read_bytes() == b"Owner instructions\r\n"
+    assert proactive._managed_ids(api.mobile, "owner", "default") == {
+        "brief_email": "old-brief", **({"watch_email": "old-watch"} if prior_watch != "absent" else {})}
+    assert proactive.status(api.mobile, "owner", "default").get("_error") is not True
+    monkeypatch.setattr(cron, "_create_cron_job_sync", create)
+    saved = proactive.set_enabled(api.mobile, "owner", "default", True)
+    assert saved["enabled"] and saved["setup_complete"]
+    assert saved["check_minutes"] == 30 and saved["quiet_start"] == "21:30"
+    assert saved["rules"] == rules and all(row["active"] for row in saved["jobs"])
+    assert next(row for row in jobs if row["id"] == "owner-job") == unrelated
+
+
+@pytest.mark.parametrize("conflict", ["Beacon: what needs you", "Beacon proactive: Nightly memory upkeep"])
+def test_failed_enable_never_adopts_or_changes_unowned_name_conflict(harness, monkeypatch, conflict):
+    api, _, _, home, _ = harness
+    unowned = {"id": "owner-job", "name": conflict, "prompt": "Owner content", "enabled": False}
+    jobs, _ = _fake_cron(api, monkeypatch, home, [unowned])
+    with pytest.raises(ValueError, match="not owned by Beacon"):
+        api.proactive.set_enabled(api.mobile, "owner", "default", True)
+    assert jobs == [unowned]
+    assert api.proactive._managed_ids(api.mobile, "owner", "default") == {}
+    assert not api.proactive.enabled(api.mobile, "owner", "default")
+    assert not (home / "SOUL.md").exists()
+
+
+@pytest.mark.parametrize("prior_soul", [None, b"Owner instructions\r\n", (
+    b"Owner instructions\n<!-- BEGIN BEACON PROACTIVE -->\nPrior managed text\n"
+    b"<!-- END BEACON PROACTIVE -->\nOwner footer\n")])
+def test_failed_enable_instruction_write_leaves_prior_file_and_setup(harness, monkeypatch, prior_soul):
+    api, _, _, home, _ = harness
+    jobs, _ = _fake_cron(api, monkeypatch, home)
+    soul = home / "SOUL.md"
+    if prior_soul is not None:
+        soul.write_bytes(prior_soul)
+
+    def fail_write(*args):
+        raise OSError("SOUL replacement failed")
+
+    monkeypatch.setattr(api.proactive, "_atomic_text", fail_write)
+    with pytest.raises(OSError, match="SOUL replacement failed"):
+        api.proactive.configure(api.mobile, "owner", "default", {"enabled": True, **api.proactive.default_setup()})
+    assert jobs == [] and api.proactive._managed_ids(api.mobile, "owner", "default") == {}
+    assert (soul.read_bytes() if soul.exists() else None) == prior_soul
+    state = api.proactive.status(api.mobile, "owner", "default")
+    assert state["enabled"] is False and state["setup_complete"] is False
+    assert state.get("_error") is not True
+
+
+@pytest.mark.parametrize("suffix", ["enabled", "setup", "setup_complete"])
+@pytest.mark.parametrize("prior_soul", [None, b"Owner instructions\r\n"])
+def test_failed_enable_metadata_save_restores_jobs_file_and_raw_setup(harness, monkeypatch, suffix, prior_soul):
+    api, _, _, home, _ = harness
+    proactive = api.proactive
+    jobs, _ = _fake_cron(api, monkeypatch, home)
+    soul = home / "SOUL.md"
+    if prior_soul is not None:
+        soul.write_bytes(prior_soul)
+    key = lambda item: proactive._key("owner", "default", item)
+    original_setup = json.dumps({**proactive.default_setup(), "check_minutes": 30})
+    proactive._meta_set(api.mobile, key("setup"), original_setup)
+    meta_set = proactive._meta_set
+    failed = []
+
+    def fail_once(mobile, meta_key, value):
+        meta_set(mobile, meta_key, value)
+        if meta_key == key(suffix) and not failed:
+            failed.append(True)
+            raise OSError("Metadata save failed")
+
+    monkeypatch.setattr(proactive, "_meta_set", fail_once)
+    with pytest.raises(OSError, match="Metadata save failed"):
+        proactive.configure(api.mobile, "owner", "default", {"enabled": True, **proactive.default_setup()})
+    assert jobs == []
+    assert (soul.read_bytes() if soul.exists() else None) == prior_soul
+    assert proactive._meta_get(api.mobile, key("setup")) == original_setup
+    state = proactive.status(api.mobile, "owner", "default")
+    assert state["enabled"] is False and state["setup_complete"] is False
+    assert state.get("_error") is not True
+
+
+@pytest.mark.parametrize("prior_watch", ["absent", "paused"])
+@pytest.mark.parametrize("recovery", [False, True])
+def test_failed_enable_cleanup_failure_is_durable_visible_and_retryable(harness, monkeypatch, prior_watch, recovery):
+    api, client, _, home, _ = harness
+    proactive = api.proactive
+    original = {"id": "old-watch", "name": "Beacon: what needs you", "prompt": "Old prompt",
+                "schedule": "*/30 8-20 * * *", "enabled": False}
+    jobs, _ = _fake_cron(api, monkeypatch, home, [original] if prior_watch == "paused" else [])
+    if prior_watch == "paused":
+        proactive._set_managed_id(api.mobile, "owner", "default", "watch_email", "old-watch")
+    cron = sys.modules["hermes_cli.web_server_cron"]
+    create, mutate = cron._create_cron_job_sync, cron._mutate_cron_for_profile
+
+    def fail_nightly(model, profile):
+        if model.name == "Beacon proactive: Nightly memory upkeep":
+            raise RuntimeError("Second create failed")
+        return create(model, profile)
+
+    def fail_cleanup(profile, action, job_id, changes=None):
+        if action == "remove_job" or action == "update_job" and (changes or {}).get("enabled") is False:
+            return None
+        return mutate(profile, action, job_id, changes)
+
+    monkeypatch.setattr(cron, "_create_cron_job_sync", fail_nightly)
+    monkeypatch.setattr(cron, "_mutate_cron_for_profile", fail_cleanup)
+    with pytest.raises(RuntimeError):
+        proactive.set_enabled(api.mobile, "owner", "default", True)
+    assert any(row.get("enabled", True) for row in jobs)
+    watch_id = proactive._managed_id(api.mobile, "owner", "default", "watch_email")
+    assert watch_id and any(row["id"] == watch_id for row in jobs)
+    sys.modules["cron.notepad"].set_note(watch_id, "last_result", json.dumps({
+        "state": "ok", "checked_at": time.time(), "message": "Recent check succeeded"}))
+    assert proactive.health(api.mobile, "other-owner", "default", proactive.default_setup())["state"] != "error"
+    for _ in range(2):
+        response = client.get("/api/plugins/beacon/mobile/proactive")
+        assert response.status_code == 200, response.text
+        state = response.json()
+        assert state["enabled"] is False and state["health"]["state"] == "error"
+        assert state["_error"] is True and state["_message"]
+    monkeypatch.setattr(cron, "_create_cron_job_sync", create)
+    monkeypatch.setattr(cron, "_mutate_cron_for_profile", mutate)
+    state = proactive.set_enabled(api.mobile, "owner", "default", recovery)
+    assert state["enabled"] is recovery and "_error" not in state
+    assert state["health"]["state"] != "error"
+    assert bool(jobs) is recovery
+
+
+def test_failed_enable_does_not_overwrite_owner_instruction_edit(harness, monkeypatch):
+    api, _, _, home, _ = harness
+    proactive = api.proactive
+    jobs, _ = _fake_cron(api, monkeypatch, home)
+    soul = home / "SOUL.md"
+    soul.write_text("Owner original\n", encoding="utf-8")
+    meta_set = proactive._meta_set
+
+    def edit_then_fail(mobile, key, value):
+        if key == proactive._key("owner", "default", "enabled") and value == "1":
+            soul.write_text("Owner edited during enable\n", encoding="utf-8")
+            raise OSError("Metadata save failed")
+        return meta_set(mobile, key, value)
+
+    monkeypatch.setattr(proactive, "_meta_set", edit_then_fail)
+    with pytest.raises(RuntimeError, match="cleanup"):
+        proactive.set_enabled(api.mobile, "owner", "default", True)
+    assert jobs == [] and soul.read_text(encoding="utf-8") == "Owner edited during enable\n"
+    assert proactive.status(api.mobile, "owner", "default")["_error"] is True
+
+
+@pytest.mark.parametrize("prior_owned", [False, True])
+def test_failed_enable_preserves_owner_job_edit_instead_of_rolling_it_back(harness, monkeypatch, prior_owned):
+    api, _, _, home, _ = harness
+    proactive = api.proactive
+    original = {
+        "id": "old-watch", "name": "Old watch", "prompt": "Old prompt",
+        "schedule": "*/30 8-20 * * *", "enabled": False}
+    jobs, _ = _fake_cron(api, monkeypatch, home, [original] if prior_owned else [])
+    if prior_owned:
+        proactive._set_managed_id(api.mobile, "owner", "default", "watch_email", "old-watch")
+    cron = sys.modules["hermes_cli.web_server_cron"]
+    create = cron._create_cron_job_sync
+
+    def edit_then_fail(model, profile):
+        if model.name == "Beacon: what needs you":
+            return create(model, profile)
+        jobs[0]["prompt"] = "Owner edited the native job"
+        raise RuntimeError("Second create failed")
+
+    monkeypatch.setattr(cron, "_create_cron_job_sync", edit_then_fail)
+    with pytest.raises(RuntimeError, match="cleanup"):
+        proactive.set_enabled(api.mobile, "owner", "default", True)
+    assert jobs[0]["prompt"] == "Owner edited the native job"
+    assert proactive.status(api.mobile, "owner", "default")["_error"] is True
+
+
+@pytest.mark.parametrize("saved_receipt", [False, True])
+def test_failed_enable_receipt_save_never_starts_unreceipted_work(harness, monkeypatch, saved_receipt):
+    api, _, _, home, _ = harness
+    proactive = api.proactive
+    jobs, _ = _fake_cron(api, monkeypatch, home)
+    set_id = proactive._set_managed_id
+
+    def fail_receipt(*args):
+        assert jobs and jobs[0]["enabled"] is False
+        if saved_receipt:
+            set_id(*args)
+        raise OSError("Receipt save failed")
+
+    monkeypatch.setattr(proactive, "_set_managed_id", fail_receipt)
+    with pytest.raises(OSError, match="Receipt save failed"):
+        proactive.set_enabled(api.mobile, "owner", "default", True)
+    assert jobs == [] and proactive._managed_ids(api.mobile, "owner", "default") == {}
+    assert not (home / "SOUL.md").exists()
+
+
+@pytest.mark.parametrize("owner_edit", [False, True])
+@pytest.mark.parametrize("failure", ["raised", "missing_receipt"])
+def test_failed_first_resume_preserves_new_job_receipt_and_notepad(harness, monkeypatch, owner_edit, failure):
+    api, client, _, home, _ = harness
+    proactive = api.proactive
+    jobs, calls = _fake_cron(api, monkeypatch, home)
+    cron = sys.modules["hermes_cli.web_server_cron"]
+    mutate = cron._mutate_cron_for_profile
+    notepad = sys.modules["cron.notepad"]
+
+    def unconfirmed_resume(profile, action, job_id, changes=None):
+        if action != "resume_job":
+            return mutate(profile, action, job_id, changes)
+        job = next(row for row in jobs if row["id"] == job_id)
+        assert job["enabled"] is False
+        notepad.set_note(job_id, "owner-note", "Keep this note")
+        if owner_edit:
+            job.update(prompt="Owner edited before first resume", schedule={
+                "kind": "once", "run_at": "2020-01-01T00:00:00Z"})
+        if failure == "missing_receipt":
+            mutate(profile, action, job_id, changes)
+            return None
+        raise ValueError("Cannot resume: one-shot time is in the past")
+
+    monkeypatch.setattr(cron, "_mutate_cron_for_profile", unconfirmed_resume)
+    with pytest.raises(Exception) as failure_result:
+        proactive.configure(api.mobile, "owner", "default", {"enabled": True, **proactive.default_setup()})
+
+    assert len(jobs) == 1 and calls["remove"] == 0
+    job = jobs[0]
+    assert job["enabled"] is (failure == "missing_receipt")
+    if owner_edit:
+        assert job["prompt"] == "Owner edited before first resume"
+        assert job["schedule"] == {"kind": "once", "run_at": "2020-01-01T00:00:00Z"}
+    assert proactive._managed_id(api.mobile, "owner", "default", "watch_email") == job["id"]
+    assert notepad.get_note(job["id"], "owner-note") == "Keep this note"
+    response = client.get("/api/plugins/beacon/mobile/proactive")
+    assert response.status_code == 200, response.text
+    state = response.json()
+    assert state["enabled"] is False and state["_error"] is True and state["health"]["state"] == "error"
+    assert proactive._meta_get(api.mobile, proactive._key("owner", "default", "enable-error")) == "1"
+    assert isinstance(failure_result.value, RuntimeError) and "cleanup" in str(failure_result.value)
+
+
+def test_failed_enable_unreceipted_native_partial_create_stays_unsettled_without_adoption(harness, monkeypatch):
+    api, _, _, home, _ = harness
+    proactive = api.proactive
+    jobs, _ = _fake_cron(api, monkeypatch, home)
+    cron = sys.modules["hermes_cli.web_server_cron"]
+    create = cron._create_cron_job_sync
+
+    def save_then_fail(model, profile):
+        job = create(model, profile)
+        if model.name == "Beacon proactive: Nightly memory upkeep":
+            raise OSError("Native create response lost")
+        return job
+
+    monkeypatch.setattr(cron, "_create_cron_job_sync", save_then_fail)
+    with pytest.raises(RuntimeError, match="cleanup"):
+        proactive.set_enabled(api.mobile, "owner", "default", True)
+    assert len(jobs) == 1 and jobs[0]["enabled"] is False
+    assert jobs[0]["name"] == "Beacon proactive: Nightly memory upkeep"
+    assert proactive._managed_ids(api.mobile, "owner", "default") == {}
+    state = proactive.status(api.mobile, "owner", "default")
+    assert state["enabled"] is False and state["health"]["state"] == "error" and state["_error"] is True
+
+
+def test_enabled_commit_with_failed_legacy_retirement_remains_visibly_unsettled(harness, monkeypatch):
+    api, _, _, home, _ = harness
+    proactive = api.proactive
+    jobs, _ = _fake_cron(api, monkeypatch, home, [{"id": "old-brief", "name": "Old brief", "enabled": True}])
+    proactive._set_managed_id(api.mobile, "owner", "default", "brief_email", "old-brief")
+    cron = sys.modules["hermes_cli.web_server_cron"]
+    mutate = cron._mutate_cron_for_profile
+
+    def fail_remove(profile, action, job_id, changes=None):
+        if action == "remove_job":
+            return False
+        return mutate(profile, action, job_id, changes)
+
+    monkeypatch.setattr(cron, "_mutate_cron_for_profile", fail_remove)
+    with pytest.raises(RuntimeError):
+        proactive.configure(api.mobile, "owner", "default", {"enabled": True, **proactive.default_setup()})
+    state = proactive.status(api.mobile, "owner", "default")
+    assert state["enabled"] is True and state["setup_complete"] is True and state["_error"] is True
+    assert next(row for row in jobs if row["id"] == "old-brief")["enabled"] is False
+    monkeypatch.setattr(cron, "_mutate_cron_for_profile", mutate)
+    state = proactive.set_enabled(api.mobile, "owner", "default", True)
+    assert state["enabled"] is True and "_error" not in state
+    assert all(row["id"] != "old-brief" for row in jobs)
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_failed_enable_restores_native_lifecycle_and_pending_occurrence(harness, monkeypatch, active):
+    api, _, _, home, _ = harness
+    proactive = api.proactive
+    original = {"id": "old-watch", "name": "Old watch", "prompt": "Old prompt", "enabled": active,
+                "schedule": "*/30 8-20 * * *", "schedule_display": "*/30 8-20 * * *",
+                "deliver": "local", "model": None, "provider": None, "skills": None, "enabled_toolsets": None,
+                "state": "scheduled" if active else "paused", "paused_at": None if active else "old-pause",
+                "paused_reason": None if active else "Owner paused", "next_run_at": "old-next-run",
+                "pending_slot": "old-pending", "quota_hold_until": "old-hold", "quota_hold_cron_expr": "old-expression"}
+    jobs, _ = _fake_cron(api, monkeypatch, home, [deepcopy(original)])
+    proactive._set_managed_id(api.mobile, "owner", "default", "watch_email", "old-watch")
+    cron = sys.modules["hermes_cli.web_server_cron"]
+    mutate = cron._mutate_cron_for_profile
+
+    def native_derived_fields(profile, action, job_id, changes=None):
+        job = mutate(profile, action, job_id, changes)
+        if action == "update_job" and "schedule" in (changes or {}):
+            if job["state"] != "paused":
+                job["next_run_at"] = "recomputed-next-run"
+            job.pop("quota_hold_until", None)
+            job.pop("quota_hold_cron_expr", None)
+        if action == "update_job" and {"schedule", "enabled", "state", "next_run_at"} & set(changes or {}):
+            job.pop("pending_slot", None)
+        if action == "resume_job":
+            job.update(state="scheduled", paused_at=None, paused_reason=None, next_run_at="resumed-next-run")
+            job.pop("pending_slot", None)
+        return job
+
+    def fail_nightly(*args):
+        raise RuntimeError("Second create failed")
+
+    monkeypatch.setattr(cron, "_mutate_cron_for_profile", native_derived_fields)
+    monkeypatch.setattr(cron, "_create_cron_job_sync", fail_nightly)
+    with pytest.raises(RuntimeError, match="Second create failed"):
+        proactive.set_enabled(api.mobile, "owner", "default", True)
+    assert jobs == [original]
+    assert proactive.status(api.mobile, "owner", "default").get("_error") is not True
+
+
+@pytest.mark.parametrize("operation", ["create", "patch", "delete"])
+@pytest.mark.parametrize("rollback", ["failed", "owner_edit"])
+def test_failed_rule_rollback_stays_visible_on_later_get(harness, monkeypatch, operation, rollback):
+    api, client, _, home, _ = harness
+    proactive = api.proactive
+    jobs, calls = _fake_cron(api, monkeypatch, home)
+    rule = None
+    if operation != "create":
+        rule = proactive.create_request(api.mobile, "owner", "default", "A meeting moves", "call",
+                                        "calendar", night=operation == "delete")
+    proactive.configure(api.mobile, "owner", "default", {"enabled": True, **proactive.default_setup()})
+    proactive._meta_set(api.mobile, proactive._key("owner", "default", "jobs-version"), proactive.JOBS_VERSION)
+    proactive._store_learned(api.mobile, "owner", "default", ["Owner feedback"])
+    proactive.sync_learned(api.mobile, "owner", "default")
+    watch_id = proactive._managed_id(api.mobile, "owner", "default", "watch_email")
+    watch = next(row for row in jobs if row["id"] == watch_id)
+    before = deepcopy(watch)
+    prior_rules = proactive.list_requests(api.mobile, "owner", "default")
+    notepad = sys.modules["cron.notepad"]
+    notepad.set_note(watch_id, "last_result", json.dumps({
+        "state": "ok", "checked_at": time.time(), "message": "Recent check succeeded"}))
+    assert proactive.status(api.mobile, "owner", "default")["health"]["state"] == "ok"
+    cron = sys.modules["hermes_cli.web_server_cron"]
+    mutate, sync = cron._mutate_cron_for_profile, proactive.sync_learned
+
+    def fail_sync(*args):
+        assert watch["prompt"] != before["prompt"] and watch["schedule"] != before["schedule"]
+        if rollback == "owner_edit":
+            watch["prompt"] = "Owner edited the native watch"
+            notepad.set_note(watch_id, "owner-note", "Preserve the owner's note")
+        raise OSError("Learned synchronization failed")
+
+    def fail_restore(profile, action, job_id, changes=None):
+        if (rollback == "failed" and action == "update_job" and job_id == watch_id
+                and (changes or {}).get("prompt") == before["prompt"]):
+            raise OSError("Native rollback failed")
+        return mutate(profile, action, job_id, changes)
+
+    def save_rule():
+        if operation == "create":
+            return proactive.create_request(api.mobile, "owner", "default", "A meeting moves", "call",
+                                             "calendar", night=True)
+        if operation == "patch":
+            return proactive.patch_request(api.mobile, "owner", "default", rule["id"], {"night": True})
+        return proactive.delete_request(api.mobile, "owner", "default", rule["id"])
+
+    monkeypatch.setattr(proactive, "sync_learned", fail_sync)
+    monkeypatch.setattr(cron, "_mutate_cron_for_profile", fail_restore)
+    with pytest.raises(Exception) as failure_result:
+        save_rule()
+    assert proactive.list_requests(api.mobile, "owner", "default") == prior_rules
+    assert watch["schedule"] != before["schedule"] and calls["remove"] == 0
+    if rollback == "owner_edit":
+        assert watch["prompt"] == "Owner edited the native watch"
+        assert notepad.get_note(watch_id, "owner-note") == "Preserve the owner's note"
+    for _ in range(2):
+        response = client.get("/api/plugins/beacon/mobile/proactive")
+        assert response.status_code == 200, response.text
+        state = response.json()
+        assert state["enabled"] is True and state["rules"] == prior_rules
+        assert state["_error"] is True and state["health"]["state"] == "error"
+    assert isinstance(failure_result.value, RuntimeError) and "cleanup" in str(failure_result.value)
+    monkeypatch.setattr(cron, "_mutate_cron_for_profile", mutate)
+    monkeypatch.setattr(proactive, "sync_learned", sync)
+    save_rule()
+    state = proactive.status(api.mobile, "owner", "default")
+    assert "_error" not in state and state["health"]["state"] == "ok"
+
+
+@pytest.mark.parametrize("prior_error", [None, "prior-uncertainty"])
+def test_verified_rule_rollback_restores_snapshot_and_prior_uncertainty(harness, monkeypatch, prior_error):
+    api, _, _, home, _ = harness
+    proactive = api.proactive
+    jobs, _ = _fake_cron(api, monkeypatch, home)
+    rule = proactive.create_request(api.mobile, "owner", "default", "A meeting moves", "call", "calendar")
+    proactive.configure(api.mobile, "owner", "default", {"enabled": True, **proactive.default_setup()})
+    proactive._store_learned(api.mobile, "owner", "default", ["Owner feedback"])
+    error_key = proactive._key("owner", "default", "enable-error")
+    proactive._meta_set(api.mobile, error_key, prior_error)
+    before = deepcopy(jobs)
+    sync = proactive.sync_learned
+
+    def fail_sync(*args):
+        assert jobs != before
+        raise OSError("Learned synchronization failed")
+
+    monkeypatch.setattr(proactive, "sync_learned", fail_sync)
+    with pytest.raises(OSError, match="Learned synchronization failed"):
+        proactive.patch_request(api.mobile, "owner", "default", rule["id"], {"night": True})
+    assert len(jobs) == len(before)
+    for job, original in zip(jobs, before):
+        assert all(job.get(field) == value for field, value in original.items())
+    assert proactive.list_requests(api.mobile, "owner", "default") == [rule]
+    assert proactive._meta_get(api.mobile, error_key) == prior_error
+    monkeypatch.setattr(proactive, "sync_learned", sync)
+    proactive.patch_request(api.mobile, "owner", "default", rule["id"], {"night": True})
+    assert proactive._meta_get(api.mobile, error_key) is None
+
+
+def test_rule_save_without_native_sync_keeps_prior_uncertainty(harness, monkeypatch):
+    api, _, _, home, _ = harness
+    proactive = api.proactive
+    jobs, _ = _fake_cron(api, monkeypatch, home)
+    error_key = proactive._key("owner", "default", "enable-error")
+    proactive._meta_set(api.mobile, error_key, "prior-uncertainty")
+    proactive.create_request(api.mobile, "owner", "default", "A meeting moves", "notify")
+    assert jobs == [] and proactive._meta_get(api.mobile, error_key) == "prior-uncertainty"
 
 
 def test_connected_watch_uses_native_discovery_and_source_aware_rules(harness):
@@ -263,7 +742,7 @@ def test_upgrade_updates_old_watch_in_place_and_preserves_rules_cursor_and_notes
     assert proactive._managed_id(api.mobile, "owner", "default", "watch_email") == "old-watch"
     watch = next(job for job in jobs if job["id"] == "old-watch")
     assert watch["name"] == "Beacon: what needs you" and watch["schedule"] == "*/30 7-21 * * *"
-    assert calls == {"create": 1, "update": 1, "remove": 0, "resume": 0}
+    assert calls == {"create": 1, "update": 1, "remove": 0, "resume": 1}
     assert proactive.list_requests(api.mobile, "owner", "default") == rules
     assert proactive._setup(api.mobile, "owner", "default") == setup
     assert notes[("old-watch", "checked_until")] == "2026-10-20T01:30:00Z"
@@ -546,6 +1025,383 @@ def test_request_limit_is_twenty_per_owner_profile(harness):
 
 
 
+def _upgrade_profile(api, monkeypatch, home, *, watch=True, is_enabled=True):
+    proactive = api.proactive
+    setup = proactive.default_setup()
+    original = {**proactive._job_fields(proactive._specs(setup)[0], update=True),
+                "id": "old-watch", "name": "Earlier watch", "prompt": "Earlier prompt", "enabled": True,
+                "schedule": "*/30 8-20 * * *", "schedule_display": "*/30 8-20 * * *"}
+    jobs, calls = _fake_cron(api, monkeypatch, home, [
+        {"id": "old-brief", "name": "Earlier brief", "enabled": True},
+        *([original] if watch else []), {"id": "owner-job", "name": "Owner report", "enabled": True}])
+    for suffix, value in (("enabled", "1" if is_enabled else None), ("setup_complete", "1"),
+                          ("setup", json.dumps(setup)), ("jobs-version", "old-version")):
+        proactive._meta_set(api.mobile, proactive._key("owner", "default", suffix), value)
+    proactive._set_managed_id(api.mobile, "owner", "default", "brief_email", "old-brief")
+    proactive._set_managed_id(api.mobile, "owner", "default", "watch_email", "old-watch")
+    proactive._store_learned(api.mobile, "owner", "default", ["Saved owner feedback"])
+    (home / "SOUL.md").write_bytes(b"Owner instructions\r\n")
+    notes = {("old-brief", "owner-note"): "Keep the old brief's notepad",
+             ("old-watch", "checked_until"): "2026-10-20T01:30:00Z",
+             ("old-watch", "owner-note"): "Keep the watch's notepad",
+             ("old-watch", "last_result"): json.dumps({
+                 "state": "ok", "checked_at": time.time(), "message": "Recent check succeeded"})}
+    monkeypatch.setitem(sys.modules, "cron.notepad", SimpleNamespace(
+        get_note=lambda job_id, key: notes.get((job_id, key)),
+        set_note=lambda job_id, key, value: notes.__setitem__((job_id, key), value),
+        delete_note=lambda job_id, key: notes.pop((job_id, key), None)))
+    cron = sys.modules["hermes_cli.web_server_cron"]
+    mutate = cron._mutate_cron_for_profile
+
+    def native_remove(profile, action, job_id, changes=None):
+        result = mutate(profile, action, job_id, changes)
+        if result and action == "remove_job":
+            for key in [key for key in notes if key[0] == job_id]:
+                del notes[key]
+        return result
+
+    monkeypatch.setattr(cron, "_mutate_cron_for_profile", native_remove)
+    return jobs, calls, notes
+
+
+def _assert_upgrade_warning(client):
+    for _ in range(2):
+        response = client.get("/api/plugins/beacon/mobile/proactive")
+        assert response.status_code == 200, response.text
+        state = response.json()
+        assert state["_error"] is True and state["health"]["state"] == "error"
+
+
+@pytest.mark.parametrize("failure", ["create", "update", "conflict", "learned"])
+def test_watcher_upgrade_failure_keeps_old_jobs_notepads_and_later_warning(harness, monkeypatch, failure):
+    api, client, _, home, _ = harness
+    proactive = api.proactive
+    jobs, _, notes = _upgrade_profile(api, monkeypatch, home)
+    cron = sys.modules["hermes_cli.web_server_cron"]
+    create, mutate, sync = cron._create_cron_job_sync, cron._mutate_cron_for_profile, proactive.sync_learned
+    if failure == "update":
+        jobs.append({**proactive._job_fields(proactive._specs(proactive.default_setup())[1], update=True),
+                     "id": "old-nightly", "prompt": "Earlier nightly prompt", "enabled": True})
+        proactive._set_managed_id(api.mobile, "owner", "default", "nightly_memory", "old-nightly")
+    if failure == "conflict":
+        jobs.append({"id": "unowned-nightly", "name": "Beacon proactive: Nightly memory upkeep", "enabled": True})
+    before, receipts = deepcopy(jobs), proactive._managed_ids(api.mobile, "owner", "default")
+
+    def fail_create(model, profile):
+        raise OSError("Later native create failed")
+
+    def fail_update(profile, action, job_id, changes=None):
+        if action == "update_job" and job_id == "old-nightly":
+            raise OSError("Later native update failed")
+        return mutate(profile, action, job_id, changes)
+
+    def fail_learned(*args):
+        sync(*args)
+        raise OSError("Learned write response lost")
+
+    if failure == "create":
+        monkeypatch.setattr(cron, "_create_cron_job_sync", fail_create)
+    elif failure == "update":
+        monkeypatch.setattr(cron, "_mutate_cron_for_profile", fail_update)
+    elif failure == "learned":
+        monkeypatch.setattr(proactive, "sync_learned", fail_learned)
+    assert proactive.status(api.mobile, "owner", "default")["health"]["state"] == "ok"
+    api._warm_profile("owner", "default")  # The real watcher caller catches the exception.
+    assert ("owner", "default") in api._jobs_retry_after
+    assert {row["id"] for row in jobs} == {row["id"] for row in before}
+    for original in before:
+        job = next(row for row in jobs if row["id"] == original["id"])
+        assert all(job.get(key) == value for key, value in original.items())
+    assert proactive._managed_ids(api.mobile, "owner", "default") == receipts
+    assert notes[("old-brief", "owner-note")] == "Keep the old brief's notepad"
+    assert notes[("old-watch", "owner-note")] == "Keep the watch's notepad"
+    assert (home / "SOUL.md").read_bytes() == b"Owner instructions\r\n"
+    assert proactive._meta_get(api.mobile, proactive._key("owner", "default", "jobs-version")) == "old-version"
+    _assert_upgrade_warning(client)
+    monkeypatch.setattr(cron, "_create_cron_job_sync", create)
+    monkeypatch.setattr(cron, "_mutate_cron_for_profile", mutate)
+    monkeypatch.setattr(proactive, "sync_learned", sync)
+    if failure == "conflict":
+        next(row for row in jobs if row["id"] == "unowned-nightly")["name"] = "Owner renamed job"
+    api._jobs_retry_after[("owner", "default")] = 0
+    api._warm_profile("owner", "default")
+    assert ("owner", "default") not in api._jobs_retry_after
+    assert proactive._meta_get(api.mobile, proactive._key("owner", "default", "jobs-version")) == proactive.JOBS_VERSION
+    assert "_error" not in proactive.status(api.mobile, "owner", "default")
+    assert all(row["id"] != "old-brief" for row in jobs) and ("old-brief", "owner-note") not in notes
+    assert notes[("old-watch", "checked_until")] == "2026-10-20T01:30:00Z"
+
+
+@pytest.mark.parametrize("rollback", ["failed", "owner_edit"])
+def test_upgrade_failed_rollback_preserves_owned_job_and_durable_warning(harness, monkeypatch, rollback):
+    api, client, _, home, _ = harness
+    proactive = api.proactive
+    jobs, calls, notes = _upgrade_profile(api, monkeypatch, home)
+    cron = sys.modules["hermes_cli.web_server_cron"]
+    mutate = cron._mutate_cron_for_profile
+
+    def fail_later_create(*args):
+        watch = next(row for row in jobs if row["id"] == "old-watch")
+        assert watch["prompt"] != "Earlier prompt"
+        if rollback == "owner_edit":
+            watch["prompt"] = "Owner edited the existing watch"
+        raise OSError("Later create failed")
+
+    def fail_restore(profile, action, job_id, changes=None):
+        if (rollback == "failed" and action == "update_job" and job_id == "old-watch"
+                and (changes or {}).get("prompt") == "Earlier prompt"):
+            raise OSError("Native rollback failed")
+        return mutate(profile, action, job_id, changes)
+
+    monkeypatch.setattr(cron, "_create_cron_job_sync", fail_later_create)
+    monkeypatch.setattr(cron, "_mutate_cron_for_profile", fail_restore)
+    with pytest.raises(RuntimeError, match="cleanup"):
+        proactive.upgrade_jobs(api.mobile, "owner", "default")
+    watch = next(row for row in jobs if row["id"] == "old-watch")
+    assert watch["prompt"] != "Earlier prompt" and calls["remove"] == 0
+    if rollback == "owner_edit":
+        assert watch["prompt"] == "Owner edited the existing watch"
+    assert notes[("old-watch", "owner-note")] == "Keep the watch's notepad"
+    assert notes[("old-brief", "owner-note")] == "Keep the old brief's notepad"
+    assert (home / "SOUL.md").read_bytes() == b"Owner instructions\r\n"
+    _assert_upgrade_warning(client)
+
+
+@pytest.mark.parametrize("owner_edit", [False, True])
+@pytest.mark.parametrize("failure", ["raised", "missing_receipt"])
+def test_upgrade_unknown_first_resume_keeps_receipt_notepad_and_owner_edit(harness, monkeypatch, owner_edit, failure):
+    api, client, _, home, _ = harness
+    proactive = api.proactive
+    jobs, calls, notes = _upgrade_profile(api, monkeypatch, home, watch=False)
+    cron = sys.modules["hermes_cli.web_server_cron"]
+    mutate = cron._mutate_cron_for_profile
+
+    def unconfirmed_resume(profile, action, job_id, changes=None):
+        if action != "resume_job" or job_id == "old-brief":
+            return mutate(profile, action, job_id, changes)
+        job = next(row for row in jobs if row["id"] == job_id)
+        assert job["enabled"] is False
+        assert proactive._managed_id(api.mobile, "owner", "default", "watch_email") == job_id
+        notes[(job_id, "owner-note")] = "Owner note before resume"
+        if owner_edit:
+            job["prompt"] = "Owner edited the new watch"
+        if failure == "missing_receipt":
+            mutate(profile, action, job_id, changes)
+            return None
+        raise OSError("Resume response lost")
+
+    monkeypatch.setattr(cron, "_mutate_cron_for_profile", unconfirmed_resume)
+    with pytest.raises(RuntimeError, match="cleanup"):
+        proactive.upgrade_jobs(api.mobile, "owner", "default")
+    watch_id = proactive._managed_id(api.mobile, "owner", "default", "watch_email")
+    watch = next(row for row in jobs if row["id"] == watch_id)
+    assert watch["enabled"] is (failure == "missing_receipt") and calls["remove"] == 0
+    if owner_edit:
+        assert watch["prompt"] == "Owner edited the new watch"
+    assert notes[(watch_id, "owner-note")] == "Owner note before resume"
+    assert notes[("old-brief", "owner-note")] == "Keep the old brief's notepad"
+    assert next(row for row in jobs if row["id"] == "old-brief")["enabled"] is True
+    assert (home / "SOUL.md").read_bytes() == b"Owner instructions\r\n"
+    _assert_upgrade_warning(client)
+
+
+@pytest.mark.parametrize("receipt", ["before_save", "after_save", "create_response"])
+def test_upgrade_never_starts_or_adopts_unreceipted_creation(harness, monkeypatch, receipt):
+    api, client, _, home, _ = harness
+    proactive = api.proactive
+    jobs, calls, notes = _upgrade_profile(api, monkeypatch, home, watch=False)
+    cron = sys.modules["hermes_cli.web_server_cron"]
+    create, set_id = cron._create_cron_job_sync, proactive._set_managed_id
+    failed = False
+
+    def fail_receipt(*args):
+        nonlocal failed
+        if failed:
+            return set_id(*args)
+        failed = True
+        assert jobs[-1]["enabled"] is False and calls["resume"] == 0
+        if receipt == "after_save":
+            set_id(*args)
+        raise OSError("Ownership receipt save failed")
+
+    def lose_create(model, profile):
+        job = create(model, profile)
+        assert job["enabled"] is False
+        notes[(job["id"], "owner-note")] = "Unknown native create"
+        raise OSError("Native create response lost")
+
+    if receipt == "create_response":
+        monkeypatch.setattr(cron, "_create_cron_job_sync", lose_create)
+    else:
+        monkeypatch.setattr(proactive, "_set_managed_id", fail_receipt)
+    with pytest.raises((OSError, RuntimeError)):
+        proactive.upgrade_jobs(api.mobile, "owner", "default")
+    assert proactive._managed_id(api.mobile, "owner", "default", "watch_email") == "old-watch"
+    assert notes[("old-brief", "owner-note")] == "Keep the old brief's notepad"
+    assert next(row for row in jobs if row["id"] == "old-brief")["enabled"] is True
+    assert calls["resume"] == 1  # Only the old brief's reversible pause is undone.
+    if receipt == "create_response":
+        unknown = next(row for row in jobs if row["id"].startswith("fixture-job-"))
+        assert unknown["enabled"] is False and calls["remove"] == 0
+        assert notes[(unknown["id"], "owner-note")] == "Unknown native create"
+        monkeypatch.setattr(cron, "_create_cron_job_sync", create)
+        with pytest.raises(ValueError, match="not owned"):
+            proactive.upgrade_jobs(api.mobile, "owner", "default")
+        assert proactive._managed_id(api.mobile, "owner", "default", "watch_email") == "old-watch"
+    else:
+        assert {row["id"] for row in jobs} == {"old-brief", "owner-job"}
+    _assert_upgrade_warning(client)
+
+
+@pytest.mark.parametrize("failure", ["soul_before", "soul_after", "cursor_before", "cursor_after",
+                                     "cursor_missing", "owner_soul"])
+def test_upgrade_rolls_back_soul_and_jobs_keeps_cursor_recovery_and_owner_text(harness, monkeypatch, failure):
+    api, client, _, home, _ = harness
+    proactive = api.proactive
+    jobs, _, notes = _upgrade_profile(api, monkeypatch, home, watch=False)
+    soul = home / "SOUL.md"
+    notepad = sys.modules["cron.notepad"]
+    write, set_note = proactive._write_profile_instructions, notepad.set_note
+
+    def fail_soul(*args):
+        if failure == "soul_after":
+            write(*args)
+        raise OSError("SOUL write failed")
+
+    def fail_cursor(job_id, key, value):
+        if key == "checked_until":
+            if failure == "cursor_missing":
+                return None
+            if failure == "cursor_after":
+                set_note(job_id, key, value)
+            if failure == "owner_soul":
+                soul.write_bytes(b"Owner edited during upgrade\r\n")
+            raise OSError("Cursor write failed")
+        return set_note(job_id, key, value)
+
+    if failure.startswith("soul_"):
+        monkeypatch.setattr(proactive, "_write_profile_instructions", fail_soul)
+    else:
+        monkeypatch.setattr(notepad, "set_note", fail_cursor)
+    with pytest.raises((OSError, RuntimeError)):
+        proactive.upgrade_jobs(api.mobile, "owner", "default")
+    assert soul.read_bytes() == (b"Owner edited during upgrade\r\n" if failure == "owner_soul"
+                                 else b"Owner instructions\r\n")
+    assert {row["id"] for row in jobs} == {"old-brief", "owner-job"}
+    assert next(row for row in jobs if row["id"] == "old-brief")["enabled"] is True
+    assert notes[("old-brief", "owner-note")] == "Keep the old brief's notepad"
+    assert proactive._managed_id(api.mobile, "owner", "default", "watch_email") == "old-watch"
+    assert proactive._meta_get(api.mobile, proactive._key("owner", "default", "checked_until")) == "2026-10-20T01:30:00Z"
+    assert proactive._meta_get(api.mobile, proactive._key("owner", "default", "jobs-version")) == "old-version"
+    _assert_upgrade_warning(client)
+    monkeypatch.setattr(proactive, "_write_profile_instructions", write)
+    monkeypatch.setattr(notepad, "set_note", set_note)
+    assert proactive.upgrade_jobs(api.mobile, "owner", "default") is True
+    watch_id = proactive._managed_id(api.mobile, "owner", "default", "watch_email")
+    assert notes[(watch_id, "checked_until")] == "2026-10-20T01:30:00Z"
+    assert "_error" not in proactive.status(api.mobile, "owner", "default")
+    if failure == "owner_soul":
+        assert soul.read_bytes().startswith(b"Owner edited during upgrade\r\n")
+
+
+@pytest.mark.parametrize("is_enabled", [False, True])
+def test_upgrade_retirement_failure_is_durable_and_retry_commits_version_last(harness, monkeypatch, is_enabled):
+    api, client, _, home, _ = harness
+    proactive = api.proactive
+    jobs, calls, notes = _upgrade_profile(api, monkeypatch, home, is_enabled=is_enabled)
+    cron = sys.modules["hermes_cli.web_server_cron"]
+    mutate, meta_set = cron._mutate_cron_for_profile, proactive._meta_set
+
+    def fail_remove(profile, action, job_id, changes=None):
+        return False if action == "remove_job" else mutate(profile, action, job_id, changes)
+
+    monkeypatch.setattr(cron, "_mutate_cron_for_profile", fail_remove)
+    with pytest.raises(RuntimeError):
+        proactive.upgrade_jobs(api.mobile, "owner", "default")
+    assert next(row for row in jobs if row["id"] == "old-brief")["enabled"] is (not is_enabled)
+    assert notes[("old-brief", "owner-note")] == "Keep the old brief's notepad"
+    assert proactive.enabled(api.mobile, "owner", "default") is is_enabled
+    assert proactive._meta_get(api.mobile, proactive._key("owner", "default", "jobs-version")) == "old-version"
+    _assert_upgrade_warning(client)
+    monkeypatch.setattr(cron, "_mutate_cron_for_profile", mutate)
+    writes = []
+
+    def observe_commit(mobile, key, value):
+        writes.append(key)
+        if key == proactive._key("owner", "default", "jobs-version"):
+            assert all(row["id"] != "old-brief" for row in jobs)
+            assert proactive._meta_get(mobile, proactive._key("owner", "default", "enable-error")) is None
+            if is_enabled:
+                assert notes[("old-watch", "checked_until")] == "2026-10-20T01:30:00Z"
+        return meta_set(mobile, key, value)
+
+    monkeypatch.setattr(proactive, "_meta_set", observe_commit)
+    assert proactive.upgrade_jobs(api.mobile, "owner", "default") is True
+    assert writes[-1] == proactive._key("owner", "default", "jobs-version")
+    assert proactive.upgrade_jobs(api.mobile, "owner", "default") is False
+    assert proactive.enabled(api.mobile, "owner", "default") is is_enabled
+    assert "_error" not in proactive.status(api.mobile, "owner", "default")
+    assert any(row["id"] == "owner-job" for row in jobs)
+    if not is_enabled:
+        assert calls["create"] == calls["update"] == calls["resume"] == 0
+        assert jobs == [{"id": "owner-job", "name": "Owner report", "enabled": True}]
+        assert (home / "SOUL.md").read_bytes() == b"Owner instructions\r\n"
+
+
+@pytest.mark.parametrize("failure", ["cursor_clear", "warning_clear", "version_before", "version_after"])
+def test_upgrade_final_write_failure_keeps_warning_and_retryable_version(harness, monkeypatch, failure):
+    api, client, _, home, _ = harness
+    proactive = api.proactive
+    jobs, _, notes = _upgrade_profile(api, monkeypatch, home)
+    meta_set = proactive._meta_set
+    version_key = proactive._key("owner", "default", "jobs-version")
+    error_key = proactive._key("owner", "default", "enable-error")
+    cursor_key = proactive._key("owner", "default", "checked_until")
+    failed = False
+
+    def fail_commit(mobile, key, value):
+        nonlocal failed
+        target = ((failure == "cursor_clear" and key == cursor_key and value is None)
+                  or (failure == "warning_clear" and key == error_key and value is None)
+                  or (failure.startswith("version_") and key == version_key and value == proactive.JOBS_VERSION))
+        if target and not failed:
+            failed = True
+            if failure in ("warning_clear", "version_after"):
+                meta_set(mobile, key, value)
+            raise OSError("Final upgrade commit failed")
+        return meta_set(mobile, key, value)
+
+    monkeypatch.setattr(proactive, "_meta_set", fail_commit)
+    with pytest.raises(OSError, match="Final upgrade commit failed"):
+        proactive.upgrade_jobs(api.mobile, "owner", "default")
+    assert failed and all(row["id"] != "old-brief" for row in jobs)
+    assert notes[("old-watch", "checked_until")] == "2026-10-20T01:30:00Z"
+    assert proactive._meta_get(api.mobile, version_key) == "old-version"
+    _assert_upgrade_warning(client)
+    assert proactive.upgrade_jobs(api.mobile, "owner", "default") is True
+    assert proactive._meta_get(api.mobile, version_key) == proactive.JOBS_VERSION
+    assert proactive._meta_get(api.mobile, error_key) is None
+
+
+@pytest.mark.parametrize("watch", [False, True])
+def test_upgrade_keeps_cursor_advanced_during_native_sync(harness, monkeypatch, watch):
+    api, _, _, home, _ = harness
+    proactive = api.proactive
+    _, _, notes = _upgrade_profile(api, monkeypatch, home, watch=watch)
+    sync = proactive.sync_learned
+
+    def advance_cursor(*args):
+        sync(*args)
+        watch_id = proactive._managed_id(api.mobile, "owner", "default", "watch_email")
+        notes[(watch_id, "checked_until")] = "2026-10-20T02:30:00Z"
+
+    monkeypatch.setattr(proactive, "sync_learned", advance_cursor)
+    assert proactive.upgrade_jobs(api.mobile, "owner", "default") is True
+    watch_id = proactive._managed_id(api.mobile, "owner", "default", "watch_email")
+    assert notes[(watch_id, "checked_until")] == "2026-10-20T02:30:00Z"
+    assert proactive._meta_get(api.mobile, proactive._key("owner", "default", "checked_until")) is None
+
+
 def test_upgrade_rebuilds_managed_jobs_once_per_jobs_version(harness, monkeypatch):
     api, _, _, home, _ = harness
     old_jobs = [
@@ -666,6 +1522,7 @@ def test_upgrade_rewrites_enabled_profile_proactive_instructions(harness, monkey
     monkeypatch.setattr(api.proactive, "_sync_request_jobs", lambda *args: None)
     monkeypatch.setattr(api.proactive, "_move_legacy_learned", lambda *args: None)
     monkeypatch.setattr(api.proactive, "_home", lambda profile: home)
+    monkeypatch.setattr(api.proactive, "_distribution_owns_soul", lambda profile_home: False)
     monkeypatch.setattr(api.proactive, "enabled", lambda *args: is_enabled)
     written = []
 
@@ -1136,7 +1993,8 @@ def test_v4_evidence_from_any_successful_tool_gates_default_email_alert(harness,
                               {"item_id": "failed-item", "reason": "Failed read"}, now)
 
 
-def test_v4_call_rule_keeps_quiet_hours_override_and_three_call_cap(harness, monkeypatch):
+@pytest.mark.parametrize("deferred", [False, True])
+def test_v4_call_rule_keeps_quiet_hours_override_and_three_call_cap(harness, monkeypatch, deferred):
     api, _, cfg, _, _ = harness
     observer = load_private("observers")
     cfg.update(callback_tool_enabled=True, scheduled_callbacks_enabled=True,
@@ -1151,6 +2009,12 @@ def test_v4_call_rule_keeps_quiet_hours_override_and_three_call_cap(harness, mon
                                            "call", "email", True)
     now = __import__("datetime").datetime.fromisoformat("2026-10-20T23:30:00+04:00")
     monkeypatch.setattr(observer, "time", SimpleNamespace(time=lambda: now.timestamp()))
+    with api.mobile.connect() as conn:
+        for prefix in ("proactive-call:other:default:", "proactive-call:owner:work:"):
+            conn.execute("INSERT INTO meta(key,value) VALUES(?,?)", (prefix + "other-scope", str(now.timestamp()).encode()))
+        if deferred:
+            conn.execute("INSERT INTO calls(id,owner,profile,conversation,created) VALUES(?,?,?,?,?)",
+                         ("active-call", "owner", "default", "assistant-chat", time.time()))
 
     results = []
     for index in range(4):
@@ -1162,10 +2026,200 @@ def test_v4_call_rule_keeps_quiet_hours_override_and_three_call_cap(harness, mon
 
     with api.mobile.connect() as conn:
         calls = conn.execute("SELECT COUNT(*) FROM notices WHERE kind='incoming_call'").fetchone()[0]
+        calls += conn.execute("SELECT COUNT(*) FROM deferred").fetchone()[0]
         fallback = conn.execute("SELECT COUNT(*) FROM notices WHERE kind='task_result'").fetchone()[0]
+        assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'proactive-call:owner:default:%'").fetchone()[0] == 3
     assert calls == 3 and fallback == 1
     assert [row["status"] for row in results].count("pending") == 3
     assert results[-1]["status"] == "notified"
+
+
+@pytest.fixture
+def proactive_call_case(harness, monkeypatch):
+    api, _, cfg, _, _ = harness
+    observers = load_private("observers")
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(observers, "time", SimpleNamespace(time=lambda: now.timestamp()))
+    monkeypatch.setattr(api.proactive, "profile_now", lambda profile: now)
+    cfg.update(callback_tool_enabled=True, scheduled_callbacks_enabled=True)
+    setup = {**api.proactive.default_setup(), "delivery": "call", "quiet_start": "00:00", "quiet_end": "00:00"}
+    rule = api.proactive.create_request(api.mobile, "owner", "default", "Release blocked", "call", "github")
+    for key, value in (("setup", json.dumps(setup)), ("enabled", "1"), ("setup_complete", "1")):
+        api.proactive._meta_set(api.mobile, api.proactive._key("owner", "default", key), value)
+    _install_profile_db(monkeypatch, {
+        "assistant-chat": {"user_id": "basic:owner"}, "foreign-chat": {"user_id": "basic:other"}})
+    monkeypatch.setattr(api.native, "verify", load_private("native").verify)
+    assert observers.source_observed(api.mobile, cfg, "default", "watch-run", "mcp__github__get_issue",
+                                     {"id": "issue-1"}, "ok")
+    args = {"source": "github", "item_id": "issue-1", "request_id": rule["id"], "reason": "Release needs a decision"}
+    return api, observers, cfg, now, args
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("use_rule", [False, True])
+def test_proactive_call_post_enqueue_failure_rolls_back_and_retry_is_accounted(proactive_call_case, deferred, use_rule):
+    api, observers, cfg, now, args = proactive_call_case
+    if not use_rule:
+        args.pop("request_id")
+    with api.mobile.connect() as conn:
+        if deferred:
+            conn.execute("INSERT INTO calls(id,owner,profile,conversation,created) VALUES(?,?,?,?,?)",
+                         ("active-call", "owner", "default", "assistant-chat", now.timestamp()))
+        # The failure must see the real enqueue; a pre-enqueue exception cannot satisfy this control.
+        conn.execute("""CREATE TRIGGER fail_proactive_provenance BEFORE INSERT ON meta
+            WHEN NEW.key LIKE 'proactive-email-rule:%'
+            BEGIN
+                SELECT RAISE(ABORT,'missing real enqueue') WHERE
+                    NOT EXISTS(SELECT 1 FROM notices WHERE NEW.key='proactive-email-rule:'||id)
+                    AND NOT EXISTS(SELECT 1 FROM deferred WHERE NEW.key='proactive-email-rule:'||id);
+                SELECT RAISE(ABORT,'post-enqueue metadata failure');
+            END""")
+
+    with pytest.raises(api.mobile.sqlite3.IntegrityError, match="post-enqueue metadata failure"):
+        observers.event_notice(api.mobile, api.native, cfg, "default", "watch-run", args, now)
+    with api.mobile.connect() as conn:
+        for table in ("notices", "deferred", "call_log"):
+            assert conn.execute("SELECT COUNT(*) FROM " + table).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'proactive-%'").fetchone()[0] == 0
+        conn.execute("DROP TRIGGER fail_proactive_provenance")
+
+    result = observers.event_notice(api.mobile, api.native, cfg, "default", "watch-run", args, now)
+    assert result["status"] == "pending" and result["conversation_id"] == "assistant-chat"
+    assert observers.event_notice(api.mobile, api.native, cfg, "default", "watch-run", args, now) == observers.DUPLICATE_ALERT
+    event = result["event_id"]
+    with api.mobile.connect() as conn:
+        delivery = conn.execute("SELECT * FROM " + ("deferred" if deferred else "notices")).fetchall()
+        assert len(delivery) == 1
+        assert (delivery[0]["id"], delivery[0]["owner"], delivery[0]["profile"], delivery[0]["conversation"]) == (
+            event, "owner", "default", "assistant-chat")
+        assert delivery[0]["reason"] == ("Release needs a decision. Rule: Release blocked" if use_rule else "Release needs a decision")
+        markers = {row["key"]: row["value"] for row in conn.execute("SELECT * FROM meta WHERE key LIKE 'proactive-%'")}
+        dedupe = ("proactive-alert:owner:default:" + args.get("request_id", "default") + ":source:"
+                  + hashlib.sha256(b"github").hexdigest() + ":" + hashlib.sha256(b"issue-1").hexdigest())
+        rate_keys = [key for key in markers if key.startswith("proactive-call:owner:default:")]
+        assert len(rate_keys) == 1
+        assert set(markers) == {dedupe, rate_keys[0], "proactive-email-notice:" + event, "proactive-email-rule:" + event}
+        assert all(float(markers[key]) == now.timestamp() for key in (dedupe, rate_keys[0], "proactive-email-notice:" + event))
+        assert json.loads(markers["proactive-email-rule:" + event]) == {
+            "created": now.timestamp(), "rule_id": args.get("request_id", "default"), "source": "github"}
+        if deferred:
+            assert conn.execute("SELECT COUNT(*) FROM call_log").fetchone()[0] == 0
+            conn.execute("UPDATE calls SET closed=1 WHERE id='active-call'")
+    if deferred:
+        api.activate("owner", "default")
+    with api.mobile.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM deferred").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM notices").fetchone()[0] == 1
+        log = conn.execute("SELECT * FROM call_log").fetchone()
+        assert (log["id"], log["email_notice_id"], log["owner"], log["profile"], log["conversation"]) == (
+            event, event, "owner", "default", "assistant-chat")
+    assert api.proactive.add_email_feedback(api.mobile, "owner", "default", event, "important") == {"ok": True}
+    assert api.proactive.learned_notes(api.mobile, "owner", "default") == [
+        'Beacon importance: github: Important: "Release needs a decision"']
+
+
+@pytest.mark.parametrize("difference", ["item", "source", "rule"])
+def test_proactive_calls_keep_distinct_source_rule_items_in_the_same_conversation(proactive_call_case, difference):
+    api, observers, cfg, now, args = proactive_call_case
+    second = dict(args)
+    if difference == "item":
+        second["item_id"] = "issue-2"
+    elif difference == "source":
+        second["source"] = "calendar"
+        rules = api.proactive.list_requests(api.mobile, "owner", "default")
+        api.proactive._meta_set(api.mobile, api.proactive._key("owner", "default", "requests"),
+                                json.dumps([{**rules[0], "signal": None}]))
+    else:
+        rules = api.proactive.list_requests(api.mobile, "owner", "default")
+        second["request_id"] = "f" * 32
+        api.proactive._meta_set(api.mobile, api.proactive._key("owner", "default", "requests"),
+                                json.dumps(rules + [{**rules[0], "id": second["request_id"]}]))
+    tool = "mcp__calendar__get_event" if difference == "source" else "mcp__github__get_issue"
+    assert observers.source_observed(api.mobile, cfg, "default", "watch-run", tool, {"id": second["item_id"]}, "ok")
+    first = observers.event_notice(api.mobile, api.native, cfg, "default", "watch-run", args, now)
+    other = observers.event_notice(api.mobile, api.native, cfg, "default", "watch-run", second, now)
+    assert first["status"] == other["status"] == "pending" and first["event_id"] != other["event_id"]
+    for alert in (args, second):
+        assert observers.event_notice(api.mobile, api.native, cfg, "default", "watch-run", alert, now) == observers.DUPLICATE_ALERT
+    with api.mobile.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM notices WHERE conversation='assistant-chat'").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'proactive-call:owner:default:%'").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_proactive_call_capacity_refusal_leaves_no_markers_and_can_retry(proactive_call_case, deferred):
+    api, observers, cfg, now, args = proactive_call_case
+    table, capacity = ("deferred", 256) if deferred else ("notices", 10000)
+    with api.mobile.connect() as conn:
+        if deferred:
+            conn.execute("INSERT INTO calls(id,owner,profile,conversation,created) VALUES(?,?,?,?,?)",
+                         ("active-call", "owner", "default", "assistant-chat", now.timestamp()))
+            conn.executemany("INSERT INTO deferred(id,owner,profile,conversation,created) VALUES(?,?,?,?,?)",
+                             [(f"full-{index}", "other", "work", "other-chat", now.timestamp()) for index in range(capacity)])
+        else:
+            conn.executemany("INSERT INTO notices(id,owner,profile,kind,conversation,created,expires) VALUES(?,?,?,?,?,?,?)",
+                             [(f"full-{index}", "other", "work", "task_result", "other-chat", now.timestamp(),
+                               now.timestamp() + 3600) for index in range(capacity)])
+    with pytest.raises(RuntimeError, match="capacity"):
+        observers.event_notice(api.mobile, api.native, cfg, "default", "watch-run", args, now)
+    with api.mobile.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM " + table).fetchone()[0] == capacity
+        assert conn.execute("SELECT COUNT(*) FROM call_log").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'proactive-%'").fetchone()[0] == 0
+        conn.execute("DELETE FROM " + table + " WHERE id='full-0'")
+    assert observers.event_notice(api.mobile, api.native, cfg, "default", "watch-run", args, now)["status"] == "pending"
+    with api.mobile.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM " + table).fetchone()[0] == capacity
+        assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'proactive-call:owner:default:%'").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("capability", ["callback_tool_enabled", "scheduled_callbacks_enabled"])
+def test_proactive_call_without_capability_falls_back_once_without_hourly_charge(proactive_call_case, capability):
+    api, observers, cfg, now, args = proactive_call_case
+    cfg[capability] = False
+    result = observers.event_notice(api.mobile, api.native, cfg, "default", "watch-run", args, now)
+    assert result["status"] == "notified"
+    assert observers.event_notice(api.mobile, api.native, cfg, "default", "watch-run", args, now) == observers.DUPLICATE_ALERT
+    with api.mobile.connect() as conn:
+        notices = conn.execute("SELECT * FROM notices").fetchall()
+        assert len(notices) == 1 and notices[0]["kind"] == "task_result"
+        assert notices[0]["id"] == result["event_id"]
+        assert conn.execute("SELECT COUNT(*) FROM deferred").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM call_log").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'proactive-call:%'").fetchone()[0] == 0
+        provenance = conn.execute("SELECT value FROM meta WHERE key=?", ("proactive-email-rule:" + result["event_id"],)).fetchone()
+        assert json.loads(provenance[0])["source"] == "github"
+
+
+@pytest.mark.parametrize("failure", ["owner", "provider", "profile", "conversation", "session", "source", "item", "rule", "stale"])
+def test_proactive_call_rejects_foreign_authority_or_evidence_before_enqueue(proactive_call_case, failure):
+    api, observers, cfg, now, args = proactive_call_case
+    session = "watch-run"
+    if failure == "owner":
+        cfg["owner_id"] = "other"
+    elif failure == "provider":
+        cfg["owner_provider"] = "other"
+    elif failure == "profile":
+        cfg["profiles"] = ["work"]
+    elif failure == "conversation":
+        cfg["scheduled_callback_conversation_id"] = "foreign-chat"
+    elif failure == "session":
+        session = "another-run"
+    elif failure == "source":
+        args["source"] = "calendar"
+        assert observers.source_observed(api.mobile, cfg, "default", session, "mcp__calendar__get_event", {"id": args["item_id"]}, "ok")
+    elif failure == "item":
+        args["item_id"] = "unobserved-item"
+    elif failure == "rule":
+        args["request_id"] = "f" * 32
+    else:
+        now = datetime.fromtimestamp(now.timestamp() + observers.EVIDENCE_TTL + 1, timezone.utc)
+    with pytest.raises((ValueError, LookupError)):
+        observers.event_notice(api.mobile, api.native, cfg, "default", session, args, now)
+    with api.mobile.connect() as conn:
+        for table in ("notices", "deferred", "call_log"):
+            assert conn.execute("SELECT COUNT(*) FROM " + table).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'proactive-%'").fetchone()[0] == 0
 
 
 def test_v4_email_checked_notepad_is_profile_scoped_and_health_expires(harness, monkeypatch):

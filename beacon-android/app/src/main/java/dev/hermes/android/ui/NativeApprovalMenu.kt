@@ -66,7 +66,7 @@ internal fun chatApprovalSelection(record: JSONObject?, profileKey: String?, ses
         }
         saving = true
         val job = vm.action("/api/approval/mode", json("yolo" to turnOn, "session_id" to capturedScope.session, "scope_key" to capturedScope.key), refresh = false,
-            successNotice = if (turnOn) "YOLO enabled for this chat" else "This chat follows the profile's approvals") { _, result -> vm.storeData(key, result) }
+            successNotice = if (turnOn) "YOLO on for this chat" else "YOLO off for this chat") { _, result -> vm.storeData(key, result) }
         scope.launch { try { job.join(); open = false } finally { saving = false } }
     }
     Box {
@@ -77,14 +77,15 @@ internal fun chatApprovalSelection(record: JSONObject?, profileKey: String?, ses
             DropdownMenuItem({ Text("Approvals in this chat") }, {}, enabled = false)
             if (loading || busy) DropdownMenuItem({ Text(if (busy) "Saving…" else "Checking…") }, {}, enabled = false)
             if (record == null && !loading) DropdownMenuItem({ Text("Approvals are unknown. Tap to retry.") }, { vm.loadChatApprovals() })
-            if (profileMode == "off") DropdownMenuItem({ Text("Approvals are off for this profile") }, {}, enabled = false)
+            if (profileMode == "off") DropdownMenuItem({ Text("Approvals are off") }, {}, enabled = false)
             val choicesEnabled = enabled && !loading && !busy && profileMode in nativeApprovalModes && profileMode != "off"
-            listOf("ask", "yolo").forEach { choice ->
+            // Hermes keeps only YOLO per chat; Manual or Auto is the profile's mode and is changed in Profiles.
+            if (profileMode != "off") listOf("ask", "yolo").forEach { choice ->
                 val isSelected = if (choice == "ask") selection in setOf("manual", "smart") else selection == "yolo"
                 DropdownMenuItem(
                     text = { Column {
-                        Text(if (choice == "ask") "Profile default" else "YOLO in this chat")
-                        Text(if (choice == "yolo") "Skip approval prompts in this chat" else if (profileMode == "manual") "Ask first" else approvalChoiceLabel(profileMode), style = MaterialTheme.typography.bodySmall)
+                        Text(if (choice == "ask") approvalChoiceLabel(profileMode) else "YOLO")
+                        Text(if (choice == "yolo") "Skip approval prompts" else if (profileMode == "smart") "Ask only for risky actions" else "Ask before actions", style = MaterialTheme.typography.bodySmall)
                     } },
                     leadingIcon = { ApprovalShield(if (choice == "ask") profileMode else "yolo", null) },
                     trailingIcon = { if (isSelected) Icon(Icons.Rounded.Check, "Selected") },
@@ -97,9 +98,6 @@ internal fun chatApprovalSelection(record: JSONObject?, profileKey: String?, ses
                     } },
                 )
             }
-            HorizontalDivider()
-            DropdownMenuItem({ Text("Change for all chats") }, { open = false; vm.more("Profiles") }, enabled = !busy, modifier = Modifier.testTag("approval-profile-settings"))
-            DropdownMenuItem({ Text("Allowed toolsets") }, { open = false; vm.openCatalog("Toolsets") }, enabled = enabled && !busy)
         }
     }
     if (confirmYolo) AlertDialog(onDismissRequest = { confirmYolo = false }, title = { Text("Enable YOLO for this chat?") },
@@ -126,7 +124,7 @@ internal fun chatApprovalSelection(record: JSONObject?, profileKey: String?, ses
     Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp).testTag("profile-approvals")) {
         Text("Approvals for all chats", style = MaterialTheme.typography.titleMedium)
         Text("Chats follow this profile unless YOLO is enabled in that chat.", style = MaterialTheme.typography.bodySmall)
-        if (loading || busy || value == null && recordError(data[key]).isBlank()) LinearProgressIndicator(Modifier.fillMaxWidth())
+        if (busy || value == null && recordError(data[key]).isBlank()) LinearProgressIndicator(Modifier.fillMaxWidth())
         if (value?.string("value") == "off") Text("Approvals are off for this profile", color = MaterialTheme.colorScheme.error)
         if (recordError(data[key]).isNotBlank()) TextButton(onClick = { refresh() }) { Text("Couldn't load approvals. Retry") }
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {

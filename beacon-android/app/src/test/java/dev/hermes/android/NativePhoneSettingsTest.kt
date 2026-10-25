@@ -202,16 +202,20 @@ class NativePhoneSettingsTest {
         } finally { worker.cancel(); client.closeNative() }
     }
     @Test fun unresolvedHostUpdateSurvivesProfileSwitchAndBlocksAnotherApply() {
-        var client = BeaconClient(AuthContext("https://native.example", emptyList(), owner = "owner"))
-        val saved = SavedStateHandle(mapOf("server-update:https://native.example:owner:at" to "2026-10-14T10:00:00Z", "server-update:https://native.example:owner:id" to "active"))
+        var client = BeaconClient(AuthContext("https://native.example", emptyList(), owner = "owner", nativeProvider = "basic"))
+        val account = client.scope.copy(profile = "", session = "").key
+        val saved = SavedStateHandle(mapOf("server-update:$account:at" to "2026-10-14T10:00:00Z", "server-update:$account:id" to "active"))
         val worker = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
         val controller = NativePhoneSettings(worker, saved) { client }
         controller.bind()
         assertEquals("active", controller.server.value.requestedActionId)
-        client = BeaconClient(AuthContext("https://native.example", emptyList(), owner = "owner", profile = "academic"))
+        client = BeaconClient(AuthContext("https://native.example", emptyList(), owner = "owner", profile = "academic", nativeProvider = "basic"))
         controller.bind()
         assertEquals("active", controller.server.value.requestedActionId)
         assertFalse(controller.server.value.copy(update = json("can_apply" to true, "update_available" to true)).canApply)
+        client = BeaconClient(client.auth.copy(nativeProvider = "oidc")); controller.bind()
+        assertEquals("", controller.server.value.requestedActionId)
+        assertEquals("active", saved.get<String>("server-update:$account:id"))
         worker.cancel(); client.closeNative()
     }
     @Test fun boundedRecoveryKeepsLongUnsavedEditsForTheOwnerToShorten() {

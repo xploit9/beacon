@@ -112,32 +112,11 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
     var submitted by remember { mutableStateOf(false) }
     var creating by rememberSaveable(owner.origin, owner.owner) { mutableStateOf(false) }
     var deleting by rememberSaveable(owner.origin, owner.owner, state.selectedSpace) { mutableStateOf(false) }
-    var choosingMembers by rememberSaveable(owner.origin, owner.owner, state.selectedSpace) { mutableStateOf(false) }
-    var members by remember { mutableStateOf(emptySet<String>()) }
-    var membersSubmitted by remember { mutableStateOf(false) }
-    LaunchedEffect(state.loading, state.error, state.members) {
-        if (membersSubmitted && !state.loading && state.error.isBlank() && state.members.toSet() == members) { choosingMembers = false; membersSubmitted = false }
-    }
     LaunchedEffect(state.selectedSpace) { if (state.selectedSpace.isNotBlank()) creating = false }
     BackHandler(creating) { creating = false }
-    if (choosingMembers && shared) AlertDialog(onDismissRequest = { if (!state.loading) choosingMembers = false },
-        title = { Text("Choose bots") },
-        text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Choose 2–6 bots. Changing the team stops its current work.")
-            state.bots.forEach { bot ->
-                Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).toggleable(bot.profile in members, enabled = !state.loading, role = androidx.compose.ui.semantics.Role.Checkbox) {
-                    members = if (bot.profile in members) members - bot.profile else if (members.size < 6) members + bot.profile else members
-                }, verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                    Checkbox(bot.profile in members, onCheckedChange = null); Text(profileDisplayLabel(bot.profile, profileRows, profileLoading), Modifier.padding(start = 8.dp))
-                }
-            }
-            if (state.error.isNotBlank()) Text(state.error, color = MaterialTheme.colorScheme.error)
-        } },
-        confirmButton = { TextButton({ membersSubmitted = true; controller.updateMembers(members) }, enabled = !state.loading && members.size in 2..6 && members != state.members.toSet()) { Text(if (state.loading) "Saving…" else "Save bots") } },
-        dismissButton = { TextButton({ choosingMembers = false }, enabled = !state.loading) { Text("Cancel") } })
     if (deleting && shared) AlertDialog(onDismissRequest = { if (!state.loading) deleting = false }, title = { Text("Delete shared space?") },
-        text = { Column { Text("Remove $spaceName from active spaces and stop its work. Individual Bot Chats are kept."); if (state.error.isNotBlank()) Text(state.error, color = MaterialTheme.colorScheme.error) } },
-        confirmButton = { TextButton({ controller.deleteSpace() }, enabled = !state.loading) { Text(if (state.loading) "Deleting…" else "Delete space", color = MaterialTheme.colorScheme.error) } },
+        text = { Column { Text("Stop its work and remove $spaceName from active spaces. Hermes may retain shared history for a limited time, and this space’s ID cannot be reused. Individual Bot Chats are kept."); if (state.error.isNotBlank()) Text(state.error, color = MaterialTheme.colorScheme.error) } },
+        confirmButton = { TextButton({ controller.deleteSpace() }, enabled = !state.loading && state.canDelete) { Text(if (state.loading) "Deleting…" else "Delete space", color = MaterialTheme.colorScheme.error) } },
         dismissButton = { TextButton({ deleting = false }, enabled = !state.loading) { Text("Cancel") } })
     LaunchedEffect(state.loading, state.error, spaceName) {
         if (submitted && !state.loading && state.error.isBlank() && spaceName == draftName.trim()) { editing = false; submitted = false }
@@ -148,20 +127,24 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
             OutlinedTextField(draftName, { draftName = it.take(120) }, label = { Text("Name") }, singleLine = true, enabled = !state.loading, modifier = Modifier.testTag("shared-space-name"))
             Text("Bots", style = MaterialTheme.typography.titleSmall)
             Text(state.members.map { profile -> profileDisplayLabel(profile, profileRows, profileLoading) }.joinToString(", "))
-            OutlinedButton({ editing = false; members = state.members.toSet(); membersSubmitted = false; choosingMembers = true }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Change bots") }
+            OutlinedButton({}, enabled = false, modifier = Modifier.heightIn(min = 48.dp)) { Text("Change bots unavailable") }
+            Text("This Hermes version cannot change bots in an existing space. Create another space with the bots you need; this space and its history are kept.")
+            TextButton({ editing = false; controller.home(); creating = true }, enabled = !state.loading, modifier = Modifier.heightIn(min = 48.dp)) { Text("Create another space") }
+            if (!state.canRename) Text("Renaming is unavailable. Refresh this space to check native support.")
             if (state.error.isNotBlank()) Text(state.error, color = MaterialTheme.colorScheme.error)
         } },
-        confirmButton = { TextButton(onClick = { submitted = true; controller.renameSpace(draftName) }, enabled = !state.loading && draftName.isNotBlank()) { Text(if (state.loading) "Saving…" else "Save") } },
+        confirmButton = { TextButton(onClick = { submitted = true; controller.renameSpace(draftName) }, enabled = !state.loading && state.canRename && draftName.isNotBlank()) { Text(if (state.loading) "Saving…" else "Save") } },
         dismissButton = { TextButton(onClick = { editing = false }, enabled = !state.loading) { Text("Cancel") } })
     Column(Modifier.fillMaxSize().imePadding().testTag(if (shared) "bot-mode-shared" else "bot-mode-home")) {
         Header(if (shared) spaceName else if (creating) "New shared space" else "Bot Mode", back = if (creating) ({ creating = false }) else null, menu = if (creating) null else LocalOpenNavigationMenu.current, actions = {
             if (shared) Box {
-                IconButton(onClick = { menu = true }, enabled = state.pendingChange == null) { Icon(Icons.Rounded.MoreVert, "Shared-space actions") }
+                IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "Shared-space actions") }
                 DropdownMenu(menu, { menu = false }) {
                     DropdownMenuItem({ Text("Edit shared space") }, onClick = { menu = false; draftName = spaceName; submitted = false; editing = true })
-                    DropdownMenuItem({ Text("Choose bots") }, onClick = { menu = false; members = state.members.toSet(); membersSubmitted = false; choosingMembers = true })
+                    DropdownMenuItem({ Text("Change bots unavailable") }, onClick = {}, enabled = false)
+                    DropdownMenuItem({ Text("Create another space") }, onClick = { menu = false; controller.home(); creating = true }, enabled = !state.loading)
                     HorizontalDivider()
-                    DropdownMenuItem({ Text("Delete shared space", color = MaterialTheme.colorScheme.error) }, onClick = { menu = false; deleting = true })
+                    DropdownMenuItem({ Text(if (state.canDelete) "Delete shared space" else "Deletion unavailable", color = MaterialTheme.colorScheme.error) }, onClick = { menu = false; deleting = true }, enabled = !state.loading && state.canDelete)
                 }
             } else if (!creating) {
                 IconButton(onClick = { controller.refresh() }, enabled = !state.loading) { Icon(Icons.Rounded.Refresh, "Refresh Bot Mode") }
@@ -198,10 +181,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
                 item { Button(onClick = { controller.createSpace() }, enabled = !state.loading && state.selectedBots.size in 2..6) { Text("Create shared space") } }
             } else {
                 item {
-                    if (state.pendingChange != null) {
-                        Text("Your change is waiting for the bots’ current work to stop.")
-                        OutlinedButton(controller::retryChange, enabled = !state.loading, modifier = Modifier.heightIn(min = 48.dp)) { Text("Retry pending change") }
-                    } else Text(state.status, style = MaterialTheme.typography.bodyMedium)
+                    Text(state.status, style = MaterialTheme.typography.bodyMedium)
                     if (state.events.any { it.failed }) OutlinedButton(onClick = { vm.more("Profiles") }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Review bot profiles") }
                     if (state.earlierEventsOmitted) Text("Showing the latest 200 shared-space events.", style = MaterialTheme.typography.bodySmall)
                     if (state.events.isEmpty() && !state.loading) Text("Send the bots a task to start the discussion.")
@@ -225,7 +205,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
         if (shared) Surface(tonalElevation = 2.dp) {
             Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(state.draft, controller::draft, label = { Text("Message the shared space") }, modifier = Modifier.fillMaxWidth().testTag("bot-shared-composer"), maxLines = 6, enabled = !state.sending)
-                Button(onClick = { controller.send() }, enabled = !state.loading && !state.sending && state.pendingChange == null && state.draft.isNotBlank(), modifier = Modifier.align(androidx.compose.ui.Alignment.End)) { Text(if (state.sending) "Sending…" else "Send") }
+                Button(onClick = { controller.send() }, enabled = !state.loading && !state.sending && state.draft.isNotBlank(), modifier = Modifier.align(androidx.compose.ui.Alignment.End)) { Text(if (state.sending) "Sending…" else "Send") }
             }
         }
     }
@@ -242,8 +222,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
                     if ("deny" in action.choices) OutlinedButton(onClick = { resolve(action, "deny") }, enabled = !loading, modifier = Modifier.heightIn(min = 48.dp), colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("Deny") }
                 }
             } else {
-                Text("A bot task needs review before retrying. Its earlier outcome may be unknown.")
-                OutlinedButton(onClick = { resolve(action, "") }, enabled = !loading, modifier = Modifier.heightIn(min = 48.dp)) { Text("Retry bot task") }
+                Text(action.description)
             }
         }
     }

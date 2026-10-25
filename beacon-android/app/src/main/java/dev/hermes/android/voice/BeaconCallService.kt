@@ -170,8 +170,10 @@ class CallController(private val app: BeaconApplication) {
         val credentials=withContext(Dispatchers.IO) { keyStore.session() }?:throw MissingVoiceKeyException(keyStore.settings().provider)
         check(ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) { "Allow microphone access to answer ${dev.hermes.android.data.currentAssistantName}" }
         require(app.push.claimInvitation(source, event)) { "This ${dev.hermes.android.data.currentAssistantName} invitation has ended" }
-        val (client, route) = callLookup { resolveIncoming(app, source, event) }
-        start(client, IncomingCall(source, event, route.getLong("expires_at")),voiceSettings=credentials)
+        try {
+            val (client, route) = callLookup { resolveIncoming(app, source, event) }
+            start(client, IncomingCall(source, event, route.getLong("expires_at")),voiceSettings=credentials)
+        } finally { app.push.retryInvitation(source, event) }
     }
     private suspend fun start(client: BeaconClient, incoming: IncomingCall?, conversationId: String? = null, voiceSettings:VoiceSessionCredentials) {
         requireCameraReleasedForNewCall(_state.value)
@@ -205,17 +207,17 @@ class CallController(private val app: BeaconApplication) {
             ContextCompat.startForegroundService(app, Intent(app, BeaconCallService::class.java).setAction(BeaconCallService.START))
         } catch (e: Throwable) {
             if (generation == epoch.get()) { spec = null; _state.value = CallState(error = e.message.orEmpty()) }
-            grant?.takeIf { it.string("call_id").isNotBlank() }?.let { release(CallSpec(frozen, it)) }
+            grant?.takeIf { it.string("call_id").isNotBlank() }?.let { release(CallSpec(frozen, it), failed = e !is CancellationException && generation == epoch.get()) }
             if (incoming != null && e !is CancellationException) reconcileIncomingFailure(app, frozen, incoming.source, incoming.event, e)
             throw e
         } finally { starting.set(false) }
     }
-    private suspend fun release(pending: CallSpec) { withContext(NonCancellable) { withTimeoutOrNull(5000) { runCatching { pending.client.nativeRequest("/api/plugins/beacon/mobile/calls/${pending.grant.getString("call_id")}", "DELETE") } } } }
-    internal fun rejectPendingStart(message: String = "The previous call is still ending. Try again.") {
+    private suspend fun release(pending: CallSpec, failed: Boolean = false) { withContext(NonCancellable) { withTimeoutOrNull(5000) { runCatching { pending.client.nativeRequest("/api/plugins/beacon/mobile/calls/${pending.grant.getString("call_id")}", "DELETE", JSONObject().put("failed", failed)) } } } }
+    internal fun rejectPendingStart(message: String = "The previous call is still ending. Try again.", failed: Boolean = false) {
         val pending = spec ?: return
         spec = null
         _state.update { it.copy(active = false, state = "idle", error = message) }
-        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch { release(pending) }
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch { release(pending, failed) }
     }
     fun hangup() { epoch.incrementAndGet(); service?.hangup() ?: run { val pending = spec; spec = null; _state.update { it.copy(active = false, state = "idle") }; if (pending != null) CoroutineScope(SupervisorJob() + Dispatchers.IO).launch { release(pending) } } }
     fun dismissFailure(expectedId: String) {
@@ -288,7 +290,9 @@ class BeaconCallService : Service() {
                 if (spec != null && !closed.get()) foreground(cameraCaptureAttempted, screenCaptureAttempted)
                 else ServiceCompat.startForeground(this, NOTIFICATION, notification(starting = true), ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL)
             } catch (_: RuntimeException) {
-                app.calls.rejectPendingStart("Android could not start the call. Open Beacon and try again.")
+                val message = "Android could not start the call. Open Beacon and try again."
+                if (spec != null && !closed.get()) failure(message)
+                else app.calls.rejectPendingStart(message, failed = true)
                 stopSelf();return START_NOT_STICKY
             }
         }
@@ -304,13 +308,13 @@ class BeaconCallService : Service() {
             return START_NOT_STICKY
         }
         if (spec != null || closed.get()) {
-            app.calls.rejectPendingStart()
+            app.calls.rejectPendingStart(failed = true)
             if (closed.get()) stopSelf()
             return START_NOT_STICKY
         }
         val pending = app.calls.spec ?: run { stopSelf(); return START_NOT_STICKY }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED || !app.auth.read(pending.client.auth.origin).authorizesPushSource(pending.client.scope)) {
-            app.calls.rejectPendingStart("Sign in and allow microphone access before calling ${dev.hermes.android.data.currentAssistantName}"); stopSelf(); return START_NOT_STICKY
+            app.calls.rejectPendingStart("Sign in and allow microphone access before calling ${dev.hermes.android.data.currentAssistantName}", failed = true); stopSelf(); return START_NOT_STICKY
         }
         spec = pending; app.calls.spec = null; app.calls.service = this
         scope.launch {
@@ -326,7 +330,7 @@ class BeaconCallService : Service() {
             }
         }
         try { foreground(camera = false) }
-        catch (e: RuntimeException) { app.calls.updateFrom(this@BeaconCallService) { it.copy(error = "Open Beacon and allow microphone access to continue the call") }; hangup(); return START_NOT_STICKY }
+        catch (e: RuntimeException) { failure("Open Beacon and allow microphone access to continue the call"); return START_NOT_STICKY }
         // Home may precede service binding; reconcile once foreground admission succeeds.
         if (backgroundNeedsBubble(app.calls.state.value,app.calls.uiVisible)) { refreshOverlay(); minimize(app.calls.state.value.callId) }
         telecomJob = scope.launch {
@@ -464,7 +468,7 @@ class BeaconCallService : Service() {
         val pending=spec ?: return
         val state=app.calls.state.value
         fun visibleOrUnlockedNotification()=if(fromNotification) !getSystemService(KeyguardManager::class.java).isDeviceLocked else app.calls.uiVisible
-        if(decision !in setOf("approve", "approve_call", "deny")||closed.get()||!visibleOrUnlockedNotification()||app.calls.ownerScope?.let { it.origin==pending.client.scope.origin&&it.owner==pending.client.scope.owner&&it.profile==pending.client.scope.profile }!=true) return
+        if(decision !in setOf("approve", "approve_call", "deny")||closed.get()||!visibleOrUnlockedNotification()||app.calls.ownerScope?.let { it.sameAccount(pending.client.scope)&&it.profile==pending.client.scope.profile }!=true) return
         if(!app.auth.read(pending.client.scope.origin).authorizesPushSource(pending.client.scope)) return
         if(state.toolApprovals.none { it.requestId==requestId&&it.proposalId==proposalId&&!it.busy }) return
         app.calls.updateFrom(this) { it.copy(toolApprovals=it.toolApprovals.map { p -> if(p.requestId==requestId) p.copy(busy=true,error="") else p }) }
@@ -472,7 +476,7 @@ class BeaconCallService : Service() {
         scope.launch {
             try {
                 check(!closed.get()&&spec===pending&&app.calls.service===this@BeaconCallService&&visibleOrUnlockedNotification())
-                check(app.calls.ownerScope?.let { it.origin==pending.client.scope.origin&&it.owner==pending.client.scope.owner&&it.profile==pending.client.scope.profile }==true)
+                check(app.calls.ownerScope?.let { it.sameAccount(pending.client.scope)&&it.profile==pending.client.scope.profile }==true)
                 check(app.auth.read(pending.client.scope.origin).authorizesPushSource(pending.client.scope))
                 checkNotNull(directVoice).decideTool(requestId,proposalId,decision)
             }
@@ -666,10 +670,18 @@ class BeaconCallService : Service() {
                 val stopped=captureReleased
                 app.calls.cameraTrack(this@BeaconCallService,null)
                 app.calls.updateFrom(this@BeaconCallService) { it.copy(active=false,state="ending",cameraSharing=false,cameraBusy=false,screenSharing=false,screenBusy=false,cameraStopPending=!stopped,screenStopPending=!stopped,audioStopPending=!audioReleased,minimized=false,error=listOfNotNull(error?:it.error,if(!audioReleased) "The microphone may still be on. Close Beacon if it stays on." else null,if(endDisposition.notSent>0) callEndNotSentText(endDisposition.notSent) else null,if(endDisposition.submissionUnknown>0) callEndUnknownText(endDisposition.submissionUnknown) else null).filter(String::isNotBlank).joinToString(" "),failureReason=if(failedConnection) error.orEmpty() else it.failureReason).afterTerminalControls(fenceFailure) }
-                val transcriptClosed=finishTranscriptSyncForCleanup { transcriptSync?.finish()==true }
+                val transcriptClosed=finishTranscriptSyncForCleanup {
+                    // Android admission can fail before transport initialization creates the text sync.
+                    val sync=transcriptSync?:spec?.let { pending ->
+                        NativeCallTranscriptSync(pending.client::nativeRequest,pending.grant.getString("call_id"),scope) { status ->
+                            app.calls.updateFrom(this@BeaconCallService) { it.copy(transcriptStatus=status) }
+                        }
+                    }
+                    sync?.finish(failed=failedConnection)==true
+                }
                 if(!transcriptClosed) app.calls.updateFrom(this@BeaconCallService) { it.copy(transcriptStatus="partial") }
                 spec?.let { pending ->
-                    val cleanup=withTimeoutOrNull(5000) { runCatching { pending.client.nativeRequest("/api/plugins/beacon/mobile/calls/${pending.grant.getString("call_id")}","DELETE") } }
+                    val cleanup=withTimeoutOrNull(5000) { runCatching { pending.client.nativeRequest("/api/plugins/beacon/mobile/calls/${pending.grant.getString("call_id")}","DELETE",JSONObject().put("failed",failedConnection)) } }
                     val receipt=cleanup?.getOrNull()
                     val deleted=receipt?.optBoolean("closed")==true||receipt?.optString("status")=="closed"
                     if(!transcriptClosed&&!deleted) {

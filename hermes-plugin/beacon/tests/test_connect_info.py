@@ -6,11 +6,6 @@ from types import ModuleType
 from test_mobile import harness
 
 
-def assert_session_matches(actual, expected):
-    if not isinstance(actual, str) or not hmac.compare_digest(actual, expected):
-        raise AssertionError('Loopback session token mismatch')
-
-
 def assert_token_absent(value, token):
     if token in value:
         raise AssertionError('Loopback session token leaked in an error response')
@@ -45,7 +40,7 @@ def test_connect_info_requires_owner_auth_but_no_profile_selection(harness, monk
     assert client.get('/api/plugins/beacon/connect-info').status_code == 401
 
 
-def test_connect_info_returns_loopback_token_only_to_the_local_owner(harness, monkeypatch):
+def test_connect_info_gives_only_the_local_owner_the_link_and_never_the_loopback_token(harness, monkeypatch):
     _, client, cfg, _, app = harness
     cfg.update(owner_id='local', owner_provider='loopback')
     app.state.auth_required = False
@@ -60,11 +55,8 @@ def test_connect_info_returns_loopback_token_only_to_the_local_owner(harness, mo
     response = client.get('/api/plugins/beacon/connect-info')
 
     assert response.status_code == 200
-    payload = response.json()
-    assert payload['url'] == 'https://hermes.example.test/beacon'
-    assert payload['name'] == 'hermes.example.test'
-    assert set(payload) == {'url', 'name', 'session'}
-    assert_session_matches(payload.get('session'), token)
+    assert response.json() == {'url': 'https://hermes.example.test/beacon', 'name': 'hermes.example.test'}
+    assert_token_absent(response.text, token)
     assert response.headers['cache-control'] == 'no-store'
 
     cfg['owner_id'] = 'different-owner'

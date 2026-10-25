@@ -3,7 +3,7 @@ package dev.hermes.android.voice
 import org.json.JSONObject
 import org.json.JSONArray
 
-data class CallToolApproval(val requestId: String, val proposalId: String, val toolName: String, val arguments: String, val busy: Boolean = false, val error: String = "") {
+data class CallToolApproval(val requestId: String, val proposalId: String, val toolName: String, val arguments: String, val busy: Boolean = false, val error: String = "", val allowCall: Boolean = true) {
     companion object {
         fun from(value: JSONObject): CallToolApproval {
             val request = value.getString("request_id")
@@ -12,7 +12,8 @@ data class CallToolApproval(val requestId: String, val proposalId: String, val t
             val arguments = value.getJSONObject("arguments").toString(2)
             require(request.matches(Regex("[A-Za-z0-9_-]{1,160}")) && proposal.matches(Regex("[A-Za-z0-9_-]{32,80}")))
             require(name.isNotBlank() && name.length <= 200 && arguments.toByteArray(Charsets.UTF_8).size <= 65536)
-            return CallToolApproval(request, proposal, name, arguments)
+            // Older plugins omit the field and keep offering the call-long allowance; any present value other than true withholds it.
+            return CallToolApproval(request, proposal, name, arguments, allowCall = !value.has("allow_call") || value.opt("allow_call") == true)
         }
     }
 }
@@ -53,18 +54,20 @@ internal fun callToolApprovalSummary(approval: CallToolApproval): CallApprovalSu
     val previewText = previewKey?.let { arguments.optString(it) }?.trim()?.replace(Regex("\\s+"), " ").orEmpty()
     // A command is shown nearly whole and a clipped preview always says so, so nothing hides behind "Always allow".
     val previewLimit = if (previewKey in setOf("command", "cmd", "code")) 1000 else 160
-    val preview = if (previewText.length > previewLimit) previewText.take(previewLimit - 1) + "…" else previewText
+    val preview = previewText.clipWithEllipsis(previewLimit)
     val service = approval.toolName.takeIf { it.startsWith("mcp__") }
         ?.removePrefix("mcp__")?.substringBefore("__")?.split('_')
         ?.joinToString(" ") { it.replaceFirstChar { char -> char.titlecase() } }.orEmpty()
     val fields = listOf("to", "cc", "bcc", "subject", "query", "title", "name", "filename", "url")
         .mapNotNull { key ->
             val value = arguments.opt(key).takeIf { it is String || it is Number || it is Boolean || it is JSONArray }?.toString()
-                ?.takeIf(String::isNotBlank)?.take(100) ?: return@mapNotNull null
+                ?.takeIf(String::isNotBlank)?.clipWithEllipsis(100) ?: return@mapNotNull null
             "$key: $value"
         }.joinToString(" · ")
     return CallApprovalSummary(action, target, preview, service, fields)
 }
+
+private fun String.clipWithEllipsis(limit: Int) = if (length > limit) take(limit - 1) + "…" else this
 
 internal fun callToolApprovalErrorMessage(message: String): String {
     val text = message.trim()
@@ -90,6 +93,12 @@ internal fun callProposalNeedingOwnerApproval(receipt: JSONObject): JSONObject? 
     return proposal.takeIf { id.matches(Regex("[A-Za-z0-9_-]{32,80}")) && it.optJSONObject("arguments") != null }
 }
 
+/** The event the call UI reads; allow_call travels only when the proposal states it. */
+internal fun callToolApprovalEvent(requestId: String, toolName: String, proposal: JSONObject): JSONObject =
+    JSONObject().put("type", "tool_approval").put("request_id", requestId).put("proposal_id", proposal.getString("id"))
+        .put("tool_name", toolName).put("arguments", JSONObject(proposal.getJSONObject("arguments").toString()))
+        .apply { if (proposal.has("allow_call")) put("allow_call", proposal.get("allow_call")) }
+
 data class CallToolReceipt(
     val requestId: String,
     val toolName: String,
@@ -107,7 +116,10 @@ data class CallToolReceipt(
             val status = value.optString("status")
             if (!requestId.matches(Regex("[A-Za-z0-9_-]{1,160}")) || toolName.isBlank() || toolName.length > 200 || status !in statuses) return null
             val approvedBy = if (value.has("approved_by") && !value.isNull("approved_by")) value.optString("approved_by").takeIf(decisions::contains) else null
-            return CallToolReceipt(requestId, toolName, status, approvedBy, value.has("result") && !value.isNull("result"))
+            // Fixed reads omit private contents; gateway receipts still require their actual result.
+            val fixedReadResult = status == "completed" && !value.has("tool_id") && value.opt("result_present") == true &&
+                toolName in setOf("discover_tools", "hermes_search", "hermes_memory", "hermes_skills", "hermes_context")
+            return CallToolReceipt(requestId, toolName, status, approvedBy, (value.has("result") && !value.isNull("result")) || fixedReadResult)
         }
     }
 }

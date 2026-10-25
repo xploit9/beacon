@@ -302,10 +302,11 @@ class NativeAuthProtocolTest {
     }
 
     @Test fun legacyOwnerCannotAuthorizeNativePush() {
-        val scope = dev.hermes.android.core.Scope("https://native.example", "owner", "work")
+        val scope = dev.hermes.android.core.Scope("https://native.example", "owner", "work", nativeProvider = "basic")
         val legacy = AuthContext(scope.origin, emptyList(), scope.owner, scope.profile, "old-csrf")
         assertFalse(legacy.authorizesPushSource(scope))
-        assertTrue(legacy.copy(backend = "hermes-dashboard").authorizesPushSource(scope))
+        assertFalse(legacy.copy(backend = "hermes-dashboard").authorizesPushSource(scope))
+        assertTrue(legacy.copy(backend = "hermes-dashboard", nativeProvider = "basic").authorizesPushSource(scope))
         assertFalse(legacy.copy(backend = "hermes-dashboard").authorizesPushSource(scope.copy(owner = "foreign")))
     }
 

@@ -184,7 +184,101 @@ class NativeBotModeTest {
         assertEquals(7, body.getInt("execution_generation"))
         assertEquals("writer", body.getString("member_id"))
         assertTrue(runCatching { action.payload("always") }.isFailure)
-        assertEquals(setOf("kind", "task_id"), BotModeAction("retry", "task").payload().keys().asSequence().toSet())
+        assertTrue(runCatching { BotModeAction("retry", "task").payload() }.isFailure)
+        assertTrue(runCatching { action.copy(generation = 0).payload("once") }.isFailure)
+    }
+    @Test fun deletionUsesNativeSystemEventRatherThanEchoingClientIntent() {
+        val native = JSONObject("""{"tombstone":{"room_id":"room","disbanded_at":1234.5,"idempotent":false,"event":{"room_id":"room","event_id":"system:room-disbanded","kind":"room.disbanded"}}}""")
+        assertTrue(botModeDisbanded(native, "room"))
+        native.getJSONObject("tombstone").put("idempotent", true)
+        assertTrue(botModeDisbanded(native, "room"))
+        assertFalse(botModeDisbanded(native, "another-room"))
+        native.getJSONObject("tombstone").getJSONObject("event").put("event_id", "phone-intent")
+        assertFalse(botModeDisbanded(native, "room"))
+        assertFalse(botModeDisbanded(JSONObject("""{"tombstone":{"room_id":"room","event_id":"phone-intent"}}"""), "room"))
+    }
+
+    @Test fun pendingActionsExposeOnlyAdvertisedExactApprovalsAndNeverUnsafeRetry() {
+        val data = JSONObject("""{"capabilities":{"approval":true},"driver_status":{"pending_actions":[{"kind":"retry","task_id":"unknown-task"},{"kind":"approval","task_id":"task","member_id":"writer","request_id":"request","execution_generation":3,"approval":{"description":"Write a QA file","choices":["once","deny","always"]}}]}}""")
+        val actions = botModeActions(data)
+        assertEquals("unavailable", actions[0].kind)
+        assertTrue(actions[0].description.contains("unknown"))
+        assertTrue(runCatching { actions[0].payload() }.isFailure)
+        assertEquals(listOf("once", "deny"), actions[1].choices)
+        assertEquals("request", actions[1].payload("once").getString("request_id"))
+        data.getJSONObject("capabilities").put("approval", false)
+        assertTrue(botModeActions(data).none { it.kind == "approval" })
+        data.getJSONObject("capabilities").put("approval", true)
+        data.getJSONObject("driver_status").getJSONArray("pending_actions").getJSONObject(1).put("execution_generation", true)
+        assertTrue(botModeActions(data).none { it.kind == "approval" })
+    }
+
+    @Test fun deletionRetainsDraftAndIntentUntilNativeTombstoneIsConfirmed() = runBlocking {
+        val sent = mutableListOf<JSONObject>()
+        var allowDelete = false
+        var readsAfterFailure = 0
+        val client = BeaconClient(AuthContext("https://native.example", emptyList(), "owner", "default"), null) { builder ->
+            builder.addInterceptor { chain ->
+                val request = chain.request()
+                var status = 200
+                val result = when {
+                    request.method == "POST" -> {
+                        assertTrue(request.url.encodedPath.endsWith("/delete"))
+                        val buffer = okio.Buffer(); request.body!!.writeTo(buffer); sent += JSONObject(buffer.readUtf8())
+                        if (!allowDelete) { status = 503; json("detail" to "Deletion is unconfirmed; bots may be stopping. Refresh before retrying.") }
+                        else JSONObject("""{"tombstone":{"room_id":"room","disbanded_at":1234.5,"idempotent":true,"event":{"room_id":"room","event_id":"system:room-disbanded","kind":"room.disbanded"}}}""")
+                    }
+                    request.url.encodedPath.endsWith("/space/room") -> {
+                        if (sent.isNotEmpty() && !allowDelete) readsAfterFailure++
+                        JSONObject("""{"room":{"room_id":"room","members":[]},"events":[],"capabilities":{"delete":true},"driver_status":{"blocked":true}}""")
+                    }
+                    else -> JSONObject("""{"bots":[],"spaces":[{"room_id":"room","name":"Team"}],"capabilities":{"delete":true}}""")
+                }
+                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(status).message("Fixture")
+                    .body(result.toString().toResponseBody("application/json".toMediaType())).build()
+            }
+        }
+        val saved = SavedStateHandle()
+        val controller = NativeBotModeController(this, saved, { _, _ -> }) { client }
+        try {
+            controller.refresh(); awaitIdle(controller); controller.selectSpace("room"); awaitIdle(controller)
+            controller.draft("Keep this draft")
+            controller.deleteSpace(); awaitIdle(controller)
+            assertEquals("room", controller.state.value.selectedSpace)
+            assertEquals("Keep this draft", controller.state.value.draft)
+            assertTrue(controller.state.value.error.contains("stopping"))
+            assertEquals(1, readsAfterFailure)
+            allowDelete = true
+            controller.deleteSpace(); awaitIdle(controller)
+            assertEquals(sent[0].getString("event_id"), sent[1].getString("event_id"))
+            assertEquals("", controller.state.value.selectedSpace)
+            assertEquals("", controller.state.value.draft)
+            assertFalse(saved.contains("bot-mode:${client.scope.key}:room"))
+        } finally { controller.clear(); client.closeNative() }
+    }
+
+    @Test fun missingCapabilitiesCannotOfferOrSendDelete() = runBlocking {
+        var posts = 0
+        val client = BeaconClient(AuthContext("https://native.example", emptyList(), "owner", "default"), null) { builder ->
+            builder.addInterceptor { chain ->
+                if (chain.request().method == "POST") posts++
+                val result = if (chain.request().url.encodedPath.endsWith("/bot-mode"))
+                    JSONObject("""{"bots":[],"spaces":[{"room_id":"room","name":"Team"}]}""")
+                else JSONObject("""{"room":{"room_id":"room"},"events":[]}""")
+                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
+                    .body(result.toString().toResponseBody("application/json".toMediaType())).build()
+            }
+        }
+        val controller = NativeBotModeController(this, SavedStateHandle(), { _, _ -> }) { client }
+        try {
+            controller.refresh(); awaitIdle(controller); controller.selectSpace("room"); awaitIdle(controller)
+            controller.draft("Retain")
+            assertFalse(controller.state.value.canDelete)
+            controller.deleteSpace(); awaitIdle(controller)
+            assertEquals(0, posts)
+            assertEquals("Retain", controller.state.value.draft)
+            assertTrue(controller.state.value.error.isNotBlank())
+        } finally { controller.clear(); client.closeNative() }
     }
     @Test fun uncertainSendRetainsScopedDraftAndReusesEventIdentity() = runBlocking {
         val sent = mutableListOf<JSONObject>()

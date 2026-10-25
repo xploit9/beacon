@@ -118,7 +118,6 @@ internal fun releaseTerminalChat(chat: ChatState, stream: String, replyConfirmed
 }
 data class EditorState(val scope: Scope? = null, val path: String = "", val text: TextFieldValue = TextFieldValue(), val serverText: String = "", val metadata: JSONObject = JSONObject(), val loading: Boolean = false, val saving: Boolean = false, val error: String = "", val reviewRequired: Boolean = false) { val dirty get() = text.text != serverText }
 data class SideQuestion(val scope: Scope, val question: String, val sessionId: String, val streamId: String, val text: String = "", val status: String = "Responding", val cursor: String = "", val error: String = "")
-data class AppUpdateState(val release: Release? = null, val busy: Boolean = false, val ready: Boolean = false, val status: String = "Beacon checks for updates automatically while connected.")
 data class AppState(val origin: String = BuildConfig.DEFAULT_ORIGIN, val authenticated: Boolean = false, val profile: String = "default", val chatProfile: String = "", val owner: String = "", val tab: String = "Chat", val connected: Boolean = false, val loading: Boolean = false, val error: String = "", val notice: String = "", val bootstrap: JSONObject = JSONObject(), val sessions: List<JSONObject> = emptyList(), val query: String = "", val showSessions: Boolean = false, val morePage: String = "", val beaconOpening: Boolean = false, val beaconError: String = "", val newChatOpening: Boolean = false, val newChatError: String = "", val initialChatReady: Boolean = false, val restoringSession: Boolean = true, val botModeEnabled: Boolean = false, val botModeSwitching: Boolean = false, val setupWizard: Boolean = false, val setupComplete: Boolean = false, val setupStep: String = "connect", val setupPluginMessage: String = "", val setupOrigin: String = "", val historyLoading: Boolean = false, val assistantSessionId: String = "", val historyUnreadable: List<String> = emptyList())
 internal fun voiceKeySetupPage(): String = "Beacon"
 internal data class VoiceCallRequest(val scope:Scope,val conversationId:String)
@@ -170,7 +169,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     private val _incomingBusy = MutableStateFlow(false)
     val incomingBusy = _incomingBusy.asStateFlow()
     val app = application as BeaconApplication
-    val phoneSettings = NativePhoneSettings(viewModelScope, saved, draftChanged = ::checkpointPhoneSettings, cache = app.cache) { client }
+    internal val screens = ScreenCache(read = { app.cache.read(it, "screens") }, write = { scope, value -> app.cache.write(scope, "screens", value) }, drop = { app.cache.delete(it, "screens") }, jobs = viewModelScope)
+    val phoneSettings = NativePhoneSettings(viewModelScope, saved, draftChanged = ::checkpointPhoneSettings, screens = screens) { client }
     val botMode = NativeBotModeController(viewModelScope, saved, openChat = ::openBotChat) { client }
     val preferences = app.preferences.data.map(AppPreferences::read).stateIn(viewModelScope, SharingStarted.Eagerly, AppPreferences())
     private fun restoredTab(): String {
@@ -209,11 +209,6 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     private var pendingVoiceCallAfterKey:VoiceCallRequest?=null
     private var pendingIncomingAfterKey:Triple<String,String,String>?=null
     private var pendingVisionSwitchAfterKey: PendingVisionSwitch? = null
-    private val _appUpdate = MutableStateFlow(AppUpdateState())
-    val appUpdate = _appUpdate.asStateFlow()
-    private var updateJob: Job? = null
-    private var installJob: Job? = null
-    private var waitingInstallPermission = false
     private val _chat = MutableStateFlow(ChatState())
     val chat = _chat.asStateFlow()
     private val _composer = MutableStateFlow(TextFieldValue())
@@ -260,8 +255,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     private var editorCheckpoint: Job? = null
     @Volatile var client: BeaconClient? = null
         private set(value) {
-            if (value == null || field?.auth?.let { it.origin != value.auth.origin || it.owner != value.auth.owner } == true) botMode.clear()
-            if (value != null && field?.auth?.let { it.origin != value.auth.origin || it.owner != value.auth.owner } == true) {
+            if (value == null || field?.scope?.let { !it.sameAccount(value.scope) } == true) botMode.clear()
+            if (value != null && field?.scope?.let { !it.sameAccount(value.scope) } == true) {
                 normalModeReturn = null
                 _ui.update { it.copy(botModeEnabled = false, botModeSwitching = false) }
             }
@@ -326,47 +321,37 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     @Volatile private var foreground = true
     private var setupProbeJob: Job? = null
     private var setupProbeGeneration = 0L
-    private var pendingSetupLink: dev.hermes.android.ui.BeaconConnectInput? = null
-    internal val setupPairing = dev.hermes.android.ui.SetupPairingState()
-    private var pairingOperation: Deferred<Unit>? = null
-    private var pairingOperationKey: PendingPairing? = null
-    private var pairingOperationScope: Scope? = null
-    private var pairingLinkedDevice: String? = null
+    /** Set by a sign-in in the setup wizard: the next startup links this phone even if it was removed on the PC before. */
+    private var linkOnNextStartup = false
+    private val _voicePage = MutableStateFlow("home")
+    /** The Voice & calls page Settings shows ("home", "provider" or "key"), so Back steps out one level at a time. */
+    val voicePage = _voicePage.asStateFlow()
+    fun setVoicePage(page: String) { if (page in setOf("home", "provider", "key")) _voicePage.value = page }
 
-    /** The screen only awaits this job; recreation must not cancel a single-use redemption. */
-    internal suspend fun completeSetupPairing(pending: PendingPairing) {
-        val active = client ?: throw PairingFailure("Sign in with Hermes before linking this phone.")
-        val generation = originGeneration
-        fun current() = client === active && originGeneration == generation && _ui.value.authenticated &&
-            active.auth.origin == pending.dashboardUrl && _ui.value.origin == pending.dashboardUrl &&
-            _ui.value.owner == active.auth.owner && _ui.value.profile == active.auth.profile
-        require(current()) { "Sign in with the Hermes dashboard shown above before linking this phone." }
-        val changed = pairingOperationKey != pending || pairingOperationScope != active.scope ||
-            pairingLinkedDevice?.let { NativePairing.deviceId(app, active.scope) != it } == true
-        if (changed || pairingOperation?.isCancelled != false) {
-            pairingOperation?.cancel()
-            if (changed) setupPairing.redeemed.value = null
-            pairingOperationKey = pending
-            pairingOperationScope = active.scope
-            pairingLinkedDevice = null
-            pairingOperation = viewModelScope.async {
-                val grant = setupPairing.redeemed.value ?: NativePairing.redeem(active, pending.code).also {
-                    check(current()) { "Sign in with Hermes again before linking this phone." }
-                    setupPairing.redeemed.value = it
-                }
-                check(current()) { "Sign in with Hermes again before linking this phone." }
-                NativePairing.link(app, active, grant)
-                check(current()) { "Sign in with Hermes again before linking this phone." }
-                pairingLinkedDevice = grant.deviceId
-            }
-        }
-        requireNotNull(pairingOperation).await()
+    /** The provider a call, an incoming call or a screen share is waiting on a key for ("" = the selected one), or null when nothing waits. */
+    internal fun pendingVoiceKeyProvider(): String? = when {
+        pendingVisionSwitchAfterKey != null -> "gemini"
+        pendingVoiceCallAfterKey != null || pendingIncomingAfterKey != null -> ""
+        else -> null
     }
 
-    private fun clearSetupPairing() {
-        pairingOperation?.cancel(); pairingOperation = null; pairingOperationKey = null
-        pairingOperationScope = null; pairingLinkedDevice = null
-        setupPairing.pending.value = null; setupPairing.redeemed.value = null
+    /**
+     * Links this phone to the account when the Beacon plugin is there; a plugin-free Hermes shows nothing and a failure stays quiet.
+     * The next sign-in or app start tries again.
+     */
+    private fun linkThisPhone(active: BeaconClient) {
+        val explicit = linkOnNextStartup
+        linkOnNextStartup = false
+        val generation = originGeneration
+        viewModelScope.launch {
+            val c = active.detached()
+            try {
+                val linked = NativePairing.link(app, c, explicit)
+                if (linked != null && client === active && generation == originGeneration) prefetchDevices(active)
+            } catch (e: CancellationException) { throw e }
+            catch (_: Exception) { /* retried silently on the next sign-in or app start */ }
+            finally { c.closeNative() }
+        }
     }
 
     init {
@@ -404,7 +389,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     }
                 }
                 if (generation != originGeneration) return@launch
-                val knownSteps = setOf("connect", "probe", "signin", "unsupported", "voice-provider", "voice-customize", "permission-microphone", "permission-notifications", "permission-full-screen", "done")
+                val knownSteps = setOf("connect", "probe", "signin", "unsupported", "voice-provider", "voice-key", "voice-customize", "permission-microphone", "permission-notifications", "permission-full-screen", "done")
                 val savedStep = prefs[stringPreferencesKey("setup_step")].orEmpty().takeIf { it in knownSteps } ?: if (complete) "done" else "connect"
                 val step = when {
                     origin.isBlank() -> "connect"
@@ -414,7 +399,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     else -> savedStep
                 }
                 _ui.update { it.copy(origin = origin, setupOrigin = setupOrigin, setupWizard = activeSetup || !complete || !cached, setupComplete = complete, setupStep = step) }
-                if (cached) connect(origin) else _ui.update { it.copy(restoringSession = false, setupWizard = true) }
+                if (auth.canReconnectNative(origin)) connect(origin) else _ui.update { it.copy(restoringSession = false, setupWizard = true) }
             } catch (e: Throwable) {
                 if (generation == originGeneration) { _ui.update { it.copy(restoringSession = false) }; fail(e) }
             }
@@ -489,7 +474,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     fun undoArchive() {
         val target = _archiveUndo.value ?: return
         val owner = client?.scope ?: return
-        if (owner.origin != target.origin || owner.owner != target.owner) return
+        if (!owner.sameAccount(target)) return
         _archiveUndo.value = null
         conversationAction(target.session, "/api/session/archive", json("archived" to false), "Unarchived", target.profile)
     }
@@ -607,7 +592,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             .onFailure { notice(appErrorText(it)) }
     }
     private suspend fun savedNativeSessionValid(auth: AuthContext?): Boolean = withContext(Dispatchers.IO) {
-        auth?.let { if (it.bearer == null) true else app.auth.read(it.origin).let { saved -> saved.owner == it.owner && saved.bearer != null } } ?: true
+        auth?.let { if (it.bearer == null) true else app.auth.read(it.origin).let { saved -> saved.scope().sameAccount(it.scope()) && saved.bearer != null } } ?: true
     }
     fun foreground(active: Boolean) {
         val changed = foreground != active
@@ -621,104 +606,20 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     return@launch
                 }
                 if (generation != originGeneration || client !== currentClient || !foreground) return@launch
-                resumeAppUpdateAfterSessionCheck()
                 if (!changed) return@launch
                 if (client == null && !_ui.value.loading) connect(_ui.value.origin)
-                else { prepareStartup(); recoverForeground(); checkForAppUpdate(quiet = true) }
+                else { prepareStartup(); recoverForeground() }
             }
             return
         }
         if (!changed) return
         if (!active) { cancelStartup(); recoveryJob?.cancel(); sessionWatch?.cancel(); sideJob?.cancel(); streams.values.toList().forEach(Job::cancel); viewModelScope.launch { runCatching { checkpointVisible() }.onFailure(::fail) } }
-        // Signed out (setup, returning from sign-in): only the update check resumes; connecting is the user's step.
-        else resumeAppUpdate()
     }
-    fun checkForAppUpdate(quiet: Boolean = false) {
-        val captured = client?.detached() ?: run { if (!quiet) _appUpdate.update { it.copy(status = "Reconnect to Tailscale to check for updates.") }; return }
-        val generation = originGeneration
-        if (updateJob?.isActive == true || installJob?.isActive == true) return
-        val installation = installJob
-        updateJob = viewModelScope.launch {
-            if (!quiet) _appUpdate.update { it.copy(busy = true, status = "Checking for an update…") }
-            try {
-                val release = app.updates.check(captured, force = !quiet, notify = true)
-                if (generation != originGeneration || client?.scope != captured.scope) return@launch
-                if (quiet && installJob !== installation) return@launch
-                if (!quiet || release != null) _appUpdate.value = AppUpdateState(release = release, ready = app.updates.hasPendingInstall(), status = release?.let { "Beacon ${it.name} is ready for you." } ?: "You're up to date.")
-            } catch (e: Throwable) {
-                if (e is CancellationException) throw e
-                if (!quiet && generation == originGeneration && client?.scope == captured.scope) _appUpdate.update { it.copy(status = "Couldn’t check for updates. ${appErrorText(e)}") }
-            } finally { if (generation == originGeneration && client?.scope == captured.scope) _appUpdate.update { it.copy(busy = installJob?.isActive == true) } }
-        }
+    /** An update notification opens the update screen, which downloads and verifies the release from GitHub. */
+    fun downloadAppUpdate(notificationToken: String) {
+        if (_ui.value.authenticated) { tab("More"); more("App updates") }
+        app.updates.updateFromNotification(notificationToken, client)
     }
-    private fun updateCallBlock(): String? = when {
-        _incomingBusy.value || app.calls.state.value.active -> "End your call before updating Beacon."
-        app.calls.state.value.state == "ending" || app.calls.service != null || app.calls.spec != null -> "Call cleanup is still finishing. Try the update again in a moment."
-        else -> null
-    }
-    fun downloadAppUpdate(notificationToken: String? = null) {
-        updateCallBlock()?.let { message -> _appUpdate.update { it.copy(status = message) }; return }
-        val captured = client?.detached() ?: run { _appUpdate.update { it.copy(status = "Reconnect to Hermes through Tailscale, then tap Update.") }; return }
-        val generation = originGeneration
-        val previous = updateJob
-        if (notificationToken == null && (_appUpdate.value.busy || installJob?.isActive == true)) return
-        if (notificationToken != null) previous?.cancel()
-        if (notificationToken == null && app.updates.hasPendingInstall()) { installAppUpdate(); return }
-        if (notificationToken != null) { tab("More"); more("App updates") }
-        updateJob = viewModelScope.launch {
-            previous?.join()
-            if (generation != originGeneration || client?.scope != captured.scope) return@launch
-            _appUpdate.update { it.copy(busy = true, ready = false, status = "Downloading and checking your update…") }
-            try {
-                val file = if (notificationToken != null) app.updates.downloadNotification(notificationToken) else {
-                    val available = _appUpdate.value.release ?: app.updates.check(captured, force = true, notify = false)
-                    if (generation != originGeneration || client?.scope != captured.scope) return@launch
-                    _appUpdate.update { it.copy(release = available) }
-                    available?.let { app.updates.download(captured, it) }
-                }
-                if (generation != originGeneration || client?.scope != captured.scope) return@launch
-                _appUpdate.update { it.copy(ready = file != null, status = if (file != null) "Ready to install. Your conversations and settings stay with you." else "You're up to date.") }
-                if (file != null && foreground) installAppUpdate()
-            } catch (e: Throwable) {
-                if (e is CancellationException) throw e
-                if (generation == originGeneration && client?.scope == captured.scope) _appUpdate.update { it.copy(release = null, ready = false, status = "Update paused. ${appErrorText(e)} Tap Update to try again.") }
-            } finally { if (generation == originGeneration && client?.scope == captured.scope) _appUpdate.update { it.copy(busy = installJob?.isActive == true) } }
-        }
-    }
-    fun installAppUpdate() {
-        updateCallBlock()?.let { message -> _appUpdate.update { it.copy(status = message) }; return }
-        if (installJob?.isActive == true) return
-        installJob = viewModelScope.launch {
-        val captured = client?.scope ?: cachedOwnerScope ?: return@launch
-        val generation = originGeneration
-        _appUpdate.update { it.copy(busy = true) }
-        runCatching { app.updates.installPending() }
-            .onSuccess { launched -> if (generation == originGeneration && (client?.scope ?: cachedOwnerScope) == captured) { waitingInstallPermission = !launched; _appUpdate.update { it.copy(ready = true, status = if (launched) "Confirm Update in Android to finish." else "Allow updates from Beacon, then return here to finish.") } } }
-            .onFailure { if (it is CancellationException) throw it; if (generation == originGeneration && (client?.scope ?: cachedOwnerScope) == captured) _appUpdate.update { state -> state.copy(ready = false, status = appErrorText(it)) } }
-        if (generation == originGeneration && (client?.scope ?: cachedOwnerScope) == captured) _appUpdate.update { it.copy(busy = false) }
-        }
-    }
-    fun resumeAppUpdate() {
-        val generation = originGeneration
-        val currentClient = client
-        viewModelScope.launch {
-            if (_ui.value.authenticated && !savedNativeSessionValid(currentClient?.auth)) {
-                if (generation == originGeneration && client === currentClient && _ui.value.authenticated) fail(NativeAuthExpiredException())
-                return@launch
-            }
-            if (generation != originGeneration || client !== currentClient) return@launch
-            resumeAppUpdateAfterSessionCheck()
-        }
-    }
-    private fun resumeAppUpdateAfterSessionCheck() {
-        if (app.updates.shouldContinueInstall() || waitingInstallPermission || app.updates.awaitingInstallPermission()) {
-            val awaitingPermission = waitingInstallPermission || app.updates.awaitingInstallPermission()
-            waitingInstallPermission = false
-            if ((!awaitingPermission || app.packageManager.canRequestPackageInstalls()) && app.updates.hasPendingInstall()) installAppUpdate()
-        }
-    }
-    private fun resetAppUpdate() { updateJob?.cancel(); installJob?.cancel(); updateJob = null; installJob = null; waitingInstallPermission = false; _appUpdate.value = AppUpdateState() }
-    private fun restoreAppUpdate() { if (app.updates.hasPendingInstall()) { _appUpdate.update { it.copy(ready = true, status = "Your verified update is ready to install.") }; if (foreground) resumeAppUpdate() } }
     private fun ScopeSettlement.current() = current(sourceScope, client, originGeneration, sessionGeneration)
     private fun recoverForeground() {
         recoveryJob?.cancel()
@@ -839,7 +740,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             val retainedEditor = _editor.value
             checkpointJob?.cancel(); editorCheckpoint?.cancel()
             val invalidation = ++originGeneration
-            cancelStartup(); resetAppUpdate(); app.updates.clearAuthorization(); ++sessionGeneration
+            cancelStartup(); ++sessionGeneration
             if (draftScope != null) {
                 drafts[draftScope.key] = retainedDraft
                 viewModelScope.launch {
@@ -851,8 +752,10 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             }
             cancelNewChatWork(); app.calls.hangup(); sessionWatch?.cancel(); selectionJob?.cancel()
             streams.values.toList().forEach(Job::cancel); loads.values.toList().forEach(Job::cancel)
-            client = null; cachedOwnerScope = owner
-            _ui.update { it.copy(origin = owner?.origin ?: it.origin, owner = owner?.owner ?: it.owner, profile = owner?.profile ?: it.profile, authenticated = false, connected = false, loading = false, restoringSession = false, setupWizard = true, setupComplete = false, setupStep = "signin", error = appErrorText(error)) }
+            lapsedAccount = owner ?: lapsedAccount
+            client = null; cachedOwnerScope = null; sourceScope = null
+            _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList(); _data.value = emptyMap(); clearDetails()
+            _ui.update { it.copy(origin = owner?.origin ?: it.origin, owner = "", profile = owner?.profile ?: it.profile, authenticated = false, connected = false, loading = false, restoringSession = false, setupWizard = true, setupComplete = false, setupStep = "signin", error = appErrorText(error)) }
             saveSetupProgress("signin", complete = false)
             return
         }
@@ -865,7 +768,6 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             checkpointJob?.cancel(); editorCheckpoint?.cancel()
             val invalidation = ++originGeneration
             cancelStartup()
-            resetAppUpdate(); app.updates.clearAuthorization()
             ++sessionGeneration
             if (draftScope != null) {
                 drafts[draftScope.key] = retainedDraft
@@ -878,6 +780,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             }
             cancelNewChatWork(); app.calls.hangup(); sessionWatch?.cancel(); selectionJob?.cancel()
             streams.values.toList().forEach(Job::cancel); loads.values.toList().forEach(Job::cancel)
+            lapsedAccount = client?.scope ?: cachedOwnerScope ?: lapsedAccount
             client = null; cachedOwnerScope = null; sourceScope = null
             val message = if (loopbackRestart) appErrorText(error) else "Sign in again. Your local draft is retained."
             origin?.let { revoked -> val version = app.auth.authorityEpoch.readVersion(); viewModelScope.launch { runCatching { app.auth.removeIfUnchanged(revoked, version) }.onFailure { if (originGeneration == invalidation) notice("Local credential removal failed: ${appErrorText(it)}") } } }
@@ -904,24 +807,25 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         modeTransition?.cancelAndJoin()
         val generation = ++originGeneration
         cancelStartup()
-        resetAppUpdate()
         cancelNewChatWork()
         try { checkpointVisible() } catch (e: Throwable) { _ui.update { it.copy(restoringSession = false) }; fail(e); return@launch }
         if (generation != originGeneration) return@launch
         sessionWatch?.cancel(); selectionJob?.cancel(); ++sessionGeneration
         streams.values.forEach(Job::cancel); streams.clear()
         _ui.update { it.copy(loading = true, restoringSession = true, error = "", beaconOpening = false, beaconError = "", newChatOpening = false, newChatError = "", initialChatReady = false, authenticated = false, connected = false, owner = "", query = "", sessions = emptyList(), bootstrap = JSONObject()) }
+        val previousAccount = client?.scope ?: cachedOwnerScope ?: lapsedAccount
         _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList(); _data.value = emptyMap(); clearDetails(); sourceScope = null; cachedOwnerScope = null; client = null
         var restoringClient: BeaconClient? = null
         var restoringScope: Scope? = null
         val credentialVersion = app.auth.authorityEpoch.readVersion()
         try {
             val origin = trustedOrigin(input)
-            if (origin != (app.preferences.data.first()[stringPreferencesKey("origin")] ?: BuildConfig.DEFAULT_ORIGIN)) app.updates.clearAuthorization()
             _ui.update { it.copy(origin = origin) }
             val auth = initialAuth?.also { require(it.origin == origin) } ?: withContext(Dispatchers.IO) { app.auth.read(origin) }
             if (generation != originGeneration) return@launch
-            val next = BeaconClient(auth, app.auth, persistContext = false)
+            // Fresh sign-in and native bootstrap's first verified legacy issuer install new authority.
+            val snapshot = initialAuth == null && auth.nativeProvider.isNotBlank()
+            val next = profileSwitchClientFactoryForTest?.invoke(auth) ?: BeaconClient(auth, app.auth, persistContext = false)
             val trustedCache = auth.cachedScopeFor(origin, replacingAccount = false)
             if (!keepsRestoredCall(app.calls.state.value.conversationScope, trustedCache, false)) app.calls.hangup()
             restoringClient = next.takeIf { trustedCache != null }
@@ -936,40 +840,48 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             val beacon = readBeaconCache(next.scope)
             if (generation != originGeneration) return@launch
             beacon?.let { writeBeaconSessionHandle(next.scope, it) }
-            if (!persistAuthIfCurrent(next.auth, credentialVersion)) {
+            if (!persistAuthIfCurrent(next.auth, credentialVersion, snapshot = snapshot, selectProfileIf = { generation == originGeneration })) {
                 if (generation == originGeneration) {
                     app.calls.hangup(); cachedOwnerScope = null; sourceScope = null
                     _ui.update { it.copy(authenticated = false, loading = false, owner = "", error = "Sign-in changed while reconnecting. Reconnect to use the current account.") }
                 }
                 return@launch
             }
-            next.markLoopbackSessionPersisted()
+            next.markAuthPersisted()
             if (generation != originGeneration) return@launch
             app.preferences.edit { it[stringPreferencesKey("origin")] = origin }
             if (generation != originGeneration) return@launch
             client = next; cachedOwnerScope = null; retireSavedDrafts(null)
+            previousAccount?.takeIf { !it.sameAccount(next.scope) }?.let { forgetScreens(it) }
+            lapsedAccount = null
+            hydrateScreens(next.scope)
             restoreBotMode(next.scope)
             restorePhoneSettings(next)
             if (generation != originGeneration || client !== next) return@launch
-            if (app.firebaseConfigured && app.push.registeredTarget(next.scope) != null) {
+            if (app.firebaseConfigured && (app.push.registeredTarget(next.scope) != null || app.push.hasUnstampedPush(next.scope))) {
                 viewModelScope.launch { runCatching { app.push.register(next.detached()) } }
             }
-            app.updates.authorize(next)
-            restoreAppUpdate()
             val previousSetupStep = _ui.value.setupStep
+            // A provider that already has a key skips straight to "Make it yours".
             val wizardStep = when {
                 !setupFlow -> previousSetupStep
                 previousSetupStep in setOf("connect", "probe") && initialAuth == null -> previousSetupStep
-                previousSetupStep in setOf("signin", "voice-provider", "voice-customize") -> "voice-provider"
+                previousSetupStep == "signin" || previousSetupStep.startsWith("voice-") ->
+                    if (withContext(Dispatchers.IO) { VoiceKeyStore(app).let { it.hasKey(it.settings().provider) } }) "voice-customize" else "voice-provider"
                 else -> firstIncompleteSetupPermission()
             }
+            if (setupFlow && initialAuth != null) linkOnNextStartup = true
             if (setupFlow) saveSetupProgress(wizardStep, setupOrigin = origin)
             _ui.update { it.copy(origin = origin, owner = next.auth.owner, profile = next.auth.profile, authenticated = true, connected = true, bootstrap = bootstrap, loading = false, setupWizard = setupFlow || it.setupWizard, setupStep = if (setupFlow) wizardStep else it.setupStep) }
             dev.hermes.android.push.KeepConnectedService.startIfEnabled(app)
-            checkForAppUpdate(quiet = true)
             prepareStartup()
             if (_ui.value.tab == "Beacon") openBeacon() else if (assistantReturn() != null) returnFromAssistant() else {
-                val selected = saved.get<String>("session:${next.scope.key}") ?: sourceScope?.takeIf { it.copy(session = "") == next.scope }?.session
+                val selected = saved.get<String>("session:${next.scope.key}") ?: sourceScope?.takeIf { it.copy(session = "") == next.scope }?.session ?:
+                    try { app.cache.authorizedLegacySelection(next) } catch (error: Throwable) {
+                        if (error is CancellationException) throw error
+                        if (endsSignIn(error) || error is NativeAuthExpiredException) throw error
+                        null
+                    }
                 val shell = app.cache.read(next.scope, "new-chat-shell")
                 if (generation != originGeneration || client !== next) return@launch
                 shell?.let { initialShells[next.scope.key] = it }
@@ -985,7 +897,10 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     if (retained != null && owner != null) {
                         try {
                             retained.auth.requireCachedIdentity(owner)
-                            persistAuthIfCurrent(retained.auth.copy(cookies = retained.jar.snapshot()), credentialVersion)
+                            retained.retainCookieRotation()
+                            // shortcut: snapshot mode keeps the stored bearer and cookies, so this rewrites the same record (replaceBearer
+                            // and retainCookieRotation already saved any rotation); NativeAuthLifetimeTest savedReconnectRecovery* holds it. Remove both together.
+                            persistAuthIfCurrent(retained.auth, credentialVersion, snapshot = true)
                         } catch (saveError: Throwable) {
                             if (saveError is CancellationException) throw saveError
                             if (generation == originGeneration) notice("The refreshed sign-in could not be retained. Reconnect before leaving Beacon.")
@@ -1004,7 +919,6 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     fun reopenSetupWizard(address: String = _ui.value.origin) {
         ++originGeneration
         setupProbeJob?.cancel(); ++setupProbeGeneration
-        pendingSetupLink = null
         val safeAddress = runCatching { dev.hermes.android.ui.parseBeaconConnectInput(address) }.getOrDefault("")
         _ui.update { it.copy(setupOrigin = safeAddress, setupWizard = true, setupStep = "connect", loading = false, restoringSession = false, setupPluginMessage = "", error = "", notice = "") }
         saveSetupProgress("connect", active = true, setupOrigin = safeAddress)
@@ -1012,20 +926,16 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     fun openSetupLink(value: String, confirmed: Boolean = false) {
         ++originGeneration
         setupProbeJob?.cancel(); ++setupProbeGeneration
-        pendingSetupLink = null
         val parsed = try { dev.hermes.android.ui.parseBeaconConnectLink(value) }
         catch (error: Exception) {
             _ui.update { it.copy(setupOrigin = "", setupWizard = true, setupStep = "connect", loading = false, restoringSession = false, error = appErrorText(error), notice = "") }
             if (confirmed) saveSetupProgress("connect", active = true, setupOrigin = "")
             return
         }
-        pendingSetupLink = parsed.takeIf { it.sessionToken != null }
         _ui.update { it.copy(setupOrigin = parsed.origin, setupWizard = true, setupStep = "connect", loading = false, restoringSession = false, setupPluginMessage = "", error = "", notice = "") }
         if (confirmed) saveSetupProgress("connect", active = true, setupOrigin = parsed.origin)
     }
     fun cancelSetupWizard() {
-        clearSetupPairing()
-        pendingSetupLink = null
         clearPendingVoiceKeyRequests()
         setupProbeJob?.cancel(); ++setupProbeGeneration
         if (_ui.value.authenticated) {
@@ -1040,19 +950,21 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     }
     fun finishSetupWizard(keepConnected: Boolean = true) {
         if (!_ui.value.authenticated) return
-        pendingSetupLink = null
         clearPendingVoiceKeyRequests()
         setKeepConnectedEnabled(keepConnected)
         _ui.update { it.copy(setupWizard = false, setupComplete = true, setupStep = "done", setupOrigin = "", error = "") }
         saveSetupProgress("done", complete = true, active = false)
+        tab("Chat")
     }
-    private suspend fun persistAuthIfCurrent(auth: AuthContext, version: Long?): Boolean {
-        if (app.auth.persistIfUnchanged(auth, version)) return true
-        val session = auth.loopbackSession?.takeIf { it.verified } ?: return false
+    private suspend fun persistAuthIfCurrent(auth: AuthContext, version: Long?, snapshot: Boolean, selectProfileIf: (() -> Boolean)? = null): Boolean {
+        if (app.auth.persistIfUnchanged(auth, version, snapshot, selectProfileIf)) return true
         return withContext(Dispatchers.IO) {
             app.auth.read(auth.origin).let { current ->
-                current.origin == auth.origin && current.owner == auth.owner && current.profile == auth.profile &&
-                    current.backend == auth.backend && current.loopbackSession?.copy(persisted = false) == session.copy(persisted = false)
+                current.scope().sameAccount(auth.scope()) && current.profile == auth.profile &&
+                    current.backend == auth.backend && (auth.bearer?.let { it == current.bearer } == true ||
+                    auth.loopbackSession?.takeIf { it.verified }?.let { session -> current.loopbackSession?.copy(persisted = false) == session.copy(persisted = false) } == true ||
+                    auth.bearer == null && auth.loopbackSession == null && auth.nativeProvider.isNotBlank() &&
+                    current == auth && current.canReconnectNative(auth.origin))
             }
         }
     }
@@ -1083,13 +995,14 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 val store = VoiceKeyStore(app)
                 val hasKey = withContext(Dispatchers.IO) { val provider = store.settings().provider; store.hasKey(provider) }
                 if (_ui.value.setupStep != "voice-provider") return@launch
-                val next = if (hasKey) "voice-customize" else firstIncompleteSetupPermission()
+                val next = if (hasKey) "voice-customize" else "voice-key"
                 _ui.update { it.copy(setupStep = next, error = "") }
                 saveSetupProgress(next)
             }
             return
         }
         val next = when (_ui.value.setupStep) {
+            "voice-key" -> "voice-customize"
             "voice-customize" -> firstIncompleteSetupPermission()
             "permission-microphone" -> when {
                 Build.VERSION.SDK_INT >= 33 && androidx.core.content.ContextCompat.checkSelfPermission(app, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED -> "permission-notifications"
@@ -1105,25 +1018,29 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     }
     fun skipVoiceSetup() {
         val next = when (_ui.value.setupStep) {
-            "voice-provider", "voice-customize" -> firstIncompleteSetupPermission()
+            "voice-provider", "voice-key", "voice-customize" -> firstIncompleteSetupPermission()
             else -> return
         }
         _ui.update { it.copy(setupStep = next, error = "") }
         saveSetupProgress(next)
     }
+    /** Moves between the three Voice & calls pages (Provider, Key, Make it yours), including Back. */
+    fun showVoiceSetupPage(step: String) {
+        val pages = setOf("voice-provider", "voice-key", "voice-customize")
+        if (_ui.value.setupStep !in pages || step !in pages) return
+        _ui.update { it.copy(setupStep = step, error = "") }
+        saveSetupProgress(step)
+    }
     fun probeSetupAddress(value: String) {
         setupProbeJob?.cancel()
         val parsed = try { dev.hermes.android.ui.parseBeaconConnectLink(value) }
         catch (error: Exception) {
-            pendingSetupLink = null
             val safeAddress = runCatching { dev.hermes.android.ui.parseBeaconConnectInput(value) }.getOrDefault("")
             _ui.update { it.copy(setupOrigin = safeAddress, setupWizard = true, setupStep = "connect", loading = false, error = appErrorText(error)) }
             saveSetupProgress("connect", active = true, setupOrigin = safeAddress)
             return
         }
         val origin = parsed.origin
-        val linkedToken = parsed.sessionToken ?: pendingSetupLink?.takeIf { it.origin == origin }?.sessionToken
-        pendingSetupLink = null
         val generation = ++setupProbeGeneration
         _ui.update { it.copy(setupOrigin = origin, setupWizard = true, setupStep = "probe", loading = true, error = "") }
         saveSetupProgress("probe", active = true, setupOrigin = origin)
@@ -1140,8 +1057,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 if (generation != setupProbeGeneration) return@launch
                 when (nativeSetupAuthMode(status)) {
                     NativeSetupAuthMode.Loopback -> {
-                        val session = linkedToken?.let { LoopbackSessionRecord(it, origin, "local") }
-                            ?: withTimeoutOrNull(30_000) { statusClient.readLoopbackSessionToken() }
+                        val session = withTimeoutOrNull(30_000) { statusClient.readLoopbackSessionToken() }
                             ?: throw LoopbackSessionRefreshFailed()
                         if (session.origin != origin || session.owner != "local") throw LoopbackSessionRefreshFailed()
                         val profile = _ui.value.profile.takeIf(::validNativeProfile) ?: "default"
@@ -1197,13 +1113,14 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val beacon = readBeaconCache(scope)
         val selected = saved.get<String>("session:${scope.key}") ?: app.cache.read(scope, "selected-session")
         val shell = app.cache.read(scope, "new-chat-shell")
+        val screenData = cachedScreens(scope)
         if (generation != originGeneration) return
         cachedOwnerScope = scope
         restoreBotMode(scope)
         app.calls.ownerScope = scope
-        restoreAppUpdate()
         if (beacon != null) writeBeaconSessionHandle(scope, beacon)
         shell?.let { initialShells[scope.key] = it }
+        _data.update { screenData + it }
         settings?.let { _data.update { data -> data + ("profile-settings" to it) } }
         _ui.update { it.copy(origin = scope.origin, owner = scope.owner, profile = scope.profile, authenticated = true, connected = false, sessions = index?.rows("sessions").orEmpty()) }
         val id = if (_ui.value.tab == "Beacon") beacon else selected
@@ -1298,27 +1215,39 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         if (client === active && originGeneration == origin && canComposeInitialChat() && newChatJobs[owner.key]?.isActive != true) createNewChat(json("worktree" to false), initial = true)
     }
     fun logout() = viewModelScope.launch {
-        clearSetupPairing()
-        pendingSetupLink = null
+        linkOnNextStartup = false
         clearPendingVoiceKeyRequests()
         setupProbeJob?.cancel(); ++setupProbeGeneration
         val generation = ++originGeneration
+        val credentialVersion = app.auth.authorityEpoch.readVersion()
         cancelStartup()
-        resetAppUpdate()
-        app.updates.clearAuthorization()
         cancelNewChatWork()
         val cached = cachedOwnerScope
-        val current = client?.detached() ?: cached?.let { owner ->
-            withContext(Dispatchers.IO) { runCatching { BeaconClient(app.auth.read(owner.origin).also { it.requireCachedIdentity(owner) }, app.auth, persistContext = false) }.getOrNull() }
+        val current = client?.detachedForLogout() ?: cached?.let { owner ->
+            withContext(Dispatchers.IO) { runCatching { BeaconClient(app.auth.read(owner.origin).also { it.requireCachedIdentity(owner) }, persistContext = false).detachedForLogout() }.getOrNull() }
         }
         val loopback = current?.auth?.loopbackSession != null
         try { checkpointVisible() } catch (e: Throwable) { fail(e); return@launch }
         if (generation != originGeneration) return@launch
         val origin = current?.auth?.origin ?: cached?.origin
+        try {
+            if (origin != null && !app.auth.removeIfUnchanged(origin, credentialVersion)) {
+                if (generation == originGeneration) notice("Sign-in changed while signing out. Try again to sign out the current account.")
+                return@launch
+            }
+        } catch (e: Throwable) { fail(e); return@launch }
+        if (generation != originGeneration) return@launch
+        (current?.scope ?: cached)?.let { forgetScreens(it) }
+        val pushRevocations = runCatching { current?.let { app.push.prepareOwnerRevocation(it.scope) }.orEmpty() }
+            .getOrElse {
+                notice("Signed out on this phone. Push notification cleanup could not be confirmed: ${appErrorText(it)}")
+                emptyList()
+            }
         origin?.let { dev.hermes.android.push.KeepConnectedService.onUserSignedOut(app, it) }
-        try { origin?.let { app.auth.remove(it) } } catch (e: Throwable) { fail(e); return@launch }
         modeTransition?.cancelAndJoin()
+        if (generation != originGeneration) return@launch
         (current?.scope ?: cached)?.let { optionalLocalSave { app.cache.delete(modeCacheScope(it), "bot-mode-return") } }
+        if (generation != originGeneration) return@launch
         normalModeReturn = null
         _ui.update { it.copy(botModeEnabled = false, botModeSwitching = false) }
         app.calls.hangup(); streams.values.toList().forEach(Job::cancel); streams.clear(); sessionWatch?.cancel(); selectionJob?.cancel(); ++sessionGeneration
@@ -1326,7 +1255,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         current?.let { frozen ->
             // Runs local push revocation before its first network suspension.
             viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
-                runCatching { try { app.push.revokeOwner(frozen) } finally { frozen.logout() } }
+                runCatching { try { app.push.revokeOwner(frozen, pushRevocations) } finally { frozen.logout() } }
                     .onFailure { if (generation == originGeneration) notice("Signed out on this phone. Push notification cleanup could not be confirmed: ${appErrorText(it)}") }
             }
         }
@@ -1334,6 +1263,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val setupStep = if (loopback) "connect" else "signin"
         _ui.update { it.copy(authenticated = false, connected = false, loading = false, restoringSession = false, setupWizard = true, setupComplete = false, setupStep = setupStep, setupOrigin = if (loopback) origin.orEmpty() else it.setupOrigin, beaconOpening = false, beaconError = "", newChatOpening = false, newChatError = "", initialChatReady = false, sessions = emptyList(), query = "", owner = "", bootstrap = JSONObject()) }
         saveSetupProgress(setupStep, complete = false, setupOrigin = if (loopback) origin else null)
+        // A load that began between the generation bump and here may have reopened the account; nothing can reopen it now.
+        (current?.scope ?: cached)?.let { forgetScreens(it) }
     }
     fun tab(value: String) { if (_ui.value.botModeSwitching) return; botMode.back(); tab(value, resumeDraft = true) }
     private fun tab(value: String, resumeDraft: Boolean): Job? {
@@ -1405,6 +1336,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     }
     fun backFromSettings() {
         if (_ui.value.botModeSwitching) return
+        // Inside Voice & calls, the header arrow steps back one page first, as system Back does.
+        if (_voicePage.value != "home" && dev.hermes.android.ui.normalizeSettingsPage(_ui.value.morePage) in setOf("Beacon", "Voice & calls")) { _voicePage.value = "home"; return }
         val owner = (client?.scope ?: cachedOwnerScope)?.key.orEmpty()
         val history = saved.get<String>("settings-navigation")?.let { runCatching { JSONObject(it) }.getOrNull() }
             ?.takeIf { it.string("scope") == owner }
@@ -1473,32 +1406,38 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     private fun switchProfile(name: String, retainBotMode: Boolean) = viewModelScope.launch {
         clearPendingVoiceKeyRequests()
         val c = client?.detached() ?: return@launch; val oldScope = c.scope; val generation = ++originGeneration
+        val credentialVersion = app.auth.authorityEpoch.readVersion()
         val navigation = navigationGeneration
         if (!retainBotMode) botMode.clear()
         cancelStartup()
-        resetAppUpdate()
         cancelNewChatWork()
         try {
             checkpointVisible()
             if (generation != originGeneration || client?.scope != oldScope) return@launch
             c.post("/api/profile/switch", json("name" to name))
             val bootstrap = c.bootstrap()
-            require(c.auth.owner == oldScope.owner) { "Profile switch changed account identity. Sign in again." }
+            require(c.scope.sameAccount(oldScope)) { "Profile switch changed account identity. Sign in again." }
+            if (generation != originGeneration || client?.scope != oldScope) return@launch
+            if (!persistAuthIfCurrent(c.auth, credentialVersion, snapshot = true, selectProfileIf = { generation == originGeneration })) {
+                if (generation == originGeneration && client?.scope == oldScope) notice("Sign-in changed while switching profiles. Reconnect and try again.")
+                return@launch
+            }
+            if (generation != originGeneration || client?.scope != oldScope) return@launch
+            val switchedAuth = withContext(Dispatchers.IO) { app.auth.read(c.auth.origin) }.takeIf { it.scope() == c.scope } ?: return@launch
             if (generation != originGeneration || client?.scope != oldScope) return@launch
             sessionWatch?.cancel(); selectionJob?.cancel(); sourceScope = null; ++sessionGeneration
-            app.auth.persist(c.auth)
-            // A request still finishing on the old profile (e.g. the history refresh) can save its auth over this write; never bind to that profile.
-            // shortcut: such a save landing after this read still reaches the store until the new client's next save; CAS the switch write if that matters.
-            val switchedAuth = withContext(Dispatchers.IO) { app.auth.read(c.auth.origin) }.takeIf { it.owner == c.auth.owner && it.profile == c.auth.profile }
-                ?: c.auth.also { app.auth.persist(it) }
             client = profileSwitchClientFactoryForTest?.invoke(switchedAuth) ?: BeaconClient(switchedAuth, app.auth, persistContext = false)
             cachedOwnerScope = null; retireSavedDrafts(null)
             val restoredClient = client ?: return@launch
             restorePhoneSettings(restoredClient)
             if (generation != originGeneration || client !== restoredClient) return@launch
-            app.updates.authorize(requireNotNull(client)); restoreAppUpdate()
             _data.value = emptyMap(); _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList(); clearDetails()
             _ui.update { it.copy(profile = c.auth.profile, owner = c.auth.owner, bootstrap = bootstrap, beaconOpening = false, beaconError = "", newChatOpening = false, newChatError = "", initialChatReady = false, morePage = if (retainBotMode && navigation == navigationGeneration) "Bots" else if (retainBotMode) it.morePage else "", query = "", sessions = emptyList()) }
+            hydrateScreens(restoredClient.scope)
+            viewModelScope.launch {
+                val index = try { app.cache.read(restoredClient.scope, "conversation-index")?.let(::JSONObject) } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
+                if (index != null && generation == originGeneration && client === restoredClient && _ui.value.sessions.isEmpty()) _ui.update { it.copy(sessions = index.rows("sessions")) }
+            }
             prepareStartup()
             val next = requireNotNull(client)
             val shell = app.cache.read(next.scope, "new-chat-shell")
@@ -1520,7 +1459,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         }
         if (navigationGeneration != navigation || !selected()) throw CancellationException("Bot Mode navigation changed")
         val active = client ?: error("Reconnect before opening Bot Mode")
-        require(active.auth.owner == owner.owner && active.auth.origin == owner.origin && active.auth.profile == profile) { "Bot profile could not be opened" }
+        require(active.scope.sameAccount(owner.scope()) && active.auth.profile == profile) { "Bot profile could not be opened" }
         selectSession(storedId)
         val selection = selectionJob
         val selectionNavigation = navigationGeneration
@@ -1633,7 +1572,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         botMode.selectSpace(id)
     }
     private fun cancelStartup() {
-        startupJob?.cancel(); startupIndex?.cancel(); startupSettings?.cancel(); optionalProbe?.cancel()
+        startupJob?.cancel(); startupIndex?.cancel(); startupSettings?.cancel(); optionalProbe?.cancel(); prefetchJob?.cancel()
         preloadJobs.toList().forEach(Job::cancel); preloadJobs.clear()
         loads.values.toList().forEach(Job::cancel)
         ++sessionIndexRequest
@@ -1653,6 +1592,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             if (!current() || active.scope != owner) return@launch
             val pluginMessage = if (optional.string("plugin") == "absent") "Beacon plugin not installed on this Hermes — chat works; calls need the plugin." else ""
             _ui.update { state -> mergeOptionalFeaturesFor(state.bootstrap, owner, optional)?.let { state.copy(bootstrap = it, setupPluginMessage = pluginMessage) } ?: state }
+            // The plugin is there: signing in is what links this phone, with nothing for the user to do.
+            if (optional.string("plugin") in setOf("available", "unauthorized")) linkThisPhone(active)
         }
         viewModelScope.launch { try { val prefs = app.cache.read(owner, "chat-preferences")?.let(::JSONObject) ?: json("render_user_markdown" to true, "send_key" to "enter"); if (current()) storeData("profile-settings", prefs) } catch (e: Exception) { if (e is CancellationException) throw e; if (current()) fail(e) } }
         phoneSettings.loadSkills(force = false)
@@ -1701,6 +1642,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 }
             }
         }
+        prefetchScreens(active, generation)
     }
     /** Alerts and calls go to the Beacon chat: tell the plugin which one, once per run. Hermes saves a chat only at its
      *  first message, so an unsaved chat is registered again after its first prompt or on a later run. */
@@ -1753,6 +1695,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val c = active.detached()
         val scope = c.scope
         val generation = originGeneration
+        val credentialVersion = app.auth.authorityEpoch.readVersion()
         val hidden = preferences.value.historyHiddenSources.sorted().joinToString(",")
         val order = preferences.value.historyOrder
         val fetchKey = "${scope.key}:$generation:$query:$archived:$threads:$allProfiles:$hidden:$order"
@@ -1813,7 +1756,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 "all_profiles" to allProfiles, "hidden_sources" to hidden, "order" to order, "sessions" to JSONArray(rows)))
             _ui.update { it.copy(sessions = if (query.isBlank()) rows else it.sessions, connected = true, assistantSessionId = assistantSessionId, historyUnreadable = unreadable) }
             if (current()) {
-                app.auth.persist(c.auth)
+                if (!persistAuthIfCurrent(c.auth, credentialVersion, snapshot = true) || !current()) return@supervisorScope
                 if (!allProfiles && query.isBlank() && !archived && !threads) app.cache.write(scope, "conversation-index", json("sessions" to JSONArray(rows)).toString())
             }
 
@@ -1958,6 +1901,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         newChatJobs[owner.key]?.takeIf { !it.isCompleted }?.let { return it }
         val selected = sourceScope
         val origin = originGeneration
+        val credentialVersion = app.auth.authorityEpoch.readVersion()
         val selection = sessionGeneration
         val navigation = navigationGeneration
         val tab = _ui.value.tab
@@ -1989,7 +1933,10 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                         .onFailure { if (it is CancellationException) throw it; if (current()) notice("Conversation opened; local recovery checkpoint failed") }
                 }
                 if (!current()) return@launch
-                optionalLocalSave { app.auth.persist(c.auth) }
+                var authRetained = false
+                optionalLocalSave { authRetained = persistAuthIfCurrent(c.auth, credentialVersion, snapshot = true) }
+                if (!current()) return@launch
+                if (!authRetained) { notice("Conversation opened on Hermes. Reconnect to continue; your draft is retained."); return@launch }
                 clearPendingVoiceKeyRequestsIfLeavingVoiceKeyPage("Chat", "")
                 _ui.update { it.copy(tab = "Chat", connected = true, newChatError = "") }; saved["tab"] = "Chat"
                 selectSession(id, preserveInitialDraft = initial, initialResponse = response, closeMenu = !initial)
@@ -2290,6 +2237,23 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             } catch (e: Throwable) {
                 if (e is CancellationException) throw e
                 if (current()) {
+                    if (e is ApiFailure && !e.plugin && e.status in setOf(401, 403)) {
+                        val retainedDraft = draft()
+                        val retainedEditor = _editor.value
+                        drafts[scope.key] = retainedDraft
+                        checkpointJob?.cancel(); editorCheckpoint?.cancel()
+                        viewModelScope.launch {
+                            runCatching {
+                                app.cache.write(scope, "draft", retainedDraft.encode(), retainedDraft.text.isNotBlank() || retainedDraft.attachments.isNotEmpty() || retainedDraft.queued.isNotEmpty())
+                                retainEditor(retainedEditor)
+                            }.onFailure { if (generation == sessionGeneration) notice("The latest local checkpoint could not be saved; its draft remains on this phone.") }
+                        }
+                        _chat.value = ChatState(sessionId = id, status = "Access denied · draft retained")
+                        _composer.value = TextFieldValue(); _attachments.value = emptyList(); _data.value = emptyMap(); clearDetails()
+                        sourceScope = null
+                        fail(e)
+                        return@launch
+                    }
                     val cached = _chat.value.raw.length() > 0
                     val pendingFirstTurn = !nativeResumeAttempted && e is ApiFailure && e.status == 404 && sessionCanStillBeUnpersisted(clientCreated, _chat.value)
                     _chat.update { it.copy(projectionReady = true, status = if (pendingFirstTurn) "" else when { missingNativeConversation(e) -> "Conversation unavailable · draft retained"; e is ApiFailure && e.status in setOf(401, 403) -> "Access denied · draft retained"; cached -> "Cached · refresh failed"; else -> "Could not load conversation · retry" }) }
@@ -2907,8 +2871,88 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     }
 
     fun closeSideQuestion() { sideJob?.cancel(); sideCheckpointJob?.cancel(); val side = _side.value; _side.value = null; if (side != null) viewModelScope.launch { app.cache.delete(side.scope, "side-question") } }
-    fun ensureLoaded(key: String, path: String, query: Map<String, String> = emptyMap()): Job = load(key, path, query, force = false)
-    fun load(key: String, path: String, query: Map<String, String> = emptyMap(), force: Boolean = true): Job {
+    /** The newest cached answer of each screen key under [scope], marked stale until a fetch confirms it. */
+    private suspend fun cachedScreens(scope: Scope): Map<String, JSONObject> = try {
+        screens.open(scope)
+        val invalidatedAt = readInvalidations[scope.key] ?: (app.cache.read(scope, "read-invalidated-at")?.toLongOrNull() ?: 0L).also { readInvalidations[scope.key] = it }
+        val now = System.currentTimeMillis()
+        withContext(Dispatchers.Default) { screens.latest(scope).associate { it.key to it.value.copy().put("_stale", !startupReadFresh(it.at, now, invalidatedAt)).put("_cached_at", it.at) } }
+    } catch (e: CancellationException) { throw e } catch (_: Exception) { emptyMap() }
+    /** Screens render from the last good answers before any network call; answers already loaded in this run win. */
+    private fun hydrateScreens(scope: Scope) {
+        viewModelScope.launch {
+            val cached = cachedScreens(scope)
+            if ((client?.scope ?: cachedOwnerScope) == scope) _data.update { cached + it }
+        }
+    }
+    /** For a screen that loads outside [load] (Kanban, devices): show its answer at once next time, and keep it on the phone. */
+    fun keepScreen(scope: Scope, key: String, value: JSONObject) {
+        if (client?.scope != scope) return
+        storeData(key, value)
+        viewModelScope.launch(Dispatchers.Default) { screens.set(scope, key, value) }
+    }
+    /** Device removal, sign-out and account change: nothing cached for the account outlives them (older per-read rows included). */
+    private suspend fun forgetScreens(scope: Scope) {
+        screens.clear(scope)
+        try {
+            startupReads.forEach { app.cache.delete(scope, "read:${it.path}") }
+            listOf("settings:skills", "settings:memory").forEach { app.cache.delete(scope, it) }
+        } catch (e: CancellationException) { throw e } catch (_: Exception) { /* those older rows expire after two days */ }
+    }
+    fun forgetScreens() { val scope = client?.scope ?: return; viewModelScope.launch { forgetScreens(scope) } }
+    private val forgetOnDeviceRemoval: (Scope) -> Unit = { scope -> viewModelScope.launch { forgetScreens(scope) } }
+    init { NativeDeviceRemoval.onForgetScreens = forgetOnDeviceRemoval }
+    private var prefetchJob: Job? = null
+    private var prefetched = "" to 0L
+    /** The account whose sign-in ended without a sign-out; if a different account connects next, its cached screens go. */
+    private var lapsedAccount: Scope? = null
+    /** Warms what the drawer and Settings open next, two reads at a time, once the chat is usable and no reply, send or call is running. */
+    private fun prefetchScreens(active: BeaconClient, generation: Int) {
+        val scope = active.scope
+        if (prefetched.first == scope.key && System.currentTimeMillis() - prefetched.second < PREFETCH_REWARM_AFTER) return
+        fun current() = generation == originGeneration && client === active && _ui.value.authenticated && foreground
+        fun idle() = !app.calls.state.value.active && _chat.value.streamId.isBlank() && pending.isEmpty()
+        prefetchJob = viewModelScope.launch {
+            var waited = 0L
+            while (current() && waited < PREFETCH_READY_WAIT && !(_ui.value.initialChatReady || _chat.value.projectionReady)) { delay(250); waited += 250 }
+            delay(PREFETCH_DELAY)
+            if (!current()) return@launch
+            val plugin = _ui.value.bootstrap.optJSONObject("optional_features")?.optString("plugin") == "available"
+            val reads = (prefetchReads + StartupRead("files", "/api/pc/files", mapOf("path" to pcFolder()))).filter { plugin || "/plugins/beacon/" !in it.path }
+            // Warming never cancels or replaces what a screen is loading or showing: only cold, stale or failed answers are fetched.
+            fun cold(read: StartupRead) = loads[read.key]?.isActive != true && _data.value[read.key].let { shown ->
+                shown == null || (shown.optBoolean("_stale") || shown.has("_error")) && shown.optString("_requested_path").let { it.isEmpty() || it == read.query["path"] } }
+            val steps = reads.map<StartupRead, suspend () -> Unit> { read -> { if (cold(read)) ensureLoaded(read.key, read.path, read.query).join() } } + listOf<suspend () -> Unit>(
+                { if (plugin) phoneSettings.loadBots()?.join() }, { prefetchKanban(active) }, { if (plugin) prefetchDevices(active) })
+            val slots = kotlinx.coroutines.sync.Semaphore(PREFETCH_PARALLELISM)
+            coroutineScope {
+                steps.forEach { step -> launch {
+                    slots.acquire()
+                    try {
+                        while (current() && !idle()) delay(1_000)
+                        if (current()) step()
+                    } catch (e: CancellationException) { throw e } catch (_: Exception) { /* a read that fails stays cold until its screen opens */ }
+                    finally { slots.release() }
+                } }
+            }
+            if (current()) prefetched = scope.key to System.currentTimeMillis()
+        }
+    }
+    private suspend fun prefetchKanban(active: BeaconClient) {
+        val c = active.detached()
+        try {
+            val repo = NativeBoards(c) { key, document -> keepScreen(c.scope, key, document) }
+            val (boards, current) = repo.choices()
+            (current.takeIf { slug -> boards.any { it.slug == slug } } ?: boards.firstOrNull()?.slug)?.let { repo.read(it) }
+        } finally { c.closeNative() }
+    }
+    private suspend fun prefetchDevices(active: BeaconClient) {
+        val c = active.detached()
+        try { keepScreen(c.scope, PAIRED_DEVICES_KEY, pairedDevicesJson(NativePairing.devices(c))) } finally { c.closeNative() }
+    }
+    fun ensureLoaded(key: String, path: String, query: Map<String, String> = emptyMap()): Job = load(key, path, query, force = false, quiet = true)
+    /** A [quiet] read warms data nobody asked for yet: a failure stays on its key and never raises the app-wide error (an expired sign-in still does). */
+    fun load(key: String, path: String, query: Map<String, String> = emptyMap(), force: Boolean = true, quiet: Boolean = false): Job {
         val active = client ?: return viewModelScope.launch { storeData(key, (_data.value[key]?.copy() ?: JSONObject()).apply { remove("_loading"); put("_error", "Reconnect to refresh this page.") }) }
         val c = active.detached(); val scope = c.scope; val generation = originGeneration
         val request = "${scope.key}:$generation:$path:${query.toSortedMap()}"
@@ -2916,30 +2960,32 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         loads[key]?.cancel()
         loadRequests[key] = request
         val session = query["session_id"]
-        val cacheable = (query - "profile").isEmpty() && (query["profile"] == null || query["profile"] == scope.profile) && startupReads.any { it.path == path }
-        val cacheKey = "read:$path"
+        val cacheable = screenReadCacheable(path, query, scope.profile)
+        val stored = screenRequest(path, query)
         fun visible() = client === active && generation == originGeneration && _ui.value.authenticated && loadRequests[key] == request && (session == null || sourceScope?.session == session)
         val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
           try {
-            if (!force && cacheable) {
+            if (cacheable) {
+                // Stale-while-revalidate: the last good answer is shown at once, then replaced when the fetch lands.
+                if (!visible()) return@launch // sign-out already cleared this account; opening it again would bring the row back
+                screens.open(scope)
                 val invalidatedAt = readInvalidations[scope.key] ?: (app.cache.read(scope, "read-invalidated-at")?.toLongOrNull() ?: 0L).also { readInvalidations[scope.key] = it }
                 val at = loadedAt[request] ?: 0L
-                if (visible() && _data.value[key]?.has("_error") == false && _data.value[key]?.optLong("_cached_at") == at && _data.value[key]?.string("_request_key") == request && startupReadFresh(at, System.currentTimeMillis(), invalidatedAt)) return@launch
-                val cached = app.cache.read(scope, cacheKey)?.let { runCatching { JSONObject(it) }.getOrNull() }
+                if (!force && visible() && _data.value[key]?.has("_error") == false && _data.value[key]?.optLong("_cached_at") == at && _data.value[key]?.string("_request_key") == request && startupReadFresh(at, System.currentTimeMillis(), invalidatedAt)) return@launch
                 if (!visible()) return@launch
-                cached?.optJSONObject("value")?.let { value ->
-                    val cachedAt = cached.optLong("at")
-                    val fresh = startupReadFresh(cachedAt, System.currentTimeMillis(), invalidatedAt)
-                    loadedAt[request] = cachedAt
-                    _data.update { it + (key to value.copy().put("_stale", !fresh).put("_cached_at", cachedAt).put("_request_key", request)) }
-                    if (fresh) return@launch
+                // The same answer this run already fetched (under any key) is reused; an older saved copy only fills the screen first.
+                (screens.exact(scope, key, stored) ?: screens.sameRequest(scope, stored))?.takeIf { (loadedAt[request] ?: it.at) == it.at }?.let { cached ->
+                    val fresh = startupReadFresh(cached.at, System.currentTimeMillis(), invalidatedAt)
+                    loadedAt[request] = cached.at
+                    _data.update { it + (key to cached.value.copy().put("_stale", !fresh).put("_cached_at", cached.at).put("_request_key", request)) }
+                    if (fresh && !force) return@launch
                 }
             }
             _refreshing.update { it + key }
-            val response = c.get(path, query, maxBytes = if (cacheable) 1024 * 1024 else LOCAL_CHECKPOINT_LIMIT_BYTES.toInt())
+            val response = c.get(path, query, maxBytes = if (cacheable && startupReads.any { it.path == path }) 1024 * 1024 else LOCAL_CHECKPOINT_LIMIT_BYTES.toInt())
             if (!visible()) return@launch
             val at = System.currentTimeMillis()
-            if (cacheable) app.cache.write(scope, cacheKey, json("at" to at, "value" to response).toString())
+            if (cacheable) withContext(Dispatchers.Default) { screens.put(scope, key, stored, at, response) }
             if (key == "profile-settings") app.cache.write(scope, "profile-settings", response.toString())
             if (visible()) { loadedAt[request] = at; _data.update { it + (key to if (cacheable) response.copy().put("_cached_at", at).put("_request_key", request) else response) }; _ui.update { it.copy(connected = true) } }
           } catch (e: Throwable) {
@@ -2949,7 +2995,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 _data.update { values -> values + (key to ((if (cacheable) values[key]?.copy() else null) ?: JSONObject()).put("_error", beaconOwnerSetupMessage(e) ?: appErrorText(failure)).apply { if (cacheable && length() > 1) put("_stale", true); if (path == "/api/commands/catalog") { put("available", false); if (!has("commands")) put("commands", JSONArray()) } }) }
                 val chatId = query["chat"].orEmpty()
                 val unsaved = path == "/api/projects/for-session" && unsavedOpenChatRead(e, chatId, clientCreatedSessions.contains(scope.session(chatId).key), _chat.value)
-                if (!unsaved && (force || !cacheable || e is ApiFailure && e.status == 401)) fail(failure)
+                if (!unsaved && ((force || !cacheable) && !quiet || e is ApiFailure && e.status == 401)) fail(failure)
             }
           } finally { c.closeNative(); if (loads[key] === currentCoroutineContext()[Job]) _refreshing.update { it - key } }
         }
@@ -2962,6 +3008,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
         val submission = _form.value?.takeIf { it.path == path && it.id == _submittingForm.value }?.id
         val active = client; val generation = originGeneration; val selection = sessionGeneration
+        val credentialVersion = app.auth.authorityEpoch.readVersion()
         val c = active?.detached() ?: run { notice("Reconnect before saving changes."); return@launch }; val scope = c.scope; val selected = sourceScope
         fun current() = client === active && originGeneration == generation && (!body.has("session_id") || sourceScope == selected && sessionGeneration == selection)
         val removing = path == "/api/session/delete"
@@ -2990,9 +3037,15 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     _ui.update { it.copy(sessions = updatedHistoryRows(it.sessions, selected.session, path, body, result, sessionIndexArchived, "", selected.profile)) }
                     _data.update { it - "history:search" }
                 }
-                if (path != "/api/profile/switch") app.auth.persist(c.auth)
+                if (path != "/api/profile/switch" && !persistAuthIfCurrent(c.auth, credentialVersion, snapshot = true)) {
+                    if (current()) notice("Saved on Hermes. Sign-in changed; reconnect before making more changes.")
+                    return@launch
+                }
+                if (!current()) return@launch
                 val invalidation = System.currentTimeMillis(); readInvalidations[scope.key] = invalidation
+                screens.invalidate(scope, path)
                 val cacheError = runCatching { app.cache.write(scope, "read-invalidated-at", invalidation.toString()) }.exceptionOrNull()
+                if (!current()) return@launch
                 val message = when {
                     path == "/api/session/update" && result.optBoolean("deferred") -> "Model saved for the next reply"
                     path == "/api/session/archive" -> if (body.optBoolean("archived")) "Archived" else "Unarchived"
@@ -3280,19 +3333,18 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             val binding = app.push.binding(source) ?: error("Sign in to the owner account before opening this notification")
             val origin = trustedOrigin(binding.getString("origin"))
             val owner = binding.getString("owner")
-            val notificationScope = Scope(origin, owner, binding.string("profile", "default"))
+            val notificationScope = Scope(origin, owner, binding.string("profile", "default"), nativeProvider = binding.string("native_provider"))
             require(app.auth.read(origin).authorizesPushSource(notificationScope)) { "Sign in to the notification's owner account before opening this activity" }
             modeTransition?.cancelAndJoin()
             setupProbeJob?.cancel(); ++setupProbeGeneration
             clearPendingVoiceKeyRequests()
             generation = ++originGeneration
             cancelStartup()
-            resetAppUpdate()
             cancelNewChatWork()
             val c = app.push.clientFor(binding)
             temporaryClient = c
             val bootstrap = c.bootstrap()
-            require(c.auth.owner == owner && c.auth.profile == binding.string("profile", "default")) { "Notification authorization no longer matches this account" }
+            require(c.scope == notificationScope) { "Notification authorization no longer matches this account" }
             val route = c.nativeRequest("/api/plugins/beacon/mobile/notifications/events/$event")
             require(route.string("profile") == c.auth.profile && route.string("source_ref") == source) { "Notification belongs to another profile" }
             require(app.push.binding(source) != null && app.auth.read(origin).authorizesPushSource(notificationScope)) { "The notification's owner signed out" }
@@ -3305,7 +3357,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             if (generation != originGeneration) return@launch
             clearDetails(); retireSavedDrafts(null); sessionWatch?.cancel(); selectionJob?.cancel(); sourceScope = null; ++sessionGeneration
             if (app.calls.state.value.active && !keepsRestoredCall(app.calls.state.value.conversationScope,c.scope,false)) app.calls.hangup()
-            require(persistAuthIfCurrent(c.auth, credentialVersion)) { "Sign-in changed while opening this notification" }
+            require(persistAuthIfCurrent(c.auth, credentialVersion, snapshot = true, selectProfileIf = { generation == originGeneration })) { "Sign-in changed while opening this notification" }
             if (generation != originGeneration) return@launch
             val refreshedAuth = withContext(Dispatchers.IO) { app.auth.read(origin) }
             require(refreshedAuth.authorizesPushSource(notificationScope) && refreshedAuth.profile == notificationScope.profile) { "Sign-in changed while opening this notification" }
@@ -3316,8 +3368,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             if (generation != originGeneration || client !== restoredClient) return@launch
             restorePhoneSettings(restoredClient)
             if (generation != originGeneration || client !== restoredClient) return@launch
-            app.updates.authorize(requireNotNull(client)); restoreAppUpdate()
             _data.value = emptyMap()
+            hydrateScreens(restoredClient.scope)
             _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList()
             if (route.string("kind") == "task_result" && id.isNotBlank()) {
                 val emailAlert = route.optBoolean("email_alert")
@@ -3326,10 +3378,9 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     storeData("task-result:${c.scope.session(id).key}", json("reason" to it, "notice_id" to route.string("event_id").ifBlank { event }, "email_alert" to emailAlert, "expires_at" to expiresAt))
                 }
             }
-            val destination = when { route.string("kind") == "incoming_call" -> "Beacon"; route.string("kind") == "task_result" && id.isNotBlank() && readBeaconSessionHandle(c.scope) == id -> "Beacon"; route.string("kind") == "release" -> "More"; route.string("kind") == "task_result" && id.isBlank() -> "Tasks"; else -> "Chat" }
-            val destinationPage = if (route.string("kind") == "release") "App updates" else ""
-            saved["tab"] = destination; saved["more"] = destinationPage
-            _ui.update { it.copy(origin = origin, owner = owner, profile = c.auth.profile, beaconOpening = false, beaconError = "", newChatOpening = false, newChatError = "", initialChatReady = false, query = "", authenticated = true, connected = true, restoringSession = false, bootstrap = bootstrap, tab = destination, morePage = destinationPage) }
+            val destination = when { route.string("kind") == "incoming_call" -> "Beacon"; route.string("kind") == "task_result" && id.isNotBlank() && readBeaconSessionHandle(c.scope) == id -> "Beacon"; route.string("kind") == "task_result" && id.isBlank() -> "Tasks"; else -> "Chat" }
+            saved["tab"] = destination; saved["more"] = ""
+            _ui.update { it.copy(origin = origin, owner = owner, profile = c.auth.profile, beaconOpening = false, beaconError = "", newChatOpening = false, newChatError = "", initialChatReady = false, query = "", authenticated = true, connected = true, restoringSession = false, bootstrap = bootstrap, tab = destination, morePage = "") }
             prepareStartup()
             if (route.string("kind") == "incoming_call") {
                 if (action!="callback") { if (route.string("state") == "pending") app.push.presentInvitation(source, event) else app.push.discardInvitation(source, event) }
@@ -3359,5 +3410,5 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         }
         finally { temporaryClient?.closeNative(); if (startsCall) _incomingBusy.value = false }
     }
-    override fun onCleared() { botMode.clear(); sessionWatch?.cancel(); stopReadAloud(); speech?.shutdown(); super.onCleared() }
+    override fun onCleared() { if (NativeDeviceRemoval.onForgetScreens === forgetOnDeviceRemoval) NativeDeviceRemoval.onForgetScreens = null; botMode.clear(); sessionWatch?.cancel(); stopReadAloud(); speech?.shutdown(); super.onCleared() }
 }

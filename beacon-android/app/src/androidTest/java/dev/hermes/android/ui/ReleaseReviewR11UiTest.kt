@@ -54,6 +54,7 @@ class ReleaseReviewR11UiTest {
         runBlocking { app.preferences.edit { it[stringPreferencesKey("origin")] = "" } }
         val fixture = NativeExperienceFixture()
         val client = makeClient(fixture)
+        runBlocking { app.auth.persist(client.auth) }
         val kind = "kanban-draft:default"
         val priorDraft = runBlocking { app.cache.read(fixture.scope, kind) }
         runBlocking { app.cache.delete(fixture.scope, kind) }
@@ -76,6 +77,7 @@ class ReleaseReviewR11UiTest {
         } finally {
             compose.runOnUiThread { store.clear(); client.closeNative(); fixture.client.closeNative(); app.calls.update { priorCall }; app.calls.ownerScope = priorOwner }
             runBlocking {
+                app.auth.remove(client.auth.origin)
                 app.preferences.updateData { priorPreferences }
                 if (priorDraft == null) app.cache.delete(fixture.scope, kind) else app.cache.write(fixture.scope, kind, priorDraft, true)
             }
@@ -144,10 +146,11 @@ class ReleaseReviewR11UiTest {
         compose.setContent { NativeLocalization("en") { BeaconTheme { NativeApprovalMenu(vm, enabled = true) } } }
         compose.waitUntil(5000) {
             val approvals = vm.data.value["picker:approvals"]
-            approvals?.let { it.string("profile_mode") == "manual" && !it.optBoolean("session_status_known") } == true &&
+            approvals?.let { it.string("profile_mode") == "manual" && it.optBoolean("session_status_known") && !it.optBoolean("session_bypass") } == true &&
                 "picker:approvals" !in vm.refreshing.value
         }
-        compose.onNodeWithContentDescription("Approvals: Unknown").assertIsDisplayed().performClick()
+        // The browsed chat shows its own saved choice (not YOLO), never Unknown, and still never resumes.
+        compose.onNodeWithContentDescription("Approvals: Manual").assertIsDisplayed().performClick()
         compose.onNodeWithTag("approval-ask").assertExists()
         lateinit var read: kotlinx.coroutines.Job
         compose.runOnIdle { read = vm.loadChatApprovals() }

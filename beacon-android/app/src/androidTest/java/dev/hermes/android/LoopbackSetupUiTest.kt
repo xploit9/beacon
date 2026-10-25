@@ -45,16 +45,13 @@ class LoopbackSetupUiTest {
         val link = "beacon://connect?url=${Uri.encode("https://hermes.example")}&name=Hermes&session=${Uri.encode(secret)}"
         val parsed = parseBeaconConnectLink(link)
         assertEquals("https://hermes.example", parsed.origin)
-        assertToken(secret, parsed.sessionToken)
+        // An old link's session value is ignored, never carried.
         assertFalse(parsed.toString().contains(secret))
         assertEquals("https://hermes.example", parseBeaconConnectLink("beacon://CONNECT?url=${Uri.encode("https://hermes.example")}").origin)
-        val scannerQr = org.json.JSONObject()
-            .put("type", "beacon-connect")
-            .put("url", "https://hermes.example")
-            .put("session", secret)
-            .toString()
-        assertToken(secret, parseBeaconConnectLink(scannerQr).sessionToken)
-        assertEquals("https://hermes.example", setupAddressForDisplay(scannerQr))
+        // A QR payload is no longer a way in: only a link or an address is read.
+        assertTrue(runCatching { parseBeaconConnectLink("""{"type":"beacon-connect","url":"https://hermes.example","session":"$secret"}""") }.isFailure)
+        assertEquals("https://hermes.example", setupAddressForDisplay(link))
+        assertEquals("https://hermes.example", setupAddressForDisplay("https://hermes.example"))
 
         val state = AppState(setupOrigin = parsed.origin, setupWizard = true, setupStep = "connect", restoringSession = false)
         var submitted: String? = null

@@ -16,7 +16,6 @@ internal object NativeOperationPolicy {
     private val toolPath = Regex("/api/tools/toolsets/[A-Za-z0-9_.%~-]+")
     private val mcpPath = Regex("/api/mcp/servers/[A-Za-z0-9_.%~-]+/(?:test|enabled)")
     private const val beaconPluginUpdatePath = "/api/dashboard/agent-plugins/beacon/update"
-    private const val pairingRedeemPath = "/api/plugins/beacon/pairing/redeem"
     private const val deviceLinkPath = "/api/plugins/beacon/devices/link"
     private const val devicesPath = "/api/plugins/beacon/devices"
     private val devicePath = Regex("/api/plugins/beacon/devices/[A-Za-z0-9_-]{1,128}")
@@ -29,8 +28,8 @@ internal object NativeOperationPolicy {
         if (path == "/api/files/upload-stream") return method == "POST"
         if (path == beaconPluginUpdatePath) return method == "POST"
         if (path == "/api/plugins/beacon/sessions/pin") return method == "POST"
-        if (path == pairingRedeemPath) return method == "POST"
-        if (path.startsWith("/api/plugins/beacon/pairing/")) return false
+        // The pairing routes are gone from the plugin; a phone is linked by `devices/link` after sign-in.
+        if (path.startsWith("/api/plugins/beacon/pairing")) return false
         if (path == deviceLinkPath) return method == "POST"
         if (path == devicesPath) return method == "GET"
         if (path.startsWith("/api/plugins/beacon/devices/")) return method == "DELETE" && path.matches(devicePath)

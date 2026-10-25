@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import json
 import sys
 import threading
 import uuid
@@ -18,24 +19,20 @@ def _release(plugin_version='1.0.0', available=False):
     }
 
 
-def _auto(api, monkeypatch, *, plugin_version='1.0.0', busy=False):
+def _auto(api, monkeypatch, *, plugin_version='1.0.0'):
+    """Fakes the GitHub check and the installed/running plugin versions; returns the checks and the installed version."""
     checked=[]
-    updated=[]
     installed=['1.0.0']
-    def check(cfg,before_apk=None):
+    def check(cfg):
         checked.append(True)
-        release=_release(plugin_version)
-        if before_apk: before_apk(release['version_name'],release['plugin_version'])
-        return release
+        return _release(plugin_version)
     monkeypatch.setattr(api, '_check_release_and_announce', check)
     monkeypatch.setattr(api, '_installed_plugin_version', lambda: installed[0])
-    monkeypatch.setattr(api, '_hermes_busy', lambda owner: busy)
-    def update():
-        updated.append('beacon');installed[0]=plugin_version
-        # Hermes' git-install shape (plugins_cmd_update.py): no restart_required key.
-        return {'ok': True, 'name': 'beacon', 'output': 'Updated beacon.', 'unchanged': False}
-    monkeypatch.setattr(api, '_update_beacon_plugin', update)
-    return checked, updated
+    monkeypatch.setattr(api, '_RUNNING_PLUGIN_VERSION', '1.0.0')
+    # Hermes' own updater is the owner's tap; the plugin reaching it by itself would be a silent install.
+    def installed_itself(name): pytest.fail('The plugin must never install its own update')
+    monkeypatch.setitem(sys.modules, 'hermes_cli.plugins_cmd', SimpleNamespace(dashboard_update_user_plugin=installed_itself))
+    return checked, installed
 
 
 def _restarted_api(api):
@@ -46,14 +43,15 @@ def _restarted_api(api):
     return restarted
 
 
-def test_plugin_update_setting_defaults_on_and_is_owner_scoped(harness):
+def test_update_status_is_owner_scoped_and_the_old_switch_cannot_turn_automatic_install_on(harness):
     _,client,_,_,_=harness
     path='/api/plugins/beacon/mobile/update-settings'
 
-    assert client.get(path).json()['enabled'] is True
-    assert client.put(path,json={'enabled':False}).json()['enabled'] is False
     assert client.get(path).json()['enabled'] is False
-    assert client.put(path,json={'enabled':0}).status_code==400
+    # An installed 1.1.x phone still sends its switch; the answer stays off and nothing is stored.
+    assert client.put(path,json={'enabled':True}).json()['enabled'] is False
+    assert client.get(path).json()['enabled'] is False
+    assert client.put(path,json={'enabled':1}).status_code==400
     client.headers['x-fixture-owner']='foreign'
     assert client.get(path).status_code==403
     assert client.put(path,json={'enabled':True}).status_code==403
@@ -66,9 +64,9 @@ def test_auto_check_is_six_hour_throttled_across_module_restart(harness,monkeypa
 
     api.auto_update_check(cfg,now=now)
     restarted=_restarted_api(api)
-    monkeypatch.setattr(restarted,'_check_release_and_announce',lambda cfg,before_apk=None: checked.append(True) or _release())
+    monkeypatch.setattr(restarted,'_check_release_and_announce',lambda cfg: checked.append(True) or _release())
     monkeypatch.setattr(restarted,'_installed_plugin_version',lambda:'1.0.0')
-    monkeypatch.setattr(restarted,'_hermes_busy',lambda owner:False)
+    monkeypatch.setattr(restarted,'_RUNNING_PLUGIN_VERSION','1.0.0')
     assert restarted.auto_update_check(cfg,now=now+6*60*60-1)['result']=='throttled'
     assert len(checked)==1
 
@@ -76,90 +74,67 @@ def test_auto_check_is_six_hour_throttled_across_module_restart(harness,monkeypa
     assert len(checked)==2
 
 
-def test_newer_plugin_uses_hermes_native_update_path_when_enabled(harness,monkeypatch):
+def test_newer_plugin_is_recorded_for_the_owner_never_installed_automatically(harness,monkeypatch):
     api,client,cfg,_,_=harness
-    checked,updated=_auto(api,monkeypatch,plugin_version='1.2.0')
+    checked,_=_auto(api,monkeypatch,plugin_version='1.2.0')
 
     result=api.auto_update_check(cfg,now=2_000_000)
 
-    assert len(checked)==1 and updated==['beacon']
-    # This process still runs 1.0.0 code, so the update finishes only after a restart.
-    assert result['result']=='restart_required'
-    assert result['message']=='Restart Hermes to finish the plugin update.'
-    assert client.get('/api/plugins/beacon/mobile/update-settings').json()['plugin_version']=='1.2.0'
+    assert len(checked)==1 and result['result']=='plugin_update_available'
+    assert result['plugin_version']=='1.2.0' and result['message']=='Plugin update available.'
+    saved=client.get('/api/plugins/beacon/mobile/update-settings').json()
+    assert saved['result']=='plugin_update_available' and saved['plugin_version']=='1.2.0' and saved['enabled'] is False
+    assert not hasattr(api,'_update_beacon_plugin') and not hasattr(api,'_hermes_busy')
+    # Every later check records it again; reaching Hermes' updater would fail the test (see _auto).
+    for interval in (1,2):
+        later=api.auto_update_check(cfg,now=2_000_000+interval*api.mobile.AUTO_UPDATE_INTERVAL_SECONDS)
+        assert later['result']=='plugin_update_available'
+    assert len(checked)==3
 
 
-def test_plugin_update_is_complete_when_running_code_matches_installed(harness,monkeypatch):
+def test_an_update_done_in_hermes_replaces_the_notice_with_the_restart_hint_then_completion(harness,monkeypatch):
     api,_,cfg,_,_=harness
-    _,updated=_auto(api,monkeypatch,plugin_version='1.2.0')
+    checked,installed=_auto(api,monkeypatch,plugin_version='1.2.0')
+    assert api.auto_update_check(cfg,now=2_000_000)['result']=='plugin_update_available'
+
+    installed[0]='1.2.0'  # the owner tapped Update in Hermes; this process still runs 1.0.0 code
+    result=api.auto_update_check(cfg,now=2_000_060)
+    assert result['result']=='restart_required' and result['message']=='Restart Hermes to finish the plugin update.'
+
     monkeypatch.setattr(api,'_RUNNING_PLUGIN_VERSION','1.2.0')
-
-    result=api.auto_update_check(cfg,now=2_000_000)
-
-    assert updated==['beacon'] and result['result']=='plugin_updated'
-
-
-def test_plugin_update_runs_inside_hermes_profile_secret_scope(harness,monkeypatch):
-    api,_,_,_,_=harness
-    scope=[]
-    class Scope:
-        def __init__(self,profile): self.profile=profile
-        def __enter__(self): scope.append(self.profile)
-        def __exit__(self,*_): scope.pop()
-    def update(name):
-        # Mirrors agent/secret_scope.py: a multi-profile Hermes refuses unscoped secret reads.
-        if scope!=[None]: raise RuntimeError('UnscopedSecretError')
-        return {'ok':True,'name':name,'output':'Already up to date.','unchanged':True}
-    monkeypatch.setitem(sys.modules,'hermes_cli.web_server_profiles',SimpleNamespace(_config_profile_scope=Scope))
-    monkeypatch.setitem(sys.modules,'hermes_cli.plugins_cmd',SimpleNamespace(dashboard_update_user_plugin=update))
-
-    assert api._update_beacon_plugin()['ok'] is True
-    assert scope==[]
+    result=api.auto_update_check(cfg,now=2_000_120)
+    assert result['result']=='plugin_updated' and result['message']=='Beacon plugin updated.'
+    assert len(checked)==1
 
 
-def test_disabled_plugin_auto_update_does_not_call_hermes_updater(harness,monkeypatch):
-    api,client,cfg,_,_=harness
-    client.put('/api/plugins/beacon/mobile/update-settings',json={'enabled':False})
-    checked,updated=_auto(api,monkeypatch,plugin_version='1.2.0')
-
-    api.auto_update_check(cfg,now=2_000_000)
-
-    assert len(checked)==1 and updated==[]
-
-
-def test_active_hermes_work_defers_reload_and_records_restart_hint(harness,monkeypatch):
-    api,client,cfg,_,_=harness
-    checked,updated=_auto(api,monkeypatch,plugin_version='1.2.0',busy=True)
-
-    result=api.auto_update_check(cfg,now=2_000_000)
-
-    assert len(checked)==1 and updated==[]
-    assert result['result']=='waiting_for_idle'
-    assert result['message']=='Plugin update waits until Hermes is idle.'
-    assert client.get('/api/plugins/beacon/mobile/update-settings').json()['message']==result['message']
-
-
-def test_deferred_plugin_update_retries_when_hermes_becomes_idle_without_another_release_check(harness,monkeypatch):
+def test_a_result_the_old_updater_recorded_is_rechecked_instead_of_throttled(harness,monkeypatch):
     api,_,cfg,_,_=harness
-    checked,updated=_auto(api,monkeypatch,plugin_version='1.2.0',busy=True)
-    first=api.auto_update_check(cfg,now=2_000_000)
-    assert first['result']=='waiting_for_idle' and updated==[]
-    monkeypatch.setattr(api,'_hermes_busy',lambda owner:False)
+    checked,_=_auto(api,monkeypatch)
+    legacy={'checked_at':2_000_000,'result':'waiting_for_idle','app_version':'1.0.0','plugin_version':'1.2.0',
+            'message':'Plugin update waits until Hermes is idle.'}
+    with api.mobile.connect() as conn:
+        conn.execute('INSERT INTO meta(key,value) VALUES(?,?)',(api.mobile._auto_update_key('status',cfg['owner_id']),json.dumps(legacy).encode()))
 
     result=api.auto_update_check(cfg,now=2_000_060)
 
-    assert result['result']=='restart_required'
-    assert len(checked)==1 and updated==['beacon']
+    assert len(checked)==1 and result['result']=='up_to_date'
+
+
+def test_a_plugin_version_too_long_for_the_status_field_is_not_a_version(harness):
+    api=harness[0]
+    assert api._plugin_version_tuple('1.2.3')==(1,2,3)
+    assert api._plugin_version_tuple('1.2.'+'9'*9)==(1,2,999999999)
+    # The status field keeps 64 characters; a longer version would be stored cut and could never match its own record.
+    assert api._plugin_version_tuple('1.2.'+'9'*64) is None
 
 
 def test_auto_checks_serialize_one_in_flight_release_check(harness,monkeypatch):
     api,_,cfg,_,_=harness
     entered=threading.Event();release=threading.Event();calls=[]
-    def slow_check(cfg,before_apk=None):
+    def slow_check(cfg):
         calls.append(True);entered.set();release.wait(2);return _release()
     monkeypatch.setattr(api,'_check_release_and_announce',slow_check)
     monkeypatch.setattr(api,'_installed_plugin_version',lambda:'1.0.0')
-    monkeypatch.setattr(api,'_hermes_busy',lambda owner:False)
     first=threading.Thread(target=lambda:api.auto_update_check(cfg,now=2_000_000))
     first.start()
     assert entered.wait(2)
@@ -173,7 +148,7 @@ def test_auto_checks_serialize_one_in_flight_release_check(harness,monkeypatch):
 
 def test_failed_release_check_is_recorded_without_stopping_watcher(harness,monkeypatch):
     api,client,cfg,_,_=harness
-    def fail(_cfg,before_apk=None): raise OSError('offline')
+    def fail(_cfg): raise OSError('offline')
     monkeypatch.setattr(api,'_check_release_and_announce',fail)
 
     result=api.auto_update_check(cfg,now=2_000_000)
@@ -181,28 +156,6 @@ def test_failed_release_check_is_recorded_without_stopping_watcher(harness,monke
     assert result['result']=='error'
     saved=client.get('/api/plugins/beacon/mobile/update-settings').json()
     assert saved['checked_at']==2_000_000 and saved['result']=='error'
-
-
-def test_idle_guard_detects_active_hermes_work_and_phone_calls(harness,monkeypatch):
-    api,_,_,_,_=harness
-    status={'active_agents':1,'active_work':['chat'],'gateway_state':'running'}
-    pid=[123];ledger=['']
-    monkeypatch.setitem(sys.modules,'gateway.status',SimpleNamespace(
-        get_running_pid=lambda:pid[0],read_runtime_status=lambda:status))
-    monkeypatch.setitem(sys.modules,'hermes_cli.web_server_idle_exit',SimpleNamespace(busy_ledger=lambda:ledger[0]))
-
-    assert api._hermes_busy('owner')
-    status.update(active_agents=0,active_work=[],gateway_state='running')
-    assert not api._hermes_busy('owner')
-    # A stopped gateway leaves a stale state file; it must not block the update forever.
-    pid[0]=None;status.update(active_agents=2,gateway_state='stopped')
-    assert not api._hermes_busy('owner')
-    for busy in ('session:dashboard-chat',None):
-        ledger[0]=busy
-        assert api._hermes_busy('owner')
-    ledger[0]=''
-    api.mobile.reserve('owner','default','active-call-session')
-    assert api._hermes_busy('owner')
 
 
 @pytest.mark.asyncio
@@ -357,14 +310,13 @@ async def test_live_watcher_keeps_one_warm_in_flight_while_version_is_invalid(ha
 
 def test_restart_hint_survives_a_later_up_to_date_check(harness,monkeypatch):
     api,_,cfg,_,_=harness
-    checked,updated=_auto(api,monkeypatch,plugin_version='1.0.0')
-    # 1.1.0 is installed on disk but this process still runs 1.0.0, and the release page has nothing newer.
-    monkeypatch.setattr(api,'_installed_plugin_version',lambda:'1.2.0')
-    monkeypatch.setattr(api,'_RUNNING_PLUGIN_VERSION','1.0.0')
+    checked,installed=_auto(api,monkeypatch,plugin_version='1.0.0')
+    # 1.2.0 is installed on disk but this process still runs 1.0.0, and the release page has nothing newer.
+    installed[0]='1.2.0'
 
     result=api.auto_update_check(cfg,now=2_000_000)
 
-    assert updated==[] and result['result']=='restart_required'
+    assert result['result']=='restart_required'
     assert result['message']=='Restart Hermes to finish the plugin update.'
 
 
@@ -374,7 +326,7 @@ def test_restart_hint_clears_when_process_runs_the_installed_version(harness,mon
     api.mobile.record_auto_update_status(owner,2_000_000,'restart_required','1.0.0','1.2.0','Restart Hermes to finish the plugin update.')
     monkeypatch.setattr(api,'_RUNNING_PLUGIN_VERSION','1.2.0')
     monkeypatch.setattr(api,'_installed_plugin_version',lambda:'1.2.0')
-    monkeypatch.setattr(api,'_check_release_and_announce',lambda cfg,before_apk=None:pytest.fail('throttled check should not fetch releases'))
+    monkeypatch.setattr(api,'_check_release_and_announce',lambda cfg:pytest.fail('throttled check should not fetch releases'))
 
     result=api.auto_update_check(cfg,now=2_000_001)
 

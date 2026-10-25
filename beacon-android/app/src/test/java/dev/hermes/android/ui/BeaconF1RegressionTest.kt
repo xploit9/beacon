@@ -29,11 +29,6 @@ class BeaconF1RegressionTest {
         assertFalse(sessionCanStillBeUnpersisted(true, ChatState(streamId = "running")))
     }
 
-    @Test fun connectInputDiagnosticsNeverPrintTheSessionToken() {
-        val token = "private-loopback-session-token"
-        assertFalse(BeaconConnectInput("https://hermes.example", token).toString().contains(token))
-    }
-
     @Test fun deniedSetupPermissionStaysOnTheCurrentStep() {
         var advanced = 0
         var denied = 0

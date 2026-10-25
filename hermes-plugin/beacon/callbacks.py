@@ -30,14 +30,24 @@ def _profile_now(profile):
 
 def _prune_expired(conn,now):
     cutoff=now-CALLBACK_MARKER_RETENTION_SECONDS-1
-    keys=conn.execute("""SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'
+    # A deferred notice still needs its scheduling marker to reject late activation.
+    keys=conn.execute("""SELECT key,value FROM meta WHERE key LIKE 'scheduled-callback:%'
         AND CASE WHEN json_valid(CAST(value AS TEXT)) THEN
           CASE WHEN json_type(CAST(value AS TEXT),'$.scheduled_at')='text' THEN
-            CAST(strftime('%s',json_extract(CAST(value AS TEXT),'$.scheduled_at')) AS REAL)
+            CAST(strftime('%s',json_extract(CAST(value AS TEXT),'$.scheduled_at')) AS REAL)<=?
+            AND NOT EXISTS (SELECT 1 FROM deferred WHERE id=json_extract(CAST(meta.value AS TEXT),'$.delivered'))
           END
-        END<=? ORDER BY rowid LIMIT ?""",(cutoff,CALLBACK_MARKER_PRUNE_BATCH)).fetchall()
+        END ORDER BY rowid LIMIT ?""",(cutoff,CALLBACK_MARKER_PRUNE_BATCH)).fetchall()
     conn.executemany('DELETE FROM meta WHERE key=?',
-                     [(key,) for row in keys for key in (row[0],'missed-callback:'+row[0].split(':',1)[1])])
+                     [(key,) for row in keys for key in (row[0],'missed-callback:'+row[0].split(':',1)[1],
+                         'missed-callback:'+(json.loads(row[1]).get('delivered') or row[0].split(':',1)[1]))])
+
+
+def _delivered_record(conn,event):
+    return conn.execute("""SELECT value FROM meta WHERE key=? OR
+        CASE WHEN key LIKE 'scheduled-callback:%' AND json_valid(CAST(value AS TEXT)) THEN
+          json_extract(CAST(value AS TEXT),'$.delivered')=?
+        END LIMIT 1""",('scheduled-callback:'+event,event)).fetchone()
 
 def _authority(cfg,row):
     return (cfg.get('scheduled_callbacks_enabled') is True and cfg.get('owner_id')==row['owner']
@@ -204,7 +214,7 @@ def deliver(mobile,native,key,now):
         if not _authority(cfg,row): raise ValueError('Callback authority changed')
         native.verify(row['owner'],row['provider'],row['profile'],row['conversation'])
         # Exact deterministic notice id makes retry atomic with its delivery marker.
-        event=key.split(':')[1]
+        event=key.split(':')[1][:32]
         if mobile.active_calls(conn,row['owner']):
             if conn.execute('SELECT COUNT(*) FROM deferred').fetchone()[0]>=256: raise RuntimeError('Deferred callback capacity reached')
             conn.execute('INSERT INTO deferred(id,owner,profile,conversation,created,reason) VALUES(?,?,?,?,?,?)',(event,row['owner'],row['profile'],row['conversation'],now.timestamp(),row['reason']))
@@ -216,11 +226,10 @@ def deliver(mobile,native,key,now):
     return {'status':'pending','event_id':event}
 
 def deferred_allowed(mobile,event,now,owner=None):
-    # None denotes a different producer; scheduled IDs remain rejectable after marker pruning.
-    key='scheduled-callback:'+event
+    # None denotes another producer; deferred scheduled notices retain their marker.
     with mobile.LOCK,mobile.connect() as conn:
         if isinstance(owner,str) and owner: _prune_expired(conn,now.timestamp())
-        found=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
+        found=_delivered_record(conn,event)
     if not found: return False if isinstance(event,str) and _CALLBACK_EVENT.fullmatch(event) else None
     try:
         row=json.loads(found[0]);target=datetime.fromisoformat(row['scheduled_at'])
@@ -228,10 +237,9 @@ def deferred_allowed(mobile,event,now,owner=None):
     return row.get('delivered')==event and 0<=(now-target).total_seconds()<CALLBACK_WINDOW_SECONDS
 
 def missed_reason(mobile,event,now,owner,profile):
-    if not isinstance(event,str) or not _CALLBACK_EVENT.fullmatch(event): return None
-    key='scheduled-callback:'+event
+    if not isinstance(event,str) or not re.fullmatch(r'[0-9a-f]{32}|[0-9a-f]{64}',event): return None
     with mobile.LOCK,mobile.connect() as conn:
-        found=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
+        found=_delivered_record(conn,event)
     if not found: return None
     try:
         row=json.loads(found[0]);target=datetime.fromisoformat(row['scheduled_at'])

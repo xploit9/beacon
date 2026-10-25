@@ -12,7 +12,7 @@ class SettingsSearchTest {
         )
         for (query in listOf("proactive", "alerts", "watch", "What needs you")) assertTrue(matches("Assistant", query))
         assertTrue(matches("Voice & calls", "API key"))
-        assertTrue(matches("Devices", "pairing"))
+        assertTrue(matches("Devices", "linked"))
         assertEquals("Name and profile", settingsDescriptions.getValue("Assistant"))
         assertEquals("Voice provider and calls", settingsDescriptions.getValue("Voice & calls"))
         assertEquals("Connection", settingsRoute("Devices"))
@@ -33,7 +33,7 @@ class SettingsSearchTest {
         assertTrue(modelSearchMatches("provider", "model", "Configured model", " model "))
     }
     @Test fun connectionSearchFindsPairedDevices() {
-        assertTrue(settingsSearchMatches(settingsLabel("Connection"), settingsDescriptions.getValue("Connection"), "paired devices"))
+        assertTrue(settingsSearchMatches(settingsLabel("Connection"), settingsDescriptions.getValue("Connection"), "phones"))
     }
     @Test fun unicodeWhitespaceSeparatesSearchTerms() {
         val label = settingsLabel("Chat"); val description = settingsDescriptions.getValue("Chat")

@@ -32,19 +32,27 @@ internal fun boardMoveFields(status: String): JSONObject {
 }
 
 /** Same native Kanban records and workflow rules as the dashboard; no secondary board database. */
-internal class NativeBoards(private val client: BeaconClient) {
+internal const val KANBAN_BOARDS_KEY = "kanban:boards"
+internal fun kanbanBoardKey(board: String) = "kanban:board:$board"
+internal fun nativeBoardChoices(result: JSONObject): Pair<List<NativeBoardChoice>, String> = result.rows("boards").map { row ->
+    val slug = row.getString("slug"); require(validBoardSlug(slug)) { "Invalid board identity" }
+    NativeBoardChoice(slug, row.string("name", slug))
+} to result.string("current", "default")
+
+/** [keep] receives each parsed read so the next open can start from it. */
+internal class NativeBoards(private val client: BeaconClient, private val keep: (String, JSONObject) -> Unit = { _, _ -> }) {
     suspend fun choices(): Pair<List<NativeBoardChoice>, String> {
         val result = client.nativeGet("/api/plugins/kanban/boards", maxBytes = 1024 * 1024)
-        return result.rows("boards").map { row ->
-            val slug = row.getString("slug"); require(validBoardSlug(slug)) { "Invalid board identity" }
-            NativeBoardChoice(slug, row.string("name", slug))
-        } to result.string("current", "default")
+        return nativeBoardChoices(result).also { keep(KANBAN_BOARDS_KEY, result) }
     }
     private suspend fun request(board: String, path: String, method: String = "GET", data: JSONObject? = null): JSONObject {
         require(validBoardSlug(board)) { "Choose an available board" }
         return client.nativeGet("/api/plugins/kanban/$path", mapOf("board" to board), method, data, maxBytes = 8 * 1024 * 1024)
     }
-    suspend fun read(board: String): List<NativeBoardCard> = nativeBoardCards(request(board, "board"))
+    suspend fun read(board: String): List<NativeBoardCard> {
+        val document = request(board, "board")
+        return nativeBoardCards(document).also { keep(kanbanBoardKey(board), document) }
+    }
     suspend fun detail(board: String, id: String): NativeBoardCard = nativeBoardCard(request(board, taskPath(id)).getJSONObject("task"))
     suspend fun create(board: String, fields: JSONObject, key: String): NativeBoardCard {
         require(key.matches(Regex("[a-f0-9-]{36}"))) { "Invalid saved draft identity" }

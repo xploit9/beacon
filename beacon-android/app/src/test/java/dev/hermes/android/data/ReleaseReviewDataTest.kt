@@ -34,7 +34,7 @@ class ReleaseReviewDataTest {
                 routes += path
                 val plugin = path == "/api/plugins/beacon/mobile/files/text"
                 val result = when (path) {
-                    "/api/plugins/beacon/mobile/files/text" -> json("detail" to "Plugin pairing expired")
+                    "/api/plugins/beacon/mobile/files/text" -> json("detail" to "Plugin session expired")
                     "/api/fs/read-text" -> json("text" to fileText, "binary" to false, "truncated" to false)
                     "/api/fs/write-text" -> {
                         fileText = JSONObject(Buffer().also { request.body!!.writeTo(it) }.readUtf8()).getString("content")

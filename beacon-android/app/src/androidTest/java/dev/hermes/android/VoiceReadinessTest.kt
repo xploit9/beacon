@@ -22,10 +22,10 @@ class VoiceReadinessTest {
         val old = app.auth.read(origin)
         val source = "native-${UUID.randomUUID()}"
         val event = "ring-${UUID.randomUUID()}"
-        val auth = AuthContext(origin, emptyList(), "fixture-owner", "default", backend = "hermes-dashboard")
+        val auth = AuthContext(origin, emptyList(), "fixture-owner", "default", backend = "hermes-dashboard", nativeProvider = "fixture")
         val key = "source:${source.digest()}"
         val prefs = app.getSharedPreferences("push-binding", Context.MODE_PRIVATE)
-        val binding = json("source" to source, "origin" to origin, "owner" to auth.owner, "profile" to auth.profile, "backend" to "hermes-dashboard", "cookies" to org.json.JSONArray())
+        val binding = json("source" to source, "origin" to origin, "owner" to auth.owner, "profile" to auth.profile, "native_provider" to auth.nativeProvider, "backend" to "hermes-dashboard", "cookies" to org.json.JSONArray())
         val audio = app.getSystemService(AudioManager::class.java)
         val volume = audio.getStreamVolume(AudioManager.STREAM_RING)
         fun waitFor(condition: () -> Boolean) {

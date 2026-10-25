@@ -1,5 +1,7 @@
 package dev.hermes.android
 
+import android.content.Context
+import android.content.ContextWrapper
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -12,6 +14,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -25,6 +28,7 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.test.core.app.ApplicationProvider
 import dev.hermes.android.core.json
+import dev.hermes.android.data.VoiceKeyStore
 import dev.hermes.android.ui.*
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -32,10 +36,11 @@ import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
+import java.util.UUID
 
 /**
- * Local-fixture proof for the Settings overview. The stateless overview checks use fixed summaries; the navigation check
- * uses a real ViewModel with a blank origin, so it exercises routes without contacting Hermes.
+ * Local-fixture proof for the Settings overview. The stateless overview checks use fixed summaries; the navigation and
+ * storage checks use real ViewModels with a blank origin, so they exercise routes and summaries without contacting Hermes.
  * Phone and tablet widths come from a density override, so the layout rule is exercised on any device.
  * A node only counts once it has been scrolled into the viewport and asserted displayed: a lazy list can compose
  * nodes that are off screen, and existing there proves nothing about the user seeing or reaching them.
@@ -116,7 +121,7 @@ class SettingsMigrationUiTest {
         tap("Connection")
         assertEquals(listOf("Connection"), host.opened)
 
-        search("paired devices")
+        search("phones")
         compose.onNodeWithTag("settings-row:Connection").assertIsDisplayed()
         tapSearch("Connection")
         assertEquals(listOf("Connection", "Connection"), host.opened)
@@ -192,7 +197,7 @@ class SettingsMigrationUiTest {
         val host = show(widthDp = PhoneWidthDp, snapshot = null)
         shown("Appearance").assertTextContains("Theme and color style")
         shown("Chat").assertTextContains("Sending and display")
-        shown("Connection").assertTextContains("Server, signed-in account, and paired devices")
+        shown("Connection").assertTextContains("Server, signed-in account, and phones")
         compose.runOnIdle { host.snapshot = known }
         shown("Appearance").assertTextContains("Dark · Graphite")
         shown("Chat").assertTextContains("Ctrl + Enter to send · Thinking shown")
@@ -231,6 +236,74 @@ class SettingsMigrationUiTest {
         shown("Chat").assertTextContains("Enter to send")
         shown("Voice & calls").assertTextContains("Grok · Add key")
         assertTrue(host.opened.isEmpty())
+    }
+
+    @Test fun composedOverviewTracksLocalVoiceSelectionAndKeyChanges() {
+        val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
+        check(BuildConfig.DEBUG && app.packageName.endsWith(".debug")) { "Use an isolated debug install" }
+        val priorPreferences = runBlocking { app.preferences.data.first() }
+        val originKey = stringPreferencesKey("origin")
+        check(priorPreferences[originKey].isNullOrBlank()) { "Use a debug fixture without a saved connection" }
+        val prefix = "settings-voice-summary-${UUID.randomUUID()}"
+        val context = object : ContextWrapper(app) {
+            // SettingsHome uses the application context for both the listener and encrypted store.
+            override fun getApplicationContext(): Context = this
+            override fun getSharedPreferences(name: String, mode: Int) = super.getSharedPreferences("$prefix-$name", mode)
+        }
+        val voicePreferences = context.getSharedPreferences(VoiceKeyStore.PREFS, Context.MODE_PRIVATE)
+        val voiceStore = VoiceKeyStore(context)
+        val store = ViewModelStore()
+        var mounted by mutableStateOf(true)
+        fun summary(text: String) {
+            compose.waitUntil(5_000) {
+                compose.onAllNodes(hasTestTag("settings-row:Beacon") and hasText(text)).fetchSemanticsNodes().size == 1
+            }
+            shown("Voice & calls").assertTextContains(text)
+        }
+        try {
+            runBlocking { app.preferences.edit { it[originKey] = "" } }
+            voiceStore.setSelection(voiceStore.settings("gemini"))
+            voiceStore.saveKey("gemini", "synthetic-gemini-key")
+            val geminiCiphertext = voicePreferences.getString("key.gemini", null)
+            lateinit var vm: BeaconViewModel
+            compose.runOnUiThread {
+                vm = ViewModelProvider(store, viewModelFactory { initializer { BeaconViewModel(app, SavedStateHandle()) } })[BeaconViewModel::class.java]
+            }
+            compose.setContent {
+                BoxWithConstraints(Modifier.fillMaxSize()) {
+                    CompositionLocalProvider(LocalContext provides context, LocalDensity provides Density(constraints.maxWidth / TabletWidthDp, 1f)) {
+                        BeaconTheme(dark = true) {
+                            Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                                if (mounted) MoreScreen(vm)
+                            }
+                        }
+                    }
+                }
+            }
+            compose.waitUntil(5_000) { vm.ui.value.origin.isBlank() && !vm.ui.value.restoringSession }
+            compose.onNodeWithTag("settings-wide-list").assertIsDisplayed()
+            compose.onNodeWithTag("settings-wide-detail").assertIsDisplayed()
+            summary("Gemini Live · Key saved")
+            voiceStore.setSelection(voiceStore.settings("grok"))
+            summary("Grok · Add key")
+            voiceStore.saveKey("grok", "synthetic-grok-key")
+            summary("Grok · Key saved")
+            voiceStore.removeKey("grok")
+            summary("Grok · Add key")
+            voiceStore.setSelection(voiceStore.settings("gemini"))
+            summary("Gemini Live · Key saved")
+            assertEquals(geminiCiphertext, voicePreferences.getString("key.gemini", null))
+            assertFalse(voicePreferences.contains("key.grok"))
+        } finally {
+            try {
+                compose.runOnIdle { mounted = false }
+                compose.waitForIdle()
+            } finally {
+                compose.runOnUiThread { store.clear() }
+                runBlocking { app.preferences.updateData { priorPreferences } }
+                check(voicePreferences.edit().clear().commit())
+            }
+        }
     }
 
     @Test fun settingsPagesShowTheirTitleOnlyInTheTopBar() {

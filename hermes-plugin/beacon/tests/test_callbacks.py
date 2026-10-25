@@ -1,4 +1,4 @@
-import importlib.util,json,sys
+import importlib.util,json,re,sys
 from pathlib import Path
 from datetime import datetime,timedelta,timezone
 import threading
@@ -66,12 +66,72 @@ def test_deliver_once_and_expired_deferred(env):
     cb,m,n,cfg,jobs,tmp=env;cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
     with m.connect() as c: key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]
     due=NOW+timedelta(seconds=60)
-    assert cb.deliver(m,n,key,due)['status']=='pending'
+    delivered=cb.deliver(m,n,key,due)
+    assert delivered['status']=='pending'
     assert cb.deliver(m,n,key,due)['status']=='duplicate'
     with m.connect() as c: assert c.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==1
-    assert cb.deferred_allowed(m,key.split(':')[1],due) is True
-    assert cb.deferred_allowed(m,key.split(':')[1],due+timedelta(seconds=120)) is False
+    assert cb.deferred_allowed(m,delivered['event_id'],due) is True
+    assert cb.deferred_allowed(m,delivered['event_id'],due+timedelta(seconds=120)) is False
     assert cb.deferred_allowed(m,'other',due) is None
+
+@pytest.mark.parametrize('busy',[False,True])
+def test_scheduled_notice_id_is_android_compatible_and_delivery_retry_is_atomic(env,monkeypatch,busy):
+    cb,m,n,cfg,jobs,_=env
+    scheduled=cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
+    assert cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)==scheduled
+    assert len(jobs)==1
+    monkeypatch.setattr(m,'active_calls',lambda conn,owner:busy)
+    with m.connect() as c:
+        key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]
+        c.execute("""CREATE TRIGGER fail_callback_marker BEFORE UPDATE ON meta
+            WHEN NEW.key LIKE 'scheduled-callback:%' AND json_extract(CAST(NEW.value AS TEXT),'$.delivered') IS NOT NULL
+            BEGIN SELECT RAISE(ABORT,'fixture delivery marker failure'); END""")
+    due=datetime.fromisoformat(scheduled['scheduled_at'])
+    with pytest.raises(sqlite3.IntegrityError,match='fixture delivery marker failure'):
+        cb.deliver(m,n,key,due)
+    with m.connect() as c:
+        assert not json.loads(c.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()[0]).get('delivered')
+        for table in ('notices','deferred','call_log'):
+            assert c.execute('SELECT COUNT(*) FROM '+table).fetchone()[0]==0
+        c.execute('DROP TRIGGER fail_callback_marker')
+    delivered=cb.deliver(m,n,key,due)
+    event=delivered['event_id']
+    assert delivered['status']=='pending' and re.fullmatch(r'[0-9a-f]{32}',event)
+    assert event==key.split(':')[1][:32] and len(key.split(':')[1])==64
+    assert cb.deliver(m,n,key,due+timedelta(seconds=1))['status']=='duplicate'
+    assert cb.deferred_allowed(m,event,due) is True
+    with m.connect() as c:
+        assert json.loads(c.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()[0])['delivered']==event
+        table='deferred' if busy else 'notices'
+        assert [row['id'] for row in c.execute('SELECT id FROM '+table)]==[event]
+        assert [row['id'] for row in c.execute('SELECT id FROM call_log')]==([] if busy else [event])
+
+def test_deferred_scheduled_notice_keeps_its_expiry_marker_until_settled(env,monkeypatch):
+    cb,m,n,cfg,_,_=env
+    cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
+    with m.connect() as c:key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]
+    monkeypatch.setattr(m,'active_calls',lambda conn,owner:True)
+    due=NOW+timedelta(seconds=60)
+    event=cb.deliver(m,n,key,due)['event_id']
+    assert re.fullmatch(r'[0-9a-f]{32}',event)
+    expired=due+timedelta(seconds=cb.CALLBACK_MARKER_RETENTION_SECONDS+2)
+    cb.prune_expired(m,n,'owner',expired.timestamp())
+    with m.connect() as c:
+        assert c.execute('SELECT 1 FROM meta WHERE key=?',(key,)).fetchone()
+        assert c.execute('SELECT 1 FROM deferred WHERE id=?',(event,)).fetchone()
+    assert cb.deferred_allowed(m,event,expired,'owner') is False
+    assert cb.missed_reason(m,event,expired,'owner','default')==VALUE['reason']
+    assert cb.missed_reason(m,event,expired,'foreign','default') is None
+    assert cb.missed_reason(m,event,expired,'owner','foreign') is None
+    assert cb.deferred_allowed(m,'f'*32,expired) is None
+    with m.connect() as c:
+        c.execute('DELETE FROM deferred WHERE id=?',(event,))
+        c.execute('INSERT INTO meta(key,value) VALUES(?,?)',('missed-callback:'+event,b'0'))
+    cb.prune_expired(m,n,'owner',(expired+timedelta(hours=1)).timestamp())
+    with m.connect() as c:
+        assert c.execute('SELECT 1 FROM meta WHERE key=?',(key,)).fetchone() is None
+        assert c.execute('SELECT 1 FROM meta WHERE key=?',('missed-callback:'+event,)).fetchone() is None
+
 def test_stale_or_changed_authority_does_not_ring(env):
     cb,m,n,cfg,jobs,tmp=env;cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
     with m.connect() as c:key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]
@@ -95,6 +155,7 @@ def test_expired_callback_replay_is_rejected_before_and_after_marker_pruning(env
         c.execute('UPDATE meta SET value=? WHERE key=?',(json.dumps(record).encode(),key))
     assert cb.deliver(m,n,key,expiry)['status']=='skipped_expired'
     assert cb.deferred_allowed(m,event,expiry) is False
+    assert cb.missed_reason(m,event,expiry,'owner','default')==VALUE['reason']
     with pytest.raises(ValueError):cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,expiry)
     margin=expiry+timedelta(days=7)
     cb.schedule(m,n,'owner','basic',ROW,cfg,{**VALUE,'request_id':'before-prune'},margin-timedelta(seconds=1))
@@ -280,7 +341,7 @@ def test_native_save_acknowledgment_excludes_a_concurrent_cron_writer(env,monkey
         record=json.loads(c.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()[0])
         notices=[dict(row) for row in c.execute('SELECT * FROM notices')]
     assert record['status']==('scheduled' if elapsed==60 else 'missed')
-    assert record.get('delivered')==(key.split(':')[1] if elapsed==60 else None)
+    assert record.get('delivered')==(key.split(':')[1][:32] if elapsed==60 else None)
     assert [(row['kind'],row['owner'],row['profile'],row['conversation']) for row in notices]==[(kind,'owner','default','owned')]
 
 

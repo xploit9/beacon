@@ -62,7 +62,7 @@ def _page(mobile, owner, profile, limit, before):
         mobile.prune_notices(conn)
         calls = query(
             'calls c',
-            "c.id,c.conversation,c.created,c.ended,c.closed,c.status,c.voice_config,"
+            "c.id,c.conversation,c.created,c.ended,c.closed,c.status,c.voice_config,c.receipt,"
             "COALESCE(NULLIF(c.callback_context,'{}'),(SELECT json_object('id',n.id,'reason',n.reason) "
             "FROM notices n WHERE n.call_id=c.id AND n.owner=c.owner AND n.profile=c.profile "
             "AND n.state='answered' ORDER BY n.created DESC LIMIT 1),'{}') AS callback_context,"
@@ -89,6 +89,7 @@ def _page(mobile, owner, profile, limit, before):
             continue
         callback = _stored_object(row['callback_context'])
         voice = _stored_object(row['voice_config'])
+        failed = row['status'] == 'failed' or _stored_object(row['receipt']).get('failed') is True
         try:
             ended = float(row['ended']) if row['ended'] is not None else None
             duration = max(0, int(ended - created)) if ended is not None and math.isfinite(ended) else None
@@ -98,7 +99,7 @@ def _page(mobile, owner, profile, limit, before):
             '_created': created,
             'id': row['id'],
             'direction': 'incoming' if callback.get('id') else 'outgoing',
-            'state': 'active' if not row['closed'] else 'failed' if row['status'] == 'failed' else 'completed',
+            'state': 'active' if not row['closed'] else 'failed' if failed else 'completed',
             'started_at': int(created),
             'duration_s': duration,
             'provider': voice.get('provider') if isinstance(voice.get('provider'), str) else None,

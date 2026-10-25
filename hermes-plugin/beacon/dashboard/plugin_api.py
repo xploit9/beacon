@@ -17,6 +17,7 @@ import re
 import sys
 import subprocess
 import time
+from urllib.parse import urlsplit
 import uuid
 from fastapi import APIRouter,HTTPException,Request
 from fastapi.responses import JSONResponse
@@ -77,10 +78,18 @@ def enforce_request_policy(request):
         raise HTTPException(403,'Cross-site requests are not allowed')
     method=request.method.upper()
     if method=='GET': return
+    # A browser without Fetch Metadata still sends Origin on every cross-origin write.
+    origin=request.headers.get('origin')
+    if site is None and origin is not None:
+        try: netloc=urlsplit(origin).netloc.casefold()
+        except ValueError: netloc=''
+        same_origin=bool(netloc) and netloc==request.headers.get('host','').strip().casefold()
+        if not same_origin: raise HTTPException(403,'Cross-site requests are not allowed')
     content_type=request.headers.get('content-type')
     has_body=(request.headers.get('content-length') not in (None,'0')
               or request.headers.get('transfer-encoding') is not None)
-    if not has_body: return
+    # An empty HTML form post still declares a form content type, so a declared type is checked without a body too.
+    if not has_body and not content_type: return
     if not content_type or content_type.split(';',1)[0].strip().casefold()!='application/json':
         raise HTTPException(415,'JSON content type required')
 def dashboard_identity(request,allow_loopback=False,browser_only=False):
@@ -179,11 +188,7 @@ async def connect_info(request:Request):
     if not loopback: dashboard_identity(request,browser_only=True)
     identity(request,owner_only=True,allow_loopback=loopback)
     url,name=connect_info_url()
-    result={'url':url,'name':name}
-    if loopback:
-        from hermes_cli.web_server import _SESSION_TOKEN
-        result['session']=_SESSION_TOKEN
-    return JSONResponse(result,headers={'Cache-Control':'no-store'})
+    return JSONResponse({'url':url,'name':name},headers={'Cache-Control':'no-store'})
 
 @router.post('/owner/claim')
 async def claim_owner(request:Request):
@@ -201,35 +206,15 @@ async def claim_owner(request:Request):
         raise HTTPException(409,'Beacon owner already configured')
     return {'claimed':True}
 
-@router.post('/pairing')
-async def mint_pairing(request:Request):
-    value=await body(request,2048)
-    if set(value)-{'profile','name'}: raise HTTPException(400,'Invalid pairing fields')
-    owner,_,profile,_=identity(request,value.get('profile'))
-    dashboard_url,dashboard_name=connect_info_url()
-    try: result=mobile.mint_device_pairing(owner,profile,value.get('name'),dashboard_url,dashboard_name)
-    except ValueError as exc: raise HTTPException(400,str(exc)) from None
-    return JSONResponse(result,headers={'Cache-Control':'no-store'})
-
-@router.post('/pairing/redeem')
-async def redeem_pairing(request:Request):
-    identity(request,owner_only=True)
-    value=await body(request,2048)
-    if set(value)!={'code','device_name'}: raise HTTPException(400,'Invalid pairing fields')
-    client_host=request.client.host if request.client else 'unknown'
-    try: result=mobile.redeem_device_pairing(value.get('code'),value.get('device_name'),client_host)
-    except mobile.PairingRateLimitError as exc: raise HTTPException(429,str(exc)) from None
-    except ValueError as exc: raise HTTPException(400,str(exc)) from None
-    return JSONResponse(result,headers={'Cache-Control':'no-store'})
-
 @router.post('/devices/link')
 async def link_device(request:Request):
+    owner,provider,_,cfg=identity(request,owner_only=True,allow_loopback=not bool(getattr(request.app.state,'auth_required',False)))
     value=await body(request,2048)
-    if set(value)!={'device_id','link_ticket'}: raise HTTPException(400,'Invalid device link fields')
-    owner,provider,_,cfg=identity(request,owner_only=True)
-    result=mobile.link_paired_device(value.get('device_id'),value.get('link_ticket'),owner,provider,cfg['profiles'])
-    if result is None: raise HTTPException(400,'That device link could not be completed.')
-    return JSONResponse(result,headers={'Cache-Control':'no-store'})
+    if set(value)-{'device_name','device_id'}: raise HTTPException(400,'Invalid device link fields')
+    try: result=await asyncio.to_thread(mobile.link_device,owner,provider,value.get('device_name'),value.get('device_id'))
+    except mobile.DeviceLimitError as exc: raise HTTPException(409,str(exc)) from None
+    except ValueError as exc: raise HTTPException(400,str(exc)) from None
+    return JSONResponse({**result,'profiles':cfg['profiles']},headers={'Cache-Control':'no-store'})
 
 @router.get('/devices')
 async def devices(request:Request):
@@ -343,10 +328,10 @@ async def auto_update_settings(request:Request):
     return JSONResponse(await asyncio.to_thread(mobile.auto_update_settings,owner),headers={'Cache-Control':'no-store'})
 @router.put('/mobile/update-settings')
 async def save_auto_update_settings(request:Request):
+    # shortcut: 1.1.x phones still send their automatic-update switch here; the plugin never installs itself, so it only answers "off". Drop in 1.1.3, once the owner's phones run 1.1.2.
     owner,_,_,_=identity(request,owner_only=True);value=await body(request,1024)
-    enabled=value.get('enabled')
-    if set(value)!={'enabled'} or type(enabled) is not bool: raise HTTPException(400,'Choose whether Beacon updates the plugin automatically')
-    return JSONResponse(await asyncio.to_thread(mobile.set_auto_plugin_updates,owner,enabled),headers={'Cache-Control':'no-store'})
+    if set(value)!={'enabled'} or type(value['enabled']) is not bool: raise HTTPException(400,'Choose whether Beacon updates the plugin automatically')
+    return JSONResponse(await asyncio.to_thread(mobile.auto_update_settings,owner),headers={'Cache-Control':'no-store'})
 @router.put('/mobile/voice-settings')
 async def save_voice_settings(request:Request):
     owner,_,profile,cfg=identity(request);value=await body(request,1024)
@@ -384,10 +369,19 @@ async def get_call(call_id:str,request:Request):
 @router.delete('/mobile/calls/{call_id}')
 async def close_call(call_id:str,request:Request):
     owner,provider,row,cfg=await call(request,call_id)
+    value=await body(request,2048)
+    if set(value)-{'failed'} or type(value.get('failed',False)) is not bool:
+        raise HTTPException(400,'Invalid call failure flag')
     ended=time.time()
-    with mobile.LOCK,mobile.connect() as conn: conn.execute('UPDATE calls SET closed=1,ended=COALESCE(ended,?) WHERE id=? AND owner=? AND profile=?',(ended,call_id,owner,row['profile']))
+    with mobile.LOCK,mobile.connect() as conn:
+        row=mobile.owned(conn,call_id,owner)
+        receipt=json.loads(row['receipt'])
+        if value.get('failed'): receipt['failed']=True
+        row['receipt']=json.dumps(receipt)
+        conn.execute('UPDATE calls SET closed=1,ended=COALESCE(ended,?),receipt=? WHERE id=? AND owner=? AND profile=?',
+                     (ended,row['receipt'],call_id,owner,row['profile']))
     await asyncio.to_thread(watch,owner,provider,row['profile'])
-    row['closed']=1
+    row['closed']=1;row['ended']=row['ended'] or ended
     clear_lookup_counts(call_id)
     return mobile.status(row)
 @router.post('/mobile/calls/{call_id}/audio')
@@ -728,6 +722,7 @@ async def notice_detail(event_id:str,request:Request):
             try: source=proactive.source_name(json.loads(source_row[0]).get('source')).title() if source_row else ''
             except (AttributeError,TypeError,ValueError): source=''
             result.update(email_alert=True,preview={'title':'Important from '+source if source else 'Important update','body':result['preview']['body']})
+        # shortcut: no code writes phone-hermes- ids since a9492d0, but older rows live up to 86400 s; remove once every install is past that.
         elif phone_job.startswith('phone-hermes-'):
             result['preview']={'title':'Hermes','body':result['preview']['body']}
     if row['request_id'] and result['state']=='pending':
@@ -1079,10 +1074,13 @@ def _atomic_write(destination,content,immutable=False):
         except FileNotFoundError: pass
 
 def _plugin_version_tuple(value):
-    match=re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)',value) if isinstance(value,str) else None
+    # Parts stay short so a recorded version is never cut by the 64-character status field.
+    match=re.fullmatch(r'(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})',value) if isinstance(value,str) else None
     return tuple(int(part) for part in match.groups()) if match else None
 
-def _check_github_release(cfg,before_apk=None):
+# shortcut: this GitHub check and APK staging serve only the installed 1.1.x phones, which install from Hermes' feed;
+# remove them and announce_release in 1.1.3, once the owner's phones run 1.1.2.
+def _check_github_release(cfg):
     global _RELEASE_CACHE_KEY,_RELEASE_CACHE_VALUE
     repo=_safe_release_repo(cfg)
     gh=shutil.which('gh')
@@ -1129,7 +1127,6 @@ def _check_github_release(cfg,before_apk=None):
                 or not isinstance(data.get('sha256'),str) or not re.fullmatch(r'[a-f0-9]{64}',data['sha256'])
                 or not isinstance(data.get('certificate_sha256'),str) or not re.fullmatch(r'[a-fA-F0-9]{64}',data['certificate_sha256'])):
             raise ReleaseCheckError('The GitHub release metadata does not describe a stable Beacon APK.')
-        if before_apk: before_apk(data['version_name'],plugin_version)
         digest=data['sha256']
         previous=None
         try: previous=release(cfg,optional=True,package=_STABLE_PACKAGE)
@@ -1185,9 +1182,9 @@ def _check_github_release(cfg,before_apk=None):
                 except OSError: pass
         return {'version_name':verified['version_name'],'version_code':verified['version_code'],'plugin_version':plugin_version,'available':True}
 
-def _check_release_and_announce(cfg,before_apk=None):
+def _check_release_and_announce(cfg):
     with _RELEASE_CHECK_LOCK:
-        checked=_check_github_release(cfg,before_apk)
+        checked=_check_github_release(cfg)
         if checked.get('available'): announce_release(cfg,package=_STABLE_PACKAGE)
         return checked
 
@@ -1201,50 +1198,8 @@ async def check_release_updates(request:Request):
 def _installed_plugin_version():
     return _read_plugin_version(ROOT/'plugin.yaml')
 
-def _hermes_busy(owner):
-    try:
-        from gateway.status import get_running_pid,read_runtime_status
-        from hermes_cli.web_server_idle_exit import busy_ledger
-        # A stopped gateway runs nothing; only a live one's state can hold work.
-        if get_running_pid() is not None:
-            runtime=read_runtime_status() or {}
-            if (type(runtime.get('active_agents')) is not int or runtime['active_agents']>0 or runtime.get('active_work')
-                  or runtime.get('gateway_state') not in ('running','degraded')): return True
-        # Dashboard chat turns, delegations and cron runs; None means a ledger was unreadable.
-        if busy_ledger()!='': return True
-        with mobile.connect() as conn:
-            return mobile.active_calls(conn,owner)>0
-    except Exception:
-        return True
-
-def _update_beacon_plugin():
-    from hermes_cli.plugins_cmd import dashboard_update_user_plugin
-    from hermes_cli.web_server_profiles import _config_profile_scope
-    # Hermes' own update route uses this scope; unscoped, a multi-profile Hermes raises UnscopedSecretError.
-    with _config_profile_scope(None):
-        return dashboard_update_user_plugin('beacon')
-
-def _auto_update_plugin(owner,checked_at,app_version,plugin_version):
-    if not mobile.auto_update_settings(owner)['enabled']:
-        return mobile.record_auto_update_status(owner,checked_at,'plugin_update_available',app_version,plugin_version,'Plugin update available.')
-    if _hermes_busy(owner):
-        state=mobile.record_auto_update_status(owner,checked_at,'waiting_for_idle',app_version,plugin_version,'Plugin update waits until Hermes is idle.')
-        return {**state,'_deferred':True}
-    update=_update_beacon_plugin()
-    if update.get('consent_required'):
-        return mobile.record_auto_update_status(owner,checked_at,'consent_required',app_version,plugin_version,'Review plugin capability changes in Settings.')
-    if not update.get('ok'):
-        return mobile.record_auto_update_status(owner,checked_at,'error',app_version,plugin_version,'Could not update the Beacon plugin. Try again later.')
-    installed=_plugin_version_tuple(_installed_plugin_version())
-    latest=_plugin_version_tuple(plugin_version)
-    if installed is None or latest is None or installed<latest:
-        return mobile.record_auto_update_status(owner,checked_at,'error',app_version,plugin_version,'The updated plugin version could not be confirmed.')
-    # Git and subfolder installs never report restart_required; this process still runs the old code.
-    if update.get('restart_required') or _RUNNING_PLUGIN_VERSION!=_installed_plugin_version():
-        return mobile.record_auto_update_status(owner,checked_at,'restart_required',app_version,plugin_version,'Restart Hermes to finish the plugin update.')
-    return mobile.record_auto_update_status(owner,checked_at,'plugin_updated',app_version,plugin_version,'Beacon plugin updated.')
-
 def auto_update_check(cfg,now=None):
+    # The plugin never installs itself: it records an available update and the owner installs it with Hermes' updater.
     owner=cfg.get('owner_id')
     if not owner or not cfg.get('owner_provider'): return None
     if not _AUTO_UPDATE_LOCK.acquire(blocking=False): return {'result':'in_progress'}
@@ -1252,46 +1207,35 @@ def auto_update_check(cfg,now=None):
         now=time.time() if now is None else now
         current_state=mobile.auto_update_settings(owner)
         last=current_state.get('checked_at',0)
-        if type(last) in (int,float) and last and now>=last and now-last<mobile.AUTO_UPDATE_INTERVAL_SECONDS:
-            pending_version=_plugin_version_tuple(current_state.get('plugin_version',''))
-            installed_version=_plugin_version_tuple(_installed_plugin_version())
-            if current_state.get('result')=='waiting_for_idle' and pending_version and installed_version and pending_version>installed_version:
-                try: return _auto_update_plugin(owner,last,current_state.get('app_version',''),current_state.get('plugin_version',''))
-                except Exception: return mobile.record_auto_update_status(owner,last,'error',current_state.get('app_version',''),current_state.get('plugin_version',''),'Could not update the Beacon plugin. Try again later.')
-            if current_state.get('result')=='restart_required' and _RUNNING_PLUGIN_VERSION==_installed_plugin_version():
-                return mobile.record_auto_update_status(owner,now,'plugin_updated',current_state.get('app_version',''),current_state.get('plugin_version',''),'Beacon plugin updated.')
+        state=current_state.get('result')
+        if type(last) in (int,float) and last and now>=last and now-last<mobile.AUTO_UPDATE_INTERVAL_SECONDS and state in mobile.AUTO_UPDATE_RESULTS:
+            pending=_plugin_version_tuple(current_state.get('plugin_version',''))
+            installed_version=_installed_plugin_version()
+            installed=_plugin_version_tuple(installed_version)
+            # The owner may have updated in Hermes since the last check.
+            if state in ('plugin_update_available','restart_required') and pending and installed and installed>=pending:
+                if _RUNNING_PLUGIN_VERSION==installed_version:
+                    return mobile.record_auto_update_status(owner,last,'plugin_updated',current_state.get('app_version',''),current_state.get('plugin_version',''),'Beacon plugin updated.')
+                if state=='plugin_update_available':
+                    return mobile.record_auto_update_status(owner,last,'restart_required',current_state.get('app_version',''),current_state.get('plugin_version',''),'Restart Hermes to finish the plugin update.')
             return {**current_state,'result':'throttled'}
         mobile.record_auto_update_status(owner,now,'checking',current_state.get('app_version',''),current_state.get('plugin_version',''),'Checking for updates.')
-        plugin_update=[]
-        def update_plugin_before_apk(app_version,plugin_version):
-            latest=_plugin_version_tuple(plugin_version)
-            installed=_plugin_version_tuple(_installed_plugin_version())
-            if latest is None or installed is None or latest<=installed: return
-            try: plugin_update.append(_auto_update_plugin(owner,now,app_version,plugin_version))
-            except Exception:
-                plugin_update.append(mobile.record_auto_update_status(owner,now,'error',app_version,plugin_version,'Could not update the Beacon plugin. Try again later.'))
         try:
-            release_info=_check_release_and_announce(cfg,before_apk=update_plugin_before_apk)
-            if plugin_update: return plugin_update[-1]
+            release_info=_check_release_and_announce(cfg)
             app_version=release_info.get('version_name','')
             plugin_version=release_info.get('plugin_version','')
             installed_version=_installed_plugin_version()
             latest=_plugin_version_tuple(plugin_version)
             installed=_plugin_version_tuple(installed_version)
             if latest is None or installed is None: raise ReleaseCheckError('The Beacon plugin version is unavailable.')
-            result='app_staged' if release_info.get('available') else 'up_to_date'
-            message='A stable app update is ready.' if release_info.get('available') else 'Up to date.'
             if latest>installed:
-                return _auto_update_plugin(owner,now,app_version,plugin_version)
+                return mobile.record_auto_update_status(owner,now,'plugin_update_available',app_version,plugin_version,'Plugin update available.')
             # An installed update this process has not loaded yet still needs a restart, even when nothing newer exists.
             if _RUNNING_PLUGIN_VERSION!=installed_version:
                 return mobile.record_auto_update_status(owner,now,'restart_required',app_version,plugin_version,'Restart Hermes to finish the plugin update.')
-            return mobile.record_auto_update_status(owner,now,result,app_version,plugin_version,message)
-        except ReleaseCheckError:
-            if plugin_update: return plugin_update[-1]
-            return mobile.record_auto_update_status(owner,now,'error',message='Could not check for updates. Try again later.')
+            staged=bool(release_info.get('available'))
+            return mobile.record_auto_update_status(owner,now,'app_staged' if staged else 'up_to_date',app_version,plugin_version,'A stable app update is ready.' if staged else 'Up to date.')
         except Exception:
-            if plugin_update: return plugin_update[-1]
             return mobile.record_auto_update_status(owner,now,'error',message='Could not check for updates. Try again later.')
     finally: _AUTO_UPDATE_LOCK.release()
 
@@ -1326,9 +1270,7 @@ async def start_watcher():
                     owner=(cfg['owner_id'],cfg['owner_provider'])
                     if owner!=auto_owner: auto_owner=owner;auto_not_before=0
                     if auto_task is not None and auto_task.done():
-                        try: outcome=auto_task.result()
-                        except Exception: outcome=None
-                        auto_task=None;auto_not_before=time.time()+(60 if outcome and outcome.get('_deferred') else mobile.AUTO_UPDATE_INTERVAL_SECONDS)
+                        auto_task=None;auto_not_before=time.time()+mobile.AUTO_UPDATE_INTERVAL_SECONDS
                     if auto_task is None and time.time()>=auto_not_before:
                         async def run_auto_update(snapshot):
                             try: return await asyncio.to_thread(auto_update_check,snapshot)

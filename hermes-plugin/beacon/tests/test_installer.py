@@ -52,9 +52,6 @@ elif len(args) >= 3 and args[:2] == ["plugins", "install"]:
     print("fake plugin installed")
 elif args == ["plugins", "update", "beacon"]:
     print("fake plugin updated")
-elif len(args) >= 2 and args[:2] == ["beacon", "pair"]:
-    # Real Hermes reroutes plugin stdout to stderr once its gateway module loads.
-    print("Dashboard: https://beacon.example.test\nPairing code: ABC-723\nexpires in 10 min", file=sys.stderr)
 elif args == ["dashboard", "--stop"]:
     print("fake dashboard stopped")
 else:
@@ -175,13 +172,19 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(any(args[:2] == ["plugins", "install"] for _, args in self.commands()))
         self.assertIn(["plugins", "update", "beacon"], [args for _, args in self.commands()])
 
-    def test_pair_block_is_printed(self) -> None:
-        result = self.run_installer("--home", str(self.home), "--profile", "default", input_text="\n")
+    def test_the_link_to_paste_is_printed_and_nothing_is_paired(self) -> None:
+        result = self.run_installer("--home", str(self.home), "--profile", "default")
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        self.assertIn("Dashboard: https://beacon.example.test", result.stdout)
-        self.assertIn("Pairing code: ABC-723", result.stdout)
-        self.assertIn("expires in 10 min", result.stdout)
-        self.assertIn(["beacon", "pair", "--name", "My phone"], [args for _, args in self.commands()])
+        self.assertIn("Paste this link into Beacon: https://beacon.example.test", result.stdout)
+        self.assertNotIn("Pairing", result.stdout)
+        self.assertFalse(any(args[:1] == ["beacon"] for _, args in self.commands()))
+
+    def test_without_a_public_https_url_no_link_is_printed(self) -> None:
+        self.write_state(public_url="")
+        result = self.run_installer("--home", str(self.home), "--profile", "default")
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertNotIn("Paste this link", result.stdout)
+        self.assertIn("Beacon can't connect a phone", result.stdout)
 
     def test_failed_scheduled_task_falls_back_to_a_detached_dashboard(self) -> None:
         spec = importlib.util.spec_from_file_location("beacon_install_under_test", INSTALLER)
@@ -215,7 +218,7 @@ class InstallerTests(unittest.TestCase):
         after = sorted((str(path.relative_to(self.home)), path.read_bytes() if path.is_file() else None)
                        for path in self.home.rglob("*"))
         self.assertEqual(after, before)
-        mutating = (["plugins", "install"], ["plugins", "update"], ["beacon", "pair"], ["dashboard", "--stop"])
+        mutating = (["plugins", "install"], ["plugins", "update"], ["dashboard", "--stop"])
         self.assertFalse(any(args[:2] in mutating for _, args in self.commands()))
 
 
@@ -415,6 +418,15 @@ def test_successful_manifest_does_not_hide_an_unchanged_dashboard_process(instal
     monkeypatch.setattr(installer, '_dashboard_pids', lambda *args: current)
     assert installer._wait_for_beacon_route(9119, None, None, seconds=1, profile='work',
         hermes='hermes', home=tmp_path, previous_pids={10}) is ready
+
+
+def test_agent_guide_points_at_the_installer():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    guide = (ROOT / "docs" / "install-with-agent.md").read_text(encoding="utf-8")
+    assert "raw.githubusercontent.com/xploit9/beacon/main/hermes-plugin/beacon/install/beacon_install.py" in readme
+    assert INSTALLER.is_file()
+    for phrase in ("plugins install xploit9/beacon/hermes-plugin/beacon --enable", "--dry-run"):
+        assert phrase in guide, phrase
 
 
 if __name__ == "__main__":

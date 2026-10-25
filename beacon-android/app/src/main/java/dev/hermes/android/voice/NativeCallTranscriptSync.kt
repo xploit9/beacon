@@ -7,11 +7,12 @@ import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicLong
 
 /** Text and call events synchronize without retaining microphone or playback audio. */
-internal class NativeCallTranscriptSync(private val request:suspend (String,String,JSONObject?)->JSONObject,callId:String,scope:CoroutineScope,private val status:(String)->Unit) {
+internal class NativeCallTranscriptSync(private val request:suspend (String,String,JSONObject?)->JSONObject,private val callId:String,scope:CoroutineScope,private val status:(String)->Unit) {
     private val path="/api/plugins/beacon/mobile/calls/$callId"
     private val pending=Channel<Pair<String,JSONObject>>(48)
     private val important=Channel<Pair<String,JSONObject>>(16)
     private val partialTranscripts=linkedMapOf<String,JSONObject>()
+    private val identitySuffix=Regex("[A-Za-z0-9_-]{1,160}")
     private val statuses=Channel<String>(Channel.CONFLATED)
     private val backgroundJob=SupervisorJob(scope.coroutineContext[Job])
     private val background=CoroutineScope(scope.coroutineContext+backgroundJob+Dispatchers.IO)
@@ -59,6 +60,7 @@ internal class NativeCallTranscriptSync(private val request:suspend (String,Stri
         if(!accepting) return
         val eventId=java.util.UUID.nameUUIDFromBytes((value.optString("event_id")+":"+eventSequence.incrementAndGet()).toByteArray(Charsets.UTF_8)).toString()
         val copy=JSONObject(value.toString()).put("event_id",eventId)
+        copy.remove("display_event_id")
         if(copy.optString("type")=="interrupted") copy.put("type","interruption")
         val text=copy.optString("text")
         if(text.length>8192) {
@@ -66,7 +68,15 @@ internal class NativeCallTranscriptSync(private val request:suspend (String,Stri
             copy.put("text",text.take(end));gap=true;report("partial")
         }
         if(copy.optString("type")=="transcript") {
-            val key=copy.optString("role")+":"+copy.optString("turn_id")
+            val role=copy.optString("role");val prefix="$callId:$role:"
+            val displayId=value.optString("event_id")
+            // Display items survive delivery UUIDs; only this call's role-bound text identity is eligible.
+            if(value.opt("event_id") is String&&role in setOf("user","assistant")&&displayId.length<=256&&
+                displayId.startsWith(prefix)&&identitySuffix.matches(displayId.removePrefix(prefix))) copy.put("display_event_id",displayId)
+            copy.remove("provider_item");copy.remove("content_index")
+            val key=copy.optString("display_event_id").ifBlank { prefix+copy.optString("turn_id") }
+            // Coalesced snapshots keep the time of the first caption that was held back.
+            partialTranscripts[key]?.opt("at_ms")?.let { copy.put("at_ms",it) }
             if(!copy.optBoolean("final")&&!copy.optBoolean("interrupted")) {
                 partialTranscripts[key]=copy
                 if(partialTranscripts.size>16) { partialTranscripts.remove(partialTranscripts.keys.first());gap=true;report("partial") }
@@ -77,7 +87,7 @@ internal class NativeCallTranscriptSync(private val request:suspend (String,Stri
         val queue=if(copy.optString("type")=="media_diagnostic") pending else important
         if(!queue.trySend("events" to JSONObject().put("events",JSONArray().put(copy))).isSuccess) { gap=true;report("partial") }
     }
-    suspend fun finish():Boolean {
+    suspend fun finish(failed:Boolean=false):Boolean {
         val first=synchronized(this) {
             if(!accepting) false else {
                 accepting=false
@@ -92,7 +102,7 @@ internal class NativeCallTranscriptSync(private val request:suspend (String,Stri
         if(!first) return finalized.await()
         try {
             if(withTimeoutOrNull(15000) { workers.joinAll();true }!=true) { gap=true;workers.forEach { it.cancel() } }
-            val receipt=requestReceipt("finalize",JSONObject().put("incomplete",gap),15000)
+            val receipt=requestReceipt("finalize",JSONObject().put("incomplete",gap).put("failed",failed),15000)
             val state=receipt?.optString("transcript_status","finalizing")?:"unavailable"
             val closed=receipt?.optBoolean("closed")==true||receipt?.optString("status")=="closed"
             report(if(gap) "partial" else if(!closed&&state=="saved") "finalizing" else state)

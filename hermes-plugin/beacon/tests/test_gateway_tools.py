@@ -136,6 +136,21 @@ def test_unknown_effect_requires_server_proposal_and_explicit_decision(gateway):
     assert settled(api)['status']=='completed' and len(backend.calls)==1 and backend.calls[0][2] is True
 
 
+def test_a_read_only_tool_sending_a_body_or_a_write_method_still_needs_approval(gateway):
+    api,backend,_=gateway
+    backend.catalog=lambda discover=True:[{'tool_id':'a'*64,'name':'configured_fetch','description':'fetch a page',
+        'parameters':{'type':'object','properties':{'query':{'type':'string'},'body':{'type':'string'},
+                      'http_method':{'type':'string','enum':['GET','HEAD','DELETE']}},'additionalProperties':False},
+        'read_only':True}]
+    def call(request,**extra):
+        return api.invoke(SCOPE,{'request_id':request,'tool_id':'a'*64,'arguments':{'query':'weather',**extra}})
+    call('r1',http_method='GET')
+    assert settled(api,'r1')['status']=='completed'
+    assert call('r2',http_method='GET',body='x')['status']=='needs_approval'
+    assert call('r3',http_method='DELETE')['status']=='needs_approval'
+    assert len(backend.calls)==1
+
+
 def test_deny_expiry_and_reconfiguration_never_execute(gateway):
     api,backend,_=gateway;backend.read_only=False
     proposal=invoke(api)
@@ -314,6 +329,38 @@ def test_native_trust_gate_uses_receipt_once_and_denies_server_elicitation(tmp_p
     assert outcomes[0] is None and outcomes[1]=='decline' and outcomes[2] is not None
     outcomes.clear();g.NativeMcp().execute(tool,{},SCOPE,False)
     assert outcomes[0] is not None
+
+
+@pytest.mark.parametrize('prompt_kind',['arguments','budget','trusted_budget','changed_text'])
+@pytest.mark.parametrize('approved',[True,False])
+def test_changed_native_mcp_consent_stays_denied_and_explains_native_approval(tmp_path,monkeypatch,prompt_kind,approved):
+    monkeypatch.syspath_prepend(str(_hermes_agent_source()))
+    monkeypatch.setenv('HERMES_HOME',str(tmp_path))
+    from tools import approval
+    pending={};choices=[];calls=[]
+    monkeypatch.setattr(approval,'register_gateway_notify',lambda key,callback:pending.update(callback=callback))
+    monkeypatch.setattr(approval,'unregister_gateway_notify',lambda key:pending.clear())
+    monkeypatch.setattr(approval,'resolve_gateway_approval',lambda key,choice,**kwargs:choices.append((choice,kwargs['request_id'])))
+    expected="MCP tool 'write' on UNTRUSTED server 'isolated' wants to run. This tool is write-capable (no readOnlyHint=true annotation) and may modify external state."
+    prompts={
+        'arguments':expected+'\n\nArguments:\n{"message": "fixture"}',
+        'budget':"MCP tool 'write' on UNTRUSTED server 'isolated' wants to run. This call goes past the chat's spend limit. This tool is write-capable (no readOnlyHint=true annotation) and may modify external state.",
+        'trusted_budget':"MCP tool 'write' on server 'isolated' would take this chat past its spend limit.",
+        'changed_text':expected+' ',
+    }
+    def handler(name,args,**kwargs):
+        calls.append((name,args))
+        pending['callback']({'request_id':'b'*32,'pattern_key':'mcp_elicitation','command':prompts[prompt_kind]})
+        return '{"error":"Native approval denied"}'
+    monkeypatch.setitem(sys.modules,'model_tools',SimpleNamespace(handle_function_call=handler))
+    tool={'name':'mcp__isolated__write','_server':'isolated','_raw':'write',
+          '_trust':'full' if prompt_kind=='trusted_budget' else 'untrusted'}
+
+    result=json.loads(g.NativeMcp().execute(tool,{'message':'fixture'},SCOPE,approved))
+
+    assert choices==[('deny','b'*32)] and calls==[(tool['name'],{'message':'fixture'})]
+    assert result['error']==('Hermes needs this approval. Approve the action in Hermes.' if approved else 'Native approval denied')
+    assert not pending
 
 
 def test_native_error_aliases_nested_content_and_truncation_are_not_completed(gateway,tmp_path,monkeypatch):
@@ -713,10 +760,11 @@ def test_native_tools_are_discovered_for_the_api_profile_and_exclusions_are_appl
 
     catalog={item['name']:item for item in native_catalog}
     assert {'read_file','write_file','web_search','web_extract','vision_analyze','metadata_read'} <= set(catalog)
-    memory_reads={'hindsight_recall','hindsight_reflect','hindsight_search_knowledge_pages','hindsight_read_knowledge_page'}
-    assert memory_reads <= set(catalog)
-    assert all(catalog[name]['read_only'] for name in memory_reads)
-    assert catalog['hindsight_retain']['read_only'] is False
+    memory_tools={'hindsight_recall','hindsight_reflect','hindsight_search_knowledge_pages','hindsight_read_knowledge_page',
+                  'hindsight_retain'}
+    assert memory_tools <= set(catalog)
+    # A provider tool is not read-only because of its name; only the tool itself can say so.
+    assert not any(catalog[name]['read_only'] for name in memory_tools)
     assert 'session_search' not in catalog
     assert not {'memory','todo_list','clarify','delegate_task','browser_click','beacon_create_proactive_request',
                 'beacon_email_notice','beacon_event_notice','beacon_events_checked',
@@ -785,7 +833,7 @@ def test_warmed_catalogue_is_off_request_path_and_summarizes_each_source_once(tm
     summary=api.compact_catalogue(profile)
     assert len(summary.splitlines())==2
     assert 'Gmail' in summary and 'Search Gmail messages' in summary and 'Get Gmail message threads' in summary
-    assert 'Hindsight' in summary and 'Recall relevant Hindsight memories' in summary
+    assert 'Memory: Recall relevant Hindsight memories' in summary
     assert calls==[True,False]
 
 

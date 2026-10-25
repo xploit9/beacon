@@ -9,7 +9,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
 /** Profile editors outlive their page; late responses never replace another account's draft. */
-class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: SavedStateHandle, private val draftChanged: () -> Unit = {}, private val cache: ProjectionCache? = null, private val client: () -> BeaconClient?) {
+class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: SavedStateHandle, private val draftChanged: () -> Unit = {}, private val screens: ScreenCache? = null, private val client: () -> BeaconClient?) {
     private val _skills = MutableStateFlow(NativeSkillsState())
     val skills = _skills.asStateFlow()
     private val _memory = MutableStateFlow(NativeMemoryState(""))
@@ -33,7 +33,8 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
     private suspend fun <T> cacheAttempt(block: suspend () -> T): T? = try { block() }
         catch (e: CancellationException) { throw e }
         catch (_: Exception) { null }
-    private fun updateKey(c: BeaconClient) = "${c.auth.origin}:${c.auth.owner}"
+    private fun updateKey(c: BeaconClient) = c.scope.copy(profile = "", session = "").key
+    private suspend fun keepSkills(scope: Scope, api: NativeSkills) { api.snapshot?.let { cacheAttempt { screens?.set(scope, "settings:skills", it) } } }
 
     /** Original bases survive recovery; a restored draft never adopts a newer host revision. */
     fun snapshotDraft(): JSONObject {
@@ -136,13 +137,13 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         skillsRequest { api ->
             val c = active
             if (!force && _skills.value.skills.isEmpty()) cacheAttempt {
-                cache?.read(c.scope, "settings:skills")?.let { encoded ->
-                    val cached = parseNativeSkills(JSONObject(encoded))
+                screens?.get(c.scope, "settings:skills")?.let { stored ->
+                    val cached = parseNativeSkills(stored.copy())
                     if (client() === active && scopeKey == c.scope.key) _skills.update { it.copy(skills = cached) }
                 }
             }
             val list = api.list()
-            api.snapshot?.let { cacheAttempt { cache?.write(c.scope, "settings:skills", it.toString()) } }
+            keepSkills(c.scope, api)
             if (scopeKey == c.scope.key) skillsAt = System.currentTimeMillis()
             val old = _skills.value
             old.copy(skills = list, selected = list.firstOrNull { it.name == old.selected?.name }, notice = api.warnings.takeIf { it.isNotEmpty() }?.joinToString("\n"))
@@ -160,6 +161,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
     fun toggleSkill(skill: NativeSkill, enabled: Boolean) = skillsRequest(true) { api ->
         api.toggle(skill.name, enabled)
         val list = api.list()
+        client()?.let { keepSkills(it.scope, api) }
         _skills.value.copy(skills = list, selected = list.firstOrNull { it.name == _skills.value.selected?.name }, notice = "Saved. New chats use this change.")
     }
     fun saveSkill() {
@@ -182,8 +184,8 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
             val c = active.detached()
             try {
                 if (!force && _memory.value.documents.isEmpty()) cacheAttempt {
-                    cache?.read(c.scope, "settings:memory")?.let { encoded ->
-                        val cached = JSONObject(encoded)
+                    screens?.get(c.scope, "settings:memory")?.let { stored ->
+                        val cached = stored.copy()
                         val value = NativeMemoryState.parse(c.scope.key, cached.getJSONObject("status"), cached.getJSONObject("notes"))
                         if (client() === active && _memory.value.editing.isBlank()) _memory.value = value
                     }
@@ -196,7 +198,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                     if (_memory.value.editing.isBlank()) { _memory.value = result; memoryAt = System.currentTimeMillis() }
                     else memoryAt = 0L
                 }
-                cacheAttempt { cache?.write(c.scope, "settings:memory", json("status" to status, "notes" to notes).toString()) }
+                cacheAttempt { screens?.set(c.scope, "settings:memory", json("status" to status, "notes" to notes)) }
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) { if (client() === active) _memory.update { it.copy(loading = false, error = appErrorText(e)) } }
             finally { c.closeNative() }
@@ -226,7 +228,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                 val saved = result.getJSONObject("document")
                 val confirmed = NativeMemoryDocument(saved.getString("target"), saved.getString("content"), saved.getString("revision"), saved.getBoolean("enabled"), saved.getInt("limit"))
                 require(confirmed.target == document.target) { "Saved memory does not match this document" }
-                cacheAttempt { cache?.delete(c.scope, "settings:memory") }
+                cacheAttempt { screens?.remove(c.scope, "settings:memory") }
                 if (client() === active) { memoryAt = System.currentTimeMillis(); _memory.update { it.copy(documents = it.documents.map { old -> if (old.target == confirmed.target) confirmed else old }, saving = false, editing = "", draft = "", message = "Notes saved. New chats use this change.") }; draftChanged() }
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) { if (client() === active) _memory.update { it.copy(saving = false, error = appErrorText(e)) } }
@@ -318,20 +320,29 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         }
     }
 
-    fun loadBots() {
-        val active = client() ?: return
-        bind(); if (_bots.value.saving || _bots.value.editing) return
+    private fun botSummaries(response: JSONObject) = response.rows("bots").map { NativeBotSummary(it.getString("profile"), it.string("title", it.getString("profile")), it.string("purpose")) }
+    fun loadBots(): Job? {
+        val active = client() ?: return null
+        bind(); if (_bots.value.saving || _bots.value.editing) return null
         botJob?.cancel(); _bots.update { it.copy(loading = true, error = "") }
         botJob = jobs.launch {
             val c = active.detached()
             try {
-                val rows = c.nativeGet("/api/plugins/beacon/admin/bots").rows("bots")
-                val profiles = rows.map { NativeBotSummary(it.getString("profile"), it.string("title", it.getString("profile")), it.string("purpose")) }
+                if (_bots.value.profiles.isEmpty()) cacheAttempt {
+                    screens?.get(c.scope, "settings:bots")?.let { stored ->
+                        val cached = botSummaries(stored.copy())
+                        if (client() === active && _bots.value.profiles.isEmpty()) _bots.update { it.copy(profiles = cached) }
+                    }
+                }
+                val response = c.nativeGet("/api/plugins/beacon/admin/bots")
+                val profiles = botSummaries(response)
+                cacheAttempt { screens?.set(c.scope, "settings:bots", response) }
                 if (client() === active) _bots.update { it.copy(profiles = profiles, loading = false) }
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) { if (client() === active) _bots.update { it.copy(loading = false, error = appErrorText(e)) } }
             finally { c.closeNative() }
         }
+        return botJob
     }
     fun openBot(profile: String) {
         val active = client() ?: return

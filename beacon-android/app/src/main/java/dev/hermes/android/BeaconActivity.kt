@@ -52,18 +52,13 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 
-internal data class SafeExternalConnectLink(val link: String, val sessionRemoved: Boolean)
-
-internal fun sanitizeExternalConnectLink(uri: Uri): SafeExternalConnectLink {
-    val parameters = uri.queryParameterNames
-    val sessionRemoved = parameters.any { name ->
-        name.equals("session", ignoreCase = true) && uri.getQueryParameters(name).any(String::isNotBlank)
-    }
+/** An outside link keeps only its address: a `session` value (an old dashboard secret) is dropped before the link is held. */
+internal fun sanitizeExternalConnectLink(uri: Uri): String {
     val safeUri = uri.buildUpon().clearQuery()
-    parameters.filterNot { it.equals("session", ignoreCase = true) }.forEach { name ->
+    uri.queryParameterNames.filterNot { it.equals("session", ignoreCase = true) }.forEach { name ->
         uri.getQueryParameters(name).forEach { value -> safeUri.appendQueryParameter(name, value) }
     }
-    return SafeExternalConnectLink(safeUri.build().toString(), sessionRemoved)
+    return safeUri.build().toString()
 }
 
 class BeaconActivity : ComponentActivity() {
@@ -71,7 +66,6 @@ class BeaconActivity : ComponentActivity() {
     private var initialPush by mutableStateOf<Triple<String, String, String>?>(null)
     private var updateToken by mutableStateOf<String?>(null)
     private var pendingConnectionLink by mutableStateOf<String?>(null)
-    private var pendingConnectionSessionNotice by mutableStateOf(false)
     private var externalConnectionLinkOrigin by mutableStateOf<String?>(null)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -89,20 +83,17 @@ class BeaconActivity : ComponentActivity() {
                 pendingConnectionLink?.let { runCatching { parseBeaconConnectLink(it).origin }.getOrNull() }
             }
             val hasKnownOrigin = ui.setupOrigin.isNotBlank() || ui.origin.isNotBlank()
-            LaunchedEffect(model, pendingConnectionLink, pendingConnectionSessionNotice, ui.restoringSession, ui.origin, ui.setupOrigin) {
+            LaunchedEffect(model, pendingConnectionLink, ui.restoringSession, ui.origin, ui.setupOrigin) {
                 val link = pendingConnectionLink ?: return@LaunchedEffect
                 if (ui.restoringSession) return@LaunchedEffect
                 val origin = pendingConnectionOrigin
                 if (origin == null) {
                     model.notice("This Beacon connection link is invalid.")
                     pendingConnectionLink = null
-                    pendingConnectionSessionNotice = false
                 } else if (!hasKnownOrigin) {
                     externalConnectionLinkOrigin = origin
                     model.openSetupLink(link, confirmed = false)
-                    if (pendingConnectionSessionNotice) model.notice("For this dashboard, scan the QR code with Beacon's scanner to sign in.")
                     pendingConnectionLink = null
-                    pendingConnectionSessionNotice = false
                 }
             }
             var permissionSource by rememberSaveable { mutableStateOf("") }
@@ -123,8 +114,9 @@ class BeaconActivity : ComponentActivity() {
                 }
             }
             val answer: (String,String) -> Unit = { source,event -> callFromNotification(source,event,"answer") }
-            LaunchedEffect(ui.authenticated, ui.connected, ui.loading, updateToken) {
-                if (ui.authenticated && ui.connected && !ui.loading && model.client != null) updateToken?.let { token -> updateToken = null; intent?.removeExtra(dev.hermes.android.updates.UpdateManager.EXTRA_TOKEN); model.downloadAppUpdate(token) }
+            // The update works without Hermes or a sign-in, so the tap only waits for the app to finish starting.
+            LaunchedEffect(ui.loading, ui.restoringSession, updateToken) {
+                if (!ui.loading && !ui.restoringSession) updateToken?.let { token -> updateToken = null; intent?.removeExtra(dev.hermes.android.updates.UpdateManager.EXTRA_TOKEN); model.downloadAppUpdate(token) }
             }
             val call by (application as BeaconApplication).calls.state.collectAsStateWithLifecycle()
             LaunchedEffect(ui.authenticated, ui.connected, ui.loading, ui.profile, pendingReturn, call.callId, call.active) {
@@ -145,10 +137,10 @@ class BeaconActivity : ComponentActivity() {
             CompositionLocalProvider(LocalBeaconSettings provides (data["profile-settings"] ?: emptySettings), LocalAssistantName provides preferences.assistantName) { NativeLocalization(nativeLanguageFor(LocalConfiguration.current.locales[0])) { BeaconTheme(dark, preferences.skin) { NativeWindowLayout(this@BeaconActivity) {
                 BeaconRoot(model, externalConnectionLinkOrigin) { externalConnectionLinkOrigin = null }
                 IncomingCallSheet(model, permissionSource.isNotBlank(), answer)
+                dev.hermes.android.updates.AppUpdateHost(model.app.updates)
                 if (pendingConnectionLink != null && pendingConnectionOrigin != null && !ui.restoringSession && hasKnownOrigin) {
                     val cancelConnectionLink = {
                         pendingConnectionLink = null
-                        pendingConnectionSessionNotice = false
                     }
                     AlertDialog(
                         onDismissRequest = cancelConnectionLink,
@@ -160,7 +152,6 @@ class BeaconActivity : ComponentActivity() {
                                 if (link != null && origin != null) {
                                     externalConnectionLinkOrigin = origin
                                     model.openSetupLink(link, confirmed = true)
-                                    if (pendingConnectionSessionNotice) model.notice("For this dashboard, scan the QR code with Beacon's scanner to sign in.")
                                 }
                                 cancelConnectionLink()
                             }) { Text("Connect") }
@@ -179,15 +170,13 @@ class BeaconActivity : ComponentActivity() {
         catch (_: RuntimeException) { vm?.notice("Floating calls aren't available; use the call notification.") }
     }
     override fun onStart() { super.onStart(); (application as BeaconApplication).calls.let { it.uiVisible = true; if (it.state.value.active) it.resumeWindow() }; vm?.foreground(true) }
-    override fun onResume() { super.onResume(); NativeAuth.onActivityResumed(); vm?.resumeAppUpdate(); (application as BeaconApplication).calls.refreshOverlayPermission() }
+    override fun onResume() { super.onResume(); NativeAuth.onActivityResumed(); (application as BeaconApplication).calls.refreshOverlayPermission() }
     override fun onStop() { (application as BeaconApplication).calls.uiVisible = false; vm?.foreground(false); super.onStop() }
     override fun onSaveInstanceState(outState: Bundle) { super.onSaveInstanceState(outState); outState.putString("pending_return", pendingReturn) }
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); setIntent(intent); push(intent) }
     private fun push(intent: Intent?) {
         intent?.data?.takeIf { it.scheme.equals("beacon", true) && it.host.equals("connect", true) }?.let {
-            val safe = sanitizeExternalConnectLink(it)
-            pendingConnectionLink = safe.link
-            pendingConnectionSessionNotice = safe.sessionRemoved
+            pendingConnectionLink = sanitizeExternalConnectLink(it)
             intent?.data = null
         }
         intent?.getStringExtra(BeaconCallService.EXTRA_CALL_ID)?.let { pendingReturn=it;intent.removeExtra(BeaconCallService.EXTRA_CALL_ID) }
@@ -301,7 +290,7 @@ internal fun NativeFeedbackEffect(
     val archiveUndo by vm.archiveUndo.collectAsStateWithLifecycle()
     NativeFeedbackEffect(ui.error, ui.notice, ui.setupWizard, snackbar,
         actionLabel = "Undo".takeIf { archiveUndo != null && ui.error.isBlank() && ui.notice == "Archived" }, onAction = vm::undoArchive, clearMessage = vm::clearMessage)
-    // The wizard stays composed while it connects after sign-in: swapping in the logo would drop its pairing code.
+    // The wizard stays composed while it connects after sign-in: swapping in the logo would drop what it has typed.
     if (ui.restoringSession && !ui.setupWizard) {
         Surface(Modifier.fillMaxSize().testTag("session-restore-logo"), color = MaterialTheme.colorScheme.background) {
             Column(Modifier.safeDrawingPadding(), verticalArrangement = Arrangement.Center, horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally) {
@@ -396,10 +385,14 @@ internal fun NativeFeedbackEffect(
         }
     }
     // Register after destination Back handlers so an open drawer always closes first.
-    BackHandler(!ui.showSessions && ui.tab == "More" && ui.morePage.isNotBlank() && ui.morePage !in setOf("Skills", "Memory", "Bots", "Profiles")) { vm.backFromSettings() }
+    // Voice & calls steps out of its Key and Provider pages first (its own handler); every other page leaves Settings.
+    val voicePage by vm.voicePage.collectAsStateWithLifecycle()
+    BackHandler(!ui.showSessions && ui.tab == "More" && ui.morePage.isNotBlank() && ui.morePage !in setOf("Skills", "Memory", "Bots", "Profiles") && !(ui.morePage == voiceKeySetupPage() && voicePage != "home")) { vm.backFromSettings() }
     BackHandler(ui.showSessions) { vm.toggleSessions(false) }
     BackHandler(ui.setupWizard && !ui.restoringSession) {
-        if (ui.authenticated) vm.cancelSetupWizard() else hostActivity?.finish()
+        // Back on the Key and Make-it-yours pages returns to the provider page, like their Back button.
+        if (ui.setupStep in setOf("voice-key", "voice-customize")) vm.showVoiceSetupPage("voice-provider")
+        else if (ui.authenticated) vm.cancelSetupWizard() else hostActivity?.finish()
     }
     form?.let { NativeForm(vm, it) }
     val approval=call.toolApprovals.firstOrNull()?.takeIf { ui.authenticated && call.active && call.conversationScope?.let { s -> s.owner==ui.owner&&s.profile==ui.profile&&s.origin==ui.origin }==true }
@@ -448,7 +441,7 @@ internal fun CallToolApprovalDialog(approval: CallToolApproval, onDecision: (Str
             Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 TextButton(onClick = { onDecision("deny") }, enabled = !approval.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("beacon-tool-deny")) { Text("Deny") }
                 TextButton(onClick = { onDecision("approve") }, enabled = !approval.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("beacon-tool-allow")) { Text("Allow once") }
-                Button(onClick = { onDecision("approve_call") }, enabled = !approval.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("beacon-tool-allow-call")) { Text("Always allow during this call") }
+                if (approval.allowCall) Button(onClick = { onDecision("approve_call") }, enabled = !approval.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("beacon-tool-allow-call")) { Text("Always allow during this call") }
             }
         },
         modifier = Modifier.testTag("beacon-tool-approval"),

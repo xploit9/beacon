@@ -235,6 +235,17 @@ class LiveCallInterfaceTest {
         assertEquals(listOf("deny", "approve", "approve_call"), decisions)
     }
 
+    @Test fun approvalDialogHidesTheCallLongChoiceWhenTheProposalForbidsIt() {
+        val decisions = mutableListOf<String>()
+        val approval = CallToolApproval("request-1", "p".repeat(32), "terminal", org.json.JSONObject().put("command", "git status").toString(2), allowCall = false)
+        rule.runOnUiThread { rule.activity.setContent { MaterialTheme { CallToolApprovalDialog(approval) { decisions += it } } } }
+
+        rule.onNodeWithTag("beacon-tool-allow-call").assertDoesNotExist()
+        rule.onNodeWithTag("beacon-tool-deny").performClick()
+        rule.onNodeWithTag("beacon-tool-allow").performClick()
+        assertEquals(listOf("deny", "approve"), decisions)
+    }
+
     @Test fun automaticToolReceiptShowsItsQuietApprovalCaptionWithoutAnApprovalDialog() {
         val receipt = requireNotNull(CallToolReceipt.from(org.json.JSONObject()
             .put("request_id", "request-1").put("tool_name", "mcp__gmail__search_messages")

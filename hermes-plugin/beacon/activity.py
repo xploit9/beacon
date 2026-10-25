@@ -108,10 +108,20 @@ def answer(mobile, native, owner, provider, profile, event, value):
         if frame['method'] == 'clarify' and (params.get('questions') or params.get('multi_select')):
             raise ValueError('Review this question in the app')
         if frame['method'] == 'approval':
-            receipt = native.rpc(owner, provider, 'approval.respond', {'session_id': row['runtime'], 'request_id': frame['id'], 'choice': value})
+            method = 'approval.respond'
+            arguments = {'session_id': row['runtime'], 'request_id': mobile.ident(params.get('request_id')), 'choice': value}
         else:
-            receipt = native.rpc(owner, provider, 'request.answer', {'id': frame['id'], 'result': {'answer': value}})
-        if not isinstance(receipt,dict) or receipt.get('ok') is not True: raise ValueError('Native request already settled')
+            method = 'request.answer'
+            arguments = {'id': frame['id'], 'result': {'answer': value}}
+        # A lost or unrecognized receipt must not send the same mutation again.
+        with mobile.LOCK, mobile.connect() as conn:
+            conn.execute("UPDATE notices SET state='settled' WHERE id=? AND owner=? AND profile=?", (event,owner,profile))
+        receipt = native.rpc(owner, provider, method, arguments)
+        if frame['method'] == 'approval':
+            accepted = isinstance(receipt,dict) and type(receipt.get('resolved')) is int and receipt['resolved'] > 0
+        else:
+            accepted = isinstance(receipt,dict) and receipt.get('status') == 'ok'
+        if not accepted: raise ValueError('Native request already settled')
         with mobile.LOCK, mobile.connect() as conn:
             conn.execute("UPDATE notices SET state='answered' WHERE id=? AND owner=? AND profile=?", (event,owner,profile))
         return {'status': 'answered', 'event_id': event}

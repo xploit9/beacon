@@ -58,7 +58,6 @@ import kotlinx.coroutines.launch
         if (crons == null) item { Column { LinearProgressIndicator(Modifier.fillMaxWidth()); Text("Loading scheduled jobs…", style = MaterialTheme.typography.bodySmall) } }
         items(crons?.rows("jobs").orEmpty(), key = { it.string("id") }) { job ->
             val id = job.string("id")
-            var actions by remember(id) { mutableStateOf(false) }
             Glass { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(job.string("name", "Scheduled task"), style = MaterialTheme.typography.titleMedium)
                 Text(job.string("prompt"), style = MaterialTheme.typography.bodyMedium, maxLines = if (selected == id) Int.MAX_VALUE else 3)
@@ -68,17 +67,16 @@ import kotlinx.coroutines.launch
                 Text("Next: ${scheduleTime(job.string("next_run_at"), timezone, "Not scheduled")}", style = MaterialTheme.typography.bodySmall)
                 Text("Last: ${scheduleTime(job.string("last_run_at"), timezone, "No recorded run")}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 if (pending == id) LinearProgressIndicator(Modifier.fillMaxWidth())
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Button(enabled = pending.isBlank(), onClick = { vm.openForm(ActionForm("Run this task", "/api/crons/run", emptyList(), json("job_id" to id), explanation = if(job.optBoolean("no_agent")) "Run the task script once. Check-up tasks consider only an opportunity due this minute; missed slots are skipped." else "Run this task now with its saved tools and delivery.", actionLabel = "Run now", onResult = { refresh() })) }, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) { Text(uiText("Run now")) }
-                    OutlinedButton(enabled = pending.isBlank(), onClick = { cronForm(vm, job, deliveries, data["task-capabilities"]?.string("timezone").orEmpty(), refresh) }, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) { Text(uiText("Edit")) }
-                    TextButton(enabled = pending.isBlank() && scheduleState(job) != "Completed", onClick = { pending = id; actionScope.launch { vm.action(if (schedulePaused(job)) "/api/crons/resume" else "/api/crons/pause", json("job_id" to id), refresh = false) { _, _ -> refresh() }.join(); pending = "" } }, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) { Text(if (schedulePaused(job)) "Resume" else "Pause") }
-                    Box {
-                        IconButton(onClick = { actions = true }, enabled = pending.isBlank(), modifier = Modifier.heightIn(min = 48.dp)) { Icon(Icons.Rounded.MoreVert, "More schedule actions") }
-                        DropdownMenu(actions, { actions = false }) {
-                            DropdownMenuItem(text = { Text(uiText("Run history")) }, onClick = { actions = false; selected = if (selected == id) "" else id })
-                            DropdownMenuItem(text = { Text(uiText("Delete"), color = MaterialTheme.colorScheme.error) }, onClick = { actions = false; vm.openForm(ActionForm("Delete schedule", "/api/crons/delete", emptyList(), json("job_id" to id), explanation = "Remove this scheduled task from Beacon.", actionLabel = "Delete", onResult = { refresh() })) })
-                        }
+                // Same actions, order and icons as the Hermes dashboard's cron page (web/src/pages/CronPage.tsx), plus run history.
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    val paused = schedulePaused(job)
+                    IconButton(enabled = pending.isBlank() && scheduleState(job) != "Completed", onClick = { pending = id; actionScope.launch { vm.action(if (paused) "/api/crons/resume" else "/api/crons/pause", json("job_id" to id), refresh = false) { _, _ -> refresh() }.join(); pending = "" } }) {
+                        Icon(if (paused) Icons.Rounded.PlayArrow else Icons.Rounded.Pause, uiText(if (paused) "Resume" else "Pause"))
                     }
+                    IconButton(enabled = pending.isBlank(), onClick = { vm.openForm(ActionForm("Run this task", "/api/crons/run", emptyList(), json("job_id" to id), explanation = if(job.optBoolean("no_agent")) "Run the task script once. Check-up tasks consider only an opportunity due this minute; missed slots are skipped." else "Run this task now with its saved tools and delivery.", actionLabel = "Run", onResult = { refresh() })) }) { Icon(Icons.Rounded.Bolt, uiText("Run")) }
+                    IconButton(enabled = pending.isBlank(), onClick = { cronForm(vm, job, deliveries, data["task-capabilities"]?.string("timezone").orEmpty(), refresh) }) { Icon(Icons.Rounded.Edit, uiText("Edit")) }
+                    IconButton(onClick = { selected = if (selected == id) "" else id }) { Icon(Icons.Rounded.History, uiText("Run history"), tint = if (selected == id) MaterialTheme.colorScheme.primary else LocalContentColor.current) }
+                    IconButton(enabled = pending.isBlank(), onClick = { vm.openForm(ActionForm("Delete schedule", "/api/crons/delete", emptyList(), json("job_id" to id), explanation = "Remove this scheduled task from Beacon.", actionLabel = "Delete", onResult = { refresh() })) }) { Icon(Icons.Rounded.Delete, uiText("Delete"), tint = if (pending.isBlank()) MaterialTheme.colorScheme.error else LocalContentColor.current) }
                 }
                 if (selected == id) {
                     val history = data["cron-history:$id"]

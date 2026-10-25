@@ -6,10 +6,10 @@ The preview is Beacon's debug build for testing. It installs separately from the
 - The `stable` build type has application ID `dev.hermes.android.stable` and launcher label "Beacon", so it installs beside production and the preview.
 - The current source builds stable version code `112`, version `1.1.2`. It inherits release minification and is not debuggable; this identifies the source configuration, not a newly accepted or published binary.
 - A stable APK is unsigned unless `beaconStableSigning` (or `BEACON_STABLE_SIGNING`) points to an external properties file with the four Android signing fields. Never store that file or its keystore in this repository. The stable signer is separate from production.
-- Release assets are named `Beacon-<version>.apk` and `Beacon-<version>.json`; Settings **App updates** checks the public GitHub release through the owner's Hermes plugin and verifies the APK before installation.
+- Release assets are named `Beacon-<version>.apk` and `Beacon-<version>.json`; Settings **App updates** asks the public GitHub release itself and verifies the APK before installation.
 
-Production and stable builds offer default-on app and plugin automatic updates in Settings **App updates**; app downloads use unmetered connections and retain package, version, checksum and signer verification, with a tap-to-install notice whenever Android requires confirmation. The debug preview remains manually installed.
-- The Hermes plugin stores stable releases separately from production and can pin them with `android_stable_certificate_sha256`. If that pin is unset, the app still requires the downloaded APK to have the same signer as the installed stable app.
+Stable builds check the latest GitHub release themselves and notify you when a new version is out; tapping **Update** downloads it from GitHub, verifies package, version, checksum and signer, and installs it (Android asks you to confirm). The same screen updates the Hermes plugin first through Hermes' own plugin updater; neither updates on its own. The debug preview remains manually installed.
+- The app asks GitHub, not the plugin. The plugin still stores stable releases separately from production and can pin them with `android_stable_certificate_sha256`, but that pin applies only to older 1.1.x phones, which update from Hermes. The app always requires the downloaded APK to have the same signer as the installed stable app.
 - Installing stable does not replace production. Production replacement remains held until physical-phone acceptance and original signer/data-preservation checks pass.
 
 ## What the preview is
@@ -73,16 +73,16 @@ Settings are grouped: Assistant (name, profile and model; voice and calls; notif
 Chat extras from Relay: quote a message into your reply, attach from the camera or paste an image, open the command list from the attach menu, start a new chat from a suggested prompt, share the whole conversation or copy its ID from the ⋮ menu. Messages are grouped under Today, Yesterday or their date, and in-chat search shows how many messages match.
 
 With the Beacon plugin installed:
-- **Pairing.** Select **Pair a phone** in the dashboard's **Beacon** tab, or print a single-use code with `hermes -p <profile> beacon pair` / `/beacon-pair` in an owned chat. In Beacon, scan the QR, choose a screenshot of it, or enter the HTTPS dashboard address and code. Manage phones in Settings > Devices.
+- **Phones.** Paste the Hermes link into Beacon and sign in with Hermes; that links the phone. Linking needs the Hermes dashboard sign-in. Linked phones are listed in Settings > Connection and on the dashboard's **Beacon** tab, where you can remove them.
 - **Proactive.** Add plain-language email rules and choose notifications or calls. Checks use the tools already connected to the selected Hermes profile; the app reports results by notification or call.
 - **Voice & calls.** One-tap realtime calls with Gemini Live, Grok or OpenAI Realtime. The provider key is entered in Beacon, stored encrypted on the phone and sent only to that provider, never to Hermes. Call audio is never stored.
 - **Call history.** Open it from the Beacon chat menu to review call entries and jump to saved transcripts.
-- **Keep connected** (Settings → Notifications & Keep connected). A low-importance foreground service keeps a connection to Hermes for each signed-in profile, so Hermes can ring the phone while Beacon is closed. The page shows the connection state and, when it fails, the reason (for example "Hermes refused profile coder (403)").
+- **Keep connected** (Settings → Notifications & Keep connected). A low-importance foreground service keeps a connection to Hermes for each signed-in profile, so Hermes can ring the phone while Beacon is closed (about 20 seconds; builds with push ring for 45). The page shows the connection state and, when it fails, the reason (for example "Hermes refused profile coder (403)").
 - **Keep call and task history** (same page): Forever (default), 1 year, 90 days or 30 days. This applies only to Beacon's own call transcripts and task history on Hermes. Shortening it asks for confirmation, then deletes older closed calls and finished tasks. Hermes conversations, messages, memories and files are never touched.
 
 Verification recorded on an Android 16 emulator against a live Hermes (19 October 2026):
 - One sign-in, chat, history, Bot Mode and settings; new phone chats are saved under the signed-in owner.
-- Incoming calls: with Keep connected on and Beacon closed, Hermes's `beacon_call_user` rings the phone for up to 45 seconds as a pop-up call card (full screen when the screen is off), bounded by the invitation's expiry, and the caller opens by saying why it is calling; Answer starts the call in that conversation, Decline settles it on Hermes, and an unanswered ring leaves a missed-call notification with Call back.
+- Incoming calls: with Keep connected on and Beacon closed, Hermes's `beacon_call_user` rings the phone for about 20 seconds as a pop-up call card (full screen when the screen is off), bounded by the invitation's expiry, and the caller opens by saying why it is calling; Answer starts the call in that conversation, Decline settles it on Hermes, and an unanswered ring leaves a missed-call notification with Call back.
 - One-tap calls with Gemini Live and Grok, with the key kept on the phone. The call transcript appears in the conversation afterwards.
 
 Remaining acceptance recorded for this preview:

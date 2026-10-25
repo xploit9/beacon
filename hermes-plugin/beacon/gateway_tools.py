@@ -33,8 +33,6 @@ CATALOG_CACHE = {}
 CATALOG_WARMING = set()
 CATALOG_FIRST_WARM = {}  # profile -> this process's first warm-up, which runs MCP discovery
 NATIVE_READ_ONLY = frozenset({'read_file','search_files','web_search','skills_list','skill_view'})
-NATIVE_READ_ONLY |= frozenset({'hindsight_recall','hindsight_reflect','hindsight_search_knowledge_pages',
-                               'hindsight_read_knowledge_page'})
 NATIVE_READ_ONLY_ACTIONS = {'cronjob_manage': frozenset({'list'}), 'process_manage': frozenset({'list'})}
 CALL_EXCLUDED_TOOLS = frozenset({'manage_connections','manage_catalog','setup_mcp',
                                  'connector_search','connector_describe'})
@@ -186,6 +184,30 @@ def readonly_methods(schema):
     return tuple(methods) if isinstance(methods,list) and methods and all(value in ('GET','HEAD') for value in methods) else ()
 
 
+REQUEST_METHOD_FIELDS=('method','http_method')
+REQUEST_BODY_FIELDS=('body','data','payload','json')
+READ_METHODS={'GET','HEAD'}
+
+
+def reads_by_method(args,schema):
+    """A tool that takes an HTTP method or a request body reads only as GET/HEAD, whatever its server annotates.
+
+    Shared by the call gateway and the Proactive read-only guard; schema is the tool's {'parameters': ...}."""
+    given=[(str(key).casefold(),value) for key,value in args.items()]
+    if any(key in REQUEST_BODY_FIELDS and value not in (None,'',{},[]) for key,value in given): return False
+    methods=[value for key,value in given if key in REQUEST_METHOD_FIELDS and value is not None]
+    if methods: return all(isinstance(method,str) and method.strip().upper() in READ_METHODS for method in methods)
+    parameters=schema.get('parameters') if isinstance(schema,dict) else None
+    properties=parameters.get('properties') if isinstance(parameters,dict) else None
+    for field in REQUEST_METHOD_FIELDS:
+        spec=properties.get(field) if isinstance(properties,dict) else None
+        if spec is None: continue
+        allowed=spec.get('enum') if isinstance(spec,dict) else None
+        # An omitted method falls back to the server's default, which may write.
+        if not (isinstance(allowed,list) and allowed and all(isinstance(item,str) and item.upper() in READ_METHODS for item in allowed)): return False
+    return True
+
+
 def _hermes_read_only(name):
     return name in NATIVE_READ_ONLY
 
@@ -228,7 +250,7 @@ def native_catalog():
 
 
 def tool_read_only(tool, arguments):
-    if tool.get('read_only'): return True
+    if tool.get('read_only'): return reads_by_method(arguments,{'parameters':tool.get('parameters')})
     if tool.get('_kind')!='hermes': return False
     name=tool.get('_raw')
     return arguments.get('action') in NATIVE_READ_ONLY_ACTIONS.get(name,())
@@ -388,9 +410,10 @@ class NativeMcp:
         expected = (f"MCP tool '{tool['_raw']}' on UNTRUSTED server '{tool['_server']}' wants to run. "
                     'This tool is write-capable (no readOnlyHint=true annotation) and may modify external state.')
         used = False
+        native_consent_required = False
         once_lock=threading.Lock()
         def notify(data):
-            nonlocal used
+            nonlocal used, native_consent_required
             request=data.get('request_id') if isinstance(data,dict) else None
             if not isinstance(request,str) or not re.fullmatch(r'[a-f0-9]{32}',request):
                 # Raising makes the native notify path fail closed immediately, without a wait.
@@ -398,13 +421,18 @@ class NativeMcp:
             with once_lock:
                 accept = (approved and not used and tool['_trust']=='untrusted'
                           and data.get('pattern_key')=='mcp_elicitation' and data.get('command')==expected)
+                if approved and data.get('pattern_key')=='mcp_elicitation' and data.get('command')!=expected:
+                    native_consent_required = True
                 used = True
             approval.resolve_gateway_approval(key, 'once' if accept else 'deny', request_id=request)
         approval.register_gateway_notify(key, notify)
         try:
             from model_tools import handle_function_call
-            return handle_function_call(tool['name'],arguments,task_id=scope[3],session_id=session_id,
-                                        enabled_tools=tool.get('_enabled_tools'))
+            result = handle_function_call(tool['name'],arguments,task_id=scope[3],session_id=session_id,
+                                          enabled_tools=tool.get('_enabled_tools'))
+            if native_consent_required:
+                return encoded({'error':'Hermes needs this approval. Approve the action in Hermes.'})
+            return result
         finally:
             approval.unregister_gateway_notify(key)
             approval_context.reset_current_session_key(token)
@@ -507,7 +535,6 @@ class Gateway:
             corpus=' '.join(str(tool.get(key) or '') for key in ('name','_raw','description')).casefold()
             if 'google_workspace' in corpus or 'google workspace' in corpus: label='Google Workspace'
             elif 'gmail' in corpus or 'email' in corpus or 'mail' in corpus: label='Gmail'
-            elif 'hindsight' in corpus: label='Hindsight'
             else: label=re.sub(r'[_-]+',' ',source).title()
             description=safe(tool.get('description',''),1200)
             description=re.sub(r'\s+',' ',''.join(c for c in description if c.isprintable())).strip()
@@ -579,10 +606,13 @@ class Gateway:
         return {k:v for k,v in value.items() if not k.startswith('_')}
 
     def _approval_source(self, scope, tool, arguments, session_id):
-        with self.db() as conn:
-            if conn.execute('''SELECT 1 FROM call_tool_allowances
-                WHERE owner=? AND provider=? AND profile=? AND call_id=? AND (tool_id=? OR tool_name=?)''',
-                (*scope,tool['tool_id'],tool['name'])).fetchone(): return 'call_allowance'
+        # A call allowance never covers Hermes' own tools: it would also answer their dangerous-command prompts.
+        # It binds to the approved definition's id: a republished definition under the same name is shown for approval again.
+        if tool.get('_kind')!='hermes':
+            with self.db() as conn:
+                if conn.execute('''SELECT 1 FROM call_tool_allowances
+                    WHERE owner=? AND provider=? AND profile=? AND call_id=? AND tool_id=?''',
+                    (*scope,tool['tool_id'])).fetchone(): return 'call_allowance'
         policy=getattr(self.backend,'approval_source',None)
         if not callable(policy): return None
         try:
@@ -630,8 +660,8 @@ class Gateway:
                     raise ValueError('Approval arguments were changed by redaction')
             except (ValueError,TypeError):
                 raise HTTPException(400,'These arguments cannot be shown accurately for approval; remove sensitive values') from None
-            result['proposal']={'id':secrets.token_urlsafe(32),'tool_name':tool['name'],
-                                'arguments':displayed}
+            result['proposal']={'id':secrets.token_urlsafe(32),'tool_name':tool['name'],'arguments':displayed,
+                                **({'allow_call':False} if tool.get('_kind')=='hermes' else {})}
         with self.db() as conn:
             previous=self._row(conn,scope,request)
             if previous:
@@ -675,6 +705,8 @@ class Gateway:
                 if stored['status']=='needs_approval':
                     stored.update(status='failed',reason='Tool changed; rediscover before a new proposal');self._save(conn,scope,request,stored)
             return self.status(scope,request)
+        if value['decision']=='approve_call' and tool.get('_kind')=='hermes':
+            raise HTTPException(409,'This tool needs approval each time')
         self._start(scope,request,tool,True,allow_call=value['decision']=='approve_call')
         return self.status(scope,request)
 
@@ -729,7 +761,7 @@ class Gateway:
             try:
                 operation={**tool,'read_only':value.get('_read_only',tool.get('read_only',False))}
                 POOL.submit(context.run,self._run,scope,request,operation,value['_arguments'],bool(value.get('approved_by')),
-                            value.get('_session_id',scope[3]),time.monotonic())
+                            value.get('_session_id',scope[3]),time.perf_counter())
             except Exception:
                 with self.db() as conn:
                     row=self._row(conn,scope,request)
@@ -744,7 +776,8 @@ class Gateway:
             if not submitted: SLOTS.release()
 
     def _run(self, scope, request, tool, arguments, approved, session_id, queued_at=None):
-        started=time.monotonic()
+        # monotonic ticks at ~15.6 ms on Windows, so durations use perf_counter.
+        started=time.perf_counter()
         queued_at=started if queued_at is None else queued_at
         timing={'queue':(started-queued_at)*1000,'authority':0,'catalogue':0,'profile':0,'execute':0}
         dispatched=False
@@ -752,16 +785,16 @@ class Gateway:
             # Recheck authority and config at the last boundary before the RPC.
             with self.mobile.connect() as conn:
                 self.mobile.owned(conn,scope[3],scope[0],scope[2],True)
-            timing['authority']=(time.monotonic()-started)*1000
+            timing['authority']=(time.perf_counter()-started)*1000
             # Catalogue discovery releases its profile scope before the store lock is needed below.
-            phase=time.monotonic()
+            phase=time.perf_counter()
             try: current=next((t for t in self.catalog(scope[2],discover=False) if t['tool_id']==tool['tool_id']),None)
-            finally: timing['catalogue']=(time.monotonic()-phase)*1000
+            finally: timing['catalogue']=(time.perf_counter()-phase)*1000
             if not current: raise HTTPException(409,'Tool configuration changed')
             current_read_only=tool_read_only(current,arguments)
             if current_read_only!=tool['read_only']: raise HTTPException(409,'Tool access classification changed')
             current={**current,'read_only':current_read_only}
-            phase=time.monotonic()
+            phase=time.perf_counter()
             # Check the store before entering the profile scope to keep one global lock order.
             if self.status(scope,request)['status']!='running':
                 raise HTTPException(409,'Tool admission cancelled or expired')
@@ -769,18 +802,18 @@ class Gateway:
             if (cfg.get('owner_id')!=scope[0] or cfg.get('owner_provider')!=scope[1]
                     or 'profiles' in cfg and scope[2] not in cfg['profiles']):
                 raise HTTPException(403,'Owner authority changed')
-            timing['authority']+=(time.monotonic()-phase)*1000
-            phase=time.monotonic()
+            timing['authority']+=(time.perf_counter()-phase)*1000
+            phase=time.perf_counter()
             def execute(_):
                 nonlocal dispatched
-                timing['profile']=(time.monotonic()-phase)*1000
+                timing['profile']=(time.perf_counter()-phase)*1000
                 dispatched=True
-                execution=time.monotonic()
+                execution=time.perf_counter()
                 try: return self.backend.execute(current,arguments,scope,approved,session_id=session_id)
-                finally: timing['execute']=(time.monotonic()-execution)*1000
+                finally: timing['execute']=(time.perf_counter()-execution)*1000
             try: raw=self.execution_scoped(scope[2],execute)
             finally:
-                if not dispatched: timing['profile']=(time.monotonic()-phase)*1000
+                if not dispatched: timing['profile']=(time.perf_counter()-phase)*1000
             if not isinstance(raw,str): raw=encoded(raw)
             state=outcome(raw,tool['read_only'])
             text=self.sanitize(raw,MAX_RESULT)
@@ -799,7 +832,7 @@ class Gateway:
                     'reason':'Tool outcome unavailable; inspect external state before retrying' if uncertain else
                             'Read-only tool failed' if dispatched else 'Tool failed before execution'}
         finally:
-            timing['total']=(time.monotonic()-queued_at)*1000
+            timing['total']=(time.perf_counter()-queued_at)*1000
             timing={name:round(value,3) for name,value in timing.items()}
             logger.info('Beacon call tool timing queue_ms=%s authority_ms=%s catalogue_ms=%s profile_ms=%s execute_ms=%s total_ms=%s',
                 *(timing[name] for name in ('queue','authority','catalogue','profile','execute','total')))

@@ -141,7 +141,7 @@ class LoopbackSessionTest {
         try {
             val error = runCatching { client.get("/api/status") }.exceptionOrNull()
             assertTrue(error is LoopbackSessionRefreshFailed)
-            assertEquals("Hermes restarted. Scan the Connect QR again.", error?.message)
+            assertEquals("Hermes restarted. Paste the link again.", error?.message)
             assertEquals(1, protectedAttempts)
             assertEquals(1, rootReads)
             assertFalse(error.toString().contains(secret))

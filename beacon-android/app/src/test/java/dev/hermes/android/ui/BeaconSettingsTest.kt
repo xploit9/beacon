@@ -30,9 +30,35 @@ class BeaconSettingsTest {
     }
 
     @Test fun voiceLabelsCapitalizeDisplayNamesWithoutChangingStoredValues() {
-        assertEquals("Eve", voiceChoiceLabel("eve"))
-        assertEquals("Aoede", voiceChoiceLabel("Aoede"))
-        assertEquals("", voiceChoiceLabel(""))
+        val options = listOf("eve", "Aoede", "Aoede", "")
+        assertEquals("Eve", voiceChoiceLabel("eve", options))
+        assertEquals("Aoede", voiceChoiceLabel("Aoede", options))
+        assertEquals("", voiceChoiceLabel("", options))
+    }
+
+    @Test fun voiceOptionProducerRemovesOnlyExactDuplicates() {
+        assertEquals(
+            listOf("aoede", "Aoede", "AOEDE", "eve"),
+            voiceOptionsWithSelected(listOf("Aoede", "aoede", "Aoede", "AOEDE", "eve"), "aoede"),
+        )
+    }
+
+    @Test fun collidingVoiceLabelsIncludeEachExactWireId() {
+        val options = listOf("aoede", "Aoede", "AOEDE", "eve")
+        assertEquals("Aoede (aoede)", voiceChoiceLabel("aoede", options))
+        assertEquals("Aoede (Aoede)", voiceChoiceLabel("Aoede", options))
+        assertEquals("AOEDE", voiceChoiceLabel("AOEDE", options))
+        assertEquals("Eve", voiceChoiceLabel("eve", options))
+    }
+
+    @Test fun savedVoiceOutsideCatalogKeepsItsExactChoiceAndCollisionLabel() {
+        val options = voiceOptionsWithSelected(listOf("Aoede", "eve"), "aoede")
+        val labels = options.associateWith { voiceChoiceLabel(it, options) }
+        assertEquals(listOf("aoede", "Aoede", "eve"), options)
+        assertEquals(
+            mapOf("aoede" to "Aoede (aoede)", "Aoede" to "Aoede (Aoede)", "eve" to "Eve"),
+            labels,
+        )
     }
 
     @Test fun voiceModelIdsUseFriendlyNames() {

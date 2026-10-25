@@ -116,7 +116,7 @@ class KeepConnectedUiTest {
         val dataBefore = app.preferences.data.first()
         val keepPrefs = app.getSharedPreferences(KeepConnectedService.PREFS, Context.MODE_PRIVATE)
         // A killed run leaves its fixture cursor ahead of this fixture's first event, so the poll would never deliver it.
-        val fixtureCursors = fixture.notificationProfiles.map { "cursor:${"${scope.origin}\u0000${scope.owner}\u0000$it".digest()}" }
+        val fixtureCursors = fixture.notificationProfiles.map { "cursor:${scope.copy(profile = it, session = "").key}" }
         val keepBefore = keepPrefs.all.toMap() - fixtureCursors.toSet()
         val pushPrefs = app.getSharedPreferences("push-binding", Context.MODE_PRIVATE)
         val voicePrefs = app.getSharedPreferences("voice-private", Context.MODE_PRIVATE)
@@ -126,6 +126,7 @@ class KeepConnectedUiTest {
             val key = "source:${source.digest()}"
             priorSources[key] = pushPrefs.getString(key, null)
             val value = JSONObject().put("source", source).put("origin", scope.origin).put("owner", scope.owner)
+                .put("native_provider", scope.nativeProvider)
                 .put("profile", scope.profile).put("backend", "hermes-dashboard").put("target", "fixture-target")
             val encoded = android.util.Base64.encodeToString(
                 app.cipher.encrypt(value.toString().toByteArray(), key), android.util.Base64.NO_WRAP,
@@ -252,7 +253,13 @@ class KeepConnectedUiTest {
 
             compose.runOnIdle { showIncomingCall.value = true }
             compose.onNodeWithTag("beacon-incoming-answer").assertIsDisplayed().performClick()
-            compose.waitUntil(15_000) { vm.ui.value.tab == "Beacon" && vm.chat.value.sessionId == "chat-b" }
+            try { compose.waitUntil(15_000) { vm.ui.value.tab == "Beacon" && vm.chat.value.sessionId == "chat-b" } }
+            catch (timeout: androidx.compose.ui.test.ComposeTimeoutException) {
+                // Keep the state that shows why answering did not open the chat.
+                throw AssertionError("Answer did not open chat-b: tab=${vm.ui.value.tab} session=${vm.chat.value.sessionId} error=${vm.ui.value.error} " +
+                    "notice=${vm.ui.value.notice} callError=${app.calls.state.value.error} invite=${app.push.ringingInvitation(answerSource, answerEventId) != null} " +
+                    "requests=${fixture.requests.takeLast(8).map { it.string("method") + " " + it.string("path") }}", timeout)
+            }
             assertEquals("chat-b", vm.chat.value.sessionId)
             val answerPath = "/api/plugins/beacon/mobile/callbacks/${answerEvent.getString("event_id")}/answer"
             // This fixture host is hidden; the service posts the explicit receipt before refusing to start a live call.

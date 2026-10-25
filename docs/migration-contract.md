@@ -10,7 +10,7 @@ Preserve Beacon's existing tabs, drawer, profiles, Bot Mode and settings, includ
 - Keep connected uses an Android foreground service. Firebase push is optional; incoming calls do not depend on it.
 - No audio retention is permitted for Beacon phone calls.
 - Public GitHub `xploit9/beacon` is the only repository for this project; Gitea is reserved for Archon.
-- The chat composer's Approvals menu offers Ask first (follow the profile's Manual or Auto policy) and YOLO in this chat. Enabling YOLO always asks for confirmation, and a status Hermes cannot report is shown as unknown, never as off. Manual and Auto are changed only in profile Settings; an existing profile Off mode is reported honestly there and in chat.
+- The chat composer's Approvals menu offers Ask first (follow the profile's Manual or Auto policy) and YOLO in this chat. Enabling YOLO always asks for confirmation. A chat opened without resuming shows its own saved YOLO choice (the shield shows the chat's own setting), and a live read replaces it once the chat is resumed; a live status Hermes cannot report is shown as unknown, never as off. Manual and Auto are changed only in profile Settings; an existing profile Off mode is reported honestly there and in chat.
 - Beacon's own call and task history on Hermes is pruned only by the user's "Keep call and task history" setting (Forever by default). Hermes conversations, messages, memories and files are never pruned by Beacon.
 - Duplicate-prevention markers are kept only as long as they can prevent a duplicate. Bot Mode stops its room scan at 1,000 rooms and refuses to create a space rather than risk a duplicate.
 
@@ -32,7 +32,7 @@ This is a clean break for the Hermes plugin identity. Do not keep compatibility 
 - Native cron is the only scheduling mechanism. Keep connected uses the foreground service; no Firebase prerequisite. WSS cannot wake a force-stopped Android app.
 
 ## Current product boundary
-Standard sign-in, chat and conversation history use native Hermes. The Beacon plugin adds owner/profile-bound phone pairing and mobile features; it is checked only after sign-in, so a missing or failed plugin does not block native chat or history. Beacon phone pairing uses the Hermes CLI or the dashboard's Beacon tab, and paired phones can be managed in Settings > Devices.
+Standard sign-in, chat and conversation history use native Hermes. The Beacon plugin adds owner-bound device records and mobile features; it is checked only after sign-in, so a missing or failed plugin does not block native chat or history. A phone is linked by the Hermes sign-in itself (pasting the link and signing in); there is no separate pairing code or QR. Linked phones are managed in Settings > Connection and on the dashboard's Beacon tab.
 
 ## Verification
 Tests must cover absent/error/older optional plugin, unauthorized account/profile, reconnect/session affinity, tool outcomes, stable scrolling, attachments, callback expiry/decline and teardown. The coordinator owns serialized Gradle/lint/device checks; workers do not run Gradle, ADB, installs, deployment or LLM reviews. Before a push, follow the project rules in `AGENTS.md`: current Ponytail review and audit, Gitleaks on the final tree and outgoing history, and a completed Strix scan of the exact clean export, with validated findings fixed. Build success alone is not acceptance. Production replacement remains held until physical-phone acceptance and original signer/data preservation are verified.

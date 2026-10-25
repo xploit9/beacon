@@ -55,7 +55,7 @@ import org.json.JSONObject
                 when (kind) {
                     "Model & provider" -> {
                         val catalog = data["picker:models"]
-                        val loading = catalog == null || "picker:models" in refreshing
+                        val loading = catalog == null // a cached list is shown while the refresh runs
                         // Hermes may omit the session's provider; then the group holding the current model is the current one.
                         val currentProvider = chat.raw.string("model_provider").ifBlank {
                             catalog?.rows("groups").orEmpty().firstOrNull { g -> (g.rows("models") + g.rows("extra_models")).any { it.string("id") == chat.raw.string("model") } }?.string("provider_id").orEmpty()

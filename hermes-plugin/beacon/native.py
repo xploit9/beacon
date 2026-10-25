@@ -157,6 +157,18 @@ def create_project(owner, provider, profile, request_id, name, description=''):
         return rpc(owner, provider, 'projects.create', {'profile': profile, 'name': name.strip(), 'description': description, 'slug': slug})
 
 
+def provision(owner,provider,profile):
+    """Save an empty owned chat without a live session: this also runs in Hermes' cron process, where session.create would start an agent."""
+    from hermes_state_ids import new_session_id
+    from tui_gateway import server
+    stored=new_session_id()
+    with server._profile_db({'profile':profile},writer=True) as db:
+        if db is None: raise RuntimeError('Native conversation store unavailable')
+        db.create_session(stored,source='android',user_id=provider+':'+owner)
+    verify(owner,provider,profile,stored)
+    return stored
+
+
 def create(owner,provider,profile):
     from tui_gateway import server
     result=rpc(owner,provider,'session.create',{'profile':profile,'source':'android','title':'Beacon voice call','close_on_disconnect':False})

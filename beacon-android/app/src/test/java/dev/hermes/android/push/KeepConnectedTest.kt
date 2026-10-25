@@ -5,6 +5,7 @@ import dev.hermes.android.data.ApiFailure
 import dev.hermes.android.data.AuthContext
 import dev.hermes.android.data.BeaconClient
 import dev.hermes.android.data.NativeAuthExpiredException
+import dev.hermes.android.voice.IncomingCall
 import dev.hermes.android.voice.RelayCallbackPhase
 import dev.hermes.android.voice.RelayCallbackPolicy
 import kotlinx.coroutines.CompletableDeferred
@@ -68,6 +69,28 @@ class KeepConnectedTest {
         assertTrue(keepConnectedLoopNeedsRestart(true, "https://one.example", "owner", "https://two.example", "owner"))
         assertTrue(keepConnectedLoopNeedsRestart(true, "https://one.example", "owner", "https://one.example", "other"))
         assertTrue(keepConnectedLoopNeedsRestart(false, null, null, "https://one.example", "owner"))
+    }
+
+    @Test fun switchSavedWithoutAProviderGainsTheVerifiedOneOnlyForTheSameOriginAndOwner() {
+        val verified = Scope("https://one.example", "owner", "default", nativeProvider = "basic")
+        assertEquals("basic", keepConnectedProviderToStamp(null, "https://one.example", "owner", verified))
+        assertEquals("basic", keepConnectedProviderToStamp("", "https://one.example", "owner", verified))
+        assertNull(keepConnectedProviderToStamp("basic", "https://one.example", "owner", verified))
+        assertNull(keepConnectedProviderToStamp("oidc", "https://one.example", "owner", verified))
+        assertNull(keepConnectedProviderToStamp(null, "https://two.example", "owner", verified))
+        assertNull(keepConnectedProviderToStamp(null, "https://one.example", "other", verified))
+        assertNull(keepConnectedProviderToStamp(null, "https://one.example", "owner", verified.copy(nativeProvider = "")))
+    }
+
+    @Test fun onlyAStillSignedInOwnerOfAnUpdatedSwitchIsToldToOpenBeacon() {
+        val verified = Scope("https://one.example", "owner", "default", nativeProvider = "basic")
+        assertTrue(keepConnectedAwaitsVerification(null, "https://one.example", "owner", null, "owner"))
+        assertTrue(keepConnectedAwaitsVerification("", "https://one.example", "owner", null, "owner"))
+        assertFalse(keepConnectedAwaitsVerification(null, "https://one.example", "owner", null, ""))
+        assertFalse(keepConnectedAwaitsVerification(null, "https://one.example", "owner", null, "other"))
+        assertFalse(keepConnectedAwaitsVerification("basic", "https://one.example", "owner", null, "owner"))
+        assertFalse(keepConnectedAwaitsVerification(null, "https://one.example", "owner", verified, "owner"))
+        assertFalse(keepConnectedAwaitsVerification(null, "", "owner", null, "owner"))
     }
 
     private fun cursors(values: MutableMap<String, String> = mutableMapOf()) = KeepConnectedCursors(
@@ -539,5 +562,39 @@ class KeepConnectedTest {
         assertNull(prepareKeepConnectedCall(scope, callEvent(profile = "coder"), true, 1_000_000L, 500L))
         assertNull(prepareKeepConnectedCall(scope, callEvent(), enabled = false, now = 1_000_000L, elapsed = 500L))
         assertNull(prepareKeepConnectedCall(scope, callEvent().put("conversation_ref", ""), true, 1_000_000L, 500L))
+    }
+
+    @Test fun keepConnectedPresentationEndsBeforeItsAnswerAndDeclineAuthority() {
+        val scope = Scope("https://hermes.example", "owner", "default")
+        val now = 1_000_333L
+        val elapsed = 500L
+        for (serverExpiry in listOf(1_120L, 1_005L)) {
+            val event = callEvent(expiresAt = serverExpiry)
+            val prepared = prepareKeepConnectedCall(scope, event, true, now, elapsed)!!
+            val data = keepConnectedCallData(event, now)
+            val invite = IncomingCall(
+                data.getValue("source_ref"), data.getValue("event_id"), data.getValue("expires_at").toLong(),
+                actionToken = prepared.call.actionToken, arrivedAt = now + 250, arrivedElapsed = elapsed + 250, boot = 1,
+                conversation = data.getValue("conversation_ref"),
+            )
+            assertEquals(serverExpiry, event.getLong("expires_at"))
+            assertEquals(prepared.call.callId, invite.event)
+            assertTrue(invite.expiresAt * 1_000 <= prepared.call.expiresAt)
+            assertTrue(invite.expiresAt <= serverExpiry)
+            assertTrue(invite.ringDurationMillis(now + 250, elapsed + 250, 1) > 0)
+            assertTrue(invite.ringDurationMillis(now + 250, elapsed + 250, 1) <=
+                prepared.call.remainingRingMillis(now + 250, elapsed + 250))
+            assertNull(prepared.protocol.answer(invite.event, invite.actionToken, prepared.binding,
+                prepared.preferences.copy(keepConnected = false), now + 1_000, elapsed + 1_000))
+            val deadline = minOf(invite.expiresAt * 1_000 - now, 25_000L)
+            for (after in listOf(deadline, 25_000L)) {
+                assertEquals(0L, invite.ringDurationMillis(now + after, elapsed + after, 1))
+            }
+            assertEquals(0L, prepared.call.remainingRingMillis(now + 25_000, elapsed + 25_000))
+            assertNull(prepared.protocol.answer(invite.event, invite.actionToken, prepared.binding,
+                prepared.preferences, now + 25_000, elapsed + 25_000))
+            assertNull(prepared.protocol.decline(invite.event, invite.actionToken, prepared.binding,
+                prepared.preferences, now + 25_000, elapsed + 25_000))
+        }
     }
 }

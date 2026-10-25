@@ -69,6 +69,9 @@ def _number(value):
 
 
 def prune_meta(conn, now):
+    # A caller reads its clock before it waits for the write lock, so a marker a faster request just committed can
+    # be dated after that stale reading; only a marker ahead of the live clock is corrupt.
+    horizon = max(now, time.time())
     for key, value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'email-evidence:%' OR key LIKE 'source-evidence:%' OR key LIKE 'mail-evidence:%' ORDER BY key LIMIT ?", (PRUNE_BATCH,)).fetchall():
         try:
             observed = json.loads(value).get("observed_at")
@@ -88,7 +91,7 @@ def prune_meta(conn, now):
                             (key[len("proactive-email-rule:"):],)).fetchone():
                 continue
         retention = CALL_WINDOW if key.startswith("proactive-call:") else ALERT_RETENTION
-        if created is None or created > now or now - created > retention:
+        if created is None or created > horizon or now - created > retention:
             conn.execute("DELETE FROM meta WHERE key=?", (key,))
     for key, value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'completion:%'").fetchall():
         created = _number(value)
@@ -376,15 +379,15 @@ def event_notice(mobile, native, cfg, profile, session_id, args, now):
     dedupe = "proactive-alert:" + owner + ":" + profile + ":" + dedupe_rule + ":" + _digest(item_id)
     if delivery == "call":
         from beacon_mobile import invitation
-        with mobile.LOCK:
-            with mobile.connect() as conn:
-                prune_meta(conn, now.timestamp())
-                if conn.execute("SELECT 1 FROM meta WHERE key=?", (dedupe,)).fetchone():
-                    return dict(DUPLICATE_ALERT)
-                prefix = f"proactive-call:{owner}:{profile}:"
-                count = sum((_number(row[0]) or 0) > now.timestamp() - CALL_WINDOW
-                            for row in conn.execute("SELECT value FROM meta WHERE substr(key,1,?)=?",
-                                                    (len(prefix), prefix)))
+        with mobile.LOCK, mobile.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            prune_meta(conn, now.timestamp())
+            if conn.execute("SELECT 1 FROM meta WHERE key=?", (dedupe,)).fetchone():
+                return dict(DUPLICATE_ALERT)
+            prefix = f"proactive-call:{owner}:{profile}:"
+            count = sum((_number(row[0]) or 0) > now.timestamp() - CALL_WINDOW
+                        for row in conn.execute("SELECT value FROM meta WHERE substr(key,1,?)=?",
+                                                (len(prefix), prefix)))
             callbacks_ready = cfg.get("callback_tool_enabled") is True and cfg.get("scheduled_callbacks_enabled") is True
             if callbacks_ready and count < CALL_LIMIT:
                 # The event's own reason leads (call history shows it first); the rule follows.
@@ -394,19 +397,19 @@ def event_notice(mobile, native, cfg, profile, session_id, args, now):
                     relay_reason = reason_text((lead + rule_note)[:240])
                 except ValueError:
                     relay_reason = reason_text(reason.strip())
-                event = invitation(owner, profile, stored, relay_reason)
-                with mobile.connect() as conn:
-                    conn.execute("INSERT INTO meta(key,value) VALUES(?,?)",
-                                 ("proactive-call:" + owner + ":" + profile + ":" + uuid.uuid4().hex,
-                                  str(now.timestamp()).encode()))
-                    conn.execute("INSERT INTO meta(key,value) VALUES(?,?)", (dedupe, str(now.timestamp()).encode()))
-                    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
-                                 ("proactive-email-notice:" + event, str(now.timestamp()).encode()))
-                    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
-                                 (EMAIL_RULE_PREFIX + event,
-                                  json.dumps({"created": now.timestamp(), "rule_id": request_id or "default",
-                                              "source": source}).encode()))
-                    conn.execute("UPDATE call_log SET email_notice_id=? WHERE id=? AND owner=? AND profile=?",
-                                 (event, event, owner, profile))
+                event = invitation(owner, profile, stored, relay_reason, conn=conn)
+                conn.execute("INSERT INTO meta(key,value) VALUES(?,?)",
+                             ("proactive-call:" + owner + ":" + profile + ":" + uuid.uuid4().hex,
+                              str(now.timestamp()).encode()))
+                conn.execute("INSERT INTO meta(key,value) VALUES(?,?)", (dedupe, str(now.timestamp()).encode()))
+                conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+                             ("proactive-email-notice:" + event, str(now.timestamp()).encode()))
+                conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+                             (EMAIL_RULE_PREFIX + event,
+                              json.dumps({"created": now.timestamp(), "rule_id": request_id or "default",
+                                          "source": source}).encode()))
+                conn.execute("UPDATE call_log SET email_notice_id=? WHERE id=? AND owner=? AND profile=?",
+                             (event, event, owner, profile))
                 return {"status": "pending", "event_id": event, "conversation_id": stored}
+            return _notice(mobile, owner, profile, stored, reason.strip(), dedupe, now, email_alert=True, source=source, conn=conn)
     return _notice(mobile, owner, profile, stored, reason.strip(), dedupe, now, email_alert=True, source=source)

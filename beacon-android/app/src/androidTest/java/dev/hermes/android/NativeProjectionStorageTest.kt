@@ -9,12 +9,233 @@ import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
 import org.junit.Test
 import java.util.UUID
+import android.content.Context
+import android.content.ContextWrapper
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.launch
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.ResponseBody.Companion.toResponseBody
 
 private const val LEGACY_SESSION_KIND = "xara-session" // This test verifies the released cache kind is migrated.
 private const val LEGACY_OPENING_KIND = "xara-opening" // This test verifies the released cache kind is migrated.
 
 /** Real Android SQLite + keystore regression; never touches the owner's installed database. */
 class NativeProjectionStorageTest {
+    @Test fun originalEncryptedCookieBearerAndLoopbackRecordsRemainReadableWithoutRewritingThem() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Context>()
+        val name = "legacy-auth-fixture-${UUID.randomUUID()}"
+        val context = object : ContextWrapper(app) {
+            override fun getSharedPreferences(ignored: String, mode: Int) = app.getSharedPreferences(name, mode)
+        }
+        val prefs = app.getSharedPreferences(name, Context.MODE_PRIVATE)
+        val cipher = AppCipher()
+        val origin = "https://native.example"
+        val cookie = okhttp3.Cookie.Builder().name("hermes_session_rt").value("legacy-cookie").hostOnlyDomain("native.example")
+            .path("/").secure().httpOnly().expiresAt(System.currentTimeMillis() + 60_000).build().toString()
+        try {
+            for (kind in listOf("cookie", "bearer", "loopback")) {
+                val owner = if (kind == "loopback") "local" else "alice"
+                val raw = org.json.JSONObject().put("owner", owner).put("profile", "default").put("backend", "hermes-dashboard")
+                    .put("cookies", org.json.JSONArray(if (kind == "cookie") listOf(cookie) else emptyList<String>()))
+                if (kind == "bearer") raw.put("bearer", org.json.JSONObject().put("access_token", "legacy-access").put("refresh_token", "legacy-refresh")
+                    .put("expires_at", 1).put("origin", origin).put("owner", owner).put("profile", "default").put("provider", "basic"))
+                if (kind == "loopback") raw.put("loopback_session", org.json.JSONObject().put("token", "legacy-loopback").put("origin", origin).put("owner", owner).put("verified", true))
+                val original = android.util.Base64.encodeToString(cipher.encrypt(raw.toString().toByteArray(), origin), android.util.Base64.NO_WRAP)
+                assertTrue(prefs.edit().putString(origin.digest(), original).commit())
+                val restored = AuthStore(context, cipher).read(origin)
+                assertEquals(owner, restored.owner)
+                assertTrue(restored.canReconnectNative(origin))
+                assertEquals(original, prefs.getString(origin.digest(), null))
+                when (kind) {
+                    "cookie" -> { assertEquals(listOf(cookie), restored.cookies); assertNull(restored.cachedScopeFor(origin, false)) }
+                    "bearer" -> { assertEquals("legacy-access", restored.bearer?.accessToken); assertEquals("basic", restored.cachedScopeFor(origin, false)?.nativeProvider) }
+                    "loopback" -> { assertEquals("legacy-loopback", restored.loopbackSession?.token); assertEquals("loopback", restored.cachedScopeFor(origin, false)?.nativeProvider) }
+                }
+            }
+        } finally { app.deleteSharedPreferences(name) }
+    }
+
+    private fun legacyRestoreClient(provider: String, storedUser: String?, denied: Boolean = false): BeaconClient {
+        val auth = AuthContext("https://native.example", emptyList(), "alice", backend = "hermes-dashboard", nativeProvider = provider)
+        return BeaconClient(auth, null, persistContext = false, configureHttp = { builder ->
+            builder.addInterceptor { chain ->
+                val path = chain.request().url.encodedPath
+                val body = when (path) {
+                    "/api/auth/me" -> """{"user_id":"alice","provider":"$provider"}"""
+                    "/api/profiles" -> """{"profiles":[{"name":"default"}]}"""
+                    "/api/sessions/legacy-chat" -> org.json.JSONObject().put("id", "legacy-chat").put("profile", "default").put("user_id", storedUser ?: org.json.JSONObject.NULL).toString()
+                    else -> error("Unexpected fixture path: $path")
+                }
+                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(if (denied) 403 else 200).message("Fixture")
+                    .body(body.toResponseBody("application/json".toMediaType())).build()
+            }
+        })
+    }
+
+    @Test fun creatorMatchedLegacySelectionNeverAssignsUnstampedSharedConversationDrafts() = runBlocking {
+        val db = database()
+        val client = legacyRestoreClient("basic", "basic:alice")
+        try {
+            val cache = ProjectionCache(db, AppCipher())
+            val legacy = Scope(client.auth.origin, "alice", "default", "legacy-chat")
+            val initial = legacy.copy(session = "")
+            cache.write(legacy, "draft", "Unstamped private draft from a shared conversation", protected = true)
+            cache.write(initial, "initial-draft", "unbound initial draft", protected = true)
+            val selectionKey = "${initial.key}:selected-session"
+            val selectionBytes = AppCipher().encrypt("legacy-chat".toByteArray(), selectionKey)
+            db.rows().put(Projection(selectionKey, initial.key, selectionBytes, 1234, true, selectionBytes.size.toLong()))
+            val oldKey = "${legacy.key}:${"draft".digest()}"
+            val oldMetadata = requireNotNull(db.rows().get(oldKey))
+            val oldCiphertext = db.rows().encryptedChunk(oldKey, 1, oldMetadata.encryptedSize.toInt())
+            assertNull(cache.read(client.scope.session("legacy-chat"), "draft"))
+            assertEquals("legacy-chat", cache.authorizedLegacySelection(client))
+            assertArrayEquals(selectionBytes, db.rows().encryptedChunk(selectionKey, 1, selectionBytes.size))
+            assertNull(cache.read(client.scope.session("legacy-chat"), "draft"))
+            assertArrayEquals(oldCiphertext, db.rows().encryptedChunk(oldKey, 1, oldMetadata.encryptedSize.toInt()))
+            assertNull(cache.read(client.scope, "initial-draft"))
+            assertEquals("unbound initial draft", cache.read(initial, "initial-draft"))
+            cache.write(client.scope.session("legacy-chat"), "draft", "New provider-bound draft", protected = true)
+            assertEquals("legacy-chat", cache.authorizedLegacySelection(client))
+            assertEquals("New provider-bound draft", cache.read(client.scope.session("legacy-chat"), "draft"))
+            assertEquals("Unstamped private draft from a shared conversation", cache.read(legacy, "draft"))
+        } finally { client.closeNative(); db.close() }
+    }
+
+    @Test fun wrongProviderMissingNativeProvenanceAndDenialNeverExposeOrConsumeLegacyDrafts() = runBlocking {
+        for ((provider, storedUser, denied) in listOf(Triple("oidc", "basic:alice", false), Triple("basic", null, false), Triple("basic", "basic:alice", true))) {
+            val db = database()
+            val client = legacyRestoreClient(provider, storedUser, denied)
+            try {
+                val cache = ProjectionCache(db, AppCipher())
+                val legacy = Scope(client.auth.origin, "alice", "default", "legacy-chat")
+                cache.write(legacy, "draft", "private original", protected = true)
+                val selectionKey = "${legacy.copy(session = "").key}:selected-session"
+                val selected = AppCipher().encrypt("legacy-chat".toByteArray(), selectionKey)
+                db.rows().put(Projection(selectionKey, legacy.copy(session = "").key, selected, 1234, true, selected.size.toLong()))
+                runCatching { assertNull(cache.authorizedLegacySelection(client)) }.getOrElse {
+                    if (it !is ApiFailure) throw it
+                }
+                assertArrayEquals(selected, db.rows().encryptedChunk(selectionKey, 1, selected.size))
+                assertNull(cache.read(client.scope.session("legacy-chat"), "draft"))
+                assertEquals("private original", cache.read(legacy, "draft"))
+                assertEquals(1, db.rows().protectedRows(legacy.key).size)
+            } finally { client.closeNative(); db.close() }
+        }
+    }
+
+    private suspend fun withAuthStore(block: suspend (AuthStore) -> Unit) {
+        val app = ApplicationProvider.getApplicationContext<Context>()
+        val name = "authority-fixture-${UUID.randomUUID()}"
+        val context = object : ContextWrapper(app) {
+            override fun getSharedPreferences(ignored: String, mode: Int) = app.getSharedPreferences(name, mode)
+        }
+        try { block(AuthStore(context, AppCipher())) } finally { app.deleteSharedPreferences(name) }
+    }
+
+    @Test fun delayedOldBearerLogoutCannotRemoveANewSignIn() = runBlocking {
+        withAuthStore { store ->
+            val old = NativeBearerRecord("old-access", "old-refresh", 100, "https://native.example", "alice", "default", "basic")
+            store.write(AuthContext(old.origin, emptyList(), old.owner, old.profile, backend = "hermes-dashboard", bearer = old))
+            val frozen = BeaconClient(store.read(old.origin), store, persistContext = false)
+            // The ViewModel removes local authority before its suspended push cleanup resumes.
+            store.clear(old.origin)
+            val resumeCleanup = CompletableDeferred<Unit>()
+            val cleanup = launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) { resumeCleanup.await(); frozen.logout() }
+            val newer = old.copy(accessToken = "new-access", refreshToken = "new-refresh", provider = "oidc")
+            store.write(AuthContext(newer.origin, emptyList(), newer.owner, newer.profile, backend = "hermes-dashboard", bearer = newer))
+            resumeCleanup.complete(Unit)
+            cleanup.join()
+            assertEquals(newer, store.read(old.origin).bearer)
+        }
+    }
+
+    @Test fun logoutEpochCapturedBeforeSuspensionCannotClearAReplacementCredential() = runBlocking {
+        withAuthStore { store ->
+            val old = NativeBearerRecord("old-access", "old-refresh", 100, "https://native.example", "alice", "default", "basic")
+            store.write(AuthContext(old.origin, emptyList(), old.owner, bearer = old, backend = "hermes-dashboard"))
+            val capturedVersion = store.authorityEpoch.readVersion()
+            val replacement = old.copy(accessToken = "new-access", refreshToken = "new-refresh")
+            store.write(AuthContext(old.origin, emptyList(), old.owner, bearer = replacement, backend = "hermes-dashboard"))
+            assertFalse(store.removeIfUnchanged(old.origin, capturedVersion))
+            assertEquals(replacement, store.read(old.origin).bearer)
+        }
+    }
+
+    @Test fun frozenCleanupRefreshesOnlyItsCapturedCredentialAndCannotWriteTheNewLogin() = runBlocking {
+        withAuthStore { store ->
+            val old = NativeBearerRecord("old-access", "old-refresh", 1, "https://native.example", "alice", "default", "basic")
+            val auth = AuthContext(old.origin, emptyList(), old.owner, bearer = old, backend = "hermes-dashboard")
+            store.write(auth)
+            val requests = mutableListOf<okhttp3.Request>()
+            val live = BeaconClient(auth, store, persistContext = false, configureHttp = { builder ->
+                builder.addInterceptor { chain ->
+                    val request = chain.request(); requests += request
+                    val refresh = request.url.encodedPath == "/auth/native/refresh"
+                    val accepted = request.header("Authorization") == "Bearer cleanup-access"
+                    val body = if (refresh) """{"access_token":"cleanup-access","refresh_token":"cleanup-refresh","token_type":"Bearer","user_id":"alice","provider":"basic"}"""
+                        else if (accepted) """{"user_id":"alice","provider":"basic"}""" else """{"detail":"Unauthorized"}"""
+                    Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if (refresh || accepted) 200 else 401).message("Fixture")
+                        .body(body.toResponseBody("application/json".toMediaType())).build()
+                }
+            })
+            val frozen = live.detachedForLogout()
+            val replacement = old.copy(accessToken = "new-login-access", refreshToken = "new-login-refresh")
+            store.clear(old.origin)
+            store.write(auth.copy(bearer = replacement))
+            try {
+                frozen.nativeRequest("/api/auth/me")
+                assertEquals(listOf("/api/auth/me", "/auth/native/refresh", "/api/auth/me"), requests.map { it.url.encodedPath })
+                assertEquals("Bearer cleanup-access", requests.last().header("Authorization"))
+                assertTrue(requests.none { it.header("Authorization") == "Bearer new-login-access" })
+                assertEquals(replacement, store.read(old.origin).bearer)
+            } finally { frozen.closeNative(); live.closeNative() }
+        }
+    }
+
+    @Test fun cookieLogoutStillPostsWithoutErasingALoginCompletedDuringCleanup() = runBlocking {
+        withAuthStore { store ->
+            val origin = "https://native.example"
+            val cookie = "hermes_session_at=old-cookie; Path=/; Secure; HttpOnly"
+            val old = AuthContext(origin, listOf(cookie), "alice", backend = "hermes-dashboard")
+            store.write(old)
+            val newer = NativeBearerRecord("new-access", "new-refresh", 200, origin, "alice", "default", "basic")
+            val requests = mutableListOf<String>()
+            val frozen = BeaconClient(old, store, persistContext = false, configureHttp = { builder ->
+                builder.addInterceptor { chain ->
+                    requests += "${chain.request().method} ${chain.request().url.encodedPath}"
+                    store.write(AuthContext(origin, emptyList(), "alice", backend = "hermes-dashboard", bearer = newer))
+                    Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(302).message("Signed out")
+                        .body("".toResponseBody("text/plain".toMediaType())).build()
+                }
+            })
+            store.clear(origin)
+            frozen.logout()
+            assertEquals(listOf("POST /auth/logout"), requests)
+            assertEquals(newer, store.read(origin).bearer)
+        }
+    }
+
+    @Test fun ordinaryLocalLogoutRemovesOnlyTheCredentialAndKeepsDrafts() = runBlocking {
+        withAuthStore { store ->
+            val bearer = NativeBearerRecord("access", "refresh", 100, "https://native.example", "alice", "default", "basic")
+            val auth = AuthContext(bearer.origin, emptyList(), bearer.owner, bearer.profile, backend = "hermes-dashboard", bearer = bearer)
+            store.write(auth)
+            val db = database()
+            try {
+                val cache = ProjectionCache(db, AppCipher())
+                val scope = auth.scope()
+                cache.write(scope, "initial-draft", "retained draft", protected = true)
+                val frozen = BeaconClient(store.read(auth.origin), store, persistContext = false)
+                store.clear(auth.origin)
+                frozen.logout()
+                assertNull(store.read(auth.origin).bearer)
+                assertEquals("retained draft", cache.read(scope, "initial-draft"))
+            } finally { db.close() }
+        }
+    }
+
     private fun database(): ProjectionDb = Room.inMemoryDatabaseBuilder(
         ApplicationProvider.getApplicationContext(), ProjectionDb::class.java
     ).build()

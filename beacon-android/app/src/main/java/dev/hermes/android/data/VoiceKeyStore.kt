@@ -56,7 +56,7 @@ internal class VoiceKeyStore private constructor(
     private val decrypt: (ByteArray, String) -> ByteArray,
 ) {
     constructor(context: Context) : this(
-        context.getSharedPreferences("voice-private", Context.MODE_PRIVATE),
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE),
         AppCipher(),
     )
 
@@ -141,7 +141,8 @@ internal class VoiceKeyStore private constructor(
     private fun validVoiceOption(value: String) =
         value.isNotBlank() && value.length <= 200 && value.none { it.isWhitespace() || it.isISOControl() }
 
-    private companion object {
-        val VOICE_PERSONALITIES = setOf("balanced", "concise", "warm")
+    companion object {
+        const val PREFS = "voice-private"
+        private val VOICE_PERSONALITIES = setOf("balanced", "concise", "warm")
     }
 }

@@ -96,6 +96,21 @@ def test_unserved_profile_cron_keeps_owner_jobs_and_guards_beacon_jobs(harness, 
         assert plugin.native_proactive_read_only_guard('read_file', {'path': 'x'}, 'work-cron-run') is None
 
 
+@pytest.mark.parametrize('job,blocked', [
+    ({'id': 'digest', 'name': 'Daily digest', 'prompt': 'Summarise the news'}, False),
+    ({'id': 'digest', 'name': 'Beacon: important emails', 'prompt': 'watch'}, True),
+])
+def test_a_cron_run_without_a_ledger_row_is_placed_by_hermes_cron_context(harness, monkeypatch, job, blocked):
+    plugin = load_private('__init__')
+    _guard_native_identity(monkeypatch, {}, 'default')
+    monkeypatch.setattr(plugin, 'current_profile', lambda cfg: 'default')
+    monkeypatch.setattr(plugin.proactive, '_cron_helpers', lambda: (lambda profile, op, *args: [job], None, None, None))
+    plugin.register(SimpleNamespace(register_tool=lambda **kwargs: None, register_hook=lambda name, handler: None,
+                                    current_cron_execution=lambda: SimpleNamespace(job_id='digest')))
+    result = plugin.native_proactive_read_only_guard('write_file', {'path': 'x', 'content': 'y'}, 'local-' + 'b' * 64)
+    assert (result is not None) is blocked
+
+
 def test_watch_guard_cannot_block_without_a_session_id(harness):
     assert load_private('__init__').native_proactive_read_only_guard('write_file', {}) is None
 
@@ -458,7 +473,8 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
     assert send_message == blocked
     assert allowed is None and outside is None and skills_list is None
     assert memory_read is None and web_read is None
-    assert hindsight_reads == [None] * 4 and hindsight_writes == [blocked] * 3
+    # Provider memory tools are not read-only by name; only the native memory tool's read actions are allowed.
+    assert hindsight_reads == [blocked] * 4 and hindsight_writes == [blocked] * 3
     assert email_notice_url is None and email_checked_url is None
     assert event_notice_url is None and events_checked is None
     mcp_tool._mcp_tool_server_names.update({"mcp__github__get_issue": "github", "mcp__github__create_issue": "github"})
@@ -781,3 +797,132 @@ def test_launch_home_stays_put_while_hermes_repoints_hermes_home(harness, monkey
     # Hermes repoints HERMES_HOME while it deletes or renames another profile.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-being-deleted"))
     assert mobile.home() == first and first.name == "launch"
+
+
+# Strix afd1b07 S4: a write is CSRF-safe by what the browser declares, even when its body is empty.
+@pytest.mark.parametrize('headers,status', [
+    ({'content-type': 'application/x-www-form-urlencoded', 'content-length': '0'}, 415),  # a zero-field HTML form post
+    ({'content-type': 'text/plain'}, 415),
+    ({'origin': 'https://evil.example', 'host': 'beacon.example'}, 403),
+    ({'origin': 'null', 'host': 'beacon.example'}, 403),
+    ({'origin': 'https://beacon.example.evil.test', 'host': 'beacon.example'}, 403),
+])
+def test_empty_bodied_cross_site_writes_are_refused_without_fetch_metadata(api, headers, status):
+    with pytest.raises(HTTPException) as error:
+        api.identity(make_request('POST', headers))
+
+    assert error.value.status_code == status
+
+
+def test_same_origin_and_non_browser_empty_writes_still_pass(api):
+    for headers in ({'origin': 'https://Beacon.example', 'host': 'beacon.example'},
+                    {'content-type': 'application/json'}, {}):
+        assert api.identity(make_request('POST', headers))[:3] == ('owner', 'basic', 'default')
+
+
+@pytest.fixture
+def watch_guard(harness, monkeypatch):
+    """A Proactive watch run whose tools come from one memory toolset and one MCP server named api."""
+    plugin = load_private("__init__")
+    monkeypatch.setattr(plugin, "current_profile", lambda cfg: "default")
+    monkeypatch.setattr(plugin, "_cron_row", lambda *args: {"source": "cron", "cron_job_id": "watch-job"})
+    monkeypatch.setattr(plugin.proactive, "watch_job_ids", lambda *args: {"watch-job"})
+    schemas = {}
+    mcp_tool = SimpleNamespace(_mcp_tool_server_names={"mcp__api__get_resource": "api"},
+                               _tool_read_only_hints={"api": {"get_resource": True}})
+    import tools
+    monkeypatch.setitem(sys.modules, "tools.mcp_tool", mcp_tool)
+    monkeypatch.setattr(tools, "mcp_tool", mcp_tool, raising=False)
+    monkeypatch.setitem(sys.modules, "tools.mcp_tool_schema",
+                        SimpleNamespace(mcp_prefixed_tool_name=lambda server, raw: f"mcp__{server}__{raw}"))
+    monkeypatch.setitem(sys.modules, "tools.mcp_tool_scope", SimpleNamespace(_resolve_server_key=lambda server: server))
+    monkeypatch.setitem(sys.modules, "tools.registry", SimpleNamespace(registry=SimpleNamespace(
+        get_toolset_for_tool=lambda name: "memory" if name in {"memory", "hindsight_retain", "hindsight_ingest",
+                                                               "hindsight_capture"} else "mcp-api",
+        get_schema=lambda name: schemas.get(name))))
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles",
+                        SimpleNamespace(_profile_scope=lambda profile: nullcontext()))
+    return plugin, schemas
+
+
+# Strix afd1b07 S9: the memory toolset also ships provider write tools; an argument never vouches for them.
+@pytest.mark.parametrize("name", ["hindsight_retain", "hindsight_ingest", "hindsight_capture"])
+@pytest.mark.parametrize("action", ["read", "list", "query", "search", "get"])
+def test_a_read_sounding_action_never_releases_a_memory_provider_write_tool(watch_guard, name, action):
+    plugin, _ = watch_guard
+    blocked = {"action": "block", "message": plugin._READ_ONLY_MESSAGE}
+
+    assert plugin.native_proactive_read_only_guard(
+        tool_name=name, args={"action": action, "content": "owner memory"}, session_id="watch-run") == blocked
+    assert plugin.native_proactive_read_only_guard(tool_name="memory", args={"action": action}, session_id="watch-run") is None
+
+
+# Strix afd1b07 S11: a server's read-only annotation does not outrank the method or body the call itself carries.
+def test_a_read_only_annotation_does_not_vouch_for_a_method_or_body_in_the_arguments(watch_guard):
+    plugin, schemas = watch_guard
+    blocked = {"action": "block", "message": plugin._READ_ONLY_MESSAGE}
+
+    def guard(args):
+        return plugin.native_proactive_read_only_guard(tool_name="mcp__api__get_resource", args=args, session_id="watch-run")
+
+    assert guard({"id": "7"}) is None and guard({"id": "7", "method": "GET"}) is None
+    for args in ({"id": "7", "method": "POST"}, {"id": "7", "method": "delete"}, {"id": "7", "http_method": "PUT"},
+                 {"id": "7", "body": "x"}, {"id": "7", "payload": {"a": 1}}, {"id": "7", "method": 5},
+                 # Every method field present is judged, so a harmless one cannot hide the other.
+                 {"id": "7", "method": "GET", "http_method": "DELETE"}, {"id": "7", "http_method": "GET", "method": "DELETE"},
+                 {"id": "7", "METHOD": "DELETE", "method": "GET"}):
+        assert guard(args) == blocked, args
+    assert guard({"id": "7", "method": "GET", "http_method": "head"}) is None
+    # A schema that offers a method without limiting it to GET/HEAD leaves an omitted method to the server's default.
+    schemas["mcp__api__get_resource"] = {"parameters": {"properties": {"id": {"type": "string"}, "method": {"type": "string"}}}}
+    assert guard({"id": "7"}) == blocked and guard({"id": "7", "method": "GET"}) is None
+    schemas["mcp__api__get_resource"]["parameters"]["properties"]["method"] = {"type": "string", "enum": ["GET", "HEAD"]}
+    assert guard({"id": "7"}) is None
+
+
+# Strix afd1b07 S12: no verdict is not permission when Beacon is set up but cannot tell which session this is.
+def test_the_guard_stays_read_only_when_beacon_is_set_up_but_the_session_cannot_be_read(harness, monkeypatch):
+    plugin = load_private("__init__")
+    monkeypatch.setattr(plugin, "current_profile", lambda cfg: "default")
+
+    def locked(*args, **kwargs): raise OSError("state locked")
+
+    monkeypatch.setattr(plugin, "_cron_row", locked)
+    monkeypatch.setitem(sys.modules, "hermes_cli.profiles", SimpleNamespace(current_profile_name=lambda: "default"))
+    monkeypatch.setitem(sys.modules, "tui_gateway", SimpleNamespace(server=SimpleNamespace(_profile_db=locked)))
+    blocked = {"action": "block", "message": plugin._READ_ONLY_MESSAGE}
+
+    assert plugin.native_proactive_read_only_guard("write_file", {"path": "x"}, "cron_job1_20261025_080000") == blocked
+    # An unreadable Beacon configuration is not proof that Beacon is absent.
+    monkeypatch.setattr(plugin.mobile, "settings", locked)
+    assert plugin.native_proactive_read_only_guard("write_file", {"path": "x"}, "cron_job1_20261025_080000") == blocked
+    # Without Beacon set up, its guard never gates ordinary Hermes tools.
+    monkeypatch.setattr(plugin.mobile, "settings", lambda profile=None: {})
+    assert plugin.native_proactive_read_only_guard("write_file", {"path": "x"}, "cron_job1_20261025_080000") is None
+    # cron_<job>_<time> is the legacy cron session name; an ordinary chat is never gated by an unreadable lookup.
+    monkeypatch.setattr(plugin.mobile, "settings", lambda profile=None: {"owner_id": "owner"})
+    assert plugin.native_proactive_read_only_guard("write_file", {"path": "x"}, "cron_job1_20261025_080000") == blocked
+    assert plugin.native_proactive_read_only_guard("write_file", {"path": "x"}, "20261025_080000_chat") is None
+
+
+# Current Hermes names a cron run local-<hash>, so only the run Hermes itself reports can fail closed.
+@pytest.mark.parametrize("store", ["raises", "unavailable"])
+def test_the_guard_blocks_a_current_cron_run_it_cannot_identify_but_not_an_ordinary_chat(harness, monkeypatch, store):
+    plugin = load_private("__init__")
+    monkeypatch.setattr(plugin, "current_profile", lambda cfg: "default")
+    monkeypatch.setattr(plugin.mobile, "settings", lambda profile=None: {"owner_id": "owner"})
+
+    def locked(*args, **kwargs): raise OSError("state locked")
+
+    profile_db = locked if store == "raises" else (lambda scope: nullcontext(None))
+    monkeypatch.setitem(sys.modules, "hermes_cli.profiles", SimpleNamespace(current_profile_name=lambda: "default"))
+    monkeypatch.setitem(sys.modules, "tui_gateway", SimpleNamespace(server=SimpleNamespace(_profile_db=profile_db)))
+    running = [SimpleNamespace(job_id="job1")]
+    plugin.register(SimpleNamespace(register_tool=lambda **kwargs: None, register_hook=lambda name, handler: None,
+                                    current_cron_execution=lambda: running[0]))
+    blocked = {"action": "block", "message": plugin._READ_ONLY_MESSAGE}
+    session = "local-" + "a" * 64
+
+    assert plugin.native_proactive_read_only_guard("write_file", {"path": "x"}, session) == blocked
+    running[0] = None  # the same session id outside a cron run is an ordinary chat
+    assert plugin.native_proactive_read_only_guard("write_file", {"path": "x"}, session) is None

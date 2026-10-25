@@ -29,7 +29,7 @@ private val publicErrorText = setOf(
     "This chat changed. Refresh and try again.",
     "This chat is busy with a reply. Try again when it finishes.",
     "Hermes didn't allow that.",
-    "This phone was removed from Beacon on your PC. Pair it again in Settings › Devices.",
+    "This phone was removed from Beacon on your PC. Add it again in Settings › Connection.",
     "That chat belongs to another profile.",
     "Hermes is restarting. Try again in a moment.",
     "Choose an owned assistant conversation before enabling Proactive",
@@ -43,9 +43,9 @@ private val publicErrorText = setOf(
 
 internal fun appErrorText(error: Throwable): String = when (error) {
     is ApiFailure -> apiFailureText(error.status, error.detail)
-    is LoopbackSessionRefreshFailed -> "Hermes restarted. Scan the Connect QR again."
+    is LoopbackSessionRefreshFailed -> "Hermes restarted. Paste the link again."
     is NativeAuthExpiredException -> "Sign-in expired. Sign in again."
-    is DeviceRemovedFailure -> "This phone was removed from Beacon on your PC. Pair it again in Settings › Devices."
+    is DeviceRemovedFailure -> "This phone was removed from Beacon on your PC. Add it again in Settings › Connection."
     is PairingFailure -> safeLocalErrorText(error.message.orEmpty())
     is java.io.IOException -> APP_CONNECTION_ERROR
     else -> safeLocalErrorText(error.message.orEmpty())
@@ -61,7 +61,7 @@ internal fun nativeErrorCodeText(detail: String): String? = when (detail) {
     "mutation_identity_required", "revision_conflict", "stale_generation", "retained_receipts" -> "This chat changed. Refresh and try again."
     "session_busy", "admission_conflict", "runtime_coordination_required" -> "This chat is busy with a reply. Try again when it finishes."
     "permission_denied" -> "Hermes didn't allow that."
-    "device_removed" -> "This phone was removed from Beacon on your PC. Pair it again in Settings › Devices."
+    "device_removed" -> "This phone was removed from Beacon on your PC. Add it again in Settings › Connection."
     "profile_mismatch" -> "That chat belongs to another profile."
     "runtime_draining" -> "Hermes is restarting. Try again in a moment."
     else -> if (Regex("[a-z]+(?:_[a-z]+)+").matches(detail)) "Hermes couldn't do that. Try again." else null

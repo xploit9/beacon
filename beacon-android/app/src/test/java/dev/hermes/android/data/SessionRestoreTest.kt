@@ -7,12 +7,21 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SessionRestoreTest {
-    private val owner = Scope("https://native.example", "owner", "work")
+    private val owner = Scope("https://native.example", "owner", "work", nativeProvider = "basic")
     private val now = System.currentTimeMillis()
     private fun token(name: String = "__Host-hermes_session_rt", expires: Long = now + 60_000) =
         Cookie.Builder().name(name).value("fixture").hostOnlyDomain("native.example").path("/")
             .secure().httpOnly().expiresAt(expires).build().toString()
-    private fun saved(cookies: List<String>) = AuthContext(owner.origin, cookies, owner.owner, owner.profile, backend = "hermes-dashboard")
+    private fun saved(cookies: List<String>) = AuthContext(owner.origin, cookies, owner.owner, owner.profile, backend = "hermes-dashboard", nativeProvider = owner.nativeProvider)
+
+    @Test fun unstampedCookieRemainsReadableButCannotOpenAnyProviderVaultBeforeNativeVerification() {
+        val retained = saved(listOf(token())).copy(nativeProvider = "")
+        assertEquals(listOf(token()), retained.cookies)
+        assertNull(retained.cachedScopeFor(owner.origin, false, now))
+        assertTrue(retained.canReconnectNative(owner.origin, now))
+        assertFalse(keepsRestoredCall(owner, owner.copy(nativeProvider = "oidc"), false))
+        assertThrows(CachedIdentityMismatch::class.java) { retained.requireCachedIdentity(owner) }
+    }
 
     @Test fun expiredAccessWithLiveRefreshRestoresAfterRelaunch() {
         val retained = saved(listOf(token("__Host-hermes_session_at", now - 1), token()))

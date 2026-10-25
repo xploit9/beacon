@@ -30,10 +30,112 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 class NativeAuthTest {
+    @Test fun retainedProfileRefreshesTheAccountInsteadOfTreatingSelectionAsRotation() = runBlocking {
+        val old = NativeBearerRecord("access", "refresh", 100, "https://native.example", "alice", "a", "basic")
+        var selected = AuthContext(old.origin, emptyList(), old.owner, "b", backend = "hermes-dashboard", bearer = old.copy(profile = "b"))
+        val requests = mutableListOf<Request>()
+        val http = OkHttpClient.Builder().addInterceptor { chain ->
+            requests += chain.request()
+            // An independent profile switch during the real refresh must survive its CAS.
+            selected = selected.copy(profile = "c", bearer = selected.bearer?.copy(profile = "c"))
+            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
+                .body("""{"access_token":"rotated","refresh_token":"rotated-refresh","token_type":"Bearer","user_id":"alice","provider":"basic"}""".toResponseBody("application/json".toMediaType())).build()
+        }.build()
+        val refreshed = NativeAuth(old.origin, http).refresh(old, { selected.bearer }, { expected, replacement ->
+            val updated = selected.compareAndSetBearer(expected, replacement)
+            if (updated == null) false else { selected = updated; true }
+        })
+
+        assertEquals("a", refreshed.profile)
+        assertEquals("rotated", refreshed.accessToken)
+        assertEquals("c", selected.profile)
+        assertEquals(refreshed.copy(profile = "c"), selected.bearer)
+        assertEquals(listOf("/auth/native/refresh"), requests.map { it.url.encodedPath })
+        val payload = JSONObject(Buffer().also { requests.single().body!!.writeTo(it) }.readUtf8())
+        assertEquals(setOf("refresh_token", "provider"), payload.keys().asSequence().toSet())
+        assertEquals("refresh", payload.getString("refresh_token"))
+        assertEquals("basic", payload.getString("provider"))
+    }
+
+    @Test fun retainedProfileAdoptsAlreadyRotatedAccountTokensWithoutARequest() = runBlocking {
+        val old = NativeBearerRecord("access", "refresh", 100, "https://native.example", "alice", "a", "basic")
+        val winner = old.copy(accessToken = "winner", refreshToken = "winner-refresh", profile = "b")
+        val http = OkHttpClient.Builder().addInterceptor { error("A rotated account token must be adopted") }.build()
+        assertEquals(winner.copy(profile = "a"), NativeAuth(old.origin, http).refresh(old, { winner }, { _, _ -> error("Adoption must not persist the old profile") }))
+    }
+
+    @Test fun differentProfilesShareOneControlledAccountRefresh() = runBlocking {
+        val old = NativeBearerRecord("access", "refresh", 100, "https://coalesced.example", "alice", "a", "basic")
+        var selected = AuthContext(old.origin, emptyList(), old.owner, "b", backend = "hermes-dashboard", bearer = old.copy(profile = "b"))
+        val monitor = Any()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val requests = CopyOnWriteArrayList<Request>()
+        val http = OkHttpClient.Builder().addInterceptor { chain ->
+            requests += chain.request(); entered.countDown()
+            check(release.await(5, TimeUnit.SECONDS))
+            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
+                .body("""{"access_token":"rotated","refresh_token":"rotated-refresh","token_type":"Bearer","user_id":"alice","provider":"basic"}""".toResponseBody("application/json".toMediaType())).build()
+        }.build()
+        val latest = { synchronized(monitor) { selected.bearer } }
+        val persist: (NativeBearerRecord, NativeBearerRecord) -> Boolean = { expected, replacement -> synchronized(monitor) {
+            val updated = selected.compareAndSetBearer(expected, replacement)
+            if (updated == null) false else { selected = updated; true }
+        } }
+        val auth = NativeAuth(old.origin, http)
+        val a = async(Dispatchers.IO) { auth.refresh(old, latest, persist) }
+        try {
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            val b = async(Dispatchers.IO) { auth.refresh(old.copy(profile = "b"), latest, persist) }
+            release.countDown()
+            assertEquals("a", a.await().profile)
+            assertEquals("b", b.await().profile)
+            assertEquals(1, requests.size)
+            assertEquals("rotated", selected.bearer?.accessToken)
+            assertEquals("b", selected.profile)
+        } finally { release.countDown(); a.cancel() }
+    }
+
+    @Test fun retainedProfileRejectsMissingForeignAndReplacedAuthority() = runBlocking {
+        val old = NativeBearerRecord("access", "refresh", 100, "https://native.example", "alice", "a", "basic")
+        val noRequests = OkHttpClient.Builder().addInterceptor { error("Foreign or revoked authority must fail before refresh") }.build()
+        for (latest in listOf(null, old.copy(profile = "b", provider = "oidc"), old.copy(profile = "b", owner = "bob"), old.copy(profile = "b", origin = "https://other.example"))) {
+            assertTrue(runCatching { NativeAuth(old.origin, noRequests).refresh(old, { latest }, { _, _ -> error("Foreign authority must not persist") }) }.exceptionOrNull() is NativeAuthException)
+        }
+        val http = OkHttpClient.Builder().addInterceptor { chain ->
+            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
+                .body("""{"access_token":"rotated","refresh_token":"rotated-refresh","token_type":"Bearer","user_id":"alice","provider":"basic"}""".toResponseBody("application/json".toMediaType())).build()
+        }.build()
+        assertTrue(runCatching { NativeAuth(old.origin, http).refresh(old, { old.copy(profile = "b") }, { _, _ -> false }) }.exceptionOrNull() is NativeAuthException)
+    }
+
+    @Test fun refreshRejectsChangedProviderOrSubjectBeforePersistence() = runBlocking {
+        val old = NativeBearerRecord("access", "refresh", 100, "https://native.example", "alice", "default", "basic")
+        for ((provider, owner) in listOf("oidc" to "alice", "basic" to "other")) {
+            var persisted = false
+            val http = OkHttpClient.Builder().addInterceptor { chain ->
+                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
+                    .body("""{"access_token":"rotated","refresh_token":"rotated-refresh","token_type":"Bearer","provider":"$provider","user_id":"$owner"}""".toResponseBody("application/json".toMediaType())).build()
+            }.build()
+            val error = runCatching { NativeAuth(old.origin, http).refresh(old, { old }, { _, _ -> persisted = true; true }) }.exceptionOrNull()
+            assertTrue(error is NativeAuthException)
+            assertFalse(persisted)
+        }
+    }
+
+    @Test fun refreshNeverAdoptsAnotherProvidersCurrentCredential() = runBlocking {
+        val old = NativeBearerRecord("access", "refresh", 100, "https://native.example", "alice", "default", "basic")
+        val current = old.copy(provider = "oidc", accessToken = "other-provider-access")
+        val http = OkHttpClient.Builder().addInterceptor { error("Changed authority must fail before a request") }.build()
+        val error = runCatching { NativeAuth(old.origin, http).refresh(old, { current }, { _, _ -> error("Changed authority must not persist") }) }.exceptionOrNull()
+        assertTrue(error is NativeAuthException)
+    }
+
     @Test fun nativeOAuthRoutesAreAllowed() {
         assertTrue(NativeOperationPolicy.direct("/auth/native/authorize", "GET"))
         assertTrue(NativeOperationPolicy.direct("/auth/native/token", "GET"))

@@ -66,6 +66,17 @@ def invoke(api, request='r1', tool='a', scope=SCOPE):
     return api.invoke(scope, {'request_id': request, 'tool_id': tool * 64, 'arguments': {'query': 'weather'}}, session_id='chat')
 
 
+def use_terminal(backend):
+    terminal = {**backend.catalog()[0], '_kind': 'hermes', '_raw': 'terminal', 'name': 'terminal',
+                'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command']}}
+    backend.catalog = lambda discover=True: [terminal]
+
+
+def invoke_terminal(api, request='r1', command='echo safe'):
+    return api.invoke(SCOPE, {'request_id': request, 'tool_id': 'a' * 64, 'arguments': {'command': command}},
+                      session_id='chat')
+
+
 def settled(api, request='r1', scope=SCOPE):
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
@@ -142,7 +153,7 @@ def test_smart_never_assesses_arbitrary_mcp_arguments_as_shell(approval_gateway)
     assert state['checks'] == [] and backend.calls == []
 
 
-def test_call_allowance_is_scoped_and_survives_schema_change(approval_gateway):
+def test_call_allowance_is_scoped_and_binds_to_the_approved_definition(approval_gateway):
     api, backend, _, _ = approval_gateway
     proposal = invoke(api)
     api.decide(SCOPE, 'r1', {'proposal_id': proposal['proposal']['id'], 'decision': 'approve_call'})
@@ -152,12 +163,16 @@ def test_call_allowance_is_scoped_and_survives_schema_change(approval_gateway):
     assert invoke(api, 'different', 'b')['status'] == 'needs_approval'
     other = (*SCOPE[:3], 'other-call')
     assert invoke(api, 'other', scope=other)['status'] == 'needs_approval'
+    # Strix afd1b07 S10: the server republished the tool under the same name with another definition.
     backend.version = 'c'
-    invoke(api, 'changed-schema', 'c')
-    assert settled(api, 'changed-schema')['approved_by'] == 'call_allowance'
+    changed = invoke(api, 'changed-schema', 'c')
+    assert changed['status'] == 'needs_approval' and changed['approved_by'] is None and 'proposal' in changed
+    backend.version = 'a'
+    invoke(api, 'unchanged-again')
+    assert settled(api, 'unchanged-again')['approved_by'] == 'call_allowance'
     for scope in [('foreign', *SCOPE[1:]), (SCOPE[0], 'other-provider', *SCOPE[2:]),
                   (*SCOPE[:2], 'other-profile', SCOPE[3])]:
-        assert invoke(api, 'isolated', 'c', scope)['status'] == 'needs_approval'
+        assert invoke(api, 'isolated', 'a', scope)['status'] == 'needs_approval'
     assert len(backend.calls) == 3
 
 
@@ -174,6 +189,35 @@ def test_approve_once_does_not_grant_and_proposals_and_signatures_stay_exact(app
     with pytest.raises(HTTPException) as error:
         api.invoke(SCOPE, {'request_id': 'r1', 'tool_id': 'a' * 64, 'arguments': {'query': 'changed'}}, session_id='chat')
     assert error.value.status_code == 409
+
+
+def test_hermes_tool_cannot_be_allowed_for_the_call_and_the_next_call_asks_again(approval_gateway):
+    api, backend, mobile, _ = approval_gateway
+    use_terminal(backend)
+    proposal = invoke_terminal(api)
+    assert proposal['status'] == 'needs_approval' and proposal['proposal']['allow_call'] is False
+    with pytest.raises(HTTPException) as error:
+        api.decide(SCOPE, 'r1', {'proposal_id': proposal['proposal']['id'], 'decision': 'approve_call'})
+    assert error.value.status_code == 409 and backend.calls == []
+    assert api.status(SCOPE, 'r1')['status'] == 'needs_approval'
+    with mobile.connect() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM call_tool_allowances').fetchone()[0] == 0
+    # The owner can still approve this one command; it grants nothing further.
+    api.decide(SCOPE, 'r1', {'proposal_id': proposal['proposal']['id'], 'decision': 'approve'})
+    assert settled(api)['approved_by'] == 'owner'
+    next_call = invoke_terminal(api, 'r2')
+    assert next_call['status'] == 'needs_approval' and next_call['approved_by'] is None
+    assert len(backend.calls) == 1
+
+
+def test_a_stored_allowance_never_approves_a_hermes_tool(approval_gateway):
+    api, backend, _, _ = approval_gateway
+    use_terminal(backend)
+    with api.db() as conn:  # an allowance row written before Hermes tools were refused
+        conn.execute('INSERT INTO call_tool_allowances VALUES(?,?,?,?,?,?,?)', (*SCOPE, 'a' * 64, 'terminal', time.time()))
+    receipt = invoke_terminal(api, command='rm -rf build')
+    assert receipt['status'] == 'needs_approval' and receipt['approved_by'] is None
+    assert backend.calls == []  # execute() and its dangerous-command answer are never reached
 
 
 def test_allowances_are_bounded_and_expired_proposals_cannot_grant(approval_gateway, monkeypatch):
@@ -270,8 +314,8 @@ def test_phone_wire_includes_reason_accepts_call_grant_and_rejects_client_author
         assert all(call[3] == 'native-stored' for call in backend.calls)
 
 
-@pytest.mark.parametrize('yolo', [False, True])
-def test_phone_bearer_wire_uses_native_policy_scope_and_persists_call_allowance(harness, monkeypatch, yolo, phone_tool_pool):
+@pytest.mark.parametrize('yolo,hermes', [(False, False), (True, False), (False, True)])
+def test_phone_bearer_wire_uses_native_policy_scope_and_persists_call_allowance(harness, monkeypatch, yolo, hermes, phone_tool_pool):
     from contextlib import nullcontext
     from test_mobile import reserve
     host, client, _, root, _ = harness
@@ -280,10 +324,10 @@ def test_phone_bearer_wire_uses_native_policy_scope_and_persists_call_allowance(
     server._profile_home = lambda profile: None
     server._hermes_home = root
     server._session_profile_runtime_scope = lambda *args, **kwargs: nullcontext()
-    tool = {'tool_id': 'f' * 64, 'name': 'write_file', '_kind': 'hermes', '_raw': 'write_file',
-            'description': 'Write a file', 'read_only': False,
+    tool = {'tool_id': 'f' * 64, 'description': 'Write a file', 'read_only': False, '_raw': 'write_file',
             'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'content': {'type': 'string'}},
-                           'required': ['path', 'content'], 'additionalProperties': False}}
+                           'required': ['path', 'content'], 'additionalProperties': False},
+            **({'name': 'write_file', '_kind': 'hermes'} if hermes else {'name': 'mcp__files__write_file', '_server': 'files'})}
     monkeypatch.setattr(native, 'catalog', lambda self, discover=True: [tool])
     monkeypatch.setattr(native, 'cache_key', lambda self: 'phone-wire-policy')
     monkeypatch.setattr(native, 'execute', lambda *args, **kwargs: json.dumps({'ok': True}))
@@ -318,14 +362,25 @@ def test_phone_bearer_wire_uses_native_policy_scope_and_persists_call_allowance(
         assert final('phone-request')['status'] == 'completed'
         return
     assert receipt['status'] == 'needs_approval'
-    decision = client.post(path + '/requests/phone-request/decision?beacon_profile=default',
-        json={'proposal_id': receipt['proposal']['id'], 'decision': 'approve_call'}, headers=headers)
+    decide = path + '/requests/phone-request/decision?beacon_profile=default'
+    if hermes:
+        assert receipt['proposal']['allow_call'] is False
+        refused = client.post(decide, json={'proposal_id': receipt['proposal']['id'], 'decision': 'approve_call'},
+                              headers=headers)
+        assert refused.status_code == 409, refused.text
+    decision = client.post(decide, json={'proposal_id': receipt['proposal']['id'],
+                                         'decision': 'approve' if hermes else 'approve_call'}, headers=headers)
     assert decision.status_code == 200, decision.text
     assert decision.json()['approved_by'] == 'owner' and decision.json()['status'] != 'needs_approval'
     assert final('phone-request')['status'] == 'completed'
     with host.mobile.connect() as conn:
         row = conn.execute('SELECT owner,provider,profile,call_id,tool_name FROM call_tool_allowances').fetchone()
-    assert tuple(row) == ('owner', 'basic', 'default', call, 'write_file')
+    if hermes:
+        assert row is None
+        again = client.post(path + '/invoke?beacon_profile=default', json={**value, 'request_id': 'next-request'}, headers=headers)
+        assert again.status_code == 200 and again.json()['status'] == 'needs_approval'
+        return
+    assert tuple(row) == ('owner', 'basic', 'default', call, 'mcp__files__write_file')
     again = client.post(path + '/invoke?beacon_profile=default', json={**value, 'request_id': 'next-request'}, headers=headers)
     assert again.status_code == 200 and again.json()['approved_by'] == 'call_allowance'
     assert final('next-request')['status'] == 'completed'

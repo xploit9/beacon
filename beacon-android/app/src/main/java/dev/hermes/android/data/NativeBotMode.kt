@@ -12,8 +12,10 @@ data class BotModeBot(val profile: String, val title: String, val description: S
 data class BotModeSpace(val id: String, val name: String)
 data class BotModeEvent(val id: String, val speaker: String, val text: String, val failed: Boolean = false)
 data class BotModeAction(val kind: String, val task: String, val member: String = "", val request: String = "", val generation: Int = 0, val description: String = "", val choices: List<String> = emptyList()) {
-    fun payload(choice: String = ""): JSONObject = json("kind" to kind, "task_id" to task).apply {
-        if (kind == "approval") { require(choice in choices && choice in setOf("once", "deny")) { "This approval choice is no longer available. Refresh the shared space." }; put("member_id", member); put("request_id", request); put("execution_generation", generation); put("choice", choice) }
+    fun payload(choice: String = ""): JSONObject {
+        require(kind == "approval" && task.isNotBlank() && member.isNotBlank() && request.isNotBlank() && generation > 0) { "This action cannot be safely resolved in Beacon. Review the shared space in Hermes." }
+        require(choice in choices && choice in setOf("once", "deny")) { "This approval choice is no longer available. Refresh the shared space." }
+        return json("kind" to kind, "task_id" to task, "member_id" to member, "request_id" to request, "execution_generation" to generation, "choice" to choice)
     }
 }
 data class NativeBotModeState(
@@ -21,8 +23,35 @@ data class NativeBotModeState(
     val selectedSpace: String = "", val members: List<String> = emptyList(), val events: List<BotModeEvent> = emptyList(), val draft: String = "",
     val selectedBots: Set<String> = emptySet(), val openingBot: BotModeBot? = null, val activeBot: BotModeBot? = null, val sessionId: String = "",
     val loading: Boolean = false, val sending: Boolean = false, val error: String = "", val status: String = "",
-    val pendingChange: JSONObject? = null, val earlierEventsOmitted: Boolean = false, val moreSpaces: Boolean = false, val actions: List<BotModeAction> = emptyList(),
+    val canRename: Boolean = false, val canDelete: Boolean = false,
+    val earlierEventsOmitted: Boolean = false, val moreSpaces: Boolean = false, val actions: List<BotModeAction> = emptyList(),
 )
+
+internal fun botModeDisbanded(data: JSONObject, id: String): Boolean {
+    val receipt = data.optJSONObject("tombstone") ?: return false
+    val event = receipt.optJSONObject("event") ?: return false
+    val stamp = receipt.opt("disbanded_at") as? Number ?: return false
+    return receipt.string("room_id") == id && stamp.toDouble().isFinite() && stamp.toDouble() > 0 &&
+        receipt.opt("idempotent") is Boolean && event.string("room_id") == id &&
+        event.string("kind") == "room.disbanded" && event.string("event_id") == "system:room-disbanded"
+}
+
+internal fun botModeActions(data: JSONObject): List<BotModeAction> = data.optJSONObject("driver_status")?.rows("pending_actions").orEmpty().mapNotNull { action ->
+    val kind = action.string("kind")
+    if (kind in setOf("retry", "discard")) return@mapNotNull BotModeAction("unavailable", action.string("task_id"), description = "This Hermes version cannot safely resolve work whose outcome may be unknown in Beacon. Review it in Hermes; do not replay it blindly.")
+    if (kind != "approval") return@mapNotNull null
+    if (data.optJSONObject("capabilities")?.optBoolean("approval") != true) return@mapNotNull BotModeAction("unavailable", action.string("task_id"), description = "Native approval support could not be confirmed. Refresh this space before trying again.")
+    val task = action.opt("task_id") as? String ?: return@mapNotNull null
+    val member = action.opt("member_id") as? String ?: return@mapNotNull null
+    val request = action.opt("request_id") as? String ?: return@mapNotNull null
+    val generation = action.opt("execution_generation") as? Int ?: return@mapNotNull null
+    if (task.isBlank() || member.isBlank() || request.isBlank() || generation < 1) return@mapNotNull null
+    val approval = action.optJSONObject("approval") ?: return@mapNotNull null
+    val choices = approval.optJSONArray("choices")
+    BotModeAction("approval", task, member, request, generation,
+        listOf(approval.string("description"), approval.string("command")).filter { it.isNotBlank() }.joinToString("\n"),
+        (0 until (choices?.length() ?: 0)).mapNotNull { choices?.optString(it) }.filter { it in setOf("once", "deny") })
+}
 
 internal fun botModeEvents(data: JSONObject): List<BotModeEvent> = data.rows("events").mapNotNull { event ->
     val payload = event.optJSONObject("payload") ?: return@mapNotNull null
@@ -86,7 +115,7 @@ class NativeBotModeController(
         return fresh
     }
     private fun current(c: BeaconClient, token: Int): Boolean = source === c && token == generation &&
-        client()?.let { it.auth.owner == c.auth.owner && it.auth.origin == c.auth.origin } == true
+        client()?.let { it.scope.sameAccount(c.scope) } == true
     fun clear() { ++generation; job?.cancel(); job = null; source?.closeNative(); source = null; accountClient = null; root = null; rosterAt = 0L; hasRoster = false; backgroundRead = false; mutable.value = NativeBotModeState() }
     fun draft(text: String) {
         if (root == null || mutable.value.selectedSpace.isBlank()) { mutable.value = mutable.value.copy(error = "Open an authorized shared space before editing its draft"); return }
@@ -98,7 +127,7 @@ class NativeBotModeController(
     }
     private fun launch(userAction: Boolean = true, action: suspend (BeaconClient, Int) -> Unit) {
         val live = client() ?: run { clear(); return }
-        if (root?.let { it.owner != live.auth.owner || it.origin != live.auth.origin } == true) clear()
+        if (root?.let { !it.sameAccount(live.scope) } == true) clear()
         if (job?.isActive == true) {
             if (!userAction) return
             if (backgroundRead) { ++generation; job?.cancel(); job = null }
@@ -141,6 +170,8 @@ class NativeBotModeController(
                     bots = result.rows("bots").map { BotModeBot(it.getString("profile"), it.getString("title"), it.string("description")) },
                     spaces = result.rows("spaces").map { BotModeSpace(it.getString("room_id"), it.getString("name")) },
                     moreSpaces = result.optBoolean("has_more_spaces"),
+                    canRename = result.optJSONObject("capabilities")?.optBoolean("rename") == true,
+                    canDelete = result.optJSONObject("capabilities")?.optBoolean("delete") == true,
                 )
                 hasRoster = true; rosterAt = clock()
             }
@@ -160,24 +191,13 @@ class NativeBotModeController(
         val failed = driver?.optJSONObject("counts")?.optInt("failed", 0) ?: 0
         val room = data.optJSONObject("room")
         mutable.value = mutable.value.copy(
-            pendingChange = room?.optJSONObject("pending_control"),
+            canRename = data.optJSONObject("capabilities")?.optBoolean("rename") == true,
+            canDelete = data.optJSONObject("capabilities")?.optBoolean("delete") == true,
             members = room?.rows("members").orEmpty().map { it.string("profile") },
             spaces = mutable.value.spaces.map { if (it.id == id && room != null) it.copy(name = room.string("name", it.name)) else it },
             events = botModeEvents(data), earlierEventsOmitted = data.optBoolean("earlier_events_omitted"),
-            actions = driver?.rows("pending_actions").orEmpty().mapNotNull { action ->
-                when (action.string("kind")) {
-                    "retry" -> BotModeAction("retry", action.getString("task_id"))
-                    "approval" -> {
-                        val approval = action.optJSONObject("approval") ?: return@mapNotNull null
-                        val choices = approval.optJSONArray("choices")
-                        BotModeAction("approval", action.getString("task_id"), action.getString("member_id"), action.getString("request_id"), action.getInt("execution_generation"),
-                            listOf(approval.string("description"), approval.string("command")).filter { it.isNotBlank() }.joinToString("\n"),
-                            (0 until (choices?.length() ?: 0)).mapNotNull { choices?.optString(it) }.filter { it in setOf("once", "deny") })
-                    }
-                    else -> null
-                }
-            },
-            status = when { driver?.optBoolean("blocked") == true -> "Waiting for approval or retry"; driver?.optBoolean("working") == true -> "Bots are discussing…"; failed > 0 -> "Shared space needs attention"; driver?.optBoolean("running") == true -> "Shared space is ready"; else -> "Shared-space worker is unavailable" } + if (failed > 0) " · $failed failed bot turn${if (failed == 1) "" else "s"}. Review the failures below." else "")
+            actions = botModeActions(data),
+            status = when { driver?.optBoolean("blocked") == true -> "Shared space needs your attention"; driver?.optBoolean("working") == true -> "Bots are discussing…"; failed > 0 -> "Shared space needs attention"; driver?.optBoolean("running") == true -> "Shared space is ready"; else -> "Shared-space worker is unavailable" } + if (failed > 0) " · $failed failed bot turn${if (failed == 1) "" else "s"}. Review the failures below." else "")
     }
     fun selectSpace(id: String) {
         back()
@@ -222,60 +242,25 @@ class NativeBotModeController(
             }
         }
     }
-    fun retryChange() {
-        val state = mutable.value
-        val id = state.selectedSpace
-        val pending = state.pendingChange ?: return
-        val request = pending.optJSONObject("request") ?: return
-        val event = pending.string("event_id")
-        if (id.isBlank() || event.isBlank()) return
-        launch { c, token ->
-            when (pending.string("operation")) {
-                "members" -> {
-                    val payload = json("event_id" to event, "expected_profiles" to request.getJSONArray("expected_profiles"),
-                        "profiles" to org.json.JSONArray(request.rows("members").map { it.getString("profile") }))
-                    c.nativeRequest("$path/space/$id/members", "POST", payload)
-                    readSpace(c, token, id)
-                }
-                "delete" -> {
-                    val result = c.nativeRequest("$path/space/$id/delete", "POST", json("event_id" to event, "expected_name" to request.getString("expected_name")))
-                    require(result.optJSONObject("tombstone")?.string("room_id") == id && result.optJSONObject("tombstone")?.string("event_id") == event) { "Deletion was not confirmed. Refresh before retrying." }
-                    if (current(c, token)) { saved.remove<String>(key(id)); mutable.value = mutable.value.copy(selectedSpace = "", spaces = state.spaces.filterNot { it.id == id }, events = emptyList(), actions = emptyList(), members = emptyList(), draft = "", status = "", pendingChange = null) }
-                }
-                else -> error("Refresh this space to review its pending change")
-            }
-        }
-    }
-    fun updateMembers(profiles: Set<String>) {
-        val before = mutable.value
-        val id = before.selectedSpace
-        val chosen = profiles.sorted()
-        if (id.isBlank() || chosen.size !in 2..6 || chosen.any { name -> before.bots.none { it.profile == name } }) {
-            mutable.value = before.copy(error = "Choose two to six currently available bots. Refresh the space if its team changed."); return
-        }
-        launch { c, token ->
-            val intentKey = operationKey("members", id, key("members:$id"))
-            val intent = saved.get<String>(intentKey)?.let { runCatching { JSONObject(it) }.getOrNull() }
-                ?.takeIf { it.optJSONArray("profiles")?.strings()?.sorted() == chosen && it.optJSONArray("expected_profiles")?.strings()?.sorted() == before.members.sorted() }
-                ?: json("profiles" to org.json.JSONArray(chosen), "expected_profiles" to org.json.JSONArray(before.members.sorted()), "event_id" to UUID.randomUUID().toString()).also { saved[intentKey] = it.toString() }
-            val result = c.nativeRequest("$path/space/$id/members", "POST", intent).getJSONObject("room")
-            require(result.getString("room_id") == id && result.rows("members").map { it.getString("profile") }.sorted() == chosen) { "The bot selection was not confirmed. Refresh before retrying." }
-            if (current(c, token) && mutable.value.selectedSpace == id) {
-                saved.remove<String>(intentKey)
-                mutable.value = mutable.value.copy(members = chosen)
-                readSpace(c, token, id)
-            }
-        }
-    }
     fun deleteSpace() {
         val before = mutable.value
         val id = before.selectedSpace
+        if (!before.canDelete) { mutable.value = before.copy(error = "Native shared-space deletion is unavailable. Refresh before trying again."); return }
         val name = before.spaces.firstOrNull { it.id == id }?.name ?: run { mutable.value = before.copy(error = "This space changed. Refresh before deleting."); return }
         launch { c, token ->
             val intentKey = operationKey("delete", id, key("delete:$id"))
             val event = saved.get<String>(intentKey) ?: UUID.randomUUID().toString().also { saved[intentKey] = it }
-            val result = c.nativeRequest("$path/space/$id/delete", "POST", json("event_id" to event, "expected_name" to name))
-            require(result.optJSONObject("tombstone")?.string("room_id") == id && result.optJSONObject("tombstone")?.string("event_id") == event) { "Space deletion was not confirmed. Refresh before retrying." }
+            try {
+                val result = c.nativeRequest("$path/space/$id/delete", "POST", json("event_id" to event, "expected_name" to name))
+                require(botModeDisbanded(result, id)) { "Space deletion was not confirmed. Refresh before retrying." }
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) {
+                // Stop can commit before deletion fails; reread without discarding the draft or intent.
+                try { readSpace(c, token, id) }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { }
+                throw e
+            }
             if (current(c, token)) {
                 saved.remove<String>(intentKey); saved.remove<String>(key(id))
                 mutable.value = mutable.value.copy(selectedSpace = "", spaces = before.spaces.filterNot { it.id == id }, events = emptyList(), actions = emptyList(), members = emptyList(), draft = "", status = "")

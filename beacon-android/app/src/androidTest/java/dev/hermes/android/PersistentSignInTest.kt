@@ -31,7 +31,7 @@ class PersistentSignInTest {
         val cookie = Cookie.Builder().name("__Host-hermes_session_rt").value(token)
             .hostOnlyDomain(origin.removePrefix("https://")).path("/").secure().httpOnly()
             .expiresAt(System.currentTimeMillis() + 60_000).build()
-        val auth = AuthContext(origin, listOf(cookie.toString()), "fixture-owner", "work", backend = "hermes-dashboard")
+        val auth = AuthContext(origin, listOf(cookie.toString()), "fixture-owner", "work", backend = "hermes-dashboard", nativeProvider = "fixture")
         val first = AuthStore(context, AppCipher())
         try {
             first.persist(auth)

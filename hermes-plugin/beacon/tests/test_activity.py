@@ -8,12 +8,13 @@ from test_mobile import harness
 @pytest.fixture
 def activity_harness(harness,monkeypatch):
     api,client,cfg,tmp,app=harness
-    frames=[{'id':'srq-fixture','method':'approval','params':{'session_id':'runtime','command':'echo fixture','choices':['once','deny']}}]
+    frames=[{'id':'srq-fixture','method':'approval','params':{'session_id':'runtime','request_id':'a'*32,'command':'echo fixture','choices':['once','deny']}}]
     work=[{'key':'activity-key','stored':'native-stored','runtime':'runtime','requests':frames}]
     monkeypatch.setattr(api.activity,'snapshot',lambda *args:work)
     monkeypatch.setitem(sys.modules,'tui_gateway',SimpleNamespace(server_requests=SimpleNamespace(open_requests=lambda sid:frames)))
     answers=[]
-    monkeypatch.setattr(api.native,'rpc',lambda *args:answers.append(args) or {'ok':True})
+    monkeypatch.setattr(api.native,'rpc',lambda *args:answers.append(args) or (
+        {'resolved':1} if args[-2]=='approval.respond' else {'status':'ok'}))
     api.activity.sync(api.mobile,api.native,'owner','basic','default')
     return api,client,frames,work,answers
 
@@ -27,7 +28,7 @@ def test_authenticated_offered_action_and_replay(activity_harness):
     assert c.post(BASE+'/native-srq-fixture/answer',json={'answer':'always'}).status_code==409
     assert not answers
     assert c.post(BASE+'/native-srq-fixture/answer',json={'answer':'once'}).status_code==200
-    assert answers[0][-2:] == ('approval.respond',{'session_id':'runtime','request_id':'srq-fixture','choice':'once'})
+    assert answers[0][-2:] == ('approval.respond',{'session_id':'runtime','request_id':'a'*32,'choice':'once'})
     assert c.post(BASE+'/native-srq-fixture/answer',json={'answer':'once'}).status_code==409
     assert len(answers)==1
 
@@ -52,7 +53,51 @@ def test_incomplete_permission_preview_cannot_authorize_a_hidden_command(activit
     assert c.post(BASE+'/native-srq-fixture/answer',json={'answer':'once'}).status_code==409
     assert not answers
     assert c.post(BASE+'/native-srq-fixture/answer',json={'answer':'deny'}).status_code==200
-    assert answers[0][-2:] == ('approval.respond',{'session_id':'runtime','request_id':'srq-fixture','choice':'deny'})
+    assert answers[0][-2:] == ('approval.respond',{'session_id':'runtime','request_id':'a'*32,'choice':'deny'})
+
+
+@pytest.mark.parametrize('request_id',[None,'',False,42,[],{},'bad id','x'*161])
+def test_approval_requires_a_valid_native_queue_id(activity_harness,request_id):
+    api,c,frames,work,answers=activity_harness
+    frames[0]['params']['request_id']=request_id
+
+    assert c.post(BASE+'/native-srq-fixture/answer',json={'answer':'once'}).status_code==409
+    assert not answers
+
+
+@pytest.mark.parametrize('receipt',[{'resolved':0},{'resolved':-1},{'resolved':True},
+    {'resolved':1.0},{'resolved':'1'},{'ok':True},None])
+def test_unconfirmed_approval_receipt_never_repeats_the_mutation(activity_harness,monkeypatch,receipt):
+    api,c,frames,work,answers=activity_harness
+    monkeypatch.setattr(api.native,'rpc',lambda *args:answers.append(args) or receipt)
+
+    for _ in range(2):
+        assert c.post(BASE+'/native-srq-fixture/answer',json={'answer':'once'}).status_code==409
+    assert len(answers)==1
+    with api.mobile.connect() as conn:
+        assert conn.execute("SELECT state FROM notices WHERE id='native-srq-fixture'").fetchone()[0]=='settled'
+
+
+def test_positive_native_resolved_count_is_accepted(activity_harness,monkeypatch):
+    api,c,frames,work,answers=activity_harness
+    monkeypatch.setattr(api.native,'rpc',lambda *args:answers.append(args) or {'resolved':2})
+
+    response=c.post(BASE+'/native-srq-fixture/answer',json={'answer':'once'})
+
+    assert response.status_code==200 and response.json()['status']=='answered'
+    assert len(answers)==1
+
+
+def test_lost_native_receipt_never_repeats_the_mutation(activity_harness,monkeypatch):
+    api,c,frames,work,answers=activity_harness
+    def fail(*args):
+        answers.append(args)
+        raise ValueError('Receipt unavailable')
+    monkeypatch.setattr(api.native,'rpc',fail)
+
+    for _ in range(2):
+        assert c.post(BASE+'/native-srq-fixture/answer',json={'answer':'once'}).status_code==409
+    assert len(answers)==1
 
 def test_redaction_is_forced_and_android_utf16_preview_limit_is_respected(activity_harness,monkeypatch):
     api,c,frames,work,answers=activity_harness
@@ -110,6 +155,18 @@ def test_empty_clarify_choices_allow_free_text(activity_harness):
 
     assert c.post(BASE+'/native-srq-fixture/answer',json={'answer':'free text'}).status_code==200
     assert answers[-1][-2:] == ('request.answer',{'id':'srq-fixture','result':{'answer':'free text'}})
+
+
+@pytest.mark.parametrize('receipt',[{'status':'expired'},{'status':'unknown'},{'ok':True},None])
+def test_expired_or_unconfirmed_answer_is_settled_without_resending(activity_harness,monkeypatch,receipt):
+    api,c,frames,work,answers=activity_harness
+    frames[0]['method']='clarify';frames[0]['params']={'question':'Fixture question','choices':[]}
+    with api.mobile.connect() as conn: conn.execute("UPDATE notices SET kind='clarify'")
+    monkeypatch.setattr(api.native,'rpc',lambda *args:answers.append(args) or receipt)
+
+    for _ in range(2):
+        assert c.post(BASE+'/native-srq-fixture/answer',json={'answer':'text'}).status_code==409
+    assert len(answers)==1
 
 def test_work_and_end_cursor_outbox(activity_harness):
     api,c,frames,work,answers=activity_harness

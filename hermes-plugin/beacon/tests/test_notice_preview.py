@@ -44,7 +44,7 @@ def test_legacy_alert_notice_detail_uses_generic_title_and_keeps_feedback_marker
 
 
 @pytest.mark.asyncio
-async def test_phone_delivery_keeps_cron_title_and_uses_hermes_for_standalone(harness,monkeypatch):
+async def test_phone_delivery_keeps_cron_title_and_rejects_unwrapped_standalone(harness,monkeypatch):
     api,client,cfg,_,_=harness
     cfg['scheduled_callback_conversation_id']='assistant-chat'
     phone=load_private('phone_delivery')
@@ -52,18 +52,17 @@ async def test_phone_delivery_keeps_cron_title_and_uses_hermes_for_standalone(ha
     monkeypatch.setattr(phone,'_profile_state',lambda:(api.mobile,cfg,'default'))
     monkeypatch.setattr(api.native,'verify',lambda *args:{'messages':[]})
 
-    cron=await phone.BeaconPhoneAdapter({}).send(
-        'phone','Cronjob Response: Daily brief\n(job_id: daily-brief)\n---\nYour task result.')
+    envelope='Cronjob Response: Daily brief\n(job_id: daily-brief)\n---\nYour task result.'
+    cron=await phone.BeaconPhoneAdapter({}).send('phone',envelope)
+    retry=await phone.standalone_send({},'phone',envelope)
     standalone=await phone.standalone_send({},'phone','Hermes is shutting down.')
 
-    assert cron.success and standalone['success']
+    assert cron.success and retry['success'] and retry['message_id']==cron.message_id
+    assert standalone.get('error') and not standalone.get('success')
     with api.mobile.connect() as conn:
         cron_job=conn.execute('SELECT job_id FROM notices WHERE id=?',(cron.message_id,)).fetchone()['job_id']
-        standalone_job=conn.execute('SELECT job_id FROM notices WHERE id=?',(standalone['message_id'],)).fetchone()['job_id']
-    assert cron_job.startswith('phone-cron-') and standalone_job.startswith('phone-hermes-')
+        assert conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==1
+    assert cron_job.startswith('phone-cron-')
     cron_detail=client.get(f"/api/plugins/beacon/mobile/notifications/events/{cron.message_id}").json()
-    standalone_detail=client.get(
-        f"/api/plugins/beacon/mobile/notifications/events/{standalone['message_id']}").json()
     assert cron_detail['preview']['title']=='Task finished'
-    assert standalone_detail['preview']['title']=='Hermes'
 

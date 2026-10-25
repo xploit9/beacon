@@ -13,7 +13,7 @@ class NotificationContentTest {
         assertEquals(4,listOf("completion","task_result","approval","incoming_call").map(::notificationChannel).toSet().size)
     }
     @Test fun typesAreDistinctAndUnknownDoesNotInventContext() {
-        val types = listOf("completion", "approval", "clarify", "task_result", "test", "incoming_call", "release")
+        val types = listOf("completion", "approval", "clarify", "task_result", "test", "incoming_call")
         assertEquals(types.size, types.map { notificationFallback(it).first }.toSet().size)
         assertEquals(notificationFallback(""), notificationFallback("forged title"))
         assertFalse(notificationFallback("task_result").second.contains("finished"))

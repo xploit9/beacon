@@ -93,6 +93,34 @@ def test_recall_uses_only_the_matching_initialized_provider(harness, monkeypatch
     assert calls == [('current question', 'native-stored')]
 
 
+@pytest.mark.parametrize('text,count,expected', [
+    ('[Acme bank=x; untrusted historical evidence]\nPolicy text', 0, 'empty'),
+    ('Retrieval failed for this turn. Disclose this; do not invent memory.', 0, 'empty'),
+    ('Saved: favorite color is green', 2, 'completed'),
+    ('Saved: favorite color is green', None, 'completed'),
+    ('Saved: favorite color is green', 'raise', 'completed'),
+])
+def test_recall_trusts_the_providers_own_status_not_its_name_or_wording(harness, monkeypatch, text, count, expected):
+    api, _, _, root, _ = harness
+    voice = api.voice_context
+    matching = SimpleNamespace(prefetch=lambda query, session_id: text)
+    def broken_status():
+        raise RuntimeError('status offline')
+    if count == 'raise': matching.recall_status = broken_status
+    elif count is not None: matching.recall_status = lambda: SimpleNamespace(count=count)
+    monkeypatch.setattr(voice.native, 'verify', lambda *args: None)
+    monkeypatch.setattr(voice, 'scoped', lambda profile, fn: fn(root))
+    monkeypatch.setattr(voice, 'config', lambda root: {'memory': {'provider': 'acme-memory'}})
+    monkeypatch.setattr(voice, 'external_provider', lambda *args: ((object(), matching), 'acme-memory'))
+    monkeypatch.setitem(sys.modules, 'agent.memory_manager', SimpleNamespace(sanitize_context=lambda value: value))
+    result = voice.recall('owner', 'basic', 'default', 'native-stored', 'current question')
+    assert result['status'] == expected
+    if expected == 'empty':
+        assert result['summary'] == 'Nothing came back from memory.' and result['sources'] == []
+    else:
+        assert result['summary'] == text and result['sources'][0]['ref'] == 'native-memory:acme-memory'
+
+
 def test_instruction_carries_the_owners_local_time(harness, monkeypatch):
     api, _, _, root, _ = harness
     call_id = api.mobile.reserve('owner', 'default', 'native-stored')['call_id']

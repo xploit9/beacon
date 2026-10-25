@@ -184,10 +184,12 @@ class NativeAuth internal constructor(
         persist: (NativeBearerRecord, NativeBearerRecord) -> Boolean,
     ): NativeBearerRecord = withContext(Dispatchers.IO) {
         if (current.origin != baseUrl || current.refreshToken.isBlank()) throw NativeAuthException("No Hermes refresh credential is available")
-        val lock = refreshLocks.computeIfAbsent(Scope(current.origin, current.owner, current.profile).key) { Mutex() }
+        // Retained calls and the selected UI profile share the account's single-use refresh token.
+        val lock = refreshLocks.computeIfAbsent(Scope(current.origin, current.owner, "", nativeProvider = current.provider).key) { Mutex() }
         lock.withLock {
-            val winner = latest()?.takeIf { it.origin == current.origin && it.owner == current.owner && it.profile == current.profile }
-            if (winner != null && winner != current) return@withLock winner
+            val winner = latest()?.takeIf { it.origin == current.origin && it.owner == current.owner && it.provider == current.provider }?.copy(profile = current.profile)
+                ?: throw NativeAuthException("Sign-in changed while refreshing. Sign in again.")
+            if (winner != current) return@withLock winner
             val refreshed = tokenResponse(
                 "/auth/native/refresh",
                 JSONObject().put("refresh_token", current.refreshToken).put("provider", current.provider),
@@ -247,6 +249,10 @@ class NativeAuth internal constructor(
                 val access = json.optString("access_token")
                 val refresh = json.optString("refresh_token")
                 val owner = json.optString("user_id").trim()
+                val provider = json.optString("provider", previous?.provider.orEmpty())
+                if (previous != null && (owner != previous.owner || previous.provider.isNotBlank() && provider != previous.provider)) {
+                    throw NativeAuthException("Sign-in changed while refreshing. Sign in again.")
+                }
                 if (!json.optString("token_type").equals("Bearer", ignoreCase = true) || access.isBlank() || access.any { it.isWhitespace() || it.isISOControl() } || refresh.isBlank() || owner.isBlank()) {
                     throw NativeAuthException(GENERIC_ERROR_MESSAGE)
                 }
@@ -257,7 +263,7 @@ class NativeAuth internal constructor(
                     origin = baseUrl,
                     owner = owner,
                     profile = previous?.profile ?: "default",
-                    provider = json.optString("provider", previous?.provider.orEmpty()),
+                    provider = provider,
                     issuedAt = System.currentTimeMillis() / 1000,
                 )
             }
