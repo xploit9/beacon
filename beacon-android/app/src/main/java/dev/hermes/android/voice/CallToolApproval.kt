@@ -107,7 +107,7 @@ data class CallToolReceipt(
     val hasResult: Boolean = false,
 ) {
     companion object {
-        private val decisions = setOf("chat_yolo", "profile_off", "smart", "call_allowance", "owner")
+        private val decisions = setOf("chat_yolo", "profile_off", "smart", "memory", "call_allowance", "owner")
         private val statuses = setOf("ready", "running", "needs_approval", "completed", "failed", "denied", "expired", "cancelled", "uncertain")
 
         fun from(value: JSONObject): CallToolReceipt? {
@@ -127,7 +127,7 @@ data class CallToolReceipt(
 internal fun CallToolReceipt.approvalCaption(): String? = when (approvedBy) {
     "chat_yolo" -> "Allowed by chat YOLO"
     "profile_off" -> "Approvals off"
-    "smart" -> "Allowed automatically"
+    "smart", "memory" -> "Allowed automatically"
     "call_allowance" -> "Allowed for this call"
     else -> null
 }

@@ -3,10 +3,14 @@ package dev.hermes.android.ui
 import dev.hermes.android.AppState
 import dev.hermes.android.ChatState
 import dev.hermes.android.Message
+import dev.hermes.android.QuietWindow
+import dev.hermes.android.STREAM_QUIET_MAX_MS
 import dev.hermes.android.SilentStream
 import dev.hermes.android.core.Draft
 import dev.hermes.android.core.json
 import dev.hermes.android.core.trustedOrigin
+import dev.hermes.android.historyRowOf
+import dev.hermes.android.plainChatRequest
 import dev.hermes.android.reconnectOnNetworkReturn
 import dev.hermes.android.reusableEmptyChat
 import dev.hermes.android.sendArrived
@@ -57,15 +61,54 @@ class UnconfirmedSendTest {
 
     @Test fun newConversationKeepsOnlyAnUnsentPhoneCreatedChat() {
         val empty = ChatState(sessionId = "new-1")
-        assertTrue(reusableEmptyChat(true, empty, sendInFlight = false))
-        assertFalse("Hermes already holds this chat", reusableEmptyChat(false, empty, sendInFlight = false))
-        assertFalse(reusableEmptyChat(true, empty.copy(messages = history("user" to "hello")), sendInFlight = false))
-        assertFalse(reusableEmptyChat(true, empty.copy(raw = json("message_count" to 2)), sendInFlight = false))
-        assertFalse(reusableEmptyChat(true, empty.copy(streamId = "runtime-1"), sendInFlight = false))
-        assertFalse(reusableEmptyChat(true, empty.copy(uncertain = "send-1"), sendInFlight = false))
-        assertFalse(reusableEmptyChat(true, empty, sendInFlight = true))
-        assertFalse("Still loading", reusableEmptyChat(true, empty.copy(projectionReady = false), sendInFlight = false))
-        assertFalse("No chat behind the screen", reusableEmptyChat(true, ChatState(), sendInFlight = false))
+        assertTrue(reusableEmptyChat(true, empty, sendInFlight = false, keptApart = false))
+        assertFalse("Hermes already holds this chat", reusableEmptyChat(false, empty, sendInFlight = false, keptApart = false))
+        assertFalse(reusableEmptyChat(true, empty.copy(messages = history("user" to "hello")), sendInFlight = false, keptApart = false))
+        assertFalse(reusableEmptyChat(true, empty.copy(raw = json("message_count" to 2)), sendInFlight = false, keptApart = false))
+        assertFalse(reusableEmptyChat(true, empty.copy(streamId = "runtime-1"), sendInFlight = false, keptApart = false))
+        assertFalse(reusableEmptyChat(true, empty.copy(uncertain = "send-1"), sendInFlight = false, keptApart = false))
+        assertFalse(reusableEmptyChat(true, empty, sendInFlight = true, keptApart = false))
+        assertFalse("Still loading", reusableEmptyChat(true, empty.copy(projectionReady = false), sendInFlight = false, keptApart = false))
+        assertFalse("No chat behind the screen", reusableEmptyChat(true, ChatState(), sendInFlight = false, keptApart = false))
+        assertFalse("A thread or a chat with a workspace or model is its own chat", reusableEmptyChat(true, empty, sendInFlight = false, keptApart = true))
+    }
+
+    @Test fun onlyTheAutomaticOpenAndABareNewConversationAskForAPlainChat() {
+        assertTrue(plainChatRequest(json()))
+        assertTrue("The automatic open", plainChatRequest(json("worktree" to false)))
+        assertFalse(plainChatRequest(json("title" to "A thread", "thread" to true)))
+        assertFalse(plainChatRequest(json("workspace" to "/work")))
+        assertFalse(plainChatRequest(json("model" to "m", "model_provider" to "p")))
+        assertFalse(plainChatRequest(json("worktree" to true)))
+    }
+
+    @Test fun aQuietStreamStretchesItsWindowOnlyOnHermesAnswersAndStartsOverOnAnEvent() {
+        val window = QuietWindow(45_000)
+        assertEquals(45_000L, window.ms)
+        assertEquals("Looking ahead changes nothing", 90_000L, window.stretched())
+        assertEquals(45_000L, window.ms)
+        window.stretch(); window.stretch()
+        assertEquals(180_000L, window.ms)
+        repeat(10) { window.stretch() }
+        assertEquals("The window never passes its cap", STREAM_QUIET_MAX_MS, window.ms)
+        window.heard()
+        assertEquals("A heard event starts over", 45_000L, window.ms)
+        // A resubscribed stream begins at the stretched window and still starts over at the base one.
+        val resubscribed = QuietWindow(45_000, 90_000)
+        assertEquals(90_000L, resubscribed.ms)
+        resubscribed.heard()
+        assertEquals(45_000L, resubscribed.ms)
+    }
+
+    @Test fun aHistoryRowIsASummaryWithoutTheChatsMessages() {
+        val session = json("session_id" to "chat-1", "title" to "Trip", "message_count" to 2, "messages" to org.json.JSONArray().put(json("role" to "user", "content" to "hi")),
+            "voice_transcripts" to org.json.JSONArray().put(json("text" to "spoken")))
+        val row = historyRowOf(session)
+        assertEquals("Trip", row.getString("title"))
+        assertEquals(2, row.getInt("message_count"))
+        assertFalse(row.has("messages"))
+        assertFalse(row.has("voice_transcripts"))
+        assertTrue("The chat itself is untouched", session.has("messages") && session.has("voice_transcripts"))
     }
 
     @Test fun theChatMenuFollowsTheRealPinnedState() {

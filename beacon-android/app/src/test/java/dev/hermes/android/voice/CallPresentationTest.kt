@@ -92,7 +92,7 @@ class CallPresentationTest {
 
     @Test fun approvedReceiptsNeverProduceAnOwnerApprovalPrompt() {
         val proposal = json("id" to "p".repeat(32), "arguments" to json("to" to "owner@example.invalid"))
-        for (approvedBy in listOf("chat_yolo", "profile_off", "smart", "call_allowance", "owner")) {
+        for (approvedBy in listOf("chat_yolo", "profile_off", "smart", "memory", "call_allowance", "owner")) {
             val receipt = json("status" to "needs_approval", "approved_by" to approvedBy, "proposal" to proposal)
             assertNull(callProposalNeedingOwnerApproval(receipt))
         }
@@ -105,6 +105,7 @@ class CallPresentationTest {
             "chat_yolo" to "Allowed by chat YOLO",
             "profile_off" to "Approvals off",
             "smart" to "Allowed automatically",
+            "memory" to "Allowed automatically",
             "call_allowance" to "Allowed for this call",
         )
         captions.forEach { (approvedBy, caption) ->

@@ -106,6 +106,19 @@ def test_call_follows_verified_chat_and_profile(approval_gateway, mode, yolo, ex
     assert receipt['approved_by'] == expected
 
 
+@pytest.mark.parametrize('inline', ['memory', 'provider'])
+def test_memory_tools_run_without_a_phone_prompt_like_in_hermes(approval_gateway, inline):
+    api, backend, _, state = approval_gateway
+    memory = {**backend.catalog()[0], '_kind': 'hermes', '_raw': 'memory', '_inline': inline}
+    other = {**backend.catalog()[0], 'tool_id': 'b' * 64, '_kind': 'hermes', '_raw': 'write_file', 'name': 'write_file'}
+    backend.catalog = lambda discover=True: [memory, other]
+    receipt = invoke(api)
+    assert receipt['approved_by'] == 'memory' and receipt['status'] in ('ready', 'running', 'completed')
+    assert invoke(api, 'r2', 'b')['status'] == 'needs_approval'
+    state['row'] = {'user_id': 'other:owner', 'model_config': '{}'}
+    assert invoke(api, 'r3')['status'] == 'needs_approval'
+
+
 @pytest.mark.parametrize('row', [None, {'user_id': 'other:owner', 'model_config': '{"yolo_mode":true}'},
     {'user_id': 'password:owner', 'model_config': 'broken'},
     {'user_id': 'password:owner', 'model_config': '[]'},

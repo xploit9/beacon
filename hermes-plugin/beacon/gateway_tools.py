@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 import re
 import secrets
+import sys
 import threading
 import time
 import uuid
@@ -32,14 +33,23 @@ CATALOG_LOCK = threading.RLock()
 CATALOG_CACHE = {}
 CATALOG_WARMING = set()
 CATALOG_FIRST_WARM = {}  # profile -> this process's first warm-up, which runs MCP discovery
-NATIVE_READ_ONLY = frozenset({'read_file','search_files','web_search','skills_list','skill_view'})
+NATIVE_READ_ONLY = frozenset({'read_file','search_files','web_search','skills_list','skill_view','session_search'})
 NATIVE_READ_ONLY_ACTIONS = {'cronjob_manage': frozenset({'list'}), 'process_manage': frozenset({'list'})}
+# Hermes runs these in its agent loop, where their state lives; voice_context gives a call the same state.
+INLINE_TOOLS = frozenset({'memory','session_search'})
 CALL_EXCLUDED_TOOLS = frozenset({'manage_connections','manage_catalog','setup_mcp',
                                  'connector_search','connector_describe'})
-NATIVE_EXCLUDED_TOOLS = frozenset({'clarify','delegate_task','todo_list','memory','session_search',
+NATIVE_EXCLUDED_TOOLS = frozenset({'clarify','delegate_task','todo_list',
                                    'beacon_create_proactive_request','beacon_event_notice','beacon_events_checked',
                                    'beacon_email_notice','beacon_email_checked'}) | CALL_EXCLUDED_TOOLS
 NATIVE_EXCLUDED_TOOLSETS = frozenset({'browser','connectors','beacon-interactive','beacon-mailbox'})
+# Why a call leaves these out (docs/voice-calls.md repeats it for the owner); hermes_work covers the work itself.
+EXCLUDED_REASONS = {
+    'clarify': 'it asks in a Hermes chat prompt; on a call the assistant asks aloud',
+    'delegate_task': 'it starts sub-agents inside a running Hermes agent; hermes_work hands the task to a full run',
+    'todo_list': 'its list lives in one running agent turn and would be lost when the call ends',
+    'browser': 'a browser session is long and interactive, so each click would wait for phone approval',
+}
 QUERY_FILLER = set('a an the my me please could can you i would like want get read list find look pull show to for of in on and from up most latest recent current last today now one two three four five six ten tool tools'.split())
 QUERY_ALIASES = {
     'email': {'email', 'mail', 'gmail', 'inbox', 'outlook'},
@@ -49,6 +59,7 @@ QUERY_ALIASES = {
     'web': {'web', 'internet', 'website', 'browser', 'scrapling'},
     'search': {'search', 'find', 'lookup', 'query'},
     'get': {'get', 'read', 'retrieve', 'fetch', 'list'},
+    'remember': {'remember', 'memory', 'save', 'note'},
 }
 logger = logging.getLogger(__name__)
 
@@ -92,7 +103,7 @@ def digest(value):
     return hashlib.sha256(encoded(value).encode()).hexdigest()
 
 
-def outcome(value, read_only, depth=0):
+def outcome(value, read_only, depth=0, own=False):
     """Recognize native errors and JSON-encoded MCP envelopes before truncation."""
     if depth>4: return 'completed'
     if isinstance(value,str):
@@ -100,6 +111,8 @@ def outcome(value, read_only, depth=0):
         except ValueError: return 'completed'
     if not isinstance(value,dict): return 'completed'
     if value.get('outcome_uncertain') is True: return 'uncertain'
+    # A call's own refusal (own=True) happened before anything ran, so it is a certain failure even for a write.
+    if own and depth==0 and value.get('not_started') is True: return 'failed'
     if value.get('error') not in (None,False,'',{},[]) or value.get('isError') is True or value.get('is_error') is True:
         return 'failed' if read_only else 'uncertain'
     for key in ('status', 'status_code', 'http_status'):
@@ -240,13 +253,40 @@ def native_catalog():
                 name in NATIVE_EXCLUDED_TOOLS or name.startswith('browser_')):
             continue
         schema=json.loads(encoded(function.get('parameters',{})))
+        # A call searches its own profile's history only, like the app's History.
+        if name=='session_search' and isinstance(schema.get('properties'),dict): schema['properties'].pop('profile',None)
         read_only=_hermes_read_only(name)
-        output.append({'tool_id':digest(['hermes-native',registry.current_scope_key(),registry._generation,
-                                         config_digest,name,toolset,schema,read_only]),
-                       'name':name,'description':safe(function.get('description',''),1200),
-                       'parameters':schema,'read_only':read_only,'_kind':'hermes','_raw':name,
-                       '_toolset':toolset,'_enabled_tools':enabled_tools})
+        row={'tool_id':digest(['hermes-native',registry.current_scope_key(),registry._generation,
+                               config_digest,name,toolset,schema,read_only]),
+             'name':name,'description':safe(function.get('description',''),1200),
+             'parameters':schema,'read_only':read_only,'_kind':'hermes','_raw':name,
+             '_toolset':toolset,'_enabled_tools':enabled_tools}
+        if name in INLINE_TOOLS: row['_inline']=name
+        output.append(row)
+    # The memory provider's own tools reach only agent turns in Hermes; a call gets them under the same memory gate.
+    voice=sys.modules.get('beacon_voice_context')
+    if voice is not None and 'memory' in enabled and 'memory' not in (disabled or ()):
+        try: offered=voice.provider_tool_schemas(config)
+        except Exception: offered=[]  # The provider's tools are an extra; the rest of the catalogue stands.
+        taken={row['name'] for row in output}
+        for provided in offered:
+            name=provided['name']
+            if name in taken: continue
+            parameters=json.loads(encoded(provided.get('parameters') or {'type':'object','properties':{}}))
+            output.append({'tool_id':digest(['hermes-memory-provider',registry.current_scope_key(),registry._generation,
+                                             config_digest,name,parameters]),
+                           'name':name,'description':safe(provided.get('description',''),1200),
+                           'parameters':parameters,'read_only':False,'_kind':'hermes','_raw':name,
+                           '_toolset':'memory','_inline':'provider','_enabled_tools':enabled_tools})
     return output
+
+
+def inline_tool(tool, arguments, scope, session_id):
+    """Run a memory or session tool through Hermes' own handler with the call's chat state; scope is the call's authority."""
+    voice=sys.modules.get('beacon_voice_context')
+    if voice is None: raise RuntimeError('Call memory is unavailable')
+    from hermes_constants import get_hermes_home
+    return voice.call_inline_tool(tool['_inline'],tool['_raw'],arguments,scope,session_id,get_hermes_home())
 
 
 def tool_read_only(tool, arguments):
@@ -272,6 +312,8 @@ class NativeMcp:
         with closing(_open_session_db_at_path(Path(root)/'state.db',read_only=True)) as db:
             row=db.get_session(session_id)
         if not row or row.get('user_id')!=scope[1]+':'+scope[0]: return None
+        # Hermes runs its memory tool and the memory provider's tools without asking in every approval mode; a call does too.
+        if tool.get('_kind')=='hermes' and tool.get('_inline') in ('memory','provider'): return 'memory'
         config=row.get('model_config') or {}
         if isinstance(config,str): config=json.loads(config)
         if not isinstance(config,dict): return None
@@ -378,6 +420,7 @@ class NativeMcp:
             try:
                 if not tool.get('read_only') and not approved:
                     raise HTTPException(403,'Hermes tool requires owner approval')
+                if tool.get('_inline'): return inline_tool(tool,arguments,scope,session_id)
                 if terminal:
                     # Only the exact authorized command can satisfy Hermes' one-shot guard.
                     from tools import approval, approval_context
@@ -617,7 +660,7 @@ class Gateway:
         if not callable(policy): return None
         try:
             result=self.scoped(scope[2],lambda root:policy(tool,arguments,scope,session_id,root))
-            return result if result in ('chat_yolo','profile_off','smart') else None
+            return result if result in ('chat_yolo','profile_off','smart','memory') else None
         except Exception:
             return None  # Missing/malformed state or a failed guardian always asks the phone.
 
@@ -815,7 +858,8 @@ class Gateway:
             finally:
                 if not dispatched: timing['profile']=(time.perf_counter()-phase)*1000
             if not isinstance(raw,str): raw=encoded(raw)
-            state=outcome(raw,tool['read_only'])
+            # Hermes' memory tool refuses before it writes, so its error is a clean failure, not an unknown effect.
+            state=outcome(raw,tool['read_only'] or tool.get('_inline')=='memory',own=bool(tool.get('_inline')))
             text=self.sanitize(raw,MAX_RESULT)
             try: result=json.loads(text)
             except ValueError: result={'text':text,'truncated':True}

@@ -353,6 +353,44 @@ async def save_voice_settings(request:Request):
         conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(voice_models.preference_key(owner,profile),value['provider']))
         conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(voice_models.options_key(owner,profile,value['provider']),json.dumps(options)))
     return await voice_settings(request)
+def hand_over(owner,provider,row,failed=False):
+    """A finished call's spoken exchanges go to the profile's Hermes memory, off the request path and once per call; a failed call only lets go of its memory provider."""
+    def run():
+        try:
+            if failed: voice_context.end_call_memory(row['id'])
+            else: voice_context.hand_over_call(owner,provider,row['profile'],row['conversation'],row['id'])
+        except Exception: pass  # Like Hermes' own turn sync, memory is best effort and never fails the call.
+    threading.Thread(target=run,name='beacon-call-hand-over',daemon=True).start()
+_warmed=set()
+def warm_memory(owner,provider,row,value):
+    """The owner's first final words start the memory provider's recall in the background, once per call."""
+    words=next((e['text'] for e in value['events'] if e.get('type')=='transcript' and e.get('role')=='user'
+                and e.get('final') is True and isinstance(e.get('text'),str) and e['text'].strip()),'')
+    if not words or row['id'] in _warmed: return
+    if len(_warmed)>256: _warmed.clear()
+    _warmed.add(row['id'])
+    def run():
+        try: voice_context.warm_recall(owner,provider,row['profile'],row['conversation'],row['id'],words)
+        except Exception: pass  # A missing provider only means no head start.
+    threading.Thread(target=run,name='beacon-call-recall',daemon=True).start()
+_swept_until={}
+_swept_calls=set()
+def sweep_unended_calls(owner,provider,profile):
+    """A call the phone never ended is closed as failed after five minutes; its finished exchanges still go to memory, once."""
+    key=(owner,profile);now=time.monotonic()
+    if now<_swept_until.get(key,0): return
+    _swept_until[key]=now+60
+    with mobile.connect() as conn:
+        rows=conn.execute("""SELECT c.id,c.profile,c.conversation FROM calls c
+            WHERE c.owner=? AND c.profile=? AND c.closed=1 AND c.status='failed' AND c.ended>?
+              AND COALESCE(json_extract(c.receipt,'$.failed'),0)!=1
+              AND EXISTS(SELECT 1 FROM timeline t WHERE t.call_id=c.id AND json_extract(t.payload,'$.type')='transcript')
+              AND NOT EXISTS(SELECT 1 FROM timeline t WHERE t.call_id=c.id AND t.event_id='memory:handed-over')
+            ORDER BY c.ended DESC LIMIT 20""",(owner,profile,time.time()-86400)).fetchall()
+    if len(_swept_calls)>256: _swept_calls.clear()
+    # Each call is tried once per run (a provider that was down is not asked again every minute), at most three a minute.
+    for row in [row for row in rows if row['id'] not in _swept_calls][:3]:
+        _swept_calls.add(row['id']);hand_over(owner,provider,dict(row))
 @router.post('/mobile/calls')
 async def calls(request:Request):
     value=await body(request);owner,provider,profile,cfg=identity(request,value.get('profile'))
@@ -392,6 +430,7 @@ async def close_call(call_id:str,request:Request):
     await asyncio.to_thread(watch,owner,provider,row['profile'])
     row['closed']=1;row['ended']=row['ended'] or ended
     clear_lookup_counts(call_id)
+    hand_over(owner,provider,row,bool(json.loads(row['receipt']).get('failed')))
     return mobile.status(row)
 @router.post('/mobile/calls/{call_id}/audio')
 async def audio(call_id:str,request:Request):
@@ -399,14 +438,17 @@ async def audio(call_id:str,request:Request):
     return await asyncio.to_thread(safely,mobile.chunk,call_id,owner,value)
 @router.post('/mobile/calls/{call_id}/events')
 async def events(call_id:str,request:Request):
-    value=await body(request);owner,_,_,_=await call(request,call_id,True)
-    return await asyncio.to_thread(safely,mobile.events,call_id,owner,value)
+    value=await body(request);owner,provider,row,_=await call(request,call_id,True)
+    result=await asyncio.to_thread(safely,mobile.events,call_id,owner,value)
+    warm_memory(owner,provider,row,value)
+    return result
 @router.post('/mobile/calls/{call_id}/finalize')
 async def finalize(call_id:str,request:Request):
     value=await body(request,1024);owner,provider,row,_=await call(request,call_id)
     result=await asyncio.to_thread(safely,mobile.finalize,call_id,owner,value)
     clear_lookup_counts(call_id)
     await asyncio.to_thread(watch,owner,provider,row['profile'])
+    hand_over(owner,provider,row,bool(result.get('failed')))
     return result
 @router.post('/mobile/calls/{call_id}/jobs')
 async def jobs(call_id:str,request:Request):
@@ -1300,6 +1342,8 @@ async def start_watcher():
                         except Exception: pass
                         try: await asyncio.to_thread(push,cfg['owner_id'],profile)
                         except Exception: pass
+                        try: await asyncio.to_thread(sweep_unended_calls,cfg['owner_id'],cfg['owner_provider'],profile)
+                        except Exception: pass
             except Exception:
                 pass
             await asyncio.sleep(3)
@@ -1374,7 +1418,7 @@ async def quick_search(call_id:str,request:Request):
 @router.post('/mobile/calls/{call_id}/memory')
 async def quick_memory(call_id:str,request:Request):
     owner,provider,row,query=await query_body(request,call_id,'memory')
-    return await feature(voice_context.recall,owner,provider,row['profile'],row['conversation'],query,timeout=12)
+    return await feature(voice_context.recall,owner,provider,row['profile'],row['conversation'],query,call_id,timeout=12)
 @router.post('/mobile/calls/{call_id}/skills')
 async def voice_skills(call_id:str,request:Request):
     value=await body(request,4096)

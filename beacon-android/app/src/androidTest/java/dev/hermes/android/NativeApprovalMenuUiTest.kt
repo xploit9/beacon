@@ -142,6 +142,20 @@ class NativeApprovalMenuUiTest {
         compose.onNodeWithContentDescription("Approvals: Manual").assertIsDisplayed()
     }
 
+    // Live 2026-10-26: enabling YOLO in a just-created chat showed "Approvals: Unknown" for about 5 s while Hermes saved it.
+    @Test fun enablingYoloShowsYoloAtOnceInsteadOfUnknownWhileItSaves() = withFixture { vm, fixture ->
+        open(vm)
+        compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
+        fixture.holdConfigAcknowledgement = true
+        compose.onNodeWithText("Enable YOLO").performClick()
+        await { vm.conversationPending.value.isNotEmpty() }
+        compose.onNodeWithContentDescription("Approvals: YOLO").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Unknown").assertDoesNotExist()
+        fixture.releaseCreateAcknowledgement()
+        await { vm.data.value["picker:approvals"]?.optBoolean("session_bypass") == true && vm.conversationPending.value.isEmpty() && "picker:approvals" !in vm.refreshing.value }
+        compose.onNodeWithContentDescription("Approvals: YOLO").assertIsDisplayed()
+    }
+
     @Test fun profileOffIsHonestAndHasNoChatOffChoice() = withFixture(prepare = { _, fixture -> fixture.approvalMode = "off" }) { vm, fixture ->
         open(vm)
         compose.onNodeWithText("Approvals are off").assertIsDisplayed()
@@ -456,6 +470,23 @@ class NativeApprovalMenuUiTest {
         compose.onAllNodesWithText("synthetic-model").assertCountEquals(1)
         compose.onNodeWithTag("model:fixture:synthetic-model", useUnmergedTree = true).assert(isSelected()).assert(hasAnyDescendant(hasContentDescription("Selected")))
         assertTrue(compose.onNodeWithText("Current provider").fetchSemanticsNode().boundsInRoot.top < compose.onNodeWithText("Other provider").fetchSemanticsNode().boundsInRoot.top)
+    }
+
+    // Live 2026-10-26: a Copilot chat reports "github-copilot" while its picker group is "copilot", and another group offers the same model.
+    @Test fun theModelPickerMarksTheRowHermesNamesForARunningChatWhoseProviderIsReportedDifferently() = withFixture(
+        content = { NativeCatalog(it) }, prepare = { vm, _ ->
+            flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(raw = vm.chat.value.raw.copy().put("model", "synthetic-model").put("model_provider", "github-copilot").put("runtime_session_id", "runtime-chat-a"))
+            vm.storeData("picker:models", json("groups" to JSONArray()
+                .put(json("provider_id" to "other", "provider" to "Other provider", "models" to JSONArray().put(json("id" to "synthetic-model", "label" to "synthetic-model"))))
+                .put(json("provider_id" to "copilot", "provider" to "GitHub Copilot", "models" to JSONArray().put(json("id" to "synthetic-model", "label" to "synthetic-model"))))))
+            flow<String>(vm, "_catalog").value = "Model & provider"
+        },
+    ) { vm, fixture ->
+        await { vm.data.value["picker:model-current"]?.string("provider_id") == "copilot" }
+        compose.onNodeWithTag("model:copilot:synthetic-model", useUnmergedTree = true).assert(isSelected()).assert(hasAnyDescendant(hasContentDescription("Selected")))
+        compose.onNodeWithTag("model:other:synthetic-model", useUnmergedTree = true).assert(isNotSelected())
+        assertTrue(compose.onNodeWithText("GitHub Copilot").fetchSemanticsNode().boundsInRoot.top < compose.onNodeWithText("Other provider").fetchSemanticsNode().boundsInRoot.top)
+        assertTrue("Asking Hermes which row it means changes nothing", fixture.requests.none { it.string("method") in setOf("config.set", "prompt.submit") })
     }
 
     @Test fun slowModelPickShowsProgressAndCannotBeSubmittedTwice() = withFixture(

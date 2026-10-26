@@ -364,8 +364,20 @@ internal class NativeOperations(private val c: BeaconClient) {
             "/api/models" -> {
                 val result = c.nativeGet("/api/model/options", q + mapOf("profile" to c.auth.profile, "include_unconfigured" to "false"))
                 return result.put("groups", JSONArray(result.rows("providers").map { p ->
-                    json("provider_id" to p.string("slug"), "provider" to p.string("name"), "models" to JSONArray(p.optJSONArray("models")?.strings().orEmpty().map { json("id" to it, "label" to it) }))
+                    // `aliases` is Hermes' own list of the other names a custom provider goes by.
+                    json("provider_id" to p.string("slug"), "provider" to p.string("name"), "aliases" to (p.optJSONArray("aliases") ?: JSONArray()),
+                        "models" to JSONArray(p.optJSONArray("models")?.strings().orEmpty().map { json("id" to it, "label" to it) }))
                 }))
+            }
+            // The live agent may report its provider under another name than the picker row's slug ("github-copilot" for the "copilot" row);
+            // Hermes' session-scoped model.options marks the row it means. The picker asks only for a chat that already runs here, never for a browsed one.
+            "/api/model/current" -> {
+                require(method == "GET" && sid().matches(storedSessionId)) { "Choose a conversation first" }
+                val b = binding()
+                require(b.storedSessionId == sid()) { "Model status belongs to another conversation" }
+                val options = c.nativeRpc("model.options", json("session_id" to b.runtimeSessionId))
+                return json("session_id" to sid(), "scope_key" to c.scope.key, "provider" to options.string("provider"),
+                    "provider_id" to options.rows("providers").firstOrNull { it.optBoolean("is_current") }?.string("slug").orEmpty())
             }
             "/api/skills" -> { require(method == "GET"); val result = c.nativeGet(path, q + ("profile" to c.auth.profile)); return result.put("skills", result.optJSONArray("items") ?: result.optJSONArray("skills") ?: JSONArray()) }
             "/api/skills/content", "/api/memory" -> { require(method == "GET"); return c.nativeGet(path, q + ("profile" to c.auth.profile)) }

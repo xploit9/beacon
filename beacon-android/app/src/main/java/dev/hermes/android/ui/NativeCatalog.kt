@@ -27,6 +27,19 @@ import dev.hermes.android.core.*
 import org.json.JSONArray
 import org.json.JSONObject
 
+/** The picker group whose slug, or a name Hermes lists for it (custom providers carry `aliases`), is [name]; blank when none. */
+internal fun pickerGroupNamed(groups: List<JSONObject>, name: String): String =
+    groups.firstOrNull { g -> name.isNotBlank() && (g.string("provider_id").equals(name.trim(), true) || g.optJSONArray("aliases")?.strings().orEmpty().any { it.equals(name.trim(), true) }) }?.string("provider_id").orEmpty()
+
+/** The picker group of the chat's provider. Hermes may report that provider under another name than the group's slug (a Copilot chat says "github-copilot", its group is "copilot"):
+ *  the group the name matches, else the row Hermes itself marked for this running chat ([hermesRow]), else the only group listing the chat's model. With no provider reported, the group holding the chat's model. */
+internal fun currentPickerProvider(groups: List<JSONObject>, provider: String, model: String, hermesRow: String = ""): String {
+    if (provider.isBlank()) return groups.firstOrNull { g -> model.isNotBlank() && (g.rows("models") + g.rows("extra_models")).any { it.string("id") == model } }?.string("provider_id").orEmpty()
+    return pickerGroupNamed(groups, provider).ifBlank { groups.firstOrNull { hermesRow.isNotBlank() && it.string("provider_id") == hermesRow }?.string("provider_id").orEmpty() }
+        // A chat that is not running cannot ask Hermes; when exactly one group lists its model, that group is the only possible one.
+        .ifBlank { groups.filter { g -> model.isNotBlank() && (g.rows("models") + g.rows("extra_models")).any { it.string("id") == model } }.singleOrNull()?.string("provider_id").orEmpty() }
+}
+
 @Composable fun NativeCatalog(vm: BeaconViewModel, containedActions: Boolean = false) {
     val kind by vm.catalog.collectAsStateWithLifecycle()
     if (kind.isBlank()) return
@@ -56,10 +69,15 @@ import org.json.JSONObject
                     "Model & provider" -> {
                         val catalog = data["picker:models"]
                         val loading = catalog == null // a cached list is shown while the refresh runs
-                        // Hermes may omit the session's provider; then the group holding the current model is the current one.
-                        val currentProvider = chat.raw.string("model_provider").ifBlank {
-                            catalog?.rows("groups").orEmpty().firstOrNull { g -> (g.rows("models") + g.rows("extra_models")).any { it.string("id") == chat.raw.string("model") } }?.string("provider_id").orEmpty()
+                        val catalogGroups = catalog?.rows("groups").orEmpty()
+                        val chatProvider = chat.raw.string("model_provider")
+                        // Hermes may report a running chat's provider under another name than its picker row; Hermes then says which row it means.
+                        val askHermes = chatProvider.isNotBlank() && chat.raw.string("runtime_session_id").isNotBlank() && catalogGroups.isNotEmpty() && pickerGroupNamed(catalogGroups, chatProvider).isBlank()
+                        LaunchedEffect(askHermes, chat.sessionId, chatProvider) {
+                            if (askHermes) vm.load("picker:model-current", "/api/model/current", mapOf("session_id" to chat.sessionId), quiet = true)
                         }
+                        val hermesRow = data["picker:model-current"]?.takeIf { it.string("scope_key") == vm.client?.scope?.key && it.string("session_id") == chat.sessionId && it.string("provider") == chatProvider }?.string("provider_id").orEmpty()
+                        val currentProvider = currentPickerProvider(catalogGroups, chatProvider, chat.raw.string("model"), hermesRow)
                         val groups = remember(catalog, query, currentProvider) { catalog?.rows("groups").orEmpty().map { group ->
                             val provider = group.string("provider", group.string("label", group.string("provider_id")))
                             group to (group.rows("models") + group.rows("extra_models")).distinctBy { it.string("id") }.filter { modelSearchMatches(provider, it.string("id"), it.string("label"), query) }

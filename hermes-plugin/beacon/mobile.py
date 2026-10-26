@@ -712,14 +712,15 @@ def refs(owner,profile,conversation=None,key=None):
     return result
 
 
-def voice_history(owner,profile,stored,limit=200,text_budget=1024*1024):
-    limit=max(1,min(int(limit),200));remaining=max(1,min(int(text_budget),1024*1024))
+def voice_history(owner,profile,stored,limit=200,text_budget=1024*1024,call_id=None):
+    # One call's own transcript (the memory hand-over) may be read up to 2000 events; a call is admitted for four hours at most.
+    limit=max(1,min(int(limit),2000 if call_id else 200));remaining=max(1,min(int(text_budget),1024*1024))
     output=[];truncated=False
     identity="COALESCE(json_extract(payload,'$.display_event_id'),call_id||':'||json_extract(payload,'$.role')||':'||COALESCE(json_extract(payload,'$.turn_id'),'none'))"
     with connect() as conn:
         # Keep metadata and rowid payload reads in one WAL snapshot while retention can delete/reuse rows.
         conn.execute('BEGIN')
-        calls=conn.execute("SELECT id,created FROM calls c WHERE owner=? AND profile=? AND conversation=? AND EXISTS(SELECT 1 FROM timeline t WHERE t.call_id=c.id AND json_extract(t.payload,'$.type')='transcript') ORDER BY created DESC,id DESC LIMIT ?",(owner,profile,stored,limit+1)).fetchall()
+        calls=conn.execute("SELECT id,created FROM calls c WHERE owner=? AND profile=? AND conversation=? AND (? IS NULL OR id=?) AND EXISTS(SELECT 1 FROM timeline t WHERE t.call_id=c.id AND json_extract(t.payload,'$.type')='transcript') ORDER BY created DESC,id DESC LIMIT ?",(owner,profile,stored,call_id,call_id,limit+1)).fetchall()
         for call_index,call in enumerate(calls):
             # Item updates retain their original turn/time, even when a late correction arrives in a new turn.
             # Rank metadata only; fetch bounded selected payloads by rowid instead of rescanning every item.

@@ -3853,6 +3853,9 @@ class NativeExperienceUiTest {
                 assertNull(runBlocking { app.cache.read(shell, "client-created-shell") })
                 assertNull(shells[owner.key])
                 assertNull(runBlocking { app.cache.read(owner, "new-chat-shell") })
+                // History gets a summary row, not the chat's messages.
+                await { vm.ui.value.sessions.any { it.string("session_id") == shellId } }
+                assertTrue(vm.ui.value.sessions.filter { it.string("session_id") == shellId }.none { it.has("messages") || it.has("voice_transcripts") })
             } finally { fixture.releasePromptAcknowledgement() }
             await { vm.chat.value.streamId.isNotBlank() }
             assertEquals("The settled send is not sent again", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
@@ -3886,6 +3889,174 @@ class NativeExperienceUiTest {
         } finally {
             runBlocking { created.forEach { id -> listOf("client-created-shell", "session", "draft", "pending").forEach { app.cache.delete(owner.session(id), it) } } }
         }
+    }
+
+    @Test fun anEmptyNewChatJoinsHistoryWithItsFirstMessageAndANamedThreadAtOnce() = withFixture { vm, fixture ->
+        val owner = fixture.scope
+        val created = mutableListOf<String>()
+        fun listed(id: String) = vm.ui.value.sessions.any { it.string("session_id") == id }
+        fun listReads() = fixture.requests.count { it.string("method") == "GET" && it.string("path") == "/api/sessions" }
+        try {
+            await { !vm.ui.value.historyLoading }
+            val readsBefore = listReads()
+            compose.runOnIdle { vm.newChat() }
+            await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+            val plain = vm.chat.value.sessionId.also { created += it }
+            assertFalse("An empty new chat is not a History row", listed(plain))
+            Thread.sleep(1_000)
+            compose.waitForIdle()
+            assertEquals("Opening a chat does not read the History list again", readsBefore, listReads())
+            // Its first message puts it there, as a summary row.
+            fixture.persistTerminalMessages = true
+            compose.runOnIdle { vm.composer(TextFieldValue("First words")); vm.send() }
+            await { fixture.requests.any { it.string("method") == "prompt.submit" } && listed(plain) }
+            assertTrue(vm.ui.value.sessions.first { it.string("session_id") == plain }.optInt("message_count") >= 1)
+            // A named thread is listed as soon as it exists, empty.
+            compose.runOnIdle { vm.newThread("A fresh thread") }
+            await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId != plain && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+            val thread = vm.chat.value.sessionId.also { created += it }
+            assertTrue("A named thread is listed at once", listed(thread))
+            receipts += "An empty new chat is listed only after its first message; a named thread at once; opening a chat reads no History list."
+        } finally {
+            runBlocking { created.forEach { id -> listOf("client-created-shell", "session", "draft", "pending").forEach { app.cache.delete(owner.session(id), it) } } }
+        }
+    }
+
+    @Test fun newConversationOpensAChatOfItsOwnAfterAnUnsentThreadOrOptionChat() = withFixture { vm, fixture ->
+        val owner = fixture.scope
+        val created = mutableListOf<String>()
+        fun creates() = fixture.requests.count { it.string("method") == "session.create" }
+        fun marker(id: String) = runBlocking { app.cache.read(owner.session(id), "client-created-shell") }
+        try {
+            for (options in listOf(json("title" to "An unsent thread", "thread" to true), json("title" to "A titled chat", "model" to "other-model", "model_provider" to "fixture"))) {
+                compose.runOnIdle { vm.newChat(options) }
+                await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId !in created && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+                val apart = vm.chat.value.sessionId.also { created += it }
+                assertEquals("A chat with options is remembered as one kept apart", "apart", marker(apart))
+                val createsBefore = creates()
+                compose.runOnIdle { vm.newChat() }
+                await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId !in created && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+                val plain = vm.chat.value.sessionId.also { created += it }
+                assertEquals("New conversation does not reuse it", createsBefore + 1, creates())
+                assertEquals("A plain chat keeps the plain marker", "1", marker(plain))
+            }
+            receipts += "Plain New conversation opens its own chat after an unsent thread or a chat opened with a title or model."
+        } finally {
+            runBlocking { created.forEach { id -> listOf("client-created-shell", "session", "draft", "pending").forEach { app.cache.delete(owner.session(id), it) } } }
+        }
+    }
+
+    @Test fun anUnsentThreadStaysApartFromNewConversationAfterAnAppRestart() = withFixture { vm, fixture ->
+        val owner = fixture.scope
+        val saved = listOf("new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session", "conversation-index").associateWith { runBlocking { app.cache.read(owner, it) } }
+        val created = mutableListOf<String>()
+        var restartedClient: dev.hermes.android.data.BeaconClient? = null
+        val restartedStore = ViewModelStore()
+        try {
+            compose.runOnIdle {
+                field(vm, "sourceScope", null)
+                flow<ChatState>(vm, "_chat").value = ChatState()
+                flow<AppState>(vm, "_ui").value = vm.ui.value.copy(tab = "Chat", initialChatReady = true, newChatOpening = false)
+                vm.newChat(json("title" to "An unsent thread", "thread" to true))
+            }
+            await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+            val thread = vm.chat.value.sessionId.also { created += it }
+            // After a restart Hermes has no row for the unsent chat and its resume snapshot carries no source: only the saved marker remains.
+            fixture.markUnpromptedShell(thread)
+            assertEquals("apart", runBlocking { app.cache.read(owner.session(thread), "client-created-shell") })
+            val cachedShell = requireNotNull(runBlocking { app.cache.read(owner, "new-chat-shell") })
+            val newClient = fixture.clientFor(requireNotNull(vm.client).auth, app.auth)
+            restartedClient = newClient
+            lateinit var restarted: BeaconViewModel
+            compose.runOnUiThread {
+                restarted = ViewModelProvider(restartedStore, viewModelFactory { initializer { BeaconViewModel(app, SavedStateHandle()) } })[BeaconViewModel::class.java]
+                field(restarted, "client", newClient)
+                field(restarted, "cachedOwnerScope", owner)
+                field(restarted, "sourceScope", null)
+                flow<AppState>(restarted, "_ui").value = vm.ui.value.copy(tab = "Chat", initialChatReady = true, newChatOpening = false, newChatError = "", restoringSession = false)
+                flow<ChatState>(restarted, "_chat").value = ChatState()
+                @Suppress("UNCHECKED_CAST")
+                val shells = BeaconViewModel::class.java.getDeclaredField("initialShells").apply { isAccessible = true }.get(restarted) as MutableMap<String, String>
+                shells[owner.key] = cachedShell
+            }
+            compose.runOnIdle { restarted.newChat() }
+            await { restarted.chat.value.sessionId == thread && restarted.chat.value.projectionReady && !restarted.ui.value.newChatOpening }
+            val createsBefore = fixture.requests.count { it.string("method") == "session.create" }
+            compose.runOnIdle { restarted.newChat() }
+            await { restarted.chat.value.sessionId.startsWith("new-") && restarted.chat.value.sessionId != thread && restarted.chat.value.projectionReady && !restarted.ui.value.newChatOpening }
+            created += restarted.chat.value.sessionId
+            assertEquals("The restored thread is not reused", createsBefore + 1, fixture.requests.count { it.string("method") == "session.create" })
+            receipts += "A thread that was never sent still gets a plain chat of its own from New conversation after the app restarts."
+        } finally {
+            compose.runOnUiThread { restartedStore.clear(); restartedClient?.closeNative() }
+            runBlocking {
+                saved.forEach { (key, value) -> if (value == null) app.cache.delete(owner, key) else app.cache.write(owner, key, value, true) }
+                created.forEach { id -> listOf("client-created-shell", "session", "draft", "pending").forEach { app.cache.delete(owner.session(id), it) } }
+            }
+        }
+    }
+
+    @Test fun aCreateThatNeverLeftThePhoneLeavesNoUnconfirmedAttemptToRetry() = withFixture { vm, fixture ->
+        val owner = fixture.scope
+        val saved = listOf("new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session", "conversation-index").associateWith { runBlocking { app.cache.read(owner, it) } }
+        val created = mutableListOf<String>()
+        @Suppress("UNCHECKED_CAST")
+        val attempts = BeaconViewModel::class.java.getDeclaredField("initialCreateAttempts").apply { isAccessible = true }.get(vm) as Map<String, String>
+        try {
+            compose.runOnIdle {
+                field(vm, "sourceScope", null)
+                flow<ChatState>(vm, "_chat").value = ChatState()
+                flow<AppState>(vm, "_ui").value = vm.ui.value.copy(tab = "Chat", initialChatReady = true, newChatOpening = false, newChatError = "", error = "")
+                // The network is down: no connection can open, so nothing reaches Hermes.
+                fixture.client.closeNative()
+                fixture.refuseConnection = true
+                vm.newChat()
+            }
+            await { !vm.ui.value.newChatOpening && vm.ui.value.error.isNotBlank() }
+            assertEquals("No Retry state waits for a create that never left the phone", "", vm.ui.value.newChatError)
+            assertTrue(attempts.isEmpty())
+            assertNull("...and no unconfirmed-attempt marker is kept", runBlocking { app.cache.read(owner, "new-chat-attempt") })
+            assertEquals(0, fixture.requests.count { it.string("method") == "session.create" })
+            // Typing while Hermes is unreachable does not retry the create on every key.
+            val refused = fixture.refusedConnections.get()
+            compose.runOnIdle { listOf("h", "he", "hey").forEach { vm.composer(androidx.compose.ui.text.input.TextFieldValue(it)) } }
+            Thread.sleep(1000); compose.waitForIdle()
+            assertEquals(refused, fixture.refusedConnections.get())
+            compose.runOnIdle { vm.composer(androidx.compose.ui.text.input.TextFieldValue()) }
+            // Back online, the next try opens a chat.
+            fixture.refuseConnection = false
+            compose.runOnIdle { vm.newChat() }
+            await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+            created += vm.chat.value.sessionId
+            assertEquals(1, fixture.requests.count { it.string("method") == "session.create" })
+            receipts += "A new chat that failed before anything was sent leaves no unconfirmed attempt: no Retry state, no marker, and the next try opens a chat."
+        } finally {
+            fixture.refuseConnection = false
+            runBlocking {
+                saved.forEach { (key, value) -> if (value == null) app.cache.delete(owner, key) else app.cache.write(owner, key, value, true) }
+                created.forEach { id -> listOf("client-created-shell", "session", "draft", "pending").forEach { app.cache.delete(owner.session(id), it) } }
+            }
+        }
+    }
+
+    @Test fun aQuietRunningTurnIsAskedAboutLessAndLessOftenAndNeverSentAgain() = withFixture { vm, fixture ->
+        field(vm, "streamSilenceMs", 800L)
+        field(vm, "streamWatchMs", 200L)
+        kotlinx.coroutines.runBlocking { app.cache.delete(fixture.scope.session("chat-a"), "live:runtime-chat-a") }
+        val subscriptionsBeforeSend = fixture.streamSubscriptions.get()
+        fixture.nativeTurnStatus = "working"
+        compose.runOnIdle { vm.composer(TextFieldValue("A long quiet task")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId == "runtime-chat-a" }
+        await { fixture.streamSubscriptions.get() > subscriptionsBeforeSend }
+        val probesBefore = fixture.requests.count { it.string("method") == "session.active_list" }
+        Thread.sleep(7_000)
+        // Windows of 0.8 s, 1.6 s, 3.2 s: about three questions in seven seconds, not one every 0.8 s.
+        val probes = fixture.requests.count { it.string("method") == "session.active_list" } - probesBefore
+        assertTrue("Hermes is asked about the quiet turn (asked $probes times)", probes >= 1)
+        assertTrue("Each answer of \"still working\" stretches the wait (asked $probes times)", probes <= 4)
+        assertEquals("Asking never sends the prompt again", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
+        assertTrue("The turn is still shown as running", vm.chat.value.streamId.isNotBlank())
+        receipts += "A quiet turn Hermes still runs is asked about less and less often, picked up again each time, and never sent twice."
     }
 
     @Test fun theBeaconChatNamedOnlyByTheCacheIsRestoredWhenTheAssistantProfileDiffersFromTheChats() = withFixture { vm, fixture ->

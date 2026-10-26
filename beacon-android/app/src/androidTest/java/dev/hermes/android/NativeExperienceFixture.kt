@@ -198,6 +198,8 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     private val currentRuntimeSessionIds = ConcurrentHashMap<String, String>()
     val streamSubscriptions = AtomicInteger()
     @Volatile var nativeTurnStatus = "idle"
+    @Volatile var refuseConnection = false
+    val refusedConnections = java.util.concurrent.atomic.AtomicInteger()
     /** Stored id -> runtime id a later `session.resume` of that conversation binds (other conversations keep their own). */
     val resumeRuntimeSessionIds = ConcurrentHashMap<String, String>()
     @Volatile var nativeStatusFailure = false
@@ -298,6 +300,8 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     }
     val configureHttp: (OkHttpClient.Builder) -> Unit = { builder ->
         builder.addInterceptor { chain ->
+            // A network that is down refuses ordinary requests too, not only the live connection.
+            if (refuseConnection) throw java.net.ConnectException("Synthetic connection refused")
             val request = chain.request()
             check(request.url.host == "ui-fixture.invalid") { "UI fixture may not access a real host" }
             if (request.url.encodedPath in setOf("/api/fs/download", "/api/files/download", "/api/file/raw")) {
@@ -824,7 +828,9 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 return true
             }
         }
-        listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Synthetic wire").build())
+        // Like a network that is down: the connection never opens, so nothing can have been sent.
+        if (refuseConnection) { refusedConnections.incrementAndGet(); listener.onFailure(socket, java.net.ConnectException("Synthetic connection refused"), null) }
+        else listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Synthetic wire").build())
         return socket
     }
     private fun rpc(method: String, params: JSONObject): JSONObject {
@@ -897,6 +903,10 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 json("sessions" to rows)
             }
             "session.usage" -> json("input_tokens" to 100, "output_tokens" to 20, "context_window" to 32000)
+            // Like Hermes for a live session: the agent reports "github-copilot" and the "copilot" row is the one marked current.
+            "model.options" -> json("model" to profileModel, "provider" to "github-copilot", "providers" to JSONArray()
+                .put(json("slug" to "other", "name" to "Other provider", "is_current" to false, "models" to JSONArray(listOf("synthetic-model"))))
+                .put(json("slug" to "copilot", "name" to "GitHub Copilot", "is_current" to true, "models" to JSONArray(listOf("synthetic-model")))))
             "session.title" -> {
                 // Hermes titles are unique per profile (idx_sessions_title_unique).
                 renameFailure?.let { throw FixtureRpcFailure(500, it) }

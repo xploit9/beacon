@@ -9,7 +9,8 @@ you can rename it in Settings › Assistant.
 - **Chat, history, threads and files.** Chat with your Hermes profile, return to saved
   conversations, create named threads, and attach or open files.
 - **Voice calls.** Talk with Gemini Live, Grok or OpenAI Realtime. Beacon uses the tools and
-  memory available to your Hermes profile. Review any action that needs approval in the app.
+  memory available to your Hermes profile, and can save new memories like a chat does
+  ([how calls use tools and memory](docs/voice-calls.md)). Review any action that needs approval in the app.
   Call transcripts are saved as text; audio is not retained.
 - **Important-email alerts.** Beacon checks email with tools connected to your Hermes profile.
   Write rules for a notification or call, and teach it with Important / Not important feedback.
@@ -26,7 +27,7 @@ you can rename it in Settings › Assistant.
 
 Before running it yourself, complete the [predecessor-removal prerequisite](docs/install-with-agent.md#before-installing-beacon). Then run `python beacon_install.py`: it selects your Hermes home/profile, installs or updates Beacon, restarts the dashboard if you say yes, and prints the link to paste into Beacon. The installer does not back up or remove a predecessor plugin or its jobs. Manual steps: [docs/install-with-agent.md](docs/install-with-agent.md).
 
-**2. On your phone**, download `Beacon-1.1.4.apk` from [Releases](https://github.com/xploit9/beacon/releases/latest) and install
+**2. On your phone**, download `Beacon-1.1.5.apk` from [Releases](https://github.com/xploit9/beacon/releases/latest) and install
 it. Open it, paste your Hermes link (also shown on the dashboard's **Beacon** tab), sign in with Hermes, and follow the setup wizard.
 
 ## Connect or manage phones
@@ -48,7 +49,7 @@ dashboard's **Beacon** tab.
 - The plugin checks your signed-in Hermes owner and profile before acting.
 - Voice provider keys are encrypted on the phone and sent only to the selected provider.
 - During a call, Beacon sends your assistant's instructions, memory notes, recent chat, tool results and any camera or screen you share to the voice provider you choose.
-- Call audio is not retained. Call history is saved as text.
+- Call audio is not retained. Call history is saved as text, and a finished call's text is passed to your Hermes memory provider like a chat.
 - Beacon's call and task retention setting does not remove Hermes conversations, memories or files.
 - Beacon checks the public GitHub release for updates on its own, without signing in, so GitHub sees the phone's address.
 

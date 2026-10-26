@@ -607,7 +607,7 @@ def test_router_reuses_native_owner_profile_and_closed_call_authority(tmp_path,m
     from fastapi.testclient import TestClient
     from test_mobile import harness, reserve
     # Borrow the real dashboard's authentication/call checks with a private fixture DB.
-    host,client,cfg,root,app=harness.__wrapped__(tmp_path,monkeypatch)
+    host,client,cfg,root,app=next(harness.__wrapped__(tmp_path,monkeypatch))
     spec=importlib.util.spec_from_file_location('beacon_gateway_api_test',ROOT/'gateway_api.py')
     api=importlib.util.module_from_spec(spec);spec.loader.exec_module(api)
     native_module=sys.modules['beacon_gateway_tools']
@@ -634,7 +634,7 @@ def test_gateway_router_passes_the_call_conversation_to_native_dispatch(tmp_path
     from fastapi import FastAPI,Request
     from fastapi.testclient import TestClient
     from test_mobile import harness
-    host,_,_,_,_=harness.__wrapped__(tmp_path,monkeypatch)
+    host,_,_,_,_=next(harness.__wrapped__(tmp_path,monkeypatch))
     spec=importlib.util.spec_from_file_location('beacon_gateway_api_session_test',ROOT/'gateway_api.py')
     api=importlib.util.module_from_spec(spec);spec.loader.exec_module(api)
     backend=Backend();native_module=sys.modules['beacon_gateway_tools']
@@ -765,8 +765,11 @@ def test_native_tools_are_discovered_for_the_api_profile_and_exclusions_are_appl
     assert memory_tools <= set(catalog)
     # A provider tool is not read-only because of its name; only the tool itself can say so.
     assert not any(catalog[name]['read_only'] for name in memory_tools)
-    assert 'session_search' not in catalog
-    assert not {'memory','todo_list','clarify','delegate_task','browser_click','beacon_create_proactive_request',
+    # Hermes' memory and session tools reach a call through their own handlers; the rest stay out, each for a stated reason.
+    assert catalog['session_search']['read_only'] and catalog['session_search']['_inline']=='session_search'
+    assert not catalog['memory']['read_only'] and catalog['memory']['_inline']=='memory'
+    assert not any('_inline' in catalog[name] for name in ('read_file','write_file','web_search'))
+    assert not {'todo_list','clarify','delegate_task','browser_click','beacon_create_proactive_request',
                 'beacon_email_notice','beacon_event_notice','beacon_events_checked',
                 'mcp-weather','video_analyze','manage_connections','manage_catalog','setup_mcp'} & set(catalog)
     assert catalog['read_file']['read_only'] and catalog['web_search']['read_only']
@@ -1081,3 +1084,116 @@ def test_numbers_and_booleans_sent_as_strings_match_the_schema():
     with pytest.raises(HTTPException):
         g.validate(schema, g.coerce(schema, {'days': 'tomorrow'}))
 
+
+def native_environment(monkeypatch,names,enabled,disabled=(),parameters=None):
+    """Hermes' registry and config as native_catalog reads them, for the API platform."""
+    entries={name:SimpleNamespace(name=name,toolset=toolset,schema={'description':name}) for name,toolset in names}
+    definitions=[{'type':'function','function':{'name':name,'description':name,
+                  'parameters':(parameters or {}).get(name,{'type':'object','properties':{}})}} for name,_ in names]
+    config={'agent':{'disabled_toolsets':list(disabled)},'memory':{'provider':'mnemo'}}
+    registry=SimpleNamespace(current_scope_key=lambda:'scope',_generation=1,get_entry=lambda name:entries.get(name))
+    monkeypatch.setitem(sys.modules,'agent.skill_utils',SimpleNamespace(parse_config_string_list=lambda value:list(value or [])))
+    monkeypatch.setitem(sys.modules,'hermes_cli.config',SimpleNamespace(load_config_readonly=lambda:config))
+    monkeypatch.setitem(sys.modules,'hermes_cli.tools_config',SimpleNamespace(_get_platform_tools=lambda cfg,platform:set(enabled)))
+    monkeypatch.setitem(sys.modules,'model_tools',SimpleNamespace(get_tool_definitions=lambda **kwargs:definitions))
+    monkeypatch.setitem(sys.modules,'tools.registry',SimpleNamespace(registry=registry))
+    return config
+
+
+def test_memory_provider_tools_join_the_catalogue_under_the_owners_memory_gate(monkeypatch):
+    provided=[{'name':'mnemo_search','description':'Search saved memory','parameters':{
+                  'type':'object','properties':{'query':{'type':'string'}},'required':['query']}},
+              {'name':'read_file','description':'named like a Hermes tool','parameters':{'type':'object'}}]
+    asked=[]
+    monkeypatch.setitem(sys.modules,'beacon_voice_context',SimpleNamespace(
+        provider_tool_schemas=lambda cfg:asked.append(cfg['memory']['provider']) or provided))
+    native_environment(monkeypatch,[('read_file','file')],['file','memory'])
+
+    catalog={row['name']:row for row in g.native_catalog()}
+
+    assert set(catalog)=={'read_file','mnemo_search'} and asked==['mnemo']
+    tool=catalog['mnemo_search']
+    assert tool['read_only'] is False and tool['_kind']=='hermes' and tool['_inline']=='provider'
+    assert tool['_raw']=='mnemo_search' and tool['parameters']['required']==['query'] and len(tool['tool_id'])==64
+    for enabled,disabled in ((['file'],[]),(['file','memory'],['memory'])):
+        asked.clear()
+        native_environment(monkeypatch,[('read_file','file')],enabled,disabled)
+        assert {row['name'] for row in g.native_catalog()}=={'read_file'} and asked==[]
+
+
+def test_a_call_searches_its_own_profile_only(monkeypatch):
+    parameters={'session_search':{'type':'object','properties':{'query':{'type':'string'},'profile':{'type':'string'}}}}
+    native_environment(monkeypatch,[('session_search','session_search')],['session_search'],parameters=parameters)
+    monkeypatch.delitem(sys.modules,'beacon_voice_context',raising=False)
+
+    tool=g.native_catalog()[0]
+
+    assert set(tool['parameters']['properties'])=={'query'}
+
+
+def test_asking_to_remember_something_finds_the_memory_tool(gateway):
+    api,backend,_=gateway
+    backend.catalog=lambda discover=True:[
+        {'tool_id':'a'*64,'name':'read_file','description':'Read a local file','parameters':{'type':'object'},'read_only':True},
+        {'tool_id':'b'*64,'name':'memory','description':'Save durable facts to persistent memory that survive across sessions',
+         'parameters':{'type':'object'},'read_only':False}]
+    assert [tool['name'] for tool in api.discover('profile','remember that my favorite color is green')['tools']]==['memory']
+
+
+def test_a_refusal_before_anything_ran_is_a_certain_failure_even_for_a_write():
+    assert g.outcome({'error':'No provider','not_started':True},False,own=True)=='failed'
+    # A connected server's own payload cannot claim that nothing ran.
+    assert g.outcome({'error':'Server said so','not_started':True},False)=='uncertain'
+    assert g.outcome({'error':'Provider crashed'},False,own=True)=='uncertain'
+    assert g.outcome({'result':'saved'},False)=='completed'
+
+
+def test_each_tool_a_call_leaves_out_has_a_stated_reason():
+    assert set(g.EXCLUDED_REASONS)=={'clarify','delegate_task','todo_list','browser'}
+    assert {'clarify','delegate_task','todo_list'}<=g.NATIVE_EXCLUDED_TOOLS and 'browser' in g.NATIVE_EXCLUDED_TOOLSETS
+    assert not {'memory','session_search'}&g.NATIVE_EXCLUDED_TOOLS
+    assert all(len(reason)>20 for reason in g.EXCLUDED_REASONS.values())
+
+
+def test_inline_tools_run_through_the_call_memory_with_the_calls_authority(tmp_path,monkeypatch):
+    seen=[];session={}
+    monkeypatch.setitem(sys.modules,'gateway',SimpleNamespace(session_context=SimpleNamespace(
+        set_session_vars=lambda **kwargs:session.update(kwargs) or kwargs,clear_session_vars=lambda _:session.clear())))
+    monkeypatch.setitem(sys.modules,'hermes_constants',SimpleNamespace(get_hermes_home=lambda:tmp_path))
+    monkeypatch.setitem(sys.modules,'beacon_voice_context',SimpleNamespace(
+        call_inline_tool=lambda *args:seen.append(args) or '{"success": true}'))
+    memory={'_kind':'hermes','_raw':'memory','_inline':'memory','read_only':False}
+    search={'_kind':'hermes','_raw':'session_search','_inline':'session_search','read_only':True}
+
+    with pytest.raises(HTTPException) as error: g.NativeMcp().execute(memory,{'target':'user'},SCOPE,False,session_id='native-stored')
+    assert error.value.status_code==403 and seen==[]
+    assert g.NativeMcp().execute(search,{'query':'tea'},SCOPE,False,session_id='native-stored')=='{"success": true}'
+    g.NativeMcp().execute(memory,{'target':'user'},SCOPE,True,session_id='native-stored')
+
+    assert seen==[('session_search','session_search',{'query':'tea'},SCOPE,'native-stored',tmp_path),
+                  ('memory','memory',{'target':'user'},SCOPE,'native-stored',tmp_path)]
+
+
+@pytest.mark.parametrize('inline,name,result',[
+    ('memory','memory',{'success':False,'error':'Memory is full'}),
+    ('provider','mnemo_save',{'error':'The memory provider is not available for this chat.','not_started':True}),
+])
+def test_memory_write_asks_each_time_and_a_refusal_is_a_clean_failure(gateway,inline,name,result):
+    api,backend,_=gateway
+    tool={'tool_id':'e'*64,'name':name,'description':'Save durable facts','read_only':False,
+          'parameters':{'type':'object','properties':{'action':{'type':'string'},'target':{'type':'string'},
+                        'content':{'type':'string'}},'required':['target']},
+          '_kind':'hermes','_raw':name,'_inline':inline}
+    backend.catalog=lambda discover=True:[tool]
+    backend.result=result
+
+    proposal=api.invoke(SCOPE,{'request_id':'save','tool_id':tool['tool_id'],
+                               'arguments':{'action':'add','target':'user','content':'Likes tea'}})
+
+    assert proposal['status']=='needs_approval' and proposal['proposal']['allow_call'] is False
+    with pytest.raises(HTTPException) as error:
+        api.decide(SCOPE,'save',{'proposal_id':proposal['proposal']['id'],'decision':'approve_call'})
+    assert error.value.status_code==409 and not backend.calls
+    api.decide(SCOPE,'save',{'proposal_id':proposal['proposal']['id'],'decision':'approve'})
+    receipt=settled(api,'save')
+    assert receipt['status']=='failed' and receipt['result']['error']==result['error']

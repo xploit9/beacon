@@ -44,7 +44,11 @@ def harness(tmp_path,monkeypatch):
         return await call_next(request)
     app.include_router(api.router,prefix='/api/plugins/beacon')
     client=TestClient(app);client.headers['x-fixture-owner']='owner'
-    return api,client,cfg,tmp_path,app
+    yield api,client,cfg,tmp_path,app
+    # Background warm-ups and hand-overs finish before the fakes they use are undone; one still running then would import real Hermes.
+    one_shot={'beacon-voice-hint','beacon-catalog-warm','beacon-call-hand-over','beacon-call-recall','beacon-call-memory-release','beacon-call-memory-mirror','beacon-memory-recall'}
+    for thread in threading.enumerate():
+        if thread.name in one_shot: thread.join(10)
 
 def reserve(client):
     provider=client.get('/api/plugins/beacon/mobile/voice-settings?profile=default').json()['selected_provider']

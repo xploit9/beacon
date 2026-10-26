@@ -123,13 +123,17 @@ internal suspend fun testVoiceProvider(provider:String,apiKey:String,model:Strin
 
 internal class DirectVoice(private val client:BeaconClient,private val callId:String,private val selectedSession:String,private val scope:CoroutineScope,
     private val audio:(ByteArray)->Unit,private val event:(JSONObject)->Unit,private val failure:(String)->Unit,private val recentSpeech:()->String={""},
-    private val credentials:VoiceSessionCredentials,private val providerSocketFactory:WebSocket.Factory?=null,private val ownerName:String="") {
+    private val credentials:VoiceSessionCredentials,private val providerSocketFactory:WebSocket.Factory?=null,private val ownerName:String="",stallAfterMs:Long=20_000) {
     // Deliberately separate from authenticated Hermes HTTP: no cookie jar, interceptors, or copied headers.
     private val provider=credentials.provider
     private val providerHttp=OkHttpClient.Builder().cookieJar(CookieJar.NO_COOKIES).followRedirects(false).followSslRedirects(false).pingInterval(20,TimeUnit.SECONDS).build()
     private val epoch=AtomicLong();@Volatile private var socket:WebSocket?=null;@Volatile private var resume:String?=null
-    private data class Outbound(val json:String,val permitted:()->Boolean,val visualBytes:Int=0,val control:Boolean=false,val onSent:()->Unit={},val onDropped:()->Unit={},val providerSession:Long?=null,val newSessionJson:String?=null)
+    private data class Outbound(val json:String,val permitted:()->Boolean,val visualBytes:Int=0,val control:Boolean=false,val onSent:()->Unit={},val onDropped:()->Unit={},val providerSession:Long?=null,val newSessionJson:String?=null,val at:Long=0)
     private val providerSession=AtomicLong()
+    // A session that took the owner's speech or a tool result and never answered is replaced; what it was owed is said again.
+    private val stall=VoiceStallWatch(limit=stallAfterMs);private val stallPoll=(stallAfterMs/4).coerceIn(50,1000)
+    private val unanswered=ArrayDeque<String>()
+    private val visualPacing=VisualPacing()
     private var run:Job?=null;private val microphone=Channel<Outbound>(20)
     private val controls=Channel<Outbound>(64)
     private var retryControl:Outbound?=null
@@ -253,6 +257,7 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
             }
             while(isActive&&!stopped) {
                 providerRejection?.let { throw VoiceProviderRejected(providerRejectionMessage(provider,it)) }
+                if(stall.stallsInARow()>=3) throw VoiceStalled()
                 if(reconnects.exhausted) error("Voice reconnect limit reached")
                 if(reconnects.failures>0) {
                     event(JSONObject().put("type","state").put("state","reconnecting"))
@@ -267,6 +272,7 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
                 val generation=epoch.incrementAndGet();ready=false
                 while(microphone.tryReceive().isSuccess) {}
                 while(true) { val dropped=visualFrames.tryReceive().getOrNull()?:break;dropped.onDropped() };visualPending.set(false)
+                stall.reset();visualPacing.reset()
                 diagnostic("provider_key_ready")
                 val grok=if(provider=="grok") GrokWire() else null
                 val openAi=if(provider=="openai") OpenAiWire() else null
@@ -297,13 +303,14 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
                         if(!current()) return
                         if(text.length>1_000_000) { ended.complete(Unit);ws.cancel();return }
                         try {
-                            val raw=JSONObject(text)
+                            val raw=JSONObject(text);stall.heard()
                             val frame=when {
                                 grok!=null -> grok.inbound(raw)?:return
                                 openAi!=null -> openAi.inbound(raw)?:return
                                 else -> raw
                             }
                             if(!current()) return
+                            if(voiceReplyFrame(frame)) { stall.replied();synchronized(unanswered) { unanswered.clear() } }
                             (grok?.continueResponse()?:openAi?.continueResponse())?.let { if(!ws.send(it.toString())) { ended.complete(Unit);ws.cancel();return } }
                             if(frame.has("setupComplete")) {
                                 if(!greeted) {
@@ -324,11 +331,11 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
                             frame.optJSONObject("sessionResumptionUpdate")?.let { resume=it.optString("newHandle").takeIf { _ -> it.optBoolean("resumable") }?.takeIf(String::isNotBlank) }
                             if(frame.has("goAway")) { ended.complete(Unit);ws.close(1000,"Resume");return }
                             frame.optJSONObject("serverContent")?.let { content ->
-                                if(content.optBoolean("interrupted")) event(JSONObject().put("type","interrupted"))
+                                if(content.optBoolean("interrupted")) { stall.interrupted();event(JSONObject().put("type","interrupted")) }
                                 content.optJSONObject("modelTurn")?.optJSONArray("parts")?.let { parts -> for(i in 0 until parts.length()) {
                                     parts.optJSONObject(i)?.optJSONObject("inlineData")?.let { data ->
                                         val pcm=Base64.decode(data.getString("data"),Base64.DEFAULT)
-                                        require(GeminiWire.validAudio(data.getString("mimeType"),pcm.size));if(current()) audio(pcm)
+                                        require(GeminiWire.validAudio(data.getString("mimeType"),pcm.size));if(current()) { stall.playing(pcm.size/2*1000L/GeminiWire.OUTPUT_RATE);audio(pcm) }
                                     }
                                 } }
                                 for((key,role) in listOf("inputTranscription" to "user","outputTranscription" to "assistant")) content.optJSONObject(key)?.let {
@@ -362,9 +369,10 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
                         // Control receipts get the first bounded queue; PCM producers never wait.
                         val next=retryControl?.also { retryControl=null } ?: nextDirectFrame(controls,microphone,visualFrames)
                         if(generation!=epoch.get()||!ready||ended.isCompleted) { if(next.control) retryControl=next else next.onDropped();break }
+                        visualPacing.drained(ws.queueSize())
                         if(next.visualBytes>0) {
                             visualPending.set(false)
-                            if(!GeminiWire.visualMayQueue(next.visualBytes,ws.queueSize(),false)) { next.onDropped();continue }
+                            if(!GeminiWire.visualMayQueue(next.visualBytes,ws.queueSize(),false,System.nanoTime()/1_000_000-next.at)) { next.onDropped();continue }
                         }
                         if(!next.permitted()) { next.onDropped();continue }
                         val payload=if(next.providerSession!=null&&next.providerSession!=providerSession.get()) next.newSessionJson?:next.json else next.json
@@ -372,16 +380,27 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
                             if(next.control) retryControl=next else next.onDropped()
                             ended.complete(Unit);break
                         }
+                        if(next.visualBytes>0) visualPacing.sent()
+                        if(next.control) when(voiceOwedReply(payload)) {
+                            OwedReply.Tool -> owe(next.newSessionJson)
+                            OwedReply.Turn -> owe(payload)
+                            OwedReply.None -> Unit
+                        }
                         next.onSent()
                     } }
-                    ended.await();writer.cancelAndJoin()
+                    val watchdog=launch { while(isActive) {
+                        delay(stallPoll)
+                        // End this session before re-queuing what it was owed, so its writer cannot send that into the dead socket.
+                        if(ready&&stall.stalled()) { ended.complete(Unit);stalledSession();break }
+                    } }
+                    ended.await();watchdog.cancel();writer.cancelAndJoin()
                 } catch(e:CancellationException) { throw e }
                 catch(e:Exception) { /* Reconnect with the same phone-held key and refreshed Hermes context. */ }
                 finally { epoch.compareAndSet(generation,generation+1);ready=false;ws.cancel();if(!stopped) { event(JSONObject().put("type","interrupted"));event(JSONObject().put("type","state").put("state","reconnecting")) } }
                 reconnects.failed()
             }
         } catch(e:TimeoutCancellationException) { currentCoroutineContext().ensureActive();diagnostic("voice_error",e);if(!stopped) failure(if(!contextReady) "Call context timed out; reconnect to Hermes and retry" else "Direct voice admission timed out") }
-        catch(e:CancellationException) { throw e } catch(e:Exception) { diagnostic("voice_error",e);if(!stopped) failure(if(e is VoiceProviderRejected) e.message.orEmpty() else if(!greeted && e is java.net.SocketTimeoutException) "Voice did not connect within 20 seconds. Check the connection and try again." else if(!contextReady) "Call context unavailable; reconnect to Hermes and retry" else "Direct voice connection failed or reconnect budget exhausted") }
+        catch(e:CancellationException) { throw e } catch(e:Exception) { diagnostic("voice_error",e);if(!stopped) failure(if(e is VoiceProviderRejected||e is VoiceStalled) e.message.orEmpty() else if(!greeted && e is java.net.SocketTimeoutException) "Voice did not connect within 20 seconds. Check the connection and try again." else if(!contextReady) "Call context unavailable; reconnect to Hermes and retry" else "Lost the voice connection and couldn't restore it. Try calling again.") }
     } }
     private fun launchTool(call:JSONObject,generation:Long) {
         val job=scope.launch(start=CoroutineStart.LAZY) { tool(call,generation) }
@@ -390,13 +409,26 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
         job.start()
     }
     private fun callOwned() = !stopped&&client.scope==callScope
+    private fun owe(again:String?) {
+        stall.expect()
+        again?.let { synchronized(unanswered) { if(unanswered.size>=8) unanswered.removeFirst();unanswered.addLast(it) } }
+    }
+    /** Replace the session at once: resume it once, then start fresh from the call transcript; tool results are re-said as text, never re-run. */
+    private fun stalledSession() {
+        val stalls=stall.stalledAgain()
+        diagnostic("provider_error",java.net.SocketTimeoutException("Voice stopped answering"))
+        if(stalls>1) resume=null
+        val again=synchronized(unanswered) { unanswered.toList().also { unanswered.clear() } }
+        for(text in again) controls.trySend(Outbound(text,{ callOwned() },control=true))
+    }
     private suspend fun selectAdmission(admitted:Deferred<Unit>,ended:Deferred<Unit>) = kotlinx.coroutines.selects.select<Unit> {
         admitted.onAwait { };ended.onAwait { error("$provider ended before setup") }
     }
     fun send(value:JSONObject):Boolean = ready&&!stopped&&controls.trySend(Outbound(value.toString(),{ true },control=true)).isSuccess
     fun pcm(bytes:ByteArray,permitted:()->Boolean):Boolean {
         if(!ready||stopped||!permitted()) return false
-        val encoded=Base64.encodeToString(bytes,Base64.NO_WRAP)
+        stall.speech(voiceLoud(bytes),bytes.size/2*1000L/(if(provider=="openai") GeminiWire.OUTPUT_RATE else GeminiWire.INPUT_RATE))
+        val encoded=java.util.Base64.getEncoder().encodeToString(bytes)
         val frame=if(provider=="openai") OpenAiWire.audio(encoded) else GeminiWire.audio(encoded)
         return microphone.trySend(Outbound(frame.toString(),permitted)).isSuccess
     }
@@ -407,9 +439,11 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
     fun image(bytes:ByteArray,permitted:()->Boolean,onSent:()->Unit={},onDropped:()->Unit={}):Boolean {
         if(provider!="gemini") return false
         val ticket=visualEvidence.ticket()?:return false
-        if(!ready||stopped||!permitted()||!GeminiWire.visualMayQueue(bytes.size,socket?.queueSize()?:Long.MAX_VALUE,visualPending.get())||!visualPending.compareAndSet(false,true)) return false
-        val accepted=visualFrames.trySend(Outbound(GeminiWire.image(Base64.encodeToString(bytes,Base64.NO_WRAP)).toString(),{permitted()&&visualEvidence.permits(ticket)},bytes.size,
-            onSent={ visualEvidence.sent(ticket,System.nanoTime()/1000000)?.let(event);onSent() },onDropped=onDropped)).isSuccess
+        val backlog=socket?.queueSize()?:Long.MAX_VALUE
+        visualPacing.drained(backlog)
+        if(!ready||stopped||!permitted()||!visualPacing.mayQueue()||!GeminiWire.visualMayQueue(bytes.size,backlog,visualPending.get())||!visualPending.compareAndSet(false,true)) return false
+        val accepted=visualFrames.trySend(Outbound(GeminiWire.image(java.util.Base64.getEncoder().encodeToString(bytes)).toString(),{permitted()&&visualEvidence.permits(ticket)},bytes.size,
+            onSent={ visualEvidence.sent(ticket,System.nanoTime()/1000000)?.let(event);onSent() },onDropped=onDropped,at=System.nanoTime()/1000000)).isSuccess
         if(!accepted) visualPending.set(false)
         return accepted
     }

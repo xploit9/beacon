@@ -36,6 +36,9 @@ internal fun chatApprovalSelection(record: JSONObject?, profileKey: String?, ses
     }
 }
 
+/** While a read or save is in flight the shield keeps a known state on screen (the one just asked for, else the last read) instead of "Unknown". */
+internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: String?): String = if (inFlight) asked ?: settled else settled
+
 /** Composer shield adapts Hermes Relay's session-info approval-bypass indicator. */
 @Composable internal fun NativeApprovalMenu(vm: BeaconViewModel, enabled: Boolean) {
     val data by vm.data.collectAsStateWithLifecycle()
@@ -57,7 +60,10 @@ internal fun chatApprovalSelection(record: JSONObject?, profileKey: String?, ses
     // A YOLO change in an unsent chat cannot be read back from Hermes before its first message, so the default is shown only until one is tried.
     val triedKey = "approvals-tried:${capturedScope?.key}"
     val newChat = chat.messages.isEmpty() && chat.streamId.isBlank() && data[triedKey] == null
-    val selection = if (loading || busy) "unknown" else chatApprovalSelection(record, capturedClient?.scope?.key, capturedScope?.session, newChat)
+    // True while a YOLO change is being saved (the choice asked for), so the shield shows it at once.
+    var askedYolo by remember(capturedClient, capturedScope) { mutableStateOf<Boolean?>(null) }
+    val askedSelection = askedYolo?.let { if (it) "yolo" else profileMode.takeIf { mode -> mode in setOf("manual", "smart") } }
+    val selection = shownApprovalSelection(chatApprovalSelection(record, capturedClient?.scope?.key, capturedScope?.session, newChat), loading || busy, askedSelection)
     val runtimeSession = chat.raw.string("runtime_session_id")
     LaunchedEffect(capturedClient, capturedScope, ui.connected, chat.projectionReady, runtimeSession, busy) {
         // A passive REST history has no runtime; painting its shield must not resume one.
@@ -69,10 +75,11 @@ internal fun chatApprovalSelection(record: JSONObject?, profileKey: String?, ses
             vm.notice("Refresh Approvals in this chat before changing it."); return
         }
         saving = true
+        askedYolo = turnOn
         vm.storeData(triedKey, JSONObject())
         val job = vm.action("/api/approval/mode", json("yolo" to turnOn, "session_id" to capturedScope.session, "scope_key" to capturedScope.key), refresh = false,
             successNotice = if (turnOn) "YOLO on for this chat" else "YOLO off for this chat") { _, result -> vm.storeData(key, result) }
-        scope.launch { try { job.join(); open = false } finally { saving = false } }
+        scope.launch { try { job.join(); open = false } finally { saving = false; askedYolo = null } }
     }
     Box {
         IconButton(onClick = { open = true; vm.loadChatApprovals() }, enabled = enabled && capturedClient != null && capturedScope != null && !busy, modifier = Modifier.testTag("composer-approvals")) {

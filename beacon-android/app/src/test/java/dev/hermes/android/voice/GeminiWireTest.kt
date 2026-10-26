@@ -12,12 +12,18 @@ class GeminiWireTest {
         assertEquals("working",response.getJSONObject("response").getString("status"))
     }
     @Test fun visualBudgetDropsOversizedCongestedAndAlreadyPendingFramesToReserveAudio() {
-        assertTrue(GeminiWire.visualMayQueue(64000,20000,false))
-        assertFalse(GeminiWire.visualMayQueue(128001,0,false))
-        assertFalse(GeminiWire.visualMayQueue(64000,64000,false))
-        assertFalse(GeminiWire.visualMayQueue(64000,0,true))
-        assertFalse(GeminiWire.visualMayQueue(128000,0,false))
-        assertFalse(GeminiWire.visualMayQueue(64000,-1,false))
+        assertTrue(GeminiWire.visualMayQueue(48000,15999,false))
+        assertTrue(GeminiWire.visualMayQueue(30000,0,false))
+        assertFalse(GeminiWire.visualMayQueue(48001,0,false))
+        // Anything already waiting beyond about 0.4 s of microphone audio means the link is behind: the frame is dropped.
+        assertFalse(GeminiWire.visualMayQueue(30000,16000,false))
+        assertFalse(GeminiWire.visualMayQueue(30000,64000,false))
+        assertFalse(GeminiWire.visualMayQueue(30000,0,true))
+        assertFalse(GeminiWire.visualMayQueue(0,0,false))
+        assertFalse(GeminiWire.visualMayQueue(30000,-1,false))
+        // A frame that sat behind a busy writer is stale: the next capture replaces it.
+        assertTrue(GeminiWire.visualMayQueue(30000,0,false,2000))
+        assertFalse(GeminiWire.visualMayQueue(30000,0,false,2001))
     }
     @Test fun quickEvidenceRequiresObservedTimeAndBoundedSourceProvenance() {
         val evidence=org.json.JSONObject().put("summary","Observed fact").put("observed_at","2026-10-13T00:00:00Z").put("sources",org.json.JSONArray().put(org.json.JSONObject().put("title","Primary source").put("url","https://example.com/fact")))

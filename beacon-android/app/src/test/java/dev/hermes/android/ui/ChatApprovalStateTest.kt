@@ -34,4 +34,13 @@ class ChatApprovalStateTest {
         assertEquals("yolo", chatApprovalSelection(record(bypass = true), "owner-profile", "chat-a"))
         assertEquals("off", chatApprovalSelection(record("off").put("session_status_known", false), "owner-profile", "chat-a"))
     }
+
+    // Live 2026-10-26: enabling YOLO in a just-created chat showed "Unknown" for about 5 s while Hermes saved it.
+    @Test fun aSaveOrReadInFlightKeepsAKnownStateOnTheShield() {
+        assertEquals("The change just asked for shows at once", "yolo", shownApprovalSelection("smart", inFlight = true, asked = "yolo"))
+        assertEquals("Turning YOLO off shows Ask first", "smart", shownApprovalSelection("yolo", inFlight = true, asked = "smart"))
+        assertEquals("A save that failed returns to what was last read", "smart", shownApprovalSelection("smart", inFlight = true, asked = null))
+        assertEquals("Nothing known stays unknown", "unknown", shownApprovalSelection("unknown", inFlight = true, asked = null))
+        assertEquals("With nothing in flight the read state rules", "smart", shownApprovalSelection("smart", inFlight = false, asked = "yolo"))
+    }
 }

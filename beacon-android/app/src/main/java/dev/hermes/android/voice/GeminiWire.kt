@@ -64,10 +64,14 @@ internal object GeminiWire {
         return if(name.isNotEmpty()&&name.none(Char::isUpperCase)&&name.any(Char::isLowerCase)) name.replaceFirstChar { it.uppercase() } else name
     }
 
-    fun visualMayQueue(bytes:Int,backlog:Long,pending:Boolean):Boolean {
-        val encoded=(bytes.toLong()+2)/3*4+200
-        return bytes in 1..128000&&backlog in 0 until 64000&&!pending&&encoded+backlog<=160000
-    }
+    /** JPEG ceiling for one Live frame (about 64 KB encoded): 1 fps of it must fit beside the microphone on a weak uplink. */
+    const val VISUAL_FRAME_MAX = 48000
+    /** A frame may join a socket queue only when at most this much (about 0.4 s of microphone audio) is already waiting. */
+    const val VISUAL_BACKLOG_MAX = 16000
+    /** A frame that waited longer than this behind a busy writer is stale: the next capture replaces it. */
+    const val VISUAL_STALE_MS = 2000L
+    fun visualMayQueue(bytes:Int,backlog:Long,pending:Boolean,ageMs:Long=0):Boolean =
+        bytes in 1..VISUAL_FRAME_MAX&&backlog in 0 until VISUAL_BACKLOG_MAX&&!pending&&ageMs in 0..VISUAL_STALE_MS
     fun evidence(value:JSONObject,web:Boolean):JSONObject {
         require(value.opt("summary") is String&&value.getString("summary").length<=12000)
         val observed=value.opt("observed_at")

@@ -244,7 +244,7 @@ internal fun boundedVisualJpeg(bitmap:Bitmap):ByteArray {
         val stream=ByteArrayOutputStream()
         check(bitmap.compress(Bitmap.CompressFormat.JPEG,quality,stream)) { "Visual frame encoding failed" }
         val bytes=stream.toByteArray()
-        if(bytes.size<=96000) return bytes
+        if(bytes.size<=GeminiWire.VISUAL_FRAME_MAX) return bytes
     }
     error("Visual frame exceeds the safe upload limit")
 }
