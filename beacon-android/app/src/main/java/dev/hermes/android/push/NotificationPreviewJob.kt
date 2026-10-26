@@ -79,6 +79,7 @@ suspend fun refreshNotificationPreview(context: Context, source: String, event: 
             return@withTimeout
         }
         val emailAlert = isEmailAlertNotificationRoute(route, source, event, scope, conversation)
+        route.string("session_id").takeIf { kind == "task_result" && !emailAlert && validOpaque(it) }?.let { app.push.conversationPosts.tryEmit(scope.session(it)) }
         if (emailAlert) {
             val session = route.string("session_id")
             val expiresAt = route.optLong("expires_at")

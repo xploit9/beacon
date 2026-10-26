@@ -95,6 +95,8 @@ class PushManager(private val app: BeaconApplication) {
     private val _incoming = kotlinx.coroutines.flow.MutableStateFlow<IncomingCall?>(null)
     val incoming = _incoming.asStateFlow()
     internal val emailAlerts = MutableSharedFlow<Pair<Scope, JSONObject>>(extraBufferCapacity = 1)
+    /** A scheduled result was posted into this chat; an open chat re-reads it. */
+    internal val conversationPosts = MutableSharedFlow<Scope>(extraBufferCapacity = 4)
     private fun encoded(key:String,value:JSONObject):String = android.util.Base64.encodeToString(app.cipher.encrypt(value.toString().toByteArray(),key),android.util.Base64.NO_WRAP)
     private fun save(key: String, value: JSONObject) { check(privatePrefs.edit().putString(key,encoded(key,value)).commit()) }
     private fun read(key: String): JSONObject? = privatePrefs.getString(key, null)?.let { JSONObject(String(app.cipher.decrypt(android.util.Base64.decode(it, android.util.Base64.NO_WRAP), key))) }

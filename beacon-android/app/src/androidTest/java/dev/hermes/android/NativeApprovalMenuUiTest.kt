@@ -388,6 +388,21 @@ class NativeApprovalMenuUiTest {
         compose.onNodeWithContentDescription("Approvals: Manual").assertIsDisplayed()
     }
 
+    // Live 2026-10-26 (1.1.5): YOLO enabled in an unsent chat that Hermes cannot report yet left the shield on "Unknown".
+    @Test fun yoloChosenInAnUnsentChatStaysShownAfterTheSave() = withFixture(prepare = { vm, fixture ->
+        fixture.omitResumeYolo = true; fixture.approvalMode = "smart"
+        flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(messages = emptyList())
+    }) { vm, _ ->
+        await { vm.data.value["picker:approvals"]?.string("profile_mode") == "smart" }
+        open(vm)
+        compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
+        compose.onNodeWithText("Enable YOLO").performClick()
+        await { vm.conversationPending.value.isEmpty() && "picker:approvals" !in vm.refreshing.value && vm.data.value.keys.any { it.startsWith("approvals-chosen:") } }
+        compose.waitForIdle()
+        compose.onNodeWithContentDescription("Approvals: YOLO").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Unknown").assertDoesNotExist()
+    }
+
     // Hermes reports nothing for a chat that is not saved yet; it runs on the profile default, so the shield shows Auto and ticks it.
     @Test fun aNewUnsentChatShowsTheProfileDefaultSelected() = withFixture(prepare = { vm, fixture ->
         fixture.omitResumeYolo = true; fixture.approvalMode = "smart"

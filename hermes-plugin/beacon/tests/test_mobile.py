@@ -528,6 +528,12 @@ def test_native_verifier_rejects_foreign_and_unowned_history(harness,monkeypatch
         with pytest.raises(LookupError):native.verify('owner','basic','default','native-stored')
     owner[0]='basic:owner'
     assert native.verify('owner','basic','default','native-stored')['id']=='native-stored'
+    @contextmanager
+    def unavailable(params):
+        yield None
+    monkeypatch.setitem(sys.modules,'tui_gateway',SimpleNamespace(server=SimpleNamespace(_profile_db=unavailable)))
+    # A store that cannot be opened is a fault to retry, never "not owned" (that reads as a deleted chat or thread).
+    with pytest.raises(RuntimeError): native.verify('owner','basic','default','native-stored')
 
 def test_archive_rejects_dot_identity(harness):
     api,c,cfg,tmp,app=harness
@@ -1573,7 +1579,7 @@ def test_phone_delivery_uses_owned_assistant_chat_for_cron_owner_rows(harness, m
     second = native_standalone('cron-job', cron_message)
     assert first.success is True
     assert second['success'] is True and second['message_id'] == first.message_id
-    assert reads == ['assistant-chat', 'assistant-chat', 'assistant-chat', 'assistant-chat']
+    assert reads == ['assistant-chat', 'assistant-chat']  # one ownership read per delivery (verify opens the store once)
     with api.mobile.connect() as conn:
         row = conn.execute('SELECT * FROM notices').fetchone()
         assert row['conversation'] == 'assistant-chat' and row['kind'] == 'task_result'

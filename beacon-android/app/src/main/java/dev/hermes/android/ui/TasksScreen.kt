@@ -14,6 +14,7 @@ import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.core.*
 import org.json.JSONObject
 import dev.hermes.android.tasks.*
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 @Composable fun TasksScreen(vm: BeaconViewModel) {
     Column(Modifier.fillMaxSize()) {
@@ -62,18 +63,19 @@ import kotlinx.coroutines.launch
                 Text(job.string("name", "Scheduled task"), style = MaterialTheme.typography.titleMedium)
                 Text(job.string("prompt"), style = MaterialTheme.typography.bodyMedium, maxLines = if (selected == id) Int.MAX_VALUE else 3)
                 Text(job.optJSONObject("schedule")?.string("display").orEmpty().ifBlank { job.string("schedule_display") }, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                Text("${scheduleState(job)} · ${profileDisplayLabel(job.string("profile", ui.profile), profileRows, profileLoading)} · ${if(job.string("deliver", "local") == "local") "Save result in Beacon" else job.string("deliver")}", style = MaterialTheme.typography.bodySmall)
+                Text("${scheduleState(job)} · ${profileDisplayLabel(job.string("profile", ui.profile), profileRows, profileLoading)} · ${deliveryLabel(job.string("deliver", "local"), deliveryNames(deliveries))}", style = MaterialTheme.typography.bodySmall)
                 val timezone = data["task-capabilities"]?.string("timezone").orEmpty()
                 Text("Next: ${scheduleTime(job.string("next_run_at"), timezone, "Not scheduled")}", style = MaterialTheme.typography.bodySmall)
                 Text("Last: ${scheduleTime(job.string("last_run_at"), timezone, "No recorded run")}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                scheduleDeliveryError(job).takeIf { it.isNotBlank() }?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
                 if (pending == id) LinearProgressIndicator(Modifier.fillMaxWidth())
                 // Same actions, order and icons as the Hermes dashboard's cron page (web/src/pages/CronPage.tsx), plus run history.
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                     val paused = schedulePaused(job)
-                    IconButton(enabled = pending.isBlank() && scheduleState(job) != "Completed", onClick = { pending = id; actionScope.launch { vm.action(if (paused) "/api/crons/resume" else "/api/crons/pause", json("job_id" to id), refresh = false) { _, _ -> refresh() }.join(); pending = "" } }) {
+                    IconButton(enabled = pending.isBlank() && scheduleState(job) != "Completed", onClick = { pending = id; actionScope.launch { pauseSchedule(vm, job, refresh).join(); pending = "" } }) {
                         Icon(if (paused) Icons.Rounded.PlayArrow else Icons.Rounded.Pause, uiText(if (paused) "Resume" else "Pause"))
                     }
-                    IconButton(enabled = pending.isBlank(), onClick = { vm.openForm(ActionForm("Run this task", "/api/crons/run", emptyList(), json("job_id" to id), explanation = if(job.optBoolean("no_agent")) "Run the task script once. Check-up tasks consider only an opportunity due this minute; missed slots are skipped." else "Run this task now with its saved tools and delivery.", actionLabel = "Run", onResult = { refresh() })) }) { Icon(Icons.Rounded.Bolt, uiText("Run")) }
+                    IconButton(enabled = pending.isBlank(), onClick = { runSchedule(vm, job, refresh) }) { Icon(Icons.Rounded.Bolt, uiText("Run")) }
                     IconButton(enabled = pending.isBlank(), onClick = { cronForm(vm, job, deliveries, data["task-capabilities"]?.string("timezone").orEmpty(), refresh) }) { Icon(Icons.Rounded.Edit, uiText("Edit")) }
                     IconButton(onClick = { selected = if (selected == id) "" else id }) { Icon(Icons.Rounded.History, uiText("Run history"), tint = if (selected == id) MaterialTheme.colorScheme.primary else LocalContentColor.current) }
                     IconButton(enabled = pending.isBlank(), onClick = { vm.openForm(ActionForm("Delete schedule", "/api/crons/delete", emptyList(), json("job_id" to id), explanation = "Remove this scheduled task from Beacon.", actionLabel = "Delete", onResult = { refresh() })) }) { Icon(Icons.Rounded.Delete, uiText("Delete"), tint = if (pending.isBlank()) MaterialTheme.colorScheme.error else LocalContentColor.current) }
@@ -94,8 +96,12 @@ import kotlinx.coroutines.launch
         if (crons != null && !crons.has("_error") && crons.rows("jobs").isEmpty() && !crons.optBoolean("cron_unavailable")) item { EmptyState("Nothing scheduled yet", assistantText("Choose what Beacon should do and when."), Icons.Rounded.EventNote) }
     }
 }
-private fun cronForm(vm: BeaconViewModel, job: JSONObject?, targets: List<JSONObject>, timezone: String, refresh: () -> Unit) {
-    val seed = job?.let(::schedulePayload) ?: json("deliver" to "local")
+internal fun pauseSchedule(vm: BeaconViewModel, job: JSONObject, refresh: () -> Unit): Job =
+    vm.action(if (schedulePaused(job)) "/api/crons/resume" else "/api/crons/pause", json("job_id" to job.string("id")), refresh = false) { _, _ -> refresh() }
+internal fun runSchedule(vm: BeaconViewModel, job: JSONObject, refresh: () -> Unit) = vm.openForm(ActionForm("Run this task", "/api/crons/run", emptyList(), json("job_id" to job.string("id")), explanation = if(job.optBoolean("no_agent")) "Run the task script once. Check-up tasks consider only an opportunity due this minute; missed slots are skipped." else "Run this task now with its saved tools and delivery.", actionLabel = "Run", onResult = { refresh() }))
+/** `deliver` is where a new task's result goes; the thread sheet starts it on its own thread. */
+internal fun cronForm(vm: BeaconViewModel, job: JSONObject?, targets: List<JSONObject>, timezone: String, refresh: () -> Unit, deliver: String = "local") {
+    val seed = job?.let(::schedulePayload) ?: json("deliver" to deliver)
     listOf("name", "prompt", "provider", "model").forEach { if (!seed.has(it)) seed.put(it, "") }
     if (!seed.has("skills")) seed.put("skills", org.json.JSONArray())
     seed.put("_schedule_mode", "Custom schedule").put("_start_hour", 10).put("_end_hour", 22).put("_every_hours", 2).put("_include_end", false).put("_timezone", timezone)
@@ -104,16 +110,19 @@ private fun cronForm(vm: BeaconViewModel, job: JSONObject?, targets: List<JSONOb
         seed.put("schedule", nativeScheduleInput(job))
         seed.put("_original", seed.copy())
     }
-    val labels = mapOf("local" to "Save result in Beacon") + targets.associate { it.string("id") to if(it.string("id") == "local") "Save result in Beacon" else it.string("name") + if(it.optBoolean("home_target_set")) "" else " (not configured)" }
+    val names = deliveryNames(targets)
     val choices = targets.filter { it.string("id") == "local" || it.optBoolean("home_target_set") }.map { it.string("id") }.ifEmpty { listOf("local") }.toMutableList()
     seed.string("deliver").takeIf { it.isNotBlank() && it !in choices }?.let { choices.add(it) }
+    // A target saved on the job but no longer listed (a deleted thread, an unset platform) keeps its place under a plain name.
+    val labels = names + targets.filter { it.string("id") != "local" && !it.optBoolean("home_target_set") }.associate { it.string("id") to names.getValue(it.string("id")) + " (not configured)" } +
+        choices.filter { it !in names }.associateWith { deliveryLabel(it, names) }
     val missing = targets.filter { it.string("id") != "local" && !it.optBoolean("home_target_set") }.joinToString { it.string("name") + ": configure " + it.string("home_env_var") }
     val fields = listOf(Field("name", "Task name"), Field("prompt", "What should ${dev.hermes.android.data.currentAssistantName} do?", FieldType.MULTILINE, true), Field("_schedule_mode", "Schedule input", FieldType.CHOICE, options = listOf("Custom schedule", "Fixed window")), Field("schedule", "When (custom schedule)", help = "Examples: every 2h, every day at 8am, in 30m. Timezone: $timezone. For an exact daytime cadence choose Fixed window. Cron expressions are also supported."), Field("_start_hour", "Start hour", FieldType.CHOICE, options = (0..23).map(Int::toString), section = "Fixed window"), Field("_end_hour", "End hour", FieldType.CHOICE, options = (1..24).map(Int::toString), section = "Fixed window"), Field("_every_hours", "Every (hours)", FieldType.CHOICE, options = listOf("1", "2", "3", "4", "6", "12"), section = "Fixed window"), Field("_include_end", "Include the end hour", FieldType.BOOLEAN, help = "Off stops before the end hour. Timezone: $timezone", section = "Fixed window"), Field("deliver", "Where should the result appear?", FieldType.CHOICE, options = choices, optionLabels = labels, help = missing), Field("provider", "Provider", section = "Advanced"), Field("model", "Model", section = "Advanced"), Field("skills", "Skills", FieldType.LIST, help = "One skill name per line", section = "Advanced"))
     val editableFields = if (job?.string("script")?.endsWith("beacon-checkups.py") == true) fields.filter { it.key == "name" } else fields
     vm.openForm(ActionForm(if (job == null) "Create schedule" else "Edit schedule", if (job == null) "/api/crons/create" else "/api/crons/update", editableFields, seed, onResult = { refresh() }))
 }
 
-private fun refreshSchedules(vm: BeaconViewModel) {
+internal fun refreshSchedules(vm: BeaconViewModel) {
     vm.load("crons", "/api/crons")
     vm.load("cron-delivery", "/api/crons/delivery-options")
     vm.load("task-capabilities", "/api/plugins/beacon/mobile/tasks/capabilities")

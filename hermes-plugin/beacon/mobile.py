@@ -210,6 +210,7 @@ def _initialize_schema(conn):
     CREATE TABLE IF NOT EXISTS targets(id TEXT PRIMARY KEY,owner TEXT,profile TEXT,token TEXT,expires REAL,payload TEXT);
     CREATE TABLE IF NOT EXISTS beacon_devices(id TEXT PRIMARY KEY,owner TEXT NOT NULL,provider TEXT NOT NULL,profile TEXT NOT NULL,name TEXT NOT NULL,created REAL NOT NULL,last_seen REAL NOT NULL,removed INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS deferred(id TEXT PRIMARY KEY,owner TEXT,profile TEXT,conversation TEXT,created REAL);
+    CREATE TABLE IF NOT EXISTS held_posts(key TEXT PRIMARY KEY,owner TEXT,provider TEXT,profile TEXT,conversation TEXT,name TEXT,text TEXT,created REAL);
     CREATE TABLE IF NOT EXISTS notices(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE,owner TEXT,profile TEXT,kind TEXT,conversation TEXT,created REAL,expires REAL,state TEXT DEFAULT 'pending',call_id TEXT,push TEXT DEFAULT 'pending');
     CREATE TABLE IF NOT EXISTS notice_deliveries(event TEXT REFERENCES notices(id) ON DELETE CASCADE,target TEXT REFERENCES targets(id) ON DELETE CASCADE,accepted REAL DEFAULT 0,attempts INTEGER DEFAULT 0,next_attempt REAL DEFAULT 0,last_error TEXT DEFAULT '',PRIMARY KEY(event,target));
     CREATE TABLE IF NOT EXISTS tool_receipts(owner TEXT,provider TEXT,profile TEXT,call_id TEXT,request_id TEXT,signature TEXT NOT NULL,payload TEXT NOT NULL,updated REAL NOT NULL,PRIMARY KEY(owner,provider,profile,call_id,request_id));
@@ -386,6 +387,27 @@ def touch_device(owner, provider, profile, device_id, update_seen=True):
         if row['removed']:
             raise LookupError('device_removed')
         if update_seen: conn.execute('UPDATE beacon_devices SET last_seen=? WHERE id=? AND removed=0', (now, device_id))
+
+HELD_POST_SECONDS=86400
+MAX_HELD_POSTS=200
+
+def hold_post(owner,provider,profile,conversation,key,text,name):
+    """A scheduled post its thread could not take yet (its own turn was running); the dashboard watcher adds it once the turn ends."""
+    if not isinstance(key,str) or not ID.fullmatch(key) or not isinstance(text,str) or '\x00' in text: raise ValueError('Invalid scheduled post')
+    conversation=ident(conversation)
+    with LOCK,connect() as conn:
+        conn.execute('DELETE FROM held_posts WHERE created<?',(time.time()-HELD_POST_SECONDS,))
+        if conn.execute('SELECT COUNT(*) FROM held_posts').fetchone()[0]>=MAX_HELD_POSTS: raise RuntimeError('Scheduled post queue is full')
+        conn.execute('INSERT OR IGNORE INTO held_posts VALUES(?,?,?,?,?,?,?,?)',(key,owner,provider,profile,conversation,str(name)[:120],text[:8192],time.time()))
+
+def held_posts(owner,profile,limit=10):
+    with LOCK,connect() as conn:
+        # A post that never landed in a day (its thread was deleted, say) leaves the host with its text.
+        conn.execute('DELETE FROM held_posts WHERE created<?',(time.time()-HELD_POST_SECONDS,))
+        return [dict(row) for row in conn.execute('SELECT * FROM held_posts WHERE owner=? AND profile=? ORDER BY created LIMIT ?',(owner,profile,limit))]
+
+def drop_held_post(key):
+    with LOCK,connect() as conn: conn.execute('DELETE FROM held_posts WHERE key=?',(key,))
 
 def enqueue_task_result(owner,profile,conversation,job_id,reason=''):
     if (not isinstance(owner,str) or not owner or len(owner)>256 or any(ord(c)<32 for c in owner)

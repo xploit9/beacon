@@ -2,6 +2,7 @@ package dev.hermes.android.ui
 
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.selection.toggleable
@@ -12,6 +13,7 @@ import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.window.DialogWindowProvider
@@ -28,11 +30,16 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.*
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.R
@@ -290,4 +297,95 @@ internal enum class BeaconMotionMode { Pulse, Sweep, Ripple }
     } else AlertDialog(onDismissRequest = { if (!busy) vm.dismissForm() }, title = { Text(form.title) }, text = {
         Column(Modifier.fillMaxWidth().heightIn(max = 540.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(16.dp)) { fields() }
     }, confirmButton = { Button(onClick = vm::submitForm, enabled = !busy) { Text(if (busy) "Saving…" else form.actionLabel) } }, dismissButton = { TextButton(onClick = vm::dismissForm, enabled = !busy) { Text(uiText("Cancel")) } })
+}
+
+// Telegram-style chat parts: avatar, date chip, send tick, bubble corners and the chat-list row.
+
+/** A chat's avatar: Beacon's mark, the title's emoji, or its initial on a colour fixed by the chat id. */
+@Composable internal fun ChatAvatar(title: String, id: String, modifier: Modifier = Modifier, size: Dp = 48.dp, beacon: Boolean = false, description: String? = null) {
+    val spec = remember(title, id) { chatAvatarSpec(title, id) }
+    val tint = Color(spec.color)
+    // Sized in px terms, so a larger system font does not overflow the circle.
+    val glyph = with(LocalDensity.current) { (size * .42f).toSp() }
+    val emoji = spec.emoji
+    Box(
+        modifier.size(size).clip(CircleShape).background(if (beacon) MaterialTheme.colorScheme.primary.copy(alpha = .16f) else if (emoji != null) tint.copy(alpha = .22f) else tint).testTag("chat-avatar").clearAndSetSemantics { if (description != null) contentDescription = description },
+        contentAlignment = androidx.compose.ui.Alignment.Center,
+    ) {
+        when {
+            beacon -> BeaconMark(size = size * .56f)
+            emoji != null -> Text(emoji, fontSize = glyph * 1.1f)
+            else -> Text(spec.initial, color = Color.White, fontSize = glyph, fontWeight = FontWeight.SemiBold)
+        }
+    }
+}
+
+/** The day between messages of different days, as a small centred chip. */
+@Composable internal fun DateChip(label: String) {
+    Box(Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 6.dp).testTag("date-chip"), contentAlignment = androidx.compose.ui.Alignment.Center) {
+        Surface(shape = RoundedCornerShape(999.dp), color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .72f)) {
+            Text(label, Modifier.padding(horizontal = 12.dp, vertical = 4.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+/** Where an own message stands: still going out, accepted by Hermes, or with an unknown outcome. */
+internal enum class SendTick { Sending, Sent, Unconfirmed }
+
+@Composable internal fun SendTickIcon(state: SendTick, modifier: Modifier = Modifier) {
+    val ink = LocalContentColor.current.copy(alpha = .72f)
+    val (icon, label, tint) = when (state) {
+        SendTick.Sending -> Triple(Icons.Rounded.Schedule, "Sending", ink)
+        SendTick.Sent -> Triple(Icons.Rounded.Check, "Sent", ink)
+        SendTick.Unconfirmed -> Triple(Icons.Rounded.ErrorOutline, "Not confirmed", MaterialTheme.colorScheme.error)
+    }
+    Icon(icon, uiText(label), modifier.size(14.dp).testTag("send-tick:" + state.name.lowercase()), tint = tint)
+}
+
+/** Large corners all round; the sender's side is tighter where bubbles of one group meet, and the last bubble carries the tail. */
+internal fun bubbleShape(own: Boolean, joinedTop: Boolean, tail: Boolean): RoundedCornerShape {
+    val round = 18.dp
+    val top = if (joinedTop) 6.dp else round
+    val bottom = if (tail) 4.dp else 6.dp
+    return if (own) RoundedCornerShape(topStart = round, topEnd = top, bottomEnd = bottom, bottomStart = round)
+    else RoundedCornerShape(topStart = top, topEnd = round, bottomEnd = round, bottomStart = bottom)
+}
+
+/** One Telegram-style row of the chat list. The caller adds the click, tag and long-press through [modifier]. */
+@Composable internal fun ChatListRow(
+    id: String,
+    title: String,
+    preview: String,
+    time: String,
+    modifier: Modifier = Modifier,
+    unread: Boolean = false,
+    pinned: Boolean = false,
+    thread: Boolean = false,
+    streaming: Boolean = false,
+    selected: Boolean = false,
+    beacon: Boolean = false,
+) {
+    val scheme = MaterialTheme.colorScheme
+    val unreadLabel = uiText("Unread reply")
+    Row(
+        modifier.fillMaxWidth().background(if (selected) scheme.secondaryContainer else Color.Transparent).heightIn(min = 72.dp).padding(horizontal = 12.dp, vertical = 8.dp)
+            .then(if (unread) Modifier.semantics { stateDescription = unreadLabel } else Modifier),
+        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+    ) {
+        ChatAvatar(title, id, size = 48.dp, beacon = beacon)
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                Text(plainTitle(title), Modifier.weight(1f), style = MaterialTheme.typography.titleMedium.copy(fontWeight = if (unread) FontWeight.Bold else FontWeight.Medium), maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                if (pinned) Icon(Icons.Rounded.PushPin, uiText("Pinned"), Modifier.padding(start = 6.dp).size(14.dp), tint = scheme.onSurfaceVariant)
+                else if (thread) ThreadSpoolGlyph(Modifier.padding(start = 6.dp).size(14.dp), tint = scheme.onSurfaceVariant)
+                if (time.isNotBlank()) Text(time, Modifier.padding(start = 6.dp), style = nativeMetadataStyle(), color = if (unread) scheme.primary else scheme.onSurfaceVariant, maxLines = 1)
+            }
+            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                Text(preview, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, color = scheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                if (streaming) CircularProgressIndicator(Modifier.padding(start = 8.dp).size(14.dp), strokeWidth = 2.dp)
+                else if (unread) Box(Modifier.padding(start = 8.dp).size(10.dp).clip(CircleShape).background(scheme.primary).testTag("unread-dot"))
+            }
+        }
+    }
 }

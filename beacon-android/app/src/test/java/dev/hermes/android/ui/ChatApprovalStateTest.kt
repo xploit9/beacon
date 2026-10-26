@@ -28,6 +28,15 @@ class ChatApprovalStateTest {
         assertEquals("yolo", chatApprovalSelection(record(bypass = true), "owner-profile", "chat-a", newChat = true))
     }
 
+    @Test fun anUnsentChatShowsTheYoloChoiceHermesAcceptedUntilHermesCanReportIt() {
+        val unreported = record().put("session_status_known", false)
+        assertEquals("yolo", chatApprovalSelection(unreported, "owner-profile", "chat-a", chosenYolo = true))
+        assertEquals("smart", chatApprovalSelection(unreported, "owner-profile", "chat-a", chosenYolo = false))
+        assertEquals("A reported state wins over the remembered choice", "smart", chatApprovalSelection(record(), "owner-profile", "chat-a", chosenYolo = true))
+        assertEquals("off", chatApprovalSelection(record("off").put("session_status_known", false), "owner-profile", "chat-a", chosenYolo = true))
+        assertEquals("unknown", chatApprovalSelection(unreported, "owner-profile", "chat-b", chosenYolo = true))
+    }
+
     @Test fun autoAndBypassNeverFallBackToManual() {
         assertEquals("smart", chatApprovalSelection(record(), "owner-profile", "chat-a"))
         assertEquals("Auto", approvalChoiceLabel("smart"))

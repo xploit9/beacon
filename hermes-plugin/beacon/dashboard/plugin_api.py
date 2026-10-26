@@ -12,6 +12,7 @@ from datetime import datetime,timedelta,timezone
 import hashlib
 import importlib.util
 import json
+import logging
 from pathlib import Path
 import re
 import sys
@@ -391,6 +392,29 @@ def sweep_unended_calls(owner,provider,profile):
     # Each call is tried once per run (a provider that was down is not asked again every minute), at most three a minute.
     for row in [row for row in rows if row['id'] not in _swept_calls][:3]:
         _swept_calls.add(row['id']);hand_over(owner,provider,dict(row))
+_posts_until={}
+_posts_logged=set()
+def flush_held_posts(owner,provider,profile):
+    """Scheduled posts a thread could not take mid-turn go in once that turn ended, and only then notify the phone."""
+    key=(owner,profile);now=time.monotonic()
+    if now<_posts_until.get(key,0): return
+    _posts_until[key]=now+15
+    for row in mobile.held_posts(owner,profile,limit=mobile.MAX_HELD_POSTS):
+        try:
+            native.verify(owner,provider,profile,row['conversation'])
+            native.post(owner,provider,profile,row['conversation'],row['key'],row['text'],row['name'])
+        except ValueError:
+            logging.getLogger(__name__).warning('Beacon dropped scheduled post %s: it can never land',row['key'])
+            mobile.drop_held_post(row['key']);continue
+        except Exception as exc:
+            # Mid-turn, a busy store or a thread that is gone: the next pass tries again, and a post that never lands expires after a day.
+            if type(exc).__name__ not in native.POST_BUSY and row['key'] not in _posts_logged:
+                if len(_posts_logged)>256: _posts_logged.clear()
+                _posts_logged.add(row['key'])
+                logging.getLogger(__name__).info('Beacon scheduled post %s waits: %s',row['key'],type(exc).__name__)
+            continue
+        mobile.enqueue_task_result(owner,profile,row['conversation'],row['key'],row['text'][:4000])
+        mobile.drop_held_post(row['key'])
 @router.post('/mobile/calls')
 async def calls(request:Request):
     value=await body(request);owner,provider,profile,cfg=identity(request,value.get('profile'))
@@ -497,7 +521,7 @@ def call_status(row,owner):
     return {**mobile.status(row),'status':'closed' if row['closed'] else 'active','jobs':jobs}
 def watch(owner,provider,profile):
     try: activity.sync(mobile,native,owner,provider,profile)
-    except (ImportError,AttributeError): pass  # Native runtime unavailable: never invent or settle activity.
+    except (ImportError,AttributeError,RuntimeError): pass  # Native runtime or store unavailable: never invent or settle activity.
     with mobile.connect() as conn: rows=[dict(r) for r in conn.execute("SELECT * FROM jobs WHERE owner=? AND profile=? AND (status IN ('watching','needs_input') OR (status='completed' AND callback=1)) ORDER BY rowid LIMIT 512",(owner,profile))]
     for job in rows:
         if job['status'] in ('watching','needs_input'):
@@ -750,7 +774,7 @@ def notice_wire(row,owner,key=None):
     return {**row,'event_id':row['id'],'callback_id':row['id'],'owner_id':owner,'conversation_id':row['conversation'],'session_id':row['conversation'] if row['kind']!='test' else '', 'expires_at':int(row['expires']),'state':state,'title':title,'body':body,'activity_ref':row.get('activity_key',''),'preview':{'title':title,'body':body},**mobile.refs(owner,row['profile'],row['conversation'],key)}
 @router.get('/mobile/notifications/events/{event_id}')
 async def notice_detail(event_id:str,request:Request):
-    owner,provider,profile,_=identity(request)
+    owner,provider,profile,cfg=identity(request)
     package=request.query_params.get('package',_PRODUCTION_PACKAGE)
     if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Beacon package')
     with mobile.connect() as conn:
@@ -776,6 +800,12 @@ async def notice_detail(event_id:str,request:Request):
         # shortcut: no code writes phone-hermes- ids since a9492d0, but older rows live up to 86400 s; remove once every install is past that.
         elif phone_job.startswith('phone-hermes-'):
             result['preview']={'title':'Hermes','body':result['preview']['body']}
+        elif phone_job.startswith('phone-cron-') and row['conversation']!=cfg.get('scheduled_callback_conversation_id'):
+            # A post into a thread reads like a channel message: the thread's name over the post.
+            try:
+                title=next((t['title'] for t in await feature(native.threads,owner,provider,profile,timeout=6) if t['id']==row['conversation']),'')
+                if title: result['preview']={'title':str(title)[:120],'body':result['preview']['body']}
+            except Exception: pass  # the generic title stays
     if row['request_id'] and result['state']=='pending':
         frame=await asyncio.to_thread(safely,activity.pending,native,owner,provider,profile,dict(row))
         result['actions']=activity.request_actions(frame)
@@ -1344,6 +1374,8 @@ async def start_watcher():
                         except Exception: pass
                         try: await asyncio.to_thread(sweep_unended_calls,cfg['owner_id'],cfg['owner_provider'],profile)
                         except Exception: pass
+                        try: await asyncio.to_thread(flush_held_posts,cfg['owner_id'],cfg['owner_provider'],profile)
+                        except Exception: pass
             except Exception:
                 pass
             await asyncio.sleep(3)
@@ -1492,7 +1524,12 @@ async def get_voice_history(stored_id:str,request:Request):
     await feature(native.verify,owner,provider,profile,stored_id,timeout=6)
     result=await feature(mobile.voice_history,owner,profile,stored_id,timeout=8)
     return JSONResponse(result,headers={'Cache-Control':'no-store'})
-
+@router.get('/mobile/threads')
+async def list_threads(request:Request):
+    # The chats a scheduled job can post into (`deliver: phone:<id>`); small and stable so the app can show a saved copy first.
+    owner,provider,profile,cfg=identity(request)
+    threads=await feature(native.threads,owner,provider,profile,timeout=8)
+    return JSONResponse({'threads':threads},headers={'Cache-Control':'no-store'})
 async def _proactive_source_labels(profile):
     # Settings can wait for a cold discovery longer than a call's opening can (6 s of the 8 s budget).
     try: catalogue=await feature(voice_context.tool_catalogue,profile,6.0,timeout=8)

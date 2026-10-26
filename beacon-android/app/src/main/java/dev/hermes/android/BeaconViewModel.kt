@@ -18,6 +18,12 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import dev.hermes.android.core.*
 import dev.hermes.android.data.*
+import dev.hermes.android.ui.ChatGlances
+import dev.hermes.android.ui.chatPreviewText
+import dev.hermes.android.ui.decodeGlances
+import dev.hermes.android.ui.encodeFor
+import dev.hermes.android.ui.epochMillis
+import dev.hermes.android.ui.rowActivityMillis
 import dev.hermes.android.voice.CallState
 import dev.hermes.android.voice.CallTranscript
 import dev.hermes.android.voice.FailedCallRedirect
@@ -77,14 +83,14 @@ internal fun assistantConversationToSelect(openScope: Scope?, openSessionId: Str
     return shared.takeIf { open.copy(session = "") == assistantScope.copy(session = "") && open.session == currentId && openSessionId == currentId }
 }
 
-data class Message(val id: String, val role: String, val text: String, val reasoning: String = "", val tools: List<JSONObject> = emptyList(), val attachments: List<JSONObject> = emptyList(), val mediaSnapshots: Map<String, String> = emptyMap(), val sessionId: String = "", val interrupted: Boolean = false, val voice: Boolean = false, val recordedAt: Long = 0L) {
+data class Message(val id: String, val role: String, val text: String, val reasoning: String = "", val tools: List<JSONObject> = emptyList(), val attachments: List<JSONObject> = emptyList(), val mediaSnapshots: Map<String, String> = emptyMap(), val sessionId: String = "", val interrupted: Boolean = false, val voice: Boolean = false, val recordedAt: Long = 0L, val displayKind: String = "") {
     companion object {
         fun from(o: JSONObject, index: Int, sessionId: String = ""): Message {
             val content = when { o.has("display_content") && !o.isNull("display_content") -> o.opt("display_content"); o.has("display_text") && !o.isNull("display_text") -> o.opt("display_text"); o.has("text") && !o.isNull("text") -> o.opt("text"); else -> o.opt("content") }
             val parts = (content as? JSONArray)?.objects().orEmpty()
             val text = messageContentText(o.string("role", "assistant"), content)
             val snapshots = o.optJSONObject("_media_snapshots")?.let { values -> values.keys().asSequence().take(256).mapNotNull { path -> values.optString(path).takeIf(::validMediaSnapshot)?.takeIf { path.length in 1..8192 && path.none { it.code < 32 || it.code == 127 } }?.let { path to it.lowercase() } }.toMap() }.orEmpty()
-            return Message(o.string("id", o.string("message_id", o.string("row_id", o.string("_row_id", o.string("tool_call_id", "${o.string("role")}:$index"))))), o.string("role", "assistant"), text, o.string("reasoning", o.string("reasoning_content")), o.rows("tool_calls"), o.rows("attachments") + parts.filter { it.string("type").contains("image") }, snapshots, sessionId, o.optBoolean("interrupted") || o.optJSONObject("display_metadata")?.optBoolean("interrupted") == true || o.string("finish_reason") == "cancelled", o.optJSONObject("display_metadata")?.optString("channel") == "voice", recordedAt = recordedMessageTime(o.opt("timestamp")))
+            return Message(o.string("id", o.string("message_id", o.string("row_id", o.string("_row_id", o.string("tool_call_id", "${o.string("role")}:$index"))))), o.string("role", "assistant"), text, o.string("reasoning", o.string("reasoning_content")), o.rows("tool_calls"), o.rows("attachments") + parts.filter { it.string("type").contains("image") }, snapshots, sessionId, o.optBoolean("interrupted") || o.optJSONObject("display_metadata")?.optBoolean("interrupted") == true || o.string("finish_reason") == "cancelled", o.optJSONObject("display_metadata")?.optString("channel") == "voice", recordedAt = recordedMessageTime(o.opt("timestamp")), displayKind = o.string("display_kind"))
         }
     }
 }
@@ -269,6 +275,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     private var pendingVisionSwitchAfterKey: PendingVisionSwitch? = null
     private val _chat = MutableStateFlow(ChatState())
     val chat = _chat.asStateFlow()
+    /** Only the open chat's id, for screens that must not redraw on every streamed token (the chat list). */
+    internal val openSessionId: StateFlow<String> = _chat.map { it.sessionId }.distinctUntilChanged().stateIn(viewModelScope, SharingStarted.Eagerly, "")
     private val _composer = MutableStateFlow(TextFieldValue())
     val composer = _composer.asStateFlow()
     private val _attachments = MutableStateFlow<List<JSONObject>>(emptyList())
@@ -444,6 +452,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         viewModelScope.launch {
             app.push.emailAlerts.collect { (scope, card) -> storeData("task-result:${scope.key}", card) }
         }
+        viewModelScope.launch { app.push.conversationPosts.collect(::refreshPostedConversation) }
         viewModelScope.launch {
             var previousFinals = emptyList<CallTranscript>()
             var wasActive = false
@@ -1196,6 +1205,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     }
     private suspend fun restoreCachedOwner(scope: Scope, generation: Int) {
         val index = app.cache.read(scope, "conversation-index")?.let(::JSONObject)
+        openGlances(scope.copy(session = ""))
         val settings = app.cache.read(scope, "profile-settings")?.let(::JSONObject)
         val beacon = readBeaconCache(scope)
         val selected = saved.get<String>("session:${scope.key}") ?: app.cache.read(scope, "selected-session")
@@ -1530,6 +1540,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             hydrateScreens(restoredClient.scope)
             viewModelScope.launch {
                 val index = try { app.cache.read(restoredClient.scope, "conversation-index")?.let(::JSONObject) } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
+                openGlances(restoredClient.scope.copy(session = ""))
                 if (index != null && generation == originGeneration && client === restoredClient && _ui.value.sessions.isEmpty()) _ui.update { it.copy(sessions = index.rows("sessions")) }
             }
             prepareStartup()
@@ -1801,6 +1812,83 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         runCatching { app.cache.write(c.scope, "beacon-session", id, protected = true); app.cache.delete(c.scope, "beacon-opening"); app.cache.delete(c.scope, LEGACY_BEACON_OPENING_CACHE_KIND); app.cache.write(sessionScope, "client-created-shell", "1", protected = true) }.onFailure { if (it is CancellationException) throw it; if (client?.scope == c.scope) notice("${dev.hermes.android.data.currentAssistantName} opened; recovery checkpoint failed") }
         id
     }
+    // What the chat list shows beside each chat (its latest line, when the owner last looked): kept encrypted per profile on this phone, never sent to Hermes.
+    private val _glances = MutableStateFlow(ChatGlances())
+    internal val glances = _glances.asStateFlow()
+    private val glanceLock = Mutex()
+    private var glanceAccount = ""
+    private val glanceLoaded = HashMap<String, Scope>()
+    private val glanceDirty = LinkedHashMap<String, Scope>()
+    private var glanceWrite: Job? = null
+    /** Loads a profile's stored glances once per account; a different account starts empty. Unreadable storage is the same as none. */
+    private suspend fun openGlances(profileScope: Scope) = glanceLock.withLock {
+        val account = profileScope.copy(profile = "", session = "").key
+        if (glanceAccount != account) { glanceAccount = account; glanceLoaded.clear(); glanceDirty.clear(); _glances.value = ChatGlances(account = account) }
+        if (glanceLoaded.put(profileScope.key, profileScope) == null) {
+            val stored = try { app.cache.read(profileScope, "chat-glances")?.let { decodeGlances(profileScope.profile, it) } }
+                catch (e: Exception) { if (e is CancellationException) { glanceLoaded.remove(profileScope.key); throw e }; null }
+            if (stored != null) _glances.update { it.merged(stored) }
+        }
+    }
+    private fun queueGlanceWrite(profileScope: Scope) {
+        glanceDirty[profileScope.key] = profileScope
+        glanceWrite?.cancel()
+        glanceWrite = viewModelScope.launch {
+            delay(1_000)
+            val snapshot = _glances.value
+            // Derived data: a failed write is retried by the next change, never surfaced.
+            glanceDirty.values.toList().forEach { dirty ->
+                try { app.cache.write(dirty, "chat-glances", snapshot.encodeFor(dirty.profile), protected = true); glanceDirty.remove(dirty.key) }
+                catch (e: Exception) { if (e is CancellationException) throw e }
+            }
+        }
+    }
+    /** Sign-out and device removal: the account's chat lists, previews and read marks leave the phone with its screens,
+     *  for every profile the app knows, and a pending write cannot bring them back. */
+    private suspend fun forgetGlances(scope: Scope) {
+        val account = scope.copy(profile = "", session = "").key
+        val known = _data.value["navigation-profiles"]?.rows("profiles").orEmpty().map { scope.copy(profile = it.string("name"), session = "") }.filter { it.profile.isNotBlank() }
+        val stored = glanceLock.withLock {
+            glanceWrite?.cancel(); glanceDirty.clear()
+            val profiles = (glanceLoaded.values.filter { it.copy(profile = "", session = "").key == account } + known + scope.copy(session = "")).distinctBy { it.key }
+            if (glanceAccount == account) { glanceLoaded.clear(); _glances.value = ChatGlances(account = account) }
+            profiles
+        }
+        stored.forEach { profile -> listOf("chat-glances", "conversation-index").forEach { kind ->
+            try { app.cache.delete(profile, kind) } catch (e: CancellationException) { throw e } catch (_: Exception) { /* one failed delete never keeps the others */ }
+        } }
+    }
+    /** The account the glances belong to; the list ignores any other account's. */
+    internal fun glanceAccountKey(): String = (client?.scope ?: cachedOwnerScope)?.copy(profile = "", session = "")?.key.orEmpty()
+    /** Loads this profile's stored glances, so the chat list opens with its previews and unread marks already in place (also offline). */
+    fun loadGlances() {
+        val profileScope = (client?.scope ?: cachedOwnerScope)?.copy(session = "") ?: return
+        viewModelScope.launch { openGlances(profileScope) }
+    }
+    /** The open chat has been looked at: keep its latest line and that everything up to it is read. */
+    fun noteChatViewed(sessionId: String, latest: Message?) {
+        val chatScope = authenticatedScope()?.takeIf { it.session == sessionId } ?: return
+        val profileScope = chatScope.copy(session = "")
+        viewModelScope.launch {
+            openGlances(profileScope)
+            if (authenticatedScope() != chatScope) return@launch
+            val row = _ui.value.sessions.firstOrNull { sessionRowId(it) == sessionId && it.string("profile", profileScope.profile) == profileScope.profile }
+            val at = latest?.let { epochMillis(it.recordedAt) } ?: 0L
+            val (line, role) = dev.hermes.android.ui.chatListLine(latest)
+            val before = _glances.value
+            val after = before.viewed(profileScope.profile, sessionId, line, role, at, maxOf(at, row?.let(::rowActivityMillis) ?: 0L))
+            if (after !== before) { _glances.value = after; queueGlanceWrite(profileScope) }
+        }
+    }
+    /** The first full list of a profile is the baseline: chats already there are not "new" on a fresh install. */
+    private suspend fun noteIndexListed(scope: Scope, rows: List<JSONObject>) {
+        val profileScope = scope.copy(session = "")
+        openGlances(profileScope)
+        val newest = rows.filter { it.string("profile", scope.profile) == scope.profile }.maxOfOrNull(::rowActivityMillis) ?: 0L
+        val before = _glances.value
+        val after = before.withBase(scope.profile, newest)
+        if (after !== before) { _glances.value = after; queueGlanceWrite(profileScope) }
+    }
     private var indexFetch: Job? = null
     private var indexFetchKey = ""
     private var indexReadAt = 0L
@@ -1872,7 +1960,10 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             _ui.update { it.copy(sessions = if (query.isBlank()) rows else it.sessions, connected = true, assistantSessionId = assistantSessionId, historyUnreadable = unreadable) }
             if (current()) {
                 if (!persistAuthIfCurrent(c.auth, credentialVersion, snapshot = true) || !current()) return@supervisorScope
-                if (!allProfiles && query.isBlank() && !archived && !threads) app.cache.write(scope, "conversation-index", json("sessions" to JSONArray(rows)).toString())
+                if (!allProfiles && query.isBlank() && !archived && !threads) {
+                    app.cache.write(scope, "conversation-index", json("sessions" to JSONArray(rows)).toString())
+                    noteIndexListed(scope, rows)
+                }
             }
 
           } } catch (e: Throwable) { if (e is CancellationException) throw e; if (current()) fail(conversationActionFailure("/api/sessions", e)) }
@@ -2539,6 +2630,22 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             "events" to state.raw.optJSONArray("voice_transcripts"),
         )).firstOrNull { it.eventId.startsWith("$callId:") && it.text.isNotBlank() }
     }
+    /** A scheduled post landed in the open chat: re-read it so the post shows at once, never during a turn of its own. */
+    private fun refreshPostedConversation(posted: Scope) {
+        val scope = sourceScope ?: return
+        val active = client ?: return
+        val chat = _chat.value
+        if (scope != posted || scope.copy(session = "") != active.scope || !foreground || chat.streamId.isNotBlank() || pending.containsKey(scope.key)) return
+        val request = ScopeSettlement(scope, active, originGeneration, sessionGeneration)
+        viewModelScope.launch {
+            try {
+                val response = active.detached().get("/api/session", mapOf("session_id" to scope.session))
+                if (!foreground || !request.current() || _chat.value.streamId.isNotBlank() || pending.containsKey(scope.key)) return@launch
+                renderSession(response, scope)
+                app.cache.writeSession(scope, response.toString())
+            } catch (e: Throwable) { if (e is CancellationException) throw e }
+        }
+    }
     private fun reconcileCallConversation(call: CallState) {
         val scope = sourceScope ?: return
         val active = client ?: return
@@ -3088,13 +3195,15 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         storeData(key, value)
         viewModelScope.launch(Dispatchers.Default) { screens.set(scope, key, value) }
     }
-    /** Device removal, sign-out and account change: nothing cached for the account outlives them (older per-read rows included). */
+    /** Device removal, sign-out and account change: the account's screens, chat lists and previews go at once; the
+     *  per-chat transcripts kept for offline reading expire on their own after two days. */
     private suspend fun forgetScreens(scope: Scope) {
         screens.clear(scope)
         try {
             startupReads.forEach { app.cache.delete(scope, "read:${it.path}") }
             listOf("settings:skills", "settings:memory").forEach { app.cache.delete(scope, it) }
-        } catch (e: CancellationException) { throw e } catch (_: Exception) { /* those older rows expire after two days */ }
+        } catch (e: CancellationException) { throw e } catch (_: Exception) { /* those unprotected rows expire after two days */ }
+        forgetGlances(scope)
     }
     fun forgetScreens() { val scope = client?.scope ?: return; viewModelScope.launch { forgetScreens(scope) } }
     private val forgetOnDeviceRemoval: (Scope) -> Unit = { scope -> viewModelScope.launch { forgetScreens(scope) } }

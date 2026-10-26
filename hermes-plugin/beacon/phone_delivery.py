@@ -1,4 +1,5 @@
 """Hermes phone cron target backed by Beacon's durable mobile outbox."""
+import asyncio
 import hashlib
 import os
 import re
@@ -28,6 +29,8 @@ except ImportError:  # The functions below remain importable in offline plugin t
 
 
 NO_CONVERSATION = "No owned assistant conversation is configured for phone delivery"
+THREAD_GONE = "That thread is no longer available"
+HOME_CHAT = "phone"  # the platform's home channel: the Beacon chat
 _PROVISION_LOCK = threading.Lock()
 
 
@@ -58,6 +61,12 @@ def is_connected(config):
         return False
 
 
+def _thread_target(chat_id):
+    """The thread id of `deliver: phone:<thread id>`; None for the home channel, which is the Beacon chat."""
+    value = chat_id.strip() if isinstance(chat_id, str) else ""
+    return None if value in ("", HOME_CHAT) else value
+
+
 def _provision_conversation(mobile, native, owner, provider, profile):
     """An owner who never opened the Beacon chat still gets a saved chat for scheduled results; their own chat replaces it once saved."""
     with _PROVISION_LOCK:
@@ -74,31 +83,49 @@ def _provision_conversation(mobile, native, owner, provider, profile):
         return registered
 
 
-def _queue_standalone_result(message, native_job_id):
+def _queue_standalone_result(message, native_job_id, name, chat_id):
+    """Queue the notice for the Beacon chat, or for the thread a job targets (`deliver: phone:<thread id>`), whose conversation also keeps the post."""
     mobile, cfg, profile = _profile_state()
     _, native, _ = _modules()
     owner, provider = cfg.get("owner_id"), cfg.get("owner_provider")
     if not owner or not provider:
         raise LookupError(NO_CONVERSATION)
-    conversation = cfg.get("scheduled_callback_conversation_id")
+    thread = _thread_target(chat_id)
+    conversation = thread or cfg.get("scheduled_callback_conversation_id")
     if not isinstance(conversation, str):
         conversation = _provision_conversation(mobile, native, owner, provider, profile)
-    native.verify(owner, provider, profile, conversation)
+    try:
+        if thread:
+            mobile.ident(thread)
+        native.verify(owner, provider, profile, conversation)
+    except (LookupError, ValueError):
+        if thread:
+            raise LookupError(THREAD_GONE) from None
+        raise
     bucket = int(time.time() // 300)
     # shortcut: no upstream run ID; keep the five-minute window until both send paths carry run identity.
     identity = native_job_id + ":" + str(message) + ":" + str(bucket)
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
     job_id = "phone-cron-" + digest
+    if thread:
+        try:
+            native.post(owner, provider, profile, conversation, job_id, str(message), name[:120])
+        except Exception as exc:
+            if type(exc).__name__ not in native.POST_BUSY:
+                raise
+            # The thread's own turn is running: the post waits, and the watcher adds it and notifies once the turn ends.
+            mobile.hold_post(owner, provider, profile, conversation, job_id, str(message), name[:120])
+            return "held-" + job_id
     return mobile.enqueue_task_result(owner, profile, conversation, job_id, str(message)[:4000])
 
 
 def _strip_cron_header(message):
-    header = re.match(r"(?s)^Cronjob Response: [^\r\n]+\r?\n\(job_id: ([A-Za-z0-9_-]{1,160})\)\r?\n", message)
+    header = re.match(r"(?s)^Cronjob Response: ([^\r\n]+)\r?\n\(job_id: ([A-Za-z0-9_-]{1,160})\)\r?\n", message)
     if not header:
         raise ValueError("Beacon phone delivery accepts scheduled job results only (Hermes needs cron.wrap_response: true)")
     body = message[header.end():]
     body = re.sub(r"^-{3,}\r?\n(?:\r?\n)?", "", body, count=1)
-    return re.sub(r'\n\nTo stop or manage this job, send me a new message \(e\.g\. "stop reminder [^\n]*"\)\.\s*\Z', "", body), header.group(1)
+    return re.sub(r'\n\nTo stop or manage this job, send me a new message \(e\.g\. "stop reminder [^\n]*"\)\.\s*\Z', "", body), header.group(2), header.group(1)
 
 
 class BeaconPhoneAdapter(BasePlatformAdapter):
@@ -124,11 +151,11 @@ class BeaconPhoneAdapter(BasePlatformAdapter):
         if not isinstance(content, str) or not content.strip():
             return SendResult(success=False, error="Refusing to queue an empty phone result")
         try:
-            message,job_id=_strip_cron_header(content)
+            message,job_id,name=_strip_cron_header(content)
         except ValueError as exc:
             return SendResult(success=False, error=str(exc), retryable=False)  # a retry can never pass
         try:
-            event = _queue_standalone_result(message,job_id)
+            event = await asyncio.to_thread(_queue_standalone_result,message,job_id,name,chat_id)
             return SendResult(success=True, message_id=event)
         except Exception as exc:
             return SendResult(success=False, error=str(exc)[:240], retryable=True)
@@ -141,8 +168,8 @@ async def standalone_send(pconfig, chat_id, message, *, thread_id=None, media_fi
     if not isinstance(message, str) or not message.strip():
         return {"error": "Refusing to queue an empty phone result"}
     try:
-        message,job_id=_strip_cron_header(message)
-        event = _queue_standalone_result(message,job_id)
+        message,job_id,name=_strip_cron_header(message)
+        event = await asyncio.to_thread(_queue_standalone_result,message,job_id,name,chat_id)
         return {"success": True, "platform": "phone", "chat_id": chat_id or "phone", "message_id": event}
     except Exception as exc:
         return {"error": str(exc)[:240]}

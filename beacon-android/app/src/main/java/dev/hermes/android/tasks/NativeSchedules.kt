@@ -2,6 +2,7 @@ package dev.hermes.android.tasks
 import dev.hermes.android.core.*
 import dev.hermes.android.data.BeaconClient
 import dev.hermes.android.data.ApiFailure
+import kotlinx.coroutines.CancellationException
 import org.json.JSONArray
 import org.json.JSONObject
 internal fun scheduleTime(value: String, timezone: String, empty: String): String {
@@ -38,11 +39,31 @@ internal fun scheduleState(job: JSONObject): String = when {
     schedulePaused(job) -> "Paused"
     job.string("state") in setOf("completed", "finished") -> "Completed"
     job.string("state") in setOf("running", "claimed") -> "Running"
-    job.string("last_status") in setOf("error", "failed") || job.string("state") == "error" -> "Failed"
+    job.string("last_status") in setOf("error", "failed", "delivery_failed") || job.string("state") == "error" -> "Failed"
     scheduleGatewayNeedsAttention(job) -> "Waiting"
     job.string("next_run_at").isNotBlank() -> "Waiting"
     else -> "Execution unconfirmed"
 }
+/** Why the last result could not be delivered (for example a thread that was deleted), as Hermes recorded it; blank otherwise. */
+internal fun scheduleDeliveryError(job: JSONObject): String = if (job.string("last_status") == "delivery_failed") job.string("last_delivery_error").take(200) else ""
+/** `phone:<id>` sends a job's result into that thread, through the Beacon plugin's phone delivery; `deliver` may list several targets. */
+internal fun threadTarget(threadId: String) = "phone:$threadId"
+internal fun deliversTo(job: JSONObject, target: String): Boolean = job.string("deliver").split(',').any { it.trim() == target }
+private fun threadRow(threadId: String, title: String) = json("id" to threadTarget(threadId), "name" to title.ifBlank { "Untitled thread" }, "home_target_set" to true, "home_env_var" to null, "thread" to true)
+/** The editor's "Deliver to" list: Hermes' own targets with the phone platform named Beacon chat, and each thread right after it. */
+internal fun deliveryTargets(native: JSONObject, threads: List<JSONObject>): JSONObject {
+    val own = native.rows("targets").map { if (it.string("id") == "phone") it.copy().put("name", "Beacon chat") else it }
+    val at = own.indexOfFirst { it.string("id") == "phone" }.let { if (it < 0) own.size else it + 1 }
+    val rows = threads.filter { it.string("id").isNotBlank() }.map { threadRow(it.string("id"), it.string("title")) }
+    return native.copy().put("targets", JSONArray(own.take(at) + rows + own.drop(at)))
+}
+/** The thread's own entry, for a list that has not loaded it yet. */
+internal fun withThreadTarget(targets: List<JSONObject>, threadId: String, title: String): List<JSONObject> =
+    if (targets.any { it.string("id") == threadTarget(threadId) }) targets else targets + threadRow(threadId, title)
+internal fun deliveryNames(targets: List<JSONObject>): Map<String, String> =
+    mapOf("local" to "Save result in Beacon") + targets.filter { it.string("id") != "local" }.associate { it.string("id") to it.string("name", it.string("id")) }
+internal fun deliveryLabel(deliver: String, names: Map<String, String>): String =
+    deliver.split(',').map(String::trim).filter(String::isNotEmpty).joinToString(", ") { names[it] ?: if (it.startsWith("phone:")) "A thread" else it }.ifEmpty { names.getValue("local") }
 internal fun fixedWindowSchedule(body: JSONObject): String {
     val start = body.getInt("_start_hour")
     val end = body.getInt("_end_hour")
@@ -75,7 +96,12 @@ internal class NativeSchedules(private val c: BeaconClient) {
         }
         val profile = mapOf("profile" to c.auth.profile)
         if (path == "/api/crons") { val result = c.nativeGet("/api/cron/jobs", profile); return result.put("jobs", result.optJSONArray("items") ?: result.optJSONArray("jobs") ?: JSONArray()) }
-        if (path == "/api/crons/delivery-options") return c.nativeGet("/api/cron/delivery-targets", profile)
+        if (path == "/api/crons/delivery-options") {
+            val native = c.nativeGet("/api/cron/delivery-targets", profile)
+            // Threads come from the optional plugin; without it the editor offers Hermes' own targets.
+            val threads = try { c.nativeGet("/api/plugins/beacon/mobile/threads").rows("threads") } catch (e: Exception) { if (e is CancellationException) throw e; emptyList<JSONObject>() }
+            return deliveryTargets(native, threads)
+        }
         if (path == "/api/crons/create") return c.nativeGet("/api/cron/jobs", profile, "POST", schedulePayload(d).apply { listOf("provider", "model", "name").forEach { if(string(it).isBlank()) remove(it) }; if(rows("skills").isEmpty() && optJSONArray("skills")?.length() == 0) remove("skills") })
         val id = d.string("job_id")
         require(id.matches(Regex("[A-Za-z0-9_-]+"))) { "Invalid schedule identity" }

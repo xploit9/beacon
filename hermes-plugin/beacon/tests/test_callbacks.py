@@ -276,6 +276,18 @@ def test_late_script_records_one_owned_missed_callback_without_ringing(env,profi
     assert cb.deliver(m,n,key,NOW+timedelta(seconds=60))['status']=='skipped_expired'
 
 
+def test_a_late_callback_waits_while_the_store_cannot_be_opened(env,monkeypatch):
+    cb,m,n,cfg,_,_=env
+    cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
+    with m.connect() as c:key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]
+    def unavailable(*args,**kwargs): raise RuntimeError('Native conversation store unavailable')
+    monkeypatch.setattr(n,'verify',unavailable)
+    assert cb.deliver(m,n,key,NOW+timedelta(seconds=180))['status']=='skipped_expired'
+    with m.connect() as c:
+        record=json.loads(c.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()[0])
+        assert record['status']!='missed' and c.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==0
+
+
 @pytest.mark.parametrize('elapsed,status,kind',[(60,'scheduled','incoming_call'),(180,'missed','task_result')])
 def test_native_save_acknowledgment_preserves_an_already_settled_callback(env,elapsed,status,kind):
     cb,m,n,cfg,_,_=env

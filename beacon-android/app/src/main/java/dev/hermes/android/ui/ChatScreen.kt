@@ -28,6 +28,7 @@ import androidx.compose.foundation.content.hasMediaType
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.*
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
@@ -36,6 +37,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -65,9 +67,13 @@ import androidx.compose.ui.semantics.onLongClick
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -180,22 +186,69 @@ internal fun foldToolResults(messages: List<JSONObject>, displayedMessages: List
     return ToolResultFolding(matched.toMap(), matched.mapTo(LinkedHashSet<String>()) { it.second.messageId })
 }
 
-internal fun assistantLabelMessageIds(messages: List<Message>, dayStartIds: Set<String>, callTranscriptIds: Set<String>): Set<String> {
-    val labels = LinkedHashSet<String>()
-    var inAssistantReply = false
-    messages.forEach { message ->
-        if (message.id in dayStartIds) inAssistantReply = false
-        when (message.role) {
-            "assistant" -> {
-                if (!inAssistantReply || message.id in callTranscriptIds) labels += message.id
-                inAssistantReply = true
-            }
-            "tool", "function" -> Unit
-            else -> inAssistantReply = false
+/** A scheduled result Hermes filed in a thread: `[Cron delivery: <job>]`, then the result. It reads as a post, not as the owner's own message. */
+internal data class ChannelPost(val job: String, val body: String)
+
+internal val cronDeliveryLabel = Regex("^\\[Cron delivery: ([^\\]\\n]{1,200})][ \\t]*(?:\\n|\\z)")
+
+internal fun channelPost(displayKind: String, role: String, text: String): ChannelPost? {
+    if (displayKind != "cron_delivery" || role != "user") return null
+    val trimmed = text.trimStart()
+    val label = cronDeliveryLabel.find(trimmed) ?: return ChannelPost("", trimmed.trim())
+    return ChannelPost(label.groupValues[1].trim(), trimmed.substring(label.range.last + 1).trim())
+}
+
+/** The owner's own message: a user row, except the posts Hermes files as user rows. */
+internal fun isOwnMessage(message: Message): Boolean = message.role == "user" && message.displayKind != "cron_delivery"
+
+/**
+ * How a message sits among its neighbours: [startsRun] opens a run of one sender (a bigger gap above it), [joinedTop] means an
+ * earlier bubble of the run is right above it, and [tail] marks the run's last bubble.
+ */
+internal data class BubbleGroup(val startsRun: Boolean, val joinedTop: Boolean, val tail: Boolean)
+
+/**
+ * Runs of consecutive messages from one sender, in display order. A new day, a call transcript ([standaloneIds]) or the other
+ * sender ends a run. Messages without a bubble (tool-only rounds) stay in their run but take no corner or tail.
+ */
+internal fun bubbleGroups(
+    messages: List<Message>,
+    dayStartIds: Set<String>,
+    standaloneIds: Set<String> = emptySet(),
+    hasBubble: (Message) -> Boolean = { it.text.isNotBlank() || it.attachments.isNotEmpty() },
+): Map<String, BubbleGroup> {
+    val runs = ArrayList<List<Message>>()
+    var run = ArrayList<Message>()
+    for (message in messages) {
+        val previous = run.lastOrNull()
+        if (previous != null && (message.id in dayStartIds || message.id in standaloneIds || previous.id in standaloneIds || isOwnMessage(previous) != isOwnMessage(message))) {
+            runs += run
+            run = ArrayList()
+        }
+        run += message
+    }
+    if (run.isNotEmpty()) runs += run
+    val groups = LinkedHashMap<String, BubbleGroup>()
+    for (members in runs) {
+        val lastBubble = members.indexOfLast(hasBubble)
+        var bubbleAbove = false
+        members.forEachIndexed { index, message ->
+            val bubble = hasBubble(message)
+            groups[message.id] = BubbleGroup(startsRun = index == 0, joinedTop = bubble && bubbleAbove, tail = bubble && index == lastBubble)
+            if (bubble) bubbleAbove = true
         }
     }
-    return labels
+    return groups
 }
+
+private val listItemStart = Regex("^\\s*(?:[-+]|\\d+[.)])\\s")
+/**
+ * Text with nothing for Markdown to do: a short bubble can then shrink to its words, as in Telegram. Anything with marks,
+ * links, lists, paragraphs or media keeps the full Markdown renderer.
+ */
+internal fun isPlainChatText(text: String): Boolean =
+    text.length <= 240 && '\n' !in text && text.none { it in "*_`[]#>|$\\<!~=&" } && !text.contains("://") && !text.contains("MEDIA:", ignoreCase = true) &&
+        !listItemStart.containsMatchIn(text)
 
 /** Hermes stores each tool round of one reply as its own assistant message; show a run of tool-only rounds as one
  *  activity, so its steps fold together instead of stacking card after card above the answer. */
@@ -223,9 +276,16 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
 
 @Composable fun SessionList(vm: BeaconViewModel, modifier: Modifier = Modifier, beforeHistory: @Composable () -> Unit = {}) {
     val ui by vm.ui.collectAsStateWithLifecycle()
-    val chat by vm.chat.collectAsStateWithLifecycle()
+    // Only the open chat's id matters to the list: a streamed token must not recompose every row.
+    val openSessionId by vm.openSessionId.collectAsStateWithLifecycle()
     val preferences by vm.preferences.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
+    val glanceState by vm.glances.collectAsStateWithLifecycle()
+    // Another account's glances are not this account's.
+    val glances = glanceState.takeIf { it.account == vm.glanceAccountKey() } ?: ChatGlances()
+    LaunchedEffect(ui.origin, ui.owner, ui.profile) { vm.loadGlances() }
+    val assistantTitle = LocalAssistantName.current
+    val youLabel = uiText("You")
     val profileCatalog = data["navigation-profiles"]
     val profileRows = profileCatalog?.rows("profiles").orEmpty()
     val profileLoading = ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
@@ -365,6 +425,22 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
         }
         val searched = historySearchRows(loaded, search, matches, ui.profile)
         val rows = historyRows(searched, view, order, ui.profile, preferences.assistantProfile, ui.assistantSessionId)
+        // The persistent assistant leads the list, like a pinned chat; its own tab keeps its conversation.
+        if (view != HistoryView.Threads && !archived && (search.isBlank() || assistantTitle.contains(search.trim(), ignoreCase = true))) item("beacon-row") {
+            val assistantRow = loaded.firstOrNull { ui.assistantSessionId.isNotBlank() && sessionRowId(it) == ui.assistantSessionId && it.string("profile", ui.profile) == preferences.assistantProfile }
+            val glance = glances.rows["${preferences.assistantProfile}:${ui.assistantSessionId}"]
+            val activity = assistantRow?.let(::rowActivityMillis) ?: 0L
+            val unread = chatUnread(activity, glance, glances.base[preferences.assistantProfile] ?: Long.MAX_VALUE, open = ui.tab == "Beacon")
+            // navigation-beacon is the tag of the drawer item this row replaces.
+            Box(Modifier.testTag("navigation-beacon")) {
+                ChatListRow(
+                    id = ui.assistantSessionId.ifBlank { "beacon" }, title = assistantTitle,
+                    preview = assistantRow?.let { chatPreviewLine(it, glance, youLabel) }.orEmpty().ifBlank { uiText("Text and voice, together") },
+                    time = chatListTime(activity), unread = unread, pinned = true, selected = ui.tab == "Beacon", beacon = true,
+                    modifier = Modifier.clickable { vm.navigate("Beacon") }.semantics { selected = ui.tab == "Beacon" }.testTag("history-beacon-row"),
+                )
+            }
+        }
         // A failed read is not "no conversations".
         if (rows.isEmpty() && (ui.historyLoading || unreadable.isEmpty())) item("empty-history") {
             // An empty list is only "empty" once the fetch has answered.
@@ -384,14 +460,29 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
             val source = row.string("source")
             val thread = isThreadSource(source)
             val external = source.isNotBlank() && source != "android" && !thread
-            Box { ListItem(headlineContent = { Text(row.string("title").ifBlank { "Untitled conversation" }, maxLines = 2) },
-                supportingContent = if (external || allProfiles) ({ Column { if (allProfiles) Text(profileDisplayLabel(rowProfile, profileRows, profileLoading), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant); if (external) Text(uiText(historySourceLabel(source)), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) } }) else null,
-                leadingContent = { if (thread && !row.optBoolean("pinned")) ThreadSpoolGlyph(Modifier.size(24.dp), tint = LocalContentColor.current) else Icon(if (row.optBoolean("pinned")) Icons.Rounded.PushPin else Icons.Rounded.ChatBubbleOutline, null) },
-                trailingContent = { if (row.string("active_stream_id").isNotBlank()) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp) }, colors = ListItemDefaults.colors(containerColor = if (rowProfile == ui.profile && id == chat.sessionId) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent), modifier = Modifier.semantics { selected = rowProfile == ui.profile && id == chat.sessionId }.combinedClickable(onLongClickLabel = uiText("Conversation actions"), onLongClick = { menuFor = rowKey }) { vm.tab("Chat"); vm.openConversation(row) }.heightIn(min = 56.dp).testTag("history-row:$rowTag"))
-            DropdownMenu(menuFor == rowKey, { menuFor = null }, modifier = Modifier.testTag("history-row-menu")) {
-                ConversationMenuItems(vm, row, onDone = { menuFor = null }, onRename = { renaming = row }, onProject = { projectFor = id },
-                    onDelete = { if (rowProfile == ui.profile && id == chat.sessionId) { vm.toggleSessions(false); chatAction(vm, "Delete conversation") } else deleting = row })
-            } }
+            val glance = glances.rows[rowKey]
+            val activity = rowActivityMillis(row)
+            val openHere = rowProfile == ui.profile && id == openSessionId
+            val caption = listOfNotNull(
+                profileDisplayLabel(rowProfile, profileRows, profileLoading).takeIf { allProfiles },
+                uiText(historySourceLabel(source)).takeIf { external },
+            ).joinToString(" · ")
+            val line = remember(row, glance, youLabel) { chatPreviewLine(row, glance, youLabel) }
+            val time = remember(activity) { chatListTime(activity) }
+            Box {
+                ChatListRow(
+                    id = id, title = row.string("title").ifBlank { "Untitled conversation" },
+                    preview = if (caption.isBlank()) line else if (line.isBlank()) caption else "$caption · $line",
+                    time = time, pinned = row.optBoolean("pinned"), thread = thread,
+                    unread = chatUnread(activity, glance, glances.base[rowProfile] ?: Long.MAX_VALUE, open = openHere && ui.tab in setOf("Chat", "Beacon")),
+                    streaming = row.string("active_stream_id").isNotBlank(), selected = openHere,
+                    modifier = Modifier.semantics { selected = openHere }.combinedClickable(onLongClickLabel = uiText("Conversation actions"), onLongClick = { menuFor = rowKey }) { vm.tab("Chat"); vm.openConversation(row) }.testTag("history-row:$rowTag"),
+                )
+                DropdownMenu(menuFor == rowKey, { menuFor = null }, modifier = Modifier.testTag("history-row-menu")) {
+                    ConversationMenuItems(vm, row, onDone = { menuFor = null }, onRename = { renaming = row }, onProject = { projectFor = id },
+                        onDelete = { if (openHere) { vm.toggleSessions(false); chatAction(vm, "Delete conversation") } else deleting = row })
+                }
+            }
         }
 
     }
@@ -400,9 +491,23 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
     projectFor?.let { id -> ChatProjectPicker(vm, id, onDismiss = { projectFor = null }) }
     if (naming) {
         var name by rememberSaveable { mutableStateOf("") }
+        var emoji by rememberSaveable { mutableStateOf("") }
         AlertDialog(onDismissRequest = { naming = false }, title = { Text(uiText("New thread")) },
-            text = { OutlinedTextField(name, { name = it.take(100) }, label = { Text(uiText("Thread name")) }, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("new-thread-name")) },
-            confirmButton = { TextButton(onClick = { naming = false; view = HistoryView.Threads; vm.tab("Chat"); vm.newThread(name) }, enabled = name.isNotBlank(), modifier = Modifier.testTag("new-thread-start")) { Text(uiText("Start thread")) } },
+            text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    ChatAvatar(threadTitle(emoji, name), "new-thread", size = 48.dp, modifier = Modifier.testTag("new-thread-avatar"))
+                    OutlinedTextField(name, { name = it.take(100) }, label = { Text(uiText("Thread name")) }, singleLine = true, modifier = Modifier.weight(1f).testTag("new-thread-name"))
+                }
+                // Optional: the pick is only the start of the Hermes title.
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    threadEmojis.forEach { choice ->
+                        val chosen = emoji == choice
+                        Box(Modifier.size(48.dp).clip(CircleShape).background(if (chosen) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
+                            .selectable(chosen, role = androidx.compose.ui.semantics.Role.Button) { emoji = if (chosen) "" else choice }.testTag("new-thread-emoji:$choice"), contentAlignment = Alignment.Center) { Text(choice, style = MaterialTheme.typography.titleLarge) }
+                    }
+                }
+            } },
+            confirmButton = { TextButton(onClick = { naming = false; view = HistoryView.Threads; vm.tab("Chat"); vm.newThread(threadTitle(emoji, name)) }, enabled = name.isNotBlank(), modifier = Modifier.testTag("new-thread-start")) { Text(uiText("Start thread")) } },
             dismissButton = { TextButton(onClick = { naming = false }) { Text(uiText("Cancel")) } })
     }
 }
@@ -417,6 +522,15 @@ internal fun callTranscriptGroupsMatchingSearch(groups: List<CallTranscriptGroup
 /** A Bot Chat speaks as its bot: its reply label and composer hint use the bot's name, not the assistant's. */
 internal fun botChatName(activeBotProfile: String?, botSessionId: String, chatSessionId: String, profiles: List<JSONObject>): String? =
     activeBotProfile?.takeIf { botSessionId.isNotBlank() && botSessionId == chatSessionId }?.let { profileDisplayName(it, profiles) }
+
+/** The line under a chat's title: what Hermes is doing while a turn streams, a call in progress, else the model. */
+internal fun chatHeaderSubtitle(streaming: Boolean, hasReplyText: Boolean, inCall: Boolean, model: String, assistantChat: Boolean): String = when {
+    streaming -> if (hasReplyText) "typing…" else "thinking…"
+    inCall -> "Voice conversation"
+    model.isNotBlank() -> model
+    assistantChat -> "Text and voice, together"
+    else -> ""
+}
 
 @Composable fun ChatScreen(vm: BeaconViewModel, beacon: Boolean = false, onComposerHeight: (Int) -> Unit = {}, navigationBack: (() -> Unit)? = null, titleOverride: String? = null) {
     val bot by vm.botMode.state.collectAsStateWithLifecycle()
@@ -448,7 +562,6 @@ internal fun botChatName(activeBotProfile: String?, botSessionId: String, chatSe
     }
     // Branch keep_count counts Hermes rows, hidden steering rows included.
     val transcriptIndex = remember(chatState.messages) { chatState.messages.withIndex().associate { it.value.id to it.index } }
-    val latestAssistantMessageId = remember(chatState.messages) { chatState.messages.lastOrNull { it.role == "assistant" && it.text.isNotBlank() }?.id }
     val chat = chatState.copy(messages = messages)
     val taskResultScope = (vm.pcScope() ?: Scope(ui.origin, ui.owner, ui.profile)).session(chat.sessionId)
     val taskResultKey = "task-result:${taskResultScope.key}"
@@ -579,6 +692,7 @@ internal fun botChatName(activeBotProfile: String?, botSessionId: String, chatSe
         }
     }
     var menu by remember { mutableStateOf(false) }
+    var threadPosts by remember(chat.sessionId) { mutableStateOf(false) }
     var activitySheet by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(false) }
     var backgroundActivity by remember(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(BackgroundActivitySummary()) }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
@@ -622,8 +736,24 @@ internal fun botChatName(activeBotProfile: String?, botSessionId: String, chatSe
         }.let(::mergeToolOnlyRuns)
     }
     val dayStarts = remember(visibleMessages) { messageDayStarts(visibleMessages.map { it.value.id to it.value.recordedAt }) }
-    val assistantLabels = remember(visibleMessages, dayStarts, callIdByMessageId) {
-        assistantLabelMessageIds(visibleMessages.map { it.value }, dayStarts.keys, callIdByMessageId.keys)
+    val liveShown = chat.streamId.isNotBlank() || chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank()
+    val liveBubble = chat.liveText.isNotBlank()
+    val sendingShown = chatSendInFlight(chat)
+    // The reply being written and the message being sent join the run before them, as their stored forms will.
+    val groups = remember(visibleMessages, dayStarts, callGroupByFirstMessageId, liveShown, liveBubble, sendingShown) {
+        bubbleGroups(
+            visibleMessages.map { it.value } + listOfNotNull(
+                Message(LIVE_REPLY_ID, "assistant", if (liveBubble) "live" else "").takeIf { liveShown },
+                Message(SENDING_MESSAGE_ID, "user", "sending").takeIf { sendingShown },
+            ),
+            dayStarts.keys, callGroupByFirstMessageId.keys,
+        )
+    }
+    // The newest line and the viewed mark of this chat, for the chat list's preview and unread dot.
+    val openRowActivity = remember(ui.sessions, chat.sessionId, ui.profile) { ui.sessions.firstOrNull { sessionRowId(it) == chat.sessionId && it.string("profile", ui.profile) == ui.profile }?.let(::rowActivityMillis) ?: 0L }
+    val newestMessage = remember(chatState.messages) { visibleTranscriptMessages(chatState.messages).lastOrNull { it.role == "user" || it.role == "assistant" && it.text.isNotBlank() } }
+    LaunchedEffect(chat.sessionId, chat.projectionReady, newestMessage?.id, newestMessage?.recordedAt, openRowActivity) {
+        if (chat.projectionReady && chat.sessionId.isNotBlank()) vm.noteChatViewed(chat.sessionId, newestMessage)
     }
     val messageIds = remember(visibleMessages) { visibleMessages.map { it.value.id } }
     val ids by rememberUpdatedState(messageIds)
@@ -842,8 +972,10 @@ internal fun botChatName(activeBotProfile: String?, botSessionId: String, chatSe
                         TextButton(onClick = { vm.more("Assistant") }, modifier = Modifier.testTag("proactive-prompt-settings")) { Text(uiText("Proactive settings")) }
                     }
                 }
-                Box(Modifier.weight(1f).fillMaxWidth().testTag("transcript-layer")) {
-                    LazyColumn(Modifier.fillMaxSize().nestedScroll(ownerScroll).testTag("conversation-transcript"), state = list, contentPadding = PaddingValues(horizontal = 20.dp, vertical = 20.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) {
+                BoxWithConstraints(Modifier.weight(1f).fillMaxWidth().testTag("transcript-layer")) {
+                    // About 80% of the width, never wider than 560 dp on a large screen.
+                    val bubbleMax = (maxWidth * 0.8f).coerceAtMost(560.dp)
+                    LazyColumn(Modifier.fillMaxSize().nestedScroll(ownerScroll).testTag("conversation-transcript"), state = list, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 12.dp)) {
                     if (beacon && (pluginStatus == "absent" || proactive?.optBoolean("_pluginUpdateRequired") == true)) item("missing-beacon-plugin") {
                         MissingBeaconPluginState(Modifier.testTag("beacon-plugin-missing"), compact = true)
                     }
@@ -856,30 +988,30 @@ internal fun botChatName(activeBotProfile: String?, botSessionId: String, chatSe
                     }
                     if (search.isNotBlank() && visibleMessages.isEmpty()) item { Text("No messages match your search.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     items(visibleMessages, key = { (_, message) -> callGroupByFirstMessageId[message.id]?.let { "call:${it.callId}" } ?: message.id }) { (index, message) ->
-                        dayStarts[message.id]?.let { DayDivider(uiText(it)) }
+                        dayStarts[message.id]?.let { DateChip(uiText(it)) }
                         val group = callGroupByFirstMessageId[message.id]
                         if (group != null) {
                             val metadata = callMetadata[group.callId]
                             CallTranscriptCard(group.callId, group.lines, metadata?.durationSeconds, metadata?.provider,
-                                assistantName = LocalAssistantName.current, modifier = Modifier.fillMaxWidth(), searchQuery = search)
-                        } else MessageRow(vm, message, transcriptIndex[message.id] ?: index, toolResultsByCallId = foldedToolResults.byCallId, resultTitle = toolResultTitles[message.id].orEmpty(), showAssistantLabel = message.id in assistantLabels, isLatestAssistant = message.id == latestAssistantMessageId, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) })
+                                assistantName = LocalAssistantName.current, modifier = Modifier.fillMaxWidth().padding(top = 10.dp), searchQuery = search)
+                        } else MessageRow(vm, message, transcriptIndex[message.id] ?: index, groups[message.id] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax, toolResultsByCallId = foldedToolResults.byCallId, resultTitle = toolResultTitles[message.id].orEmpty(), onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) })
                     }
-                    if (chat.streamId.isNotBlank() || chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank()) item("live") {
-                        // Same header and spacing as the stored reply, so replacing this row does not move the text.
-                        Column(Modifier.testTag("live-reply"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Text(LocalAssistantName.current, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            // The blank meta line and the status row hold the places of the stored reply's time and action row.
-                            if (chat.liveText.isNotBlank()) AssistantSurface { Markdown(chat.liveText, vm, vm.authenticatedScope(), interactive = false); Text(" ", Modifier.padding(top = 4.dp), style = nativeMetadataStyle()) }
-                            Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("live-status"), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (liveShown) item("live") {
+                        // Same bubble and spacing as the stored reply, so replacing this row does not move the text.
+                        val liveGroup = groups[LIVE_REPLY_ID] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true)
+                        Column(Modifier.fillMaxWidth().padding(top = if (liveGroup.startsRun) 10.dp else 3.dp).testTag("live-reply"), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                            // A blank meta line holds the place of the stored reply time.
+                            if (chat.liveText.isNotBlank()) ChatBubble(own = false, liveGroup, bubbleMax) { BubbleText(chat.liveText, vm, vm.authenticatedScope(), interactive = false); BubbleMeta(0L, LIVE_REPLY_ID, null, reserve = true) }
+                            Row(Modifier.heightIn(min = 32.dp).testTag("live-status"), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 BeaconSignal(BeaconMotionMode.Pulse, size = 18.dp)
                                 Text(chat.status.ifBlank { "Working" }, Modifier.testTag("message-activity-status"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
-                            MessageActivity(chat.liveReasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), chat.liveTools, "", streaming = true, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }, vm = vm, scope = vm.authenticatedScope()?.session(chat.sessionId))
+                            Box(Modifier.widthIn(max = bubbleMax)) { MessageActivity(chat.liveReasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), chat.liveTools, "", streaming = true, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }, vm = vm, scope = vm.authenticatedScope()?.session(chat.sessionId)) }
                         }
                     }
                     chat.approval?.let { p -> item("approval:${p.string("approval_id", p.string("id"))}") {
                         val exactBeaconAction = p.string("approval_id").startsWith("beacon-cf:")
-                        Glass { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Glass(Modifier.padding(top = 10.dp)) { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             Text(uiText("Approval needed"), style = MaterialTheme.typography.titleMedium)
                             Text(p.string("description", p.string("command", "The agent requests permission to continue.")))
                             if (p.string("command").isNotBlank()) CodeBlock(if (exactBeaconAction) "json" else "shell", p.string("command"))
@@ -891,9 +1023,9 @@ internal fun botChatName(activeBotProfile: String?, botSessionId: String, chatSe
                             }
                         } }
                     } }
-                    chat.clarification?.let { p -> item("clarify:$questionId") { Clarification(vm, p, promptScope, questionAnswers) { id, value -> questionAnswers = questionAnswers + (id to value) } } }
-                    if (chatSendInFlight(chat)) item("sending") { SendingMessage(composerDraft.text) }
-                    else if (chat.status.isNotBlank() && chat.streamId.isBlank()) item { Text(chat.status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    chat.clarification?.let { p -> item("clarify:$questionId") { Box(Modifier.padding(top = 10.dp)) { Clarification(vm, p, promptScope, questionAnswers) { id, value -> questionAnswers = questionAnswers + (id to value) } } } }
+                    if (chatSendInFlight(chat)) item("sending") { SendingMessage(composerDraft.text, groups[SENDING_MESSAGE_ID] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax) }
+                    else if (chat.status.isNotBlank() && chat.streamId.isBlank()) item { Text(chat.status, Modifier.padding(top = 10.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     }
                     if (ready && !follow && list.canScrollForward) FloatingActionButton(
                         onClick = { follow = true; scope.launch { val last = (list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0); if (motionEnabled) list.animateScrollToItem(last) else list.scrollToItem(last) } },
@@ -904,8 +1036,12 @@ internal fun botChatName(activeBotProfile: String?, botSessionId: String, chatSe
                     ) { Icon(Icons.Rounded.ExpandMore, uiText("Scroll to latest"), Modifier.size(24.dp)) }
                 }
             }
-            if (ready && chat.uncertain.isNotBlank() && !chatSendInFlight(chat)) Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp).testTag("send-unconfirmed")) {
-                Text(uiText("Not sure your last message arrived. Resending may duplicate it. Your draft is saved."), style = MaterialTheme.typography.bodyMedium)
+            if (ready && chat.uncertain.isNotBlank() && !chatSendInFlight(chat)) Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp).testTag("send-unconfirmed"), horizontalAlignment = Alignment.End) {
+                // Where the message sits in the transcript: not confirmed, with the choices below.
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    SendTickIcon(SendTick.Unconfirmed)
+                    Text(uiText("Not sure your last message arrived. Resending may duplicate it. Your draft is saved."), style = MaterialTheme.typography.bodyMedium)
+                }
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     TextButton(onClick = { vm.reconcileSend() }) { Text(uiText("Check receipt")) }
                     TextButton(onClick = { vm.openForm(resendForm(vm)) }, modifier = Modifier.testTag("send-resend")) { Text(uiText("Resend")) }
@@ -930,12 +1066,14 @@ internal fun botChatName(activeBotProfile: String?, botSessionId: String, chatSe
                 Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     if (navigationBack != null) IconButton(onClick = navigationBack, modifier = Modifier.testTag("bot-chat-back")) { Icon(Icons.Rounded.ArrowBack, "Back to bots") }
                     else IconButton(onClick = LocalOpenNavigationMenu.current ?: { vm.toggleSessions(!ui.showSessions) }, modifier = Modifier.testTag("navigation-toggle")) { Icon(Icons.Rounded.Menu, uiText(if (LocalPersistentNavigation.current) "Hide navigation" else "Show navigation")) }
-                    if (beacon || activeHere) BeaconMark(size = 26.dp, contentDescription = assistantText("Beacon"))
-                    Column(Modifier.weight(1f).padding(vertical = 8.dp)) {
-                        Text(titleOverride ?: if (beacon || activeHere) LocalAssistantName.current else chat.title, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                    val headerTitle = titleOverride ?: if (beacon || activeHere) LocalAssistantName.current else chat.title
+                    ChatAvatar(headerTitle, chat.sessionId, size = 40.dp, beacon = beacon || activeHere, description = if (beacon || activeHere) assistantText("Beacon") else null)
+                    // The title opens the same chat menu as the dots.
+                    Column(Modifier.weight(1f).padding(start = 10.dp).heightIn(min = 48.dp).clickable(enabled = ready, onClickLabel = uiText("Conversation actions")) { menu = true }.padding(vertical = 4.dp).testTag("chat-header-title"), verticalArrangement = Arrangement.Center) {
+                        Text(plainTitle(headerTitle), style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                         val headerModel = chatModelLabel(chat.raw.string("model"), profileDefaults["profile-defaults"]?.takeIf { it.string("profile") == ui.profile && recordError(it).isBlank() }?.string("model").orEmpty())
-                        if (beacon || activeHere) Text(uiText(if (call.active) "Voice conversation" else "Text and voice, together"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-                        else if (headerModel.isNotBlank()) Text(headerModel, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                        val subtitle = chatHeaderSubtitle(chat.streamId.isNotBlank(), chat.liveText.isNotBlank(), (beacon || activeHere) && call.active, headerModel, beacon || activeHere)
+                        if (subtitle.isNotBlank()) Text(uiText(subtitle), Modifier.testTag("chat-header-subtitle"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                     }
                     if (!beacon && !permanentBotChat) IconButton(onClick = { vm.newChat() }) { Icon(Icons.Rounded.Edit, uiText("New conversation")) }
                     IconButton(onClick = { showSearch = !showSearch; if (activeHere && showSearch) showCallHistory = true }, enabled = canonical) { Icon(Icons.Rounded.Search, uiText("Search this conversation")) }
@@ -961,6 +1099,7 @@ internal fun botChatName(activeBotProfile: String?, botSessionId: String, chatSe
                                 .onFailure { vm.notice(if (it is IllegalArgumentException) it.message.orEmpty() else "No app is available to share this conversation") } }, leadingIcon = { Icon(Icons.Rounded.Share, null) })
                         if (canonical) DropdownMenuItem({ Text(uiText("Copy conversation ID")) }, { menu = false
                             (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Conversation ID", chat.sessionId)); vm.notice("Conversation ID copied") }, leadingIcon = { Icon(Icons.Rounded.ContentCopy, null) })
+                        if (canonical && isThreadSource(chat.raw.string("source"))) DropdownMenuItem({ Text(uiText("Scheduled posts")) }, { menu = false; threadPosts = true }, leadingIcon = { Icon(Icons.Rounded.Schedule, null) })
                         DropdownMenuItem({ Text("Chat preferences") }, { menu = false; vm.more("Settings") })
                     } }
                 }
@@ -985,6 +1124,7 @@ internal fun botChatName(activeBotProfile: String?, botSessionId: String, chatSe
     side?.takeIf { ready }?.let { question -> AlertDialog(onDismissRequest = vm::closeSideQuestion, title = { Text(uiText("Side question")) }, text = { Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) { Text(question.question, style = MaterialTheme.typography.titleMedium); Text(question.status, color = MaterialTheme.colorScheme.onSurfaceVariant); Markdown(question.text, vm, question.scope.session(question.sessionId), interactive = false) } }, confirmButton = { TextButton(onClick = vm::closeSideQuestion) { Text(uiText("Close")) } }, dismissButton = { TextButton(onClick = vm::resumeSideQuestion) { Text(uiText("Reconnect")) } }) }
     if (canonical) NativeCatalog(vm)
     if (activitySheet && ready && (backgroundActivity.active || !backgroundActivity.available)) ChatActivitySheet(backgroundActivity) { activitySheet = false }
+    if (threadPosts && chat.sessionId.isNotBlank()) ThreadSchedulesSheet(vm, chat.sessionId, plainTitle(chat.title)) { threadPosts = false }
     if (showCallHistorySheet && beacon) CallHistorySheet(vm, onOpenCall = { conversationId, callId ->
         showCallHistorySheet = false
         showSearch = false
@@ -1119,6 +1259,7 @@ internal fun acceptsInitialConversationEdit(
     val dictation = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r -> val request = dictationRequest; dictationRequest = null; val text = r.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull(); if (r.resultCode == android.app.Activity.RESULT_OK && text != null) { if (request != null && vm.client === request.first && vm.authenticatedScope() == request.second) vm.dictated(text) else vm.notice("Reopen dictation in the original account and conversation.") } }
     var modelMenu by remember { mutableStateOf(false) }
     var attachMenu by remember { mutableStateOf(false) }
+    val inputFocus = remember { FocusRequester() }
     LaunchedEffect(ui.origin, ui.owner, ui.profile) { vm.loadSlashCatalog() }
     // Hermes reports a blank model/effort when the chat follows its profile (tui_gateway _session_info, _cfg_get_reasoning),
     // so the profile's own values are the chat's effective ones.
@@ -1131,15 +1272,22 @@ internal fun acceptsInitialConversationEdit(
     }
     BoxWithConstraints(Modifier.widthIn(max = 840.dp).fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
         // Reserve the action row before the editor grows. The editor scrolls its own long draft.
-        val commandHeight = if (draft.text.startsWith("/")) (maxHeight - 160.dp).coerceIn(48.dp, 160.dp) else 0.dp
+        val commandHeight = if (draft.text.startsWith("/")) (maxHeight - 160.dp).coerceIn(48.dp, 224.dp) else 0.dp
         val editorHeight = (maxHeight - 112.dp - commandHeight - (if (commandHeight > 0.dp) 8.dp else 0.dp) - if(chat.streamId.isNotBlank()) 48.dp else 0.dp).coerceAtMost(160.dp).coerceAtLeast(1.dp)
         Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             if (draft.text.startsWith("/")) {
                 val catalog = data["slash:catalog"]
                 val commands = mobileSlashCommands(catalog?.rows("commands").orEmpty()).filter { slashMatches(it.string("name"), it.string("description"), draft.text) }.sortedBy { if (it.string("name").removePrefix("/").startsWith(draft.text.removePrefix("/"), true)) 0 else 1 }.take(20)
-                LazyColumn(Modifier.fillMaxWidth().heightIn(max = commandHeight).clip(RoundedCornerShape(16.dp)).background(MaterialTheme.colorScheme.surfaceContainerHigh).testTag("slash-suggestions")) {
-                    items(commands) { command -> TextButton(onClick = { val text = "/${command.string("name").removePrefix("/")} "; changeDraft(TextFieldValue(text, androidx.compose.ui.text.TextRange(text.length))) }, enabled = editable && !readOnly, modifier = Modifier.heightIn(min = 48.dp)) { Column(Modifier.fillMaxWidth()) { Text("/${command.string("name").removePrefix("/")}"); Text(command.string("description"), style = MaterialTheme.typography.bodySmall, maxLines = 2) } } }
-                    if (commands.isEmpty()) item { Text(if (catalog == null) "Loading commands…" else if (draft.text.contains(' ')) "Review arguments, then run command" else "No matching native commands", style = MaterialTheme.typography.bodySmall) }
+                LazyColumn(Modifier.fillMaxWidth().heightIn(max = commandHeight).clip(RoundedCornerShape(14.dp)).background(MaterialTheme.colorScheme.surfaceContainerHigh).border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(14.dp)).testTag("slash-suggestions")) {
+                    // Compact: the bold command and its description on one line.
+                    items(commands) { command ->
+                        val name = "/${command.string("name").removePrefix("/")}"
+                        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(enabled = editable && !readOnly) { val text = "$name "; changeDraft(TextFieldValue(text, androidx.compose.ui.text.TextRange(text.length))) }.padding(horizontal = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text(name, style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold), maxLines = 1)
+                            Text(command.string("description"), Modifier.weight(1f).padding(start = 10.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                        }
+                    }
+                    if (commands.isEmpty()) item { Text(if (catalog == null) "Loading commands…" else if (draft.text.contains(' ')) "Review arguments, then run command" else "No matching native commands", Modifier.padding(14.dp), style = MaterialTheme.typography.bodySmall) }
                     if (recordError(catalog).isNotBlank()) item { TextButton(onClick = { vm.loadSlashCatalog(force = true) }) { Text("Retry commands") } }
                 }
             }
@@ -1183,8 +1331,16 @@ internal fun acceptsInitialConversationEdit(
                             }
                         }
                     }
-                    Box(Modifier.fillMaxWidth().contentReceiver(imagePasteReceiver)) {
-                        OutlinedTextField(if (sending) TextFieldValue("") else draft, if (sending) { _ -> } else changeDraft, placeholder = { Text(if (sending) uiText("Sending…") else if (callActive) "Finish your call to continue typing" else if (readOnly) "Branch this conversation to reply" else if (streaming) uiText("Correct the response...") else assistantText("Message Beacon")) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp.coerceAtMost(editorHeight), max = editorHeight).testTag("message-input").onPreviewKeyEvent { event ->
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    // Telegram's bot-menu button: while the composer is empty it starts the command list.
+                    if (draft.text.isEmpty() && !sending && files.isEmpty() && preparing.isEmpty()) {
+                        val commandsLabel = uiText("Commands")
+                        IconButton(onClick = { changeDraft(TextFieldValue("/", TextRange(1))); runCatching { inputFocus.requestFocus() } }, enabled = editable && !callActive && !readOnly, modifier = Modifier.size(48.dp).testTag("composer-commands").semantics { contentDescription = commandsLabel }) {
+                            Text("/", Modifier.clearAndSetSemantics {}, style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold), color = MaterialTheme.colorScheme.primary)
+                        }
+                    }
+                    Box(Modifier.weight(1f).contentReceiver(imagePasteReceiver)) {
+                        OutlinedTextField(if (sending) TextFieldValue("") else draft, if (sending) { _ -> } else changeDraft, placeholder = { Text(if (sending) uiText("Sending…") else if (callActive) "Finish your call to continue typing" else if (readOnly) "Branch this conversation to reply" else if (streaming) uiText("Correct the response...") else assistantText("Message Beacon")) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp.coerceAtMost(editorHeight), max = editorHeight).testTag("message-input").focusRequester(inputFocus).onPreviewKeyEvent { event ->
                             val key = event.nativeKeyEvent
                             val pastedImage = key.action == android.view.KeyEvent.ACTION_DOWN && key.repeatCount == 0 && key.keyCode == android.view.KeyEvent.KEYCODE_V && key.isCtrlPressed && pasteClipboardImage()
                             if (pastedImage) true else {
@@ -1193,6 +1349,7 @@ internal fun acceptsInitialConversationEdit(
                                 if (key.action == android.view.KeyEvent.ACTION_DOWN && key.keyCode == android.view.KeyEvent.KEYCODE_ENTER && matched && !callActive && !readOnly) { if (editable && chat.uncertain.isBlank()) submit(); true } else false
                             }
                         }, minLines = 1, maxLines = 6, enabled = editable && !callActive && !readOnly, shape = RoundedCornerShape(18.dp), colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = .5f)))
+                    }
                     }
                     if (streaming && !voiceAction) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                         TextButton(onClick = { vm.steer() }, enabled = canonical && preparing.isEmpty() && !readOnly && !callActive && draft.text.isNotBlank() && !draft.text.startsWith("/") && chat.uncertain.isBlank() && files.isEmpty(), modifier = Modifier.heightIn(min = 48.dp)) { Text("Guide") }
@@ -1270,86 +1427,122 @@ internal fun acceptsInitialConversationEdit(
 }
 
 
+/** Ids the reply being written and the message being sent take among the bubble groups. */
+private const val LIVE_REPLY_ID = "live-reply"
+private const val SENDING_MESSAGE_ID = "sending-message"
+
 /**
- * Tap shows the message's actions, long-press opens its menu (Relay MessageBubble). Unlike clickable, this does not merge the
- * message's semantics, so checklists, links and code controls inside it stay separately reachable and tappable.
+ * Long-press opens the message's menu (Relay MessageBubble); TalkBack gets each action by name. Unlike clickable, this does not
+ * merge the message's semantics, so checklists, links and code controls inside it stay separately reachable and tappable.
  */
-@Composable private fun Modifier.messageGestures(onTap: () -> Unit, onLongPress: () -> Unit): Modifier {
-    val tap by rememberUpdatedState(onTap); val press by rememberUpdatedState(onLongPress)
-    val show = uiText("Show message actions"); val menu = uiText("Message actions")
-    return pointerInput(Unit) { detectTapGestures(onTap = { tap() }, onLongPress = { press() }) }
-        .semantics { onClick(show) { tap(); true }; onLongClick(menu) { press(); true } }
+@Composable private fun Modifier.messageGestures(onLongPress: () -> Unit, actions: List<CustomAccessibilityAction>): Modifier {
+    val press by rememberUpdatedState(onLongPress)
+    val menu = uiText("Message actions")
+    return pointerInput(Unit) { detectTapGestures(onLongPress = { press() }) }
+        .semantics { onLongClick(menu) { press(); true }; customActions = actions }
 }
-@Composable private fun MessageRow(vm: BeaconViewModel, message: Message, index: Int, callTranscript: CallTranscript? = null, toolResultsByCallId: Map<String, FoldedToolResult> = emptyMap(), resultTitle: String = "", showAssistantLabel: Boolean = true, isLatestAssistant: Boolean = false, onToolExpanded: (Boolean) -> Unit = {}) {
+
+/** A bubble: the owner's on the right in the accent tint, the assistant's on the left on a surface. */
+@Composable private fun ChatBubble(own: Boolean, group: BubbleGroup, bubbleMax: Dp, modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
+    Surface(
+        modifier.widthIn(max = bubbleMax),
+        shape = bubbleShape(own, group.joinedTop, group.tail),
+        color = if (own) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerLow,
+        border = if (own) null else BorderStroke(.5.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f)),
+    ) { Column(Modifier.padding(start = 12.dp, end = 12.dp, top = 7.dp, bottom = 5.dp), content = content) }
+}
+
+/** Plain words stay plain Text, so a short bubble shrinks to them; anything richer keeps the Markdown renderer. */
+@Composable private fun BubbleText(text: String, vm: BeaconViewModel, origin: Scope?, snapshots: Map<String, String> = emptyMap(), documentKey: String = "", interactive: Boolean = true) {
+    if (isPlainChatText(text)) SelectionContainer { Text(text, style = MaterialTheme.typography.bodyLarge) }
+    else Markdown(text, vm, origin, snapshots, documentKey, interactive)
+}
+
+/** The recorded time (none when Hermes recorded none) and, for the owner's own message, its send tick, at the bubble's bottom right. */
+@Composable private fun ColumnScope.BubbleMeta(recordedAt: Long, messageId: String, tick: SendTick?, reserve: Boolean = false) {
+    val time = messageTimeLabel(recordedAt)
+    if (time == null && tick == null && !reserve) return
+    Row(Modifier.align(Alignment.End).padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+        if (time != null) Text(time, Modifier.testTag("message-time:$messageId"), style = nativeMetadataStyle(), color = LocalContentColor.current.copy(alpha = .7f))
+        else if (reserve) Text(" ", style = nativeMetadataStyle())
+        if (tick != null) SendTickIcon(tick)
+    }
+}
+
+@Composable private fun MessageRow(vm: BeaconViewModel, message: Message, index: Int, group: BubbleGroup, bubbleMax: Dp, toolResultsByCallId: Map<String, FoldedToolResult> = emptyMap(), resultTitle: String = "", onToolExpanded: (Boolean) -> Unit = {}) {
     val context = LocalContext.current
     val origin = vm.authenticatedScope()?.session(message.sessionId.ifBlank { vm.chat.value.sessionId })
     val settings = LocalBeaconSettings.current
     val assistantMessageLabel = assistantText("Beacon message")
     val history = remember(message.role, message.text) { safeHistoryMessagePresentation(message.role, message.text) }
-    val stopped = if (callTranscript == null) stoppedMessageMarker(message.role, message.text, message.interrupted) else null
-    val displayText = history.text
+    val stopped = stoppedMessageMarker(message.role, message.text, message.interrupted)
+    val post = channelPost(message.displayKind, message.role, history.text)
+    val displayText = post?.body ?: history.text
     val presentation = chatPresentation(message.role, displayText, JSONObject().put("name", resultTitle), tools = message.tools)
     val reading by vm.readingAloud.collectAsStateWithLifecycle()
-    val currentCall by vm.app.calls.state.collectAsStateWithLifecycle()
     val haptic = LocalHapticFeedback.current
     var actions by remember(message.id) { mutableStateOf(false) }
-    var inlineActions by remember(message.id) { mutableStateOf(false) }
-    val toggleInlineActions = { inlineActions = !inlineActions }
+    val own = isOwnMessage(message)
+    val hasContent = displayText.isNotBlank() || history.attachments.isNotEmpty()
     val openMessageActions = { haptic.performHapticFeedback(HapticFeedbackType.LongPress); actions = true }
     val copySource: (String) -> Unit = { text -> runCatching { ensureClipboardFits(text); (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText(assistantMessageLabel, text)) }.onSuccess { vm.notice("Message copied") }.onFailure { vm.notice("Couldn’t copy the whole message. Select a smaller section.") }; Unit }
+    val copyFormatted = { runCatching { val (text, html) = formattedClipboard(displayText); (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newHtmlText(assistantMessageLabel, text, html)) }.onSuccess { vm.notice("Formatted message copied") }.onFailure { vm.notice("Couldn't copy the whole message. Select a smaller section.") }; Unit }
     val share = { runCatching { context.startActivity(Intent.createChooser(formattedShareIntent(displayText), "Share message")) }.onFailure { vm.notice(if (it is IllegalArgumentException) it.message.orEmpty() else "No app is available to share this message") }; Unit }
-    val renderActions: @Composable () -> Unit = {
-            if (callTranscript == null && (displayText.isNotBlank() || history.attachments.isNotEmpty()) && (inlineActions || actions || isLatestAssistant)) Row(Modifier.horizontalScroll(rememberScrollState()).testTag("message-actions:${message.id}"), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-                IconButton(onClick = { runCatching { val (text, html) = formattedClipboard(displayText); (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newHtmlText(assistantMessageLabel, text, html)) }.onSuccess { vm.notice("Formatted message copied") }.onFailure { vm.notice("Couldn't copy the whole message. Select a smaller section.") } }, enabled = displayText.isNotBlank()) { Icon(Icons.Rounded.ContentCopy, uiText("Copy formatted message")) }
-                IconButton(onClick = share) { Icon(Icons.Rounded.Share, uiText("Share text")) }
-                IconButton(onClick = { vm.quoteInReply(presentation.text) }, enabled = displayText.isNotBlank(), modifier = Modifier.testTag("message-quote:${message.id}")) { Icon(Icons.Rounded.FormatQuote, uiText("Quote in reply")) }
-                IconButton(onClick = { if (reading) vm.stopReadAloud() else vm.readAloud(presentation.text) }, enabled = reading || displayText.isNotBlank()) { Icon(if (reading) Icons.Rounded.Stop else Icons.Rounded.VolumeUp, uiText(if (reading) "Stop read aloud" else "Read aloud")) }
-                Box {
-                    IconButton(onClick = { actions = true }) { Icon(Icons.Rounded.MoreHoriz, uiText("More message actions")) }
-                    DropdownMenu(actions, { actions = false }) {
-                        DropdownMenuItem({ Text("Copy source") }, { actions = false; copySource(displayText) }, leadingIcon = { Icon(Icons.Rounded.ContentCopy, null, Modifier.testTag("copy-source-icon")) }, modifier = Modifier.testTag("copy-source-action"))
-                        DropdownMenuItem({ Text(uiText("Branch from here")) }, { actions = false; vm.sessionAction("/api/session/branch", json("keep_count" to index + 1)) { o -> branchSessionId(o).takeIf(String::isNotBlank)?.let { id -> vm.selectSession(id, titleHint = branchTitle(o)); vm.refreshSessions(); vm.notice("Branched into a new conversation") } } }, leadingIcon = { Icon(Icons.Rounded.CallSplit, null) })
-                        if (message.role == "user") DropdownMenuItem({ Text(uiText("Edit and branch")) }, { actions = false; vm.sessionAction("/api/session/branch", json("keep_count" to index)) { o -> (o.optJSONObject("session") ?: o).string("session_id").takeIf(String::isNotBlank)?.let { vm.selectSession(it, message.text, titleHint = branchTitle(o)); vm.refreshSessions() } } }, leadingIcon = { Icon(Icons.Rounded.Edit, null) })
-                    }
-                }
-            }
+    val quote = { vm.quoteInReply(presentation.text) }
+    val readAloud = { if (reading) vm.stopReadAloud() else vm.readAloud(presentation.text); Unit }
+    val a11yActions = if (!hasContent) emptyList() else listOf(
+        CustomAccessibilityAction(uiText("Copy")) { copyFormatted(); true },
+        CustomAccessibilityAction(uiText("Quote in reply")) { quote(); true },
+        CustomAccessibilityAction(uiText("Share")) { share(); true },
+        CustomAccessibilityAction(uiText(if (reading) "Stop read aloud" else "Read aloud")) { readAloud(); true },
+        CustomAccessibilityAction(uiText("More message actions")) { openMessageActions(); true },
+    )
+    // Long-press menu, in place of an always-visible row: Copy, Quote, Share, Read aloud, then the rest.
+    val actionsMenu: @Composable () -> Unit = {
+        DropdownMenu(actions, { actions = false }, modifier = Modifier.testTag("message-actions:${message.id}")) {
+            DropdownMenuItem({ Text(uiText("Copy")) }, { actions = false; copyFormatted() }, leadingIcon = { Icon(Icons.Rounded.ContentCopy, null) }, enabled = displayText.isNotBlank(), modifier = Modifier.testTag("message-copy:${message.id}"))
+            DropdownMenuItem({ Text(uiText("Quote in reply")) }, { actions = false; quote() }, leadingIcon = { Icon(Icons.Rounded.FormatQuote, null) }, enabled = displayText.isNotBlank(), modifier = Modifier.testTag("message-quote:${message.id}"))
+            DropdownMenuItem({ Text(uiText("Share")) }, { actions = false; share() }, leadingIcon = { Icon(Icons.Rounded.Share, null) }, modifier = Modifier.testTag("message-share:${message.id}"))
+            DropdownMenuItem({ Text(uiText(if (reading) "Stop read aloud" else "Read aloud")) }, { actions = false; readAloud() }, leadingIcon = { Icon(if (reading) Icons.Rounded.Stop else Icons.Rounded.VolumeUp, null) }, enabled = reading || displayText.isNotBlank(), modifier = Modifier.testTag("message-read-aloud:${message.id}"))
+            HorizontalDivider()
+            DropdownMenuItem({ Text("Copy source") }, { actions = false; copySource(displayText) }, leadingIcon = { Icon(Icons.Rounded.Code, null, Modifier.testTag("copy-source-icon")) }, modifier = Modifier.testTag("copy-source-action"))
+            DropdownMenuItem({ Text(uiText("Branch from here")) }, { actions = false; vm.sessionAction("/api/session/branch", json("keep_count" to index + 1)) { o -> branchSessionId(o).takeIf(String::isNotBlank)?.let { id -> vm.selectSession(id, titleHint = branchTitle(o)); vm.refreshSessions(); vm.notice("Branched into a new conversation") } } }, leadingIcon = { Icon(Icons.Rounded.CallSplit, null) })
+            if (own) DropdownMenuItem({ Text(uiText("Edit and branch")) }, { actions = false; vm.sessionAction("/api/session/branch", json("keep_count" to index)) { o -> (o.optJSONObject("session") ?: o).string("session_id").takeIf(String::isNotBlank)?.let { vm.selectSession(it, message.text, titleHint = branchTitle(o)); vm.refreshSessions() } } }, leadingIcon = { Icon(Icons.Rounded.Edit, null) })
+        }
     }
-    Column(Modifier.fillMaxWidth().testTag("message-row:${message.id}"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    Column(
+        Modifier.fillMaxWidth().padding(top = if (group.startsRun) 10.dp else 3.dp).testTag("message-row:${message.id}"),
+        horizontalAlignment = if (own) Alignment.End else Alignment.Start,
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
         if (stopped != null) Text(uiText(stopped), Modifier.testTag("message-stopped:${message.id}"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         val reasoning = message.reasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty()
+        if (reasoning.isNotBlank()) Box(Modifier.widthIn(max = bubbleMax)) { MessageReasoningDisclosure(reasoning, message.id, vm, origin) }
         if (presentation.activity) {
-            if (reasoning.isNotBlank()) MessageReasoningDisclosure(reasoning, message.id, vm, origin)
-            Box(Modifier.fillMaxWidth().messageGestures(toggleInlineActions, openMessageActions).testTag("message-bubble:${message.id}")) {
+            Box(Modifier.widthIn(max = bubbleMax).messageGestures(openMessageActions, a11yActions).testTag("message-bubble:${message.id}")) {
                 Disclosure(presentation.summary, displayText)
+                actionsMenu()
             }
-        } else {
-            if (stopped == null && (message.role != "assistant" || showAssistantLabel || callTranscript != null)) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = if (message.role == "user") Arrangement.End else Arrangement.Start) {
-                Text(if (message.role == "user") uiText("You") else LocalAssistantName.current, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                if (callTranscript != null) { Spacer(Modifier.weight(1f)); Text(archivedCallLabel(callTranscript.final, callTranscript.interrupted, currentCall.active && currentCall.conversationScope == origin), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-            }
-            if (reasoning.isNotBlank()) MessageReasoningDisclosure(reasoning, message.id, vm, origin)
-            if (message.role == "user" && (displayText.isNotBlank() || history.attachments.isNotEmpty())) BoxWithConstraints(Modifier.fillMaxWidth().messageGestures(toggleInlineActions, openMessageActions).testTag("message-bubble:${message.id}")) {
-                Surface(modifier = Modifier.widthIn(max = maxWidth * .9f).align(Alignment.CenterEnd), shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp, bottomStart = 22.dp, bottomEnd = 4.dp), color = MaterialTheme.colorScheme.primaryContainer) {
-                    Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
-                        if (displayText.isNotBlank()) {
-                            if (settings.optBoolean("render_user_markdown", true)) Markdown(displayText, vm, origin, message.mediaSnapshots, documentKey = message.id)
-                            else SelectionContainer { Text(displayText, style = MaterialTheme.typography.bodyLarge) }
-                        }
-                        HistoryAttachmentChips(history.attachments)
-                        BubbleTime(message)
+        } else if (hasContent) {
+            Box(Modifier.messageGestures(openMessageActions, a11yActions).testTag("message-bubble:${message.id}")) {
+                ChatBubble(own, group, bubbleMax) {
+                    // A scheduled result filed in this thread reads as a post, headed by the job that made it.
+                    if (post != null) Row(Modifier.padding(bottom = 2.dp).testTag("channel-post:${message.id}"), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Icon(Icons.Rounded.Schedule, null, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.primary)
+                        Text(post.job.ifBlank { uiText("Scheduled post") }, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                     }
-                }
-            } else if (message.role != "user" && (displayText.isNotBlank() || history.attachments.isNotEmpty())) Box(Modifier.fillMaxWidth().messageGestures(toggleInlineActions, openMessageActions).testTag("message-bubble:${message.id}"), contentAlignment = Alignment.CenterStart) {
-                AssistantSurface {
-                    if (displayText.isNotBlank()) Markdown(displayText, vm, origin, message.mediaSnapshots, documentKey = message.id)
+                    if (displayText.isNotBlank()) {
+                        if (own && !settings.optBoolean("render_user_markdown", true)) SelectionContainer { Text(displayText, style = MaterialTheme.typography.bodyLarge) }
+                        else BubbleText(displayText, vm, origin, message.mediaSnapshots, message.id)
+                    }
                     HistoryAttachmentChips(history.attachments)
-                    BubbleTime(message)
+                    BubbleMeta(message.recordedAt, message.id, if (own) SendTick.Sent else null)
                 }
+                actionsMenu()
             }
         }
-        renderActions()
-        MessageActivity("", message.tools, messageTime = message.recordedAt, toolResultsByCallId = toolResultsByCallId, onToolExpanded = onToolExpanded, onCopyResult = copySource, vm = vm, scope = origin)
-        message.attachments.forEach { attachment -> SecureAttachment(vm, attachment, origin, message.mediaSnapshots) }
+        if (message.tools.isNotEmpty()) Box(Modifier.widthIn(max = bubbleMax)) { MessageActivity("", message.tools, messageTime = message.recordedAt, toolResultsByCallId = toolResultsByCallId, onToolExpanded = onToolExpanded, onCopyResult = copySource, vm = vm, scope = origin) }
+        message.attachments.forEach { attachment -> Box(Modifier.widthIn(max = bubbleMax)) { SecureAttachment(vm, attachment, origin, message.mediaSnapshots) } }
     }
 }
 
@@ -1669,41 +1862,20 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
     if (shownLimit > ToolDetailPageSize) TextButton(onClick = { detailLimit = ToolDetailPageSize }, modifier = Modifier.testTag("$tag-show-less")) { Text(uiText("Show less")) }
 }
 
-/** Relay's assistant bubble: restrained surface, small tail corner, wide enough for rich content. */
 /** A send Hermes has not answered yet; an unknown outcome is shown separately, once the request has failed or been interrupted. */
 internal fun chatSendInFlight(chat: ChatState): Boolean = chat.uncertain.isNotBlank() && chat.status == "Sending"
 
 /** The confirmation before a resend of a message whose delivery is unconfirmed; one place for the row and the details sheet. */
 private fun resendForm(vm: BeaconViewModel) = ActionForm("Resend retained draft", "", emptyList(), explanation = "The earlier delivery is unconfirmed. Resending may create a duplicate if it already arrived.", actionLabel = "Resend", onResult = { vm.reviewPendingSend(resend = true) })
 
-/** The message being sent, laid out like the stored user row (label, bubble, action-row height) so its arrival does not shift the list. */
-@Composable private fun SendingMessage(text: String) {
-    Column(Modifier.fillMaxWidth().testTag("sending-message"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) { Text(uiText("You"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-        BoxWithConstraints(Modifier.fillMaxWidth()) {
-            Surface(Modifier.widthIn(max = maxWidth * .9f).align(Alignment.CenterEnd).alpha(.7f), shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp, bottomStart = 22.dp, bottomEnd = 4.dp), color = MaterialTheme.colorScheme.primaryContainer) {
-                Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
-                    Text(text.ifBlank { uiText("Attachment") })
-                    Text(messageTimeLabel(System.currentTimeMillis()).orEmpty(), Modifier.padding(top = 4.dp), style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
-        }
-        val sendingLabel = uiText("Sending…")
-        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).semantics { contentDescription = sendingLabel }, horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
-            CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+/** The message being sent, as its stored bubble will look (with a clock tick), so its arrival does not shift the list. */
+@Composable private fun SendingMessage(text: String, group: BubbleGroup, bubbleMax: Dp) {
+    Column(Modifier.fillMaxWidth().padding(top = if (group.startsRun) 10.dp else 3.dp).testTag("sending-message"), horizontalAlignment = Alignment.End) {
+        ChatBubble(own = true, group, bubbleMax, Modifier.alpha(.7f)) {
+            Text(text.ifBlank { uiText("Attachment") }, style = MaterialTheme.typography.bodyLarge)
+            BubbleMeta(System.currentTimeMillis(), SENDING_MESSAGE_ID, SendTick.Sending)
         }
     }
-}
-
-@Composable private fun AssistantSurface(content: @Composable ColumnScope.() -> Unit) {
-    Surface(Modifier.fillMaxWidth(.96f).testTag("assistant-bubble"), shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomEnd = 16.dp, bottomStart = 4.dp), color = MaterialTheme.colorScheme.surfaceContainerLow) {
-        Column(Modifier.padding(horizontal = 14.dp, vertical = 12.dp), content = content)
-    }
-}
-
-/** Real recorded time only; messages without one show none. */
-@Composable private fun BubbleTime(message: Message) {
-    messageTimeLabel(message.recordedAt)?.let { Text(it, Modifier.padding(top = 4.dp).testTag("message-time:${message.id}"), style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant) }
 }
 
 internal fun queuedHeading(count: Int): String = "$count ${if (count == 1) "message" else "messages"} queued — delivers after this turn"

@@ -25,7 +25,9 @@ def rpc(owner,provider,method,params):
 def verify(owner,provider,profile,stored,runtime=None,history=True):
     from tui_gateway import server
     with server._profile_db({'profile':profile}) as db:
-        stored_row=db.get_session(stored) if db else None
+        # A store that cannot be opened says nothing about ownership: the caller may try again.
+        if db is None: raise RuntimeError('Native conversation store unavailable')
+        stored_row=db.get_session(stored)
         if not stored_row or stored_row.get('user_id')!=provider+':'+owner:
             raise LookupError('Native stored conversation not owned')
     if runtime:
@@ -37,17 +39,14 @@ def verify(owner,provider,profile,stored,runtime=None,history=True):
             if (record.get('profile_home') or None)!=(str(requested_home) if requested_home else None):
                 raise LookupError('Native profile mismatch')
         return rpc(owner,provider,'session.history',{'profile':profile,'session_id':runtime}) if history else stored_row
-    with server._profile_db({'profile':profile}) as db:
-        row=db.get_session(stored) if db else None
-        if not row or row.get('user_id')!=provider+':'+owner:
-            raise LookupError('Native conversation not owned')
-        return row
+    return stored_row
 
 def reserve_conversation(owner,provider,profile,stored):
     """Persist an already-owned live draft without changing its conversation identity."""
     from tui_gateway import server
     with server._profile_db({'profile':profile}) as db:
-        existing=db.get_session(stored) if db else None
+        if db is None: raise RuntimeError('Native conversation store unavailable')
+        existing=db.get_session(stored)
     if existing is not None:
         return verify(owner,provider,profile,stored)
     requested_home=server._profile_home(profile)
@@ -90,6 +89,8 @@ def conversation_snapshot(owner, provider, profile, stored):
         ephemeral = list(active.get('history') or [])
         info = {key: active[key] for key in ('model', 'provider', 'title', 'cwd', 'reasoning_effort') if key in active}
     with server._profile_db({'profile': profile}) as db:
+        # A live chat still answers from its runtime; a saved one needs the store, and an unopenable store is not "not found".
+        if db is None and not active: raise RuntimeError('Native conversation store unavailable')
         row = db.get_session(stored) if db else None
         if row is not None and row.get('user_id') != expected_owner:
             raise LookupError('Native conversation not owned')
@@ -134,6 +135,36 @@ def conversation_list(owner, provider, profile, archived=False):
             seen.add(sid)
             selected.append(dict(item, id=sid, stored_session_id=sid))
     return dict(result, sessions=selected)
+
+THREAD_SOURCES = ('android_thread', 'phone')  # the app's Threads lane: Beacon threads and Relay threads
+POST_KIND = 'cron_delivery'
+# Hermes refuses a row while the thread's own turn runs or its context is being compressed; the post waits instead.
+POST_BUSY = ('SessionTurnLeaseLostError', 'SessionCompressionInProgressError')
+
+
+def threads(owner, provider, profile):
+    """The owner's open threads, newest first: the chats a scheduled job can post into."""
+    rows = conversation_list(owner, provider, profile)['sessions']
+    return [{'id': row['id'], 'title': row.get('title') or ''} for row in rows if row.get('source') in THREAD_SOURCES]
+
+
+def post(owner, provider, profile, stored, key, text, name):
+    """Record a scheduled result in an owned conversation, as Hermes records any result that arrives between turns.
+
+    The row is a user turn labelled like Hermes' own cron mirror ("[Cron delivery: ...]"), so alternation holds and
+    the thread's next turn adopts it (tui_gateway.prompt_turn._adopt_out_of_band_turns) whether the thread is open
+    or not. One row per ``key``, on the thread's live continuation; Hermes refuses it while a turn is running and the
+    caller retries. The caller has verified that the owner holds ``stored``."""
+    from tui_gateway import server
+    with server._profile_db({'profile': profile}, writer=True) as db:
+        if db is None: raise RuntimeError('Native conversation store unavailable')
+        add = getattr(db, 'append_completion_note', None)
+        if add is None: raise RuntimeError('Scheduled posts need a newer Hermes')
+        # A compressed thread continues under a new id; a row on the closed parent would be refused for good, as Hermes' own delivery rows are.
+        try: target = db.resolve_resume_session_id(stored) or stored
+        except Exception: target = stored
+        return add(target, key, '[Cron delivery: ' + name + ']\n' + text, POST_KIND, {'job': name})
+
 
 PROJECT_CREATION_LOCK = threading.Lock()
 

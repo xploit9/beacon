@@ -23,13 +23,18 @@ import dev.hermes.android.data.nativeApprovalModes
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 
-/** A new, unsent chat has no state Hermes can report yet; it runs on the profile's default, so that is what it shows. */
-internal fun chatApprovalSelection(record: JSONObject?, profileKey: String?, sessionId: String?, newChat: Boolean = false): String {
+/** A new, unsent chat has no state Hermes can report yet; it runs on the profile's default, so that is what it shows,
+ *  or the YOLO choice Hermes accepted for it ([chosenYolo]) until Hermes can report the chat itself. */
+internal fun chatApprovalSelection(record: JSONObject?, profileKey: String?, sessionId: String?, newChat: Boolean = false, chosenYolo: Boolean? = null): String {
     if (record == null || record.string("scope_key") != profileKey || record.string("session_id") != sessionId || recordError(record).isNotBlank()) return "unknown"
     val mode = record.string("profile_mode")
     return when {
         mode == "off" -> "off"
-        !record.optBoolean("session_status_known") -> if (newChat && mode in setOf("manual", "smart")) mode else "unknown"
+        !record.optBoolean("session_status_known") -> when {
+            chosenYolo == true && mode in setOf("manual", "smart") -> "yolo"
+            (chosenYolo == false || newChat) && mode in setOf("manual", "smart") -> mode
+            else -> "unknown"
+        }
         record.optBoolean("session_bypass") -> "yolo"
         mode in setOf("manual", "smart") -> mode
         else -> "unknown"
@@ -60,10 +65,13 @@ internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: S
     // A YOLO change in an unsent chat cannot be read back from Hermes before its first message, so the default is shown only until one is tried.
     val triedKey = "approvals-tried:${capturedScope?.key}"
     val newChat = chat.messages.isEmpty() && chat.streamId.isBlank() && data[triedKey] == null
+    // The YOLO choice Hermes accepted for this chat, shown while Hermes cannot report an unsent chat's state.
+    val chosenKey = "approvals-chosen:${capturedScope?.key}"
+    val chosenYolo = data[chosenKey]?.takeIf { it.has("yolo") }?.optBoolean("yolo")
     // True while a YOLO change is being saved (the choice asked for), so the shield shows it at once.
     var askedYolo by remember(capturedClient, capturedScope) { mutableStateOf<Boolean?>(null) }
     val askedSelection = askedYolo?.let { if (it) "yolo" else profileMode.takeIf { mode -> mode in setOf("manual", "smart") } }
-    val selection = shownApprovalSelection(chatApprovalSelection(record, capturedClient?.scope?.key, capturedScope?.session, newChat), loading || busy, askedSelection)
+    val selection = shownApprovalSelection(chatApprovalSelection(record, capturedClient?.scope?.key, capturedScope?.session, newChat, chosenYolo), loading || busy, askedSelection)
     val runtimeSession = chat.raw.string("runtime_session_id")
     LaunchedEffect(capturedClient, capturedScope, ui.connected, chat.projectionReady, runtimeSession, busy) {
         // A passive REST history has no runtime; painting its shield must not resume one.
@@ -78,7 +86,7 @@ internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: S
         askedYolo = turnOn
         vm.storeData(triedKey, JSONObject())
         val job = vm.action("/api/approval/mode", json("yolo" to turnOn, "session_id" to capturedScope.session, "scope_key" to capturedScope.key), refresh = false,
-            successNotice = if (turnOn) "YOLO on for this chat" else "YOLO off for this chat") { _, result -> vm.storeData(key, result) }
+            successNotice = if (turnOn) "YOLO on for this chat" else "YOLO off for this chat") { _, result -> vm.storeData(chosenKey, json("yolo" to turnOn)); vm.storeData(key, result) }
         scope.launch { try { job.join(); open = false } finally { saving = false; askedYolo = null } }
     }
     Box {

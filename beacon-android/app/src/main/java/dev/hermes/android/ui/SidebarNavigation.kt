@@ -129,8 +129,6 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
                 }
             }
         }
-        NavigationDrawerItem(label = { Text(assistantText("Beacon chat")) }, selected = ui.tab == "Beacon", onClick = { vm.navigate("Beacon") }, icon = { BeaconMark(contentDescription = assistantText("Beacon")) }, modifier = Modifier.testTag("navigation-beacon"))
-        HorizontalDivider()
     }
 }
 

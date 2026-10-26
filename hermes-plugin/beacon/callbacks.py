@@ -63,7 +63,7 @@ def _missed(mobile,native,conn,key,row,now):
         if (now-target).total_seconds()<CALLBACK_WINDOW_SECONDS or not _authority(mobile.settings(row['profile']),row): return False
         native.verify(row['owner'],row['provider'],row['profile'],row['conversation'])
         reason=observers.reason_text(row['reason'])
-    except (KeyError,TypeError,ValueError,LookupError): return False
+    except (KeyError,TypeError,ValueError,LookupError,RuntimeError): return False  # an unopenable store: try again on the next pass
     observers._notice(mobile,row['owner'],row['profile'],row['conversation'],
                       'Missed scheduled callback: '+reason,'missed-callback:'+event,now,conn=conn)
     row['status']='missed'

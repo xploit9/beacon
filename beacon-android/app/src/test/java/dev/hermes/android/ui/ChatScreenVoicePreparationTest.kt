@@ -65,25 +65,6 @@ class ChatScreenVoicePreparationTest {
         assertEquals(emptyMap<String, FoldedToolResult>(), folded.byCallId)
     }
 
-    @Test fun assistantLabelsShowOncePerReplyAndResetAtBoundaries() {
-        val messages = listOf(
-            Message("orphan-first", "tool", "result before call"),
-            Message("assistant-1", "assistant", "First part"),
-            Message("tool-result", "tool", "result"),
-            Message("assistant-2", "assistant", "Second part"),
-            Message("user-1", "user", "Next turn"),
-            Message("assistant-3", "assistant", "New reply"),
-            Message("assistant-day", "assistant", "New day"),
-            Message("assistant-call", "assistant", "Call transcript"),
-            Message("assistant-4", "assistant", "After call"),
-        )
-
-        assertEquals(
-            setOf("assistant-1", "assistant-3", "assistant-day", "assistant-call"),
-            assistantLabelMessageIds(messages, setOf("assistant-day"), setOf("assistant-call")),
-        )
-    }
-
     @Test fun explicitToolCallIdTakesPrecedenceWhenLinkingAStoredResult() {
         val tool = JSONObject().put("id", "other-id").put("tool_call_id", "call-1")
         assertEquals("call-1", toolCallResultId(tool))

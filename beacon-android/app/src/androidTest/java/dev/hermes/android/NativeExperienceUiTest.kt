@@ -22,6 +22,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.junit4.StateRestorationTester
@@ -638,35 +639,25 @@ class NativeExperienceUiTest {
         await { vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady && vm.chat.value.messages.size == 3 }
         val original = vm.chat.value.messages[1]
         val latestAssistant = vm.chat.value.messages.last { it.role == "assistant" && it.text.isNotBlank() }
-        compose.onNodeWithTag("message-actions:${latestAssistant.id}").assertExists()
+        // No always-visible row: the actions are in the menu a long-press opens, attached to the bubble.
+        compose.onNodeWithTag("message-actions:${latestAssistant.id}").assertDoesNotExist()
         compose.onNodeWithTag("message-actions:${original.id}").assertDoesNotExist()
-        fun action(label: String) = compose.onNode(hasContentDescription(label) and hasAnyAncestor(hasTestTag("message-actions:${original.id}")))
-        fun revealAction(label: String) {
-            val target = action(label)
-            val bubble = compose.onNodeWithTag("message-bubble:${original.id}").performScrollTo()
-            if (runCatching { target.assertIsDisplayed() }.isFailure) bubble.performClick()
-            target.assertIsDisplayed()
+        fun openMenu() {
+            compose.onNodeWithTag("message-bubble:${original.id}").performScrollTo().performTouchInput { longClick() }
+            compose.onNodeWithTag("message-actions:${original.id}").assertExists()
         }
-        val bubble = compose.onNodeWithTag("message-bubble:${original.id}").performScrollTo()
-        bubble.performClick()
-        compose.onNodeWithTag("message-actions:${original.id}").assertExists()
-        bubble.performClick()
-        compose.onNodeWithTag("message-actions:${original.id}").assertDoesNotExist()
-        bubble.performTouchInput { longClick() }
-        compose.onNodeWithText("Copy source").assertIsDisplayed().performClick()
-        revealAction("More message actions")
-        action("More message actions").performScrollTo().performClick()
+        openMenu()
+        listOf("Copy", "Quote in reply", "Share", "Read aloud", "Copy source", "Branch from here", "Edit and branch").forEach { compose.onNodeWithText(it).assertExists() }
         compose.onNodeWithText("Copy source").performClick()
         val clipboard = app.getSystemService(android.content.ClipboardManager::class.java)
         assertEquals(original.text, clipboard.primaryClip!!.getItemAt(0).text.toString())
-        revealAction("Share text")
-        action("Share text").performScrollTo().performClick()
+        openMenu()
+        compose.onNodeWithText("Share").performClick()
         val automation = InstrumentationRegistry.getInstrumentation().uiAutomation
         await { automation.rootInActiveWindow?.packageName?.toString()?.let { it != app.packageName } == true }
         assertTrue(automation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK))
         compose.waitForIdle()
-        revealAction("More message actions")
-        action("More message actions").performScrollTo().performClick()
+        openMenu()
         compose.onNodeWithText("Branch from here").performClick()
         await { vm.chat.value.sessionId.startsWith("branch-") }
         await { vm.ui.value.notice == "Branched into a new conversation" }
@@ -677,8 +668,7 @@ class NativeExperienceUiTest {
         assertEquals(2, fixture.requests.last { it.string("method") == "session.branch" }.getJSONObject("params").getInt("count"))
         compose.runOnIdle { vm.selectSession("chat-a") }
         await { vm.chat.value.sessionId == "chat-a" && vm.chat.value.messages.isNotEmpty() }
-        revealAction("More message actions")
-        action("More message actions").performScrollTo().performClick()
+        openMenu()
         compose.onNodeWithText("Edit and branch").performClick()
         await { vm.chat.value.sessionId.startsWith("branch-") && vm.composer.value.text == original.text }
         assertEquals(1, fixture.requests.last { it.string("method") == "session.branch" }.getJSONObject("params").getInt("count"))
@@ -718,9 +708,9 @@ class NativeExperienceUiTest {
         }
         message("[Read test PDF](/api/file/raw?path=C:/synthetic-workspace/reader.pdf)")
         val textLayouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
-        compose.onNodeWithText("Read test PDF").performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(textLayouts) }
+        compose.onNode(inConversation(hasText("Read test PDF")), useUnmergedTree = true).performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(textLayouts) }
         val linkPosition = textLayouts.single().getBoundingBox(2).center
-        compose.onNodeWithText("Read test PDF").performTouchInput { click(linkPosition) }
+        compose.onNode(inConversation(hasText("Read test PDF")), useUnmergedTree = true).performTouchInput { click(linkPosition) }
         await { compose.onAllNodesWithContentDescription("PDF page 1").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithTag("pdf-page-count").assertTextEquals("1 / 2")
         compose.onNodeWithContentDescription("Previous PDF page").assertIsNotEnabled()
@@ -926,7 +916,7 @@ class NativeExperienceUiTest {
         val reasoning = compose.onNodeWithTag("message-reasoning:reasoned-answer").performScrollTo().fetchSemanticsNode().boundsInRoot
         val answer = compose.onNodeWithTag("message-bubble:reasoned-answer").performScrollTo().fetchSemanticsNode().boundsInRoot
         assertTrue("Reasoning belongs above its answer", reasoning.top < answer.top)
-        compose.onNodeWithContentDescription("More message actions").performScrollTo().performClick()
+        compose.onNodeWithTag("message-bubble:reasoned-answer").performScrollTo().performTouchInput { longClick() }
         compose.onNodeWithTag("copy-source-action").performScrollTo()
         compose.onNodeWithTag("copy-source-icon", useUnmergedTree = true).assertIsDisplayed()
         compose.onNodeWithTag("copy-source-action").performClick()
@@ -1315,15 +1305,30 @@ class NativeExperienceUiTest {
         compose.onNodeWithTag("history-filter").performScrollTo().performClick()
         compose.onNodeWithTag("history-all-profiles").performClick()
         await { vm.data.value["navigation-profiles"]?.rows("profiles")?.any { it.string("name") == "coder" && it.string("display_name") == "Code profile" } == true && vm.ui.value.sessions.any { it.string("profile") == "coder" && sessionRowId(it) == "coder-chat" } && !vm.ui.value.historyLoading }
-        compose.onNodeWithTag("history-row:coder:coder-chat").assertTextContains("Code profile").performClick()
+        compose.onNodeWithTag("history-row:coder:coder-chat").assertTextContains("Code profile", substring = true).performClick()
         await { vm.ui.value.profile == "coder" && vm.chat.value.sessionId == "coder-chat" && vm.chat.value.projectionReady }
         assertTrue(fixture.requests.any { it.string("path") == "/api/sessions" && it.string("profile") == "coder" })
         receipts += "All Profiles labels history rows with Hermes display names and opens a selected row after switching to its authorized profile."
     }
 
+    @Test fun signOutForgetsChatPreviewsForEveryKnownProfile() = withFixture { vm, fixture ->
+        val profiles = listOf("default", "coder").map { fixture.scope.copy(profile = it, session = "") }
+        runBlocking { profiles.forEach { app.cache.write(it, "chat-glances", "{}", protected = true); app.cache.write(it, "conversation-index", json("sessions" to org.json.JSONArray()).toString()) } }
+        compose.runOnIdle { vm.storeData("navigation-profiles", json("profiles" to org.json.JSONArray().put(json("name" to "default")).put(json("name" to "coder")))) }
+        val otherAccount = fixture.scope.copy(owner = "someone-else", profile = "default", session = "")
+        runBlocking { app.cache.write(otherAccount, "chat-glances", "{}", protected = true) }
+        compose.runOnIdle { vm.forgetScreens() }
+        await { runBlocking { profiles.all { app.cache.read(it, "chat-glances") == null && app.cache.read(it, "conversation-index") == null } } }
+        assertNotNull("Another account's previews are never touched", runBlocking { app.cache.read(otherAccount, "chat-glances") })
+        runBlocking { app.cache.delete(otherAccount, "chat-glances") }
+        receipts += "Sign-out and device removal forget the chat list and its previews for every profile the app knows."
+    }
+
     @Test fun historyAllProfilesListsOtherProfilesWhenTheCurrentOneHasNoStore() = withFixture { vm, fixture ->
         // An earlier test may have cached the profile catalogue (fresh for two minutes) without these names.
         runBlocking { listOf("default", "coder").forEach { app.cache.delete(fixture.scope.copy(profile = it), "read:/api/profiles") } }
+        // The chat list opens from cache first: an earlier test's cached coder list would stand in for the empty one.
+        runBlocking { listOf("conversation-index", "chat-glances").forEach { app.cache.delete(fixture.scope.copy(profile = "coder", session = ""), it) } }
         fixture.profileDisplayNames = mapOf("default" to "Personal profile", "coder" to "Code profile")
         fixture.profileSessionIds = mapOf("default" to setOf("chat-a", "chat-b"))
         // Real Hermes: a profile whose gateway never ran has no state.db, and its list read answers this 503.
@@ -1876,7 +1881,7 @@ class NativeExperienceUiTest {
             await { vm.ui.value.tab == "Beacon" && !vm.ui.value.beaconOpening && vm.chat.value.projectionReady }
             compose.waitUntil(5_000) { compose.onAllNodesWithText("Message Nova", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
             compose.runOnIdle { vm.toggleSessions(true) }
-            compose.waitUntil(5_000) { compose.onAllNodesWithText("Nova chat", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+            compose.waitUntil(5_000) { compose.onAllNodes(hasTestTag("history-beacon-row") and hasText("Nova", substring = true)).fetchSemanticsNodes().isNotEmpty() }
             receipts += "Renaming the assistant in Settings shows the new name on its tab and composer."
         } finally {
             runBlocking { app.preferences.edit { it.remove(stringPreferencesKey("assistant_name")) } }
@@ -2067,8 +2072,8 @@ class NativeExperienceUiTest {
         assertTrue(share.getStringExtra(android.content.Intent.EXTRA_TEXT).orEmpty().contains("Mountains"))
         receipts += "Share payload carries safe HTML and readable plain text; receiving-app formatting remains its responsibility."
         await { compose.onAllNodesWithText("Mountains and the surrounding national park", substring = true).fetchSemanticsNodes().isNotEmpty() }
-        compose.onNodeWithTag("message-actions:11").performScrollTo()
-        compose.onNode(hasContentDescription("Copy formatted message") and hasAnyAncestor(hasTestTag("message-actions:11"))).assertIsDisplayed().performClick()
+        compose.onNodeWithTag("message-bubble:11").performScrollTo().performTouchInput { longClick() }
+        compose.onNodeWithTag("message-copy:11").assertIsDisplayed().performClick()
         val clipboard = app.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
         compose.waitForIdle()
         await { clipboard.primaryClip?.getItemAt(0)?.htmlText?.contains("<table") == true }
@@ -2704,9 +2709,12 @@ class NativeExperienceUiTest {
         val automation=InstrumentationRegistry.getInstrumentation().uiAutomation
         val audio=app.getSystemService(android.media.AudioManager::class.java)
         try {
-            compose.onAllNodesWithContentDescription("Read aloud").onFirst().performScrollTo().performClick()
+            val reply = vm.chat.value.messages.last { it.role == "assistant" && it.text.isNotBlank() }
+            compose.onNodeWithTag("message-bubble:${reply.id}").performScrollTo().performTouchInput { longClick() }
+            compose.onNodeWithTag("message-read-aloud:${reply.id}").performClick()
             await { vm.readingAloud.value && audio.activePlaybackConfigurations.isNotEmpty() }
-            compose.onAllNodesWithContentDescription("Stop read aloud").onFirst().performClick()
+            compose.onNodeWithTag("message-bubble:${reply.id}").performScrollTo().performTouchInput { longClick() }
+            compose.onNodeWithTag("message-read-aloud:${reply.id}").performClick()
             await { !vm.readingAloud.value && audio.activePlaybackConfigurations.isEmpty() }
             val draft=vm.composer.value.text
             compose.onNodeWithContentDescription("Dictate").performClick()
@@ -2824,7 +2832,8 @@ class NativeExperienceUiTest {
 
     @Test fun relayChatExtrasQuoteCommandsAndConversationId() = withFixture { vm, fixture ->
         val message = vm.chat.value.messages.last { it.role == "assistant" && it.text.isNotBlank() }
-        compose.onNodeWithTag("message-quote:${message.id}", useUnmergedTree = true).performScrollTo().performClick()
+        compose.onNodeWithTag("message-bubble:${message.id}").performScrollTo().performTouchInput { longClick() }
+        compose.onNodeWithTag("message-quote:${message.id}", useUnmergedTree = true).performClick()
         await { vm.composer.value.text.startsWith("> " + dev.hermes.android.ui.quoteExcerpt(message.text).take(12)) && vm.composer.value.text.endsWith("\n\n") }
 
         compose.runOnIdle { vm.composer(TextFieldValue("")) }
@@ -2845,6 +2854,128 @@ class NativeExperienceUiTest {
         await { vm.composer.value.text == "/" }
         compose.onNodeWithTag("slash-suggestions").assertIsDisplayed()
         receipts += "Quote in reply, Copy conversation ID and Camera remain reachable; commands use '/' and image paste uses the field menu."
+    }
+
+    @Test fun bubblesSitOnTheirSideGroupedWithATimeAndTickAndNoNameLabels() = withFixture { vm, _ ->
+        val now = System.currentTimeMillis()
+        val chatId = vm.chat.value.sessionId
+        val messages = listOf(
+            Message("tg-old", "user", "From two days ago", sessionId = chatId, recordedAt = now - 2 * 24 * 60 * 60 * 1000L),
+            Message("tg-u1", "user", "Short question", sessionId = chatId, recordedAt = now),
+            Message("tg-a1", "assistant", "First part.", sessionId = chatId, recordedAt = now),
+            Message("tg-a2", "assistant", "Second part.", sessionId = chatId, recordedAt = now),
+            Message("tg-long", "assistant", "A **long** answer " + "with many words ".repeat(60), sessionId = chatId, recordedAt = now),
+            Message("tg-post", "user", "[Cron delivery: Cyber news]\nTop story: patch Tuesday.", sessionId = chatId, recordedAt = now, displayKind = "cron_delivery"),
+        )
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(messages = messages) }
+        val transcript = compose.onNodeWithTag("conversation-transcript")
+        await { compose.onAllNodesWithTag("message-bubble:tg-post").fetchSemanticsNodes().isNotEmpty() }
+        fun bounds(id: String) = compose.onNodeWithTag("message-bubble:$id").getUnclippedBoundsInRoot()
+        val layer = compose.onNodeWithTag("transcript-layer").getUnclippedBoundsInRoot()
+
+        // The transcript follows the newest message until the owner drags it, so reveal older bubbles with a real swipe.
+        repeat(8) {
+            if (compose.onAllNodesWithTag("message-bubble:tg-a2").fetchSemanticsNodes().isNotEmpty() && compose.onAllNodesWithTag("message-bubble:tg-u1").fetchSemanticsNodes().isNotEmpty()) return@repeat
+            transcript.performTouchInput { swipeDown() }
+            compose.waitForIdle()
+        }
+        val own = bounds("tg-u1"); val first = bounds("tg-a1"); val second = bounds("tg-a2")
+        assertTrue("Own messages sit on the right", layer.right - own.right < 24.dp)
+        assertTrue("The assistant's sit on the left", first.left - layer.left < 24.dp)
+        assertEquals("One sender's bubbles are tight", 3f, (second.top - first.bottom).value, 1f)
+        assertEquals("Groups sit further apart", 10f, (first.top - own.bottom).value, 1f)
+        val limit = minOf((layer.right - layer.left).value * .8f, 560f)
+        assertTrue("A short plain message shrinks to its words", (own.right - own.left).value < limit / 2)
+        // No name above a message; the time sits inside the bubble and only the owner's own message carries the sent tick.
+        compose.onAllNodes(hasText("You") and hasAnyAncestor(hasTestTag("conversation-transcript"))).assertCountEquals(0)
+        compose.onAllNodes(hasText(dev.hermes.android.data.currentAssistantName) and hasAnyAncestor(hasTestTag("conversation-transcript"))).assertCountEquals(0)
+        compose.onNodeWithTag("message-time:tg-u1", useUnmergedTree = true).assertIsDisplayed()
+        compose.onNode(hasTestTag("send-tick:sent") and hasAnyAncestor(hasTestTag("message-row:tg-u1")), useUnmergedTree = true).assertExists()
+        compose.onAllNodes(hasTestTag("send-tick:sent") and hasAnyAncestor(hasTestTag("message-row:tg-a1")), useUnmergedTree = true).assertCountEquals(0)
+        // TalkBack gets each action by name.
+        compose.onNodeWithTag("message-bubble:tg-a1").assert(SemanticsMatcher.keyIsDefined(androidx.compose.ui.semantics.SemanticsActions.CustomActions))
+        // The day between messages is a centred chip.
+        compose.onNode(hasText("Today") and hasAnyAncestor(hasTestTag("date-chip"))).assertExists()
+        assertTrue(compose.onAllNodes(hasTestTag("date-chip")).fetchSemanticsNodes().isNotEmpty())
+
+        transcript.performScrollToNode(hasTestTag("message-bubble:tg-long"))
+        val long = bounds("tg-long")
+        assertTrue("A wide bubble stops near 80% of the width, never past 560dp", (long.right - long.left).value <= limit + 1f)
+        // A scheduled result filed in the thread is a post: on the assistant's side, headed by its job, without Hermes' label or a tick.
+        transcript.performScrollToNode(hasTestTag("message-bubble:tg-post"))
+        compose.onNode(hasText("Cyber news") and hasAnyAncestor(hasTestTag("channel-post:tg-post"))).assertExists()
+        compose.onNode(inConversation(hasText("Top story: patch Tuesday.", substring = true))).assertExists()
+        compose.onAllNodesWithText("[Cron delivery", substring = true).assertCountEquals(0)
+        assertTrue("A post sits on the assistant's side", bounds("tg-post").left - layer.left < 24.dp)
+        compose.onAllNodes(hasTestTag("send-tick:sent") and hasAnyAncestor(hasTestTag("message-row:tg-post")), useUnmergedTree = true).assertCountEquals(0)
+        receipts += "Bubbles: own on the right, the assistant's on the left, grouped 3dp apart and groups 10dp apart; no name labels, the time and sent tick inside the bubble, date chips between days, width capped at 80% or 560dp."
+        capture("telegram-bubbles")
+    }
+
+    @Test fun theSlashButtonOpensTheCommandListFromAnEmptyComposer() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.composer(TextFieldValue("")) }
+        compose.onNodeWithTag("composer-commands").assertIsDisplayed().assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp).performClick()
+        await { vm.composer.value.text == "/" }
+        await { vm.data.value["slash:catalog"] != null }
+        compose.onNodeWithTag("slash-suggestions").assertIsDisplayed()
+        compose.onNodeWithText("/help", substring = true).assertExists()
+        // The button gives way to the text; the list filters as the command is typed and stays above the field.
+        compose.onNodeWithTag("composer-commands").assertDoesNotExist()
+        compose.onNodeWithTag("message-input").performTextInput("he")
+        await { vm.composer.value.text == "/he" }
+        compose.onNodeWithText("/help", substring = true).assertExists()
+        val suggestions = compose.onNodeWithTag("slash-suggestions").getUnclippedBoundsInRoot()
+        val input = compose.onNodeWithTag("message-input").getUnclippedBoundsInRoot()
+        assertTrue("The list sits above the field", suggestions.bottom <= input.top)
+        assertEquals("Opening the list creates nothing", 0, fixture.requests.count { it.string("method") == "session.create" })
+        compose.runOnIdle { vm.composer(TextFieldValue("")) }
+        compose.onNodeWithTag("composer-commands").assertIsDisplayed()
+        receipts += "The slash button starts the command list from an empty composer; the list filters as you type and the button returns when the draft is empty."
+        capture("telegram-slash-button")
+    }
+
+    @Test fun theHeaderNamesWhatTheAssistantIsDoingAndItsTitleOpensTheChatMenu() = withFixture { vm, _ ->
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "runtime-chat-a", liveText = "") }
+        compose.onNodeWithTag("chat-header-subtitle", useUnmergedTree = true).assertTextEquals("Thinking…")
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "runtime-chat-a", liveText = "Working on it") }
+        compose.onNodeWithTag("chat-header-subtitle", useUnmergedTree = true).assertTextEquals("Typing…")
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "", liveText = "") }
+        compose.onNodeWithTag("chat-header-title").assertHeightIsAtLeast(48.dp).performClick()
+        compose.onNodeWithTag("conversation-actions-menu").assertIsDisplayed()
+        androidx.test.espresso.Espresso.pressBack()
+        receipts += "The header shows an avatar, thinking or typing while a turn streams, and its title opens the chat menu."
+    }
+
+    @Test fun aNewThreadAsksForANameWithAnOptionalEmojiStoredAsTheHermesTitle() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.toggleSessions(true) }
+        compose.onNodeWithTag("history-filter").performScrollTo().performClick()
+        compose.onNodeWithTag("history-new-thread").performClick()
+        val emoji = threadEmojis.first()
+        compose.onNodeWithTag("new-thread-emoji:$emoji").assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp).performClick()
+        compose.onNodeWithTag("new-thread-name").performTextInput("Cyber news")
+        compose.onNodeWithTag("new-thread-start").performClick()
+        await { fixture.requests.any { it.string("method") == "session.create" && it.getJSONObject("params").string("source") == "android_thread" } }
+        assertEquals("The emoji is only the start of the Hermes title", "$emoji Cyber news", fixture.requests.last { it.string("method") == "session.create" }.getJSONObject("params").string("title"))
+        await { vm.chat.value.sessionId.isNotBlank() && vm.chat.value.title == "$emoji Cyber news" }
+        // The emoji is the avatar, so the header text is the name alone.
+        compose.onNode(hasText("Cyber news") and hasAnyAncestor(hasTestTag("chat-header-title")), useUnmergedTree = true).assertExists()
+        receipts += "New thread takes a name and an optional emoji; both become the Hermes title and the thread's avatar and header show them."
+    }
+
+    @Test fun theBeaconChatLeadsTheListInTheSameRowStyleAsTheOthers() = withFixture { vm, _ ->
+        compose.runOnIdle { vm.toggleSessions(true) }
+        await { vm.ui.value.sessions.any { sessionRowId(it) == "chat-b" } && !vm.ui.value.historyLoading }
+        compose.onNodeWithTag("history-view-all").performScrollTo()
+        val filters = compose.onNodeWithTag("history-view-all").getUnclippedBoundsInRoot()
+        val beacon = compose.onNodeWithTag("history-beacon-row").getUnclippedBoundsInRoot()
+        val firstChat = compose.onNodeWithTag("history-row:chat-a").getUnclippedBoundsInRoot()
+        assertTrue("The Beacon row is the first of the list", filters.top < beacon.top && beacon.top < firstChat.top)
+        assertEquals("Same row height", (firstChat.bottom - firstChat.top).value, (beacon.bottom - beacon.top).value, 1f)
+        // Telegram rows: a title, then one line with what Hermes knows of the chat.
+        compose.onNodeWithTag("history-row:chat-b").assert(SemanticsMatcher("a title and a preview line") { (it.config.getOrNull(androidx.compose.ui.semantics.SemanticsProperties.Text)?.size ?: 0) >= 2 })
+        compose.onNodeWithTag("history-beacon-row").performClick()
+        await { vm.ui.value.tab == "Beacon" }
+        receipts += "The Beacon chat is the first row of the history list in the same style as every chat row, and opens the Beacon tab."
     }
 
     @Test fun aNewChatOffersStarterPromptsThatFillTheComposer() = withFixture { vm, fixture ->
@@ -4173,7 +4304,7 @@ class NativeExperienceUiTest {
             catch (error: Throwable) {
                 throw AssertionError("Queued follow-up: stream=${vm.chat.value.streamId} status=${vm.chat.value.status} texts=${vm.chat.value.messages.map { it.text.take(30) }} live=${vm.chat.value.liveText.take(40)} active=${fixture.activeRuntimeForTest()} requests=${recentCalls(fixture)}", error)
             }
-            compose.onNodeWithText("Queued follow-up completed", useUnmergedTree = true).assertIsDisplayed()
+            compose.onNode(inConversation(hasText("Queued follow-up completed")), useUnmergedTree = true).assertIsDisplayed()
             compose.onNodeWithTag("message-input").performClick().performTextInput("Send after recovery")
             compose.onNodeWithTag("message-send").assertIsEnabled().performClick()
             await { fixture.requests.count { it.string("method") == "prompt.submit" } == 3 }
@@ -4184,3 +4315,9 @@ class NativeExperienceUiTest {
     }
 
 }
+
+/** A node in the open conversation, not the chat list beside it (which previews each chat's latest message). */
+private val inChatList = SemanticsMatcher("in the chat list") {
+    it.config.getOrNull(androidx.compose.ui.semantics.SemanticsProperties.TestTag)?.let { tag -> tag.startsWith("history-row") || tag == "history-beacon-row" } == true
+}
+internal fun inConversation(matcher: SemanticsMatcher): SemanticsMatcher = matcher and !inChatList and !hasAnyAncestor(inChatList)
