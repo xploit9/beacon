@@ -329,6 +329,10 @@ class NativeApprovalMenuUiTest {
                 assertEquals("other-model --provider fixture", writes.single().string("value"))
                 assertEquals("session", writes.single().string("scope"))
                 assertEquals("runtime-chat-b", writes.single().string("session_id"))
+                // Hermes keeps a pick that names its provider only on a built agent, so the chat's agent is started first.
+                val sent = fixture.requests.toList()
+                assertTrue(sent.take(sent.indexOfFirst { it.string("method") == "config.set" })
+                    .any { it.string("method") == "approval.pending" && it.getJSONObject("params").string("session_id") == "runtime-chat-b" })
                 assertEquals("synthetic-model", fixture.profileModel)
                 assertEquals("medium", fixture.reasoningEffort)
                 assertEquals("manual", fixture.approvalMode)
@@ -368,6 +372,18 @@ class NativeApprovalMenuUiTest {
         assertEquals("runtime-chat-a", reset.string("session_id"))
         await { vm.data.value["picker:approvals"]?.optBoolean("session_status_known") == true && vm.conversationPending.value.isEmpty() && "picker:approvals" !in vm.refreshing.value }
         compose.onNodeWithContentDescription("Approvals: Manual").assertIsDisplayed()
+    }
+
+    // Hermes reports nothing for a chat that is not saved yet; it runs on the profile default, so the shield shows Auto and ticks it.
+    @Test fun aNewUnsentChatShowsTheProfileDefaultSelected() = withFixture(prepare = { vm, fixture ->
+        fixture.omitResumeYolo = true; fixture.approvalMode = "smart"
+        flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(messages = emptyList())
+    }) { vm, _ ->
+        await { vm.data.value["picker:approvals"]?.string("profile_mode") == "smart" }
+        compose.onNodeWithContentDescription("Approvals: Auto").assertIsDisplayed()
+        open(vm)
+        compose.onNodeWithTag("approval-ask").assert(isSelected())
+        compose.onNodeWithTag("approval-yolo").assert(isNotSelected())
     }
 
     @Test fun savedTrueBypassIsShownWhenTheRuntimeDoesNotReportIt() = withFixture(prepare = { _, fixture ->

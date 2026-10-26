@@ -28,13 +28,15 @@ internal object GeminiWire {
         return VoiceProviderRequest(Request.Builder().url("$API_BASE/voices?type=prebuilt&page_size=1000").header("x-goog-api-key", apiKey).build(),"gemini")
     }
 
+    // shortcut: Google gives no capability flag for conversational live, so these names are matched; revisit if one appears.
+    private val NOT_CONVERSATIONAL = Regex("transcribe|translate|robotics", RegexOption.IGNORE_CASE)
     fun models(value: JSONObject): List<String> {
         val rows = value.optJSONArray("models") ?: return emptyList()
         return (0 until rows.length()).mapNotNull { index ->
             val row = rows.optJSONObject(index) ?: return@mapNotNull null
             val methods = row.optJSONArray("supportedGenerationMethods") ?: return@mapNotNull null
             val supportsLive = (0 until methods.length()).any { methods.optString(it) == "bidiGenerateContent" }
-            row.optString("name").takeIf { supportsLive && safeCatalogValue(it) && it.startsWith("models/") }
+            row.optString("name").takeIf { supportsLive && safeCatalogValue(it) && it.startsWith("models/") && !NOT_CONVERSATIONAL.containsMatchIn(it + " " + row.optString("displayName")) }
         }.distinct()
     }
 

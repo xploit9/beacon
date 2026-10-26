@@ -112,6 +112,7 @@ class KeepConnectedUiTest {
         val hadRecordAudio = app.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         val fixture = NativeExperienceFixture()
         val scope = fixture.scope
+        val priorBeacon = app.cache.read(scope, "beacon-session")
         val oldAuth = app.auth.read(scope.origin)
         val dataBefore = app.preferences.data.first()
         val keepPrefs = app.getSharedPreferences(KeepConnectedService.PREFS, Context.MODE_PRIVATE)
@@ -185,9 +186,10 @@ class KeepConnectedUiTest {
             }
             compose.waitUntil(5_000) { !vm.ui.value.restoringSession }
             vmClient = fixture.clientFor(auth, app.auth)
+            // Only the cache names the Beacon chat, as after a cold start: nothing prepared and an empty saved handle.
+            app.cache.write(scope, "beacon-session", "chat-b", protected = true)
             compose.runOnUiThread {
                 field(vm, "client", vmClient)
-                field(vm, "preparedBeacon", scope to "chat-b")
                 flow<AppState>(vm, "_ui").value = AppState(origin = scope.origin, authenticated = true, connected = true, owner = scope.owner, profile = scope.profile, setupComplete = true, restoringSession = false)
                 app.calls.ownerScope = scope
                 app.calls.uiVisible = false
@@ -253,10 +255,11 @@ class KeepConnectedUiTest {
 
             compose.runOnIdle { showIncomingCall.value = true }
             compose.onNodeWithTag("beacon-incoming-answer").assertIsDisplayed().performClick()
-            try { compose.waitUntil(15_000) { vm.ui.value.tab == "Beacon" && vm.chat.value.sessionId == "chat-b" } }
+            // The saved Beacon handle starts empty here, as after a cold start; the Beacon screen must still be usable.
+            try { compose.waitUntil(15_000) { vm.ui.value.tab == "Beacon" && vm.chat.value.sessionId == "chat-b" && vm.isBeaconConversation() } }
             catch (timeout: androidx.compose.ui.test.ComposeTimeoutException) {
                 // Keep the state that shows why answering did not open the chat.
-                throw AssertionError("Answer did not open chat-b: tab=${vm.ui.value.tab} session=${vm.chat.value.sessionId} error=${vm.ui.value.error} " +
+                throw AssertionError("Answer did not open chat-b: tab=${vm.ui.value.tab} session=${vm.chat.value.sessionId} ready=${vm.isBeaconConversation()} error=${vm.ui.value.error} " +
                     "notice=${vm.ui.value.notice} callError=${app.calls.state.value.error} invite=${app.push.ringingInvitation(answerSource, answerEventId) != null} " +
                     "requests=${fixture.requests.takeLast(8).map { it.string("method") + " " + it.string("path") }}", timeout)
             }
@@ -320,6 +323,7 @@ class KeepConnectedUiTest {
             )))
             assertFalse(app.push.authorizeKeepConnectedAction(receiptlessSource, receiptlessEventId, "answer"))
         } finally {
+            if (priorBeacon == null) app.cache.delete(scope, "beacon-session") else app.cache.write(scope, "beacon-session", priorBeacon, protected = true)
             KeepConnectedService.setEnabled(app, null, false)
             if (previousSignInNotification == null) manager.cancel(4083)
             else manager.notify(previousSignInNotification.tag, previousSignInNotification.id, previousSignInNotification.notification)

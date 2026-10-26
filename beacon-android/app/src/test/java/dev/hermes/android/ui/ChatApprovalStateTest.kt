@@ -17,6 +17,17 @@ class ChatApprovalStateTest {
         assertEquals("Unknown", approvalChoiceLabel("unknown"))
     }
 
+    @Test fun aNewUnsentChatShowsTheProfileDefaultButNeverHidesAReportedState() {
+        val unreported = record().put("session_status_known", false)
+        assertEquals("smart", chatApprovalSelection(unreported, "owner-profile", "chat-a", newChat = true))
+        assertEquals("manual", chatApprovalSelection(record("manual").put("session_status_known", false), "owner-profile", "chat-a", newChat = true))
+        assertEquals("unknown", chatApprovalSelection(unreported, "owner-profile", "chat-a"))
+        assertEquals("unknown", chatApprovalSelection(record("").put("session_status_known", false), "owner-profile", "chat-a", newChat = true))
+        assertEquals("unknown", chatApprovalSelection(unreported, "owner-profile", "chat-b", newChat = true))
+        assertEquals("off", chatApprovalSelection(record("off").put("session_status_known", false), "owner-profile", "chat-a", newChat = true))
+        assertEquals("yolo", chatApprovalSelection(record(bypass = true), "owner-profile", "chat-a", newChat = true))
+    }
+
     @Test fun autoAndBypassNeverFallBackToManual() {
         assertEquals("smart", chatApprovalSelection(record(), "owner-profile", "chat-a"))
         assertEquals("Auto", approvalChoiceLabel("smart"))

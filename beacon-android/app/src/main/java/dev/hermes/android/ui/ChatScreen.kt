@@ -414,7 +414,19 @@ private data class CallTranscriptMetadata(val durationSeconds: Long?, val provid
 internal fun callTranscriptGroupsMatchingSearch(groups: List<CallTranscriptGroup>, search: String): List<CallTranscriptGroup> =
     groups.filter { group -> search.isBlank() || group.lines.any { it.text.contains(search, ignoreCase = true) } }
 
+/** A Bot Chat speaks as its bot: its reply label and composer hint use the bot's name, not the assistant's. */
+internal fun botChatName(activeBotProfile: String?, botSessionId: String, chatSessionId: String, profiles: List<JSONObject>): String? =
+    activeBotProfile?.takeIf { botSessionId.isNotBlank() && botSessionId == chatSessionId }?.let { profileDisplayName(it, profiles) }
+
 @Composable fun ChatScreen(vm: BeaconViewModel, beacon: Boolean = false, onComposerHeight: (Int) -> Unit = {}, navigationBack: (() -> Unit)? = null, titleOverride: String? = null) {
+    val bot by vm.botMode.state.collectAsStateWithLifecycle()
+    val openChat by vm.chat.collectAsStateWithLifecycle()
+    val profiles = vm.data.collectAsStateWithLifecycle().value["navigation-profiles"]?.rows("profiles").orEmpty()
+    val assistantName = botChatName(bot.activeBot?.profile, bot.sessionId, openChat.sessionId, profiles) ?: LocalAssistantName.current
+    CompositionLocalProvider(LocalAssistantName provides assistantName) { ChatScreenBody(vm, beacon, onComposerHeight, navigationBack, titleOverride) }
+}
+
+@Composable private fun ChatScreenBody(vm: BeaconViewModel, beacon: Boolean, onComposerHeight: (Int) -> Unit, navigationBack: (() -> Unit)?, titleOverride: String?) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val profileDefaults by vm.data.collectAsStateWithLifecycle()
     val preferences by vm.preferences.collectAsStateWithLifecycle()
@@ -892,7 +904,14 @@ internal fun callTranscriptGroupsMatchingSearch(groups: List<CallTranscriptGroup
                     ) { Icon(Icons.Rounded.ExpandMore, uiText("Scroll to latest"), Modifier.size(24.dp)) }
                 }
             }
-            if (ready && chat.uncertain.isNotBlank() && !chatSendInFlight(chat)) Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) { Text(uiText("Checking whether your last message arrived. Your draft is saved."), Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium); TextButton(onClick = { vm.reconcileSend() }) { Text(uiText("Check receipt")) } }
+            if (ready && chat.uncertain.isNotBlank() && !chatSendInFlight(chat)) Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp).testTag("send-unconfirmed")) {
+                Text(uiText("Not sure your last message arrived. Resending may duplicate it. Your draft is saved."), style = MaterialTheme.typography.bodyMedium)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { vm.reconcileSend() }) { Text(uiText("Check receipt")) }
+                    TextButton(onClick = { vm.openForm(resendForm(vm)) }, modifier = Modifier.testTag("send-resend")) { Text(uiText("Resend")) }
+                    TextButton(onClick = { vm.reviewPendingSend() }, modifier = Modifier.testTag("send-dismiss")) { Text(uiText("Dismiss")) }
+                }
+            }
         }
     }
     BoxWithConstraints(Modifier.fillMaxSize()) {
@@ -1239,7 +1258,7 @@ internal fun acceptsInitialConversationEdit(
                 Text("Not sure this message arrived. Check the chat, then resend or dismiss.")
                 TextButton(onClick = { vm.reconcileSend() }) { Text("Refresh saved conversation") }
                 TextButton(onClick = { vm.openForm(ActionForm("Mark message reviewed", "", emptyList(), explanation = "You have checked the saved conversation. Keep the draft and clear its unconfirmed delivery state.", actionLabel = "Mark reviewed", onResult = { vm.reviewPendingSend() })); onDetails(false) }) { Text("Mark reviewed") }
-                TextButton(onClick = { vm.openForm(ActionForm("Resend retained draft", "", emptyList(), explanation = "The earlier delivery is unconfirmed. Resending may create a duplicate if it already arrived.", actionLabel = "Resend", onResult = { vm.reviewPendingSend(resend = true) })); onDetails(false) }) { Text("Resend draft…") }
+                TextButton(onClick = { vm.openForm(resendForm(vm)); onDetails(false) }) { Text("Resend draft…") }
             }
 
             preparing.forEach { file -> Text(attachmentPreparationLabel(file.string("name"), file.string("status"), file.string("error"))) }
@@ -1289,8 +1308,8 @@ internal fun acceptsInitialConversationEdit(
                     IconButton(onClick = { actions = true }) { Icon(Icons.Rounded.MoreHoriz, uiText("More message actions")) }
                     DropdownMenu(actions, { actions = false }) {
                         DropdownMenuItem({ Text("Copy source") }, { actions = false; copySource(displayText) }, leadingIcon = { Icon(Icons.Rounded.ContentCopy, null, Modifier.testTag("copy-source-icon")) }, modifier = Modifier.testTag("copy-source-action"))
-                        DropdownMenuItem({ Text(uiText("Branch from here")) }, { actions = false; vm.sessionAction("/api/session/branch", json("keep_count" to index + 1)) { o -> branchSessionId(o).takeIf(String::isNotBlank)?.let { id -> vm.selectSession(id); vm.notice("Branched into a new conversation") } } }, leadingIcon = { Icon(Icons.Rounded.CallSplit, null) })
-                        if (message.role == "user") DropdownMenuItem({ Text(uiText("Edit and branch")) }, { actions = false; vm.sessionAction("/api/session/branch", json("keep_count" to index)) { o -> (o.optJSONObject("session") ?: o).string("session_id").takeIf(String::isNotBlank)?.let { vm.selectSession(it, message.text) } } }, leadingIcon = { Icon(Icons.Rounded.Edit, null) })
+                        DropdownMenuItem({ Text(uiText("Branch from here")) }, { actions = false; vm.sessionAction("/api/session/branch", json("keep_count" to index + 1)) { o -> branchSessionId(o).takeIf(String::isNotBlank)?.let { id -> vm.selectSession(id, titleHint = branchTitle(o)); vm.refreshSessions(); vm.notice("Branched into a new conversation") } } }, leadingIcon = { Icon(Icons.Rounded.CallSplit, null) })
+                        if (message.role == "user") DropdownMenuItem({ Text(uiText("Edit and branch")) }, { actions = false; vm.sessionAction("/api/session/branch", json("keep_count" to index)) { o -> (o.optJSONObject("session") ?: o).string("session_id").takeIf(String::isNotBlank)?.let { vm.selectSession(it, message.text, titleHint = branchTitle(o)); vm.refreshSessions() } } }, leadingIcon = { Icon(Icons.Rounded.Edit, null) })
                     }
                 }
             }
@@ -1654,6 +1673,9 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
 /** A send Hermes has not answered yet; an unknown outcome is shown separately, once the request has failed or been interrupted. */
 internal fun chatSendInFlight(chat: ChatState): Boolean = chat.uncertain.isNotBlank() && chat.status == "Sending"
 
+/** The confirmation before a resend of a message whose delivery is unconfirmed; one place for the row and the details sheet. */
+private fun resendForm(vm: BeaconViewModel) = ActionForm("Resend retained draft", "", emptyList(), explanation = "The earlier delivery is unconfirmed. Resending may create a duplicate if it already arrived.", actionLabel = "Resend", onResult = { vm.reviewPendingSend(resend = true) })
+
 /** The message being sent, laid out like the stored user row (label, bubble, action-row height) so its arrival does not shift the list. */
 @Composable private fun SendingMessage(text: String) {
     Column(Modifier.fillMaxWidth().testTag("sending-message"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1840,7 +1862,7 @@ private fun chatAction(vm: BeaconViewModel, title: String) {
     if (!nativeConversationAction(title)) return vm.notice("$title is unavailable in native Hermes.")
     val chat = vm.chat.value
     val seed = json("session_id" to chat.sessionId)
-    val result: suspend (JSONObject) -> Unit = { response -> vm.selectSession((response.optJSONObject("session") ?: response).string("session_id", chat.sessionId)); vm.refreshSessions() }
+    val result: suspend (JSONObject) -> Unit = { response -> vm.selectSession((response.optJSONObject("session") ?: response).string("session_id", chat.sessionId), titleHint = branchTitle(response)); vm.refreshSessions() }
     when (title) {
         "New conversation" -> vm.newChat()
         "Rename" -> vm.openForm(ActionForm(title, "/api/session/rename", listOf(Field("title", "Conversation title", required = true)), seed.put("title", chat.title), onResult = result))

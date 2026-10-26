@@ -252,6 +252,15 @@ async def register_assistant_conversation(request:Request):
         raise HTTPException(409,'Assistant conversation registration unavailable')
     return {'registered':True,'conversation_id':conversation_id}
 
+@router.get('/mobile/assistant-conversation')
+async def assistant_conversation(request:Request):
+    # A phone with no Beacon chat of its own adopts the account's registered one instead of starting another.
+    owner,provider,profile,cfg=identity(request)
+    stored=cfg.get('scheduled_callback_conversation_id')
+    if not isinstance(stored,str) or not stored: raise HTTPException(404,'No assistant conversation')
+    await feature(native.verify,owner,provider,profile,stored,timeout=8,lookup_message='No assistant conversation')
+    return JSONResponse({'conversation_id':stored},headers={'Cache-Control':'no-store'})
+
 def skill_scope(profile,fn):
     # Skills use import-bound directories; use the native router's shared profile lock.
     from hermes_cli.web_server_profiles import _profile_scope
@@ -328,7 +337,7 @@ async def auto_update_settings(request:Request):
     return JSONResponse(await asyncio.to_thread(mobile.auto_update_settings,owner),headers={'Cache-Control':'no-store'})
 @router.put('/mobile/update-settings')
 async def save_auto_update_settings(request:Request):
-    # shortcut: 1.1.x phones still send their automatic-update switch here; the plugin never installs itself, so it only answers "off". Drop in 1.1.3, once the owner's phones run 1.1.2.
+    # shortcut: 1.1.x phones still send their automatic-update switch here; the plugin never installs itself, so it only answers "off". Drop once the owner's phones run 1.1.2 or later.
     owner,_,_,_=identity(request,owner_only=True);value=await body(request,1024)
     if set(value)!={'enabled'} or type(value['enabled']) is not bool: raise HTTPException(400,'Choose whether Beacon updates the plugin automatically')
     return JSONResponse(await asyncio.to_thread(mobile.auto_update_settings,owner),headers={'Cache-Control':'no-store'})
@@ -1079,7 +1088,7 @@ def _plugin_version_tuple(value):
     return tuple(int(part) for part in match.groups()) if match else None
 
 # shortcut: this GitHub check and APK staging serve only the installed 1.1.x phones, which install from Hermes' feed;
-# remove them and announce_release in 1.1.3, once the owner's phones run 1.1.2.
+# remove them and announce_release once the owner's phones run 1.1.2 or later.
 def _check_github_release(cfg):
     global _RELEASE_CACHE_KEY,_RELEASE_CACHE_VALUE
     repo=_safe_release_repo(cfg)

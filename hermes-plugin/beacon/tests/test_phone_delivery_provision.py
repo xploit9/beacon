@@ -77,6 +77,26 @@ def test_a_registered_beacon_chat_is_used_unchanged(unregistered):
     assert notice_conversation(s.api, sent['message_id'])[0] == 'my-beacon-chat'
 
 
+def test_another_phone_reads_the_accounts_registered_beacon_chat(unregistered, monkeypatch):
+    s = unregistered
+    assert s.client.get(PATH, params={'profile': 'default'}).status_code == 404  # nothing registered yet
+    assert s.client.put(PATH, json={'profile': 'default', 'session_id': 'my-beacon-chat'}).status_code == 200
+
+    found = s.client.get(PATH, params={'profile': 'default'})
+
+    assert found.status_code == 200 and found.json() == {'conversation_id': 'my-beacon-chat'}
+    assert s.client.get(PATH, params={'profile': 'work'}).status_code == 404  # every profile has its own chat
+    assert s.client.get(PATH, params={'profile': 'unknown'}).status_code == 403
+
+    def gone(*args, **kwargs):
+        raise LookupError('gone')
+
+    monkeypatch.setattr(s.api.native, 'verify', gone)
+    assert s.client.get(PATH, params={'profile': 'default'}).status_code == 404  # a deleted or foreign chat is never offered
+    s.client.headers['x-fixture-owner'] = 'foreign'
+    assert s.client.get(PATH, params={'profile': 'default'}).status_code == 403
+
+
 def test_the_owners_own_beacon_chat_replaces_the_saved_one_and_then_stays(unregistered):
     s = unregistered
     s.send('daily-brief')

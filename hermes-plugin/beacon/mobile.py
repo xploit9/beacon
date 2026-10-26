@@ -501,7 +501,7 @@ def auto_update_settings(owner):
             saved=json.loads(status_row[0].decode() if isinstance(status_row[0],bytes) else status_row[0])
             if isinstance(saved,dict): result.update(saved)
         except Exception: pass
-    # shortcut: 1.1.x phones still show an automatic-update switch read from "enabled"; the plugin never installs itself, so it is always off. Drop in 1.1.3, once the owner's phones run 1.1.2.
+    # shortcut: 1.1.x phones still show an automatic-update switch read from "enabled"; the plugin never installs itself, so it is always off. Drop once the owner's phones run 1.1.2 or later.
     return {'enabled':False,**result}
 
 def record_auto_update_status(owner,checked_at,result,app_version='',plugin_version='',message=''):

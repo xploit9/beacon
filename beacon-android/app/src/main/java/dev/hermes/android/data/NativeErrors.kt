@@ -1,5 +1,6 @@
 package dev.hermes.android.data
 
+import dev.hermes.android.core.string
 import org.json.JSONObject
 
 internal fun missingNativeConversation(error: Throwable): Boolean = error is ApiFailure &&
@@ -7,6 +8,26 @@ internal fun missingNativeConversation(error: Throwable): Boolean = error is Api
 
 internal const val APP_CONNECTION_ERROR = "Can't reach Hermes. Check your connection, then try again."
 private const val APP_OPERATION_ERROR = "Hermes couldn't do that. Try again."
+
+/**
+ * The failure happened while connecting (no network, DNS, refused or timed-out connect), so the message cannot have left the phone.
+ * A lost reply or a timeout after the prompt was written stays uncertain. shortcut: a read timeout before the prompt step also stays uncertain, refine only if that shows up.
+ */
+internal fun requestNeverSent(error: Throwable): Boolean {
+    val chain = generateSequence(error) { it.cause }.take(8).toList()
+    if (chain.any { it.message == NATIVE_OUTCOME_UNKNOWN }) return false
+    return chain.any {
+        it is java.net.UnknownHostException || it is java.net.ConnectException || it is java.net.NoRouteToHostException ||
+            it is java.net.SocketTimeoutException && it.message.orEmpty().contains("connect", ignoreCase = true)
+    }
+}
+
+private val modelRejectedCodes = setOf("model_not_found", "model_entitlement", "provider_policy_blocked", "format_error")
+
+/** The line for a failed turn. Hermes' `error_surface.code` says the provider turned the chosen model down; anything else keeps the generic text. */
+internal fun turnErrorText(event: JSONObject): String =
+    if (event.optJSONObject("error_surface")?.optString("code") in modelRejectedCodes) "The model rejected this request. Try again or pick another model."
+    else apiFailureText(event.optInt("code", 500), event.string("message", event.string("error")))
 
 /** UI presentation only: transport and model-facing tool results retain their original details and types. */
 internal fun apiFailureText(status: Int, detail: String): String {

@@ -223,7 +223,7 @@ import org.json.JSONObject
         } }
         Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(horizontal = 20.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
+                Column(Modifier.weight(1f).padding(end = 16.dp)) {
                     Text("Keep connected", style = MaterialTheme.typography.titleMedium)
                     Text("Let Hermes reach this phone for incoming calls while Beacon is closed.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }

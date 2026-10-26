@@ -23,12 +23,13 @@ import dev.hermes.android.data.nativeApprovalModes
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 
-internal fun chatApprovalSelection(record: JSONObject?, profileKey: String?, sessionId: String?): String {
+/** A new, unsent chat has no state Hermes can report yet; it runs on the profile's default, so that is what it shows. */
+internal fun chatApprovalSelection(record: JSONObject?, profileKey: String?, sessionId: String?, newChat: Boolean = false): String {
     if (record == null || record.string("scope_key") != profileKey || record.string("session_id") != sessionId || recordError(record).isNotBlank()) return "unknown"
     val mode = record.string("profile_mode")
     return when {
         mode == "off" -> "off"
-        !record.optBoolean("session_status_known") -> "unknown"
+        !record.optBoolean("session_status_known") -> if (newChat && mode in setOf("manual", "smart")) mode else "unknown"
         record.optBoolean("session_bypass") -> "yolo"
         mode in setOf("manual", "smart") -> mode
         else -> "unknown"
@@ -53,7 +54,10 @@ internal fun chatApprovalSelection(record: JSONObject?, profileKey: String?, ses
     val record = data[key]?.takeIf { it.string("scope_key") == capturedClient?.scope?.key && it.string("session_id") == capturedScope?.session }
     val profileMode = record?.string("profile_mode").orEmpty()
     val loading = key in refreshing
-    val selection = if (loading || busy) "unknown" else chatApprovalSelection(record, capturedClient?.scope?.key, capturedScope?.session)
+    // A YOLO change in an unsent chat cannot be read back from Hermes before its first message, so the default is shown only until one is tried.
+    val triedKey = "approvals-tried:${capturedScope?.key}"
+    val newChat = chat.messages.isEmpty() && chat.streamId.isBlank() && data[triedKey] == null
+    val selection = if (loading || busy) "unknown" else chatApprovalSelection(record, capturedClient?.scope?.key, capturedScope?.session, newChat)
     val runtimeSession = chat.raw.string("runtime_session_id")
     LaunchedEffect(capturedClient, capturedScope, ui.connected, chat.projectionReady, runtimeSession, busy) {
         // A passive REST history has no runtime; painting its shield must not resume one.
@@ -65,6 +69,7 @@ internal fun chatApprovalSelection(record: JSONObject?, profileKey: String?, ses
             vm.notice("Refresh Approvals in this chat before changing it."); return
         }
         saving = true
+        vm.storeData(triedKey, JSONObject())
         val job = vm.action("/api/approval/mode", json("yolo" to turnOn, "session_id" to capturedScope.session, "scope_key" to capturedScope.key), refresh = false,
             successNotice = if (turnOn) "YOLO on for this chat" else "YOLO off for this chat") { _, result -> vm.storeData(key, result) }
         scope.launch { try { job.join(); open = false } finally { saving = false } }

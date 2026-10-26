@@ -483,7 +483,7 @@ private fun VoiceMoreRow(text: String, tag: String, onClick: () -> Unit) {
 
 /**
  * Page 3: Voice, Personality and Model as real lists with the current choice marked. A tap saves at once and the lists never
- * reorder. In Settings ([settingsMode]) it has no buttons of its own, a provider row with Change, and "Add key" when none is saved.
+ * reorder (the model chosen when the page opens is listed first). In Settings ([settingsMode]) it has no buttons of its own, a provider row with Change, and "Add key" when none is saved.
  */
 @Composable
 internal fun voiceChoicesPage(
@@ -502,6 +502,7 @@ internal fun voiceChoicesPage(
     val scope = rememberCoroutineScope()
     var selection by remember { mutableStateOf(store.settings()) }
     val provider = selection.provider
+    val openingModel = remember(provider) { selection.model }
     var hasKey by remember(provider) { mutableStateOf<Boolean?>(null) }
     var catalog by remember(provider) { mutableStateOf(VoiceCatalogCache.get(provider)) }
     var moreVoices by remember(provider) { mutableStateOf(false) }
@@ -558,7 +559,7 @@ internal fun voiceChoicesPage(
                         VoiceOptionRow(label, note, id == selection.personality, "voice-option-personality-$id", index > 0) { pick(selection.copy(personality = id)) }
                     }
                 }
-                val models = (catalog?.models.orEmpty().ifEmpty { listOf(defaultVoiceModel(provider)) } + selection.model).distinct()
+                val models = (listOf(openingModel) + catalog?.models.orEmpty().ifEmpty { listOf(defaultVoiceModel(provider)) } + selection.model).distinct()
                 if (models.size > 1) {
                     val shownModels = visibleOptions(models, selection.model, moreModels, 4)
                     VoiceOptionGroup("Model") {

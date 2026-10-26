@@ -77,6 +77,16 @@ class RealtimeProvidersTest {
               {"name":"models/gemini-3.8-flash","supportedGenerationMethods":["generateContent"]}
             ]}
         """)))
+        // Transcription, translation and robotics models list bidiGenerateContent too but cannot hold a call.
+        assertEquals(listOf("models/gemini-3.8-live", "models/gemini-3.1-flash-live-preview"), GeminiWire.models(JSONObject("""
+            {"models":[
+              {"name":"models/gemini-3.8-live","supportedGenerationMethods":["bidiGenerateContent"]},
+              {"name":"models/gemini-3.5-transcribe-live","displayName":"Gemini 3.5 Transcribe Live","supportedGenerationMethods":["bidiGenerateContent"]},
+              {"name":"models/gemini-3.5-live-translate-preview","displayName":"Gemini 3.5 Live Translate Preview","supportedGenerationMethods":["bidiGenerateContent"]},
+              {"name":"models/gemini-er-2-streaming-preview","displayName":"Gemini Robotics-ER 2 Streaming Preview","supportedGenerationMethods":["bidiGenerateContent"]},
+              {"name":"models/gemini-3.1-flash-live-preview","supportedGenerationMethods":["bidiGenerateContent"]}
+            ]}
+        """)))
         assertEquals(listOf("Puck"), GeminiWire.voices(JSONObject("""
             {"voices":[
               {"id":"Puck","type":"prebuilt","display_name":"Puck"},

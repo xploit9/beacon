@@ -243,6 +243,9 @@ internal class NativeOperations(private val c: BeaconClient) {
                         require(profileMode in nativeApprovalModes) { "Approvals are unavailable. Refresh and try again." }
                         require(profileMode != "off") { "Approvals are off for this profile." }
                     }
+                    // Hermes reports a chat's YOLO state only from a built agent, and the check below needs it; a chat opened moments ago may still be
+                    // building one. This scoped read starts the agent and waits for it; a failed build (5032) is left to the check below.
+                    try { c.nativeRpc("approval.pending", json("session_id" to target.runtimeSessionId)) } catch (e: ApiFailure) { if (e.status != 5032) throw e }
                     setSessionYolo(target, d.getBoolean("yolo"))
                 }
                 val result = c.nativeRpc("config.get", json("key" to "approvals.mode"))
@@ -322,6 +325,10 @@ internal class NativeOperations(private val c: BeaconClient) {
             "/api/session/update" -> {
                 val b = binding()
                 if (d.has("model")) {
+                    // Hermes keeps a pick that names its provider only on a built agent; a chat still resuming would lose it when this socket closes.
+                    // A live lazy runtime ignores eager_build, so this scoped read is what starts the agent and waits for it (as in awaitNativeVoiceAgent).
+                    // A failed build (5032) is left to config.set, which repairs it.
+                    try { c.nativeRpc("approval.pending", json("session_id" to b.runtimeSessionId)) } catch (e: ApiFailure) { if (e.status != 5032) throw e }
                     val result = c.nativeRpc("config.set", json("session_id" to b.runtimeSessionId, "key" to "model", "value" to (d.getString("model") + d.string("model_provider").takeIf { it.isNotBlank() }?.let { " --provider $it" }.orEmpty()), "scope" to "session", "confirm_expensive_model" to d.optBoolean("confirm_expensive_model")))
                     if (result.optBoolean("confirm_required")) {
                         val message = result.string("confirm_message", "Hermes requires confirmation before selecting this model.")

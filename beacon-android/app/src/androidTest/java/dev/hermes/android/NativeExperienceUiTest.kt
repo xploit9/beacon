@@ -345,6 +345,30 @@ class NativeExperienceUiTest {
         } finally { runBlocking { app.cache.delete(scope, "pending") }; compose.runOnIdle { pending.remove(scope.key) } }
     }
 
+    @Test fun unconfirmedTextSendOffersResendAndDismissOnTheVisibleRow() = withFixture { vm, fixture ->
+        val scope = fixture.scope.session("chat-a")
+        val receipt = PendingSend.create(scope, Draft("Keep this message", 0, 0, emptyList()))
+        @Suppress("UNCHECKED_CAST")
+        val pending = BeaconViewModel::class.java.getDeclaredField("pending").apply { isAccessible = true }.get(vm) as MutableMap<String, PendingSend>
+        runBlocking { app.cache.write(scope, "pending", receipt.encode(), protected = true) }
+        try {
+            compose.runOnIdle {
+                pending[scope.key] = receipt
+                flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(uncertain = receipt.id)
+                vm.composer(TextFieldValue("Keep this message"))
+            }
+            compose.onNodeWithTag("send-resend").assertIsDisplayed().performClick()
+            compose.onNodeWithText("Resend retained draft").assertIsDisplayed()
+            compose.runOnIdle { vm.dismissForm() }
+            compose.onNodeWithTag("send-dismiss").performClick()
+            await { vm.chat.value.uncertain.isBlank() }
+            assertNull(runBlocking { app.cache.read(scope, "pending") })
+            assertEquals("Keep this message", vm.composer.value.text)
+            receipts += "A text-only unconfirmed send shows Resend and Dismiss on the chat row; Resend asks first, Dismiss clears the receipt and keeps the draft."
+            capture("journey3-unconfirmed-send-row")
+        } finally { runBlocking { app.cache.delete(scope, "pending") }; compose.runOnIdle { pending.remove(scope.key) } }
+    }
+
     @Test fun historyRowsWithTheSupportedIdAliasOpenTheRightConversation() = withFixture { vm, fixture ->
         compose.runOnIdle {
             val rows = listOf("chat-a", "chat-b").map { fixture.snapshot(it).apply { put("id", getString("session_id")); remove("session_id") } }
@@ -645,6 +669,9 @@ class NativeExperienceUiTest {
         await { vm.chat.value.sessionId.startsWith("branch-") }
         await { vm.ui.value.notice == "Branched into a new conversation" }
         compose.onNodeWithText("Branched into a new conversation").assertExists()
+        // History lists the new branch without a manual refresh, and the open branch carries its own title, not its parent's.
+        await { vm.ui.value.sessions.any { it.string("session_id") == vm.chat.value.sessionId } }
+        assertEquals("Branch", vm.chat.value.title)
         assertEquals(2, fixture.requests.last { it.string("method") == "session.branch" }.getJSONObject("params").getInt("count"))
         compose.runOnIdle { vm.selectSession("chat-a") }
         await { vm.chat.value.sessionId == "chat-a" && vm.chat.value.messages.isNotEmpty() }
@@ -3770,7 +3797,7 @@ class NativeExperienceUiTest {
         fixture.interruptActiveNativeStream()
         await { fixture.requests.count { it.string("method") == "prompt.submit" } == 2 }
         val queuedSubmitIndex = fixture.requests.indexOfLast { it.string("method") == "prompt.submit" }
-        assertTrue("The terminal history refresh happens before the queued prompt", fixture.requests.subList(requestsBeforeCompletion, queuedSubmitIndex).any { it.string("path") == "/api/sessions/chat-a/messages" })
+        assertTrue("The terminal history refresh happens before the queued prompt", fixture.requests.toList().subList(requestsBeforeCompletion, queuedSubmitIndex).any { it.string("path") == "/api/sessions/chat-a/messages" })
         assertTrue("The final assistant reply is visible before another history poll", vm.chat.value.messages.any { it.text == "Completed answer" })
         compose.onNodeWithText("Completed answer", useUnmergedTree = true).assertIsDisplayed()
         await { vm.chat.value.queued.isEmpty() }

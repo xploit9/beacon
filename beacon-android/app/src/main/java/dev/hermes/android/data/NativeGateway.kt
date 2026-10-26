@@ -48,6 +48,9 @@ internal fun nativeConnectionTicket(value: String): String {
     return value
 }
 
+/** A request whose frame may have reached Hermes; [requestNeverSent] reads this to keep such sends uncertain. */
+internal const val NATIVE_OUTCOME_UNKNOWN = "Native request outcome may be unknown; reconcile history before resending"
+
 internal class NativeGateway(private val client: BeaconClient, private val socketFactory: WebSocket.Factory = client.http, private val rpcTimeoutMs: Long = 60000) {
     private class Connection {
         val frames = Channel<JSONObject>(256)
@@ -133,7 +136,7 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         // Channel closure cannot be dropped when the queue is full and wakes an idle collector.
         mine.frames.close(error)
     }
-    private fun unknown(cause: Throwable) = IOException("Native request outcome may be unknown; reconcile history before resending", cause)
+    private fun unknown(cause: Throwable) = IOException(NATIVE_OUTCOME_UNKNOWN, cause)
     suspend fun rpc(method: String, params: JSONObject): JSONObject {
         val mine = connect()
         val id = UUID.randomUUID().toString(); val result = CompletableDeferred<JSONObject>()
