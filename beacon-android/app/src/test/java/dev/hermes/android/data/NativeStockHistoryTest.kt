@@ -168,7 +168,9 @@ class NativeStockHistoryTest {
 
     private fun Stock.native() = requests.filterNot { it.url.encodedPath.startsWith("/api/plugins/") }
     private fun Stock.pluginHistory() = requests.filter { it.url.encodedPath.startsWith("/api/plugins/beacon/mobile/sessions") && !it.url.encodedPath.endsWith("/voice-history") }
-    private fun Stock.listPages() = requests.filter { it.url.encodedPath == "/api/sessions" }
+    /** The window pages; the one extra read for empty threads (it names `sources`) is checked on its own. */
+    private fun Stock.listPages() = requests.filter { it.url.encodedPath == "/api/sessions" && it.url.queryParameter("sources") == null }
+    private fun Stock.threadReads() = requests.filter { it.url.encodedPath == "/api/sessions" && it.url.queryParameter("sources") != null }
     private fun ids(result: JSONObject) = (0 until result.getJSONArray("sessions").length()).map { result.getJSONArray("sessions").getJSONObject(it).getString("session_id") }
     private fun assertProfiled(stock: Stock) {
         assertTrue("Every history read is scoped to the verified profile", stock.native().isNotEmpty() && stock.native().filter { it.url.encodedPath.startsWith("/api/sessions") }.all { it.url.queryParameter("profile") == "work" })
@@ -202,6 +204,41 @@ class NativeStockHistoryTest {
         val refreshed = visibleSessionRows(result.rows("sessions"), listOf(confirmedShell), "", archived = false)
         assertEquals(listOf("phone-created", "active-0", "active-1"), refreshed.map(::sessionRowId))
         assertTrue("Every stock recents page requests the minimum message count", stock.listPages().all { it.url.queryParameter("min_messages") == "1" })
+    }
+
+    @Test fun anEmptyThreadIsListedLikeAChannelButAnEmptyChatIsNot() = runBlocking<Unit> {
+        val stock = Stock().apply { active = Stock.rows("active", 2) +
+            json("id" to "news-thread", "title" to "News", "source" to "android_thread", "message_count" to 0) +
+            json("id" to "old-empty", "title" to "Untitled conversation", "message_count" to 0) }
+        val result = list(client(stock))
+        assertEquals("An empty thread waits for its first post in the list", setOf("active-0", "active-1", "news-thread"), ids(result).toSet())
+        assertTrue(stock.threadReads().single().let { it.url.queryParameter("min_messages") == "0" && it.url.queryParameter("sources") == "android_thread,phone" })
+    }
+
+    @Test fun anOldPinStaysListedWhenAnEmptyThreadReordersTheWindow() = runBlocking<Unit> {
+        // Hermes appends a pin the page missed to that page, so it sits inside the 200 rows the phone reads.
+        val recent = Stock.rows("row", 200).onEachIndexed { i, row -> row.put("last_active", 1000.0 - i) }
+        val pin = json("id" to "old-pin", "title" to "Pinned", "message_count" to 2, "last_active" to 1.0, "pinned" to true, "profile" to "work")
+        val thread = json("id" to "news-thread", "title" to "News", "source" to "android_thread", "message_count" to 0, "last_active" to 2000.0, "profile" to "work")
+        val stock = Stock().apply { active = listOf(thread) + recent.take(100) + pin + recent.drop(100) }  // newest first, as Hermes lists
+        val shown = ids(list(client(stock)))
+        assertEquals("news-thread", shown.first())
+        assertTrue("A pinned chat is never cut by the re-sort", "old-pin" in shown)
+    }
+
+    @Test fun aFailedEmptyThreadReadKeepsTheList() = runBlocking<Unit> {
+        val stock = Stock().apply { override = { r -> if (r.url.encodedPath == "/api/sessions" && r.url.queryParameter("sources") != null) 503 to json("detail" to "busy").toString() else null } }
+        assertEquals(listOf("active-0", "active-1", "active-2"), ids(list(client(stock))))
+        val signedOut = Stock().apply { override = { r -> if (r.url.encodedPath == "/api/sessions" && r.url.queryParameter("sources") != null) 401 to json("detail" to "Unauthorized").toString() else null } }
+        assertEquals("A sign-in that ended still ends the refresh", 401, (runCatching { list(client(signedOut)) }.exceptionOrNull() as? ApiFailure)?.status)
+        val ended = Stock().apply { override = { r -> if (r.url.encodedPath == "/api/sessions" && r.url.queryParameter("sources") != null) throw LoopbackSessionRefreshFailed() else null } }
+        assertTrue(runCatching { list(client(ended)) }.exceptionOrNull() is LoopbackSessionRefreshFailed)
+    }
+
+    @Test fun anArchivedPinStaysOutOfTheActiveList() = runBlocking<Unit> {
+        // Hermes back-fills pins into every page, archived ones too.
+        val stock = Stock().apply { active = Stock.rows("active", 2) + json("id" to "archived-pin", "title" to "Old", "message_count" to 2, "pinned" to true, "archived" to true, "profile" to "work") }
+        assertEquals(listOf("active-0", "active-1"), ids(list(client(stock))))
     }
 
     @Test fun archivedListContainsOnlyArchivedConversations() = runBlocking<Unit> {
@@ -247,9 +284,11 @@ class NativeStockHistoryTest {
 
         val threads = Stock(); val t = client(threads)
         t.get("/api/sessions", mapOf("profile" to "work", "include_archived" to "0", "view" to "threads", "hidden_sources" to "telegram"))
-        assertTrue("The Threads lane asks Hermes for Beacon and Relay threads only", threads.listPages().all { it.url.queryParameter("sources") == "android_thread,phone" && it.url.queryParameter("exclude_sources") == null })
-        assertTrue("Recent activity is the default order", threads.listPages().all { it.url.queryParameter("order") == "recent" })
-        assertTrue(threads.listPages().all { it.url.queryParameter("min_messages") == "1" })
+        val lane = threads.threadReads()
+        assertTrue(lane.isNotEmpty() && threads.listPages().isEmpty())
+        assertTrue("The Threads lane asks Hermes for Beacon and Relay threads only", lane.all { it.url.queryParameter("sources") == "android_thread,phone" && it.url.queryParameter("exclude_sources") == null })
+        assertTrue("Recent activity is the default order", lane.all { it.url.queryParameter("order") == "recent" })
+        assertTrue("A thread waiting for its first post is listed", lane.all { it.url.queryParameter("min_messages") == "0" })
         assertProfiled(threads)
     }
 

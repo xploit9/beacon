@@ -13,6 +13,7 @@ import dev.hermes.android.core.string
 import dev.hermes.android.core.sessionRowId
 import dev.hermes.android.core.sessionRowKey
 import dev.hermes.android.data.BEACON_THREAD_SOURCE
+import dev.hermes.android.data.THREAD_SOURCES
 import dev.hermes.android.data.currentAssistantName
 import org.json.JSONObject
 import java.util.Calendar
@@ -32,7 +33,7 @@ internal enum class HistoryOrder(val key: String, val label: String) {
     companion object { fun of(key: String) = entries.firstOrNull { it.key == key } ?: Recent }
 }
 
-internal fun isThreadSource(source: String?): Boolean = source?.trim()?.lowercase(Locale.ROOT) in setOf(BEACON_THREAD_SOURCE, "phone")
+internal fun isThreadSource(source: String?): Boolean = source?.trim()?.lowercase(Locale.ROOT) in THREAD_SOURCES
 internal fun historyRowKey(row: JSONObject, currentProfile: String = ""): String = sessionRowKey(row, currentProfile)
 
 /** Loaded titles answer each keystroke; only results for that exact query may supplement them. */

@@ -17,10 +17,15 @@ spec.loader.exec_module(native)
 def state(monkeypatch):
     rows = {}
     record = {'session_key': 'stored', 'profile_home': '/profiles/academic', 'user_id': 'basic:owner'}
+    def set_title(key, title, writer):
+        if not writer: raise PermissionError('attempt to write a readonly database')  # another profile's store opens read-only
+        if any(row.get('title') == title for other, row in rows.items() if other != key): raise ValueError('Title already in use')
+        rows[key]['title'] = title
+        return True
     @contextmanager
-    def profile_db(params):
+    def profile_db(params, writer=False):
         assert params['profile'] == 'academic'
-        yield SimpleNamespace(get_session=rows.get)
+        yield SimpleNamespace(get_session=rows.get, set_session_title=lambda key, title: set_title(key, title, writer))
     writes = []
     def ensure(session):
         writes.append(session)
@@ -66,3 +71,18 @@ def test_replaced_runtime_cannot_confirm_a_reservation(state):
     server._ensure_session_db_row = replace
     with pytest.raises(LookupError): native.reserve_conversation('owner', 'basic', 'academic', 'stored')
     assert len(writes) == 1
+
+
+def test_a_reserved_thread_keeps_its_create_title(state):
+    _, rows, record, _ = state
+    record['pending_title'] = 'Cyber news'
+    native.reserve_conversation('owner', 'basic', 'academic', 'stored')
+    assert rows['stored']['title'] == 'Cyber news' and record['pending_title'] is None
+
+
+def test_a_taken_title_stays_queued_for_the_first_turn(state):
+    _, rows, record, _ = state
+    rows['other'] = {'user_id': 'basic:owner', 'title': 'Cyber news'}
+    record['pending_title'] = 'Cyber news'
+    assert native.reserve_conversation('owner', 'basic', 'academic', 'stored')['user_id'] == 'basic:owner'
+    assert 'title' not in rows['stored'] and record['pending_title'] == 'Cyber news'

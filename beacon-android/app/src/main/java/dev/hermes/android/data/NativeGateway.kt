@@ -14,6 +14,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /** Hermes `source` for a named Beacon thread (Relay tags its threads `phone`); every other phone chat is `android`. */
 internal const val BEACON_THREAD_SOURCE = "android_thread"
+internal val THREAD_SOURCES = listOf(BEACON_THREAD_SOURCE, "phone")
 private val WINDOW_SERVER_REQUESTS = setOf("preview.act", "preview.read", "terminal.read", "window.read", "tour")
 
 private data class ParsedNativeRequestId(val key: String, val text: String)

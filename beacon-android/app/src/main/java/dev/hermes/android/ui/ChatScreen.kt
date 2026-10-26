@@ -1124,7 +1124,7 @@ internal fun chatHeaderSubtitle(streaming: Boolean, hasReplyText: Boolean, inCal
     side?.takeIf { ready }?.let { question -> AlertDialog(onDismissRequest = vm::closeSideQuestion, title = { Text(uiText("Side question")) }, text = { Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) { Text(question.question, style = MaterialTheme.typography.titleMedium); Text(question.status, color = MaterialTheme.colorScheme.onSurfaceVariant); Markdown(question.text, vm, question.scope.session(question.sessionId), interactive = false) } }, confirmButton = { TextButton(onClick = vm::closeSideQuestion) { Text(uiText("Close")) } }, dismissButton = { TextButton(onClick = vm::resumeSideQuestion) { Text(uiText("Reconnect")) } }) }
     if (canonical) NativeCatalog(vm)
     if (activitySheet && ready && (backgroundActivity.active || !backgroundActivity.available)) ChatActivitySheet(backgroundActivity) { activitySheet = false }
-    if (threadPosts && chat.sessionId.isNotBlank()) ThreadSchedulesSheet(vm, chat.sessionId, plainTitle(chat.title)) { threadPosts = false }
+    if (threadPosts && chat.sessionId.isNotBlank()) ThreadSchedulesSheet(vm, chat.sessionId, chat.title) { threadPosts = false }
     if (showCallHistorySheet && beacon) CallHistorySheet(vm, onOpenCall = { conversationId, callId ->
         showCallHistorySheet = false
         showSearch = false

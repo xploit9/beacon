@@ -466,12 +466,12 @@ internal class NativeOperations(private val c: BeaconClient) {
     private suspend fun sessionIndex(archived: Boolean, query: String, threads: Boolean = false, hidden: String = "", order: String = ""): JSONObject {
         // Filters run in Hermes, so the 200-row window holds only what the drawer shows.
         val hiddenSources = hidden.split(',').map { it.trim().lowercase() }.filter { it.matches(sourceName) }
-        val scope = if (threads) mapOf("sources" to "$BEACON_THREAD_SOURCE,phone") else mapOf("exclude_sources" to (listOf("cron") + hiddenSources).distinct().joinToString(","))
+        val scope = if (threads) mapOf("sources" to THREAD_SOURCES.joinToString(",")) else mapOf("exclude_sources" to (listOf("cron") + hiddenSources).distinct().joinToString(","))
         val rows = LinkedHashMap<String, JSONObject>()
         var offset = 0
         while (offset < SESSION_INDEX_WINDOW) {
             val limit = minOf(SESSION_PAGE_LIMIT, SESSION_INDEX_WINDOW - offset)
-            val page = c.nativeGet("/api/sessions", mapOf("profile" to c.auth.profile, "archived" to if (archived) "only" else "exclude", "order" to if (order == "created") "created" else "recent", "min_messages" to "1", "limit" to "$limit", "offset" to "$offset") + scope)
+            val page = c.nativeGet("/api/sessions", mapOf("profile" to c.auth.profile, "archived" to if (archived) "only" else "exclude", "order" to if (order == "created") "created" else "recent", "min_messages" to if (threads) "0" else "1", "limit" to "$limit", "offset" to "$offset") + scope)
             val items = listOf("sessions", "items", "data").firstNotNullOfOrNull { page.opt(it) as? JSONArray } ?: error("Hermes returned an unreadable conversation list")
             for (index in 0 until items.length()) {
                 val row = items.opt(index) as? JSONObject ?: error("Hermes returned an unreadable conversation list")
@@ -482,6 +482,28 @@ internal class NativeOperations(private val c: BeaconClient) {
             }
             if (items.length() < limit) break
             offset += limit
+        }
+        // A thread waiting for its first post is still a channel the owner has: list empty threads with the others.
+        val mergedThreads = mutableSetOf<String>()
+        if (!threads && !archived) {
+            val empty = try {
+                c.nativeGet("/api/sessions", mapOf("profile" to c.auth.profile, "archived" to "exclude", "order" to if (order == "created") "created" else "recent",
+                    "min_messages" to "0", "sources" to THREAD_SOURCES.joinToString(","), "limit" to "$SESSION_PAGE_LIMIT"))
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) {
+                // Only the empty threads wait for the next refresh; a sign-in that ended still ends here.
+                if (e is NativeAuthExpiredException || e is LoopbackSessionRefreshFailed || e is CachedIdentityMismatch || e is ApiFailure && e.status == 401) throw e
+                null
+            }
+            val items = listOf("sessions", "items", "data").firstNotNullOfOrNull { empty?.opt(it) as? JSONArray } ?: JSONArray()
+            for (index in 0 until items.length()) {
+                val row = items.opt(index) as? JSONObject ?: continue
+                val id = row.string("id", row.string("session_id"))
+                // Only an empty thread joins (an older Hermes may ignore the sources filter); empty plain chats stay out.
+                if (!id.matches(storedSessionId) || !ownedByProfile(row) || row.optInt("message_count") > 0 ||
+                    row.string("source").lowercase() !in THREAD_SOURCES) continue
+                if (rows.putIfAbsent(id, row) == null) mergedThreads += id
+            }
         }
         // REST has no include_hidden option. Gateway session.list is read-only and does not resume an agent.
         if (archived) {
@@ -501,13 +523,14 @@ internal class NativeOperations(private val c: BeaconClient) {
                     require(ownedByProfile(row) && row.string("id", row.string("session_id")) == id) { "Conversation list belongs to another profile" }
                     val source = row.string("source").lowercase()
                     if (nativeSessionFlag(row, "hidden") && candidate.optInt("message_count", row.optInt("message_count")) > 0 && source != "cron" &&
-                        (if (threads) source in setOf(BEACON_THREAD_SOURCE, "phone") else source !in hiddenSources)) id to row else null
+                        (if (threads) source in THREAD_SOURCES else source !in hiddenSources)) id to row else null
                 } } }.awaitAll().filterNotNull()
             }
             verified.forEach { (id, row) -> rows[id] = row }
         } else rows.entries.removeAll { nativeSessionFlag(it.value, "hidden") || nativeSessionFlag(it.value, "archived") }
-        val window = if (archived) rows.entries.sortedByDescending { (_, row) -> row.optDouble(if (order == "created") "started_at" else "last_active", row.optDouble("started_at", 0.0)) } else rows.entries.toList()
-        val listed = window.take(SESSION_INDEX_WINDOW).filter { (id, row) -> query.isBlank() || row.string("title").contains(query, true) || id.contains(query, true) }
+        val window = if (archived || mergedThreads.any(rows::containsKey)) rows.entries.sortedByDescending { (_, row) -> row.optDouble(if (order == "created") "started_at" else "last_active", row.optDouble("started_at", 0.0)) } else rows.entries.toList()
+        // Hermes back-fills every pin onto a page, so a pinned chat stays past the window after a re-sort too.
+        val listed = window.filterIndexed { index, entry -> index < SESSION_INDEX_WINDOW || nativeSessionFlag(entry.value, "pinned") }.filter { (id, row) -> query.isBlank() || row.string("title").contains(query, true) || id.contains(query, true) }
         return json("sessions" to JSONArray(listed.map { (id, row) -> row.copy().put("session_id", id).put("profile", c.auth.profile).put("archived", nativeSessionFlag(row, "archived") || nativeSessionFlag(row, "hidden")) }),
             "search_scope" to "Newest 200 conversation titles and identities", "limit" to SESSION_INDEX_WINDOW)
     }

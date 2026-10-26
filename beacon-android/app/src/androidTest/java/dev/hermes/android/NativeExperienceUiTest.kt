@@ -2957,6 +2957,9 @@ class NativeExperienceUiTest {
         await { fixture.requests.any { it.string("method") == "session.create" && it.getJSONObject("params").string("source") == "android_thread" } }
         assertEquals("The emoji is only the start of the Hermes title", "$emoji Cyber news", fixture.requests.last { it.string("method") == "session.create" }.getJSONObject("params").string("title"))
         await { vm.chat.value.sessionId.isNotBlank() && vm.chat.value.title == "$emoji Cyber news" }
+        // Saved in Hermes at once, so a scheduled post can land before the first message (live 26 Oct: an empty thread refused posts).
+        val threadId = vm.chat.value.sessionId
+        await { fixture.requests.any { it.string("path") == "/api/plugins/beacon/mobile/sessions/$threadId/reserve" } }
         // The emoji is the avatar, so the header text is the name alone.
         compose.onNode(hasText("Cyber news") and hasAnyAncestor(hasTestTag("chat-header-title")), useUnmergedTree = true).assertExists()
         receipts += "New thread takes a name and an optional emoji; both become the Hermes title and the thread's avatar and header show them."
@@ -3307,6 +3310,8 @@ class NativeExperienceUiTest {
             val newClient = fixture.clientFor(auth, app.auth)
             restartedClient = newClient
             lateinit var restarted: BeaconViewModel
+            // Counted before the restart: the new ViewModel may resume the cached shell while starting, before newChat() asks.
+            val resumesBefore = fixture.requests.count { it.string("method") == "session.resume" }
             compose.runOnUiThread {
                 restarted = ViewModelProvider(restartedStore, viewModelFactory { initializer { BeaconViewModel(app, SavedStateHandle()) } })[BeaconViewModel::class.java]
                 field(restarted, "client", newClient)
@@ -3318,7 +3323,6 @@ class NativeExperienceUiTest {
                 val shells = BeaconViewModel::class.java.getDeclaredField("initialShells").apply { isAccessible = true }.get(restarted) as MutableMap<String, String>
                 shells[owner.key] = cachedShell
             }
-            val resumesBefore = fixture.requests.count { it.string("method") == "session.resume" }
             compose.runOnIdle {
                 restarted.composer(TextFieldValue("Keep this draft after restart"))
                 restarted.newChat()

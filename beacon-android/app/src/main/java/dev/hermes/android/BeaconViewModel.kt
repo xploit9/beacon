@@ -2043,6 +2043,16 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         ++navigationGeneration
         return createNewChat(body, initial = false)
     }
+    /** A thread is a channel from the start: Hermes saves it now (not at its first message), so a scheduled post can land in it at once.
+     *  Best effort: without the Beacon plugin it stays a draft until its first message, as before. */
+    fun reserveThread(sessionId: String) {
+        val active = client ?: return
+        if (sessionId.isBlank()) return
+        viewModelScope.launch {
+            try { active.nativeRequest("/api/plugins/beacon/mobile/sessions/$sessionId/reserve", "POST", JSONObject()) }
+            catch (e: CancellationException) { throw e } catch (_: Exception) { /* the plugin is optional; the first message saves it */ }
+        }
+    }
     /** A named thread (Relay-style): a new native chat with its own source, titled by the user, not by Hermes's auto-title. */
     fun newThread(name: String): Job {
         val title = dev.hermes.android.ui.uniqueThreadTitle(name, _ui.value.sessions.map { it.string("title") })
@@ -2159,7 +2169,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 if (!plainChatRequest(body)) keptApartShells.add(createdScope.key)
                 optionalLocalSave { app.cache.write(createdScope, "client-created-shell", clientShellMarker(createdScope.key), protected = true) }
                 // An empty new chat joins History with its first message (accepted() publishes it); a named thread is listed at once.
-                if (client === active && originGeneration == origin && request.optBoolean("thread")) publishConfirmedSession(owner, id, response)
+                if (client === active && originGeneration == origin && request.optBoolean("thread")) { publishConfirmedSession(owner, id, response); reserveThread(id) }
                 if (initial) {
                     initialShells[owner.key] = id
                     if (initialCreateAttempts[owner.key] == attempt) initialCreateAttempts.remove(owner.key)

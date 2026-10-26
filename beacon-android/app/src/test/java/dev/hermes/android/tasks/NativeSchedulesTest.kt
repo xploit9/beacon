@@ -86,6 +86,10 @@ class NativeSchedulesTest {
         val added = withThreadTarget(own, "t1", "News")
         assertEquals(listOf("local", "phone:t1"), added.map { it.string("id") })
         assertSame(added, withThreadTarget(added, "t1", "Other"))
+        // A thread Hermes lists without a title yet takes the open thread's own name.
+        val listed = deliveryTargets(JSONObject().put("targets", JSONArray()), listOf(JSONObject().put("id", "t2").put("title", ""))).rows("targets")
+        assertEquals("Untitled thread", listed.single().string("name"))
+        assertEquals("📰 QA channel", withThreadTarget(listed, "t2", "📰 QA channel").single().string("name"))
     }
     @Test fun editingAJobKeepsItsThreadUnlessTheTargetChanges() {
         val original = JSONObject().put("name", "News").put("schedule", "every day at 8am").put("deliver", "phone:t1")

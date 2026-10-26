@@ -49,7 +49,7 @@ internal fun scheduleDeliveryError(job: JSONObject): String = if (job.string("la
 /** `phone:<id>` sends a job's result into that thread, through the Beacon plugin's phone delivery; `deliver` may list several targets. */
 internal fun threadTarget(threadId: String) = "phone:$threadId"
 internal fun deliversTo(job: JSONObject, target: String): Boolean = job.string("deliver").split(',').any { it.trim() == target }
-private fun threadRow(threadId: String, title: String) = json("id" to threadTarget(threadId), "name" to title.ifBlank { "Untitled thread" }, "home_target_set" to true, "home_env_var" to null, "thread" to true)
+private fun threadRow(threadId: String, title: String) = json("id" to threadTarget(threadId), "name" to title.ifBlank { "Untitled thread" }, "untitled" to title.isBlank(), "home_target_set" to true, "home_env_var" to null, "thread" to true)
 /** The editor's "Deliver to" list: Hermes' own targets with the phone platform named Beacon chat, and each thread right after it. */
 internal fun deliveryTargets(native: JSONObject, threads: List<JSONObject>): JSONObject {
     val own = native.rows("targets").map { if (it.string("id") == "phone") it.copy().put("name", "Beacon chat") else it }
@@ -58,8 +58,13 @@ internal fun deliveryTargets(native: JSONObject, threads: List<JSONObject>): JSO
     return native.copy().put("targets", JSONArray(own.take(at) + rows + own.drop(at)))
 }
 /** The thread's own entry, for a list that has not loaded it yet. */
-internal fun withThreadTarget(targets: List<JSONObject>, threadId: String, title: String): List<JSONObject> =
-    if (targets.any { it.string("id") == threadTarget(threadId) }) targets else targets + threadRow(threadId, title)
+internal fun withThreadTarget(targets: List<JSONObject>, threadId: String, title: String): List<JSONObject> {
+    val id = threadTarget(threadId)
+    if (targets.none { it.string("id") == id }) return targets + threadRow(threadId, title)
+    // Hermes may not hold a new thread's title yet; the open thread's own name beats "Untitled thread".
+    if (title.isBlank() || targets.none { it.string("id") == id && it.optBoolean("untitled") }) return targets
+    return targets.map { if (it.string("id") == id && it.optBoolean("untitled")) threadRow(threadId, title) else it }
+}
 internal fun deliveryNames(targets: List<JSONObject>): Map<String, String> =
     mapOf("local" to "Save result in Beacon") + targets.filter { it.string("id") != "local" }.associate { it.string("id") to it.string("name", it.string("id")) }
 internal fun deliveryLabel(deliver: String, names: Map<String, String>): String =

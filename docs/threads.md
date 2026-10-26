@@ -17,6 +17,7 @@ Each thread's **Scheduled posts** sheet lists the tasks that post into it, with 
 
 ## Good to know
 
+- A new thread can take posts right away, before you write in it. It stays in your chat list while it waits for the first one.
 - A post is saved in the thread's conversation, so it is there when you open the thread on another device and the next reply sees it, whether the thread was open or closed.
 - If a run finishes while that thread is in the middle of answering you, the post waits and arrives right after that answer. A post is never added twice.
 - If you delete a thread, tasks that point at it stop delivering and show "That thread is no longer available" until you change their target.

@@ -66,6 +66,12 @@ def reserve_conversation(owner,provider,profile,stored):
     with server._sessions_lock:
         if server._sessions.get(sid) is not record or not owned(record):
             raise LookupError('Conversation reservation changed')
+    # The create-time title lands with the row, as Hermes' own _seed_row does, so a thread is named before its first message.
+    if title:=record.get('pending_title'):
+        try:
+            with server._profile_db({'profile':profile},writer=True) as db:
+                if db is not None and db.set_session_title(stored,title): record['pending_title']=None
+        except Exception: pass  # a taken title stays queued; the first turn names the thread as before
     return verify(owner,provider,profile,stored)
 
 

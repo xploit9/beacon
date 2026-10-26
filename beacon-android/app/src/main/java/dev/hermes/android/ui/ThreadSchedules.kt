@@ -31,13 +31,14 @@ internal fun threadJobs(jobs: List<JSONObject>, threadId: String): List<JSONObje
     val refresh: () -> Unit = { refreshSchedules(vm) }
     var pending by remember(threadId) { mutableStateOf("") }
     val actionScope = rememberCoroutineScope()
-    LaunchedEffect(ui.origin, ui.owner, ui.profile, threadId) { refresh() }
+    // A thread made before it reserved itself is saved now, so the posts set up here can land before its first message.
+    LaunchedEffect(ui.origin, ui.owner, ui.profile, threadId) { vm.reserveThread(threadId); refresh() }
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.fillMaxWidth().fillMaxHeight(.8f).padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("Scheduled posts", style = MaterialTheme.typography.titleLarge)
-                    Text(title.ifBlank { "This thread" }, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                    Text(plainTitle(title).ifBlank { "This thread" }, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
                 }
                 IconButton(onClick = onDismiss) { Icon(Icons.Rounded.Close, uiText("Close")) }
             }
