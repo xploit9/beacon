@@ -33,7 +33,7 @@ data class Scope(val origin: String, val owner: String, val profile: String, val
 fun trustedOrigin(input: String): String {
     val url = input.trim().toHttpUrl()
     require(url.isHttps && url.username.isEmpty() && url.password.isEmpty() && url.encodedPath == "/" && url.query == null && url.fragment == null) {
-        "Enter an HTTPS Beacon origin, without a path, credentials or query."
+        "Paste the https:// link from your Hermes dashboard, with nothing after the address."
     }
     return url.toString().trimEnd('/')
 }

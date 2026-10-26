@@ -945,7 +945,7 @@ internal fun botChatName(activeBotProfile: String?, botSessionId: String, chatSe
                             if (index > 0) HorizontalDivider()
                             Text(uiText(if (group == "Model and tools") "Tools" else group), Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             titles.filterNot { it in setOf("Model & provider", "Reasoning") || (permanentBotChat && it == "New conversation") }.forEach { title ->
-                                val label = conversationActionLabel(title, chat.raw.optBoolean("pinned"), chat.raw.optBoolean("archived")).replaceFirstChar { it.uppercase() }
+                                val label = conversationActionLabel(title, openChatPinned(ui.sessions, chat, ui.profile), chat.raw.optBoolean("archived")).replaceFirstChar { it.uppercase() }
                             DropdownMenuItem({ Column { Text(conversationMenuTitle(uiText(label))); if (activeHere && title in setOf("Delete conversation", "Undo last turn", "Compress context")) Text("End this call to continue", style = MaterialTheme.typography.labelSmall) } }, onClick = { menu = false; chatAction(vm, title) }, enabled = nativeConversationAction(title) && (canonical || title == "New conversation") && !(activeHere && title in setOf("Delete conversation", "Undo last turn", "Compress context")), leadingIcon = { Icon(chatActionIcon(label), null) }, modifier = Modifier.testTag("conversation-action:$title"))
                             }
                         }
@@ -1858,6 +1858,10 @@ internal fun queuedHeading(count: Int): String = "$count ${if (count == 1) "mess
     }
 }
 
+/** Whether the open chat is pinned, as History lists it; the chat's own snapshot never carries it, so only an action in this chat leaves a mark there. */
+internal fun openChatPinned(rows: List<JSONObject>, chat: ChatState, profile: String): Boolean =
+    rows.firstOrNull { sessionRowId(it) == chat.sessionId && it.string("profile", profile) == profile }?.optBoolean("pinned") ?: chat.raw.optBoolean("pinned")
+
 private fun chatAction(vm: BeaconViewModel, title: String) {
     if (!nativeConversationAction(title)) return vm.notice("$title is unavailable in native Hermes.")
     val chat = vm.chat.value
@@ -1868,7 +1872,7 @@ private fun chatAction(vm: BeaconViewModel, title: String) {
         "Rename" -> vm.openForm(ActionForm(title, "/api/session/rename", listOf(Field("title", "Conversation title", required = true)), seed.put("title", chat.title), onResult = result))
         "Model & provider", "Reasoning", "Toolsets" -> vm.openCatalog(title)
         "Archive" -> vm.sessionAction("/api/session/archive", json("archived" to !chat.raw.optBoolean("archived")))
-        "Pin" -> chat.raw.optBoolean("pinned").let { pinned -> vm.conversationAction(chat.sessionId, "/api/session/pin", json("pinned" to !pinned), if (pinned) "Unpinned" else "Pinned") }
+        "Pin" -> openChatPinned(vm.ui.value.sessions, chat, vm.ui.value.profile).let { pinned -> vm.conversationAction(chat.sessionId, "/api/session/pin", json("pinned" to !pinned), if (pinned) "Unpinned" else "Pinned") }
         "Branch" -> vm.openForm(ActionForm(title, "/api/session/branch", listOf(Field("title", "Branch title"), Field("keep_count", "Messages to keep", FieldType.INTEGER)), seed.put("keep_count", chat.messages.size), onResult = result))
         "Compress context" -> vm.sessionAction("/api/session/compress") { response ->
             vm.notice(when (response.string("status")) { "compressed" -> "Context compressed"; "aborted" -> "Compression was not needed or was cancelled."; "pending", "lock_held" -> "${dev.hermes.android.data.currentAssistantName} is still working. Refresh the conversation to check progress."; else -> "Compression result is not confirmed. Refresh the conversation." })

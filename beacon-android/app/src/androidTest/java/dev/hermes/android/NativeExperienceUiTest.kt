@@ -115,10 +115,12 @@ class NativeExperienceUiTest {
         val priorChatPreferences = runBlocking { app.cache.read(fixture.scope, "chat-preferences") }
         runBlocking { app.cache.write(fixture.scope, "chat-preferences", json("render_user_markdown" to true, "show_thinking" to true, "send_key" to "enter").toString(), true) }
         // Each case starts without another case's initial-chat pointers (a shell id unknown to this fixture would block sends).
-        runBlocking { listOf("new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session").forEach { app.cache.delete(fixture.scope, it) } }
+        // A profile switch opens a new chat in the other profile too, so the coder profile starts clean as well.
+        val profiles = listOf(fixture.scope, fixture.scope.copy(profile = "coder"))
+        runBlocking { profiles.forEach { owner -> listOf("new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session").forEach { app.cache.delete(owner, it) } } }
         // Fixture chat ids (new-N) repeat across cases and runs; drop their per-chat receipts, drafts and projections too.
         // shortcut: ids come from one counter shared with projects and branches; 24 covers every current case, widen it if one creates more.
-        runBlocking { (1..24).forEach { n -> listOf("pending", "draft", "session", "client-created-shell", "side-question").forEach { app.cache.delete(fixture.scope.session("new-$n"), it) } } }
+        runBlocking { profiles.forEach { owner -> (1..24).forEach { n -> listOf("pending", "draft", "session", "client-created-shell", "side-question").forEach { app.cache.delete(owner.session("new-$n"), it) } } } }
         runBlocking { app.cache.delete(fixture.scope, "bot-mode-return"); app.cache.delete(fixture.scope, "beacon-session"); app.cache.delete(fixture.scope, "beacon-opening"); app.cache.delete(fixture.scope, "phone-editors"); app.cache.delete(fixture.scope, "editor:C:/synthetic-workspace/notes.md") }
         lateinit var vm: BeaconViewModel
         val profileSwitchClientFactory: (dev.hermes.android.data.AuthContext) -> dev.hermes.android.data.BeaconClient = { auth -> fixture.freshClientFor(auth, app.auth) }
@@ -3264,6 +3266,37 @@ class NativeExperienceUiTest {
         }
     }
 
+    @Test fun aNewChatAndItsDraftComeBackAfterSwitchingProfileAndBack() = withFixture { vm, fixture ->
+        val createsBefore = fixture.requests.count { it.string("method") == "session.create" }
+        compose.runOnIdle { vm.newChat() }
+        await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+        val shell = vm.chat.value.sessionId
+        compose.runOnIdle { vm.composer(TextFieldValue("Keep this across profiles")) }
+        compose.runOnIdle { vm.switchProfile("coder") }
+        // The other profile opens its own new chat; wait for it so the switch back is not racing it.
+        await { vm.client?.scope?.profile == "coder" && vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId != shell && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+        compose.runOnIdle { vm.switchProfile("default") }
+        await { vm.client?.scope?.profile == "default" && vm.chat.value.sessionId == shell && vm.composer.value.text == "Keep this across profiles" }
+        assertEquals("", vm.ui.value.newChatError)
+        assertEquals("The unsent chat is reopened, not replaced: one chat per profile and no extra shell on the way back", createsBefore + 2, fixture.requests.count { it.string("method") == "session.create" })
+        receipts += "Switching profile and back reopens the unsent new chat with its draft instead of a blank new-chat screen."
+    }
+
+    @Test fun aNewChatAfterSwitchingProfileHasUsableControlsBeforeTheFirstMessage() = withFixture { vm, fixture ->
+        // Nothing was ever opened through the app in either profile, so each switch lands on a new chat with no chat behind it.
+        compose.runOnIdle { vm.switchProfile("coder") }
+        await { vm.client?.scope?.profile == "coder" && vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+        compose.runOnIdle { vm.switchProfile("default") }
+        await { vm.client?.scope?.profile == "default" && vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+        await { compose.onAllNodes(hasTestTag("composer-approvals") and isEnabled()).fetchSemanticsNodes().isNotEmpty() }
+        await { compose.onAllNodes(hasTestTag("composer-model-effort") and isEnabled()).fetchSemanticsNodes().isNotEmpty() }
+        // The shield shows the profile default (the fixture's profile mode), not Unknown.
+        await { compose.onAllNodesWithContentDescription("Approvals: ${approvalChoiceLabel(fixture.approvalMode)}", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+        compose.onAllNodesWithContentDescription("Approvals: Unknown", useUnmergedTree = true).assertCountEquals(0)
+        assertEquals("", vm.ui.value.newChatError)
+        receipts += "A new chat after a profile switch is a real chat: the approvals shield shows the profile default and the model chip is enabled before the first message."
+    }
+
     @Test fun selectingTheCurrentSettingsDestinationClosesTheDrawerWithoutAddingBackHistory() = withFixture { vm, _ ->
         compose.runOnIdle { vm.composer(TextFieldValue("Keep this draft")); vm.more("") }
         compose.onNodeWithTag("navigation-toggle").performClick()
@@ -3762,6 +3795,120 @@ class NativeExperienceUiTest {
         runCatching { compose.waitUntil(3_000) { fixture.requests.count { it.string("method") == "prompt.submit" } > 1 } }
         assertEquals("The queued prompt waits for review", "Queued follow-up", vm.chat.value.queued.single().text)
         assertEquals("Nothing more is sent after an unconfirmed reply", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
+    }
+
+    // Live 2026-10-26: a message sent seconds after the network returned finished in Hermes, but the chat stayed "Working" until the app was backgrounded.
+    @Test fun aStreamThatLostItsSubscriptionSettlesFromHistoryWithoutSendingAgain() = withFixture { vm, fixture ->
+        field(vm, "streamSilenceMs", 1_500L)
+        field(vm, "streamWatchMs", 300L)
+        kotlinx.coroutines.runBlocking { app.cache.delete(fixture.scope.session("chat-a"), "live:runtime-chat-a") }
+        val subscriptionsBeforeSend = fixture.streamSubscriptions.get()
+        compose.runOnIdle { fixture.persistTerminalMessages = true; vm.composer(TextFieldValue("Prompt whose events go astray")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId == "runtime-chat-a" }
+        await { fixture.streamSubscriptions.get() > subscriptionsBeforeSend }
+        // Another connection subscribes to the same turn, as an overlapping attach or a reconnect does: Hermes now sends the turn's events there.
+        val other = fixture.client.detached()
+        try {
+            runBlocking { other.nativeSession("chat-a"); other.nativeReplay() }
+            fixture.nativeTurnStatus = "idle"
+            fixture.emitNativeEvent("message.complete", json("text" to "A reply the first stream never heard"))
+            try { await { vm.chat.value.streamId.isBlank() && vm.chat.value.messages.any { it.text == "A reply the first stream never heard" } } }
+            catch (error: Throwable) { throw AssertionError("Chat stayed on its stream: status=${vm.chat.value.status} stream=${vm.chat.value.streamId} requests=${recentCalls(fixture)}", error) }
+            assertEquals("Settling reads history; it never sends the prompt again", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
+            receipts += "A stream another connection took over asks Hermes after a quiet spell and settles the finished turn from history."
+        } finally { other.closeNative() }
+    }
+
+    @Test fun aSendFoundInHistoryClearsTheFirstPromptMarkersLikeAnAcceptedOne() = withFixture { vm, fixture ->
+        val owner = fixture.scope
+        var shellId = ""
+        try {
+            compose.runOnUiThread {
+                field(vm, "sourceScope", null)
+                flow<ChatState>(vm, "_chat").value = ChatState()
+                flow<AppState>(vm, "_ui").value = vm.ui.value.copy(tab = "Chat", initialChatReady = true, newChatOpening = false, sessions = emptyList())
+            }
+            compose.runOnIdle { vm.newChat() }
+            await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+            shellId = vm.chat.value.sessionId
+            val shell = owner.session(shellId)
+            @Suppress("UNCHECKED_CAST")
+            val created = BeaconViewModel::class.java.getDeclaredField("clientCreatedSessions").apply { isAccessible = true }.get(vm) as Set<String>
+            @Suppress("UNCHECKED_CAST")
+            val shells = BeaconViewModel::class.java.getDeclaredField("initialShells").apply { isAccessible = true }.get(vm) as Map<String, String>
+            assertTrue(created.contains(shell.key))
+            assertEquals(shellId, shells[owner.key])
+            assertEquals("1", runBlocking { app.cache.read(shell, "client-created-shell") })
+            assertEquals(shellId, runBlocking { app.cache.read(owner, "new-chat-shell") })
+
+            fixture.persistTerminalMessages = true
+            fixture.holdPromptAcknowledgement = true
+            try {
+                compose.runOnIdle { vm.composer(TextFieldValue("First words")); vm.send() }
+                await { fixture.requests.any { it.string("method") == "prompt.submit" } }
+                // Hermes saved the prompt, but its acknowledgement never arrives: the receipt check finds it in history.
+                compose.runOnIdle { vm.reconcileSend() }
+                await { vm.chat.value.uncertain.isBlank() && vm.chat.value.messages.any { it.text == "First words" } }
+                assertFalse("The creating-client marker ends once Hermes holds the prompt", created.contains(shell.key))
+                assertNull(runBlocking { app.cache.read(shell, "client-created-shell") })
+                assertNull(shells[owner.key])
+                assertNull(runBlocking { app.cache.read(owner, "new-chat-shell") })
+            } finally { fixture.releasePromptAcknowledgement() }
+            await { vm.chat.value.streamId.isNotBlank() }
+            assertEquals("The settled send is not sent again", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
+            receipts += "A first prompt found in history by the receipt check clears the new-chat markers exactly as an acknowledged one does."
+        } finally {
+            runBlocking {
+                listOf("new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session", "conversation-index").forEach { app.cache.delete(owner, it) }
+                if (shellId.isNotBlank()) listOf("client-created-shell", "session", "draft", "pending").forEach { app.cache.delete(owner.session(shellId), it) }
+            }
+        }
+    }
+
+    @Test fun newConversationKeepsTheOpenUnsentChatInsteadOfAddingEmptyRows() = withFixture { vm, fixture ->
+        val owner = fixture.scope
+        val created = mutableListOf<String>()
+        try {
+            compose.runOnIdle { vm.newChat() }
+            await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+            val shell = vm.chat.value.sessionId.also { created += it }
+            val createsBefore = fixture.requests.count { it.string("method") == "session.create" }
+            repeat(3) { compose.runOnIdle { vm.newChat() } }
+            compose.waitForIdle()
+            assertEquals("Tapping New conversation again keeps the open unsent chat", shell, vm.chat.value.sessionId)
+            assertEquals("...and creates no further empty chat", createsBefore, fixture.requests.count { it.string("method") == "session.create" })
+            // A named thread asks for a chat of its own.
+            compose.runOnIdle { vm.newChat(json("title" to "A separate thread")) }
+            await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId != shell && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+            created += vm.chat.value.sessionId
+            assertEquals(createsBefore + 1, fixture.requests.count { it.string("method") == "session.create" })
+            receipts += "New conversation reuses the open unsent chat, so History gains no empty rows; a chat with options still opens its own."
+        } finally {
+            runBlocking { created.forEach { id -> listOf("client-created-shell", "session", "draft", "pending").forEach { app.cache.delete(owner.session(id), it) } } }
+        }
+    }
+
+    @Test fun theBeaconChatNamedOnlyByTheCacheIsRestoredWhenTheAssistantProfileDiffersFromTheChats() = withFixture { vm, fixture ->
+        val coder = fixture.scope.copy(profile = "coder")
+        fun handle(): String? = BeaconViewModel::class.java.getDeclaredMethod("readBeaconSessionHandle", Scope::class.java).apply { isAccessible = true }.invoke(vm, coder) as String?
+        runBlocking {
+            app.preferences.edit { it[stringPreferencesKey("assistant_profile")] = "coder" }
+            app.cache.write(coder, "beacon-session", "chat-b", protected = true)
+        }
+        try {
+            await { vm.preferences.value.assistantProfile == "coder" }
+            assertNull("Only the cache names the Beacon chat", compose.runOnIdle { handle() })
+            compose.runOnIdle { vm.tab("Beacon") }
+            await { vm.ui.value.tab == "Beacon" && vm.ui.value.profile == "coder" && !vm.ui.value.beaconOpening && vm.chat.value.projectionReady && vm.chat.value.sessionId == "chat-b" }
+            assertEquals("The saved handle is restored from the cache", "chat-b", compose.runOnIdle { handle() })
+            assertTrue("The Beacon screen trusts only that handle", vm.isBeaconConversation())
+            receipts += "The Beacon chat the cache names is restored as the saved handle for an assistant profile other than the chats'."
+        } finally {
+            runBlocking {
+                app.preferences.edit { it.remove(stringPreferencesKey("assistant_profile")); it.remove(stringPreferencesKey("assistant_return")) }
+                listOf("beacon-session", "beacon-opening", "new-chat-shell", "selected-session").forEach { app.cache.delete(coder, it) }
+            }
+        }
     }
 
     @Test fun interruptedTurnKeepsLiveProgressAndQueuedDraftUntilTerminalReplay() = withFixture { vm, fixture ->
