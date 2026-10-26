@@ -246,6 +246,12 @@ internal class NativeOperations(private val c: BeaconClient) {
                     // Hermes reports a chat's YOLO state only from a built agent, and the check below needs it; a chat opened moments ago may still be
                     // building one. This scoped read starts the agent and waits for it; a failed build (5032) is left to the check below.
                     try { c.nativeRpc("approval.pending", json("session_id" to target.runtimeSessionId)) } catch (e: ApiFailure) { if (e.status != 5032) throw e }
+                    // An unsent chat has no saved row, so Hermes would keep its YOLO only in memory: save it first (Beacon plugin, best
+                    // effort) and the choice lands on the row and survives a restart. Saved chats never touch the plugin.
+                    if (storedYolo(target.storedSessionId) == null) {
+                        try { c.nativeRequest("/api/plugins/beacon/mobile/sessions/${target.storedSessionId}/reserve", "POST", JSONObject()) }
+                        catch (e: ApiFailure) { if (!e.plugin) throw e }
+                    }
                     setSessionYolo(target, d.getBoolean("yolo"))
                 }
                 val result = c.nativeRpc("config.get", json("key" to "approvals.mode"))
@@ -259,7 +265,10 @@ internal class NativeOperations(private val c: BeaconClient) {
                 val bypass = reported ?: savedBypass?.takeIf { it }
                 val reportedMode = fresh.optJSONObject("info")?.string("approval_mode").orEmpty()
                 val profileMode = if (result.string("value") == "off" || reportedMode == "off") "off" else reportedMode.takeIf { it in nativeApprovalModes } ?: result.getString("value")
-                if (yoloWrite) require(bypass == d.getBoolean("yolo")) { "Approvals could not be verified. Refresh before continuing." }
+                // Without a saved row Hermes cannot report the state back (its resume of an unsaved chat has no yolo). Turning YOLO on then
+                // trusts config.set's confirmation; turning it off must be proven, so approvals are never shown active when they might not be.
+                // shortcut: without the Beacon plugin an unsent chat's YOLO can be turned on but not off until its first message saves it; ask Hermes for a session read that reports yolo if this matters.
+                if (yoloWrite && !(bypass == null && d.getBoolean("yolo"))) require(bypass == d.getBoolean("yolo")) { "Approvals could not be verified. Refresh before continuing." }
                 val sessionBypass = if (bypass is Boolean) bypass == true && profileMode != "off" else JSONObject.NULL
                 return result.put("profile_mode", profileMode).put("value", if (bypass == true || profileMode == "off") "off" else profileMode).put("session_status_known", bypass is Boolean).put("session_bypass", sessionBypass).put("session_id", sid()).put("scope_key", c.scope.key)
             }

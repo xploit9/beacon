@@ -13,17 +13,21 @@ import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Reads whose last good answer is kept on the phone: local configuration lists only, never chat-scoped or secret-bearing (MCP server configs can carry env secrets, so they stay in memory). */
+/** Reads whose last good answer is kept on the phone: configuration lists, never messages or secrets (MCP server configs can carry env secrets, so they stay in memory). The one per-chat read is the chat's project. */
 val screenReadPaths = setOf(
     "/api/profiles", "/api/tools/toolsets", "/api/commands/catalog", "/api/projects", "/api/plugins/beacon/mobile/voice-settings",
     "/api/crons", "/api/crons/delivery-options", "/api/crons/history", "/api/plugins/beacon/mobile/tasks/capabilities",
     "/api/pc/files", "/api/models", "/api/profile/approval-mode", "/api/plugins/beacon/mobile/history-retention",
+    "/api/projects/for-session",
 )
 // Query keys that name the screen; a chat, session or cursor makes a read live-only.
 private val SCREEN_QUERY_KEYS = setOf("profile", "path", "job_id")
 
+// A chat's project is a small configuration answer (no messages), so it is the one read kept per chat.
+internal const val CHAT_PROJECT_READ = "/api/projects/for-session"
+
 fun screenReadCacheable(path: String, query: Map<String, String>, profile: String): Boolean =
-    path in screenReadPaths && query.keys.all { it in SCREEN_QUERY_KEYS } && (query["profile"] ?: profile) == profile
+    path in screenReadPaths && query.keys.all { it in SCREEN_QUERY_KEYS || it == "chat" && path == CHAT_PROJECT_READ } && (query["profile"] ?: profile) == profile
 
 /** The answer's identity inside one profile: the profile is the scope, so it is not part of the request. */
 fun screenRequest(path: String, query: Map<String, String>): String =
@@ -134,6 +138,7 @@ class ScreenCache(
         }
     }
     private fun trim(map: LinkedHashMap<String, Entry>) {
+        map.values.filter { it.request.startsWith(CHAT_PROJECT_READ) }.sortedByDescending { it.at }.drop(CHAT_PROJECT_ENTRIES).forEach { map.remove(it.id) }
         var total = map.values.sumOf { it.bytes }
         for (old in map.values.sortedBy { it.at }) {
             if (total <= MAX_ROW_BYTES && map.size <= MAX_ENTRIES) break
@@ -155,5 +160,6 @@ class ScreenCache(
         const val MAX_ENTRY_BYTES = 512 * 1024
         const val MAX_ROW_BYTES = 4 * 1024 * 1024
         const val MAX_ENTRIES = 128
+        const val CHAT_PROJECT_ENTRIES = 20
     }
 }

@@ -162,6 +162,9 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     }
     @Volatile var cronFailure: String? = null
     @Volatile var historyFailure = false
+    @Volatile var projectLookupFailure = false
+    /** Chats Hermes has no saved row for yet (an unsent chat): their REST read is a 404, as on real Hermes. */
+    val unsavedRows: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
     /** When set, every optional `/api/plugins/beacon/` route answers with this status. */
     @Volatile var pluginStatus: Int? = null
     /** `devices/link` calls and their bodies; a phone is linked by signing in, with no code. */
@@ -331,7 +334,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 "method" to request.method,
                 "body_fields" to JSONArray().apply { body.keys().forEach { put(it) } },
             )
-                else json("path" to request.url.encodedPath, "method" to request.method, "body" to body, "profile" to profile)
+                else json("path" to request.url.encodedPath, "method" to request.method, "body" to body, "profile" to profile, "query" to request.url.encodedQuery.orEmpty())
             val expired = forceExpiredAccessToken?.let { request.header("Authorization") == "Bearer $it" } == true
             val outage = pluginStatus?.takeIf { request.url.encodedPath.startsWith("/api/plugins/beacon/") }
             val (status, result) = if (expired) 401 to json("error" to "session_expired")
@@ -384,7 +387,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         val parts = path.removePrefix("/api/sessions/").split('/')
         val id = parts.first()
         val row = sessions[id]
-        if (historyFailure || row == null || profileSessionIds[profile]?.contains(id) == false) return 404 to json("detail" to "Session not found")
+        if (historyFailure || id in unsavedRows || row == null || profileSessionIds[profile]?.contains(id) == false) return 404 to json("detail" to "Session not found")
         val messages = row.getJSONArray("messages")
         return when (parts.getOrNull(1)) {
             null -> 200 to row.getJSONObject("info").copy().put("id", id).put("profile", profile).put("message_count", messages.length()).put("last_active", messages.length()).put("model_config", row.optString("model_config").ifBlank { "{}" })
@@ -750,7 +753,10 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 else -> 200 to json("job" to job)
             }
         }
-        path.startsWith("/api/plugins/beacon/mobile/sessions/") && path.endsWith("/reserve") -> 200 to json("reserved" to true, "stored_session_id" to path.substringBeforeLast('/').substringAfterLast('/'), "profile" to profile)
+        path.startsWith("/api/plugins/beacon/mobile/sessions/") && path.endsWith("/reserve") -> {
+            unsavedRows.remove(path.substringBeforeLast('/').substringAfterLast('/'))  // like the plugin, reserve saves the chat's row
+            200 to json("reserved" to true, "stored_session_id" to path.substringBeforeLast('/').substringAfterLast('/'), "profile" to profile)
+        }
         path.endsWith("/voice-history") -> 200 to json("session_id" to path.substringBeforeLast('/').substringAfterLast('/'), "profile" to scope.profile, "events" to JSONArray())
         path.endsWith("/notifications/status") -> 200 to json("android_configured" to false, "targets" to JSONArray(), "delivery" to json("pending" to 0), "available" to false)
         path.endsWith("/tasks/capabilities") -> 200 to json("timezone" to "Asia/Dubai", "random_checkups" to false)
@@ -843,7 +849,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             "session.list" -> json("sessions" to JSONArray(sessions.values.filter { !it.getJSONObject("info").optBoolean("archived") && (params.optBoolean("include_hidden") || !it.getJSONObject("info").optBoolean("hidden")) }.map { row -> row.getJSONObject("info").copy().put("id", row.string("stored_session_id")).put("stored_session_id", row.string("stored_session_id")) }))
             "projects.list" -> json("projects" to JSONArray(projects.values.toList()))
             // Like Hermes: the project owning a folder; no cwd means the profile's own (project-free) folder.
-            "projects.for_cwd" -> params.string("cwd").ifBlank { "C:/synthetic-home" }.let { cwd -> json("cwd" to cwd, "project" to (projects.values.filter { project -> project.rows("folders").any { cwd.startsWith(it.string("path")) } }.maxByOrNull { project -> project.rows("folders").maxOfOrNull { it.string("path").length } ?: 0 } ?: JSONObject.NULL)) }
+            "projects.for_cwd" -> if (projectLookupFailure) throw FixtureRpcFailure(5007, "Projects are unavailable") else params.string("cwd").ifBlank { "C:/synthetic-home" }.let { cwd -> json("cwd" to cwd, "project" to (projects.values.filter { project -> project.rows("folders").any { cwd.startsWith(it.string("path")) } }.maxByOrNull { project -> project.rows("folders").maxOfOrNull { it.string("path").length } ?: 0 } ?: JSONObject.NULL)) }
             "session.workspace.move" -> params.getString("session_key").let { key -> sessions.getValue(key).getJSONObject("info").put("cwd", params.getString("cwd")); json("session_key" to key, "cwd" to params.getString("cwd")) }
             "projects.get" -> json("project" to projects.getValue(params.getString("id")))
             "projects.create" -> {

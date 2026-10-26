@@ -71,6 +71,16 @@ class ScreenCacheTest {
         assertNotNull(many.exact(other, "k${ScreenCache.MAX_ENTRIES + 1}"))
     }
 
+    @Test fun chatProjectsKeepOnlyTheNewestTwentyAndNeverPushOutTheScreens() = runBlocking<Unit> {
+        val cache = newCache().apply { open(default) }
+        cache.put(default, "profiles", "/api/profiles", at(0), json("n" to 0))
+        repeat(25) { cache.put(default, "project-of:c$it", screenRequest("/api/projects/for-session", mapOf("chat" to "c$it")), at(it + 1L), json("n" to it)) }
+        val chats = cache.latest(default).filter { it.request.startsWith(CHAT_PROJECT_READ) }
+        assertEquals(ScreenCache.CHAT_PROJECT_ENTRIES, chats.size)
+        assertEquals((5 until 25).map { "project-of:c$it" }.toSet(), chats.map { it.key }.toSet())
+        assertNotNull(cache.exact(default, "profiles", "/api/profiles"))
+    }
+
     @Test fun oversizedAndCredentialShapedAnswersAreNeverKeptAndReplaceTheOlderCopy() = runBlocking<Unit> {
         val cache = newCache().apply { open(default) }
         cache.put(default, "models", "", at(1), json("groups" to 1))
@@ -161,7 +171,10 @@ class ScreenCacheTest {
         assertFalse("chat-scoped reads stay live", screenReadCacheable("/api/crons/history", mapOf("session_id" to "s"), "p"))
         assertFalse(screenReadCacheable("/api/session/usage", mapOf("session_id" to "s"), "p"))
         assertFalse("MCP server configs can hold secrets", screenReadCacheable("/api/mcp/servers", emptyMap(), "p"))
-        assertFalse(screenReadPaths.any { "pair" in it || "token" in it || "auth" in it || "session" in it || "mcp" in it })
+        // The one chat-keyed read is a chat's project (no messages); every other chat-scoped read stays live.
+        assertTrue(screenReadCacheable("/api/projects/for-session", mapOf("chat" to "c"), "p"))
+        assertFalse(screenReadCacheable("/api/crons/history", mapOf("chat" to "c"), "p"))
+        assertFalse(screenReadPaths.filterNot { it == "/api/projects/for-session" }.any { "pair" in it || "token" in it || "auth" in it || "session" in it || "mcp" in it })
         assertEquals("/api/pc/files&path=.", screenRequest("/api/pc/files", mapOf("profile" to "p", "path" to ".")))
         assertEquals(screenRequest("/api/tools/toolsets", emptyMap()), screenRequest("/api/tools/toolsets", mapOf("profile" to "p")))
     }

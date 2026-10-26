@@ -287,9 +287,7 @@ class NativeExperienceUiTest {
 
     @Test fun commandsLeaveTheirPickerAndExplicitRefreshReadsTheServer() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.openCatalog("Toolsets") }
-        // R6M keeps the chat's toolsets read-only; commands live in profile Settings.
-        await { vm.data.value["picker:toolsets"] != null }
-        compose.onNodeWithTag("toolsets-profile-settings").performClick()
+        // The chat's Toolsets sheet is the Settings Tools page itself.
         await { vm.data.value["native-tools"] != null }
         clickText("Browse chat commands")
         await { vm.catalog.value.isBlank() && vm.ui.value.morePage == "Commands" && vm.data.value["slash:catalog"] != null }
@@ -297,10 +295,8 @@ class NativeExperienceUiTest {
         compose.onNodeWithContentDescription("Refresh commands").performClick()
         await { fixture.requests.count { it.string("method") == "commands.catalog" } > before }
         compose.onNodeWithContentDescription("Back").performClick()
-        await { vm.ui.value.morePage == "Tools & commands" }
-        compose.onNodeWithContentDescription("Back").performClick()
         await { vm.ui.value.tab == "Chat" }
-        receipts += "Toolsets links to profile Settings; Browse commands closes the picker, explicit Refresh reads Hermes, and Back retraces Settings to Chat."
+        receipts += "The chat's Toolsets sheet holds the Settings Tools page; Browse commands closes the sheet, explicit Refresh reads Hermes, and Back returns to Chat."
         capture("audit-commands-picker-return")
     }
 
@@ -1223,7 +1219,8 @@ class NativeExperienceUiTest {
         assertEquals("Travel", vm.ui.value.query)
         compose.onNodeWithTag("navigation-bots").assertIsOff()
         compose.onNodeWithTag("navigation-menu").performScrollToNode(hasText("Travel"))
-        compose.onNodeWithText("Travel", substring = false).assertExists()
+        // The chat header now names Travel as chat-a's project too, so look only inside the menu.
+        compose.onNode(hasText("Travel", substring = false) and hasAnyAncestor(hasTestTag("navigation-menu"))).assertExists()
         assertEquals(0, fixture.requests.count { it.string("method") == "session.create" })
         capture("bot-mode-toggle-restored")
         toggle()
@@ -3035,11 +3032,16 @@ class NativeExperienceUiTest {
             compose.onNodeWithContentDescription("Conversation actions").performClick()
             compose.waitUntil(5_000) { compose.onAllNodesWithTag(tag).fetchSemanticsNodes().isNotEmpty() }
         }
-        // The fixture files chat-a under Travel by its folder.
+        fun headerShows(project: String) = compose.onAllNodes(hasTestTag("chat-header-project") and hasText(project, substring = true), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
+        // The fixture files chat-a under Travel by its folder, and the header says so.
+        await { headerShows("Travel") }
         menuShows("conversation-project-remove")
+        compose.onNodeWithTag("conversation-project-open").assertTextContains("Open Travel")
         compose.onNodeWithTag("conversation-project-remove").performScrollTo().assertTextContains("Remove from Travel").performClick()
         await { fixture.sessions.getValue("chat-a").getJSONObject("info").string("cwd") == "C:/synthetic-home" }
         await { vm.data.value["project-of:chat-a"]?.let { it.has("project") && it.optJSONObject("project") == null } == true }
+        // The header follows without a refresh: a chat in no project shows nothing.
+        await { compose.onAllNodesWithTag("chat-header-project", useUnmergedTree = true).fetchSemanticsNodes().isEmpty() }
 
         menuShows("conversation-project-add")
         compose.onNodeWithTag("conversation-project-add").performScrollTo().performClick()
@@ -3048,9 +3050,123 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Research", useUnmergedTree = true).performClick()
         await { fixture.sessions.getValue("chat-a").getJSONObject("info").string("cwd") == "C:/synthetic-workspace/research" }
         await { vm.data.value["project-of:chat-a"]?.optJSONObject("project")?.string("id") == "p_research" }
+        await { headerShows("Research") }
         menuShows("conversation-project-remove")
         compose.onNodeWithTag("conversation-project-remove").assertTextContains("Remove from Research")
-        receipts += "The chat menu removes a chat from its project and adds it to another, from Hermes's own filing."
+        receipts += "The chat menu removes a chat from its project and adds it to another, from Hermes's own filing, and the chat header follows each change."
+    }
+
+    @Test fun aChatReadsItsProjectAgainAfterItsFirstSendButNotOnEveryOpen() = withFixture { vm, fixture ->
+        // Every fixture chat shares one folder, so a chat's own reads are told apart by its answer's load time.
+        fun loadedAt() = vm.data.value["project-of:chat-a"]?.optLong("_cached_at") ?: 0L
+        await { vm.data.value["project-of:chat-a"]?.has("project") == true && loadedAt() > 0 }
+        compose.waitForIdle()
+        val first = loadedAt()
+        // Opening a saved chat again uses the answer it has.
+        compose.runOnIdle { vm.selectSession("chat-b") }
+        await { vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady }
+        compose.runOnIdle { vm.selectSession("chat-a") }
+        await { vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
+        Thread.sleep(1_000); compose.waitForIdle()
+        assertEquals("A saved chat is not read again on every open", first, loadedAt())
+        // A new chat's answer is read again once its first message is in.
+        compose.runOnIdle { vm.newChat() }
+        await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+        val fresh = vm.chat.value.sessionId
+        compose.waitForIdle()
+        val beforeSend = fixture.requests.count { it.string("method") == "projects.for_cwd" }
+        compose.runOnIdle { fixture.persistTerminalMessages = true; vm.composer(TextFieldValue("Hello")); vm.send() }
+        await { vm.chat.value.sessionId == fresh && vm.chat.value.messages.isNotEmpty() }
+        await { fixture.requests.count { it.string("method") == "projects.for_cwd" } == beforeSend + 1 }
+        Thread.sleep(500); compose.waitForIdle()
+        assertEquals("One read after the first send, not one per update", beforeSend + 1, fixture.requests.count { it.string("method") == "projects.for_cwd" })
+        receipts += "A saved chat keeps its project answer when reopened; a new chat reads its project once after its first message."
+    }
+
+    @Test fun aProjectThatCouldNotBeReadOffersAnotherTry() = withFixture { vm, fixture ->
+        await { vm.data.value["project-of:chat-a"]?.has("project") == true }
+        // A failed refresh keeps a known answer on screen (memory and the phone's cache); the retry is for a chat whose project was never read.
+        compose.runOnIdle { vm.screens.invalidate(fixture.scope, "/api/projects/for-session"); vm.storeData("project-of:chat-a", JSONObject()) }
+        fixture.projectLookupFailure = true
+        compose.runOnIdle { vm.loadConversationProject("chat-a") }
+        await { vm.data.value["project-of:chat-a"]?.has("_error") == true }
+        compose.onNodeWithContentDescription("Conversation actions").performClick()
+        compose.waitUntil(5_000) { compose.onAllNodesWithTag("conversation-project-retry").fetchSemanticsNodes().isNotEmpty() }
+        fixture.projectLookupFailure = false
+        compose.onNodeWithTag("conversation-project-retry").performScrollTo().performClick()
+        // The answer comes back, so the item becomes the chat's own project actions.
+        compose.waitUntil(5_000) { compose.onAllNodesWithTag("conversation-project-remove").fetchSemanticsNodes().isNotEmpty() }
+        receipts += "A project read that failed offers Try again in the chat menu, and a retry brings the project actions back."
+    }
+
+    @Test fun theChatHeaderShowsItsProjectAndTheMenuOpensThatProject() = withFixture { vm, _ ->
+        // The fixture files chat-a under Travel by its folder.
+        await { compose.onAllNodes(hasTestTag("chat-header-project") and hasText("Travel", substring = true), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+        // Thinking and typing take the line over from the project.
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "runtime-chat-a", liveText = "") }
+        compose.onNodeWithTag("chat-header-project", useUnmergedTree = true).assertDoesNotExist()
+        compose.onNodeWithTag("chat-header-subtitle", useUnmergedTree = true).assertTextEquals("Thinking…")
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "", liveText = "") }
+        await { compose.onAllNodesWithTag("chat-header-project", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithContentDescription("Conversation actions").performClick()
+        compose.waitUntil(5_000) { compose.onAllNodesWithTag("conversation-project-open").fetchSemanticsNodes().isNotEmpty() }
+        // The chat menu is height-capped, so the item is scrolled into view before the tap.
+        compose.onNodeWithTag("conversation-project-open").performScrollTo().assertHeightIsAtLeast(48.dp).performClick()
+        await { vm.ui.value.tab == "Projects" }
+        // The project's own page opens, not the list of projects.
+        await { vm.data.value["native-project:p_project_a"]?.optJSONObject("project") != null }
+        compose.onNodeWithText("Linked folders").assertExists()
+        receipts += "The chat header names the chat's project beside the model, Thinking or Typing takes the line over, and the menu's Open <project> opens the Projects tab on that project."
+    }
+
+    @Test fun aProjectWithoutAFolderOffersLinkingOneAndThenTakesTheChat() = withFixture { vm, fixture ->
+        fixture.projects["p_fresh"] = json("id" to "p_fresh", "name" to "Fresh start", "archived" to false, "folders" to org.json.JSONArray())
+        compose.runOnIdle { vm.loadNativeProjects(force = true) }
+        await { vm.data.value["native-projects"]?.rows("projects")?.any { it.string("id") == "p_fresh" } == true }
+        compose.onNodeWithContentDescription("Conversation actions").performClick()
+        compose.waitUntil(5_000) { compose.onAllNodesWithTag("conversation-project-move").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("conversation-project-move").performScrollTo().performClick()
+        compose.onNodeWithText("Move to project").assertExists()
+        compose.onNodeWithText("No folder yet").assertExists()
+        compose.onNodeWithText("Fresh start", useUnmergedTree = true).performClick()
+        // Nothing to choose from, so the sheet offers to link a folder here instead of ending.
+        compose.onNodeWithTag("project-link-folder").assertHeightIsAtLeast(48.dp).performClick()
+        await { compose.onAllNodesWithText("research", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("research", useUnmergedTree = true).performClick()
+        await { vm.data.value["project-folder"]?.string("path") == "C:/synthetic-workspace/research" }
+        compose.onNodeWithText("Use this folder").performClick()
+        await { fixture.sessions.getValue("chat-a").getJSONObject("info").string("cwd") == "C:/synthetic-workspace/research" }
+        assertEquals("The folder is linked to the project", 1, fixture.projects.getValue("p_fresh").rows("folders").size)
+        await { vm.data.value["project-of:chat-a"]?.optJSONObject("project")?.string("id") == "p_fresh" }
+        await { compose.onAllNodes(hasTestTag("chat-header-project") and hasText("Fresh start", substring = true), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+        receipts += "A project made on the phone has no folder: the chat sheet links a PC folder right there, then moves the chat into it and the header shows the project."
+    }
+
+    @Test fun theHistoryMenuAddsAChatToAProjectAndRemovesItAgain() = withFixture { vm, fixture ->
+        fixture.projects["p_research"] = json("id" to "p_research", "name" to "Research", "archived" to false, "primary_path" to "C:/synthetic-workspace/research",
+            "folders" to org.json.JSONArray().put(json("path" to "C:/synthetic-workspace/research", "label" to "research", "is_primary" to true)))
+        compose.runOnIdle { vm.loadNativeProjects(force = true); vm.toggleSessions(true) }
+        await { vm.data.value["native-projects"]?.rows("projects")?.any { it.string("id") == "p_research" } == true }
+        await { vm.ui.value.sessions.any { sessionRowId(it) == "chat-b" } }
+        fun menuShows(tag: String) {
+            compose.onNodeWithTag("history-row:chat-b").performScrollTo().performTouchInput { longClick() }
+            compose.waitUntil(5_000) { compose.onAllNodesWithTag(tag).fetchSemanticsNodes().isNotEmpty() }
+        }
+        // The fixture files chat-b under Travel by its folder.
+        menuShows("conversation-project-remove")
+        compose.onNodeWithTag("conversation-project-remove").assertTextContains("Remove from Travel").performClick()
+        await { fixture.sessions.getValue("chat-b").getJSONObject("info").string("cwd") == "C:/synthetic-home" }
+        await { vm.data.value["project-of:chat-b"]?.let { it.has("project") && it.optJSONObject("project") == null } == true }
+        assertEquals("Acting on another conversation leaves the open chat in place", "chat-a", vm.chat.value.sessionId)
+
+        menuShows("conversation-project-add")
+        compose.onNodeWithTag("conversation-project-add").performClick()
+        compose.onNodeWithText("Add to project").assertExists()
+        compose.onNodeWithText("Research", useUnmergedTree = true).performClick()
+        await { fixture.sessions.getValue("chat-b").getJSONObject("info").string("cwd") == "C:/synthetic-workspace/research" }
+        await { vm.data.value["project-of:chat-b"]?.optJSONObject("project")?.string("id") == "p_research" }
+        assertEquals("chat-a", vm.chat.value.sessionId)
+        receipts += "The history long-press menu adds a chat to a project and removes it again without opening the chat."
     }
 
     @Test fun nativeProjectManagementAssignsFolderWithoutDeletingChatsOrFiles() = withFixture { vm, fixture ->
@@ -3103,6 +3219,7 @@ class NativeExperienceUiTest {
         await { vm.chat.value.raw.string("workspace") == "C:/synthetic-workspace/research" }
         assertEquals("Retain during project move", vm.composer.value.text)
         assertEquals("chat-a", vm.chat.value.sessionId)
+        await { compose.onAllNodes(hasTestTag("chat-header-project") and hasText("Research", substring = true), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
         compose.runOnIdle { vm.navigate("Projects") }
         await { vm.data.value["native-projects"]?.rows("projects")?.any { it.string("id") == id } == true }
         compose.onNodeWithText("Research", useUnmergedTree = true).performClick()
@@ -3300,6 +3417,12 @@ class NativeExperienceUiTest {
             await { vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.newChatOpening }
             shellId = vm.chat.value.sessionId
             assertEquals(createsBefore + 1, fixture.requests.count { it.string("method") == "session.create" })
+            // The first app leaves the shell before it is marked unsaved: while it shows or is bound to the shell, its own reads
+            // (the approval shield, a background socket reopen) could resume and so save it, leaving the restarted app nothing to resume.
+            compose.runOnIdle { vm.selectSession("chat-a") }
+            await { vm.chat.value.sessionId == "chat-a" }
+            compose.waitForIdle()
+            runBlocking { fixture.client.nativeSession("chat-a") }
             fixture.markUnpromptedShell(shellId)
             assertFalse(fixture.sessions.containsKey(shellId))
             val cachedShell = requireNotNull(runBlocking { app.cache.read(owner, "new-chat-shell") })
@@ -3310,8 +3433,9 @@ class NativeExperienceUiTest {
             val newClient = fixture.clientFor(auth, app.auth)
             restartedClient = newClient
             lateinit var restarted: BeaconViewModel
-            // Counted before the restart: the new ViewModel may resume the cached shell while starting, before newChat() asks.
-            val resumesBefore = fixture.requests.count { it.string("method") == "session.resume" }
+            assertFalse("The shell is still unsaved when the app restarts", fixture.sessions.containsKey(shellId))
+            fun shellResumes() = fixture.requests.count { it.string("method") == "session.resume" && it.getJSONObject("params").string("session_id") == shellId }
+            val resumesBefore = shellResumes()
             compose.runOnUiThread {
                 restarted = ViewModelProvider(restartedStore, viewModelFactory { initializer { BeaconViewModel(app, SavedStateHandle()) } })[BeaconViewModel::class.java]
                 field(restarted, "client", newClient)
@@ -3335,7 +3459,7 @@ class NativeExperienceUiTest {
             assertEquals("Keep this draft after restart", restarted.composer.value.text)
             assertEquals(createsBefore + 1, fixture.requests.count { it.string("method") == "session.create" })
             assertTrue(fixture.requests.any { it.string("method") == "GET" && it.string("path") == "/api/sessions/$shellId" })
-            assertEquals(resumesBefore + 1, fixture.requests.count { it.string("method") == "session.resume" })
+            assertEquals(resumesBefore + 1, shellResumes())
             assertTrue(fixture.sessions.containsKey(shellId))
             receipts += "After a fresh ViewModel restores the owner-bound shell, passive history may be absent until Hermes resumes the minted key; the same shell resumes without another create and the draft survives."
         } finally {
@@ -3540,6 +3664,8 @@ class NativeExperienceUiTest {
                 // The stored and requested voice id keeps the provider's spelling.
                 val choices = if (provider == "grok") listOf("eve", "ara", "rex", "sal", "leo") else listOf("Puck", "Charon", "Kore", "Fenrir", "Aoede", "Leda", "Orus", "Zephyr")
                 val voice = choices.first { it != before.voice }
+                // The voice list comes in with the next step's animation; wait until it is settled before scrolling to it.
+                compose.waitUntil(5_000) { compose.onAllNodesWithTag("voice-option-voice-$voice").fetchSemanticsNodes().isNotEmpty() }
                 compose.onNodeWithTag("voice-option-voice-$voice").performScrollTo().performClick()
                 await { store.settings(provider).voice == voice }
                 compose.onNodeWithTag("voice-option-voice-$voice").assertIsSelected()
@@ -4032,7 +4158,9 @@ class NativeExperienceUiTest {
         fun listed(id: String) = vm.ui.value.sessions.any { it.string("session_id") == id }
         fun listReads() = fixture.requests.count { it.string("method") == "GET" && it.string("path") == "/api/sessions" }
         try {
-            await { !vm.ui.value.historyLoading }
+            // The list's own first read must be in before the baseline, or it lands later and looks like a read the open caused.
+            await { listReads() > 0 && !vm.ui.value.historyLoading }
+            compose.waitForIdle()
             val readsBefore = listReads()
             compose.runOnIdle { vm.newChat() }
             await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
@@ -4040,7 +4168,8 @@ class NativeExperienceUiTest {
             assertFalse("An empty new chat is not a History row", listed(plain))
             Thread.sleep(1_000)
             compose.waitForIdle()
-            assertEquals("Opening a chat does not read the History list again", readsBefore, listReads())
+            val extra = fixture.requests.filter { it.string("method") == "GET" && it.string("path") == "/api/sessions" }.drop(readsBefore).map { it.string("query") }
+            assertEquals("Opening a chat does not read the History list again: $extra", readsBefore, listReads())
             // Its first message puts it there, as a summary row.
             fixture.persistTerminalMessages = true
             compose.runOnIdle { vm.composer(TextFieldValue("First words")); vm.send() }

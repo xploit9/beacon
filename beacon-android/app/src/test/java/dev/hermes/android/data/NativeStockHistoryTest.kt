@@ -233,6 +233,8 @@ class NativeStockHistoryTest {
         assertEquals("A sign-in that ended still ends the refresh", 401, (runCatching { list(client(signedOut)) }.exceptionOrNull() as? ApiFailure)?.status)
         val ended = Stock().apply { override = { r -> if (r.url.encodedPath == "/api/sessions" && r.url.queryParameter("sources") != null) throw LoopbackSessionRefreshFailed() else null } }
         assertTrue(runCatching { list(client(ended)) }.exceptionOrNull() is LoopbackSessionRefreshFailed)
+        val expired = Stock().apply { override = { r -> if (r.url.encodedPath == "/api/sessions" && r.url.queryParameter("sources") != null) throw NativeAuthExpiredException() else null } }
+        assertTrue(runCatching { list(client(expired)) }.exceptionOrNull() is NativeAuthExpiredException)
     }
 
     @Test fun anArchivedPinStaysOutOfTheActiveList() = runBlocking<Unit> {

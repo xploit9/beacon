@@ -12,6 +12,7 @@ import androidx.compose.ui.test.isNotSelected
 import androidx.compose.ui.test.isSelected
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertHeightIsAtLeast
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
@@ -21,6 +22,7 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.performTextReplacement
+import androidx.compose.ui.unit.dp
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.lifecycle.SavedStateHandle
@@ -388,12 +390,45 @@ class NativeApprovalMenuUiTest {
         compose.onNodeWithContentDescription("Approvals: Manual").assertIsDisplayed()
     }
 
+    // Without the plugin an unsent chat stays unsaved: YOLO on is taken from Hermes' own confirmation, but YOLO off cannot be proven
+    // and is refused, so the shield never claims approvals are back while a bypass may still be on.
+    @Test fun withoutThePluginAnUnsentChatTakesYoloOnButNotAnUnprovenOff() = withFixture(prepare = { vm, fixture ->
+        fixture.omitResumeYolo = true; fixture.approvalMode = "smart"; fixture.pluginStatus = 404
+        flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(messages = emptyList())
+    }) { vm, fixture ->
+        await { vm.data.value["picker:approvals"]?.string("profile_mode") == "smart" }
+        fixture.unsavedRows += vm.chat.value.sessionId
+        open(vm)
+        compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
+        compose.onNodeWithText("Enable YOLO").performClick()
+        await { vm.conversationPending.value.isEmpty() && "picker:approvals" !in vm.refreshing.value && vm.data.value.keys.any { it.startsWith("approvals-chosen:") } }
+        compose.onNodeWithContentDescription("Approvals: YOLO").assertIsDisplayed()
+        open(vm)
+        compose.onNodeWithTag("approval-ask").performScrollTo().performClick()
+        await { vm.ui.value.error.isNotBlank() && vm.conversationPending.value.isEmpty() }
+        assertTrue(vm.ui.value.error, vm.ui.value.error.contains("approvals", ignoreCase = true))
+        compose.onNodeWithContentDescription("Approvals: Auto").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Approvals: YOLO").assertIsDisplayed()
+    }
+
+    @Test fun aSavedChatsYoloNeverUsesThePlugin() = withFixture(prepare = { _, fixture -> fixture.approvalMode = "smart" }) { vm, fixture ->
+        await { vm.data.value["picker:approvals"]?.string("profile_mode") == "smart" }
+        open(vm)
+        compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
+        compose.onNodeWithText("Enable YOLO").performClick()
+        await { fixture.requests.any { it.string("method") == "config.set" && it.getJSONObject("params").string("key") == "yolo" } && vm.conversationPending.value.isEmpty() }
+        assertTrue(fixture.requests.none { it.string("path").endsWith("/reserve") })
+    }
+
     // Live 2026-10-26 (1.1.5): YOLO enabled in an unsent chat that Hermes cannot report yet left the shield on "Unknown".
     @Test fun yoloChosenInAnUnsentChatStaysShownAfterTheSave() = withFixture(prepare = { vm, fixture ->
         fixture.omitResumeYolo = true; fixture.approvalMode = "smart"
         flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(messages = emptyList())
-    }) { vm, _ ->
+    }) { vm, fixture ->
         await { vm.data.value["picker:approvals"]?.string("profile_mode") == "smart" }
+        // Real Hermes has no saved row for an unsent chat, so it cannot read the choice back (live 27 Oct: the save failed).
+        val chatId = vm.chat.value.sessionId
+        fixture.unsavedRows += chatId
         open(vm)
         compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
         compose.onNodeWithText("Enable YOLO").performClick()
@@ -401,6 +436,10 @@ class NativeApprovalMenuUiTest {
         compose.waitForIdle()
         compose.onNodeWithContentDescription("Approvals: YOLO").assertIsDisplayed()
         compose.onNodeWithContentDescription("Approvals: Unknown").assertDoesNotExist()
+        // The chat is saved before YOLO is set, so Hermes keeps the choice on its row.
+        val reserve = fixture.requests.indexOfFirst { it.string("path") == "/api/plugins/beacon/mobile/sessions/$chatId/reserve" }
+        val set = fixture.requests.indexOfFirst { it.string("method") == "config.set" && it.optJSONObject("params")?.string("key") == "yolo" }
+        assertTrue("reserve=$reserve set=$set", reserve in 0 until set)
     }
 
     // Hermes reports nothing for a chat that is not saved yet; it runs on the profile default, so the shield shows Auto and ticks it.
@@ -531,16 +570,46 @@ class NativeApprovalMenuUiTest {
         compose.onNodeWithText("Use the model's maximum reasoning budget").assertIsDisplayed()
     }
 
-    @Test fun chatToolsetsAreReadOnlyAndLinkToProfileSettings() = withFixture(
-        content = { NativeCatalog(it) }, prepare = { vm, _ ->
-            vm.storeData("picker:toolsets", json("items" to JSONArray().put(json("name" to "web", "label" to "Web tools", "enabled" to true))))
-            flow<String>(vm, "_catalog").value = "Toolsets"
-        },
+    // 2026-10-26: the chat's Toolsets sheet carries the same Tools and MCP servers controls as Settings, not a read-only list.
+    @Test fun chatToolsetsSheetShowsTheSettingsToolsAndSendsTheSameToggle() = withFixture(
+        content = { NativeCatalog(it) }, prepare = { vm, _ -> flow<String>(vm, "_catalog").value = "Toolsets" },
     ) { vm, fixture ->
-        compose.onNodeWithText("Enabled for this profile").assertIsDisplayed()
-        compose.onNodeWithTag("toolsets-profile-settings").performClick()
-        assertEquals("Tools & commands", vm.ui.value.morePage)
-        assertTrue(fixture.requests.none { it.string("method") in setOf("PUT", "POST") && it.string("path").startsWith("/api/tools/toolsets") })
+        compose.onNodeWithTag("chat-toolsets").assertIsDisplayed()
+        compose.onNodeWithTag("chat-toolsets-tools").assertHeightIsAtLeast(48.dp).assert(isSelected())
+        compose.onNodeWithTag("chat-toolsets-mcp").assertHeightIsAtLeast(48.dp).assert(isNotSelected())
+        await { vm.data.value["native-tools"] != null && "native-tools" !in vm.refreshing.value }
+        compose.onNodeWithText("Web research").assertIsDisplayed()
+        compose.onNodeWithText("Browse chat commands").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Change for all chats").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Web research").performClick()
+        await { !fixture.toolEnabled && "native-tools" !in vm.refreshing.value }
+        val write = fixture.requests.single { it.string("method") == "PUT" && it.string("path") == "/api/tools/toolsets/web" }
+        assertEquals(false, write.getJSONObject("body").getBoolean("enabled"))
+        assertEquals(fixture.client.auth.profile, write.getJSONObject("body").string("profile"))
+        assertEquals(fixture.client.auth.profile, write.string("profile"))
+    }
+
+    @Test fun chatToolsetsSheetSwitchesToTheMcpServersPage() = withFixture(
+        content = { NativeCatalog(it) }, prepare = { vm, _ -> flow<String>(vm, "_catalog").value = "Toolsets" },
+    ) { vm, fixture ->
+        compose.onNodeWithText("Changes apply to this profile's new chats.").assertDoesNotExist()
+        compose.onNodeWithTag("chat-toolsets-mcp").performClick()
+        compose.onNodeWithTag("chat-toolsets-mcp").assert(isSelected())
+        compose.onNodeWithTag("chat-toolsets-tools").assert(isNotSelected())
+        await { vm.data.value["native-mcp"] != null && "native-mcp" !in vm.refreshing.value }
+        compose.onNodeWithText("fixture_mcp").assertIsDisplayed()
+        compose.onNodeWithText("Changes apply to this profile's new chats.").assertIsDisplayed()
+        compose.onNodeWithText("Web research").assertDoesNotExist()
+        compose.onNodeWithText("Test connection").performScrollTo().performClick()
+        await { vm.data.value["mcp-test:fixture_mcp"] != null }
+        compose.onNodeWithText("View 1 tools").performScrollTo().performClick()
+        compose.onNodeWithText("read_fixture").assertExists()
+        compose.onNodeWithContentDescription("fixture_mcp").performClick()
+        await { !fixture.connectionEnabled && "native-mcp" !in vm.refreshing.value }
+        assertEquals(1, fixture.requests.count { it.string("method") == "POST" && it.string("path") == "/api/mcp/servers/fixture_mcp/test" })
+        assertEquals(false, fixture.requests.single { it.string("method") == "PUT" && it.string("path") == "/api/mcp/servers/fixture_mcp/enabled" }.getJSONObject("body").getBoolean("enabled"))
+        compose.onNodeWithTag("chat-toolsets-tools").performClick()
+        compose.onNodeWithText("Web research").assertIsDisplayed()
     }
 
     @Test fun historyFiltersLoadedTitlesAndShowsNoMatchesWhileTheServerIsPending() = withFixture(

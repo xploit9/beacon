@@ -40,6 +40,7 @@ internal fun currentPickerProvider(groups: List<JSONObject>, provider: String, m
         .ifBlank { groups.filter { g -> model.isNotBlank() && (g.rows("models") + g.rows("extra_models")).any { it.string("id") == model } }.singleOrNull()?.string("provider_id").orEmpty() }
 }
 
+@OptIn(ExperimentalMaterial3Api::class) // SegmentedButton, as in ChatScreen
 @Composable fun NativeCatalog(vm: BeaconViewModel, containedActions: Boolean = false) {
     val kind by vm.catalog.collectAsStateWithLifecycle()
     if (kind.isBlank()) return
@@ -53,10 +54,12 @@ internal fun currentPickerProvider(groups: List<JSONObject>, provider: String, m
     val modelPending = modelSaving.isNotBlank() || "$scopeKey|/api/session/update" in pending
     val reasoningPending = reasoningSaving || "$scopeKey|/api/reasoning" in pending
     var query by rememberSaveable(kind, chat.sessionId) { mutableStateOf("") }
+    var toolsMcp by rememberSaveable(kind, chat.sessionId) { mutableStateOf(false) }
     Dialog(vm::closeCatalog, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Surface(Modifier.widthIn(max = 900.dp).fillMaxWidth().fillMaxHeight(.92f).padding(12.dp), shape = MaterialTheme.shapes.extraLarge, color = MaterialTheme.colorScheme.surface.copy(alpha = 1f)) {
+        Surface(Modifier.widthIn(max = if (kind == "Toolsets") 560.dp else 900.dp).fillMaxWidth().fillMaxHeight(if (kind == "Toolsets") .8f else .92f).padding(12.dp), shape = MaterialTheme.shapes.extraLarge, color = MaterialTheme.colorScheme.surface.copy(alpha = 1f)) {
             Column(Modifier.fillMaxSize()) {
-                Header(kind, chat.title, actions = {
+                // Toolsets belong to the profile, not to this chat, so the chat's title is not shown under them.
+                Header(kind, if (kind == "Toolsets") "" else chat.title, actions = {
                     if (kind == "Reasoning" || kind == "Model & provider") IconButton(
                         onClick = { vm.openCatalog(kind) },
                         enabled = if (kind == "Reasoning") !reasoningPending && "picker:reasoning" !in refreshing else !modelPending && "picker:models" !in refreshing,
@@ -116,19 +119,21 @@ internal fun currentPickerProvider(groups: List<JSONObject>, provider: String, m
                             }
                         }
                     }
-                    "Toolsets" -> {
-                        val record = data["picker:toolsets"]
-                        Column(Modifier.fillMaxSize().padding(20.dp).testTag("chat-toolsets")) {
-                            Text("Toolsets are shared by all chats in this profile.")
-                            TextButton(onClick = { vm.closeCatalog(); vm.more("Tools & commands") }, modifier = Modifier.testTag("toolsets-profile-settings")) { Text("Change for all chats") }
-                            if (record == null || "picker:toolsets" in refreshing) LinearProgressIndicator(Modifier.fillMaxWidth())
-                            if (recordError(record).isNotBlank()) Text("Couldn't load toolsets. Reopen to try again.", color = MaterialTheme.colorScheme.error)
-                            LazyColumn(Modifier.weight(1f)) {
-                                items(record?.rows("items").orEmpty(), key = { it.string("name") }) { row ->
-                                    ListItem(headlineContent = { Text(row.string("label", row.string("name"))) }, supportingContent = { Text(if (row.optBoolean("enabled")) "Enabled for this profile" else "Disabled for this profile") })
-                                }
+                    // The same pages as Settings > Tools & MCP; the Tools page already says its changes apply to new chats.
+                    "Toolsets" -> Column(Modifier.fillMaxSize().testTag("chat-toolsets")) {
+                        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
+                            listOf(false to "Tools", true to "MCP servers").forEachIndexed { index, (mcp, label) ->
+                                SegmentedButton(
+                                    selected = toolsMcp == mcp,
+                                    onClick = { toolsMcp = mcp },
+                                    shape = SegmentedButtonDefaults.itemShape(index, 2),
+                                    modifier = Modifier.heightIn(min = 48.dp).testTag(if (mcp) "chat-toolsets-mcp" else "chat-toolsets-tools"),
+                                ) { Text(uiText(label), maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
                             }
                         }
+                        if (toolsMcp) Text("Changes apply to this profile's new chats.", Modifier.padding(start = 20.dp, top = 12.dp, end = 20.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        // One scroller inside the sheet: the page's own list fills this bounded box.
+                        Box(Modifier.weight(1f).fillMaxWidth()) { NativeToolSettings(vm, mcp = toolsMcp, containedActions = true) }
                     }
                     "Reasoning" -> {
                         val value = data["picker:reasoning"]

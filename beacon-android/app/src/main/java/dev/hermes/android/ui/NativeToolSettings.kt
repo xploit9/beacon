@@ -13,6 +13,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewModelScope
 import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.core.*
 import kotlinx.coroutines.CancellationException
@@ -26,7 +27,6 @@ import java.net.URLEncoder
     val key = if (mcp) "native-mcp" else "native-tools"
     val path = if (mcp) "/api/mcp/servers" else "/api/tools/toolsets"
     val loading = key in refreshing
-    val scope = rememberCoroutineScope()
     val client = vm.client
     var search by rememberSaveable(ui.origin, ui.owner, ui.profile, mcp) { mutableStateOf("") }
     var busy by remember(client, ui.origin, ui.owner, ui.profile, mcp) { mutableStateOf("") }
@@ -35,11 +35,14 @@ import java.net.URLEncoder
     var opened by remember(client, ui.origin, ui.owner, ui.profile, mcp) { mutableStateOf("") }
     fun refresh(force: Boolean = true) { error = ""; vm.load(key, path, mapOf("profile" to ui.profile), force = force) }
     LaunchedEffect(path, ui.origin, ui.owner, ui.profile, ui.connected, client) { refresh(force = false) }
+    // A save runs on after the window closes; this says whether its own error line is still on screen.
+    val shown = remember(mcp) { java.util.concurrent.atomic.AtomicBoolean(true) }
+    DisposableEffect(mcp) { onDispose { shown.set(false) } }
     fun operate(name: String, enabled: Boolean? = null) {
         val active = vm.client ?: return
         val c = active.detached()
         busy = name; error = ""; result = ""
-        scope.launch {
+        vm.viewModelScope.launch {
             try {
                 val encoded = URLEncoder.encode(name, "UTF-8").replace("+", "%20")
                 val operation = if (mcp) "$path/$encoded/${if (enabled == null) "test" else "enabled"}" else "$path/$encoded"
@@ -50,7 +53,7 @@ import java.net.URLEncoder
                     if (enabled == null) vm.storeData("mcp-test:$name", response) else { if (mcp) vm.storeData("mcp-test:$name", json()); refresh() }
                 }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (vm.client === active) error = e.message ?: "Couldn't finish. Try again." }
+            catch (e: Exception) { if (vm.client === active) { error = e.message ?: "Couldn't finish. Try again."; if (!shown.get()) vm.notice(if (mcp) "Couldn't save the connection. Try again." else "Couldn't save the tool change. Try again.") } }
             finally { c.closeNative(); if (vm.client === active) busy = "" }
         }
     }

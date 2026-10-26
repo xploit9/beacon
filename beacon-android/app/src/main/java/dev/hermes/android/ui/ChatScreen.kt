@@ -532,6 +532,28 @@ internal fun chatHeaderSubtitle(streaming: Boolean, hasReplyText: Boolean, inCal
     else -> ""
 }
 
+/** The header's second line: the chat's project, then what [chatHeaderSubtitle] says. Hermes status (thinking, typing, a call) takes the line over from the project. */
+internal data class ChatHeaderLine(val project: String, val text: String)
+
+internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: Boolean, model: String, assistantChat: Boolean, project: String): ChatHeaderLine {
+    val status = streaming || inCall
+    val shown = if (status) "" else project.trim()
+    // The project already names the chat's place, so the assistant tagline would only crowd it.
+    return ChatHeaderLine(shown, if (shown.isNotBlank() && model.isBlank()) "" else chatHeaderSubtitle(streaming, hasReplyText, inCall, model, assistantChat))
+}
+
+/** A small folder and the project's name, then the model: "[folder] Research · gpt-6-luna", one line that ellipsizes as a whole. */
+@Composable private fun ChatHeaderSubtitle(line: ChatHeaderLine) {
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        if (line.project.isNotBlank()) Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Rounded.FolderOpen, uiText("Project"), Modifier.size(12.dp), tint = muted)
+            Text(line.project + if (line.text.isNotBlank()) "  ·  " + uiText(line.text) else "", Modifier.padding(start = 4.dp).testTag("chat-header-project"), style = MaterialTheme.typography.labelSmall, color = muted, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+        }
+        else if (line.text.isNotBlank()) Text(uiText(line.text), Modifier.testTag("chat-header-subtitle"), style = MaterialTheme.typography.labelSmall, color = muted, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+    }
+}
+
 @Composable fun ChatScreen(vm: BeaconViewModel, beacon: Boolean = false, onComposerHeight: (Int) -> Unit = {}, navigationBack: (() -> Unit)? = null, titleOverride: String? = null) {
     val bot by vm.botMode.state.collectAsStateWithLifecycle()
     val openChat by vm.chat.collectAsStateWithLifecycle()
@@ -717,7 +739,12 @@ internal fun chatHeaderSubtitle(streaming: Boolean, hasReplyText: Boolean, inCal
     var projects by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(false) }
     if (projects) ChatProjectPicker(vm, chat.sessionId, onDismiss = { projects = false })
     // The chat menu offers Add to or Remove from its project at once, without a loading step.
-    LaunchedEffect(chat.sessionId, ui.connected) { if (chat.sessionId.isNotBlank() && ui.connected) vm.loadConversationProject(chat.sessionId, force = false) }
+    // Read again once a send from here has landed: before its first message Hermes has no row for a new chat, so the answer was
+    // "no project". An accepted send sets a stream; one whose outcome was unknown is settled from history, so both count.
+    var sentHere by remember(chat.sessionId) { mutableStateOf(false) }
+    LaunchedEffect(chat.streamId, chat.uncertain) { if (chat.streamId.isNotBlank() || chat.uncertain.isNotBlank()) sentHere = true }
+    val chatSaved = sentHere && messages.isNotEmpty()
+    LaunchedEffect(chat.sessionId, ui.connected, chatSaved) { if (chat.sessionId.isNotBlank() && ui.connected) vm.loadConversationProject(chat.sessionId, force = chatSaved, quiet = true) }
     var search by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf("") }
     var showSearch by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(false) }
     val searchFocusRequester = remember { FocusRequester() }
@@ -1072,8 +1099,10 @@ internal fun chatHeaderSubtitle(streaming: Boolean, hasReplyText: Boolean, inCal
                     Column(Modifier.weight(1f).padding(start = 10.dp).heightIn(min = 48.dp).clickable(enabled = ready, onClickLabel = uiText("Conversation actions")) { menu = true }.padding(vertical = 4.dp).testTag("chat-header-title"), verticalArrangement = Arrangement.Center) {
                         Text(plainTitle(headerTitle), style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                         val headerModel = chatModelLabel(chat.raw.string("model"), profileDefaults["profile-defaults"]?.takeIf { it.string("profile") == ui.profile && recordError(it).isBlank() }?.string("model").orEmpty())
-                        val subtitle = chatHeaderSubtitle(chat.streamId.isNotBlank(), chat.liveText.isNotBlank(), (beacon || activeHere) && call.active, headerModel, beacon || activeHere)
-                        if (subtitle.isNotBlank()) Text(uiText(subtitle), Modifier.testTag("chat-header-subtitle"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                        // Read from the cached project answer, so the project shows with the chat; nothing shows for a chat in no project.
+                        val headerProject = chatProjectOf(profileDefaults["project-of:${chat.sessionId}"], chat.sessionId)
+                        val headerLine = chatHeaderLine(chat.streamId.isNotBlank(), chat.liveText.isNotBlank(), (beacon || activeHere) && call.active, headerModel, beacon || activeHere, headerProject?.string("name").orEmpty())
+                        if (headerLine.project.isNotBlank() || headerLine.text.isNotBlank()) ChatHeaderSubtitle(headerLine)
                     }
                     if (!beacon && !permanentBotChat) IconButton(onClick = { vm.newChat() }) { Icon(Icons.Rounded.Edit, uiText("New conversation")) }
                     IconButton(onClick = { showSearch = !showSearch; if (activeHere && showSearch) showCallHistory = true }, enabled = canonical) { Icon(Icons.Rounded.Search, uiText("Search this conversation")) }
@@ -1090,7 +1119,7 @@ internal fun chatHeaderSubtitle(streaming: Boolean, hasReplyText: Boolean, inCal
                         HorizontalDivider()
                         if (chat.queued.isNotEmpty() || chat.uncertain.isNotBlank()) DropdownMenuItem({ Text("Message queue") }, { menu = false; composerDetails = true }, enabled = !activeHere)
                         if (composerDraft.text.startsWith("/")) DropdownMenuItem({ Text(if (chat.streamId.isNotBlank()) "Queue as text" else "Send as text") }, { menu = false; if (chat.streamId.isNotBlank()) vm.queue() else vm.send() }, enabled = canonical && !activeHere && chat.uncertain.isBlank())
-                        if (canonical && !activeHere && chat.streamId.isBlank()) ConversationProjectItem(vm, chat.sessionId, onAdd = { projects = true }, onDone = { menu = false })
+                        if (canonical && !activeHere && chat.streamId.isBlank()) ConversationProjectItem(vm, chat.sessionId, onAdd = { projects = true }, onDone = { menu = false }, onOpen = { openProjectFromChat(vm, it) })
                         val assistantName = LocalAssistantName.current
                         val context = LocalContext.current
                         val shareTitle = uiText("Share conversation")

@@ -15,20 +15,24 @@ import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.core.*
 import org.json.JSONObject
 
-/** "Add to project…" or "Remove from <project>", from where Hermes files the conversation. */
-@Composable internal fun ConversationProjectItem(vm: BeaconViewModel, id: String, onAdd: () -> Unit, onDone: () -> Unit) {
+/** "Add to project…" or "Remove from <project>", from where Hermes files the conversation; [onOpen] adds a way to the project itself. */
+@Composable internal fun ConversationProjectItem(vm: BeaconViewModel, id: String, onAdd: () -> Unit, onDone: () -> Unit, onOpen: ((String) -> Unit)? = null) {
     val data by vm.data.collectAsStateWithLifecycle()
     LaunchedEffect(id) { vm.loadConversationProject(id) }
     // A known answer stays shown while it refreshes, so the item does not flicker.
     val record = data["project-of:$id"]?.takeIf { it.string("session_id") == id && it.has("project") }
     val project = record?.optJSONObject("project")
     when {
+        // A read that failed leaves no answer to wait for: offer another try rather than a dead item.
+        record == null && data["project-of:$id"]?.has("_error") == true -> DropdownMenuItem({ Text(uiText("Couldn’t load project. Try again")) }, { vm.loadConversationProject(id) }, leadingIcon = { Icon(Icons.Rounded.Refresh, null) }, modifier = Modifier.testTag("conversation-project-retry"))
         record == null -> DropdownMenuItem({ Text(uiText("Project…")) }, {}, leadingIcon = { Icon(Icons.Rounded.Folder, null) }, enabled = false)
         project != null -> {
+            if (onOpen != null) DropdownMenuItem({ Text(uiText("Open") + " " + project.string("name")) }, leadingIcon = { Icon(Icons.Rounded.FolderOpen, null) }, modifier = Modifier.testTag("conversation-project-open"),
+                onClick = { onDone(); onOpen(project.string("id")) })
             DropdownMenuItem({ Text(uiText("Move to another project…")) }, leadingIcon = { Icon(Icons.AutoMirrored.Rounded.DriveFileMove, null) }, modifier = Modifier.testTag("conversation-project-move"),
                 onClick = { onDone(); onAdd() })
             DropdownMenuItem({ Text(uiText("Remove from") + " " + project.string("name")) }, leadingIcon = { Icon(Icons.Rounded.FolderOff, null) }, modifier = Modifier.testTag("conversation-project-remove"),
-                onClick = { onDone(); vm.conversationAction(id, "/api/projects/detach", json("id" to project.string("id")), "Removed from ${project.string("name")}") })
+                onClick = { onDone(); removeChatFromProject(vm, id, project) })
         }
         else -> DropdownMenuItem({ Text(uiText("Add to project…")) }, leadingIcon = { Icon(Icons.Rounded.CreateNewFolder, null) }, modifier = Modifier.testTag("conversation-project-add"),
             onClick = { onDone(); onAdd() })

@@ -792,7 +792,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             ?: return viewModelScope.launch {}
         return load("picker:approvals", "/api/approval/mode", chatApprovalReadQuery(_chat.value, passive))
     }
-    fun openCatalog(kind: String) { if (!admitConversation()) return; _catalog.value = kind; when (kind) { "Model & provider" -> load("picker:models", "/api/models"); "Toolsets" -> load("picker:toolsets", "/api/tools/toolsets"); "Reasoning" -> { _data.update { it - "picker:reasoning" }; load("picker:reasoning", if (isBeaconConversation()) "/api/mobile/beacon/reasoning" else "/api/reasoning", mapOf("session_id" to _chat.value.sessionId, "model" to _chat.value.raw.string("model"), "provider" to _chat.value.raw.string("model_provider"))) } } }
+    fun openCatalog(kind: String) { if (!admitConversation()) return; _catalog.value = kind; when (kind) { "Model & provider" -> load("picker:models", "/api/models"); "Reasoning" -> { _data.update { it - "picker:reasoning" }; load("picker:reasoning", if (isBeaconConversation()) "/api/mobile/beacon/reasoning" else "/api/reasoning", mapOf("session_id" to _chat.value.sessionId, "model" to _chat.value.raw.string("model"), "provider" to _chat.value.raw.string("model_provider"))) } } }
     fun setReasoning(effort: String) {
         if (!admitConversation() || _reasoningSaving.value) return
         if (conversationChanges["${sourceScope?.key}|/api/reasoning"]?.isCompleted == false) return
@@ -2075,7 +2075,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     }
     /** Which project (if any) holds a conversation, as Hermes files it; read when a conversation menu opens. */
     // Keyed by its chat, so it is not tied to the open chat like session_id page reads are.
-    fun loadConversationProject(id: String, force: Boolean = true) = load("project-of:$id", "/api/projects/for-session", mapOf("chat" to id), force = force)
+    fun loadConversationProject(id: String, force: Boolean = true, quiet: Boolean = false) = load("project-of:$id", "/api/projects/for-session", mapOf("chat" to id), force = force, quiet = quiet)
     /** Pin, rename, archive, project and delete for any listed conversation; the open chat follows the change. */
     fun conversationAction(id: String, path: String, body: JSONObject = JSONObject(), done: String = "Saved", profile: String = client?.scope?.profile.orEmpty()): Job {
         val targetKey = client?.scope?.copy(profile = profile.ifBlank { client?.scope?.profile.orEmpty() }, session = id)?.key.orEmpty()
@@ -3309,9 +3309,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             if (visible()) {
                 val failure = conversationActionFailure(path, e)
                 _data.update { values -> values + (key to ((if (cacheable) values[key]?.copy() else null) ?: JSONObject()).put("_error", beaconOwnerSetupMessage(e) ?: appErrorText(failure)).apply { if (cacheable && length() > 1) put("_stale", true); if (path == "/api/commands/catalog") { put("available", false); if (!has("commands")) put("commands", JSONArray()) } }) }
-                val chatId = query["chat"].orEmpty()
-                val unsaved = path == "/api/projects/for-session" && unsavedOpenChatRead(e, chatId, clientCreatedSessions.contains(scope.session(chatId).key), _chat.value)
-                if (!unsaved && ((force || !cacheable) && !quiet || e is ApiFailure && e.status == 401)) fail(failure)
+                if ((force || !cacheable) && !quiet || e is ApiFailure && e.status == 401) fail(failure)
             }
           } finally { c.closeNative(); if (loads[key] === currentCoroutineContext()[Job]) _refreshing.update { it - key } }
         }

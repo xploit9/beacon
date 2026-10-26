@@ -59,7 +59,8 @@ internal class NativeProjects(private val client: BeaconClient) {
             "/api/projects/for-session" -> {
                 require(method == "GET")
                 val stored = data.string("chat")
-                return json("session_id" to stored, "project" to (projectOf(stored) ?: JSONObject.NULL))
+                val project = try { projectOf(stored) } catch (e: ApiFailure) { if (e.status != 404) throw e; null }
+                return json("session_id" to stored, "project" to (project ?: JSONObject.NULL))
             }
             "/api/projects/detach" -> {
                 require(method == "POST")
@@ -77,13 +78,23 @@ internal class NativeProjects(private val client: BeaconClient) {
                 require(method == "POST")
                 val stored = data.string("session_id")
                 require(stored.isNotBlank() && data.string("scope_key") == client.scope.session(stored).key) { "Reopen Projects in the original conversation" }
-                val project = client.nativeRpc("projects.get", identity()).getJSONObject("project")
+                var project = client.nativeRpc("projects.get", identity()).getJSONObject("project")
                 require(!project.optBoolean("archived")) { "Choose an active project" }
-                val selected = data.string("path").ifBlank { project.string("primary_path") }
+                var selected = data.string("path").ifBlank { project.string("primary_path") }
+                if (data.optBoolean("link") && selected.isNotBlank() && project.rows("folders").none { it.string("path") == selected }) {
+                    // A project made on the phone starts without a folder: link the chosen one, then file the chat there.
+                    val wanted = folder(selected)
+                    // Hermes gives a folder two projects list to the older one, so a taken folder is refused before it is linked.
+                    val holder = client.nativeRpc("projects.for_cwd", json("cwd" to wanted)).optJSONObject("project")
+                    require(holder == null || holder.string("id") == id || holder.rows("folders").none { sameNativeFolder(it.string("path"), wanted) }) { "That folder already belongs to another project." }
+                    client.nativeRpc("projects.add_folder", identity().put("path", wanted))
+                    project = client.nativeRpc("projects.get", identity()).getJSONObject("project")
+                    selected = linkedFolderPath(project, wanted) ?: wanted
+                }
                 require(selected.isNotBlank() && project.rows("folders").any { it.string("path") == selected }) { "Link a PC folder to this project first" }
                 val target = folder(selected)
                 val owning = client.nativeRpc("projects.for_cwd", json("cwd" to target)).optJSONObject("project")
-                require(owning?.string("id") == id) { "This folder resolves to another project. Choose a folder linked uniquely to this project." }
+                require(owning?.string("id") == id) { "That folder already belongs to another project." }
                 val binding = client.nativeSession(stored)
                 require(client.scope.session(binding.storedSessionId).key == data.string("scope_key")) { "Conversation changed. Reopen Projects." }
                 val reserved = client.nativeRequest("/api/plugins/beacon/mobile/sessions/${binding.storedSessionId}/reserve", "POST", JSONObject())
@@ -102,6 +113,10 @@ internal fun sameNativeFolder(first: String, second: String): Boolean {
     fun normalized(path: String) = path.replace('\\', '/').trimEnd('/').let { if (it.matches(Regex("^[A-Za-z]:.*")) || it.startsWith("//")) it.lowercase(java.util.Locale.ROOT) else it }
     return first.isNotBlank() && second.isNotBlank() && normalized(first) == normalized(second)
 }
+
+/** The path Hermes stored for a folder just linked as [wanted]; null when [project] does not list it. */
+internal fun linkedFolderPath(project: JSONObject, wanted: String): String? =
+    project.rows("folders").map { it.string("path") }.firstOrNull { sameNativeFolder(it, wanted) }
 
 internal fun nativeProjectRemovalConfirmed(result: JSONObject, id: String): Boolean {
     val rows = result.optJSONArray("projects") ?: return false
