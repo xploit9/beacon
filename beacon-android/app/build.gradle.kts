@@ -37,8 +37,8 @@ android {
         applicationId = "dev.hermes.android"
         minSdk = 29
         targetSdk = 36
-        versionCode = 119
-        versionName = "1.1.9"
+        versionCode = 120
+        versionName = "1.1.10"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "DEFAULT_ORIGIN", quoted(owner.getProperty("native.origin", "")))
         buildConfigField("String", "FIREBASE_APP_ID", quoted(owner.getProperty("firebase.appId", "")))

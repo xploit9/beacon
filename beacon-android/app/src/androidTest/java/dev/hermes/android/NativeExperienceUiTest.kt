@@ -1208,7 +1208,6 @@ class NativeExperienceUiTest {
         assertTrue(vm.ui.value.botModeEnabled)
         compose.runOnIdle { vm.toggleSessions(true) }; coder()
         await { vm.botMode.state.value.activeBot?.profile == "coder" }
-        compose.onNodeWithContentDescription("New conversation").assertDoesNotExist()
         compose.runOnIdle { vm.composer(TextFieldValue("Coder bot draft")); vm.toggleSessions(true) }
         compose.onNodeWithTag("bot-mode-sidebar").performScrollToNode(hasTestTag("navigation-leave-bot-mode"))
         compose.onNodeWithTag("navigation-leave-bot-mode").performClick()
@@ -1381,6 +1380,32 @@ class NativeExperienceUiTest {
         receipts += "A thread whose name another conversation holds is renamed with the next free number instead of losing its name."
     }
 
+    // Live 2026-10-27: a thread started from Beacon's chat was made in Hermes, but the screen stayed on the chat open before Beacon,
+    // because that chat's return finished opening after the create began and the create took it for the owner moving elsewhere.
+    private fun startFromBeaconsChat(vm: BeaconViewModel, fixture: NativeExperienceFixture, start: () -> Unit, expect: (ChatState) -> Boolean) {
+        await { vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
+        compose.runOnIdle { vm.tab("Beacon") }
+        await { vm.ui.value.tab == "Beacon" && vm.isBeaconConversation() && vm.chat.value.projectionReady }
+        val beacon = vm.chat.value.sessionId // also a new-N id in the fixture, so the check below must rule it out
+        try {
+            val creates = fixture.requests.count { it.string("method") == "session.create" }
+            compose.runOnIdle { vm.tab("Chat"); start() } // what the New thread dialog and the drawer's New chat do
+            await { fixture.requests.count { it.string("method") == "session.create" } == creates + 1 }
+            await { vm.ui.value.tab == "Chat" && vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady }
+            Thread.sleep(500); compose.waitForIdle()
+            assertTrue("The new chat stays open: ${vm.chat.value.sessionId} ${vm.chat.value.title}",
+                vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId != beacon && expect(vm.chat.value))
+        } finally { runBlocking { app.preferences.edit { it.remove(stringPreferencesKey("assistant_return")) } } }
+    }
+
+    @Test fun aThreadStartedFromBeaconsChatOpensTheThread() = withFixture { vm, fixture ->
+        startFromBeaconsChat(vm, fixture, { vm.newThread("🔒 Security news") }) { it.title == "🔒 Security news" }
+    }
+
+    @Test fun aNewChatStartedFromBeaconsChatOpensTheNewChat() = withFixture { vm, fixture ->
+        startFromBeaconsChat(vm, fixture, { vm.newChat() }) { it.messages.isEmpty() }
+    }
+
     @Test fun aThreadStopsRenamingAfterAnUnrelatedHermesError() = withFixture { vm, fixture ->
         val taken = fixture.sessions.getValue("chat-b").getJSONObject("info").string("title")
         fixture.dropCreateTitle = true
@@ -1415,6 +1440,13 @@ class NativeExperienceUiTest {
             await { fixture.requests.any { it.string("method") == "session.create" && it.getJSONObject("params").string("source") == "android_thread" } }
             assertEquals("Trip planning", fixture.requests.last { it.string("method") == "session.create" }.getJSONObject("params").string("title"))
             await { vm.chat.value.sessionId.isNotBlank() && vm.chat.value.title == "Trip planning" }
+            // With a thread listed, starting the next one stays in sight instead of only in the filter menu.
+            compose.runOnIdle { vm.toggleSessions(true) }
+            compose.onNodeWithTag("history-threads").performScrollTo().performClick()
+            compose.waitUntil(5_000) { compose.onAllNodesWithTag("threads-new-thread").fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithTag("threads-new-thread").performScrollTo().performClick()
+            compose.onNodeWithTag("new-thread-start").assertExists()
+            androidx.test.espresso.Espresso.pressBack()
 
             compose.runOnIdle { vm.setHistoryFilters(setOf("telegram"), "created") }
             await { vm.preferences.value.historyOrder == "created" && vm.preferences.value.historyHiddenSources == setOf("telegram") }

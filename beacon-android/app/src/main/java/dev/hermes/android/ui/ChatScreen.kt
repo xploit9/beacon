@@ -441,6 +441,11 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                 )
             }
         }
+        // Threads are channels you keep adding; once one exists, starting the next stays in sight (the filter menu has it too).
+        if (view == HistoryView.Threads && !archived && search.isBlank() && rows.isNotEmpty()) item("new-thread-row") {
+            ListItem(headlineContent = { Text(uiText("New thread")) }, leadingContent = { Icon(Icons.Rounded.Add, null) },
+                colors = ListItemDefaults.colors(containerColor = Color.Transparent), modifier = Modifier.clickable { naming = true }.testTag("threads-new-thread"))
+        }
         // A failed read is not "no conversations".
         if (rows.isEmpty() && (ui.historyLoading || unreadable.isEmpty())) item("empty-history") {
             // An empty list is only "empty" once the fetch has answered.
@@ -1104,7 +1109,6 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                         val headerLine = chatHeaderLine(chat.streamId.isNotBlank(), chat.liveText.isNotBlank(), (beacon || activeHere) && call.active, headerModel, beacon || activeHere, headerProject?.string("name").orEmpty())
                         if (headerLine.project.isNotBlank() || headerLine.text.isNotBlank()) ChatHeaderSubtitle(headerLine)
                     }
-                    if (!beacon && !permanentBotChat) IconButton(onClick = { vm.newChat() }) { Icon(Icons.Rounded.Edit, uiText("New conversation")) }
                     IconButton(onClick = { showSearch = !showSearch; if (activeHere && showSearch) showCallHistory = true }, enabled = canonical) { Icon(Icons.Rounded.Search, uiText("Search this conversation")) }
                     Box { IconButton(onClick = { menu = true }, enabled = ready) { Icon(Icons.Rounded.MoreVert, uiText("Conversation actions")) }; DropdownMenu(menu && ready, { menu = false }, modifier = Modifier.heightIn(max = actionMenuHeight).testTag("conversation-actions-menu")) {
                         if (beacon) DropdownMenuItem({ Text("Call history") }, { menu = false; showCallHistorySheet = true }, modifier = Modifier.testTag("call-history-open"))

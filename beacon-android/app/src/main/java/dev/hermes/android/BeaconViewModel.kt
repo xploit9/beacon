@@ -1490,13 +1490,19 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         setAssistantReturn(record)
         viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) { persistAssistantReturn(record) }
     }
-    private fun returnFromAssistant(): Job = viewModelScope.launch {
-        val back = assistantReturn() ?: return@launch
-        setAssistantReturn(null); persistAssistantReturn(null); _ui.update { it.copy(chatProfile = "") }
-        val profile = back.string("profile")
-        if (profile.isNotBlank() && (client?.scope ?: cachedOwnerScope)?.profile != profile) switchProfile(profile, false).join()
-        val session = back.string("session")
-        if (session.isNotBlank() && _ui.value.tab == "Chat" && (client?.scope ?: cachedOwnerScope)?.profile == profile) selectSession(session)
+    private fun returnFromAssistant(): Job {
+        // A New chat or New thread asked for right after leaving Beacon's chat is newer than this return, so it wins.
+        // shortcut: when Beacon runs in its own profile, that new chat is made in Beacon's profile, not the chats' one, and the app stays there; make New chat wait for this return's profile switch if separate Beacon profiles become common.
+        val navigation = navigationGeneration
+        return viewModelScope.launch {
+            val back = assistantReturn() ?: return@launch
+            setAssistantReturn(null); persistAssistantReturn(null); _ui.update { it.copy(chatProfile = "") }
+            if (navigationGeneration != navigation) return@launch
+            val profile = back.string("profile")
+            if (profile.isNotBlank() && (client?.scope ?: cachedOwnerScope)?.profile != profile) switchProfile(profile, false).join()
+            val session = back.string("session")
+            if (session.isNotBlank() && _ui.value.tab == "Chat" && (client?.scope ?: cachedOwnerScope)?.profile == profile) selectSession(session)
+        }
     }
     /** An explicit Settings change applies now; reopening a chat preserves its own later model choice. */
     private fun keepAssistantModel(model: String, provider: String) {

@@ -50,6 +50,7 @@ import java.util.UUID
 
 enum class FieldType { TEXT, MULTILINE, SECRET, INTEGER, DECIMAL, BOOLEAN, CHOICE, LIST, MAP }
 data class Field(val key: String, val label: String = key.replace('_', ' ').replaceFirstChar { it.titlecase() }, val type: FieldType = FieldType.TEXT, val required: Boolean = false, val options: List<String> = emptyList(), val help: String = "", val inverse: Boolean = false, val optionLabels: Map<String, String> = emptyMap(), val section: String = "")
+internal fun busyLabel(action: String) = when (action) { "Save" -> "Saving…"; "Run" -> "Running…"; else -> "Working…" }
 data class ActionForm(val title: String, val path: String, val fields: List<Field>, val seed: JSONObject = JSONObject(), val method: String = "POST", val values: Map<String, String> = emptyMap(), val explanation: String = "", val actionLabel: String = "Save", val id: String = UUID.randomUUID().toString(), val onResult: (suspend (JSONObject) -> Unit)? = null, val error: String = "")
 
 fun fieldValue(seed: JSONObject, key: String): Any? { var value: Any? = seed; key.split('.').forEach { value = (value as? JSONObject)?.opt(it) }; return value?.takeUnless { it == JSONObject.NULL } }
@@ -287,7 +288,7 @@ internal enum class BeaconMotionMode { Pulse, Sweep, Ripple }
                     Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) { fields() }
                     Surface(shadowElevation = 4.dp) { Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         error()
-                        Button(onClick = vm::submitForm, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text(if (busy) "Saving…" else form.actionLabel) }
+                        Button(onClick = vm::submitForm, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text(if (busy) busyLabel(form.actionLabel) else form.actionLabel) }
                     } }
                 }
                 }
@@ -296,7 +297,7 @@ internal enum class BeaconMotionMode { Pulse, Sweep, Ripple }
         }
     } else AlertDialog(onDismissRequest = { if (!busy) vm.dismissForm() }, title = { Text(form.title) }, text = {
         Column(Modifier.fillMaxWidth().heightIn(max = 540.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(16.dp)) { fields() }
-    }, confirmButton = { Button(onClick = vm::submitForm, enabled = !busy) { Text(if (busy) "Saving…" else form.actionLabel) } }, dismissButton = { TextButton(onClick = vm::dismissForm, enabled = !busy) { Text(uiText("Cancel")) } })
+    }, confirmButton = { Button(onClick = vm::submitForm, enabled = !busy) { Text(if (busy) busyLabel(form.actionLabel) else form.actionLabel) } }, dismissButton = { TextButton(onClick = vm::dismissForm, enabled = !busy) { Text(uiText("Cancel")) } })
 }
 
 // Telegram-style chat parts: avatar, date chip, send tick, bubble corners and the chat-list row.
