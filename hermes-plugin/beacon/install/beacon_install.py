@@ -467,7 +467,7 @@ def _configure_tailscale(hermes: str, home: Path, profile: str, port: int, allow
         return None
     command = f"tailscale serve --bg {port}"
     print(f"No public HTTPS dashboard URL is configured. Tailscale Serve can publish the dashboard to your tailnet: {command}")
-    if not (allow or _yes_no("Run that command and save its HTTPS URL as Hermes dashboard.public_url? [y/N] ")):
+    if not (allow or _yes_no("Run that command and save its HTTPS URL as Hermes dashboard.public_url? [y/N] (an agent: ask the owner, then rerun with --tailscale) ")):
         _line(False, "Skipped; configure a public HTTPS dashboard URL to connect a phone.")
         return None
     try:

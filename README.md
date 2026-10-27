@@ -5,6 +5,17 @@
 scheduled posts, voice calls that use your Hermes tools and memory, and a heads-up when something needs you.
 The assistant is named Beacon by default; rename it in Settings › Assistant.
 
+## Install
+
+**1. On the PC that runs Hermes**, give your coding agent (Codex, Claude Code, or Hermes itself) this prompt:
+
+> Install Beacon on my Hermes: download https://raw.githubusercontent.com/xploit9/beacon/main/hermes-plugin/beacon/install/beacon_install.py and run it with Python. Whenever it stops to ask something, it names a flag — ask me, then rerun it with that flag. Show me the link it prints at the end. Never print or store passwords, tokens or API keys, and never modify Hermes core.
+
+Or download [`beacon_install.py`](https://raw.githubusercontent.com/xploit9/beacon/main/hermes-plugin/beacon/install/beacon_install.py) and run `python beacon_install.py` yourself. It picks your Hermes home and profile, installs Beacon, restarts the dashboard if you say yes, and prints the link for your phone. The link needs an HTTPS address for your dashboard; if you have none, the installer can set one up with Tailscale. Manual steps: [docs/install-with-agent.md](docs/install-with-agent.md).
+
+**2. On your phone**, download the latest `Beacon-*.apk` from [Releases](https://github.com/xploit9/beacon/releases/latest) and install
+it. Open it, paste your Hermes link (also shown on the dashboard's **Beacon** tab), sign in with Hermes, and follow the setup wizard.
+
 <p align="center">
   <img src="https://github.com/user-attachments/assets/bee7a28c-e6f1-497c-8dad-b1b13afbc320" width="31%" alt="Beacon chat">
   <img src="https://github.com/user-attachments/assets/20e84c96-cba7-481a-b593-edc0aa3d7b06" width="31%" alt="A scheduled post in a thread">
@@ -40,17 +51,6 @@ The voice is Grok; the caller's side is synthetic speech. Screens and videos com
 - **All of Hermes.** Profiles, skills, memory, cron, files, Kanban and Bot Mode, with screens that open ready.
 - **Updates from GitHub.** Beacon tells you when a release is out; tap Update for the app and the Hermes plugin.
 - **Foldables.** On a wide screen, the chat list and the chat sit side by side.
-
-## Install
-
-**1. On the PC that runs Hermes**, give your coding agent (Codex, Claude Code, or Hermes itself) this prompt:
-
-> Set up Beacon on my Hermes. First follow the predecessor-removal prerequisite in https://github.com/xploit9/beacon/blob/main/docs/install-with-agent.md: verify an external backup, then use supported native operations to remove only positively identified predecessor-managed cron jobs and the predecessor plugin. Stop and ask me if ownership is uncertain. Then download https://raw.githubusercontent.com/xploit9/beacon/main/hermes-plugin/beacon/install/beacon_install.py and run it with Python. Whenever it stops to ask something, it names a flag — ask me, then rerun it with that flag. Show me the link it prints at the end. Never print or store passwords, tokens or API keys, and never modify Hermes core.
-
-Before running it yourself, complete the [predecessor-removal prerequisite](docs/install-with-agent.md#before-installing-beacon) first: it removes an older plugin such as `hermes-relay`, or confirms you have none. Then run `python beacon_install.py`: it selects your Hermes home/profile, installs or updates Beacon, restarts the dashboard if you say yes, and prints the link to paste into Beacon. The installer does not back up or remove a predecessor plugin or its jobs. Manual steps: [docs/install-with-agent.md](docs/install-with-agent.md).
-
-**2. On your phone**, download the latest `Beacon-*.apk` from [Releases](https://github.com/xploit9/beacon/releases/latest) and install
-it. Open it, paste your Hermes link (also shown on the dashboard's **Beacon** tab), sign in with Hermes, and follow the setup wizard.
 
 ## The journey
 

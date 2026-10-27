@@ -97,7 +97,6 @@ class InstallerTests(unittest.TestCase):
             "public_url": "https://beacon.example.test",
             "dashboard_port": 9119,
             "dashboard_running": False,
-            "require_backup_before_remove": False,
         }
         state.update(changes)
         self.state_path.write_text(json.dumps(state), encoding="utf-8")

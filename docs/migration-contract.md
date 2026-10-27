@@ -19,7 +19,7 @@ Hermes Relay is the primary implementation reference for Hermes and all native w
 
 ## Clean plugin rename
 
-This is a clean break for the Hermes plugin identity. Do not keep compatibility code that consults retired plugin IDs, module prefixes, route names, tool identifiers, commands, or release asset prefixes. The install guide directs agents to back up and remove the previous plugin and its managed cron jobs before installing Beacon.
+This is a clean break for the Hermes plugin identity. Do not keep compatibility code that consults retired plugin IDs, module prefixes, route names, tool identifiers, commands, or release asset prefixes. The install guide tells Hermes Relay users to back up and remove that plugin and its own cron jobs before installing Beacon.
 
 ## Stable boundaries
 - Keep `dev.hermes.android` production application ID, storage formats, scoped cache/draft keys and signer. The debug preview uses `dev.hermes.android.debug` with the `-preview` version suffix and "Beacon Preview" launcher label; the stable channel uses `dev.hermes.android.stable`. These installs remain separate. Production replacement is held for physical-phone acceptance and original signer/data-preservation checks; see [preview](preview.md).
