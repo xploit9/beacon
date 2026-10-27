@@ -40,9 +40,6 @@ internal fun navigationColumns(width: Float, fontScale: Float): Int = if (width 
 internal fun navigationRows(columns: Int): List<List<String>> = if (columns == 4) navigationTiles.chunked(4) else listOf(
     listOf("Skills", "Memory"), listOf("Cron", "Files"), listOf("Projects"), listOf("Bots", "Kanban"), listOf("Settings"),
 )
-internal fun navigationHistoryGroups(pinned: List<Boolean>): List<Pair<String, List<Int>>> = listOf(
-    "Pinned" to pinned.indices.filter { pinned[it] }, "Recent" to pinned.indices.filter { !pinned[it] },
-)
 private fun navigationIcon(name: String): ImageVector = when (name) {
     "Skills" -> Icons.Rounded.AutoAwesome
     "Memory" -> Icons.Rounded.Psychology

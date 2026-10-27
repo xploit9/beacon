@@ -9,10 +9,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.size
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -26,8 +23,6 @@ import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
-import androidx.compose.ui.tooling.preview.Preview
-import androidx.compose.ui.unit.dp
 
 /**
  * ASCII morphing sphere — the visual embodiment of the AI agent.
@@ -35,8 +30,7 @@ import androidx.compose.ui.unit.dp
  * Inspired by Amp Code's Supernova orb. Renders a sphere from monospace
  * characters with layered procedural effects. Algorithm lives in
  * [forEachSphereCell] (see `MorphingSphereCore.kt`) so the same math powers
- * Android here, the JS browser preview in `preview/web/`, and any future
- * renderer (Compose Desktop, terminal TUI).
+ * Android here and any future renderer (Compose Desktop, terminal TUI).
  *
  * This file is the Android/Compose renderer only — it owns animation state
  * (`animateFloatAsState` for state transitions, a throttled per-frame loop for
@@ -193,92 +187,5 @@ private class SphereCanvasRenderer(
         glyphs.set(char)
         paint.color = Color(r, g, b, alpha).toArgb()
         target.drawText(glyphs.characters, 0, 1, col * cellW, row * cellH + cellH * 0.8f, paint)
-    }
-}
-
-// ── Previews ─────────────────────────────────────────────────────────
-
-@Preview(name = "Idle", showBackground = true, backgroundColor = 0xFF0D0D0D, widthDp = 360, heightDp = 640)
-@Composable
-private fun PreviewIdle() {
-    Box(Modifier.fillMaxSize().background(Color(0xFF0D0D0D))) {
-        MorphingSphere(Modifier.fillMaxSize(), state = SphereState.Idle, fixedTime = 5f, fixedColorPhase = 0.5f)
-    }
-}
-
-@Preview(name = "Thinking", showBackground = true, backgroundColor = 0xFF0D0D0D, widthDp = 360, heightDp = 640)
-@Composable
-private fun PreviewThinking() {
-    Box(Modifier.fillMaxSize().background(Color(0xFF0D0D0D))) {
-        MorphingSphere(Modifier.fillMaxSize(), state = SphereState.Thinking, fixedTime = 5f, fixedColorPhase = 1.5f)
-    }
-}
-
-@Preview(name = "Streaming", showBackground = true, backgroundColor = 0xFF0D0D0D, widthDp = 360, heightDp = 640)
-@Composable
-private fun PreviewStreaming() {
-    Box(Modifier.fillMaxSize().background(Color(0xFF0D0D0D))) {
-        MorphingSphere(Modifier.fillMaxSize(), state = SphereState.Streaming, fixedTime = 5f, fixedColorPhase = 2.5f)
-    }
-}
-
-@Preview(name = "Error", showBackground = true, backgroundColor = 0xFF0D0D0D, widthDp = 360, heightDp = 640)
-@Composable
-private fun PreviewError() {
-    Box(Modifier.fillMaxSize().background(Color(0xFF0D0D0D))) {
-        MorphingSphere(Modifier.fillMaxSize(), state = SphereState.Error, fixedTime = 5f, fixedColorPhase = 3.0f)
-    }
-}
-
-@Preview(name = "Compact", showBackground = true, backgroundColor = 0xFF0D0D0D, widthDp = 200, heightDp = 200)
-@Composable
-private fun PreviewCompact() {
-    Box(Modifier.size(200.dp).background(Color(0xFF0D0D0D))) {
-        MorphingSphere(Modifier.fillMaxSize(), fixedTime = 8f, fixedColorPhase = 2.0f)
-    }
-}
-
-@Preview(name = "Listening", showBackground = true, backgroundColor = 0xFF0A0A0A, widthDp = 360, heightDp = 640)
-@Composable
-private fun MorphingSphereListeningPreview() {
-    Box(Modifier.fillMaxSize().background(Color(0xFF0A0A0A))) {
-        MorphingSphere(
-            modifier = Modifier.fillMaxSize(),
-            state = SphereState.Listening,
-            voiceAmplitude = 0.4f,
-            voiceMode = true,
-            fixedTime = 5f,
-            fixedColorPhase = 1.0f
-        )
-    }
-}
-
-@Preview(name = "Speaking (low)", showBackground = true, backgroundColor = 0xFF0A0A0A, widthDp = 360, heightDp = 640)
-@Composable
-private fun MorphingSphereSpeakingLowPreview() {
-    Box(Modifier.fillMaxSize().background(Color(0xFF0A0A0A))) {
-        MorphingSphere(
-            modifier = Modifier.fillMaxSize(),
-            state = SphereState.Speaking,
-            voiceAmplitude = 0.2f,
-            voiceMode = true,
-            fixedTime = 5f,
-            fixedColorPhase = 2.0f
-        )
-    }
-}
-
-@Preview(name = "Speaking (peak)", showBackground = true, backgroundColor = 0xFF0A0A0A, widthDp = 360, heightDp = 640)
-@Composable
-private fun MorphingSphereSpeakingPeakPreview() {
-    Box(Modifier.fillMaxSize().background(Color(0xFF0A0A0A))) {
-        MorphingSphere(
-            modifier = Modifier.fillMaxSize(),
-            state = SphereState.Speaking,
-            voiceAmplitude = 0.95f,
-            voiceMode = true,
-            fixedTime = 5f,
-            fixedColorPhase = 2.5f
-        )
     }
 }

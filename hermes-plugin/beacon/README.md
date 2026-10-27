@@ -1,6 +1,6 @@
 # Beacon native dashboard plugin
 
-Supported native Hermes user plugin, manifest name `beacon`. Install or update it with Hermes' native CLI as described below. It ships no Hermes core files and no live secrets. `dashboard/plugin_api.py` is mounted by Hermes at `/api/plugins/beacon`. The API requires secure native auth middleware and a verified session on every request, including APK bytes. Native Hermes itself only logs cross-login session attachment: this plugin additionally verifies persisted `sessions.user_id` and runtime `auth_user_id` against `provider:owner_id`.
+Supported native Hermes user plugin, manifest name `beacon`. Install or update it with Hermes' native CLI as described below. It ships no Hermes core files and no live secrets. `dashboard/plugin_api.py` is mounted by Hermes at `/api/plugins/beacon`. The API requires secure native auth middleware and a verified session on every request. Native Hermes itself only logs cross-login session attachment: this plugin additionally verifies persisted `sessions.user_id` and runtime `auth_user_id` against `provider:owner_id`.
 
 Beacon is the app's default assistant name; the owner can rename it in Settings > Assistant.
 
@@ -32,10 +32,6 @@ plugins:
         callback_tool_enabled: true
         scheduled_callbacks_enabled: true
         scheduled_callback_conversation_id: OWNER_STAMPED_NATIVE_STORED_ID
-        release_root: PRIVATE_RELEASE_DIRECTORY
-        android_certificate_sha256: EXPECTED_CERTIFICATE_SHA256
-        aapt: ABSOLUTE_AAPT_PATH
-        apksigner: ABSOLUTE_APKSIGNER_PATH
 ```
 
 On a fresh install, leave `owner_id`, `owner_provider`, `profiles`, and `scheduled_callback_conversation_id` unset: the first verified Hermes dashboard account binds the plugin automatically, and the Beacon tab shows the link to paste into Beacon. The app registers its assistant chat for that profile when it opens. If a scheduled result for the phone arrives first, the plugin saves an empty owned chat for that profile to receive it; the app's own Beacon chat replaces it as soon as that chat is saved. Explicit YAML settings always take precedence, so `scheduled_callback_conversation_id` can remain an operator-managed override and either callback flag can explicitly turn calls off. Voice provider keys are configured and kept on the phone; the plugin requires no Gemini, Grok, or OpenAI credentials on the Hermes host. Required Python packages are in requirements.txt; test dependencies in requirements-test.txt. Native Hermes must already supply its own dashboard/gateway packages on Python's import path.
@@ -60,15 +56,13 @@ Notification target POST uses `{id|device_id, token|fcm_token, profile}`; GET re
 
 `beacon_call_user` is a namespaced native tool. It does not accept a user-selected owner, profile or session; the bound session and native profile authorize each invitation. Scheduled callbacks require an existing owner-stamped conversation configured for that profile. Invitations wait while another call is active, then ring the linked phone. Calls that cannot be tied to the configured owner and conversation are rejected.
 
-The plugin keeps immutable APKs and release manifests in its private release directory. Production and stable packages use separate feeds. Before serving an APK, the plugin verifies its hash, size, package, version and configured signing certificate; older immutable downloads remain available after a new release.
-
 ## Fixture checks
 
 Run `python -m pytest hermes-plugin/beacon/tests -q -p no:cacheprovider` from the repository root. Tests import the real plugin module and use temporary HERMES_HOME/private fixture state. Authentication injection and native/Google/FCM substitutes are test-only. No live provider, network or owner history/recordings is accessed. Parent must still validate installed native plugin/auth, real owner-stamped RPC sessions/jobs, actual Google constrained-token connection/audio, FCM, APK signer/upgrade and physical phone/Bluetooth behavior.
 
 Compatibility notification fields: target registration returns target.id/target_id/source_ref, and event list/detail provides owner_id/profile/event_id/kind/source_ref/conversation_ref/callback_id/state/expiry. Refs are stable HMAC opaque values backed by a private durable random key. GET `/mobile/notifications/events/{event_id}?profile=` is owner-scoped; FCM includes only opaque refs and generic preview plus expiry.
 
-Target revocation also supports DELETE `/mobile/notifications/targets/{target_id}?profile=` for existing Android revoke flows.
+Target revocation also supports DELETE `/mobile/notifications/targets/{target_id}?profile=` for existing Android revoke flows. A target must name a linked phone with `X-Beacon-Device-ID`; a missing or unknown ID gets 403 `device_required` and a removed phone gets 403 `device_removed`. Pushes go only to targets of phones that are still linked. Removing a phone does not end its Hermes sign-in. With Hermes' built-in login, set a new `dashboard.basic_auth.secret` (or `HERMES_DASHBOARD_BASIC_AUTH_SECRET`, which wins over the config when it is set) and restart the dashboard; that signs every phone out, so sign in again on the ones you keep.
 
 ## Native voice context and quick lookups
 
@@ -80,11 +74,11 @@ Lookup workers have a separate four-worker pool and live-slot cap so slow lookup
 
 Realtime provider connections go directly from Beacon to Gemini Live, Grok, or OpenAI Realtime. Provider keys stay encrypted on the phone; call admission sends only the provider id and `client_key: true` to Hermes. The plugin neither holds provider keys nor mints server-side voice tokens.
 
-Release metadata includes artifact_path and min_contract_version=max_contract_version=2 for the current Android native contract. Authenticated notifications include preview.title/body; FCM preview remains generic and carries opaque references. No WebUI presence-check capability is advertised or simulated.
+Authenticated notifications include preview.title/body; FCM preview remains generic and carries opaque references. No WebUI presence-check capability is advertised or simulated.
 
 C6 wire: GET `/mobile/sessions/{stored_id}/voice-history?profile=` requires current native owner/profile verification and returns `{session_id,profile,events:[{call_id,event_id:"<call>:<role>:<turn>",session_id,role,text,final,interrupted,at_ms,created_at}],truncated}`. Versions group by call/role/turn with stable IDs; actual final text replaces earlier partials, while unfinished dialogue remains final=false with an explicit marker. Latest 200 grouped events and at most 1 MiB UTF-8 text return chronologically. created_at is the server reservation timestamp plus the call-relative at_ms offset. Authenticated response is no-store; unowned legacy sessions fail without relabelling. New-call context includes a bounded prior voice-dialogue excerpt marked historical reference data, never instructions. Nothing is inserted into native core history and no prompt is auto-run.
 
-The mobile API does not retain call audio; audio-storage requests are rejected and finalization reports `audio_available: false`. Transcript, call, and job metadata remain separate from audio.
+The mobile API has no audio route and retains no call audio; finalization reports `audio_available: false`. Transcript, call, and job metadata remain separate from audio.
 
 
 ## Native Tasks and category notification contracts

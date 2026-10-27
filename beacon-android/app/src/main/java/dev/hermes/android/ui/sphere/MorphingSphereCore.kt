@@ -11,9 +11,8 @@ import kotlin.math.sqrt
  * Pure, platform-agnostic core of the ASCII morphing sphere.
  *
  * No Android, no Compose — only `kotlin.math`. Intended as the single source of
- * truth for the sphere algorithm. Android renders via Compose Canvas; a JS port
- * in `preview/web/` mirrors this file for browser iteration; future renderers
- * (Compose Desktop, terminal TUI) can call this same core.
+ * truth for the sphere algorithm. Android renders via Compose Canvas; future
+ * renderers (Compose Desktop, terminal TUI) can call this same core.
  */
 
 /** Agent visual state — controls animation parameters and color palette. */

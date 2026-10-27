@@ -1,9 +1,8 @@
-from test_mobile import harness, reserve, audio
+from test_mobile import harness, reserve
 
 
-def test_old_clients_cannot_persist_audio_but_text_survives(harness):
+def test_calls_keep_text_and_never_persist_audio(harness):
     api,c,_,tmp,_=harness;cid=reserve(c);path=f'/api/plugins/beacon/mobile/calls/{cid}'
-    assert c.post(path+'/audio',json=audio()).status_code==409
     event={'event_id':'caption','turn_id':'turn','type':'transcript','role':'user','text':'Keep my conversation','final':True,'at_ms':0}
     assert c.post(path+'/events',json={'events':[event]}).status_code==200
     result=c.post(path+'/finalize',json={'last_user_sequence':999,'last_assistant_sequence':999})
@@ -16,12 +15,6 @@ def test_old_clients_cannot_persist_audio_but_text_survives(harness):
     assert not (tmp/'call-recordings').exists()
 
 
-def test_audio_rejection_retains_owner_scope(harness):
-    _,c,_,_,_=harness;cid=reserve(c)
-    c.headers['x-fixture-owner']='foreign'
-    assert c.post(f'/api/plugins/beacon/mobile/calls/{cid}/audio',json=audio()).status_code==403
-
-
 def test_finalize_persists_explicit_missing_text_and_validates_flag(harness):
     api,c,_,_,_=harness;cid=reserve(c);path=f'/api/plugins/beacon/mobile/calls/{cid}/finalize'
     assert c.post(path,json={'incomplete':'true'}).status_code==409
@@ -32,12 +25,12 @@ def test_finalize_persists_explicit_missing_text_and_validates_flag(harness):
     assert c.post(path,json={'incomplete':True}).json()==result.json()
 
 
-def test_late_incomplete_receipt_can_only_downgrade_completeness(harness):
+def test_a_saved_receipt_is_terminal_for_a_late_incomplete_finalize(harness):
     _,c,_,_,_=harness;cid=reserve(c);path=f'/api/plugins/beacon/mobile/calls/{cid}/finalize'
-    assert c.post(path,json={}).json()['complete'] is True
-    result=c.post(path,json={'incomplete':True}).json()
-    assert result['complete'] is False and result['transcript_status']=='partial'
-    assert c.post(path,json={}).json()==result
+    saved=c.post(path,json={}).json()
+    assert saved['complete'] is True
+    assert c.post(path,json={'incomplete':True}).json()==saved
+    assert c.post(path,json={}).json()==saved
 
 
 def test_connection_and_lookup_diagnostics_are_bounded_without_private_payloads(harness):

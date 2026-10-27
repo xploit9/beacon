@@ -42,7 +42,6 @@ class CallTranscriptTest {
         assertEquals(2,visible.size)
         val assistant=visible.single { it.role=="assistant" }
         assertEquals("I can see the",assistant.text);assertTrue(assistant.final);assertTrue(assistant.interrupted)
-        assertEquals("Interrupted call transcript",dev.hermes.android.ui.archivedCallLabel(assistant.final,assistant.interrupted,true))
         assertFalse(visible.single { it.role=="user" }.interrupted)
         assertTrue(archived.all { it.getString("turn_id")=="7" })
         assertEquals(setOf("call:user:7","call:assistant:7"),archived.map { it.getString("event_id") }.toSet())
@@ -72,7 +71,6 @@ class CallTranscriptTest {
         var event:CallTranscript?=null
         assertEquals(4L,finishDirectTranscriptTurn("call","session",3,captions,900) { event=CallTranscript.from(it,"session","call") })
         assertTrue(event!!.final);assertFalse(event!!.interrupted)
-        assertEquals("Call transcript",dev.hermes.android.ui.archivedCallLabel(event!!.final,event!!.interrupted,false))
     }
 
     @org.junit.Test fun canonicalFinalReplacesDifferentSpeechProgressIdWithoutDiscardingOtherRole() {

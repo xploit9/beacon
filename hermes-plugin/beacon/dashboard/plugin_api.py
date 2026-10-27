@@ -3,10 +3,7 @@ import asyncio
 import contextvars
 from concurrent.futures import ThreadPoolExecutor
 import math
-import os
-import shutil
 import threading
-import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime,timedelta,timezone
 import hashlib
@@ -16,31 +13,18 @@ import logging
 from pathlib import Path
 import re
 import sys
-import subprocess
 import time
 from urllib.parse import urlsplit
 import uuid
 from fastapi import APIRouter,HTTPException,Request
 from fastapi.responses import JSONResponse
-from fastapi.responses import StreamingResponse
 # Hermes loads this file by path rather than as a package. Load private sibling modules
 # under stable plugin-specific names so the native tool and dashboard share durable state.
 ROOT=Path(__file__).resolve().parent.parent
-_RELEASE_CACHE_LOCK=threading.RLock()
-_RELEASE_CACHE_KEY=None
-_RELEASE_CACHE_VALUE=None
 _PRODUCTION_PACKAGE='dev.hermes.android'
 _STABLE_PACKAGE='dev.hermes.android.stable'
 _PREVIEW_PACKAGE='dev.hermes.android.debug'
 _SUPPORTED_PHONE_PACKAGES=(_PRODUCTION_PACKAGE,_STABLE_PACKAGE,_PREVIEW_PACKAGE)
-_RELEASE_CHECK_LOCK=threading.Lock()
-_AUTO_UPDATE_LOCK=threading.Lock()
-def _target_package(payload):
-    try: package=json.loads(payload or '{}').get('package_name')
-    except Exception: package=None
-    return package if package in _SUPPORTED_PHONE_PACKAGES else _PRODUCTION_PACKAGE
-def _notice_package(row):
-    return _STABLE_PACKAGE if str(row.get('conversation','')).startswith('release-stable-') else _PRODUCTION_PACKAGE
 def _read_plugin_version(path):
     try:
         import yaml
@@ -191,22 +175,6 @@ async def connect_info(request:Request):
     url,name=connect_info_url()
     return JSONResponse({'url':url,'name':name},headers={'Cache-Control':'no-store'})
 
-@router.post('/owner/claim')
-async def claim_owner(request:Request):
-    enforce_request_policy(request)
-    owner,provider=dashboard_identity(request,browser_only=True)
-    cfg=mobile.settings()
-    if 'owner_id' in cfg or 'owner_provider' in cfg:
-        raise HTTPException(409,'Beacon owner already configured')
-    _native_profile_names()
-    try:
-        created=mobile.claim_owner(owner,provider)
-    except ValueError:
-        raise HTTPException(403,'Verified dashboard identity invalid') from None
-    if not created:
-        raise HTTPException(409,'Beacon owner already configured')
-    return {'claimed':True}
-
 @router.post('/devices/link')
 async def link_device(request:Request):
     owner,provider,_,cfg=identity(request,owner_only=True,allow_loopback=not bool(getattr(request.app.state,'auth_required',False)))
@@ -219,12 +187,12 @@ async def link_device(request:Request):
 
 @router.get('/devices')
 async def devices(request:Request):
-    owner,_,_,cfg=identity(request,owner_only=True)
+    owner,_,_,cfg=identity(request,owner_only=True,allow_loopback=not bool(getattr(request.app.state,'auth_required',False)))
     return {'devices':mobile.list_devices(owner),'profiles':cfg['profiles']}
 
 @router.delete('/devices/{device_id}')
 async def remove_device(device_id:str,request:Request):
-    owner,_,_,_=identity(request,owner_only=True)
+    owner,_,_,_=identity(request,owner_only=True,allow_loopback=not bool(getattr(request.app.state,'auth_required',False)))
     if not await asyncio.to_thread(mobile.remove_device,owner,device_id): raise HTTPException(404,'Device not found')
     return {'removed':True,'device_id':device_id}
 
@@ -332,16 +300,6 @@ async def save_history_retention(request:Request):
         raise HTTPException(400,'Choose Forever, 1 year, 90 days, or 30 days')
     days=await asyncio.to_thread(mobile.set_history_retention_days,owner,days)
     return JSONResponse({'history_retention_days':days},headers={'Cache-Control':'no-store'})
-@router.get('/mobile/update-settings')
-async def auto_update_settings(request:Request):
-    owner,_,_,_=identity(request,owner_only=True)
-    return JSONResponse(await asyncio.to_thread(mobile.auto_update_settings,owner),headers={'Cache-Control':'no-store'})
-@router.put('/mobile/update-settings')
-async def save_auto_update_settings(request:Request):
-    # shortcut: 1.1.x phones still send their automatic-update switch here; the plugin never installs itself, so it only answers "off". Drop once the owner's phones run 1.1.2 or later.
-    owner,_,_,_=identity(request,owner_only=True);value=await body(request,1024)
-    if set(value)!={'enabled'} or type(value['enabled']) is not bool: raise HTTPException(400,'Choose whether Beacon updates the plugin automatically')
-    return JSONResponse(await asyncio.to_thread(mobile.auto_update_settings,owner),headers={'Cache-Control':'no-store'})
 @router.put('/mobile/voice-settings')
 async def save_voice_settings(request:Request):
     owner,_,profile,cfg=identity(request);value=await body(request,1024)
@@ -405,7 +363,7 @@ def flush_held_posts(owner,provider,profile):
             native.post(owner,provider,profile,row['conversation'],row['key'],row['text'],row['name'])
         except ValueError:
             logging.getLogger(__name__).warning('Beacon dropped scheduled post %s: it can never land',row['key'])
-            mobile.drop_held_post(row['key']);continue
+            mobile.drop_held_post(owner,profile,row['key']);continue
         except Exception as exc:
             # Mid-turn, a busy store or a thread that is gone: the next pass tries again, and a post that never lands expires after a day.
             if type(exc).__name__ not in native.POST_BUSY and row['key'] not in _posts_logged:
@@ -414,7 +372,7 @@ def flush_held_posts(owner,provider,profile):
                 logging.getLogger(__name__).info('Beacon scheduled post %s waits: %s',row['key'],type(exc).__name__)
             continue
         mobile.enqueue_task_result(owner,profile,row['conversation'],row['key'],row['text'][:4000])
-        mobile.drop_held_post(row['key'])
+        mobile.drop_held_post(owner,profile,row['key'])
 @router.post('/mobile/calls')
 async def calls(request:Request):
     value=await body(request);owner,provider,profile,cfg=identity(request,value.get('profile'))
@@ -447,7 +405,8 @@ async def close_call(call_id:str,request:Request):
     with mobile.LOCK,mobile.connect() as conn:
         row=mobile.owned(conn,call_id,owner)
         receipt=json.loads(row['receipt'])
-        if value.get('failed'): receipt['failed']=True
+        # A closed call keeps its verdict: a replayed close reports it and never rewrites it.
+        if value.get('failed') and not row['closed']: receipt['failed']=True
         row['receipt']=json.dumps(receipt)
         conn.execute('UPDATE calls SET closed=1,ended=COALESCE(ended,?),receipt=? WHERE id=? AND owner=? AND profile=?',
                      (ended,row['receipt'],call_id,owner,row['profile']))
@@ -456,10 +415,6 @@ async def close_call(call_id:str,request:Request):
     clear_lookup_counts(call_id)
     hand_over(owner,provider,row,bool(json.loads(row['receipt']).get('failed')))
     return mobile.status(row)
-@router.post('/mobile/calls/{call_id}/audio')
-async def audio(call_id:str,request:Request):
-    value=await body(request,32768);owner,_,_,_=await call(request,call_id,True)
-    return await asyncio.to_thread(safely,mobile.chunk,call_id,owner,value)
 @router.post('/mobile/calls/{call_id}/events')
 async def events(call_id:str,request:Request):
     value=await body(request);owner,provider,row,_=await call(request,call_id,True)
@@ -633,7 +588,7 @@ def _install_checkup_task(profile):
 @router.get('/mobile/notifications/targets')
 async def targets(request:Request):
     owner,_,profile,_=identity(request)
-    with mobile.connect() as conn: rows=[dict(r) for r in conn.execute('SELECT id,profile,expires FROM targets WHERE owner=? AND profile=?',(owner,profile))]
+    with mobile.connect() as conn: rows=[dict(r) for r in conn.execute('SELECT id,profile,expires FROM targets WHERE owner=? AND profile=? AND '+mobile.ACTIVE_TARGET,(owner,profile))]
     return {'targets':[{**r,'target_id':r['id'],'kind':'fcm','revoked':r['expires']<=time.time(),**mobile.refs(owner,profile)} for r in rows]}
 def firebase_sender_configured(cfg):
     credentials=cfg.get('firebase_credentials')
@@ -661,7 +616,7 @@ async def notification_test(request:Request):
     owner,provider,profile,cfg=identity(request)
     if set(value)-{'kind','conversation_id'} or value.get('kind','fcm')!='fcm': raise HTTPException(400,'Only a synthetic FCM test is supported')
     with mobile.connect() as conn:
-        if not conn.execute('SELECT 1 FROM targets WHERE owner=? AND profile=? AND expires>?',(owner,profile,time.time())).fetchone(): raise HTTPException(409,'Register this phone before testing')
+        if not conn.execute('SELECT 1 FROM targets WHERE owner=? AND profile=? AND expires>? AND '+mobile.ACTIVE_TARGET,(owner,profile,time.time())).fetchone(): raise HTTPException(409,'Register this phone before testing')
     # Test has its own opaque reference and never creates a chat/model run or callback.
     event_id=uuid.uuid4().hex
     with mobile.LOCK,mobile.connect() as conn:
@@ -672,7 +627,6 @@ async def notification_test(request:Request):
 async def target(request:Request):
     value=await body(request,8192);owner,provider,profile,_=identity(request,value.get('profile'))
     device_id=request.headers.get('x-beacon-device-id')
-    if device_id is not None: safely(mobile.ident,device_id)
     tok=value.get('token') or value.get('fcm_token')
     package=value.get('package_name',_PRODUCTION_PACKAGE)
     if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Beacon package')
@@ -680,10 +634,9 @@ async def target(request:Request):
     safely(mobile.ident,tid)
     if not isinstance(tok,str) or not 20<=len(tok)<=4096 or any(ord(c)<32 for c in tok): raise HTTPException(400,'Invalid FCM target')
     with mobile.LOCK,mobile.connect() as conn:
-        # Recheck inside the registration lock so a concurrent removal cannot restore its token.
-        if device_id:
-            try: mobile.touch_device(owner,provider,profile,device_id,False)
-            except LookupError: raise HTTPException(403,'device_removed') from None
+        # Only a linked, active phone of the owner registers push, checked inside the registration lock so a concurrent removal cannot restore its token.
+        try: mobile.touch_device(owner,provider,profile,device_id,False,True)
+        except LookupError as exc: raise HTTPException(403,str(exc)) from None
         conn.execute('DELETE FROM targets WHERE expires<=?',(time.time(),))
         if conn.execute('SELECT COUNT(*) FROM targets').fetchone()[0]>=32 and not conn.execute('SELECT 1 FROM targets WHERE id=?',(tid,)).fetchone(): raise HTTPException(409,'Target capacity reached')
         old=conn.execute('SELECT owner,profile,token FROM targets WHERE id=?',(tid,)).fetchone()
@@ -705,15 +658,13 @@ async def remove_target_id(target_id:str,request:Request):
 @router.get('/mobile/notifications/events')
 async def notices(request:Request,after:int=0,wait:float=0):
     owner,provider,profile,_=identity(request)
-    package=request.query_params.get('package',_PRODUCTION_PACKAGE)
-    if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Beacon package')
     if after<0: raise HTTPException(400,'Invalid cursor')
     duration=_bounded_event_wait(wait)
     async def snapshot():
         await asyncio.to_thread(mobile.prune_history,owner)
         await asyncio.to_thread(sys.modules['beacon_callbacks'].prune_expired,mobile,native,owner)
         await asyncio.to_thread(watch,owner,provider,profile)
-        return await asyncio.to_thread(_notices_after,owner,profile,after,package)
+        return await asyncio.to_thread(_notices_after,owner,profile,after)
     rows,reset,cursor=await snapshot()
     if rows or reset or duration<=0:
         key=mobile.reference_key() if rows else None
@@ -725,7 +676,7 @@ async def notices(request:Request,after:int=0,wait:float=0):
         remaining=deadline-loop.time()
         if remaining<=0: break
         await asyncio.sleep(min(1.0,remaining))
-        rows,reset,cursor=await asyncio.to_thread(_notices_after,owner,profile,after,package)
+        rows,reset,cursor=await asyncio.to_thread(_notices_after,owner,profile,after)
         if rows or reset: break
         after=cursor
         if await request.is_disconnected(): break
@@ -734,17 +685,15 @@ async def notices(request:Request,after:int=0,wait:float=0):
     if reset: result['reset']=True
     return result
 
-def _notices_after(owner,profile,after,package=_PRODUCTION_PACKAGE):
+def _notices_after(owner,profile,after):
     with mobile.connect() as conn:
         sequence=conn.execute("SELECT seq FROM sqlite_sequence WHERE name='notices'").fetchone()
         max_seq=sequence[0] if sequence else 0
         reset=after>max_seq
         rows=[dict(r) for r in conn.execute('SELECT * FROM notices WHERE owner=? AND profile=? AND seq>? ORDER BY seq LIMIT 100',(owner,profile,0 if reset else after))]
     cursor=rows[-1]['seq'] if rows else max_seq if reset else after
-    visible=[row for row in rows if row['kind']!='release' or _notice_package(row)==package]
-    return visible,reset,cursor
+    return rows,reset,cursor
 def notice_preview(kind):
-    if kind=='release': return 'Beacon update available','Open Beacon to install the latest verified update.'
     if kind=='test': return 'Beacon notification test','Synthetic test. Seeing this notification confirms arrival on this phone.'
     if kind=='approval': return 'Approval needed','Open Beacon to review the request.'
     if kind=='clarify': return 'Question for you','Answer here or open Beacon.'
@@ -775,11 +724,9 @@ def notice_wire(row,owner,key=None):
 @router.get('/mobile/notifications/events/{event_id}')
 async def notice_detail(event_id:str,request:Request):
     owner,provider,profile,cfg=identity(request)
-    package=request.query_params.get('package',_PRODUCTION_PACKAGE)
-    if package not in _SUPPORTED_PHONE_PACKAGES: raise HTTPException(400,'Invalid Beacon package')
     with mobile.connect() as conn:
         row=conn.execute('SELECT * FROM notices WHERE id=? AND owner=? AND profile=?',(event_id,owner,profile)).fetchone()
-    if not row or row['kind']=='release' and _notice_package(dict(row))!=package: raise HTTPException(404,'Owned notification unavailable')
+    if not row: raise HTTPException(404,'Owned notification unavailable')
     result=notice_wire(dict(row),owner)
     if row['kind']=='completion' and row['conversation']:
         # The notification shows what the reply says; Android's lock-screen setting still hides it when locked.
@@ -932,7 +879,7 @@ def _push_devices(owner,profile):
     if not credentials: return
     with mobile.connect() as conn:
         rows=[dict(r) for r in conn.execute("SELECT * FROM notices WHERE owner=? AND profile=? AND push='pending' AND state='pending' AND expires>? ORDER BY seq LIMIT 64",(owner,profile,time.time()))]
-        targets=[dict(r) for r in conn.execute('SELECT id,token,payload FROM targets WHERE owner=? AND profile=? AND expires>?',(owner,profile,time.time()))]
+        targets=[dict(r) for r in conn.execute('SELECT id,token,payload FROM targets WHERE owner=? AND profile=? AND expires>? AND '+mobile.ACTIVE_TARGET,(owner,profile,time.time()))]
     if not targets: return
     try:
         import firebase_admin
@@ -940,8 +887,7 @@ def _push_devices(owner,profile):
         try: app=firebase_admin.get_app('beacon')
         except ValueError: app=firebase_admin.initialize_app(fb_credentials.Certificate(credentials),options={'httpTimeout':10},name='beacon')
         for row in rows:
-            eligible_targets=[target for target in targets if row['kind']!='release' or _target_package(target.get('payload'))==_notice_package(row)]
-            for target in eligible_targets:
+            for target in targets:
                 now=time.time()
                 with mobile.LOCK,mobile.connect() as conn:
                     current=conn.execute("SELECT 1 FROM notices WHERE id=? AND state='pending' AND expires>?",(row['id'],now)).fetchone()
@@ -952,7 +898,6 @@ def _push_devices(owner,profile):
                 accepted=0;error=''
                 try:
                     data={'type':row['kind'],'kind':row['kind'],'event_id':row['id'],'profile':profile,'owner_id':owner,'expires_at':str(int(row['expires'])),'activity_ref':row.get('activity_key',''),'title':notice_preview(row['kind'])[0],'body':notice_preview(row['kind'])[1],**mobile.refs(owner,profile,row['conversation'])}
-                    if row['kind']=='release': data['release_version']=str(row['release_version'])
                     messaging.send(messaging.Message(token=target['token'],data=data,android=messaging.AndroidConfig(priority='high',ttl=timedelta(seconds=max(1,row['expires']-time.time())))),app=app)
                     accepted=time.time()
                 except Exception as exc:
@@ -963,362 +908,10 @@ def _push_devices(owner,profile):
                         conn.execute('INSERT OR REPLACE INTO notice_deliveries VALUES(?,?,?,?,?,?)',(row['id'],target['id'],accepted,attempts,0 if accepted else time.time()+min(60,3*2**min(attempts-1,5)),error))
                         if error=='UnregisteredError': conn.execute('UPDATE targets SET expires=0 WHERE id=?',(target['id'],))
             with mobile.LOCK,mobile.connect() as conn:
-                remaining=sum(not conn.execute('SELECT 1 FROM notice_deliveries WHERE event=? AND target=? AND accepted>0',(row['id'],target['id'])).fetchone() for target in eligible_targets)
+                remaining=sum(not conn.execute('SELECT 1 FROM notice_deliveries WHERE event=? AND target=? AND accepted>0',(row['id'],target['id'])).fetchone() for target in targets)
                 accepted=conn.execute('SELECT COUNT(*) FROM notice_deliveries WHERE event=? AND accepted>0',(row['id'],)).fetchone()[0]
                 if not remaining and accepted: conn.execute("UPDATE notices SET push='sent' WHERE id=?",(row['id'],))
     except Exception: return
-
-_release_failures={}
-def announce_release(cfg,package=_PRODUCTION_PACKAGE):
-    """A changed verified feed creates durable hints; clients still verify before installing."""
-    if package not in (_PRODUCTION_PACKAGE,_STABLE_PACKAGE): raise ValueError('Invalid Beacon package')
-    owner=cfg.get('owner_id');profiles=cfg.get('profiles')
-    if profiles is None:
-        try: profiles=_native_profile_names()
-        except HTTPException: return
-    if not owner or not cfg.get('owner_provider') or not profiles: return
-    stable=package==_STABLE_PACKAGE
-    manifest=_release_root(cfg,stable=stable)/'latest.json'
-    if not manifest.is_file(): return
-    with manifest.open('rb') as stream: raw=stream.read(16385)
-    if len(raw)>16384: return
-    cache_key=str(manifest.resolve());fingerprint=hashlib.sha256(raw).hexdigest()
-    if _release_failures.get(cache_key)==fingerprint: return
-    candidate=json.loads(raw.decode('utf-8-sig')).get('version_code')
-    if type(candidate) is not int or not 20<candidate<=2147483647: return
-    def key(profile): return 'release-announced:'+hashlib.sha256((owner+'\0'+profile+'\0'+package).encode()).hexdigest()
-    with mobile.connect() as conn:
-        wanted=[profile for profile in profiles if any(_target_package(row['payload'])==package for row in conn.execute('SELECT payload FROM targets WHERE owner=? AND profile=? AND expires>?',(owner,profile,time.time())))
-                and int((conn.execute('SELECT value FROM meta WHERE key=?',(key(profile),)).fetchone() or [0])[0])<candidate]
-    if not wanted: return
-    try: verified=release(cfg,package=package)
-    except Exception:
-        _release_failures[cache_key]=fingerprint
-        raise
-    _release_failures.pop(cache_key,None)
-    version=verified['version_code']
-    with mobile.LOCK,mobile.connect() as conn:
-        for profile in wanted:
-            previous=conn.execute('SELECT value FROM meta WHERE key=?',(key(profile),)).fetchone()
-            if previous and int(previous[0])>=version: continue
-            if not any(_target_package(row['payload'])==package for row in conn.execute('SELECT payload FROM targets WHERE owner=? AND profile=? AND expires>?',(owner,profile,time.time()))): continue
-            mobile.prune_notices(conn)
-            if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: raise RuntimeError('Notification capacity reached')
-            event=hashlib.sha256((owner+'\0'+profile+'\0release:'+package+':'+str(version)+':'+verified['sha256']).encode()).hexdigest()
-            conn.execute('INSERT OR IGNORE INTO notices(id,owner,profile,kind,conversation,created,expires,release_version) VALUES(?,?,?,?,?,?,?,?)',
-                         (event,owner,profile,'release',('release-stable-' if stable else 'release-')+str(version),time.time(),time.time()+7*86400,version))
-            conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(key(profile),version))
-def release(cfg,optional=False,digest=None,package=None,root_path=None):
-    with _RELEASE_CACHE_LOCK:
-        return _release(cfg,optional,digest,package,root_path)
-
-def _release_root(cfg,create=False,stable=False):
-    if stable:
-        root=mobile.home()/'plugin-data'/'beacon'/'releases-stable'
-        if create: mobile.protect(root)
-        return root
-    configured=cfg.get('release_root')
-    if isinstance(configured,str) and configured.strip():
-        root=Path(configured).expanduser()
-        if create:
-            if root.is_symlink() or getattr(root,'is_junction',lambda:False)(): raise ValueError('Unsafe release directory')
-            root.mkdir(parents=True,exist_ok=True)
-    else:
-        root=mobile.home()/'plugin-data'/'beacon'/'releases'
-        if create: mobile.protect(root)
-    return root
-
-def _release(cfg,optional=False,digest=None,package=None,root_path=None):
-    global _RELEASE_CACHE_KEY,_RELEASE_CACHE_VALUE
-    stable=package==_STABLE_PACKAGE
-    package_name=_STABLE_PACKAGE if stable else _PRODUCTION_PACKAGE
-    root_path=Path(root_path) if root_path is not None else _release_root(cfg,stable=stable)
-    if not root_path.is_dir():
-        if optional: return {'available':False}
-        raise LookupError('Release unavailable')
-    root=root_path.resolve(strict=True)
-    if digest is not None and not re.fullmatch(r'[a-f0-9]{64}',digest): raise LookupError('Invalid immutable release')
-    manifest=root/((digest+'.json') if digest else 'latest.json')
-    if manifest.is_symlink() or getattr(manifest,'is_junction',lambda:False)(): raise ValueError('Unsafe release manifest')
-    if not manifest.is_file():
-        if optional: return {'available':False}
-        raise LookupError('Release unavailable')
-    manifest_stat=manifest.stat()
-    if manifest_stat.st_size>16384: raise ValueError('Oversized release manifest')
-    data=json.loads(manifest.read_text(encoding='utf-8-sig'))
-    if not isinstance(data,dict): raise ValueError('Invalid release manifest')
-    filename=data.get('artifact_filename','')
-    if not re.fullmatch(r'[A-Za-z0-9_.-]+\.apk',filename): raise ValueError('Invalid artifact name')
-    path=root/filename
-    if path.is_symlink() or getattr(path,'is_junction',lambda:False)() or path.resolve().parent!=root: raise ValueError('Unsafe artifact')
-    if data.get('package_name')!=package_name or type(data.get('version_code')) is not int or data['version_code']<=20 or not re.fullmatch(r'[a-fA-F0-9]{64}',data.get('certificate_sha256','')): raise ValueError('Invalid release identity')
-    artifact_stat=path.stat()
-    if not 1<=artifact_stat.st_size<=256*1024*1024: raise ValueError('APK size outside bounds')
-    if artifact_stat.st_size!=data.get('size_bytes') or not re.fullmatch(r'[a-fA-F0-9]{64}',data.get('sha256','')): raise ValueError('Release artifact changed')
-    expected=cfg.get('android_stable_certificate_sha256') if stable else cfg.get('android_certificate_sha256')
-    if stable and not expected: expected=data['certificate_sha256']
-    if not isinstance(expected,str) or not re.fullmatch(r'[a-fA-F0-9]{64}',expected) or expected.lower()!=data['certificate_sha256'].lower(): raise ValueError('Unexpected signing identity')
-    version_name=data.get('version_name')
-    if not isinstance(version_name,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}',version_name): raise ValueError('Invalid release version')
-    aapt=cfg.get('aapt');signer=cfg.get('apksigner')
-    # The stable phone checks package, version, hash, and signer before install; Android refuses signer changes.
-    verify_apk=not (stable and not aapt and not signer)
-    tools=[]
-    if verify_apk:
-        if not aapt or not signer or not Path(aapt).is_file() or not Path(signer).is_file(): raise RuntimeError('APK verification tools unavailable')
-        for tool in (aapt,signer):
-            tool_path=Path(tool);tool_stat=tool_path.stat()
-            tools.append((str(tool_path.resolve()),tool_stat.st_size,tool_stat.st_mtime_ns))
-    cache_key=(str(manifest.resolve()),manifest_stat.st_size,manifest_stat.st_mtime_ns,
-               str(path.resolve()),artifact_stat.st_size,artifact_stat.st_mtime_ns,
-               digest,package_name,expected.lower(),tuple(tools))
-    if cache_key==_RELEASE_CACHE_KEY:
-        return dict(_RELEASE_CACHE_VALUE)
-    with path.open('rb') as stream: computed=hashlib.file_digest(stream,'sha256').hexdigest()
-    if digest is not None and digest!=computed: raise ValueError('Immutable manifest hash mismatch')
-    digest=computed
-    if digest!=data.get('sha256'): raise ValueError('Release artifact changed')
-    if verify_apk:
-        flags=subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0
-        try:
-            badging=subprocess.run([aapt,'dump','badging',str(path)],capture_output=True,text=True,check=True,timeout=20,creationflags=flags).stdout
-            certificates=subprocess.run([signer,'verify','--print-certs',str(path)],capture_output=True,text=True,check=True,timeout=20,creationflags=flags).stdout
-        except (OSError,subprocess.SubprocessError): raise RuntimeError('APK verification failed') from None
-        package=re.search(r"package: name='([^']+)' versionCode='([0-9]+)' versionName='([^']+)'",badging)
-        digests=re.findall(r'Signer #[0-9]+ certificate SHA-256 digest: ([a-fA-F0-9]{64})',certificates)
-        if not package or package[1]!=data['package_name'] or int(package[2])!=data['version_code'] or package[3]!=version_name or len(digests)!=1 or digests[0].lower()!=expected.lower(): raise ValueError('APK metadata/signature mismatch')
-    # The app sends ?package= on download; a query here fails its artifact-path check.
-    artifact_path='/api/plugins/beacon/mobile/releases/'+digest+'/download'
-    result={k:data[k] for k in ('version_code','version_name','package_name','certificate_sha256','sha256','size_bytes')} | {'available':True,'download_url':artifact_path,'artifact_path':artifact_path,'min_contract_version':2,'max_contract_version':2}
-    if isinstance(data.get('plugin_version'),str): result['plugin_version']=data['plugin_version']
-    _RELEASE_CACHE_KEY=cache_key;_RELEASE_CACHE_VALUE=dict(result)
-    return result
-@router.get('/mobile/releases/latest')
-async def latest(request:Request):
-    _,_,_,cfg=identity(request);package=request.query_params.get('package')
-    if package and package not in (_PRODUCTION_PACKAGE,_STABLE_PACKAGE): raise HTTPException(400,'Unsupported Beacon update package')
-    return await asyncio.to_thread(safely,release,cfg,False,None,package)
-@router.get('/mobile/releases/{digest}/download')
-async def download(digest:str,request:Request):
-    _,_,_,cfg=identity(request);package=request.query_params.get('package')
-    if package and package not in (_PRODUCTION_PACKAGE,_STABLE_PACKAGE): raise HTTPException(400,'Unsupported Beacon update package')
-    metadata=await asyncio.to_thread(safely,release,cfg,False,digest,package)
-    if digest!=metadata['sha256']: raise HTTPException(404,'Immutable artifact unavailable')
-    root=_release_root(cfg,stable=package==_STABLE_PACKAGE).resolve();data=json.loads((root/(digest+'.json')).read_text(encoding='utf-8-sig'));path=root/data['artifact_filename']
-    # Snapshot immutable bytes before any response headers; a concurrent replacement
-    # cannot turn validated metadata into a different delivered package.
-    content=await asyncio.to_thread(path.read_bytes)
-    if hashlib.sha256(content).hexdigest()!=digest: raise HTTPException(409,'Artifact changed')
-    return StreamingResponse(iter(content[i:i+65536] for i in range(0,len(content),65536)),media_type='application/vnd.android.package-archive',headers={'Content-Length':str(len(content)),'ETag':'"'+digest+'"','Cache-Control':'private, immutable'})
-
-class ReleaseCheckError(Exception): pass
-
-def _safe_release_repo(cfg):
-    repo=cfg.get('release_repo','xploit9/beacon')
-    if not isinstance(repo,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}',repo):
-        raise ReleaseCheckError('The configured GitHub release repository is invalid.')
-    return repo
-
-def _is_link(path):
-    return path.is_symlink() or getattr(path,'is_junction',lambda:False)()
-
-def _file_sha256(path):
-    with path.open('rb') as stream: return hashlib.file_digest(stream,'sha256').hexdigest()
-
-def _atomic_copy(source,destination,digest):
-    if _is_link(destination): raise ReleaseCheckError('The configured release feed contains an unsafe file.')
-    if destination.exists():
-        if destination.is_file() and _file_sha256(destination)==digest: return
-        raise ReleaseCheckError('A published Beacon APK filename cannot be replaced with different bytes.')
-    temporary=destination.with_name('.'+destination.name+'.'+uuid.uuid4().hex+'.tmp')
-    try:
-        with source.open('rb') as incoming,temporary.open('xb') as outgoing:
-            shutil.copyfileobj(incoming,outgoing,1024*1024);outgoing.flush();os.fsync(outgoing.fileno())
-        if _file_sha256(temporary)!=digest: raise ReleaseCheckError('The verified Beacon APK changed while it was being saved.')
-        os.replace(temporary,destination)
-    finally:
-        try: temporary.unlink()
-        except FileNotFoundError: pass
-
-def _atomic_write(destination,content,immutable=False):
-    if _is_link(destination): raise ReleaseCheckError('The configured release feed contains an unsafe file.')
-    if immutable and destination.exists():
-        if destination.is_file() and destination.read_bytes()==content: return
-        raise ReleaseCheckError('A published Beacon release manifest cannot be replaced.')
-    temporary=destination.with_name('.'+destination.name+'.'+uuid.uuid4().hex+'.tmp')
-    try:
-        with temporary.open('xb') as stream:
-            stream.write(content);stream.flush();os.fsync(stream.fileno())
-        os.replace(temporary,destination)
-    finally:
-        try: temporary.unlink()
-        except FileNotFoundError: pass
-
-def _plugin_version_tuple(value):
-    # Parts stay short so a recorded version is never cut by the 64-character status field.
-    match=re.fullmatch(r'(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})',value) if isinstance(value,str) else None
-    return tuple(int(part) for part in match.groups()) if match else None
-
-# shortcut: this GitHub check and APK staging serve only the installed 1.1.x phones, which install from Hermes' feed;
-# remove them and announce_release once the owner's phones run 1.1.2 or later.
-def _check_github_release(cfg):
-    global _RELEASE_CACHE_KEY,_RELEASE_CACHE_VALUE
-    repo=_safe_release_repo(cfg)
-    gh=shutil.which('gh')
-    if not gh: raise ReleaseCheckError('GitHub CLI is not installed on your PC.')
-    flags=subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0
-    with tempfile.TemporaryDirectory(prefix='beacon-release-') as temporary:
-        download_dir=Path(temporary)
-        def download(pattern):
-            try:
-                result=subprocess.run([gh,'release','download','--repo',repo,'--pattern',pattern,'--dir',str(download_dir)],
-                                      cwd=str(download_dir),capture_output=True,text=True,check=False,timeout=120,shell=False,creationflags=flags)
-            except subprocess.TimeoutExpired: raise ReleaseCheckError('GitHub release check timed out on your PC. Try again.') from None
-            except OSError: raise ReleaseCheckError('GitHub CLI could not start on your PC.') from None
-            if result.returncode:
-                detail=(result.stderr+'\n'+result.stdout).casefold()
-                if any(part in detail for part in ('not logged in','not logged into','auth login','authentication required','http 401')):
-                    raise ReleaseCheckError('GitHub CLI is not signed in on your PC. Sign in with gh auth login.')
-                if 'release not found' in detail or 'no releases found' in detail:
-                    raise ReleaseCheckError('No stable Beacon release was found in the configured GitHub repository.')
-                if 'no assets found' in detail or 'no matching assets' in detail:
-                    raise ReleaseCheckError('The latest GitHub release is missing the Beacon APK or metadata.')
-                raise ReleaseCheckError('GitHub CLI cannot access the configured release repository on your PC.')
-            return list(download_dir.glob(pattern))
-
-        manifests=download('Beacon-*.json')
-        if len(manifests)!=1: raise ReleaseCheckError('The GitHub release must contain one Beacon metadata file.')
-        manifest=manifests[0]
-        if _is_link(manifest) or manifest.resolve().parent!=download_dir.resolve():
-            raise ReleaseCheckError('The GitHub release contains an unsafe artifact path.')
-        name=re.fullmatch(r'Beacon-([A-Za-z0-9][A-Za-z0-9._-]{0,63})\.json',manifest.name)
-        if not name or manifest.stat().st_size>16384:
-            raise ReleaseCheckError('The GitHub release metadata is outside the supported size limits.')
-        try:
-            manifest_bytes=manifest.read_bytes();data=json.loads(manifest_bytes.decode('utf-8-sig'))
-        except Exception: raise ReleaseCheckError('The GitHub release metadata is invalid.') from None
-        version_name=name[1]
-        artifact_name=f'Beacon-{version_name}.apk'
-        plugin_version=data.get('plugin_version') if isinstance(data,dict) else None
-        if _plugin_version_tuple(plugin_version) is None:
-            raise ReleaseCheckError('The GitHub release metadata must include a valid Beacon plugin version.')
-        if (not isinstance(data,dict) or data.get('artifact_filename')!=artifact_name or data.get('package_name')!=_STABLE_PACKAGE
-                or data.get('version_name')!=version_name or type(data.get('version_code')) is not int or data['version_code']<=20
-                or type(data.get('size_bytes')) is not int or not 1<=data['size_bytes']<=256*1024*1024
-                or not isinstance(data.get('sha256'),str) or not re.fullmatch(r'[a-f0-9]{64}',data['sha256'])
-                or not isinstance(data.get('certificate_sha256'),str) or not re.fullmatch(r'[a-fA-F0-9]{64}',data['certificate_sha256'])):
-            raise ReleaseCheckError('The GitHub release metadata does not describe a stable Beacon APK.')
-        digest=data['sha256']
-        previous=None
-        try: previous=release(cfg,optional=True,package=_STABLE_PACKAGE)
-        except Exception: pass
-        if previous and previous.get('package_name')==_STABLE_PACKAGE:
-            if data['version_code']<previous['version_code']:
-                return {'version_name':data['version_name'],'version_code':data['version_code'],'plugin_version':plugin_version,'available':False}
-            if data['version_code']==previous['version_code']:
-                if digest!=previous['sha256']:
-                    raise ReleaseCheckError('A published Beacon version cannot be replaced with different APK bytes.')
-                if (data['version_name']!=previous['version_name'] or
-                        data['certificate_sha256'].lower()!=previous['certificate_sha256'].lower()):
-                    raise ReleaseCheckError('A published Beacon version cannot change its release metadata.')
-                previous_plugin=previous.get('plugin_version','')
-                if _plugin_version_tuple(previous_plugin) and _plugin_version_tuple(plugin_version)<_plugin_version_tuple(previous_plugin):
-                    raise ReleaseCheckError('A published Beacon release cannot downgrade its plugin version.')
-                if plugin_version!=previous_plugin:
-                    root=_release_root(cfg,create=True,stable=True)
-                    _atomic_write(root.resolve()/'latest.json',manifest_bytes)
-                    with _RELEASE_CACHE_LOCK: _RELEASE_CACHE_KEY=None;_RELEASE_CACHE_VALUE=None
-                return {'version_name':data['version_name'],'version_code':data['version_code'],'plugin_version':plugin_version,'available':False}
-
-        apks=download(artifact_name)
-        if len(apks)!=1 or apks[0].name!=artifact_name:
-            raise ReleaseCheckError('The GitHub release must contain the APK named by its metadata.')
-        apk=apks[0]
-        if _is_link(apk) or apk.resolve().parent!=download_dir.resolve():
-            raise ReleaseCheckError('The GitHub release contains an unsafe artifact path.')
-        if not 1<=apk.stat().st_size<=256*1024*1024 or apk.stat().st_size!=data['size_bytes']:
-            raise ReleaseCheckError('The GitHub release artifact is outside the supported size limits.')
-        if _file_sha256(apk)!=digest: raise ReleaseCheckError('The GitHub APK checksum does not match its metadata.')
-        stage=download_dir/'feed';stage.mkdir()
-        shutil.copyfile(apk,stage/apk.name)
-        (stage/(digest+'.json')).write_bytes(manifest_bytes)
-        (stage/'latest.json').write_bytes(manifest_bytes)
-        try: verified=release(cfg,package=_STABLE_PACKAGE,root_path=stage)
-        except Exception: raise ReleaseCheckError('The downloaded Beacon APK failed signature or metadata verification.') from None
-        root=_release_root(cfg,create=True,stable=True)
-        if not root.is_dir(): raise ReleaseCheckError('The verified release feed could not be saved on Hermes.')
-        root=root.resolve(strict=True)
-        _atomic_copy(apk,root/data['artifact_filename'],digest)
-        _atomic_write(root/(digest+'.json'),manifest_bytes,immutable=True)
-        _atomic_write(root/'latest.json',manifest_bytes)
-        with _RELEASE_CACHE_LOCK: _RELEASE_CACHE_KEY=None;_RELEASE_CACHE_VALUE=None
-        # Keep this release and the one it replaces (a phone may be mid-download); drop older ones.
-        keep={data['artifact_filename'],digest+'.json'}
-        if previous and previous.get('package_name')==_STABLE_PACKAGE:
-            keep.add('Beacon-'+previous['version_name']+'.apk')
-            keep.add(previous['sha256']+'.json')
-        for stale in root.iterdir():
-            if stale.name not in keep and (re.fullmatch(r'Beacon-.+\.apk',stale.name) or re.fullmatch(r'[a-f0-9]{64}\.json',stale.name)):
-                try: stale.unlink()
-                except OSError: pass
-        return {'version_name':verified['version_name'],'version_code':verified['version_code'],'plugin_version':plugin_version,'available':True}
-
-def _check_release_and_announce(cfg):
-    with _RELEASE_CHECK_LOCK:
-        checked=_check_github_release(cfg)
-        if checked.get('available'): announce_release(cfg,package=_STABLE_PACKAGE)
-        return checked
-
-@router.post('/mobile/releases/check')
-async def check_release_updates(request:Request):
-    _,_,_,cfg=identity(request,owner_only=True)
-    try: return await asyncio.to_thread(_check_release_and_announce,cfg)
-    except ReleaseCheckError as error: raise HTTPException(503,str(error)) from None
-    except Exception: raise HTTPException(503,'The verified Beacon release could not be saved on Hermes.') from None
-
-def _installed_plugin_version():
-    return _read_plugin_version(ROOT/'plugin.yaml')
-
-def auto_update_check(cfg,now=None):
-    # The plugin never installs itself: it records an available update and the owner installs it with Hermes' updater.
-    owner=cfg.get('owner_id')
-    if not owner or not cfg.get('owner_provider'): return None
-    if not _AUTO_UPDATE_LOCK.acquire(blocking=False): return {'result':'in_progress'}
-    try:
-        now=time.time() if now is None else now
-        current_state=mobile.auto_update_settings(owner)
-        last=current_state.get('checked_at',0)
-        state=current_state.get('result')
-        if type(last) in (int,float) and last and now>=last and now-last<mobile.AUTO_UPDATE_INTERVAL_SECONDS and state in mobile.AUTO_UPDATE_RESULTS:
-            pending=_plugin_version_tuple(current_state.get('plugin_version',''))
-            installed_version=_installed_plugin_version()
-            installed=_plugin_version_tuple(installed_version)
-            # The owner may have updated in Hermes since the last check.
-            if state in ('plugin_update_available','restart_required') and pending and installed and installed>=pending:
-                if _RUNNING_PLUGIN_VERSION==installed_version:
-                    return mobile.record_auto_update_status(owner,last,'plugin_updated',current_state.get('app_version',''),current_state.get('plugin_version',''),'Beacon plugin updated.')
-                if state=='plugin_update_available':
-                    return mobile.record_auto_update_status(owner,last,'restart_required',current_state.get('app_version',''),current_state.get('plugin_version',''),'Restart Hermes to finish the plugin update.')
-            return {**current_state,'result':'throttled'}
-        mobile.record_auto_update_status(owner,now,'checking',current_state.get('app_version',''),current_state.get('plugin_version',''),'Checking for updates.')
-        try:
-            release_info=_check_release_and_announce(cfg)
-            app_version=release_info.get('version_name','')
-            plugin_version=release_info.get('plugin_version','')
-            installed_version=_installed_plugin_version()
-            latest=_plugin_version_tuple(plugin_version)
-            installed=_plugin_version_tuple(installed_version)
-            if latest is None or installed is None: raise ReleaseCheckError('The Beacon plugin version is unavailable.')
-            if latest>installed:
-                return mobile.record_auto_update_status(owner,now,'plugin_update_available',app_version,plugin_version,'Plugin update available.')
-            # An installed update this process has not loaded yet still needs a restart, even when nothing newer exists.
-            if _RUNNING_PLUGIN_VERSION!=installed_version:
-                return mobile.record_auto_update_status(owner,now,'restart_required',app_version,plugin_version,'Restart Hermes to finish the plugin update.')
-            staged=bool(release_info.get('available'))
-            return mobile.record_auto_update_status(owner,now,'app_staged' if staged else 'up_to_date',app_version,plugin_version,'A stable app update is ready.' if staged else 'Up to date.')
-        except Exception:
-            return mobile.record_auto_update_status(owner,now,'error',message='Could not check for updates. Try again later.')
-    finally: _AUTO_UPDATE_LOCK.release()
 
 @router.get('/mobile/plugin/version')
 async def plugin_version(request:Request):
@@ -1343,22 +936,10 @@ def _warm_profile(owner,profile):
 async def start_watcher():
     global _watch_task
     async def loop():
-        auto_task=None;auto_owner=None;auto_not_before=0
         while True:
             try:
                 cfg=mobile.settings()
                 if cfg.get('owner_id') and cfg.get('owner_provider'):
-                    owner=(cfg['owner_id'],cfg['owner_provider'])
-                    if owner!=auto_owner: auto_owner=owner;auto_not_before=0
-                    if auto_task is not None and auto_task.done():
-                        auto_task=None;auto_not_before=time.time()+mobile.AUTO_UPDATE_INTERVAL_SECONDS
-                    if auto_task is None and time.time()>=auto_not_before:
-                        async def run_auto_update(snapshot):
-                            try: return await asyncio.to_thread(auto_update_check,snapshot)
-                            except Exception: return None
-                        auto_task=asyncio.create_task(run_auto_update(cfg))
-                    try: await asyncio.to_thread(announce_release,cfg)
-                    except Exception: pass  # A missing/invalid release must not stop call/approval delivery.
                     profiles=cfg.get('profiles')
                     if profiles is None: profiles=_native_profile_names()
                     for profile in profiles:

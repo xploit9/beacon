@@ -1,7 +1,7 @@
 package dev.hermes.android.ui
 
-// Tool-state and activity rules adapted from Hermes Relay (MIT; see licenses/Hermes-Relay-MIT.txt):
-// ToolProgressCard.isDetachedDelegationDispatch and compactToolDetail.
+// Tool-state rules adapted from Hermes Relay (MIT; see licenses/Hermes-Relay-MIT.txt):
+// ToolProgressCard.isDetachedDelegationDispatch.
 // Pure functions only, so they run as plain JVM unit tests.
 
 /** Seed the first measurement, so history never renders at the top before restoration. */
@@ -89,12 +89,6 @@ private fun String.takeWholeChars(count: Int): String {
     return substring(0, end)
 }
 
-/** One-line summary for collapsed use; the expanded card shows [boundedDetail] instead. Honors [maxChars]. */
-internal fun compactToolDetail(value: String, maxChars: Int = 700): String {
-    val compact = value.replace(whitespaceRun, " ").trim()
-    return if (compact.length <= maxChars) compact else compact.takeWholeChars(maxChars).trimEnd() + "..."
-}
-
 internal const val ToolDetailLimit = 200_000
 internal const val ToolDetailPageSize = 4_000
 
@@ -108,28 +102,6 @@ internal fun boundedDetail(value: String, limit: Int = ToolDetailLimit): String 
     val shown = value.takeWholeChars(limit)
     return shown + "\n… ${value.length - shown.length} more characters not shown"
 }
-
-internal data class ToolSnapshot(val key: String, val name: String, val outcome: ToolOutcome, val durationSeconds: Double? = null)
-
-/** Real activity of the current chat only: its tools, queue and pending prompts. */
-internal data class ChatActivity(val running: List<ToolSnapshot>, val recent: List<ToolSnapshot>, val queued: Int, val waiting: List<String>) {
-    /** Finished work stays in its transcript card; only active work owns composer space. */
-    val active: Boolean get() = running.isNotEmpty() || queued > 0 || waiting.isNotEmpty()
-}
-
-internal fun chatActivity(tools: List<ToolSnapshot>, queued: Int, approval: Boolean, question: Boolean): ChatActivity {
-    val (running, recent) = tools.partition { it.outcome == ToolOutcome.Running || it.outcome == ToolOutcome.Preparing }
-    return ChatActivity(running, recent, queued.coerceAtLeast(0), listOfNotNull("Approval needed".takeIf { approval }, "Question waiting".takeIf { question }))
-}
-
-internal fun chatActivityStatus(activity: ChatActivity): String = listOfNotNull(
-    "${activity.running.size} running".takeIf { activity.running.isNotEmpty() },
-    "${activity.queued} queued".takeIf { activity.queued > 0 },
-    "Waiting for you".takeIf { activity.waiting.isNotEmpty() },
-).joinToString(" · ")
-
-/** The native connection exposes no process registry yet; say so instead of showing an empty list as truth. */
-internal const val ProcessControlUnavailable = "Background process list and stop controls aren’t available from this connection yet. Only this chat’s own tools, queue and prompts are shown."
 
 /** One-line excerpt for "Quote in reply" (Relay's bounded excerpt): whitespace collapsed, at most [max] characters. */
 internal fun quoteExcerpt(text: String, max: Int = 240): String {

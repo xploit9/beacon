@@ -590,7 +590,7 @@ internal fun validNativeProfile(name: String): Boolean = name.length in 1..80 &&
     name.all { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it == '_' || it == '-' || it == '.' }
 
 // Optional plugin capabilities surface through the explicit probe; none of them gate native chat/history.
-private val OPTIONAL_FEATURES = listOf("voice", "callbacks", "push", "bot_mode", "projects", "skills_extensions", "memory_documents", "admin", "release", "notifications", "tasks")
+private val OPTIONAL_FEATURES = listOf("voice", "callbacks", "push", "bot_mode", "projects", "skills_extensions", "memory_documents", "admin", "notifications", "tasks")
 private val NATIVE_CAPABILITY_KEYS = listOf("native_jobs", "pc_recording", "callbacks", "push", "permanent_recording_retention")
 
 // A cold optional projection must not hold sign-in for the native read timeout.

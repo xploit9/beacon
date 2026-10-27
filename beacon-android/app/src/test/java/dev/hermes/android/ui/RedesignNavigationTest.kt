@@ -42,12 +42,5 @@ class RedesignNavigationTest {
         assertFalse(nativeProjectDetailCurrent("project-a", "project-b"))
         assertFalse(nativeProjectDetailCurrent("", ""))
     }
-    @Test fun pinnedHistoryIsSeparatedWithoutDroppingOrDuplicatingRows() {
-        val groups = navigationHistoryGroups(listOf(false, true, false, true))
-        assertEquals(listOf(1, 3), groups[0].second)
-        assertEquals(listOf(0, 2), groups[1].second)
-        assertEquals(listOf(0, 1, 2, 3), groups.flatMap { it.second }.sorted())
-        assertTrue(navigationHistoryGroups(emptyList()).all { it.second.isEmpty() })
-    }
     @Test(expected = IllegalStateException::class) fun unknownDestinationsCannotSilentlyOpenSettings() { navigationRoute("Unsupported") }
 }

@@ -136,6 +136,9 @@ class NativeBotModeTest {
         failCreate = false
         controller.createSpace(); awaitIdle(controller)
         assertEquals(bodies[0].getString("request_id"), bodies[1].getString("request_id"))
+        // The bot in use is always a member, even though only "writer" could be ticked.
+        val members = bodies[0].getJSONArray("profiles")
+        assertEquals(listOf("default", "writer"), (0 until members.length()).map(members::getString))
         assertEquals("new-room", controller.state.value.selectedSpace)
         controller.home(); controller.createSpace(); awaitIdle(controller)
         assertNotEquals(bodies[1].getString("request_id"), bodies[2].getString("request_id"))

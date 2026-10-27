@@ -241,16 +241,37 @@ def test_late_finalization_never_upgrades_a_preexisting_stale_failure(harness):
 
 
 @pytest.mark.parametrize('incomplete',[False,True])
-def test_terminal_failure_preserves_an_earlier_text_completeness_receipt(harness,incomplete):
+def test_a_saved_receipt_is_terminal_and_a_replayed_finalize_or_close_cannot_rewrite_it(harness,incomplete):
+    # Strix 1c4f37e vuln-0013: a replay carrying another verdict turned a saved call into a failed or partial one.
     api,client,_,_,_=harness
     call_id=add_call(api)
-    path=f'{PATH}/{call_id}/finalize'
-    assert client.post(path,json={'incomplete':incomplete}).json()['complete'] is (not incomplete)
-    failed=client.post(path,json={'failed':True})
-    assert failed.status_code==200 and failed.json().get('failed') is True
-    assert failed.json()['complete'] is (not incomplete) and failed.json()['incomplete'] is incomplete
-    assert failed.json()['transcript_status']==('partial' if incomplete else 'saved')
-    assert next(row for row in history(client)['calls'] if row['id']==call_id)['state']=='failed'
+    path=f'{PATH}/{call_id}'
+    saved=client.post(path+'/finalize',json={'incomplete':incomplete}).json()
+    assert saved['complete'] is (not incomplete) and saved['incomplete'] is incomplete
+    assert saved['transcript_status']==('partial' if incomplete else 'saved') and not saved.get('failed')
+    state=next(row for row in history(client)['calls'] if row['id']==call_id)['state']
+    for replay in ({'failed':True},{'incomplete':True},{'failed':True,'incomplete':True},{}):
+        assert client.post(path+'/finalize',json=replay).json()==saved
+        closed=client.request('DELETE',path,json={'failed':replay.get('failed',False)}).json()
+        assert {key:closed.get(key) for key in saved}=={key:saved.get(key) for key in saved}
+        assert next(row for row in history(client)['calls'] if row['id']==call_id)['state']==state
+    with api.mobile.connect() as conn:
+        stored=json.loads(conn.execute('SELECT receipt FROM calls WHERE id=?',(call_id,)).fetchone()[0])
+    assert not stored['failed'] and stored['incomplete'] is incomplete and stored['complete'] is (not incomplete)
+
+
+def test_a_replayed_close_cannot_fail_a_call_that_already_closed(harness):
+    api,client,_,_,_=harness
+    call_id=add_call(api)
+    path=f'{PATH}/{call_id}'
+    assert client.delete(path).json()['closed'] is True
+
+    replay=client.request('DELETE',path,json={'failed':True})
+
+    assert replay.status_code==200 and replay.json().get('failed') is not True
+    with api.mobile.connect() as conn:
+        assert json.loads(conn.execute('SELECT receipt FROM calls WHERE id=?',(call_id,)).fetchone()[0])=={}
+    assert next(row for row in history(client)['calls'] if row['id']==call_id)['state']!='failed'
 
 
 @pytest.mark.parametrize('value',[None,0,1,'failed',{},[]])

@@ -154,7 +154,6 @@ class KeepConnectedTest {
             .put("kind", "task_result")
             .put("activity_ref", "activity-1")
             .put("expires_at", "1234")
-            .put("release_version", "9")
 
         assertEquals(
             mapOf(
@@ -164,7 +163,6 @@ class KeepConnectedTest {
                 "kind" to "task_result",
                 "activity_ref" to "activity-1",
                 "expires_at" to "1234",
-                "release_version" to "9",
             ),
             keepConnectedPushData(event),
         )
@@ -549,9 +547,6 @@ class KeepConnectedTest {
         assertEquals(RelayCallbackPhase.Ringing, prepared.call.phase)
         assertEquals(20_000L, prepared.call.remainingRingMillis(1_000_000L, 500L))
         assertTrue(RelayCallbackPolicy.callsAllowed(prepared.preferences, prepared.binding.connectionId))
-        assertNull(prepared.protocol.answer("c0ffee00112233445566778899aabbcc", "forged", prepared.binding, prepared.preferences, 1_000_000L, 500L))
-        assertEquals(RelayCallbackPhase.Answering,
-            prepared.protocol.answer("c0ffee00112233445566778899aabbcc", prepared.call.actionToken, prepared.binding, prepared.preferences, 1_000_000L, 500L)?.call?.phase)
     }
 
     @Test fun beaconCallEventHonorsTheServerExpiryAndRejectsForeignOrMalformedScope() {
@@ -564,7 +559,7 @@ class KeepConnectedTest {
         assertNull(prepareKeepConnectedCall(scope, callEvent().put("conversation_ref", ""), true, 1_000_000L, 500L))
     }
 
-    @Test fun keepConnectedPresentationEndsBeforeItsAnswerAndDeclineAuthority() {
+    @Test fun keepConnectedPresentationEndsBeforeItsRingAuthority() {
         val scope = Scope("https://hermes.example", "owner", "default")
         val now = 1_000_333L
         val elapsed = 500L
@@ -584,17 +579,13 @@ class KeepConnectedTest {
             assertTrue(invite.ringDurationMillis(now + 250, elapsed + 250, 1) > 0)
             assertTrue(invite.ringDurationMillis(now + 250, elapsed + 250, 1) <=
                 prepared.call.remainingRingMillis(now + 250, elapsed + 250))
-            assertNull(prepared.protocol.answer(invite.event, invite.actionToken, prepared.binding,
-                prepared.preferences.copy(keepConnected = false), now + 1_000, elapsed + 1_000))
             val deadline = minOf(invite.expiresAt * 1_000 - now, 25_000L)
             for (after in listOf(deadline, 25_000L)) {
                 assertEquals(0L, invite.ringDurationMillis(now + after, elapsed + after, 1))
             }
             assertEquals(0L, prepared.call.remainingRingMillis(now + 25_000, elapsed + 25_000))
-            assertNull(prepared.protocol.answer(invite.event, invite.actionToken, prepared.binding,
-                prepared.preferences, now + 25_000, elapsed + 25_000))
-            assertNull(prepared.protocol.decline(invite.event, invite.actionToken, prepared.binding,
-                prepared.preferences, now + 25_000, elapsed + 25_000))
+            assertEquals(RelayCallbackPhase.Finished,
+                prepared.protocol.expire(now + 25_000, elapsed + 25_000, prepared.binding, prepared.preferences)!!.call.phase)
         }
     }
 }

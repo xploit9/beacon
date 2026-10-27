@@ -84,7 +84,7 @@ internal fun parseKeepConnectedPage(response: JSONObject, after: Long): KeepConn
 }
 
 internal fun keepConnectedPushData(event: JSONObject): Map<String, String> =
-    listOf("source_ref", "event_id", "conversation_ref", "kind", "activity_ref", "expires_at", "release_version")
+    listOf("source_ref", "event_id", "conversation_ref", "kind", "activity_ref", "expires_at")
         .associateWith(event::optString)
 
 internal fun keepConnectedFailureReason(profile: String, error: Throwable, profileLabel: String = profile): String = when (error) {

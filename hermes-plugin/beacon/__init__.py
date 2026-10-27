@@ -517,7 +517,8 @@ def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**
             # No ledger row: Hermes' own cron context still names the job, so it is placed instead of trusted blind.
             try: job_id=str(getattr(_ctx.current_cron_execution(),'job_id','') or '')
             except Exception: job_id=''
-            if not job_id: return None
+            # Hermes cannot name this run, but a run it reports as cron (or the legacy cron_ session) stays read-only like the unreadable-store case above.
+            if not job_id: return blocked if configured and _in_cron_run(session_id) else None
         # A cron run Beacon can't place: the owner's own jobs keep their tools, anything else stays read-only.
         try:
             call,_,_,_=proactive._cron_helpers()

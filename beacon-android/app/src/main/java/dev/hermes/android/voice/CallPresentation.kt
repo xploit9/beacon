@@ -71,9 +71,3 @@ internal fun persistentCallNavigation(widthDp: Float, fontScale: Float): Boolean
     widthDp >= 720f && widthDp - persistentCallNavigationWidthDp >= 420f * fontScale.coerceIn(1f, 1.4f)
 internal fun clampBubblePosition(x: Int, y: Int, width: Int, height: Int, screenWidth: Int, screenHeight: Int, top: Int, bottom: Int): Pair<Int, Int> =
     x.coerceIn(0, (screenWidth-width).coerceAtLeast(0)) to y.coerceIn(top.coerceAtLeast(0), (screenHeight-height-bottom).coerceAtLeast(top.coerceAtLeast(0)))
-/** Abstract activity indicator geometry, not an acoustic waveform or playback measurement. */
-internal fun voiceWaveY(x: Float, phase: Float, amplitude: Float, layer: Int): Float {
-    val envelope = sin(PI.toFloat()*x).coerceAtLeast(0f)
-    val fluid = sin(x*PI.toFloat()*2.2f-phase+layer*.8f) + .35f*sin(x*PI.toFloat()*5f+phase*.7f)
-    return (.60f + layer*.065f + fluid*envelope*(.04f+amplitude.coerceIn(0f,1f)*.18f)).coerceIn(.1f,.95f)
-}

@@ -172,13 +172,15 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
                 }
             } else if (creating) {
                 item { Text("Create a shared space", style = MaterialTheme.typography.titleLarge); Text("Choose two to six bots to work together.") }
+                val using = controller.usingBot()
                 items(state.bots, key = { "member:${it.profile}" }) { member ->
-                    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).toggleable(value = member.profile in state.selectedBots, enabled = !state.loading, role = androidx.compose.ui.semantics.Role.Checkbox, onValueChange = { controller.toggleBot(member.profile) }), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                        Checkbox(checked = member.profile in state.selectedBots, onCheckedChange = null, enabled = !state.loading)
+                    val chosen = member.profile in state.selectedBots || member.profile == using
+                    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).toggleable(value = chosen, enabled = !state.loading && member.profile != using, role = androidx.compose.ui.semantics.Role.Checkbox, onValueChange = { controller.toggleBot(member.profile) }), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                        Checkbox(checked = chosen, onCheckedChange = null, enabled = !state.loading && member.profile != using)
                         Text(profileDisplayLabel(member.profile, profileRows, profileLoading), Modifier.padding(start = 12.dp))
                     }
                 }
-                item { Button(onClick = { controller.createSpace() }, enabled = !state.loading && state.selectedBots.size in 2..6) { Text("Create shared space") } }
+                item { Button(onClick = { controller.createSpace() }, enabled = !state.loading && (state.selectedBots + using).size in 2..6) { Text("Create shared space") } }
             } else {
                 item {
                     Text(state.status, style = MaterialTheme.typography.bodyMedium)

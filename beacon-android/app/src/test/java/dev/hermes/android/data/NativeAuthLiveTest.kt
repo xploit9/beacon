@@ -10,7 +10,7 @@ import java.io.File
 
 /** Explicitly opted-in check against the deployed native dashboard; no credentials in fixtures. */
 class NativeAuthLiveTest {
-    @Test(timeout = 120_000) fun nativeLoginProfilesAndReleaseUseTheDeployedDashboard() = runBlocking<Unit> {
+    @Test(timeout = 120_000) fun nativeLoginAndProfilesUseTheDeployedDashboard() = runBlocking<Unit> {
         val credentialsPath = System.getenv("BEACON_LIVE_CREDENTIAL_FILE")
         assumeTrue("Live credentials are supplied only for deployment verification", !credentialsPath.isNullOrBlank())
         val origin = System.getenv("BEACON_LIVE_ORIGIN").orEmpty()
@@ -27,9 +27,5 @@ class NativeAuthLiveTest {
             assertEquals(profile, scopedBoot.getString("profile"))
             assertEquals(client.auth.owner, scoped.auth.owner)
         }
-        val release = client.nativeRequest("/api/plugins/beacon/mobile/releases/latest")
-        assertEquals(2, release.getInt("min_contract_version"))
-        assertEquals("dev.hermes.android", release.getString("package_name"))
-        assertTrue(release.getLong("size_bytes") > 0)
     }
 }

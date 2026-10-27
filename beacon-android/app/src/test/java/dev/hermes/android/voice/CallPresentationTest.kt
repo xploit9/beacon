@@ -48,13 +48,6 @@ class CallPresentationTest {
         assertEquals(0 to 24,clampBubblePosition(-100,-100,64,64,400,800,24,32))
         assertEquals(336 to 704,clampBubblePosition(2000,2000,64,64,400,800,24,32))
     }
-    @Test fun waveGeometryIsFiniteBoundedAndUsesActivityInsteadOfUnboundedFrameWork() {
-        for(phase in listOf(0f,1f,4f)) for(i in 0..56) for(layer in 0..2) {
-            val y=voiceWaveY(i/56f,phase,1f,layer); assertTrue(y.isFinite()&&y in .1f..0.95f)
-        }
-        assertNotEquals(voiceWaveY(.4f,0f,.1f,0),voiceWaveY(.4f,1f,.8f,0))
-    }
-
     @Test fun automaticApprovalReceiptKeepsItsOutcomeAndShowsTheQuietPolicyCaption() {
         val receipt = requireNotNull(CallToolReceipt.from(json(
             "request_id" to "request-1", "tool_name" to "mcp__gmail__search_messages", "status" to "running", "approved_by" to "chat_yolo",

@@ -106,7 +106,7 @@ internal class GitHubReleases(
     private fun assetUrl(asset: JSONObject): HttpUrl =
         asset.string("browser_download_url").toHttpUrlOrNull()?.takeIf { permitted(it, assetHosts) } ?: throw verification("The release points to an address Beacon does not download from")
 
-    /** The plugin's own rules for `Beacon-<version>.json`, plus the API's asset size as a second witness. */
+    /** The rules for `Beacon-<version>.json` (written by tools/release-metadata.py), plus the API's asset size as a second witness. */
     private fun checkMetadata(metadata: JSONObject, versionName: String, apiSize: Long) {
         fun text(key: String) = metadata.opt(key) as? String ?: ""
         fun whole(key: String): Long? = (metadata.opt(key) as? Number)?.takeIf { it.toDouble() == it.toLong().toDouble() }?.toLong()

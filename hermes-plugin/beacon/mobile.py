@@ -27,8 +27,6 @@ MAX_ACTIVE_CALLS = 8
 HISTORY_RETENTION_DAYS = (0,30,90,365)
 HISTORY_RETENTION_EVENTS_PER_BATCH = 1000
 HISTORY_RETENTION_CALLS_PER_BATCH = 100
-AUTO_UPDATE_INTERVAL_SECONDS = 6 * 60 * 60
-AUTO_UPDATE_RESULTS = frozenset({'checking','up_to_date','app_staged','plugin_updated','plugin_update_available','restart_required','error'})
 MAX_DEVICES = 32
 DEVICE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 
@@ -97,8 +95,6 @@ def settings(profile=None):
         if profile and 'scheduled_callback_conversation_id' not in result:
             stored=conversations.get(profile)
             if stored: result['scheduled_callback_conversation_id']=stored
-    result.setdefault('release_repo','xploit9/beacon')
-    result.setdefault('android_stable_certificate_sha256','')
     return result
 
 def claim_owner(owner,provider):
@@ -356,6 +352,11 @@ def list_devices(owner):
              'created_at': row['created'], 'last_seen': row['last_seen']} for row in rows]
 
 
+# A push target is live only while its payload binds a linked, non-removed phone of its owner; older unbound rows are skipped.
+ACTIVE_TARGET = ("EXISTS (SELECT 1 FROM beacon_devices d WHERE d.owner=targets.owner AND d.removed=0 AND d.id="
+                 "(CASE WHEN json_valid(targets.payload) THEN json_extract(targets.payload,'$.device_id') END))")
+
+
 def remove_device(owner, device_id):
     now = time.time()
     with PUSH_LOCK, LOCK, connect() as conn:
@@ -374,15 +375,18 @@ def remove_device(owner, device_id):
     return True
 
 
-def touch_device(owner, provider, profile, device_id, update_seen=True):
-    """Marks the owner's phone as seen and refuses only a phone the owner removed. The Hermes sign-in authorizes the
-    request; the device ID is not a credential, so an unknown ID (or another owner's) changes nothing."""
+def touch_device(owner, provider, profile, device_id, update_seen=True, require=False):
+    """Marks the owner's phone as seen and refuses a phone the owner removed. The Hermes sign-in authorizes the
+    request; the device ID is not a credential, so an unknown ID (or another owner's) changes nothing, except where
+    `require` is set (push registration): there only a linked phone of the owner passes, else `device_required`."""
     if not isinstance(device_id, str) or not ID.fullmatch(device_id):
+        if require: raise LookupError('device_required')
         return
     now = time.time()
     with LOCK, connect() as conn:
         row = conn.execute('SELECT owner,provider,removed FROM beacon_devices WHERE id=?', (device_id,)).fetchone()
         if not row or row['owner'] != owner or row['provider'] != provider:
+            if require: raise LookupError('device_required')
             return
         if row['removed']:
             raise LookupError('device_removed')
@@ -406,8 +410,8 @@ def held_posts(owner,profile,limit=10):
         conn.execute('DELETE FROM held_posts WHERE created<?',(time.time()-HELD_POST_SECONDS,))
         return [dict(row) for row in conn.execute('SELECT * FROM held_posts WHERE owner=? AND profile=? ORDER BY created LIMIT ?',(owner,profile,limit))]
 
-def drop_held_post(key):
-    with LOCK,connect() as conn: conn.execute('DELETE FROM held_posts WHERE key=?',(key,))
+def drop_held_post(owner,profile,key):
+    with LOCK,connect() as conn: conn.execute('DELETE FROM held_posts WHERE owner=? AND profile=? AND key=?',(owner,profile,key))
 
 def enqueue_task_result(owner,profile,conversation,job_id,reason=''):
     if (not isinstance(owner,str) or not owner or len(owner)>256 or any(ord(c)<32 for c in owner)
@@ -510,31 +514,6 @@ def set_history_retention_days(owner,days):
             conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(last_key,str(now).encode()))
     return days
 
-def _auto_update_key(kind,owner):
-    if not isinstance(owner,str) or not owner: raise ValueError('Invalid owner')
-    return 'auto-update:'+kind+':'+hashlib.sha256(owner.encode('utf-8')).hexdigest()
-
-def auto_update_settings(owner):
-    with LOCK,connect() as conn:
-        status_row=conn.execute('SELECT value FROM meta WHERE key=?',(_auto_update_key('status',owner),)).fetchone()
-    result={'checked_at':0,'result':'never','app_version':'','plugin_version':'','message':''}
-    if status_row:
-        try:
-            saved=json.loads(status_row[0].decode() if isinstance(status_row[0],bytes) else status_row[0])
-            if isinstance(saved,dict): result.update(saved)
-        except Exception: pass
-    # shortcut: 1.1.x phones still show an automatic-update switch read from "enabled"; the plugin never installs itself, so it is always off. Drop once the owner's phones run 1.1.2 or later.
-    return {'enabled':False,**result}
-
-def record_auto_update_status(owner,checked_at,result,app_version='',plugin_version='',message=''):
-    if type(checked_at) not in (int,float) or not math.isfinite(checked_at): raise ValueError('Invalid check time')
-    if result not in AUTO_UPDATE_RESULTS: raise ValueError('Invalid auto-update result')
-    status={'checked_at':checked_at,'result':result,'app_version':str(app_version)[:64],
-            'plugin_version':str(plugin_version)[:64],'message':str(message)[:240]}
-    with LOCK,connect() as conn:
-        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(_auto_update_key('status',owner),json.dumps(status,separators=(',',':')).encode()))
-    return status
-
 def call_lock(call_id):
     with LOCK:
         lock=_CALL_LOCKS.get(call_id)
@@ -599,11 +578,6 @@ def reserve(owner, profile, conversation, voice=None):
 
 def status(row):
     return {'call_id':row['id'],'conversation_id':row['conversation'],'profile':row['profile'],'closed':bool(row['closed']),'recording_status':'disabled','transcript_status':row['status'],**json.loads(row['receipt']),'audio_available':False}
-
-def chunk(call_id, owner, body):
-    # Reject old installed clients as well as new callers; PCM never enters storage.
-    with connect() as conn: owned(conn,call_id,owner,writable=True)
-    raise ValueError('Call audio storage has been removed')
 
 EVENT_TYPES = {'transcript','interruption','capture_started','capture_stopped','playout_started','playout_stopped','upload_gap','state','media_diagnostic','job_link','visual_state','tool_receipt'}
 def events(call_id,owner,body):
@@ -672,7 +646,8 @@ def finalize(call_id,owner,body):
         prior=json.loads(call['receipt'])
         failed=failed or prior.get('failed') is True or call['status']=='failed'
         incomplete=incomplete or prior.get('incomplete') is True
-        if call['closed'] and prior.get('transcript_available') and prior.get('failed',False)==failed and (not incomplete or prior.get('incomplete')):
+        # A saved receipt is terminal: a replayed or retried finalize reports it and never rewrites its verdict.
+        if call['closed'] and prior.get('transcript_available'):
             return status(call)
         rows=[json.loads(r[0]) for r in conn.execute('SELECT payload FROM timeline WHERE call_id=?',(call_id,))]
         groups={}

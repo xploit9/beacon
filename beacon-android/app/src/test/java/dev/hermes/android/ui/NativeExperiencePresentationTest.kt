@@ -139,11 +139,6 @@ class NativeExperiencePresentationTest {
         assertEquals("This file is no longer available.", fileDownloadError(dev.hermes.android.data.ApiFailure(404, "private path", plugin = false)))
         assertEquals("Couldn’t download this file. Check your connection and try again.", fileDownloadError(IllegalStateException("private path")))
     }
-    @Test fun endedUnfinishedCallNeverClaimsLiveOrSaved() {
-        assertEquals("Unfinished call transcript", archivedCallLabel(false, false, false))
-        assertEquals("Live call transcript", archivedCallLabel(false, false, true))
-        assertEquals("Interrupted call transcript", archivedCallLabel(true, true, false))
-    }
     @Test fun formattedCopyEscapesHtmlAndUnsafeLinksPreservingSourceSeparately() {
         val source = "<script>alert(1)</script>\n\n[click](javascript:alert(1))\n\n| A | B |\n|---|---|\n| 1 | 2 |"
         val (_, html) = formattedClipboard(source)

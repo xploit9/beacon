@@ -26,6 +26,13 @@ def authorized_members(members, profiles):
         for m in members)
 
 
+def space_member(members, profile):
+    """Authority over the owner's bots is not membership: a space answers only to a bot inside it.
+
+    Call it after authorized_members, which leaves every entry a local profile."""
+    return any(m['profile'] == profile for m in members)
+
+
 def build_router(identity, body, native):
     router = APIRouter(prefix='/mobile/bot-mode')
 
@@ -79,6 +86,8 @@ def build_router(identity, body, native):
         # Revoking profile access also revokes old shared-space access.
         if not authorized_members(members, cfg['profiles']):
             raise HTTPException(403, 'Shared space contains an unauthorized bot')
+        if not space_member(members, profile):
+            raise HTTPException(403, 'This bot is not in that shared space')
         return owner, provider, profile, rid, result
 
     @router.get('')
@@ -88,7 +97,7 @@ def build_router(identity, body, native):
         rooms = await rpc(owner, provider, profile, 'groups.list', limit=100, offset=0)
         def authorized(row):
             members = row.get('members') or []
-            return authorized_members(members, cfg['profiles'])
+            return authorized_members(members, cfg['profiles']) and space_member(members, profile)
         return {'bots': bots, 'spaces': [row for row in rooms.get('rooms', []) if authorized(row)],
                 'has_more_spaces': rooms.get('next_offset') is not None,
                 'capabilities': await capabilities(owner, provider, profile)}
@@ -119,6 +128,9 @@ def build_router(identity, body, native):
         allowed = {row['profile'] for row in bots}
         if set(value) not in ({'profiles'}, {'profiles', 'request_id'}) or not isinstance(chosen, list) or not 2 <= len(chosen) <= 6 or any(not isinstance(p, str) or p not in allowed for p in chosen) or len(set(chosen)) != len(chosen):
             raise HTTPException(400, 'Choose two to six authorized bots')
+        # A space this bot could not open again would be a dead end.
+        if profile not in chosen:
+            raise HTTPException(400, 'A shared space must include the bot you are using')
         request_id = value.get('request_id')
         if 'request_id' in value and (not isinstance(request_id, str) or not 1 <= len(request_id) <= 100 or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in request_id)):
             raise HTTPException(400, 'A stable creation identity is required')
@@ -195,6 +207,8 @@ def build_router(identity, body, native):
                 raise HTTPException(503, 'Native shared-space identity was not confirmed; refresh')
             if not authorized_members(current.get('members'), cfg['profiles']):
                 raise HTTPException(403, 'Shared space contains an unauthorized bot')
+            if not space_member(current['members'], profile):
+                raise HTTPException(403, 'This bot is not in that shared space')
             if current.get('name') != expected:
                 raise HTTPException(409, 'The name changed elsewhere. Refresh before deleting.')
             if not (await capabilities(owner, provider, profile))['delete']:

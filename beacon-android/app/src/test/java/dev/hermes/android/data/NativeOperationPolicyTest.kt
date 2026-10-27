@@ -123,15 +123,11 @@ class NativeOperationPolicyTest {
         )) assertFalse("POST $other", NativeOperationPolicy.direct(other, "POST"))
     }
 
-    @Test fun deviceRoutesAllowOnlyTheirDeclaredMethodsAndThePairingRoutesAreGone() {
+    @Test fun deviceRoutesAllowOnlyTheirDeclaredMethods() {
         assertTrue(NativeOperationPolicy.direct("/api/plugins/beacon/devices/link", "POST"))
         assertTrue(NativeOperationPolicy.direct("/api/plugins/beacon/devices", "GET"))
         assertTrue(NativeOperationPolicy.direct("/api/plugins/beacon/devices/device-123", "DELETE"))
 
-        for (method in listOf("GET", "POST")) {
-            assertFalse(NativeOperationPolicy.direct("/api/plugins/beacon/pairing", method))
-            assertFalse(NativeOperationPolicy.direct("/api/plugins/beacon/pairing/redeem", method))
-        }
         assertFalse(NativeOperationPolicy.direct("/api/plugins/beacon/devices/link", "GET"))
         assertFalse(NativeOperationPolicy.direct("/api/plugins/beacon/devices", "DELETE"))
         assertFalse(NativeOperationPolicy.direct("/api/plugins/beacon/devices/../mobile/bootstrap", "DELETE"))

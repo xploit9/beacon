@@ -69,16 +69,23 @@ class ScreenCache(
         val id get() = "$profile\u0000$key\u0000$request"
     }
     private val rows = HashMap<String, LinkedHashMap<String, Entry>>()
+    // Per account, bumped by clear(): what an open() or flush() took before a sign-out must not be installed or written after it.
+    private val epochs = HashMap<String, Int>()
     private val flushes = HashMap<String, Job>()
     private val io = Mutex()
     private fun account(scope: Scope) = scope.copy(profile = "", session = "")
+    private fun epoch(account: Scope) = epochs[account.key] ?: 0
 
-    /** Loads the account's row once; later calls are free and an unreadable row is the same as no row. */
+    /** Loads the account's row once; later calls are free and an unreadable row is the same as no row. A sign-out that lands first leaves the account closed. */
     suspend fun open(scope: Scope) {
         val account = account(scope)
-        if (synchronized(this) { account.key in rows }) return
-        val loaded = withContext(Dispatchers.Default) { try { read(account)?.let(::parse) } catch (e: CancellationException) { throw e } catch (_: Exception) { null } }.orEmpty()
-        synchronized(this) { rows.getOrPut(account.key) { LinkedHashMap<String, Entry>().also { map -> loaded.forEach { map[it.id] = it }; trim(map) } } }
+        val opened = synchronized(this) { if (account.key in rows) return; epoch(account) }
+        // Read under the row's lock, so clear() cannot drop the row between this read and the install below.
+        val loaded = io.withLock { withContext(Dispatchers.Default) { try { read(account)?.let(::parse) } catch (e: CancellationException) { throw e } catch (_: Exception) { null } } }.orEmpty()
+        synchronized(this) {
+            if (epoch(account) != opened) return
+            rows.getOrPut(account.key) { LinkedHashMap<String, Entry>().also { map -> loaded.forEach { map[it.id] = it }; trim(map) } }
+        }
     }
     fun latest(scope: Scope): List<Entry> = synchronized(this) {
         rows[account(scope).key]?.values.orEmpty().filter { it.profile == scope.profile }.groupBy { it.key }.values.mapNotNull { group -> group.maxByOrNull { it.at } }
@@ -120,14 +127,18 @@ class ScreenCache(
     /** Sign-out, account change and device removal: the row and the in-memory copy go together; a pending flush cannot bring it back. */
     suspend fun clear(scope: Scope) {
         val account = account(scope)
-        synchronized(this) { rows.remove(account.key); flushes.remove(account.key)?.cancel() }
-        io.withLock { try { drop(account) } catch (e: CancellationException) { throw e } catch (_: Exception) { /* the next open reads whatever remains */ } }
+        // One step under the row's lock: an open() either finished before it (and is removed here) or reads the empty store.
+        io.withLock {
+            synchronized(this) { rows.remove(account.key); epochs[account.key] = epoch(account) + 1; flushes.remove(account.key)?.cancel() }
+            try { drop(account) } catch (e: CancellationException) { throw e } catch (_: Exception) { /* the next open reads whatever remains */ }
+        }
     }
     suspend fun flush(scope: Scope) {
         val account = account(scope)
-        val text = synchronized(this) { rows[account.key]?.values?.let(::encode) } ?: return
+        val (text, taken) = synchronized(this) { rows[account.key]?.values?.let(::encode) to epoch(account) }
+        if (text == null) return
         io.withLock {
-            if (synchronized(this) { account.key !in rows }) return
+            if (synchronized(this) { epoch(account) != taken }) return
             try { write(account, text) } catch (e: CancellationException) { throw e } catch (_: Exception) { /* live reads stay authoritative */ }
         }
     }

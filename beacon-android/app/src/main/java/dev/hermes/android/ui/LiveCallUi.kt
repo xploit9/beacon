@@ -7,7 +7,6 @@ import kotlinx.coroutines.delay
 
 
 
-import androidx.compose.animation.core.*
 
 import androidx.compose.foundation.*
 
@@ -31,11 +30,11 @@ import androidx.compose.ui.draw.alpha
 
 import androidx.compose.ui.draw.clip
 
-import androidx.compose.ui.geometry.Offset
 
-import androidx.compose.ui.geometry.Size
 
 import androidx.compose.ui.graphics.*
+
+import androidx.compose.ui.layout.Layout
 
 import androidx.compose.ui.platform.LocalDensity
 
@@ -43,11 +42,13 @@ import androidx.compose.ui.platform.testTag
 
 import androidx.compose.ui.semantics.*
 
+import androidx.compose.ui.unit.Constraints
+
+import androidx.compose.ui.unit.Dp
+
 import androidx.compose.ui.unit.dp
 
-import androidx.lifecycle.Lifecycle
 
-import androidx.lifecycle.compose.LocalLifecycleOwner
 
 import dev.hermes.android.voice.*
 
@@ -80,39 +81,32 @@ val LocalPersistentNavigation = staticCompositionLocalOf { false }
     }
 }
 
-@Composable internal fun VoiceWave(call: CallState, modifier: Modifier, motionEnabled: Boolean, circular: Boolean = false) {
-    val lifecycle = LocalLifecycleOwner.current.lifecycle
-    val lifecycleState by lifecycle.currentStateFlow.collectAsState()
-    val motionAllowed = motionEnabled && call.active && lifecycleState.isAtLeast(Lifecycle.State.STARTED)
-    val amplitude by animateFloatAsState(call.voiceAmplitude(), if (motionAllowed) tween(110, easing = FastOutSlowInEasing) else snap(), label = "Call voice activity")
-    val activeMotion = voiceMotionActive(amplitude, motionAllowed, true)
-    val phase = if (activeMotion) {
-        val transition = rememberInfiniteTransition(label = "Call voice activity")
-        val progress by transition.animateFloat(0f, (Math.PI * 2).toFloat(),
-            infiniteRepeatable(tween(1600, easing = LinearEasing)), label = "Gold wave phase")
-        progress
-    } else 0f
-    val shape = if (circular) RoundedCornerShape(50) else RoundedCornerShape(48.dp)
-
-    Canvas(modifier.clip(shape).background(CallBackground).testTag("beacon-blue-wave")
-        .semantics { contentDescription = dev.hermes.android.data.currentAssistantName + " voice activity"; stateDescription = callStatusLabel(call) }) {
-        drawRect(Brush.verticalGradient(listOf(Color(0xff101827), Color(0xff30271a), Color(0xff72552b))))
-        for (layer in 2 downTo 0) {
-            val path = Path()
-            path.moveTo(0f, size.height)
-            for (i in 0..56) {
-                val x = i / 56f
-                path.lineTo(x * size.width, voiceWaveY(x, phase, amplitude, layer) * size.height)
-            }
-            path.lineTo(size.width, size.height)
-            path.close()
-            drawPath(path, Brush.verticalGradient(
-                listOf(Color(0xffffe7a1).copy(alpha = .78f - layer * .15f), Color(0xffd39a32).copy(alpha = .92f)),
-                startY = size.height * .28f, endY = size.height,
-            ))
+/** Header on top, the control stack at the bottom, and the presence takes the height between them. A short screen scrolls instead of squeezing the presence below [minPresence]. */
+@Composable private fun PresenceStack(
+    viewportHeight: Dp,
+    minPresence: Dp,
+    modifier: Modifier = Modifier,
+    header: @Composable () -> Unit,
+    presence: @Composable () -> Unit,
+    footer: @Composable () -> Unit = {},
+) {
+    Layout({
+        Box { header() }
+        Box { presence() }
+        Box { footer() }
+    }, modifier) { measurables, constraints ->
+        val width = constraints.maxWidth
+        val gap = 8.dp.roundToPx()
+        val head = measurables[0].measure(Constraints(minWidth = width, maxWidth = width))
+        val foot = measurables[2].measure(Constraints(minWidth = width, maxWidth = width))
+        val footGap = if (foot.height > 0) gap else 0
+        val room = (viewportHeight.roundToPx() - head.height - foot.height - gap - footGap).coerceAtLeast(minPresence.roundToPx())
+        val body = measurables[1].measure(Constraints.fixed(width, room))
+        layout(width, head.height + gap + room + footGap + foot.height) {
+            head.placeRelative(0, 0)
+            body.placeRelative(0, head.height + gap)
+            foot.placeRelative(0, head.height + gap + room + footGap)
         }
-        drawOval(Brush.radialGradient(listOf(Color(0xffffe9b2).copy(alpha = .34f), Color.Transparent)),
-            topLeft = Offset(size.width * .15f, size.height * .60f), size = Size(size.width * .7f, size.height * .45f))
     }
 }
 
@@ -417,20 +411,21 @@ internal data class CallUiActions(
         if (call.cameraSharing || call.cameraBusy) cameraPreview(Modifier.fillMaxSize())
         BoxWithConstraints(Modifier.fillMaxSize()) {
             val landscape = maxWidth > maxHeight
+            val viewport = maxHeight // read here: inside Row/Column scopes maxHeight is not the implicit receiver
             if (landscape) {
-                val heroSize = minOf(200.dp, maxHeight * .48f, maxWidth * .34f)
                 Row(
                     Modifier.align(Alignment.Center).widthIn(max = 1240.dp).fillMaxWidth().fillMaxHeight()
                         .padding(horizontal = 24.dp, vertical = 12.dp),
                     horizontalArrangement = Arrangement.spacedBy(24.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Column(Modifier.weight(1f).fillMaxHeight().verticalScroll(rememberScrollState()),
-                        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-                        CallHeader(call, onConversation, Modifier.fillMaxWidth())
-                        Spacer(Modifier.height(8.dp))
-                        VoiceWave(call, Modifier.size(heroSize).testTag("beacon-call-hero"), motionEnabled, circular = true)
-                    }
+                    PresenceStack(
+                        viewportHeight = viewport - 24.dp,
+                        minPresence = 120.dp,
+                        modifier = Modifier.weight(1f).fillMaxHeight().verticalScroll(rememberScrollState()),
+                        header = { CallHeader(call, onConversation, Modifier.fillMaxWidth()) },
+                        presence = { VoicePresence(call, Modifier.fillMaxSize().testTag("beacon-call-hero"), motionEnabled) },
+                    )
                     Column(Modifier.weight(1.2f).fillMaxHeight().verticalScroll(rememberScrollState()),
                         horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
                         call.toolReceipts.lastOrNull { it.chipLabel() != null }?.let { CallToolChip(it, Modifier.padding(bottom = 12.dp)) }
@@ -446,31 +441,26 @@ internal data class CallUiActions(
                     }
                 }
             } else {
-                val heroSize = when {
-                    maxHeight < 600.dp -> 132.dp
-                    maxHeight < 760.dp -> 196.dp
-                    else -> 260.dp
-                }.coerceAtMost(maxWidth - 32.dp)
-                Column(
-                    Modifier.align(Alignment.Center).widthIn(max = 920.dp).fillMaxWidth().fillMaxHeight()
+                PresenceStack(
+                    viewportHeight = viewport - 16.dp,
+                    minPresence = 140.dp,
+                    modifier = Modifier.align(Alignment.Center).widthIn(max = 920.dp).fillMaxWidth().fillMaxHeight()
                         .verticalScroll(rememberScrollState()).padding(horizontal = if (maxWidth >= 720.dp) 32.dp else 16.dp, vertical = 8.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    header = { CallHeader(call, onConversation, Modifier.fillMaxWidth()) },
+                    presence = { VoicePresence(call, Modifier.fillMaxSize().testTag("beacon-call-hero"), motionEnabled) },
                 ) {
-                    CallHeader(call, onConversation, Modifier.fillMaxWidth())
-                    Box(Modifier.fillMaxWidth().height(heroSize), contentAlignment = Alignment.Center) {
-                        VoiceWave(call, Modifier.size(heroSize).testTag("beacon-call-hero"), motionEnabled, circular = true)
+                    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        call.toolReceipts.lastOrNull { it.chipLabel() != null }?.let { CallToolChip(it) }
+                        if (call.screenSharing) Text(assistantText("Screen shared with Beacon"), color = CallText, style = MaterialTheme.typography.labelLarge)
+                        if (call.screenBusy) Text(uiText("Waiting for screen-sharing consent or first frame…"), color = CallMuted, style = MaterialTheme.typography.labelLarge)
+                        if (call.cameraBusy) Text(uiText("Starting camera…"), color = CallMuted, style = MaterialTheme.typography.labelLarge, modifier = Modifier.testTag("beacon-camera-starting"))
+                        if (call.error.isNotBlank()) Text(call.error, color = Color(0xffffb4ab), style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+                        LiveCallCaptions(call, Modifier.padding(top = 2.dp))
+                        LiveCallDock(call, actions, motionEnabled, Modifier.widthIn(max = 640.dp).fillMaxWidth().align(Alignment.CenterHorizontally))
+                        if (call.transcriptLabel().isNotBlank()) Text(uiText(call.transcriptLabel()), color = CallMuted, style = MaterialTheme.typography.labelSmall,
+                            modifier = Modifier.padding(vertical = 4.dp).semantics { liveRegion = LiveRegionMode.Polite })
                     }
-                    call.toolReceipts.lastOrNull { it.chipLabel() != null }?.let { CallToolChip(it) }
-                    if (call.screenSharing) Text(assistantText("Screen shared with Beacon"), color = CallText, style = MaterialTheme.typography.labelLarge)
-                    if (call.screenBusy) Text(uiText("Waiting for screen-sharing consent or first frame…"), color = CallMuted, style = MaterialTheme.typography.labelLarge)
-                    if (call.cameraBusy) Text(uiText("Starting camera…"), color = CallMuted, style = MaterialTheme.typography.labelLarge, modifier = Modifier.testTag("beacon-camera-starting"))
-                    if (call.error.isNotBlank()) Text(call.error, color = Color(0xffffb4ab), style = MaterialTheme.typography.bodyMedium,
-                        modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
-                    LiveCallCaptions(call, Modifier.padding(top = 2.dp))
-                    LiveCallDock(call, actions, motionEnabled, Modifier.widthIn(max = 640.dp).fillMaxWidth().align(Alignment.CenterHorizontally))
-                    if (call.transcriptLabel().isNotBlank()) Text(uiText(call.transcriptLabel()), color = CallMuted, style = MaterialTheme.typography.labelSmall,
-                        modifier = Modifier.padding(vertical = 4.dp).semantics { liveRegion = LiveRegionMode.Polite })
                 }
             }
         }
@@ -489,7 +479,7 @@ internal data class CallUiActions(
     }
 }
 
-private val CallBackground = Color(0xff080d15)
+internal val CallBackground = Color(0xff080d15)
 private val CallSurface = Color(0xff101a2b)
 private val CallSurfaceRaised = Color(0xff1b2940)
 private val CallControl = Color(0xff202e45)

@@ -26,7 +26,7 @@ def unregistered(harness, monkeypatch):
     _use_real_settings(api, monkeypatch)
     _native_profiles(monkeypatch, ['default', 'work'])
     monkeypatch.setattr(api.native, 'verify', lambda *args, **kwargs: {'id': args[3]})
-    assert client.post('/api/plugins/beacon/owner/claim').status_code == 200
+    assert api.mobile.claim_owner('owner', 'basic')
     created = []
 
     def provision(owner, provider, profile):

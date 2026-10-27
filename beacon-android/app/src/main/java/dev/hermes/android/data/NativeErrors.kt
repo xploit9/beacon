@@ -74,7 +74,7 @@ internal fun appErrorText(error: Throwable): String = when (error) {
 
 private fun safeLocalErrorText(message: String): String {
     if (message.length > 240 || Regex("(?i)([a-z]:[\\\\/]|https?://|[/\\\\]|[\\r\\n]|\\[errno|exception|expecting value|json|native|traceback)").containsMatchIn(message)) return APP_OPERATION_ERROR
-    return if (message in publicErrorText || listOf("Enter ", "Choose ", "Use ", "Add ", "Keep ", "Pair ", "Finish ", "Sign in ", "Reconnect ", "Refresh ", "This file changed", "The phone editor supports", "File preview is", "Saved file preview is", "Attachment exceeds", "Download exceeds", "That code ", "Too many attempts.").any(message::startsWith)) message else APP_OPERATION_ERROR
+    return if (message in publicErrorText || listOf("Enter ", "Choose ", "Use ", "Add ", "Keep ", "Finish ", "Sign in ", "Reconnect ", "Refresh ", "This file changed", "The phone editor supports", "File preview is", "Saved file preview is", "Attachment exceeds", "Download exceeds", "That code ", "Too many attempts.").any(message::startsWith)) message else APP_OPERATION_ERROR
 }
 
 /** Hermes answers some refusals with a bare machine code; the owner sees plain words instead. Unknown codes stay generic. */

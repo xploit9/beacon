@@ -43,13 +43,6 @@ NATIVE_EXCLUDED_TOOLS = frozenset({'clarify','delegate_task','todo_list',
                                    'beacon_create_proactive_request','beacon_event_notice','beacon_events_checked',
                                    'beacon_email_notice','beacon_email_checked'}) | CALL_EXCLUDED_TOOLS
 NATIVE_EXCLUDED_TOOLSETS = frozenset({'browser','connectors','beacon-interactive','beacon-mailbox'})
-# Why a call leaves these out (docs/voice-calls.md repeats it for the owner); hermes_work covers the work itself.
-EXCLUDED_REASONS = {
-    'clarify': 'it asks in a Hermes chat prompt; on a call the assistant asks aloud',
-    'delegate_task': 'it starts sub-agents inside a running Hermes agent; hermes_work hands the task to a full run',
-    'todo_list': 'its list lives in one running agent turn and would be lost when the call ends',
-    'browser': 'a browser session is long and interactive, so each click would wait for phone approval',
-}
 QUERY_FILLER = set('a an the my me please could can you i would like want get read list find look pull show to for of in on and from up most latest recent current last today now one two three four five six ten tool tools'.split())
 QUERY_ALIASES = {
     'email': {'email', 'mail', 'gmail', 'inbox', 'outlook'},
@@ -221,6 +214,46 @@ def reads_by_method(args,schema):
     return True
 
 
+# The Proactive read-only guard's vocabulary (__init__._ARG_WRITE_TOOL_WORDS, _UNSAFE_NAME_WORDS, _READ_TOOL_WORDS);
+# test_security_hardening keeps the copies equal, because the agent process and the dashboard cannot share one module.
+WRITE_WORDS = frozenset({
+    'send','create','delete','remove','modify','update','manage','draft','reply','forward',
+    'move','archive','trash','label','post','write','upload','accept','decline','invite',
+    'share','set','add','patch','put','mark','star','snooze','mute','block',
+    'unsubscribe','replace','rename','merge','approve','submit','cancel','execute','run',
+    'import','restore','copy','insert','append','apply','push','commit','pay','transfer',
+    'toggle','save','store','notify','acknowledge','ack','seen','flag','unflag','pin','unpin',
+    'unstar','download','export','attach','respond','rsvp','confirm','dismiss','clear','reset',
+    'assign','subscribe','react','sync','publish','change','hide','unhide','purge','tag','untag',
+    'categorize','report','unmark','untrash','unarchive','unlabel','unmute','unsnooze','unblock',
+    'empty','reschedule','revoke','trigger','install','edit','enable','disable','pause','resume','schedule'})
+UNSAFE_NAME_WORDS = WRITE_WORDS | frozenset({
+    'exec','sql','call','invoke','eval','shell','command','script','http','request',
+    'and','then','book','reserve','purchase','buy','checkout','complete','finish',
+    'resolve','deliver','dispatch','erase','discard','destroy','wipe','grant','refund',
+    'redeem','settle','enrol','enroll','register','unregister','upgrade','downgrade',
+    'unfollow','unlink','unlock','detach','disconnect','connect','topup','claim','vote',
+    'join','leave','close','switch','begin','boost'})
+READ_NAME_WORDS = frozenset({'get','list','search','read','find','view','show','describe','lookup'})
+
+
+def name_words(text):
+    return set(re.findall(r'[a-z0-9]+', re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', text or '').casefold()))
+
+
+def mcp_reads_by_name(raw, trust):
+    """A read-only annotation is the server's own claim: it releases the owner's approval only for a name with no write
+    verb, and on an untrusted server only for a name that also says it reads."""
+    words=name_words(raw)
+    return not words&UNSAFE_NAME_WORDS and (trust!='untrusted' or bool(words&READ_NAME_WORDS))
+
+
+def writes_by_action(arguments):
+    """An action or operation argument that names a write makes the call a write, whatever the tool is annotated."""
+    given={str(key).casefold():value for key,value in arguments.items()}
+    return any(isinstance(given.get(field),str) and bool(name_words(given[field])&WRITE_WORDS) for field in ('action','operation'))
+
+
 def _hermes_read_only(name):
     return name in NATIVE_READ_ONLY
 
@@ -290,7 +323,7 @@ def inline_tool(tool, arguments, scope, session_id):
 
 
 def tool_read_only(tool, arguments):
-    if tool.get('read_only'): return reads_by_method(arguments,{'parameters':tool.get('parameters')})
+    if tool.get('read_only'): return reads_by_method(arguments,{'parameters':tool.get('parameters')}) and not writes_by_action(arguments)
     if tool.get('_kind')!='hermes': return False
     name=tool.get('_raw')
     return arguments.get('action') in NATIVE_READ_ONLY_ACTIONS.get(name,())
@@ -392,7 +425,8 @@ class NativeMcp:
                 method_read_only=True
             # Generic HTTP request tools can POST despite a provider's read-only annotation.
             has_method=isinstance(properties,dict) and 'method' in properties
-            readonly = (_tool_is_read_only(server, raw) and not generic_http
+            trust=_normalize_server_trust(cfg.get('trust'))
+            readonly = (_tool_is_read_only(server, raw) and mcp_reads_by_name(raw, trust) and not generic_http
                         and not (has_method and not method_read_only))
             tool_timeout=float(closure.get('tool_timeout') or 60)
             version = digest([registry.current_scope_key(), server, raw, cfg, schema, readonly])
@@ -401,7 +435,7 @@ class NativeMcp:
                            'parameters':schema, 'read_only':readonly,
                            '_timeout':tool_timeout,
                            '_server':server, '_raw':raw,
-                           '_trust':_normalize_server_trust(cfg.get('trust'))})
+                           '_trust':trust})
         output.extend(native_catalog())
         return output
 

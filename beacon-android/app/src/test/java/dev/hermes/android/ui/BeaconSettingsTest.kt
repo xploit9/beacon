@@ -14,13 +14,6 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class BeaconSettingsTest {
-    @Test fun providerKeyRejectionUsesTheShortKeySpecificMessage() {
-        assertEquals("That key wasn't accepted. Check it and try again.",
-            voiceProviderTestMessage(dev.hermes.android.voice.VoiceProviderTestResult.KeyRejected))
-        assertEquals("The provider responded with an error. Check the selected model or try again.",
-            voiceProviderTestMessage(dev.hermes.android.voice.VoiceProviderTestResult.ProviderError))
-    }
-
     @Test fun ownerNameIsTrimmedBoundedAndContainsOnlyAllowedNameCharacters() {
         assertEquals("Maya O'Neil", ownerNameOf(" Maya O'Neil "))
         assertEquals("Maya Smith", ownerNameOf("Maya! Smith2"))

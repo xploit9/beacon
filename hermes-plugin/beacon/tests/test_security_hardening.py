@@ -14,6 +14,7 @@ from fastapi import HTTPException
 from starlette.datastructures import Headers, QueryParams
 
 from test_callbacks import NOW, ROW, VALUE, env, load
+from test_gateway_tools import g as gateway_tools
 from test_mobile import harness, load_private
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -926,3 +927,41 @@ def test_the_guard_blocks_a_current_cron_run_it_cannot_identify_but_not_an_ordin
     assert plugin.native_proactive_read_only_guard("write_file", {"path": "x"}, session) == blocked
     running[0] = None  # the same session id outside a cron run is an ordinary chat
     assert plugin.native_proactive_read_only_guard("write_file", {"path": "x"}, session) is None
+
+
+# Strix 1c4f37e 0011: a session store that answers without a job id knows no more than one that raises.
+@pytest.mark.parametrize("identity", [None, {}, {"cron_job_id": ""}])
+def test_the_guard_blocks_a_cron_run_the_store_answers_without_a_job_id_but_not_an_ordinary_chat(harness, monkeypatch, identity):
+    plugin = load_private("__init__")
+    monkeypatch.setattr(plugin, "current_profile", lambda cfg: "default")
+    monkeypatch.setattr(plugin, "_cron_row", lambda *args: None)
+    monkeypatch.setattr(plugin.mobile, "settings", lambda profile=None: {"owner_id": "owner"})
+    _guard_native_identity(monkeypatch, identity)
+    running = [None]
+    plugin.register(SimpleNamespace(register_tool=lambda **kwargs: None, register_hook=lambda name, handler: None,
+                                    current_cron_execution=lambda: running[0]))
+    blocked = {"action": "block", "message": plugin._READ_ONLY_MESSAGE}
+
+    def guard(tool, session):
+        return plugin.native_proactive_read_only_guard(tool, {"path": "x", "command": "id", "target": "phone"}, session)
+
+    legacy = "cron_job7_20261025_080000"
+    for tool in ("write_file", "terminal", "send_message", "beacon_call_user"):
+        assert guard(tool, legacy) == blocked
+    session = "local-" + "a" * 64
+    # Hermes reports a cron run but cannot name its job: still a cron run.
+    running[0] = SimpleNamespace(job_id="")
+    assert guard("write_file", session) == blocked
+    # The same session outside a cron run is an ordinary chat, and without Beacon set up nothing is gated.
+    running[0] = None
+    assert guard("write_file", session) is None
+    monkeypatch.setattr(plugin.mobile, "settings", lambda profile=None: {})
+    assert guard("write_file", legacy) is None
+
+
+# The call gateway cannot import the Proactive guard's word lists (the dashboard never loads the agent module), so it carries copies.
+def test_the_call_gateway_keeps_the_proactive_guards_write_vocabulary(harness):
+    plugin = load_private("__init__")
+    assert gateway_tools.WRITE_WORDS == plugin._ARG_WRITE_TOOL_WORDS
+    assert gateway_tools.UNSAFE_NAME_WORDS == plugin._UNSAFE_NAME_WORDS
+    assert gateway_tools.READ_NAME_WORDS == plugin._READ_TOOL_WORDS

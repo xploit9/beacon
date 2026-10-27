@@ -117,6 +117,13 @@ class DirectGatewayTest {
         assertEquals("audio1",nextDirectFrame(control,pcm,visual))
         control.close();pcm.close();visual.cancel()
     }
+    // A call that ends while the writer waits closes these channels; an uncaught ClosedReceiveChannelException there would crash the app.
+    @Test fun aWriterWaitingWhenTheCallEndsStopsQuietly()=runBlocking<Unit> {
+        val control=Channel<String>(2);val pcm=Channel<String>(2);val visual=Channel<String>(Channel.CONFLATED)
+        control.close();pcm.close();visual.cancel()
+        val ended=runCatching { nextDirectFrame(control,pcm,visual) }.exceptionOrNull()
+        assertTrue("$ended", ended is kotlinx.coroutines.CancellationException)
+    }
     @Test fun admissionDeadlineAndTransientFailurePermitAnotherAttempt()=runBlocking<Unit> {
         assertNull(directAdmissionAttempt(1) { kotlinx.coroutines.delay(30);"too late" })
         assertNull(directAdmissionAttempt(100) { kotlinx.coroutines.withTimeout(1) { kotlinx.coroutines.delay(30);"nested timeout" } })

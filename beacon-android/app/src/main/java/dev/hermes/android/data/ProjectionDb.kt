@@ -20,11 +20,9 @@ data class ProjectionMetadata(val key: String, val scope: String, val updated: L
     @Query("SELECT substr(encrypted, :start, :count) FROM projections WHERE `key`=:key") suspend fun encryptedChunk(key: String, start: Int, count: Int): ByteArray?
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun put(row: Projection)
     @Query("DELETE FROM projections WHERE `key`=:key") suspend fun delete(key: String)
-    @Query("DELETE FROM projections WHERE scope=:scope") suspend fun clearScope(scope: String)
     @Query("DELETE FROM projections WHERE protected=0 AND updated<:before") suspend fun expire(before: Long)
     @Query("SELECT COALESCE(SUM(length(encrypted)),0) FROM projections") suspend fun total(): Long
     @Query("SELECT `key`, scope, updated, protected, bytes, length(encrypted) AS encryptedSize FROM projections WHERE protected=0 ORDER BY updated ASC LIMIT 1") suspend fun oldest(): ProjectionMetadata?
-    @Query("SELECT `key`, scope, updated, protected, bytes, length(encrypted) AS encryptedSize FROM projections WHERE scope=:scope AND protected=1") suspend fun protectedRows(scope: String): List<ProjectionMetadata>
 }
 @Database(entities = [Projection::class], version = 1, exportSchema = false)
 abstract class ProjectionDb : RoomDatabase() { abstract fun rows(): ProjectionDao }

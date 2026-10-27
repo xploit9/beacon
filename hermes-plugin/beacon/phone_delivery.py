@@ -1,6 +1,7 @@
 """Hermes phone cron target backed by Beacon's durable mobile outbox."""
 import asyncio
 import hashlib
+import json
 import os
 import re
 import sys
@@ -104,7 +105,8 @@ def _queue_standalone_result(message, native_job_id, name, chat_id):
         raise
     bucket = int(time.time() // 300)
     # shortcut: no upstream run ID; keep the five-minute window until both send paths carry run identity.
-    identity = native_job_id + ":" + str(message) + ":" + str(bucket)
+    # The destination is part of the identity: one run delivering to two threads or profiles keeps a post for each (held_posts is keyed by this value).
+    identity = json.dumps([owner, profile, conversation, native_job_id, str(message), bucket])
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
     job_id = "phone-cron-" + digest
     if thread:

@@ -28,8 +28,6 @@ internal object NativeOperationPolicy {
         if (path == "/api/files/upload-stream") return method == "POST"
         if (path == beaconPluginUpdatePath) return method == "POST"
         if (path == "/api/plugins/beacon/sessions/pin") return method == "POST"
-        // The pairing routes are gone from the plugin; a phone is linked by `devices/link` after sign-in.
-        if (path.startsWith("/api/plugins/beacon/pairing")) return false
         if (path == deviceLinkPath) return method == "POST"
         if (path == devicesPath) return method == "GET"
         if (path.startsWith("/api/plugins/beacon/devices/")) return method == "DELETE" && path.matches(devicePath)

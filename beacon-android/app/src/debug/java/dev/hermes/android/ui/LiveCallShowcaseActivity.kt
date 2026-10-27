@@ -37,11 +37,12 @@ class LiveCallShowcaseActivity : ComponentActivity() {
         var reduced=false
         private var overlay: CallOverlayWindow?=null
         const val mediaStarts=1 // Explicitly mocked; never a native connection claim.
+        const val REDUCED_MOTION="reduced_motion"
     }
     private var hidden=false
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (savedInstanceState == null) { overlay?.close(); overlay = null; source.value = initialCall(); ownerAllowed = true; reduced = false }
+        if (savedInstanceState == null) { overlay?.close(); overlay = null; source.value = initialCall(); ownerAllowed = true; reduced = intent.getBooleanExtra(REDUCED_MOTION, false) }
         enableEdgeToEdge(statusBarStyle=SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),navigationBarStyle=SystemBarStyle.dark(android.graphics.Color.TRANSPARENT))
         setContent { BeaconTheme(dark=true) {
             val call by source.collectAsState()

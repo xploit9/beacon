@@ -38,6 +38,10 @@ def test_connect_info_requires_owner_auth_but_no_profile_selection(harness, monk
     assert response.headers['cache-control'] == 'no-store'
     del client.headers['x-fixture-owner']
     assert client.get('/api/plugins/beacon/connect-info').status_code == 401
+    # A phone's Bearer token is not the dashboard owner in a browser: the link stays with the browser session.
+    client.headers['authorization'] = 'Bearer phone-access-token'
+    client.headers['x-fixture-bearer'] = 'owner'
+    assert client.get('/api/plugins/beacon/connect-info').status_code == 401
 
 
 def test_connect_info_gives_only_the_local_owner_the_link_and_never_the_loopback_token(harness, monkeypatch):

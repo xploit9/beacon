@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create the named stable APK asset and manifest used by the Hermes release feed."""
+"""Create the named stable APK asset and the Beacon-<version>.json manifest the app's GitHub updater checks."""
 
 import argparse
 import hashlib

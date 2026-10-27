@@ -39,12 +39,6 @@ internal fun voiceChoiceLabel(voice: String, options: List<String>): String {
     val label = voice.replaceFirstChar(Char::titlecase)
     return if (options.any { it != voice && it.replaceFirstChar(Char::titlecase) == label }) "$label ($voice)" else label
 }
-internal fun voiceProviderTestMessage(result: dev.hermes.android.voice.VoiceProviderTestResult): String = when (result) {
-    dev.hermes.android.voice.VoiceProviderTestResult.Success -> "Connection succeeded. The key is stored on this phone."
-    dev.hermes.android.voice.VoiceProviderTestResult.KeyRejected -> "That key wasn't accepted. Check it and try again."
-    dev.hermes.android.voice.VoiceProviderTestResult.Unreachable -> "The provider could not be reached. Check your connection and try again."
-    dev.hermes.android.voice.VoiceProviderTestResult.ProviderError -> "The provider responded with an error. Check the selected model or try again."
-}
 internal fun voiceModelDisplayName(model: String): String = model.substringAfterLast('/')
     .split(Regex("[-_]"))
     .filter(String::isNotBlank)

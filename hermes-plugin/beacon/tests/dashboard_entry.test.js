@@ -133,5 +133,4 @@ test("an unowned response never exposes a claim action", () => {
 
   assert.equal(page.nodes.some((node) => node.type === "button" && node.children.includes("Use Beacon with this Hermes account")), false);
   assert.equal(JSON.stringify(page.tree).includes("Use Beacon with this Hermes account"), false);
-  assert.equal(page.requests.some(({ path }) => path.endsWith("/owner/claim")), false);
 });

@@ -2,10 +2,14 @@ package dev.hermes.android.data
 
 import dev.hermes.android.core.Scope
 import dev.hermes.android.core.json
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
 import org.json.JSONArray
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -137,6 +141,45 @@ class ScreenCacheTest {
         cache.open(default)
         cache.set(default, "settings:skills", json("skills" to 3))
         assertEquals("the next sign-in opens the account again", 1, cache.latest(default).size)
+    }
+
+    @Test fun anOpenThatIsReadingWhenTheOwnerSignsOutDoesNotBringTheRowBack() = runBlocking<Unit> {
+        rows[default.copy(profile = "", session = "").key] = """{"v":1,"e":[{"p":"default","k":"crons","r":"/api/crons","a":1,"d":{"jobs":1}}]}"""
+        val reading = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        // The stored row is captured before the read suspends, like a key-store read that finishes after the sign-out.
+        val cache = ScreenCache(read = { scope -> val stored = rows[scope.key]; reading.complete(Unit); release.await(); stored }, write = { scope, value -> rows[scope.key] = value }, drop = { rows.remove(it.key) }, jobs = jobs, quietMs = 600_000)
+        val opening = launch { cache.open(default) }
+        reading.await()
+        val signOut = launch { cache.clear(default) }
+        yield()
+        release.complete(Unit)
+        joinAll(opening, signOut)
+        assertTrue("the signed-out account's screens are not readable again", cache.latest(default).isEmpty())
+        cache.set(default, "settings:memory", json("notes" to 1))
+        cache.flush(default)
+        assertTrue("a late settings write is refused and nothing reaches the key store", cache.latest(default).isEmpty() && rows.isEmpty())
+    }
+
+    @Test fun anOpenThatWaitedBehindTheSignOutLeavesTheAccountClosed() = runBlocking<Unit> {
+        val stranger = default.copy(owner = "someone-else").copy(profile = "", session = "")
+        val dropping = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val cache = ScreenCache(read = { rows[it.key] }, write = { scope, value -> rows[scope.key] = value }, drop = { scope -> if (scope.key == stranger.key) { dropping.complete(Unit); release.await() }; rows.remove(scope.key) }, jobs = jobs, quietMs = 600_000)
+        val busy = launch { cache.clear(stranger) }
+        dropping.await()
+        val signOut = launch { cache.clear(default) }
+        yield()
+        // This open began before the sign-out ran but gets the row's lock after it.
+        val hydrating = launch { cache.open(default) }
+        yield()
+        release.complete(Unit)
+        joinAll(busy, signOut, hydrating)
+        cache.set(default, "settings:memory", json("notes" to 1))
+        assertTrue("the account stays closed until the next sign-in opens it", cache.latest(default).isEmpty())
+        cache.open(default)
+        cache.set(default, "settings:memory", json("notes" to 2))
+        assertEquals(1, cache.latest(default).size)
     }
 
     @Test fun aMutationDropsTheCachedReadsOfItsOwnFamilyOnly() = runBlocking<Unit> {

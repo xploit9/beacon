@@ -58,7 +58,6 @@ import dev.hermes.android.AppState
 import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.core.trustedOrigin
 import dev.hermes.android.data.VoiceKeyStore
-import dev.hermes.android.data.pairingBlockAddress
 import dev.hermes.android.push.KeepConnectedService
 
 internal fun handleSetupPermissionResult(granted: Boolean, advance: () -> Unit, denied: () -> Unit) {
@@ -114,7 +113,7 @@ private tailrec fun Context.findActivity(): android.app.Activity? = when (this) 
 
 internal data class BeaconConnectInput(val origin: String)
 
-/** The Hermes address in what the user pasted: a `beacon://connect` link, a plain address, or an old pairing block (its code is dropped). */
+/** The Hermes address in what the user pasted: a `beacon://connect` link or a plain address. */
 internal fun parseBeaconConnectLink(value: String): BeaconConnectInput {
     val input = value.trim()
     val uri = Uri.parse(input)
@@ -123,7 +122,7 @@ internal fun parseBeaconConnectLink(value: String): BeaconConnectInput {
         require(uri.host.equals("connect", ignoreCase = true) && uri.path.isNullOrEmpty()) { "Paste the link from your Hermes dashboard or its https address." }
         uri.getQueryParameter("url")?.takeIf(String::isNotBlank)
             ?: throw IllegalArgumentException("This link has no Hermes address. Copy it again or paste the https address.")
-    } else pairingBlockAddress(input) ?: input
+    } else input
     val explicitScheme = Regex("^[A-Za-z][A-Za-z0-9+.-]*://").containsMatchIn(address.trim())
     return BeaconConnectInput(trustedOrigin(if (explicitScheme) address else "https://$address"))
 }
@@ -194,8 +193,7 @@ internal fun SetupWizardScreen(
     var voiceKeyProvider by rememberSaveable { mutableStateOf("") }
     var keyWorks by rememberSaveable { mutableStateOf(false) }
 
-    // An old pairing block is reduced to its address: there is no code step.
-    fun updateAddress(value: String) { address = pairingBlockAddress(value) ?: value.take(4096) }
+    fun updateAddress(value: String) { address = value.take(4096) }
     fun pasteAddress() {
         val clip = context.getSystemService(ClipboardManager::class.java)?.primaryClip?.takeIf { it.itemCount > 0 }
         clip?.getItemAt(0)?.coerceToText(context)?.toString()?.let(::updateAddress)

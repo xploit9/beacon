@@ -291,6 +291,7 @@ class NativeAuth internal constructor(
                 if (code == null) {
                     callback.respondBestEffort(400, "Bad Request", body = INVALID_CALLBACK_MESSAGE)
                 } else {
+                    // Stays before the redirect: AuthReturnActivity ignores a return that comes before the callback.
                     pendingAuthorization.get()?.callbackCaptured()
                     callback.respondBestEffort(
                         302,
@@ -389,6 +390,9 @@ class NativeAuth internal constructor(
             pendingAuthorization.get()?.onActivityResumed()
         }
 
+        /** The genuine return link follows a captured callback, so a return while this is true came from another app. */
+        internal fun awaitingSignInCallback(): Boolean = pendingAuthorization.get()?.awaitingCallback == true
+
         internal fun mapSignInFailure(error: Exception, cancelledOnResume: Boolean = false): NativeAuthException = when {
             error is NativeAuthException -> error
             cancelledOnResume -> NativeAuthException(RESUME_CANCEL_MESSAGE, cause = error)
@@ -429,6 +433,8 @@ internal class PendingNativeAuthorization(
 
     val isForeground: Boolean get() = foreground.value
 
+    val awaitingCallback: Boolean get() = synchronized(lock) { !codeCaptured }
+
     suspend fun awaitForeground() {
         foreground.first { it }
     }
@@ -456,7 +462,8 @@ internal class PendingNativeAuthorization(
     }
 
     /** The activity that opened the sign-in tab is back on top, so the tab was closed. Another app's launch
-     *  opens a new activity above the tab instead, so it can't end a sign-in this way. */
+     *  opens a new activity above the tab instead, and AuthReturnActivity ignores returns before the callback,
+     *  so another app can't end a sign-in this way. */
     fun onLauncherReturned() {
         schedule(RESUME_GRACE_MS) {
             val abandoned = synchronized(lock) { (!codeCaptured).also { if (it) cancelledOnResume = true } }

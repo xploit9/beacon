@@ -32,13 +32,6 @@ internal fun slashMatches(name: String, description: String, draft: String): Boo
     draft.startsWith('/') && !draft.substringAfter('/').contains(' ') &&
         (name.removePrefix("/").startsWith(draft.removePrefix("/"), true) || draft.removePrefix("/").length >= 3 && description.contains(draft.removePrefix("/"), true))
 
-internal fun archivedCallLabel(final: Boolean, interrupted: Boolean, active: Boolean): String = when {
-    !final && active -> "Live call transcript"
-    !final -> "Unfinished call transcript"
-    interrupted -> "Interrupted call transcript"
-    else -> "Call transcript"
-}
-
 internal fun nativeSlashName(draft: String, names: List<String>): String? {
     if (!draft.startsWith('/')) return null
     val name = draft.substringBefore(' ').removePrefix("/")

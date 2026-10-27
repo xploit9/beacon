@@ -48,16 +48,4 @@ class NativePairingTest {
         assertEquals("phone-1", later.getString("device_id"))
         assertEquals(setOf("device_name", "device_id"), later.keys().asSequence().toSet())
     }
-
-    @Test fun anOldPairingBlockIsReducedToItsAddress() {
-        // What the dashboard used to print: the code is dropped, only the Hermes address is kept.
-        assertEquals("https://hermes.example", pairingBlockAddress("Dashboard address: https://hermes.example\nPairing code: abc-123\nExpires: 10 minutes"))
-        assertEquals("https://hermes.example.ts.net", pairingBlockAddress("Dashboard: https://hermes.example.ts.net\nPairing code: K7Q-4ZP\nexpires in 10 min"))
-        assertEquals("https://hermes.example", pairingBlockAddress("Open (https://hermes.example), code: K7Q4ZP."))
-    }
-
-    @Test fun anAddressWithoutAPairingCodeIsLeftAlone() {
-        assertNull(pairingBlockAddress("https://hermes.example without a code"))
-        assertNull(pairingBlockAddress("https://hermes.example"))
-    }
 }

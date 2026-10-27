@@ -19,10 +19,14 @@ import androidx.lifecycle.viewModelScope
 import dev.hermes.android.core.*
 import dev.hermes.android.data.*
 import dev.hermes.android.ui.ChatGlances
+import dev.hermes.android.ui.GLANCE_PROFILES_KIND
 import dev.hermes.android.ui.chatPreviewText
+import dev.hermes.android.ui.decodeGlanceProfiles
 import dev.hermes.android.ui.decodeGlances
 import dev.hermes.android.ui.encodeFor
 import dev.hermes.android.ui.epochMillis
+import dev.hermes.android.ui.glanceProfilesJson
+import dev.hermes.android.ui.glanceProfilesToForget
 import dev.hermes.android.ui.rowActivityMillis
 import dev.hermes.android.voice.CallState
 import dev.hermes.android.voice.CallTranscript
@@ -1842,8 +1846,19 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         if (glanceLoaded.put(profileScope.key, profileScope) == null) {
             val stored = try { app.cache.read(profileScope, "chat-glances")?.let { decodeGlances(profileScope.profile, it) } }
                 catch (e: Exception) { if (e is CancellationException) { glanceLoaded.remove(profileScope.key); throw e }; null }
-            if (stored != null) _glances.update { it.merged(stored) }
+            if (stored != null) {
+                _glances.update { it.merged(stored) }
+                // Rows written before the account row existed are named as soon as their profile is opened.
+                try { rememberGlanceProfile(profileScope) } catch (e: CancellationException) { throw e } catch (_: Exception) { /* the next write records it */ }
+            }
         }
+    }
+    /** The account row names every profile with previews on this phone, and is written before that profile's first preview row, so sign-out never has to guess. */
+    private val glanceIndexLock = Mutex()
+    private suspend fun rememberGlanceProfile(profileScope: Scope) = glanceIndexLock.withLock {
+        val account = profileScope.copy(profile = "", session = "")
+        val recorded = decodeGlanceProfiles(app.cache.read(account, GLANCE_PROFILES_KIND))
+        if (profileScope.profile.isNotBlank() && profileScope.profile !in recorded) app.cache.write(account, GLANCE_PROFILES_KIND, glanceProfilesJson(recorded + profileScope.profile), protected = true)
     }
     private fun queueGlanceWrite(profileScope: Scope) {
         glanceDirty[profileScope.key] = profileScope
@@ -1853,25 +1868,30 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             val snapshot = _glances.value
             // Derived data: a failed write is retried by the next change, never surfaced.
             glanceDirty.values.toList().forEach { dirty ->
-                try { app.cache.write(dirty, "chat-glances", snapshot.encodeFor(dirty.profile), protected = true); glanceDirty.remove(dirty.key) }
+                try { rememberGlanceProfile(dirty); app.cache.write(dirty, "chat-glances", snapshot.encodeFor(dirty.profile), protected = true); glanceDirty.remove(dirty.key) }
                 catch (e: Exception) { if (e is CancellationException) throw e }
             }
         }
     }
     /** Sign-out and device removal: the account's chat lists, previews and read marks leave the phone with its screens,
-     *  for every profile the app knows, and a pending write cannot bring them back. */
+     *  for every profile the account row, the profile list or this run names, and a pending write cannot bring them back. */
     private suspend fun forgetGlances(scope: Scope) {
-        val account = scope.copy(profile = "", session = "").key
-        val known = _data.value["navigation-profiles"]?.rows("profiles").orEmpty().map { scope.copy(profile = it.string("name"), session = "") }.filter { it.profile.isNotBlank() }
+        val account = scope.copy(profile = "", session = "")
+        val listed = _data.value["navigation-profiles"]?.rows("profiles").orEmpty().map { it.string("name") }
+        var wiped = true
         val stored = glanceLock.withLock {
-            glanceWrite?.cancel(); glanceDirty.clear()
-            val profiles = (glanceLoaded.values.filter { it.copy(profile = "", session = "").key == account } + known + scope.copy(session = "")).distinctBy { it.key }
-            if (glanceAccount == account) { glanceLoaded.clear(); _glances.value = ChatGlances(account = account) }
+            // No write may be running while the account row is read, or it could name a profile the wipe then misses.
+            glanceWrite?.cancelAndJoin(); glanceDirty.clear()
+            val recorded = try { decodeGlanceProfiles(app.cache.read(account, GLANCE_PROFILES_KIND)) } catch (e: CancellationException) { throw e } catch (_: Exception) { wiped = false; emptyList<String>() }
+            val profiles = glanceProfilesToForget(scope, glanceLoaded.values, listed, recorded)
+            if (glanceAccount == account.key) { glanceLoaded.clear(); _glances.value = ChatGlances(account = account.key) }
             profiles
         }
-        stored.forEach { profile -> listOf("chat-glances", "conversation-index").forEach { kind ->
-            try { app.cache.delete(profile, kind) } catch (e: CancellationException) { throw e } catch (_: Exception) { /* one failed delete never keeps the others */ }
-        } }
+        for (profile in stored) for (kind in listOf("chat-glances", "conversation-index")) {
+            // One failed delete never keeps the others, but it keeps the account row, so the next sign-out finds what is left.
+            try { app.cache.delete(profile, kind) } catch (e: CancellationException) { throw e } catch (_: Exception) { wiped = false }
+        }
+        if (wiped) try { app.cache.delete(account, GLANCE_PROFILES_KIND) } catch (e: CancellationException) { throw e } catch (_: Exception) { /* the next write rewrites it */ }
     }
     /** The account the glances belong to; the list ignores any other account's. */
     internal fun glanceAccountKey(): String = (client?.scope ?: cachedOwnerScope)?.copy(profile = "", session = "")?.key.orEmpty()

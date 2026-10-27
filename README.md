@@ -19,18 +19,18 @@ it. Open it, paste your Hermes link (also shown on the dashboard's **Beacon** ta
 <p align="center">
   <img src="https://github.com/user-attachments/assets/bee7a28c-e6f1-497c-8dad-b1b13afbc320" width="31%" alt="Beacon chat">
   <img src="https://github.com/user-attachments/assets/20e84c96-cba7-481a-b593-edc0aa3d7b06" width="31%" alt="A scheduled post in a thread">
-  <img src="https://github.com/user-attachments/assets/54b85748-656a-493a-a65d-284138a1f724" width="31%" alt="A voice call">
+  <img src="https://github.com/user-attachments/assets/b0f25871-6398-43af-a0d2-e824c63dcd5b" width="31%" alt="A voice call">
 </p>
 
 ## See it work
 
 **You call Beacon.** It checks the calendar and saves a note to your Hermes memory, all by voice:
 
-https://github.com/user-attachments/assets/6a723567-d330-4776-a0fd-974f11506226
+https://github.com/user-attachments/assets/76615260-87e8-4475-8867-0d1d9b610aad
 
 **Beacon calls you.** Ask it to ring you about an email. It calls, says why, and drafts the reply:
 
-https://github.com/user-attachments/assets/157763a7-d7e0-4181-9f6a-46efbedb6d11
+https://github.com/user-attachments/assets/cc0944c5-63a8-40f2-866e-771889d7186b
 
 The voice is Grok; the caller's side is synthetic speech. Screens and videos come from a demo Hermes with sample data.
 
@@ -44,7 +44,8 @@ The voice is Grok; the caller's side is synthetic speech. Screens and videos com
 - **Tools at hand.** Toolsets in a chat's menu opens your tools and MCP servers, the same controls as Settings.
 - **Approvals per chat.** Each chat follows your profile's approval mode, or YOLO for that chat only.
 - **Voice calls.** Talk with Gemini Live, Grok or OpenAI Realtime. Calls use the tools and memory of your Hermes profile,
-  and can save new memories like a chat ([how calls use tools and memory](docs/voice-calls.md)). Call text is saved;
+  and can save new memories like a chat ([how calls use tools and memory](docs/voice-calls.md)). A cloud of light
+  shows the call: blue while Beacon listens, amber while it thinks, green while it speaks. Call text is saved;
   audio is not kept.
 - **What needs you.** Beacon watches what your Hermes can reach and tells you, or calls you, when something matters.
   Write rules like "Call me if a client moves a meeting" and teach it with Important / Not important.
@@ -77,7 +78,7 @@ you have linked.
 <p align="center">
   <img src="https://github.com/user-attachments/assets/bd391502-b138-45ba-ad4a-a19ec986f60b" width="31%" alt="Choose a voice provider">
   <img src="https://github.com/user-attachments/assets/cec4327f-53e9-4e5a-9f82-5f00a726b122" width="31%" alt="Pick a voice">
-  <img src="https://github.com/user-attachments/assets/54b85748-656a-493a-a65d-284138a1f724" width="31%" alt="A call with Beacon">
+  <img src="https://github.com/user-attachments/assets/b2c56b17-749f-46dd-9821-6e1f2d5d48f4" width="31%" alt="Beacon answers after checking the calendar">
 </p>
 
 **4. Talk to Beacon.** Ask about your day, have it draft a reply, use `/` commands, and set approvals for the chat.

@@ -1,7 +1,6 @@
 """Profile-scoped installed skill requirements and revision-checked native edits."""
 import asyncio
 import hashlib
-from pathlib import Path
 from fastapi import APIRouter, HTTPException, Request
 
 MAX_BYTES = 512 * 1024
@@ -73,7 +72,8 @@ def inventory(root):
 def document(root, name):
     from tools.skill_manager_tool import _find_skill, _validate_name
     from tools import skills_tool as native
-    if not isinstance(name, str) or not name or _validate_name(Path(name).name):
+    # Every segment is a native identifier: a category folder may precede the name, but '..', backslashes and rooted paths never pass.
+    if not isinstance(name, str) or not name or any(_validate_name(part) for part in name.split('/')):
         raise HTTPException(400, 'Choose a valid skill name')
     found = _find_skill(name)
     if not found:

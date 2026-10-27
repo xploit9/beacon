@@ -149,8 +149,10 @@ class PushManager(private val app: BeaconApplication) {
     private suspend fun registerCurrent(client: BeaconClient, rotatedToken: String?): String {
         require(app.firebaseConfigured) { "Firebase is not configured in this build. Set the owner Firebase project before enabling background push." }
         require(app.auth.read(client.auth.origin).authorizesPushSource(client.scope)) { "Sign in to this owner account before registering notifications" }
+        // The plugin takes a push target only from a linked phone, so link first; an automatic link leaves a removed phone alone (null).
         val deviceId = NativePairing.deviceId(app, client.scope)
-        require(!privatePrefs.getBoolean(removedKey(client.scope), false) || deviceId != null) { "Add this phone again in Settings › Connection before turning on notifications" }
+            ?: if (privatePrefs.getBoolean(removedKey(client.scope), false)) null else NativePairing.link(app, client, explicit = false)
+        requireNotNull(deviceId) { "Add this phone again in Settings › Connection before turning on notifications" }
         val token = rotatedToken ?: suspendCancellableCoroutine<String> { c -> FirebaseMessaging.getInstance().token.addOnSuccessListener { if (c.isActive) c.resume(it) }.addOnFailureListener { if (c.isActive) c.resumeWithException(it) } }
         require(token.isNotBlank()) { "Firebase did not return a device token" }
         val previous = synchronized(lock) {
@@ -584,8 +586,6 @@ private fun receivePush(context: Context, data: Map<String, String>, localAction
         val app = context.applicationContext as BeaconApplication
         val source = data["source_ref"].orEmpty()
         val event = data["event_id"].orEmpty()
-        // Beacon asks GitHub for releases itself; a plugin's release hint is only for 1.1.x phones.
-        if (data["kind"] == "release") return
         if (!validOpaque(source) || !validOpaque(event) || !validOpaque(data["conversation_ref"].orEmpty()) || !app.push.permitsIncoming(source)) return
         val nativeKind = data["kind"].orEmpty()
         val activity = data["activity_ref"].orEmpty()

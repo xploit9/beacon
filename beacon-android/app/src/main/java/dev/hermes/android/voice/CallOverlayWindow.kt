@@ -7,6 +7,7 @@ import android.os.Build
 import android.provider.Settings
 import android.view.*
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.platform.LocalConfiguration
@@ -152,7 +153,7 @@ internal class CallOverlayWindow(private val context: Context, private val read:
                             MotionEvent.ACTION_CANCEL -> { dragging=false;hideDismissTarget();clamp();true }
                             else -> false
                         }
-                    }) { VoiceWave(call,Modifier.fillMaxSize(),!reducedMotion(),circular=true) }
+                    }) { VoicePresence(call,Modifier.fillMaxSize().background(CallBackground),!reducedMotion()) }
             }
         } }
     }

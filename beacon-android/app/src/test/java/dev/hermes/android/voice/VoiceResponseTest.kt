@@ -1,5 +1,9 @@
 package dev.hermes.android.voice
 
+import dev.hermes.android.ui.presenceEnergy
+import dev.hermes.android.ui.presenceGain
+import dev.hermes.android.ui.presenceSpread
+import dev.hermes.android.ui.presenceStir
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -9,13 +13,14 @@ class VoiceResponseTest {
         assertTrue(call.copy(userSpeaking=true,localAudioLevel=.04f).voiceAmplitude() >= .3f)
         assertTrue(call.copy(remoteSpeaking=true,remoteAudioLevel=.04f).voiceAmplitude() >= .3f)
     }
-    @Test fun louderSpeechHasMoreExcursionThanQuietSpeech() {
+    @Test fun louderSpeechOpensTheCloudMoreThanQuietSpeech() {
         val quiet=call.copy(userSpeaking=true,localAudioLevel=.04f).voiceAmplitude()
         val voiced=call.copy(userSpeaking=true,localAudioLevel=.25f).voiceAmplitude()
-        fun excursion(a: Float)= (0..32).map { voiceWaveY(.4f,it/8f,a,0) }.let { it.max()-it.min() }
+        fun excursion(a: Float)= presenceSpread(presenceEnergy(a))-presenceSpread(presenceEnergy(call.voiceAmplitude()))
         println("VOICE_RESPONSE18 quietAmplitude=$quiet quietExcursion=${excursion(quiet)} voicedAmplitude=$voiced voicedExcursion=${excursion(voiced)} silenceAmplitude=${call.voiceAmplitude()}")
-        assertTrue(excursion(quiet) >= .10f)
+        assertTrue(excursion(quiet) >= .06f)
         assertTrue(excursion(voiced) > excursion(quiet)*1.4f)
+        assertTrue(presenceStir(presenceEnergy(voiced)) > presenceStir(presenceEnergy(quiet)))
     }
     @Test fun duplexKeepsTheStrongerMeasuredChannel() {
         val user=call.copy(userSpeaking=true,localAudioLevel=.25f).voiceAmplitude()
@@ -50,15 +55,15 @@ class VoiceResponseTest {
             assertEquals(t%40L==0L,cadence.accept(false,t))
         }
     }
-    @Test fun gainIsMonotonicFiniteAndGeometryStaysInsideTheCapsule() {
+    @Test fun gainIsMonotonicFiniteAndTheCloudStaysWithinItsBounds() {
         var previous=0f
         for(i in 0..100) {
             val amplitude=call.copy(userSpeaking=true,localAudioLevel=i/100f).voiceAmplitude()
             assertTrue(amplitude in 0f..1f);assertTrue(amplitude>=previous);previous=amplitude
-            for(p in 0..12) for(x in 0..56) for(layer in 0..2) {
-                val y=voiceWaveY(x/56f,p/2f,amplitude,layer)
-                assertTrue(y.isFinite() && y in .1f..0.95f)
-            }
+            val energy=presenceEnergy(amplitude)
+            assertEquals(amplitude,energy,0f)
+            assertTrue(presenceSpread(energy) in 1f..1.25f)
+            assertTrue(presenceGain(energy) in .6f..1f)
         }
         assertEquals(1f,call.copy(userSpeaking=true,localAudioLevel=3f).voiceAmplitude(),0f)
     }

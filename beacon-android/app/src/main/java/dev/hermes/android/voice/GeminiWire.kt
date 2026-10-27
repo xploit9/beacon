@@ -300,9 +300,12 @@ internal class DirectGatewayReceipts {
 }
 
 
+/** A closed channel means the call ended while the writer waited, so the writer ends like a cancellation, not a crash. */
 internal suspend fun <T> nextDirectFrame(controls: kotlinx.coroutines.channels.Channel<T>, microphone: kotlinx.coroutines.channels.Channel<T>, visual: kotlinx.coroutines.channels.Channel<T>): T =
-    controls.tryReceive().getOrNull() ?: kotlinx.coroutines.selects.select<T> {
-        controls.onReceive { it }; microphone.onReceive { it }; visual.onReceive { it }
+    controls.tryReceive().getOrNull() ?: try {
+        kotlinx.coroutines.selects.select<T> { controls.onReceive { it }; microphone.onReceive { it }; visual.onReceive { it } }
+    } catch (closed: kotlinx.coroutines.channels.ClosedReceiveChannelException) {
+        throw kotlinx.coroutines.CancellationException("The call ended", closed)
     }
 
 

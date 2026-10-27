@@ -120,7 +120,6 @@ class NativeProjectionStorageTest {
                 assertArrayEquals(selected, db.rows().encryptedChunk(selectionKey, 1, selected.size))
                 assertNull(cache.read(client.scope.session("legacy-chat"), "draft"))
                 assertEquals("private original", cache.read(legacy, "draft"))
-                assertEquals(1, db.rows().protectedRows(legacy.key).size)
             } finally { client.closeNative(); db.close() }
         }
     }
@@ -255,7 +254,6 @@ class NativeProjectionStorageTest {
             assertEquals("unknown", cache.read(scope, "beacon-opening"))
             assertNull(cache.read(scope, LEGACY_SESSION_KIND))
             assertNull(cache.read(scope, LEGACY_OPENING_KIND))
-            assertEquals(2, db.rows().protectedRows(scope.key).size)
         } finally { db.close() }
     }
 
@@ -277,7 +275,6 @@ class NativeProjectionStorageTest {
             val migrated = requireNotNull(db.rows().get(newKey))
             assertEquals(1234L, migrated.updated)
             assertTrue(migrated.protected)
-            assertEquals(1, db.rows().protectedRows(scope.key).size)
             assertNull(cache.read(scope.copy(owner = "another-owner"), kind))
             cache.write(scope, kind, "replacement", protected = true)
             assertEquals("replacement", cache.read(scope, kind))

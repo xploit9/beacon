@@ -159,3 +159,36 @@ def test_uneditable_skill_content_is_bounded_and_actionable(native_home, content
         api.document(native_home, 'mail')
     assert error.value.status_code == status
     assert path.read_bytes() == content
+
+
+# Strix 1c4f37e 0016: the whole name is checked.
+FOREIGN_SKILL = '---\nname: payroll\ndescription: d\n---\n'
+
+
+@pytest.mark.parametrize('name', ['../work/skills/payroll', '..\\work\\skills\\payroll', '/work/skills/payroll',
+                                  'C:/work/skills/payroll', 'tools/../../work/skills/payroll', 'tools//mail',
+                                  '.', '..', 'mail/', ''])
+def test_a_skill_name_cannot_leave_the_profiles_skills_folder(native_home, monkeypatch, name):
+    create(native_home)
+    foreign = native_home / 'work' / 'skills' / 'payroll' / 'SKILL.md'
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text(FOREIGN_SKILL + 'WORK-PROFILE-SECRET\n', encoding='utf-8')
+    before = foreign.read_bytes()
+    from tools import skill_manager_tool
+    # The worst native lookup joins the name onto the skills folder; the name check must stop the request first.
+    monkeypatch.setattr(skill_manager_tool, '_find_skill', lambda value: {'path': (native_home / 'skills' / value).resolve()})
+    with pytest.raises(HTTPException) as error:
+        api.document(native_home, name)
+    assert error.value.status_code == 400
+    with pytest.raises(HTTPException) as error:
+        api.update(native_home, {'name': name, 'content': FOREIGN_SKILL + 'HIJACKED\n', 'revision': 'x'})
+    assert error.value.status_code == 400
+    assert foreign.read_bytes() == before
+
+
+def test_a_category_folder_may_precede_the_skill_name(native_home):
+    nested = native_home / 'skills' / 'tools' / 'mail'
+    nested.mkdir(parents=True)
+    (nested / 'SKILL.md').write_text('---\nname: mail\ndescription: Read work mail\n---\nSign in first.\n', encoding='utf-8')
+    result = api.document(native_home, 'tools/mail')
+    assert result['name'] == 'tools/mail' and result['edit_name'] == 'tools/mail' and result['content'].endswith('Sign in first.\n')

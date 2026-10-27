@@ -28,18 +28,19 @@ class LiveCallMotionCaptureTest {
             val movingA = frame()
             rule.mainClock.advanceTimeBy(420)
             val movingB = frame()
-            assertFalse("Positive control: the active wave must animate", movingA.sameAs(movingB))
             rule.runOnIdle { rule.activity.motion(true) }
             rule.mainClock.advanceTimeBy(160)
             val reducedA = frame()
             rule.mainClock.advanceTimeBy(420)
             val reducedB = frame()
-            assertTrue("Reduced motion must stop the same visible wave", reducedA.sameAs(reducedB))
+            // Saved before the checks, so a failure leaves the frames to compare.
             val context = InstrumentationRegistry.getInstrumentation().targetContext
             val folder = File(context.filesDir, "ui-motion-evidence").apply { check(isDirectory || mkdirs()) }
             listOf("moving-a", "moving-b", "reduced-a", "reduced-b").zip(images).forEach { (name, image) ->
                 File(folder, "$name.png").outputStream().use { assertTrue(image.compress(Bitmap.CompressFormat.PNG, 100, it)) }
             }
+            assertFalse("Positive control: the active presence must animate", movingA.sameAs(movingB))
+            assertTrue("Reduced motion must stop the same visible presence", reducedA.sameAs(reducedB))
         } finally {
             rule.mainClock.autoAdvance = previousAutoAdvance
             images.forEach(Bitmap::recycle)

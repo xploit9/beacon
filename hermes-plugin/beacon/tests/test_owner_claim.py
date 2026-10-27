@@ -108,34 +108,15 @@ def test_two_first_bindings_atomically_choose_one_owner(harness, monkeypatch):
     assert api.mobile.settings()['owner_id'] in {'owner-a', 'owner-b'}
 
 
-def test_claim_refuses_bearer_cross_site_and_loopback_requests(harness):
-    _, client, cfg, _, app = harness
-    cfg.clear()
-    path = '/api/plugins/beacon/owner/claim'
-
-    assert client.post(path, headers={'sec-fetch-site': 'cross-site'}).status_code == 403
-
-    del client.headers['x-fixture-owner']
-    client.headers['authorization'] = 'Bearer phone-access-token'
-    client.headers['x-fixture-bearer'] = 'owner'
-    assert client.post(path).status_code == 401
-
-    del client.headers['authorization']
-    del client.headers['x-fixture-bearer']
-    app.state.auth_required = False
-    assert client.post(path).status_code == 401
-
-
-def test_claim_persists_owner_and_authorizes_native_profiles_including_new_ones(harness, monkeypatch):
+def test_first_request_persists_owner_and_authorizes_native_profiles_including_new_ones(harness, monkeypatch):
     api, client, _, home, _ = harness
     _write_config(home, {})
     _use_real_settings(api, monkeypatch)
     names = ['default', 'work']
     calls = _native_profiles(monkeypatch, names)
 
-    claimed = client.post('/api/plugins/beacon/owner/claim')
-    assert claimed.status_code == 200, claimed.text
-    assert claimed.json() == {'claimed': True}
+    path = '/api/plugins/beacon/mobile/history-retention'
+    assert client.get(path + '?profile=default').status_code == 200
     assert calls[0] is True
 
     settings = api.mobile.settings()
@@ -151,13 +132,10 @@ def test_claim_persists_owner_and_authorizes_native_profiles_including_new_ones(
     assert info.status_code == 200
     assert info.json() == {'url': 'https://hermes.example.test/beacon', 'name': 'hermes.example.test'}
 
-    path = '/api/plugins/beacon/mobile/history-retention'
-    assert client.get(path + '?profile=default').status_code == 200
     assert client.get(path + '?profile=work').status_code == 200
     names.append('created-after-claim')
     assert client.get(path + '?profile=created-after-claim').status_code == 200
 
-    assert client.post('/api/plugins/beacon/owner/claim').status_code == 409
     _write_config(home, {'callback_tool_enabled': False, 'scheduled_callbacks_enabled': False})
     assert api.mobile.settings(profile='work')['callback_tool_enabled'] is False
     assert api.mobile.settings(profile='work')['scheduled_callbacks_enabled'] is False
@@ -176,7 +154,7 @@ def test_fresh_install_bot_mode_uses_native_profiles_without_yaml_profiles(harne
         'groups.list': {'rooms': [], 'next_offset': None},
     }[method])
 
-    assert client.post('/api/plugins/beacon/owner/claim').status_code == 200
+    assert api.mobile.claim_owner('owner', 'basic')
     response = client.get('/api/plugins/beacon/mobile/bot-mode')
 
     assert response.status_code == 200, response.text
@@ -204,7 +182,7 @@ def test_explicit_yaml_owner_settings_win_over_stored_claim(harness, monkeypatch
     assert settings.get('owner_provider') == 'yaml-provider'
     assert settings.get('profiles') == ['yaml-profile']
     assert api.mobile.settings(profile='yaml-profile').get('scheduled_callback_conversation_id') == 'yaml-assistant'
-    assert client.post('/api/plugins/beacon/owner/claim').status_code == 409
+    assert client.get('/api/plugins/beacon/mobile/history-retention?profile=yaml-profile').status_code == 403
 
 
 def test_assistant_conversation_registration_verifies_and_persists_per_profile(harness, monkeypatch):
@@ -219,7 +197,7 @@ def test_assistant_conversation_registration_verifies_and_persists_per_profile(h
         return {'id': args[3]}
 
     monkeypatch.setattr(api.native, 'verify', verify)
-    assert client.post('/api/plugins/beacon/owner/claim').status_code == 200
+    assert api.mobile.claim_owner('owner', 'basic')
 
     path = '/api/plugins/beacon/mobile/assistant-conversation'
     session = '20261020_123456_abcd'
@@ -258,7 +236,7 @@ def test_assistant_conversation_registration_replaces_a_gone_stored_chat(harness
     _write_config(home, {})
     _use_real_settings(api, monkeypatch)
     _native_profiles(monkeypatch, ['default'])
-    assert client.post('/api/plugins/beacon/owner/claim').status_code == 200
+    assert api.mobile.claim_owner('owner', 'basic')
     gone_checks = 0
 
     def verify(owner, provider, profile, session_id, **kwargs):
@@ -287,7 +265,7 @@ def test_claimed_profile_call_delivery_uses_registered_assistant_conversation(ha
     _write_config(home, {})
     _use_real_settings(api, monkeypatch)
     _native_profiles(monkeypatch, ['default'])
-    assert client.post('/api/plugins/beacon/owner/claim').status_code == 200
+    assert api.mobile.claim_owner('owner', 'basic')
     session = '20261020_123456_abcd'
     assert client.put('/api/plugins/beacon/mobile/assistant-conversation',
                       json={'profile': 'default', 'session_id': session}).status_code == 200

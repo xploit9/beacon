@@ -20,7 +20,8 @@ class LiveCallPermissionTest {
         val instrumentation=InstrumentationRegistry.getInstrumentation()
         fun shell(command: String) = ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand(command)).bufferedReader().use{it.readText()}
         shell("appops set ${instrumentation.targetContext.packageName} SYSTEM_ALERT_WINDOW deny")
-        ActivityScenario.launch<LiveCallShowcaseActivity>(Intent(instrumentation.targetContext,LiveCallShowcaseActivity::class.java)).use { scenario ->
+        // This checks the permission flow, not motion; a moving presence never lets ActivityScenario's idle wait finish on a software-rendered emulator.
+        ActivityScenario.launch<LiveCallShowcaseActivity>(Intent(instrumentation.targetContext,LiveCallShowcaseActivity::class.java).putExtra(LiveCallShowcaseActivity.REDUCED_MOTION,true)).use { scenario ->
             Thread.sleep(600)
             val id=LiveCallShowcaseActivity.source.value.callId
             val scope=LiveCallShowcaseActivity.source.value.conversationScope

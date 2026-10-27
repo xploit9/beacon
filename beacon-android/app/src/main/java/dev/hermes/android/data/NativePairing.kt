@@ -15,17 +15,6 @@ import okhttp3.Response
 import org.json.JSONObject
 import java.io.IOException
 
-private val pairingCodeLinePattern = Regex("(?im)(?:pairing\\s+)?code\\s*[:=]\\s*[A-Z0-9]{3}-?[A-Z0-9]{3}(?![A-Z0-9])")
-private val dashboardUrlPattern = Regex("(?im)^\\s*(?:dashboard(?:\\s+address)?|address)\\s*[:=]\\s*(https?://[^\\s<>\\\"']+)")
-private val urlPattern = Regex("(?i)https?://[^\\s<>\\\"']+")
-
-/** An old dashboard pairing block carries a code Beacon no longer uses; keep only its address. */
-internal fun pairingBlockAddress(value: String): String? {
-    if (!pairingCodeLinePattern.containsMatchIn(value)) return null
-    val address = dashboardUrlPattern.find(value)?.groupValues?.getOrNull(1) ?: urlPattern.find(value)?.value ?: return null
-    return address.trimEnd { it in ",.;)]}>\"'" }
-}
-
 internal data class PairedDevice(val id: String, val name: String, val lastSeen: String)
 
 /** Device ids and names only; credentials never reach this snapshot. */

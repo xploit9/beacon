@@ -430,3 +430,45 @@ def test_rename_requires_advertised_native_method(harness):
     payload = {'name': 'New name', 'expected_name': 'Team', 'event_id': 'rename1'}
     assert client.post('/mobile/bot-mode/space/native-room/rename', json=payload).status_code == 409
     assert not any(c[2] == 'groups.rename' for c in calls)
+
+
+# Strix 1c4f37e 0017: authority over the owner's bots is not membership of one space.
+def test_a_bot_outside_a_space_cannot_list_read_post_approve_rename_or_delete_it(harness):
+    client, calls, results = harness
+    results['authorized_profiles'] = ['default', 'writer', 'ops']
+    results['profiles.list']['profiles'].append({'name': 'ops'})
+    room = results['groups.state']['room']
+    room['members'] = [{'profile': 'writer', 'target': {'kind': 'local', 'profile': 'writer'}},
+                       {'profile': 'ops', 'target': {'kind': 'local', 'profile': 'ops'}}]
+    pending = {'kind': 'approval', 'task_id': 'task', 'member_id': 'writer', 'request_id': 'req', 'execution_generation': 3}
+    results['groups.state']['driver_status'] = {'pending_actions': [dict(pending, approval={'choices': ['once', 'deny']})]}
+    results['groups.approve'] = {'approved': True, 'result': {}}
+    space = '/mobile/bot-mode/space/native-room'
+
+    assert client.get('/mobile/bot-mode').json()['spaces'] == []
+    for response in (
+            client.get(space),
+            client.post(space + '/messages', json={'text': 'hello', 'event_id': 'stable'}),
+            client.post(space + '/action', json=dict(pending, choice='once')),
+            client.post(space + '/rename', json={'name': 'New', 'expected_name': 'Team', 'event_id': 'rename-1'}),
+            client.post(space + '/members', json={'profiles': ['default', 'writer']}),
+            client.post(space + '/delete', json={'event_id': 'd', 'expected_name': 'Team'})):
+        assert response.status_code == 403 and response.json()['detail'] == 'This bot is not in that shared space'
+    assert not any(c[2] in ('groups.log', 'groups.send', 'groups.approve', 'groups.rename', 'groups.disband') for c in calls)
+
+    # A bot inside the space still reaches it, whichever of the owner's bots the phone is using.
+    assert [r['room_id'] for r in client.get('/mobile/bot-mode?profile=ops').json()['spaces']] == ['native-room']
+    assert client.get(space + '?profile=writer').status_code == 200
+    assert client.post(space + '/action?profile=writer', json=dict(pending, choice='once')).status_code == 200
+    assert any(c[2] == 'groups.approve' and c[3]['profile'] == 'writer' for c in calls)
+
+
+def test_a_shared_space_must_include_the_bot_creating_it(harness):
+    client, calls, results = harness
+    results['authorized_profiles'] = ['default', 'writer', 'ops']
+    results['profiles.list']['profiles'].append({'name': 'ops'})
+    response = client.post('/mobile/bot-mode/space', json={'profiles': ['writer', 'ops']})
+    assert response.status_code == 400 and 'include the bot you are using' in response.json()['detail']
+    assert not any(c[2] in ('groups.list', 'groups.create') for c in calls)
+    assert client.post('/mobile/bot-mode/space', json={'profiles': ['ops', 'default']}).status_code == 200
+    assert any(c[2] == 'groups.create' for c in calls)

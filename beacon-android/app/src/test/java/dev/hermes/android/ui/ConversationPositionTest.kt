@@ -128,26 +128,14 @@ class ConversationPositionTest {
         assertNull(toolDurationLabel(Double.NaN))
         assertNull(toolDurationLabel(Double.POSITIVE_INFINITY))
     }
-    @Test fun collapsedSummaryHonorsTheExactLimit() {
-        assertEquals("x".repeat(700), compactToolDetail("x".repeat(700)))
-        assertEquals("x".repeat(700) + "...", compactToolDetail("x".repeat(701)))
-        assertEquals("abc...", compactToolDetail("abcdef", 3))
-        assertEquals("ab...", compactToolDetail("ab  cdef", 3)) // trailing space trimmed before the ellipsis
-        assertEquals("...", compactToolDetail("abc", 0))
-        assertEquals("", compactToolDetail("   \n "))
-    }
     @Test fun truncationNeverSplitsASurrogatePair() {
         val smile = "😀"
-        assertEquals("a...", compactToolDetail("a${smile}b", 2))
-        assertEquals("a$smile...", compactToolDetail("a${smile}b", 3))
         val cut = boundedDetail("a${smile}b", limit = 2)
         assertEquals("a\n… 3 more characters not shown", cut)
         assertEquals("a$smile\n… 1 more characters not shown", boundedDetail("a${smile}b", limit = 3))
         assertFalse(cut.any { it.isSurrogate() })
     }
-    @Test fun compactSummaryCollapsesWhitespaceButFullDetailKeepsNewlines() {
-        assertEquals("a b", compactToolDetail("a \n  b"))
-        assertTrue(compactToolDetail("x".repeat(900)).endsWith("..."))
+    @Test fun fullDetailKeepsNewlines() {
         val full = (1..80).joinToString("\n") { "line $it " + "x".repeat(20) }
         assertTrue(full.length > 700)
         assertEquals(full, boundedDetail(full))
@@ -163,35 +151,6 @@ class ConversationPositionTest {
         assertEquals(ToolDetailPageSize * 2, nextToolDetailLimit(ToolDetailPageSize))
         assertEquals(ToolDetailLimit, nextToolDetailLimit(ToolDetailLimit - 1))
         assertEquals(ToolDetailLimit, nextToolDetailLimit(ToolDetailLimit))
-    }
-
-    private fun snap(name: String, outcome: ToolOutcome) = ToolSnapshot(name, name, outcome)
-
-    @Test fun activityCountsOnlyRealRunningQueuedAndWaitingWork() {
-        val tools = listOf(snap("a", ToolOutcome.Running), snap("b", ToolOutcome.Preparing), snap("c", ToolOutcome.Completed), snap("d", ToolOutcome.Dispatched))
-        val activity = chatActivity(tools, queued = 1, approval = true, question = false)
-        assertEquals(2, activity.running.size)
-        assertEquals(listOf("c", "d"), activity.recent.map { it.name })
-        assertEquals(listOf("Approval needed"), activity.waiting)
-        assertEquals("2 running · 1 queued · Waiting for you", chatActivityStatus(activity))
-        assertTrue(activity.active)
-    }
-    @Test fun aWaitingQuestionAloneIsActivityAndANegativeQueueIsClamped() {
-        val activity = chatActivity(emptyList(), queued = -3, approval = false, question = true)
-        assertEquals(0, activity.queued)
-        assertEquals(listOf("Question waiting"), activity.waiting)
-        assertTrue(activity.active)
-        assertEquals("Waiting for you", chatActivityStatus(activity))
-    }
-    @Test fun finishedToolsAloneDoNotOwnComposerSpace() {
-        val activity = chatActivity(listOf(snap("c", ToolOutcome.Completed)), queued = 0, approval = false, question = false)
-        assertFalse(activity.active)
-        assertEquals("", chatActivityStatus(activity))
-        assertFalse(chatActivity(emptyList(), 0, false, false).active)
-    }
-    @Test fun unsupportedProcessControlIsStatedNotHiddenAsZeroProcesses() {
-        assertTrue(ProcessControlUnavailable.contains("aren’t available"))
-        assertFalse(ProcessControlUnavailable.contains("0 "))
     }
 
     @Test fun quotingKeepsOneBoundedLineAboveTheDraft() {

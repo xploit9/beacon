@@ -1,4 +1,3 @@
-import base64
 import hashlib
 import importlib.util
 import json
@@ -58,14 +57,19 @@ def reserve(client):
     assert result.status_code==200,result.text
     return result.json()['call_id']
 
+def phone(client,name='Pixel'):
+    """The header of a phone linked through /devices/link: push registration is refused without one."""
+    return {'x-beacon-device-id':client.post('/api/plugins/beacon/devices/link',json={'device_name':name}).json()['device_id']}
+
 
 def test_removed_phone_revokes_automatic_push_ids_across_profiles(harness):
     api, client, cfg, _, _ = harness
     cfg['profiles'] = ['default', 'work']
     now = time.time()
     with api.mobile.connect() as conn:
-        conn.execute('INSERT INTO beacon_devices(id,owner,provider,profile,name,created,last_seen) VALUES(?,?,?,?,?,?,?)',
-                     ('phone-lost', 'owner', 'basic', 'default', 'Phone', now, now))
+        for device in ('phone-lost', 'phone-kept'):
+            conn.execute('INSERT INTO beacon_devices(id,owner,provider,profile,name,created,last_seen) VALUES(?,?,?,?,?,?,?)',
+                         (device, 'owner', 'basic', 'default', 'Phone', now, now))
     tokens = []
     for profile, device in [('default', 'phone-lost'), ('work', 'phone-lost'), ('work', 'phone-kept')]:
         token = 'synthetic-' + profile + '-' + device + '-token-12345'
@@ -299,10 +303,6 @@ def test_call_authorization_is_offloaded_from_event_loop(harness,monkeypatch):
     assert [step for step,_ in observed]==['identity-owner','connect','owned','seen','identity-profile','conversation-owner']
     assert all(thread_id!=loop_thread for _,thread_id in observed)
 
-def audio(seq=0,stream='user',at=0,pcm=None):
-    rate=16000 if stream=='user' else 24000
-    return {'stream':stream,'sequence':seq,'started_at_ms':at,'sample_rate':rate,'pcm16':base64.b64encode(pcm or b'\0\1'*(rate//5)).decode()}
-
 def test_visual_tool_and_aggregated_clock_evidence_is_scoped_and_validated(harness):
     api,c,_,_,_=harness;cid=reserve(c);url=f'/api/plugins/beacon/mobile/calls/{cid}/events'
     rows=[
@@ -418,12 +418,6 @@ def test_foreign_calls_and_limits(harness):
     c.headers['x-fixture-owner']='foreign'
     assert c.get(url).status_code==403
     c.headers['x-fixture-owner']='owner'
-    assert c.post(url+'/audio',json=audio(pcm=b'0'*20000)).status_code==409
-    bad=audio();bad['sequence']=True
-    assert c.post(url+'/audio',json=bad).status_code==409
-    bad=audio();bad['started_at_ms']=-1
-    assert c.post(url+'/audio',json=bad).status_code==409
-    assert c.post(url+'/audio',content=b' '*32769).status_code==413
     assert c.post(url+'/events',json={'events':[{'event_id':'x','type':'tool.raw','at_ms':0}]}).status_code==409
     events={'events':[{'event_id':'x','type':'state','state':'listening','at_ms':0}]}
     assert c.post(url+'/events',json=events).status_code==200
@@ -448,7 +442,7 @@ def test_owned_callback_consumption_expiry(harness):
 
 def test_targets_durable_scoped_no_tokens_in_reads(harness):
     api,c,cfg,tmp,app=harness
-    result=c.post('/api/plugins/beacon/mobile/notifications/targets',json={'id':'device1','token':'fixture-token-'+'x'*30,'profile':'default'})
+    result=c.post('/api/plugins/beacon/mobile/notifications/targets',json={'id':'device1','token':'fixture-token-'+'x'*30,'profile':'default'},headers=phone(c))
     assert result.status_code==200
     # A non-string package is rejected before it reaches the target-id hash.
     for package in (7,['dev.hermes.android'],'evil.app'):
@@ -460,18 +454,20 @@ def test_targets_durable_scoped_no_tokens_in_reads(harness):
     assert c.get('/api/plugins/beacon/mobile/notifications/targets').json()['targets']==[]
     assert c.delete('/api/plugins/beacon/mobile/notifications/targets/device1').json()['revoked'] is True
 
+def test_notification_target_identity_includes_package(harness):
+    _,client,_,_,_=harness
+    token='same-fixture-token-'+'x'*32;headers=phone(client)
+    production=client.post('/api/plugins/beacon/mobile/notifications/targets',json={'token':token,'package_name':'dev.hermes.android'},headers=headers)
+    stable=client.post('/api/plugins/beacon/mobile/notifications/targets',json={'token':token,'package_name':'dev.hermes.android.stable'},headers=headers)
+
+    assert production.status_code==stable.status_code==200
+    assert production.json()['target_id']!=stable.json()['target_id']
+
 def test_jobs_require_native_user_row_proof(harness):
     api,c,cfg,tmp,app=harness;cid=reserve(c)
     body={'stored_session_id':'native-stored','runtime_session_id':'runtime','request_id':'request','title':'fixture'}
     result=c.post(f'/api/plugins/beacon/mobile/calls/{cid}/jobs',json=body)
     assert result.status_code==409 and 'user_row_id' in result.text
-
-def test_release_absent_and_path_escape(harness):
-    api,c,cfg,tmp,app=harness
-    assert c.get('/api/plugins/beacon/mobile/releases/latest').status_code==404
-    cfg['release_root']=str(tmp/'releases');(tmp/'releases').mkdir()
-    (tmp/'releases'/'latest.json').write_text(json.dumps({'artifact_filename':'../secret.apk'}))
-    assert c.get('/api/plugins/beacon/mobile/releases/latest').status_code==409
 
 def test_profile_call_uses_recorded_profile(harness):
     api,c,cfg,tmp,app=harness;cid=reserve(c)
@@ -540,27 +536,6 @@ def test_archive_rejects_dot_identity(harness):
     for value in ('.','..','C:escape','nested\\escape'):
         with pytest.raises(ValueError): api.mobile.reserve('owner','default',value)
 
-def test_signed_immutable_release_and_tamper(harness,monkeypatch):
-    api,c,cfg,tmp,app=harness
-    import hashlib
-    root=tmp/'releases';root.mkdir();cfg['release_root']=str(root);certificate='a'*64;cfg['android_certificate_sha256']=certificate
-    aapt=tmp/'aapt.exe';signer=tmp/'apksigner.exe';aapt.touch();signer.touch();cfg.update(aapt=str(aapt),apksigner=str(signer))
-    apk=root/'fixture21.apk';apk.write_bytes(b'fixture apk bytes');digest=hashlib.sha256(apk.read_bytes()).hexdigest()
-    manifest={'artifact_filename':apk.name,'version_code':21,'version_name':'2.1','package_name':'dev.hermes.android','certificate_sha256':certificate,'sha256':digest,'size_bytes':apk.stat().st_size}
-    (root/'latest.json').write_text(json.dumps(manifest));(root/(digest+'.json')).write_text(json.dumps(manifest))
-    def run(args,**kwargs):
-        return SimpleNamespace(stdout=("package: name='dev.hermes.android' versionCode='21' versionName='2.1'" if args[0]==str(aapt) else 'Signer #1 certificate SHA-256 digest: '+certificate))
-    monkeypatch.setattr(api.subprocess,'run',run)
-    latest=c.get('/api/plugins/beacon/mobile/releases/latest');assert latest.status_code==200,latest.text
-    assert latest.json()['artifact_path']==latest.json()['download_url']
-    assert latest.json()['min_contract_version']==latest.json()['max_contract_version']==2
-    url=latest.json()['download_url'];result=c.get(url);assert result.status_code==200 and result.content==apk.read_bytes()
-    # An old hash has its own manifest and stays immutable after latest changes.
-    (root/'latest.json').write_text('{}')
-    assert c.get(url).status_code==200
-    apk.write_bytes(b'tampered bytes')
-    assert c.get(url).status_code==409
-
 def test_callback_defers_until_calls_end(harness):
     api,c,cfg,tmp,app=harness;cid=reserve(c)
     nid=api.mobile.invitation('owner','default','native-stored')
@@ -574,7 +549,7 @@ def test_callback_defers_until_calls_end(harness):
 
 def test_notification_detail_refs_and_legacy_registration(harness):
     api,c,cfg,tmp,app=harness
-    target=c.post('/api/plugins/beacon/mobile/notifications/targets',json={'kind':'fcm','token':'legacy-fixture-'+'x'*30}).json()
+    target=c.post('/api/plugins/beacon/mobile/notifications/targets',json={'kind':'fcm','token':'legacy-fixture-'+'x'*30},headers=phone(c)).json()
     assert target['target']['id']==target['target_id']
     assert len(target['source_ref'])==64
     nid=api.mobile.invitation('owner','default','native-stored')
@@ -586,7 +561,7 @@ def test_notification_detail_refs_and_legacy_registration(harness):
 
 def test_fcm_failure_retries_private_opaque_payload(harness,monkeypatch):
     api,c,cfg,tmp,app=harness;cfg['firebase_credentials']='fixture-private-file'
-    c.post('/api/plugins/beacon/mobile/notifications/targets',json={'id':'device','token':'fixture-fcm-token-'+30*'x'})
+    assert c.post('/api/plugins/beacon/mobile/notifications/targets',json={'id':'device','token':'fixture-fcm-token-'+30*'x'},headers=phone(c)).status_code==200
     nid=api.mobile.invitation('owner','default','native-stored');sent=[];fail=[True]
     def send(message,app=None):
         if fail[0]: raise RuntimeError('fixture provider unavailable')
@@ -605,8 +580,9 @@ def test_fcm_failure_retries_private_opaque_payload(harness,monkeypatch):
 def test_each_phone_retries_without_replaying_successes(harness,monkeypatch):
     api,c,cfg,tmp,app=harness;cfg['firebase_credentials']='fixture-private-file'
     base='/api/plugins/beacon/mobile/notifications'
+    phones={device:phone(c,device) for device in ('first','second')}
     for device in ('first','second'):
-        assert c.post(base+'/targets',json={'id':device,'token':device+'-synthetic-token-'+'x'*20}).status_code==200
+        assert c.post(base+'/targets',json={'id':device,'token':device+'-synthetic-token-'+'x'*20},headers=phones[device]).status_code==200
     nid=api.mobile.invitation('owner','default','native-stored');attempts=[];fail=[True]
     def send(message,app=None):
         attempts.append(message['token'].split('-')[0])
@@ -623,7 +599,7 @@ def test_each_phone_retries_without_replaying_successes(harness,monkeypatch):
     assert status['pending']==1 and status['last_error'] and not status['device_delivery_confirmed']
     assert 'private provider' not in json.dumps(status)
     # Routine registration refresh must keep the first phone's accepted receipt.
-    c.post(base+'/targets',json={'id':'first','token':'first-synthetic-token-'+'x'*20})
+    assert c.post(base+'/targets',json={'id':'first','token':'first-synthetic-token-'+'x'*20},headers=phones['first']).status_code==200
     with api.mobile.connect() as conn: conn.execute('UPDATE notice_deliveries SET next_attempt=0')
     fail[0]=False;api.push('owner','default')
     assert attempts==['first','second','second']
@@ -635,13 +611,13 @@ def test_expired_devices_do_not_exhaust_registration_capacity(harness):
     api,c,cfg,tmp,app=harness
     with api.mobile.connect() as conn:
         conn.executemany('INSERT INTO targets VALUES(?,?,?,?,?,?)',[(f'expired-{i}','owner','default',f'old-token-{i}',0,'{}') for i in range(32)])
-    result=c.post('/api/plugins/beacon/mobile/notifications/targets',json={'id':'fresh','token':'fresh-synthetic-token-12345'})
+    result=c.post('/api/plugins/beacon/mobile/notifications/targets',json={'id':'fresh','token':'fresh-synthetic-token-12345'},headers=phone(c))
     assert result.status_code==200
     assert [row['target_id'] for row in c.get('/api/plugins/beacon/mobile/notifications/targets').json()['targets']]==['fresh']
 
 def test_push_skips_settled_expired_and_foreign_devices(harness,monkeypatch):
     api,c,cfg,tmp,app=harness;cfg['firebase_credentials']='fixture-private-file'
-    c.post('/api/plugins/beacon/mobile/notifications/targets',json={'id':'owned','token':'owned-synthetic-token-12345'})
+    assert c.post('/api/plugins/beacon/mobile/notifications/targets',json={'id':'owned','token':'owned-synthetic-token-12345'},headers=phone(c)).status_code==200
     pending=api.mobile.invitation('owner','default','native-stored')
     expired=api.mobile.invitation('owner','default','native-stored')
     with api.mobile.connect() as conn:
@@ -655,6 +631,35 @@ def test_push_skips_settled_expired_and_foreign_devices(harness,monkeypatch):
     api.push('owner','default')
     assert len(sent)==1 and sent[0]['data']['event_id']==pending and sent[0]['token']=='owned-synthetic-token-12345'
     assert sent[0]['android']['priority']=='high'
+
+def test_push_reaches_only_targets_bound_to_an_active_phone(harness,monkeypatch):
+    # Strix 1c4f37e vuln-0009: a target that names no live phone of the owner must not keep receiving notifications.
+    api,c,cfg,tmp,app=harness;cfg['firebase_credentials']='fixture-private-file'
+    base='/api/plugins/beacon/mobile/notifications'
+    phones={name:phone(c,name) for name in ('active','removed')}
+    for name,headers in phones.items():
+        assert c.post(base+'/targets',json={'id':name,'token':name+'-synthetic-token-'+'x'*20},headers=headers).status_code==200
+    # Rows a removal sweep did not reach: its phone removed behind it, older registrations with no binding, an invented binding.
+    with api.mobile.connect() as conn:
+        conn.execute('UPDATE beacon_devices SET removed=1 WHERE id=?',(phones['removed']['x-beacon-device-id'],))
+        for name,payload in (('unbound','{}'),('null-bound','{"device_id": null}'),('unreadable','not json'),('invented',json.dumps({'device_id':'f'*32}))):
+            conn.execute('INSERT INTO targets VALUES(?,?,?,?,?,?)',(name,'owner','default',name+'-synthetic-token-'+'x'*20,time.time()+300,payload))
+    api.mobile.invitation('owner','default','native-stored');sent=[]
+    messaging=SimpleNamespace(Message=lambda **kwargs:kwargs,AndroidConfig=lambda **kwargs:kwargs,send=lambda message,app=None:sent.append(message))
+    monkeypatch.setitem(sys.modules,'firebase_admin',SimpleNamespace(get_app=lambda name:object(),credentials=SimpleNamespace(),messaging=messaging))
+    api.push('owner','default')
+    assert [message['token'] for message in sent]==['active-synthetic-token-'+'x'*20]
+    assert [target['target_id'] for target in c.get(base+'/targets').json()['targets']]==['active']
+
+def test_the_notification_test_needs_a_target_of_an_active_phone(harness):
+    api,c,cfg,tmp,app=harness
+    url='/api/plugins/beacon/mobile/notifications/test'
+    with api.mobile.connect() as conn:
+        conn.execute('INSERT INTO targets VALUES(?,?,?,?,?,?)',('unbound','owner','default','unbound-synthetic-token-12345',time.time()+300,'{}'))
+    refused=c.post(url,json={})
+    assert refused.status_code==409 and 'Register this phone' in refused.text
+    assert c.post('/api/plugins/beacon/mobile/notifications/targets',json={'id':'bound','token':'bound-synthetic-token-12345'},headers=phone(c)).status_code==200
+    assert c.post(url,json={}).status_code==200
 
 def test_plugin_lifespan_starts_and_stops_watcher(harness):
     api,c,cfg,tmp,app=harness
@@ -793,10 +798,9 @@ def test_native_create_failure_rolls_back_only_own_draft(harness,monkeypatch):
     with pytest.raises(RuntimeError):native.create('owner','basic','default')
     assert calls==['session.create'] and server._sessions['new'] is replacement
 
-def test_bootstrap_never_verifies_a_release_and_safely_hides_errors(harness,monkeypatch):
+def test_bootstrap_has_no_release_and_safely_hides_errors(harness):
     api,c,cfg,tmp,app=harness
     def broken(cfg,optional=False): raise KeyError('version_name')
-    monkeypatch.setattr(api,'release',lambda *args,**kwargs:pytest.fail('bootstrap must not re-verify an APK'))
     result=c.get('/api/plugins/beacon/mobile/bootstrap')
     assert result.status_code==200 and 'release' not in result.json()
     with pytest.raises(Exception) as exc:api.safely(broken,cfg)
@@ -1139,7 +1143,7 @@ def test_owned_synthetic_notification_status_and_test(harness):
     assert status['android_configured'] is False
     assert status['producers']['messages'] is True
     assert c.post(url+'/test',json={'kind':'fcm'}).status_code==409
-    target=c.post(url+'/targets',json={'token':'synthetic-device-token-12345'}).json()['target_id']
+    target=c.post(url+'/targets',json={'token':'synthetic-device-token-12345'},headers=phone(c)).json()['target_id']
     status=c.get(url+'/status').json()
     assert status['targets'][0]['target_id']==target
     result=c.post(url+'/test',json={'kind':'fcm'}).json()
@@ -1300,16 +1304,13 @@ def test_plugin_settings_copy_authority_and_track_replacement(harness,monkeypatc
     # This fixture writes JSON, so it does not depend on Hermes' optional YAML adapter.
     monkeypatch.setitem(sys.modules,'utils',SimpleNamespace(load_yaml_file_readonly=lambda path:json.loads(Path(path).read_text(encoding='utf-8'))))
     path=tmp/'config.yaml'
-    def replace(owner,enabled=True,release_repo=None):
+    def replace(owner,enabled=True):
         settings={'owner_id':owner,'profiles':['default']}
-        if release_repo is not None: settings['release_repo']=release_repo
         text=json.dumps({'plugins':{'enabled':['beacon'] if enabled else [],'entries':{'beacon':{'settings':settings}}},'other_secret':'fixture-private-value'})
         replacement=tmp/'replacement.yaml';replacement.write_text(text);replacement.replace(path)
     replace('first');value=module.settings()
     value['owner_id']='mutated';value['profiles'].append('foreign')
-    assert module.settings()=={'owner_id':'first','profiles':['default'],'release_repo':'xploit9/beacon',
-                               'android_stable_certificate_sha256':''}
-    replace('second',release_repo='owner/other-beacon');assert module.settings()['release_repo']=='owner/other-beacon'
+    assert module.settings()=={'owner_id':'first','profiles':['default']}
     replace('second',False);assert module.settings()=={}
     path.write_text('plugins: [');assert module.settings()=={}
 
@@ -1662,53 +1663,6 @@ def test_phone_delivery_uses_owned_assistant_chat_for_cron_owner_rows(harness, m
         rows=conn.execute("SELECT conversation,reason FROM notices WHERE kind='task_result'").fetchall()
     assert len(rows)==4 + int(oversized_result)
     assert all(row['conversation']=='assistant-chat' and row['reason']==result[:4000] for row in rows)
-
-
-def test_release_verification_cache_hits_unchanged_files_and_misses_stat_changes(harness, monkeypatch):
-    import hashlib
-
-    api, _, cfg, tmp, _ = harness
-    root = tmp / 'release-cache'
-    root.mkdir()
-    apk = root / 'fixture.apk'
-    apk.write_bytes(b'fixture apk bytes')
-    certificate = 'a' * 64
-    digest = hashlib.sha256(apk.read_bytes()).hexdigest()
-    cfg.update(release_root=str(root), android_certificate_sha256=certificate,
-               aapt=str(tmp / 'aapt.exe'), apksigner=str(tmp / 'apksigner.exe'))
-    Path(cfg['aapt']).touch()
-    Path(cfg['apksigner']).touch()
-    manifest = root / 'latest.json'
-    manifest_data = {
-        'artifact_filename': apk.name, 'version_code': 21, 'version_name': '2.1',
-        'package_name': 'dev.hermes.android', 'certificate_sha256': certificate,
-        'sha256': digest, 'size_bytes': apk.stat().st_size,
-    }
-    manifest.write_text(json.dumps(manifest_data), encoding='utf-8')
-    calls = []
-
-    def run(args, **kwargs):
-        calls.append(args[0])
-        output = ("package: name='dev.hermes.android' versionCode='21' versionName='2.1'"
-                  if args[0] == cfg['aapt'] else 'Signer #1 certificate SHA-256 digest: ' + certificate)
-        return SimpleNamespace(stdout=output)
-
-    monkeypatch.setattr(api.subprocess, 'run', run)
-    first = api.release(cfg)
-    assert api.release(cfg) == first
-    assert len(calls) == 2
-
-    manifest.write_text(manifest.read_text(encoding='utf-8') + ' ', encoding='utf-8')
-    assert api.release(cfg) == first
-    assert len(calls) == 4
-
-    apk.write_bytes(apk.read_bytes() + b' changed')
-    manifest_data.update(sha256=hashlib.sha256(apk.read_bytes()).hexdigest(), size_bytes=apk.stat().st_size)
-    manifest.write_text(json.dumps(manifest_data), encoding='utf-8')
-    changed = api.release(cfg)
-    assert changed['sha256'] == manifest_data['sha256']
-    assert changed['size_bytes'] == manifest_data['size_bytes']
-    assert len(calls) == 6
 
 
 def test_mobile_schema_initializes_once_per_database_in_process(harness, monkeypatch, tmp_path):

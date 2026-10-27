@@ -281,6 +281,15 @@ class NativeAuthTest {
         assertFalse(finished.cancelledOnResume)
     }
 
+    // The return link reaches Beacon only after the callback; before it, a launch is another app's and is ignored.
+    @Test fun theReturnLinkCountsOnlyAfterTheCallback() {
+        val pending = PendingNativeAuthorization(closeListener = {}, schedule = { _, _ -> })
+        assertTrue(pending.awaitingCallback)
+        pending.callbackCaptured()
+        assertFalse(pending.awaitingCallback)
+        assertFalse("with no sign-in running, the link just opens Beacon", NativeAuth.awaitingSignInCallback())
+    }
+
     @Test fun tokenExchangeWaitsUntilBeaconResumes() = runBlocking {
         val requests = CopyOnWriteArrayList<Request>()
         val pending = pendingAuthorization(initiallyForeground = false)

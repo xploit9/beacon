@@ -613,21 +613,6 @@ class SetupWizardUiTest {
         assertEquals(address, probed)
     }
 
-    @Test fun anOldPairingBlockPastedInTheAddressFieldKeepsOnlyTheAddress() {
-        var probed = ""
-        compose.setContent { NativeLocalization("en") { BeaconTheme(dark = true) {
-            SetupWizardScreen(AppState(setupStep = "connect"), onProbe = { probed = it }, onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {})
-        } } }
-        compose.onNodeWithTag("setup-address").performTextInput("Dashboard address: https://hermes.example\nPairing code: abc-123\nExpires: 10 minutes")
-        compose.onNodeWithTag("setup-address").assertTextEquals("Paste link or address", "https://hermes.example")
-        compose.onNodeWithTag("setup-pairing-code").assertDoesNotExist()
-        compose.onNodeWithTag("setup-connect").performClick()
-        assertEquals("https://hermes.example", probed)
-        // A link or block that still carries a code is reduced to its address too.
-        assertEquals("https://hermes.example", parseBeaconConnectInput("beacon://connect?url=https%3A%2F%2Fhermes.example&code=abc-123"))
-        assertEquals("https://hermes.example", parseBeaconConnectInput("Dashboard: https://hermes.example\nPairing code: K7Q-4ZP"))
-    }
-
     @Test fun primaryAndErrorColorsReadOnTheWizardSurfaceInLightAndDark() {
         val bases = listOf(
             lightColorScheme(primary = Color(0xFF80511D), error = Color(0xFFA93128)),

@@ -9,12 +9,14 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import dev.hermes.android.core.Scope
 import dev.hermes.android.core.string
 import dev.hermes.android.core.sessionRowId
 import dev.hermes.android.core.sessionRowKey
 import dev.hermes.android.data.BEACON_THREAD_SOURCE
 import dev.hermes.android.data.THREAD_SOURCES
 import dev.hermes.android.data.currentAssistantName
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Calendar
 import java.util.Locale
@@ -178,6 +180,23 @@ internal fun decodeGlances(profile: String, text: String): ChatGlances? = try {
     }
     ChatGlances(base = if (root.optBoolean("has_base")) mapOf(profile to root.optLong("base").coerceAtLeast(0L)) else emptyMap(), rows = parsed)
 } catch (_: Exception) { null }
+
+/** The account's own row names every profile whose previews are on this phone, so a sign-out never depends on what is in memory. */
+internal const val GLANCE_PROFILES_KIND = "chat-glance-profiles"
+
+internal fun glanceProfilesJson(profiles: Collection<String>): String = JSONArray(profiles.filter(String::isNotBlank).distinct()).toString()
+
+/** No row or an unreadable one names no profile. */
+internal fun decodeGlanceProfiles(text: String?): List<String> = try {
+    JSONArray(text.orEmpty()).let { names -> (0 until names.length()).map { names.optString(it) }.filter(String::isNotBlank) }
+} catch (_: Exception) { emptyList() }
+
+/** Every profile of [scope]'s account whose previews a sign-out deletes: those opened in this run, those the profile list or the account row names, and the active one. */
+internal fun glanceProfilesToForget(scope: Scope, opened: Collection<Scope>, listed: Collection<String>, recorded: Collection<String>): List<Scope> {
+    val account = scope.copy(profile = "", session = "").key
+    return (opened.filter { it.copy(profile = "", session = "").key == account } + (listed + recorded).filter(String::isNotBlank).map { scope.copy(profile = it, session = "") } + scope.copy(session = ""))
+        .distinctBy { it.key }
+}
 
 private const val PLAUSIBLE_AFTER_MS = 946_684_800_000L // 2000-01-01; earlier values are not real times
 private const val GLANCE_SKEW_MS = 2_000L

@@ -91,7 +91,7 @@ data class PendingSend(val id: String, val scope: Scope, val draft: Draft, val s
 }
 
 const val MAX_UPDATE_APK_BYTES = 256L * 1024 * 1024
-/** The plugin's own release-version rule (hermes-plugin dashboard/plugin_api.py `_plugin_version_tuple`), bounded so each part fits an Int. */
+/** The release-version rule for app and plugin (major.minor.patch), bounded so each part fits an Int. */
 val PLUGIN_VERSION_PATTERN = Regex("(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})")
 
 /** One public GitHub release: this app version and the Hermes plugin version it ships with. [url] is the APK asset's download address. */

@@ -214,23 +214,6 @@ internal enum class BeaconMotionMode { Pulse, Sweep, Ripple }
     val text = choiceDisplayLabel(value, labels, offered)
     return if (value.isBlank() || labels[value]?.isNotBlank() == true) uiText(text) else text
 }
-@Composable fun SectionPicker(selected: String, options: List<String>, onSelect: (String) -> Unit) {
-    val fontScale = LocalDensity.current.fontScale
-    BoxWithConstraints(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
-        if (maxWidth < 420.dp || fontScale > 1.15f) {
-            var expanded by remember { mutableStateOf(false) }
-            Box {
-                FilledTonalButton(onClick = { expanded = true }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("section-picker")) {
-                    Text(uiText(selected), Modifier.weight(1f), textAlign = androidx.compose.ui.text.style.TextAlign.Start)
-                    Icon(Icons.Rounded.ExpandMore, null)
-                }
-                DropdownMenu(expanded, { expanded = false }) { options.forEach { option -> DropdownMenuItem(text = { Text(uiText(option)) }, onClick = { expanded = false; onSelect(option) }, trailingIcon = if (option == selected) ({ Icon(Icons.Rounded.Check, null) }) else null) } }
-            }
-        } else Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            options.forEach { option -> FilterChip(selected == option, { onSelect(option) }, { Text(uiText(option), maxLines = 1) }, modifier = Modifier.heightIn(min = 48.dp)) }
-        }
-    }
-}
 @Composable fun NativeForm(vm: BeaconViewModel, form: ActionForm) {
     var confirmDiscard by remember(form.id) { mutableStateOf(false) }
     if (confirmDiscard) AlertDialog(onDismissRequest = { confirmDiscard = false }, title = { Text("Discard this draft?") }, text = { Text("Your saved task will stay unchanged.") }, confirmButton = { TextButton(onClick = { confirmDiscard = false; vm.discardScheduleDraft() }) { Text("Discard") } }, dismissButton = { TextButton(onClick = { confirmDiscard = false }) { Text("Keep editing") } })

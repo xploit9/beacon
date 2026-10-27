@@ -18,29 +18,16 @@ class RelayCallbackTest {
         assertNotNull(protocol.receive(envelope(), binding, prefs, now, elapsed))
         return protocol
     }
-    private fun answer(protocol: RelayCallbackProtocol) =
-        protocol.answer(id, protocol.current!!.actionToken, binding, prefs, 1000, 50)!!
-    private fun accept(protocol: RelayCallbackProtocol): RelayCallbackProtocol {
-        val outgoing = answer(protocol).outgoing!!
-        assertNotNull(protocol.receive(envelope("phone.call.state", payload().put("status", "accepted"), outgoing.getString("id")),
-            binding, prefs, 1000, 50))
-        return protocol
-    }
-    private fun start(protocol: RelayCallbackProtocol): Boolean = protocol.beginStart(id, protocol.current!!.actionToken,
-        binding, prefs, true, true, 1000, 50)
-    private fun foreground(protocol: RelayCallbackProtocol): Boolean = protocol.foregroundReady(id, binding, prefs, true, true, 1000, 50)
-    private fun capture(protocol: RelayCallbackProtocol) = protocol.captureStarted(id, binding, prefs, true, true, 1000, 50)
-    private fun verb(effect: RelayCallbackTransition?) = effect?.outgoing?.getJSONObject("payload")?.getString("action")
 
     @Test fun `wire decoder rejects foreign channels types and malformed envelope fields`() {
         assertNotNull(RelayCallbackWire.parse(envelope()))
         for (message in listOf(envelope().put("channel", "voice"), envelope().put("type", "unknown"),
             envelope().put("payload", "{}"), envelope().put("id", JSONObject.NULL), envelope().put("id", 123),
-            envelope().put("id", ""), envelope().put("id", "x".repeat(257)), JSONObject())) {
+            envelope().put("id", ""), envelope().put("id", "x".repeat(257)), JSONObject(),
+            envelope("phone.call.state", payload()), envelope("phone.call.error", JSONObject().put("error", "unauthorized")),
+            envelope("phone.call.action", JSONObject().put("call_id", id).put("action", "answer")))) {
             assertNull(RelayCallbackWire.parse(message))
         }
-        assertNotNull(RelayCallbackWire.parse(envelope("phone.call.error", JSONObject().put("error", "unauthorized"))))
-        assertNotNull(RelayCallbackWire.parse(envelope("phone.call.action", JSONObject().put("call_id", id).put("action", "answer"))))
     }
 
     @Test fun `malformed payloads and foreign device profile or session fail closed`() {
@@ -111,19 +98,15 @@ class RelayCallbackTest {
         assertNotNull(RelayCallback.parse(edge, binding, Long.MAX_VALUE - 20000, 50))
     }
 
-    @Test fun `receive requires current connection bound calls consent and cannot start voice`() {
+    @Test fun `receive requires current connection bound calls consent`() {
         for (snapshot in listOf(null, prefs.copy(connectionId = null), prefs.copy(connectionId = "foreign"),
             prefs.copy(calls = false), prefs.copy(keepConnected = false))) {
             val protocol = RelayCallbackProtocol()
             assertNull(protocol.receive(envelope(), binding, snapshot, 1000, 50))
             assertNull(protocol.current)
-            assertFalse(foreground(protocol))
         }
         val protocol = invite()
         assertEquals(RelayCallbackPhase.Ringing, protocol.current!!.phase)
-        assertFalse(start(protocol))
-        assertFalse(foreground(protocol))
-        assertNull(capture(protocol))
     }
 
     @Test fun `duplicate UUID casing and busy calls do not replace local capability`() {
@@ -132,233 +115,50 @@ class RelayCallbackTest {
         assertNull(protocol.receive(envelope(), binding, prefs, 1000, 50))
         assertNull(protocol.receive(envelope(data = payload(id.uppercase())), binding, prefs, 1000, 50))
         val busy = protocol.receive(envelope(data = payload(UUID.randomUUID().toString())), binding, prefs, 1000, 50)!!
-        assertEquals("decline", verb(busy))
-        assertFalse(busy.stopVoice)
-        assertFalse(busy.stopAlerting)
+        assertEquals(RelayCallbackPhase.Finished, busy.call.phase)
         assertEquals(call, protocol.current)
-        assertFalse(busy.outgoing.toString().contains(call.actionToken))
     }
 
-    @Test fun `answer rejects foreign identity forged tokens expired rings and repeat gestures`() {
-        val protocol = invite()
-        val call = protocol.current!!
-        assertNull(protocol.answer("other", call.actionToken, binding, prefs, 1000, 50))
-        assertNull(protocol.answer(id, "forged", binding, prefs, 1000, 50))
-        assertNull(protocol.answer(id, call.actionToken, binding.copy(connectionId = "foreign"), prefs, 1000, 50))
-        assertNull(protocol.answer(id, call.actionToken, binding.copy(sessionId = "foreign"), prefs, 1000, 50))
-        assertNull(protocol.answer(id, call.actionToken, binding, prefs, 21000, 50))
-        val effect = answer(protocol)
-        assertEquals("answer", verb(effect))
-        assertTrue(effect.stopAlerting)
-        assertFalse(effect.stopVoice)
-        assertEquals(2, effect.outgoing!!.getJSONObject("payload").length())
-        assertFalse(effect.outgoing.toString().contains(call.actionToken))
-        val retry = protocol.answer(id, call.actionToken, binding, prefs, 1000, 50)!!
-        assertEquals(effect.call.startDeadlineElapsed, retry.call.startDeadlineElapsed)
-        assertNull(retry.outgoing)
-        assertNull(protocol.answer(id, call.actionToken, binding, prefs, 1000, effect.call.startDeadlineElapsed))
-        assertFalse(start(protocol))
-    }
-
-    @Test fun `answer can be retried after local setup without extending the start deadline`() {
-        val protocol = invite()
-        val first = answer(protocol)
-        val deadline = first.call.startDeadlineElapsed
-
-        val retry = protocol.answer(id, first.call.actionToken, binding, prefs, 2_000, 1_050)
-
-        assertNotNull(retry)
-        assertEquals(RelayCallbackPhase.Answering, retry!!.call.phase)
-        assertEquals(deadline, retry.call.startDeadlineElapsed)
-        assertNull(retry.outgoing)
-        val accepted = protocol.receive(
-            envelope("phone.call.state", payload().put("status", "accepted"), first.outgoing!!.getString("id")),
-            binding, prefs, 2_000, 1_050,
-        )
-        assertEquals(RelayCallbackPhase.Accepted, accepted!!.call.phase)
-    }
-
-    @Test fun `answering call can still be declined or ended before startup`() {
-        val declined = invite()
-        val token = answer(declined).call.actionToken
-        val decline = declined.decline(id, token, binding, prefs, 2_000, 1_050)
-        assertEquals("decline", verb(decline))
-        assertFalse(decline!!.stopVoice)
-
-        val ended = invite()
-        val answering = answer(ended).call
-        assertEquals("failed", verb(ended.end(id, answering.actionToken, binding, prefs)))
-    }
-
-    @Test fun `only correlated accepted acknowledgement advances an explicit answer`() {
-        val protocol = invite()
-        assertNull(protocol.receive(envelope("phone.call.state", payload().put("status", "accepted")), binding, prefs, 1000, 50))
-        val ack = answer(protocol).outgoing!!.getString("id")
-        for (data in listOf(payload().put("status", "accepted").put("device_id", "foreign"),
-            payload().put("status", "accepted").put("profile", "other"),
-            payload().put("status", "accepted").put("session_id", "other"),
-            payload(UUID.randomUUID().toString()).put("status", "accepted"))) {
-            assertNull(protocol.receive(envelope("phone.call.state", data, ack), binding, prefs, 1000, 50))
-        }
-        assertNull(protocol.receive(envelope("phone.call.state", payload().put("status", "accepted"), "unrelated"), binding, prefs, 1000, 50))
-        assertEquals(RelayCallbackPhase.Answering, protocol.current!!.phase)
-        // Server state supplies the original scope, or inherits it from the trusted invite.
-        val data = payload().put("status", "accepted").apply { remove("profile"); remove("session_id") }
-        assertNotNull(protocol.receive(envelope("phone.call.state", data, ack), binding, prefs, 1000, 50))
-        assertEquals(RelayCallbackPhase.Accepted, protocol.current!!.phase)
-        assertNull(protocol.receive(envelope("phone.call.state", data, ack), binding, prefs, 1000, 50))
-    }
-
-    @Test fun `accepted permission association and foreground admission are each single use`() {
-        val protocol = accept(invite())
-        val token = protocol.current!!.actionToken
-        assertNull(protocol.permissionTarget("old", true, binding, prefs, 1000, 50))
-        assertNull(protocol.permissionTarget(id, false, binding, prefs, 1000, 50))
-        assertEquals(id, protocol.permissionTarget(id, true, binding, prefs, 1000, 50))
-        assertFalse(protocol.beginStart(id, token, binding, prefs, false, true, 1000, 50))
-        assertFalse(protocol.beginStart(id, token, binding, prefs, true, false, 1000, 50))
-        assertFalse(protocol.beginStart(id, "forged", binding, prefs, true, true, 1000, 50))
-        assertTrue(start(protocol))
-        assertFalse(start(protocol))
-        assertNull(capture(protocol))
-        assertFalse(protocol.foregroundReady(id, binding, prefs, false, true, 1000, 50))
-        assertTrue(foreground(protocol))
-        assertFalse(foreground(protocol))
-        assertEquals("started", verb(capture(protocol)))
-        assertNull(capture(protocol))
-        assertTrue(protocol.canContinue(id, binding, prefs, true, true, 1000, 30050))
-        assertFalse(protocol.canContinue(id, binding, prefs, false, true, 1000, 30050))
-        assertEquals(RelayCallbackPhase.Connected, protocol.current!!.phase)
-    }
-
-    @Test fun `decline timeout and terminal replay never authorize microphone or resurrection`() {
-        val protocol = invite()
-        assertNull(protocol.decline(id, "forged", binding, prefs, 1000, 50))
-        val decline = protocol.decline(id, protocol.current!!.actionToken, binding, prefs, 1000, 50)!!
-        assertEquals("decline", verb(decline))
-        assertTrue(decline.stopAlerting)
-        assertFalse(decline.stopVoice)
-        assertFalse(start(protocol))
-        assertNull(protocol.receive(envelope(), binding, prefs, 1000, 50))
-        assertNull(protocol.receive(envelope("phone.call.state", payload().put("status", "accepted")), binding, prefs, 1000, 50))
-        assertNull(protocol.decline(id, decline.call.actionToken, binding, prefs, 1000, 50))
+    @Test fun `an expired ring ends once and cannot be resurrected`() {
         val expired = invite(now = 20000)
-        val missed = expired.expire(20000, 1050, binding, prefs)!!
-        assertTrue(missed.missed)
-        assertNull(missed.outgoing)
-        assertFalse(missed.stopVoice)
-        assertFalse(start(expired))
+        assertEquals(RelayCallbackPhase.Finished, expired.expire(20000, 1050, binding, prefs)!!.call.phase)
         assertNull(expired.expire(21000, 1050, binding, prefs))
+        assertNull(expired.receive(envelope(), binding, prefs, 1000, 50))
     }
 
-    @Test fun `startup deadline and clock reset retire answering accepted and starting states`() {
-        for (stage in 0..2) {
-            val protocol = invite()
-            if (stage == 0) answer(protocol) else accept(protocol)
-            if (stage == 2) assertTrue(start(protocol))
-            assertNull(protocol.expire(1000, 30049, binding, prefs))
-            val failed = protocol.expire(1000, 30050, binding, prefs)!!
-            assertEquals("failed", verb(failed))
-            assertEquals(stage == 2, failed.stopVoice)
-            assertFalse(foreground(protocol))
-            assertNull(capture(protocol))
-        }
-        assertTrue(invite().expire(999, 51, binding, prefs)!!.missed)
-        assertEquals("failed", verb(accept(invite()).expire(1000, 49, binding, prefs)))
-    }
-
-    @Test fun `startup expiry does not emit an action without current connection authority`() {
-        val protocol = invite()
-        answer(protocol)
-
-        val expired = protocol.expire(1_000, 30_050, binding.copy(connectionId = "foreign"), prefs)
-
-        assertNotNull(expired)
-        assertNull(expired!!.outgoing)
-    }
-
-    @Test fun `only current action errors retire a call and terminal states stop owned voice once`() {
-        val protocol = invite()
-        val ack = answer(protocol).outgoing!!.getString("id")
-        val error = JSONObject().put("error", "unauthorized")
-        assertNull(protocol.receive(envelope("phone.call.error", error, "unrelated"), binding, prefs, 1000, 50))
-        assertNull(protocol.receive(envelope("phone.call.error", JSONObject().put("device_id", "foreign"), ack), binding, prefs, 1000, 50))
-        assertNotNull(protocol.receive(envelope("phone.call.error", error, ack), binding, prefs, 1000, 50))
-        assertNull(protocol.receive(envelope("phone.call.error", error, ack), binding, prefs, 1000, 50))
-        assertFalse(start(protocol))
-        for (terminal in listOf("declined", "cancelled", "missed", "failed", "ended")) {
-            val connected = accept(invite())
-            assertTrue(start(connected)); assertTrue(foreground(connected)); assertNotNull(capture(connected))
-            val message = envelope("phone.call.state", payload().put("status", terminal))
-            val effect = connected.receive(message, binding, prefs, 1000, 50)!!
-            assertTrue(effect.stopVoice)
-            assertTrue(effect.stopAlerting)
-            assertEquals(terminal == "missed", effect.missed)
-            assertNull(connected.receive(message, binding, prefs, 1000, 50))
-            assertNull(connected.receive(envelope("phone.call.state", payload().put("status", "accepted")), binding, prefs, 1000, 50))
-            assertFalse(foreground(connected))
-        }
+    @Test fun `clock rollback retires a ringing call`() {
+        assertEquals(RelayCallbackPhase.Finished, invite().expire(999, 51, binding, prefs)!!.call.phase)
     }
 
     @Test fun `opt out profile session or connection loss retires authority without foreign actions`() {
         for (other in listOf(null, binding.copy(connectionId = "other"), binding.copy(deviceId = "other"),
             binding.copy(profile = "other"), binding.copy(sessionId = "other"),
             binding.copy(owner = "other"), binding.copy(origin = "https://other.example"))) {
-            val protocol = accept(invite())
-            assertTrue(start(protocol))
-            val effect = protocol.invalidate(other, prefs)!!
-            assertTrue(effect.stopVoice)
-            assertNull(effect.outgoing)
-            assertFalse(protocol.canContinue(id, binding, prefs, true, true, 1000, 50))
+            val protocol = invite()
+            assertEquals(RelayCallbackPhase.Finished, protocol.invalidate(other, prefs)!!.call.phase)
+            assertEquals(RelayCallbackPhase.Finished, protocol.current!!.phase)
         }
         val protocol = invite()
-        val effect = protocol.invalidate(binding, prefs.copy(calls = false))!!
-        assertTrue(effect.missed)
-        assertFalse(effect.stopVoice)
-        assertNull(effect.outgoing)
+        assertEquals(RelayCallbackPhase.Finished, protocol.invalidate(binding, prefs.copy(calls = false))!!.call.phase)
     }
 
-    @Test fun `unknown preferences preserve active voice while lost binding still tears it down`() {
-        val protocol = accept(invite())
-        assertTrue(start(protocol))
-        assertTrue(foreground(protocol))
-        assertNotNull(capture(protocol))
+    @Test fun `unknown preferences keep a ringing call while a lost binding still retires it`() {
+        val protocol = invite()
 
         assertNull(protocol.invalidate(binding, null))
-        assertEquals(RelayCallbackPhase.Connected, protocol.current!!.phase)
+        assertEquals(RelayCallbackPhase.Ringing, protocol.current!!.phase)
 
-        val invalidated = protocol.invalidate(null, null)!!
-        assertTrue(invalidated.stopVoice)
-        assertNull(invalidated.outgoing)
+        assertNotNull(protocol.invalidate(null, null))
+        assertEquals(RelayCallbackPhase.Finished, protocol.current!!.phase)
     }
 
-    @Test fun `hangup is capability bound and delayed old actions cannot end next call`() {
-        val protocol = accept(invite())
-        assertTrue(start(protocol)); assertTrue(foreground(protocol)); assertNotNull(capture(protocol))
+    @Test fun `an invitation after a retired one gets its own action token`() {
+        val protocol = invite()
         val old = protocol.current!!
-        assertNull(protocol.end(id, "forged", binding, prefs))
-        assertEquals("hangup", verb(protocol.end(id, old.actionToken, binding, prefs)))
-        assertNull(protocol.end(id, old.actionToken, binding, prefs))
+        assertNotNull(protocol.invalidate(null, null))
         val nextId = UUID.randomUUID().toString()
         assertNotNull(protocol.receive(envelope(data = payload(nextId)), binding, prefs, 1000, 50))
         assertNotEquals(old.actionToken, protocol.current!!.actionToken)
-        assertNull(protocol.end(nextId, old.actionToken, binding, prefs))
-        assertNull(protocol.end(id, old.actionToken, binding, prefs))
-        assertEquals(RelayCallbackPhase.Ringing, protocol.current!!.phase)
-    }
-
-    @Test fun `foreign terminal identity and stale prior call errors cannot retire a newer invitation`() {
-        val protocol = invite()
-        val oldAnswer = answer(protocol).outgoing!!.getString("id")
-        for (data in listOf(payload().put("device_id", "foreign"), payload().put("profile", "other"),
-            payload().put("session_id", JSONObject.NULL), payload(UUID.randomUUID().toString()))) {
-            assertNull(protocol.receive(envelope("phone.call.state", data.put("status", "ended")), binding, prefs, 1000, 50))
-        }
-        assertEquals(RelayCallbackPhase.Answering, protocol.current!!.phase)
-        assertNotNull(protocol.end(id, protocol.current!!.actionToken, binding, prefs))
-        val nextId = UUID.randomUUID().toString()
-        assertNotNull(protocol.receive(envelope(data = payload(nextId)), binding, prefs, 1000, 50))
-        assertNull(protocol.receive(envelope("phone.call.error", JSONObject().put("error", "unauthorized"), oldAnswer), binding, prefs, 1000, 50))
         assertEquals(nextId, protocol.current!!.callId)
         assertEquals(RelayCallbackPhase.Ringing, protocol.current!!.phase)
     }
@@ -368,8 +168,7 @@ class RelayCallbackTest {
         repeat(256) {
             val callId = if (it == 0) id else UUID.randomUUID().toString()
             assertNotNull(protocol.receive(envelope(data = payload(callId)), binding, prefs, 1000, 50))
-            val call = protocol.current!!
-            assertNotNull(protocol.decline(callId, call.actionToken, binding, prefs, 1000, 50))
+            assertNotNull(protocol.invalidate(null, null))
         }
         assertNull(protocol.receive(envelope(data = payload(UUID.randomUUID().toString())), binding, prefs, 1000, 50))
         assertNull(protocol.receive(envelope(), binding, prefs, 1000, 50))

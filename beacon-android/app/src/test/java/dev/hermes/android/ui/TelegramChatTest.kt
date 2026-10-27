@@ -4,6 +4,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.unit.Density
 import dev.hermes.android.Message
+import dev.hermes.android.core.Scope
 import dev.hermes.android.core.json
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -126,6 +127,23 @@ class TelegramChatTest {
         assertEquals("Stored values only fill gaps", ChatGlance(seen = 7), ChatGlances(rows = mapOf("default:c1" to ChatGlance(seen = 7))).merged(ChatGlances(rows = mapOf("default:c1" to ChatGlance(seen = 1), "default:c2" to ChatGlance(seen = 2)))).rows.getValue("default:c1"))
         assertNotNull(ChatGlances().withBase("default", 3).base["default"])
         assertEquals("The first baseline stays", 3L, ChatGlances().withBase("default", 3).withBase("default", 9).base["default"])
+    }
+
+    @Test fun glanceProfilesToForgetNamesEveryProfileOfTheAccount() {
+        val default = Scope("https://native.example", "owner", "default", nativeProvider = "provider")
+        val strangersWork = default.copy(owner = "someone-else", profile = "work")
+        // After a restart while offline: no profile list, and only the active profile was opened in this run.
+        val recorded = decodeGlanceProfiles(glanceProfilesJson(listOf("default", "work", "research", "work", "")))
+        assertEquals(listOf("default", "work", "research"), recorded)
+        val wipe = glanceProfilesToForget(default.copy(session = "chat"), opened = listOf(default, strangersWork), listed = emptyList(), recorded = recorded)
+        assertEquals(setOf("default", "work", "research"), wipe.map { it.profile }.toSet())
+        assertEquals("one scope per profile, none for another account", 3, wipe.size)
+        assertTrue(wipe.all { it.sameAccount(default) && it.session.isEmpty() })
+        assertEquals(listOf("default"), glanceProfilesToForget(default, emptyList(), emptyList(), emptyList()).map { it.profile })
+        assertEquals(setOf("default", "work"), glanceProfilesToForget(default, listOf(default.copy(profile = "work")), listOf("work", " "), listOf("default")).map { it.profile }.toSet())
+        assertEquals(emptyList<String>(), decodeGlanceProfiles(null))
+        assertEquals("an unreadable row names nothing", emptyList<String>(), decodeGlanceProfiles("not json"))
+        assertEquals(listOf("a", "b"), decodeGlanceProfiles("[\"a\",\"\",\"b\"]"))
     }
 
     @Test fun aChatIsUnreadWhenSomethingNewArrivedAfterTheOwnerLastLooked() {

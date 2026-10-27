@@ -157,8 +157,6 @@ private suspend fun fetchBackgroundActivity(source: BeaconClient, profile: Strin
     BackgroundActivitySummary(available = false)
 }
 
-private fun String.takeCharacters(count: Int): String = substring(0, offsetByCodePoints(0, minOf(count, codePointCount(0, length))))
-
 private val toolNamePattern = Regex("[A-Za-z0-9_.:-]{1,80}")
 
 internal data class FoldedToolResult(val messageId: String, val content: String, val isError: Boolean)

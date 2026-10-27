@@ -32,7 +32,7 @@ def poster(harness, monkeypatch):
     monkeypatch.setattr(phone, '_profile_state', lambda: (api.mobile, cfg, 'default'))
     posts = []
     monkeypatch.setattr(api.native, 'post', lambda *args: posts.append(args) or 1)
-    return SimpleNamespace(api=api, client=client, phone=phone, posts=posts)
+    return SimpleNamespace(api=api, client=client, cfg=cfg, phone=phone, posts=posts)
 
 
 def test_a_job_posts_into_its_thread_and_the_phone_opens_it(poster):
@@ -102,6 +102,66 @@ def test_a_post_that_arrives_mid_turn_waits_and_lands_with_its_notice_after_the_
     assert len(poster.posts) == 1 and poster.posts[0][5] == 'Three new advisories.'
     assert [row['conversation'] for row in notices(poster.api)] == [THREAD]
     assert poster.api.mobile.held_posts('owner', 'default') == []
+
+
+def mid_turn(poster, monkeypatch):
+    """Every thread is mid-turn until the returned flag is cleared."""
+    busy = [True]
+
+    def post(*args):
+        if busy[0]:
+            raise SessionTurnLeaseLostError('Session has an active turn lease')
+        poster.posts.append(args)
+
+    monkeypatch.setattr(poster.api.native, 'post', post)
+    monkeypatch.setattr(poster.api, '_posts_until', {})
+    return busy
+
+
+def held(api):
+    with api.mobile.connect() as conn:
+        return sorted((row['profile'], row['conversation']) for row in conn.execute('SELECT profile,conversation FROM held_posts'))
+
+
+def test_one_run_delivering_to_two_threads_holds_a_post_for_each(poster, monkeypatch):
+    # Strix 1c4f37e vuln-0008: the second thread's post shared the first one's key and was silently dropped.
+    mid_turn(poster, monkeypatch)
+    other = '20261026_083012_fedcba'
+
+    sent = [asyncio.run(poster.phone.standalone_send({}, thread, envelope())) for thread in (THREAD, other)]
+
+    assert all(result['success'] for result in sent) and sent[0]['message_id'] != sent[1]['message_id']
+    assert held(poster.api) == [('default', THREAD), ('default', other)]
+    asyncio.run(poster.phone.standalone_send({}, THREAD, envelope()))  # a retry of one delivery still lands on its row
+    assert held(poster.api) == [('default', THREAD), ('default', other)]
+
+
+def test_one_job_in_two_profiles_holds_a_post_for_each_and_a_flush_keeps_the_other(poster, monkeypatch):
+    busy = mid_turn(poster, monkeypatch)
+    profile = ['default']
+    monkeypatch.setattr(poster.phone, '_profile_state', lambda: (poster.api.mobile, poster.cfg, profile[0]))
+
+    for name in ('default', 'work'):
+        profile[0] = name
+        assert asyncio.run(poster.phone.standalone_send({}, THREAD, envelope()))['success'] is True
+
+    assert held(poster.api) == [('default', THREAD), ('work', THREAD)]
+    busy[0] = False
+    poster.api.flush_held_posts('owner', 'basic', 'default')
+    assert [post[2] for post in poster.posts] == ['default'] and held(poster.api) == [('work', THREAD)]
+
+
+def test_dropping_a_held_post_needs_its_owner_and_profile(poster):
+    mobile = poster.api.mobile
+    key = 'phone-cron-' + 'a' * 32
+    mobile.hold_post('owner', 'basic', 'default', THREAD, key, 'News', 'News')
+
+    mobile.drop_held_post('owner', 'work', key)
+    mobile.drop_held_post('someone-else', 'default', key)
+    assert held(poster.api) == [('default', THREAD)]
+
+    mobile.drop_held_post('owner', 'default', key)
+    assert held(poster.api) == []
 
 
 def test_a_thread_post_notification_shows_the_thread_name_over_the_post(poster, monkeypatch):

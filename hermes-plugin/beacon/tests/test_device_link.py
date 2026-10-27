@@ -1,5 +1,6 @@
 from contextlib import closing
 import hmac
+import json
 import secrets
 import sys
 import time
@@ -97,7 +98,7 @@ def test_link_never_reuses_a_removed_device(harness):
 def test_removing_a_linked_device_revokes_push_and_blocks_its_next_request(harness):
     api, client, cfg, _, _ = harness
     device_id = link(client).json()["device_id"]
-    target = client.post("/api/plugins/beacon/mobile/notifications/targets", json={"id": device_id, "token": "f" * 40})
+    target = client.post(TARGETS, json={"id": device_id, "token": "f" * 40}, headers={"x-beacon-device-id": device_id})
     assert target.status_code == 200, target.text
 
     assert client.delete(f"{DEVICES}/{device_id}").status_code == 200
@@ -174,8 +175,8 @@ def test_link_needs_the_owners_hermes_sign_in(harness):
         assert conn.execute("SELECT COUNT(*) FROM beacon_devices").fetchone()[0] == 0
 
 
-def test_link_on_a_no_auth_dashboard_needs_its_loopback_session(harness, monkeypatch):
-    api, client, cfg, _, app = harness
+def no_auth_dashboard(client, cfg, app, monkeypatch):
+    """A Hermes dashboard without browser sign-in, where only its loopback session token authorizes. Returns that token."""
     cfg.update(owner_id="local", owner_provider="loopback")
     app.state.auth_required = False
     del client.headers["x-fixture-owner"]
@@ -184,6 +185,33 @@ def test_link_on_a_no_auth_dashboard_needs_its_loopback_session(harness, monkeyp
     server = ModuleType("hermes_cli.web_server")
     server._has_valid_session_token = lambda request: hmac.compare_digest(request.headers.get("x-hermes-session-token", ""), token)
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server", server)
+    return token
+
+
+def test_a_no_auth_dashboard_lists_and_removes_the_phones_it_links(harness, monkeypatch):
+    # Strix 1c4f37e vuln-0010: linking took the loopback session but listing and removing refused it.
+    _, client, cfg, _, app = harness
+    token = no_auth_dashboard(client, cfg, app, monkeypatch)
+
+    for refused in ({}, {"authorization": "Bearer phone-token"}, {"x-hermes-session-token": "wrong"}):
+        assert client.get(DEVICES, headers=refused).status_code == 401
+        assert client.delete(f"{DEVICES}/{'f' * 32}", headers=refused).status_code == 401
+    client.headers["x-hermes-session-token"] = token
+    device_id = link(client).json()["device_id"]
+
+    listed = client.get(DEVICES)
+    assert listed.status_code == 200 and [device["device_id"] for device in listed.json()["devices"]] == [device_id]
+    assert client.delete(f"{DEVICES}/{'f' * 32}").status_code == 404
+    assert client.delete(f"{DEVICES}/{device_id}").json() == {"removed": True, "device_id": device_id}
+    assert client.get(DEVICES).json()["devices"] == []
+    cfg["owner_id"] = "different-owner"
+    assert client.get(DEVICES).status_code == 403
+    assert client.delete(f"{DEVICES}/{device_id}").status_code == 403
+
+
+def test_link_on_a_no_auth_dashboard_needs_its_loopback_session(harness, monkeypatch):
+    api, client, cfg, _, app = harness
+    token = no_auth_dashboard(client, cfg, app, monkeypatch)
 
     assert link(client).status_code == 401
     client.headers["x-hermes-session-token"] = token
@@ -251,16 +279,39 @@ def test_removing_a_phone_still_revokes_when_another_target_payload_is_unreadabl
     assert client.get(DEVICES).json()["devices"] == []
 
 
-def test_removing_a_removed_phone_again_revokes_the_push_it_registered_without_its_id(harness):
-    # Strix afd1b07 S7: the Hermes sign-in is the credential, so a removed phone can register push with no device header.
+def test_removing_a_removed_phone_again_revokes_push_rows_that_name_no_device(harness):
+    # Strix afd1b07 S7: push rows from before registration required a linked phone name none; removal still sweeps them.
     api, client, _, _, _ = harness
     device_id = link(client).json()["device_id"]
     assert client.delete(f"{DEVICES}/{device_id}").status_code == 200
-    again = client.post(TARGETS, json={"id": "lost-phone-push", "token": "r" * 40})
-    assert again.status_code == 200, again.text
+    with api.mobile.connect() as conn:
+        conn.execute("INSERT INTO targets VALUES(?,?,?,?,?,?)", ("lost-phone-push", "owner", "default", "r" * 40, time.time() + 3600, "{}"))
 
     assert client.delete(f"{DEVICES}/{device_id}").status_code == 200
 
     with api.mobile.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM targets").fetchone()[0] == 0
     assert client.delete(f"{DEVICES}/{'f' * 32}").status_code == 404
+
+
+def test_push_registration_needs_a_linked_phone_of_the_owner(harness):
+    # Strix 1c4f37e vuln-0009: an unbound target kept receiving the owner's notifications after the phone was removed.
+    api, client, _, _, _ = harness
+    foreign = api.mobile.link_device("someone-else", "basic", "Their phone")["device_id"]
+    other_provider = api.mobile.link_device("owner", "other-provider", "Other provider")["device_id"]
+    removed = link(client).json()["device_id"]
+    assert client.delete(f"{DEVICES}/{removed}").status_code == 200
+
+    for header in (None, "f" * 32, "bad id!", foreign, other_provider):
+        refused = client.post(TARGETS, json={"token": "t" * 40}, headers={} if header is None else {"x-beacon-device-id": header})
+        assert refused.status_code == 403 and refused.json() == {"detail": "device_required"}, header
+    gone = client.post(TARGETS, json={"token": "t" * 40}, headers={"x-beacon-device-id": removed})
+    assert gone.status_code == 403 and gone.json() == {"detail": "device_removed"}
+    with api.mobile.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM targets").fetchone()[0] == 0
+
+    linked = link(client).json()["device_id"]
+    ok = client.post(TARGETS, json={"token": "t" * 40}, headers={"x-beacon-device-id": linked})
+    assert ok.status_code == 200, ok.text
+    with api.mobile.connect() as conn:
+        assert json.loads(conn.execute("SELECT payload FROM targets").fetchone()[0])["device_id"] == linked

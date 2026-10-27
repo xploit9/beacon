@@ -121,9 +121,12 @@ class NativeBotModeController(
         if (root == null || mutable.value.selectedSpace.isBlank()) { mutable.value = mutable.value.copy(error = "Open an authorized shared space before editing its draft"); return }
         mutable.value = mutable.value.copy(draft = text); saved[key(mutable.value.selectedSpace)] = text
     }
+    /** The bot you are using is always in a space you create: Hermes lets only a space's own bots open it. */
+    fun usingBot(): String = (root ?: client()?.scope)?.profile.orEmpty()
     fun toggleBot(profile: String) {
         val old = mutable.value.selectedBots
-        if (profile in old || old.size < 6) mutable.value = mutable.value.copy(selectedBots = if (profile in old) old - profile else old + profile)
+        if (profile == usingBot()) return
+        if (profile in old || (old + usingBot()).size < 6) mutable.value = mutable.value.copy(selectedBots = if (profile in old) old - profile else old + profile)
     }
     private fun launch(userAction: Boolean = true, action: suspend (BeaconClient, Int) -> Unit) {
         val live = client() ?: run { clear(); return }
@@ -207,7 +210,7 @@ class NativeBotModeController(
         }
     }
     fun createSpace() {
-        val chosen = mutable.value.selectedBots.sorted()
+        val chosen = (mutable.value.selectedBots + usingBot()).filter(String::isNotBlank).distinct().sorted()
         launch { c, token ->
             val members = chosen.joinToString(",")
             val requestKey = operationKey("create", members, key("create:$members"))

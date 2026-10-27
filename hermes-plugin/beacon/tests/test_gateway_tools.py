@@ -151,6 +151,66 @@ def test_a_read_only_tool_sending_a_body_or_a_write_method_still_needs_approval(
     assert len(backend.calls)==1
 
 
+# Strix 1c4f37e 0012: an annotation or a read-sounding tool name never vouches for a write the arguments carry.
+def test_a_read_only_tool_naming_a_write_in_its_action_still_needs_approval(gateway):
+    api,backend,_=gateway
+    backend.catalog=lambda discover=True:[{'tool_id':'a'*64,'name':'configured_manage','description':'read or change items',
+        'parameters':{'type':'object','properties':{'query':{'type':'string'},'action':{'type':'string'},
+                      'Operation':{'type':'string'}},'additionalProperties':False},
+        'read_only':True}]
+    def call(request,**extra):
+        return api.invoke(SCOPE,{'request_id':request,'tool_id':'a'*64,'arguments':{'query':'weather',**extra}})
+    call('r1',action='list')
+    assert settled(api,'r1')['status']=='completed'
+    for index,extra in enumerate(({'action':'delete'},{'action':'sendEmail'},{'Operation':'purge_all'},
+                                  {'action':'list','Operation':'update'})):
+        assert call(f'w{index}',**extra)['status']=='needs_approval'
+    assert len(backend.calls)==1
+
+
+@pytest.mark.parametrize('raw,trust,annotated,expected',[
+    ('search_messages','full',True,True),
+    ('search_messages','untrusted',True,True),
+    ('GMAIL_LIST_THREADS','untrusted',True,True),
+    ('search_messages','full',False,False),
+    ('purge_all','full',True,False),
+    ('purge_all','untrusted',True,False),
+    ('deleteFile','full',True,False),
+    ('cleanup','full',True,True),
+    ('cleanup','untrusted',True,False),
+],ids=lambda value:str(value))
+def test_a_servers_read_only_annotation_needs_a_name_that_agrees(gateway,monkeypatch,raw,trust,annotated,expected):
+    api,backend,_=gateway
+    monkeypatch.setattr(g,'native_catalog',lambda:[])
+    def handler(): return raw
+    server_name='files';tool_name=raw;tool_timeout=10
+    def registered(*args): return handler(),server_name,tool_name,tool_timeout
+    entry=SimpleNamespace(name=raw,toolset='mcp-files',handler=registered,schema={'description':raw,'parameters':{
+        'type':'object','properties':{'prefix':{'type':'string'}},'required':['prefix'],'additionalProperties':False}})
+    cfg={'url':'https://example.invalid','trust':trust}
+    modules={
+        'tools':SimpleNamespace(mcp_tool=SimpleNamespace(_servers={},_lazy_server_configs={'files':cfg})),
+        'tools.mcp_tool_config':SimpleNamespace(_load_mcp_config=lambda:{'files':cfg}),
+        'tools.mcp_tool_common':SimpleNamespace(mcp_server_enabled=lambda cfg:True),
+        'tools.mcp_tool_discovery':SimpleNamespace(discover_mcp_tools=lambda:None),
+        'tools.mcp_tool_registration':SimpleNamespace(_same_server_route=lambda *a,**k:True,
+            _make_tool_filter=lambda *a:lambda raw:True,_normalize_server_trust=lambda value:value),
+        'tools.mcp_tool_scope':SimpleNamespace(_resolve_server_key=lambda server:server),
+        'tools.mcp_tool_handlers':SimpleNamespace(_tool_is_read_only=lambda *args:annotated),
+        'tools.registry':SimpleNamespace(registry=SimpleNamespace(current_scope_key=lambda:'scope',get_all_entries=lambda:[entry])),
+    }
+    for name,module in modules.items(): monkeypatch.setitem(sys.modules,name,module)
+
+    tool=next(row for row in g.NativeMcp().catalog() if row['_raw']==raw)
+    assert tool['read_only'] is expected and tool['_trust']==trust
+
+    backend.catalog=lambda discover=True:[tool]
+    receipt=api.invoke(SCOPE,{'request_id':'r1','tool_id':tool['tool_id'],'arguments':{'prefix':'all'}})
+    assert (receipt['status']=='needs_approval')==(not expected)
+    if expected: assert settled(api,'r1')['status']=='completed'
+    else: assert not backend.calls
+
+
 def test_deny_expiry_and_reconfiguration_never_execute(gateway):
     api,backend,_=gateway;backend.read_only=False
     proposal=invoke(api)
@@ -1041,16 +1101,13 @@ def test_voice_tool_catalogue_is_bounded_live_and_uncached(tmp_path):
                      'read_only':True,'_toolset':'file'}
                     for i in range(100)]
     backend=Backend();api=g.Gateway(Mobile(tmp_path/'catalog.sqlite'),lambda profile,fn:fn(tmp_path),backend)
-    started=time.perf_counter();first=api.compact_catalogue('profile')
-    first_ms=(time.perf_counter()-started)*1000
-    started=time.perf_counter();again=api.compact_catalogue('profile')
-    repeated_ms=(time.perf_counter()-started)*1000
+    first=api.compact_catalogue('profile')
+    again=api.compact_catalogue('profile')
     assert first==again and len(first.encode('utf-8'))<=3072
     assert 'File:' in first and backend.calls==2 and backend.discover==[False,False]
     api.compact_catalogue('profile')
     api.compact_catalogue('other-profile')
     assert backend.calls==4 and backend.discover==[False]*4
-    print(f'voice_catalogue_latency_ms: first={first_ms:.3f}, repeated={repeated_ms:.3f}')
 
 
 def test_native_mcp_catalog_can_skip_discovery_for_call_context(monkeypatch):
@@ -1148,11 +1205,9 @@ def test_a_refusal_before_anything_ran_is_a_certain_failure_even_for_a_write():
     assert g.outcome({'result':'saved'},False)=='completed'
 
 
-def test_each_tool_a_call_leaves_out_has_a_stated_reason():
-    assert set(g.EXCLUDED_REASONS)=={'clarify','delegate_task','todo_list','browser'}
+def test_a_call_leaves_out_the_tools_that_need_an_agent_turn():
     assert {'clarify','delegate_task','todo_list'}<=g.NATIVE_EXCLUDED_TOOLS and 'browser' in g.NATIVE_EXCLUDED_TOOLSETS
     assert not {'memory','session_search'}&g.NATIVE_EXCLUDED_TOOLS
-    assert all(len(reason)>20 for reason in g.EXCLUDED_REASONS.values())
 
 
 def test_inline_tools_run_through_the_call_memory_with_the_calls_authority(tmp_path,monkeypatch):
