@@ -205,6 +205,14 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     val refusedConnections = java.util.concurrent.atomic.AtomicInteger()
     /** Stored id -> runtime id a later `session.resume` of that conversation binds (other conversations keep their own). */
     val resumeRuntimeSessionIds = ConcurrentHashMap<String, String>()
+    /** Runtimes Hermes dropped after their socket closed: a session-scoped call naming one answers 4001, as Hermes does for a runtime not in memory. */
+    val reapedRuntimes = ConcurrentHashMap.newKeySet<String>()
+    /** Hermes reaps an idle detached runtime; the next `session.resume` of the stored conversation mints another. */
+    fun reapRuntime(storedSessionId: String) {
+        val runtime = currentRuntimeSessionIds[storedSessionId] ?: error("Synthetic runtime missing: $storedSessionId")
+        reapedRuntimes += runtime
+        resumeRuntimeSessionIds[storedSessionId] = "$runtime-resumed"
+    }
     @Volatile var nativeStatusFailure = false
     @Volatile var persistTerminalMessages = false
     @Volatile var terminalOnActiveList: JSONObject? = null
@@ -841,6 +849,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     }
     private fun rpc(method: String, params: JSONObject): JSONObject {
         check(params.string("profile") in setOf("default", "coder"))
+        if (method != "session.resume" && params.string("session_id") in reapedRuntimes) throw FixtureRpcFailure(4001, "session not found")
         val id = params.string("session_id").let { runtimeStoredSessionIds[it] ?: it.removePrefix("runtime-") }
         return when (method) {
             "subagent.list" -> json("subagents" to JSONArray())

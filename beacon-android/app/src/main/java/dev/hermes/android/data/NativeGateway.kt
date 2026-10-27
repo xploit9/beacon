@@ -63,7 +63,8 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         @Volatile var socket: WebSocket? = null
         @Volatile var failure: IOException? = null
     }
-    private class Cursor(val binding: NativeSessionBinding, var sequence: Long = 0, var epoch: String = "")
+    /** A binding names a runtime that lives on the socket that made it: once that socket is gone Hermes may reap the runtime. */
+    private class Cursor(val binding: NativeSessionBinding, val connection: Connection?, var sequence: Long = 0, var epoch: String = "")
     private companion object {
         // Weak, so a gateway leaves with its client; answers are only routed between gateways of one account and profile.
         val gateways: MutableSet<NativeGateway> = java.util.Collections.newSetFromMap(java.util.WeakHashMap())
@@ -149,7 +150,11 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
             if (method == "session.resume") wireParams.put("source", "android").put("inline_images", false)
             if (mine.socket?.send(json("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to wireParams).toString()) != true) throw unknown(IOException("Native connection unavailable"))
             val response = try { withTimeout(rpcTimeoutMs) { result.await() } } catch (e: TimeoutCancellationException) { currentCoroutineContext().ensureActive(); throw unknown(e) }
-            response.optJSONObject("error")?.let { throw ApiFailure(it.optInt("code", 500), it.optString("message", "Native operation failed")) }
+            response.optJSONObject("error")?.let {
+                // 4001: Hermes no longer holds this runtime (reaped or evicted). Nothing may keep addressing it; the next use resumes the stored conversation.
+                if (it.optInt("code", 500) == 4001 && it.optString("message") == "session not found") forget(params.string("session_id"))
+                throw ApiFailure(it.optInt("code", 500), it.optString("message", "Native operation failed"))
+            }
             return response.optJSONObject("result") ?: JSONObject().put("value", response.opt("result"))
         } finally { mine.pending.remove(id) }
     }
@@ -327,12 +332,16 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
     }
 
     private var sessionState = JSONObject()
-    internal fun sessionSnapshot(): JSONObject = synchronized(cursorLock) { sessionState.copy() }
-    private fun bind(result: JSONObject): NativeSessionBinding = nativeSessionBinding(client.scope, result).also { synchronized(cursorLock) { sessionState = result.copy(); cursor = Cursor(it) } }
+    private fun Cursor.live() = connection != null && connection === this@NativeGateway.connection && connection.failure == null && connection.ready.isCompleted
+    /** The runtime this gateway holds right now: empty once its socket has closed, so a poller never names a runtime Hermes may have reaped. */
+    internal fun sessionSnapshot(): JSONObject = synchronized(cursorLock) { if (cursor?.live() == true) sessionState.copy() else JSONObject() }
+    private fun forget(runtime: String) { if (runtime.isNotBlank()) synchronized(cursorLock) { if (cursor?.binding?.runtimeSessionId == runtime) { cursor = null; sessionState = JSONObject() } } }
+    // shortcut: the binding takes the connection current at bind time, so a socket that died and was replaced between the reply and here looks live; pass the reply's own connection from rpc if that window ever shows up.
+    private fun bind(result: JSONObject): NativeSessionBinding = nativeSessionBinding(client.scope, result).also { synchronized(cursorLock) { sessionState = result.copy(); cursor = Cursor(it, connection) } }
     suspend fun create(params: JSONObject): NativeSessionBinding = sessionLock.withLock { bind(rpc("session.create", params.copy().put("source", if (params.string("source") == BEACON_THREAD_SOURCE) BEACON_THREAD_SOURCE else "android").put("close_on_disconnect", false))) }
     /** [lazy]: reattach a live unsent shell or answer 4007, never let Hermes materialize an ownerless row for a runtime that is gone. */
     suspend fun session(stored: String?, lazy: Boolean = false): NativeSessionBinding = sessionLock.withLock {
-        synchronized(cursorLock) { cursor?.binding }?.takeIf { connection?.failure == null && connection?.ready?.isCompleted == true && it.scope == client.scope && (stored == it.storedSessionId || stored == it.runtimeSessionId) }?.let { return@withLock it }
+        synchronized(cursorLock) { cursor }?.takeIf { it.live() && it.binding.scope == client.scope && (stored == it.binding.storedSessionId || stored == it.binding.runtimeSessionId) }?.let { return@withLock it.binding }
         bind(rpc(if (stored.isNullOrBlank()) "session.create" else "session.resume", if (stored.isNullOrBlank()) json("source" to "android", "close_on_disconnect" to false) else json("session_id" to stored, "close_on_disconnect" to false, "omit_messages" to false).apply { if (lazy && !stored.isNullOrBlank()) put("lazy", true) }))
     }
     private suspend fun reconciliationHistory(binding: NativeSessionBinding): JSONObject {

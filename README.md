@@ -27,7 +27,7 @@ you can rename it in Settings › Assistant.
 
 Before running it yourself, complete the [predecessor-removal prerequisite](docs/install-with-agent.md#before-installing-beacon). Then run `python beacon_install.py`: it selects your Hermes home/profile, installs or updates Beacon, restarts the dashboard if you say yes, and prints the link to paste into Beacon. The installer does not back up or remove a predecessor plugin or its jobs. Manual steps: [docs/install-with-agent.md](docs/install-with-agent.md).
 
-**2. On your phone**, download `Beacon-1.1.8.apk` from [Releases](https://github.com/xploit9/beacon/releases/latest) and install
+**2. On your phone**, download `Beacon-1.1.9.apk` from [Releases](https://github.com/xploit9/beacon/releases/latest) and install
 it. Open it, paste your Hermes link (also shown on the dashboard's **Beacon** tab), sign in with Hermes, and follow the setup wizard.
 
 ## Connect or manage phones

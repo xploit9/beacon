@@ -734,12 +734,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 reconcile(scope, c)
                 if (!request.current() || !foreground) return@launch
                 val stream = _chat.value.streamId
-                if (stream.isNotBlank() && streams[scope.key]?.isActive != true) {
-                    val nativeStatus = try { c.recoveredNativeSessionStatus(scope.session) }
-                    catch (e: Throwable) { if (e is CancellationException || e is ApiFailure && e.status in setOf(401, 403)) throw e; null }
-                    if (!request.current() || !foreground) return@launch
-                    attachStream(c, scope, stream, terminalAlreadyObserved = nativeStatus == "idle")
-                }
+                if (stream.isNotBlank() && streams[scope.key]?.isActive != true && !followRunningTurn(c, scope, stream, request)) return@launch
                 watchSession(c, scope)
                 _side.value?.takeIf { it.scope == scope && it.status !in setOf("Complete", "Stopped") }?.let { resumeSideQuestion() }
             } catch (e: Throwable) {
@@ -748,6 +743,20 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 if (unsavedOpenChatRead(e, scope.session, clientCreatedSessions.contains(scope.key), _chat.value)) watchSession(c, scope) else fail(e)
             }
         }
+    }
+    /**
+     * The chat shows a running turn that no stream follows (it never connected, or ended unseen, and the socket that sent the prompt is long closed).
+     * Hermes says whether the turn ended, which is settled from its saved history, or still runs, which is subscribed to again.
+     * False when the chat moved on meanwhile.
+     */
+    private suspend fun followRunningTurn(c: BeaconClient, scope: Scope, stream: String, request: ScopeSettlement): Boolean {
+        val status = try { c.recoveredNativeSessionStatus(scope.session) }
+        catch (e: Throwable) { if (e is CancellationException || e is ApiFailure && e.status in setOf(401, 403) || missingNativeConversation(e)) { c.closeNative(); throw e }; null }
+        val current = request.current() && foreground
+        // Settled or followed by another path while Hermes was asked: nothing is left to do here.
+        val stale = !current || _chat.value.streamId != stream || streams[scope.key]?.isActive == true
+        if (stale) c.closeNative() else if (!attachStream(c, scope, stream, terminalAlreadyObserved = status == "idle")) c.closeNative()
+        return current
     }
     private fun checkpointPhoneSettings() {
         val owner = client?.scope ?: return
@@ -2855,8 +2864,9 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             fail(e)
         }
     }
-    private fun attachStream(c: BeaconClient, scope: Scope, stream: String, terminalAlreadyObserved: Boolean = false, quietMs: Long = streamSilenceMs) {
-        if (!foreground || client?.scope != c.scope || scope.copy(session = "") != c.scope) return
+    /** False when the chat is not in a state to follow a stream (the app is in the background, or another account is signed in); nothing was started then. */
+    private fun attachStream(c: BeaconClient, scope: Scope, stream: String, terminalAlreadyObserved: Boolean = false, quietMs: Long = streamSilenceMs): Boolean {
+        if (!foreground || client?.scope != c.scope || scope.copy(session = "") != c.scope) return false
         streams[scope.key]?.cancel()
         streamClients[scope.key] = c
         streams[scope.key] = viewModelScope.launch {
@@ -2995,6 +3005,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 if (c !== client && streamClients.values.none { it === c }) c.closeNative()
             }
         }
+        return true
     }
     private fun applyEvent(scope: Scope, event: SseEvent) {
         if (sourceScope != scope) return
@@ -3054,9 +3065,12 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             var observedMetadata = displayedNativeHistoryStamp(_chat.value.raw)
             var reconciledAt = android.os.SystemClock.elapsedRealtime()
             while (isActive && foreground && request.current()) {
-                delay(15_000)
+                delay(streamWatchMs)
                 if (streams[scope.key]?.isActive == true) continue
                 try {
+                    // History alone cannot end a turn nobody heard (a saved projection names no running stream), so a chat that still shows one without a stream asks Hermes.
+                    val unfollowed = _chat.value.takeIf { sourceScope == scope && it.sessionId == scope.session && !pending.containsKey(scope.key) }?.streamId.orEmpty()
+                    if (unfollowed.isNotBlank()) { followRunningTurn(c.detached(), scope, unfollowed, request); continue }
                     val revision = chatHistoryRevision
                     val metadata = c.nativeRequest("/api/sessions/${scope.session}", params = mapOf("profile" to scope.profile))
                     require(metadata.string("id", metadata.string("session_id")) == scope.session && metadata.string("profile", scope.profile) == scope.profile) { "Conversation scope changed" }

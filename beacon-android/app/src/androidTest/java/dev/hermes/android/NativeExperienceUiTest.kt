@@ -4080,6 +4080,68 @@ class NativeExperienceUiTest {
         } finally { other.closeNative() }
     }
 
+    @Test fun browsingAChatAcrossWatcherTicksNeverResumesIt() = withFixture { vm, fixture ->
+        // The app's rule: reading a chat opens or resumes no native session. The re-arm only asks Hermes about a chat that shows a running turn.
+        field(vm, "streamWatchMs", 300L)
+        // Opened the normal way, so its watcher runs with the short tick.
+        compose.runOnIdle { vm.selectSession("chat-a") }
+        await { vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady && vm.chat.value.streamId.isBlank() }
+        compose.waitForIdle()
+        fun asks() = fixture.requests.count { it.string("method") in setOf("session.resume", "session.active_list") }
+        val before = asks()
+        Thread.sleep(1_500); compose.waitForIdle()
+        assertEquals("An idle chat is not resumed or probed on watcher ticks", before, asks())
+    }
+
+    @Test fun aRunningTurnInAChatThatWasDeletedElsewhereSaysSoInsteadOfReconnecting() = withFixture { vm, fixture ->
+        field(vm, "streamWatchMs", 300L)
+        compose.runOnIdle { vm.newChat() }
+        await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+        val stored = vm.chat.value.sessionId
+        compose.runOnIdle { vm.composer(TextFieldValue("Still there?")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId.isNotBlank() }
+        @Suppress("UNCHECKED_CAST")
+        val streams = BeaconViewModel::class.java.getDeclaredField("streams").apply { isAccessible = true }.get(vm) as MutableMap<String, kotlinx.coroutines.Job>
+        compose.runOnIdle { streams.values.toList().forEach { it.cancel() }; streams.clear() }
+        // Deleted on another device: its runtime and its saved row are gone.
+        fixture.reapRuntime(stored)
+        fixture.sessions.remove(stored)
+        await { vm.chat.value.status.contains("unavailable", ignoreCase = true) }
+        val requests = fixture.requests.size
+        Thread.sleep(1_500)
+        assertTrue("No reconnect loop for a chat that is gone: ${fixture.requests.drop(requests).map { it.string("method") + " " + it.string("path") }}", fixture.requests.size - requests <= 2)
+        receipts += "A running turn in a chat deleted elsewhere ends with Conversation unavailable instead of a reconnect loop."
+    }
+
+    // Live 2026-10-27: a new chat's first message finished in Hermes in 4.3 s, but the chat stayed "Working" with Stop for minutes, until the app was backgrounded.
+    // The socket that sent the prompt closed at once, no stream socket ever opened, and Hermes dropped the idle runtime a few seconds later.
+    // Before the fix nothing re-armed such a chat: a saved history names no running stream and cannot end a turn nobody heard, and the silence watcher lives inside the stream.
+    @Test fun aNewChatsFirstReplySettlesWhenNoStreamFollowedItAndHermesDroppedTheRuntime() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.newChat() }
+        await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+        val stored = vm.chat.value.sessionId
+        val creatingRuntime = "runtime-$stored"
+        fixture.persistTerminalMessages = true
+        compose.runOnIdle { vm.composer(TextFieldValue("QA unfolded check. Reply ok.")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId == creatingRuntime }
+        // The stream that should follow the reply is gone, as in the live run.
+        @Suppress("UNCHECKED_CAST")
+        val streams = BeaconViewModel::class.java.getDeclaredField("streams").apply { isAccessible = true }.get(vm) as MutableMap<String, kotlinx.coroutines.Job>
+        compose.runOnIdle { streams.values.toList().forEach { it.cancel() }; streams.clear() }
+        // Hermes finishes the turn, then drops the idle runtime: a call naming it now answers 4001, a resume by the stored id mints another.
+        fixture.nativeTurnStatus = "idle"
+        fixture.retainNativeEvent(creatingRuntime, "message.complete", json("text" to "ok"))
+        fixture.reapRuntime(stored)
+        fun storedResumes() = fixture.requests.count { it.string("method") == "session.resume" && it.getJSONObject("params").string("session_id") == stored }
+        val resumesBefore = storedResumes()
+        // Within the silence window (45 s), without leaving the app.
+        try { compose.waitUntil(40_000) { vm.chat.value.streamId.isBlank() && vm.chat.value.messages.any { it.text == "ok" } } }
+        catch (error: Throwable) { throw AssertionError("Chat stayed on its turn: status=${vm.chat.value.status} stream=${vm.chat.value.streamId} requests=${recentCalls(fixture)}", error) }
+        assertEquals("Settling reads history; it never sends the prompt again", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
+        assertTrue("The stored conversation was resumed, not the dropped runtime", storedResumes() > resumesBefore)
+        receipts += "A new chat whose first reply nothing followed asks Hermes after a quiet spell, finds the runtime gone, and settles the finished turn from history without leaving the app."
+    }
+
     @Test fun aSendFoundInHistoryClearsTheFirstPromptMarkersLikeAnAcceptedOne() = withFixture { vm, fixture ->
         val owner = fixture.scope
         var shellId = ""
@@ -4104,12 +4166,19 @@ class NativeExperienceUiTest {
 
             fixture.persistTerminalMessages = true
             fixture.holdPromptAcknowledgement = true
+            fun projectReads() = fixture.requests.count { it.string("method") == "projects.for_cwd" }
+            compose.waitForIdle()
+            val projectReadsBefore = projectReads()
             try {
                 compose.runOnIdle { vm.composer(TextFieldValue("First words")); vm.send() }
                 await { fixture.requests.any { it.string("method") == "prompt.submit" } }
                 // Hermes saved the prompt, but its acknowledgement never arrives: the receipt check finds it in history.
                 compose.runOnIdle { vm.reconcileSend() }
                 await { vm.chat.value.uncertain.isBlank() && vm.chat.value.messages.any { it.text == "First words" } }
+                // A send settled from history saves the chat too, so its project is read again once.
+                await { projectReads() == projectReadsBefore + 1 }
+                Thread.sleep(500); compose.waitForIdle()
+                assertEquals("One project read, not one per update", projectReadsBefore + 1, projectReads())
                 assertFalse("The creating-client marker ends once Hermes holds the prompt", created.contains(shell.key))
                 assertNull(runBlocking { app.cache.read(shell, "client-created-shell") })
                 assertNull(shells[owner.key])
