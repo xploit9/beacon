@@ -123,6 +123,66 @@ def summaries(allowed):
                       'purpose': row['description']} for row in rows]}
 
 
+def set_aside_stale_gateway_pids():
+    """Hermes' updater stops at "Could not inspect gateway PID" when a profile's gateway.pid names a process that is gone
+    (or whose PID another process reuses now) while another gateway holds that profile's lock: one gateway serving several
+    profiles writes their locks, not their PID files, so every later update stops there too. Such a file is stale and is set
+    aside; it goes back if Hermes' own strict check still refuses, and a newer file written meanwhile always wins."""
+    import logging, os, time
+    from pathlib import Path
+    try:
+        from gateway import status
+        from hermes_cli.profiles import list_profiles
+        strict, read_record, live_pid = status.get_running_pid_identity_strict, status._read_pid_record, status._live_pid_from_record
+    except Exception as error:
+        logging.getLogger(__name__).warning('Beacon cannot check gateway files before an update: %s', type(error).__name__)
+        return []
+    moved = []
+    for profile in list_profiles(lazy_skill_count=True):
+        pid_path = Path(profile.path) / 'gateway.pid'
+        try:
+            if not pid_path.is_file():
+                continue
+            try:
+                strict(pid_path)
+                continue  # Hermes accepts it
+            except Exception:
+                pass
+            try:
+                record = read_record(pid_path)
+            except Exception:
+                record = None
+            # Hermes' own liveness rule (PID alive and its start time matches): a live gateway's file is never touched.
+            if record and live_pid(record) is not None:
+                continue
+            aside = pid_path.with_name(f'gateway.pid.stale-{time.time_ns()}')
+            os.replace(pid_path, aside)
+            try:
+                strict(pid_path)
+            except Exception:
+                try:
+                    os.rename(aside, pid_path)  # not the case this repair understands; never over a newer file
+                except OSError:
+                    pass
+                continue
+            moved.append(profile.name)
+        except Exception:
+            continue
+    if moved:
+        logging.getLogger(__name__).info('Beacon set aside stale gateway files before an update: %s', ', '.join(moved))
+    return moved
+
+
+def update_in_progress():
+    """A live update, even one a restarted dashboard no longer remembers, holds Hermes' update marker or checkout lock."""
+    try:
+        from hermes_cli.update_lock import read_live_update
+        from hermes_cli.web_server import PROJECT_ROOT
+        return read_live_update(install_root=PROJECT_ROOT) is not None
+    except Exception:
+        return False
+
+
 async def native_update():
     from hermes_cli.web_routers.actions import update_hermes
     return await update_hermes()
@@ -156,6 +216,10 @@ def current_receipt(state, requested_at, action_id):
     except (ValueError, TypeError, KeyError):
         return False
 
+# Two taps at once clear and start in turn, so the second one sees the first update running.
+_update_gate = asyncio.Lock()
+
+
 def build_router(identity, read_body):
     router = APIRouter()
 
@@ -173,9 +237,13 @@ def build_router(identity, read_body):
     async def start_update(request: Request):
         from datetime import datetime, timezone
         identity(request, owner_only=True)
-        # Native action owns admission, spawning and already-running de-duplication.
-        requested_at = datetime.now(timezone.utc).isoformat()
-        result = await native_update()
+        # Clear the stale gateway files Hermes' updater would stop on, unless an update already runs; the native action then
+        # owns admission, spawning and already-running de-duplication.
+        async with _update_gate:
+            if not await asyncio.to_thread(update_in_progress):
+                await asyncio.to_thread(set_aside_stale_gateway_pids)
+            requested_at = datetime.now(timezone.utc).isoformat()
+            result = await native_update()
         if result.get('already_running'):
             return {**result, 'ok': False, 'accepted': False, 'requested_at': None,
                     'error': 'update_already_running',

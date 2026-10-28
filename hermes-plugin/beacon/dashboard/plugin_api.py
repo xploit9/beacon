@@ -704,12 +704,16 @@ def notice_preview(kind):
     if kind=='completion': return 'Reply ready','A reply is ready.'
     return 'Beacon calling','Open Beacon to hear the saved result.'
 def reply_preview(messages,limit=300):
-    """The newest assistant reply as one plain line for a notification."""
+    """This turn's final reply as one plain line for a notification; '' keeps the generic text."""
     for message in reversed(messages):
-        if not isinstance(message,dict) or message.get('role')!='assistant': continue
-        content=message.get('content')
-        if isinstance(content,list): content=' '.join(part.get('text','') for part in content if isinstance(part,dict))
-        if not isinstance(content,str) or not content.strip(): continue
+        if not isinstance(message,dict): continue
+        role=message.get('role')
+        if role=='user': return ''  # the owner spoke last: this turn has no reply text yet
+        if role!='assistant': continue
+        if message.get('display_kind'): return ''  # a failed-turn notice or other display row is not a reply
+        # Hermes' cleaned copy (think-blocks stripped, secrets redacted) first; its projection names the reply `text`.
+        content=message.get('display_content') or message.get('text')
+        if not isinstance(content,str) or not content.strip(): return ''
         text=re.sub(r'```.*?```',' ',content,flags=re.S)
         text=re.sub(r'[*_`#>]+','',text)
         text=' '.join(text.split())
@@ -992,7 +996,9 @@ async def feature(fn,*args,timeout=12,value_error_status=409,lookup_message='Own
     except HTTPException: raise
     except LookupError: raise HTTPException(404,lookup_message) from None
     except ValueError as exc: raise HTTPException(value_error_status,str(exc)) from None
-    except Exception: raise HTTPException(503,'Native lookup unavailable') from None
+    except Exception as exc:
+        logging.getLogger(__name__).warning('Beacon native lookup %s failed: %s',getattr(fn,'__name__','?'),type(exc).__name__)
+        raise HTTPException(503,'Native lookup unavailable') from None
 def lookup_budget(call_id,kind):
     key=(call_id,kind)
     with mobile.LOCK:

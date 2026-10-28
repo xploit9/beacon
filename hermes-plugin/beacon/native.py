@@ -78,7 +78,11 @@ def reserve_conversation(owner,provider,profile,stored):
 def conversation_snapshot(owner, provider, profile, stored):
     """Read native history without resuming, attaching or prewarming an agent."""
     from tui_gateway import server
-    from tui_gateway.session_history import _history_to_messages
+    # Newer Hermes rebinds session_history's functions onto server (method_ctx.bind_module); the module's own copy then
+    # lacks server's names and raises NameError, which left every reply notification on its generic text.
+    _history_to_messages = getattr(server, '_history_to_messages', None)
+    if _history_to_messages is None:
+        from tui_gateway.session_history import _history_to_messages
     expected_owner = provider + ':' + owner
     profile_home = server._profile_home(profile)
     expected_home = str(profile_home) if profile_home else None

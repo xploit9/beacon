@@ -176,6 +176,10 @@ def test_update_helper_server_clock_scope_and_old_receipts(harness, monkeypatch)
                 'receipt': {'receipt': {'started_at': '2020-01-01T00:00:00Z', 'finished_at': '2020-01-01T00:01:00Z', 'outcome': 'success'}}}
     monkeypatch.setattr(api, 'native_update', start)
     monkeypatch.setattr(api, 'native_update_status', status)
+    # A tapped Update clears what Hermes' guards would stop on before the native update starts (never real processes here).
+    running = []
+    monkeypatch.setattr(api, 'set_aside_stale_gateway_pids', lambda: calls.append('repair') or ['cybercb'])
+    monkeypatch.setattr(api, 'update_in_progress', lambda: bool(running))
     app.include_router(api.build_router(host.identity, host.body), prefix='/api/plugins/beacon-update-fixture')
     url = '/api/plugins/beacon-update-fixture/admin/update'
     result = client.post(url).json()
@@ -194,7 +198,11 @@ def test_update_helper_server_clock_scope_and_old_receipts(harness, monkeypatch)
     client.headers['x-fixture-owner'] = 'foreign'
     assert client.post(url).status_code == 403
     assert client.get(url + '/status').status_code == 403
-    assert calls == ['start']
+    assert calls == ['repair', 'start', 'repair'], 'a foreign caller clears nothing'
+    # While an update runs (even one a restarted dashboard forgot), a tap clears nothing and only reaches the native de-dup.
+    running.append(True)
+    client.post(url)
+    assert calls == ['repair', 'start', 'repair']
     del client.headers['x-fixture-owner']
     assert client.post(url).status_code == 401
 
@@ -204,3 +212,67 @@ def test_current_receipt_requires_matching_time_and_action():
     assert api.current_receipt(state, '2026-10-14T10:00:00Z', 'current')
     assert not api.current_receipt(state, '2026-10-14T10:00:00Z', 'different')
     assert not api.current_receipt(state, '', 'current')
+
+
+
+def _gateway_modules(monkeypatch, tmp_path, live_pids, lock_pid=6500):
+    from types import ModuleType, SimpleNamespace
+    import json as _json
+    profiles = []
+    for name in ('default', 'cybercb', 'coder'):
+        home = tmp_path / name
+        home.mkdir()
+        profiles.append(SimpleNamespace(name=name, path=home))
+    status = ModuleType('gateway.status')
+
+    def strict(pid_path):
+        # Hermes' rule: a PID file beside a held lock must name the lock holder.
+        if pid_path.exists() and _json.loads(pid_path.read_text())['pid'] != lock_pid:
+            raise RuntimeError('gateway PID and lock identities disagree')
+        return (lock_pid, 1.0)
+    status.get_running_pid_identity_strict = strict
+    status._read_pid_record = lambda pid_path: _json.loads(Path(pid_path).read_text())
+    # Hermes' rule: alive and with the recorded start time (a reused PID has another one).
+    status._live_pid_from_record = lambda record: record['pid'] if record.get('pid') in live_pids and record.get('start_time', 1.0) == 1.0 else None
+    gateway = ModuleType('gateway'); gateway.status = status
+    hermes_cli = ModuleType('hermes_cli'); hermes_cli.__path__ = []
+    profiles_api = ModuleType('hermes_cli.profiles'); profiles_api.list_profiles = lambda **kwargs: profiles
+    hermes_cli.profiles = profiles_api
+    for name, module in (('gateway', gateway), ('gateway.status', status), ('hermes_cli', hermes_cli), ('hermes_cli.profiles', profiles_api)):
+        monkeypatch.setitem(sys.modules, name, module)
+    return {p.name: p.path for p in profiles}
+
+
+def test_a_stale_gateway_pid_beside_another_gateways_lock_is_set_aside(monkeypatch, tmp_path):
+    import json as _json
+    homes = _gateway_modules(monkeypatch, tmp_path, live_pids={6500, 777})
+    (homes['default'] / 'gateway.pid').write_text(_json.dumps({'pid': 6500}))   # the live holder itself: fine
+    (homes['cybercb'] / 'gateway.pid').write_text(_json.dumps({'pid': 67256}))  # exited a month ago: blocks every update
+    (homes['coder'] / 'gateway.pid').write_text(_json.dumps({'pid': 777}))      # alive, though Hermes disagrees: not ours to touch
+    assert api.set_aside_stale_gateway_pids() == ['cybercb']
+    assert not (homes['cybercb'] / 'gateway.pid').exists()
+    assert len(list(homes['cybercb'].glob('gateway.pid.stale-*'))) == 1
+    assert (homes['default'] / 'gateway.pid').exists() and (homes['coder'] / 'gateway.pid').exists()
+    # A PID another process reuses now (other start time) and an unreadable file are as stale as a dead one.
+    (homes['cybercb'] / 'gateway.pid').write_text(_json.dumps({'pid': 777, 'start_time': 5.0}))
+    (homes['default'] / 'gateway.pid').write_text('not json')
+    assert sorted(api.set_aside_stale_gateway_pids()) == ['cybercb', 'default']
+    assert len(list(homes['cybercb'].glob('gateway.pid.stale-*'))) == 2, 'each set-aside keeps its own copy'
+
+
+def test_a_set_aside_that_does_not_satisfy_hermes_is_put_back(monkeypatch, tmp_path):
+    import json as _json
+    homes = _gateway_modules(monkeypatch, tmp_path, live_pids=set())
+    (homes['cybercb'] / 'gateway.pid').write_text(_json.dumps({'pid': 67256}))
+    def still_refuses(pid_path): raise RuntimeError('gateway identity is not live')
+    sys.modules['gateway.status'].get_running_pid_identity_strict = still_refuses
+    assert api.set_aside_stale_gateway_pids() == []
+    assert (homes['cybercb'] / 'gateway.pid').exists() and not list(homes['cybercb'].glob('gateway.pid.stale-*'))
+
+
+
+def test_the_hermes_under_test_still_has_the_gateway_helpers_the_repair_uses():
+    # The repair turns itself off (with a warning) if Hermes renames these; this fails the installed and upstream runs first.
+    status = pytest.importorskip('gateway.status')
+    for name in ('get_running_pid_identity_strict', '_read_pid_record', '_live_pid_from_record'):
+        assert callable(getattr(status, name, None)), name

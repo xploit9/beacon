@@ -40,6 +40,14 @@ def test_saved_history_keeps_identity_and_never_creates_a_runtime(reader):
     assert server._sessions == {} and len(calls) == 10
 
 
+def test_the_server_bound_history_projection_is_used_when_hermes_has_one(reader):
+    # Newer Hermes publishes session_history's functions on server with server's globals; the module copy cannot run alone.
+    native, server, row, calls = reader
+    server._history_to_messages = lambda history, **kwargs: [{'role': 'assistant', 'content': 'bound', '_row_id': 7}]
+    sys.modules['tui_gateway.session_history']._history_to_messages = lambda history, **kwargs: pytest.fail('module copy used')
+    assert native.conversation_snapshot('owner', 'basic', 'default', 'owned')['messages'] == [{'role': 'assistant', 'content': 'bound', '_row_id': 7}]
+
+
 def test_foreign_owner_is_denied_before_reading_history(reader):
     native, server, row, calls = reader
     with pytest.raises(LookupError):
