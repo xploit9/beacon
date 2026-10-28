@@ -310,8 +310,8 @@ private val NoInstall = MutableStateFlow(PluginInstallUi()).asStateFlow()
     val submitting by vm.submittingForm.collectAsStateWithLifecycle()
     val busy = submitting == form.id
     val scheduleForm = form.path in setOf("/api/crons/create", "/api/crons/update")
-    val fixedWindow = form.values["_schedule_mode"] == "Fixed window"
-    val visibleFields = form.fields.filter { field -> !scheduleForm || (field.key != "schedule" || !fixedWindow) && (field.section != "Fixed window" || fixedWindow) }
+    val scheduleMode = form.values["_schedule_mode"].orEmpty()
+    val visibleFields = form.fields.filter { field -> !scheduleForm || dev.hermes.android.tasks.scheduleFieldVisible(field.key, scheduleMode) }
     val longForm = form.fields.size > 4 || form.fields.any { it.section.isNotBlank() || it.type in setOf(FieldType.MULTILINE, FieldType.LIST, FieldType.MAP) }
     val error: @Composable () -> Unit = { if (form.error.isNotBlank()) Text(uiText(form.error), color = MaterialTheme.colorScheme.error, modifier = Modifier.semantics { liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite }) }
     val fields: @Composable () -> Unit = {
@@ -325,10 +325,9 @@ private val NoInstall = MutableStateFlow(PluginInstallUi()).asStateFlow()
                 else -> OutlinedTextField(value, { vm.formValue(field.key, it) }, enabled = !busy, label = { Text(uiText(field.label) + if (field.required) " *" else "") }, modifier = Modifier.fillMaxWidth(), minLines = if (field.type in setOf(FieldType.MULTILINE, FieldType.LIST, FieldType.MAP)) 3 else 1, maxLines = if (field.type in setOf(FieldType.MULTILINE, FieldType.LIST, FieldType.MAP)) 12 else 1, visualTransformation = if (field.type == FieldType.SECRET) PasswordVisualTransformation() else VisualTransformation.None, keyboardOptions = KeyboardOptions(keyboardType = when (field.type) { FieldType.INTEGER -> KeyboardType.Number; FieldType.DECIMAL -> KeyboardType.Decimal; FieldType.SECRET -> KeyboardType.Password; else -> KeyboardType.Text }), supportingText = if (field.help.isBlank()) null else ({ Text(uiText(field.help), style = MaterialTheme.typography.bodyMedium) }))
             }
         }
-        if (scheduleForm && fixedWindow) dev.hermes.android.tasks.fixedWindowPreview(form.values)?.let { preview -> Text("${uiText("Runs at")} $preview · ${form.seed.string("_timezone")}", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.semantics { liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite }) }
         if (visibleFields.any { it.section.isNotBlank() }) visibleFields.groupBy { it.section }.forEach { (section, fields) ->
             if (section.isNotBlank()) Text(uiText(section), Modifier.semantics { heading() }, style = MaterialTheme.typography.titleMedium)
-            Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) { fields.forEach { renderField(it) } } }
+            Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) { fields.forEach { renderField(it) }; if (scheduleForm && section == "When") ScheduleSummary(form.values, form.seed.string("_timezone")) } }
         } else visibleFields.forEach { renderField(it) }
 
     }

@@ -173,12 +173,19 @@ def set_aside_stale_gateway_pids():
     return moved
 
 
+try:  # loaded now: mid-update the checkout under this process is being replaced
+    from hermes_cli.update_lock import update_in_progress as _native_update_in_progress
+except Exception:
+    _native_update_in_progress = None
+UPDATING = 'Hermes is updating'
+
+
 def update_in_progress():
     """A live update, even one a restarted dashboard no longer remembers, holds Hermes' update marker or checkout lock."""
+    if _native_update_in_progress is None:
+        return False
     try:
-        from hermes_cli.update_lock import read_live_update
-        from hermes_cli.web_server import PROJECT_ROOT
-        return read_live_update(install_root=PROJECT_ROOT) is not None
+        return bool(_native_update_in_progress())  # Hermes defaults to the checkout this process runs from
     except Exception:
         return False
 

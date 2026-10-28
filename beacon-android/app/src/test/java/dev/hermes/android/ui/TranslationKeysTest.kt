@@ -2,6 +2,7 @@ package dev.hermes.android.ui
 
 import dev.hermes.android.data.ErrorStrings
 import dev.hermes.android.tasks.DeliveryNameStrings
+import dev.hermes.android.tasks.ScheduleBuilderStrings
 import dev.hermes.android.updates.PluginRowStrings
 import dev.hermes.android.updates.UpdateFailureStrings
 import dev.hermes.android.voice.CallToolStrings
@@ -165,7 +166,7 @@ class TranslationKeysTest {
             "HistoryStrings" to HistoryStrings, "KanbanStrings" to KanbanStrings, "SettingsStrings" to SettingsStrings, "settingsSummary" to settingsSummaryTexts(),
             "ScheduleStateStrings" to ScheduleStateStrings, "ApprovalStrings" to ApprovalStrings, "NavigationStrings" to NavigationStrings,
             "UpdateFailureStrings" to UpdateFailureStrings, "PluginRowStrings" to PluginRowStrings, "CallToolStrings" to CallToolStrings,
-            "ErrorStrings" to ErrorStrings, "DeliveryNameStrings" to DeliveryNameStrings, "HistoryRetentionStrings" to HistoryRetentionStrings, "VoiceStyleStrings" to VoiceStyleStrings,
+            "ErrorStrings" to ErrorStrings, "DeliveryNameStrings" to DeliveryNameStrings, "ScheduleBuilderStrings" to ScheduleBuilderStrings, "HistoryRetentionStrings" to HistoryRetentionStrings, "VoiceStyleStrings" to VoiceStyleStrings,
         )
         lists.forEach { (name, texts) -> assertTrue("$name is empty, so nothing is checked.", texts.isNotEmpty()) }
         val missing = untranslated(lists.flatMap { (name, texts) -> texts.map { it to name } })

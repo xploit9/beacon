@@ -622,6 +622,8 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
         catch(e:Exception) {
             val stage=synchronized(toolReceipts) { toolReceipts[id]?.optString("status") }
             when {
+                // The plugin answers this at once while Hermes updates (admin_api.UPDATING), before anything runs.
+                e is ApiFailure&&e.status==503&&e.message=="Hermes is updating" -> JSONObject().put("status","not_sent").put("error_code","hermes_updating").put("message","Hermes is updating, so nothing ran. Tell the user to try again in a few minutes.")
                 name in setOf("hermes_search","hermes_memory","hermes_skills","hermes_context","discover_tools","tool_status","get_visual_state") -> JSONObject().put("status","unavailable").put("error_code",errorCode(e)).put("message",(if(errorCode(e)=="timeout") "This lookup timed out." else "This lookup failed.")+" No current result was verified; report the failure without inventing facts or claiming the service is disconnected.")
                 name=="schedule_callback"&&e is ApiFailure&&callbackDefinitelyRejected(e.status,e.message) -> JSONObject().put("status","not_sent").put("request_id",requestId).put("error_code",errorCode(e)).put("message","Callback was rejected before acceptance. Check the requested time and host callback settings.")
                 name=="hermes_work"&&stage in setOf("creating_native_session","waiting_for_idle","submitting") -> JSONObject().put("status","not_sent").put("request_id",requestId).put("message","The request was not submitted because native admission failed or the call ended.")

@@ -92,6 +92,19 @@ def prune_expired(mobile,native,owner,now=None):
         _prune_expired(conn,now)
         return missed
 
+def reasons(mobile,owner,provider,profile,limit=100):
+    """job id -> what the owner asked to be called about, for the owner's own scheduled callbacks on this profile."""
+    with mobile.LOCK,mobile.connect() as conn:
+        rows=conn.execute("""SELECT value FROM meta WHERE key LIKE 'scheduled-callback:%' AND json_valid(CAST(value AS TEXT))
+            AND json_extract(CAST(value AS TEXT),'$.owner')=? AND json_extract(CAST(value AS TEXT),'$.provider')=?
+            AND json_extract(CAST(value AS TEXT),'$.profile')=? ORDER BY rowid DESC LIMIT ?""",(owner,provider,profile,limit)).fetchall()
+    found={}
+    for (value,) in rows:
+        record=json.loads(value)
+        if isinstance(record.get('job_id'),str) and isinstance(record.get('reason'),str):
+            found[record['job_id']]={'reason':record['reason'][:120]}
+    return found
+
 def target_time(value, now):
     if set(value) - {'request_id','reason','delay_seconds','at'}: raise ValueError('Unknown callback field')
     if ('delay_seconds' in value) == ('at' in value): raise ValueError('Choose delay_seconds or at')

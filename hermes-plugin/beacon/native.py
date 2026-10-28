@@ -112,19 +112,12 @@ def conversation_snapshot(owner, provider, profile, stored):
         history = db.get_messages_as_conversation(stored, include_ancestors=True, include_row_ids=True) if row else ephemeral
     base = {key: row[key] for key in ('title', 'model', 'provider', 'cwd', 'reasoning_effort', 'hidden') if row and key in row}
     base.update(info)
-    assignment = {}
-    if row and hasattr(server, '_session_project_assignment'):
-        from pathlib import Path
-        from hermes_constants import get_hermes_home
-        from hermes_cli import projects_db
-        with projects_db.connect_closing(Path(expected_home or get_hermes_home()) / 'projects.db') as conn:
-            assignment = server._session_project_assignment(projects_db, conn, row, expected_owner)
     messages = _history_to_messages(history, profile_home=expected_home)
     return dict(base, session_id=stored, stored_session_id=stored, runtime_session_id=sid,
                 profile=profile, messages=messages, message_count=len(messages),
                 running=running, active_stream_id=sid if running else '',
                 model_provider=base.get('provider') or '', workspace=base.get('cwd') or '',
-                archived=bool(base.get('hidden')), passive_read=True, project_id=assignment.get("project_id"), project_detached=assignment.get("detached", False))
+                archived=bool(base.get('hidden')), passive_read=True)
 
 
 def conversation_list(owner, provider, profile, archived=False):

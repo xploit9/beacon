@@ -12,7 +12,11 @@ if key not in sys.modules:
     module=importlib.util.module_from_spec(spec);sys.modules[key]=module;spec.loader.exec_module(module)
 
 
-def build_router(call, body, scoped, mobile):
+async def _never_updating():
+    return None
+
+
+def build_router(call, body, scoped, mobile, refuse_while_updating=_never_updating):
     router=APIRouter()
     gateway=sys.modules[key].Gateway(mobile,scoped)
     metadata_scope=getattr(getattr(gateway,'backend',None),'scoped_metadata',None)
@@ -38,12 +42,14 @@ def build_router(call, body, scoped, mobile):
     @router.get('/mobile/calls/{call_id}/tools')
     async def discover(call_id:str,request:Request,query:str=''):
         binding,_=await scope(request,call_id,True)
+        await refuse_while_updating()
         return await bounded(gateway.discover,binding[2],query)
 
     @router.post('/mobile/calls/{call_id}/tools/invoke')
     async def invoke(call_id:str,request:Request):
         binding,session_id=await scope(request,call_id,True)
         value=await body(request,20000)
+        await refuse_while_updating()
         return await bounded(gateway.invoke,binding,value,session_id)
 
     @router.get('/mobile/calls/{call_id}/tools/requests/{request_id}')

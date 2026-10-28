@@ -37,7 +37,7 @@ def _stale(module):
     seen=getattr(module,'_beacon_mtime',None)
     try: return seen is not None and seen!=Path(module.__file__).stat().st_mtime_ns
     except (OSError,TypeError): return True
-_MODULE_NAMES=('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_tools','gateway_api','bot_mode_api','observers','callbacks','callback_api','call_history_api','proactive')
+_MODULE_NAMES=('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_tools','gateway_api','bot_mode_api','observers','callbacks','callback_api','call_history_api','proactive','compat')
 # Only purge the siblings loaded here; other plugin entry points may still serve live work.
 if any(_stale(sys.modules.get('beacon_'+name)) for name in _MODULE_NAMES):
     for name in _MODULE_NAMES: sys.modules.pop('beacon_'+name,None)
@@ -272,7 +272,11 @@ async def call(request,call_id,writable=False):
         reject_unowned_conversation(owner,provider,row['profile'],row['conversation'])
         return owner,provider,row,cfg
     return await asyncio.to_thread(authorize)
-router.include_router(sys.modules['beacon_gateway_api'].build_router(call,body,voice_context.scoped,mobile))
+admin=sys.modules['beacon_admin_api']
+async def refuse_while_updating():
+    # Mid-update Hermes replaces its code under this dashboard and lookups hang; say so at once instead.
+    if await asyncio.to_thread(admin.update_in_progress): raise HTTPException(503,admin.UPDATING)
+router.include_router(sys.modules['beacon_gateway_api'].build_router(call,body,voice_context.scoped,mobile,refuse_while_updating))
 
 @router.get('/mobile/bootstrap')
 async def bootstrap(request:Request):
@@ -540,7 +544,9 @@ async def task_capabilities(request:Request):
     owner,provider,profile,cfg=identity(request)
     zone=await feature(task_clock,profile,timeout=8)
     ready=cfg.get('scheduled_callbacks_enabled') is True and bool(cfg.get('scheduled_callback_conversation_id')) and bool(zone)
-    return {'timezone':zone,'checkups_ready':ready,'checkups_preview':'3–4 random opportunities daily, 10:00 inclusive to 22:00 exclusive, profile local time; busy and missed opportunities are skipped.'}
+    try: callbacks=await feature(sys.modules['beacon_callbacks'].reasons,mobile,owner,provider,profile,timeout=8)
+    except HTTPException: callbacks={}  # reasons are extra; the clock and check-up state still answer
+    return {'timezone':zone,'checkups_ready':ready,'callbacks':callbacks,'checkups_preview':'3–4 random opportunities daily, 10:00 inclusive to 22:00 exclusive, profile local time; busy and missed opportunities are skipped.'}
 @router.post('/mobile/tasks/checkups')
 async def create_checkups(request:Request):
     value=await body(request,1024)
@@ -966,6 +972,18 @@ async def start_watcher():
                 pass
             await asyncio.sleep(3)
     _watch_task=asyncio.create_task(loop())
+    asyncio.create_task(asyncio.to_thread(check_hermes))
+def check_hermes():
+    """Once per start: name any Hermes function this Beacon uses that this Hermes no longer has, so a feature never just goes quiet."""
+    try:
+        from hermes_cli.web_server import PROJECT_ROOT
+        compat=sys.modules['beacon_compat']
+        gone=compat.missing(compat.needs(),PROJECT_ROOT)
+    except Exception as exc:
+        logging.getLogger(__name__).info('Beacon could not compare itself with this Hermes: %s',type(exc).__name__)
+        return
+    if gone: logging.getLogger(__name__).warning('Beacon uses Hermes names this Hermes lacks; update Beacon: %s','; '.join(gone[:20]))
+    else: logging.getLogger(__name__).info('Beacon matches this Hermes')
 async def stop_watcher():
     global _watch_task
     if _watch_task:
@@ -1013,6 +1031,7 @@ async def query_body(request,call_id,kind):
     query=value.get('query')
     if not isinstance(query,str) or len(query)>1024 or not query.strip(): raise HTTPException(400,'A bounded query is required')
     query=' '.join(query.split())
+    await refuse_while_updating()
     lookup_budget(call_id,kind)
     # The call's native stored row is reverified before any profile lookup.
     await feature(native.verify,owner,provider,row['profile'],row['conversation'],timeout=6)
@@ -1047,6 +1066,7 @@ async def voice_skills(call_id:str,request:Request):
     if (set(value)-{'query','name'} or not isinstance(query,str) or len(query)>1024
             or not isinstance(name,str) or len(name)>160 or any(ord(c)<32 for c in name)):
         raise HTTPException(400,'A bounded skill name or query is required')
+    await refuse_while_updating()
     lookup_budget(call_id,'skills')
     await feature(native.verify,owner,provider,row['profile'],row['conversation'],timeout=6)
     return await feature(voice_context.skills,row['profile'],query,name,skill_scope,timeout=12)

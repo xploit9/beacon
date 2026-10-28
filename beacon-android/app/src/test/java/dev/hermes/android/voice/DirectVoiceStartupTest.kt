@@ -257,6 +257,34 @@ class DirectVoiceStartupTest {
         } finally { voice.close();scope.cancel();client.closeNative() }
     }
 
+    @Test(timeout=10000) fun aLookupDuringAHermesUpdateTellsTheModelToTryAgainLater() = runBlocking {
+        val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
+        val frames=mutableListOf<JSONObject>()
+        val client=BeaconClient(AuthContext("https://voice-fixture.invalid",emptyList(),"owner","default",backend="hermes-dashboard"),null) { builder ->
+            builder.addInterceptor { chain ->
+                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(503).message("Fixture")
+                    .body(json("detail" to "Hermes is updating").toString().toResponseBody("application/json".toMediaType())).build()
+            }
+        }
+        val voice=DirectVoice(client,"call","stored",scope,{}, {}, {},credentials=credentials())
+        DirectVoice::class.java.getDeclaredField("context").apply { isAccessible=true }.set(voice,json("capabilities" to json("memory_recall" to true)))
+        DirectVoice::class.java.getDeclaredField("ready").apply { isAccessible=true }.set(voice,true)
+        val method=DirectVoice::class.java.getDeclaredMethod("tool",JSONObject::class.java,java.lang.Long.TYPE,Continuation::class.java).apply { isAccessible=true }
+        try {
+            runCatching { suspendCoroutineUninterceptedOrReturn<Unit> { continuation ->
+                method.invoke(voice,json("id" to "updating-memory","name" to "hermes_memory","args" to json("query" to "Owned fixture")),0L,continuation)
+            } }
+            val channel=DirectVoice::class.java.getDeclaredField("controls").apply { isAccessible=true }.get(voice) as kotlinx.coroutines.channels.Channel<*>
+            while(true) {
+                val frame=channel.tryReceive().getOrNull()?:break
+                frames.add(JSONObject(frame.javaClass.getDeclaredField("json").apply { isAccessible=true }.get(frame) as String))
+            }
+            val response=frames.single().getJSONObject("toolResponse").getJSONArray("functionResponses").getJSONObject(0).getJSONObject("response")
+            assertEquals("not_sent",response.getString("status"));assertEquals("hermes_updating",response.getString("error_code"))
+            assertTrue(response.getString("message").contains("try again in a few minutes"))
+        } finally { voice.close();scope.cancel();client.closeNative() }
+    }
+
     @Test(timeout=5000) fun rejectedSetupReportsTheProviderReasonWithoutRetrying() = runBlocking {
         val connections = AtomicInteger()
         val failed = CompletableDeferred<String>()

@@ -498,10 +498,11 @@ class NativeExperienceUiTest {
         compose.onAllNodesWithText("Delete", useUnmergedTree = true).onLast().performClick()
         await { fixture.jobs.isEmpty() && vm.form.value == null }
         clickText("Create schedule"); await { vm.form.value != null }
-        compose.runOnIdle { vm.formValue("name", "Owned schedule fixture"); vm.formValue("prompt", "Summarize the synthetic workspace"); vm.formValue("schedule", "every 2h") }
+        compose.runOnIdle { vm.formValue("name", "Owned schedule fixture"); vm.formValue("prompt", "Summarize the synthetic workspace"); vm.formValue("_schedule_mode", "Every"); vm.formValue("_every_n", "2"); vm.formValue("_every_unit", "hours") }
         compose.onNodeWithText("Save", useUnmergedTree = true).performClick()
         await { fixture.jobs.containsKey("task-new") && vm.form.value == null }
         assertEquals("Owned schedule fixture", fixture.jobs.getValue("task-new").string("name"))
+        assertEquals("every 2h", fixture.jobs.getValue("task-new").string("schedule"))
         clickText("Check-up calls")
         compose.onNodeWithText("Turn on").performScrollTo().assertIsNotEnabled()
         compose.onNodeWithText("Create vetted mail task").assertDoesNotExist()
@@ -518,6 +519,56 @@ class NativeExperienceUiTest {
         compose.onAllNodesWithText("Schedules aren't running. Start Hermes on your computer.").assertCountEquals(1)
         compose.onAllNodesWithText("Scheduler needs attention").assertCountEquals(0)
         compose.onAllNodesWithText("Waiting", substring = true).assertCountEquals(2)
+    }
+
+    @Test fun schedulesReadInPlainWordsAndFinishedOnesMoveToCompleted() = withFixture { vm, fixture ->
+        val hash = "0123456789abcdef".repeat(4)
+        val dailyText = if (android.text.format.DateFormat.is24HourFormat(app)) "Every day at 08:00" else "Every day at 8:00 AM"
+        fixture.jobs["task-daily"] = json("id" to "task-daily", "name" to "Cybersecurity news", "prompt" to "<!-- hidden note -->Summarize the synthetic security news.", "deliver" to "local", "enabled" to true, "state" to "scheduled",
+            "schedule" to json("kind" to "cron", "expr" to "0 8 * * *", "display" to "0 8 * * *"), "schedule_display" to "0 8 * * *", "next_run_at" to "2026-10-29T08:00:00+04:00", "scheduler_heartbeat_age_s" to 8)
+        fixture.jobs["task-callback"] = json("id" to "task-callback", "name" to "Beacon callback $hash", "prompt" to "", "script" to "beacon-callback-$hash.py", "no_agent" to true, "deliver" to "local", "enabled" to true, "state" to "scheduled",
+            "schedule" to json("kind" to "once", "run_at" to "2026-10-29T19:01:00+04:00", "display" to "once at 2026-10-29 19:01"), "next_run_at" to "2026-10-29T19:01:00+04:00", "scheduler_heartbeat_age_s" to 8)
+        fixture.jobs["task-done"] = json("id" to "task-done", "name" to "Dentist reminder", "prompt" to "Remind me about the synthetic appointment.", "deliver" to "local", "enabled" to false, "state" to "completed", "last_status" to "ok", "last_run_at" to "2026-10-14T09:00:05+04:00",
+            "schedule" to json("kind" to "once", "run_at" to "2026-10-14T09:00:00+04:00", "display" to "once at 2026-10-14 09:00"), "scheduler_heartbeat_age_s" to 8)
+        compose.runOnIdle { vm.tab("Tasks") }
+        await { vm.data.value["crons"]?.rows("jobs")?.size == 4 }
+        val list = compose.onNodeWithTag("schedules-list")
+        // A daily job reads as words, with no cron code and no hidden comment.
+        list.performScrollToNode(hasTestTag("schedule-card:task-daily"))
+        compose.onNodeWithText(dailyText, useUnmergedTree = true).assertExists()
+        compose.onAllNodesWithText("0 8 * * *", substring = true, useUnmergedTree = true).assertCountEquals(0)
+        compose.onAllNodesWithText("hidden note", substring = true, useUnmergedTree = true).assertCountEquals(0)
+        // A callback is titled Callback, shows no hash and has no Edit; Delete stays.
+        list.performScrollToNode(hasTestTag("schedule-card:task-callback"))
+        val callback = hasAnyAncestor(hasTestTag("schedule-card:task-callback"))
+        compose.onNode(hasText("Callback") and callback, useUnmergedTree = true).assertExists()
+        compose.onAllNodesWithText(hash.take(12), substring = true, useUnmergedTree = true).assertCountEquals(0)
+        compose.onAllNodesWithText("Beacon callback", substring = true, useUnmergedTree = true).assertCountEquals(0)
+        compose.onNode(hasContentDescription("Edit") and callback, useUnmergedTree = true).assertDoesNotExist()
+        compose.onNode(hasContentDescription("Delete") and callback, useUnmergedTree = true).assertExists()
+        // The finished one-time job is only under Completed, which starts closed and counts its rows.
+        compose.onAllNodes(hasTestTag("schedule-card:task-done")).assertCountEquals(0)
+        compose.onAllNodesWithText("Dentist reminder", useUnmergedTree = true).assertCountEquals(0)
+        list.performScrollToNode(hasTestTag("completed-schedules"))
+        compose.onNodeWithTag("completed-schedules").assertTextContains("(1)", substring = true).performClick()
+        list.performScrollToNode(hasTestTag("completed-schedule:task-done"))
+        compose.onNodeWithText("Dentist reminder", useUnmergedTree = true).assertExists()
+        compose.onNode(hasText("Ran", substring = true) and hasAnyAncestor(hasTestTag("completed-schedule:task-done")), useUnmergedTree = true).assertExists()
+        compose.onAllNodes(hasTestTag("schedule-card:task-done")).assertCountEquals(0)
+        // The daily job opens as Daily at 08:00, says so in words, and renaming it leaves its schedule alone.
+        list.performScrollToNode(hasTestTag("schedule-card:task-daily"))
+        compose.onNode(hasContentDescription("Edit") and hasAnyAncestor(hasTestTag("schedule-card:task-daily")), useUnmergedTree = true).performScrollTo().performClick()
+        await { vm.form.value != null }
+        assertEquals("Daily", vm.form.value!!.values["_schedule_mode"]); assertEquals("8", vm.form.value!!.values["_hour"]); assertEquals("0", vm.form.value!!.values["_minute"])
+        compose.onNodeWithText("$dailyText · Asia/Dubai", useUnmergedTree = true).assertExists()
+        compose.onAllNodesWithText("Day of the month", useUnmergedTree = true).assertCountEquals(0)
+        compose.runOnIdle { vm.formValue("name", "Security digest") }
+        compose.onNodeWithText("Save").assertIsDisplayed().performClick()
+        await { vm.form.value == null && fixture.jobs.getValue("task-daily").string("name") == "Security digest" }
+        val updates = fixture.requests.last { it.string("method") == "PUT" }.getJSONObject("body").getJSONObject("updates")
+        assertEquals(setOf("name"), updates.keys().asSequence().toSet())
+        receipts += "Schedules read in words, a callback shows no hash or Edit, finished one-time jobs sit under Completed, and an unchanged schedule is not rewritten."
+        capture("schedules-plain-words")
     }
 
     @Test fun kanbanStartsOnTheFirstColumnWithTasksAndShowsTheBoardNameOnce() = withFixture { vm, fixture ->
@@ -947,7 +998,8 @@ class NativeExperienceUiTest {
             takePhotoThenRestore()
             picker.deliver(Activity.RESULT_OK)
             await { photos() == 1 }
-            assertTrue(vm.attachmentPreparation.value.isEmpty())
+            // The photo lands a moment before its preparing marker clears.
+            await { vm.attachmentPreparation.value.isEmpty() }
 
             // After process death the result arrives while the restored client is still connecting.
             takePhotoThenRestore()
@@ -957,7 +1009,7 @@ class NativeExperienceUiTest {
             assertEquals(1, photos())
             compose.runOnIdle { field(vm, "client", fixture.client); flow<AppState>(vm, "_ui").let { it.value = it.value.copy(connected = true) } }
             await { photos() == 2 }
-            assertTrue(vm.attachmentPreparation.value.isEmpty())
+            await { vm.attachmentPreparation.value.isEmpty() }
             receipts += "The camera URI and original conversation key survive saved-state recreation; the result uploads when the restored account and conversation still match, also once a client that was still connecting connects."
         }
     }
@@ -2530,7 +2582,7 @@ class NativeExperienceUiTest {
         clickLabel("Edit")
         await { vm.form.value != null }
         fixture.cronFailure = "Choose a single interval or a cron expression for this schedule."
-        compose.runOnIdle { vm.formValue("name", "A revised summary"); vm.formValue("schedule", "every hour to two hours") }
+        compose.runOnIdle { vm.formValue("name", "A revised summary"); vm.formValue("_schedule_mode", "Custom schedule"); vm.formValue("schedule", "every hour to two hours") }
         compose.onNodeWithText("Save").assertIsDisplayed().performClick()
         await { vm.submittingForm.value.isBlank() }
         assertNotNull("Validation must retain the editor", vm.form.value)

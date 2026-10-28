@@ -108,4 +108,131 @@ class NativeSchedulesTest {
         assertEquals("Paused",scheduleState(JSONObject().put("enabled",false).put("state","scheduled")))
         assertFalse(schedulePaused(JSONObject().put("enabled",false).put("state","completed")))
     }
+
+    private val hash = "0123456789abcdef".repeat(4) // 64 hex, as the plugin names a callback
+    private fun callbackJob() = json("id" to "cb1", "name" to "Beacon callback $hash", "script" to "beacon-callback-$hash.py", "no_agent" to true, "state" to "scheduled",
+        "schedule" to json("kind" to "once", "run_at" to "2026-10-28T19:01:00+04:00", "display" to "once at 2026-10-28 19:01"))
+    private fun watchJob(stored: String = "*/15 10-21 * * *") = json("id" to "w1", "name" to "Beacon: what needs you", "deliver" to "local", "schedule" to json("kind" to "cron", "expr" to stored, "display" to stored),
+        "prompt" to "<!-- BEACON_PROACTIVE_JOB:watch_email -->\nBefore using any tool, require a fresh guard marker.")
+
+    @Test fun finishedOneTimeSchedulesMoveToCompletedAndFailedOnesStay() {
+        val once = json("kind" to "once", "run_at" to "2026-10-14T09:00:00+04:00")
+        val daily = json("kind" to "cron", "expr" to "0 8 * * *")
+        val upcoming = json("id" to "a", "state" to "scheduled", "next_run_at" to "2026-10-29T08:00:00+04:00", "schedule" to daily)
+        val done = json("id" to "b", "state" to "completed", "enabled" to false, "last_status" to "ok", "schedule" to once)
+        val failed = json("id" to "c", "state" to "completed", "enabled" to false, "last_status" to "error", "schedule" to once)
+        val pendingOnce = json("id" to "d", "state" to "scheduled", "next_run_at" to "2026-10-29T19:01:00+04:00", "schedule" to once)
+        val limitReached = json("id" to "e", "state" to "completed", "enabled" to false, "schedule" to daily, "repeat" to json("times" to 3, "completed" to 3))
+        val limitNotReached = json("id" to "f", "state" to "completed", "enabled" to false, "schedule" to daily, "repeat" to json("times" to 3, "completed" to 1))
+        val pausedOnce = json("id" to "g", "state" to "paused", "enabled" to false, "schedule" to once)
+        val unknown = json("id" to "h", "state" to "completed", "enabled" to false)
+        val (active, completed) = splitSchedules(listOf(upcoming, done, failed, pendingOnce, limitReached, limitNotReached, pausedOnce, unknown))
+        assertEquals(listOf("a", "c", "d", "f", "g", "h"), active.map { it.string("id") })
+        assertEquals(listOf("b", "e"), completed.map { it.string("id") })
+        // A one-time job that ran badly is a Failed schedule to look at, not a completed one, and it is finished, so it cannot be paused.
+        assertEquals("Failed", scheduleState(failed)); assertTrue(scheduleEnded(failed)); assertEquals("Completed", scheduleState(done))
+        assertFalse(scheduleEnded(pendingOnce)); assertFalse(scheduleEnded(pausedOnce))
+        assertEquals("Failed", scheduleState(JSONObject(done.toString()).put("last_status", "delivery_failed")))
+        // A one-time job a gateway restart cut off ends with a status Hermes names freely, but always with last_error.
+        val interrupted = JSONObject(done.toString()).put("last_status", "interrupted").put("last_error", "interrupted")
+        assertEquals("Failed", scheduleState(interrupted)); assertTrue(splitSchedules(listOf(interrupted)).second.isEmpty())
+        assertEquals(emptyList<JSONObject>() to emptyList<JSONObject>(), splitSchedules(emptyList()))
+    }
+
+    @Test fun aCallbackIsTitledCallbackAndNeverShowsItsHash() {
+        val callback = callbackJob()
+        assertTrue(scheduleIsCallback(callback))
+        assertTrue("by name alone", scheduleIsCallback(json("name" to "Beacon callback $hash")))
+        assertTrue("by script alone, in a folder", scheduleIsCallback(json("script" to "C:\\Users\\x\\scripts\\beacon-callback-$hash.py")))
+        assertFalse(scheduleIsCallback(json("name" to "Beacon callback notes", "script" to "daily-notes.py")))
+        assertFalse(scheduleIsCallback(json("name" to "Morning summary")))
+        assertEquals("Callback", scheduleTitle(callback, "Untitled schedule", "Callback"))
+        assertEquals("Morning summary", scheduleTitle(json("name" to "Morning summary"), "Untitled schedule", "Callback"))
+        assertEquals("Untitled schedule", scheduleTitle(JSONObject(), "Untitled schedule", "Callback"))
+        val shown = listOf(scheduleTitle(callback, "Untitled schedule", "Callback"), scheduleBody(callback, ""), describeSchedule(callback.getJSONObject("schedule"), scheduleDisplay(callback), "Asia/Dubai", ScheduleFormat(true, java.util.Locale.US, { it }, "d MMM")))
+        shown.forEach { assertFalse(it, it.contains(hash.take(8))) }
+        assertEquals("Once · 28 Oct, 19:01", shown[2])
+    }
+
+    @Test fun aCallbackBodyIsTheReasonThePluginGivesOrNothing() {
+        val capabilities = json("callbacks" to json("cb1" to json("reason" to "  Follow up on the invoice ")))
+        assertEquals("Follow up on the invoice", callbackReason(capabilities, "cb1"))
+        assertEquals("", callbackReason(capabilities, "other"))
+        assertEquals("", callbackReason(null, "cb1"))
+        assertEquals("", callbackReason(JSONObject(), "cb1"))
+        assertEquals("", callbackReason(json("callbacks" to json("cb1" to json("reason" to JSONObject.NULL))), "cb1"))
+        assertEquals("Follow up on the invoice", scheduleBody(callbackJob(), callbackReason(capabilities, "cb1")))
+        assertEquals("", scheduleBody(callbackJob(), ""))
+    }
+
+    @Test fun aBeaconManagedJobReadsInOneLineAndAnOwnersPromptLosesItsComments() {
+        val watch = watchJob()
+        assertEquals("watch_email", proactiveKind(watch))
+        assertEquals("Looks through your connected sources and lets you know when something needs you.", scheduleBody(watch, ""))
+        assertEquals("Tidies up what Beacon remembers about you.", scheduleBody(json("prompt" to "<!-- BEACON_PROACTIVE_JOB:nightly_memory -->\nReview only this profile's memory."), ""))
+        assertEquals("Runs in the background for Beacon.", scheduleBody(json("prompt" to "<!-- BEACON_PROACTIVE_JOB:future_kind -->\nx"), ""))
+        assertFalse(scheduleBody(watch, "").contains("<!--"))
+        assertEquals("Summarize the news.", scheduleBody(json("prompt" to "<!-- note -->\nSummarize the news.\n<!-- two\nlines -->"), ""))
+        assertEquals("", scheduleBody(json("prompt" to "<!-- only a comment -->"), ""))
+        // The marker counts only at the start of the prompt.
+        assertNull(proactiveKind(json("prompt" to "Keep <!-- BEACON_PROACTIVE_JOB:watch_email --> out of it")))
+        assertTrue(scheduleNameOnly(watch)); assertTrue(scheduleNameOnly(json("script" to "C:/x/beacon-checkups.py")))
+        assertFalse(scheduleNameOnly(json("prompt" to "Keep <!-- BEACON_PROACTIVE_JOB:watch_email --> out of it"))); assertFalse(scheduleNameOnly(JSONObject()))
+    }
+
+    private fun openedAsTheFormSeedsIt(job: JSONObject, today: java.time.LocalDate = java.time.LocalDate.of(2026, 10, 28)): JSONObject {
+        val stored = nativeScheduleInput(job)
+        val seed = schedulePayload(job)
+        parseScheduleString(stored).formSeed(today).forEach { (key, value) -> seed.put(key, value) }
+        seed.put("_timezone", "Asia/Dubai").put("schedule", stored)
+        return seed.put("_original", JSONObject(seed.toString()))
+    }
+
+    @Test fun renamingABeaconManagedJobSendsOnlyTheName() {
+        val body = JSONObject(openedAsTheFormSeedsIt(watchJob()).toString()).put("name", "Renamed")
+        body.put("schedule", formSchedule(body))
+        assertEquals(setOf("name"), scheduleUpdates(body).keys().asSequence().toSet())
+        assertEquals("*/15 10-21 * * *", body.getString("schedule"))
+    }
+
+    @Test fun aSavedDailyScheduleOpensAsDailyAndOnlyChangesWhenItIsChanged() {
+        val job = json("id" to "d1", "name" to "Cybersecurity news", "deliver" to "local", "schedule" to json("kind" to "cron", "expr" to "0 8 * * *", "display" to "0 8 * * *"))
+        val seed = openedAsTheFormSeedsIt(job)
+        assertEquals("Daily", seed.getString("_schedule_mode")); assertEquals(8, seed.getInt("_hour")); assertEquals(0, seed.getInt("_minute"))
+        val untouched = JSONObject(seed.toString()).put("name", "Security digest")
+        untouched.put("schedule", formSchedule(untouched))
+        assertEquals(setOf("name"), scheduleUpdates(untouched).keys().asSequence().toSet())
+        val later = JSONObject(seed.toString()).put("_hour", 9L)
+        later.put("schedule", formSchedule(later))
+        assertEquals(setOf("schedule"), scheduleUpdates(later).keys().asSequence().toSet()); assertEquals("0 9 * * *", scheduleUpdates(later).getString("schedule"))
+        // Another mode builds its own string and ignores the stale text field; Weekly starts on Monday to Friday.
+        val weekly = JSONObject(seed.toString()).put("_schedule_mode", "Weekly")
+        assertEquals("0 8 * * 1,2,3,4,5", formSchedule(weekly))
+        assertEquals("0 8 * * 1,3", formSchedule(weekly.put("_wd_2", false).put("_wd_4", false).put("_wd_5", false)))
+    }
+
+    @Test fun aStoredIntervalOpensInItsLargestUnitAndIsNotRewrittenByAnUnrelatedEdit() {
+        val job = json("id" to "i1", "name" to "Poll", "deliver" to "local", "schedule" to json("kind" to "interval", "minutes" to 120, "display" to "every 120m"))
+        val seed = openedAsTheFormSeedsIt(job)
+        assertEquals("Every", seed.getString("_schedule_mode")); assertEquals(2, seed.getInt("_every_n")); assertEquals("hours", seed.getString("_every_unit"))
+        val renamed = JSONObject(seed.toString()).put("name", "Poll often")
+        renamed.put("schedule", formSchedule(renamed))
+        assertEquals("every 120m", renamed.getString("schedule"))
+        assertEquals(setOf("name"), scheduleUpdates(renamed).keys().asSequence().toSet())
+    }
+
+    @Test fun aThreadTargetNeverShowsItsRawIdOnACard() {
+        val thread = "phone:$hash"
+        assertEquals("A thread", deliveryLabel(thread, deliveryNames(listOf(json("id" to "phone", "name" to "Beacon chat")))))
+        assertEquals("Cybersecurity news", deliveryLabel(thread, deliveryNames(listOf(json("id" to thread, "name" to "Cybersecurity news")))))
+        assertEquals("Beacon chat, A thread", deliveryLabel("phone, $thread", deliveryNames(listOf(json("id" to "phone", "name" to "Beacon chat")))))
+        assertEquals("Untitled thread", deliveryLabel(thread, deliveryNames(listOf(json("id" to thread, "name" to "Untitled thread")))))
+    }
+
+    @Test fun hermesDisplayTextIsOnlyAFallbackForTheScheduleLine() {
+        assertEquals("every 2h", scheduleDisplay(json("schedule" to "every 2h")))
+        assertEquals("every 15m", scheduleDisplay(json("schedule" to json("kind" to "interval", "display" to "every 15m"), "schedule_display" to "ignored")))
+        assertEquals("0 10 * * *", scheduleDisplay(json("schedule" to json("kind" to "cron"), "schedule_display" to "0 10 * * *")))
+        assertEquals("", scheduleDisplay(json("schedule" to json("kind" to "cron"))))
+    }
 }

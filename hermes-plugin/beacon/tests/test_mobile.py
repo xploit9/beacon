@@ -1746,3 +1746,40 @@ def test_invitation_supplied_connection_leaves_commit_and_close_to_caller(harnes
     standalone=api.mobile.invitation('owner','default','chat-a','Build failed')
     with api.mobile.connect() as conn:
         assert conn.execute('SELECT id FROM '+table).fetchone()[0]==standalone
+
+
+def test_call_lookups_say_hermes_is_updating_instead_of_timing_out(harness,monkeypatch):
+    api,c,cfg,tmp,app=harness;cid=reserve(c)
+    monkeypatch.setattr(api.admin,'update_in_progress',lambda:True)
+    for route,value in (('search',{'query':'news'}),('memory',{'query':'preferences'}),('skills',{'query':'web'}),('profile-context',{'query':'me'})):
+        response=c.post(f'/api/plugins/beacon/mobile/calls/{cid}/{route}',json=value)
+        assert response.status_code==503 and response.json()['detail']=='Hermes is updating', route
+    tools=c.get(f'/api/plugins/beacon/mobile/calls/{cid}/tools')
+    assert tools.status_code==503 and tools.json()['detail']=='Hermes is updating'
+    invoke=c.post(f'/api/plugins/beacon/mobile/calls/{cid}/tools/invoke',json={'request_id':'r1','tool_id':'a'*64,'arguments':{}})
+    assert invoke.status_code==503 and invoke.json()['detail']=='Hermes is updating'
+
+
+def test_task_capabilities_name_only_the_owners_callbacks(harness,monkeypatch):
+    api,c,cfg,tmp,app=harness
+    with api.mobile.connect() as conn:
+        for key,owner,provider,profile in (('a','owner','basic','default'),('b','someone-else','basic','default'),('c','owner','basic','other'),('d','owner','other-provider','default')):
+            record={'owner':owner,'provider':provider,'profile':profile,'job_id':'job-'+key,'reason':'Ring me about '+key}
+            conn.execute('INSERT INTO meta VALUES(?,?)',('scheduled-callback:'+key*64,json.dumps(record).encode()))
+    monkeypatch.setattr(api,'task_clock',lambda profile:'Asia/Dubai')
+    assert c.get('/api/plugins/beacon/mobile/tasks/capabilities').json()['callbacks']=={'job-a':{'reason':'Ring me about a'}}
+    # The reasons are extra: when they cannot be read, the clock and check-up state still answer.
+    def broken(*args): raise RuntimeError('database is locked')
+    monkeypatch.setattr(sys.modules['beacon_callbacks'],'reasons',broken)
+    body=c.get('/api/plugins/beacon/mobile/tasks/capabilities').json()
+    assert body['timezone']=='Asia/Dubai' and body['callbacks']=={}
+
+
+def test_a_start_names_hermes_functions_this_hermes_no_longer_has(harness,monkeypatch,caplog):
+    import logging
+    api,c,cfg,tmp,app=harness
+    monkeypatch.setitem(sys.modules,'hermes_cli.web_server',SimpleNamespace(PROJECT_ROOT=str(tmp)))
+    monkeypatch.setattr(sys.modules['beacon_compat'],'missing',lambda groups,root:['tui_gateway.server._gone (native.py)'])
+    with caplog.at_level(logging.INFO):
+        api.check_hermes()
+    assert 'update Beacon: tui_gateway.server._gone (native.py)' in caplog.text

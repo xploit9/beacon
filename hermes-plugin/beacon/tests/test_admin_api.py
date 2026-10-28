@@ -276,3 +276,11 @@ def test_the_hermes_under_test_still_has_the_gateway_helpers_the_repair_uses():
     status = pytest.importorskip('gateway.status')
     for name in ('get_running_pid_identity_strict', '_read_pid_record', '_live_pid_from_record'):
         assert callable(getattr(status, name, None)), name
+
+
+def test_update_in_progress_asks_hermes_for_its_marker_and_checkout_lock(monkeypatch):
+    seen = []
+    monkeypatch.setattr(api, '_native_update_in_progress', lambda: seen.append('asked') or True)
+    assert api.update_in_progress() is True and seen == ['asked']
+    monkeypatch.setattr(api, '_native_update_in_progress', None)
+    assert api.update_in_progress() is False
