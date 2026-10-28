@@ -97,7 +97,7 @@ internal class NativeOperations(private val c: BeaconClient) {
     private suspend fun setSessionYolo(target: NativeSessionBinding, enabled: Boolean) {
         val value = if (enabled) "1" else "0"
         val result = c.nativeRpc("config.set", json("session_id" to target.runtimeSessionId, "key" to "yolo", "value" to value, "scope" to "session"))
-        require(result.string("value") == value) { "Hermes did not confirm the chat YOLO state. Refresh before trying again." }
+        require(result.string("value") == value) { "Hermes did not confirm this chat's approval setting. Refresh before trying again." }
     }
     private suspend fun dispatch(path: String, q: Map<String, String>, method: String, body: JSONObject?, maxBytes: Int): JSONObject {
         require(q["profile"] == null || q["profile"] == c.auth.profile) { "Native request belongs to another profile" }
@@ -114,7 +114,7 @@ internal class NativeOperations(private val c: BeaconClient) {
                 val name = d.getString("name").removePrefix("/").lowercase()
                 val argument = d.string("argument").trim()
                 require(!chatCommandChangesProfile(name, argument)) { "Change this for all chats in Settings." }
-                require(name != "yolo") { "Use Approvals beside the composer to change YOLO." }
+                require(name != "yolo") { "Use Approvals beside the composer to skip approvals." }
                 if (name == "model") {
                     val (model, provider) = chatModelChoice(argument)
                     return dispatch("/api/session/update", emptyMap(), "POST", json("session_id" to sid(), "model" to model, "model_provider" to provider,

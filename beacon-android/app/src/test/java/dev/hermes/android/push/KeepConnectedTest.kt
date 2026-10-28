@@ -585,7 +585,7 @@ class KeepConnectedTest {
             }
             assertEquals(0L, prepared.call.remainingRingMillis(now + 25_000, elapsed + 25_000))
             assertEquals(RelayCallbackPhase.Finished,
-                prepared.protocol.expire(now + 25_000, elapsed + 25_000, prepared.binding, prepared.preferences)!!.call.phase)
+                prepared.protocol.expire(now + 25_000, elapsed + 25_000, prepared.binding, prepared.preferences)!!.phase)
         }
     }
 }

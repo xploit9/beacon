@@ -69,10 +69,10 @@ class GrokCallLiveUiTest {
             val grokBefore=voiceStore.settings("grok")
             val targetVoice=if(grokBefore.voice=="ara") "eve" else "ara"
             val targetPersonality=if(grokBefore.personality=="warm") "balanced" else "warm"
-            rule.onNodeWithText("Voice: ${grokBefore.voice}").performScrollTo().performClick()
+            rule.onNode(hasText("Voice") and hasText("${grokBefore.voice}")).performScrollTo().performClick()
             rule.onNodeWithText(targetVoice).performClick()
             await { voiceStore.settings("grok").voice==targetVoice }
-            rule.onNodeWithText("Personality: ${grokBefore.personality.replaceFirstChar { it.uppercase() }}").performScrollTo().performClick()
+            rule.onNode(hasText("Personality") and hasText("${grokBefore.personality.replaceFirstChar { it.uppercase() }}")).performScrollTo().performClick()
             rule.onNodeWithText(targetPersonality.replaceFirstChar { it.uppercase() }).performClick()
             await { voiceStore.settings("grok").personality==targetPersonality }
             phase="create-chat"

@@ -39,13 +39,18 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.data.NativeAuth
 import dev.hermes.android.ui.*
+import dev.hermes.android.voice.CallState
 import dev.hermes.android.voice.CallToolApproval
+import dev.hermes.android.voice.callTimerLabel
 import dev.hermes.android.voice.callToolApprovalErrorMessage
 import dev.hermes.android.voice.callToolApprovalSummary
 import kotlinx.coroutines.flow.collect
@@ -144,7 +149,7 @@ class BeaconActivity : ComponentActivity() {
                     }
                     AlertDialog(
                         onDismissRequest = cancelConnectionLink,
-                        title = { Text("Connect to $pendingConnectionOrigin?") },
+                        title = { Text(uiText("Connect to {0}?").replace("{0}", pendingConnectionOrigin.orEmpty())) },
                         confirmButton = {
                             TextButton(onClick = {
                                 val link = pendingConnectionLink
@@ -154,9 +159,9 @@ class BeaconActivity : ComponentActivity() {
                                     model.openSetupLink(link, confirmed = true)
                                 }
                                 cancelConnectionLink()
-                            }) { Text("Connect") }
+                            }) { Text(uiText("Connect")) }
                         },
-                        dismissButton = { TextButton(onClick = cancelConnectionLink) { Text("Cancel") } },
+                        dismissButton = { TextButton(onClick = cancelConnectionLink) { Text(uiText("Cancel")) } },
                     )
                 }
             } } } }
@@ -243,10 +248,10 @@ internal fun NativeFeedbackEffect(
             Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Icon(Icons.Rounded.Call, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(32.dp))
-                    Text(assistantText("Beacon is calling"), style = MaterialTheme.typography.headlineSmall)
+                    Text(assistantText("Beacon is calling"), Modifier.semantics { liveRegion = LiveRegionMode.Assertive }, style = MaterialTheme.typography.headlineSmall)
                 }
-                ui.error.ifBlank { call.error }.takeIf { it.isNotBlank() }?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium) }
-                Button(onClick = { onAnswer(pending.source, pending.event) }, enabled = !requestingPermission && !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("beacon-incoming-answer")) { Icon(Icons.Rounded.Call, null); Spacer(Modifier.width(8.dp)); Text(uiText(when { requestingPermission -> "Waiting for microphone permission"; busy -> "Please wait"; else -> "Answer" })) }
+                ui.error.ifBlank { call.error }.takeIf { it.isNotBlank() }?.let { Text(it, Modifier.semantics { liveRegion = LiveRegionMode.Polite }, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium) }
+                Button(onClick = { onAnswer(pending.source, pending.event) }, enabled = !requestingPermission && !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("beacon-incoming-answer")) { Icon(Icons.Rounded.Call, null); Spacer(Modifier.width(8.dp)); Text(when { requestingPermission -> uiText("Waiting for microphone permission"); busy -> uiText("Please wait"); else -> uiText("Answer") }) }
                 OutlinedButton(onClick = { vm.declineIncoming(pending.source, pending.event) }, enabled = !requestingPermission && !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("beacon-incoming-decline")) { Icon(Icons.Rounded.CallEnd, null); Spacer(Modifier.width(8.dp)); Text(uiText("Decline")) }
             }
         }
@@ -288,8 +293,8 @@ internal fun NativeFeedbackEffect(
         if (ui.tab == "More") vm.backFromSettings() else if (ui.tab == "Spaces" && vm.editor.value.path.isNotBlank()) vm.closeEditor() else if (ui.botModeEnabled) vm.showBotMode() else vm.tab("Chat")
     }
     val archiveUndo by vm.archiveUndo.collectAsStateWithLifecycle()
-    NativeFeedbackEffect(ui.error, ui.notice, ui.setupWizard, snackbar,
-        actionLabel = "Undo".takeIf { archiveUndo != null && ui.error.isBlank() && ui.notice == "Archived" }, onAction = vm::undoArchive, clearMessage = vm::clearMessage)
+    NativeFeedbackEffect(uiText(ui.error), uiText(ui.notice), ui.setupWizard, snackbar,
+        actionLabel = uiText("Undo").takeIf { archiveUndo != null && ui.error.isBlank() && ui.notice == "Archived" }, onAction = vm::undoArchive, clearMessage = vm::clearMessage)
     // The wizard stays composed while it connects after sign-in: swapping in the logo would drop what it has typed.
     if (ui.restoringSession && !ui.setupWizard) {
         Surface(Modifier.fillMaxSize().testTag("session-restore-logo"), color = MaterialTheme.colorScheme.background) {
@@ -366,15 +371,15 @@ internal fun NativeFeedbackEffect(
                     Column(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Brush.linearGradient(nativeAmbientColors(MaterialTheme.colorScheme))).padding(padding).padding(bottom = feedbackReserve).consumeWindowInsets(padding)) {
                         if (!ui.connected) Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth()) {
                             Row(Modifier.padding(start = 16.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                                Text(if (ui.loading) "Opening saved history · checking connection" else "Saved history · offline", Modifier.weight(1f), style = MaterialTheme.typography.labelMedium)
+                                Text(if (ui.loading) uiText("Reconnecting…") else uiText("Offline · showing saved chats"), Modifier.weight(1f), style = MaterialTheme.typography.labelMedium)
                                 TextButton(enabled = !ui.loading, onClick = { vm.connect(ui.origin) }) { Text(uiText("Reconnect")) }
                             }
                         }
-                        if (call.active && (ui.tab !in setOf("Chat","Beacon") && !botChatVisible || call.conversationScope != vm.authenticatedScope())) Surface(color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.fillMaxWidth()) { Row(Modifier.padding(start = 16.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) { Text("${LocalAssistantName.current} · ${call.state}", Modifier.weight(1f)); TextButton(onClick = { vm.openCurrentCall() }) { Text(uiText("Open call")) }; IconButton(onClick = vm.app.calls::hangup) { Icon(Icons.Rounded.CallEnd, assistantText("Hang up Beacon")) } } }
+                        if (call.active && (ui.tab !in setOf("Chat","Beacon") && !botChatVisible || call.conversationScope != vm.authenticatedScope())) CallBanner(call, onOpen = { vm.openCurrentCall() }, onHangUp = vm.app.calls::hangup)
                         Box(Modifier.weight(1f).then(modeMotion)) {
                         if (vm.client == null && !ui.loading && ui.tab in setOf("Tasks", "Spaces", "Projects", "Kanban")) {
-                            Header(when(ui.tab) { "Tasks" -> "Cron"; "Spaces" -> "Files"; else -> ui.tab }, menu = openMenu)
-                            EmptyState("Reconnect to Hermes", "Keep Tailscale connected to open this page. Your drafts remain saved on this phone.", action = "Reconnect", onAction = { vm.connect(ui.origin) })
+                            Header(when(ui.tab) { "Tasks" -> uiText("Schedules"); "Spaces" -> uiText("Files"); else -> uiText(ui.tab) }, menu = openMenu)
+                            EmptyState(uiText("Reconnect to Hermes"), uiText("Check your network, then retry. Your drafts remain saved on this phone."), action = uiText("Reconnect"), onAction = { vm.connect(ui.origin) })
                         } else when (ui.tab) { "Beacon" -> ChatScreen(vm, beacon = true, onComposerHeight = { composerHeightPx = it }); "Chat" -> ChatScreen(vm, onComposerHeight = { composerHeightPx = it }); "Tasks" -> TasksScreen(vm); "Spaces" -> SpacesScreen(vm); "Projects" -> NativeProjectsScreen(vm); "Kanban" -> KanbanScreen(vm); else -> MoreScreen(vm) }
                         }
                     }
@@ -403,6 +408,20 @@ internal fun NativeFeedbackEffect(
     }
 }
 
+/** The strip over every other tab while a call runs: who, what the call is doing, how long it has lasted. */
+@Composable private fun CallBanner(call: CallState, onOpen: () -> Unit, onHangUp: () -> Unit) {
+    var now by remember(call.callId) { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(call.callId) { while (true) { now = System.currentTimeMillis(); kotlinx.coroutines.delay(1000) } }
+    Surface(color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.fillMaxWidth()) {
+        Row(Modifier.padding(start = 16.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+            Text("${LocalAssistantName.current} · ${callStatusText(call)} · ${callTimerLabel(call.startedAt, now)}", Modifier.weight(1f),
+                style = LocalTextStyle.current.copy(fontFeatureSettings = "tnum"), maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+            TextButton(onClick = onOpen) { Text(uiText("Open call")) }
+            IconButton(onClick = onHangUp) { Icon(Icons.Rounded.CallEnd, assistantText("Hang up Beacon")) }
+        }
+    }
+}
+
 @Composable
 internal fun CallToolApprovalDialog(approval: CallToolApproval, onDecision: (String) -> Unit) {
     var details by rememberSaveable(approval.requestId) { mutableStateOf(false) }
@@ -410,25 +429,25 @@ internal fun CallToolApprovalDialog(approval: CallToolApproval, onDecision: (Str
     AlertDialog(
         onDismissRequest = { if (!approval.busy) onDecision("deny") },
         icon = { Icon(Icons.Rounded.VerifiedUser, null) },
-        title = { Text("Allow this action?") },
+        title = { Text(uiText("Allow this action?")) },
         text = {
             Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(summary.action, style = MaterialTheme.typography.titleMedium)
                 if (summary.service.isNotBlank()) Text(summary.service, style = MaterialTheme.typography.bodySmall)
                 if (summary.target.isNotBlank()) Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text("Target", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(uiText("Target"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Text(summary.target, style = MaterialTheme.typography.bodyLarge)
                 }
                 if (summary.fields.isNotBlank()) Text(summary.fields, style = MaterialTheme.typography.bodyMedium)
                 if (summary.preview.isNotBlank()) Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text("Content preview", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(uiText("Content preview"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Surface(shape = MaterialTheme.shapes.medium, color = MaterialTheme.colorScheme.surfaceContainerLow) {
                         Text(summary.preview, Modifier.fillMaxWidth().padding(12.dp), style = MaterialTheme.typography.bodyMedium)
                     }
                 }
                 Text(assistantText("Review the details before Beacon runs this action."))
                 TextButton(onClick = { details = !details }, modifier = Modifier.heightIn(min = 48.dp).testTag("beacon-tool-approval-details-toggle")) {
-                    Text(if (details) "Hide details" else "Details")
+                    Text(if (details) uiText("Hide details") else uiText("Details"))
                 }
                 if (details) androidx.compose.foundation.text.selection.SelectionContainer {
                     Text(approval.arguments, Modifier.testTag("beacon-tool-approval-details"), style = MaterialTheme.typography.bodySmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace))
@@ -438,10 +457,14 @@ internal fun CallToolApprovalDialog(approval: CallToolApproval, onDecision: (Str
             }
         },
         confirmButton = {
-            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                TextButton(onClick = { onDecision("deny") }, enabled = !approval.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("beacon-tool-deny")) { Text("Deny") }
-                TextButton(onClick = { onDecision("approve") }, enabled = !approval.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("beacon-tool-allow")) { Text("Allow once") }
-                if (approval.allowCall) Button(onClick = { onDecision("approve_call") }, enabled = !approval.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("beacon-tool-allow-call")) { Text("Always allow during this call") }
+            // Emphasis goes to the one-time choice; the standing permission is the quietest button and sits apart.
+            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { onDecision("deny") }, enabled = !approval.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("beacon-tool-deny")) { Text(uiText("Deny")) }
+                Button(onClick = { onDecision("approve") }, enabled = !approval.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("beacon-tool-allow")) { Text(uiText("Allow once")) }
+                if (approval.allowCall) {
+                    Spacer(Modifier.height(4.dp))
+                    TextButton(onClick = { onDecision("approve_call") }, enabled = !approval.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("beacon-tool-allow-call")) { Text(uiText("Always allow during this call")) }
+                }
             }
         },
         modifier = Modifier.testTag("beacon-tool-approval"),

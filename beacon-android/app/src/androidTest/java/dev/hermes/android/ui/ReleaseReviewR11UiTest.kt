@@ -133,7 +133,7 @@ class ReleaseReviewR11UiTest {
             compose.onNodeWithText("Save").performClick()
             compose.waitUntil(5000) { creates.get() == 1 && compose.onAllNodesWithText("Couldn't update this task. Refresh the board and try again.").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithTag("kanban-title").assertTextContains("Keep my new task")
-            compose.onNodeWithText("Cancel").performClick()
+            compose.onNodeWithText("Keep draft").performClick()
             compose.onNodeWithText("Continue saved task draft").assertIsDisplayed().performClick()
             compose.onNodeWithTag("kanban-title").assertTextContains("Keep my new task")
             compose.onNodeWithTag("kanban-discard").performClick()

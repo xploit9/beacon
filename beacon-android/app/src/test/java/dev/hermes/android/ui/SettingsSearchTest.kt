@@ -119,7 +119,7 @@ class SettingsSearchTest {
             installedVersion = "0.4.14", voiceProviderId = "gemini", voiceKeySaved = true, autoFollow = true, animateBackground = false,
             keepConnectedEnabled = true,
         )
-        assertEquals("Connected privately · work", summary("Connection", known))
+        assertEquals("Connected · work", summary("Connection", known))
         assertEquals("Connection needs attention · work", summary("Connection", known.copy(connected = false)))
         assertEquals("Active profile · work", summary("Profiles & model", known))
         // Two facts at most, so a hub row stays on one line.

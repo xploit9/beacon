@@ -269,7 +269,7 @@ class NativeExperienceUiTest {
         await { vm.data.value["native-tools"] != null && "native-tools" !in vm.refreshing.value }
         fixture.holdNextToolOperation.set(true)
         try {
-            compose.onNodeWithContentDescription("Web research").performScrollTo().performClick()
+            compose.onNode(hasText("Web research") and isToggleable()).performScrollTo().performClick()
             assertTrue(fixture.toolOperationCaptured.await(5, java.util.concurrent.TimeUnit.SECONDS))
             compose.runOnIdle {
                 field(vm, "client", fixture.client.detached())
@@ -500,8 +500,8 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Save", useUnmergedTree = true).performClick()
         await { fixture.jobs.containsKey("task-new") && vm.form.value == null }
         assertEquals("Owned schedule fixture", fixture.jobs.getValue("task-new").string("name"))
-        clickText("Call tasks")
-        compose.onNodeWithText("Create check-up task").performScrollTo().assertIsNotEnabled()
+        clickText("Check-up calls")
+        compose.onNodeWithText("Turn on").performScrollTo().assertIsNotEnabled()
         compose.onNodeWithText("Create vetted mail task").assertDoesNotExist()
         receipts += "Schedule create, pause, resume, run/cancel, history/result and delete use actual controls; check-up calls respect their prerequisites and the retired mail preset is absent."
         capture("audit-schedule-workflow")
@@ -512,8 +512,8 @@ class NativeExperienceUiTest {
         fixture.jobs["task-b"] = JSONObject(fixture.jobs.getValue("task-a").toString()).put("id", "task-b").put("name", "Evening summary")
         compose.runOnIdle { vm.tab("Tasks") }
         await { vm.data.value["crons"]?.rows("jobs")?.size == 2 }
-        compose.onNodeWithText("Scheduled jobs aren't running. Start Hermes on your computer.").assertExists()
-        compose.onAllNodesWithText("Scheduled jobs aren't running. Start Hermes on your computer.").assertCountEquals(1)
+        compose.onNodeWithText("Schedules aren't running. Start Hermes on your computer.").assertExists()
+        compose.onAllNodesWithText("Schedules aren't running. Start Hermes on your computer.").assertCountEquals(1)
         compose.onAllNodesWithText("Scheduler needs attention").assertCountEquals(0)
         compose.onAllNodesWithText("Waiting", substring = true).assertCountEquals(2)
     }
@@ -530,8 +530,8 @@ class NativeExperienceUiTest {
         fixture.boardTasks["t_claimed"] = json("id" to "t_claimed", "title" to "Claimed task", "body" to "In progress", "status" to "running", "assignee" to "coder", "priority" to 1)
         compose.runOnIdle { vm.navigate("Kanban") }
         await { compose.onAllNodesWithText("Review travel options").fetchSemanticsNodes().isNotEmpty() }
-        clickText("Move")
-        compose.onNode(hasText("Done") and hasAnyAncestor(isPopup())).performClick()
+        compose.onAllNodesWithContentDescription("Task actions").onFirst().performClick()
+        compose.onNode(hasText("Move to Done") and hasAnyAncestor(isPopup())).performClick()
         compose.onNodeWithTag("kanban-completion-result").assertExists()
         compose.onNodeWithText("A worker is actively working on this task. This change will override its claim.").assertDoesNotExist()
         compose.onNode(hasText("Move") and hasClickAction() and hasAnyAncestor(isDialog())).assertIsNotEnabled()
@@ -543,8 +543,8 @@ class NativeExperienceUiTest {
         assertEquals("Reviewed the work and confirmed the result.", patch.getJSONObject("body").string("result"))
 
         compose.onNode(hasText("Running 1") and isSelectable()).performClick()
-        clickText("Move")
-        compose.onNode(hasText("Done") and hasAnyAncestor(isPopup())).performClick()
+        compose.onAllNodesWithContentDescription("Task actions").onFirst().performClick()
+        compose.onNode(hasText("Move to Done") and hasAnyAncestor(isPopup())).performClick()
         compose.onNodeWithText("A worker is actively working on this task. This change will override its claim.").assertExists()
         compose.onNodeWithText("Cancel").performClick()
     }
@@ -552,16 +552,17 @@ class NativeExperienceUiTest {
     @Test fun kanbanMoveEditAndDeletingTheLastArchivedCardKeepAValidColumn() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.navigate("Kanban") }
         await { compose.onAllNodesWithText("Review travel options").fetchSemanticsNodes().isNotEmpty() }
-        clickText("Edit")
+        compose.onNodeWithTag("kanban-edit:t_fixture").performClick()
         compose.onNodeWithTag("kanban-title").performTextReplacement("Review the itinerary")
         compose.onNodeWithText("Save", useUnmergedTree = true).performClick()
         await { fixture.boardTasks.getValue("t_fixture").string("title") == "Review the itinerary" }
-        clickText("Move")
-        compose.onNode(hasText("Archived") and hasAnyAncestor(isPopup())).performScrollTo().performClick()
-        compose.onAllNodesWithText("Move", useUnmergedTree = true).onLast().performClick()
+        compose.onAllNodesWithContentDescription("Task actions").onFirst().performClick()
+        // A move between idle columns applies at once; only Done, Ready, Delete and moves off a running task ask first.
+        compose.onNode(hasText("Move to Archived") and hasAnyAncestor(isPopup())).performScrollTo().performClick()
         await { fixture.boardTasks.getValue("t_fixture").string("status") == "archived" }
-        clickText("Delete")
-        compose.onAllNodesWithText("Delete", useUnmergedTree = true).onLast().performClick()
+        compose.onAllNodesWithContentDescription("Task actions").onFirst().performClick()
+        compose.onNode(hasText("Delete") and hasAnyAncestor(isPopup())).performClick()
+        compose.onNode(hasText("Delete") and hasClickAction() and hasAnyAncestor(isDialog())).performClick()
         await { fixture.boardTasks.isEmpty() }
         // The emptied Archived column is hidden, and the board falls back to an existing column.
         compose.onAllNodes(hasText("Archived", substring = true) and isSelectable()).assertCountEquals(0)
@@ -597,11 +598,11 @@ class NativeExperienceUiTest {
         await { vm.botMode.state.value.selectedSpace == "fixture-room" && !vm.botMode.state.value.loading }
         fixture.rejectRoomSend = true
         compose.onNodeWithTag("bot-shared-composer").performTextInput("Plan the synthetic review")
-        compose.onNodeWithText("Send").performClick()
+        compose.onNodeWithTag("bot-shared-send").performClick()
         await { !vm.botMode.state.value.loading && vm.botMode.state.value.error.isNotBlank() }
         assertEquals("Plan the synthetic review", vm.botMode.state.value.draft)
         fixture.rejectRoomSend = false
-        compose.onNodeWithText("Send").performClick()
+        compose.onNodeWithTag("bot-shared-send").performClick()
         await { vm.botMode.state.value.draft.isBlank() && !vm.botMode.state.value.loading }
         // Only shared-space sends: stock history reads also end in /messages.
         val sends = fixture.requests.filter { it.string("path").endsWith("/space/fixture-room/messages") }
@@ -719,9 +720,9 @@ class NativeExperienceUiTest {
         capture("audit-pdf-pager")
         compose.onNodeWithText("Close").performClick()
         message("```json\n{\"plan\": [1, 2]}\n```")
-        compose.onNodeWithText("Tree").performScrollTo().performClick()
-        compose.onNodeWithText("Source").performClick()
-        compose.onNodeWithText("Tree").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Tree").performScrollTo().performClick()
+        compose.onNodeWithContentDescription("Source").performClick()
+        compose.onNodeWithContentDescription("Tree").assertIsDisplayed()
         receipts += "Native PDF page navigation reaches both pages and disables boundaries; its dialog closes, and JSON switches between source and tree."
     }
 
@@ -1052,11 +1053,11 @@ class NativeExperienceUiTest {
         compose.onNodeWithTag("approval-mode-off").assertDoesNotExist()
         compose.onNodeWithTag("approval-mode-smart").assertDoesNotExist()
         compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
-        compose.onNodeWithText("Enable YOLO for this chat?").assertIsDisplayed()
+        compose.onNodeWithText("Skip approvals for this chat?").assertIsDisplayed()
         compose.onNodeWithText("Cancel").performClick()
         assertTrue(fixture.requests.none { it.string("method") == "config.set" })
         open(); compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
-        compose.onNodeWithText("Enable YOLO").performClick()
+        compose.onNode(hasText("Skip approvals") and hasAnyAncestor(isDialog())).performClick()
         await { vm.data.value["picker:approvals"]?.optBoolean("session_bypass") == true }
         open(); compose.onNodeWithTag("approval-ask").performScrollTo().performClick()
         await { vm.data.value["picker:approvals"]?.let { it.optBoolean("session_status_known") && !it.optBoolean("session_bypass") } == true }
@@ -1067,7 +1068,7 @@ class NativeExperienceUiTest {
         open(); compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
         compose.runOnIdle { vm.selectSession("chat-b") }
         await { vm.chat.value.sessionId == "chat-b" }
-        compose.onNodeWithText("Enable YOLO for this chat?").assertDoesNotExist()
+        compose.onNodeWithText("Skip approvals for this chat?").assertDoesNotExist()
         assertEquals(2, fixture.requests.count { it.string("method") == "config.set" })
         receipts += "Chat approvals only change session YOLO; enabling confirms, Ask first restores the profile policy, and switching chat cancels stale confirmation."
     }
@@ -1320,6 +1321,47 @@ class NativeExperienceUiTest {
         receipts += "Sign-out and device removal forget the chat list and its previews for every profile the app knows."
     }
 
+    @Test fun signOutForgetsPreviewsOfAProfileOnlyTheAccountRowNames() = withFixture { vm, fixture ->
+        val account = fixture.scope.copy(profile = "", session = "")
+        val unlisted = fixture.scope.copy(profile = "scratch", session = "")
+        runBlocking {
+            app.cache.write(unlisted, "chat-glances", "{}", protected = true)
+            app.cache.write(unlisted, "conversation-index", json("sessions" to org.json.JSONArray()).toString())
+            app.cache.write(account, GLANCE_PROFILES_KIND, glanceProfilesJson(listOf("scratch")), protected = true)
+        }
+        // The profile list does not name it and this run never opened it: only the account row does.
+        compose.runOnIdle { vm.storeData("navigation-profiles", json("profiles" to org.json.JSONArray().put(json("name" to "default")))) }
+        compose.runOnIdle { vm.forgetScreens() }
+        await { runBlocking { listOf("chat-glances", "conversation-index").all { app.cache.read(unlisted, it) == null } && app.cache.read(account, GLANCE_PROFILES_KIND) == null } }
+        receipts += "Sign-out forgets the previews of a profile that only the account row names, then the account row."
+    }
+
+    /** What the view model has already put in the account row this run (private state, read to know the first save really recorded it). */
+    @Suppress("UNCHECKED_CAST") private fun recordedGlanceProfiles(vm: BeaconViewModel) =
+        (BeaconViewModel::class.java.getDeclaredField("glanceRecorded").apply { isAccessible = true }.get(vm) as Set<String>).toSet()
+
+    @Test fun signingInAgainAfterSignOutRecordsTheProfileInTheAccountRowAgainSoTheNextSignOutForgetsItsPreviews() = withFixture { vm, fixture ->
+        val account = fixture.scope.copy(profile = "", session = "")
+        val chatList = fixture.scope.copy(session = "")
+        fun stored(scope: Scope, kind: String) = runBlocking { app.cache.read(scope, kind) }
+        fun named() = decodeGlanceProfiles(stored(account, GLANCE_PROFILES_KIND))
+        val latest = requireNotNull(vm.chat.value.messages.lastOrNull { (it.role == "user" || it.role == "assistant") && it.text.isNotBlank() })
+        // The first sign-in saves a preview; the account row names the profile and this run knows it did.
+        compose.runOnIdle { vm.noteChatViewed("chat-a", latest) }
+        await { chatList.key in compose.runOnUiThread { recordedGlanceProfiles(vm) } && stored(chatList, "chat-glances") != null && fixture.scope.profile in named() }
+        // Sign-out forgets both. The fixture keeps its client, which is all the glance state sees of signing in again to the same account.
+        compose.runOnIdle { vm.forgetScreens() }
+        await { stored(chatList, "chat-glances") == null && stored(account, GLANCE_PROFILES_KIND) == null }
+        // The preview saved after that must name the profile again, or the next sign-out could not find it by the account row.
+        compose.runOnIdle { vm.noteChatViewed("chat-a", latest) }
+        await { stored(chatList, "chat-glances") != null }
+        assertTrue("The account row names the profile again", fixture.scope.profile in named())
+        runBlocking { app.cache.write(chatList, "conversation-index", json("sessions" to org.json.JSONArray()).toString()) }
+        compose.runOnIdle { vm.forgetScreens() }
+        await { listOf("chat-glances", "conversation-index").all { stored(chatList, it) == null } && stored(account, GLANCE_PROFILES_KIND) == null }
+        receipts += "Signing in again after a sign-out records the profile's previews in the account row again, and the next sign-out forgets them and the row."
+    }
+
     @Test fun historyAllProfilesListsOtherProfilesWhenTheCurrentOneHasNoStore() = withFixture { vm, fixture ->
         // An earlier test may have cached the profile catalogue (fresh for two minutes) without these names.
         runBlocking { listOf("default", "coder").forEach { app.cache.delete(fixture.scope.copy(profile = it), "read:/api/profiles") } }
@@ -1344,7 +1386,7 @@ class NativeExperienceUiTest {
         fixture.sessionListFailures = mapOf("coder" to noStore, "default" to (503 to "Session store is busy (disk I/O or lock). Retry; the list was not cleared."))
         compose.runOnIdle { vm.refreshSessions() }
         await { vm.ui.value.historyUnreadable == listOf("default") && !vm.ui.value.historyLoading && vm.data.value["navigation-profiles"]?.rows("profiles")?.any { it.string("display_name") == "Personal profile" } == true }
-        compose.onNodeWithTag("history-unreadable:default").assertTextEquals("Couldn't load Personal profile's conversations")
+        compose.onNodeWithTag("history-unreadable:default").assertTextEquals("Couldn't load conversations: Personal profile")
         compose.onNodeWithText("No conversations here").assertDoesNotExist()
         receipts += "All Profiles lists another profile's chats when the current profile has no store yet, and names a profile whose chats could not be read."
     }
@@ -1433,8 +1475,7 @@ class NativeExperienceUiTest {
             compose.waitUntil(5_000) { fixture.sessionListQueries.any { it.string("sources") == "android_thread,phone" } }
             compose.waitUntil(5_000) { compose.onAllNodesWithText("No threads yet").fetchSemanticsNodes().isNotEmpty() }
 
-            compose.onNodeWithTag("history-filter").performScrollTo().performClick()
-            compose.onNodeWithTag("history-new-thread").performClick()
+            compose.onNodeWithTag("navigation-new-thread").performScrollTo().performClick()
             compose.onNodeWithTag("new-thread-name").performTextInput("Trip planning")
             compose.onNodeWithTag("new-thread-start").performClick()
             await { fixture.requests.any { it.string("method") == "session.create" && it.getJSONObject("params").string("source") == "android_thread" } }
@@ -1969,7 +2010,7 @@ class NativeExperienceUiTest {
         compose.onNodeWithTag("kanban-title").performTextInput("Prepare the itinerary")
         compose.onNodeWithText("Bot profile: Unassigned").performScrollTo().performClick()
         compose.onNode(hasText("Code profile") and hasAnyAncestor(isPopup())).performClick()
-        compose.onNodeWithText("Cancel").performClick()
+        compose.onNodeWithText("Keep draft").performClick()
         compose.onNodeWithText("Continue saved task draft").performClick()
         compose.onNodeWithTag("kanban-title").assertTextContains("Prepare the itinerary")
         compose.onNodeWithText("Bot profile: Code profile").assertExists()
@@ -2044,7 +2085,7 @@ class NativeExperienceUiTest {
         compose.onNodeWithTag("rich-mermaid").performScrollTo()
         fun web(diagram: Boolean): android.webkit.WebView? {
             fun find(view: android.view.View): android.webkit.WebView? {
-                if (view is android.webkit.WebView && view.contentDescription == if (diagram) "Mermaid diagram preview" else "Isolated HTML card") return view
+                if (view is android.webkit.WebView && view.contentDescription == if (diagram) "Mermaid diagram preview" else "HTML card") return view
                 if (view is android.view.ViewGroup) for (i in 0 until view.childCount) find(view.getChildAt(i))?.let { return it }
                 return null
             }
@@ -2214,10 +2255,11 @@ class NativeExperienceUiTest {
         val known = java.time.Instant.parse("2026-10-14T09:41:00Z").toEpochMilli()
         val zone = java.util.TimeZone.getDefault()
         val locale = java.util.Locale.getDefault()
-        val shown = java.text.SimpleDateFormat("h:mm a", locale).apply { timeZone = zone }.format(java.util.Date(known))
+        val shown = java.text.SimpleDateFormat(dev.hermes.android.ui.nativeClockPattern(locale, false), locale).apply { timeZone = zone }.format(java.util.Date(known))
         assertEquals(shown, messageTimeLabel(known, zone, locale))
         assertEquals("Native seconds and milliseconds name the same instant", shown, messageTimeLabel(known / 1000, zone, locale))
-        assertEquals("9:41 AM", messageTimeLabel(known, java.util.TimeZone.getTimeZone("UTC"), java.util.Locale.US))
+        assertEquals("9:41 AM", messageTimeLabel(known, java.util.TimeZone.getTimeZone("UTC"), java.util.Locale.US)?.replace(' ', ' '))
+        assertEquals("09:41", messageTimeLabel(known, java.util.TimeZone.getTimeZone("UTC"), java.util.Locale.GERMANY, is24Hour = true))
         assertNull("An unrecorded time stays unknown", messageTimeLabel(0))
         val passedArguments = "gradle test\n--tests dev.hermes.ChatTest\n--info"
         val passedResult = "> Task :app:test\nBUILD SUCCESSFUL in 4s\n12 tests passed"
@@ -2524,7 +2566,7 @@ class NativeExperienceUiTest {
         // The overview reports only local state it actually holds; the Beacon left menu is still the way into navigation.
         compose.onNodeWithTag("settings-overview").assertIsDisplayed()
         compose.onNodeWithTag("navigation-toggle").assertIsDisplayed()
-        compose.onNode(hasText("Connected privately · default") and hasAnyAncestor(hasTestTag("settings-connection")), useUnmergedTree = true).assertExists()
+        compose.onNode(hasText("Connected · default") and hasAnyAncestor(hasTestTag("settings-connection")), useUnmergedTree = true).assertExists()
         summary("Settings", "Enter to send · Thinking shown").assertExists()
         summary("Profiles", "Active profile · default").assertExists()
         summary("Appearance", settingsThemeLabels.getValue(vm.preferences.value.theme), substring = true).assertExists()
@@ -2555,10 +2597,10 @@ class NativeExperienceUiTest {
         capture("settings-summaries-updated")
         compose.onNodeWithTag("settings-row:Settings").performScrollTo().performClick()
         await { vm.ui.value.tab == "More" && vm.ui.value.morePage == "Settings" }
-        compose.onNodeWithText("Send shortcut: Ctrl + Enter").assertExists()
+        compose.onNode(hasText("Send shortcut") and hasText("Ctrl + Enter")).assertExists()
         compose.onNode(hasText("Show thinking") and isToggleable()).performScrollTo().assertIsOff()
         compose.onNode(hasText("Format your messages") and isToggleable()).performScrollTo().assertIsOn()
-        compose.onNodeWithText("Send shortcut: Ctrl + Enter").performScrollTo()
+        compose.onNode(hasText("Send shortcut") and hasText("Ctrl + Enter")).performScrollTo()
         capture("settings-detail-saved")
         compose.onNodeWithContentDescription("Back").performClick()
         await { vm.ui.value.tab == "More" && vm.ui.value.morePage.isBlank() }
@@ -2746,7 +2788,7 @@ class NativeExperienceUiTest {
             compose.onNodeWithTag("message-read-aloud:${reply.id}").performClick()
             await { !vm.readingAloud.value && audio.activePlaybackConfigurations.isEmpty() }
             val draft=vm.composer.value.text
-            compose.onNodeWithContentDescription("Dictate").performClick()
+            compose.onNodeWithTag("composer-dictate").performClick()
             val end=android.os.SystemClock.elapsedRealtime()+10_000
             while(automation.rootInActiveWindow?.packageName?.toString()==app.packageName && android.os.SystemClock.elapsedRealtime()<end) Thread.sleep(50)
             val speechPackage=automation.rootInActiveWindow?.packageName?.toString().orEmpty()
@@ -2765,12 +2807,12 @@ class NativeExperienceUiTest {
         compose.setContent { BeaconTheme(dark=true) {
             CompositionLocalProvider(LocalBeaconSettings provides json("structured_code_default_view" to "on")) { CodeBlock("json",source) }
         } }
-        await { compose.onAllNodesWithText("Source").fetchSemanticsNodes().isNotEmpty() }
-        compose.onNodeWithText("Source").performClick()
-        compose.onNodeWithText("Tree").assertExists()
+        await { compose.onAllNodesWithContentDescription("Source").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithContentDescription("Source").performClick()
+        compose.onNodeWithContentDescription("Tree").assertExists()
         compose.runOnIdle { source="{\n\"answer\":2,\n\"status\":\"streaming\"\n}" }
-        compose.onNodeWithText("Tree").assertExists()
-        compose.onNodeWithText("Source").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Tree").assertExists()
+        compose.onNodeWithContentDescription("Source").assertDoesNotExist()
         receipts += "Manual Source mode survives changing streamed JSON; automatic Tree mode waits for valid parsing."
     }
 
@@ -2867,6 +2909,7 @@ class NativeExperienceUiTest {
 
         compose.runOnIdle { vm.composer(TextFieldValue("")) }
         compose.onNodeWithContentDescription("Conversation actions").performClick()
+        compose.onNodeWithTag("conversation-more").performScrollTo().performClick()
         compose.onNodeWithText("Copy conversation ID").performScrollTo().performClick()
         compose.runOnIdle {
             val clip = (app.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).primaryClip
@@ -2965,9 +3008,9 @@ class NativeExperienceUiTest {
 
     @Test fun theHeaderNamesWhatTheAssistantIsDoingAndItsTitleOpensTheChatMenu() = withFixture { vm, _ ->
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "runtime-chat-a", liveText = "") }
-        compose.onNodeWithTag("chat-header-subtitle", useUnmergedTree = true).assertTextEquals("Thinking…")
+        compose.onNodeWithTag("chat-header-subtitle", useUnmergedTree = true).assertTextEquals("thinking…")
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "runtime-chat-a", liveText = "Working on it") }
-        compose.onNodeWithTag("chat-header-subtitle", useUnmergedTree = true).assertTextEquals("Typing…")
+        compose.onNodeWithTag("chat-header-subtitle", useUnmergedTree = true).assertTextEquals("typing…")
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "", liveText = "") }
         compose.onNodeWithTag("chat-header-title").assertHeightIsAtLeast(48.dp).performClick()
         compose.onNodeWithTag("conversation-actions-menu").assertIsDisplayed()
@@ -2977,8 +3020,7 @@ class NativeExperienceUiTest {
 
     @Test fun aNewThreadAsksForANameWithAnOptionalEmojiStoredAsTheHermesTitle() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.toggleSessions(true) }
-        compose.onNodeWithTag("history-filter").performScrollTo().performClick()
-        compose.onNodeWithTag("history-new-thread").performClick()
+        compose.onNodeWithTag("navigation-new-thread").performScrollTo().performClick()
         val emoji = threadEmojis.first()
         compose.onNodeWithTag("new-thread-emoji:$emoji").assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp).performClick()
         compose.onNodeWithTag("new-thread-name").performTextInput("Cyber news")
@@ -3137,7 +3179,7 @@ class NativeExperienceUiTest {
         // Thinking and typing take the line over from the project.
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "runtime-chat-a", liveText = "") }
         compose.onNodeWithTag("chat-header-project", useUnmergedTree = true).assertDoesNotExist()
-        compose.onNodeWithTag("chat-header-subtitle", useUnmergedTree = true).assertTextEquals("Thinking…")
+        compose.onNodeWithTag("chat-header-subtitle", useUnmergedTree = true).assertTextEquals("thinking…")
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "", liveText = "") }
         await { compose.onAllNodesWithTag("chat-header-project", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithContentDescription("Conversation actions").performClick()
@@ -3211,7 +3253,7 @@ class NativeExperienceUiTest {
         val project = fixture.projects.values.single { it.string("name") == "Research" }
         val id = project.getString("id")
         await { vm.data.value["native-project:$id"] != null }
-        compose.onNodeWithText("Link PC folder").performScrollTo().performClick()
+        compose.onNodeWithText("Link computer folder").performScrollTo().performClick()
         await { compose.onAllNodesWithText("research", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithContentDescription("Show hidden folders").assertIsDisplayed()
         compose.onNodeWithText(".cache", useUnmergedTree = true).assertDoesNotExist()
@@ -3651,11 +3693,11 @@ class NativeExperienceUiTest {
     @Test fun appearanceChatAndLicenseControlsHaveWorkingChoicesAndRetainStoredPreferences() = withFixture { vm, _ ->
         compose.runOnIdle { vm.more("Appearance") }
         fun choice(label: String, value: String) {
-            compose.onNode(hasText("$label:", substring = true) and hasClickAction()).performScrollTo().performClick()
+            compose.onNode(hasText(label) and hasClickAction()).performScrollTo().performClick()
             compose.onNodeWithTag("choice-option:$label:$value").performScrollTo().performClick()
         }
         for (theme in listOf("light", "dark", "system")) { choice("Theme", theme); await { vm.preferences.value.theme == theme } }
-        for (skin in NativeSkins) { choice("Color style", skin); await { vm.preferences.value.skin == skin } }
+        for (skin in NativeSkins) { compose.onNodeWithTag("skin-option:$skin").performScrollTo().performClick(); await { vm.preferences.value.skin == skin } }
         // Text size, language, text direction and motion belong to the phone's own settings.
         for (removed in listOf("Text size", "Language", "Reduce motion", "Right-to-left layout")) compose.onAllNodesWithText(removed, substring = true).assertCountEquals(0)
         capture("audit-appearance")
@@ -3722,6 +3764,7 @@ class NativeExperienceUiTest {
     @Test fun conversationManagementBranchesArchivesAndDeletesOnlyAnIdleOwnedConversation() = withFixture { vm, fixture ->
         fun menu(label: String) {
             compose.onNodeWithContentDescription("Conversation actions").performClick()
+            if (label in dev.hermes.android.ui.conversationMoreActions) compose.onNodeWithTag("conversation-more").performScrollTo().performClick()
             compose.onNodeWithTag("conversation-action:$label").performScrollTo().performClick()
         }
         menu("Archive")
@@ -3773,7 +3816,7 @@ class NativeExperienceUiTest {
         await { vm.phoneSettings.skills.value.skills.isNotEmpty() && !vm.phoneSettings.skills.value.loading }
         compose.onNodeWithText("Enabled", useUnmergedTree = true).performScrollTo().performClick()
         compose.onNodeWithText("Needs setup").performClick()
-        compose.onNodeWithText("No skills match this filter and search.").assertExists()
+        compose.onNodeWithText("No matching skills").assertExists()
         // The drawer's history "All" chip stays composed off-screen; pick the skills filter.
         compose.onNode(hasText("All") and !hasAnyAncestor(hasTestTag("history-view-all")), useUnmergedTree = true).performClick()
         compose.onNodeWithTag("skill-row-travel-planning").performScrollTo().performClick()
@@ -3792,7 +3835,7 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Discard changes").performClick()
         assertNotNull(vm.phoneSettings.skills.value.selected)
         assertEquals(fixture.skillText, vm.phoneSettings.skills.value.content?.content)
-        compose.onNodeWithText("All skills").performScrollTo().performClick()
+        compose.onNodeWithContentDescription("Back").performClick()
         compose.onNodeWithContentDescription("Enable travel-planning").performScrollTo().performClick()
         await { !fixture.skillEnabled && !vm.phoneSettings.skills.value.loading }
         compose.onNodeWithContentDescription("Enable travel-planning").performClick()
@@ -3839,15 +3882,15 @@ class NativeExperienceUiTest {
     @Test fun toolAndConnectionControlsChangeNativeStateAndShowVerifiedTools() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.more("Tools & commands") }
         await { vm.data.value["native-tools"] != null }
-        compose.onNodeWithText("View 1 tools").performScrollTo().performClick()
+        compose.onNodeWithText("View tools · 1").performScrollTo().performClick()
         compose.onNodeWithText("web_search").assertExists()
         compose.onNodeWithText("Hide tools").performClick()
-        compose.onNodeWithContentDescription("Web research").performScrollTo().performClick()
+        compose.onNode(hasText("Web research") and isToggleable()).performScrollTo().performClick()
         await { !fixture.toolEnabled && "native-tools" !in vm.refreshing.value }
-        compose.onNodeWithContentDescription("Web research").performClick()
+        compose.onNode(hasText("Web research") and isToggleable()).performClick()
         await { fixture.toolEnabled && "native-tools" !in vm.refreshing.value }
         compose.onNode(hasSetTextAction() and hasText("Search tools")).performScrollTo().performTextReplacement("no-match")
-        compose.onNodeWithText("No matches. Try another search.").assertExists()
+        compose.onNodeWithText("No matches").assertExists()
         androidx.test.espresso.Espresso.closeSoftKeyboard()
         compose.onNodeWithText("Browse chat commands").performScrollTo().performClick()
         await { vm.ui.value.morePage == "Commands" }
@@ -3858,13 +3901,13 @@ class NativeExperienceUiTest {
         assertFalse(fixture.requests.any { it.string("method") == "chat.send" })
         compose.runOnIdle { vm.more("MCP servers") }
         await { vm.data.value["native-mcp"] != null }
-        compose.onNodeWithText("Test connection").performScrollTo().performClick()
+        compose.onNodeWithText("Test server").performScrollTo().performClick()
         await { vm.data.value["mcp-test:fixture_mcp"] != null }
-        compose.onNodeWithText("View 1 tools").performScrollTo().performClick()
+        compose.onNodeWithText("View tools · 1").performScrollTo().performClick()
         compose.onNodeWithText("read_fixture").assertExists()
-        compose.onNodeWithContentDescription("fixture_mcp").performScrollTo().performClick()
+        compose.onNode(hasText("fixture_mcp") and isToggleable()).performScrollTo().performClick()
         await { !fixture.connectionEnabled && "native-mcp" !in vm.refreshing.value }
-        compose.onNodeWithContentDescription("fixture_mcp").performClick()
+        compose.onNode(hasText("fixture_mcp") and isToggleable()).performClick()
         await { fixture.connectionEnabled && "native-mcp" !in vm.refreshing.value }
         receipts += "Tool groups and MCP search, enable/disable, test connection, tool disclosures and command preparation use real callbacks; selecting a command never sends it."
         capture("audit-connections")
@@ -3932,14 +3975,14 @@ class NativeExperienceUiTest {
         await { vm.ui.value.tab == "More" && vm.ui.value.morePage.isBlank() }
         // Hub rows keep their compatibility tags (Connection is settings-connection).
         fun summary(tag: String, text: String) = compose.onNode(hasText(text) and hasAnyAncestor(hasTestTag(tag)), useUnmergedTree = true)
-        summary("settings-connection", "Connected privately · Personal profile").assertExists()
+        summary("settings-connection", "Connected · Personal profile").assertExists()
         summary("settings-row:Profiles", "Active profile · Personal profile").assertExists()
         summary("settings-row:Assistant", "Beacon · Code profile").assertExists()
 
         compose.runOnIdle { vm.more("Connection") }
         compose.onNodeWithText("Profile · Personal profile").assertExists()
         compose.runOnIdle { vm.more("Assistant") }
-        compose.onNodeWithText("Profile: Code profile").assertExists()
+        compose.onNode(hasText("Profile") and hasText("Code profile")).assertExists()
         compose.onNodeWithText("What needs you · Code profile").assertExists()
         compose.runOnIdle { vm.more("Profiles") }
         await { vm.phoneSettings.bots.value.profiles.isNotEmpty() && !vm.phoneSettings.bots.value.loading }
@@ -3967,9 +4010,9 @@ class NativeExperienceUiTest {
         await { vm.botMode.state.value.selectedSpace == "fixture-room" && !vm.botMode.state.value.loading }
         compose.runOnIdle { vm.botMode.draft("Keep this team draft") }
         compose.onNodeWithContentDescription("Shared-space actions").performClick()
-        compose.onNodeWithText("Change bots unavailable").assertIsNotEnabled()
+        compose.onNodeWithText("Change bots unavailable").assertDoesNotExist()
         compose.onNodeWithText("Edit shared space").performClick()
-        compose.onNodeWithText("Change bots unavailable").assertIsNotEnabled()
+        compose.onNodeWithText("Change bots unavailable").assertDoesNotExist()
         compose.onNode(hasText("Create another space") and hasAnyAncestor(isDialog())).assertExists()
         compose.onNodeWithText("Cancel").performClick()
         assertEquals(setOf("default", "coder"), vm.botMode.state.value.members.toSet())

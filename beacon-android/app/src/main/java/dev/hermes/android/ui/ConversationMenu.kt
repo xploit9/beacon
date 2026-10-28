@@ -57,7 +57,7 @@ import org.json.JSONObject
         enabled = !busy, modifier = Modifier.testTag("conversation-archive"), onClick = { onDone(); vm.conversationAction(id, "/api/session/archive", json("archived" to !archived), if (archived) "Unarchived" else "Archived", profile) })
     DropdownMenuItem({ Text(conversationMenuTitle(uiText("Delete")), color = MaterialTheme.colorScheme.error) }, leadingIcon = { Icon(Icons.Rounded.DeleteOutline, null, tint = MaterialTheme.colorScheme.error) },
         enabled = !busy, modifier = Modifier.testTag("conversation-delete"), onClick = { onDone(); onDelete() })
-    if (busy) DropdownMenuItem({ Text("Working…") }, {}, enabled = false)
+    if (busy) DropdownMenuItem({ Text(uiText("Working…")) }, {}, enabled = false)
 }
 
 @Composable internal fun RenameConversationDialog(vm: BeaconViewModel, id: String, profile: String, title: String, onDismiss: () -> Unit) {
@@ -69,7 +69,7 @@ import org.json.JSONObject
 }
 
 @Composable internal fun DeleteConversationDialog(vm: BeaconViewModel, id: String, profile: String, title: String, onDismiss: () -> Unit) {
-    AlertDialog(onDismissRequest = onDismiss, title = { Text(uiText("Delete conversation?")) }, text = { Text(title.ifBlank { uiText("Untitled conversation") } + "\n\n" + "This deletes it from Hermes on every device. It can’t be undone.") },
+    AlertDialog(onDismissRequest = onDismiss, title = { Text(uiText("Delete conversation?")) }, text = { Text(title.ifBlank { uiText("Untitled conversation") } + "\n\n" + uiText("This deletes it from Hermes on every device. It can’t be undone.")) },
         confirmButton = { TextButton(onClick = { onDismiss(); vm.conversationAction(id, "/api/session/delete", done = "Deleted", profile = profile) }, modifier = Modifier.testTag("conversation-delete-confirm")) { Text(uiText("Delete"), color = MaterialTheme.colorScheme.error) } },
         dismissButton = { TextButton(onClick = onDismiss) { Text(uiText("Cancel")) } })
 }

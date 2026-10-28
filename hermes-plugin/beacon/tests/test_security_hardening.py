@@ -14,7 +14,6 @@ from fastapi import HTTPException
 from starlette.datastructures import Headers, QueryParams
 
 from test_callbacks import NOW, ROW, VALUE, env, load
-from test_gateway_tools import g as gateway_tools
 from test_mobile import harness, load_private
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +52,22 @@ def test_watch_guard_blocks_when_identity_or_tool_classification_raises(harness,
     monkeypatch.setattr(plugin, '_mail_provider_read', fail if failure_at == 'tool' else lambda *args: False)
     result = plugin.native_proactive_read_only_guard('mcp__mail__search', {}, 'watch-run')
     assert result == ({'action': 'block', 'message': plugin._READ_ONLY_MESSAGE} if cron else None)
+
+
+@pytest.mark.parametrize('cron', [False, True])
+def test_watch_guard_blocks_a_read_when_its_word_list_cannot_load(harness, monkeypatch, tmp_path, cron):
+    # The guard loads its word lists from gateway_tools.py; if that load fails, a watch run must stay blocked, not open.
+    plugin = load_private('__init__')
+    _guard_native_identity(monkeypatch, {'cron_job_id': 'watch'} if cron else None)
+    monkeypatch.setattr(plugin, 'current_profile', lambda cfg: 'default')
+    monkeypatch.setattr(plugin, '_cron_row', lambda *args: {'source': 'cron', 'cron_job_id': 'watch'} if cron else None)
+    monkeypatch.setattr(plugin.proactive, 'watch_job_ids', lambda *args: {'watch'})
+    monkeypatch.setattr(plugin, 'ROOT', tmp_path)
+    monkeypatch.delitem(sys.modules, 'beacon_gateway_tools', raising=False)
+    # read_file passes a working guard, so only a failed load can block it here.
+    for tool in ('read_file',):
+        result = plugin.native_proactive_read_only_guard(tool, {}, 'watch-run')
+        assert result == ({'action': 'block', 'message': plugin._READ_ONLY_MESSAGE} if cron else None), tool
 
 
 @pytest.mark.parametrize('row', [None, {}])
@@ -959,9 +974,25 @@ def test_the_guard_blocks_a_cron_run_the_store_answers_without_a_job_id_but_not_
     assert guard("write_file", legacy) is None
 
 
-# The call gateway cannot import the Proactive guard's word lists (the dashboard never loads the agent module), so it carries copies.
-def test_the_call_gateway_keeps_the_proactive_guards_write_vocabulary(harness):
-    plugin = load_private("__init__")
-    assert gateway_tools.WRITE_WORDS == plugin._ARG_WRITE_TOOL_WORDS
-    assert gateway_tools.UNSAFE_NAME_WORDS == plugin._UNSAFE_NAME_WORDS
-    assert gateway_tools.READ_NAME_WORDS == plugin._READ_TOOL_WORDS
+# The guard shares the call gateway's word lists and name rule: a read verb first makes a noun after it a thing, not an action.
+def test_the_guard_lets_a_read_verb_name_a_noun_but_blocks_a_real_write_action(watch_guard):
+    plugin, _ = watch_guard
+    blocked = {"action": "block", "message": plugin._READ_ONLY_MESSAGE}
+    reads = ("get_pull_request", "get_commit", "list_workflow_runs", "get_workflow_run", "search_issues")
+    writes = ("get_and_delete_x", "create_pull_request", "merge_pull_request", "send_report", "run_workflow")
+    mcp_tool = sys.modules["tools.mcp_tool"]
+    mcp_tool._mcp_tool_server_names.update({"mcp__api__" + name: "api" for name in reads + writes})
+    mcp_tool._tool_read_only_hints["api"] = {name: True for name in reads + writes}
+
+    def guard(name, args=None):
+        return plugin.native_proactive_read_only_guard(tool_name="mcp__api__" + name, args=args or {}, session_id="watch-run")
+
+    for name in reads:
+        assert guard(name) is None, name
+    for name in writes:
+        assert guard(name) == blocked, name
+    # The argument rule still asks for any write the action names, noun or verb.
+    assert guard("get_commit", {"action": "run"}) == blocked and guard("get_commit", {"action": "delete"}) == blocked
+    # Without the server's read-only hint the name must still be plain mail reading.
+    mcp_tool._tool_read_only_hints["api"] = {name: False for name in reads}
+    assert all(guard(name) == blocked for name in reads)

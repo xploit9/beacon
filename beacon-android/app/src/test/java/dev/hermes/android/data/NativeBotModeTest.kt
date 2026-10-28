@@ -130,7 +130,7 @@ class NativeBotModeTest {
         }
         val controller = NativeBotModeController(this, SavedStateHandle(), { _, _ -> fail("Unexpected Bot Chat") }) { c }
         controller.refresh(); awaitIdle(controller)
-        controller.toggleBot("default"); controller.toggleBot("writer")
+        controller.toggleBot("writer")
         controller.createSpace(); awaitIdle(controller)
         assertTrue(controller.state.value.error.isNotBlank())
         failCreate = false

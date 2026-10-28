@@ -36,6 +36,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.util.UUID
 
@@ -50,6 +52,9 @@ internal enum class UpdateFailure(val text: String, val retriesCheck: Boolean = 
     Install("Android couldn't install the update. Try again."),
     Call("End your call before updating Beacon."),
 }
+
+/** Every failure text the update screen shows through uiText. */
+internal val UpdateFailureStrings = UpdateFailure.entries.map { it.text }
 
 /** Shown once, on the first launch after the update this phone asked for. */
 internal data class UpdatedNotice(val name: String, val notes: String)
@@ -88,7 +93,8 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     private val _state = MutableStateFlow(AppUpdateUi(supported = selfUpdates))
     internal val state: StateFlow<AppUpdateUi> = _state.asStateFlow()
     private var job: Job? = null
-    private var checking = false
+    // Held by every GitHub check, including the one an Update tap starts, so only one runs at a time.
+    private val checking = Mutex()
     @Volatile private var probe: PluginProbe = PluginProbe.None
     @Volatile private var pluginResult: PluginRow? = null
 
@@ -152,48 +158,61 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
 
     /** The periodic job. */
     suspend fun backgroundCheck() { if (selfUpdates) runCheck(force = false, visible = false) }
-    /** Beacon came to the foreground; checks only when the last check is older than 6 hours. */
-    internal fun checkIfDue() { if (selfUpdates) scope.launch { runCheck(force = false, visible = true) } }
+    /**
+     * Beacon came to the foreground; checks only when the last check is older than 6 hours. An offer already on screen stays put
+     * while it refreshes behind it, and on the update screen ([onUpdateScreen]) that refresh is due after 30 minutes.
+     */
+    internal fun checkIfDue(onUpdateScreen: Boolean = false) {
+        if (!selfUpdates) return
+        val offered = _state.value.phase == UpdatePhase.Available
+        scope.launch { runCheck(force = false, visible = !offered, window = checkWindow(offered, onUpdateScreen)) }
+    }
     /** "Check for updates": always asks GitHub. */
     internal fun checkNow() { if (selfUpdates) scope.launch { runCheck(force = true, visible = true) } }
 
-    private suspend fun runCheck(force: Boolean, visible: Boolean) {
+    private suspend fun runCheck(force: Boolean, visible: Boolean, window: Long = UPDATE_CHECK_INTERVAL_MS) {
         val now = System.currentTimeMillis()
         synchronized(lock) {
-            if (checking || job?.isActive == true) return
-            if (!updateCheckDue(prefs.getLong("last_check", 0), now, force, prefs.getLong("last_attempt", 0))) return
-            checking = true
-            prefs.edit().putLong("last_attempt", now).commit()
+            if (job?.isActive == true || !updateCheckDue(prefs.getLong("last_check", 0), now, force, prefs.getLong("last_attempt", 0), window) || !checking.tryLock()) return
         }
         // An install waiting on Android keeps its own state on screen.
         if (visible) publish { if (phase == UpdatePhase.Idle || phase == UpdatePhase.Available || phase == UpdatePhase.Failed) copy(phase = UpdatePhase.Checking, failure = null) else this }
         try {
-            val installed = updater.installedVersion()
-            // A 304 is only useful while the release it vouches for is still stored.
-            val stored = Release.decode(prefs.getString("release", null))
-            val found = releases.latest(prefs.getString("etag", null)?.takeIf { stored != null })
-            val latest = when (found) {
-                is LatestRelease.NotModified -> stored
-                is LatestRelease.Found -> found.release
-            }
-            val vetted = latest?.let { vet(it) }
-            val release = vetted?.takeIf { it.version > installed }
-            synchronized(lock) {
-                val edit = prefs.edit().putLong("last_check", now)
-                if (found is LatestRelease.Found) {
-                    edit.putString("etag", found.etag.orEmpty())
-                    if (latest != null) edit.putString("release", latest.encode()) else edit.remove("release")
-                }
-                edit.commit()
-            }
-            publish { copy(latest = vetted, release = release, checkedAt = now, failure = null, phase = if (visible && (phase == UpdatePhase.Checking || phase == UpdatePhase.Failed)) UpdatePhase.Idle else phase) }
-            if (release != null) notifyRelease(release)
-            else synchronized(lock) { notifications.cancel(NOTIFICATION_ID); prefs.edit().remove("notification_token").commit() }
+            fetchLatest(now, visible)?.let(::notifyRelease)
         } catch (error: CancellationException) { throw error }
-        catch (error: Exception) {
-            val network = error is UpdateException && error.kind == UpdateException.Kind.Network
-            if (visible) fail(if (error is UpdateException && !network || error is IllegalArgumentException || error is IllegalStateException) UpdateFailure.CheckVerification else UpdateFailure.Check)
-        } finally { synchronized(lock) { checking = false } }
+        catch (error: Exception) { if (visible) fail(checkFailure(error)) }
+        finally { checking.unlock() }
+    }
+
+    /** Asks GitHub for its latest release (the stored ETag makes "nothing new" a free 304), vets and publishes it; returns it when it is newer than this build. */
+    private suspend fun fetchLatest(now: Long, visible: Boolean): Release? {
+        synchronized(lock) { prefs.edit().putLong("last_attempt", now).commit() }
+        val installed = updater.installedVersion()
+        // A 304 is only useful while the release it vouches for is still stored.
+        val stored = Release.decode(prefs.getString("release", null))
+        val found = releases.latest(prefs.getString("etag", null)?.takeIf { stored != null })
+        val latest = when (found) {
+            is LatestRelease.NotModified -> stored
+            is LatestRelease.Found -> found.release
+        }
+        val vetted = latest?.let { vet(it) }
+        val release = vetted?.takeIf { it.version > installed }
+        synchronized(lock) {
+            val edit = prefs.edit().putLong("last_check", now)
+            if (found is LatestRelease.Found) {
+                edit.putString("etag", found.etag.orEmpty())
+                if (latest != null) edit.putString("release", latest.encode()) else edit.remove("release")
+            }
+            edit.commit()
+        }
+        publish { copy(latest = vetted, release = release, checkedAt = now, failure = null, phase = if (visible && (phase == UpdatePhase.Checking || phase == UpdatePhase.Failed)) UpdatePhase.Idle else phase) }
+        if (release == null) synchronized(lock) { notifications.cancel(NOTIFICATION_ID); prefs.edit().remove("notification_token").commit() }
+        return release
+    }
+
+    private fun checkFailure(error: Exception): UpdateFailure {
+        val network = error is UpdateException && error.kind == UpdateException.Kind.Network
+        return if (error is UpdateException && !network || error is IllegalArgumentException || error is IllegalStateException) UpdateFailure.CheckVerification else UpdateFailure.Check
     }
 
     /** Fails closed: returns the release for this build, null when it is for another package, and throws when it is not trustworthy. */
@@ -208,6 +227,9 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
         }
         return candidate
     }
+
+    /** The stored release as the last check vetted it: this build's package, signer, version and the bytes first seen for that version. */
+    private fun stillVerifies(release: Release) = runCatching { vet(release) }.getOrNull() != null
 
     private fun notifyRelease(release: Release) {
         if (!updateNotificationDue(release.version, prefs.getLong("notified_version", 0))) return
@@ -249,14 +271,17 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
         }
     }
 
-    /** The Update button: plugin first when Hermes has one to update, then download, check and hand the app to Android. */
-    internal fun startUpdate(client: BeaconClient?, pluginAbsent: Boolean = false) {
+    /**
+     * The Update button: asks GitHub for the newest release, then the plugin first when Hermes has one to update, then download,
+     * check and hand the app to Android. [refresh] is false only for the install that waited on Android's permission page.
+     */
+    internal fun startUpdate(client: BeaconClient?, pluginAbsent: Boolean = false, refresh: Boolean = true) {
         if (!selfUpdates) return
         val detached = client?.detached()
         synchronized(lock) {
             if (job?.isActive == true) { detached?.closeNative(); return }
             pluginResult = null
-            job = scope.launch { try { runUpdate(detached, pluginAbsent) } finally { detached?.closeNative() } }
+            job = scope.launch { try { runUpdate(detached, pluginAbsent, refresh) } finally { detached?.closeNative() } }
         }
     }
 
@@ -264,14 +289,7 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     internal fun updateFromNotification(token: String, client: BeaconClient?) {
         val ours = synchronized(lock) { validUpdateToken(token) && token == prefs.getString("notification_token", null) }
         if (!ours) { checkNow(); return }
-        updateNow(client)
-    }
-
-    private fun updateNow(client: BeaconClient?) {
-        scope.launch {
-            if (_state.value.release == null) runCheck(force = true, visible = true)
-            startUpdate(client)
-        }
+        startUpdate(client)
     }
 
     internal fun cancel() { job?.cancel() }
@@ -283,13 +301,13 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     }
 
     /** Beacon is back on screen: finish an install that waited for Android's permission, or check if due. */
-    internal fun resume() {
+    internal fun resume(onUpdateScreen: Boolean = false) {
         // Android may restart Beacon when the permission changes, so the waiting install is kept on disk, not only in state.
         val waiting = _state.value.phase == UpdatePhase.NeedsPermission || prefs.getBoolean("install_after_permission", false)
         if (waiting && app.packageManager.canRequestPackageInstalls()) {
             synchronized(lock) { prefs.edit().remove("install_after_permission").commit() }
-            updateNow(null)
-        } else checkIfDue()
+            startUpdate(null, refresh = false)
+        } else checkIfDue(onUpdateScreen)
     }
 
     /** "Review changes" accepted: runs the plugin update once more with the owner's consent. */
@@ -303,17 +321,22 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
         publish { copy(updated = null) }
     }
 
-    private suspend fun runUpdate(client: BeaconClient?, pluginAbsent: Boolean) {
+    private suspend fun runUpdate(client: BeaconClient?, pluginAbsent: Boolean, refresh: Boolean) {
         if (callActive()) return fail(UpdateFailure.Call)
         // Coming back from Android's permission page the verified file is already here: no download to show.
         if (_state.value.phase != UpdatePhase.NeedsPermission) publish { copy(phase = UpdatePhase.Downloading, downloaded = 0, failure = null) }
         try {
+            // The newest release goes first, so the plugin step and the download below are for it and not for the last check's answer.
+            val release = try {
+                if (refresh) releaseForUpdate(_state.value.release, { checking.withLock { fetchLatest(System.currentTimeMillis(), visible = false) } }, ::stillVerifies)
+                else _state.value.release
+            } catch (error: CancellationException) { throw error }
+            catch (error: Exception) { return fail(checkFailure(error)) }
             if (client != null && !pluginAbsent && selfUpdates) {
                 probe = probePlugin(HermesPluginUpdater(client))
                 publish { this }
                 if (_state.value.plugin.status == PluginStatus.Available) pluginStep(client, accept = false)
             }
-            val release = _state.value.release
             if (release == null) { publish { copy(phase = UpdatePhase.Idle) }; return }
             install(pendingFor(release) ?: download(release))
         } catch (error: CancellationException) {

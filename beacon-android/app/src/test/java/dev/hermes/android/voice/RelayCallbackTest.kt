@@ -115,19 +115,19 @@ class RelayCallbackTest {
         assertNull(protocol.receive(envelope(), binding, prefs, 1000, 50))
         assertNull(protocol.receive(envelope(data = payload(id.uppercase())), binding, prefs, 1000, 50))
         val busy = protocol.receive(envelope(data = payload(UUID.randomUUID().toString())), binding, prefs, 1000, 50)!!
-        assertEquals(RelayCallbackPhase.Finished, busy.call.phase)
+        assertEquals(RelayCallbackPhase.Finished, busy.phase)
         assertEquals(call, protocol.current)
     }
 
     @Test fun `an expired ring ends once and cannot be resurrected`() {
         val expired = invite(now = 20000)
-        assertEquals(RelayCallbackPhase.Finished, expired.expire(20000, 1050, binding, prefs)!!.call.phase)
+        assertEquals(RelayCallbackPhase.Finished, expired.expire(20000, 1050, binding, prefs)!!.phase)
         assertNull(expired.expire(21000, 1050, binding, prefs))
         assertNull(expired.receive(envelope(), binding, prefs, 1000, 50))
     }
 
     @Test fun `clock rollback retires a ringing call`() {
-        assertEquals(RelayCallbackPhase.Finished, invite().expire(999, 51, binding, prefs)!!.call.phase)
+        assertEquals(RelayCallbackPhase.Finished, invite().expire(999, 51, binding, prefs)!!.phase)
     }
 
     @Test fun `opt out profile session or connection loss retires authority without foreign actions`() {
@@ -135,11 +135,11 @@ class RelayCallbackTest {
             binding.copy(profile = "other"), binding.copy(sessionId = "other"),
             binding.copy(owner = "other"), binding.copy(origin = "https://other.example"))) {
             val protocol = invite()
-            assertEquals(RelayCallbackPhase.Finished, protocol.invalidate(other, prefs)!!.call.phase)
+            assertEquals(RelayCallbackPhase.Finished, protocol.invalidate(other, prefs)!!.phase)
             assertEquals(RelayCallbackPhase.Finished, protocol.current!!.phase)
         }
         val protocol = invite()
-        assertEquals(RelayCallbackPhase.Finished, protocol.invalidate(binding, prefs.copy(calls = false))!!.call.phase)
+        assertEquals(RelayCallbackPhase.Finished, protocol.invalidate(binding, prefs.copy(calls = false))!!.phase)
     }
 
     @Test fun `unknown preferences keep a ringing call while a lost binding still retires it`() {

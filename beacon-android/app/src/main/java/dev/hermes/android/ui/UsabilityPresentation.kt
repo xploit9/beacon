@@ -62,17 +62,25 @@ internal data class BackgroundActivitySummary(
     val active get() = agents > 0 || processes > 0 || cronJobs > 0 || watches > 0
 }
 
-internal fun backgroundActivityStatus(activity: BackgroundActivitySummary): String {
+/** The background line's fixed texts, which reach uiText through [backgroundActivityStatus]. Each count sits inside its own template as {0}. */
+internal val BackgroundActivityStrings = listOf(
+    "1 agent", "{0} agents", "1 process", "{0} processes", "1 schedule running", "{0} schedules running", "1 watch", "{0} watches",
+    "More may be active", "Background status unavailable",
+)
+
+/** [text] translates one of [BackgroundActivityStrings] whole. */
+internal fun backgroundActivityStatus(activity: BackgroundActivitySummary, text: (String) -> String = { it }): String {
+    fun count(n: Int, one: String, many: String) = if (n > 0) text(if (n == 1) one else many).replace("{0}", "$n") else null
     val counts = listOfNotNull(
-    "${activity.agents} ${if (activity.agents == 1) "agent" else "agents"}".takeIf { activity.agents > 0 },
-    "${activity.processes} ${if (activity.processes == 1) "process" else "processes"}".takeIf { activity.processes > 0 },
-    "${activity.cronJobs} ${if (activity.cronJobs == 1) "cron job" else "cron jobs"}".takeIf { activity.cronJobs > 0 },
-    "${activity.watches} ${if (activity.watches == 1) "watch" else "watches"}".takeIf { activity.watches > 0 },
+        count(activity.agents, "1 agent", "{0} agents"),
+        count(activity.processes, "1 process", "{0} processes"),
+        count(activity.cronJobs, "1 schedule running", "{0} schedules running"),
+        count(activity.watches, "1 watch", "{0} watches"),
     )
     return when {
-        counts.isNotEmpty() && !activity.available -> counts.joinToString(" · ") + " · More may be active"
+        counts.isNotEmpty() && !activity.available -> counts.joinToString(" · ") + " · " + text("More may be active")
         counts.isNotEmpty() -> counts.joinToString(" · ")
-        !activity.available -> "Background status unavailable"
+        !activity.available -> text("Background status unavailable")
         else -> ""
     }
 }
@@ -87,6 +95,8 @@ internal fun sessionScopedSubagentCount(sessionRoster: JSONObject, profileStatus
 internal fun conversationActionLabel(action: String, pinned: Boolean, archived: Boolean): String = when {
     action == "Pin" && pinned -> "Unpin"
     action == "Archive" && archived -> "Unarchive"
+    // The sheet it opens is called Tools; "Toolsets" stays the action's id.
+    action == "Toolsets" -> "Tools"
     else -> action
 }
 
@@ -112,9 +122,12 @@ internal fun mobileSlashCommands(commands: List<JSONObject>): List<JSONObject> =
 internal fun acceptsComposerEdit(client: Any?, currentClient: Any?, scope: Any?, currentScope: Any?, callActiveHere: Boolean): Boolean =
     client === currentClient && scope == currentScope && !callActiveHere
 
+/** The chat menu's daily items; model and reasoning live on the composer, and the rarer actions sit under More. */
 internal val conversationActionGroups = linkedMapOf(
     "Conversation" to listOf("New conversation", "Rename", "Pin", "Archive", "Branch"),
-    "Model and tools" to listOf("Model & provider", "Reasoning", "Toolsets"),
-    "Context and replies" to listOf("Compress context", "Undo last turn", "Usage"),
     "Manage" to listOf("Delete conversation"),
 )
+internal val conversationMoreActions = listOf("Toolsets", "Compress context", "Undo last turn", "Usage")
+
+/** The chat menu's and message marker's fixed texts, which reach uiText through variables. */
+internal val ConversationStrings = conversationActionGroups.keys + conversationActionGroups.values.flatten() + conversationMoreActions + listOf("Unpin", "Unarchive", "Tools", "Stopped")

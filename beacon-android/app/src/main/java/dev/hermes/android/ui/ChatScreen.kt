@@ -32,6 +32,7 @@ import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.*
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -54,8 +55,10 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.draw.alpha
@@ -68,8 +71,11 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.input.TextFieldValue
@@ -272,6 +278,9 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
     .mapNotNull { row -> row.string("tool_name").takeIf { it.matches(toolNamePattern) }?.let { row.string("id") to humanToolName(it, " result").replaceFirstChar(Char::titlecase) } }
     .toMap()
 
+/** The phone's 12/24-hour setting, for the times chats and lists show. */
+@Composable private fun phoneIs24Hour(): Boolean = android.text.format.DateFormat.is24HourFormat(LocalContext.current)
+
 @Composable fun SessionList(vm: BeaconViewModel, modifier: Modifier = Modifier, beforeHistory: @Composable () -> Unit = {}) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     // Only the open chat's id matters to the list: a streamed token must not recompose every row.
@@ -284,6 +293,9 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
     LaunchedEffect(ui.origin, ui.owner, ui.profile) { vm.loadGlances() }
     val assistantTitle = LocalAssistantName.current
     val youLabel = uiText("You")
+    val oneMessage = uiText("1 message")
+    val manyMessages = uiText("{0} messages")
+    val is24Hour = phoneIs24Hour()
     val profileCatalog = data["navigation-profiles"]
     val profileRows = profileCatalog?.rows("profiles").orEmpty()
     val profileLoading = ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
@@ -350,12 +362,15 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
             Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 SingleChoiceSegmentedButtonRow(Modifier.weight(1f)) {
                     val choices = listOf(HistoryView.All to "All", HistoryView.Pinned to "Pinned", HistoryView.Threads to "Threads")
+                    // At a large font the check mark would take the label's room.
+                    val largeFont = LocalDensity.current.fontScale > 1.15f
                     choices.forEachIndexed { index, (choice, label) ->
                         SegmentedButton(
                             selected = view == choice,
                             onClick = { view = choice },
                             shape = SegmentedButtonDefaults.itemShape(index, choices.size),
                             modifier = Modifier.testTag(when (choice) { HistoryView.All -> "history-view-all"; HistoryView.Pinned -> "history-view-pinned"; HistoryView.Threads -> "history-threads" }),
+                            icon = if (largeFont) ({}) else ({ SegmentedButtonDefaults.Icon(view == choice) }),
                         ) { Text(uiText(label), maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
                     }
                 }
@@ -365,13 +380,6 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                         modifier = Modifier.testTag("history-filter").semantics { selected = filtered },
                     ) { Icon(Icons.Rounded.FilterList, uiText("History filters")) }
                     DropdownMenu(filtersOpen, { filtersOpen = false }) {
-                        DropdownMenuItem(
-                            text = { Text(uiText("New thread")) },
-                            leadingIcon = { Icon(Icons.Rounded.Forum, null) },
-                            onClick = { filtersOpen = false; naming = true },
-                            modifier = Modifier.testTag("history-new-thread"),
-                        )
-                        HorizontalDivider()
                         Text(uiText("Profile scope"), Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         DropdownMenuItem(
                             text = { Text(uiText("This profile")) },
@@ -410,7 +418,7 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
         }
         val unreadable = if (allProfiles) ui.historyUnreadable else emptyList()
         unreadable.forEach { profile -> item("history-unreadable:$profile") {
-            Text("Couldn't load ${profileDisplayName(profile, profileRows)}'s conversations", Modifier.padding(horizontal = 16.dp, vertical = 8.dp).testTag("history-unreadable:$profile"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(uiText("Couldn't load conversations") + ": " + profileDisplayName(profile, profileRows), Modifier.padding(horizontal = 16.dp, vertical = 8.dp).testTag("history-unreadable:$profile"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         } }
         val matches = data["history:search"]?.takeIf {
             it.string("query") == search && it.string("scope_key") == vm.client?.scope?.key && it.optBoolean("archived") == archived &&
@@ -433,13 +441,13 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
             Box(Modifier.testTag("navigation-beacon")) {
                 ChatListRow(
                     id = ui.assistantSessionId.ifBlank { "beacon" }, title = assistantTitle,
-                    preview = assistantRow?.let { chatPreviewLine(it, glance, youLabel) }.orEmpty().ifBlank { uiText("Text and voice, together") },
-                    time = chatListTime(activity), unread = unread, pinned = true, selected = ui.tab == "Beacon", beacon = true,
+                    preview = assistantRow?.let { chatPreviewLine(it, glance, youLabel, oneMessage, manyMessages) }.orEmpty().ifBlank { uiText("Text and voice, together") },
+                    time = chatListTime(activity, is24Hour = is24Hour), unread = unread, pinned = true, selected = ui.tab == "Beacon", beacon = true,
                     modifier = Modifier.clickable { vm.navigate("Beacon") }.semantics { selected = ui.tab == "Beacon" }.testTag("history-beacon-row"),
                 )
             }
         }
-        // Threads are channels you keep adding; once one exists, starting the next stays in sight (the filter menu has it too).
+        // Threads are channels you keep adding; once one exists, starting the next stays in sight (the drawer has New thread too).
         if (view == HistoryView.Threads && !archived && search.isBlank() && rows.isNotEmpty()) item("new-thread-row") {
             ListItem(headlineContent = { Text(uiText("New thread")) }, leadingContent = { Icon(Icons.Rounded.Add, null) },
                 colors = ListItemDefaults.colors(containerColor = Color.Transparent), modifier = Modifier.clickable { naming = true }.testTag("threads-new-thread"))
@@ -447,12 +455,12 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
         // A failed read is not "no conversations".
         if (rows.isEmpty() && (ui.historyLoading || unreadable.isEmpty())) item("empty-history") {
             // An empty list is only "empty" once the fetch has answered.
-            if (search.isNotBlank()) Text("No matching chats", Modifier.padding(16.dp).testTag("history-no-matches"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (search.isNotBlank()) Text(uiText("No matching chats"), Modifier.padding(16.dp).testTag("history-no-matches"), color = MaterialTheme.colorScheme.onSurfaceVariant)
             else if (ui.historyLoading) ListItem(headlineContent = { Text(uiText("Loading conversations…")) }, leadingContent = { CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) }, colors = ListItemDefaults.colors(containerColor = Color.Transparent), modifier = Modifier.testTag("history-loading"))
             else when (view) {
-                HistoryView.Threads -> EmptyState("No threads yet", "Start a named thread for a topic you will come back to.", action = "New thread", onAction = { naming = true })
-                HistoryView.Pinned -> EmptyState("No pinned conversations", "Pin a conversation from its actions to keep it here.")
-                HistoryView.All -> EmptyState("No conversations here", "Start a conversation or try another search.", action = "New conversation", onAction = { vm.toggleSessions(false); vm.newChat() })
+                HistoryView.Threads -> EmptyState(uiText("No threads yet"), uiText("Start a named thread for a topic you will come back to."), action = uiText("New thread"), onAction = { naming = true })
+                HistoryView.Pinned -> EmptyState(uiText("No pinned conversations"), uiText("Pin a conversation from its actions to keep it here."))
+                HistoryView.All -> EmptyState(uiText("No conversations here"), uiText("Start a conversation or try another search."), action = uiText("New conversation"), onAction = { vm.toggleSessions(false); vm.newChat() })
             }
         }
         items(rows, key = { "session:" + historyRowKey(it, ui.profile) }) { row ->
@@ -470,11 +478,11 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                 profileDisplayLabel(rowProfile, profileRows, profileLoading).takeIf { allProfiles },
                 uiText(historySourceLabel(source)).takeIf { external },
             ).joinToString(" · ")
-            val line = remember(row, glance, youLabel) { chatPreviewLine(row, glance, youLabel) }
-            val time = remember(activity) { chatListTime(activity) }
+            val line = remember(row, glance, youLabel, manyMessages) { chatPreviewLine(row, glance, youLabel, oneMessage, manyMessages) }
+            val time = remember(activity, is24Hour) { chatListTime(activity, is24Hour = is24Hour) }
             Box {
                 ChatListRow(
-                    id = id, title = row.string("title").ifBlank { "Untitled conversation" },
+                    id = id, title = row.string("title").ifBlank { uiText("Untitled conversation") },
                     preview = if (caption.isBlank()) line else if (line.isBlank()) caption else "$caption · $line",
                     time = time, pinned = row.optBoolean("pinned"), thread = thread,
                     unread = chatUnread(activity, glance, glances.base[rowProfile] ?: Long.MAX_VALUE, open = openHere && ui.tab in setOf("Chat", "Beacon")),
@@ -492,27 +500,30 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
     renaming?.let { row -> RenameConversationDialog(vm, sessionRowId(row), row.string("profile", ui.profile), row.string("title"), onDismiss = { renaming = null }) }
     deleting?.let { row -> DeleteConversationDialog(vm, sessionRowId(row), row.string("profile", ui.profile), row.string("title"), onDismiss = { deleting = null }) }
     projectFor?.let { id -> ChatProjectPicker(vm, id, onDismiss = { projectFor = null }) }
-    if (naming) {
-        var name by rememberSaveable { mutableStateOf("") }
-        var emoji by rememberSaveable { mutableStateOf("") }
-        AlertDialog(onDismissRequest = { naming = false }, title = { Text(uiText("New thread")) },
-            text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    ChatAvatar(threadTitle(emoji, name), "new-thread", size = 48.dp, modifier = Modifier.testTag("new-thread-avatar"))
-                    OutlinedTextField(name, { name = it.take(100) }, label = { Text(uiText("Thread name")) }, singleLine = true, modifier = Modifier.weight(1f).testTag("new-thread-name"))
+    if (naming) NewThreadDialog(vm, onDismiss = { naming = false }, onStarted = { view = HistoryView.Threads })
+}
+
+/** The New thread dialog (a name and an optional emoji), shared by History and the drawer's New thread button. Starting calls `vm.tab("Chat")` then `vm.newThread(title)`. */
+@Composable internal fun NewThreadDialog(vm: BeaconViewModel, onDismiss: () -> Unit, onStarted: () -> Unit = {}) {
+    var name by rememberSaveable { mutableStateOf("") }
+    var emoji by rememberSaveable { mutableStateOf("") }
+    AlertDialog(onDismissRequest = onDismiss, title = { Text(uiText("New thread")) },
+        text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                ChatAvatar(threadTitle(emoji, name), "new-thread", size = 48.dp, modifier = Modifier.testTag("new-thread-avatar"))
+                OutlinedTextField(name, { name = it.take(100) }, label = { Text(uiText("Thread name")) }, singleLine = true, modifier = Modifier.weight(1f).testTag("new-thread-name"))
+            }
+            // Optional: the pick is only the start of the Hermes title.
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                threadEmojis.forEach { choice ->
+                    val chosen = emoji == choice
+                    Box(Modifier.size(48.dp).clip(CircleShape).background(if (chosen) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
+                        .selectable(chosen, role = androidx.compose.ui.semantics.Role.Button) { emoji = if (chosen) "" else choice }.testTag("new-thread-emoji:$choice"), contentAlignment = Alignment.Center) { Text(choice, style = MaterialTheme.typography.titleLarge) }
                 }
-                // Optional: the pick is only the start of the Hermes title.
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    threadEmojis.forEach { choice ->
-                        val chosen = emoji == choice
-                        Box(Modifier.size(48.dp).clip(CircleShape).background(if (chosen) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
-                            .selectable(chosen, role = androidx.compose.ui.semantics.Role.Button) { emoji = if (chosen) "" else choice }.testTag("new-thread-emoji:$choice"), contentAlignment = Alignment.Center) { Text(choice, style = MaterialTheme.typography.titleLarge) }
-                    }
-                }
-            } },
-            confirmButton = { TextButton(onClick = { naming = false; view = HistoryView.Threads; vm.tab("Chat"); vm.newThread(threadTitle(emoji, name)) }, enabled = name.isNotBlank(), modifier = Modifier.testTag("new-thread-start")) { Text(uiText("Start thread")) } },
-            dismissButton = { TextButton(onClick = { naming = false }) { Text(uiText("Cancel")) } })
-    }
+            }
+        } },
+        confirmButton = { TextButton(onClick = { onDismiss(); onStarted(); vm.tab("Chat"); vm.newThread(threadTitle(emoji, name)) }, enabled = name.isNotBlank(), modifier = Modifier.testTag("new-thread-start")) { Text(uiText("Start thread")) } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(uiText("Cancel")) } })
 }
 
 private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt_dismissed")
@@ -534,6 +545,9 @@ internal fun chatHeaderSubtitle(streaming: Boolean, hasReplyText: Boolean, inCal
     assistantChat -> "Text and voice, together"
     else -> ""
 }
+
+/** Fixed texts the chat shows through variables: tool outcomes and the header's status line. */
+internal val ChatStrings = ToolOutcome.entries.map(::toolOutcomeLabel) + listOf("typing…", "thinking…", "Voice conversation")
 
 /** The header's second line: the chat's project, then what [chatHeaderSubtitle] says. Hermes status (thinking, typing, a call) takes the line over from the project. */
 internal data class ChatHeaderLine(val project: String, val text: String)
@@ -613,9 +627,9 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     val pendingVoiceCall by vm.voiceCallRequest.collectAsStateWithLifecycle()
     if(handoff?.scope==vm.authenticatedScope()&&handoff?.targetCall?.isBlank()==true) AlertDialog(
         onDismissRequest=vm::cancelVoiceHandoff,
-        title={Text("Switching to Gemini…")},
-        text={Column(verticalArrangement=Arrangement.spacedBy(12.dp)) { LinearProgressIndicator(Modifier.fillMaxWidth());Text("Reconnecting this chat…") }},
-        confirmButton={TextButton(vm::cancelVoiceHandoff) { Text("Stop") }})
+        title={Text(uiText("Switching voice…"))},
+        text={Column(verticalArrangement=Arrangement.spacedBy(12.dp)) { LinearProgressIndicator(Modifier.fillMaxWidth());Text(uiText("Reconnecting the call…")) }},
+        confirmButton={TextButton(vm::cancelVoiceHandoff) { Text(uiText("Stop")) }})
     val side by vm.side.collectAsStateWithLifecycle()
     val settings = LocalBeaconSettings.current
     val ready = !beacon || vm.isBeaconConversation()
@@ -717,6 +731,7 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
         }
     }
     var menu by remember { mutableStateOf(false) }
+    var moreMenu by remember { mutableStateOf(false) }
     var threadPosts by remember(chat.sessionId) { mutableStateOf(false) }
     var activitySheet by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(false) }
     var backgroundActivity by remember(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(BackgroundActivitySummary()) }
@@ -769,6 +784,16 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     val liveShown = chat.streamId.isNotBlank() || chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank()
     val liveBubble = chat.liveText.isNotBlank()
     val sendingShown = chatSendInFlight(chat)
+    // A screen reader hears the reply once, when it is complete.
+    val view = LocalView.current
+    var streamedReply by remember(chat.sessionId) { mutableStateOf("") }
+    LaunchedEffect(chat.liveText) { if (chat.liveText.isNotBlank()) streamedReply = chat.liveText }
+    LaunchedEffect(chat.streamId) {
+        if (chat.streamId.isBlank() && streamedReply.isNotBlank()) {
+            @Suppress("DEPRECATION") view.announceForAccessibility(chatPreviewText(streamedReply))
+            streamedReply = ""
+        }
+    }
     // The reply being written and the message being sent join the run before them, as their stored forms will.
     val groups = remember(visibleMessages, dayStarts, callGroupByFirstMessageId, liveShown, liveBubble, sendingShown) {
         bubbleGroups(
@@ -813,7 +838,7 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     BackHandler(showCallHistorySheet) { showCallHistorySheet = false }
     BackHandler(activeHere && showCallHistory) { showCallHistory = false }
     LaunchedEffect(call.active) { if (!call.active) showCallHistory = false }
-    LaunchedEffect(ready) { if (!ready) { menu = false; showSearch = false; search = "" } }
+    LaunchedEffect(ready) { if (!ready) { menu = false; moreMenu = false; showSearch = false; search = "" } }
     var follow by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId, chat.projectionReady) { mutableStateOf(followsTail(true, settings.optBoolean("auto_scroll_follow", true), chat.anchorId.isNotBlank() || chat.anchor != 0 || chat.anchorOffset != 0)) }
     var anchorRestored by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId, chat.projectionReady) { mutableStateOf(chat.projectionReady) }
     var ownerScrolling by remember(list) { mutableStateOf(false) }
@@ -953,10 +978,11 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
             if (canonical && showSearch) LaunchedEffect(chat.sessionId) { searchFocusRequester.requestFocus() }
             if (canonical && showSearch) OutlinedTextField(search, { search = it }, placeholder = { Text(uiText("Find in conversation")) }, singleLine = true, suffix = if (search.isBlank()) null else ({ Text(visibleMessages.size.toString(), Modifier.testTag("search-count")) }), trailingIcon = { IconButton(onClick = { showSearch = false; search = "" }) { Icon(Icons.Rounded.Close, uiText("Close search")) } }, modifier = Modifier.fillMaxWidth().focusRequester(searchFocusRequester).padding(horizontal = 16.dp))
             if (beacon && !ready) Box(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
-                EmptyState(assistantText(if (ui.beaconOpening) "Opening Beacon’s conversation" else "Beacon’s conversation is unavailable"), ui.beaconError.ifBlank { "Your conversation is opening. Your other chats and drafts are safely saved." }, action = if (ui.beaconOpening) "" else assistantText("Retry Beacon"), onAction = { vm.openBeacon() })
+                // Without an error the conversation is only switching (answering a call does this), so it says Opening, not unavailable.
+                EmptyState(assistantText(if (ui.beaconError.isBlank()) "Opening Beacon’s conversation" else "Beacon’s conversation is unavailable"), uiText(ui.beaconError).ifBlank { uiText("Your conversation is opening. Your other chats and drafts are safely saved.") }, action = if (ui.beaconOpening) "" else assistantText("Retry Beacon"), onAction = { vm.openBeacon() })
             } else if (chat.sessionId.isBlank()) Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
                 Box(Modifier.widthIn(max = 280.dp).fillMaxWidth(.9f).aspectRatio(1f).clipToBounds().testTag("chat-sphere-empty")) { ChatSphere(Modifier.fillMaxSize(), avatarState) }
-                EmptyState(if (ui.newChatOpening) "Opening your conversation" else "Make room for a thought", if (ui.newChatError.isNotBlank()) ui.newChatError else if (ui.newChatOpening) "Keep typing. Your draft stays here while the conversation opens." else "Ask, explore or turn an idea into working progress.", action = if (ui.newChatError.isNotBlank() && !ui.newChatOpening) "Retry" else "", onAction = { vm.retryInitialChat() })
+                EmptyState(uiText(if (ui.newChatOpening) "Opening your conversation" else "Make room for a thought"), if (ui.newChatError.isNotBlank()) ui.newChatError else uiText(if (ui.newChatOpening) "Keep typing. Your draft stays here while the conversation opens." else "Ask, explore or turn an idea into working progress."), icon = null, action = if (ui.newChatError.isNotBlank() && !ui.newChatOpening) uiText("Retry") else "", onAction = { vm.retryInitialChat() }, centered = true)
                 if (!ui.newChatOpening && ui.newChatError.isBlank()) StarterPrompts { vm.composer(TextFieldValue(it, TextRange(it.length))) }
             }
             else if (!chat.projectionReady) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -1012,11 +1038,11 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                     if (chat.messages.isEmpty() && chat.streamId.isBlank() && !chatSendInFlight(chat)) item("empty-state") {
                         Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
                             Box(Modifier.widthIn(max = 280.dp).fillMaxWidth(.9f).aspectRatio(1f).clipToBounds().testTag("chat-sphere-empty")) { ChatSphere(Modifier.fillMaxSize(), avatarState) }
-                            EmptyState("Where shall we begin?", if (beacon) assistantText("Beacon keeps the same context across text, calls and completed tasks.") else "Your work starts here. Choose a model and send your first message.")
+                            EmptyState(uiText("Where shall we begin?"), if (beacon) assistantText("Beacon keeps the same context across text, calls and completed tasks.") else uiText("Your work starts here. Choose a model and send your first message."), icon = null, centered = true)
                             StarterPrompts { vm.composer(TextFieldValue(it, TextRange(it.length))) }
                         }
                     }
-                    if (search.isNotBlank() && visibleMessages.isEmpty()) item { Text("No messages match your search.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    if (search.isNotBlank() && visibleMessages.isEmpty()) item { Text(uiText("No messages match your search."), color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     items(visibleMessages, key = { (_, message) -> callGroupByFirstMessageId[message.id]?.let { "call:${it.callId}" } ?: message.id }) { (index, message) ->
                         dayStarts[message.id]?.let { DateChip(uiText(it)) }
                         val group = callGroupByFirstMessageId[message.id]
@@ -1034,7 +1060,7 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                             if (chat.liveText.isNotBlank()) ChatBubble(own = false, liveGroup, bubbleMax) { BubbleText(chat.liveText, vm, vm.authenticatedScope(), interactive = false); BubbleMeta(0L, LIVE_REPLY_ID, null, reserve = true) }
                             Row(Modifier.heightIn(min = 32.dp).testTag("live-status"), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 BeaconSignal(BeaconMotionMode.Pulse, size = 18.dp)
-                                Text(chat.status.ifBlank { "Working" }, Modifier.testTag("message-activity-status"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(chat.status.ifBlank { uiText("Working") }, Modifier.testTag("message-activity-status").semantics { liveRegion = LiveRegionMode.Polite }, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                             Box(Modifier.widthIn(max = bubbleMax)) { MessageActivity(chat.liveReasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), chat.liveTools, "", streaming = true, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }, vm = vm, scope = vm.authenticatedScope()?.session(chat.sessionId)) }
                         }
@@ -1043,8 +1069,8 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                         val exactBeaconAction = p.string("approval_id").startsWith("beacon-cf:")
                         Glass(Modifier.padding(top = 10.dp)) { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             Text(uiText("Approval needed"), style = MaterialTheme.typography.titleMedium)
-                            Text(p.string("description", p.string("command", "The agent requests permission to continue.")))
-                            if (p.string("command").isNotBlank()) CodeBlock(if (exactBeaconAction) "json" else "shell", p.string("command"))
+                            Text(p.string("description", p.string("command", uiText("The agent requests permission to continue."))))
+                            if (p.string("command").isNotBlank()) CodeBlock(if (exactBeaconAction) "json" else "shell", p.string("command"), vm)
                             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Button(onClick = { promptScope?.let { vm.approval("once", p, it) } }, enabled = promptScope != null && "once" in p.optJSONArray("choices")?.strings().orEmpty()) { Text(uiText("Allow once")) }
                                 if (!exactBeaconAction && "session" in p.optJSONArray("choices")?.strings().orEmpty()) OutlinedButton(onClick = { promptScope?.let { vm.approval("session", p, it) } }, enabled = promptScope != null) { Text(uiText("This session")) }
@@ -1055,14 +1081,14 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                     } }
                     chat.clarification?.let { p -> item("clarify:$questionId") { Box(Modifier.padding(top = 10.dp)) { Clarification(vm, p, promptScope, questionAnswers) { id, value -> questionAnswers = questionAnswers + (id to value) } } } }
                     if (chatSendInFlight(chat)) item("sending") { SendingMessage(composerDraft.text, groups[SENDING_MESSAGE_ID] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax) }
-                    else if (chat.status.isNotBlank() && chat.streamId.isBlank()) item { Text(chat.status, Modifier.padding(top = 10.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    else if (chat.status.isNotBlank() && chat.streamId.isBlank()) item { Text(uiText(chat.status), Modifier.padding(top = 10.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     }
-                    if (ready && !follow && list.canScrollForward) FloatingActionButton(
+                    if (ready && !follow && list.canScrollForward) SmallFloatingActionButton(
                         onClick = { follow = true; scope.launch { val last = (list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0); if (motionEnabled) list.animateScrollToItem(last) else list.scrollToItem(last) } },
-                        modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp).testTag("scroll-to-latest"),
+                        modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp).minimumInteractiveComponentSize().testTag("scroll-to-latest"),
                         shape = CircleShape,
-                        containerColor = MaterialTheme.colorScheme.primary,
-                        contentColor = MaterialTheme.colorScheme.onPrimary,
+                        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                        contentColor = MaterialTheme.colorScheme.primary,
                     ) { Icon(Icons.Rounded.ExpandMore, uiText("Scroll to latest"), Modifier.size(24.dp)) }
                 }
             }
@@ -1081,7 +1107,10 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
         }
     }
     BoxWithConstraints(Modifier.fillMaxSize()) {
-    val actionMenuHeight = (maxHeight - 16.dp).coerceAtLeast(48.dp).coerceAtMost(440.dp)
+    // The chat menu may use the screen's height, so every action shows on a phone; a short window still scrolls.
+    val actionMenuHeight = (maxHeight - 16.dp).coerceAtLeast(48.dp)
+    // Landscape with the keyboard open: the field gets the room the strip and header padding would take.
+    val shortWindow = maxHeight < 420.dp
     val headerColorScheme = if (activeHere) MaterialTheme.colorScheme.copy(
         background = Color(0xff080d15),
         surface = Color(0xff101a2b),
@@ -1092,15 +1121,15 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     ) else MaterialTheme.colorScheme
     Column(Modifier.fillMaxSize()) {
         MaterialTheme(colorScheme = headerColorScheme) {
-            Glass(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
+            Glass(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = if (shortWindow) 0.dp else 8.dp)) {
                 Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    if (navigationBack != null) IconButton(onClick = navigationBack, modifier = Modifier.testTag("bot-chat-back")) { Icon(Icons.Rounded.ArrowBack, "Back to bots") }
+                    if (navigationBack != null) IconButton(onClick = navigationBack, modifier = Modifier.testTag("bot-chat-back")) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, uiText("Back to bots")) }
                     else IconButton(onClick = LocalOpenNavigationMenu.current ?: { vm.toggleSessions(!ui.showSessions) }, modifier = Modifier.testTag("navigation-toggle")) { Icon(Icons.Rounded.Menu, uiText(if (LocalPersistentNavigation.current) "Hide navigation" else "Show navigation")) }
                     val headerTitle = titleOverride ?: if (beacon || activeHere) LocalAssistantName.current else chat.title
                     ChatAvatar(headerTitle, chat.sessionId, size = 40.dp, beacon = beacon || activeHere, description = if (beacon || activeHere) assistantText("Beacon") else null)
                     // The title opens the same chat menu as the dots.
                     Column(Modifier.weight(1f).padding(start = 10.dp).heightIn(min = 48.dp).clickable(enabled = ready, onClickLabel = uiText("Conversation actions")) { menu = true }.padding(vertical = 4.dp).testTag("chat-header-title"), verticalArrangement = Arrangement.Center) {
-                        Text(plainTitle(headerTitle), style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                        Text(plainTitle(headerTitle), Modifier.semantics { heading() }, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                         val headerModel = chatModelLabel(chat.raw.string("model"), profileDefaults["profile-defaults"]?.takeIf { it.string("profile") == ui.profile && recordError(it).isBlank() }?.string("model").orEmpty())
                         // Read from the cached project answer, so the project shows with the chat; nothing shows for a chat in no project.
                         val headerProject = chatProjectOf(profileDefaults["project-of:${chat.sessionId}"], chat.sessionId)
@@ -1108,31 +1137,47 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                         if (headerLine.project.isNotBlank() || headerLine.text.isNotBlank()) ChatHeaderSubtitle(headerLine)
                     }
                     IconButton(onClick = { showSearch = !showSearch; if (activeHere && showSearch) showCallHistory = true }, enabled = canonical) { Icon(Icons.Rounded.Search, uiText("Search this conversation")) }
-                    Box { IconButton(onClick = { menu = true }, enabled = ready) { Icon(Icons.Rounded.MoreVert, uiText("Conversation actions")) }; DropdownMenu(menu && ready, { menu = false }, modifier = Modifier.heightIn(max = actionMenuHeight).testTag("conversation-actions-menu")) {
-                        if (beacon) DropdownMenuItem({ Text("Call history") }, { menu = false; showCallHistorySheet = true }, modifier = Modifier.testTag("call-history-open"))
-                        conversationActionGroups.entries.forEachIndexed { index, (group, titles) ->
-                            if (index > 0) HorizontalDivider()
-                            Text(uiText(if (group == "Model and tools") "Tools" else group), Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            titles.filterNot { it in setOf("Model & provider", "Reasoning") || (permanentBotChat && it == "New conversation") }.forEach { title ->
-                                val label = conversationActionLabel(title, openChatPinned(ui.sessions, chat, ui.profile), chat.raw.optBoolean("archived")).replaceFirstChar { it.uppercase() }
-                            DropdownMenuItem({ Column { Text(conversationMenuTitle(uiText(label))); if (activeHere && title in setOf("Delete conversation", "Undo last turn", "Compress context")) Text("End this call to continue", style = MaterialTheme.typography.labelSmall) } }, onClick = { menu = false; chatAction(vm, title) }, enabled = nativeConversationAction(title) && (canonical || title == "New conversation") && !(activeHere && title in setOf("Delete conversation", "Undo last turn", "Compress context")), leadingIcon = { Icon(chatActionIcon(label), null) }, modifier = Modifier.testTag("conversation-action:$title"))
-                            }
-                        }
-                        HorizontalDivider()
-                        if (chat.queued.isNotEmpty() || chat.uncertain.isNotBlank()) DropdownMenuItem({ Text("Message queue") }, { menu = false; composerDetails = true }, enabled = !activeHere)
-                        if (composerDraft.text.startsWith("/")) DropdownMenuItem({ Text(if (chat.streamId.isNotBlank()) "Queue as text" else "Send as text") }, { menu = false; if (chat.streamId.isNotBlank()) vm.queue() else vm.send() }, enabled = canonical && !activeHere && chat.uncertain.isBlank())
-                        if (canonical && !activeHere && chat.streamId.isBlank()) ConversationProjectItem(vm, chat.sessionId, onAdd = { projects = true }, onDone = { menu = false }, onOpen = { openProjectFromChat(vm, it) })
+                    Box {
+                        IconButton(onClick = { menu = true }, enabled = ready) { Icon(Icons.Rounded.MoreVert, uiText("Conversation actions")) }
                         val assistantName = LocalAssistantName.current
                         val context = LocalContext.current
                         val shareTitle = uiText("Share conversation")
-                        if (canonical && chat.messages.isNotEmpty()) DropdownMenuItem({ Text(uiText("Share conversation")) }, { menu = false
-                            runCatching { context.startActivity(Intent.createChooser(formattedShareIntent(conversationShareText(chat.messages.map { it.role to safeHistoryMessageText(it.role, it.text) }, assistantName)), shareTitle)) }
-                                .onFailure { vm.notice(if (it is IllegalArgumentException) it.message.orEmpty() else "No app is available to share this conversation") } }, leadingIcon = { Icon(Icons.Rounded.Share, null) })
-                        if (canonical) DropdownMenuItem({ Text(uiText("Copy conversation ID")) }, { menu = false
-                            (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Conversation ID", chat.sessionId)); vm.notice("Conversation ID copied") }, leadingIcon = { Icon(Icons.Rounded.ContentCopy, null) })
-                        if (canonical && isThreadSource(chat.raw.string("source"))) DropdownMenuItem({ Text(uiText("Scheduled posts")) }, { menu = false; threadPosts = true }, leadingIcon = { Icon(Icons.Rounded.Schedule, null) })
-                        DropdownMenuItem({ Text("Chat preferences") }, { menu = false; vm.more("Settings") })
-                    } }
+                        val noShareApp = uiText("No app is available to share this conversation")
+                        val idCopied = uiText("Conversation ID copied")
+                        val endCall = uiText("End this call to continue")
+                        // One chat action as a menu row; Delete is red, as it is in History.
+                        val actionItem: @Composable (String) -> Unit = { title ->
+                            val label = conversationActionLabel(title, openChatPinned(ui.sessions, chat, ui.profile), chat.raw.optBoolean("archived")).replaceFirstChar { it.uppercase() }
+                            val blocked = activeHere && title in setOf("Delete conversation", "Undo last turn", "Compress context")
+                            val ink = if (title == "Delete conversation") MaterialTheme.colorScheme.error else Color.Unspecified
+                            DropdownMenuItem({ Column { Text(conversationMenuTitle(uiText(label))); if (blocked) Text(endCall, style = MaterialTheme.typography.labelSmall) } }, onClick = { menu = false; moreMenu = false; chatAction(vm, title) }, enabled = nativeConversationAction(title) && (canonical || title == "New conversation") && !blocked, leadingIcon = { Icon(chatActionIcon(label), null) },
+                                colors = MenuDefaults.itemColors(textColor = ink, leadingIconColor = ink), modifier = Modifier.testTag("conversation-action:$title"))
+                        }
+                        DropdownMenu(menu && ready, { menu = false }, modifier = Modifier.heightIn(max = actionMenuHeight).testTag("conversation-actions-menu")) {
+                            if (beacon) DropdownMenuItem({ Text(uiText("Call history")) }, { menu = false; showCallHistorySheet = true }, leadingIcon = { Icon(Icons.Rounded.History, null) }, modifier = Modifier.testTag("call-history-open"))
+                            conversationActionGroups.entries.forEachIndexed { index, (group, titles) ->
+                                if (index > 0) HorizontalDivider()
+                                Text(uiText(group), Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                titles.filterNot { permanentBotChat && it == "New conversation" }.forEach { actionItem(it) }
+                            }
+                            HorizontalDivider()
+                            if (chat.queued.isNotEmpty() || chat.uncertain.isNotBlank()) DropdownMenuItem({ Text(uiText("Message queue")) }, { menu = false; composerDetails = true }, enabled = !activeHere)
+                            if (composerDraft.text.startsWith("/")) DropdownMenuItem({ Text(uiText(if (chat.streamId.isNotBlank()) "Queue as text" else "Send as text")) }, { menu = false; if (chat.streamId.isNotBlank()) vm.queue() else vm.send() }, enabled = canonical && !activeHere && chat.uncertain.isBlank())
+                            if (canonical && !activeHere && chat.streamId.isBlank()) ConversationProjectItem(vm, chat.sessionId, onAdd = { projects = true }, onDone = { menu = false }, onOpen = { openProjectFromChat(vm, it) })
+                            if (canonical && chat.messages.isNotEmpty()) DropdownMenuItem({ Text(uiText("Share conversation")) }, { menu = false
+                                runCatching { context.startActivity(Intent.createChooser(formattedShareIntent(conversationShareText(chat.messages.map { it.role to safeHistoryMessageText(it.role, it.text) }, assistantName)), shareTitle)) }
+                                    .onFailure { vm.notice(if (it is IllegalArgumentException) it.message.orEmpty() else noShareApp) } }, leadingIcon = { Icon(Icons.Rounded.Share, null) })
+                            if (canonical && isThreadSource(chat.raw.string("source"))) DropdownMenuItem({ Text(uiText("Scheduled posts")) }, { menu = false; threadPosts = true }, leadingIcon = { Icon(Icons.Rounded.Schedule, null) })
+                            // The developer-facing actions live one step away from the daily ones.
+                            if (canonical) DropdownMenuItem({ Text(uiText("More")) }, { menu = false; moreMenu = true }, leadingIcon = { Icon(Icons.Rounded.MoreHoriz, null) }, trailingIcon = { Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, null) }, modifier = Modifier.testTag("conversation-more"))
+                            DropdownMenuItem({ Text(uiText("Chat preferences")) }, { menu = false; vm.more("Settings") }, leadingIcon = { Icon(Icons.Rounded.Tune, null) })
+                        }
+                        DropdownMenu(moreMenu && ready, { moreMenu = false }, modifier = Modifier.heightIn(max = actionMenuHeight).testTag("conversation-more-menu")) {
+                            conversationMoreActions.forEach { actionItem(it) }
+                            DropdownMenuItem({ Text(uiText("Copy conversation ID")) }, { moreMenu = false
+                                (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Conversation ID", chat.sessionId)); vm.notice(idCopied) }, leadingIcon = { Icon(Icons.Rounded.ContentCopy, null) })
+                        }
+                    }
                 }
             }
         }
@@ -1147,7 +1192,7 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
             }
         }
         if (ready && !activeHere) Column(Modifier.fillMaxWidth().onSizeChanged { onComposerHeight(it.height) }) {
-            Box(Modifier.fillMaxWidth().widthIn(max = 840.dp).align(Alignment.CenterHorizontally)) { ChatActivityStrip(backgroundActivity) { activitySheet = true } }
+            if (!shortWindow) Box(Modifier.fillMaxWidth().widthIn(max = 840.dp).align(Alignment.CenterHorizontally)) { ChatActivityStrip(backgroundActivity) { activitySheet = true } }
             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { Composer(vm, activeHere, !call.active, callThisChat, composerDetails, { composerDetails = it }) }
         }
     }
@@ -1291,6 +1336,7 @@ internal fun acceptsInitialConversationEdit(
     var modelMenu by remember { mutableStateOf(false) }
     var attachMenu by remember { mutableStateOf(false) }
     val inputFocus = remember { FocusRequester() }
+    var inputFocused by remember { mutableStateOf(false) }
     LaunchedEffect(ui.origin, ui.owner, ui.profile) { vm.loadSlashCatalog() }
     // Hermes reports a blank model/effort when the chat follows its profile (tui_gateway _session_info, _cfg_get_reasoning),
     // so the profile's own values are the chat's effective ones.
@@ -1304,7 +1350,7 @@ internal fun acceptsInitialConversationEdit(
     BoxWithConstraints(Modifier.widthIn(max = 840.dp).fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
         // Reserve the action row before the editor grows. The editor scrolls its own long draft.
         val commandHeight = if (draft.text.startsWith("/")) (maxHeight - 160.dp).coerceIn(48.dp, 224.dp) else 0.dp
-        val editorHeight = (maxHeight - 112.dp - commandHeight - (if (commandHeight > 0.dp) 8.dp else 0.dp) - if(chat.streamId.isNotBlank()) 48.dp else 0.dp).coerceAtMost(160.dp).coerceAtLeast(1.dp)
+        val editorHeight = (maxHeight - 112.dp - commandHeight - (if (commandHeight > 0.dp) 8.dp else 0.dp) - if(chat.streamId.isNotBlank()) 48.dp else 0.dp).coerceAtMost(160.dp).coerceAtLeast(48.dp)
         Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             if (draft.text.startsWith("/")) {
                 val catalog = data["slash:catalog"]
@@ -1318,29 +1364,29 @@ internal fun acceptsInitialConversationEdit(
                             Text(command.string("description"), Modifier.weight(1f).padding(start = 10.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                         }
                     }
-                    if (commands.isEmpty()) item { Text(if (catalog == null) "Loading commands…" else if (draft.text.contains(' ')) "Review arguments, then run command" else "No matching native commands", Modifier.padding(14.dp), style = MaterialTheme.typography.bodySmall) }
-                    if (recordError(catalog).isNotBlank()) item { TextButton(onClick = { vm.loadSlashCatalog(force = true) }) { Text("Retry commands") } }
+                    if (commands.isEmpty()) item { Text(uiText(if (catalog == null) "Loading commands…" else if (draft.text.contains(' ')) "Review arguments, then run command" else "No matching commands"), Modifier.padding(14.dp), style = MaterialTheme.typography.bodySmall) }
+                    if (recordError(catalog).isNotBlank()) item { TextButton(onClick = { vm.loadSlashCatalog(force = true) }) { Text(uiText("Retry commands")) } }
                 }
             }
             val voiceAction = composerUsesVoice(draft.text, files.size, preparing.size)
             val streaming = chat.streamId.isNotBlank()
             val sending = chatSendInFlight(chat)
             // Relay-style composer surface: one pill with a hairline border.
-            Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh, border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
+            Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh, border = BorderStroke(if (inputFocused) 2.dp else 1.dp, if (inputFocused) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant)) {
                 Column(Modifier.padding(horizontal = 6.dp, vertical = 3.dp)) {
                     if (chat.queued.isNotEmpty()) LazyColumn(Modifier.fillMaxWidth().heightIn(max = 144.dp).testTag("composer-queue"), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        item(key = "queue-heading") { Text(queuedHeading(chat.queued.size), Modifier.padding(horizontal = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                        item(key = "queue-heading") { Text(queuedHeading(chat.queued.size, uiText("1 message will send after this reply"), uiText("{0} messages will send after this reply")), Modifier.padding(horizontal = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                         itemsIndexed(chat.queued) { index, queued -> Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Text(queued.text.ifBlank { "Attachment" } + if (queued.attachments.isNotEmpty()) " · ${queued.attachments.size} files" else "", Modifier.weight(1f).padding(horizontal = 8.dp), style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                            Text(queued.text.ifBlank { uiText("Attachment") } + if (queued.attachments.isNotEmpty()) " · " + uiText(if (queued.attachments.size == 1) "1 file" else "{0} files").replace("{0}", "${queued.attachments.size}") else "", Modifier.weight(1f).padding(horizontal = 8.dp), style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                             IconButton(onClick = { vm.removeQueued(index) }, modifier = Modifier.size(48.dp)) { Icon(Icons.Rounded.Close, uiText("Remove queued message")) }
                         } }
                     }
                     if (files.isNotEmpty() || preparing.isNotEmpty()) Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).testTag("composer-attachments"), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         files.forEachIndexed { index, file -> PendingAttachmentChip(file, onClick = { onDetails(true) }, onRemove = { vm.removeAttachment(index) }) }
-                        preparing.forEach { file -> InputChip(selected = false, onClick = { onDetails(true) }, label = { Text(attachmentPreparationLabel(file.string("name"), file.string("status"), file.string("error")), maxLines = 2) }, leadingIcon = { if (file.string("status") != "error") CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp) else Icon(Icons.Rounded.ErrorOutline, "Upload failed") }, trailingIcon = { IconButton(onClick = { vm.dismissAttachmentPreparation(file.string("id")) }, Modifier.size(48.dp)) { Icon(Icons.Rounded.Close, "Remove ${file.string("name")}") } }, modifier = Modifier.heightIn(min = 48.dp).widthIn(max = 280.dp)) }
+                        preparing.forEach { file -> InputChip(selected = false, onClick = { onDetails(true) }, label = { Text(attachmentPreparationLabel(file.string("name"), file.string("status"), uiText(file.string("error")), uiText("Upload failed. Remove and attach again."), uiText("Preparing…")), maxLines = 2) }, leadingIcon = { if (file.string("status") != "error") CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp) else Icon(Icons.Rounded.ErrorOutline, uiText("Upload failed")) }, trailingIcon = { IconButton(onClick = { vm.dismissAttachmentPreparation(file.string("id")) }, Modifier.size(48.dp)) { Icon(Icons.Rounded.Close, uiText("Remove") + " " + file.string("name")) } }, modifier = Modifier.heightIn(min = 48.dp).widthIn(max = 280.dp)) }
                     }
                     // A visible state pill, so Queue vs. Guide does not depend on the trailing icon alone.
-                    if (streaming && !voiceAction) Text(uiText("Queue next · delivers after this turn"), Modifier.padding(horizontal = 8.dp, vertical = 2.dp).clip(RoundedCornerShape(999.dp)).background(MaterialTheme.colorScheme.secondaryContainer).padding(horizontal = 8.dp, vertical = 3.dp).testTag("composer-queue-caption"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSecondaryContainer)
+                    if (streaming && !voiceAction) Text(uiText("Will send after this reply"), Modifier.padding(horizontal = 8.dp, vertical = 2.dp).clip(RoundedCornerShape(999.dp)).background(MaterialTheme.colorScheme.secondaryContainer).padding(horizontal = 8.dp, vertical = 3.dp).testTag("composer-queue-caption"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSecondaryContainer)
                     // In flight the transcript shows the message; the draft stays held (not shown twice) until Hermes accepts it.
                     // Edits are ignored rather than the field made read-only: read-only ends the input session and drops the keyboard.
                     val imagePasteReceiver = ReceiveContentListener { content ->
@@ -1371,7 +1417,7 @@ internal fun acceptsInitialConversationEdit(
                         }
                     }
                     Box(Modifier.weight(1f).contentReceiver(imagePasteReceiver)) {
-                        OutlinedTextField(if (sending) TextFieldValue("") else draft, if (sending) { _ -> } else changeDraft, placeholder = { Text(if (sending) uiText("Sending…") else if (callActive) "Finish your call to continue typing" else if (readOnly) "Branch this conversation to reply" else if (streaming) uiText("Correct the response...") else assistantText("Message Beacon")) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp.coerceAtMost(editorHeight), max = editorHeight).testTag("message-input").focusRequester(inputFocus).onPreviewKeyEvent { event ->
+                        OutlinedTextField(if (sending) TextFieldValue("") else draft, if (sending) { _ -> } else changeDraft, placeholder = { Text(if (sending) uiText("Sending…") else if (callActive) uiText("Finish your call to continue typing") else if (readOnly) uiText("Branch this conversation to reply") else if (streaming) uiText("Correct the response...") else assistantText("Message Beacon")) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp, max = editorHeight).testTag("message-input").focusRequester(inputFocus).onFocusChanged { inputFocused = it.isFocused }.onPreviewKeyEvent { event ->
                             val key = event.nativeKeyEvent
                             val pastedImage = key.action == android.view.KeyEvent.ACTION_DOWN && key.repeatCount == 0 && key.keyCode == android.view.KeyEvent.KEYCODE_V && key.isCtrlPressed && pasteClipboardImage()
                             if (pastedImage) true else {
@@ -1379,12 +1425,12 @@ internal fun acceptsInitialConversationEdit(
                                 val matched = when (sendKey) { "ctrl_enter", "ctrl+enter" -> key.isCtrlPressed && !key.isShiftPressed; "shift+enter" -> key.isShiftPressed && !key.isCtrlPressed; else -> !key.isShiftPressed && !key.isCtrlPressed && !key.isAltPressed }
                                 if (key.action == android.view.KeyEvent.ACTION_DOWN && key.keyCode == android.view.KeyEvent.KEYCODE_ENTER && matched && !callActive && !readOnly) { if (editable && chat.uncertain.isBlank()) submit(); true } else false
                             }
-                        }, minLines = 1, maxLines = 6, enabled = editable && !callActive && !readOnly, shape = RoundedCornerShape(18.dp), colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = .5f)))
+                        }, minLines = 1, maxLines = 6, enabled = editable && !callActive && !readOnly, shape = RoundedCornerShape(18.dp), colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = Color.Transparent))
                     }
                     }
                     if (streaming && !voiceAction) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                        TextButton(onClick = { vm.steer() }, enabled = canonical && preparing.isEmpty() && !readOnly && !callActive && draft.text.isNotBlank() && !draft.text.startsWith("/") && chat.uncertain.isBlank() && files.isEmpty(), modifier = Modifier.heightIn(min = 48.dp)) { Text("Guide") }
-                        TextButton(onClick = { vm.cancel() }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Stop") }
+                        TextButton(onClick = { vm.steer() }, enabled = canonical && preparing.isEmpty() && !readOnly && !callActive && draft.text.isNotBlank() && !draft.text.startsWith("/") && chat.uncertain.isBlank() && files.isEmpty(), modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Send now")) }
+                        TextButton(onClick = { vm.cancel() }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Stop")) }
                     }
                     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
                         Box {
@@ -1414,8 +1460,8 @@ internal fun acceptsInitialConversationEdit(
                                 Icon(Icons.Rounded.ExpandMore, null, Modifier.size(16.dp))
                             }
                             DropdownMenu(modelMenu, { modelMenu = false }) {
-                                DropdownMenuItem({ Text("Model & provider") }, { modelMenu = false; vm.openCatalog("Model & provider") })
-                                DropdownMenuItem({ Text("Reasoning effort") }, { modelMenu = false; vm.openCatalog("Reasoning") })
+                                DropdownMenuItem({ Text(uiText("Model & provider")) }, { modelMenu = false; vm.openCatalog("Model & provider") })
+                                DropdownMenuItem({ Text(uiText("Reasoning effort")) }, { modelMenu = false; vm.openCatalog("Reasoning") })
                             }
                         }
                         } }
@@ -1441,18 +1487,18 @@ internal fun acceptsInitialConversationEdit(
         Column(Modifier.fillMaxWidth().heightIn(max = 520.dp).verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text(uiText("Message details"), style = MaterialTheme.typography.titleLarge)
             if (readOnly) Text(uiText("This source is read-only. Branch into a new conversation to continue."))
-            if (chat.status.isNotBlank()) Text(chat.status, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (chat.status.isNotBlank()) Text(uiText(chat.status), color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (chat.uncertain.isNotBlank()) {
-                Text("Not sure this message arrived. Check the chat, then resend or dismiss.")
-                TextButton(onClick = { vm.reconcileSend() }) { Text("Refresh saved conversation") }
-                TextButton(onClick = { vm.openForm(ActionForm("Mark message reviewed", "", emptyList(), explanation = "You have checked the saved conversation. Keep the draft and clear its unconfirmed delivery state.", actionLabel = "Mark reviewed", onResult = { vm.reviewPendingSend() })); onDetails(false) }) { Text("Mark reviewed") }
-                TextButton(onClick = { vm.openForm(resendForm(vm)); onDetails(false) }) { Text("Resend draft…") }
+                Text(uiText("Not sure this message arrived. Check the chat, then resend or dismiss."))
+                TextButton(onClick = { vm.reconcileSend() }) { Text(uiText("Check receipt")) }
+                TextButton(onClick = { vm.openForm(ActionForm("Dismiss this warning", "", emptyList(), explanation = "You have checked the chat. Your draft stays; the warning goes away.", actionLabel = "Dismiss", onResult = { vm.reviewPendingSend() })); onDetails(false) }) { Text(uiText("Dismiss")) }
+                TextButton(onClick = { vm.openForm(resendForm(vm)); onDetails(false) }) { Text(uiText("Resend")) }
             }
 
-            preparing.forEach { file -> Text(attachmentPreparationLabel(file.string("name"), file.string("status"), file.string("error"))) }
+            preparing.forEach { file -> Text(attachmentPreparationLabel(file.string("name"), file.string("status"), uiText(file.string("error")), uiText("Upload failed. Remove and attach again."), uiText("Preparing…"))) }
             if (files.isEmpty() && preparing.isEmpty() && chat.queued.isEmpty()) Text(uiText("No attachments or queued messages"), color = MaterialTheme.colorScheme.onSurfaceVariant)
-            files.forEachIndexed { index, file -> Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { Text(file.string("name", file.string("filename", "Attachment")), Modifier.weight(1f)); IconButton(onClick = { vm.removeAttachment(index) }) { Icon(Icons.Rounded.Close, uiText("Remove attachment")) } } }
-            chat.queued.forEachIndexed { index, queued -> Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { Text("Queued: ${queued.text}${if (queued.attachments.isNotEmpty()) " · ${queued.attachments.size} files" else ""}", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall); IconButton(onClick = { vm.removeQueued(index) }) { Icon(Icons.Rounded.Close, uiText("Remove queued message")) } } }
+            files.forEachIndexed { index, file -> Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { Text(file.string("name", file.string("filename", uiText("Attachment"))), Modifier.weight(1f)); IconButton(onClick = { vm.removeAttachment(index) }) { Icon(Icons.Rounded.Close, uiText("Remove attachment")) } } }
+            chat.queued.forEachIndexed { index, queued -> Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { Text(uiText("Queued") + ": ${queued.text}${if (queued.attachments.isNotEmpty()) " · " + uiText(if (queued.attachments.size == 1) "1 file" else "{0} files").replace("{0}", "${queued.attachments.size}") else ""}", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall); IconButton(onClick = { vm.removeQueued(index) }) { Icon(Icons.Rounded.Close, uiText("Remove queued message")) } } }
         }
     }
 }
@@ -1491,7 +1537,7 @@ private const val SENDING_MESSAGE_ID = "sending-message"
 
 /** The recorded time (none when Hermes recorded none) and, for the owner's own message, its send tick, at the bubble's bottom right. */
 @Composable private fun ColumnScope.BubbleMeta(recordedAt: Long, messageId: String, tick: SendTick?, reserve: Boolean = false) {
-    val time = messageTimeLabel(recordedAt)
+    val time = messageTimeLabel(recordedAt, is24Hour = phoneIs24Hour())
     if (time == null && tick == null && !reserve) return
     Row(Modifier.align(Alignment.End).padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
         if (time != null) Text(time, Modifier.testTag("message-time:$messageId"), style = nativeMetadataStyle(), color = LocalContentColor.current.copy(alpha = .7f))
@@ -1534,10 +1580,10 @@ private const val SENDING_MESSAGE_ID = "sending-message"
             DropdownMenuItem({ Text(uiText("Copy")) }, { actions = false; copyFormatted() }, leadingIcon = { Icon(Icons.Rounded.ContentCopy, null) }, enabled = displayText.isNotBlank(), modifier = Modifier.testTag("message-copy:${message.id}"))
             DropdownMenuItem({ Text(uiText("Quote in reply")) }, { actions = false; quote() }, leadingIcon = { Icon(Icons.Rounded.FormatQuote, null) }, enabled = displayText.isNotBlank(), modifier = Modifier.testTag("message-quote:${message.id}"))
             DropdownMenuItem({ Text(uiText("Share")) }, { actions = false; share() }, leadingIcon = { Icon(Icons.Rounded.Share, null) }, modifier = Modifier.testTag("message-share:${message.id}"))
-            DropdownMenuItem({ Text(uiText(if (reading) "Stop read aloud" else "Read aloud")) }, { actions = false; readAloud() }, leadingIcon = { Icon(if (reading) Icons.Rounded.Stop else Icons.Rounded.VolumeUp, null) }, enabled = reading || displayText.isNotBlank(), modifier = Modifier.testTag("message-read-aloud:${message.id}"))
+            DropdownMenuItem({ Text(uiText(if (reading) "Stop read aloud" else "Read aloud")) }, { actions = false; readAloud() }, leadingIcon = { Icon(if (reading) Icons.Rounded.Stop else Icons.AutoMirrored.Rounded.VolumeUp, null) }, enabled = reading || displayText.isNotBlank(), modifier = Modifier.testTag("message-read-aloud:${message.id}"))
             HorizontalDivider()
-            DropdownMenuItem({ Text("Copy source") }, { actions = false; copySource(displayText) }, leadingIcon = { Icon(Icons.Rounded.Code, null, Modifier.testTag("copy-source-icon")) }, modifier = Modifier.testTag("copy-source-action"))
-            DropdownMenuItem({ Text(uiText("Branch from here")) }, { actions = false; vm.sessionAction("/api/session/branch", json("keep_count" to index + 1)) { o -> branchSessionId(o).takeIf(String::isNotBlank)?.let { id -> vm.selectSession(id, titleHint = branchTitle(o)); vm.refreshSessions(); vm.notice("Branched into a new conversation") } } }, leadingIcon = { Icon(Icons.Rounded.CallSplit, null) })
+            DropdownMenuItem({ Text(uiText("Copy source")) }, { actions = false; copySource(displayText) }, leadingIcon = { Icon(Icons.Rounded.Code, null, Modifier.testTag("copy-source-icon")) }, modifier = Modifier.testTag("copy-source-action"))
+            DropdownMenuItem({ Text(uiText("Branch from here")) }, { actions = false; vm.sessionAction("/api/session/branch", json("keep_count" to index + 1)) { o -> branchSessionId(o).takeIf(String::isNotBlank)?.let { id -> vm.selectSession(id, titleHint = branchTitle(o)); vm.refreshSessions(); vm.notice("Branched into a new conversation") } } }, leadingIcon = { Icon(Icons.AutoMirrored.Rounded.CallSplit, null) })
             if (own) DropdownMenuItem({ Text(uiText("Edit and branch")) }, { actions = false; vm.sessionAction("/api/session/branch", json("keep_count" to index)) { o -> (o.optJSONObject("session") ?: o).string("session_id").takeIf(String::isNotBlank)?.let { vm.selectSession(it, message.text, titleHint = branchTitle(o)); vm.refreshSessions() } } }, leadingIcon = { Icon(Icons.Rounded.Edit, null) })
         }
     }
@@ -1609,7 +1655,7 @@ private fun decodePendingAttachmentThumbnail(encoded: String): Bitmap? {
 }
 
 @Composable private fun PendingAttachmentChip(file: JSONObject, onClick: () -> Unit, onRemove: () -> Unit) {
-    val name = file.string("name", file.string("filename", "Attachment"))
+    val name = file.string("name", file.string("filename", uiText("Attachment")))
     val image = imageMimeType(file.string("mime"))
     val encoded = file.string("staged_base64")
     val thumbnail by produceState<Bitmap?>(null, file.string("id"), encoded, image) {
@@ -1626,14 +1672,14 @@ private fun decodePendingAttachmentThumbnail(encoded: String): Bitmap? {
                 else Icon(if (image) Icons.Rounded.Image else Icons.Rounded.AttachFile, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Text(name, Modifier.weight(1f, fill = false).padding(horizontal = 7.dp), style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-            IconButton(onClick = onRemove, modifier = Modifier.size(48.dp)) { Icon(Icons.Rounded.Close, "Remove $name", Modifier.size(18.dp)) }
+            IconButton(onClick = onRemove, modifier = Modifier.size(48.dp)) { Icon(Icons.Rounded.Close, uiText("Remove") + " " + name, Modifier.size(18.dp)) }
         }
     }
 }
 
 @Composable fun Disclosure(title: String, content: String, actions: @Composable () -> Unit = {}, renderContent: (@Composable () -> Unit)? = null) {
     var expanded by rememberSaveable(title, content.take(50)) { mutableStateOf(false) }
-    val toggleDescription = uiText(if (expanded) "Hide $title" else "Show $title")
+    val toggleDescription = uiText(if (expanded) "Hide {0}" else "Show {0}").replace("{0}", uiText(title))
     Column {
         TextButton(onClick = { expanded = !expanded }, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = toggleDescription }.testTag("disclosure:$title")) {
             Icon(if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, null)
@@ -1685,13 +1731,14 @@ private fun decodePendingAttachmentThumbnail(encoded: String): Bitmap? {
 
 @Composable private fun ToolStepsHeader(tools: List<JSONObject>, live: Boolean, expanded: Boolean, motionEnabled: Boolean, onClick: () -> Unit) {
     val current = tools.lastOrNull()?.let(::toolDisplayName).orEmpty()
-    val summary = if (live) current else toolStepsSummary(tools)
-    val count = "${tools.size} ${if (tools.size == 1) "step" else "steps"}"
+    val summary = if (live) current else toolStepsSummary(tools, uiText("1 step"), uiText("{0} steps"))
+    val count = uiText(if (tools.size == 1) "1 step" else "{0} steps").replace("{0}", "${tools.size}")
+    val stateText = uiText(if (expanded) "Expanded" else "Collapsed")
     val chevronRotation by animateFloatAsState(if (expanded) 180f else 0f, animationSpec = if (motionEnabled) tween(180) else snap(), label = "tool-steps-chevron")
     Surface(
         Modifier.fillMaxWidth().testTag("tool-steps").semantics {
             contentDescription = if (live) "$summary, $count" else summary
-            stateDescription = if (expanded) "Expanded" else "Collapsed"
+            stateDescription = stateText
         },
         shape = RoundedCornerShape(20.dp),
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -1739,10 +1786,10 @@ internal fun toolDisplayName(tool: JSONObject): String {
 }
 /** Hermes' own lookup steps say nothing about the work; a step summary names the tools that did it. */
 private val toolLookupNames = setOf("tool_search", "tool_describe", "skills_list", "skill_view")
-internal fun toolStepsSummary(tools: List<JSONObject>): String {
+internal fun toolStepsSummary(tools: List<JSONObject>, one: String = "1 step", many: String = "{0} steps"): String {
     val names = tools.filterNot { it.rawToolName() in toolLookupNames }.map(::toolDisplayName).distinct()
     val shown = names.take(3).joinToString(", ")
-    return "${tools.size} steps" + if (shown.isNotBlank()) " · " + shown + if (names.size > 3) "…" else "" else ""
+    return (if (tools.size == 1) one else many).replace("{0}", "${tools.size}") + if (shown.isNotBlank()) " · " + shown + if (names.size > 3) "…" else "" else ""
 }
 /** Calls use the phone's own provider key; Hermes only needs the Beacon plugin. A missing phone key opens Voice & calls. */
 internal fun voiceCallsOffered(bootstrap: JSONObject): Boolean = bootstrap.optJSONObject("optional_features")?.optString("plugin") == "available"
@@ -1827,15 +1874,15 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
     val finished = outcome == ToolOutcome.Completed || outcome == ToolOutcome.Failed || outcome == ToolOutcome.Dispatched
     val duration = toolDurationLabel(tool.durationSeconds())
     // Native tool events carry a duration but no clock time; like Relay, a finished call shows its message's recorded time.
-    val time = messageTimeLabel(messageTime.takeIf { finished } ?: 0L)
+    val time = messageTimeLabel(messageTime.takeIf { finished } ?: 0L, is24Hour = phoneIs24Hour())
     val argumentsText = tool.argumentsValue()?.detailText()
     val embeddedResult = tool.recordedValue("result", "output")?.detailText()
     val resultText = foldedResult?.content ?: embeddedResult.orEmpty()
     val previewText = tool.recordedValue("preview")?.detailText().orEmpty().takeIf { resultText.isBlank() && it.isNotBlank() }
     val statusTitle = uiText("Status")
     val meta = when (outcome) {
-        ToolOutcome.Dispatched -> toolOutcomeLabel(outcome)
-        ToolOutcome.NoResult -> "No result"
+        ToolOutcome.Dispatched -> uiText(toolOutcomeLabel(outcome))
+        ToolOutcome.NoResult -> uiText("No result")
         else -> listOfNotNull(duration, time).joinToString(" · ")
     }
     val (statusIcon, statusColor) = when (outcome) {
@@ -1843,10 +1890,10 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
         ToolOutcome.Failed -> Icons.Rounded.Close to MaterialTheme.colorScheme.error
         ToolOutcome.Preparing -> Icons.Rounded.MoreHoriz to MaterialTheme.colorScheme.onSurfaceVariant
         ToolOutcome.Running -> Icons.Rounded.HourglassTop to MaterialTheme.colorScheme.primary
-        ToolOutcome.Dispatched -> Icons.Rounded.Send to MaterialTheme.colorScheme.secondary
-        ToolOutcome.NoResult -> Icons.Rounded.HelpOutline to MaterialTheme.colorScheme.onSurfaceVariant
+        ToolOutcome.Dispatched -> Icons.AutoMirrored.Rounded.Send to MaterialTheme.colorScheme.secondary
+        ToolOutcome.NoResult -> Icons.AutoMirrored.Rounded.HelpOutline to MaterialTheme.colorScheme.onSurfaceVariant
     }
-    val label = toolOutcomeLabel(outcome)
+    val label = uiText(toolOutcomeLabel(outcome))
     Surface(Modifier.fillMaxWidth().testTag("tool-card").semantics { contentDescription = "${toolDisplayName(tool)}, $label" + (if (meta.isNotBlank() && outcome != ToolOutcome.Dispatched && outcome != ToolOutcome.NoResult) ", $meta" else "") }, shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
         Column(Modifier.padding(horizontal = 12.dp)) {
             Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(onClickLabel = uiText(if (expanded) "Hide details" else "Details")) { expanded = !expanded; onExpandedChange(expanded) }.testTag("tool-card-toggle"), verticalAlignment = Alignment.CenterVertically) {
@@ -1861,15 +1908,15 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
             if (running) LinearProgressIndicator(Modifier.fillMaxWidth().padding(bottom = 6.dp).height(2.dp), color = MaterialTheme.colorScheme.primary)
             if (expanded) SelectionContainer { Column(Modifier.padding(bottom = 12.dp).testTag("tool-card-details"), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text("$statusTitle: $label", Modifier.testTag("tool-card-status"), style = MaterialTheme.typography.labelSmall, color = statusColor)
-                if (outcome == ToolOutcome.Dispatched) Text("The task was handed off. Its own completion isn’t recorded here.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (outcome == ToolOutcome.Dispatched) Text(uiText("The task was handed off. Its own completion isn’t recorded here."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 tool.string("description").takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                 // Full recorded text, newlines intact, in a bounded scroll area; plain text only.
-                argumentsText?.let { ToolDetailBlock("Arguments", it, "tool-card-arguments", MaterialTheme.colorScheme.onSurface, toolKey) }
-                if (resultText.isNotBlank()) ToolDetailBlock(if (outcome == ToolOutcome.Failed) "Error" else "Result", resultText, "tool-card-result", if (outcome == ToolOutcome.Failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface, toolKey, onCopy = if (foldedResult != null) ({ onCopyResult(resultText) }) else null)
-                else if (outcome == ToolOutcome.Completed || outcome == ToolOutcome.Failed) Text("The tool finished with an empty result.", Modifier.testTag("tool-card-empty-result"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                argumentsText?.let { ToolDetailBlock(uiText("Arguments"), it, "tool-card-arguments", MaterialTheme.colorScheme.onSurface, toolKey) }
+                if (resultText.isNotBlank()) ToolDetailBlock(uiText(if (outcome == ToolOutcome.Failed) "Error" else "Result"), resultText, "tool-card-result", if (outcome == ToolOutcome.Failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface, toolKey, onCopy = if (foldedResult != null) ({ onCopyResult(resultText) }) else null)
+                else if (outcome == ToolOutcome.Completed || outcome == ToolOutcome.Failed) Text(uiText("The tool finished with an empty result."), Modifier.testTag("tool-card-empty-result"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 // Partial output is shown as such; it never marks the call finished.
-                previewText?.let { ToolDetailBlock("Preview (partial)", it, "tool-card-preview", MaterialTheme.colorScheme.onSurface, toolKey) }
-                if (outcome == ToolOutcome.NoResult) Text("No completion was recorded for this tool.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                previewText?.let { ToolDetailBlock(uiText("Preview (partial)"), it, "tool-card-preview", MaterialTheme.colorScheme.onSurface, toolKey) }
+                if (outcome == ToolOutcome.NoResult) Text(uiText("No completion was recorded for this tool."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } }
         }
     }
@@ -1909,12 +1956,15 @@ private fun resendForm(vm: BeaconViewModel) = ActionForm("Resend retained draft"
     }
 }
 
-internal fun queuedHeading(count: Int): String = "$count ${if (count == 1) "message" else "messages"} queued — delivers after this turn"
+/** "2 messages will send after this reply"; [one] and [many] are the translated templates, and {0} is the count. */
+internal fun queuedHeading(count: Int, one: String = "1 message will send after this reply", many: String = "{0} messages will send after this reply"): String =
+    (if (count == 1) one else many).replace("{0}", "$count")
 
 /** Compact summary of background work, separate from the current reply's transcript activity. */
 @Composable internal fun ChatActivityStrip(activity: BackgroundActivitySummary, onClick: () -> Unit) {
     if (!activity.active) return  // owner: hidden unless something runs in the background; an unknown status hides too
-    val status = backgroundActivityStatus(activity)
+    val texts = BackgroundActivityStrings.associateWith { uiText(it) }
+    val status = backgroundActivityStatus(activity) { texts.getValue(it) }
     val title = uiText("Background activity")
     val openLabel = uiText("Open background activity")
     val description = "$title, $status"
@@ -1952,11 +2002,11 @@ internal fun queuedHeading(count: Int): String = "$count ${if (count == 1) "mess
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             ) else {
                 val total = activity.agents + activity.processes + activity.cronJobs + activity.watches
-                ActivitySection("Background", total)
-                if (activity.agents > 0) ActivityRow("${activity.agents} background ${if (activity.agents == 1) "agent" else "agents"}", "Running", true)
-                if (activity.processes > 0) ActivityRow("${activity.processes} background ${if (activity.processes == 1) "process" else "processes"}", "Running", true)
-                if (activity.cronJobs > 0) ActivityRow("${activity.cronJobs} running ${if (activity.cronJobs == 1) "cron job" else "cron jobs"}", "Running", true)
-                if (activity.watches > 0) ActivityRow("${activity.watches} active ${if (activity.watches == 1) "watch" else "watches"}", "Watching", true)
+                ActivitySection(uiText("Background"), total)
+                if (activity.agents > 0) ActivityRow(uiText(if (activity.agents == 1) "1 background agent" else "{0} background agents").replace("{0}", "${activity.agents}"), uiText("Running"), true)
+                if (activity.processes > 0) ActivityRow(uiText(if (activity.processes == 1) "1 background process" else "{0} background processes").replace("{0}", "${activity.processes}"), uiText("Running"), true)
+                if (activity.cronJobs > 0) ActivityRow(uiText(if (activity.cronJobs == 1) "1 schedule running" else "{0} schedules running").replace("{0}", "${activity.cronJobs}"), uiText("Running"), true)
+                if (activity.watches > 0) ActivityRow(uiText(if (activity.watches == 1) "1 active watch" else "{0} active watches").replace("{0}", "${activity.watches}"), uiText("Watching"), true)
                 if (!activity.available) Text(uiText("More background work may be active."), Modifier.padding(horizontal = 20.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
@@ -1964,7 +2014,7 @@ internal fun queuedHeading(count: Int): String = "$count ${if (count == 1) "mess
 }
 
 @Composable private fun ActivitySection(label: String, count: Int) {
-    Text("${uiText(label)} · $count", Modifier.padding(horizontal = 20.dp, vertical = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    Text("$label · $count", Modifier.padding(horizontal = 20.dp, vertical = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
 }
 
 @Composable private fun ActivityRow(title: String, detail: String, spinning: Boolean) {
@@ -1981,13 +2031,13 @@ internal fun queuedHeading(count: Int): String = "$count ${if (count == 1) "mess
     val answer = answers[""].orEmpty()
     val questions = prompt.rows("questions")
     Glass { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text(prompt.string("question", "One detail before continuing"), style = MaterialTheme.typography.titleMedium)
+        Text(prompt.string("question", uiText("One detail before continuing")), style = MaterialTheme.typography.titleMedium)
         if (questions.any { it.string("qid").isBlank() || it.string("question").isBlank() }) {
-            Text("The question could not be read. Refresh before answering.", color = MaterialTheme.colorScheme.error)
-            TextButton(onClick = { vm.selectSession(vm.chat.value.sessionId) }) { Text("Refresh question") }
+            Text(uiText("The question could not be read. Refresh before answering."), color = MaterialTheme.colorScheme.error)
+            TextButton(onClick = { vm.selectSession(vm.chat.value.sessionId) }) { Text(uiText("Refresh question")) }
         } else if (questions.isNotEmpty()) {
-            questions.forEach { q -> val id = q.getString("qid"); Text(q.getString("question")); OutlinedTextField(answers[id].orEmpty(), { onAnswer(id, it) }, label = { Text("Your answer") }, modifier = Modifier.fillMaxWidth()); q.optJSONArray("choices")?.strings()?.forEach { choice -> TextButton(onClick = { onAnswer(id, choice) }) { Text(choice) } } }
-            Button(onClick = { promptScope?.let { vm.clarifyBatch(JSONObject(questions.associate { question -> question.getString("qid") to answers[question.getString("qid")] }), prompt, it) } }, enabled = promptScope != null && questions.all { answers[it.string("qid")].orEmpty().isNotBlank() }) { Text("Continue") }
+            questions.forEach { q -> val id = q.getString("qid"); Text(q.getString("question")); OutlinedTextField(answers[id].orEmpty(), { onAnswer(id, it) }, label = { Text(uiText("Your answer")) }, modifier = Modifier.fillMaxWidth()); q.optJSONArray("choices")?.strings()?.forEach { choice -> TextButton(onClick = { onAnswer(id, choice) }) { Text(choice) } } }
+            Button(onClick = { promptScope?.let { vm.clarifyBatch(JSONObject(questions.associate { question -> question.getString("qid") to answers[question.getString("qid")] }), prompt, it) } }, enabled = promptScope != null && questions.all { answers[it.string("qid")].orEmpty().isNotBlank() }) { Text(uiText("Continue")) }
         } else {
             prompt.optJSONArray("choices")?.strings()?.forEach { choice -> OutlinedButton(onClick = { promptScope?.let { vm.clarify(choice, prompt, it) } }, enabled = promptScope != null) { Text(choice) } }
             OutlinedTextField(answer, { onAnswer("", it) }, label = { Text(uiText("Your answer")) }, modifier = Modifier.fillMaxWidth())
@@ -2035,10 +2085,10 @@ internal fun queuedHeading(count: Int): String = "$count ${if (count == 1) "mess
     }
     if(confirmVision.isNotBlank()) AlertDialog(
         onDismissRequest={confirmVision=""},
-        title={Text("Switch to Gemini?")},
-        text={Text("To ${if(confirmVision=="camera") "share your camera" else "share your screen"}, end this Grok call and reconnect with Gemini in the same conversation. Your saved voice preference stays unchanged.")},
-        confirmButton={TextButton({ val media=confirmVision;confirmVision="";vm.switchCallForVision(call.callId,media) },Modifier.testTag("beacon-confirm-vision-switch")) { Text("Switch to Gemini") }},
-        dismissButton={TextButton({confirmVision=""},Modifier.testTag("beacon-cancel-vision-switch")) { Text("Cancel") }})
+        title={Text(uiText("Switch voice?"))},
+        text={Text(uiText("Camera and screen sharing need another voice. Switch and continue the call?"))},
+        confirmButton={TextButton({ val media=confirmVision;confirmVision="";vm.switchCallForVision(call.callId,media) },Modifier.testTag("beacon-confirm-vision-switch")) { Text(uiText("Switch")) }},
+        dismissButton={TextButton({confirmVision=""},Modifier.testTag("beacon-cancel-vision-switch")) { Text(uiText("Cancel")) }})
     val actions=CallUiActions(vm.app.calls::mute,{
         if(!call.visionAvailable) confirmVision="camera" else camera()
     },vm.app.calls::flipCamera,{
@@ -2082,7 +2132,7 @@ private fun chatAction(vm: BeaconViewModel, title: String) {
         }
         "Undo last turn" -> vm.openForm(ActionForm(title, "/api/session/undo", emptyList(), seed, explanation = "Undo the latest conversation turn.", actionLabel = "Undo", onResult = result))
         "Usage" -> { vm.more("Session usage") }
-        "Delete conversation" -> vm.openForm(ActionForm(title, "/api/session/delete", emptyList(), seed, explanation = "This deletes it from Hermes on every device. It can’t be undone.", actionLabel = "Delete", onResult = { vm.newChat(); vm.refreshSessions() }))
+        "Delete conversation" -> vm.openForm(ActionForm(title, "/api/session/delete", emptyList(), seed, explanation = "This deletes it from Hermes on every device. It can’t be undone.", actionLabel = "Delete", onResult = { vm.newChat(); vm.refreshSessions() }, destructive = true))
     }
 }
 
@@ -2092,11 +2142,11 @@ private fun chatActionIcon(title: String): androidx.compose.ui.graphics.vector.I
     "Pin", "Unpin" -> Icons.Rounded.PushPin
     "Archive" -> Icons.Rounded.Archive
     "Unarchive" -> Icons.Rounded.Unarchive
-    "Branch" -> Icons.Rounded.CallSplit
+    "Branch" -> Icons.AutoMirrored.Rounded.CallSplit
     "Model & provider", "Reasoning" -> Icons.Rounded.Tune
     "Toolsets" -> Icons.Rounded.Build
     "Compress context" -> Icons.Rounded.UnfoldLess
-    "Undo last turn" -> Icons.Rounded.Undo
+    "Undo last turn" -> Icons.AutoMirrored.Rounded.Undo
     "Usage" -> Icons.Rounded.DataUsage
     "Delete conversation" -> Icons.Rounded.DeleteOutline
     else -> Icons.Rounded.MoreHoriz
@@ -2107,8 +2157,8 @@ private fun chatActionIcon(title: String): androidx.compose.ui.graphics.vector.I
 internal val composerActionSize = 42.dp
 internal val composerActionIconSize = 22.dp
 
-internal fun attachmentPreparationLabel(name: String, status: String, error: String): String =
-    "$name · " + if (status == "error") error.ifBlank { "Upload failed. Remove and attach again." } else "Preparing…"
+internal fun attachmentPreparationLabel(name: String, status: String, error: String, failed: String = "Upload failed. Remove and attach again.", preparing: String = "Preparing…"): String =
+    "$name · " + if (status == "error") error.ifBlank { failed } else preparing
 
 internal fun composerUsesVoice(text: String, readyAttachments: Int, preparingAttachments: Int): Boolean =
     text.isBlank() && readyAttachments == 0 && preparingAttachments == 0

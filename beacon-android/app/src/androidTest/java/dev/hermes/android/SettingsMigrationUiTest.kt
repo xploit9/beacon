@@ -102,7 +102,7 @@ class SettingsMigrationUiTest {
     }
     @Test fun phoneShowsRelayOrderedHubRowsAndLiveSummaries() {
         show(widthDp = PhoneWidthDp)
-        shown("Connection").assertTextContains("Connected privately · work")
+        shown("Connection").assertTextContains("Connected · work")
         shown("Chat").assertTextContains("Ctrl + Enter to send · Thinking shown")
         shown("Voice & calls").assertTextContains("Gemini Live · Key saved")
         shown("Appearance").assertTextContains("Dark · Graphite")

@@ -1,8 +1,6 @@
 package dev.hermes.android.ui
 
-import android.app.Activity
-import androidx.core.view.WindowInsetsControllerCompat
-import androidx.compose.ui.platform.LocalView
+import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import kotlinx.coroutines.delay
 
 
@@ -113,7 +111,10 @@ val LocalPersistentNavigation = staticCompositionLocalOf { false }
 @Composable internal fun LiveCallCaptions(call: CallState, modifier: Modifier = Modifier, compact: Boolean = false) {
     val lines = if (call.active) orderCallTranscriptLines(call.transcripts.filter { it.text.isNotBlank() && !it.interrupted }).takeLast(if (compact) 2 else 4) else emptyList()
     if (lines.isEmpty()) return
-    val transcriptDescription = uiText("Call transcript")
+    val motion = rememberNativeMotionEnabled()
+    val scroll = rememberScrollState()
+    // The card is taller than its cap at large text, so keep the newest words in view as it grows.
+    LaunchedEffect(scroll.maxValue) { if (motion) scroll.animateScrollTo(scroll.maxValue) else scroll.scrollTo(scroll.maxValue) }
     Surface(
         modifier.widthIn(max = 680.dp).fillMaxWidth().testTag("beacon-live-captions"),
         shape = RoundedCornerShape(24.dp),
@@ -121,18 +122,16 @@ val LocalPersistentNavigation = staticCompositionLocalOf { false }
         contentColor = CallText,
     ) {
         Column(
+            // No contentDescription here: it would replace the lines a live region reads out.
             Modifier.padding(horizontal = 20.dp, vertical = 16.dp).heightIn(max = if (compact) 128.dp else 236.dp)
-                .verticalScroll(rememberScrollState()).semantics {
-                    if (lines.last().final) liveRegion = LiveRegionMode.Polite
-                    contentDescription = transcriptDescription
-                },
+                .verticalScroll(scroll).semantics { if (lines.last().final) liveRegion = LiveRegionMode.Polite },
             verticalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 12.dp),
         ) {
             lines.forEachIndexed { index, line ->
                 val latest = index == lines.lastIndex
                 val latestForRole = index == lines.indexOfLast { it.role == line.role }
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = if (line.role == "user") Arrangement.End else Arrangement.Start) {
-                    Column(Modifier.widthIn(max = 620.dp).fillMaxWidth(.94f).alpha(if (latest) 1f else .52f)) {
+                    Column(Modifier.widthIn(max = 620.dp).fillMaxWidth(.94f).alpha(if (latest) 1f else .7f)) {
                         Text(
                             uiText(if (line.role == "user") "You" else dev.hermes.android.data.currentAssistantName),
                             style = MaterialTheme.typography.labelSmall,
@@ -171,8 +170,8 @@ internal data class CallUiActions(
             Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(reason, Modifier.testTag("beacon-call-failure-reason").semantics { liveRegion = LiveRegionMode.Polite },
                     color = Color(0xffffb4ab), style = MaterialTheme.typography.bodyLarge)
-                Button(onRetry, Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("beacon-call-failure-retry")) { Text("Retry") }
-                OutlinedButton(onClose, Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("beacon-call-failure-close")) { Text("Close") }
+                Button(onRetry, Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("beacon-call-failure-retry")) { Text(uiText("Retry")) }
+                OutlinedButton(onClose, Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("beacon-call-failure-close")) { Text(uiText("Close")) }
             }
         }
     }
@@ -189,7 +188,7 @@ internal data class CallUiActions(
         Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Icon(Icons.Rounded.Build, null, tint = CallGoldBright)
-                Text(uiText(activity), Modifier.testTag("beacon-call-tool-status"), style = MaterialTheme.typography.labelLarge)
+                Text(receipt.activityTemplate()?.let { uiText(it).replace("{0}", receipt.activitySubject()) } ?: uiText(activity), Modifier.testTag("beacon-call-tool-status"), style = MaterialTheme.typography.labelLarge)
             }
             receipt.approvalCaption()?.let { caption ->
                 Text(uiText(caption), Modifier.padding(start = 32.dp).testTag("beacon-tool-approval-caption"),
@@ -198,6 +197,15 @@ internal data class CallUiActions(
         }
     }
 }
+
+@Composable private fun CallControlLabel(text: String, show: Boolean) {
+    // The button already carries this name; reading the caption as well would make every control two TalkBack stops.
+    if (show) Text(text, Modifier.clearAndSetSemantics {}, color = CallText, style = MaterialTheme.typography.labelMedium,
+        maxLines = 2, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+}
+
+/** A caption stays beside each control up to this text size; beyond it the five columns are too narrow and the icons carry the names. */
+private const val CallLabelMaxFontScale = 1.6f
 
 @Composable private fun CallControl(
     label: String,
@@ -209,31 +217,39 @@ internal data class CallUiActions(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     hangup: Boolean = false,
-    iconLabel: String = label,
+    showLabel: Boolean = true,
 ) {
-    val accessibleLabel = uiText(iconLabel)
-    val accessibleState = uiText(stateDescription)
+    val state = stateDescription
+    val button = Modifier.size(48.dp).testTag(tag).semantics { this.stateDescription = state }
     Column(modifier, horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        FilledIconButton(
-            onClick,
-            Modifier.size(48.dp).testTag(tag).semantics { this.selected = selected; this.stateDescription = accessibleState },
-            enabled = enabled,
+        if (hangup) FilledIconButton(
+            onClick, button, enabled = enabled,
             colors = IconButtonDefaults.filledIconButtonColors(
-                containerColor = if (hangup) Color(0xff9f3d3d) else CallControl,
+                containerColor = Color(0xff9f3d3d),
                 contentColor = CallText,
                 disabledContainerColor = CallControl.copy(alpha = .55f),
                 disabledContentColor = CallMuted,
             ),
-        ) { Icon(icon, accessibleLabel) }
-        Text(uiText(label), color = CallText, style = MaterialTheme.typography.labelSmall,
-            maxLines = 2, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+        ) { Icon(icon, label) }
+        else FilledIconToggleButton(
+            selected, { onClick() }, button, enabled = enabled,
+            colors = IconButtonDefaults.filledIconToggleButtonColors(
+                containerColor = CallControl,
+                contentColor = CallText,
+                disabledContainerColor = CallControl.copy(alpha = .55f),
+                disabledContentColor = CallMuted,
+                checkedContainerColor = CallGoldBright,
+                checkedContentColor = CallBackground,
+            ),
+        ) { Icon(icon, label) }
+        CallControlLabel(label, showLabel)
     }
 }
 
-@Composable private fun CallSpeakerControl(call: CallState, actions: CallUiActions, modifier: Modifier = Modifier) {
+@Composable private fun CallSpeakerControl(call: CallState, actions: CallUiActions, modifier: Modifier = Modifier, showLabel: Boolean = true) {
     var routes by remember(call.callId) { mutableStateOf(false) }
     val speakerLabel = uiText("Speaker")
-    val routeLabel = uiText(call.routes.firstOrNull { it.id == call.route }?.name ?: "Audio output")
+    val routeLabel = call.routes.firstOrNull { it.id == call.route }?.name ?: uiText("Audio output")
     Column(modifier, horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Box {
             FilledIconButton(
@@ -244,7 +260,7 @@ internal data class CallUiActions(
                 },
                 enabled = call.routes.isNotEmpty(),
                 colors = IconButtonDefaults.filledIconButtonColors(containerColor = CallControl, contentColor = CallText),
-            ) { Icon(Icons.Rounded.VolumeUp, uiText("Speaker")) }
+            ) { Icon(Icons.AutoMirrored.Rounded.VolumeUp, speakerLabel) }
             DropdownMenu(routes, { routes = false }) {
                 call.routes.forEach { route ->
                     DropdownMenuItem(
@@ -255,12 +271,14 @@ internal data class CallUiActions(
                 }
             }
         }
-        Text(uiText("Speaker"), color = CallText, style = MaterialTheme.typography.labelSmall,
-            maxLines = 2, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+        CallControlLabel(speakerLabel, showLabel)
     }
 }
 
 @Composable internal fun LiveCallDock(call: CallState, actions: CallUiActions, motionEnabled: Boolean, modifier: Modifier = Modifier) {
+    val labels = LocalDensity.current.fontScale <= CallLabelMaxFontScale
+    val cameraOn = call.cameraSharing || call.cameraBusy || call.cameraStopPending
+    val screenOn = call.screenSharing || call.screenBusy || call.screenStopPending
     Column(
         modifier.background(CallSurface.copy(alpha = .98f), RoundedCornerShape(26.dp)).padding(horizontal = 10.dp, vertical = 12.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -268,49 +286,50 @@ internal data class CallUiActions(
     ) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.Top) {
             CallControl(
-                "Camera",
-                if (call.cameraSharing || call.cameraBusy || call.cameraStopPending) Icons.Rounded.VideocamOff else Icons.Rounded.Videocam,
+                if (cameraOn) uiText("Stop camera") else uiText("Camera"),
+                if (cameraOn) Icons.Rounded.VideocamOff else Icons.Rounded.Videocam,
                 "beacon-camera",
-                call.active && (call.cameraSharing || call.cameraBusy || call.cameraStopPending || !call.held && call.state != "connecting") && !call.screenSharing && !call.screenBusy && !call.screenStopPending,
+                call.active && (cameraOn || !call.held && call.state != "connecting") && !call.screenSharing && !call.screenBusy && !call.screenStopPending,
                 call.cameraSharing,
-                if (call.cameraStopPending) "Camera stop unconfirmed. Retry stopping." else if (call.cameraBusy) "Camera changing" else if (call.cameraSharing) "Camera sharing" else "Camera stopped",
+                if (call.cameraStopPending) uiText("Camera stop unconfirmed. Retry stopping.") else if (call.cameraBusy) uiText("Camera changing") else if (call.cameraSharing) uiText("Camera sharing") else uiText("Camera stopped"),
                 actions.camera,
                 Modifier.weight(1f),
-                iconLabel = if (call.cameraSharing || call.cameraBusy || call.cameraStopPending) "Turn camera off" else "Camera",
+                showLabel = labels,
             )
             CallControl(
-                "Mute",
+                if (call.muted) uiText("Unmute") else uiText("Mute"),
                 if (call.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic,
                 "beacon-mute",
                 call.active,
                 call.muted,
-                if (call.muted) "Microphone muted" else "Microphone active",
+                if (call.muted) uiText("Microphone muted") else uiText("Microphone active"),
                 actions.mute,
                 Modifier.weight(1f),
-                iconLabel = if (call.muted) "Unmute" else "Mute",
+                showLabel = labels,
             )
-            CallSpeakerControl(call, actions, Modifier.weight(1f))
+            CallSpeakerControl(call, actions, Modifier.weight(1f), labels)
             CallControl(
-                if (call.screenSharing || call.screenBusy || call.screenStopPending) "Stop sharing" else "Share screen",
-                if (call.screenSharing || call.screenBusy || call.screenStopPending) Icons.Rounded.StopScreenShare else Icons.Rounded.ScreenShare,
+                if (screenOn) uiText("Stop sharing") else uiText("Share screen"),
+                if (screenOn) Icons.Rounded.StopScreenShare else Icons.Rounded.ScreenShare,
                 "beacon-share-screen",
-                call.active && (call.screenSharing || call.screenBusy || call.screenStopPending || !call.held && call.state != "connecting" && !call.cameraStopPending),
+                call.active && (screenOn || !call.held && call.state != "connecting" && !call.cameraStopPending),
                 call.screenSharing,
-                if (call.screenStopPending) "Screen stop unconfirmed. Retry stopping." else if (call.screenSharing) "Screen sharing" else "Screen stopped",
+                if (call.screenStopPending) uiText("Screen stop unconfirmed. Retry stopping.") else if (call.screenSharing) uiText("Screen sharing") else uiText("Screen stopped"),
                 actions.screen,
                 Modifier.weight(1f),
-                iconLabel = if (call.screenSharing || call.screenBusy || call.screenStopPending) "Stop sharing screen" else "Share screen",
+                showLabel = labels,
             )
             CallControl(
-                "Hang up",
+                uiText("Hang up"),
                 Icons.Rounded.CallEnd,
                 "beacon-hang-up",
                 call.active,
                 false,
-                "End call",
+                uiText("End call"),
                 actions.end,
                 Modifier.weight(1f),
                 hangup = true,
+                showLabel = labels,
             )
         }
         if (call.overlayPermissionMissing) AssistChip(
@@ -341,38 +360,23 @@ internal data class CallUiActions(
             delay(1000)
         }
     }
-    Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Box(Modifier.size(48.dp).clip(CircleShape).background(CallGold.copy(alpha = .16f))
-                .border(1.dp, CallGold.copy(alpha = .52f), CircleShape), contentAlignment = Alignment.Center) {
-                BeaconMark(Modifier.testTag("call-beacon-mark"), size = 36.dp, contentDescription = assistantText("Beacon"))
-            }
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                Text(dev.hermes.android.data.currentAssistantName, color = CallText, style = MaterialTheme.typography.titleLarge, maxLines = 1,
-                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                    Box(Modifier.size(8.dp).clip(CircleShape).background(CallGoldBright))
-                    Text(uiText(callStatusLabel(call)), Modifier.testTag("beacon-call-status"), color = CallGoldBright, style = MaterialTheme.typography.labelMedium,
-                        maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-                }
-            }
-            Column(horizontalAlignment = Alignment.End) {
-                Text(callTimerLabel(call.startedAt, now), Modifier.testTag("beacon-call-timer"), color = CallText,
-                    style = MaterialTheme.typography.titleMedium)
-                Text(uiText("CALL TIME"), style = MaterialTheme.typography.labelSmall, color = CallMuted)
-            }
+    // The chat header above already shows who this is; this row is the call's own state, time and way back to the chat.
+    Row(modifier, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+            Box(Modifier.size(8.dp).clip(CircleShape).background(CallGoldBright))
+            Text(callStatusText(call), Modifier.testTag("beacon-call-status"), color = CallGoldBright, style = MaterialTheme.typography.labelMedium,
+                maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
         }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-            FilledTonalButton(
-                onConversation,
-                Modifier.heightIn(min = 48.dp).testTag("beacon-view-conversation"),
-                colors = ButtonDefaults.filledTonalButtonColors(containerColor = CallSurfaceRaised, contentColor = CallGoldBright),
-            ) {
-                Icon(Icons.Rounded.ChatBubbleOutline, null)
-                Spacer(Modifier.width(8.dp))
-                Text(uiText("View conversation"))
-            }
+        Column(horizontalAlignment = Alignment.End) {
+            Text(callTimerLabel(call.startedAt, now), Modifier.testTag("beacon-call-timer"), color = CallText,
+                style = MaterialTheme.typography.titleMedium.copy(fontFeatureSettings = "tnum"))
+            Text(uiText("Call time"), style = MaterialTheme.typography.labelSmall, color = CallMuted)
         }
+        FilledTonalIconButton(
+            onConversation,
+            Modifier.size(48.dp).testTag("beacon-view-conversation"),
+            colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = CallSurfaceRaised, contentColor = CallGoldBright),
+        ) { Icon(Icons.Rounded.ChatBubbleOutline, uiText("View conversation")) }
     }
 }
 
@@ -384,29 +388,8 @@ internal data class CallUiActions(
     onConversation: () -> Unit,
     cameraPreview: @Composable (Modifier) -> Unit,
 ) {
-    val view = LocalView.current
-    val window = (view.context as? Activity)?.window
-    DisposableEffect(window, view) {
-        val bars = window?.let { WindowInsetsControllerCompat(it, view) }
-        val oldStatusColor = window?.statusBarColor
-        val oldNavigationColor = window?.navigationBarColor
-        val oldLightStatus = bars?.isAppearanceLightStatusBars
-        val oldLightNavigation = bars?.isAppearanceLightNavigationBars
-        if (window != null) {
-            window.statusBarColor = CallBackground.toArgb()
-            window.navigationBarColor = CallBackground.toArgb()
-            bars?.isAppearanceLightStatusBars = false
-            bars?.isAppearanceLightNavigationBars = false
-        }
-        onDispose {
-            if (window != null) {
-                if (oldStatusColor != null) window.statusBarColor = oldStatusColor
-                if (oldNavigationColor != null) window.navigationBarColor = oldNavigationColor
-                if (oldLightStatus != null) bars?.isAppearanceLightStatusBars = oldLightStatus
-                if (oldLightNavigation != null) bars?.isAppearanceLightNavigationBars = oldLightNavigation
-            }
-        }
-    }
+    // Edge-to-edge ignores the bar colours; the call background shows through, so only the icon shades matter.
+    SetupSystemBars()
     Box(modifier.fillMaxSize().background(CallBackground).testTag("beacon-live-call-surface")) {
         if (call.cameraSharing || call.cameraBusy) cameraPreview(Modifier.fillMaxSize())
         BoxWithConstraints(Modifier.fillMaxSize()) {
@@ -430,7 +413,7 @@ internal data class CallUiActions(
                         horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
                         call.toolReceipts.lastOrNull { it.chipLabel() != null }?.let { CallToolChip(it, Modifier.padding(bottom = 12.dp)) }
                         LiveCallCaptions(call, Modifier.padding(bottom = 12.dp))
-                        if (call.screenSharing) Text(uiText("Screen shared with Beacon"), color = CallText, style = MaterialTheme.typography.labelLarge)
+                        if (call.screenSharing) Text(assistantText("Screen shared with Beacon"), color = CallText, style = MaterialTheme.typography.labelLarge)
                         if (call.screenBusy) Text(uiText("Waiting for screen-sharing consent or first frame…"), color = CallMuted, style = MaterialTheme.typography.labelLarge)
                         if (call.cameraBusy) Text(uiText("Starting camera…"), color = CallMuted, style = MaterialTheme.typography.labelLarge, modifier = Modifier.testTag("beacon-camera-starting"))
                         if (call.error.isNotBlank()) Text(call.error, color = Color(0xffffb4ab), style = MaterialTheme.typography.bodyMedium,
@@ -485,5 +468,12 @@ private val CallSurfaceRaised = Color(0xff1b2940)
 private val CallControl = Color(0xff202e45)
 private val CallText = Color(0xfff5f4f0)
 private val CallMuted = Color(0xffc4cede)
-private val CallGold = Color(0xffd5a64a)
+internal val CallGold = Color(0xffd5a64a)
 private val CallGoldBright = Color(0xffffe2a0)
+
+/** The call status in the phone's language; a tool's status names its service, so the words are translated around the name. */
+@Composable internal fun callStatusText(call: CallState): String {
+    val label = callStatusLabel(call)
+    val tool = call.toolReceipts.lastOrNull { it.statusLabel() != null }
+    return tool?.statusTemplate()?.takeIf { tool.statusLabel() == label }?.let { uiText(it).replace("{0}", tool.activitySubject()) } ?: uiText(label)
+}

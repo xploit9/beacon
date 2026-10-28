@@ -2,15 +2,19 @@ package dev.hermes.android.tasks
 import dev.hermes.android.core.*
 import dev.hermes.android.data.BeaconClient
 import dev.hermes.android.data.ApiFailure
+import dev.hermes.android.ui.nativeClockPattern
+import dev.hermes.android.ui.nativeDayPattern
 import kotlinx.coroutines.CancellationException
 import org.json.JSONArray
 import org.json.JSONObject
-internal fun scheduleTime(value: String, timezone: String, empty: String): String {
+/** Schedules showed 24-hour time before the phone's setting counted, so that stays the default; callers pass the phone's own. */
+internal fun scheduleTime(value: String, timezone: String, empty: String, is24Hour: Boolean = true, locale: java.util.Locale = java.util.Locale.getDefault()): String {
     if (value.isBlank()) return empty
     return runCatching {
         val time = java.time.OffsetDateTime.parse(value)
-        val zone = java.time.ZoneId.of(timezone)
-        time.atZoneSameInstant(zone).format(java.time.format.DateTimeFormatter.ofPattern("d MMM yyyy, HH:mm"))
+        val zone = java.util.TimeZone.getTimeZone(java.time.ZoneId.of(timezone))
+        val pattern = nativeDayPattern(locale, withYear = true, withWeekday = false) + ", " + nativeClockPattern(locale, is24Hour)
+        java.text.SimpleDateFormat(pattern, locale).also { it.timeZone = zone }.format(java.util.Date.from(time.toInstant()))
     }.getOrDefault("Time unavailable")
 }
 internal val editableScheduleFields = setOf("name", "prompt", "schedule", "deliver", "skills", "model", "provider")
@@ -67,8 +71,12 @@ internal fun withThreadTarget(targets: List<JSONObject>, threadId: String, title
 }
 internal fun deliveryNames(targets: List<JSONObject>): Map<String, String> =
     mapOf("local" to "Save result in Beacon") + targets.filter { it.string("id") != "local" }.associate { it.string("id") to it.string("name", it.string("id")) }
-internal fun deliveryLabel(deliver: String, names: Map<String, String>): String =
-    deliver.split(',').map(String::trim).filter(String::isNotEmpty).joinToString(", ") { names[it] ?: if (it.startsWith("phone:")) "A thread" else it }.ifEmpty { names.getValue("local") }
+/** The delivery names the app writes itself; Hermes' own target names and a thread's title are shown as they are. */
+internal val DeliveryNameStrings = listOf("Beacon chat", "Save result in Beacon", "A thread", "Untitled thread")
+/** [translated] maps [DeliveryNameStrings] to the phone's language, so only the app's own names change. */
+internal fun deliveryLabel(deliver: String, names: Map<String, String>, translated: Map<String, String> = emptyMap()): String =
+    deliver.split(',').map(String::trim).filter(String::isNotEmpty).joinToString(", ") { (names[it] ?: if (it.startsWith("phone:")) "A thread" else it).let { name -> translated[name] ?: name } }
+        .ifEmpty { names.getValue("local").let { translated[it] ?: it } }
 internal fun fixedWindowSchedule(body: JSONObject): String {
     val start = body.getInt("_start_hour")
     val end = body.getInt("_end_hour")

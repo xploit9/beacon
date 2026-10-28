@@ -5,6 +5,7 @@ internal fun settingsLabel(route: String): String = when (route) {
     "Beacon" -> "Voice & calls"
     "Notifications" -> "Notifications & Keep connected"
     "Licenses" -> "About & licenses"
+    "Tools & commands" -> "Tools"
     else -> route
 }
 
@@ -48,7 +49,7 @@ internal val settingsDescriptions = mapOf(
     "App updates" to "Install the latest Beacon version",
     "Providers & models" to "Models for chats and bots", "Tools & commands" to "Tool groups and commands",
     "Skills" to "Installed skills", "Memory" to "What Hermes knows about you",
-    "MCP servers" to "Service connections",
+    "MCP servers" to "Services Hermes can use",
     "Health" to "Check the dashboard and agent", "Logs" to "Recent server activity",
     "Server updates" to "Check and update Hermes", "Session checkpoints" to "Saved file recovery points", "Licenses" to "Version and licenses",
 )
@@ -86,6 +87,10 @@ internal fun normalizeSettingsPage(page: String): String = when (page) {
 }
 
 internal val settingsThemeLabels = mapOf("system" to "Follow device", "dark" to "Dark", "light" to "Light")
+
+/** The hub's fixed texts, which reach uiText through variables: row names and descriptions, section and category titles, theme names. */
+internal val SettingsStrings = (settingsSearchRoutes.map(::settingsLabel) + settingsDescriptions.values + settingsHubSections.keys.filter(String::isNotBlank) +
+    settingsCategories.keys + settingsThemeLabels.values + listOf("Tools and services", "Settings")).distinct()
 
 /**
  * Values the overview may summarize. Blank or null means unknown on this phone, and unknown values produce no summary,
@@ -132,7 +137,7 @@ internal fun settingsSummary(route: String, s: SettingsSnapshot): List<SettingsS
         else -> emptyList()
     }
     return when (route) {
-        "Connection" -> listOfNotNull(SettingsSummaryPart(if (s.connected) "Connected privately" else "Connection needs attention"), literal(s.profile))
+        "Connection" -> listOfNotNull(SettingsSummaryPart(if (s.connected) "Connected" else "Connection needs attention"), literal(s.profile))
         "Profiles", "Profiles & model" -> if (s.profile.isBlank()) emptyList() else listOfNotNull(SettingsSummaryPart("Active profile"), literal(s.profile))
         "Chat", "Settings" -> listOfNotNull(
             settingsSendKeyLabel(s.sendKey)?.let { SettingsSummaryPart(it) },

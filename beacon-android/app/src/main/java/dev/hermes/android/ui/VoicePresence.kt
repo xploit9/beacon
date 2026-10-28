@@ -36,7 +36,9 @@ import dev.hermes.android.ui.sphere.lerp
 import dev.hermes.android.voice.*
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.exp
 import kotlin.math.sin
+import kotlin.math.sqrt
 import kotlin.random.Random
 
 /** Two colour poles as 0xRRGGBB. Each speck bucket mixes them by its own slow phase, so no state sits on one flat colour. */
@@ -69,9 +71,20 @@ internal fun presenceState(call: CallState): SphereState = when {
 }
 
 internal fun presenceEnergy(amplitude: Float): Float = if (amplitude.isFinite()) amplitude.coerceIn(0f, 1f) else 0f
-/** How much faster the flow runs, how far the cloud opens and how bright it gets at a given energy. */
-internal fun presenceStir(energy: Float): Float = 1f + 3.5f * energy
-internal fun presenceSpread(energy: Float): Float = 1f + .22f * energy
+/** How much the dust stirs, disperses and gathers: fully while the assistant talks, half while you do. */
+internal fun presenceTalk(call: CallState): Float = when (presenceState(call)) {
+    SphereState.Speaking -> 1f
+    SphereState.Listening -> if (call.userSpeaking) .5f else 0f
+    else -> 0f
+}
+/**
+ * How hard each speck is drawn back to its strand, per second: steady in silence; while someone talks it loosens and
+ * tightens every few seconds, so the flow scatters the dust into new filaments and the pull gathers it again.
+ */
+internal fun presencePull(time: Float, talk: Float): Float = lerp(.8f, .45f + 1.35f * (.5f + .5f * cos(time * .3f)), talk)
+/** How much faster the flow runs and how far the cloud opens while someone talks, and how bright voice makes it. */
+internal fun presenceStir(talk: Float): Float = 1f + 1.6f * talk
+internal fun presenceSpread(talk: Float): Float = 1f + .1f * talk
 internal fun presenceGain(energy: Float): Float = .62f + .38f * energy
 
 /** About one speck per 8 dp², in steps of 500 so a small resize does not refit the cloud. */
@@ -90,9 +103,12 @@ internal fun seedParticles(seed: Long, count: Int): FloatArray {
     val xy = FloatArray(count * 2)
     var i = 0
     while (i < xy.size) {
-        // Three uniforms sum to a soft bell, so the cloud thins out with no edge.
-        val x = (random.nextFloat() + random.nextFloat() + random.nextFloat() - 1.5f) * .8f
-        val y = (random.nextFloat() + random.nextFloat() + random.nextFloat() - 1.5f) * .8f
+        // A point in the thick shell of a ball seen from the front: the dust thickens toward the rim, like a nebula.
+        val z = random.nextFloat() * 2f - 1f
+        val angle = random.nextFloat() * 6.2832f
+        val r = (.55f + .45f * random.nextFloat()) * sqrt(1f - z * z)
+        val x = r * cos(angle)
+        val y = r * sin(angle)
         // Specks gather on one contour of the noise, which reads as wispy strands with dark voids between them.
         val ridge = 1f - abs(2f * fbm(x * 1.8f + 4.1f, y * 1.8f - 2.7f, 4) / .9375f - 1f)
         if (random.nextFloat() < .04f + .96f * ridge * ridge * ridge * ridge) { xy[i] = x; xy[i + 1] = y; i += 2 }
@@ -111,7 +127,7 @@ internal class PresenceField(private val seed: Long) {
     var count = 0; private set
     /** Where each speck rests on its strand. */
     var home = FloatArray(0); private set
-    /** Where each speck is now: home bent by the current flow. */
+    /** Where each speck is now: carried off its strand by the flow and drawn back toward it. */
     var xy = FloatArray(0); private set
     var screen = FloatArray(0); private set
     var edges = presenceBucketEdges(0); private set
@@ -119,50 +135,65 @@ internal class PresenceField(private val seed: Long) {
     val pole = FloatArray(6)
     // The flow is sampled on a small grid once per frame and read back per speck, so thousands of specks cost a lookup each.
     private val grid = FloatArray(GRID * GRID * 2)
+    private var last = Float.NaN
 
-    /** Seeds once at the cap; a smaller area uses the first [count] specks, which are the same cloud at that count. */
+    /**
+     * Seeds the count first needed, so the 48 dp bubble does not pay for a full screen. A later, larger fit reseeds once at the
+     * cap; the seed draws its random stream in order, so the first specks rest where they did and stay where they drifted.
+     */
     fun fit(count: Int) {
         if (count == this.count) return
-        if (home.isEmpty()) {
-            home = seedParticles(seed, PRESENCE_MAX_SPECKS)
-            xy = home.copyOf()
+        val wanted = count.coerceAtMost(PRESENCE_MAX_SPECKS)
+        if (wanted * 2 > home.size) {
+            val drifted = xy
+            home = seedParticles(seed, if (home.isEmpty()) wanted else PRESENCE_MAX_SPECKS)
+            xy = home.copyOf().also { drifted.copyInto(it) }
             screen = FloatArray(home.size)
         }
-        this.count = count.coerceAtMost(PRESENCE_MAX_SPECKS)
-        edges = presenceBucketEdges(this.count)
+        this.count = wanted
+        edges = presenceBucketEdges(wanted)
     }
 
-    /** Bends the strands with a slowly turning, divergence-free noise flow; voice bends them further. */
-    fun step(time: Float, energy: Float) {
-        val reach = .09f + .05f * presenceStir(energy)
-        val drift = time * .05f
+    /**
+     * Moves the dust on to [time]: a slowly changing, divergence-free noise flow carries every speck and stretches the strands
+     * into new filaments, while a pull ([presencePull]) draws each speck back toward its rest, which turns slowly. The first
+     * call, or a clock that went back, only places the specks.
+     */
+    fun step(time: Float, talk: Float) {
+        val dt = if (last.isNaN() || time < last) 0f else (time - last).coerceAtMost(.1f)
+        last = time
+        val speed = .05f + .05f * talk
+        val drift = time * .08f
         for (gy in 0 until GRID) for (gx in 0 until GRID) {
             val u = (gx * CELL - GRID_EXTENT) * 1.4f + drift
             val v = (gy * CELL - GRID_EXTENT) * 1.4f - drift * .7f
             val n = fbm(u, v, 2)
             val k = (gy * GRID + gx) * 2
-            grid[k] = (fbm(u, v + FLOW_STEP, 2) - n) / FLOW_STEP * reach
-            grid[k + 1] = (n - fbm(u + FLOW_STEP, v, 2)) / FLOW_STEP * reach
+            grid[k] = (fbm(u, v + FLOW_STEP, 2) - n) / FLOW_STEP * speed
+            grid[k + 1] = (n - fbm(u + FLOW_STEP, v, 2)) / FLOW_STEP * speed
         }
-        val turn = time * .04f
+        val hold = 1f - exp(-presencePull(time, talk) * dt)
+        val turn = time * .05f
         val cos = cos(turn)
         val sin = sin(turn)
         var i = 0
         while (i < count * 2) {
-            val hx = home[i]
-            val hy = home[i + 1]
-            val fx = ((hx + GRID_EXTENT) / CELL).coerceIn(0f, GRID - 1.001f)
-            val fy = ((hy + GRID_EXTENT) / CELL).coerceIn(0f, GRID - 1.001f)
+            val px = xy[i]
+            val py = xy[i + 1]
+            val fx = ((px + GRID_EXTENT) / CELL).coerceIn(0f, GRID - 1.001f)
+            val fy = ((py + GRID_EXTENT) / CELL).coerceIn(0f, GRID - 1.001f)
             val x0 = fx.toInt()
             val y0 = fy.toInt()
             val tx = fx - x0
             val ty = fy - y0
             val a = (y0 * GRID + x0) * 2
             val b = a + GRID * 2
-            val x = hx + lerp(lerp(grid[a], grid[a + 2], tx), lerp(grid[b], grid[b + 2], tx), ty)
-            val y = hy + lerp(lerp(grid[a + 1], grid[a + 3], tx), lerp(grid[b + 1], grid[b + 3], tx), ty)
-            xy[i] = x * cos - y * sin
-            xy[i + 1] = x * sin + y * cos
+            val x = px + lerp(lerp(grid[a], grid[a + 2], tx), lerp(grid[b], grid[b + 2], tx), ty) * dt
+            val y = py + lerp(lerp(grid[a + 1], grid[a + 3], tx), lerp(grid[b + 1], grid[b + 3], tx), ty) * dt
+            val restX = home[i] * cos - home[i + 1] * sin
+            val restY = home[i] * sin + home[i + 1] * cos
+            xy[i] = (x + (restX - x) * hold).coerceIn(-PRESENCE_REACH, PRESENCE_REACH)
+            xy[i + 1] = (y + (restY - y) * hold).coerceIn(-PRESENCE_REACH, PRESENCE_REACH)
             i += 2
         }
     }
@@ -172,14 +203,17 @@ private const val GRID = 33
 private const val GRID_EXTENT = 1.4f
 private const val CELL = GRID_EXTENT * 2 / (GRID - 1)
 private const val FLOW_STEP = .03f
+/** No speck strays further than this from the centre, in unit space. */
+internal const val PRESENCE_REACH = 1.6f
 private const val PRESENCE_SEED = 1729L
 private val BucketAlpha = floatArrayOf(.3f, .42f, .6f, .9f)
-private val BucketLift = floatArrayOf(.2f, .5f, .7f, .9f)
+// Specks are nearly white with a tint of the state colour; the colour itself lives in the glow behind them.
+private val BucketLift = floatArrayOf(.45f, .6f, .78f, .92f)
 private val BucketSize = floatArrayOf(1f, 1.1f, 1.3f, 1.8f)
 
 private fun poleChannel(rgb: Int, shift: Int) = ((rgb shr shift) and 255) / 255f
 
-/** A drifting dust cloud that takes its colour from the call state and stirs and brightens with voice. */
+/** A drifting dust cloud that takes its colour from the call state, swirls and scatters while someone talks, and brightens with voice. */
 @Composable internal fun VoicePresence(call: CallState, modifier: Modifier, motionEnabled: Boolean) {
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val lifecycleState by lifecycle.currentStateFlow.collectAsState()
@@ -195,6 +229,9 @@ private fun poleChannel(rgb: Int, shift: Int) = ((rgb shr shift) and 255) / 255f
     // Reduced motion, a hidden screen or an ended call settle the cloud: no stirring, only the state colour.
     val energy = animateFloatAsState(if (motionAllowed) presenceEnergy(call.voiceAmplitude()) else 0f,
         if (motionAllowed) tween(110, easing = FastOutSlowInEasing) else snap(), label = "Presence voice")
+    // Who is talking changes slowly, so the motion eases in and out instead of twitching with each syllable.
+    val talk = animateFloatAsState(if (motionAllowed) presenceTalk(call) else 0f,
+        if (motionAllowed) tween(1600, easing = FastOutSlowInEasing) else snap(), label = "Presence talk")
     val field = remember { PresenceField(PRESENCE_SEED) }
     // The drawn height changes as captions grow: the first height lands at once, later ones ease instead of jumping.
     val halfHeight = remember { mutableFloatStateOf(0f) }
@@ -228,21 +265,23 @@ private fun poleChannel(rgb: Int, shift: Int) = ((rgb shr shift) and 255) / 255f
             val now = withInfiniteAnimationFrameNanos { it }
             pending += (now - last).coerceIn(0L, 100_000_000L) / 1_000_000_000f
             last = now
-            val e = energy.value
-            // Silent drift is slow, so about 15 fps is enough and the loop sleeps between steps; voice gets every frame.
-            if (!voiceMotionActive(e, true, true)) {
+            val v = talk.value
+            // Silent drift is slow, so about 15 fps is enough and the loop sleeps between steps; talking gets every frame.
+            if (v < .01f && !voiceMotionActive(energy.value, true, true)) {
                 if (pending < .066f) { kotlinx.coroutines.delay(((.066f - pending) * 1000).toLong().coerceAtLeast(1)); continue }
             }
-            // Voice runs the flow's clock faster, so the strands stir while someone speaks.
-            time.floatValue += pending * presenceStir(e)
-            field.step(time.floatValue, e)
+            // Talking runs the clock faster, so the strands stir while someone speaks.
+            time.floatValue += pending * presenceStir(v)
+            field.step(time.floatValue, v)
             pending = 0f
         }
     }
 
+    val description = uiText("{0} voice activity").replace("{0}", LocalAssistantName.current)
+    val status = callStatusText(call)
     Canvas(modifier.clipToBounds().testTag("beacon-voice-presence").semantics {
-        contentDescription = dev.hermes.android.data.currentAssistantName + " voice activity"
-        stateDescription = callStatusLabel(call)
+        contentDescription = description
+        stateDescription = status
     }) {
         val w = size.width
         val h = size.height
@@ -251,10 +290,11 @@ private fun poleChannel(rgb: Int, shift: Int) = ((rgb shr shift) and 255) / 255f
         val still = !motionAllowed
         val t = time.floatValue
         val e = if (still) 0f else energy.value
+        val v = if (still) 0f else talk.value
         val wanted = presenceParticleCount(w / density, h / density)
         if (field.count != wanted) {
             field.fit(wanted)
-            field.step(t, e)
+            field.step(t, v)
         }
         val pole = field.pole
         if (still) {
@@ -268,20 +308,21 @@ private fun poleChannel(rgb: Int, shift: Int) = ((rgb shr shift) and 255) / 255f
         val cx = w / 2f
         val cy = h / 2f
         if (halfHeight.floatValue != cy) halfHeight.floatValue = cy
-        val spread = presenceSpread(e)
-        val sx = cx * .95f * spread
-        val sy = (easedHalfHeight.value.takeIf { it > 0f && !still } ?: cy) * .95f * spread
+        val spread = presenceSpread(v)
+        // A ball of dust, a little taller than wide at most, so a tall screen does not stretch it into an oval.
+        val sx = cx * .92f * spread
+        val sy = minOf(easedHalfHeight.value.takeIf { it > 0f && !still } ?: cy, cx * 1.2f) * .92f * spread
         val gain = presenceGain(e)
         val phase = t * .6f
 
-        // A broad haze and a small hot core in the state colour; the core wanders a little inside the cloud.
-        val haze = Color(presenceArgb(pole, sin(phase) * .5f + .5f, .05f, (.14f + .2f * e).coerceAtMost(1f)))
+        // A broad haze and a soft inner glow in the state colour; the glow wanders a little inside the cloud.
+        val haze = Color(presenceArgb(pole, sin(phase) * .5f + .5f, .05f, (.08f + .12f * e).coerceAtMost(1f)))
         scale(1f, sy / sx, Offset(cx, cy)) {
-            drawCircle(Brush.radialGradient(listOf(haze, Color.Transparent), Offset(cx, cy), sx * .62f), sx * .62f, Offset(cx, cy), blendMode = BlendMode.Plus)
+            drawCircle(Brush.radialGradient(listOf(haze, Color.Transparent), Offset(cx, cy), sx * .8f), sx * .8f, Offset(cx, cy), blendMode = BlendMode.Plus)
         }
         val heart = Offset(cx + sx * .12f * sin(t * .23f), cy + sy * .1f * sin(t * .31f + 1f))
-        val core = Color(presenceArgb(pole, sin(phase + 1f) * .5f + .5f, .15f, (.5f + .35f * e).coerceAtMost(1f)))
-        drawCircle(Brush.radialGradient(listOf(core, Color.Transparent), heart, sx * .16f), sx * .16f, heart, blendMode = BlendMode.Plus)
+        val core = Color(presenceArgb(pole, sin(phase + 1f) * .5f + .5f, .1f, (.2f + .25f * e).coerceAtMost(1f)))
+        drawCircle(Brush.radialGradient(listOf(core, Color.Transparent), heart, sx * .45f), sx * .45f, heart, blendMode = BlendMode.Plus)
 
         val xy = field.xy
         val out = field.screen
@@ -291,7 +332,7 @@ private fun poleChannel(rgb: Int, shift: Int) = ((rgb shr shift) and 255) / 255f
             out[i + 1] = cy + xy[i + 1] * sy
             i += 2
         }
-        val dot = (minOf(w, h) / 520f).coerceIn(.9f, 2.2f)
+        val dot = (minOf(w, h) / 600f).coerceIn(.8f, 2f)
         val canvas = drawContext.canvas.nativeCanvas
         // A faint wide pass over a quarter of the dimmest specks turns the strands into smoke.
         paint.color = presenceArgb(pole, sin(phase) * .5f + .5f, .1f, .1f * gain)

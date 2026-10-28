@@ -4,7 +4,7 @@ The preview is Beacon's debug build for testing. It installs separately from the
 
 ## Stable channel
 - The `stable` build type has application ID `dev.hermes.android.stable` and launcher label "Beacon", so it installs beside production and the preview.
-- The current source builds stable version code `122`, version `1.1.12`. It inherits release minification and is not debuggable; this identifies the source configuration, not a newly accepted or published binary.
+- The current source builds stable version code `123`, version `1.1.13`. It inherits release minification and is not debuggable; this identifies the source configuration, not a newly accepted or published binary.
 - A stable APK is unsigned unless `beaconStableSigning` (or `BEACON_STABLE_SIGNING`) points to an external properties file with the four Android signing fields. Never store that file or its keystore in this repository. The stable signer is separate from production.
 - Release assets are named `Beacon-<version>.apk` and `Beacon-<version>.json`; Settings **App updates** asks the public GitHub release itself and verifies the APK before installation.
 
@@ -14,7 +14,7 @@ Stable builds check the latest GitHub release themselves and notify you when a n
 ## What the preview is
 - It is the existing `debug` build type. Nothing else is added (no product flavors, no new dependencies).
 - Application ID `dev.hermes.android.debug`, so it installs **next to** production `dev.hermes.android` and never upgrades it.
-- The current source version name is `1.1.12-preview`. The launcher label is "Beacon Preview" (set only in `app/src/debug/AndroidManifest.xml`); the release label stays "Beacon".
+- The current source version name is `1.1.13-preview`. The launcher label is "Beacon Preview" (set only in `app/src/debug/AndroidManifest.xml`); the release label stays "Beacon".
 - It is signed with the local Android debug key, not the production signer. Android will never accept it as an update to production, and production cannot update it.
 - It is a debuggable build. `src/debug/res/xml/fixture_network_security.xml` allows cleartext only to `10.0.2.2` for the local crash reporter, and trusts the bundled test-fixture CA (`beacon_fixture_ca.pem`) through `debug-overrides`. Use the preview only on your own test devices.
 
@@ -61,7 +61,7 @@ Threads and filters (drawer, under Search; native Hermes, no plugin needed):
 
 Display: Beacon follows the phone for text size, language, text direction and animations (Android's font size, app language and "Remove animations" settings). Settings → Appearance keeps only Theme and Color style.
 
-Approvals (composer shield, native Hermes): **Profile default** follows the profile's Manual (Ask first) or Auto policy; **YOLO in this chat** skips prompts only in that conversation. Enabling YOLO always asks for confirmation, and Hermes saves that choice until you turn it off. **Change for all chats** opens profile Settings, where Manual and Auto are changed. An existing Off policy is displayed honestly in Settings and chat, with chat choices disabled; unavailable approval status is shown as unknown with a retry action.
+Approvals (composer shield, native Hermes): **Profile default** follows the profile's Manual (Ask first) or Auto policy; **Skip approvals** (Hermes's YOLO mode) skips prompts only in that conversation. Turning it on always asks for confirmation, and Hermes saves that choice until you turn it off. **Change for all chats** opens profile Settings, where Manual and Auto are changed. An existing Off policy is displayed honestly in Settings and chat, with chat choices disabled; unavailable approval status is shown as unknown with a retry action.
 
 Conversation actions: long-press any conversation in History (or use the chat's ⋮ menu) to pin or unpin, rename, add it to a project or remove it from its project, archive or delete it. Removing a chat from a project moves it to the profile's own folder; its messages stay.
 

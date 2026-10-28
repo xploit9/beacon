@@ -653,7 +653,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         if (!admitConversation()) return
         val commandName = name.removePrefix("/").lowercase()
         if (chatCommandChangesProfile(commandName, argument)) { notice("Change this for all chats in Settings."); return }
-        if (commandName == "yolo") { notice("Use Approvals beside the composer to change YOLO."); return }
+        if (commandName == "yolo") { notice("Use Approvals beside the composer to skip approvals."); return }
         if (_chat.value.raw.length() == 0 || _chat.value.streamId.isNotBlank() || _chat.value.uncertain.isNotBlank() || _chat.value.approval != null || _chat.value.clarification != null || app.calls.state.value.active || _attachments.value.isNotEmpty() || _chat.value.raw.optBoolean("read_only") || _chat.value.raw.optBoolean("is_read_only")) { notice("Finish the current turn and attachments before running a command"); return }
         if (commandName == "model" && argument.isBlank()) { openCatalog("Model & provider"); return }
         if (commandName == "model") {
@@ -1838,11 +1838,13 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     private var glanceAccount = ""
     private val glanceLoaded = HashMap<String, Scope>()
     private val glanceDirty = LinkedHashMap<String, Scope>()
+    // Profiles whose name this run has already put in the account row; cleared wherever glanceLoaded is.
+    private val glanceRecorded = HashSet<String>()
     private var glanceWrite: Job? = null
     /** Loads a profile's stored glances once per account; a different account starts empty. Unreadable storage is the same as none. */
     private suspend fun openGlances(profileScope: Scope) = glanceLock.withLock {
         val account = profileScope.copy(profile = "", session = "").key
-        if (glanceAccount != account) { glanceAccount = account; glanceLoaded.clear(); glanceDirty.clear(); _glances.value = ChatGlances(account = account) }
+        if (glanceAccount != account) { glanceAccount = account; glanceLoaded.clear(); glanceRecorded.clear(); glanceDirty.clear(); _glances.value = ChatGlances(account = account) }
         if (glanceLoaded.put(profileScope.key, profileScope) == null) {
             val stored = try { app.cache.read(profileScope, "chat-glances")?.let { decodeGlances(profileScope.profile, it) } }
                 catch (e: Exception) { if (e is CancellationException) { glanceLoaded.remove(profileScope.key); throw e }; null }
@@ -1856,9 +1858,12 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     /** The account row names every profile with previews on this phone, and is written before that profile's first preview row, so sign-out never has to guess. */
     private val glanceIndexLock = Mutex()
     private suspend fun rememberGlanceProfile(profileScope: Scope) = glanceIndexLock.withLock {
-        val account = profileScope.copy(profile = "", session = "")
-        val recorded = decodeGlanceProfiles(app.cache.read(account, GLANCE_PROFILES_KIND))
-        if (profileScope.profile.isNotBlank() && profileScope.profile !in recorded) app.cache.write(account, GLANCE_PROFILES_KIND, glanceProfilesJson(recorded + profileScope.profile), protected = true)
+        if (profileScope.key !in glanceRecorded) {
+            val account = profileScope.copy(profile = "", session = "")
+            val recorded = decodeGlanceProfiles(app.cache.read(account, GLANCE_PROFILES_KIND))
+            if (profileScope.profile.isNotBlank() && profileScope.profile !in recorded) app.cache.write(account, GLANCE_PROFILES_KIND, glanceProfilesJson(recorded + profileScope.profile), protected = true)
+            glanceRecorded.add(profileScope.key)
+        }
     }
     private fun queueGlanceWrite(profileScope: Scope) {
         glanceDirty[profileScope.key] = profileScope
@@ -1884,7 +1889,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             glanceWrite?.cancelAndJoin(); glanceDirty.clear()
             val recorded = try { decodeGlanceProfiles(app.cache.read(account, GLANCE_PROFILES_KIND)) } catch (e: CancellationException) { throw e } catch (_: Exception) { wiped = false; emptyList<String>() }
             val profiles = glanceProfilesToForget(scope, glanceLoaded.values, listed, recorded)
-            if (glanceAccount == account.key) { glanceLoaded.clear(); _glances.value = ChatGlances(account = account.key) }
+            if (glanceAccount == account.key) { glanceLoaded.clear(); glanceRecorded.clear(); _glances.value = ChatGlances(account = account.key) }
             profiles
         }
         for (profile in stored) for (kind in listOf("chat-glances", "conversation-index")) {
@@ -1892,6 +1897,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             try { app.cache.delete(profile, kind) } catch (e: CancellationException) { throw e } catch (_: Exception) { wiped = false }
         }
         if (wiped) try { app.cache.delete(account, GLANCE_PROFILES_KIND) } catch (e: CancellationException) { throw e } catch (_: Exception) { /* the next write rewrites it */ }
+        // A profile opened while the rows were going was recorded in a row that is now gone.
+        glanceRecorded.clear()
     }
     /** The account the glances belong to; the list ignores any other account's. */
     internal fun glanceAccountKey(): String = (client?.scope ?: cachedOwnerScope)?.copy(profile = "", session = "")?.key.orEmpty()

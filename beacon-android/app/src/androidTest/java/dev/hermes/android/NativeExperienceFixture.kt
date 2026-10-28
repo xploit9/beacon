@@ -73,6 +73,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var proactiveFeedbackStatusCode = 200
     @Volatile var proactiveRouteMissing = false
     @Volatile var proactiveStatusCode = 200
+    @Volatile var proactiveSaveStatusCode = 200
     val workspaceFiles = ConcurrentHashMap<String, String>()
     val downloads = ConcurrentHashMap<String, ByteArray>()
     val fileRequests = CopyOnWriteArrayList<String>()
@@ -461,6 +462,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         path == "/api/plugins/beacon/mobile/proactive" -> {
             if (proactiveRouteMissing) return 404 to json("detail" to "Unknown route")
             if (proactiveStatusCode != 200) return proactiveStatusCode to json("detail" to "Email access needs attention")
+            if (method == "PUT" && proactiveSaveStatusCode != 200) return proactiveSaveStatusCode to json("detail" to "Settings change refused")
             if (method == "PUT") {
                 if (body.has("enabled")) proactiveEnabled[profile] = body.getBoolean("enabled")
                 if (body.has("delivery")) proactiveDelivery[profile] = body.getString("delivery")

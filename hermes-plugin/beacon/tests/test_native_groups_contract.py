@@ -62,9 +62,12 @@ def test_adapter_group_calls_match_actual_tui_contract_and_reject_prior_inventio
             seen.add(method.value)
     assert {'groups.capabilities', 'groups.create', 'groups.state', 'groups.log', 'groups.send', 'groups.rename', 'groups.disband', 'groups.approve'} <= seen
     assert 'groups.retry' not in seen  # TUI pending rows cannot distinguish unknown work from deferred work.
-    for method, fields in (('groups.delete', {'room_id'}), ('groups.members.set', {'room_id', 'members'}),
-                           ('groups.disband', {'room_id', 'event_id'}), ('groups.disband', {'room_id', 'expected_name'}),
-                           ('groups.retry', {'room_id', 'task_id', 'member_id', 'execution_generation'})):
+    inventions = [('groups.delete', {'room_id'}), ('groups.members.set', {'room_id', 'members'}),
+                  ('groups.disband', {'room_id', 'event_id'}), ('groups.disband', {'room_id', 'expected_name'})]
+    # Newer Hermes lets a retry name its exact attempt; on older Hermes those fields are still an invention.
+    if not {'member_id', 'execution_generation'} <= contracts['groups.retry']:
+        inventions.append(('groups.retry', {'room_id', 'task_id', 'member_id', 'execution_generation'}))
+    for method, fields in inventions:
         with pytest.raises(AssertionError):
             validate_group_call(method, fields, methods, contracts)
 
@@ -72,7 +75,9 @@ def test_adapter_group_calls_match_actual_tui_contract_and_reject_prior_inventio
 def test_real_disband_contract_and_transport_are_not_canonical_retry(native_source):
     contracts = group_contracts(native_source)
     assert contracts['groups.disband'] == {'profile', 'room_id', 'cancel_id'}
-    assert contracts['groups.retry'] == {'profile', 'room_id', 'task_id'}
+    # Older Hermes takes the task only; newer Hermes may also name the exact attempt.
+    assert contracts['groups.retry'] in ({'profile', 'room_id', 'task_id'},
+                                         {'profile', 'room_id', 'task_id', 'member_id', 'execution_generation'})
     canonical = literal(native_source['gateway/session_group_controls.py'], '_FIELDS')
     assert canonical['groups.retry'] == {'room_id', 'member_id', 'task_id', 'execution_generation'}
     assert 'groups.discard' in canonical and 'groups.discard' not in contracts

@@ -37,9 +37,9 @@ import kotlinx.coroutines.launch
         if (page == "Skills") editor.loadSkills(force = false) else editor.loadMemory(force = false)
     }
     Column(Modifier.fillMaxSize()) {
-        Header(page, back = if (page == "Memory" || page == "Skills" && skills.selected == null) null else back, menu = LocalOpenNavigationMenu.current) {
-            if (page == "Memory") IconButton(onClick = { editor.loadMemory() }, enabled = vm.client != null && !memory.loading && !memory.saving && memory.editing.isBlank()) { Icon(Icons.Rounded.Refresh, "Refresh memory") }
-            else IconButton(onClick = { skills.selected?.let(editor::openSkill) ?: editor.loadSkills() }, enabled = vm.client != null && !skills.loading && !skills.saving && !skills.editing) { Icon(Icons.Rounded.Refresh, "Refresh skills") }
+        Header(uiText(settingsLabel(page)), back = if (page == "Memory" || page == "Skills" && skills.selected == null) null else back, menu = LocalOpenNavigationMenu.current) {
+            if (page == "Memory") IconButton(onClick = { editor.loadMemory() }, enabled = vm.client != null && !memory.loading && !memory.saving && memory.editing.isBlank()) { Icon(Icons.Rounded.Refresh, uiText("Refresh memory")) }
+            else IconButton(onClick = { skills.selected?.let(editor::openSkill) ?: editor.loadSkills() }, enabled = vm.client != null && !skills.loading && !skills.saving && !skills.editing) { Icon(Icons.Rounded.Refresh, uiText("Refresh skills")) }
         }
         if (editor.scopeKey != vm.client?.scope?.key) LinearProgressIndicator(Modifier.fillMaxWidth())
         else if (page == "Skills") NativeSkillsScreen(skills, editor::skillSearch, editor::openSkill,
@@ -51,10 +51,10 @@ import kotlinx.coroutines.launch
         else NativeMemoryScreen(memory, editor::editMemory, editor::memoryDraft, editor::saveMemory,
             onCancel = { leave { editor.editMemory("") } }, renderNotes = { Markdown(it, vm) })
     }
-    discard?.let { action -> AlertDialog(onDismissRequest = { discard = null }, title = { Text("Discard unsaved changes?") },
-        text = { Text(if (page == "Memory") "Your saved notes stay unchanged." else "Your saved instructions stay unchanged.") },
-        confirmButton = { TextButton(onClick = { discard = null; action() }) { Text("Discard changes") } },
-        dismissButton = { TextButton(onClick = { discard = null }) { Text("Keep editing") } }) }
+    discard?.let { action -> AlertDialog(onDismissRequest = { discard = null }, title = { Text(uiText("Discard unsaved changes?")) },
+        text = { Text(uiText(if (page == "Memory") "Your saved notes stay unchanged." else "Your saved instructions stay unchanged.")) },
+        confirmButton = { TextButton(onClick = { discard = null; action() }) { Text(uiText("Discard changes")) } },
+        dismissButton = { TextButton(onClick = { discard = null }) { Text(uiText("Keep editing")) } }) }
 }
 
 @Composable internal fun NativeServerPage(vm: BeaconViewModel, page: String) {
@@ -62,25 +62,26 @@ import kotlinx.coroutines.launch
     val state by vm.phoneSettings.server.collectAsStateWithLifecycle()
     var confirm by remember { mutableStateOf(false) }
     var reviewUnknown by remember { mutableStateOf(false) }
+    val callBlocksUpdate = uiText("End the current call before updating Hermes.")
     LaunchedEffect(page, ui.origin, ui.owner, ui.profile, ui.connected, vm.client) { vm.phoneSettings.bind(); vm.phoneSettings.loadServer(page) }
     Column(Modifier.fillMaxSize()) {
-        Header(page, back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current, actions = {
+        Header(uiText(settingsLabel(page)), back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current, actions = {
             IconButton(onClick = { vm.phoneSettings.loadServer(page) }, enabled = !state.loading) {
                 Icon(Icons.Rounded.Refresh, uiText(if (page == "Server updates") "Refresh update status" else "Refresh"))
             }
         })
         NativeServerSettings(page, state, { vm.phoneSettings.loadServer(page, force = true) },
-            onApplyUpdate = { if (vm.app.calls.state.value.active) vm.notice("End the current call before updating Hermes.") else confirm = true },
+            onApplyUpdate = { if (vm.app.calls.state.value.active) vm.notice(callBlocksUpdate) else confirm = true },
             onLogFile = vm.phoneSettings::logFile, onLogSearch = vm.phoneSettings::logSearch, onReviewUnknown = { reviewUnknown = true })
     }
-    if (confirm) AlertDialog(onDismissRequest = { confirm = false }, title = { Text("Update Hermes on your computer?") },
-        text = { Text("Hermes may reconnect while updating.") },
-        confirmButton = { TextButton(onClick = { confirm = false; if (!vm.app.calls.state.value.active) vm.phoneSettings.applyServerUpdate() else vm.notice("End the current call before updating Hermes.") }) { Text("Apply update") } },
-        dismissButton = { TextButton(onClick = { confirm = false }) { Text("Cancel") } })
-    if (reviewUnknown) AlertDialog(onDismissRequest = { reviewUnknown = false }, title = { Text("Check the server before retrying") },
-        text = { Text("The update's result is unknown. Check the installed version.") },
-        confirmButton = { TextButton(onClick = { reviewUnknown = false; vm.phoneSettings.clearReviewedUpdate() }) { Text("Check current version") } },
-        dismissButton = { TextButton(onClick = { reviewUnknown = false }) { Text("Keep waiting") } })
+    if (confirm) AlertDialog(onDismissRequest = { confirm = false }, title = { Text(uiText("Update Hermes on your computer?")) },
+        text = { Text(uiText("Hermes may reconnect while updating.")) },
+        confirmButton = { TextButton(onClick = { confirm = false; if (!vm.app.calls.state.value.active) vm.phoneSettings.applyServerUpdate() else vm.notice(callBlocksUpdate) }) { Text(uiText("Apply update")) } },
+        dismissButton = { TextButton(onClick = { confirm = false }) { Text(uiText("Cancel")) } })
+    if (reviewUnknown) AlertDialog(onDismissRequest = { reviewUnknown = false }, title = { Text(uiText("Check the server before retrying")) },
+        text = { Text(uiText("The update's result is unknown. Check the installed version.")) },
+        confirmButton = { TextButton(onClick = { reviewUnknown = false; vm.phoneSettings.clearReviewedUpdate() }) { Text(uiText("Check current version")) } },
+        dismissButton = { TextButton(onClick = { reviewUnknown = false }) { Text(uiText("Keep waiting")) } })
 }
 
 @Composable internal fun NativeProfilesPage(vm: BeaconViewModel) {
@@ -102,7 +103,7 @@ import kotlinx.coroutines.launch
     BackHandler(onBack = back)
     LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, vm.client) { vm.phoneSettings.bind(); vm.phoneSettings.loadBots(); if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     Column(Modifier.fillMaxSize()) {
-        Header("Profiles", back = back, menu = LocalOpenNavigationMenu.current)
+        Header(uiText("Profiles"), back = back, menu = LocalOpenNavigationMenu.current)
         ProfileApprovalSettings(vm)
         NativeBotSettings(state, vm.phoneSettings::openBot, { leave(vm.phoneSettings::closeBot) }, { vm.phoneSettings.editBot(true) },
             vm.phoneSettings::botDraft, vm.phoneSettings::saveBot, { leave { vm.phoneSettings.editBot(false) } },
@@ -113,9 +114,9 @@ import kotlinx.coroutines.launch
             renderBehavior = { Markdown(it, vm) },
             profileLabel = { profile -> profileDisplayLabel(profile, profileRows, profileLoading) })
     }
-    discard?.let { action -> AlertDialog(onDismissRequest = { discard = null }, title = { Text("Discard model selection?") },
-        confirmButton = { TextButton(onClick = { discard = null; action() }) { Text("Discard") } },
-        dismissButton = { TextButton(onClick = { discard = null }) { Text("Keep editing") } }) }
+    discard?.let { action -> AlertDialog(onDismissRequest = { discard = null }, title = { Text(uiText("Discard model selection?")) },
+        confirmButton = { TextButton(onClick = { discard = null; action() }) { Text(uiText("Discard")) } },
+        dismissButton = { TextButton(onClick = { discard = null }) { Text(uiText("Keep editing")) } }) }
 }
 
 private val skillDivider = Regex("(?m)^---[ \t]*$")

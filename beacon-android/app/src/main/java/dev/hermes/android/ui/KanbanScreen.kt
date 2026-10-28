@@ -30,6 +30,13 @@ import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import java.util.UUID
 
+/** Fixed texts the board shows through variables: its column names and the errors it keeps in state. */
+internal val KanbanStrings = boardStatuses.values.toList() + listOf(
+    "Couldn't load boards. Check your connection and try again.", "Couldn't load this board. Check your connection and try again.",
+    "This task no longer exists. Its saved draft was cleared.", "Add a short result before marking this task done.",
+    "Couldn't update this task. Refresh the board and try again.",
+)
+
 internal fun kanbanLaterColumnTaskCount(cards: List<NativeBoardCard>, shownStatuses: List<String>): Int {
     val laterStatuses = shownStatuses.drop(3).toSet()
     return cards.count { it.status in laterStatuses }
@@ -62,11 +69,11 @@ internal fun kanbanDraftChanged(record: JSONObject): Boolean {
 internal fun kanbanMissingSavedTask(record: JSONObject?, error: Throwable): Boolean =
     record?.string("id")?.isNotBlank() == true && error is ApiFailure && error.status == 404
 
-private fun kanbanProfileLabel(profile: String, profiles: List<JSONObject>, loading: Boolean): String = when {
-    profile.isBlank() -> "Unassigned"
+@Composable private fun kanbanProfileLabel(profile: String, profiles: List<JSONObject>, loading: Boolean): String = when {
+    profile.isBlank() -> uiText("Unassigned")
     profiles.any { it.string("name") == profile } -> profileDisplayName(profile, profiles)
-    loading -> "Loading profiles…"
-    else -> "Unavailable profile"
+    loading -> uiText("Loading profiles…")
+    else -> uiText("Unavailable profile")
 }
 
 @Composable fun KanbanScreen(vm: BeaconViewModel) {
@@ -100,6 +107,9 @@ private fun kanbanProfileLabel(profile: String, profiles: List<JSONObject>, load
     var conflict by remember(origin?.key, board) { mutableStateOf<NativeBoardCard?>(null) }
     val latestBoard by rememberUpdatedState(board)
     val scope = rememberCoroutineScope()
+    val draftSaveFailed = uiText("This task draft could not be saved on the phone")
+    val draftReadFailed = uiText("The saved task draft could not be read. It has been retained on this phone.")
+    val movedTo = uiText("Moved to")
     val draftLock = remember(origin?.key, board) { Mutex() }
     val draftKind = "kanban-draft:$board"
     fun current(requestedBoard: String? = null) = client != null && vm.client === client && vm.client?.scope == origin && vm.ui.value.profile == ui.profile && (requestedBoard == null || latestBoard == requestedBoard)
@@ -111,7 +121,7 @@ private fun kanbanProfileLabel(profile: String, profiles: List<JSONObject>, load
         if (origin != null && board.isNotBlank()) vm.viewModelScope.launch {
             draftLock.withLock { try {
                 if (snapshot.isBlank()) vm.app.cache.delete(origin, draftKind) else vm.app.cache.write(origin, draftKind, snapshot, protected = true)
-            } catch (e: Exception) { if (e is CancellationException) throw e; if (current()) vm.notice("This task draft could not be saved on the phone") } }
+            } catch (e: Exception) { if (e is CancellationException) throw e; if (current()) vm.notice(draftSaveFailed) } }
         }
     }
     suspend fun refresh() {
@@ -150,7 +160,7 @@ private fun kanbanProfileLabel(profile: String, profiles: List<JSONObject>, load
                     savedDrafts = if (merged.length() == 0) "" else merged.toString()
                 }
             } }
-            catch (e: Exception) { if (e is CancellationException) throw e; if (current(requestedBoard)) vm.notice("The saved task draft could not be read. It has been retained on this phone.") }
+            catch (e: Exception) { if (e is CancellationException) throw e; if (current(requestedBoard)) vm.notice(draftReadFailed) }
             refresh()
         }
     }
@@ -167,6 +177,10 @@ private fun kanbanProfileLabel(profile: String, profiles: List<JSONObject>, load
             }
         } finally { if (current(requestedBoard)) busy = false } }
     }
+    fun move(card: NativeBoardCard, target: String, notice: String) = act {
+        val changed = repo!!.update(board, card.id, boardMoveFields(target))
+        if (current()) { cards = cards.filterNot { it.id == changed.id } + changed; selectedColumn = changed.status; vm.notice(notice) }
+    }
     fun edit(card: NativeBoardCard?) {
         if (busy || loading) return
         draftTaskKey = kanbanDraftKey(card?.id.orEmpty())
@@ -178,18 +192,18 @@ private fun kanbanProfileLabel(profile: String, profiles: List<JSONObject>, load
         }
     }
     Column(Modifier.fillMaxSize().testTag("kanban-screen")) {
-        Header("Kanban", menu = LocalOpenNavigationMenu.current) {
-            IconButton(onClick = { scope.launch { refresh() } }, enabled = !loading && !busy) { Icon(Icons.Rounded.Refresh, "Refresh board") }
-            IconButton(onClick = { edit(null) }, enabled = repo != null && !busy && !loading && board.isNotBlank(), modifier = Modifier.testTag("kanban-new-task")) { Icon(Icons.Rounded.Add, "New task") }
+        Header(uiText("Kanban"), menu = LocalOpenNavigationMenu.current) {
+            IconButton(onClick = { scope.launch { refresh() } }, enabled = !loading && !busy) { Icon(Icons.Rounded.Refresh, uiText("Refresh board")) }
+            IconButton(onClick = { edit(null) }, enabled = repo != null && !busy && !loading && board.isNotBlank(), modifier = Modifier.testTag("kanban-new-task")) { Icon(Icons.Rounded.Add, uiText("New task")) }
         }
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box { OutlinedButton(onClick = { menu = true }, enabled = boards.isNotEmpty() && !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text(boards.firstOrNull { it.slug == board }?.name ?: "Choose board"); Icon(Icons.Rounded.ExpandMore, null) }; DropdownMenu(menu, { menu = false }) { boards.forEach { choice -> DropdownMenuItem({ Text(choice.name) }, { menu = false; editing = false; board = choice.slug }) } } }
-            Spacer(Modifier.weight(1f)); Text("${cards.size} tasks", style = MaterialTheme.typography.labelMedium)
+            Box { OutlinedButton(onClick = { menu = true }, enabled = boards.isNotEmpty() && !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text(boards.firstOrNull { it.slug == board }?.name ?: uiText("Choose board")); Icon(Icons.Rounded.ExpandMore, null) }; DropdownMenu(menu, { menu = false }) { boards.forEach { choice -> DropdownMenuItem({ Text(choice.name) }, { menu = false; editing = false; board = choice.slug }) } } }
+            Spacer(Modifier.weight(1f)); Text(uiText(if (cards.size == 1) "1 task" else "{0} tasks").replace("{0}", "${cards.size}"), style = MaterialTheme.typography.labelMedium)
         }
-        if (records.length() > 0 && !editing) OutlinedButton(onClick = { if (!records.has(draftTaskKey)) draftTaskKey = records.keys().next(); editing = true }, enabled = !busy && !loading, modifier = Modifier.padding(horizontal = 16.dp).heightIn(min = 48.dp)) { Icon(Icons.Rounded.EditNote, null); Text("Continue saved task draft", Modifier.padding(start = 8.dp)) }
-        if (error.isNotBlank()) Column(Modifier.padding(16.dp)) { Text(error, color = MaterialTheme.colorScheme.error); OutlinedButton(onClick = { scope.launch { refresh() } }, enabled = !loading && !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("Retry") } }
+        if (records.length() > 0 && !editing) OutlinedButton(onClick = { if (!records.has(draftTaskKey)) draftTaskKey = records.keys().next(); editing = true }, enabled = !busy && !loading, modifier = Modifier.padding(horizontal = 16.dp).heightIn(min = 48.dp)) { Icon(Icons.Rounded.EditNote, null); Text(uiText("Continue saved task draft"), Modifier.padding(start = 8.dp)) }
+        if (error.isNotBlank()) Column(Modifier.padding(16.dp)) { Text(uiText(error), color = MaterialTheme.colorScheme.error); OutlinedButton(onClick = { scope.launch { refresh() } }, enabled = !loading && !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Retry")) } }
         if (loading && cards.isEmpty() || busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-        if (!loading && board.isBlank() && error.isBlank()) EmptyState("No boards yet", "Create a Kanban board in your Hermes dashboard, then refresh it here.", Icons.Rounded.ViewKanban)
+        if (!loading && board.isBlank() && error.isBlank()) EmptyState(uiText("No boards yet"), uiText("Create a Kanban board in your Hermes dashboard, then refresh it here."), Icons.Rounded.ViewKanban)
         val shownStatuses = boardStatuses.keys.filter { it != "archived" || cards.any { card -> card.status == "archived" } }
         val visibleColumn = selectedColumn.takeIf { it in shownStatuses } ?: cards.firstOrNull { it.status in shownStatuses }?.status ?: "todo"
         BoxWithConstraints(Modifier.weight(1f)) {
@@ -198,51 +212,60 @@ private fun kanbanProfileLabel(profile: String, profiles: List<JSONObject>, load
             @Composable fun column(status: String, modifier: Modifier) {
                 val rows = cards.filter { it.status == status }
                 Column(modifier) {
-                    Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.SpaceBetween) { Text(boardStatuses.getValue(status), style = MaterialTheme.typography.titleSmall); Text(rows.size.toString(), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.SpaceBetween) { Text(uiText(boardStatuses.getValue(status)), style = MaterialTheme.typography.titleSmall); Text(rows.size.toString(), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        if (rows.isEmpty() && !loading) item { Text("No tasks here", Modifier.padding(8.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                        if (rows.isEmpty() && !loading) item { EmptyState(uiText("No tasks here"), uiText("Tap + to add one."), null) }
                         items(rows, key = { it.id }) { card ->
-                            Surface(shape = MaterialTheme.shapes.medium, color = MaterialTheme.colorScheme.surfaceContainer) { Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Text(card.title, style = MaterialTheme.typography.titleMedium)
-                                if (card.body.isNotBlank()) Text(card.body, maxLines = 4, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
-                                Text(kanbanProfileLabel(card.assignee, profileRows, profileLoading), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                                if (card.summary.isNotBlank()) Text(card.summary, style = MaterialTheme.typography.bodySmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
-                                var moving by remember(card.id) { mutableStateOf(false) }
-                                FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    OutlinedButton(onClick = { edit(card) }, enabled = !busy && !loading, modifier = Modifier.heightIn(min = 48.dp).testTag("kanban-edit:${card.id}")) { Text("Edit") }
-                                    Box { OutlinedButton(onClick = { moving = true }, enabled = !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("Move") }; DropdownMenu(moving, { moving = false }) { boardStatuses.filterKeys { it != card.status && it != "running" }.forEach { (target, label) -> DropdownMenuItem({ Text(label) }, { moving = false; error = ""; confirm = card to target }) } } }
-                                    OutlinedButton(onClick = { error = ""; confirm = card to "delete" }, enabled = !busy, modifier = Modifier.heightIn(min = 48.dp), colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("Delete") }
+                            var moving by remember(card.id) { mutableStateOf(false) }
+                            Surface(onClick = { edit(card) }, enabled = !busy && !loading, shape = MaterialTheme.shapes.medium, color = MaterialTheme.colorScheme.surfaceContainer, modifier = Modifier.testTag("kanban-edit:${card.id}")) {
+                                Row(Modifier.fillMaxWidth().padding(start = 14.dp, top = 14.dp, bottom = 14.dp, end = 4.dp), verticalAlignment = Alignment.Top) {
+                                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Text(card.title, style = MaterialTheme.typography.titleMedium)
+                                        if (card.body.isNotBlank()) Text(card.body, maxLines = 4, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
+                                        Text(kanbanProfileLabel(card.assignee, profileRows, profileLoading), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                                        if (card.summary.isNotBlank()) Text(card.summary, style = MaterialTheme.typography.bodySmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                                    }
+                                    Box {
+                                        IconButton(onClick = { moving = true }, enabled = !busy) { Icon(Icons.Rounded.MoreVert, uiText("Task actions")) }
+                                        DropdownMenu(moving, { moving = false }) {
+                                            boardStatuses.filterKeys { it != card.status && it != "running" }.forEach { (target, label) ->
+                                                val destination = uiText(label)
+                                                DropdownMenuItem({ Text("${uiText("Move to")} $destination") }, { moving = false; error = ""; if (target == "done" || target == "ready" || card.status == "running") confirm = card to target else move(card, target, "$movedTo $destination") })
+                                            }
+                                            HorizontalDivider()
+                                            DropdownMenuItem({ Text(uiText("Delete"), color = MaterialTheme.colorScheme.error) }, { moving = false; error = ""; confirm = card to "delete" })
+                                        }
+                                    }
                                 }
-                            } }
+                            }
                         }
                     }
                 }
             }
             if (expanded) Column(Modifier.fillMaxSize()) {
-                if (laterTaskCount > 0) Text("$laterTaskCount ${if (laterTaskCount == 1) "task" else "tasks"} in later columns",
+                if (laterTaskCount > 0) Text(uiText(if (laterTaskCount == 1) "1 task in later columns" else "{0} tasks in later columns").replace("{0}", "$laterTaskCount"),
                     style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp))
                 Row(Modifier.weight(1f).horizontalScroll(rememberScrollState())) { shownStatuses.forEach { status -> column(status, Modifier.width(300.dp).fillMaxHeight()) } }
             }
-            else Column { key(shownStatuses) { ScrollableTabRow(selectedTabIndex = shownStatuses.indexOf(visibleColumn), edgePadding = 8.dp) { shownStatuses.forEach { status -> Tab(selected = visibleColumn == status, onClick = { selectedColumn = status }, text = { Text("${boardStatuses[status]} ${cards.count { it.status == status }}") }) } } }; column(visibleColumn, Modifier.weight(1f)) }
+            else Column { key(shownStatuses) { ScrollableTabRow(selectedTabIndex = shownStatuses.indexOf(visibleColumn), edgePadding = 8.dp) { shownStatuses.forEach { status -> Tab(selected = visibleColumn == status, onClick = { selectedColumn = status }, text = { Text("${uiText(boardStatuses.getValue(status))} ${cards.count { it.status == status }}") }) } } }; column(visibleColumn, Modifier.weight(1f)) }
         }
     }
     confirm?.let { (card, destination) ->
         var completionResult by remember(card.id, destination) { mutableStateOf("") }
         AlertDialog(
             onDismissRequest = { if (!busy) { confirm = null; error = "" } },
-            title = { Text(if (destination == "delete") "Delete task?" else "Move to ${boardStatuses[destination]}?") },
+            title = { Text(if (destination == "delete") uiText("Delete task?") else "${uiText("Move to")} ${boardStatuses[destination]?.let { uiText(it) }.orEmpty()}?") },
             text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(when (destination) {
-                    "delete" -> "This removes “${card.title}” from the native Hermes board."
-                    "ready" -> "An assigned bot may begin this task when the dispatcher picks it up."
-                    "done" -> "Add a short result before marking this task done."
-                    "review" -> "Send this task for review."
-                    else -> card.title
-                })
-                if (destination == "done") OutlinedTextField(completionResult, { completionResult = it }, label = { Text("Result") }, minLines = 2, maxLines = 3, modifier = Modifier.fillMaxWidth().testTag("kanban-completion-result"), enabled = !busy)
-                if (destination in setOf("done", "review") && card.status == "running") Text("A worker is actively working on this task. This change will override its claim.", color = MaterialTheme.colorScheme.error)
-                if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error)
+                Text(card.title, style = MaterialTheme.typography.titleMedium)
+                when (destination) {
+                    "delete" -> Text(uiText("This removes the task from the board."))
+                    "ready" -> Text(uiText("An assigned bot may start this task."))
+                    "done" -> Text(uiText("Add a short result before marking this task done."))
+                }
+                if (destination == "done") OutlinedTextField(completionResult, { completionResult = it }, label = { Text(uiText("Result")) }, minLines = 2, maxLines = 3, modifier = Modifier.fillMaxWidth().testTag("kanban-completion-result"), enabled = !busy)
+                if (destination != "delete" && card.status == "running") Text(uiText("A worker is actively working on this task. This change will override its claim."), color = MaterialTheme.colorScheme.error)
+                if (error.isNotBlank()) Text(uiText(error), color = MaterialTheme.colorScheme.error)
             } },
             confirmButton = {
                 TextButton(
@@ -258,9 +281,9 @@ private fun kanbanProfileLabel(profile: String, profiles: List<JSONObject>, load
                         }
                         if (current()) confirm = null
                     } },
-                ) { Text(if (destination == "delete") "Delete" else "Move") }
+                ) { Text(uiText(if (destination == "delete") "Delete" else "Move")) }
             },
-            dismissButton = { TextButton(enabled = !busy, onClick = { confirm = null; error = "" }) { Text("Cancel") } },
+            dismissButton = { TextButton(enabled = !busy, onClick = { confirm = null; error = "" }) { Text(uiText("Cancel")) } },
         )
     }
     if (editing && draft.isNotBlank()) {
@@ -271,19 +294,19 @@ private fun kanbanProfileLabel(profile: String, profiles: List<JSONObject>, load
             fun change(key: String, value: String) { persist(record.copy().put(key, value).toString()) }
             fun cancelEdit() { if (!kanbanDraftChanged(record)) persist(""); editing = false; error = ""; conflict = null }
             BackHandler { if (editable) cancelEdit() }
-            AlertDialog(onDismissRequest = { if (editable) cancelEdit() }, title = { Text(if (record.string("id").isBlank()) "New task" else "Edit task") }, text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedTextField(record.string("title"), { change("title", it.take(160)) }, label = { Text("Title") }, modifier = Modifier.fillMaxWidth().testTag("kanban-title"), enabled = editable)
-                OutlinedTextField(record.string("body"), { change("body", it.take(16_000)) }, label = { Text("Description") }, minLines = 3, maxLines = 7, modifier = Modifier.fillMaxWidth(), enabled = editable)
+            AlertDialog(onDismissRequest = { if (editable) cancelEdit() }, title = { Text(uiText(if (record.string("id").isBlank()) "New task" else "Edit task")) }, text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedTextField(record.string("title"), { change("title", it.take(160)) }, label = { Text(uiText("Title")) }, modifier = Modifier.fillMaxWidth().testTag("kanban-title"), enabled = editable)
+                OutlinedTextField(record.string("body"), { change("body", it.take(16_000)) }, label = { Text(uiText("Description")) }, minLines = 3, maxLines = 7, modifier = Modifier.fillMaxWidth(), enabled = editable)
                 Box(Modifier.fillMaxWidth()) {
                     OutlinedButton(onClick = { profileMenu = true }, enabled = editable, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
-                        Text("Bot profile: ${kanbanProfileLabel(record.string("assignee"), profileRows, profileLoading)}", Modifier.weight(1f))
+                        Text("${uiText("Bot profile")}: ${kanbanProfileLabel(record.string("assignee"), profileRows, profileLoading)}", Modifier.weight(1f))
                         Icon(Icons.Rounded.ExpandMore, null)
                     }
                     DropdownMenu(profileMenu, { profileMenu = false }) {
-                        DropdownMenuItem(text = { Text("Unassigned") }, onClick = { profileMenu = false; change("assignee", "") })
+                        DropdownMenuItem(text = { Text(uiText("Unassigned")) }, onClick = { profileMenu = false; change("assignee", "") })
                         when {
-                            profileCatalog == null || profileCatalog.optBoolean("_loading") -> DropdownMenuItem(text = { Text("Loading profiles…") }, onClick = {}, enabled = false)
-                            profileCatalog.string("_error").isNotBlank() -> DropdownMenuItem(text = { Text("Profiles unavailable") }, onClick = {}, enabled = false)
+                            profileCatalog == null || profileCatalog.optBoolean("_loading") -> DropdownMenuItem(text = { Text(uiText("Loading profiles…")) }, onClick = {}, enabled = false)
+                            profileCatalog.string("_error").isNotBlank() -> DropdownMenuItem(text = { Text(uiText("Profiles unavailable")) }, onClick = {}, enabled = false)
                             else -> profileRows.forEach { profile ->
                                 val name = profile.string("name")
                                 if (name.isNotBlank()) DropdownMenuItem(text = { Text(profileDisplayName(name, profileRows)) }, onClick = { profileMenu = false; change("assignee", name) })
@@ -291,7 +314,7 @@ private fun kanbanProfileLabel(profile: String, profiles: List<JSONObject>, load
                         }
                     }
                 }
-                if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error)
+                if (error.isNotBlank()) Text(uiText(error), color = MaterialTheme.colorScheme.error)
             } }, confirmButton = { TextButton(enabled = editable && record.string("title").isNotBlank(), onClick = { act {
                 val fields = boardTaskFields(record.string("title"), record.string("body"), record.string("assignee"))
                 val id = record.string("id")
@@ -302,11 +325,11 @@ private fun kanbanProfileLabel(profile: String, profiles: List<JSONObject>, load
                     repo.update(board, id, fields)
                 }
                 if (current()) { cards = cards.filterNot { it.id == result.id } + result; selectedColumn = result.status; persist(""); editing = false }
-            } }) { Text(if (busy) "Saving…" else "Save") } }, dismissButton = { Row {
-                TextButton(enabled = editable, onClick = { persist(""); editing = false; error = ""; conflict = null }, modifier = Modifier.testTag("kanban-discard")) { Text("Discard") }
-                TextButton(enabled = editable, onClick = ::cancelEdit) { Text("Cancel") }
+            } }) { Text(uiText(if (busy) "Saving…" else "Save")) } }, dismissButton = { Row {
+                TextButton(enabled = editable, onClick = { persist(""); editing = false; error = ""; conflict = null }, modifier = Modifier.testTag("kanban-discard")) { Text(uiText("Discard")) }
+                TextButton(enabled = editable, onClick = ::cancelEdit) { Text(uiText("Keep draft")) }
             } })
-            conflict?.let { latest -> AlertDialog(onDismissRequest = { conflict = null }, title = { Text("Task changed on the dashboard") }, text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) { Text(latest.title); Text(latest.body); Text("Bot: ${kanbanProfileLabel(latest.assignee, profileRows, profileLoading)}"); Text("Review this version, then keep your edits or use the latest details.") } }, confirmButton = { TextButton(onClick = { persist(record.copy().put("base", latest.json()).toString()); conflict = null; error = "" }) { Text("Keep my edits") } }, dismissButton = { TextButton(onClick = { persist(record.copy().put("title", latest.title).put("body", latest.body).put("assignee", latest.assignee).put("base", latest.json()).toString()); conflict = null; error = "" }) { Text("Use latest") } }) }
+            conflict?.let { latest -> AlertDialog(onDismissRequest = { conflict = null }, title = { Text(uiText("Task changed on the dashboard")) }, text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) { Text(latest.title); Text(latest.body); Text("${uiText("Bot")}: ${kanbanProfileLabel(latest.assignee, profileRows, profileLoading)}"); Text(uiText("Review this version, then keep your edits or use the latest details.")) } }, confirmButton = { TextButton(onClick = { persist(record.copy().put("base", latest.json()).toString()); conflict = null; error = "" }) { Text(uiText("Keep my edits")) } }, dismissButton = { TextButton(onClick = { persist(record.copy().put("title", latest.title).put("body", latest.body).put("assignee", latest.assignee).put("base", latest.json()).toString()); conflict = null; error = "" }) { Text(uiText("Use latest")) } }) }
         }
     }
 }

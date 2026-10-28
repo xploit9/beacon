@@ -17,11 +17,11 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.clickable
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.ContentPaste
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.Info
-import androidx.compose.material.icons.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.AlertDialog
@@ -169,14 +169,17 @@ private val voiceStyles: Map<String, Map<String, String>> = mapOf(
     "gemini" to mapOf(
         "Zephyr" to "Bright", "Puck" to "Upbeat", "Charon" to "Informative", "Kore" to "Firm", "Fenrir" to "Excitable",
         "Leda" to "Youthful", "Orus" to "Firm", "Aoede" to "Breezy", "Callirrhoe" to "Easy-going", "Autonoe" to "Bright",
-        "Enceladus" to "Breathy", "Iapetus" to "Clear", "Umbriel" to "Easy-going", "Algieba" to "Smooth", "Despina" to "Smooth",
-        "Erinome" to "Clear", "Algenib" to "Gravelly", "Rasalgethi" to "Informative", "Laomedeia" to "Upbeat", "Achernar" to "Soft",
+        "Enceladus" to "Breathy", "Iapetus" to "Clear voice", "Umbriel" to "Easy-going", "Algieba" to "Smooth", "Despina" to "Smooth",
+        "Erinome" to "Clear voice", "Algenib" to "Gravelly", "Rasalgethi" to "Informative", "Laomedeia" to "Upbeat", "Achernar" to "Soft",
         "Alnilam" to "Firm", "Schedar" to "Even", "Gacrux" to "Mature", "Pulcherrima" to "Forward", "Achird" to "Friendly",
         "Zubenelgenubi" to "Casual", "Vindemiatrix" to "Gentle", "Sadachbia" to "Lively", "Sadaltager" to "Knowledgeable", "Sulafat" to "Warm",
     ),
     "grok" to mapOf("eve" to "Energetic", "ara" to "Warm and friendly", "rex" to "Confident and clear", "sal" to "Smooth", "leo" to "Authoritative"),
     "openai" to mapOf("marin" to "Best quality", "cedar" to "Best quality"),
 ).mapValues { (_, styles) -> styles.mapKeys { it.key.lowercase() } }
+
+/** The style words under the voices; the picker shows each through uiText. */
+internal val VoiceStyleStrings = voiceStyles.values.flatMap { it.values }.distinct()
 
 internal fun voiceStyle(provider: String, voice: String): String = voiceStyles[provider]?.get(voice.lowercase()).orEmpty()
 
@@ -194,28 +197,16 @@ internal val voicePersonalities = listOf(
     Triple("warm", "Warm", "Friendly and patient"),
 )
 
-internal fun voiceKeyResultMessage(provider: String, result: VoiceProviderTestResult): String {
-    val name = voiceProviderInfo(provider).short
-    return when (result) {
-        VoiceProviderTestResult.Success -> "Your $name key works."
-        VoiceProviderTestResult.KeyRejected -> "$name didn't accept this key. Check it and try again."
-        VoiceProviderTestResult.Unreachable -> "Couldn't reach $name. Check your connection and try again."
-        VoiceProviderTestResult.ProviderError -> "$name returned an error. Try again in a moment."
-    }
-}
-
 /** The rows shown before "More": the first [limit], plus the selected one wherever it sits in the stable order. */
 internal fun <T> visibleOptions(all: List<T>, selected: T, expanded: Boolean, limit: Int): List<T> =
     if (expanded) all else all.filterIndexed { index, option -> index < limit || option == selected }
-
-private const val VOICE_PAGE_DISCLOSURE = "During a call, Beacon sends your assistant's instructions, memory notes, recent chat, tool results and any camera or screen you share to the voice provider you choose."
 
 @Composable
 private fun KeySavedBadge() {
     Surface(shape = RoundedCornerShape(100.dp), color = MaterialTheme.colorScheme.primaryContainer, contentColor = MaterialTheme.colorScheme.onPrimaryContainer) {
         Row(Modifier.padding(horizontal = 10.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             Icon(Icons.Rounded.Check, null, Modifier.size(16.dp))
-            Text("Key saved", style = MaterialTheme.typography.labelMedium)
+            Text(uiText("Key saved"), style = MaterialTheme.typography.labelMedium)
         }
     }
 }
@@ -235,6 +226,7 @@ internal fun voiceProviderPage(
     var busy by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
+    val choiceNotSaved = uiText("Couldn't save that choice. Try again.")
     LaunchedEffect(Unit) { saved = withContext(Dispatchers.IO) { voiceProviders.map { it.id }.filter(store::hasKey).toSet() } }
 
     fun proceed() {
@@ -244,7 +236,7 @@ internal fun voiceProviderPage(
             val provider = selected
             val hasKey = withContext(Dispatchers.IO) { store.hasKey(provider) }
             if (hasKey && runCatchingCancellable { withContext(Dispatchers.IO) { store.setSelection(store.settings(provider)) } }.isFailure) {
-                status = "Couldn't save that choice. Try again."
+                status = choiceNotSaved
                 busy = false
                 return@launch
             }
@@ -268,7 +260,7 @@ internal fun voiceProviderPage(
                             RadioButton(isSelected, onClick = null)
                             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                 Text(info.name, style = MaterialTheme.typography.titleMedium)
-                                Text(info.note, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(uiText(info.note), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 if (info.id in saved) KeySavedBadge()
                             }
                         }
@@ -278,10 +270,10 @@ internal fun voiceProviderPage(
             SetupStatusLine(status, error = true)
         },
         actions = {
-            SetupPrimaryButton("Continue", ::proceed, Modifier.testTag("setup-voice-continue"), enabled = !busy)
-            onSkip?.let { SetupTextAction("Skip for now", it, Modifier.testTag("setup-voice-skip")) }
-            onBack?.let { SetupTextAction("Back", it, Modifier.testTag("voice-page-back")) }
-            onClose?.let { SetupTextAction("Close setup", it) }
+            SetupPrimaryButton(uiText("Continue"), ::proceed, Modifier.testTag("setup-voice-continue"), enabled = !busy)
+            onSkip?.let { SetupTextAction(uiText("Skip for now"), it, Modifier.testTag("setup-voice-skip")) }
+            onBack?.let { SetupTextAction(uiText("Back"), it, Modifier.testTag("voice-page-back")) }
+            onClose?.let { SetupTextAction(uiText("Close setup"), it) }
         },
     )
 }
@@ -315,6 +307,18 @@ internal fun voiceKeyPage(
     var status by remember(provider) { mutableStateOf("") }
     var statusIsError by remember(provider) { mutableStateOf(false) }
     var confirmRemove by remember(provider) { mutableStateOf(false) }
+    // Words the callbacks below show are translated here, where uiText can run.
+    val checkingText = uiText("Checking…")
+    val enterKeyFirst = uiText("Enter an API key first.")
+    val keyNotSaved = uiText("That key couldn't be saved. Try again.")
+    val choiceNotSaved = uiText("Couldn't save that choice. Try again.")
+    val keyNotRemoved = uiText("The key could not be removed.")
+    val keyMessages = mapOf(
+        VoiceProviderTestResult.Success to uiText("Your {0} key works."),
+        VoiceProviderTestResult.KeyRejected to uiText("{0} didn't accept this key. Check it and try again."),
+        VoiceProviderTestResult.Unreachable to uiText("Couldn't reach {0}. Check your connection and try again."),
+        VoiceProviderTestResult.ProviderError to uiText("{0} returned an error. Try again in a moment."),
+    )
     LaunchedEffect(provider) { saved = withContext(Dispatchers.IO) { store.maskedKey(provider) } }
     // A first key typed here is saved (encrypted) when the page is left, unless the provider just refused it. A saved key is only replaced by Test key, so a stray paste cannot overwrite a working one.
     DisposableEffect(provider) { onDispose { if (saved == null && draft.isNotBlank() && !rejected) runCatching { store.saveKey(provider, draft) } } }
@@ -328,13 +332,13 @@ internal fun voiceKeyPage(
 
     fun test() {
         val entered = draft
-        testing = true; rejected = false; retry = false; statusIsError = false; status = "Checking…"
+        testing = true; rejected = false; retry = false; statusIsError = false; status = checkingText
         scope.launch {
             val previous = withContext(Dispatchers.IO) { store.key(provider) }
             val apiKey = entered.ifEmpty { previous.orEmpty() }
-            if (apiKey.isBlank()) { status = "Enter an API key first."; statusIsError = true; testing = false; return@launch }
+            if (apiKey.isBlank()) { status = enterKeyFirst; statusIsError = true; testing = false; return@launch }
             if (entered.isNotEmpty() && runCatchingCancellable { withContext(Dispatchers.IO) { store.saveKey(provider, entered) } }.isFailure) {
-                status = "That key couldn't be saved. Try again."; statusIsError = true; testing = false; return@launch
+                status = keyNotSaved; statusIsError = true; testing = false; return@launch
             }
             val outcome = testVoiceProvider(provider, apiKey, store.settings(provider).model)
             when (outcome) {
@@ -345,7 +349,7 @@ internal fun voiceKeyPage(
                     VoiceCatalogCache.clear(provider)
                     VoiceCatalogCache.prefetch(provider, apiKey)
                     if (chosen) { status = ""; onKeySaved(); onVerified() }
-                    else { status = "Couldn't save that choice. Try again."; statusIsError = true }
+                    else { status = choiceNotSaved; statusIsError = true }
                 }
                 VoiceProviderTestResult.KeyRejected -> {
                     // Undo the replacement: the refused key must never show up as the saved one.
@@ -354,14 +358,14 @@ internal fun voiceKeyPage(
                     }
                     saved = withContext(Dispatchers.IO) { store.maskedKey(provider) }
                     rejected = true
-                    status = voiceKeyResultMessage(provider, outcome); statusIsError = true
+                    status = keyMessages.getValue(outcome).replace("{0}", info.short); statusIsError = true
                 }
                 else -> {
                     // The key could not be judged; it stays saved, the provider choice is kept, and the user may carry on.
                     runCatchingCancellable { withContext(Dispatchers.IO) { store.setSelection(store.settings(provider)) } }
                     if (entered.isNotEmpty()) { draft = ""; saved = withContext(Dispatchers.IO) { store.maskedKey(provider) } }
                     retry = true
-                    status = voiceKeyResultMessage(provider, outcome); statusIsError = true
+                    status = keyMessages.getValue(outcome).replace("{0}", info.short); statusIsError = true
                 }
             }
             testing = false
@@ -371,22 +375,22 @@ internal fun voiceKeyPage(
     return SetupPage(
         content = {
             TextButton(onClick = { uriHandler.openUri(info.keyUrl) }, Modifier.heightIn(min = 48.dp).testTag("voice-key-get")) {
-                Text("Get a key")
+                Text(uiText("Get a key"))
                 Spacer(Modifier.size(8.dp))
-                Icon(Icons.Rounded.OpenInNew, null, Modifier.size(18.dp))
+                Icon(Icons.AutoMirrored.Rounded.OpenInNew, null, Modifier.size(18.dp))
             }
             SetupContainer {
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Icon(Icons.Rounded.Info, null, Modifier.padding(top = 2.dp).size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(VOICE_PAGE_DISCLOSURE, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(uiText("During a call, Beacon sends your assistant's instructions, memory notes, recent chat, tool results and any camera or screen you share to the voice provider you choose."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
             OutlinedTextField(
                 value = draft,
                 onValueChange = { draft = it.filterNot(Char::isWhitespace).take(8192); status = ""; rejected = false; retry = false },
                 modifier = Modifier.fillMaxWidth().testTag("voice-provider-key"),
-                label = { Text("${info.short} API key") },
-                supportingText = { saved?.let { Text("Saved $it. Paste a new key to replace it.") } },
+                label = { Text(uiText("{0} API key").replace("{0}", info.short)) },
+                supportingText = { saved?.let { Text(uiText("Saved {0}. Paste a new key to replace it.").replace("{0}", it)) } },
                 isError = rejected,
                 enabled = !testing,
                 singleLine = true,
@@ -397,7 +401,7 @@ internal fun voiceKeyPage(
                     IconButton(onClick = { if (draft.isEmpty()) paste() else visible = !visible }, enabled = !testing) {
                         Icon(
                             if (draft.isEmpty()) Icons.Rounded.ContentPaste else if (visible) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
-                            if (draft.isEmpty()) "Paste key" else if (visible) "Hide key" else "Show key",
+                            if (draft.isEmpty()) uiText("Paste key") else if (visible) uiText("Hide key") else uiText("Show key"),
                         )
                     }
                 },
@@ -407,11 +411,11 @@ internal fun voiceKeyPage(
                 onClick = { confirmRemove = true }, enabled = !testing,
                 modifier = Modifier.heightIn(min = 48.dp).testTag("voice-key-remove"),
                 colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
-            ) { Text("Remove key") }
+            ) { Text(uiText("Remove key")) }
             if (confirmRemove) AlertDialog(
                 onDismissRequest = { confirmRemove = false },
-                title = { Text("Remove the ${info.short} key from this phone?") },
-                text = { Text("Calls with ${info.short} stop until you add a key.") },
+                title = { Text(uiText("Remove the {0} key from this phone?").replace("{0}", info.short)) },
+                text = { Text(uiText("Calls with {0} stop until you add a key.").replace("{0}", info.short)) },
                 confirmButton = {
                     TextButton(onClick = {
                         confirmRemove = false
@@ -420,18 +424,18 @@ internal fun voiceKeyPage(
                                 VoiceCatalogCache.clear(provider)
                                 saved = null
                                 onRemoved()
-                            } else { status = "The key could not be removed."; statusIsError = true }
+                            } else { status = keyNotRemoved; statusIsError = true }
                         }
-                    }, Modifier.testTag("voice-key-remove-confirm")) { Text("Remove key") }
+                    }, Modifier.testTag("voice-key-remove-confirm")) { Text(uiText("Remove key")) }
                 },
-                dismissButton = { TextButton(onClick = { confirmRemove = false }) { Text("Cancel") } },
+                dismissButton = { TextButton(onClick = { confirmRemove = false }) { Text(uiText("Cancel")) } },
             )
         },
         actions = {
-            SetupPrimaryButton(if (retry) "Try again" else "Test key", ::test, Modifier.testTag("voice-key-test"), enabled = canTest, loading = testing)
-            if (retry) SetupTextAction("Continue anyway", onContinueAnyway, Modifier.testTag("voice-key-continue-anyway"), enabled = !testing)
-            SetupTextAction("Back", onBack, Modifier.testTag("voice-page-back"), enabled = !testing)
-            if (!retry) onSkip?.let { SetupTextAction("Skip for now", it, Modifier.testTag("setup-voice-skip"), enabled = !testing) }
+            SetupPrimaryButton(if (retry) uiText("Try again") else uiText("Test key"), ::test, Modifier.testTag("voice-key-test"), enabled = canTest, loading = testing)
+            if (retry) SetupTextAction(uiText("Continue anyway"), onContinueAnyway, Modifier.testTag("voice-key-continue-anyway"), enabled = !testing)
+            SetupTextAction(uiText("Back"), onBack, Modifier.testTag("voice-page-back"), enabled = !testing)
+            if (!retry) onSkip?.let { SetupTextAction(uiText("Skip for now"), it, Modifier.testTag("setup-voice-skip"), enabled = !testing) }
         },
     )
 }
@@ -460,7 +464,7 @@ private fun VoiceOptionRow(label: String, note: String, selected: Boolean, tag: 
             RadioButton(selected, onClick = null)
             Column(Modifier.weight(1f)) {
                 Text(label, style = MaterialTheme.typography.bodyLarge)
-                if (note.isNotBlank()) Text(note, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (note.isNotBlank()) Text(uiText(note), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
@@ -468,11 +472,12 @@ private fun VoiceOptionRow(label: String, note: String, selected: Boolean, tag: 
 
 @Composable
 private fun VoiceMoreRow(text: String, tag: String, onClick: () -> Unit) {
+    val collapsed = uiText("Collapsed")
     Column {
         HorizontalDivider(Modifier.padding(start = 16.dp), color = MaterialTheme.colorScheme.outlineVariant)
         Row(
             Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag(tag).clickable(role = Role.Button, onClick = onClick)
-                .semantics { stateDescription = "Collapsed" }.padding(horizontal = 16.dp, vertical = 8.dp),
+                .semantics { stateDescription = collapsed }.padding(horizontal = 16.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(text, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
@@ -509,6 +514,7 @@ internal fun voiceChoicesPage(
     var moreModels by remember(provider) { mutableStateOf(false) }
     var status by remember { mutableStateOf("") }
     var ownerDraft by remember(ownerName) { mutableStateOf(ownerName) }
+    val choiceNotSaved = uiText("Couldn't save that choice. Try again.")
     LaunchedEffect(provider) {
         val key = withContext(Dispatchers.IO) { store.key(provider) }
         hasKey = key != null
@@ -524,7 +530,7 @@ internal fun voiceChoicesPage(
         scope.launch {
             if (runCatchingCancellable { withContext(Dispatchers.IO) { store.setSelection(next) } }.isFailure) {
                 selection = previous
-                status = "Couldn't save that choice. Try again."
+                status = choiceNotSaved
             }
         }
     }
@@ -535,53 +541,53 @@ internal fun voiceChoicesPage(
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (hasKey == true) Icon(Icons.Rounded.Check, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
                 Text(
-                    info.name + " · " + when { hasKey == false -> "No key"; keyWorks -> "Key works"; else -> "Key saved" },
+                    info.name + " · " + when { hasKey == false -> uiText("No key"); keyWorks -> uiText("Key works"); else -> uiText("Key saved") },
                     Modifier.weight(1f).testTag("voice-provider-summary"), style = MaterialTheme.typography.bodyMedium,
                 )
-                if (settingsMode) TextButton(onClick = onChange, Modifier.heightIn(min = 48.dp).testTag("voice-provider-change")) { Text("Change") }
+                if (settingsMode) TextButton(onClick = onChange, Modifier.heightIn(min = 48.dp).testTag("voice-provider-change")) { Text(uiText("Change")) }
             }
-            if (settingsMode && hasKey == false) SetupPrimaryButton("Add key", onAddKey, Modifier.testTag("voice-add-key"))
+            if (settingsMode && hasKey == false) SetupPrimaryButton(uiText("Add key"), onAddKey, Modifier.testTag("voice-add-key"))
             // The lists render at once from the built-in choices; only a confirmed missing key hides them (the key read can be slow).
             if (hasKey != false) {
-                if (settingsMode && callActive) Text("Changes apply to your next call.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (settingsMode && callActive) Text(uiText("Changes apply to your next call."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 // One row per voice whatever its capitalisation; a saved "aoede" selects the "Aoede" row.
                 val voices = (defaultVoiceChoices(provider) + catalog?.voices.orEmpty() + selection.voice).distinctBy { it.lowercase() }
                 val selectedVoice = voices.firstOrNull { it.equals(selection.voice, ignoreCase = true) } ?: selection.voice
                 val shownVoices = visibleOptions(voices, selectedVoice, moreVoices, 6)
-                VoiceOptionGroup("Voice") {
+                VoiceOptionGroup(uiText("Voice")) {
                     shownVoices.forEachIndexed { index, voice ->
                         VoiceOptionRow(voiceChoiceLabel(voice, voices), voiceStyle(provider, voice), voice == selectedVoice, "voice-option-voice-$voice", index > 0) { pick(selection.copy(voice = voice)) }
                     }
-                    if (shownVoices.size < voices.size) VoiceMoreRow("More voices (${voices.size - shownVoices.size})", "voice-more-voices") { moreVoices = true }
+                    if (shownVoices.size < voices.size) VoiceMoreRow(uiText("More voices ({0})").replace("{0}", "${voices.size - shownVoices.size}"), "voice-more-voices") { moreVoices = true }
                 }
-                VoiceOptionGroup("Personality") {
+                VoiceOptionGroup(uiText("Personality")) {
                     voicePersonalities.forEachIndexed { index, (id, label, note) ->
-                        VoiceOptionRow(label, note, id == selection.personality, "voice-option-personality-$id", index > 0) { pick(selection.copy(personality = id)) }
+                        VoiceOptionRow(uiText(label), note, id == selection.personality, "voice-option-personality-$id", index > 0) { pick(selection.copy(personality = id)) }
                     }
                 }
                 val models = (listOf(openingModel) + catalog?.models.orEmpty().ifEmpty { listOf(defaultVoiceModel(provider)) } + selection.model).distinct()
                 if (models.size > 1) {
                     val shownModels = visibleOptions(models, selection.model, moreModels, 4)
-                    VoiceOptionGroup("Model") {
+                    VoiceOptionGroup(uiText("Model")) {
                         shownModels.forEachIndexed { index, model ->
                             VoiceOptionRow(voiceModelDisplayName(model), voiceModelNote(provider, model), model == selection.model, "voice-option-model-$model", index > 0) { pick(selection.copy(model = model)) }
                         }
-                        if (shownModels.size < models.size) VoiceMoreRow("More models (${models.size - shownModels.size})", "voice-more-models") { moreModels = true }
+                        if (shownModels.size < models.size) VoiceMoreRow(uiText("More models ({0})").replace("{0}", "${models.size - shownModels.size}"), "voice-more-models") { moreModels = true }
                     }
                 }
                 if (onOwnerNameChange != null) OutlinedTextField(
                     ownerDraft, { ownerDraft = ownerNameOf(it); onOwnerNameChange(ownerDraft) },
-                    label = { Text("What should Beacon call you?") }, supportingText = { Text("Optional") }, singleLine = true,
+                    label = { Text(assistantText("What should Beacon call you?")) }, supportingText = { Text(uiText("Optional")) }, singleLine = true,
                     modifier = Modifier.fillMaxWidth().testTag("setup-owner-name"),
                 )
-                if (models.size <= 1) Text("Model: " + voiceModelDisplayName(selection.model), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (models.size <= 1) Text(uiText("Model: {0}").replace("{0}", voiceModelDisplayName(selection.model)), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 SetupStatusLine(status, error = true)
             }
         },
         actions = {
             if (!settingsMode) {
-                SetupPrimaryButton("Continue", onContinue, Modifier.testTag("setup-voice-customize-continue"))
-                SetupTextAction("Back", onBack, Modifier.testTag("voice-page-back"))
+                SetupPrimaryButton(uiText("Continue"), onContinue, Modifier.testTag("setup-voice-customize-continue"))
+                SetupTextAction(uiText("Back"), onBack, Modifier.testTag("voice-page-back"))
             }
         },
     )

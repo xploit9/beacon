@@ -3,9 +3,11 @@ package dev.hermes.android.ui
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.shadow
@@ -37,9 +39,10 @@ internal fun navigationRoute(destination: String): NavigationRoute = when (desti
     else -> error("Unknown navigation destination: $destination")
 }
 internal fun navigationColumns(width: Float, fontScale: Float): Int = if (width >= 240 && fontScale <= 1.1f) 4 else 2
-internal fun navigationRows(columns: Int): List<List<String>> = if (columns == 4) navigationTiles.chunked(4) else listOf(
-    listOf("Skills", "Memory"), listOf("Cron", "Files"), listOf("Projects"), listOf("Bots", "Kanban"), listOf("Settings"),
-)
+// The tiles are in pairs, so two columns give four full rows and no tile stretches alone.
+internal fun navigationRows(columns: Int): List<List<String>> = navigationTiles.chunked(columns)
+/** What a tile says; its name and test tag stay "Cron". */
+internal fun navigationLabel(name: String): String = if (name == "Cron") "Schedules" else name
 private fun navigationIcon(name: String): ImageVector = when (name) {
     "Skills" -> Icons.Rounded.AutoAwesome
     "Memory" -> Icons.Rounded.Psychology
@@ -51,6 +54,9 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
     else -> Icons.Rounded.Tune
 }
 
+/** The tile names the drawer shows through uiText ("Cron" reads Schedules); the Bots tile reads Bot Mode instead. */
+internal val NavigationStrings = (navigationTiles - "Bots").map(::navigationLabel)
+
 @Composable internal fun SidebarNavigation(vm: BeaconViewModel) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
@@ -60,6 +66,11 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
     val currentProfileLabel = profileDisplayLabel(currentProfile, profileRows, ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading")))
     LaunchedEffect(ui.origin, ui.owner, ui.connected) { if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     var profilesOpen by remember(ui.origin, ui.owner, ui.profile) { mutableStateOf(false) }
+    var naming by rememberSaveable { mutableStateOf(false) }
+    val switchingLabel = uiText("Switching")
+    val onLabel = uiText("On")
+    val offLabel = uiText("Off")
+    if (naming) NewThreadDialog(vm, onDismiss = { naming = false })
     Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         if (ui.botModeEnabled) {
             OutlinedButton(onClick = vm::showBotMode, enabled = !ui.botModeSwitching, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp).testTag("navigation-bot-mode-home")) {
@@ -69,7 +80,7 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
                     Text(uiText("Bot Mode"), style = MaterialTheme.typography.titleMedium)
                     Text(uiText("Bots & shared spaces"), style = MaterialTheme.typography.labelSmall)
                 }
-                Icon(Icons.Rounded.ChevronRight, null)
+                Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, null)
             }
             OutlinedButton(onClick = vm::toggleBotMode, enabled = !ui.botModeSwitching, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("navigation-leave-bot-mode")) {
                 Text(uiText("Leave Bot Mode"))
@@ -101,8 +112,13 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
                     }
                 }
             }
-            Button(onClick = { vm.tab("Chat"); vm.newChat() }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("navigation-new-chat"), shape = RoundedCornerShape(14.dp), enabled = !ui.newChatOpening) {
-                Icon(Icons.Rounded.Add, null); Spacer(Modifier.width(8.dp)); Text(uiText(if (ui.newChatOpening) "Opening chat…" else "New chat"))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { vm.tab("Chat"); vm.newChat() }, modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("navigation-new-chat"), shape = RoundedCornerShape(14.dp), enabled = !ui.newChatOpening) {
+                    Icon(Icons.Rounded.Add, null); Spacer(Modifier.width(8.dp)); Text(uiText(if (ui.newChatOpening) "Opening chat…" else "New chat"))
+                }
+                FilledTonalButton(onClick = { naming = true }, modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("navigation-new-thread"), shape = RoundedCornerShape(14.dp), enabled = !ui.newChatOpening) {
+                    Icon(Icons.Rounded.Forum, null); Spacer(Modifier.width(8.dp)); Text(uiText("New thread"))
+                }
             }
         }
         BoxWithConstraints(Modifier.fillMaxWidth()) {
@@ -114,11 +130,11 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
                             val route = navigationRoute(name)
                             val isBotToggle = name == "Bots"
                             val active = if (isBotToggle) ui.botModeEnabled else ui.tab == route.tab && ui.morePage == route.page
-                            Surface(onClick = { vm.navigate(name) }, enabled = !isBotToggle || !ui.botModeSwitching, modifier = Modifier.weight(1f).shadow(if (isBotToggle && active) 12.dp else 0.dp, RoundedCornerShape(12.dp), clip = false, ambientColor = MaterialTheme.colorScheme.primary, spotColor = MaterialTheme.colorScheme.primary).semantics { role = if (isBotToggle) Role.Switch else Role.Button; if (isBotToggle) { toggleableState = if (ui.botModeEnabled) ToggleableState.On else ToggleableState.Off; stateDescription = if (ui.botModeSwitching) "Switching" else if (ui.botModeEnabled) "On" else "Off" } else selected = active }.testTag("navigation-${name.lowercase()}"), shape = RoundedCornerShape(12.dp), color = if (active) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh, border = androidx.compose.foundation.BorderStroke(if (isBotToggle && active) 2.dp else 1.dp, if (isBotToggle && active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant)) {
+                            Surface(onClick = { vm.navigate(name) }, enabled = !isBotToggle || !ui.botModeSwitching, modifier = Modifier.weight(1f).shadow(if (isBotToggle && active) 12.dp else 0.dp, RoundedCornerShape(12.dp), clip = false, ambientColor = MaterialTheme.colorScheme.primary, spotColor = MaterialTheme.colorScheme.primary).semantics { role = if (isBotToggle) Role.Switch else Role.Button; if (isBotToggle) { toggleableState = if (ui.botModeEnabled) ToggleableState.On else ToggleableState.Off; stateDescription = if (ui.botModeSwitching) switchingLabel else if (ui.botModeEnabled) onLabel else offLabel } else selected = active }.testTag("navigation-${name.lowercase()}"), shape = RoundedCornerShape(12.dp), color = if (active) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh, border = androidx.compose.foundation.BorderStroke(if (isBotToggle && active) 2.dp else 1.dp, if (isBotToggle && active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant)) {
                                 Column(Modifier.fillMaxWidth().heightIn(min = 64.dp).padding(horizontal = 4.dp, vertical = 10.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(5.dp)) {
                                     Icon(navigationIcon(name), null, Modifier.size(20.dp), tint = if (isBotToggle && active) MaterialTheme.colorScheme.primary else LocalContentColor.current)
                                     // The glow and border show Bot Mode is on; TalkBack hears it from the row's state description.
-                                    Text(uiText(if (isBotToggle) "Bot Mode" else name), style = MaterialTheme.typography.labelMedium, color = if (isBotToggle && active) MaterialTheme.colorScheme.primary else LocalContentColor.current)
+                                    Text(uiText(if (isBotToggle) "Bot Mode" else navigationLabel(name)), style = MaterialTheme.typography.labelMedium, color = if (isBotToggle && active) MaterialTheme.colorScheme.primary else LocalContentColor.current)
                                 }
                             }
                         }

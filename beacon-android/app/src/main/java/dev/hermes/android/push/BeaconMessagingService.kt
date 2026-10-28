@@ -12,11 +12,13 @@ import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 import dev.hermes.android.*
 import dev.hermes.android.core.*
+import dev.hermes.android.data.ApiFailure
 import dev.hermes.android.data.AppPreferences
 import dev.hermes.android.data.BeaconClient
 import dev.hermes.android.data.NativePairing
 import dev.hermes.android.data.NativeDeviceRemoval
 import dev.hermes.android.data.authorizesPushSource
+import dev.hermes.android.data.nativeErrorCodeText
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -60,6 +62,20 @@ internal fun restampableKeepConnectedSource(existing: JSONObject, scope: Scope, 
 internal fun pushTargetRetained(target: String, bindings: List<JSONObject>): Boolean = bindings.any { it.string("target") == target }
 internal fun pushDeviceAuthorized(removed: Boolean, registeredDevice: String, currentDevice: String?): Boolean =
     !removed && (registeredDevice.isBlank() || registeredDevice == currentDevice)
+private const val ADD_PHONE_AGAIN = "Add this phone again in Settings › Connection before turning on notifications"
+/**
+ * A push registration from a phone Hermes no longer knows is a 403 `device_required`: link again and retry once. ApiFailure
+ * carries that code as plain words, so compare through the same mapping; a removed phone (`device_removed`) maps to other words and is refused.
+ * shortcut: any other unmapped snake_case 403 reads the same, so it costs one extra link and retry (the targets route sends only these two); upgrade if ApiFailure ever carries the raw code.
+ */
+internal fun staleDeviceFailure(error: Throwable): Boolean =
+    error is ApiFailure && error.plugin && error.status == 403 && error.detail == nativeErrorCodeText("device_required")
+/** Sends [request]; if Hermes lost this phone, links it again with [relink] and sends once more. A second failure is thrown, never retried. */
+internal suspend fun <T> retryOnceAfterRelink(request: suspend () -> T, relink: suspend () -> Unit): T = try { request() } catch (e: ApiFailure) {
+    if (!staleDeviceFailure(e)) throw e
+    relink()
+    request()
+}
 /** A failed commit may still mutate SharedPreferences memory; restore the prior transaction before reporting failure. */
 internal fun persistPushBindings(prefs:android.content.SharedPreferences,values:Map<String,String?>) {
     val previous=values.keys.associateWith { prefs.getString(it,null) }
@@ -150,16 +166,20 @@ class PushManager(private val app: BeaconApplication) {
         require(app.firebaseConfigured) { "Firebase is not configured in this build. Set the owner Firebase project before enabling background push." }
         require(app.auth.read(client.auth.origin).authorizesPushSource(client.scope)) { "Sign in to this owner account before registering notifications" }
         // The plugin takes a push target only from a linked phone, so link first; an automatic link leaves a removed phone alone (null).
-        val deviceId = NativePairing.deviceId(app, client.scope)
-            ?: if (privatePrefs.getBoolean(removedKey(client.scope), false)) null else NativePairing.link(app, client, explicit = false)
-        requireNotNull(deviceId) { "Add this phone again in Settings › Connection before turning on notifications" }
+        var deviceId: String = requireNotNull(NativePairing.deviceId(app, client.scope)
+            ?: if (privatePrefs.getBoolean(removedKey(client.scope), false)) null else NativePairing.link(app, client, explicit = false)) { ADD_PHONE_AGAIN }
         val token = rotatedToken ?: suspendCancellableCoroutine<String> { c -> FirebaseMessaging.getInstance().token.addOnSuccessListener { if (c.isActive) c.resume(it) }.addOnFailureListener { if (c.isActive) c.resumeWithException(it) } }
         require(token.isNotBlank()) { "Firebase did not return a device token" }
         val previous = synchronized(lock) {
             runCatching { read("active:${client.scope.key}") }.getOrNull()?.takeIf { validOpaque(it.string("source"))&&validOpaque(it.string("target")) }
                 ?:bindings().firstOrNull { bindingScope(it)==client.scope&&validOpaque(it.string("source"))&&validOpaque(it.string("target")) }
         }
-        val o = client.nativeRequest("/api/plugins/beacon/mobile/notifications/targets", "POST", json("kind" to "fcm", "token" to token, "app_version_code" to BuildConfig.VERSION_CODE, "package_name" to BuildConfig.APPLICATION_ID))
+        val targets = "/api/plugins/beacon/mobile/notifications/targets"
+        val body = json("kind" to "fcm", "token" to token, "app_version_code" to BuildConfig.VERSION_CODE, "package_name" to BuildConfig.APPLICATION_ID)
+        // Hermes lost this phone if its database was reset; linking again replaces the unknown ID before the one retry.
+        val o = retryOnceAfterRelink({ client.nativeRequest(targets, "POST", body) }) {
+            deviceId = requireNotNull(NativePairing.link(app, client, explicit = false)) { ADD_PHONE_AGAIN }
+        }
         val target = o.getString("target_id")
         val source = o.string("source_ref")
         try {
@@ -442,7 +462,7 @@ class PushManager(private val app: BeaconApplication) {
             if(account.nativeProvider.isNotBlank()&&unstampedBindingOfAccount(binding,account.scope())) {
                 val carried=runCatching {
                     withTimeout(10000) {
-                        require(deviceAuthorized(binding)) { "Add this phone again in Settings › Connection before turning on notifications" }
+                        require(deviceAuthorized(binding)) { ADD_PHONE_AGAIN }
                         val c=KeepConnectedService.createClient(app,account).forAuthorizedProfile(binding.getString("profile"))
                         try {
                             c.bootstrap()

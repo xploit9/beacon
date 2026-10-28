@@ -9,13 +9,14 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import dev.hermes.android.core.Scope
 import dev.hermes.android.core.string
 import dev.hermes.android.core.sessionRowId
 import dev.hermes.android.core.sessionRowKey
 import dev.hermes.android.data.BEACON_THREAD_SOURCE
 import dev.hermes.android.data.THREAD_SOURCES
-import dev.hermes.android.data.currentAssistantName
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Calendar
@@ -48,7 +49,8 @@ internal fun historySearchRows(loaded: List<JSONObject>, query: String, serverMa
 /** Readable names for Hermes session sources; an unknown platform keeps its own name. */
 internal fun historySourceLabel(source: String): String = when (source.trim().lowercase(Locale.ROOT)) {
     "android" -> "Beacon"
-    BEACON_THREAD_SOURCE -> "$currentAssistantName threads"
+    // Thread sources are never offered as a filter (historySources drops them); this label only sorts and is listed.
+    BEACON_THREAD_SOURCE -> "Beacon threads"
     "phone" -> "Relay threads"
     "webui" -> "Web"
     "desktop" -> "Desktop"
@@ -60,6 +62,10 @@ internal fun historySourceLabel(source: String): String = when (source.trim().lo
     "oneshot" -> "One-off runs"
     else -> source.trim().replace('_', ' ').replaceFirstChar { it.titlecase(Locale.ROOT) }
 }
+
+/** The fixed texts History shows through variables: its view tabs, orders and source names. */
+internal val HistoryStrings = listOf("All", "Pinned", "Threads") + HistoryOrder.entries.map(HistoryOrder::label) +
+    listOf("android", BEACON_THREAD_SOURCE, "phone", "webui", "desktop", "tui", "cli", "api_server", "bot_room", "subagent", "oneshot").map(::historySourceLabel)
 
 /** Sources offered in the filter: those listed now plus any the user has hidden (they are no longer listed). */
 internal fun historySources(rows: List<JSONObject>, hidden: Set<String>): List<String> =
@@ -252,7 +258,7 @@ internal fun chatPreviewText(raw: String): String {
  * The line under a chat's title: the newest message this phone has seen, else Hermes' own preview (the chat's first message).
  * A preview that only repeats the title gives way to the message count.
  */
-internal fun chatPreviewLine(row: JSONObject, glance: ChatGlance?, you: String = "You"): String {
+internal fun chatPreviewLine(row: JSONObject, glance: ChatGlance?, you: String = "You", oneMessage: String = "1 message", manyMessages: String = "{0} messages"): String {
     val remembered = glance?.preview?.takeIf { it.isNotBlank() }
     if (glance != null && remembered != null) return if (glance.role == "user") "$you: $remembered" else remembered
     val title = row.string("title").trim().trimEnd('.', '…')
@@ -260,28 +266,28 @@ internal fun chatPreviewLine(row: JSONObject, glance: ChatGlance?, you: String =
     val cut = first.trimEnd('.', '…')
     if (cut.isNotBlank() && !title.equals(cut, ignoreCase = true) && !title.startsWith(cut, ignoreCase = true)) return first
     val count = row.optInt("message_count")
-    return if (count > 0) "$count ${if (count == 1) "message" else "messages"}" else ""
+    return if (count > 0) (if (count == 1) oneMessage else manyMessages).replace("{0}", "$count") else ""
 }
 
 /** Time of the newest activity for a list row: the clock today, the weekday this week, else the date. */
-internal fun chatListTime(epochMs: Long, now: Long = System.currentTimeMillis(), zone: TimeZone = TimeZone.getDefault(), locale: Locale = Locale.getDefault()): String {
+internal fun chatListTime(epochMs: Long, now: Long = System.currentTimeMillis(), zone: TimeZone = TimeZone.getDefault(), locale: Locale = Locale.getDefault(), is24Hour: Boolean = false): String {
     if (epochMs <= 0L) return ""
     fun midnight(daysBack: Int) = Calendar.getInstance(zone).apply {
         timeInMillis = now; set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0); add(Calendar.DAY_OF_YEAR, -daysBack)
     }.timeInMillis
     fun year(millis: Long) = Calendar.getInstance(zone).apply { timeInMillis = millis }.get(Calendar.YEAR)
     val pattern = when {
-        epochMs >= midnight(0) -> "h:mm a"
+        epochMs >= midnight(0) -> nativeClockPattern(locale, is24Hour)
         epochMs >= midnight(6) -> "EEE"
-        year(epochMs) == year(now) -> "MMM d"
-        else -> "MMM d, yyyy"
+        else -> nativeDayPattern(locale, withYear = year(epochMs) != year(now), withWeekday = false)
     }
     return java.text.SimpleDateFormat(pattern, locale).also { it.timeZone = zone }.format(java.util.Date(epochMs))
 }
 
 /** Relay's thread-spool glyph: a message trunk that curls into a second message. */
 @Composable internal fun ThreadSpoolGlyph(modifier: Modifier = Modifier, tint: Color = Color.Black) {
-    Canvas(modifier = modifier) {
+    val description = uiText("Thread")
+    Canvas(modifier = modifier.semantics { contentDescription = description }) {
         val s = size.minDimension
         val strokeW = s * 0.10f
         val trunkX = s * 0.30f

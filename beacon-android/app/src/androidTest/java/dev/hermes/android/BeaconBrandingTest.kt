@@ -29,6 +29,14 @@ class BeaconBrandingTest {
         compose.onNodeWithText("Nova chat").assertExists()
     }
 
+    @Test fun englishShowsTheAppsOwnWordsWhereTheCatalogCasesThemDifferently() {
+        // The catalog's English has "off", "no key" and "Schedule"; the app's words must not change case under it.
+        compose.setContent { NativeLocalization("en") { Text(dev.hermes.android.ui.uiText("Off")); Text(dev.hermes.android.ui.uiText("No key")); Text("1 " + dev.hermes.android.ui.uiText("schedule")) } }
+        compose.onNodeWithText("Off").assertExists()
+        compose.onNodeWithText("No key").assertExists()
+        compose.onNodeWithText("1 schedule").assertExists()
+    }
+
     @Test fun darkSkinGivesPlainTextTheBackgroundForegroundColor() {
         var observed = Color.Unspecified
         var expected = Color.Unspecified
@@ -55,16 +63,17 @@ class BeaconBrandingTest {
         compose.onNode(hasText("Xara", substring = true)).assertDoesNotExist()
         val catalogs = app.assets.open("native-locales.json").bufferedReader().use { JSONObject(it.readText()) }
         assertEquals("Open Beacon", catalogs.getJSONObject("en").getString("open beacon"))
-        assertEquals("Open Beacon", catalogs.getJSONObject("en").getString("open beacon"))
-        assertEquals("Beacon", catalogs.getJSONObject("ar").getString("beacon"))
         assertEquals("Beacon", catalogs.getJSONObject("ar").getString("beacon"))
         assertTrue(catalogs.getJSONObject("ar").getString("beacon password").contains("Beacon"))
-        assertTrue(catalogs.getJSONObject("ar").getString("beacon password").contains("Beacon"))
+        // Hermes is the server's name: a translation may say it only where the English text does, not inside a path or variable.
+        val namesHermes = Regex("""(?<![./_])\bhermes\b""")
         for (language in catalogs.keys()) {
             val values = catalogs.getJSONObject(language)
             for (key in values.keys()) {
                 val translated = values.getString(key)
-                assertFalse("Retired visible brand in $language/$key", Regex("""(?<![./_])\b(?:Hermes|Xara)\b""", RegexOption.IGNORE_CASE).containsMatchIn(translated))
+                // Xara never appears.
+                val retired = if (namesHermes.containsMatchIn(key)) """(?<![./_])\bXara\b""" else """(?<![./_])\b(?:Hermes|Xara)\b"""
+                assertFalse("Retired visible brand in $language/$key", Regex(retired, RegexOption.IGNORE_CASE).containsMatchIn(translated))
             }
         }
     }

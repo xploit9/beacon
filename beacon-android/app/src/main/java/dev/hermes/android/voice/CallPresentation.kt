@@ -32,6 +32,12 @@ internal fun callStatusLabel(call: CallState): String {
         else -> call.state.replaceFirstChar { it.titlecase() }
     }
 }
+/** Every fixed English label that reaches uiText through a variable ([callStatusLabel], [transcriptLabel], the call history error), so the translation test can read them. */
+internal val CallStrings = listOf(
+    "Call on hold", "Connecting", "Thinking", "Speaking", "Muted", "Listening", "Idle", "Ending",
+    "Some of this call wasn't saved to the chat", "Saving to the chat", "Saved to the chat",
+    "Call history unavailable",
+)
 internal fun callTimerLabel(startedAtMillis: Long, nowMillis: Long): String {
     val elapsedSeconds = if (startedAtMillis > 0) ((nowMillis - startedAtMillis).coerceAtLeast(0) / 1000) else 0
     return String.format(Locale.ROOT, "%02d:%02d", elapsedSeconds / 60, elapsedSeconds % 60)

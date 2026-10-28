@@ -11,19 +11,22 @@ internal fun nativeLanguageFor(locale: java.util.Locale): String {
     if (language == "zh") return if (locale.script == "Hant" || locale.country in setOf("TW", "HK", "MO")) "zh-Hant" else "zh"
     return language.takeIf { it in NativeLanguages } ?: "en"
 }
-private val LocalUiStrings = staticCompositionLocalOf { JSONObject() }
-private val nativeAliases = mapOf("Conversations" to "Sessions", "Spaces" to "Workspaces", "Connect securely" to "Sign in", "Beacon password" to "Password", "Model & provider" to "Model", "Providers & models" to "Providers", "Tools & commands" to "Tools", "App updates" to "Updates", "Search conversations" to "Search sessions", "New conversation" to "New chat", "Search this conversation" to "Search in conversation", "Undo last turn" to "Undo", "Retry last turn" to "Retry", "Attach a file" to "Attach file", "Stop response" to "Stop", "Dictate message" to "Dictate", "Toolsets" to "Toolsets")
+// One shared empty dictionary: English and a catalog still loading look nothing up.
+private val NoStrings = JSONObject()
+private val LocalUiStrings = staticCompositionLocalOf { NoStrings }
+internal val nativeAliases = mapOf("Conversations" to "Sessions", "Spaces" to "Workspaces", "Connect securely" to "Sign in", "Beacon password" to "Password", "Model & provider" to "Model", "Providers & models" to "Providers", "Tools & commands" to "Tools", "App updates" to "Updates", "Search conversations" to "Search sessions", "New conversation" to "New chat", "Search this conversation" to "Search in conversation", "Undo last turn" to "Undo", "Retry last turn" to "Retry", "Attach a file" to "Attach file", "Stop response" to "Stop", "Dictate message" to "Dictate", "Toolsets" to "Toolsets")
 private val whitespace = Regex("\\s+")
-private fun normalized(value: String) = value.lowercase().replace("…", "...").replace(whitespace, " ").trim()
+internal fun normalized(value: String) = value.lowercase().replace("…", "...").replace(whitespace, " ").trim()
 
 /** Bundled translations are data from the same frozen catalog as Hermes WebUI. Content stays verbatim. */
 @Composable fun NativeLocalization(language: String, content: @Composable () -> Unit) {
     val context = LocalContext.current
     val app = context.applicationContext as dev.hermes.android.BeaconApplication
-    val catalogs by produceState(app.cachedTranslations, app) {
-        if (value == null) value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { app.readTranslations() }
+    // English shows the app's own words as written, so it never reads the catalog; its entries differ in case and would only change them.
+    val catalogs by produceState(app.cachedTranslations, app, language) {
+        if (value == null && language != "en") value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { app.readTranslations() }
     }
-    CompositionLocalProvider(LocalUiStrings provides (catalogs?.optJSONObject(language) ?: JSONObject()), content = content)
+    CompositionLocalProvider(LocalUiStrings provides (catalogs?.optJSONObject(language)?.takeIf { language != "en" } ?: NoStrings), content = content)
 }
 /** The assistant's display name from Settings › Assistant (the app itself stays Beacon). */
 val LocalAssistantName = staticCompositionLocalOf { dev.hermes.android.data.DEFAULT_ASSISTANT_NAME }

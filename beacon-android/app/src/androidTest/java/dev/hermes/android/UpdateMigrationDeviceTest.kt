@@ -70,16 +70,16 @@ class UpdateMigrationDeviceTest {
     }
 
     /** GitHub, as the app sees it: the latest release, its metadata file and its APK. Every request is recorded. */
-    private inner class FakeGitHub(var code: Long = installedCode + 1, var digest: String = "", var signer: String = ApkUpdater(app).signer()) : Interceptor {
+    private inner class FakeGitHub(var code: Long = installedCode + 1, var digest: String = "", var signer: String = ApkUpdater(app).signer(), var name: String = "99.0.0") : Interceptor {
         val paths = CopyOnWriteArrayList<String>()
         var etag = "\"v1\""
         private val sha get() = digest.ifBlank { sha256(apk) }
-        private fun assetUrl(name: String) = "https://github.com/xploit9/beacon/releases/download/v99.0.0/$name"
-        private fun announcement() = JSONObject().put("tag_name", "v99.0.0").put("draft", false).put("prerelease", false).put("body", "## What's new\n- Calmer updates")
+        private fun assetUrl(file: String) = "https://github.com/xploit9/beacon/releases/download/v$name/$file"
+        private fun announcement() = JSONObject().put("tag_name", "v$name").put("draft", false).put("prerelease", false).put("body", "## What's new\n- Calmer updates")
             .put("published_at", "2026-10-24T09:00:00Z").put("assets", JSONArray(listOf(
-                JSONObject().put("name", "Beacon-99.0.0.json").put("browser_download_url", assetUrl("Beacon-99.0.0.json")).put("size", 10).put("state", "uploaded"),
-                JSONObject().put("name", "Beacon-99.0.0.apk").put("browser_download_url", assetUrl("Beacon-99.0.0.apk")).put("size", apk.size).put("state", "uploaded"))))
-        private fun metadata() = JSONObject().put("package_name", target.packageName).put("version_name", "99.0.0").put("version_code", code).put("artifact_filename", "Beacon-99.0.0.apk")
+                JSONObject().put("name", "Beacon-$name.json").put("browser_download_url", assetUrl("Beacon-$name.json")).put("size", 10).put("state", "uploaded"),
+                JSONObject().put("name", "Beacon-$name.apk").put("browser_download_url", assetUrl("Beacon-$name.apk")).put("size", apk.size).put("state", "uploaded"))))
+        private fun metadata() = JSONObject().put("package_name", target.packageName).put("version_name", name).put("version_code", code).put("artifact_filename", "Beacon-$name.apk")
             .put("size_bytes", apk.size).put("sha256", sha).put("certificate_sha256", signer).put("plugin_version", "1.1.3")
         override fun intercept(chain: Interceptor.Chain): Response {
             val request = chain.request()
@@ -186,6 +186,81 @@ class UpdateMigrationDeviceTest {
         assertTrue(File(directory, "updates").listFiles().orEmpty().isEmpty())
         assertEquals(sessions, sessionsBefore)
         assertEquals(0, installerOpened.get())
+    }
+
+    /** The verified download an earlier tap kept for [version], as download() leaves it: the stand-in bytes carry exactly the size and checksum FakeGitHub announces. */
+    private fun retainDownload(version: Long) {
+        val name = "Beacon-$version-${sha256(apk).take(16)}.apk"
+        File(File(directory, "updates").apply { mkdirs() }, name).writeBytes(apk)
+        assertTrue(prefs.edit().putString("pending_file", name).putString("pending_sha", sha256(apk)).putLong("pending_size", apk.size.toLong()).putLong("pending_version", version).commit())
+    }
+
+    /** Where a run that reaches the installer ends on these stand-in bytes: Android's permission page, or with that permission the install-time check that refuses them. No session is created either way. */
+    private suspend fun reachedTheInstaller(manager: UpdateManager) {
+        val settled = withTimeout(20_000) { manager.state.first { it.phase == UpdatePhase.NeedsPermission || it.phase == UpdatePhase.Failed } }
+        if (app.packageManager.canRequestPackageInstalls()) assertEquals(UpdateFailure.Verification, settled.failure) else assertEquals(UpdatePhase.NeedsPermission, settled.phase)
+    }
+
+    @Test fun anUpdateTapDownloadsTheReleaseGitHubHasNowAndNotTheOneFromTheLastCheck() = runBlocking {
+        val sessions = sessionsBefore
+        val github = FakeGitHub()
+        val manager = manager(github)
+        manager.backgroundCheck()
+        assertEquals(installedCode + 1, manager.state.value.release?.version)
+        // GitHub moves on after that check: the offer on screen still names the older release, the tap must not.
+        github.code = installedCode + 2; github.name = "99.0.1"; github.etag = "\"v2\""
+        manager.startUpdate(null)
+        // The stand-in bytes are not an APK, so the run ends at the download's own verification, before any installer.
+        val failed = withTimeout(20_000) { manager.state.first { it.phase == UpdatePhase.Failed } }
+        assertEquals(UpdateFailure.Verification, failed.failure)
+        assertEquals(installedCode + 2, failed.release?.version)
+        assertEquals(installedCode + 2, prefs.getLong("seen_code", 0))
+        assertEquals(2, github.requests("/releases/latest"))
+        assertEquals(1, github.requests("Beacon-99.0.1.apk"))
+        assertEquals(0, github.requests("Beacon-99.0.0.apk"))
+        assertFalse(prefs.contains("pending_file"))
+        assertTrue(File(directory, "updates").listFiles().orEmpty().isEmpty())
+        assertEquals(sessions, sessionsBefore)
+        assertEquals(0, installerOpened.get())
+    }
+
+    @Test fun anUpdateTapOffersTheNewestReleasesKeptDownloadForInstallAndNeverTheOlderOne() = runBlocking {
+        val sessions = sessionsBefore
+        val github = FakeGitHub()
+        val manager = manager(github)
+        manager.backgroundCheck()
+        github.code = installedCode + 2; github.name = "99.0.1"; github.etag = "\"v2\""
+        retainDownload(installedCode + 2)
+        manager.startUpdate(null)
+        reachedTheInstaller(manager)
+        assertEquals(installedCode + 2, manager.state.value.release?.version)
+        assertEquals(2, github.requests("/releases/latest"))
+        assertEquals(0, github.requests(".apk"))
+        assertEquals(sessions, sessionsBefore)
+    }
+
+    private fun keptReleaseInstallsWithoutAskingGitHub(start: (UpdateManager) -> Unit) = runBlocking {
+        val sessions = sessionsBefore
+        val github = FakeGitHub()
+        val manager = manager(github)
+        manager.backgroundCheck()
+        retainDownload(installedCode + 1)
+        assertTrue(prefs.edit().putBoolean("install_after_permission", true).commit())
+        val asked = github.paths.size
+        start(manager)
+        reachedTheInstaller(manager)
+        // Not even the release check: the stored release and its kept download are what installs.
+        assertEquals(asked, github.paths.size)
+        assertEquals(installedCode + 1, manager.state.value.release?.version)
+        assertEquals(sessions, sessionsBefore)
+    }
+
+    @Test fun theInstallThatWaitedForAndroidsPermissionUsesTheKeptReleaseWithoutAskingGitHub() = keptReleaseInstallsWithoutAskingGitHub { it.startUpdate(null, refresh = false) }
+
+    @Test fun comingBackFromAndroidsPermissionPageInstallsTheKeptReleaseWithoutAskingGitHub() {
+        // The device suite allows it before the run; a skip here would leave the permission-return path unguarded.
+        check(app.packageManager.canRequestPackageInstalls()) { "Allow Install unknown apps for the isolated debug test installation" }
+        keptReleaseInstallsWithoutAskingGitHub { it.resume() }
     }
 
     @Test fun aReplacedVersionOrAnotherSignerIsRefusedAndNeverAnnounced() = runBlocking {

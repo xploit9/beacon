@@ -114,7 +114,7 @@ class NativePhoneAuditTest {
             steps.add("Profile purpose/model reader, configured search and cancel")
 
             navigate("Settings")
-            click("Tools & MCP"); click("Tools & commands")
+            click("Tools & MCP"); click("Tools")
             waitFor { vm.data.value["native-tools"] != null }
             assertEquals("", recordError(vm.data.value["native-tools"]))
             capture("tools")
@@ -122,9 +122,9 @@ class NativePhoneAuditTest {
             click("MCP servers")
             waitFor { vm.data.value["native-mcp"] != null }
             assertEquals("", recordError(vm.data.value["native-mcp"]))
-            field("Search connections").performTextReplacement("tool_gateway_research")
+            field("Search MCP servers").performTextReplacement("tool_gateway_research")
             androidx.test.espresso.Espresso.closeSoftKeyboard()
-            click("Test connection")
+            click("Test server")
             waitFor { vm.data.value["mcp-test:tool_gateway_research"] != null }
             assertTrue(vm.data.value.getValue("mcp-test:tool_gateway_research").optBoolean("ok"))
             capture("connections")
@@ -155,7 +155,7 @@ class NativePhoneAuditTest {
             waitFor { compose.onAllNodes(hasText("Checking notification status", substring = true)).fetchSemanticsNodes().isEmpty() }
             capture("notifications")
             navigate("Cron"); waitFor { vm.data.value["crons"] != null }
-            compose.onNodeWithContentDescription("Refresh tasks").performClick()
+            compose.onNodeWithContentDescription("Refresh schedules").performClick()
             waitFor { vm.data.value["task-capabilities"] != null && vm.data.value["cron-delivery"] != null }
             capture("cron")
             navigate("Kanban"); compose.onNodeWithTag("kanban-screen").assertExists()

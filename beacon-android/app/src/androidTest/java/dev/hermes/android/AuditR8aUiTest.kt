@@ -69,19 +69,19 @@ class AuditR8aUiTest {
         compose.waitUntil(5_000) { compose.onAllNodesWithTag("kanban-edit:first").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithTag("kanban-edit:first").performClick()
         compose.waitUntil(5_000) { compose.onAllNodesWithTag("kanban-title").fetchSemanticsNodes().isNotEmpty() }
-        compose.onNodeWithText("Cancel").performClick()
+        compose.onNodeWithText("Keep draft").performClick()
         compose.onNodeWithTag("kanban-edit:second").performClick()
         compose.waitUntil(5_000) { compose.onAllNodesWithTag("kanban-title").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithTag("kanban-title").assertTextContains("Second task")
-        compose.onNodeWithText("Cancel").performClick()
+        compose.onNodeWithText("Keep draft").performClick()
         compose.onNodeWithTag("kanban-edit:first").performClick()
         compose.waitUntil(5_000) { compose.onAllNodesWithTag("kanban-title").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithTag("kanban-title").performTextReplacement("Retained first draft")
-        compose.onNodeWithText("Cancel").performClick()
+        compose.onNodeWithText("Keep draft").performClick()
         compose.onNodeWithTag("kanban-new-task").performClick()
         compose.waitUntil(5_000) { compose.onAllNodesWithTag("kanban-title").fetchSemanticsNodes().isNotEmpty() }
         assertEquals("", compose.onNodeWithTag("kanban-title").fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
-        compose.onNodeWithText("Cancel").performClick()
+        compose.onNodeWithText("Keep draft").performClick()
         compose.onNodeWithTag("kanban-edit:first").performClick()
         compose.onNodeWithTag("kanban-title").assertTextContains("Retained first draft")
         fixture.boardTasks.remove("first")
@@ -91,6 +91,6 @@ class AuditR8aUiTest {
         compose.onNodeWithTag("kanban-edit:second").performClick()
         compose.waitUntil(5_000) { compose.onAllNodesWithTag("kanban-title").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithTag("kanban-title").assertTextContains("Second task")
-        compose.onNodeWithText("Cancel").performClick()
+        compose.onNodeWithText("Keep draft").performClick()
     }
 }

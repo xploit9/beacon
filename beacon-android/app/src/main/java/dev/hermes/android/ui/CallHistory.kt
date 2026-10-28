@@ -6,16 +6,19 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.CallMade
-import androidx.compose.material.icons.rounded.CallReceived
+import androidx.compose.material.icons.automirrored.rounded.CallMade
+import androidx.compose.material.icons.automirrored.rounded.CallReceived
+import androidx.compose.material.icons.automirrored.rounded.PhoneMissed
+import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.PhoneMissed
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.hermes.android.BeaconViewModel
@@ -137,20 +140,21 @@ internal fun CallHistorySheet(vm: BeaconViewModel, onOpenCall: (conversationId: 
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.fillMaxWidth().fillMaxHeight(.8f).padding(horizontal = 20.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text("Call history", Modifier.weight(1f), style = MaterialTheme.typography.titleLarge)
+                Text(uiText("Call history"), Modifier.weight(1f), style = MaterialTheme.typography.titleLarge)
                 IconButton(onClick = onDismiss, modifier = Modifier.testTag("call-history-close")) {
-                    Icon(Icons.Rounded.Close, "Close call history")
+                    Icon(Icons.Rounded.Close, uiText("Close call history"))
                 }
             }
             when {
                 missingPlugin -> MissingBeaconPluginState(Modifier.weight(1f), compact = true, update = true)
                 error.isNotBlank() -> Column(Modifier.weight(1f).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-                    Text(error, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    if (retryAvailable) TextButton(onClick = { coroutineScope.launch { calls = emptyList(); next = null; load() } }) { Text("Retry") }
+                    Text(uiText(error), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (retryAvailable) TextButton(onClick = { coroutineScope.launch { calls = emptyList(); next = null; load() } }) { Text(uiText("Retry")) }
                 }
                 calls.isEmpty() && loading -> Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
-                calls.isEmpty() -> Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                    Text("No calls yet", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                calls.isEmpty() -> Column(Modifier.weight(1f).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterVertically)) {
+                    Icon(Icons.Rounded.Call, null, Modifier.size(32.dp), tint = MaterialTheme.colorScheme.primary)
+                    Text(assistantText("Calls with Beacon appear here."), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 else -> LazyColumn(Modifier.weight(1f), state = list, contentPadding = PaddingValues(bottom = 24.dp)) {
                     itemsIndexed(calls, key = { _, call -> call.id }) { _, call ->
@@ -159,7 +163,7 @@ internal fun CallHistorySheet(vm: BeaconViewModel, onOpenCall: (conversationId: 
                     }
                     if (loading) item("call-history-loading") { Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() } }
                     else if (next != null) item("call-history-more") {
-                        TextButton(onClick = { coroutineScope.launch { load(next) } }, modifier = Modifier.fillMaxWidth()) { Text("Load more") }
+                        TextButton(onClick = { coroutineScope.launch { load(next) } }, modifier = Modifier.fillMaxWidth()) { Text(uiText("Load more")) }
                     }
                 }
             }
@@ -170,26 +174,31 @@ internal fun CallHistorySheet(vm: BeaconViewModel, onOpenCall: (conversationId: 
 @Composable
 private fun CallHistoryRow(call: CallHistoryEntry, feedbackStatus: String?, onFeedback: (String) -> Unit, onOpen: () -> Unit) {
     val icon = when {
-        call.state == "missed" -> Icons.Rounded.PhoneMissed
-        call.direction == "incoming" -> Icons.Rounded.CallReceived
-        else -> Icons.Rounded.CallMade
+        call.state == "missed" -> Icons.AutoMirrored.Rounded.PhoneMissed
+        call.direction == "incoming" -> Icons.AutoMirrored.Rounded.CallReceived
+        else -> Icons.AutoMirrored.Rounded.CallMade
     }
+    val incoming = call.direction == "incoming"
     val title = when (call.state) {
-        "missed" -> "Missed call"
-        "declined" -> "Declined call"
-        "failed" -> "Call failed"
-        "active" -> if (call.direction == "incoming") "Incoming call" else "Call in progress"
-        else -> if (call.direction == "incoming") "Incoming call" else "Outgoing call"
+        "missed" -> uiText("Missed call")
+        "declined" -> uiText("Declined call")
+        "failed" -> uiText("Call failed")
+        "active" -> if (incoming) uiText("Incoming call") else uiText("Call in progress")
+        else -> if (incoming) uiText("Incoming call") else uiText("Outgoing call")
     }
+    val locale = Locale.getDefault()
+    val clock = nativeClockPattern(locale, android.text.format.DateFormat.is24HourFormat(LocalContext.current))
     val details = buildList {
-        add(SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(call.startedAt * 1000)))
+        add(SimpleDateFormat(clock, locale).format(Date(call.startedAt * 1000)))
         call.durationSeconds?.let { add(formatCallDuration(it)) }
         call.provider?.let { add(if (it == "openai") "OpenAI" else it.replaceFirstChar { character -> character.uppercase() }) }
     }.joinToString(" · ")
-    Column(Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
+    Column(Modifier.fillMaxWidth()) {
         Row(
             Modifier.fillMaxWidth()
-                .clickable(onClick = onOpen)
+                .clickable(role = Role.Button, onClick = onOpen)
+                .heightIn(min = 56.dp)
+                .padding(vertical = 8.dp)
                 .testTag("call-history-row:${call.id}"),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -204,10 +213,10 @@ private fun CallHistoryRow(call: CallHistoryEntry, feedbackStatus: String?, onFe
             if (feedbackStatus == "saved") {
                 Text(assistantText("Thanks — Beacon will remember."), Modifier.padding(start = 56.dp).testTag("call-history-feedback-sent:${call.id}"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
-                if (feedbackStatus == "failed") Text("Couldn't save your choice. Try again.", Modifier.padding(start = 56.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                if (feedbackStatus == "failed") Text(uiText("Couldn't save your choice. Try again."), Modifier.padding(start = 56.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                    TextButton(onClick = { onFeedback("important") }, enabled = feedbackStatus != "sending", modifier = Modifier.testTag("call-history-feedback-important:${call.id}")) { Text("Important") }
-                    TextButton(onClick = { onFeedback("not_important") }, enabled = feedbackStatus != "sending", modifier = Modifier.testTag("call-history-feedback-not-important:${call.id}")) { Text("Not important") }
+                    TextButton(onClick = { onFeedback("important") }, enabled = feedbackStatus != "sending", modifier = Modifier.testTag("call-history-feedback-important:${call.id}")) { Text(uiText("Important")) }
+                    TextButton(onClick = { onFeedback("not_important") }, enabled = feedbackStatus != "sending", modifier = Modifier.testTag("call-history-feedback-not-important:${call.id}")) { Text(uiText("Not important")) }
                 }
             }
         }

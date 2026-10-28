@@ -70,10 +70,19 @@ internal fun epochMillis(value: Long): Long = when {
     else -> value
 }
 
-/** "h:mm a" like Relay's message and tool timestamps; null when no time was recorded. */
-internal fun messageTimeLabel(epoch: Long, zone: java.util.TimeZone = java.util.TimeZone.getDefault(), locale: java.util.Locale = java.util.Locale.getDefault()): String? {
+/** The phone's clock pattern for its 12/24-hour setting and locale; today's English one where the platform has none (JVM tests). */
+internal fun nativeClockPattern(locale: java.util.Locale, is24Hour: Boolean): String =
+    android.text.format.DateFormat.getBestDateTimePattern(locale, if (is24Hour) "Hm" else "hm")?.takeIf { it.isNotBlank() } ?: if (is24Hour) "HH:mm" else "h:mm a"
+
+/** The phone's day pattern in its locale's order ("Tue, Oct 7", "Sep 4, 2024"); today's English one where the platform has none. */
+internal fun nativeDayPattern(locale: java.util.Locale, withYear: Boolean, withWeekday: Boolean): String =
+    android.text.format.DateFormat.getBestDateTimePattern(locale, (if (withWeekday) "EEE" else "") + (if (withYear) "y" else "") + "MMMd")?.takeIf { it.isNotBlank() }
+        ?: (if (withWeekday) "EEE, " else "") + "MMM d" + (if (withYear) ", yyyy" else "")
+
+/** Like Relay's message and tool timestamps, in the phone's clock; null when no time was recorded. */
+internal fun messageTimeLabel(epoch: Long, zone: java.util.TimeZone = java.util.TimeZone.getDefault(), locale: java.util.Locale = java.util.Locale.getDefault(), is24Hour: Boolean = false): String? {
     val millis = epochMillis(epoch).takeIf { it > 0 } ?: return null
-    return java.text.SimpleDateFormat("h:mm a", locale).also { it.timeZone = zone }.format(java.util.Date(millis))
+    return java.text.SimpleDateFormat(nativeClockPattern(locale, is24Hour), locale).also { it.timeZone = zone }.format(java.util.Date(millis))
 }
 
 /** The native `duration_s` as recorded; null when absent, negative or not finite. */
@@ -129,7 +138,10 @@ internal fun messageDayStarts(times: List<Pair<String, Long>>, now: Long = Syste
         starts[id] = when (day) {
             today -> "Today"
             yesterday -> "Yesterday"
-            else -> java.text.SimpleDateFormat(if (day / 1000 == year) "EEE, MMM d" else "MMM d, yyyy", locale).also { it.timeZone = zone }.format(java.util.Date(millis))
+            else -> {
+                val sameYear = day / 1000 == year
+                java.text.SimpleDateFormat(nativeDayPattern(locale, withYear = !sameYear, withWeekday = sameYear), locale).also { it.timeZone = zone }.format(java.util.Date(millis))
+            }
         }
     }
     return starts

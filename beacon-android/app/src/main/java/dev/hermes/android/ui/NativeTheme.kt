@@ -101,13 +101,13 @@ fun nativeRoleBackgrounds(scheme: ColorScheme): List<Color> {
     val glass = backdrops.map { nativeGlassFill(scheme).compositeOver(it) }
     return backdrops + glass + glass.map { Color.White.copy(alpha = nativeGlassHighlightAlpha(scheme)).compositeOver(it) }
 }
-private fun readableInk(color: Color, backgrounds: (Color) -> List<Color>): Color {
+private fun readableInk(color: Color, min: Float = 4.55f, backgrounds: (Color) -> List<Color>): Color {
     fun score(ink: Color) = backgrounds(ink).minOf { nativeContrast(ink, it) }
-    if (score(color) >= 4.55f) return color
+    if (score(color) >= min) return color
     val targets = listOf(Color.Black, Color.White).sortedByDescending(::score)
     for (step in 1..100) for (target in targets) {
         val candidate = lerp(color, target, step / 100f)
-        if (score(candidate) >= 4.55f) return candidate
+        if (score(candidate) >= min) return candidate
     }
     return targets.first()
 }
@@ -126,15 +126,19 @@ fun nativeSkinColorScheme(values: JSONObject, dark: Boolean): ColorScheme {
     val background = color("bg", defaults.background)
     val surface = color("surface", background)
     val chrome = color("sidebar", surface)
-    fun containers(primary: Color) = defaults.copy(background = background, surface = background, surfaceContainerLowest = background, surfaceContainerLow = lerp(background, chrome, .5f), surfaceContainer = chrome, surfaceContainerHigh = surface, surfaceContainerHighest = surface, surfaceDim = chrome, surfaceBright = surface, primary = primary, surfaceTint = primary, primaryContainer = lerp(chrome, primary, .13f), secondaryContainer = lerp(chrome, primary, .13f))
+    fun containers(primary: Color) = defaults.copy(background = background, surface = background, surfaceContainerLowest = background, surfaceContainerLow = lerp(background, chrome, .5f), surfaceContainer = chrome, surfaceContainerHigh = surface, surfaceContainerHighest = surface, surfaceDim = chrome, surfaceBright = surface, surfaceVariant = chrome, primary = primary, surfaceTint = primary, primaryContainer = lerp(chrome, primary, .13f), secondaryContainer = lerp(chrome, primary, .13f))
     val primary = readableInk(color("accent-text", color("accent", defaults.primary))) { nativeRoleBackgrounds(containers(it)) }
     val base = containers(primary)
     val backgrounds = nativeRoleBackgrounds(base)
     val foreground = readableInk(color("text", defaults.onSurface)) { backgrounds }
     val muted = readableInk(color("muted", defaults.onSurfaceVariant)) { backgrounds }
     val error = readableInk(color("error", defaults.error)) { backgrounds }
+    // Borders of fields and outlined buttons need 3:1 against every surface they sit on; dividers keep the soft outlineVariant.
+    val outline = readableInk(color("border2", muted).compositeOver(background), min = 3.05f) { backgrounds }
+    // Only the default skin names an info colour; the others get a lighter step of their own accent, never Material's pink.
+    val tertiary = readableInk(color("info", lerp(primary, foreground, .45f))) { backgrounds }
     fun on(ink: Color) = if (nativeContrast(Color.Black, ink) > nativeContrast(Color.White, ink)) Color.Black else Color.White
-    return base.copy(onBackground = foreground, onSurface = foreground, onSurfaceVariant = muted, onPrimary = on(primary), onPrimaryContainer = foreground, onSecondaryContainer = foreground, secondary = muted, onSecondary = on(muted), outline = color("border2", muted), outlineVariant = color("border", chrome), error = error, onError = on(error))
+    return base.copy(onBackground = foreground, onSurface = foreground, onSurfaceVariant = muted, onPrimary = on(primary), onPrimaryContainer = foreground, onSecondaryContainer = foreground, secondary = muted, onSecondary = on(muted), tertiary = tertiary, onTertiary = on(tertiary), outline = outline, outlineVariant = color("border", chrome), error = error, onError = on(error))
 }
 @Composable fun NativeSkinTheme(dark: Boolean, skin: String, content: @Composable () -> Unit) {
     val context = LocalContext.current
@@ -145,7 +149,7 @@ fun nativeSkinColorScheme(values: JSONObject, dark: Boolean): ColorScheme {
     val weight = if (skin in setOf("graphite", "github", "codex", "terracotta")) FontWeight(430) else FontWeight.Normal
     val spacing = if (skin == "geist-contrast") (-.16).sp else 0.sp
     val base = Typography()
-    val typography = base.copy(displayLarge = base.displayLarge.copy(fontFamily = family), displayMedium = base.displayMedium.copy(fontFamily = family), displaySmall = base.displaySmall.copy(fontFamily = family), headlineLarge = base.headlineLarge.copy(fontFamily = family), headlineMedium = base.headlineMedium.copy(fontFamily = family), headlineSmall = base.headlineSmall.copy(fontFamily = family), bodyLarge = base.bodyLarge.copy(fontFamily = family, fontWeight = weight, letterSpacing = spacing, fontSize = 16.sp, lineHeight = 26.sp), bodyMedium = base.bodyMedium.copy(fontFamily = family, fontWeight = weight, letterSpacing = spacing, fontSize = 15.sp, lineHeight = 22.sp), bodySmall = base.bodySmall.copy(fontFamily = family, letterSpacing = spacing), titleLarge = base.titleLarge.copy(fontFamily = family), titleMedium = base.titleMedium.copy(fontFamily = family), titleSmall = base.titleSmall.copy(fontFamily = family), labelLarge = base.labelLarge.copy(fontFamily = family), labelMedium = base.labelMedium.copy(fontFamily = family), labelSmall = base.labelSmall.copy(fontFamily = family))
+    val typography = base.copy(displayLarge = base.displayLarge.copy(fontFamily = family), displayMedium = base.displayMedium.copy(fontFamily = family), displaySmall = base.displaySmall.copy(fontFamily = family), headlineLarge = base.headlineLarge.copy(fontFamily = family), headlineMedium = base.headlineMedium.copy(fontFamily = family), headlineSmall = base.headlineSmall.copy(fontFamily = family), bodyLarge = base.bodyLarge.copy(fontFamily = family, fontWeight = weight, letterSpacing = spacing, fontSize = 16.sp, lineHeight = 23.sp), bodyMedium = base.bodyMedium.copy(fontFamily = family, fontWeight = weight, letterSpacing = spacing, fontSize = 15.sp, lineHeight = 22.sp), bodySmall = base.bodySmall.copy(fontFamily = family, letterSpacing = spacing), titleLarge = base.titleLarge.copy(fontFamily = family), titleMedium = base.titleMedium.copy(fontFamily = family), titleSmall = base.titleSmall.copy(fontFamily = family), labelLarge = base.labelLarge.copy(fontFamily = family), labelMedium = base.labelMedium.copy(fontFamily = family), labelSmall = base.labelSmall.copy(fontFamily = family))
     MaterialTheme(colorScheme = scheme, typography = typography, shapes = Shapes(small = androidx.compose.foundation.shape.RoundedCornerShape(10.dp), medium = androidx.compose.foundation.shape.RoundedCornerShape(16.dp), large = androidx.compose.foundation.shape.RoundedCornerShape(24.dp), extraLarge = androidx.compose.foundation.shape.RoundedCornerShape(28.dp))) {
         CompositionLocalProvider(LocalContentColor provides scheme.onBackground, content = content)
     }

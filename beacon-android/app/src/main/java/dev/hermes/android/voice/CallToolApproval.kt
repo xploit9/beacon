@@ -125,30 +125,45 @@ data class CallToolReceipt(
 }
 
 internal fun CallToolReceipt.approvalCaption(): String? = when (approvedBy) {
-    "chat_yolo" -> "Allowed by chat YOLO"
+    "chat_yolo" -> "Approvals skipped in this chat"
     "profile_off" -> "Approvals off"
     "smart", "memory" -> "Allowed automatically"
     "call_allowance" -> "Allowed for this call"
     else -> null
 }
 
-internal fun CallToolReceipt.activityLabel(): String? {
+private fun CallToolReceipt.service(): String? = toolName.takeIf { it.startsWith("mcp__") }?.removePrefix("mcp__")?.substringBefore("__")
+    ?.split('_')?.joinToString(" ") { it.replaceFirstChar { char -> char.titlecase() } }?.takeIf(String::isNotBlank)
+
+/** What the activity names: the service for an MCP tool, else the tool. It is the {0} of [activityTemplate]. */
+internal fun CallToolReceipt.activitySubject(): String = service() ?: toolName.substringAfterLast("__").lowercase().replace('_', ' ').replaceFirstChar { it.titlecase() }
+
+/** The activity with its subject left as {0}, so uiText can translate the wording and the subject goes in after. */
+internal fun CallToolReceipt.activityTemplate(): String? {
     if (status !in setOf("ready", "running")) return null
     val tool = toolName.substringAfterLast("__").lowercase()
-    val service = toolName.takeIf { it.startsWith("mcp__") }?.removePrefix("mcp__")?.substringBefore("__")
-        ?.split('_')?.joinToString(" ") { it.replaceFirstChar { char -> char.titlecase() } }
     return when {
-        !service.isNullOrBlank() -> "Checking $service…"
+        service() != null -> "Checking {0}…"
         tool in setOf("write_file", "create_file") -> "Writing a file…"
         tool in setOf("edit_file", "patch_file") -> "Updating a file…"
         tool in setOf("read_file", "list_directory") -> "Reading files…"
-        else -> "Using ${tool.replace('_', ' ').replaceFirstChar { it.titlecase() }}…"
+        else -> "Using {0}…"
     }
 }
 
-internal fun CallToolReceipt.statusLabel(): String? = activityLabel()?.let { label ->
-    if (label.startsWith("Checking ")) "Using ${label.removePrefix("Checking ")}" else label
-}
+internal fun CallToolReceipt.activityLabel(): String? = activityTemplate()?.replace("{0}", activitySubject())
+
+/** [activityTemplate] as the call status line says it: a service is "Using", not "Checking". */
+internal fun CallToolReceipt.statusTemplate(): String? = activityTemplate()?.let { if (it == "Checking {0}…") "Using {0}…" else it }
+
+internal fun CallToolReceipt.statusLabel(): String? = statusTemplate()?.replace("{0}", activitySubject())
+
+/** The receipt texts that reach uiText whole or as templates; the tool chip's "<tool> complete" forms are built from the tool's own name. */
+internal val CallToolStrings = listOf(
+    "Checking {0}…", "Using {0}…", "Writing a file…", "Updating a file…", "Reading files…",
+    "Approvals skipped in this chat", "Approvals off", "Allowed automatically", "Allowed for this call",
+    "Needs approval", "Completion not confirmed", "Action denied", "Approval expired", "Action cancelled",
+)
 
 internal fun CallToolReceipt.chipLabel(): String? {
     activityLabel()?.let { return it }

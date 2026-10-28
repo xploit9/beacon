@@ -178,6 +178,18 @@ def test_a_read_only_tool_naming_a_write_in_its_action_still_needs_approval(gate
     ('deleteFile','full',True,False),
     ('cleanup','full',True,True),
     ('cleanup','untrusted',True,False),
+    # A leading read verb makes a noun after it a thing (get_pull_request); a real write action anywhere still asks.
+    ('get_pull_request','full',True,True),
+    ('get_commit','full',True,True),
+    ('list_workflow_runs','full',True,True),
+    ('get_workflow_run','full',True,True),
+    ('search_issues','full',True,True),
+    ('get_and_delete_x','full',True,False),
+    ('create_pull_request','full',True,False),
+    ('merge_pull_request','full',True,False),
+    ('send_report','full',True,False),
+    ('run_workflow','full',True,False),
+    ('get_pull_request','untrusted',True,False),
 ],ids=lambda value:str(value))
 def test_a_servers_read_only_annotation_needs_a_name_that_agrees(gateway,monkeypatch,raw,trust,annotated,expected):
     api,backend,_=gateway

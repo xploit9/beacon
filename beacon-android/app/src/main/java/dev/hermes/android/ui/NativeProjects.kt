@@ -5,14 +5,20 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
@@ -27,7 +33,10 @@ internal fun nativeProjectSessionAllowed(id: String, rowProfile: String, profile
 internal fun nativeProjectDetailCurrent(requestedId: String, returnedId: String): Boolean = requestedId.isNotBlank() && returnedId == requestedId
 
 /** What a project offers a chat, in the chat's project list. */
-internal fun projectFolderSummary(count: Int): String = when (count) { 0 -> "No folder yet"; 1 -> "1 linked folder"; else -> "$count linked folders" }
+internal fun projectFolderSummary(count: Int, none: String = "No folder yet", one: String = "1 linked folder", many: String = "{0} linked folders"): String =
+    when (count) { 0 -> none; 1 -> one; else -> many.replace("{0}", "$count") }
+/** [projectFolderSummary] in the app's language: [none], [one] and [many] are whole translated phrases, and {0} is the count. */
+@Composable private fun folderSummary(count: Int): String = projectFolderSummary(count, uiText("No folder yet"), uiText("1 linked folder"), uiText("{0} linked folders"))
 
 /** The project Hermes files [sessionId] under, from the cached `project-of` read; null when it is in none or not read yet. */
 internal fun chatProjectOf(record: JSONObject?, sessionId: String): JSONObject? =
@@ -104,12 +113,16 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
     var editSaving by remember { mutableStateOf(false) }
     var updatedHeader by rememberSaveable { mutableStateOf<Pair<String, String>?>(null) }
     val editScope = rememberCoroutineScope()
+    // The actions below run outside composition, so their words are looked up here.
+    val projectUpdated = uiText("Project updated")
+    val folderLinked = uiText("Folder linked")
+    val deleteConsequence = uiText("Its conversations and files on your computer will remain.")
     LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, vm.client, selected) { vm.loadNativeProjects(selected) }
     BackHandler(selected.isNotBlank()) { selected = "" }
     val key = if (selected.isBlank()) "native-projects" else "native-project:$selected"
     val record = data[key]
     val project = record?.optJSONObject("project")?.takeIf { nativeProjectDetailCurrent(selected, it.string("id")) }
-    val headerName = updatedHeader?.takeIf { it.first == selected }?.second ?: project?.string("name") ?: "Projects"
+    val headerName = updatedHeader?.takeIf { it.first == selected }?.second ?: project?.string("name") ?: uiText("Projects")
     LaunchedEffect(selected, project?.string("name"), updatedHeader) {
         val override = updatedHeader
         if (override != null && (override.first != selected || project?.string("name") == override.second)) updatedHeader = null
@@ -140,7 +153,7 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
             "/api/projects/update",
             json("id" to draft.id, "name" to draft.name.trim(), "description" to draft.description.trim()),
             refresh = false,
-            successNotice = "Project updated",
+            successNotice = projectUpdated,
             onSuccess = { _, result ->
                 val updated = result.getJSONObject("project")
                 val id = updated.getString("id")
@@ -169,22 +182,22 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
             if (discardEdit) discardEdit = false else requestEditDismiss()
         }
     }
-    if (folderPicker && project != null) PcFolderPicker(vm, "Link PC folder", onDismiss = { folderPicker = false }, onChoose = { path ->
+    if (folderPicker && project != null) PcFolderPicker(vm, "Link computer folder", onDismiss = { folderPicker = false }, onChoose = { path ->
         folderPicker = false
-        vm.action("/api/projects/folders/add", json("id" to selected, "path" to path), refresh = false, successNotice = "Folder linked", onSuccess = { _, _ -> vm.loadNativeProjects(selected); refreshOpenChatProject(vm) })
+        vm.action("/api/projects/folders/add", json("id" to selected, "path" to path), refresh = false, successNotice = folderLinked, onSuccess = { _, _ -> vm.loadNativeProjects(selected); refreshOpenChatProject(vm) })
     })
     Column(Modifier.fillMaxSize().testTag("projects-screen")) {
         Header(headerName, back = if (selected.isBlank()) null else ({ selected = "" }), menu = LocalOpenNavigationMenu.current) {
-            if (selected.isBlank()) IconButton(onClick = { edit() }) { Icon(Icons.Rounded.Add, "New project") }
+            if (selected.isBlank()) IconButton(onClick = { edit() }) { Icon(Icons.Rounded.Add, uiText("New project")) }
             else if (project != null) Box {
-                IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "Project actions") }
+                IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, uiText("Project actions")) }
                 DropdownMenu(menu, { menu = false }) {
-                    DropdownMenuItem({ Text("Edit project") }, onClick = { menu = false; edit(project) })
-                    DropdownMenuItem({ Text("Delete project") }, onClick = {
+                    DropdownMenuItem({ Text(uiText("Edit project")) }, onClick = { menu = false; edit(project) })
+                    DropdownMenuItem({ Text(uiText("Delete project"), color = MaterialTheme.colorScheme.error) }, onClick = {
                         menu = false
                         vm.openForm(ActionForm("Delete project?", "/api/projects/delete", emptyList(), seed = json("id" to selected),
-                            explanation = "Remove ${project.string("name")} from this profile. Its conversations and files on your computer will remain.", actionLabel = "Delete project",
-                            onResult = { selected = ""; vm.loadNativeProjects(); refreshOpenChatProject(vm) }))
+                            explanation = "${project.string("name")}\n\n$deleteConsequence", actionLabel = "Delete project",
+                            onResult = { selected = ""; vm.loadNativeProjects(); refreshOpenChatProject(vm) }, destructive = true))
                     })
                 }
             }
@@ -198,70 +211,74 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
             LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 when {
                 record == null || record.optBoolean("_loading") -> item { BeaconSignal(BeaconMotionMode.Sweep, Modifier.fillMaxWidth().wrapContentWidth(), 32.dp) }
-                record.string("_error").isNotBlank() -> item { Text(record.string("_error"), color = MaterialTheme.colorScheme.error); OutlinedButton(onClick = { vm.loadNativeProjects(selected) }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Retry") } }
+                record.string("_error").isNotBlank() -> item { Text(uiText("Couldn't load projects. Check your connection and try again."), color = MaterialTheme.colorScheme.error); OutlinedButton(onClick = { vm.loadNativeProjects(selected) }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Retry")) } }
                 selected.isBlank() -> {
                     val projects = record.rows("projects").filterNot { it.optBoolean("archived") }
                     if (projects.isEmpty()) item {
                         Glass(Modifier.fillMaxWidth()) {
                             Column(Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                                 BeaconSignal(BeaconMotionMode.Sweep, size = 56.dp)
-                                Text("Your projects", style = MaterialTheme.typography.titleLarge)
-                                Text("Create a project to keep related chats and folders together.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                Button(onClick = { edit() }) { Text("New project") }
+                                Text(uiText("Your projects"), Modifier.semantics { heading() }, style = MaterialTheme.typography.titleLarge)
+                                Text(uiText("Create a project to keep related chats and folders together."), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Button(onClick = { edit() }) { Text(uiText("New project")) }
                             }
                         }
                     }
                     items(projects, key = { it.getString("id") }) { value ->
-                        Glass(Modifier.fillMaxWidth().clickable { selected = value.getString("id") }) {
+                        // Clipped to the card's shape, so the ripple stays inside it.
+                        Glass(Modifier.fillMaxWidth().clip(RoundedCornerShape(26.dp)).clickable(role = Role.Button) { selected = value.getString("id") }) {
                             Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                                 Icon(Icons.Rounded.FolderOpen, null, tint = MaterialTheme.colorScheme.primary)
                                 Column(Modifier.weight(1f)) {
-                                    Text(value.string("name", "Project"), style = MaterialTheme.typography.titleMedium)
-                                    Text(value.string("description").ifBlank { "${value.rows("folders").size} linked folder${if (value.rows("folders").size == 1) "" else "s"}" }, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text(value.string("name").ifBlank { uiText("Project") }, style = MaterialTheme.typography.titleMedium)
+                                    Text(value.string("description").ifBlank { folderSummary(value.rows("folders").size) }, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
-                                Icon(Icons.Rounded.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                         }
                     }
                 }
-                project == null -> item { EmptyState("Project not found", "It may have been removed on another device.", action = "All projects", onAction = { selected = "" }) }
+                project == null -> item { EmptyState(uiText("Project not found"), uiText("It may have been removed on another device."), action = uiText("All projects"), onAction = { selected = "" }) }
                 else -> {
                     if (project.string("description").isNotBlank()) item { Text(project.string("description"), color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                    item { Text("Linked folders", style = MaterialTheme.typography.titleMedium) }
+                    item { Text(uiText("Linked folders"), Modifier.semantics { heading() }, style = MaterialTheme.typography.titleMedium) }
                     items(project.rows("folders"), key = { it.getString("path") }) { folder ->
                         var actions by remember { mutableStateOf(false) }
                         val path = folder.getString("path")
                         ListItem(headlineContent = { Text(folder.string("label").ifBlank { path.replace('\\', '/').substringAfterLast('/').ifBlank { path } }) },
-                            supportingContent = { Text((if (folder.optBoolean("is_primary")) "Main folder · " else "") + path) },
+                            supportingContent = { Text((if (folder.optBoolean("is_primary")) uiText("Main folder") + " · " else "") + path) },
                             leadingContent = { Icon(Icons.Rounded.Folder, null) }, modifier = Modifier.clickable { vm.browsePcFolder(path) },
                             colors = ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent),
                             trailingContent = { Box {
-                                IconButton(onClick = { actions = true }) { Icon(Icons.Rounded.MoreVert, "Folder actions") }
+                                IconButton(onClick = { actions = true }) { Icon(Icons.Rounded.MoreVert, uiText("Folder actions")) }
                                 DropdownMenu(actions, { actions = false }) {
-                                    if (!folder.optBoolean("is_primary")) DropdownMenuItem({ Text("Use as main folder") }, onClick = { actions = false; vm.action("/api/projects/folders/primary", json("id" to selected, "path" to path), refresh = false, onSuccess = { _, _ -> vm.loadNativeProjects(selected) }) })
-                                    DropdownMenuItem({ Text("Unlink folder") }, onClick = { actions = false
+                                    if (!folder.optBoolean("is_primary")) DropdownMenuItem({ Text(uiText("Use as main folder")) }, onClick = { actions = false; vm.action("/api/projects/folders/primary", json("id" to selected, "path" to path), refresh = false, onSuccess = { _, _ -> vm.loadNativeProjects(selected) }) })
+                                    DropdownMenuItem({ Text(uiText("Unlink folder")) }, onClick = { actions = false
                                         vm.openForm(ActionForm("Unlink folder?", "/api/projects/folders/remove", emptyList(), seed = json("id" to selected, "path" to path),
-                                            explanation = "Files stay on your computer. Chats in this folder may appear outside this project.", actionLabel = "Unlink", onResult = { vm.loadNativeProjects(selected); refreshOpenChatProject(vm) }))
+                                            explanation = "Files stay on your computer. Chats in this folder may appear outside this project.", actionLabel = "Unlink", onResult = { vm.loadNativeProjects(selected); refreshOpenChatProject(vm) }, destructive = true))
                                     })
                                 }
                             } })
                     }
-                    item { OutlinedButton(onClick = { folderPicker = true }) { Icon(Icons.Rounded.Add, null); Text("Link PC folder", Modifier.padding(start = 8.dp)) } }
-                    item { Text("Conversations", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 12.dp)) }
+                    item { OutlinedButton(onClick = { folderPicker = true }, modifier = Modifier.heightIn(min = 48.dp)) { Icon(Icons.Rounded.Add, null); Text(uiText("Link computer folder"), Modifier.padding(start = 8.dp)) } }
+                    item { Text(uiText("Conversations"), Modifier.padding(top = 12.dp).semantics { heading() }, style = MaterialTheme.typography.titleMedium) }
                     val tree = record.optJSONObject("tree")
                     val allowed = tree?.optJSONArray("sessionIds")?.strings().orEmpty().toSet()
                     val rows = (tree?.rows("repos").orEmpty().flatMap { it.rows("groups").flatMap { group -> group.rows("sessions") } } + tree?.rows("previewSessions").orEmpty())
                         .filter { nativeProjectSessionAllowed(it.string("id", it.string("session_id")), it.string("profile"), ui.profile, allowed, it.optBoolean("archived")) }.distinctBy { it.string("id", it.string("session_id")) }
-                    if (rows.isEmpty()) item { Text("Open a chat’s menu and choose Add to project to move it here.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    if (rows.isEmpty()) item { Text(uiText("Open a chat’s menu and choose Add to project to move it here."), color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     items(rows, key = { it.string("id", it.string("session_id")) }) { row ->
                         var actions by remember { mutableStateOf(false) }
-                        ListItem(headlineContent = { Text(row.string("title").ifBlank { "Untitled conversation" }) },
-                            modifier = Modifier.clickable { vm.tab("Chat"); vm.selectSession(row.string("id", row.string("session_id"))) },
-                            colors = ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent),
-                            trailingContent = { Box {
-                                IconButton({ actions = true }) { Icon(Icons.Rounded.MoreVert, "Chat project actions") }
-                                DropdownMenu(actions, { actions = false }) { DropdownMenuItem({ Text("Remove from project") }, { actions = false; detach(row) }) }
-                            } })
+                        val sessionId = row.string("id", row.string("session_id"))
+                        // The same row as the drawer's chat list, with the project's own menu beside it.
+                        Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                            ChatListRow(sessionId, row.string("title").ifBlank { uiText("Untitled conversation") }, preview = "", time = "",
+                                modifier = Modifier.weight(1f).clickable { vm.tab("Chat"); vm.selectSession(sessionId) })
+                            Box {
+                                IconButton({ actions = true }) { Icon(Icons.Rounded.MoreVert, uiText("Chat project actions")) }
+                                DropdownMenu(actions, { actions = false }) { DropdownMenuItem({ Text(uiText("Remove from project")) }, { actions = false; detach(row) }) }
+                            }
+                        }
                     }
                 }
                 }
@@ -270,33 +287,33 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
     }
     if (discardEdit) AlertDialog(
         onDismissRequest = { discardEdit = false },
-        title = { Text("Discard changes?") },
-        text = { Text("Your unsaved project edits will be lost.") },
-        confirmButton = { TextButton(onClick = { editDraft = null; discardEdit = false }) { Text("Discard") } },
-        dismissButton = { TextButton(onClick = { discardEdit = false }) { Text("Keep editing") } },
+        title = { Text(uiText("Discard changes?")) },
+        text = { Text(uiText("Your unsaved project edits will be lost.")) },
+        confirmButton = { TextButton(onClick = { editDraft = null; discardEdit = false }, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text(uiText("Discard")) } },
+        dismissButton = { TextButton(onClick = { discardEdit = false }) { Text(uiText("Keep editing")) } },
     ) else editDraft?.let { draft ->
         AlertDialog(
             onDismissRequest = ::requestEditDismiss,
-            title = { Text("Edit project") },
+            title = { Text(uiText("Edit project")) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
                         value = draft.name,
                         onValueChange = { editDraft = draft.copy(name = it) },
-                        label = { Text("Name *") },
+                        label = { Text(uiText("Name") + " *") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth().testTag("project-edit-name"),
                     )
                     OutlinedTextField(
                         value = draft.description,
                         onValueChange = { editDraft = draft.copy(description = it) },
-                        label = { Text("Description") },
+                        label = { Text(uiText("Description")) },
                         minLines = 3,
                         maxLines = 6,
                         modifier = Modifier.fillMaxWidth().testTag("project-edit-description"),
                     )
-                    if (vm.client == null) Text("Reconnect to save this project.", color = MaterialTheme.colorScheme.error)
-                    else if (ui.error.isNotBlank()) Text(ui.error, color = MaterialTheme.colorScheme.error)
+                    if (vm.client == null) Text(uiText("Reconnect to save this project."), color = MaterialTheme.colorScheme.error)
+                    else if (ui.error.isNotBlank()) Text(uiText(ui.error), color = MaterialTheme.colorScheme.error)
                 }
             },
             confirmButton = {
@@ -304,9 +321,9 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
                     onClick = ::saveEdit,
                     enabled = draft.name.isNotBlank() && draft.dirty && !editSaving && vm.client != null,
                     modifier = Modifier.testTag("project-edit-save"),
-                ) { Text(if (editSaving) "Saving…" else "Save") }
+                ) { Text(uiText(if (editSaving) "Saving…" else "Save")) }
             },
-            dismissButton = { TextButton(onClick = ::requestEditDismiss, enabled = !editSaving) { Text("Cancel") } },
+            dismissButton = { TextButton(onClick = ::requestEditDismiss, enabled = !editSaving) { Text(uiText("Cancel")) } },
         )
     }
 }
@@ -322,28 +339,28 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
     LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, vm.client, directory) { vm.load("project-folder", "/api/pc/files", mapOf("path" to directory)) }
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.fillMaxWidth().imePadding().fillMaxHeight(.85f).padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(title, style = MaterialTheme.typography.titleLarge)
+            Text(uiText(title), Modifier.semantics { heading() }, style = MaterialTheme.typography.titleLarge)
             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                OutlinedTextField(address, { address = it }, label = { Text("PC folder path") }, singleLine = true, modifier = Modifier.weight(1f).testTag("pc-folder-address"))
-                TextButton(onClick = { val target = address.trim(); if (target == directory) vm.load("project-folder", "/api/pc/files", mapOf("path" to target)) else directory = target }) { Text("Go") }
+                OutlinedTextField(address, { address = it }, label = { Text(uiText("Computer folder path")) }, singleLine = true, modifier = Modifier.weight(1f).testTag("pc-folder-address"))
+                TextButton(onClick = { val target = address.trim(); if (target == directory) vm.load("project-folder", "/api/pc/files", mapOf("path" to target)) else directory = target }) { Text(uiText("Go")) }
             }
             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                IconButton(onClick = { directory = ""; address = "" }) { Icon(Icons.Rounded.Home, "Home folder") }
-                IconButton(onClick = { directory = record?.string("parent").orEmpty(); address = directory }, enabled = !record?.string("parent").isNullOrBlank()) { Icon(Icons.Rounded.ArrowUpward, "Parent folder") }
+                IconButton(onClick = { directory = ""; address = "" }) { Icon(Icons.Rounded.Home, uiText("Home folder")) }
+                IconButton(onClick = { directory = record?.string("parent").orEmpty(); address = directory }, enabled = !record?.string("parent").isNullOrBlank()) { Icon(Icons.Rounded.ArrowUpward, uiText("Parent folder")) }
                 Text(record?.string("path").orEmpty(), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
                 IconButton(onClick = { showHidden = !showHidden }, modifier = Modifier.testTag("project-folders-show-hidden")) {
-                    Icon(if (showHidden) Icons.Rounded.Visibility else Icons.Rounded.VisibilityOff, if (showHidden) "Hide hidden folders" else "Show hidden folders")
+                    Icon(if (showHidden) Icons.Rounded.Visibility else Icons.Rounded.VisibilityOff, uiText(if (showHidden) "Hide hidden folders" else "Show hidden folders"))
                 }
             }
-            Button(onClick = { record?.getString("path")?.let(onChoose) }, enabled = record != null && !record.has("_error") && record.string("path").isNotBlank(), modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp)) { Text("Use this folder") }
+            Button(onClick = { record?.getString("path")?.let(onChoose) }, enabled = record != null && !record.has("_error") && record.string("path").isNotBlank(), modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp)) { Text(uiText("Use this folder")) }
             LazyColumn(Modifier.weight(1f)) {
                 if (record == null) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
-                else if (record.has("_error")) item { Text(record.string("_error"), color = MaterialTheme.colorScheme.error); TextButton(onClick = { vm.load("project-folder", "/api/pc/files", mapOf("path" to directory)) }) { Text("Retry") } }
+                else if (record.has("_error")) item { Text(uiText("Couldn't load this folder. Check your connection and try again."), color = MaterialTheme.colorScheme.error); TextButton(onClick = { vm.load("project-folder", "/api/pc/files", mapOf("path" to directory)) }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Retry")) } }
                 else {
                     val allFolders = record.rows("entries").filter { it.optBoolean("is_directory") }
                     val folders = if (showHidden) allFolders else allFolders.filterNot { it.string("name").startsWith(".") }
-                    if (allFolders.isEmpty()) item { Text("No subfolders", Modifier.padding(vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                    else if (folders.isEmpty()) item { Text("Only hidden folders here. Show hidden folders to see them.", Modifier.padding(vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    if (allFolders.isEmpty()) item { Text(uiText("No subfolders"), Modifier.padding(vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    else if (folders.isEmpty()) item { Text(uiText("Only hidden folders here. Show hidden folders to see them."), Modifier.padding(vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     items(folders, key = { it.getString("path") }) { row -> ActionRow(row.getString("name"), icon = Icons.Rounded.Folder) { directory = row.getString("path"); address = directory } }
                 }
             }
@@ -367,9 +384,10 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
     val record = data["native-projects"]
     // Read from the latest list each time, so a folder linked just now shows.
     val selected = selectedId?.let { id -> record?.rows("projects")?.firstOrNull { it.string("id") == id } }
+    val reconnect = uiText("Reconnect to choose a project.")
     fun assign(project: JSONObject, path: String, link: Boolean = false) {
         if (saving) return
-        if (scope == null) vm.notice("Reconnect to choose a project.") else {
+        if (scope == null) vm.notice(reconnect) else {
             saving = true
             attempted = true
             val job = addChatToProject(vm, sessionId, project, path, link, current)
@@ -380,47 +398,50 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
     }
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp).heightIn(max = 520.dp)) {
-            Text(if (current != null) "Move to project" else "Add to project", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(bottom = 12.dp))
-            if (saving) { LinearProgressIndicator(Modifier.fillMaxWidth()); Text("Moving chat…", Modifier.testTag("project-chat-saving")) }
-            if (scope == null) Text("Reconnect to choose a project.", color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(bottom = 12.dp))
+            Text(uiText(if (current != null) "Move to project" else "Add to project"), style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(bottom = 12.dp).semantics { heading() })
+            if (saving) { LinearProgressIndicator(Modifier.fillMaxWidth()); Text(uiText("Moving chat…"), Modifier.testTag("project-chat-saving")) }
+            if (scope == null) Text(reconnect, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(bottom = 12.dp))
             // A failed move stays on this sheet, so say why here.
-            if (attempted && !saving && ui.error.isNotBlank()) Text(ui.error, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(bottom = 12.dp).testTag("project-chat-error"))
+            if (attempted && !saving && ui.error.isNotBlank()) Text(uiText(ui.error), color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(bottom = 12.dp).testTag("project-chat-error"))
             if (scope != null && current != null) TextButton({
                 onDismiss()
                 removeChatFromProject(vm, sessionId, current)
-            }, enabled = !saving, modifier = Modifier.heightIn(min = 48.dp)) { Icon(Icons.Rounded.FolderOff, null); Text("Remove from ${current.string("name")}", Modifier.padding(start = 8.dp)) }
+            }, enabled = !saving, modifier = Modifier.heightIn(min = 48.dp)) { Icon(Icons.Rounded.FolderOff, null); Text(uiText("Remove from") + " " + current.string("name"), Modifier.padding(start = 8.dp)) }
             LazyColumn(Modifier.weight(1f, fill = false)) {
                 if (record == null || record.optBoolean("_loading")) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
-                else if (record.has("_error")) item { Text(record.string("_error"), color = MaterialTheme.colorScheme.error); TextButton(onClick = { vm.loadNativeProjects() }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Retry") } }
+                else if (record.has("_error")) item { Text(uiText("Couldn't load projects. Check your connection and try again."), color = MaterialTheme.colorScheme.error); TextButton(onClick = { vm.loadNativeProjects() }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Retry")) } }
                 else if (selected == null) {
                     val projects = record.rows("projects").filterNot { it.optBoolean("archived") }
-                    if (projects.isEmpty()) item { Text("Create a project and link a folder to get started.") }
+                    if (projects.isEmpty()) item { Text(uiText("Create a project and link a folder to get started.")) }
                     items(projects, key = { it.getString("id") }) { project ->
-                        ActionRow(project.string("name"), if (project.string("id") == current?.string("id")) "Current project" else projectFolderSummary(project.rows("folders").size)) {
+                        val here = project.string("id") == current?.string("id")
+                        val folderCount = project.rows("folders").size
+                        // A row that moves the chat at once has no chevron; only one that opens a folder list does.
+                        ActionRow(project.string("name"), if (here) uiText("Current project") else folderSummary(folderCount), icon = if (here || folderCount == 1) null else Icons.AutoMirrored.Rounded.KeyboardArrowRight) {
                             // The chat is already here; one folder: nothing to choose, so the chat moves there at once.
-                            if (project.string("id") == current?.string("id")) onDismiss()
+                            if (here) onDismiss()
                             else project.rows("folders").singleOrNull()?.let { assign(project, it.getString("path")) } ?: run { selectedId = project.getString("id") }
                         }
                     }
                 } else {
-                    item { TextButton(onClick = { selectedId = null }, modifier = Modifier.heightIn(min = 48.dp)) { Text("All projects") } }
+                    item { TextButton(onClick = { selectedId = null }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("All projects")) } }
                     val folders = selected.rows("folders")
                     if (folders.isEmpty()) {
-                        item { Text("Pick a PC folder to link. The chat moves there.", Modifier.padding(vertical = 8.dp)) }
+                        item { Text(uiText("Pick a computer folder to link. The chat moves there."), Modifier.padding(vertical = 8.dp)) }
                         item {
                             Button(onClick = { linking = true }, enabled = scope != null && !saving, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("project-link-folder")) {
-                                Icon(Icons.Rounded.CreateNewFolder, null); Text("Link a PC folder", Modifier.padding(start = 8.dp))
+                                Icon(Icons.Rounded.CreateNewFolder, null); Text(uiText("Link a computer folder"), Modifier.padding(start = 8.dp))
                             }
                         }
                     }
                     items(if (scope == null) emptyList() else folders, key = { it.getString("path") }) { folder ->
-                        ActionRow(folder.string("label").ifBlank { folder.getString("path") }, if (folder.optBoolean("is_primary")) "Main folder" else "") { assign(selected, folder.getString("path")) }
+                        ActionRow(folder.string("label").ifBlank { folder.getString("path") }, if (folder.optBoolean("is_primary")) uiText("Main folder") else "", icon = null) { assign(selected, folder.getString("path")) }
                     }
                 }
             }
-            TextButton(onClick = { onDismiss(); vm.tab("Projects") }, modifier = Modifier.padding(vertical = 12.dp).heightIn(min = 48.dp)) { Text("Manage projects") }
+            TextButton(onClick = { onDismiss(); vm.tab("Projects") }, modifier = Modifier.padding(vertical = 12.dp).heightIn(min = 48.dp)) { Text(uiText("Manage projects")) }
         }
     }
-    // The same PC folder browser the Projects screen uses; the chosen folder is linked and the chat moves there in one step.
-    if (linking && selected != null) PcFolderPicker(vm, "Link PC folder", onDismiss = { linking = false }, onChoose = { path -> linking = false; assign(selected, path, link = true) })
+    // The same computer folder browser the Projects screen uses; the chosen folder is linked and the chat moves there in one step.
+    if (linking && selected != null) PcFolderPicker(vm, "Link computer folder", onDismiss = { linking = false }, onChoose = { path -> linking = false; assign(selected, path, link = true) })
 }

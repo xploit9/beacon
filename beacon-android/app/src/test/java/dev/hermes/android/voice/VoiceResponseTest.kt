@@ -3,7 +3,6 @@ package dev.hermes.android.voice
 import dev.hermes.android.ui.presenceEnergy
 import dev.hermes.android.ui.presenceGain
 import dev.hermes.android.ui.presenceSpread
-import dev.hermes.android.ui.presenceStir
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -13,14 +12,13 @@ class VoiceResponseTest {
         assertTrue(call.copy(userSpeaking=true,localAudioLevel=.04f).voiceAmplitude() >= .3f)
         assertTrue(call.copy(remoteSpeaking=true,remoteAudioLevel=.04f).voiceAmplitude() >= .3f)
     }
-    @Test fun louderSpeechOpensTheCloudMoreThanQuietSpeech() {
+    @Test fun louderSpeechBrightensTheCloudMoreThanQuietSpeech() {
         val quiet=call.copy(userSpeaking=true,localAudioLevel=.04f).voiceAmplitude()
         val voiced=call.copy(userSpeaking=true,localAudioLevel=.25f).voiceAmplitude()
-        fun excursion(a: Float)= presenceSpread(presenceEnergy(a))-presenceSpread(presenceEnergy(call.voiceAmplitude()))
-        println("VOICE_RESPONSE18 quietAmplitude=$quiet quietExcursion=${excursion(quiet)} voicedAmplitude=$voiced voicedExcursion=${excursion(voiced)} silenceAmplitude=${call.voiceAmplitude()}")
+        // Who talks sets the motion; how loud only sets how bright the dust glows.
+        fun excursion(a: Float)= presenceGain(presenceEnergy(a))-presenceGain(presenceEnergy(call.voiceAmplitude()))
         assertTrue(excursion(quiet) >= .06f)
         assertTrue(excursion(voiced) > excursion(quiet)*1.4f)
-        assertTrue(presenceStir(presenceEnergy(voiced)) > presenceStir(presenceEnergy(quiet)))
     }
     @Test fun duplexKeepsTheStrongerMeasuredChannel() {
         val user=call.copy(userSpeaking=true,localAudioLevel=.25f).voiceAmplitude()
@@ -62,7 +60,7 @@ class VoiceResponseTest {
             assertTrue(amplitude in 0f..1f);assertTrue(amplitude>=previous);previous=amplitude
             val energy=presenceEnergy(amplitude)
             assertEquals(amplitude,energy,0f)
-            assertTrue(presenceSpread(energy) in 1f..1.25f)
+            assertTrue(presenceSpread(energy) in 1f..1.1f)
             assertTrue(presenceGain(energy) in .6f..1f)
         }
         assertEquals(1f,call.copy(userSpeaking=true,localAudioLevel=3f).voiceAmplitude(),0f)

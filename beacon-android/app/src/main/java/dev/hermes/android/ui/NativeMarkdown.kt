@@ -84,14 +84,14 @@ internal fun Node.children(): List<Node> = buildList { var c = firstChild; while
 internal fun Node.plain(): String = when (this) { is Text -> literal; is Code -> literal; is MathNode -> source; is NativeMediaNode -> source; is SoftLineBreak, is HardLineBreak -> "\n"; else -> children().joinToString("") { it.plain() } }
 internal fun Node.descendants(): Sequence<Node> = sequence { for (child in children()) { yield(child); yieldAll(child.descendants()) } }
 
-/** The same annotated path is used with bitmap placeholders and readable source fallback. */
-internal fun inlineAnnotations(node: Node, primary: Color, math: Map<MathNode, String> = emptyMap(), onLink: ((String) -> Unit)? = null): AnnotatedString = buildAnnotatedString {
+/** The same annotated path is used with bitmap placeholders and readable source fallback. [codeBackground] is the themed ground of inline code. */
+internal fun inlineAnnotations(node: Node, primary: Color, math: Map<MathNode, String> = emptyMap(), onLink: ((String) -> Unit)? = null, codeBackground: Color = Color.Gray.copy(alpha = .12f)): AnnotatedString = buildAnnotatedString {
     fun appendNode(n: Node) {
         when (n) {
             is Text -> append(n.literal)
             is MathNode -> math[n]?.let { appendInlineContent(it, n.source) } ?: append(n.source)
             is NativeMediaNode -> append(n.source)
-            is Code -> withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = Color.Gray.copy(alpha = .12f))) { append(n.literal) }
+            is Code -> withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = codeBackground)) { append(n.literal) }
             is StrongEmphasis -> withStyle(SpanStyle(fontWeight = FontWeight.SemiBold)) { n.children().forEach(::appendNode) }
             is Emphasis -> withStyle(SpanStyle(fontStyle = FontStyle.Italic)) { n.children().forEach(::appendNode) }
             is Link -> {

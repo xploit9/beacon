@@ -8,6 +8,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.ui.platform.testTag
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.SearchOff
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.*
@@ -59,7 +60,7 @@ internal fun currentPickerProvider(groups: List<JSONObject>, provider: String, m
         Surface(Modifier.widthIn(max = if (kind == "Toolsets") 560.dp else 900.dp).fillMaxWidth().fillMaxHeight(if (kind == "Toolsets") .8f else .92f).padding(12.dp), shape = MaterialTheme.shapes.extraLarge, color = MaterialTheme.colorScheme.surface.copy(alpha = 1f)) {
             Column(Modifier.fillMaxSize()) {
                 // Toolsets belong to the profile, not to this chat, so the chat's title is not shown under them.
-                Header(kind, if (kind == "Toolsets") "" else chat.title, actions = {
+                Header(uiText(if (kind == "Toolsets") "Tools" else kind), if (kind == "Toolsets") "" else chat.title, actions = {
                     if (kind == "Reasoning" || kind == "Model & provider") IconButton(
                         onClick = { vm.openCatalog(kind) },
                         enabled = if (kind == "Reasoning") !reasoningPending && "picker:reasoning" !in refreshing else !modelPending && "picker:models" !in refreshing,
@@ -87,8 +88,8 @@ internal fun currentPickerProvider(groups: List<JSONObject>, provider: String, m
                         }.filter { it.second.isNotEmpty() }.sortedBy { it.first.string("provider_id") != currentProvider } }
                         OutlinedTextField(query, { query = it }, label = { Text(uiText("Search model or provider")) }, singleLine = true, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp))
                         LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(16.dp)) {
-                            if (loading) item { Column(Modifier.testTag("models-loading")) { LinearProgressIndicator(Modifier.fillMaxWidth()); Text("Loading models…", Modifier.padding(vertical = 12.dp)) } }
-                            if (modelPending && modelSaving.isBlank()) item { LinearProgressIndicator(Modifier.fillMaxWidth()); Text("Applying model…") }
+                            if (loading) item { LinearProgressIndicator(Modifier.fillMaxWidth().testTag("models-loading")) }
+                            if (modelPending && modelSaving.isBlank()) item { LinearProgressIndicator(Modifier.fillMaxWidth()); Text(uiText("Applying model…")) }
                             groups.forEach { (group, models) ->
                                 val provider = group.string("provider_id")
                                 val label = group.string("provider", group.string("label", provider))
@@ -102,16 +103,17 @@ internal fun currentPickerProvider(groups: List<JSONObject>, provider: String, m
                                             supportingContent = if (modelSubtitle(title, id).isNotBlank()) ({ Text(id, style = MaterialTheme.typography.bodySmall) }) else null,
                                             trailingContent = { when {
                                                 modelSaving == "$provider:$id" -> CircularProgressIndicator(Modifier.size(24.dp).testTag("model-applying"), strokeWidth = 2.dp)
-                                                selected -> Icon(Icons.Rounded.Check, "Selected", tint = MaterialTheme.colorScheme.primary)
+                                                selected -> Icon(Icons.Rounded.Check, uiText("Selected"), tint = MaterialTheme.colorScheme.primary)
                                             } },
                                             modifier = Modifier.testTag("model:$provider:$id").semantics { this.selected = selected }.clickable(enabled = !loading && !modelPending) { vm.pickModel(id, provider) }.heightIn(min = 64.dp))
                                     }
                                 }
                             }
                             item {
-                                if (catalog != null && !loading && recordError(catalog).isBlank() && groups.isEmpty()) Text("No matching models. Try another search.")
-                                if (recordError(catalog).isNotBlank()) Text("Couldn't load models. Tap refresh to try again.", color = MaterialTheme.colorScheme.error)
-                                val enterCustomModel = { vm.closeCatalog(); vm.openForm(ActionForm("Custom model", "/api/session/update", listOf(Field("model", required = true), Field("model_provider", "Provider ID")), json("session_id" to chat.sessionId))) }
+                                if (catalog != null && !loading && recordError(catalog).isBlank() && groups.isEmpty()) EmptyState(uiText("No matching models"), uiText("Try another search."), Icons.Rounded.SearchOff, action = if (query.isBlank()) "" else uiText("Clear search"), onAction = { query = "" })
+                                if (recordError(catalog).isNotBlank()) Text(uiText("Couldn't load models. Tap refresh to try again."), color = MaterialTheme.colorScheme.error)
+                                val customModelTitle = uiText("Custom model"); val modelLabel = uiText("Model"); val providerIdLabel = uiText("Provider ID")
+                                val enterCustomModel = { vm.closeCatalog(); vm.openForm(ActionForm(customModelTitle, "/api/session/update", listOf(Field("model", modelLabel, required = true), Field("model_provider", providerIdLabel)), json("session_id" to chat.sessionId))) }
                                 if (!loading) {
                                     if (containedActions) OutlinedButton(onClick = enterCustomModel, enabled = !modelPending, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Enter a configured model ID")) }
                                     else TextButton(onClick = enterCustomModel, enabled = !modelPending) { Text(uiText("Enter a configured model ID")) }
@@ -131,7 +133,7 @@ internal fun currentPickerProvider(groups: List<JSONObject>, provider: String, m
                                 ) { Text(uiText(label), maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
                             }
                         }
-                        if (toolsMcp) Text("Changes apply to this profile's new chats.", Modifier.padding(start = 20.dp, top = 12.dp, end = 20.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (toolsMcp) Text(uiText("Changes apply to this profile's new chats."), Modifier.padding(start = 16.dp, top = 12.dp, end = 16.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         // One scroller inside the sheet: the page's own list fills this bounded box.
                         Box(Modifier.weight(1f).fillMaxWidth()) { NativeToolSettings(vm, mcp = toolsMcp, containedActions = true) }
                     }
@@ -140,15 +142,15 @@ internal fun currentPickerProvider(groups: List<JSONObject>, provider: String, m
                         val options = value?.optJSONArray("options")?.strings().orEmpty()
                         var level by remember(value?.toString()) { mutableStateOf(value?.string("value").orEmpty().takeIf { it in options }.orEmpty()) }
                         Column(Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                            Text("Choose a reasoning level for this conversation.", style = MaterialTheme.typography.bodyLarge)
+                            Text(uiText("Choose a reasoning level for this conversation."), style = MaterialTheme.typography.bodyLarge)
                             if (value == null || "picker:reasoning" in refreshing) ReasoningSkeleton()
-                            else if (recordError(value).isNotBlank()) Text("Reasoning options are unavailable. Your current setting is unchanged.", color = MaterialTheme.colorScheme.error)
+                            else if (recordError(value).isNotBlank()) Text(uiText("Reasoning options are unavailable. Your current setting is unchanged."), color = MaterialTheme.colorScheme.error)
                             else if (options.isNotEmpty()) {
-                                value.string("value").takeIf(String::isNotBlank)?.let { Text("Current: ${reasoningLevelLabel(it)}", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                                value.string("value").takeIf(String::isNotBlank)?.let { Text("${uiText("Current")}: ${uiText(reasoningLevelLabel(it))}", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                                 options.forEach { option -> ReasoningLevelOption(option, level == option, enabled = !reasoningPending) { level = option } }
-                                Button(onClick = { vm.setReasoning(level) }, enabled = !reasoningPending && level in options, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text(if (reasoningPending) "Applying…" else "Apply to conversation") }
-                            } else if (value.optBoolean("known")) Text("This model manages reasoning automatically.")
-                            else Text("No reasoning choices are available.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Button(onClick = { vm.setReasoning(level) }, enabled = !reasoningPending && level in options, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text(uiText(if (reasoningPending) "Applying…" else "Apply to conversation")) }
+                            } else if (value.optBoolean("known")) Text(uiText("This model manages reasoning automatically."))
+                            else Text(uiText("No reasoning choices are available."), color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
                 }
@@ -183,8 +185,8 @@ internal fun reasoningLevelDescription(level: String): String = when (level.lowe
         Row(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
             RadioButton(selected, onClick = null, enabled = enabled)
             Column(Modifier.padding(start = 8.dp)) {
-                Text(reasoningLevelLabel(level), style = MaterialTheme.typography.titleSmall)
-                Text(reasoningLevelDescription(level), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(uiText(reasoningLevelLabel(level)), style = MaterialTheme.typography.titleSmall)
+                Text(uiText(reasoningLevelDescription(level)), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
@@ -216,31 +218,34 @@ internal fun reasoningLevelDescription(level: String): String = when (level.lowe
         if (page == "Session usage") vm.load("native-usage:${ui.profile}:${chat.sessionId}", "/api/session/usage", mapOf("session_id" to chat.sessionId))
     }
     Column(Modifier.fillMaxSize()) {
-        Header(page, back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current, actions = {
+        Header(uiText(settingsLabel(page)), back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current, actions = {
             if (page == "Commands") IconButton(onClick = { vm.loadSlashCatalog(force = true) }, enabled = "slash:catalog" !in refreshing) { Icon(Icons.Rounded.Refresh, uiText("Refresh commands")) }
             if (page == "Session usage") IconButton(onClick = { vm.load("native-usage:${ui.profile}:${chat.sessionId}", "/api/session/usage", mapOf("session_id" to chat.sessionId)) }, enabled = "native-usage:${ui.profile}:${chat.sessionId}" !in refreshing) { Icon(Icons.Rounded.Refresh, uiText("Refresh usage")) }
         })
         when (page) {
             "Tools & commands" -> NativeToolSettings(vm, containedActions = true)
             "MCP servers" -> NativeToolSettings(vm, mcp = true, containedActions = true)
-            "Providers & models" -> Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                Text("Model for this chat.")
-                Text(chat.title, style = MaterialTheme.typography.titleMedium)
-                Text(chat.raw.string("model").ifBlank { "Uses the profile default" })
-                Button(onClick = { vm.openCatalog("Model & provider") }, enabled = chat.sessionId.isNotBlank()) { Text("Change conversation model") }
-                OutlinedButton(onClick = { vm.more("Profiles") }) { Text("Manage profile defaults") }
+            "Providers & models" -> Column(Modifier.padding(SettingsPagePadding), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                Text(uiText("Model for this chat"))
+                if (chat.sessionId.isBlank()) Text(uiText("Pick a chat first"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                else {
+                    Text(chat.title, style = MaterialTheme.typography.titleMedium)
+                    Text(chat.raw.string("model").ifBlank { uiText("Uses the profile default") })
+                }
+                Button(onClick = { vm.openCatalog("Model & provider") }, enabled = chat.sessionId.isNotBlank()) { Text(uiText("Change conversation model")) }
+                OutlinedButton(onClick = { vm.more("Profiles") }) { Text(uiText("Manage profile defaults")) }
             }
-            "Commands" -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                item { Text("Choose a command to prepare it in Chat. Review it before sending."); OutlinedTextField(query, { query = it }, label = { Text("Search commands") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
+            "Commands" -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(SettingsPagePadding), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                item { Text(uiText("Choose a command to prepare it in Chat. Review it before sending.")); OutlinedTextField(query, { query = it }, label = { Text(uiText("Search commands")) }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
                 val catalog = data["slash:catalog"]
                 if (catalog == null) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
-                if (recordError(catalog).isNotBlank()) item { Text(recordError(catalog), color = MaterialTheme.colorScheme.error) }
+                if (recordError(catalog).isNotBlank()) item { Text(uiText(recordError(catalog)), color = MaterialTheme.colorScheme.error) }
                 val commands = mobileSlashCommands(catalog?.rows("commands").orEmpty()).filter { query.isBlank() || (it.string("name") + it.string("description")).contains(query, true) }
-                if (catalog != null && commands.isEmpty()) item { Text("No matching commands") }
+                if (catalog != null && commands.isEmpty()) item { EmptyState(uiText("No matching commands"), uiText("Try another search."), Icons.Rounded.SearchOff, action = if (query.isBlank()) "" else uiText("Clear search"), onAction = { query = "" }) }
                 items(commands) { row -> ActionRow("/${row.string("name")}", row.string("description")) { vm.tab("Chat"); vm.composer(androidx.compose.ui.text.input.TextFieldValue("/${row.string("name").removePrefix("/")} ")) } }
             }
-            "Session usage" -> LazyColumn(contentPadding = PaddingValues(20.dp)) {
-                item { val usage = data["native-usage:${ui.profile}:${chat.sessionId}"]; if (usage == null) LinearProgressIndicator(Modifier.fillMaxWidth()) else if (recordError(usage).isNotBlank()) Text(recordError(usage), color = MaterialTheme.colorScheme.error) else StructuredRead(usage) }
+            "Session usage" -> LazyColumn(contentPadding = PaddingValues(SettingsPagePadding)) {
+                item { val usage = data["native-usage:${ui.profile}:${chat.sessionId}"]; if (usage == null) LinearProgressIndicator(Modifier.fillMaxWidth()) else if (recordError(usage).isNotBlank()) Text(uiText(recordError(usage)), color = MaterialTheme.colorScheme.error) else StructuredRead(usage) }
             }
             else -> LaunchedEffect(page) { vm.tab("More") }
         }

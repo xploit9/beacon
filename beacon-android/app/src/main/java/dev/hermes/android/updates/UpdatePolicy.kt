@@ -18,13 +18,27 @@ internal fun sameCodeDifferentBytes(seenCode: Long, seenSha: String, release: Re
     seenCode != 0L && release.version == seenCode && !release.sha.equals(seenSha, true)
 
 internal const val UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60_000L
+internal const val UPDATE_OFFER_REFRESH_MS = 30 * 60_000L
 private const val UPDATE_RETRY_MS = 15 * 60_000L
 
-/** A check is due every 6 hours; a failed attempt waits 15 minutes. A manual check is always due. */
-internal fun updateCheckDue(lastCheck: Long, now: Long, force: Boolean, lastAttempt: Long = 0): Boolean {
-    fun aged(last: Long, window: Long) = last == 0L || now < last || now - last >= window
-    return force || aged(lastCheck, UPDATE_CHECK_INTERVAL_MS) && aged(lastAttempt, UPDATE_RETRY_MS)
+/** A check is due every [window] (6 hours); a failed attempt waits 15 minutes. A manual check is always due. */
+internal fun updateCheckDue(lastCheck: Long, now: Long, force: Boolean, lastAttempt: Long = 0, window: Long = UPDATE_CHECK_INTERVAL_MS): Boolean {
+    fun aged(last: Long, span: Long) = last == 0L || now < last || now - last >= span
+    return force || aged(lastCheck, window) && aged(lastAttempt, UPDATE_RETRY_MS)
 }
+
+/** Opening the update screen on an offer refreshes it after 30 minutes; every other check keeps the 6-hour schedule. */
+internal fun checkWindow(offered: Boolean, onUpdateScreen: Boolean): Long = if (offered && onUpdateScreen) UPDATE_OFFER_REFRESH_MS else UPDATE_CHECK_INTERVAL_MS
+
+/**
+ * The release an Update tap goes on with: what [ask] (GitHub's latest, vetted; null when nothing is newer) answers now, never the
+ * release found at the last check. Only when GitHub cannot be reached does the [stored] one stand in, and only while it
+ * [stillVerifies]; every other failure, and an unreachable GitHub with nothing verified stored, is rethrown for the check failure.
+ */
+internal suspend fun releaseForUpdate(stored: Release?, ask: suspend () -> Release?, stillVerifies: (Release) -> Boolean): Release? =
+    try { ask() } catch (error: UpdateException) {
+        if (error.kind == UpdateException.Kind.Network && stored != null && stillVerifies(stored)) stored else throw error
+    }
 
 internal fun updateNotificationDue(version: Long, lastNotified: Long): Boolean = version > lastNotified
 
@@ -59,14 +73,15 @@ internal fun progressPercent(done: Long, total: Long): Int = if (total <= 0) 0 e
 internal fun progressLine(done: Long, total: Long): String =
     "${progressPercent(done, total)}% · ${megabytes(done, total < 10L * 1024 * 1024)} of ${formatSize(total)}"
 
-/** "just now", "5 min ago", "3 h ago", "2 d ago"; blank when never checked. */
-internal fun checkedAgo(lastCheck: Long, now: Long): String {
+/** "just now", "5 min ago", "3 h ago", "2 d ago"; blank when never checked. The screen passes the words in the phone's language. */
+internal fun checkedAgo(lastCheck: Long, now: Long, justNow: String = "just now", minutesAgo: String = "{0} min ago",
+                        hoursAgo: String = "{0} h ago", daysAgo: String = "{0} d ago"): String {
     if (lastCheck <= 0) return ""
     val minutes = ((now - lastCheck) / 60_000).coerceAtLeast(0)
     return when {
-        minutes < 1 -> "just now"
-        minutes < 60 -> "$minutes min ago"
-        minutes < 24 * 60 -> "${minutes / 60} h ago"
-        else -> "${minutes / (24 * 60)} d ago"
+        minutes < 1 -> justNow
+        minutes < 60 -> minutesAgo.replace("{0}", "$minutes")
+        minutes < 24 * 60 -> hoursAgo.replace("{0}", "${minutes / 60}")
+        else -> daysAgo.replace("{0}", "${minutes / (24 * 60)}")
     }
 }

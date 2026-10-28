@@ -263,7 +263,7 @@ class ChatMigrationUiTest {
             if (open) ChatActivitySheet(activity, onDismiss = { open = false })
         } }
         compose.waitForIdle()
-        compose.onNodeWithTag("chat-activity-strip").assertTextContains("2 agents · 1 process · 1 cron job · 1 watch")
+        compose.onNodeWithTag("chat-activity-strip").assertTextContains("2 agents · 1 process · 1 schedule running · 1 watch")
         val stripBounds = compose.onNodeWithTag("chat-activity-strip").getUnclippedBoundsInRoot()
         assertTrue("The background strip stays compact", stripBounds.bottom - stripBounds.top <= 48.dp)
         compose.onNodeWithTag("chat-activity-sheet").assertDoesNotExist()
@@ -273,7 +273,7 @@ class ChatMigrationUiTest {
         compose.onNodeWithText("Read-only status from this profile").assertIsDisplayed()
         compose.onNodeWithText("2 background agents").performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("1 background process").performScrollTo().assertIsDisplayed()
-        compose.onNodeWithText("1 running cron job").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("1 schedule running").performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("1 active watch").performScrollTo().assertIsDisplayed()
         compose.onAllNodesWithText("sa-current").assertCountEquals(0)
         compose.onAllNodesWithText("C:\\SyntheticOwner", substring = true).assertCountEquals(0)

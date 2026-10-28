@@ -54,7 +54,7 @@ import java.time.format.FormatStyle
     LifecycleResumeEffect(context) {
         val allowed = alertsEnabled()
         // Back from Android's permission pages: finish a waiting install, and tell the user now if alerts were just allowed.
-        if (allowed && !alertsAllowed) updates.checkNow() else updates.resume()
+        if (allowed && !alertsAllowed) updates.checkNow() else updates.resume(onUpdateScreen = true)
         alertsAllowed = allowed
         onPauseOrDispose { }
     }
@@ -100,7 +100,7 @@ import java.time.format.FormatStyle
             Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Icon(painterResource(R.drawable.ic_beacon_logo), null, Modifier.size(44.dp), tint = Color.Unspecified)
-                    Text("Beacon ${release?.name ?: installed}", Modifier.weight(1f, fill = false).testTag("update-version"), style = MaterialTheme.typography.titleLarge)
+                    Text("Beacon ${release?.name ?: installed}", Modifier.weight(1f, fill = false).testTag("update-version"), style = MaterialTheme.typography.titleLarge) // verbatim
                     // A plugin-only action also reads as Available, but the app itself is current then.
                     if (state.phase == UpdatePhase.Available && release != null) NewBadge()
                 }
@@ -135,8 +135,8 @@ import java.time.format.FormatStyle
         Text(uiText(if (checking) "Checking for updates…" else "You're up to date"), style = MaterialTheme.typography.bodyMedium)
         Row(Modifier.heightIn(min = 20.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             if (checking) CircularProgressIndicator(Modifier.size(16.dp).testTag("update-checking"), strokeWidth = 2.dp)
-            else checkedAgo(state.checkedAt, now).takeIf { it.isNotBlank() }?.let {
-                Text("Checked $it", Modifier.testTag("update-checked"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            else checkedAgo(state.checkedAt, now, uiText("just now"), uiText("{0} min ago"), uiText("{0} h ago"), uiText("{0} d ago")).takeIf { it.isNotBlank() }?.let {
+                Text(uiText("Checked {0}").replace("{0}", it), Modifier.testTag("update-checked"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
@@ -148,23 +148,23 @@ import java.time.format.FormatStyle
     val plugin = state.plugin
     release?.let {
         val date = remember(it.published) { releaseDate(it.published) }
-        Text(listOfNotNull(date.takeIf(String::isNotBlank)?.let { day -> "Released $day" }, formatSize(it.size)).joinToString(" · "), Modifier.testTag("update-meta"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(listOfNotNull(date.takeIf(String::isNotBlank)?.let { day -> uiText("Released {0}").replace("{0}", day) }, formatSize(it.size)).joinToString(" · "), Modifier.testTag("update-meta"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         if (it.notes.isNotBlank()) Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(uiText("What's new"), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
             ReleaseNotes(it.notes)
         }
     }
     Column(Modifier.fillMaxWidth()) {
-        UpdateRow("update-row-app", "App", if (release != null) "$installed → ${release.name}" else installed, uiText(if (release != null) "Ready to update" else "Up to date"))
+        UpdateRow("update-row-app", uiText("App"), if (release != null) "$installed → ${release.name}" else installed, uiText(if (release != null) "Ready to update" else "Up to date"))
         if (plugin.status != PluginStatus.Hidden) {
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f))
-            UpdateRow("update-row-plugin", "Hermes plugin", if (plugin.installed.isNotBlank()) "${plugin.installed} → ${plugin.target}" else plugin.target, uiText(plugin.text),
+            UpdateRow("update-row-plugin", uiText("Hermes plugin"), if (plugin.installed.isNotBlank()) "${plugin.installed} → ${plugin.target}" else plugin.target, uiText(plugin.text),
                 onAction = onReview.takeIf { plugin.status == PluginStatus.NeedsReview })
         }
     }
     if (release != null || plugin.status in setOf(PluginStatus.Available, PluginStatus.Busy, PluginStatus.Failed)) {
         Button(onClick = onUpdate, enabled = !callBusy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("update-primary")) { Text(uiText("Update")) }
-        if (callBusy) Text(UpdateFailure.Call.text, Modifier.testTag("update-call-busy"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (callBusy) Text(uiText(UpdateFailure.Call.text), Modifier.testTag("update-call-busy"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -203,7 +203,7 @@ import java.time.format.FormatStyle
 }
 
 @Composable private fun UpdateFailed(state: AppUpdateUi, onRetry: () -> Unit) {
-    Text(state.failure?.text ?: UpdateFailure.Download.text, Modifier.testTag("update-failure"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
+    Text(uiText(state.failure?.text ?: UpdateFailure.Download.text), Modifier.testTag("update-failure"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
     Button(onClick = onRetry, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("update-retry")) { Text(uiText("Try again")) }
 }
 
@@ -226,16 +226,16 @@ import java.time.format.FormatStyle
 @Composable private fun PluginReviewDialog(lines: List<String>, onAllow: () -> Unit, onDismiss: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Review plugin capability changes") },
+        title = { Text(uiText("Review plugin capability changes")) },
         text = {
             Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("This update changes what the Beacon plugin can access. Review the changes before continuing.")
-                if (lines.isEmpty()) Text("Hermes did not provide a change list. Review the plugin update on your PC before allowing it.")
+                Text(uiText("This update changes what the Beacon plugin can access. Review the changes before continuing."))
+                if (lines.isEmpty()) Text(uiText("Hermes did not provide a change list. Review the plugin update on your PC before allowing it."))
                 lines.forEach { Text("• $it", style = MaterialTheme.typography.bodySmall) }
             }
         },
-        confirmButton = { TextButton(onClick = onAllow) { Text("Allow and update") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        confirmButton = { TextButton(onClick = onAllow) { Text(uiText("Allow and update")) } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(uiText("Cancel")) } },
     )
 }
 

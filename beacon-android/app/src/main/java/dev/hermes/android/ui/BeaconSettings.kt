@@ -59,19 +59,15 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
     Result.failure(error)
 }
 
-@Composable private fun AssistantProfileChoice(selected: String, options: List<String>, profiles: List<JSONObject>, loading: Boolean, onSelect: (String) -> Unit, modifier: Modifier = Modifier) {
-    var expanded by remember(selected) { mutableStateOf(false) }
-    Box(modifier) {
-        OutlinedButton(onClick = { expanded = true }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
-            Text(uiText("Profile") + ": " + if (loading) uiText("Loading profile…") else profileDisplayName(selected, profiles), Modifier.weight(1f))
-        }
-        DropdownMenu(expanded, { expanded = false }) {
-            voiceOptionsWithSelected(options, selected).forEach { id ->
-                val label = if (loading && id == selected) uiText("Loading profile…") else profileDisplayName(id, profiles)
-                DropdownMenuItem(text = { Text(label) }, onClick = { expanded = false; onSelect(id) }, modifier = Modifier.testTag("choice-option:Profile:$id"))
-            }
-        }
-    }
+/** Asks before a rule or a learned note is removed; what the user wrote is shown as it is. */
+@Composable private fun ConfirmRemovalDialog(title: String, text: String, confirmLabel: String, confirmTag: String, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = { Text(text) },
+        confirmButton = { TextButton(onClick = onConfirm, modifier = Modifier.testTag(confirmTag)) { Text(confirmLabel, color = MaterialTheme.colorScheme.error) } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(uiText("Cancel")) } },
+    )
 }
 
 /** The assistant's name (on this phone) and the profile its chat always uses. */
@@ -96,16 +92,18 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
     var proactiveCheckMinutes by remember(proactiveVersion) { mutableIntStateOf(proactive?.optInt("check_minutes", 15) ?: 15) }
     var proactiveQuietStart by remember(proactiveVersion) { mutableStateOf(proactive?.string("quiet_start").orEmpty().ifBlank { "22:00" }) }
     var proactiveQuietEnd by remember(proactiveVersion) { mutableStateOf(proactive?.string("quiet_end").orEmpty().ifBlank { "07:00" }) }
+    var ruleToDelete by remember(profile) { mutableStateOf<Pair<String, String>?>(null) }
+    var noteToRemove by remember(profile) { mutableStateOf<String?>(null) }
+    // Words the callbacks below show are translated here, where uiText can run.
+    val loadFailed = uiText("Couldn't load Proactive settings. Try again.")
+    val updateFailed = uiText("Couldn't update Proactive settings. Try again.")
+    val ruleFailed = uiText("Couldn't update the rule. Try again.")
+    val noteFailed = uiText("Couldn't remove this preference. Try again.")
+    val ruleExplanation = assistantText("Tell Beacon what needs your attention.")
     fun reportProactiveError(error: Throwable, fallback: String) {
         if (isMissingBeaconPluginRoute(error)) vm.storeData(proactiveKey, JSONObject().put("_pluginUpdateRequired", true))
         else vm.notice(proactiveErrorMessage(error, fallback))
     }
-    val proactiveChoicesChanged = proactive != null && (
-        proactiveDelivery != proactive.string("delivery", "notify") ||
-            proactiveCheckMinutes != proactive.optInt("check_minutes", 15) ||
-            proactiveQuietStart != proactive.string("quiet_start", "22:00") ||
-            proactiveQuietEnd != proactive.string("quiet_end", "07:00")
-        )
     LaunchedEffect(ui.origin, ui.owner, ui.profile, profile, ui.connected, pluginStatus, vm.client, proactiveRefresh) {
         if (!ui.connected || pluginStatus == "absent") return@LaunchedEffect
         val source = vm.client ?: return@LaunchedEffect
@@ -119,7 +117,7 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
             if (vm.client === source && vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile)
                 vm.storeData(proactiveKey, JSONObject().put("_error", true)
                     .put("_pluginUpdateRequired", isMissingBeaconPluginRoute(error))
-                    .put("_message", proactiveErrorMessage(error, "Couldn't load Proactive settings. Try again.")))
+                    .put("_message", proactiveErrorMessage(error, loadFailed)))
         }
     }
     fun setProactive(enabled: Boolean) {
@@ -127,7 +125,7 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
         val source = vm.client
         if (source == null || !ui.connected || pluginStatus == "absent") return
         val client = try { source.forAuthorizedProfile(profile) } catch (_: Throwable) {
-            vm.notice("Couldn't update Proactive settings. Try again.")
+            vm.notice(updateFailed)
             return
         }
         savingProactive = true
@@ -138,29 +136,37 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
                     vm.storeData(proactiveKey, response)
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
-                reportProactiveError(error, "Couldn't update Proactive settings. Try again.")
+                reportProactiveError(error, updateFailed)
             } finally { client.closeNative(); savingProactive = false }
         }
     }
-    fun saveProactiveChoices() {
-        if (savingProactive || !proactiveLoaded || !proactiveChoicesChanged) return
+    /** A changed choice is saved at once; if the save fails the controls go back to what Hermes has. */
+    fun saveProactiveChoices(delivery: String = proactiveDelivery, checkMinutes: Int = proactiveCheckMinutes, quietStart: String = proactiveQuietStart, quietEnd: String = proactiveQuietEnd) {
+        if (savingProactive || !proactiveLoaded) return
+        if (delivery == proactiveDelivery && checkMinutes == proactiveCheckMinutes && quietStart == proactiveQuietStart && quietEnd == proactiveQuietEnd) return
+        val wasDelivery = proactiveDelivery
+        val wasCheckMinutes = proactiveCheckMinutes
+        val wasQuietStart = proactiveQuietStart
+        val wasQuietEnd = proactiveQuietEnd
+        proactiveDelivery = delivery; proactiveCheckMinutes = checkMinutes; proactiveQuietStart = quietStart; proactiveQuietEnd = quietEnd
         savingProactive = true
         scope.launch {
             try {
-                val body = proactiveSettingsBody(proactiveEnabled, proactiveDelivery, proactiveCheckMinutes, proactiveQuietStart, proactiveQuietEnd, prefs)
+                val body = proactiveSettingsBody(proactiveEnabled, delivery, checkMinutes, quietStart, quietEnd, prefs)
                 val response = saveProactiveSettings(vm, profile, body)
                 if (vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile)
                     vm.storeData(proactiveKey, response)
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
-                reportProactiveError(error, "Couldn't update Proactive settings. Try again.")
+                proactiveDelivery = wasDelivery; proactiveCheckMinutes = wasCheckMinutes; proactiveQuietStart = wasQuietStart; proactiveQuietEnd = wasQuietEnd
+                reportProactiveError(error, updateFailed)
             } finally { savingProactive = false }
         }
     }
     fun updateProactiveRule(id: String, method: String, body: JSONObject? = null) {
-        if (savingProactive || proactiveChoicesChanged) return
+        if (savingProactive) return
         val source = vm.client ?: return
-        val client = try { source.forAuthorizedProfile(profile) } catch (_: Throwable) { vm.notice("Couldn't update the rule. Try again."); return }
+        val client = try { source.forAuthorizedProfile(profile) } catch (_: Throwable) { vm.notice(ruleFailed); return }
         savingProactive = true
         scope.launch {
             try {
@@ -168,21 +174,21 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
                 if (vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile) proactiveRefresh++
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
-                reportProactiveError(error, "Couldn't update the rule. Try again.")
+                reportProactiveError(error, ruleFailed)
             } finally { client.closeNative(); savingProactive = false }
         }
     }
     fun addProactiveRule() {
-        openProactiveRuleForm(vm, profile,
+        openProactiveRuleForm(vm, profile, ruleExplanation,
             onCreated = { if (vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile) proactiveRefresh++ },
             onMissingPlugin = { vm.storeData(proactiveKey, JSONObject().put("_pluginUpdateRequired", true)) },
             sources = proactive?.let(::proactiveSources).orEmpty(),
         )
     }
     fun removeLearnedNote(note: String) {
-        if (savingProactive || proactiveChoicesChanged) return
+        if (savingProactive) return
         val source = vm.client ?: return
-        val client = try { source.forAuthorizedProfile(profile) } catch (_: Throwable) { vm.notice("Couldn't remove this preference. Try again."); return }
+        val client = try { source.forAuthorizedProfile(profile) } catch (_: Throwable) { vm.notice(noteFailed); return }
         savingProactive = true
         scope.launch {
             try {
@@ -190,7 +196,7 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
                 if (vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile) proactiveRefresh++
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
-                reportProactiveError(error, "Couldn't remove this preference. Try again.")
+                reportProactiveError(error, noteFailed)
             } finally { client.closeNative(); savingProactive = false }
         }
     }
@@ -209,11 +215,14 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     OutlinedTextField(name, { name = it.take(ASSISTANT_NAME_MAX) }, label = { Text(uiText("Name")) }, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("assistant-name"),
                         trailingIcon = { if (assistantNameOf(name) != prefs.assistantName) FilledTonalButton(onClick = { vm.setAssistantName(name) }, modifier = Modifier.testTag("assistant-name-save"), contentPadding = PaddingValues(horizontal = 8.dp)) { Text(uiText("Save")) } })
-                    OutlinedTextField(ownerName, { ownerName = ownerNameOf(it) }, label = { Text("What should Beacon call you?") }, supportingText = { Text("Optional") }, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("owner-name"),
+                    OutlinedTextField(ownerName, { ownerName = ownerNameOf(it) }, label = { Text(assistantText("What should Beacon call you?")) }, supportingText = { Text(uiText("Optional")) }, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("owner-name"),
                         trailingIcon = { if (ownerName != prefs.ownerName) FilledTonalButton(onClick = { vm.setOwnerName(ownerName) }, modifier = Modifier.testTag("owner-name-save"), contentPadding = PaddingValues(horizontal = 8.dp)) { Text(uiText("Save")) } })
-                    AssistantProfileChoice(prefs.assistantProfile, profiles, profileRows, profileLoading, { vm.setAssistantProfile(it) }, Modifier.fillMaxWidth().testTag("assistant-profile"))
+                    val profileOptions = voiceOptionsWithSelected(profiles, prefs.assistantProfile)
+                    val loadingProfile = uiText("Loading profile…")
+                    Choice("Profile", prefs.assistantProfile, profileOptions, { vm.setAssistantProfile(it) }, Modifier.fillMaxWidth().testTag("assistant-profile"),
+                        optionLabels = profileOptions.associateWith { id -> if (profileLoading && id == prefs.assistantProfile) loadingProfile else profileDisplayName(id, profileRows) })
                     Choice("Model", selectedModel, voiceOptionsWithSelected(listOf("") + models.keys, selectedModel), { key -> vm.setAssistantModel(key.substringAfter('\t', ""), if (key.isBlank()) "" else key.substringBefore('\t')) },
-                        Modifier.fillMaxWidth().testTag("assistant-model"), optionLabels = models + ("" to "Profile default") + (selectedModel to (models[selectedModel] ?: prefs.assistantModel)).takeIf { selectedModel.isNotBlank() }.let { listOfNotNull(it).toMap() })
+                        Modifier.fillMaxWidth().testTag("assistant-model"), optionLabels = mapOf("" to "Profile default") + models + (selectedModel to (models[selectedModel] ?: prefs.assistantModel)).takeIf { selectedModel.isNotBlank() }.let { listOfNotNull(it).toMap() })
                     Text(uiText("Its chat always uses this profile and model. Your other chats keep theirs."), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
@@ -230,7 +239,7 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
                         if (pluginStatus != "absent" && proactive?.optBoolean("_pluginUpdateRequired") != true) Switch(
                             checked = proactiveEnabled,
                             onCheckedChange = ::setProactive,
-                            enabled = proactiveLoaded && ui.connected && vm.client != null && !savingProactive && !proactiveChoicesChanged,
+                            enabled = proactiveLoaded && ui.connected && vm.client != null && !savingProactive,
                             modifier = Modifier.testTag("assistant-proactive-toggle"),
                         )
                     }
@@ -259,17 +268,15 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
                                 Text(uiText("Watch status"), Modifier.weight(1f), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 ProactiveHealthChip(proactiveHealthState(proactive, checking))
                             }
-                            proactive?.takeIf { it.optJSONObject("health")?.string("state") == "error" }?.let {
-                                Text(proactiveHealthText(it), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-                            }
+                            if (proactive?.optJSONObject("health")?.string("state") == "error")
+                                Text(uiText("Couldn't check just now. Try again later."), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                             Text(uiText("When something matters"), style = MaterialTheme.typography.titleMedium)
-                            Choice("Delivery", proactiveDelivery, listOf("notify", "call"), { proactiveDelivery = it }, Modifier.testTag("proactive-delivery"), mapOf("notify" to "Notify", "call" to "Call"), controlsEnabled)
+                            Choice("Delivery", proactiveDelivery, listOf("notify", "call"), { saveProactiveChoices(delivery = it) }, Modifier.testTag("proactive-delivery"), optionLabels = mapOf("notify" to "Notify", "call" to "Call"), enabled = controlsEnabled)
                             if (proactiveCallsUnavailable(proactive, proactiveDelivery, callbacksAvailable))
                                 Text(uiText("Calls are off on this Hermes. You'll get a notification instead."), Modifier.testTag("proactive-calls-off"), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Choice("Check every", proactiveCheckMinutes.toString(), listOf("5", "15", "30"), { proactiveCheckMinutes = it.toInt() }, Modifier.testTag("proactive-check-minutes"), mapOf("5" to "5 min", "15" to "15 min", "30" to "30 min"), controlsEnabled)
-                            ProactiveTimePicker("Quiet hours start", proactiveQuietStart, controlsEnabled) { proactiveQuietStart = it }
-                            ProactiveTimePicker("Quiet hours end", proactiveQuietEnd, controlsEnabled) { proactiveQuietEnd = it }
-                            Button(onClick = ::saveProactiveChoices, enabled = proactiveChoicesChanged && controlsEnabled, modifier = Modifier.testTag("proactive-save-settings")) { Text(uiText("Save settings")) }
+                            Choice("Check every", proactiveCheckMinutes.toString(), listOf("5", "15", "30"), { saveProactiveChoices(checkMinutes = it.toInt()) }, Modifier.testTag("proactive-check-minutes"), optionLabels = mapOf("5" to "5 min", "15" to "15 min", "30" to "30 min"), enabled = controlsEnabled)
+                            ProactiveTimePicker(uiText("Quiet hours start"), proactiveQuietStart, controlsEnabled) { saveProactiveChoices(quietStart = it) }
+                            ProactiveTimePicker(uiText("Quiet hours end"), proactiveQuietEnd, controlsEnabled) { saveProactiveChoices(quietEnd = it) }
                         }
                     }
                 }
@@ -283,27 +290,26 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
                     if (rules.isEmpty()) Text(uiText("No rules yet."), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     rules.forEach { rule ->
                         val id = rule.string("id")
-                        val controlsEnabled = ui.connected && vm.client != null && !savingProactive
-                        val enabled = controlsEnabled && !proactiveChoicesChanged
+                        val enabled = ui.connected && vm.client != null && !savingProactive
                         Column(Modifier.fillMaxWidth().testTag("proactive-rule-$id"), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text(rule.string("text"), Modifier.testTag("proactive-rule-text-$id"), style = MaterialTheme.typography.bodyMedium)
                             Text(uiText("Source") + ": " + ((rule.opt("signal") as? String)?.takeIf(String::isNotBlank) ?: uiText("Anything")),
                                 Modifier.testTag("proactive-rule-source-$id"), style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Choice("When it matches", rule.string("action", "notify"), listOf("notify", "call"), { updateProactiveRule(id, "PATCH", json("action" to it)) }, Modifier.testTag("proactive-rule-action-$id"), mapOf("notify" to "Notify", "call" to "Call"), enabled)
+                            Choice("When it matches", rule.string("action", "notify"), listOf("notify", "call"), { updateProactiveRule(id, "PATCH", json("action" to it)) }, Modifier.testTag("proactive-rule-action-$id"), optionLabels = mapOf("notify" to "Notify", "call" to "Call"), enabled = enabled)
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(uiText("Even at night"), Modifier.weight(1f))
                                 Switch(rule.optBoolean("night"), { updateProactiveRule(id, "PATCH", json("night" to it)) }, enabled = enabled, modifier = Modifier.testTag("proactive-rule-night-$id"))
                             }
-                            Row(verticalAlignment = Alignment.CenterVertically) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                                 Text(uiText(if (rule.optBoolean("enabled")) "On" else "Off").replaceFirstChar(Char::titlecase), Modifier.weight(1f).testTag("proactive-rule-status-$id"))
                                 Switch(rule.optBoolean("enabled"), { updateProactiveRule(id, "PATCH", json("enabled" to it)) }, enabled = enabled, modifier = Modifier.testTag("proactive-rule-enabled-$id"))
-                                OutlinedButton(onClick = { updateProactiveRule(id, "DELETE") }, enabled = enabled, modifier = Modifier.heightIn(min = 48.dp).testTag("proactive-rule-delete-$id"), colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text(uiText("Delete")) }
+                                OutlinedButton(onClick = { ruleToDelete = id to rule.string("text") }, enabled = enabled, modifier = Modifier.heightIn(min = 48.dp).testTag("proactive-rule-delete-$id"), colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text(uiText("Delete")) }
                             }
                         }
                     }
                     val controlsEnabled = ui.connected && vm.client != null && !savingProactive
-                    Button(onClick = ::addProactiveRule, enabled = controlsEnabled && !proactiveChoicesChanged && rules.size < 20, modifier = Modifier.heightIn(min = 48.dp).testTag("proactive-add-rule")) { Text(uiText("Add a rule")) }
+                    Button(onClick = ::addProactiveRule, enabled = controlsEnabled && rules.size < 20, modifier = Modifier.heightIn(min = 48.dp).testTag("proactive-add-rule")) { Text(uiText("Add a rule")) }
                     if (rules.size >= 20) Text(uiText("Delete a rule to add another."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
@@ -317,12 +323,18 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
                     learned.forEachIndexed { index, note ->
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(note, Modifier.weight(1f).testTag("proactive-learned-$index"), style = MaterialTheme.typography.bodyMedium)
-                            OutlinedButton(onClick = { removeLearnedNote(note) }, enabled = ui.connected && vm.client != null && !savingProactive && !proactiveChoicesChanged, modifier = Modifier.heightIn(min = 48.dp).testTag("proactive-learned-remove-$index"), colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text(uiText("Remove")) }
+                            OutlinedButton(onClick = { noteToRemove = note }, enabled = ui.connected && vm.client != null && !savingProactive, modifier = Modifier.heightIn(min = 48.dp).testTag("proactive-learned-remove-$index"), colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text(uiText("Remove")) }
                         }
                     }
                 }
             }
         }
+    }
+    ruleToDelete?.let { (id, text) ->
+        ConfirmRemovalDialog(uiText("Delete this rule?"), text, uiText("Delete"), "proactive-rule-delete-confirm", { ruleToDelete = null; updateProactiveRule(id, "DELETE") }, { ruleToDelete = null })
+    }
+    noteToRemove?.let { note ->
+        ConfirmRemovalDialog(uiText("Remove this note?"), note, uiText("Remove"), "proactive-learned-remove-confirm", { noteToRemove = null; removeLearnedNote(note) }, { noteToRemove = null })
     }
 }
 
@@ -360,10 +372,10 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
     }
     Column(Modifier.fillMaxSize().imePadding().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         when (page) {
-            "provider" -> Text("Choose a voice provider", style = MaterialTheme.typography.titleLarge)
-            "key" -> Text("Add your ${voiceProviderInfo(keyFor).short} key", style = MaterialTheme.typography.titleLarge)
+            "provider" -> Text(uiText("Choose a voice provider"), style = MaterialTheme.typography.titleLarge)
+            "key" -> Text(uiText("Add your {0} key").replace("{0}", voiceProviderInfo(keyFor).short), style = MaterialTheme.typography.titleLarge)
             else -> {
-                Text("Provider for one-tap calls. Keys stay on this phone.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(uiText("Provider for one-tap calls. Keys stay on this phone."), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 VoiceSettingsPluginNote(pluginAbsent)
             }
         }
@@ -387,8 +399,15 @@ internal fun DevicesSettingsSection(vm: BeaconViewModel, pluginAbsent: Boolean) 
     var refresh by remember(scopeKey) { mutableIntStateOf(0) }
     var pendingRemoval by remember(scopeKey) { mutableStateOf<PairedDevice?>(null) }
     val requests = rememberCoroutineScope()
+    // Words the callbacks below show are translated here, where uiText can run.
+    val tooManyPhones = uiText("Too many phones. Remove one below.")
+    val couldntAddPhone = uiText("Couldn't add this phone. Try again.")
+    val finishSetup = uiText("Finish setting up Beacon on your Hermes dashboard, then retry.")
+    val pluginMissing = uiText("Devices are unavailable because the Beacon plugin isn't installed on this Hermes.")
+    val couldntLoad = uiText("Couldn't load devices. Check your connection and try again.")
+    val couldntRemove = uiText("Couldn't remove this device. Try again.")
 
-    fun linkFailure(failure: Throwable) = if ((failure as? ApiFailure)?.status == 409) "Too many phones. Remove one below." else "Couldn't add this phone. Try again."
+    fun linkFailure(failure: Throwable) = if ((failure as? ApiFailure)?.status == 409) tooManyPhones else couldntAddPhone
 
     LaunchedEffect(scopeKey, refresh, pluginAbsent) {
         val client = vm.client ?: return@LaunchedEffect
@@ -421,12 +440,12 @@ internal fun DevicesSettingsSection(vm: BeaconViewModel, pluginAbsent: Boolean) 
             }
         } catch (failure: ApiFailure) {
             if (vm.client === client) error = when {
-                failure.status == 403 -> "Finish setting up Beacon on your Hermes dashboard, then retry."
-                isMissingBeaconPluginRoute(failure) -> "Devices are unavailable because the Beacon plugin isn't installed on this Hermes."
-                else -> "Couldn't load devices. Check your connection and try again."
+                failure.status == 403 -> finishSetup
+                isMissingBeaconPluginRoute(failure) -> pluginMissing
+                else -> couldntLoad
             }
         } catch (_: Exception) {
-            if (vm.client === client) error = "Couldn't load devices. Check your connection and try again."
+            if (vm.client === client) error = couldntLoad
         } finally {
             if (vm.client === client) loading = false
         }
@@ -451,34 +470,34 @@ internal fun DevicesSettingsSection(vm: BeaconViewModel, pluginAbsent: Boolean) 
 
     val thisDeviceId = source?.let { NativePairing.deviceId(context, it.scope) }
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text("Devices", style = MaterialTheme.typography.titleLarge)
+        Text(uiText("Devices"), style = MaterialTheme.typography.titleLarge)
         when {
             pluginAbsent -> MissingBeaconPluginState(compact = true)
             source == null || !ui.authenticated -> {
-                Text("Reconnect to Hermes to manage your devices.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                OutlinedButton(onClick = { vm.connect(ui.origin) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Reconnect") }
+                Text(uiText("Reconnect to Hermes to manage your devices."), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                OutlinedButton(onClick = { vm.connect(ui.origin) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text(uiText("Reconnect")) }
             }
             removed -> {
-                Text("This phone was removed from Beacon", Modifier.testTag("devices-removed"), style = MaterialTheme.typography.bodyLarge)
-                Text("It won't get calls or alerts until you add it again. It stays signed in to Hermes.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(uiText("This phone was removed from Beacon"), Modifier.testTag("devices-removed"), style = MaterialTheme.typography.bodyLarge)
+                Text(uiText("It won't get calls or alerts until you add it again. It stays signed in to Hermes."), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
-                Button(onClick = ::addThisPhone, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("devices-link-this-phone")) { Text("Add this phone") }
+                Button(onClick = ::addThisPhone, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("devices-link-this-phone")) { Text(uiText("Add this phone")) }
             }
             loading && devices == null -> {
                 LinearProgressIndicator(Modifier.fillMaxWidth())
-                Text("Loading devices…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(uiText("Loading devices…"), color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             error.isNotBlank() && devices == null -> {
                 Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
-                OutlinedButton(onClick = { refresh++ }, enabled = !loading, modifier = Modifier.heightIn(min = 48.dp).testTag("settings-devices-retry")) { Text("Retry") }
+                OutlinedButton(onClick = { refresh++ }, enabled = !loading, modifier = Modifier.heightIn(min = 48.dp).testTag("settings-devices-retry")) { Text(uiText("Retry")) }
             }
             else -> {
                 if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
-                OutlinedButton(onClick = { refresh++ }, enabled = !loading && !busy, modifier = Modifier.align(Alignment.End).heightIn(min = 48.dp).testTag("settings-devices-refresh")) { Text("Refresh") }
+                OutlinedButton(onClick = { refresh++ }, enabled = !loading && !busy, modifier = Modifier.align(Alignment.End).heightIn(min = 48.dp).testTag("settings-devices-refresh")) { Text(uiText("Refresh")) }
                 val rows = devices.orEmpty()
                 if (rows.none { it.id == thisDeviceId }) {
-                    Text("This phone isn't linked to Beacon.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Button(onClick = ::addThisPhone, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("devices-link-this-phone")) { Text("Add this phone") }
+                    Text(uiText("This phone isn't linked to Beacon."), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Button(onClick = ::addThisPhone, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("devices-link-this-phone")) { Text(uiText("Add this phone")) }
                 }
                 DevicesList(rows, thisDeviceId, enabled = !busy) { pendingRemoval = it }
                 if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
@@ -489,8 +508,8 @@ internal fun DevicesSettingsSection(vm: BeaconViewModel, pluginAbsent: Boolean) 
     pendingRemoval?.let { device ->
         AlertDialog(
             onDismissRequest = { if (!busy) pendingRemoval = null },
-            title = { Text("Remove ${device.name}?") },
-            text = { Text("It stops getting calls and alerts from Beacon.") },
+            title = { Text(uiText("Remove {0}?").replace("{0}", device.name)) },
+            text = { Text(uiText("It stops getting calls and alerts from Beacon.")) },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -505,7 +524,7 @@ internal fun DevicesSettingsSection(vm: BeaconViewModel, pluginAbsent: Boolean) 
                                 } catch (cancelled: CancellationException) {
                                     throw cancelled
                                 } catch (_: Exception) {
-                                    if (vm.client === active) error = "Couldn't remove this device. Try again."
+                                    if (vm.client === active) error = couldntRemove
                                 } finally {
                                     if (vm.client === active) busy = false
                                 }
@@ -513,11 +532,12 @@ internal fun DevicesSettingsSection(vm: BeaconViewModel, pluginAbsent: Boolean) 
                         }
                     },
                     enabled = !busy,
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
                     modifier = Modifier.testTag("settings-device-remove-confirm"),
-                ) { Text("Remove") }
+                ) { Text(uiText("Remove")) }
             },
             dismissButton = {
-                TextButton(onClick = { pendingRemoval = null }, enabled = !busy) { Text("Cancel") }
+                TextButton(onClick = { pendingRemoval = null }, enabled = !busy) { Text(uiText("Cancel")) }
             },
         )
     }
@@ -531,10 +551,10 @@ internal fun DevicesList(devices: List<PairedDevice>, thisDeviceId: String?, ena
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         thisPhone?.let { DeviceSettingsRow(it, current = true, enabled = enabled, onRemove = null) }
         if (others.isNotEmpty()) {
-            Text("Other phones", style = MaterialTheme.typography.titleMedium)
+            Text(uiText("Other phones"), style = MaterialTheme.typography.titleMedium)
             others.forEach { device -> DeviceSettingsRow(device, current = false, enabled = enabled) { onRemove(device) } }
         } else if (thisPhone != null) {
-            Text("No other phones are linked.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(uiText("No other phones are linked."), color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -542,18 +562,18 @@ internal fun DevicesList(devices: List<PairedDevice>, thisDeviceId: String?, ena
 @Composable
 private fun DeviceSettingsRow(device: PairedDevice, current: Boolean, enabled: Boolean, onRemove: (() -> Unit)?) {
     val lastSeen = recordedMessageTime(device.lastSeen).takeIf { it > 0 }
-    val seen = lastSeen?.let { "Last seen ${DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(it))}" } ?: "Last seen unavailable"
+    val seen = lastSeen?.let { uiText("Last seen {0}").replace("{0}", DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(it))) } ?: uiText("Last seen unavailable")
     Column(Modifier.fillMaxWidth().testTag("settings-device-${device.id}"), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                if (current) Text("This phone", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                if (current) Text(uiText("This phone"), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
                 Text(device.name, style = MaterialTheme.typography.bodyMedium)
             }
             onRemove?.let {
-                OutlinedButton(onClick = it, enabled = enabled, modifier = Modifier.heightIn(min = 48.dp).testTag("settings-device-remove-${device.id}"), colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("Remove") }
+                OutlinedButton(onClick = it, enabled = enabled, modifier = Modifier.heightIn(min = 48.dp).testTag("settings-device-remove-${device.id}"), colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text(uiText("Remove")) }
             }
         }
-        Text(if (current) "Linked · $seen" else seen, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(if (current) uiText("Linked · {0}").replace("{0}", seen) else seen, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 

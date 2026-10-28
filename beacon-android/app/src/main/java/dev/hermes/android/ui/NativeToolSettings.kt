@@ -5,12 +5,11 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.SearchOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
@@ -33,6 +32,12 @@ import java.net.URLEncoder
     var error by remember(client, ui.origin, ui.owner, ui.profile, mcp) { mutableStateOf("") }
     var result by remember(client, ui.origin, ui.owner, ui.profile, mcp) { mutableStateOf("") }
     var opened by remember(client, ui.origin, ui.owner, ui.profile, mcp) { mutableStateOf("") }
+    val saved = uiText("Saved. New chats use this change.")
+    val connectedTo = uiText("Connected to")
+    val toolsAvailable = uiText("tools available")
+    val couldNotFinish = uiText("Couldn't finish. Try again.")
+    val notConfirmed = uiText("Hermes did not confirm this change. Refresh to see the saved state.")
+    val couldNotSave = uiText(if (mcp) "Couldn't save the MCP server. Try again." else "Couldn't save the tool change. Try again.")
     fun refresh(force: Boolean = true) { error = ""; vm.load(key, path, mapOf("profile" to ui.profile), force = force) }
     LaunchedEffect(path, ui.origin, ui.owner, ui.profile, ui.connected, client) { refresh(force = false) }
     // A save runs on after the window closes; this says whether its own error line is still on screen.
@@ -47,25 +52,25 @@ import java.net.URLEncoder
                 val encoded = URLEncoder.encode(name, "UTF-8").replace("+", "%20")
                 val operation = if (mcp) "$path/$encoded/${if (enabled == null) "test" else "enabled"}" else "$path/$encoded"
                 val response = c.nativeGet(operation, mapOf("profile" to c.auth.profile), method = if (enabled == null) "POST" else "PUT", data = if (enabled == null) json() else json("enabled" to enabled, "profile" to c.auth.profile))
-                require(response.optBoolean("ok")) { response.string("error", "Hermes did not confirm this change. Refresh to see the saved state.") }
+                require(response.optBoolean("ok")) { notConfirmed }
                 if (vm.client === active) {
-                    result = if (enabled == null) "Connected to $name · ${response.rows("tools").size} tools available" else "Saved. New chats use this change."
+                    result = if (enabled == null) "$connectedTo $name · ${response.rows("tools").size} $toolsAvailable" else saved
                     if (enabled == null) vm.storeData("mcp-test:$name", response) else { if (mcp) vm.storeData("mcp-test:$name", json()); refresh() }
                 }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (vm.client === active) { error = e.message ?: "Couldn't finish. Try again."; if (!shown.get()) vm.notice(if (mcp) "Couldn't save the connection. Try again." else "Couldn't save the tool change. Try again.") } }
+            catch (e: Exception) { if (vm.client === active) { error = couldNotFinish; if (!shown.get()) vm.notice(couldNotSave) } }
             finally { c.closeNative(); if (vm.client === active) busy = "" }
         }
     }
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(SettingsPagePadding), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
             Row(Modifier.fillMaxWidth(), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                Text(if (mcp) "Connections let Hermes use your services. Test a connection to check its available tools." else "Choose the tool groups available to this profile. Changes apply to new chats.", Modifier.weight(1f))
+                Text(uiText(if (mcp) "MCP servers let Hermes use your services. Test one to see its tools." else "Choose the tool groups available to this profile. Changes apply to new chats."), Modifier.weight(1f))
                 IconButton(onClick = { refresh() }, enabled = busy.isBlank() && !loading) {
-                    Icon(Icons.Rounded.Refresh, uiText(if (mcp) "Refresh connections" else "Refresh tools"))
+                    Icon(Icons.Rounded.Refresh, uiText(if (mcp) "Refresh MCP servers" else "Refresh tools"))
                 }
             }
-            OutlinedTextField(search, { search = it }, label = { Text(if (mcp) "Search connections" else "Search tools") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+            OutlinedTextField(search, { search = it }, label = { Text(uiText(if (mcp) "Search MCP servers" else "Search tools")) }, modifier = Modifier.fillMaxWidth(), singleLine = true)
         }
         val record = data[key]
         if (record == null) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
@@ -73,23 +78,23 @@ import java.net.URLEncoder
         if (problem.isNotBlank()) item { Text(problem, color = MaterialTheme.colorScheme.error) }
         if (result.isNotBlank()) item { Text(result, color = MaterialTheme.colorScheme.primary) }
         val rows = record?.rows(if (mcp) "servers" else "items").orEmpty().filter { search.isBlank() || (it.string("name") + it.string("label") + it.string("description")).contains(search, true) }
-        if (record != null && !loading && problem.isBlank() && rows.isEmpty()) item { Text(if (search.isBlank()) "No ${if (mcp) "connections" else "tools"} configured in this profile." else "No matches. Try another search.") }
+        if (record != null && !loading && problem.isBlank() && rows.isEmpty()) item {
+            if (search.isBlank()) EmptyState(uiText(if (mcp) "No MCP servers yet" else "No tools yet"), uiText(if (mcp) "Add one in your Hermes settings on your computer, then refresh." else "Tool groups for this profile show up here."), action = uiText("Refresh"), onAction = { refresh() })
+            else EmptyState(uiText("No matches"), uiText("Try another search."), Icons.Rounded.SearchOff, action = uiText("Clear search"), onAction = { search = "" })
+        }
         items(rows, key = { it.string("name") }) { row ->
             val name = row.string("name")
+            val managedByPlugin = row.string("source") == "plugin"
+            val status = if (mcp || row.optBoolean("configured")) "" else uiText("Setup needed")
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Row(Modifier.fillMaxWidth()) {
-                    Column(Modifier.weight(1f)) {
-                        Text(row.string("label", name), style = MaterialTheme.typography.titleMedium)
-                        if (row.string("description").isNotBlank()) Text(row.string("description"), style = MaterialTheme.typography.bodyMedium)
-                        Text(if (mcp) "${if (row.optBoolean("enabled")) "Enabled" else "Disabled"} · ${row.string("transport")}" else "${if (row.optBoolean("enabled")) "Enabled" else "Disabled"} · ${if (row.optBoolean("configured")) "Setup ready" else "Setup needed"}", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    Switch(row.optBoolean("enabled"), { operate(name, it) }, enabled = busy.isBlank() && !loading && row.string("source") != "plugin", modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = row.string("label", name) })
-                }
-                if (row.string("source") == "plugin") Text("Provided by ${row.string("plugin")}. Managed with that plugin.", style = MaterialTheme.typography.bodySmall)
-                if (mcp) OutlinedButton(onClick = { operate(name) }, enabled = busy.isBlank() && !loading) { Text("Test connection") }
+                LabeledToggle(row.string("label", name), row.optBoolean("enabled"), { operate(name, it) },
+                    description = listOf(row.string("description"), status).filter(String::isNotBlank).joinToString("\n"),
+                    enabled = busy.isBlank() && !loading && !managedByPlugin)
+                if (managedByPlugin) Text("${uiText("Provided by")} ${row.string("plugin")}. ${uiText("Managed with that plugin.")}", style = MaterialTheme.typography.bodySmall)
+                if (mcp) OutlinedButton(onClick = { operate(name) }, enabled = busy.isBlank() && !loading) { Text(uiText("Test server")) }
                 val tools = if (mcp) data["mcp-test:$name"]?.takeIf { row.optBoolean("enabled") }?.rows("tools")?.map { it.string("name") }.orEmpty() else row.optJSONArray("tools")?.strings().orEmpty()
                 if (tools.isNotEmpty()) {
-                    TextButton(onClick = { opened = if (opened == name) "" else name }, modifier = if (containedActions) Modifier.heightIn(min = 48.dp) else Modifier) { Text(if (opened == name) "Hide tools" else "View ${tools.size} tools") }
+                    TextButton(onClick = { opened = if (opened == name) "" else name }, modifier = if (containedActions) Modifier.heightIn(min = 48.dp) else Modifier) { Text(if (opened == name) uiText("Hide tools") else "${uiText("View tools")} · ${tools.size}") }
                     if (opened == name) Text(tools.joinToString("\n"), style = MaterialTheme.typography.bodyMedium)
                 }
                 HorizontalDivider()
@@ -97,8 +102,8 @@ import java.net.URLEncoder
         }
         if (!mcp) item {
             val browseCommands = { vm.closeCatalog(); vm.loadSlashCatalog(); vm.more("Commands") }
-            if (containedActions) OutlinedButton(onClick = browseCommands, modifier = Modifier.heightIn(min = 48.dp)) { Text("Browse chat commands") }
-            else TextButton(onClick = browseCommands) { Text("Browse chat commands") }
+            if (containedActions) OutlinedButton(onClick = browseCommands, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Browse chat commands")) }
+            else TextButton(onClick = browseCommands) { Text(uiText("Browse chat commands")) }
         }
     }
 }

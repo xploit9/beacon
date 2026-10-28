@@ -9,6 +9,7 @@ import androidx.compose.foundation.selection.toggleable
 import androidx.compose.animation.core.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -40,6 +41,7 @@ import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.R
@@ -51,7 +53,7 @@ import java.util.UUID
 enum class FieldType { TEXT, MULTILINE, SECRET, INTEGER, DECIMAL, BOOLEAN, CHOICE, LIST, MAP }
 data class Field(val key: String, val label: String = key.replace('_', ' ').replaceFirstChar { it.titlecase() }, val type: FieldType = FieldType.TEXT, val required: Boolean = false, val options: List<String> = emptyList(), val help: String = "", val inverse: Boolean = false, val optionLabels: Map<String, String> = emptyMap(), val section: String = "")
 internal fun busyLabel(action: String) = when (action) { "Save" -> "Saving…"; "Run" -> "Running…"; else -> "Working…" }
-data class ActionForm(val title: String, val path: String, val fields: List<Field>, val seed: JSONObject = JSONObject(), val method: String = "POST", val values: Map<String, String> = emptyMap(), val explanation: String = "", val actionLabel: String = "Save", val id: String = UUID.randomUUID().toString(), val onResult: (suspend (JSONObject) -> Unit)? = null, val error: String = "")
+data class ActionForm(val title: String, val path: String, val fields: List<Field>, val seed: JSONObject = JSONObject(), val method: String = "POST", val values: Map<String, String> = emptyMap(), val explanation: String = "", val actionLabel: String = "Save", val id: String = UUID.randomUUID().toString(), val onResult: (suspend (JSONObject) -> Unit)? = null, val error: String = "", val destructive: Boolean = false)
 
 fun fieldValue(seed: JSONObject, key: String): Any? { var value: Any? = seed; key.split('.').forEach { value = (value as? JSONObject)?.opt(it) }; return value?.takeUnless { it == JSONObject.NULL } }
 fun formValues(form: ActionForm): Map<String, String> = form.fields.associate { f -> f.key to when (val v = fieldValue(form.seed, f.key)) { is JSONArray -> v.strings().joinToString("\n"); is JSONObject -> if (f.type == FieldType.MAP) v.keys().asSequence().joinToString("\n") { "$it=${v.opt(it)}" } else v.toString(); else -> v?.toString().orEmpty() } }
@@ -114,16 +116,18 @@ val LocalOpenNavigationMenu = staticCompositionLocalOf<(() -> Unit)?> { null }
     Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
         menu?.takeIf { back == null }?.let { toggle -> IconButton(onClick = toggle, modifier = Modifier.testTag("navigation-toggle")) { Icon(Icons.Rounded.Menu, uiText(if (LocalPersistentNavigation.current) "Hide navigation" else "Show navigation")) } }
         if (back != null) IconButton(onClick = back) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, uiText("Back")) }
-        Column(Modifier.weight(1f)) { Text(title, style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis); if (subtitle.isNotBlank()) Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
+        Column(Modifier.weight(1f)) { Text(title, Modifier.semantics { heading() }, style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis); if (subtitle.isNotBlank()) Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
         actions()
     }
 }
-@Composable fun EmptyState(title: String, description: String, icon: ImageVector = Icons.Rounded.ChatBubbleOutline, action: String = "", onAction: () -> Unit = {}) {
-    Column(Modifier.fillMaxWidth().padding(32.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Icon(icon, null, modifier = Modifier.size(32.dp), tint = MaterialTheme.colorScheme.primary)
-        Text(title, style = MaterialTheme.typography.headlineSmall)
-        Text(description, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        if (action.isNotBlank()) Button(onClick = onAction) { Text(action) }
+/** [centered] is for a state that sits under a centred picture (a null [icon] when the picture is already there). */
+@Composable fun EmptyState(title: String, description: String, icon: ImageVector? = Icons.Rounded.ChatBubbleOutline, action: String = "", onAction: () -> Unit = {}, centered: Boolean = false) {
+    val align = if (centered) androidx.compose.ui.text.style.TextAlign.Center else androidx.compose.ui.text.style.TextAlign.Start
+    Column(Modifier.fillMaxWidth().padding(32.dp), verticalArrangement = Arrangement.spacedBy(12.dp), horizontalAlignment = if (centered) androidx.compose.ui.Alignment.CenterHorizontally else androidx.compose.ui.Alignment.Start) {
+        if (icon != null) Icon(icon, null, modifier = Modifier.size(32.dp), tint = MaterialTheme.colorScheme.primary)
+        Text(title, Modifier.semantics { heading() }, style = MaterialTheme.typography.headlineSmall, textAlign = align)
+        Text(description, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = align)
+        if (action.isNotBlank()) Button(onClick = onAction, modifier = Modifier.heightIn(min = 48.dp)) { Text(action) }
     }
 }
 
@@ -199,15 +203,19 @@ internal enum class BeaconMotionMode { Pulse, Sweep, Ripple }
     }
 }
 
-@Composable fun ActionRow(label: String, description: String = "", icon: ImageVector = Icons.Rounded.ChevronRight, onClick: () -> Unit) {
-    ListItem(headlineContent = { Text(label) }, supportingContent = if (description.isBlank()) null else ({ Text(description) }), trailingContent = { Icon(icon, null) }, modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).heightIn(min = 64.dp), colors = ListItemDefaults.colors(containerColor = Color.Transparent))
+/** A null [icon] drops the trailing mark, for a row that acts at once instead of opening something. */
+@Composable fun ActionRow(label: String, description: String = "", icon: ImageVector? = Icons.AutoMirrored.Rounded.KeyboardArrowRight, onClick: () -> Unit) {
+    ListItem(headlineContent = { Text(label) }, supportingContent = if (description.isBlank()) null else ({ Text(description) }), trailingContent = if (icon == null) null else ({ Icon(icon, null) }), modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).heightIn(min = 64.dp), colors = ListItemDefaults.colors(containerColor = Color.Transparent))
 }
+/** A form select: a read-only field like its neighbours, whose anchor carries the dropdown role and expanded state. A long value wraps to a second line. */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable fun Choice(label: String, selected: String, options: List<String>, onSelect: (String) -> Unit, modifier: Modifier = Modifier, optionLabels: Map<String, String> = emptyMap(), enabled: Boolean = true) {
     var expanded by remember { mutableStateOf(false) }
     LaunchedEffect(enabled) { if (!enabled) expanded = false }
-    Box(modifier) {
-        OutlinedButton(onClick = { expanded = true }, enabled = enabled, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("$label: ${translatedChoiceLabel(selected, optionLabels, selected in options)}", modifier = Modifier.weight(1f)); Icon(Icons.Rounded.ExpandMore, null) }
-        DropdownMenu(expanded, { expanded = false }) { options.forEach { option -> DropdownMenuItem(text = { Text(translatedChoiceLabel(option, optionLabels, true)) }, enabled = enabled, onClick = { expanded = false; onSelect(option) }, modifier = Modifier.testTag("choice-option:$label:$option")) } }
+    ExposedDropdownMenuBox(expanded, { expanded = enabled && it }, modifier) {
+        OutlinedTextField(translatedChoiceLabel(selected, optionLabels, selected in options), {}, readOnly = true, enabled = enabled, maxLines = 2, label = { Text(uiText(label)) },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) }, modifier = Modifier.fillMaxWidth().menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable, enabled))
+        ExposedDropdownMenu(expanded, { expanded = false }) { options.forEach { option -> DropdownMenuItem(text = { Text(translatedChoiceLabel(option, optionLabels, true)) }, enabled = enabled, onClick = { expanded = false; onSelect(option) }, modifier = Modifier.testTag("choice-option:$label:$option")) } }
     }
 }
 @Composable private fun translatedChoiceLabel(value: String, labels: Map<String, String>, offered: Boolean): String {
@@ -216,7 +224,9 @@ internal enum class BeaconMotionMode { Pulse, Sweep, Ripple }
 }
 @Composable fun NativeForm(vm: BeaconViewModel, form: ActionForm) {
     var confirmDiscard by remember(form.id) { mutableStateOf(false) }
-    if (confirmDiscard) AlertDialog(onDismissRequest = { confirmDiscard = false }, title = { Text("Discard this draft?") }, text = { Text("Your saved task will stay unchanged.") }, confirmButton = { TextButton(onClick = { confirmDiscard = false; vm.discardScheduleDraft() }) { Text("Discard") } }, dismissButton = { TextButton(onClick = { confirmDiscard = false }) { Text("Keep editing") } })
+    if (confirmDiscard) AlertDialog(onDismissRequest = { confirmDiscard = false }, title = { Text(uiText("Discard this draft?")) }, text = { Text(uiText("Your saved task will stay unchanged.")) }, confirmButton = { TextButton(onClick = { confirmDiscard = false; vm.discardScheduleDraft() }, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text(uiText("Discard")) } }, dismissButton = { TextButton(onClick = { confirmDiscard = false }) { Text(uiText("Keep editing")) } })
+    // A destructive form confirms in the error colours, like the history Delete.
+    val confirmColors = if (form.destructive) ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error, contentColor = MaterialTheme.colorScheme.onError) else ButtonDefaults.buttonColors()
     val parentDensity = LocalDensity.current
     val lightSystemBars = MaterialTheme.colorScheme.background.luminance() > .5f
     val submitting by vm.submittingForm.collectAsStateWithLifecycle()
@@ -225,21 +235,21 @@ internal enum class BeaconMotionMode { Pulse, Sweep, Ripple }
     val fixedWindow = form.values["_schedule_mode"] == "Fixed window"
     val visibleFields = form.fields.filter { field -> !scheduleForm || (field.key != "schedule" || !fixedWindow) && (field.section != "Fixed window" || fixedWindow) }
     val longForm = form.fields.size > 4 || form.fields.any { it.section.isNotBlank() || it.type in setOf(FieldType.MULTILINE, FieldType.LIST, FieldType.MAP) }
-    val error: @Composable () -> Unit = { if (form.error.isNotBlank()) Text(form.error, color = MaterialTheme.colorScheme.error, modifier = Modifier.semantics { liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite }) }
+    val error: @Composable () -> Unit = { if (form.error.isNotBlank()) Text(uiText(form.error), color = MaterialTheme.colorScheme.error, modifier = Modifier.semantics { liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite }) }
     val fields: @Composable () -> Unit = {
         if (!longForm) error()
-        if (form.explanation.isNotBlank()) Text(form.explanation, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (form.explanation.isNotBlank()) Text(uiText(form.explanation), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
         val renderField: @Composable (Field) -> Unit = { field ->
             val value = form.values[field.key].orEmpty()
             when (field.type) {
-                FieldType.BOOLEAN -> LabeledToggle(uiText(field.label), displayedBoolean(field, value), { vm.formValue(field.key, storedBoolean(field, it)) }, field.help, enabled = !busy)
-                FieldType.CHOICE -> Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { Choice(field.label, value, field.options, { vm.formValue(field.key, it) }, optionLabels = field.optionLabels, enabled = !busy); if (field.help.isNotBlank()) Text(field.help, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                else -> OutlinedTextField(value, { vm.formValue(field.key, it) }, enabled = !busy, label = { Text(field.label + if (field.required) " *" else "") }, modifier = Modifier.fillMaxWidth(), minLines = if (field.type in setOf(FieldType.MULTILINE, FieldType.LIST, FieldType.MAP)) 3 else 1, maxLines = if (field.type in setOf(FieldType.MULTILINE, FieldType.LIST, FieldType.MAP)) 12 else 1, visualTransformation = if (field.type == FieldType.SECRET) PasswordVisualTransformation() else VisualTransformation.None, keyboardOptions = KeyboardOptions(keyboardType = when (field.type) { FieldType.INTEGER -> KeyboardType.Number; FieldType.DECIMAL -> KeyboardType.Decimal; FieldType.SECRET -> KeyboardType.Password; else -> KeyboardType.Text }), supportingText = if (field.help.isBlank()) null else ({ Text(field.help, style = MaterialTheme.typography.bodyMedium) }))
+                FieldType.BOOLEAN -> LabeledToggle(uiText(field.label), displayedBoolean(field, value), { vm.formValue(field.key, storedBoolean(field, it)) }, uiText(field.help), enabled = !busy)
+                FieldType.CHOICE -> Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { Choice(field.label, value, field.options, { vm.formValue(field.key, it) }, optionLabels = field.optionLabels, enabled = !busy); if (field.help.isNotBlank()) Text(uiText(field.help), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                else -> OutlinedTextField(value, { vm.formValue(field.key, it) }, enabled = !busy, label = { Text(uiText(field.label) + if (field.required) " *" else "") }, modifier = Modifier.fillMaxWidth(), minLines = if (field.type in setOf(FieldType.MULTILINE, FieldType.LIST, FieldType.MAP)) 3 else 1, maxLines = if (field.type in setOf(FieldType.MULTILINE, FieldType.LIST, FieldType.MAP)) 12 else 1, visualTransformation = if (field.type == FieldType.SECRET) PasswordVisualTransformation() else VisualTransformation.None, keyboardOptions = KeyboardOptions(keyboardType = when (field.type) { FieldType.INTEGER -> KeyboardType.Number; FieldType.DECIMAL -> KeyboardType.Decimal; FieldType.SECRET -> KeyboardType.Password; else -> KeyboardType.Text }), supportingText = if (field.help.isBlank()) null else ({ Text(uiText(field.help), style = MaterialTheme.typography.bodyMedium) }))
             }
         }
-        if (scheduleForm && fixedWindow) dev.hermes.android.tasks.fixedWindowPreview(form.values)?.let { preview -> Text("Runs at $preview · ${form.seed.string("_timezone")}", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.semantics { liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite }) }
+        if (scheduleForm && fixedWindow) dev.hermes.android.tasks.fixedWindowPreview(form.values)?.let { preview -> Text("${uiText("Runs at")} $preview · ${form.seed.string("_timezone")}", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.semantics { liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite }) }
         if (visibleFields.any { it.section.isNotBlank() }) visibleFields.groupBy { it.section }.forEach { (section, fields) ->
-            if (section.isNotBlank()) Text(section, style = MaterialTheme.typography.titleMedium)
+            if (section.isNotBlank()) Text(uiText(section), Modifier.semantics { heading() }, style = MaterialTheme.typography.titleMedium)
             Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) { fields.forEach { renderField(it) } } }
         } else visibleFields.forEach { renderField(it) }
 
@@ -265,22 +275,22 @@ internal enum class BeaconMotionMode { Pulse, Sweep, Ripple }
                 Column(Modifier.windowInsetsPadding(WindowInsets.safeDrawing).imePadding().widthIn(max = 720.dp).fillMaxWidth().fillMaxHeight()) {
                     Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                         IconButton(onClick = vm::dismissForm, enabled = !busy) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, uiText(if (scheduleForm) "Close editor" else "Cancel")) }
-                        Text(form.title, Modifier.weight(1f), style = MaterialTheme.typography.titleLarge)
-                        if (scheduleForm) IconButton(onClick = { confirmDiscard = true }, enabled = !busy) { Icon(Icons.Rounded.DeleteOutline, "Discard draft") }
+                        Text(uiText(form.title), Modifier.weight(1f).semantics { heading() }, style = MaterialTheme.typography.titleLarge)
+                        if (scheduleForm) IconButton(onClick = { confirmDiscard = true }, enabled = !busy) { Icon(Icons.Rounded.DeleteOutline, uiText("Discard draft")) }
                     }
                     Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) { fields() }
                     Surface(shadowElevation = 4.dp) { Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         error()
-                        Button(onClick = vm::submitForm, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text(if (busy) busyLabel(form.actionLabel) else form.actionLabel) }
+                        Button(onClick = vm::submitForm, enabled = !busy, colors = confirmColors, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text(uiText(if (busy) busyLabel(form.actionLabel) else form.actionLabel)) }
                     } }
                 }
                 }
             }
             }
         }
-    } else AlertDialog(onDismissRequest = { if (!busy) vm.dismissForm() }, title = { Text(form.title) }, text = {
+    } else AlertDialog(onDismissRequest = { if (!busy) vm.dismissForm() }, title = { Text(uiText(form.title)) }, text = {
         Column(Modifier.fillMaxWidth().heightIn(max = 540.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(16.dp)) { fields() }
-    }, confirmButton = { Button(onClick = vm::submitForm, enabled = !busy) { Text(if (busy) busyLabel(form.actionLabel) else form.actionLabel) } }, dismissButton = { TextButton(onClick = vm::dismissForm, enabled = !busy) { Text(uiText("Cancel")) } })
+    }, confirmButton = { Button(onClick = vm::submitForm, enabled = !busy, colors = confirmColors) { Text(uiText(if (busy) busyLabel(form.actionLabel) else form.actionLabel)) } }, dismissButton = { TextButton(onClick = vm::dismissForm, enabled = !busy) { Text(uiText("Cancel")) } })
 }
 
 // Telegram-style chat parts: avatar, date chip, send tick, bubble corners and the chat-list row.

@@ -39,7 +39,7 @@ class BeaconApplication : Application() {
         updates.schedule()
         val staleBefore = System.currentTimeMillis()
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-            launch { readTranslations() }
+            if (dev.hermes.android.ui.nativeLanguageFor(java.util.Locale.getDefault()) != "en") launch { readTranslations() }
             launch { preferences.data.collect { dev.hermes.android.data.currentAssistantName = dev.hermes.android.data.AppPreferences.read(it).assistantName } }
             runCatching { push.reconcileIncomingDeadlines() }
             runCatching { cache.trim() }

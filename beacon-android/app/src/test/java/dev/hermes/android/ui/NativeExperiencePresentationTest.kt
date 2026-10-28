@@ -91,7 +91,7 @@ class NativeExperiencePresentationTest {
     @Test fun backgroundActivitySummaryShowsCategoriesAndStaysEmptyWhenIdle() {
         val activity = BackgroundActivitySummary(agents = 2, processes = 1, cronJobs = 1, watches = 1)
         assertTrue(activity.active)
-        assertEquals("2 agents · 1 process · 1 cron job · 1 watch", backgroundActivityStatus(activity))
+        assertEquals("2 agents · 1 process · 1 schedule running · 1 watch", backgroundActivityStatus(activity))
         assertFalse(BackgroundActivitySummary().active)
         assertEquals("", backgroundActivityStatus(BackgroundActivitySummary()))
         assertEquals("Background status unavailable", backgroundActivityStatus(BackgroundActivitySummary(available = false)))

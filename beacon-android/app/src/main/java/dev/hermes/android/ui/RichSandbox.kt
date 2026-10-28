@@ -31,12 +31,12 @@ internal fun safeRichHtml(source: String): String {
     doc.select("script,style,iframe,object,embed,svg,math,form,input,button,link,meta,base").remove()
     return Jsoup.clean(doc.body().html(), allowed)
 }
-internal fun richPage(source: String, diagram: Boolean, dark: Boolean, foreground: String = if(dark) "#F4EEE5" else "#20272D", background: String = if(dark) "#151C22" else "#ECE7DE", fontScale: Float = 1f): String {
+internal fun richPage(source: String, diagram: Boolean, dark: Boolean, foreground: String = if(dark) "#F4EEE5" else "#20272D", background: String = if(dark) "#151C22" else "#ECE7DE", fontScale: Float = 1f, rendering: String = "Rendering diagram...", failed: String = "Diagram could not be rendered. Open Source to read the original."): String {
     require(source.length <= RICH_LIMIT) { "Preview exceeds the 64,000 character limit" }
-    val body = if (diagram) "<pre class=mermaid>" + org.jsoup.nodes.Entities.escape(source) + "</pre><p id=status>Rendering diagram...</p>" else safeRichHtml(source)
+    val body = if (diagram) "<pre class=mermaid>" + org.jsoup.nodes.Entities.escape(source) + "</pre><p id=status>" + org.jsoup.nodes.Entities.escape(rendering) + "</p><p id=failed hidden>" + org.jsoup.nodes.Entities.escape(failed) + "</p>" else safeRichHtml(source)
     val scripts = if (diagram) """<script src="https://rich.invalid/polyfills.js"></script><script src="https://rich.invalid/mermaid.js"></script><script>
     const status=document.getElementById('status');let settled=false;
-    const fail=()=>{if(settled)return;settled=true;document.querySelector('.mermaid').textContent='Diagram could not be rendered. Open Source to read the original.';status.remove()};
+    const fail=()=>{if(settled)return;settled=true;document.querySelector('.mermaid').textContent=document.getElementById('failed').textContent;status.remove()};
     const timeout=setTimeout(fail,10000);
     try{mermaid.initialize({startOnLoad:false,securityLevel:'strict',suppressErrorRendering:true,theme:'${if (dark) "dark" else "default"}',maxTextSize:64000,maxEdges:500,themeVariables:{primaryColor:'$background',primaryTextColor:'$foreground',lineColor:'$foreground'}});
     mermaid.run({querySelector:'.mermaid',suppressErrors:false}).then(()=>{clearTimeout(timeout);if(!settled){settled=true;status.remove()}}).catch(fail)}catch(e){fail()}
@@ -52,31 +52,34 @@ internal fun richPage(source: String, diagram: Boolean, dark: Boolean, foregroun
     val foreground="#%06X".format(MaterialTheme.colorScheme.onSurface.toArgb() and 0xFFFFFF)
     val background="#%06X".format(MaterialTheme.colorScheme.surfaceContainer.toArgb() and 0xFFFFFF)
     val fontScale=LocalDensity.current.fontScale
-    val contentKey = listOf(source,diagram,dark,foreground,background,fontScale)
-    val prepared by produceState<PreparedContent<Result<String>>?>(null,contentKey) { value=PreparedContent("",contentKey,withContext(Dispatchers.Default) { runCatching { richPage(source,diagram,dark,foreground,background,fontScale) } }) }
+    val rendering = uiText("Rendering diagram...")
+    val failed = uiText("Diagram could not be rendered. Open Source to read the original.")
+    val contentKey = listOf(source,diagram,dark,foreground,background,fontScale,rendering,failed)
+    val prepared by produceState<PreparedContent<Result<String>>?>(null,contentKey) { value=PreparedContent("",contentKey,withContext(Dispatchers.Default) { runCatching { richPage(source,diagram,dark,foreground,background,fontScale,rendering,failed) } }) }
     val page = prepared?.forContext("",contentKey) ?: run { LinearProgressIndicator(); return }
     Column {
-        Row { TextButton(onClick = { fullscreen = true }, enabled = page.isSuccess) { Text(if(diagram) "Fullscreen diagram" else "Fullscreen card") }; TextButton(onClick = { showSource = !showSource }) { Text(if(showSource) "Hide source" else "Source") } }
-        if(page.isFailure) Text(page.exceptionOrNull()?.message.orEmpty(), color = MaterialTheme.colorScheme.error)
+        Row { TextButton(onClick = { fullscreen = true }, enabled = page.isSuccess) { Text(uiText(if(diagram) "Fullscreen diagram" else "Fullscreen card")) }; TextButton(onClick = { showSource = !showSource }) { Text(uiText(if(showSource) "Hide source" else "Source")) } }
+        if(page.isFailure) Text(uiText("This preview can't be shown."), color = MaterialTheme.colorScheme.error)
         else SandboxView(page.getOrThrow(), diagram, Modifier.fillMaxWidth().height(320.dp), android.graphics.Color.parseColor(background))
         if(showSource || page.isFailure) CodeBlock(if(diagram) "mermaid" else "html", source.take(RICH_LIMIT))
     }
     if(fullscreen) Dialog(onDismissRequest = { fullscreen = false }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface { Column(Modifier.fillMaxSize().safeDrawingPadding()) {
             Row(Modifier.fillMaxWidth()) {
-                TextButton(onClick = { fullscreen = false }, modifier = Modifier.weight(1f)) { Text("Close fullscreen") }
-                IconButton(onClick = { fullscreenView?.zoomOut() }, enabled = fullscreenView != null) { Icon(Icons.Rounded.Remove, "Zoom out preview") }
-                IconButton(onClick = { fullscreenView?.zoomIn() }, enabled = fullscreenView != null) { Icon(Icons.Rounded.Add, "Zoom in preview") }
+                TextButton(onClick = { fullscreen = false }, modifier = Modifier.weight(1f)) { Text(uiText("Close fullscreen")) }
+                IconButton(onClick = { fullscreenView?.zoomOut() }, enabled = fullscreenView != null) { Icon(Icons.Rounded.Remove, uiText("Zoom out preview")) }
+                IconButton(onClick = { fullscreenView?.zoomIn() }, enabled = fullscreenView != null) { Icon(Icons.Rounded.Add, uiText("Zoom in preview")) }
             }
-            Text("Pinch to zoom", Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.labelMedium)
+            Text(uiText("Pinch to zoom"), Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.labelMedium)
             SandboxView(page.getOrThrow(), diagram, Modifier.fillMaxWidth().weight(1f), android.graphics.Color.parseColor(background)) { fullscreenView = it }
         } }
     }
 }
 @Composable private fun SandboxView(page: String, diagram: Boolean, modifier: Modifier, backgroundColor: Int, onReady: (WebView?) -> Unit = {}) {
     var rendererFailed by remember(page) { mutableStateOf(false) }
+    val description = uiText(if(diagram) "Mermaid diagram preview" else "HTML card")
     if (rendererFailed) {
-        Column(modifier.padding(16.dp)) { Text("Preview stopped. Your message is unchanged."); TextButton(onClick = { rendererFailed = false }) { Text("Retry preview") } }
+        Column(modifier.padding(16.dp)) { Text(uiText("Preview stopped. Your message is unchanged.")); TextButton(onClick = { rendererFailed = false }) { Text(uiText("Retry preview")) } }
         return
     }
     AndroidView(factory = { context -> WebView(context).apply {
@@ -91,7 +94,7 @@ internal fun richPage(source: String, diagram: Boolean, dark: Boolean, foregroun
         settings.setSupportZoom(true); settings.builtInZoomControls = true; settings.displayZoomControls = false
         settings.javaScriptCanOpenWindowsAutomatically = false; settings.setSupportMultipleWindows(false)
         isLongClickable = false
-        contentDescription = if(diagram) "Mermaid diagram preview" else "Isolated HTML card"
+        contentDescription = description
         webViewClient = object : WebViewClient() {
             override fun onRenderProcessGone(view: WebView, detail: android.webkit.RenderProcessGoneDetail): Boolean {
                 (view.parent as? android.view.ViewGroup)?.removeView(view)

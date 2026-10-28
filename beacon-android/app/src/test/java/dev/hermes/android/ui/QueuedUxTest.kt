@@ -12,8 +12,8 @@ class QueuedUxTest {
         assertFalse(composerUsesVoice("", 1, 0))
         assertFalse(composerUsesVoice("", 0, 1))
         assertEquals(42f, composerActionSize.value, 0f)
-        assertEquals("1 message queued — delivers after this turn", queuedHeading(1))
-        assertEquals("3 messages queued — delivers after this turn", queuedHeading(3))
+        assertEquals("1 message will send after this reply", queuedHeading(1))
+        assertEquals("3 messages will send after this reply", queuedHeading(3))
     }
     @Test fun profilesAndBotsHaveDistinctRoutes() {
         assertEquals(NavigationRoute("More", "Bots"), navigationRoute("Bots"))

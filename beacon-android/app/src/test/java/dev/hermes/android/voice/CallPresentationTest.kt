@@ -54,7 +54,7 @@ class CallPresentationTest {
         )))
 
         assertEquals("Checking Gmail…", receipt.activityLabel())
-        assertEquals("Allowed by chat YOLO", receipt.approvalCaption())
+        assertEquals("Approvals skipped in this chat", receipt.approvalCaption())
         assertEquals("Using Gmail…", callStatusLabel(call.copy(toolReceipts = listOf(receipt))))
         assertEquals("Muted", callStatusLabel(call.copy(muted = true)))
     }
@@ -95,7 +95,7 @@ class CallPresentationTest {
 
     @Test fun eachAutomaticApprovalSourceGetsItsShortCallCaption() {
         val captions = mapOf(
-            "chat_yolo" to "Allowed by chat YOLO",
+            "chat_yolo" to "Approvals skipped in this chat",
             "profile_off" to "Approvals off",
             "smart" to "Allowed automatically",
             "memory" to "Allowed automatically",

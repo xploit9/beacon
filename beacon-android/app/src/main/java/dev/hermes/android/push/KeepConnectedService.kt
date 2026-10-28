@@ -37,7 +37,6 @@ import dev.hermes.android.voice.RelayCallbackBinding
 import dev.hermes.android.voice.RelayCallbackPhase
 import dev.hermes.android.voice.RelayCallbackPreferences
 import dev.hermes.android.voice.RelayCallbackProtocol
-import dev.hermes.android.voice.RelayCallbackTransition
 import dev.hermes.android.voice.RelayCallbackWire
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
@@ -406,15 +405,15 @@ internal fun prepareKeepConnectedCall(
         .put("expires_at", expires)
         .put("status", "ringing")
     val protocol = RelayCallbackProtocol()
-    val transition: RelayCallbackTransition = protocol.receive(
+    val call = protocol.receive(
         RelayCallbackWire.envelope("phone.call.invite", payload, eventId),
         binding,
         preferences,
         now,
         elapsed,
     ) ?: return null
-    return transition.takeIf { it.call.phase == RelayCallbackPhase.Ringing }
-        ?.let { PreparedKeepConnectedCall(it.call, binding, preferences, protocol, scope) }
+    return call.takeIf { it.phase == RelayCallbackPhase.Ringing }
+        ?.let { PreparedKeepConnectedCall(it, binding, preferences, protocol, scope) }
 }
 
 class KeepConnectedService : Service() {

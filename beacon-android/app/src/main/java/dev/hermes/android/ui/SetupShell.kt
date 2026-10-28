@@ -1,5 +1,6 @@
 package dev.hermes.android.ui
 
+import android.app.Activity
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
@@ -32,13 +33,18 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.clearAndSetSemantics
@@ -46,6 +52,7 @@ import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import androidx.core.view.WindowInsetsControllerCompat
 
 // The shared wizard shell. The stepper ("Step n of 4"), the grouped chooser rows and the text-button escapes are adapted
 // from Hermes Relay's ConnectionWizard (ui/components/ConnectionWizard.kt, MIT) in Beacon's own look.
@@ -81,6 +88,27 @@ internal fun setupColorScheme(base: ColorScheme): ColorScheme = base.copy(
     error = readableOnSea(base.error, SetupSurfaceHighest),
     primaryContainer = Color(0xff35412c), onPrimaryContainer = SetupInk,
 )
+
+/** The wizard and the call screen are dark in both themes, so the clock, battery and gesture bar draw light on them; the app's bars come back when they close. */
+@Composable
+internal fun SetupSystemBars() {
+    val view = LocalView.current
+    val window = (view.context as? Activity)?.window
+    val bars = remember(window, view) { window?.let { WindowInsetsControllerCompat(it, view) } }
+    DisposableEffect(bars) {
+        val oldLightStatus = bars?.isAppearanceLightStatusBars
+        val oldLightNavigation = bars?.isAppearanceLightNavigationBars
+        onDispose {
+            if (oldLightStatus != null) bars?.isAppearanceLightStatusBars = oldLightStatus
+            if (oldLightNavigation != null) bars?.isAppearanceLightNavigationBars = oldLightNavigation
+        }
+    }
+    // The activity applies edge-to-edge from its own LaunchedEffect, on the first frame and on every theme change. This one is launched after it, so these flags win.
+    LaunchedEffect(bars, MaterialTheme.colorScheme.background) {
+        bars?.isAppearanceLightStatusBars = false
+        bars?.isAppearanceLightNavigationBars = false
+    }
+}
 
 @Composable
 internal fun SetupSeaTheme(content: @Composable () -> Unit) {
@@ -154,7 +182,7 @@ private fun SetupHeader(step: Int) {
                 BeaconMark(size = 28.dp, contentDescription = assistantText("Beacon"))
             }
             Text(uiText("Beacon"), Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
-            Text("Step $step of $SETUP_STEPS", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(uiText("Step {0} of {1}").replace("{0}", "$step").replace("{1}", "$SETUP_STEPS"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         // Decorative: the step text carries the meaning.
         Row(Modifier.fillMaxWidth().clearAndSetSemantics {}, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -183,14 +211,18 @@ internal fun SetupStatusLine(message: String, error: Boolean, modifier: Modifier
     val tint = if (error) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
     Row(modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Icon(if (error) Icons.Rounded.ErrorOutline else Icons.Rounded.Info, null, Modifier.padding(top = 2.dp).size(16.dp), tint = tint)
-        Text(message, Modifier.weight(1f).semantics { liveRegion = LiveRegionMode.Polite }, style = MaterialTheme.typography.bodySmall, color = tint)
+        Text(uiText(message), Modifier.weight(1f).semantics { liveRegion = LiveRegionMode.Polite }, style = MaterialTheme.typography.bodySmall, color = tint)
     }
 }
 
 @Composable
 internal fun SetupPrimaryButton(text: String, onClick: () -> Unit, modifier: Modifier = Modifier, enabled: Boolean = true, loading: Boolean = false) {
     Button(onClick, modifier.fillMaxWidth().heightIn(min = 52.dp), enabled = enabled) {
-        if (loading) BeaconSignal(BeaconMotionMode.Sweep, size = 20.dp) else Text(text)
+        // The label stays (hidden) while loading, so TalkBack still names the button and it keeps its size.
+        Box(contentAlignment = Alignment.Center) {
+            Text(text, Modifier.alpha(if (loading) 0f else 1f))
+            if (loading) BeaconSignal(BeaconMotionMode.Sweep, size = 20.dp)
+        }
     }
 }
 

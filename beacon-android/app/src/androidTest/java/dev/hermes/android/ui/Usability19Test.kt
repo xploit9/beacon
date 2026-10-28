@@ -183,8 +183,8 @@ class Usability19Test {
             compose.onNodeWithText("Reset zoom").assertIsDisplayed().assertIsEnabled().performClick()
             compose.onNodeWithText("Reset zoom").assertDoesNotExist()
             compose.runOnIdle { screen = "code" }
-            compose.onNodeWithText("Tree").assertIsDisplayed().performClick(); compose.onNodeWithText("Source").assertIsDisplayed().performClick()
-            compose.onNodeWithText("Tree").assertIsDisplayed(); capture("code-controls")
+            compose.onNodeWithContentDescription("Tree").assertIsDisplayed().performClick(); compose.onNodeWithContentDescription("Source").assertIsDisplayed().performClick()
+            compose.onNodeWithContentDescription("Tree").assertIsDisplayed(); capture("code-controls")
             compose.runOnIdle { screen = "link" }
             await("PDF link name appeared", 25_000, { previewState() }) {
                 compose.onAllNodesWithText("Native pager PDF").fetchSemanticsNodes().isNotEmpty()
@@ -202,9 +202,9 @@ class Usability19Test {
             }
             compose.runOnIdle { screen = "diagram" }
             await("Oversized diagram fallback appeared", 25_000, { previewState() }) {
-                compose.onAllNodesWithText("Preview exceeds the 64,000 character limit").fetchSemanticsNodes().isNotEmpty()
+                compose.onAllNodesWithText("This preview can't be shown.").fetchSemanticsNodes().isNotEmpty()
             }
-            compose.onNodeWithText("Preview exceeds the 64,000 character limit").assertIsDisplayed()
+            compose.onNodeWithText("This preview can't be shown.").assertIsDisplayed()
             compose.onNodeWithText("Source").assertIsDisplayed()
             compose.onNodeWithText("Fullscreen diagram").assertIsNotEnabled()
             compose.onNodeWithText("mermaid").assertIsDisplayed(); capture("diagram-fallback")
@@ -241,26 +241,26 @@ class Usability19Test {
             }
             compose.onNodeWithTag("choice-option:Service tier:").performClick()
         }
-        compose.onNodeWithText("Generic blank: Default").assertIsDisplayed().performClick()
+        compose.onNode(hasText("Generic blank") and hasText("Default")).assertIsDisplayed().performClick()
         compose.onNodeWithTag("choice-option:Generic blank:").assertTextEquals("Default").assertIsDisplayed().performClick()
-        assertEquals("", generic); compose.onNodeWithText("Generic blank: Default").assertExists()
-        compose.onNodeWithText("Generic blank: Default").performClick()
+        assertEquals("", generic); compose.onNode(hasText("Generic blank") and hasText("Default")).assertExists()
+        compose.onNode(hasText("Generic blank") and hasText("Default")).performClick()
         compose.onNodeWithTag("choice-option:Generic blank:provider/Model_ID-v1").assertTextEquals("provider/Model_ID-v1").performClick()
         assertEquals("provider/Model_ID-v1", generic)
         val field = Field("advanced.service_tier", "Service tier", FieldType.CHOICE, options = listOf("", "default", "priority"), optionLabels = mapOf("" to "Use profile default", "default" to "Default tier", "priority" to "Priority tier"))
         fun open(required: Boolean = false) = compose.runOnIdle { vm.openForm(ActionForm("Choice proof", "", listOf(field.copy(required = required)), json("advanced" to json("service_tier" to "priority")), onResult = { saved = it })) }
-        open(); compose.onNodeWithText("Service tier: Priority tier").performClick()
+        open(); compose.onNode(hasText("Service tier") and hasText("Priority tier")).performClick()
         selectBlank()
-        assertEquals("", vm.form.value!!.values[field.key]); compose.onNodeWithText("Service tier: Use profile default").performScrollTo().assertIsDisplayed()
+        assertEquals("", vm.form.value!!.values[field.key]); compose.onNode(hasText("Service tier") and hasText("Use profile default")).performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("Cancel").performClick()
         await("Choice form closed after cancel", 25_000, { formState() }) { vm.form.value == null }
         assertNull(saved)
-        open(); compose.onNodeWithText("Service tier: Priority tier").performClick()
+        open(); compose.onNode(hasText("Service tier") and hasText("Priority tier")).performClick()
         selectBlank(); capture("blank-selected")
         compose.onNodeWithText("Save").performClick()
         await("Blank choice saved", 25_000, { formState() }) { saved != null && vm.form.value == null }
         assertEquals("", saved!!.getJSONObject("advanced").getString("service_tier"))
-        saved = null; open(required = true); compose.onNodeWithText("Service tier: Priority tier").performClick()
+        saved = null; open(required = true); compose.onNode(hasText("Service tier") and hasText("Priority tier")).performClick()
         selectBlank(); assertEquals("", vm.form.value!!.values[field.key]); compose.onNodeWithText("Save").performClick()
         await("Required choice validation appeared", 25_000, { formState() }) {
             vm.form.value?.error == "Enter Service tier."

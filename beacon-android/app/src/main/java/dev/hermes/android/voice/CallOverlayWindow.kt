@@ -7,6 +7,7 @@ import android.os.Build
 import android.provider.Settings
 import android.view.*
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
@@ -42,6 +43,12 @@ private class BubbleOwner : LifecycleOwner, SavedStateRegistryOwner, ViewModelSt
     override val viewModelStore=ViewModelStore()
     init { saved.performAttach();saved.performRestore(null);registry.currentState=Lifecycle.State.CREATED }
 }
+/** The bubble lives in its own window, so it carries the app's language and the assistant's name itself. */
+@Composable private fun BubbleTheme(content: @Composable () -> Unit) = BeaconTheme(dark=true,skin="default") {
+    NativeLocalization(nativeLanguageFor(LocalConfiguration.current.locales[0])) {
+        CompositionLocalProvider(LocalAssistantName provides dev.hermes.android.data.currentAssistantName,content=content)
+    }
+}
 /** One window belongs to one admitted call. No additional service or media client. */
 internal class CallOverlayWindow(private val context: Context, private val read: () -> CallState, private val eligible: () -> Boolean,
     private val mute: () -> Unit, private val end: () -> Unit, private val returnToCall: () -> Unit,
@@ -74,22 +81,26 @@ internal class CallOverlayWindow(private val context: Context, private val read:
     }
     private val dismissView=ComposeView(context).apply {
         setViewTreeLifecycleOwner(owner);setViewTreeSavedStateRegistryOwner(owner);setViewTreeViewModelStoreOwner(owner)
-        setContent { BeaconTheme(dark=true,skin="default") {
+        setContent { BubbleTheme {
             Column(Modifier.width(220.dp).padding(8.dp).testTag("beacon-bubble-dismiss-target"),horizontalAlignment=Alignment.CenterHorizontally) {
-                Surface(shape=CircleShape,color=if(overDismiss) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.surfaceContainerHigh,
-                    contentColor=if(overDismiss) MaterialTheme.colorScheme.onError else MaterialTheme.colorScheme.onSurface,modifier=Modifier.size(72.dp)) {
-                    Box(contentAlignment=Alignment.Center) { Icon(Icons.Rounded.DeleteOutline,"Hide bubble",Modifier.size(30.dp)) }
+                // Hiding is not destructive and the call stays on, so the target highlights calmly instead of turning red.
+                Surface(shape=CircleShape,color=if(overDismiss) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
+                    contentColor=if(overDismiss) MaterialTheme.colorScheme.onSecondaryContainer else MaterialTheme.colorScheme.onSurface,modifier=Modifier.size(72.dp)) {
+                    Box(contentAlignment=Alignment.Center) { Icon(Icons.Rounded.VisibilityOff,uiText("Hide bubble"),Modifier.size(30.dp)) }
                 }
                 Surface(shape=MaterialTheme.shapes.small,color=MaterialTheme.colorScheme.surfaceContainer,modifier=Modifier.padding(top=8.dp)) {
-                    Text(if(overDismiss) "Release to hide · call stays on" else "Drag here to hide bubble",Modifier.padding(8.dp),style=MaterialTheme.typography.labelMedium)
+                    Text(if(overDismiss) uiText("Release to hide · call stays on") else uiText("Drag here to hide bubble"),Modifier.padding(8.dp),style=MaterialTheme.typography.labelMedium)
                 }
             }
         } }
     }
     private val view: ComposeView=ComposeView(context).apply {
         setViewTreeLifecycleOwner(owner);setViewTreeSavedStateRegistryOwner(owner);setViewTreeViewModelStoreOwner(owner)
-        setContent { BeaconTheme(dark=true,skin="default") {
+        setContent { BubbleTheme {
             val call=current
+            val mutedState=if(call.muted) uiText("Microphone muted") else uiText("Microphone active")
+            val controlsLabel=uiText("Floating call controls")
+            val hideLabel=uiText("Hide bubble and keep call")
             val cardWidth=(LocalConfiguration.current.screenWidthDp-16).coerceIn(48,232).dp
             val user=call.latestCaption("user")
             val assistant=call.latestCaption("assistant")
@@ -109,20 +120,20 @@ internal class CallOverlayWindow(private val context: Context, private val read:
                 if(expanded) Surface(shape=MaterialTheme.shapes.large,color=MaterialTheme.colorScheme.surfaceContainer,
                     modifier=Modifier.padding(top=8.dp).width(cardWidth).testTag("beacon-bubble-menu")) {
                     Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal=4.dp),
-                        verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.SpaceEvenly) {
+                        verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(8.dp)) {
                         IconButton({if(eligible()) mute()},modifier=Modifier.size(48.dp).testTag("beacon-bubble-mute").semantics {
-                            selected=call.muted;stateDescription=if(call.muted) "Microphone muted" else "Microphone active"
-                        }) { Icon(if(call.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic,if(call.muted) "Unmute" else "Mute") }
-                        IconButton({if(eligible()) returnToCall()},modifier=Modifier.size(48.dp).testTag("beacon-bubble-return")) { Icon(Icons.Rounded.OpenInFull,"Return to call") }
-                        IconButton({dismissBubble()},modifier=Modifier.size(48.dp).testTag("beacon-bubble-hide")) { Icon(Icons.Rounded.VisibilityOff,"Hide bubble and keep call") }
-                        IconButton({if(eligible()) end()},modifier=Modifier.size(48.dp).testTag("beacon-bubble-end")) { Icon(Icons.Rounded.CallEnd,"Hang up",tint=MaterialTheme.colorScheme.error) }
+                            selected=call.muted;stateDescription=mutedState
+                        }) { Icon(if(call.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic,if(call.muted) uiText("Unmute") else uiText("Mute")) }
+                        IconButton({if(eligible()) returnToCall()},modifier=Modifier.size(48.dp).testTag("beacon-bubble-return")) { Icon(Icons.Rounded.OpenInFull,uiText("Return to call")) }
+                        IconButton({dismissBubble()},modifier=Modifier.size(48.dp).testTag("beacon-bubble-hide")) { Icon(Icons.Rounded.VisibilityOff,hideLabel) }
+                        IconButton({if(eligible()) end()},modifier=Modifier.size(48.dp).testTag("beacon-bubble-end")) { Icon(Icons.Rounded.CallEnd,uiText("Hang up"),tint=MaterialTheme.colorScheme.error) }
                     }
                 }
-                Surface(shape=CircleShape,color=androidx.compose.ui.graphics.Color.Transparent,
+                Surface(shape=CircleShape,color=androidx.compose.ui.graphics.Color.Transparent,border=BorderStroke(1.dp,CallGold.copy(alpha=.52f)),
                     modifier=Modifier.padding(top=8.dp).absoluteOffset(x=bubbleOffset.dp).size(48.dp).testTag("beacon-call-bubble").semantics {
-                        role=Role.Button;contentDescription="Floating call controls"
+                        role=Role.Button;contentDescription=controlsLabel
                         onClick { if(eligible()) { expanded=!expanded;view.post{clamp()};true } else false }
-                        customActions=listOf(CustomAccessibilityAction("Hide bubble and keep call") { dismissBubble();true })
+                        customActions=listOf(CustomAccessibilityAction(hideLabel) { dismissBubble();true })
                     }.pointerInteropFilter { event ->
                         if(!eligible()) false else when(event.actionMasked) {
                             MotionEvent.ACTION_DOWN -> { dragRawX=event.rawX;dragRawY=event.rawY;dragOriginX=bubbleX;dragOriginY=bubbleY;true }

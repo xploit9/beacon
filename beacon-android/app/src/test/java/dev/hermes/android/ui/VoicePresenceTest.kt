@@ -7,6 +7,9 @@ import dev.hermes.android.voice.callStatusLabel
 import org.junit.Assert.*
 import org.junit.Test
 import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.hypot
+import kotlin.math.sin
 
 class VoicePresenceTest {
     private val call = CallState(active = true, state = "listening")
@@ -57,7 +60,7 @@ class VoicePresenceTest {
         assertSame(presencePoles(SphereState.Speaking), presencePoles(SphereState.Streaming))
     }
 
-    @Test fun amplitudeBecomesBoundedMonotonicEnergy() {
+    @Test fun amplitudeBecomesBoundedEnergyAndTalkAndEnergyGrowTheCloudMonotonically() {
         assertEquals(0f, presenceEnergy(Float.NaN), 0f)
         assertEquals(0f, presenceEnergy(-1f), 0f)
         assertEquals(1f, presenceEnergy(3f), 0f)
@@ -66,11 +69,46 @@ class VoicePresenceTest {
         assertEquals(1f, presenceSpread(0f), 0f)
         var previous = listOf(-1f, -1f, -1f)
         for (i in 0..100) {
-            val energy = presenceEnergy(i / 100f)
-            val now = listOf(presenceStir(energy), presenceSpread(energy), presenceGain(energy))
+            // Talk (who speaks, eased slowly) sets the stir and spread; voice energy sets the glow.
+            val level = i / 100f
+            val now = listOf(presenceStir(level), presenceSpread(level), presenceGain(presenceEnergy(level)))
             now.zip(previous).forEach { (value, before) -> assertTrue(value.isFinite() && value >= before) }
             previous = now
         }
+        assertEquals(1.1f, presenceSpread(1f), 1e-6f)
+    }
+
+    @Test fun talkingScattersTheDustAndGathersItAgainSlowlyWhileSilenceKeepsTheStrands() {
+        assertEquals(1f, presenceTalk(call.copy(remoteSpeaking = true)), 0f)
+        assertEquals(1f, presenceTalk(call.copy(remoteSpeaking = true, muted = true)), 0f)
+        assertEquals(.5f, presenceTalk(call.copy(userSpeaking = true)), 0f)
+        assertEquals(0f, presenceTalk(call), 0f)
+        assertEquals(0f, presenceTalk(call.copy(userSpeaking = true, muted = true)), 0f)
+        assertEquals(0f, presenceTalk(call.copy(state = "thinking")), 0f)
+        assertEquals(0f, presenceTalk(call.copy(active = false, remoteSpeaking = true)), 0f)
+        for (i in 0..400) assertEquals(.8f, presencePull(i / 10f, 0f), 1e-6f)
+        val pull = (0..400).map { presencePull(it / 10f, 1f) }
+        // While talking the pull loosens so the dust disperses, then tightens so it gathers, and never jumps between frames.
+        assertTrue(pull.min() < .5f && pull.max() > 1.7f)
+        pull.zipWithNext().forEach { (a, b) -> assertTrue(abs(a - b) < .03f) }
+    }
+
+    @Test fun talkingScattersTheSpecksFurtherFromTheirStrandsThanSilenceDoes() {
+        fun meanDrift(talk: Float): Float {
+            val field = PresenceField(3L)
+            field.fit(500)
+            // Ten seconds in, a talking pull is at its loosest, so the flow has carried the dust furthest.
+            repeat(600) { field.step(it / 60f, talk) }
+            val turn = 599 / 60f * .05f
+            return (0 until 500).map { i ->
+                val rx = field.home[i * 2] * cos(turn) - field.home[i * 2 + 1] * sin(turn)
+                val ry = field.home[i * 2] * sin(turn) + field.home[i * 2 + 1] * cos(turn)
+                hypot(field.xy[i * 2] - rx, field.xy[i * 2 + 1] - ry)
+            }.average().toFloat()
+        }
+        val silent = meanDrift(0f)
+        val talking = meanDrift(1f)
+        assertTrue("silent $silent talking $talking", silent > .005f && talking > silent * 1.5f)
     }
 
     @Test fun particleCountScalesWithAreaAndTheBubbleGetsFarFewer() {
@@ -112,21 +150,51 @@ class VoicePresenceTest {
         val moved = run()
         assertArrayEquals(moved, run(), 0f)
         assertFalse(moved.contentEquals(seedParticles(3L, 500)))
-        assertTrue(moved.all { it.isFinite() && abs(it) < 2f })
+        assertTrue(moved.all { it.isFinite() && abs(it) <= PRESENCE_REACH })
     }
 
     @Test fun fittingTheSameCountKeepsTheCloudAndAGrowingAreaKeepsTheSameCloud() {
         val field = PresenceField(3L)
         field.fit(250)
-        field.step(.1f, 0f)
+        // The first step only places the specks; the second lets the flow carry them off their rest.
+        field.step(0f, 0f)
+        field.step(.5f, 0f)
         val stirred = field.xy.copyOf()
+        assertFalse(stirred.copyOf(500).contentEquals(field.home.copyOf(500)))
         field.fit(250)
         assertArrayEquals(stirred, field.xy, 0f)
+        val first = field.home.copyOf()
         field.fit(500)
         assertEquals(500, field.count)
-        // Seeded once at the cap: a bigger area only uses more of the same cloud, so a resize never reseeds while drawing.
+        // A bigger area reseeds at the cap, but its first specks rest where they did and stay where they drifted.
+        assertArrayEquals(first, field.home.copyOf(first.size), 0f)
         assertArrayEquals(seedParticles(3L, 500), field.home.copyOf(1000), 0f)
+        assertArrayEquals(stirred.copyOf(500), field.xy.copyOf(500), 0f)
+    }
+
+    @Test fun theBubbleSeedsOnlyWhatItDrawsAndGrowingReseedsOnceKeepingTheFirstSpecks() {
+        val field = PresenceField(3L)
+        val bubble = presenceParticleCount(48f, 48f)
+        field.fit(bubble)
+        assertEquals(bubble, field.count)
+        assertEquals(bubble * 2, field.home.size)
+        assertEquals(bubble * 2, field.xy.size)
+        assertEquals(bubble * 2, field.screen.size)
+        val bubbleCloud = field.home.copyOf()
+
+        field.fit(presenceParticleCount(360f, 520f))
+        assertEquals(PRESENCE_MAX_SPECKS * 2, field.home.size)
+        assertEquals(PRESENCE_MAX_SPECKS * 2, field.xy.size)
         assertEquals(PRESENCE_MAX_SPECKS * 2, field.screen.size)
+        assertArrayEquals(bubbleCloud, field.home.copyOf(bubbleCloud.size), 0f)
+        assertArrayEquals(seedParticles(3L, PRESENCE_MAX_SPECKS), field.home, 0f)
+
+        // At the cap nothing is seeded again, whether the area shrinks or grows.
+        val seeded = field.home
+        field.fit(bubble)
+        field.fit(PRESENCE_MAX_SPECKS)
+        assertSame(seeded, field.home)
+        assertEquals(PRESENCE_MAX_SPECKS, field.count)
     }
 
     @Test fun colourMixesTheEasedPolesAndLiftsTowardsWhite() {

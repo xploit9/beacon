@@ -1,5 +1,7 @@
 package dev.hermes.android.core
 
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.ui.graphics.Color
 import dev.hermes.android.Message
 import dev.hermes.android.data.externalMediaRequest
@@ -167,6 +169,14 @@ class NativeReviewTest {
             listOf(scheme.onSurface, scheme.onSurfaceVariant, scheme.primary, scheme.error).forEach { ink -> backgrounds.forEach { background -> assertTrue("$skin dark=$dark ink=$ink background=$background ratio=${nativeContrast(ink, background)}", nativeContrast(ink, background) >= 4.5f) } }
             assertTrue(nativeContrast(scheme.onPrimary, scheme.primary) >= 4.5f)
             assertTrue(nativeContrast(scheme.onError, scheme.error) >= 4.5f)
+            // Field and outlined-button borders are non-text UI: 3:1 on every surface; the skin themes surfaceVariant and tertiary itself.
+            backgrounds.forEach { background -> assertTrue("$skin dark=$dark outline=${scheme.outline} background=$background ratio=${nativeContrast(scheme.outline, background)}", nativeContrast(scheme.outline, background) >= 3f) }
+            val material = if (dark) darkColorScheme() else lightColorScheme()
+            assertTrue("$skin dark=$dark muted ink on surfaceVariant", nativeContrast(scheme.onSurfaceVariant, scheme.surfaceVariant) >= 4.5f)
+            assertTrue("$skin dark=$dark surfaceVariant is the skin's own", scheme.surfaceVariant != material.surfaceVariant)
+            assertTrue("$skin dark=$dark tertiary is the skin's own", scheme.tertiary != material.tertiary)
+            backgrounds.forEach { background -> assertTrue("$skin dark=$dark tertiary=${scheme.tertiary} background=$background", nativeContrast(scheme.tertiary, background) >= 4.5f) }
+            assertTrue(nativeContrast(scheme.onTertiary, scheme.tertiary) >= 4.5f)
         } }
     }
 

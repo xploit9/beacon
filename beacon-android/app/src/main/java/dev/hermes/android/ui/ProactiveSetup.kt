@@ -6,7 +6,10 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
@@ -23,8 +26,15 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.Role
+import androidx.compose.foundation.clickable
 import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.beaconOwnerSetupMessage
 import dev.hermes.android.core.json
@@ -32,13 +42,14 @@ import dev.hermes.android.core.string
 import dev.hermes.android.data.AppPreferences
 import dev.hermes.android.data.ApiFailure
 import dev.hermes.android.data.BeaconClient
-import dev.hermes.android.data.currentAssistantName
 import dev.hermes.android.isMissingBeaconPluginRoute
 import org.json.JSONObject
 import kotlinx.coroutines.CancellationException
 import java.time.Instant
+import java.time.LocalTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.Locale
 
 private val proactiveTimePattern = Regex("(?:[01]\\d|2[0-3]):[0-5]\\d")
 private val proactiveHealthTime = DateTimeFormatter.ofPattern("HH:mm")
@@ -110,9 +121,9 @@ internal fun proactiveHealthState(proactive: JSONObject?, checking: Boolean): Pr
                 ProactiveHealthState.NotYet -> BeaconMotionMode.Pulse
             }, size = 18.dp, trigger = state)
             Text(when (state) {
-                ProactiveHealthState.Checking -> "Checking"
-                ProactiveHealthState.Ok -> "OK"
-                ProactiveHealthState.NotYet -> "Not yet"
+                ProactiveHealthState.Checking -> uiText("Checking")
+                ProactiveHealthState.Ok -> uiText("OK")
+                ProactiveHealthState.NotYet -> uiText("Not yet")
             }, style = MaterialTheme.typography.labelMedium)
         }
     }
@@ -153,6 +164,10 @@ internal suspend fun fetchProactiveSettings(source: BeaconClient, profile: Strin
     } finally { client.closeNative() }
 }
 
+/** A stored "HH:mm" as the phone writes a time of day (24-hour or 12-hour); anything that does not parse stays as it is. */
+internal fun proactiveClockLabel(value: String, pattern: String, locale: Locale = Locale.getDefault()): String =
+    runCatching { LocalTime.parse(value).format(DateTimeFormatter.ofPattern(pattern, locale)) }.getOrDefault(value)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable internal fun ProactiveTimePicker(
     label: String,
@@ -161,16 +176,23 @@ internal suspend fun fetchProactiveSettings(source: BeaconClient, profile: Strin
     onChange: (String) -> Unit,
 ) {
     var open by remember(label, value) { mutableStateOf(false) }
+    val is24Hour = android.text.format.DateFormat.is24HourFormat(LocalContext.current)
     val parts = value.split(':')
     val state = key(value) {
         rememberTimePickerState(
             initialHour = parts.getOrNull(0)?.toIntOrNull()?.takeIf { it in 0..23 } ?: 22,
             initialMinute = parts.getOrNull(1)?.toIntOrNull()?.takeIf { it in 0..59 } ?: 0,
-            is24Hour = true,
+            is24Hour = is24Hour,
         )
     }
-    OutlinedButton(onClick = { open = true }, enabled = enabled, modifier = Modifier.fillMaxWidth().testTag("proactive-time-$label")) {
-        Text("$label: $value")
+    // Same look as Choice: a read-only field with the label above the time and a clock at the end.
+    val time = proactiveClockLabel(value, nativeClockPattern(Locale.getDefault(), is24Hour))
+    androidx.compose.foundation.layout.Box(Modifier.fillMaxWidth()) {
+        androidx.compose.material3.OutlinedTextField(time, {}, readOnly = true, enabled = enabled, singleLine = true, label = { Text(label) },
+            trailingIcon = { Icon(Icons.Rounded.Schedule, null) }, modifier = Modifier.fillMaxWidth().focusProperties { canFocus = false }.clearAndSetSemantics {})
+        // A read-only field takes no taps, so a layer over it opens the picker and reads as one button.
+        androidx.compose.foundation.layout.Box(Modifier.matchParentSize().clickable(enabled = enabled, role = Role.Button) { open = true }
+            .semantics { contentDescription = "$label: $time" }.testTag("proactive-time-$label"))
     }
     if (open) AlertDialog(
         onDismissRequest = { open = false },
@@ -180,13 +202,13 @@ internal suspend fun fetchProactiveSettings(source: BeaconClient, profile: Strin
             TextButton(onClick = {
                 onChange("%02d:%02d".format(state.hour, state.minute))
                 open = false
-            }, modifier = Modifier.testTag("proactive-time-confirm-$label")) { Text("OK") }
+            }, modifier = Modifier.testTag("proactive-time-confirm-$label")) { Text(uiText("OK")) }
         },
-        dismissButton = { TextButton(onClick = { open = false }) { Text("Cancel") } },
+        dismissButton = { TextButton(onClick = { open = false }) { Text(uiText("Cancel")) } },
     )
 }
 
-internal fun openProactiveRuleForm(vm: BeaconViewModel, profile: String, onCreated: () -> Unit, onMissingPlugin: () -> Unit = {}, sources: List<String> = emptyList()) {
+internal fun openProactiveRuleForm(vm: BeaconViewModel, profile: String, explanation: String, onCreated: () -> Unit, onMissingPlugin: () -> Unit = {}, sources: List<String> = emptyList()) {
     vm.openForm(ActionForm(
         "Add a rule", "", listOf(
             Field("text", "Your rule", FieldType.MULTILINE, required = true),
@@ -196,7 +218,7 @@ internal fun openProactiveRuleForm(vm: BeaconViewModel, profile: String, onCreat
             Field("night", "Even at night", FieldType.BOOLEAN),
         ),
         seed = json("signal" to "anything", "action" to "notify", "night" to false),
-        explanation = "Tell $currentAssistantName what needs your attention.",
+        explanation = explanation,
         actionLabel = "Add rule",
         onResult = onResult@{ form ->
             val text = form.string("text").trim()

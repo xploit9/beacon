@@ -16,7 +16,7 @@ class RedesignNavigationTest {
         assertEquals(NavigationRoute("More"), navigationRoute("Settings"))
         assertEquals(NavigationRoute("Beacon"), navigationRoute("Beacon"))
     }
-    @Test fun largeTypeReflowsAndKeepsBotsBesideKanban() {
+    @Test fun largeTypeReflowsIntoFullRows() {
         assertEquals(4, navigationColumns(320f, 1f))
         assertEquals(2, navigationColumns(320f, 2f))
         assertEquals(4, navigationColumns(260f, 1f))
@@ -25,8 +25,8 @@ class RedesignNavigationTest {
         for (columns in listOf(2, 4)) {
             val rows = navigationRows(columns)
             assertEquals(navigationTiles, rows.flatten())
-            val bots = rows.single { "Bots" in it }
-            assertEquals(bots.indexOf("Bots") + 1, bots.indexOf("Kanban"))
+            // No tile is left alone on a row, stretched wider than the others.
+            assertTrue(rows.all { it.size == columns })
         }
     }
     @Test fun projectSessionsRejectForeignHiddenAndUnlistedSessions() {

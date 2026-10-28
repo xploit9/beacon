@@ -408,7 +408,7 @@ class SetupWizardUiTest {
             for (rerun in listOf(false, true)) {
                 if (rerun) {
                     compose.runOnIdle { vm.more("Connection") }
-                    compose.onNodeWithText("Set up again").performScrollTo().performClick()
+                    compose.onNodeWithText("Change server").performScrollTo().performClick()
                     // Seed completed auth/voice prerequisites; keep the real completion callback and root routing.
                     compose.runOnIdle { flow<AppState>(vm, "_ui").value = vm.ui.value.copy(setupStep = "done") }
                 } else {

@@ -214,8 +214,8 @@ def reads_by_method(args,schema):
     return True
 
 
-# The Proactive read-only guard's vocabulary (__init__._ARG_WRITE_TOOL_WORDS, _UNSAFE_NAME_WORDS, _READ_TOOL_WORDS);
-# test_security_hardening keeps the copies equal, because the agent process and the dashboard cannot share one module.
+# The one write/read vocabulary of the call gateway and the Proactive read-only guard (the agent loads this file by path,
+# as for reads_by_method).
 WRITE_WORDS = frozenset({
     'send','create','delete','remove','modify','update','manage','draft','reply','forward',
     'move','archive','trash','label','post','write','upload','accept','decline','invite',
@@ -234,24 +234,37 @@ UNSAFE_NAME_WORDS = WRITE_WORDS | frozenset({
     'redeem','settle','enrol','enroll','register','unregister','upgrade','downgrade',
     'unfollow','unlink','unlock','detach','disconnect','connect','topup','claim','vote',
     'join','leave','close','switch','begin','boost'})
+# query, fetch and check also name SQL runners and URL fetchers, so they do not count as reads by name alone.
 READ_NAME_WORDS = frozenset({'get','list','search','read','find','view','show','describe','lookup'})
+# Words of the lists above that are also plain nouns: after a leading read verb they name a thing, not an action
+# (get_pull_request, get_commit, get_workflow_run).
+NOUN_NAME_WORDS = frozenset({'request','call','commit','run','label','report','draft','tag','change','schedule'})
+ACTION_NAME_WORDS = UNSAFE_NAME_WORDS - NOUN_NAME_WORDS
 
 
 def name_words(text):
-    return set(re.findall(r'[a-z0-9]+', re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', text or '').casefold()))
+    return re.findall(r'[a-z0-9]+', re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', text or '').casefold())
+
+
+def name_writes(raw):
+    """A tool name that carries a write. After a leading read verb only a real action counts: get_pull_request reads,
+    get_and_delete_x writes ('and' chains a second action)."""
+    words=name_words(raw)
+    return bool(set(words)&(ACTION_NAME_WORDS if words and words[0] in READ_NAME_WORDS else UNSAFE_NAME_WORDS))
 
 
 def mcp_reads_by_name(raw, trust):
     """A read-only annotation is the server's own claim: it releases the owner's approval only for a name with no write
-    verb, and on an untrusted server only for a name that also says it reads."""
-    words=name_words(raw)
-    return not words&UNSAFE_NAME_WORDS and (trust!='untrusted' or bool(words&READ_NAME_WORDS))
+    action, and on an untrusted server only for a name that also says it reads, with every noun counted as a write."""
+    if trust!='untrusted': return not name_writes(raw)
+    words=set(name_words(raw))
+    return not words&UNSAFE_NAME_WORDS and bool(words&READ_NAME_WORDS)
 
 
 def writes_by_action(arguments):
     """An action or operation argument that names a write makes the call a write, whatever the tool is annotated."""
     given={str(key).casefold():value for key,value in arguments.items()}
-    return any(isinstance(given.get(field),str) and bool(name_words(given[field])&WRITE_WORDS) for field in ('action','operation'))
+    return any(isinstance(given.get(field),str) and bool(set(name_words(given[field]))&WRITE_WORDS) for field in ('action','operation'))
 
 
 def _hermes_read_only(name):

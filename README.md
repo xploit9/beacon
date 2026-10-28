@@ -17,20 +17,20 @@ Or download [`beacon_install.py`](https://raw.githubusercontent.com/xploit9/beac
 it. Open it, paste your Hermes link (also shown on the dashboard's **Beacon** tab), sign in with Hermes, and follow the setup wizard.
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/bee7a28c-e6f1-497c-8dad-b1b13afbc320" width="31%" alt="Beacon chat">
+  <img src="https://github.com/user-attachments/assets/05bc3b64-e9d7-48b2-94e7-0661e322d950" width="31%" alt="Beacon chat">
   <img src="https://github.com/user-attachments/assets/20e84c96-cba7-481a-b593-edc0aa3d7b06" width="31%" alt="A scheduled post in a thread">
-  <img src="https://github.com/user-attachments/assets/b0f25871-6398-43af-a0d2-e824c63dcd5b" width="31%" alt="A voice call">
+  <img src="https://github.com/user-attachments/assets/e9954d6f-7348-4751-a7e2-bf845ae2b757" width="31%" alt="A voice call">
 </p>
 
 ## See it work
 
 **You call Beacon.** It checks the calendar and saves a note to your Hermes memory, all by voice:
 
-https://github.com/user-attachments/assets/76615260-87e8-4475-8867-0d1d9b610aad
+https://github.com/user-attachments/assets/14f70977-0855-4e36-a583-0262a7718bf5
 
 **Beacon calls you.** Ask it to ring you about an email. It calls, says why, and drafts the reply:
 
-https://github.com/user-attachments/assets/cc0944c5-63a8-40f2-866e-771889d7186b
+https://github.com/user-attachments/assets/25658228-96aa-4c44-ba31-dae53892b5ab
 
 The voice is Grok; the caller's side is synthetic speech. Screens and videos come from a demo Hermes with sample data.
 
@@ -41,17 +41,18 @@ The voice is Grok; the caller's side is synthetic speech. Screens and videos com
 - **Threads as channels.** Give a thread a name and an emoji, point a scheduled task at it, and each result arrives
   there as a post. Reply and the answer builds on it ([how threads work](docs/threads.md)).
 - **Projects.** Add a chat to a project from its menu. It works in the project's folder and shows the project at the top.
-- **Tools at hand.** Toolsets in a chat's menu opens your tools and MCP servers, the same controls as Settings.
-- **Approvals per chat.** Each chat follows your profile's approval mode, or YOLO for that chat only.
+- **Tools at hand.** Tools, under More in a chat's menu, opens your tools and MCP servers, the same controls as Settings.
+- **Approvals per chat.** Each chat follows your profile's approval mode, or skips approvals for that chat only.
 - **Voice calls.** Talk with Gemini Live, Grok or OpenAI Realtime. Calls use the tools and memory of your Hermes profile,
-  and can save new memories like a chat ([how calls use tools and memory](docs/voice-calls.md)). A cloud of light
-  shows the call: blue while Beacon listens, amber while it thinks, green while it speaks. Call text is saved;
-  audio is not kept.
+  and can save new memories like a chat ([how calls use tools and memory](docs/voice-calls.md)). A ball of drifting
+  dust shows the call: blue while Beacon listens, amber while it thinks, green while it speaks, and it swirls and
+  scatters while someone talks. Call text is saved; audio is not kept.
 - **What needs you.** Beacon watches what your Hermes can reach and tells you, or calls you, when something matters.
   Write rules like "Call me if a client moves a meeting" and teach it with Important / Not important.
-- **All of Hermes.** Profiles, skills, memory, cron, files, Kanban and Bot Mode, with screens that open ready.
+- **All of Hermes.** Profiles, skills, memory, schedules, files, Kanban and Bot Mode, with screens that open ready.
 - **Updates from GitHub.** Beacon tells you when a release is out; tap Update for the app and the Hermes plugin.
 - **Foldables.** On a wide screen, the chat list and the chat sit side by side.
+- **Your language.** The app follows your phone's language in 16 languages, including right-to-left Arabic.
 
 ## The journey
 
@@ -78,29 +79,29 @@ you have linked.
 <p align="center">
   <img src="https://github.com/user-attachments/assets/bd391502-b138-45ba-ad4a-a19ec986f60b" width="31%" alt="Choose a voice provider">
   <img src="https://github.com/user-attachments/assets/cec4327f-53e9-4e5a-9f82-5f00a726b122" width="31%" alt="Pick a voice">
-  <img src="https://github.com/user-attachments/assets/b2c56b17-749f-46dd-9821-6e1f2d5d48f4" width="31%" alt="Beacon answers after checking the calendar">
+  <img src="https://github.com/user-attachments/assets/a453b7e7-d705-4a1e-b1b2-f68a05f16b2d" width="31%" alt="Beacon answers after checking the calendar">
 </p>
 
 **4. Talk to Beacon.** Ask about your day, have it draft a reply, use `/` commands, and set approvals for the chat.
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/bee7a28c-e6f1-497c-8dad-b1b13afbc320" width="23%" alt="Plan the day from calendar and inbox">
-  <img src="https://github.com/user-attachments/assets/549be056-143a-4c68-9ae1-5d5aae3110fe" width="23%" alt="A drafted reply">
+  <img src="https://github.com/user-attachments/assets/05bc3b64-e9d7-48b2-94e7-0661e322d950" width="23%" alt="Plan the day from calendar and inbox">
+  <img src="https://github.com/user-attachments/assets/2831e1c4-279d-42b8-b487-8d934bb2b62b" width="23%" alt="A drafted reply">
   <img src="https://github.com/user-attachments/assets/d7686bee-d635-4754-bb6b-852be5b24640" width="23%" alt="Slash commands">
-  <img src="https://github.com/user-attachments/assets/2be62168-3852-4f60-b4f9-6f02e04438dc" width="23%" alt="Approvals in this chat">
+  <img src="https://github.com/user-attachments/assets/d6f2cd69-67c4-48ca-9a1a-491b517863e0" width="23%" alt="Approvals in this chat">
 </p>
 
 **5. Threads as channels.** Start a thread, give it a scheduled task, and read the posts like a channel.
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/d675c9e6-83d0-4a4d-a167-6d72928eefb7" width="23%" alt="New thread">
-  <img src="https://github.com/user-attachments/assets/f1945320-66c4-418e-9e74-c77a7eb9ac49" width="23%" alt="A scheduled post">
+  <img src="https://github.com/user-attachments/assets/b1a2624d-8fb7-46b1-a7ed-1ffdaa5436ee" width="23%" alt="A scheduled post">
   <img src="https://github.com/user-attachments/assets/20e84c96-cba7-481a-b593-edc0aa3d7b06" width="23%" alt="The post arrives">
   <img src="https://github.com/user-attachments/assets/5164349d-9526-41ca-8b8a-8f188411feed" width="23%" alt="A reply builds on it">
 </p>
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/3e968e0e-d75e-4226-a438-01ec7b0974f2" width="31%" alt="Scheduled posts for the thread">
+  <img src="https://github.com/user-attachments/assets/fc43815d-bf7a-4ca8-8287-2e0a1bae20f2" width="31%" alt="Scheduled posts for the thread">
   <img src="https://github.com/user-attachments/assets/3dc7d52a-6394-4c50-9127-60d91484fc5e" width="31%" alt="Threads">
 </p>
 
@@ -110,22 +111,22 @@ tap away.
 <p align="center">
   <img src="https://github.com/user-attachments/assets/332087d1-59a0-43d9-a6d4-55529513e0f3" width="23%" alt="Add to project">
   <img src="https://github.com/user-attachments/assets/902c558c-47aa-4c37-b6b3-ab11fb19a597" width="23%" alt="A chat in a project">
-  <img src="https://github.com/user-attachments/assets/506a1bd5-0dc4-49fe-b08e-c7fe50356d84" width="23%" alt="Toolsets">
-  <img src="https://github.com/user-attachments/assets/013b162f-7408-4566-9f95-1e8d61f32fc0" width="23%" alt="MCP servers">
+  <img src="https://github.com/user-attachments/assets/945f17f3-4a9f-4530-bc79-7c5b846331e9" width="23%" alt="Tools">
+  <img src="https://github.com/user-attachments/assets/de0b51cc-2e72-411b-8570-10c564535d08" width="23%" alt="MCP servers">
 </p>
 
 **7. What needs you.** Turn it on, choose Notify or Call, and add your own rules.
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/406aa3ce-1749-4604-b4a9-9d46565fe717" width="31%" alt="What needs you">
-  <img src="https://github.com/user-attachments/assets/1fb5a2c2-1453-4d27-8f88-356b41e6b3ce" width="31%" alt="Add a rule">
+  <img src="https://github.com/user-attachments/assets/5e51e140-22a9-4790-ae53-fa8bca8fa78c" width="31%" alt="What needs you">
+  <img src="https://github.com/user-attachments/assets/8d67816a-d605-48c9-931f-11ec4bc4a47d" width="31%" alt="Add a rule">
 </p>
 
 **8. The rest of Hermes.** Chats, settings, updates and a light theme.
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/8da571b3-f6e6-4347-90c3-60bc8ec4c942" width="23%" alt="Chats">
-  <img src="https://github.com/user-attachments/assets/120c6066-5458-4428-a67a-f30b932e25b2" width="23%" alt="Settings">
+  <img src="https://github.com/user-attachments/assets/cb6ba6a1-7936-4671-b631-7a7ff255bfb5" width="23%" alt="Chats">
+  <img src="https://github.com/user-attachments/assets/536125e4-f175-4b24-95f8-ab15210d7d58" width="23%" alt="Settings">
   <img src="https://github.com/user-attachments/assets/c1e5fe50-210b-46ab-b117-b02d181cb5b0" width="23%" alt="App updates">
   <img src="https://github.com/user-attachments/assets/56123012-1185-498d-a95a-ee0aa63553b0" width="23%" alt="Light theme">
 </p>

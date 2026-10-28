@@ -29,6 +29,9 @@ internal data class PluginRow(val status: PluginStatus = PluginStatus.Hidden, va
     val actionable: Boolean get() = status in setOf(PluginStatus.Available, PluginStatus.NeedsReview, PluginStatus.Busy, PluginStatus.Failed, PluginStatus.Restart)
 }
 
+/** Every status text the plugin row shows through uiText. */
+internal val PluginRowStrings = PluginStatus.entries.map { PluginRow(it).text }.filter(String::isNotBlank)
+
 /** What the phone learned about the plugin on Hermes. */
 internal sealed interface PluginProbe {
     /** No Hermes session, no plugin, or not the owner: nothing to update. */

@@ -28,10 +28,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.OpenInNew
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ContentPaste
-import androidx.compose.material.icons.rounded.OpenInNew
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -49,6 +51,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
@@ -81,19 +84,20 @@ internal fun KeepConnectedSetupGroup(
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.weight(1f).padding(end = 16.dp)) {
-                Text("Keep connected", style = MaterialTheme.typography.titleMedium)
-                Text("Let Hermes reach this phone for incoming calls while Beacon is closed.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(uiText("Keep connected"), style = MaterialTheme.typography.titleMedium)
+                Text(uiText("Let Hermes reach this phone for incoming calls while Beacon is closed."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(uiText("Shows a quiet notification and uses some battery."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Switch(checked = keepConnected, onCheckedChange = onKeepConnectedChange, modifier = Modifier.testTag("setup-keep-connected"))
         }
-        if (keepConnected && !notificationAllowed) Text("Allow notifications so incoming call alerts can appear.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+        if (keepConnected && !notificationAllowed) Text(uiText("Allow notifications so incoming call alerts can appear."), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
         if (backgroundActionVisible) OutlinedButton(
             onClick = onOpenBackgroundSettings,
             modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("setup-background-use"),
         ) {
-            Icon(Icons.Rounded.OpenInNew, null)
+            Icon(Icons.AutoMirrored.Rounded.OpenInNew, null)
             Spacer(Modifier.width(8.dp))
-            Text("Allow Beacon to run in the background")
+            Text(uiText("Allow Beacon to run in the background"))
         }
     }
 }
@@ -141,6 +145,7 @@ fun SetupWizard(vm: BeaconViewModel, modifier: Modifier = Modifier, externalLink
     val state by vm.ui.collectAsStateWithLifecycle()
     val prefs by vm.preferences.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val backgroundHint = uiText("Open Beacon’s app settings in Android and allow background use.")
     SetupWizardScreen(
         state = state,
         modifier = modifier,
@@ -156,7 +161,7 @@ fun SetupWizard(vm: BeaconViewModel, modifier: Modifier = Modifier, externalLink
         onFinish = { vm.finishSetupWizard(it); onExternalLinkCleared() },
         onReopen = vm::reopenSetupWizard,
         onCancel = { vm.cancelSetupWizard(); onExternalLinkCleared() },
-        onOpenBackgroundSettings = { if (!requestBackgroundUse(context)) vm.notice("Open Beacon’s app settings in Android and allow background use.") },
+        onOpenBackgroundSettings = { if (!requestBackgroundUse(context)) vm.notice(backgroundHint) },
     )
 }
 
@@ -179,6 +184,7 @@ internal fun SetupWizardScreen(
     onOwnerNameChange: (String) -> Unit = {},
 ) {
     val context = LocalContext.current
+    SetupSystemBars()
     val motionEnabled = rememberNativeMotionEnabled()
     val powerManager = remember(context) { context.getSystemService(android.os.PowerManager::class.java) }
     var ignoringBatteryOptimizations by remember(context) { mutableStateOf(powerManager.isIgnoringBatteryOptimizations(context.packageName)) }
@@ -189,6 +195,7 @@ internal fun SetupWizardScreen(
     val initialAddress = setupAddressForDisplay(state.setupOrigin.ifBlank { state.origin })
     val visibleOrigin = initialAddress
     var address by rememberSaveable(initialAddress) { mutableStateOf(initialAddress) }
+    val canContinue = !state.loading && address.isNotBlank()
     // The provider chosen on the first voice page, for the key page after it; empty means the saved one.
     var voiceKeyProvider by rememberSaveable { mutableStateOf("") }
     var keyWorks by rememberSaveable { mutableStateOf(false) }
@@ -199,6 +206,12 @@ internal fun SetupWizardScreen(
         clip?.getItemAt(0)?.coerceToText(context)?.toString()?.let(::updateAddress)
     }
 
+    val microphoneLabel = uiText("Microphone")
+    val notificationsLabel = uiText("Notifications")
+    val fullScreenLabel = uiText("Full-screen call alerts")
+    val fullScreenStillOff = uiText("Full-screen call alerts are still off. Open settings again or skip for now.")
+    val permissionBlocked = uiText("{0} permission is blocked. Open app settings or skip for now.")
+    val permissionNotGranted = uiText("{0} permission wasn't granted. You can try again or skip for now.")
     var permissionDenied by rememberSaveable(state.setupStep) { mutableStateOf(false) }
     var permissionNotice by rememberSaveable(state.setupStep) { mutableStateOf("") }
 
@@ -218,9 +231,9 @@ internal fun SetupWizardScreen(
             denied = {
                 permissionDenied = true
                 val title = when (step) {
-                    "permission-microphone" -> "Microphone"
-                    "permission-notifications" -> "Notifications"
-                    else -> "Full-screen call alerts"
+                    "permission-microphone" -> microphoneLabel
+                    "permission-notifications" -> notificationsLabel
+                    else -> fullScreenLabel
                 }
                 val permanent = when (step) {
                     "permission-microphone" -> setupPermissionRequiresSettings(true, showRationale(Manifest.permission.RECORD_AUDIO))
@@ -228,9 +241,9 @@ internal fun SetupWizardScreen(
                     else -> true
                 }
                 permissionNotice = when {
-                    step == "permission-full-screen" -> "Full-screen call alerts are still off. Open settings again or skip for now."
-                    permanent -> "$title permission is blocked. Open app settings or skip for now."
-                    else -> "$title permission wasn't granted. You can try again or skip for now."
+                    step == "permission-full-screen" -> fullScreenStillOff
+                    permanent -> permissionBlocked.replace("{0}", title)
+                    else -> permissionNotGranted.replace("{0}", title)
                 }
             },
         )
@@ -272,7 +285,7 @@ internal fun SetupWizardScreen(
         val step = setupStepNumber(current)
         when (current) {
             "probe" -> SetupShell(
-                step, if (state.loading) "Checking the connection…" else "Check the connection", modifier, visibleOrigin,
+                step, if (state.loading) uiText("Checking the connection…") else uiText("Check the connection"), modifier, visibleOrigin,
                 content = {
                     if (state.loading) Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { BeaconSignal(BeaconMotionMode.Sweep, size = 40.dp) }
                     else {
@@ -282,14 +295,14 @@ internal fun SetupWizardScreen(
                 },
                 actions = {
                     if (!state.loading) {
-                        SetupPrimaryButton("Retry", { onProbe(visibleOrigin) }, Modifier.testTag("setup-probe-retry"))
-                        SetupTextAction("Change address", { onReopen(visibleOrigin) })
-                        if (state.authenticated) SetupTextAction("Close setup", onCancel)
+                        SetupPrimaryButton(uiText("Retry"), { onProbe(visibleOrigin) }, Modifier.testTag("setup-probe-retry"))
+                        SetupTextAction(uiText("Change address"), { onReopen(visibleOrigin) })
+                        if (state.authenticated) SetupTextAction(uiText("Close setup"), onCancel)
                     }
                 },
             )
             "signin" -> SetupShell(
-                step, "Sign in with Hermes", modifier, "Use your Hermes account.",
+                step, uiText("Sign in with Hermes"), modifier, uiText("Use your Hermes account."),
                 content = {
                     Text(visibleOrigin, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     SetupStatusLine(state.setupPluginMessage, error = false)
@@ -297,17 +310,17 @@ internal fun SetupWizardScreen(
                     SetupStatusLine(state.notice, error = false)
                 },
                 actions = {
-                    SetupPrimaryButton("Sign in with Hermes", { onSignIn(context) }, Modifier.testTag("setup-signin"), enabled = !state.loading, loading = state.loading)
-                    SetupTextAction("Use another server", { onReopen(visibleOrigin) }, enabled = !state.loading)
-                    if (state.authenticated && !state.loading) SetupTextAction("Close setup", onCancel)
+                    SetupPrimaryButton(uiText("Sign in with Hermes"), { onSignIn(context) }, Modifier.testTag("setup-signin"), enabled = !state.loading, loading = state.loading)
+                    SetupTextAction(uiText("Use another server"), { onReopen(visibleOrigin) }, enabled = !state.loading)
+                    if (state.authenticated && !state.loading) SetupTextAction(uiText("Close setup"), onCancel)
                 },
             )
             "unsupported" -> SetupShell(
-                step, "Update needed", modifier, "This Hermes needs an update before phones can sign in.",
+                step, uiText("Update needed"), modifier, uiText("This Hermes needs an update before phones can sign in."),
                 content = {},
                 actions = {
-                    SetupTextAction("Use another server", { onReopen(visibleOrigin) })
-                    if (state.authenticated) SetupTextAction("Close setup", onCancel)
+                    SetupTextAction(uiText("Use another server"), { onReopen(visibleOrigin) })
+                    if (state.authenticated) SetupTextAction(uiText("Close setup"), onCancel)
                 },
             )
             "voice-provider" -> {
@@ -316,7 +329,7 @@ internal fun SetupWizardScreen(
                     onSkip = onSkipVoiceSetup,
                     onClose = onCancel.takeIf { state.authenticated },
                 )
-                SetupShell(step, "Choose a voice provider", modifier, "Calls use your own account. You can add or change this later in Settings.", page.content, page.actions)
+                SetupShell(step, uiText("Choose a voice provider"), modifier, uiText("Calls use your own account. You can add or change this later in Settings."), page.content, page.actions)
             }
             "voice-key" -> {
                 val provider = voiceKeyProvider.ifBlank { VoiceKeyStore(context.applicationContext).settings().provider }
@@ -326,22 +339,22 @@ internal fun SetupWizardScreen(
                     onVerified = { keyWorks = true; onAdvancePermission() }, onContinueAnyway = onAdvancePermission,
                     onBack = { onVoicePage("voice-provider") }, onSkip = onSkipVoiceSetup,
                 )
-                SetupShell(step, "Add your $name key", modifier, "Calls use your $name account.", page.content, page.actions)
+                SetupShell(step, uiText("Add your {0} key").replace("{0}", name), modifier, uiText("Calls use your {0} account.").replace("{0}", name), page.content, page.actions)
             }
             "voice-customize" -> {
                 val page = voiceChoicesPage(
                     settingsMode = false, keyWorks = keyWorks, ownerName = ownerName, onOwnerNameChange = onOwnerNameChange,
                     onContinue = onAdvancePermission, onBack = { onVoicePage("voice-provider") },
                 )
-                SetupShell(step, "Make it yours", modifier, "Pick how calls sound.", page.content, page.actions)
+                SetupShell(step, uiText("Make it yours"), modifier, uiText("Pick how calls sound."), page.content, page.actions)
             }
             // KEEP_CONNECTED_STEP_EXTENSION_POINT; kept empty until the connection-service leaf adds its step.
             "permission-microphone", "permission-notifications", "permission-full-screen" -> {
                 val permission = current
                 val (title, reason) = when (permission) {
-                    "permission-microphone" -> Pair("Microphone", "Allow the microphone when you start a call.")
-                    "permission-notifications" -> Pair("Notifications", "Allow notifications so calls and updates can reach you.")
-                    else -> Pair("Full-screen call alerts", "Allow full-screen alerts so an incoming call can get your attention.")
+                    "permission-microphone" -> Pair(microphoneLabel, uiText("Allow the microphone when you start a call."))
+                    "permission-notifications" -> Pair(notificationsLabel, uiText("Allow notifications so calls and updates can reach you."))
+                    else -> Pair(fullScreenLabel, uiText("Allow full-screen alerts so an incoming call can get your attention."))
                 }
                 val allowed = permissionAllowed(permission)
                 val permanentDenial = when (permission) {
@@ -369,21 +382,21 @@ internal fun SetupWizardScreen(
                     actions = {
                         SetupPrimaryButton(
                             when {
-                                allowed -> "Continue"
-                                permission == "permission-full-screen" -> "Open settings"
-                                permanentDenial -> "Open app settings"
-                                else -> "Allow $title"
+                                allowed -> uiText("Continue")
+                                permission == "permission-full-screen" -> uiText("Open settings")
+                                permanentDenial -> uiText("Open app settings")
+                                else -> uiText("Allow {0}").replace("{0}", title)
                             },
                             { if (allowed) reportPermissionResult(true, permission) else action() },
                             Modifier.testTag("setup-permission-primary"), enabled = !state.loading,
                         )
-                        SetupTextAction("Skip for now", onAdvancePermission, Modifier.testTag("setup-permission-skip"))
-                        if (state.authenticated) SetupTextAction("Close setup", onCancel)
+                        SetupTextAction(uiText("Skip for now"), onAdvancePermission, Modifier.testTag("setup-permission-skip"))
+                        if (state.authenticated) SetupTextAction(uiText("Close setup"), onCancel)
                     },
                 )
             }
             "done" -> SetupShell(
-                step, "You're connected", modifier, "Beacon is ready.",
+                step, uiText("You're connected"), modifier, assistantText("Beacon is ready."),
                 content = {
                     SetupStatusLine(state.setupPluginMessage, error = false)
                     SetupContainer {
@@ -396,34 +409,39 @@ internal fun SetupWizardScreen(
                         )
                     }
                 },
-                actions = { SetupPrimaryButton("Open chat", { onFinish(keepConnected) }, Modifier.testTag("setup-finish"), enabled = state.authenticated) },
+                actions = { SetupPrimaryButton(uiText("Open chat"), { onFinish(keepConnected) }, Modifier.testTag("setup-finish"), enabled = state.authenticated) },
             )
             else -> SetupShell(
-                step, "Connect to Hermes", modifier, "Paste the link from your Hermes dashboard.",
+                step, uiText("Connect to Hermes"), modifier, uiText("Paste the link from your Hermes dashboard."),
                 content = {
                     externalLinkOrigin?.takeIf(String::isNotBlank)?.let {
-                        Text("Address from external link: $it", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+                        Text(uiText("Address from external link: {0}").replace("{0}", it), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                     }
                     OutlinedTextField(
                         value = address,
                         onValueChange = ::updateAddress,
-                        label = { Text("Paste link or address") },
+                        label = { Text(uiText("Paste link or address")) },
                         placeholder = { Text("https://hermes.example.com") },
-                        trailingIcon = if (address.isEmpty()) ({
-                            IconButton(onClick = ::pasteAddress) { Icon(Icons.Rounded.ContentPaste, "Paste link") }
-                        }) else null,
+                        trailingIcon = {
+                            if (address.isEmpty()) IconButton(onClick = ::pasteAddress) { Icon(Icons.Rounded.ContentPaste, uiText("Paste link")) }
+                            else IconButton(onClick = { updateAddress("") }) { Icon(Icons.Rounded.Close, uiText("Clear")) }
+                        },
                         isError = state.error.isNotBlank(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, autoCorrectEnabled = false, imeAction = ImeAction.Go),
+                        keyboardActions = KeyboardActions(onGo = { if (canContinue) onProbe(address) }),
                         minLines = 1,
                         maxLines = 3,
                         modifier = Modifier.fillMaxWidth().testTag("setup-address"),
                     )
+                    var showHelp by rememberSaveable { mutableStateOf(false) }
+                    SetupTextAction(uiText("Where do I find it?"), { showHelp = !showHelp }, Modifier.testTag("setup-address-help"))
+                    if (showHelp) Text(uiText("In your Hermes dashboard, open Beacon and tap Copy link."), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                     SetupStatusLine(state.error, error = true)
                     SetupStatusLine(state.notice, error = false)
                 },
                 actions = {
-                    SetupPrimaryButton("Continue", { onProbe(address) }, Modifier.testTag("setup-connect"), enabled = !state.loading && address.isNotBlank())
-                    if (state.authenticated) SetupTextAction("Close setup", onCancel)
+                    SetupPrimaryButton(uiText("Continue"), { onProbe(address) }, Modifier.testTag("setup-connect"), enabled = canContinue)
+                    if (state.authenticated) SetupTextAction(uiText("Close setup"), onCancel)
                 },
             )
         }

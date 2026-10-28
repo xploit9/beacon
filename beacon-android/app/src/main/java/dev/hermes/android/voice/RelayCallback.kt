@@ -104,9 +104,6 @@ data class RelayCallback(
     }
 }
 
-/** The call after one protocol step; the reducer owns no Android service, notification, permission prompt or microphone. */
-data class RelayCallbackTransition(val call: RelayCallback)
-
 /**
  * One instance per authenticated pairing lifetime; keep it across socket reconnects.
  * Serialize effects with the existing call controller. Retired UUIDs are never evicted.
@@ -119,14 +116,11 @@ class RelayCallbackProtocol {
         private set
     private val seen = mutableSetOf<String>()
 
-    private fun finish(call: RelayCallback): RelayCallbackTransition {
-        val ended = call.copy(phase = RelayCallbackPhase.Finished)
-        current = ended
-        return RelayCallbackTransition(ended)
-    }
+    // Each step returns the call it produced; the reducer owns no Android service, notification, permission prompt or microphone.
+    private fun finish(call: RelayCallback): RelayCallback = call.copy(phase = RelayCallbackPhase.Finished).also { current = it }
 
     /** Call on sign-out, re-pairing, scope changes and opt-out, even without incoming traffic. */
-    @Synchronized fun invalidate(binding: RelayCallbackBinding?, prefs: RelayCallbackPreferences?): RelayCallbackTransition? {
+    @Synchronized fun invalidate(binding: RelayCallbackBinding?, prefs: RelayCallbackPreferences?): RelayCallback? {
         val call = current?.takeUnless { it.phase == RelayCallbackPhase.Finished } ?: return null
         if (binding == null || !binding.valid || binding != call.binding) return finish(call)
         if (prefs == null) return null
@@ -135,21 +129,21 @@ class RelayCallbackProtocol {
     }
 
     @Synchronized fun receive(message: JSONObject, binding: RelayCallbackBinding?, prefs: RelayCallbackPreferences?,
-        now: Long, elapsed: Long): RelayCallbackTransition? {
+        now: Long, elapsed: Long): RelayCallback? {
         invalidate(binding, prefs)?.let { return it }
         if (binding == null || !binding.valid || !RelayCallbackPolicy.callsAllowed(prefs, binding.connectionId)) return null
         val envelope = RelayCallbackWire.parse(message) ?: return null
         val call = RelayCallback.parse(envelope.payload, binding, now, elapsed) ?: return null
         if (seen.size >= 256 || !seen.add(call.callId)) return null
         if (current?.phase?.let { it != RelayCallbackPhase.Finished } == true) {
-            return RelayCallbackTransition(call.copy(phase = RelayCallbackPhase.Finished))
+            return call.copy(phase = RelayCallbackPhase.Finished)
         }
         current = call
-        return RelayCallbackTransition(call)
+        return call
     }
 
     @Synchronized fun expire(now: Long, elapsed: Long, binding: RelayCallbackBinding?,
-        prefs: RelayCallbackPreferences?): RelayCallbackTransition? {
+        prefs: RelayCallbackPreferences?): RelayCallback? {
         invalidate(binding, prefs)?.let { return it }
         val call = current ?: return null
         if (call.phase == RelayCallbackPhase.Ringing && call.remainingRingMillis(now, elapsed) == 0L) return finish(call)

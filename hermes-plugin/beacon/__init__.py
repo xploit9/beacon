@@ -267,31 +267,11 @@ def native_voice_context(session_id=None, conversation_history=None, **kwargs):
         return {'context': 'Earlier voice context could not be read for this turn. Do not guess missing spoken details.'}
 
 
-# query, fetch and check also name SQL runners and URL fetchers, so they do not count as reads by name alone.
-_READ_TOOL_WORDS={'get','list','search','read','find','view','show','describe','lookup'}
-_WRITE_TOOL_WORDS={'send','create','delete','remove','modify','update','manage','draft','reply','forward',
-                   'move','archive','trash','label','post','write','upload','accept','decline','invite',
-                   'share','set','add','patch','put','mark','star','snooze','mute','block',
-                   'unsubscribe','replace','rename','merge','approve','submit','cancel','execute','run',
-                   'import','restore','copy','insert','append','apply','push','commit','pay','transfer',
-                   'toggle','save','store','notify','acknowledge','ack','seen','flag','unflag','pin','unpin',
-                   'unstar','download','export','attach','respond','rsvp','confirm','dismiss','clear','reset',
-                   'assign','subscribe','react','sync','publish','change','hide','unhide','purge','tag','untag',
-                   'categorize','report','unmark','untrash','unarchive','unlabel','unmute','unsnooze','unblock',
-                   'empty','reschedule','revoke'}
 # Native tools whose names carry no read word but only read or plan inside the run.
 _PROACTIVE_READ_TOOLS={'todo'}
-_ARG_WRITE_TOOL_WORDS=_WRITE_TOOL_WORDS|{'run','trigger','install','edit','enable','disable','pause','resume','schedule'}
-_UNSAFE_NAME_WORDS=_ARG_WRITE_TOOL_WORDS|{'exec','sql','call','invoke','eval','shell','command','script','http','request',
-                                          # a name that chains a second action ('and', 'then') is never a plain read
-                                          'and','then','book','reserve','purchase','buy','checkout','complete','finish',
-                                          'resolve','deliver','dispatch','erase','discard','destroy','wipe','grant','refund',
-                                          'redeem','settle','enrol','enroll','register','unregister','upgrade','downgrade',
-                                          'unfollow','unlink','unlock','detach','disconnect','connect','topup','claim','vote',
-                                          'join','leave','close','switch','begin','boost'}
 # An MCP tool its server does not mark read-only runs only when every word of its name is a read word or plain mail,
 # calendar or task vocabulary: an unknown word may be a verb that changes something (Strix 7d8f96b #3).
-_MAIL_READ_NAME_WORDS=_READ_TOOL_WORDS|{
+_MAIL_NAME_WORDS={
     'email','emails','mail','mails','gmail','outlook','message','messages','msg','msgs','thread','threads','inbox',
     'mailbox','mailboxes','folder','folders','conversation','conversations','labels','important','starred','unread',
     'unseen','sender','subject','account','accounts','available','batch',
@@ -316,13 +296,24 @@ _READ_ONLY_MESSAGE='Proactive runs are read-only; this would change something.'
 _READ_ONLY_TERMINAL_MESSAGE=('Proactive runs are read-only. The terminal may run only gws gmail … list/get, '
                              'himalaya envelope list/search, or himalaya message read <id> --preview.')
 
+def _gateway_tools():
+    # One word list and name rule with the call gateway, loaded here when the agent process has not and again after a plugin update.
+    # A load failure blocks the tool, so a broken gateway_tools.py stops almost every tool in a watch run until it is fixed
+    # (the terminal and the four Beacon notice tools still run).
+    path=ROOT/'gateway_tools.py';module=sys.modules.get('beacon_gateway_tools')
+    seen=getattr(module,'_beacon_mtime',None)
+    if module is None or seen is not None and seen!=path.stat().st_mtime_ns:
+        spec=importlib.util.spec_from_file_location('beacon_gateway_tools',path)
+        module=importlib.util.module_from_spec(spec);module._beacon_mtime=path.stat().st_mtime_ns
+        spec.loader.exec_module(module);sys.modules['beacon_gateway_tools']=module
+    return module
+
 def _tool_words(name):
-    spaced=re.sub(r'([a-z0-9])([A-Z])',r'\1 \2',name or '')
-    return set(re.findall(r'[a-z0-9]+',spaced.casefold()))
+    return set(_gateway_tools().name_words(name))
 
 def _named_read_only(raw_name):
-    words=_tool_words(raw_name)
-    return bool(words&_READ_TOOL_WORDS) and not bool(words&_UNSAFE_NAME_WORDS)
+    gateway=_gateway_tools()
+    return bool(_tool_words(raw_name)&gateway.READ_NAME_WORDS) and not gateway.name_writes(raw_name)
 
 # No calendar words: fetch_calendar and fetch_events usually name ICS feed fetchers that take a URL.
 _FETCHED_MAIL_WORDS={'email','emails','mail','mails','gmail','outlook','message','messages','msg','msgs','thread',
@@ -330,9 +321,9 @@ _FETCHED_MAIL_WORDS={'email','emails','mail','mails','gmail','outlook','message'
 
 def _plain_mail_read(raw_name):
     # 'fetch' also names URL fetchers, so it reads only beside a mail word: GMAIL_FETCH_EMAILS, never fetch or fetch_page.
-    words=_tool_words(raw_name)
-    reads=bool(words&_READ_TOOL_WORDS) or ('fetch' in words and bool(words&_FETCHED_MAIL_WORDS))
-    return reads and words<=_MAIL_READ_NAME_WORDS|{'fetch'}
+    words=_tool_words(raw_name);read_words=_gateway_tools().READ_NAME_WORDS
+    reads=bool(words&read_words) or ('fetch' in words and bool(words&_FETCHED_MAIL_WORDS))
+    return reads and words<=read_words|_MAIL_NAME_WORDS|{'fetch'}
 
 def _mcp_tool_entry(tool_name,profile):
     try:
@@ -357,17 +348,11 @@ def _mcp_read_only(tool_name,profile):
     if not entry: return False
     raw_name,hint,_=entry
     # Hermes accepts unannotated mail reads by name, but a read word never excuses a possible write verb.
-    return not bool(_tool_words(raw_name)&_UNSAFE_NAME_WORDS) and (hint is True or _plain_mail_read(raw_name))
+    # The guard takes the server's read-only hint whatever the server's trust; the name rule only catches honest mistakes.
+    return not _gateway_tools().name_writes(raw_name) and (hint is True or _plain_mail_read(raw_name))
 
 def _reads_by_method(args,schema):
-    # One rule with the call gateway, loaded here when the agent process has not and again after a plugin update. A load failure blocks the tool.
-    path=ROOT/'gateway_tools.py';module=sys.modules.get('beacon_gateway_tools')
-    seen=getattr(module,'_beacon_mtime',None)
-    if module is None or seen is not None and seen!=path.stat().st_mtime_ns:
-        spec=importlib.util.spec_from_file_location('beacon_gateway_tools',path)
-        module=importlib.util.module_from_spec(spec);module._beacon_mtime=path.stat().st_mtime_ns
-        spec.loader.exec_module(module);sys.modules['beacon_gateway_tools']=module
-    return module.reads_by_method(args,schema)
+    return _gateway_tools().reads_by_method(args,schema)
 
 def _mail_provider_read(tool_name,profile):
     entry=_mcp_tool_entry(tool_name,profile)
@@ -377,7 +362,7 @@ def _mail_provider_read(tool_name,profile):
     providers=_tool_words(server_name)
     return (_plain_mail_read(raw_name) and bool(words&_FETCHED_MAIL_WORDS)
             and bool((words|providers)&_MAIL_PROVIDER_WORDS)
-            and not bool(words&_UNSAFE_NAME_WORDS))
+            and not _gateway_tools().name_writes(raw_name))
 
 
 _DESTINATION_FIELDS={'url','uri','urls','link','href','host','hostname','domain','endpoint','server','webhook','feed',
@@ -571,7 +556,7 @@ def _watch_tool_guard(tool_name,args,profile):
     for field in ('action','operation'):
         value=args.get(field)
         if isinstance(value,str): argument_words.update(_tool_words(value))
-    if argument_words&_ARG_WRITE_TOOL_WORDS:
+    if argument_words&_gateway_tools().WRITE_WORDS:
         return {'action':'block','message':_READ_ONLY_MESSAGE}
     schema=None
     try:

@@ -8,6 +8,9 @@ internal fun missingNativeConversation(error: Throwable): Boolean = error is Api
 
 internal const val APP_CONNECTION_ERROR = "Can't reach Hermes. Check your connection, then try again."
 private const val APP_OPERATION_ERROR = "Hermes couldn't do that. Try again."
+private const val MODEL_REJECTED_ERROR = "The model rejected this request. Try again or pick another model."
+private const val LOOPBACK_RESTARTED_ERROR = "Hermes restarted. Paste the link again."
+private const val SIGN_IN_EXPIRED_ERROR = "Sign-in expired. Sign in again."
 
 /**
  * The failure happened while connecting (no network, DNS, refused or timed-out connect), so the message cannot have left the phone.
@@ -26,7 +29,7 @@ private val modelRejectedCodes = setOf("model_not_found", "model_entitlement", "
 
 /** The line for a failed turn. Hermes' `error_surface.code` says the provider turned the chosen model down; anything else keeps the generic text. */
 internal fun turnErrorText(event: JSONObject): String =
-    if (event.optJSONObject("error_surface")?.optString("code") in modelRejectedCodes) "The model rejected this request. Try again or pick another model."
+    if (event.optJSONObject("error_surface")?.optString("code") in modelRejectedCodes) MODEL_REJECTED_ERROR
     else apiFailureText(event.optInt("code", 500), event.string("message", event.string("error")))
 
 /** UI presentation only: transport and model-facing tool results retain their original details and types. */
@@ -62,10 +65,15 @@ private val publicErrorText = setOf(
 ) + listOf("pin", "archive or restore", "rename", "branch", "load or change the model for", "load or change reasoning for", "check or change approvals for", "load the defaults for", "load toolsets for", "load the history for")
     .map { "Couldn't $it this chat. Refresh and try again." }
 
+/** Every fixed sentence this file returns, for the translation test: one answer per HTTP error status covers each branch of [apiFailureText]. */
+internal val ErrorStrings: List<String>
+    get() = (publicErrorText + listOf(APP_CONNECTION_ERROR, APP_OPERATION_ERROR, MODEL_REJECTED_ERROR, LOOPBACK_RESTARTED_ERROR, SIGN_IN_EXPIRED_ERROR, apiFailureText(403, "Owner not authorized")) +
+        (400..599).map { apiFailureText(it, "") }).distinct()
+
 internal fun appErrorText(error: Throwable): String = when (error) {
     is ApiFailure -> apiFailureText(error.status, error.detail)
-    is LoopbackSessionRefreshFailed -> "Hermes restarted. Paste the link again."
-    is NativeAuthExpiredException -> "Sign-in expired. Sign in again."
+    is LoopbackSessionRefreshFailed -> LOOPBACK_RESTARTED_ERROR
+    is NativeAuthExpiredException -> SIGN_IN_EXPIRED_ERROR
     is DeviceRemovedFailure -> "This phone was removed from Beacon on your PC. Add it again in Settings › Connection."
     is PairingFailure -> safeLocalErrorText(error.message.orEmpty())
     is java.io.IOException -> APP_CONNECTION_ERROR
