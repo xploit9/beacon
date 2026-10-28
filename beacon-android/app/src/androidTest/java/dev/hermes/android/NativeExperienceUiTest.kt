@@ -122,6 +122,8 @@ class NativeExperienceUiTest {
         // Fixture chat ids (new-N) repeat across cases and runs; drop their per-chat receipts, drafts and projections too.
         // shortcut: ids come from one counter shared with projects and branches; 24 covers every current case, widen it if one creates more.
         runBlocking { profiles.forEach { owner -> (1..24).forEach { n -> listOf("pending", "draft", "session", "client-created-shell", "side-question").forEach { app.cache.delete(owner.session("new-$n"), it) } } } }
+        // A reply another case left running marks its chat (the reattach marker), so this case would ask Hermes once on open.
+        runBlocking { profiles.forEach { owner -> (fixture.sessions.keys + (1..24).map { "new-$it" }).forEach { app.cache.delete(owner.session(it), "running-turn") } } }
         runBlocking { app.cache.delete(fixture.scope, "bot-mode-return"); app.cache.delete(fixture.scope, "beacon-session"); app.cache.delete(fixture.scope, "beacon-opening"); app.cache.delete(fixture.scope, "phone-editors"); app.cache.delete(fixture.scope, "editor:C:/synthetic-workspace/notes.md") }
         lateinit var vm: BeaconViewModel
         val profileSwitchClientFactory: (dev.hermes.android.data.AuthContext) -> dev.hermes.android.data.BeaconClient = { auth -> fixture.freshClientFor(auth, app.auth) }
@@ -2626,7 +2628,7 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Send a test notification").assertDoesNotExist()
         compose.onNodeWithText("Proactive calls").assertDoesNotExist()
         val notifications = app.getSystemService(android.app.NotificationManager::class.java)
-        listOf("hermes-messages", "hermes-tasks", "hermes-approvals", "hermes-updates").forEach { assertNotNull("Advertised notification category exists: $it", notifications.getNotificationChannel(it)) }
+        listOf("hermes-messages-v2", "hermes-tasks-v2", "hermes-approvals", "hermes-updates").forEach { assertNotNull("Advertised notification category exists: $it", notifications.getNotificationChannel(it)) }
         assertTrue(fixture.requests.none { it.string("path") == "/api/mobile/proactive" })
         receipts += "Local chat preferences are reachable; Keep connected state leads Notifications, Firebase-only controls stay hidden in this build, and no proactive calls are scheduled."
         capture("notification-categories")

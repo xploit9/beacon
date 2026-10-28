@@ -622,6 +622,13 @@ def test_scheme_less_destinations_block_non_mail_tools_but_keep_gmail_queries(ha
     assert plugin.native_proactive_read_only_guard("mcp__research__read_page",{"query":"inbox"},"watch-run") is None
     for args in destinations:
         assert plugin.native_proactive_read_only_guard("mcp__research__read_page",args,"watch-run")==blocked,args
+    # A calendar or account address names what to read: it is a link out only in a destination field, or with a path.
+    for args in ({"user_google_email":"owner@example.com","calendar_id":"en.usa#holiday@group.v.calendar.google.com"},
+                 {"calendar_id":"team-calendar@group.calendar.google.com","time_min":"2026-10-28T07:00:16Z"}):
+        assert plugin.native_proactive_read_only_guard("mcp__research__read_page",args,"watch-run") is None,args
+    for args in ({"webhook":"en.usa#x@evil.example"},{"calendar_id":"bob@evil.example/x?d=mail"},{"callback":"bob@evil.example"},
+                 {"to":"bob@evil.example"},{"recipients":["bob@evil.example"]},{"share_with":"bob@evil.example"},{"reply_to":"bob@evil.example"}):
+        assert plugin.native_proactive_read_only_guard("mcp__research__read_page",args,"watch-run")==blocked,args
     destination="evil.example/x?d=mail"
     assert plugin.native_proactive_read_only_guard("web_search",{"query":destination},"watch-run")==blocked
     assert plugin.native_proactive_read_only_guard("hindsight_recall",{"query":destination},"watch-run")==blocked

@@ -1,11 +1,9 @@
 package dev.hermes.android.push
 import android.app.NotificationManager
-import android.app.PendingIntent
 import android.app.job.*
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import androidx.core.app.NotificationCompat
 import dev.hermes.android.BeaconApplication
 import dev.hermes.android.core.*
@@ -40,18 +38,6 @@ fun isEmailAlertNotificationRoute(route: JSONObject, source: String, event: Stri
 internal const val EMAIL_FEEDBACK_PATH = "/api/plugins/beacon/mobile/proactive/feedback"
 private fun validEmailVerdict(verdict: String) = verdict == "important" || verdict == "not_important"
 
-private fun emailFeedbackAction(context: Context, source: String, event: String, verdict: String, label: String): NotificationCompat.Action {
-    val tag = "$source\u0000$event".digest()
-    val intent = Intent(context, NativeActivityReceiver::class.java)
-        .setAction(NativeActivityReceiver.ACTION_EMAIL_FEEDBACK)
-        .setData(Uri.parse("beacon://email-feedback/$tag/$verdict"))
-        .putExtra("source", source)
-        .putExtra("event", event)
-        .putExtra("verdict", verdict)
-    val pending = PendingIntent.getBroadcast(context, "$source:$event:$verdict".hashCode(), intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-    return NotificationCompat.Action.Builder(0, label, pending).setAuthenticationRequired(true).build()
-}
-
 /** Private text is fetched only from the encrypted registered owner binding. */
 suspend fun refreshNotificationPreview(context: Context, source: String, event: String, conversation: String, kind: String) {
     if (kind == "incoming_call") return // The incoming/missed card owns its actions and fixed deadline.
@@ -78,18 +64,10 @@ suspend fun refreshNotificationPreview(context: Context, source: String, event: 
                 presentNativeActivity(context,source,event,route.string("activity_ref"),"activity_end",route.optLong("expires_at"))
             return@withTimeout
         }
-        val emailAlert = isEmailAlertNotificationRoute(route, source, event, scope, conversation)
-        route.string("session_id").takeIf { kind == "task_result" && !emailAlert && validOpaque(it) }?.let { app.push.conversationPosts.tryEmit(scope.session(it)) }
-        if (emailAlert) {
-            val session = route.string("session_id")
-            val expiresAt = route.optLong("expires_at")
-            val reason = route.string("reason")
-            if (validOpaque(session) && reason.isNotBlank() && expiresAt > System.currentTimeMillis() / 1000) {
-                val taskScope = scope.session(session)
-                val card = json("reason" to reason, "notice_id" to event, "email_alert" to true, "expires_at" to expiresAt)
-                runCatching { app.cache.write(taskScope, "task-result", card.toString(), protected = true) }
-                app.push.emailAlerts.emit(taskScope to card)
-            }
+        // A scheduled post and an email alert both land in their chat; an open chat reads it at once.
+        route.string("session_id").takeIf { kind == "task_result" && validOpaque(it) }?.let {
+            if (isEmailAlertNotificationRoute(route, source, event, scope, conversation)) app.push.emailAlerts.emit(scope.session(it))
+            else app.push.conversationPosts.tryEmit(scope.session(it))
         }
         val preview = route.optJSONObject("preview") ?: return@withTimeout
         val title = boundedNotificationText(preview.opt("title") as? String ?: "", 120)
@@ -99,17 +77,13 @@ suspend fun refreshNotificationPreview(context: Context, source: String, event: 
         val posted = active(1) ?: return@withTimeout
         val builder = NotificationCompat.Builder(context, posted.notification)
             .setContentTitle(title).setContentText(body).setStyle(NotificationCompat.BigTextStyle().bigText(body)).setOnlyAlertOnce(true)
-        if (emailAlert) {
-            builder.clearActions()
-            builder.addAction(emailFeedbackAction(context, source, event, "important", "Important"))
-            builder.addAction(emailFeedbackAction(context, source, event, "not_important", "Not important"))
-        }
         if (!authorized() || active(1)?.postTime != posted.postTime) return@withTimeout
         try { manager.notify(tag, 1, builder.build()) } catch (_: SecurityException) { return@withTimeout }
         // Updating the looping call with ONLY_ALERT_ONCE stops its ringtone; hydrate only its context notification.
     }
 }
 
+// shortcut: only a notification posted by an earlier build still carries these buttons; delete this, enqueueFeedback and NativeActivityReceiver's ACTION_EMAIL_FEEDBACK branch once none can remain.
 private suspend fun sendEmailFeedback(context: Context, source: String, event: String, verdict: String) {
     if (!validOpaque(source) || !validOpaque(event) || !validEmailVerdict(verdict)) return
     val app = context.applicationContext as BeaconApplication
@@ -128,15 +102,6 @@ private suspend fun sendEmailFeedback(context: Context, source: String, event: S
         // A refused save (for example, full Hermes memory) must not look like success; the buttons stay for a retry.
         val saved = try { client.nativeRequest(EMAIL_FEEDBACK_PATH, "POST", json("notice_id" to event, "verdict" to verdict)); true }
         catch (e: CancellationException) { throw e } catch (_: Exception) { false }
-        if (saved && authorized()) {
-            val session = route.string("session_id")
-            if (validOpaque(session)) {
-                val taskScope = scope.session(session)
-                val stored = app.cache.read(taskScope, "task-result")
-                if (stored != null && runCatching { JSONObject(stored).string("notice_id") }.getOrNull() == event)
-                    app.cache.delete(taskScope, "task-result", stored)
-            }
-        }
         val manager = context.getSystemService(NotificationManager::class.java)
         val tag = "$source\u0000$event".digest()
         val posted = manager.activeNotifications.firstOrNull { it.tag == tag && it.id == 1 } ?: return@withTimeout

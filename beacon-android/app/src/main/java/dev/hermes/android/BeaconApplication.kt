@@ -63,7 +63,9 @@ internal fun notificationChannelIdsToDelete(existingIds: Set<String>, currentIds
 // shortcut: IDs stay with their services; centralize if adding channels makes this set hard to keep in sync.
 private val CURRENT_NOTIFICATION_CHANNEL_IDS = setOf(
     "hermes-messages",
+    "hermes-messages-v2",
     "hermes-tasks",
+    "hermes-tasks-v2",
     "hermes-approvals",
     "hermes-prompts-v2",
     "xara-incoming-call-v2",

@@ -110,7 +110,7 @@ class PushManager(private val app: BeaconApplication) {
     @Volatile private var newestToken:String?=null
     private val _incoming = kotlinx.coroutines.flow.MutableStateFlow<IncomingCall?>(null)
     val incoming = _incoming.asStateFlow()
-    internal val emailAlerts = MutableSharedFlow<Pair<Scope, JSONObject>>(extraBufferCapacity = 1)
+    internal val emailAlerts = MutableSharedFlow<Scope>(extraBufferCapacity = 1)
     /** A scheduled result was posted into this chat; an open chat re-reads it. */
     internal val conversationPosts = MutableSharedFlow<Scope>(extraBufferCapacity = 4)
     private fun encoded(key:String,value:JSONObject):String = android.util.Base64.encodeToString(app.cipher.encrypt(value.toString().toByteArray(),key),android.util.Base64.NO_WRAP)
@@ -421,7 +421,7 @@ class PushManager(private val app: BeaconApplication) {
             .setData(android.net.Uri.parse("hermes://incoming/${invite.key}/callback"))
             .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP).putExtra("push_source", source).putExtra("push_event", event)
         val callback = PendingIntent.getActivity(app, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        try { manager.notify(invite.key, 2, NotificationCompat.Builder(app, "hermes-messages").setSmallIcon(R.drawable.ic_beacon_notification)
+        try { manager.notify(invite.key, 2, NotificationCompat.Builder(app, alertingChannel(manager, "hermes-messages")).setSmallIcon(R.drawable.ic_beacon_notification)
             .setContentTitle("Beacon · Missed call").setContentText("Open Beacon to call back or view its history.")
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE).setSilent(true).setAutoCancel(true).setContentIntent(callback)
             .addAction(R.drawable.ic_beacon_logo, "Call back", callback).build()) } catch (_: SecurityException) { /* Notification permission was revoked. */ }
@@ -629,7 +629,7 @@ private fun receivePush(context: Context, data: Map<String, String>, localAction
         if (android.os.Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
         val manager = context.getSystemService(NotificationManager::class.java)
         ensureActivityChannels(manager)
-        val activityChannel = if (incoming) incomingCallChannel(manager) else if(nativeKind in setOf("approval","clarify")) promptNotificationChannel(manager) else notificationChannel(nativeKind)
+        val activityChannel = if (incoming) incomingCallChannel(manager) else if(nativeKind in setOf("approval","clarify")) promptNotificationChannel(manager) else alertingChannel(manager, notificationChannel(nativeKind))
         val routeKey = "$source\u0000$event".digest()
         val intent = Intent(context, BeaconActivity::class.java).setData(android.net.Uri.parse("hermes://activity/$routeKey")).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP).putExtra("push_source", source).putExtra("push_event", event)
         val pending = PendingIntent.getActivity(context, "$source:$event".hashCode(), intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
@@ -697,12 +697,28 @@ internal fun notificationChannel(kind: String): String = when(kind) {
     else -> "hermes-messages"
 }
 fun ensureActivityChannels(manager: NotificationManager) {
-    listOf("hermes-messages" to "Beacon messages", "hermes-tasks" to "Beacon tasks", "hermes-approvals" to "Beacon approvals").forEach { (id, name) ->
-        if (manager.getNotificationChannel(id) == null) {
-            manager.createNotificationChannel(NotificationChannel(id, name, NotificationManager.IMPORTANCE_DEFAULT))
-        }
+    if (manager.getNotificationChannel("hermes-approvals") == null) {
+        manager.createNotificationChannel(NotificationChannel("hermes-approvals", "Beacon approvals", NotificationManager.IMPORTANCE_DEFAULT))
     }
+    alertingChannel(manager, "hermes-messages")
+    alertingChannel(manager, "hermes-tasks")
     promptNotificationChannel(manager)
+}
+/**
+ * Replies and task updates pop up like a chat message. Android never raises an existing channel's importance, so they move once
+ * to a high-importance channel; an owner who set the old channel's importance or sound keeps that one.
+ */
+fun alertingChannel(manager: NotificationManager, base: String): String {
+    val (id, name) = when (base) {
+        "hermes-messages" -> "hermes-messages-v2" to "Beacon messages"
+        "hermes-tasks" -> "hermes-tasks-v2" to "Beacon tasks"
+        else -> return base
+    }
+    val previous = manager.getNotificationChannel(base)
+    if (previous != null && (previous.hasUserSetImportance() || android.os.Build.VERSION.SDK_INT >= 30 && previous.hasUserSetSound())) return base
+    if (manager.getNotificationChannel(id) == null) manager.createNotificationChannel(NotificationChannel(id, name, NotificationManager.IMPORTANCE_HIGH).apply { enableVibration(true) })
+    if (previous != null) manager.deleteNotificationChannel(base)
+    return id
 }
 /** Upgrade the old default channel once, preserving explicit owner sound/importance choices. */
 fun promptNotificationChannel(manager:NotificationManager):String {

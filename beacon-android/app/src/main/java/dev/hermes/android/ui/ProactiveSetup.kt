@@ -102,11 +102,12 @@ internal fun proactiveHealthText(proactive: JSONObject): String {
     }
 }
 
-internal enum class ProactiveHealthState { Checking, Ok, NotYet }
+internal enum class ProactiveHealthState { Checking, Ok, NotYet, Failed }
 
 internal fun proactiveHealthState(proactive: JSONObject?, checking: Boolean): ProactiveHealthState = when {
     checking -> ProactiveHealthState.Checking
     proactive?.optJSONObject("health")?.string("state") == "ok" -> ProactiveHealthState.Ok
+    proactive?.optJSONObject("health")?.string("state") == "error" -> ProactiveHealthState.Failed
     else -> ProactiveHealthState.NotYet
 }
 
@@ -118,12 +119,13 @@ internal fun proactiveHealthState(proactive: JSONObject?, checking: Boolean): Pr
             BeaconSignal(when (state) {
                 ProactiveHealthState.Checking -> BeaconMotionMode.Sweep
                 ProactiveHealthState.Ok -> BeaconMotionMode.Ripple
-                ProactiveHealthState.NotYet -> BeaconMotionMode.Pulse
+                ProactiveHealthState.NotYet, ProactiveHealthState.Failed -> BeaconMotionMode.Pulse
             }, size = 18.dp, trigger = state)
             Text(when (state) {
                 ProactiveHealthState.Checking -> uiText("Checking")
                 ProactiveHealthState.Ok -> uiText("OK")
                 ProactiveHealthState.NotYet -> uiText("Not yet")
+                ProactiveHealthState.Failed -> uiText("Couldn't check")
             }, style = MaterialTheme.typography.labelMedium)
         }
     }

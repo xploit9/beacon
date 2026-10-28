@@ -25,9 +25,13 @@ import dev.hermes.android.push.KeepConnectedService
 import dev.hermes.android.push.persistPushBindings
 import dev.hermes.android.push.refreshNotificationPreview
 import dev.hermes.android.ui.*
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Rule
@@ -197,55 +201,62 @@ class ProactiveUiTest {
         assertFalse(fixture.proactiveEnabled["coder"] == true)
     }
 
-    @Test fun emailAlertCardPostsOnlyItsNoticeIdAndV4Verdict() = withFixture { vm, fixture ->
+    private fun alertJson(noticeId: String, text: String, ageSeconds: Long = 60, expiresInSeconds: Long = 3600, verdict: String = "") = json(
+        "notice_id" to noticeId, "text" to text, "source" to "Email", "created_at" to System.currentTimeMillis() / 1000 - ageSeconds,
+        "expires_at" to System.currentTimeMillis() / 1000 + expiresInSeconds, "verdict" to verdict,
+    )
+    private fun saveAlerts(scope: Scope, vararg alerts: JSONObject) = runBlocking { app.cache.write(scope, "alerts", JSONArray(alerts.toList()).toString(), protected = true) }
+    private fun emailAlertRoute(fixture: NativeExperienceFixture, source: String, noticeId: String, reason: String) = json(
+        "seq" to 1,
+        "event_id" to noticeId,
+        "owner_id" to fixture.scope.owner,
+        "profile" to fixture.scope.profile,
+        "kind" to "task_result",
+        "state" to "finished",
+        "source_ref" to source,
+        "conversation_ref" to "ref-chat-a",
+        "session_id" to "chat-a",
+        "reason" to reason,
+        "email_alert" to true,
+        "expires_at" to System.currentTimeMillis() / 1000 + 3600,
+        "preview" to json("title" to "Important email", "body" to reason),
+    )
+
+    // Replaces the pinned "Important update" card: an alert is a message from Beacon in the chat, with its own buttons.
+    @Test fun emailAlertIsAChatMessageWhoseButtonsPostOnlyItsNoticeIdAndVerdict() = withFixture { vm, fixture ->
         val source = "email-alert-source-test"
         val noticeId = "important-email-notice-test"
         val reason = "Daniel Reyes moved the client review to Friday."
         runBlocking { app.auth.persist(fixture.client.auth) }
         assertTrue(app.push.bindKeepConnectedSource(fixture.scope, source))
-        val taskScope = fixture.scope.session("chat-a")
-        runBlocking { app.cache.write(taskScope, "task-result", json("reason" to reason, "notice_id" to noticeId, "email_alert" to true, "expires_at" to System.currentTimeMillis() / 1000 + 3600).toString(), protected = true) }
-        fixture.incomingNotification = json(
-            "seq" to 1,
-            "event_id" to noticeId,
-            "owner_id" to fixture.scope.owner,
-            "profile" to fixture.scope.profile,
-            "kind" to "task_result",
-            "state" to "finished",
-            "source_ref" to source,
-            "conversation_ref" to "ref-chat-a",
-            "session_id" to "chat-a",
-            "reason" to reason,
-            "email_alert" to true,
-            "expires_at" to System.currentTimeMillis() / 1000 + 3600,
-            "preview" to json("title" to "Important email", "body" to reason),
-        )
+        saveAlerts(fixture.scope.session("chat-a"), alertJson(noticeId, reason))
+        fixture.incomingNotification = emailAlertRoute(fixture, source, noticeId, reason)
         val previousFactory = KeepConnectedService.clientFactoryForTest
         val pushClients = mutableListOf<BeaconClient>()
         KeepConnectedService.clientFactoryForTest = { auth, store -> fixture.freshClientFor(auth, store).also(pushClients::add) }
         try {
             vm.handlePush(source, noticeId)
             await { vm.ui.value.tab == "Chat" && vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
-            // The chat was already open, so wait for the notification's card itself.
-            await { compose.onAllNodesWithText("Important update").fetchSemanticsNodes().isNotEmpty() }
+            await { compose.onAllNodesWithTag("alert-message:$noticeId").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText(reason).assertExists()
-            compose.onNodeWithTag("task-result-feedback-important").assertExists()
-            compose.onNodeWithTag("task-result-feedback-not-important").performClick()
+            compose.onAllNodesWithTag("task-result-card").assertCountEquals(0)
+            compose.onNodeWithTag("alert-important:$noticeId").assertExists()
+            compose.onNodeWithTag("alert-not-important:$noticeId").performClick()
             await { fixture.proactiveFeedbacks.isNotEmpty() }
             val request = fixture.requests.last { it.string("path") == "$PROACTIVE_SETTINGS_PATH/feedback" }
             assertEquals(fixture.scope.profile, request.string("profile"))
             assertEquals(setOf("notice_id", "verdict"), request.getJSONObject("body").keys().asSequence().toSet())
             assertEquals(noticeId, request.getJSONObject("body").string("notice_id"))
             assertEquals("not_important", request.getJSONObject("body").string("verdict"))
-            await { compose.onAllNodesWithText("Thanks — Beacon will remember.").fetchSemanticsNodes().isNotEmpty() }
-            await { runBlocking { app.cache.read(taskScope, "task-result") == null } }
-            compose.runOnIdle { vm.storeData("task-result:${taskScope.key}", JSONObject()) }
-            // Leave and come back, so the chat restores from its saved state.
+            await { compose.onAllNodesWithTag("alert-verdict:$noticeId").fetchSemanticsNodes().isNotEmpty() }
+            compose.onAllNodesWithTag("alert-important:$noticeId").assertCountEquals(0)
+            compose.onAllNodesWithTag("alert-not-important:$noticeId").assertCountEquals(0)
+            // Leave and come back, so the chat restores from its saved state: the choice is still there.
             compose.runOnIdle { vm.selectSession("chat-b") }
             await { vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady }
             compose.runOnIdle { vm.selectSession("chat-a") }
             await { vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
-            compose.onNodeWithTag("task-result-card").assertDoesNotExist()
+            await { compose.onAllNodesWithTag("alert-verdict:$noticeId").fetchSemanticsNodes().isNotEmpty() }
         } finally {
             vm.client?.closeNative()
             pushClients.forEach(BeaconClient::closeNative)
@@ -256,7 +267,8 @@ class ProactiveUiTest {
         }
     }
 
-    @Test fun emailAlertPreviewSavesTheCardForItsChatWhenTheRouteRefIsAHash() = withFixture { _, fixture ->
+    // The preview no longer saves a pinned card or adds buttons; it tells the open chat to read its alerts.
+    @Test fun emailAlertPreviewTellsTheChatToReadItsAlertsWhenTheRouteRefIsAHash() = withFixture { _, fixture ->
         val source = "email-alert-preview-test"
         val noticeId = "preview-email-notice"
         val reason = "The client review moved to Friday."
@@ -270,120 +282,91 @@ class ProactiveUiTest {
             android.util.Base64.encodeToString(app.cipher.encrypt(binding.toString().toByteArray(), bindingKey), android.util.Base64.NO_WRAP)))
         assertTrue(app.push.permitsIncoming(source))
         // Hermes sends conversation_ref as an HMAC of the conversation, so it never equals session_id.
-        fixture.incomingNotification = json(
-            "seq" to 1,
-            "event_id" to noticeId,
-            "owner_id" to fixture.scope.owner,
-            "profile" to fixture.scope.profile,
-            "kind" to "task_result",
-            "state" to "finished",
-            "source_ref" to source,
-            "conversation_ref" to "ref-chat-a",
-            "session_id" to "chat-a",
-            "reason" to reason,
-            "email_alert" to true,
-            "expires_at" to System.currentTimeMillis() / 1000 + 3600,
-            "preview" to json("title" to "Important email", "body" to reason),
-        )
+        fixture.incomingNotification = emailAlertRoute(fixture, source, noticeId, reason)
         val previousFactory = KeepConnectedService.clientFactoryForTest
         val pushClients = mutableListOf<BeaconClient>()
         KeepConnectedService.clientFactoryForTest = { auth, store -> fixture.freshClientFor(auth, store).also(pushClients::add) }
         try {
-            runBlocking { refreshNotificationPreview(app, source, noticeId, "ref-chat-a", "task_result") }
-            val saved = runBlocking { app.cache.read(fixture.scope.session("chat-a"), "task-result") }
-            assertEquals(noticeId, JSONObject(requireNotNull(saved) { "the alert card was not saved" }).string("notice_id"))
+            val posted = runBlocking {
+                val first = async(start = CoroutineStart.UNDISPATCHED) { withTimeout(20_000) { app.push.emailAlerts.first() } }
+                refreshNotificationPreview(app, source, noticeId, "ref-chat-a", "task_result")
+                first.await()
+            }
+            assertEquals(fixture.scope.session("chat-a").key, posted.key)
+            assertNull("The alert is a chat message, not a saved card", runBlocking { app.cache.read(fixture.scope.session("chat-a"), "task-result") })
         } finally {
             pushClients.forEach(BeaconClient::closeNative)
             KeepConnectedService.clientFactoryForTest = previousFactory
-            runBlocking { app.cache.delete(fixture.scope.session("chat-a"), "task-result") }
             app.getSharedPreferences("push-binding", android.content.Context.MODE_PRIVATE).edit()
                 .remove("source:${source.digest()}").commit()
             runBlocking { app.auth.remove(fixture.scope.origin) }
         }
     }
 
-    @Test fun emailAlertDeliveredWhileBeaconChatIsOpenAppearsWithoutPushTap() = withFixture { vm, _ ->
+    // Was: a delivered alert filled the pinned card. Now the open Beacon chat reads its alerts from the plugin.
+    @Test fun emailAlertDeliveredWhileBeaconChatIsOpenMakesTheChatReadItsAlerts() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.tab("Beacon") }
         await { vm.ui.value.tab == "Beacon" && vm.chat.value.projectionReady && vm.isBeaconConversation() }
         val scope = requireNotNull(vm.authenticatedScope()).session(vm.chat.value.sessionId)
-        val noticeId = "live-email-notice"
-        val reason = "The client review moved to Friday."
         await { app.push.emailAlerts.subscriptionCount.value > 0 }
+        fixture.requests.clear()
 
-        runBlocking {
-            app.push.emailAlerts.emit(scope to json(
-                "reason" to reason,
-                "notice_id" to noticeId,
-                "email_alert" to true,
-                "expires_at" to System.currentTimeMillis() / 1000 + 3600,
-            ))
-        }
+        runBlocking { app.push.emailAlerts.emit(scope) }
 
-        await { vm.data.value["task-result:${scope.key}"]?.string("notice_id") == noticeId }
-        compose.onNodeWithTag("task-result-card").assertExists()
-        compose.onNodeWithText(reason).assertExists()
+        await { fixture.requests.any { it.string("path") == "$PROACTIVE_SETTINGS_PATH/alerts" && it.string("query").contains("session_id=${scope.session}") } }
     }
 
-    @Test fun cachedEmailAlertAppearsWhenItsChatOpensWithoutPushExtras() = withFixture { vm, fixture ->
+    // Was: the cached card appeared pinned. Now the cached alert is a message as soon as the chat opens.
+    @Test fun cachedEmailAlertAppearsAsAMessageWhenItsChatOpensWithoutPushExtras() = withFixture { vm, fixture ->
         val scope = fixture.scope.session("chat-a")
         val noticeId = "cached-email-notice"
         val reason = "The client review moved to Friday."
-        runBlocking {
-            app.cache.write(scope, "task-result", json(
-                "reason" to reason,
-                "notice_id" to noticeId,
-                "email_alert" to true,
-                "expires_at" to System.currentTimeMillis() / 1000 + 3600,
-            ).toString(), protected = true)
-        }
+        saveAlerts(scope, alertJson(noticeId, reason))
 
         compose.runOnIdle { vm.selectSession("chat-a") }
 
-        await { vm.data.value["task-result:${scope.key}"]?.string("notice_id") == noticeId }
-        compose.onNodeWithTag("task-result-card").assertExists()
+        await { compose.onAllNodesWithTag("alert-message:$noticeId").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText(reason).assertExists()
+        compose.onAllNodesWithTag("task-result-card").assertCountEquals(0)
     }
 
-    @Test fun expiredCachedEmailAlertIsDeletedWhenItsChatOpens() = withFixture { vm, fixture ->
+    // Was: an expired cached alert was deleted. Now it stays as a message; only its feedback is off.
+    @Test fun expiredEmailAlertStaysAsAMessageWithItsFeedbackOff() = withFixture { vm, fixture ->
         val scope = fixture.scope.session("chat-a")
-        val raw = json(
-            "reason" to "Old alert",
-            "notice_id" to "expired-email-notice",
-            "email_alert" to true,
-            "expires_at" to System.currentTimeMillis() / 1000 - 1,
-        ).toString()
-        runBlocking { app.cache.write(scope, "task-result", raw, protected = true) }
+        saveAlerts(scope, alertJson("expired-email-notice", "Old alert", ageSeconds = 90_000, expiresInSeconds = -1))
 
         compose.runOnIdle { vm.selectSession("chat-a") }
 
-        await { vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady && runBlocking { app.cache.read(scope, "task-result") == null } }
-        assertTrue(vm.data.value["task-result:${scope.key}"]?.string("reason").isNullOrBlank())
-        compose.onNodeWithTag("task-result-card").assertDoesNotExist()
+        await { compose.onAllNodesWithTag("alert-message:expired-email-notice").fetchSemanticsNodes().isNotEmpty() }
+        compose.onAllNodesWithTag("alert-important:expired-email-notice").assertCountEquals(0)
+        compose.onAllNodesWithTag("alert-not-important:expired-email-notice").assertCountEquals(0)
+        assertTrue(fixture.proactiveFeedbacks.isEmpty())
     }
 
-    @Test fun dismissingCachedEmailAlertStopsItReturningWhenTheChatReopens() = withFixture { vm, fixture ->
+    // Was: dismissing the alert card. Alerts have no dismiss, so this checks that each one is its own message and keeps its own choice.
+    @Test fun severalEmailAlertsStayAsSeparateMessagesWithTheirOwnChoices() = withFixture { vm, fixture ->
         val scope = fixture.scope.session("chat-a")
-        val noticeId = "dismissed-email-notice"
-        val reason = "The client review moved to Friday."
-        runBlocking {
-            app.cache.write(scope, "task-result", json(
-                "reason" to reason,
-                "notice_id" to noticeId,
-                "email_alert" to true,
-                "expires_at" to System.currentTimeMillis() / 1000 + 3600,
-            ).toString(), protected = true)
-        }
+        saveAlerts(scope, alertJson("older-email-notice", "Invoice 4471 is overdue", ageSeconds = 600, verdict = "important"), alertJson("newer-email-notice", "The client review moved to Friday.", ageSeconds = 60))
+
         compose.runOnIdle { vm.selectSession("chat-a") }
-        await { vm.data.value["task-result:${scope.key}"]?.string("notice_id") == noticeId }
+
+        await { compose.onAllNodesWithTag("alert-message:newer-email-notice").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("alert-verdict:older-email-notice").assertExists()
+        compose.onAllNodesWithTag("alert-important:older-email-notice").assertCountEquals(0)
+        compose.onNodeWithTag("alert-important:newer-email-notice").assertExists()
+    }
+
+    // The generic card stays for task results that are not alerts.
+    @Test fun dismissingATaskResultCardClearsIt() = withFixture { vm, fixture ->
+        val scope = fixture.scope.session("chat-a")
+        compose.runOnIdle { vm.storeData("task-result:${scope.key}", json("reason" to "The nightly backup finished.")) }
+        await { compose.onAllNodesWithTag("task-result-card").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("Task result").assertExists()
+        compose.onAllNodesWithTag("task-result-feedback-important").assertCountEquals(0)
+
         compose.onNodeWithTag("task-result-dismiss").performClick()
-        await { runBlocking { app.cache.read(scope, "task-result") == null } && vm.data.value["task-result:${scope.key}"]?.string("reason").isNullOrBlank() }
 
-        // Leave and come back, so the chat restores from its saved state.
-        compose.runOnIdle { vm.selectSession("chat-b") }
-        await { vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady }
-        compose.runOnIdle { vm.selectSession("chat-a") }
-        await { vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady }
-        compose.onNodeWithTag("task-result-card").assertDoesNotExist()
+        await { compose.onAllNodesWithTag("task-result-card").fetchSemanticsNodes().isEmpty() }
     }
 
     @Test fun taskResultForTheBoundBeaconSessionOpensTheBeaconTab() = withFixture { vm, fixture ->
@@ -474,7 +457,7 @@ class ProactiveUiTest {
             profileScopes.forEach { owner ->
                 listOf("beacon-session", "beacon-opening", "bot-mode-return", "new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session").forEach { app.cache.delete(owner, it) }
                 (listOf("chat-a", "chat-b") + (1..4).map { "new-$it" }).forEach { id ->
-                    listOf("pending", "draft", "session", "client-created-shell", "task-result").forEach { app.cache.delete(owner.session(id), it) }
+                    listOf("pending", "draft", "session", "client-created-shell", "task-result", "alerts").forEach { app.cache.delete(owner.session(id), it) }
                 }
             }
         }
@@ -529,7 +512,7 @@ class ProactiveUiTest {
                 profileScopes.forEach { owner ->
                     listOf("beacon-session", "beacon-opening", "bot-mode-return", "new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session").forEach { app.cache.delete(owner, it) }
                     (listOf("chat-a", "chat-b") + (1..4).map { "new-$it" }).forEach { id ->
-                        listOf("pending", "draft", "session", "client-created-shell", "task-result").forEach { app.cache.delete(owner.session(id), it) }
+                        listOf("pending", "draft", "session", "client-created-shell", "task-result", "alerts").forEach { app.cache.delete(owner.session(id), it) }
                     }
                 }
                 app.preferences.updateData { prior }

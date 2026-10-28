@@ -48,6 +48,8 @@ private const val MAX_CHAT_ATTACHMENT_BYTES = 12L * 1024 * 1024
 private const val LOCAL_CHECKPOINT_LIMIT_BYTES = 16L * 1024 * 1024
 /** Value of the client-created-shell marker for a chat opened with options; a plain one keeps "1". */
 private const val KEPT_APART_SHELL = "apart"
+/** Per-conversation marker (the cache is scoped by origin, account, profile and session): Beacon delivered a prompt here and has not seen that reply end. It survives process death and expires with the cache. */
+private const val RUN_MARKER = "running-turn"
 private const val LEGACY_BEACON_SESSION_CACHE_KIND = "xara-session" // Migrate the existing encrypted conversation pointer on first read.
 private const val LEGACY_BEACON_OPENING_CACHE_KIND = "xara-opening" // Migrate the existing encrypted creation marker on first read.
 private const val LEGACY_BEACON_SESSION_HANDLE_PREFIX = "xara:" // Migrate existing scoped SavedStateHandle pointers on first read.
@@ -98,6 +100,24 @@ data class Message(val id: String, val role: String, val text: String, val reaso
         }
     }
 }
+
+/** An email alert Beacon posted into the chat. [verdict] stays blank until the owner marks it "important" or "not_important". */
+data class ChatAlert(val noticeId: String, val text: String, val source: String, val createdAt: Long, val expiresAt: Long, val verdict: String = "") {
+    fun toJson() = json("notice_id" to noticeId, "text" to text, "source" to source, "created_at" to createdAt / 1000.0, "expires_at" to expiresAt, "verdict" to verdict)
+    companion object {
+        /** A plugin or saved row; its times are in seconds. */
+        fun from(row: JSONObject): ChatAlert? {
+            val id = row.string("notice_id").takeIf { dev.hermes.android.push.validOpaque(it) } ?: return null
+            val text = row.string("text").takeIf { it.isNotBlank() } ?: return null
+            return ChatAlert(id, text, row.string("source"), Math.round(row.optDouble("created_at", 0.0) * 1000), row.optLong("expires_at"), row.string("verdict").takeIf { it in setOf("important", "not_important") }.orEmpty())
+        }
+    }
+}
+private const val CHAT_ALERT_LIMIT = 100
+/** The plugin keeps an alert only while its notice lives; the saved copy keeps the rest, so alerts the plugin no longer lists stay in the chat. */
+internal fun mergeChatAlerts(saved: List<ChatAlert>, fresh: List<ChatAlert>): List<ChatAlert> =
+    (saved.associateBy { it.noticeId } + fresh.associateBy { it.noticeId }).values.sortedBy { it.createdAt }.takeLast(CHAT_ALERT_LIMIT)
+internal fun decodeChatAlerts(raw: String): List<ChatAlert> = runCatching { JSONArray(raw).objects().mapNotNull(ChatAlert::from) }.getOrDefault(emptyList())
 
 internal fun stoppingNoticeAfterEvent(notice: String, event: String): String =
     if (notice == "Stopping the current turn" && event in setOf("done", "state_saved", "cancel", "stream_end", "error", "apperror")) "" else notice
@@ -156,7 +176,16 @@ internal fun silentStreamAction(status: String?): SilentStream = when (status) {
     "working" -> SilentStream.Resubscribe
     else -> SilentStream.Wait
 }
-data class ChatState(val sessionId: String = "", val title: String = "New conversation", val messages: List<Message> = emptyList(), val raw: JSONObject = JSONObject(), val streamId: String = "", val liveText: String = "", val liveReasoning: String = "", val liveTools: List<JSONObject> = emptyList(), val status: String = "", val approval: JSONObject? = null, val clarification: JSONObject? = null, val uncertain: String = "", val queued: List<QueuedMessage> = emptyList(), val anchor: Int = 0, val anchorOffset: Int = 0, val anchorId: String = "", val callMessages: List<CallTranscript> = emptyList(), val projectionReady: Boolean = true, val sessionReasoningEffort: String = "")
+/** A cold look at a chat (the process restarted, or the chat was left and reopened) asks Hermes about its reply only when Beacon delivered a prompt it never saw end and no stream is shown. Ordinary browsing never asks. */
+internal fun shouldAskRunning(marked: Boolean, shownStream: String): Boolean = marked && shownStream.isBlank()
+internal enum class ColdRun { Keep, Follow, Settle }
+/** Hermes' answer to that one question. A reply still working or waiting for the user is followed again; an ended one is settled from history, which also drops the marker; an unreadable answer changes nothing and keeps the marker. */
+internal fun coldRunAction(status: String?): ColdRun = when (status) {
+    "working", "waiting" -> ColdRun.Follow
+    "idle" -> ColdRun.Settle
+    else -> ColdRun.Keep
+}
+data class ChatState(val sessionId: String = "", val title: String = "New conversation", val messages: List<Message> = emptyList(), val raw: JSONObject = JSONObject(), val streamId: String = "", val liveText: String = "", val liveReasoning: String = "", val liveTools: List<JSONObject> = emptyList(), val status: String = "", val approval: JSONObject? = null, val clarification: JSONObject? = null, val uncertain: String = "", val queued: List<QueuedMessage> = emptyList(), val anchor: Int = 0, val anchorOffset: Int = 0, val anchorId: String = "", val callMessages: List<CallTranscript> = emptyList(), val alerts: List<ChatAlert> = emptyList(), val projectionReady: Boolean = true, val sessionReasoningEffort: String = "")
 internal fun sessionCanStillBeUnpersisted(clientCreated: Boolean, chat: ChatState): Boolean =
     clientCreated && chat.messages.isEmpty() && chat.callMessages.isEmpty() && chat.liveText.isBlank() && chat.streamId.isBlank() && chat.raw.optInt("message_count") == 0
 /** The open chat is a phone-created one that was never sent, so New conversation keeps it instead of adding another empty row.
@@ -240,6 +269,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     internal val screens = ScreenCache(read = { app.cache.read(it, "screens") }, write = { scope, value -> app.cache.write(scope, "screens", value) }, drop = { app.cache.delete(it, "screens") }, jobs = viewModelScope)
     val phoneSettings = NativePhoneSettings(viewModelScope, saved, draftChanged = ::checkpointPhoneSettings, screens = screens) { client }
     val botMode = NativeBotModeController(viewModelScope, saved, openChat = ::openBotChat) { client }
+    /** Beacon's own plugin install from the app; [pluginInstalled] runs when Beacon is ready on this Hermes. */
+    internal val pluginInstall = dev.hermes.android.updates.PluginInstallController(viewModelScope, { client }, ::pluginInstalled, ::openAppUpdates)
     val preferences = app.preferences.data.map(AppPreferences::read).stateIn(viewModelScope, SharingStarted.Eagerly, AppPreferences())
     private fun restoredTab(): String {
         val tab = saved.get<String>("tab") ?: return "Chat"
@@ -325,7 +356,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     private var editorCheckpoint: Job? = null
     @Volatile var client: BeaconClient? = null
         private set(value) {
-            if (value == null || field?.scope?.let { !it.sameAccount(value.scope) } == true) botMode.clear()
+            if (value == null || field?.scope?.let { !it.sameAccount(value.scope) } == true) { botMode.clear(); pluginInstall.reset() }
             if (value != null && field?.scope?.let { !it.sameAccount(value.scope) } == true) {
                 normalModeReturn = null
                 _ui.update { it.copy(botModeEnabled = false, botModeSwitching = false) }
@@ -433,6 +464,25 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         }
     }
 
+    /** Beacon was just added to this Hermes: read the plugin again so every screen drops its missing-plugin card, then link this phone as a sign-in does. */
+    private fun pluginInstalled() {
+        val active = client ?: return
+        val c = active.detached()
+        val owner = c.scope
+        viewModelScope.launch {
+            try {
+                val optional = c.probeOptionalFeatures()
+                if (client?.scope?.sameAccount(owner) != true) return@launch
+                val there = optional.string("plugin") in setOf("available", "unauthorized")
+                _ui.update { state -> mergeOptionalFeaturesFor(state.bootstrap, owner, optional)?.let { state.copy(bootstrap = it, setupPluginMessage = if (there) "" else state.setupPluginMessage) } ?: state }
+                if (there) linkThisPhone(active)
+            } catch (e: Exception) { if (e is CancellationException) throw e /* The next app start reads the plugin again. */ }
+            finally { c.closeNative() }
+        }
+    }
+    /** "Update Beacon" on a missing-plugin card: the update screen already updates the Hermes plugin, asks the owner to review what changed, and says when Hermes must restart. */
+    fun openAppUpdates() { if (_ui.value.authenticated) { tab("More"); more("App updates") } }
+
     @Volatile private var networkValidated = false
     private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
     /** Reconnects once when Android reports a validated network again while Beacon shows its saved history offline. */
@@ -454,7 +504,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     init {
         reconnectWhenNetworkReturns()
         viewModelScope.launch {
-            app.push.emailAlerts.collect { (scope, card) -> storeData("task-result:${scope.key}", card) }
+            app.push.emailAlerts.collect { scope -> if (scope == sourceScope) client?.let { refreshChatAlerts(scope, it) } }
         }
         viewModelScope.launch { app.push.conversationPosts.collect(::refreshPostedConversation) }
         viewModelScope.launch {
@@ -668,23 +718,46 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         }
     }
     fun storeData(key: String, value: JSONObject) { _data.update { it + (key to value) } }
-    fun clearTaskResult(scope: Scope, noticeId: String, dismiss: Boolean = false) = viewModelScope.launch {
-        val key = "task-result:${scope.key}"
-        if (noticeId.isBlank()) {
-            if (dismiss && _data.value[key]?.string("notice_id").isNullOrBlank()) storeData(key, JSONObject())
-            return@launch
+    fun dismissTaskResult(scope: Scope) = storeData("task-result:${scope.key}", JSONObject())
+    /** An alert's Important / Not important choice reached the plugin: show it at once, then read it back. */
+    fun alertChosen(scope: Scope, noticeId: String, verdict: String) {
+        if (sourceScope != scope) return
+        val chosen = _chat.value.alerts.map { if (it.noticeId == noticeId) it.copy(verdict = verdict) else it }
+        _chat.update { it.copy(alerts = chosen) }
+        viewModelScope.launch { saveChatAlerts(scope, chosen) }
+        client?.let { refreshChatAlerts(scope, it) }
+    }
+    private var alertsGeneration = 0
+    private val _alertFocus = MutableStateFlow<Pair<Scope, String>?>(null)
+    /** The alert a tapped notification names; the chat scrolls to it once, then [consumeAlertFocus]. */
+    val alertFocus: StateFlow<Pair<Scope, String>?> = _alertFocus
+    fun consumeAlertFocus(target: Pair<Scope, String>) { _alertFocus.compareAndSet(target, null) }
+    private suspend fun saveChatAlerts(scope: Scope, alerts: List<ChatAlert>) {
+        try { app.cache.write(scope, "alerts", JSONArray(alerts.map { it.toJson() }).toString(), protected = true) }
+        catch (e: Exception) { if (e is CancellationException) throw e /* The next read from the plugin rebuilds the saved copy. */ }
+    }
+    /** Cache-first: the saved alerts are already in the chat; this reads the plugin's current list behind them. Only the Beacon chat has alerts. */
+    private fun refreshChatAlerts(scope: Scope, active: BeaconClient) {
+        // Not isBeaconConversation(): that stays false while Beacon's chat is still opening, which is when its alerts are first read.
+        if (scope.profile != preferences.value.assistantProfile || readBeaconSessionHandle(scope.copy(session = "")) != scope.session ||
+            _ui.value.bootstrap.optJSONObject("optional_features")?.optString("plugin") != "available") return
+        val generation = ++alertsGeneration
+        val request = ScopeSettlement(scope, active, originGeneration, sessionGeneration)
+        viewModelScope.launch {
+            try {
+                val reader = active.detached()
+                val response = try { reader.get("${dev.hermes.android.ui.PROACTIVE_SETTINGS_PATH}/alerts", mapOf("profile" to scope.profile, "session_id" to scope.session)) } finally { reader.closeNative() }
+                if (generation != alertsGeneration || !request.current()) return@launch
+                val merged = mergeChatAlerts(_chat.value.alerts, response.rows("alerts").mapNotNull(ChatAlert::from))
+                _chat.update { it.copy(alerts = merged) }
+                saveChatAlerts(scope, merged)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e // Offline or an older plugin: the saved alerts stay as they are.
+            } finally {
+                // A tapped alert the newest read does not find (pruned, never saved) must not hold the scroll forever.
+                if (generation == alertsGeneration) _alertFocus.value?.takeIf { it.first == scope && _chat.value.alerts.none { alert -> alert.noticeId == it.second } }?.let(::consumeAlertFocus)
+            }
         }
-        try {
-            val stored = app.cache.read(scope, "task-result")
-            if (stored != null && runCatching { JSONObject(stored).string("notice_id") }.getOrNull() == noticeId)
-                app.cache.delete(scope, "task-result", stored)
-        } catch (error: Throwable) {
-            if (error is CancellationException) throw error
-            notice("The saved email alert may return when this chat is reopened.")
-        }
-        val current = _data.value[key] ?: return@launch
-        if (current.string("notice_id") == noticeId)
-            storeData(key, if (dismiss) JSONObject() else current.copy().put("feedback_sent", true))
     }
     fun setKeepConnectedEnabled(enabled: Boolean) {
         runCatching { dev.hermes.android.push.KeepConnectedService.setEnabled(app, client?.auth, enabled) }
@@ -739,6 +812,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 if (!request.current() || !foreground) return@launch
                 val stream = _chat.value.streamId
                 if (stream.isNotBlank() && streams[scope.key]?.isActive != true && !followRunningTurn(c, scope, stream, request)) return@launch
+                if (!reattachMarkedRun(c.detached(), scope, request)) return@launch
                 watchSession(c, scope)
                 _side.value?.takeIf { it.scope == scope && it.status !in setOf("Complete", "Stopped") }?.let { resumeSideQuestion() }
             } catch (e: Throwable) {
@@ -761,6 +835,31 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val stale = !current || _chat.value.streamId != stream || streams[scope.key]?.isActive == true
         if (stale) c.closeNative() else if (!attachStream(c, scope, stream, terminalAlreadyObserved = status == "idle")) c.closeNative()
         return current
+    }
+    /**
+     * Beacon delivered a prompt here and never saw its reply end, yet the chat shows no stream: the process was killed, or the chat was left and reopened.
+     * Browsing is passive, so only this evidence earns one lazy resume. A reply still running is shown and followed again (replay skips what the saved live frame already holds),
+     * one that ended is settled from history, and an unreadable answer leaves the chat and the marker alone. False when the chat moved on meanwhile.
+     */
+    private suspend fun reattachMarkedRun(c: BeaconClient, scope: Scope, request: ScopeSettlement): Boolean {
+        var handedOver = false
+        try {
+            val marked = try { app.cache.read(scope, RUN_MARKER) != null } catch (e: Exception) { if (e is CancellationException) throw e; false }
+            if (!request.current() || !foreground) return false
+            if (!shouldAskRunning(marked, _chat.value.streamId) || streams[scope.key]?.isActive == true) return true
+            val answer = try { c.recoveredNativeSession(scope.session) }
+            catch (e: Throwable) { if (e is CancellationException || e is ApiFailure && e.status in setOf(401, 403) || missingNativeConversation(e)) throw e; null }
+            // Another account, profile or chat was opened while Hermes was asked, or a send already follows its own stream.
+            if (!request.current() || !foreground) return false
+            if (_chat.value.streamId.isNotBlank()) return true
+            val action = coldRunAction(answer?.second)
+            if (action == ColdRun.Keep) return true
+            val runtime = answer?.first.orEmpty()
+            if (action == ColdRun.Follow) _chat.update { it.copy(streamId = runtime, status = "Working") }
+            // A reply that ended while Beacon was closed puts a queued message back in the box for the owner to send.
+            handedOver = attachStream(c, scope, runtime, terminalAlreadyObserved = action == ColdRun.Settle, sendQueued = action != ColdRun.Settle)
+            return true
+        } finally { if (!handedOver) c.closeNative() }
     }
     private fun checkpointPhoneSettings() {
         val owner = client?.scope ?: return
@@ -2517,6 +2616,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 renderSession(response, scope)
                 // No per-chat effort read here: native config.get needs a resumed session, and browsing never resumes an agent.
                 app.cache.writeSession(scope, response.toString())
+                client?.let { refreshChatAlerts(scope, it) }
                 val session = response.optJSONObject("session") ?: response
                 if (session.rows("messages").isNotEmpty() || session.optInt("message_count") > 0 || session.string("active_stream_id").isNotBlank()) {
                     clientCreated = false
@@ -2527,6 +2627,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 if (pending.containsKey(scope.key)) reconcile(scope, c.detached())
                 val active = (response.optJSONObject("session") ?: response).string("active_stream_id")
                 if (active.isNotBlank() && streams[scope.key]?.isActive != true) attachStream(c.detached(), scope, active)
+                else if (active.isBlank() && !reattachMarkedRun(c.detached(), scope, ScopeSettlement(scope, client ?: return@launch, origin, generation))) return@launch
                 watchSession(c.detached(), scope)
             } catch (e: Throwable) {
                 if (e is CancellationException) throw e
@@ -2558,23 +2659,11 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     }
     private suspend fun restoreCachedConversation(scope: Scope, generation: Int, preserveActiveInput: Boolean = false): Boolean {
         fun current() = generation == sessionGeneration && sourceScope == scope && (client?.scope ?: cachedOwnerScope) == scope.copy(session = "")
-        val cached = app.cache.readMany(scope, listOf("draft", "side-question", "session", "pending", "task-result"))
+        val cached = app.cache.readMany(scope, listOf("draft", "side-question", "session", "pending", "alerts"))
         if (!current()) return false
-        cached["task-result"]?.let { raw ->
-            val key = "task-result:${scope.key}"
-            val card = runCatching { JSONObject(raw) }.getOrNull()
-            if (card != null && card.optLong("expires_at") > System.currentTimeMillis() / 1000) {
-                val shown = _data.value[key]
-                val feedbackSent = shown?.let { it.optBoolean("feedback_sent") && it.string("notice_id") == card.string("notice_id") } == true
-                if (!feedbackSent) {
-                    if (shown == null || shown.optLong("expires_at") < card.optLong("expires_at")) storeData(key, card)
-                }
-            } else {
-                optionalLocalSave { app.cache.delete(scope, "task-result", raw) }
-                if (!current()) return false
-                if (card != null && _data.value[key]?.string("notice_id") == card.string("notice_id")) storeData(key, JSONObject())
-            }
-        }
+        cached["alerts"]?.let { raw -> _chat.update { it.copy(alerts = decodeChatAlerts(raw)) } }
+        // shortcut: 1.1.14 saved email alerts as a pinned "task-result" card; remove this once no 1.1.14 install remains.
+        optionalLocalSave { app.cache.delete(scope, "task-result") }
         if (!preserveActiveInput) {
             val localDraft = drafts[scope.key] ?: cached["draft"]?.let(Draft::decode) ?: Draft()
             if (!current()) return false
@@ -2825,6 +2914,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     /** Hermes holds the prompt, whether its start was acknowledged or only found in history: the first-prompt markers, the receipt and the draft are done with. */
     private suspend fun promptDelivered(scope: Scope, send: PendingSend, response: JSONObject, accepted: Boolean) {
         val owner = scope.copy(session = "")
+        // From here a restart cannot lose the reply: the marker tells the next cold open to ask Hermes (a history-found send may already be over; the ask settles it).
+        optionalLocalSave { app.cache.write(scope, RUN_MARKER, "1") }
         // The creating socket owns only the first accepted prompt; later turns resume by stored identity.
         clientCreatedSessions.remove(scope.key)
         optionalLocalSave { app.cache.delete(scope, "client-created-shell") }
@@ -2898,7 +2989,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         }
     }
     /** False when the chat is not in a state to follow a stream (the app is in the background, or another account is signed in); nothing was started then. */
-    private fun attachStream(c: BeaconClient, scope: Scope, stream: String, terminalAlreadyObserved: Boolean = false, quietMs: Long = streamSilenceMs): Boolean {
+    private fun attachStream(c: BeaconClient, scope: Scope, stream: String, terminalAlreadyObserved: Boolean = false, quietMs: Long = streamSilenceMs, sendQueued: Boolean = true): Boolean {
         if (!foreground || client?.scope != c.scope || scope.copy(session = "") != c.scope) return false
         streams[scope.key]?.cancel()
         streamClients[scope.key] = c
@@ -3021,13 +3112,15 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     }
                 }
                 if (terminalObserved) {
+                    // The reply is over; a queued send below writes a fresh marker of its own.
+                    optionalLocalSave { app.cache.delete(scope, RUN_MARKER) }
                     if (terminalReplyVisible) { liveFrames.remove(frameKey); liveBoundaries.remove(frameKey); persistedTurns.remove(frameKey); app.cache.delete(scope, "live:$stream") }
                     if (sourceScope == scope) {
                         _chat.update { releaseTerminalChat(it, stream, terminalReplyVisible, terminalError) }
                         pollPrompts(c, scope); refreshSessions()
                         // An unconfirmed reply after a live terminal event keeps the queue for review; a validated idle settled it.
                         val q = _chat.value.queued.firstOrNull()?.takeIf { terminalReplyVisible || terminalAlreadyObserved && terminalError.isBlank() }
-                        if (q != null && _composer.value.text.isBlank() && _attachments.value.isEmpty()) { removeQueued(0); _attachments.value = q.attachments; composer(TextFieldValue(q.text)); send(q) }
+                        if (q != null && _composer.value.text.isBlank() && _attachments.value.isEmpty()) { removeQueued(0); _attachments.value = q.attachments; composer(TextFieldValue(q.text)); if (sendQueued) send(q) }
                     }
                 }
             } catch (e: Throwable) { if (e is CancellationException) throw e; if (sourceScope == scope) fail(e) } finally {
@@ -3264,7 +3357,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     }
     fun forgetScreens() { val scope = client?.scope ?: return; viewModelScope.launch { forgetScreens(scope) } }
     private val forgetOnDeviceRemoval: (Scope) -> Unit = { scope -> viewModelScope.launch { forgetScreens(scope) } }
-    init { NativeDeviceRemoval.onForgetScreens = forgetOnDeviceRemoval }
+    init { NativeDeviceRemoval.onForgetScreens = forgetOnDeviceRemoval; dev.hermes.android.updates.PluginInstallHub.controller = pluginInstall }
     private var prefetchJob: Job? = null
     private var prefetched = "" to 0L
     /** The account whose sign-in ended without a sign-out; if a different account connects next, its cached screens go. */
@@ -3740,11 +3833,9 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             hydrateScreens(restoredClient.scope)
             _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList()
             if (route.string("kind") == "task_result" && id.isNotBlank()) {
-                val emailAlert = route.optBoolean("email_alert")
-                val expiresAt = route.optLong("expires_at")
-                route.string("reason").takeIf { it.isNotBlank() && (!emailAlert || expiresAt > System.currentTimeMillis() / 1000) }?.let {
-                    storeData("task-result:${c.scope.session(id).key}", json("reason" to it, "notice_id" to route.string("event_id").ifBlank { event }, "email_alert" to emailAlert, "expires_at" to expiresAt))
-                }
+                // An email alert is a message in the chat; the tap scrolls to it. Any other task result keeps its card.
+                if (route.optBoolean("email_alert")) _alertFocus.value = c.scope.session(id) to route.string("event_id").ifBlank { event }
+                else route.string("reason").takeIf { it.isNotBlank() }?.let { storeData("task-result:${c.scope.session(id).key}", json("reason" to it)) }
             }
             // The Beacon screen trusts only the saved handle, which a notification cold start skips (connect() never runs); restore it as connect() does.
             beaconChat?.let { writeBeaconSessionHandle(c.scope, it) }
@@ -3782,5 +3873,5 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         }
         finally { temporaryClient?.closeNative(); if (startsCall) _incomingBusy.value = false }
     }
-    override fun onCleared() { if (NativeDeviceRemoval.onForgetScreens === forgetOnDeviceRemoval) NativeDeviceRemoval.onForgetScreens = null; networkCallback?.let { runCatching { app.getSystemService(android.net.ConnectivityManager::class.java)?.unregisterNetworkCallback(it) } }; botMode.clear(); sessionWatch?.cancel(); stopReadAloud(); speech?.shutdown(); super.onCleared() }
+    override fun onCleared() { if (NativeDeviceRemoval.onForgetScreens === forgetOnDeviceRemoval) NativeDeviceRemoval.onForgetScreens = null; if (dev.hermes.android.updates.PluginInstallHub.controller === pluginInstall) dev.hermes.android.updates.PluginInstallHub.controller = null; pluginInstall.reset(); networkCallback?.let { runCatching { app.getSystemService(android.net.ConnectivityManager::class.java)?.unregisterNetworkCallback(it) } }; botMode.clear(); sessionWatch?.cancel(); stopReadAloud(); speech?.shutdown(); super.onCleared() }
 }

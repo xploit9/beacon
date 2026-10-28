@@ -734,7 +734,8 @@ async def notice_detail(event_id:str,request:Request):
             snapshot=await feature(native.conversation_snapshot,owner,provider,profile,row['conversation'],timeout=6)
             reply=reply_preview(snapshot.get('messages') or [])
             if reply: result['preview']={'title':str(snapshot.get('title') or 'Reply ready')[:120],'body':reply}
-        except Exception: pass  # the generic text stays
+        except Exception as exc:  # the generic text stays
+            logging.getLogger(__name__).info('Beacon reply preview unavailable: %s',type(exc).__name__)
     if row['kind']=='task_result':
         with mobile.connect() as conn:
             email_alert=conn.execute('SELECT 1 FROM meta WHERE key=?',('proactive-email-notice:'+event_id,)).fetchone() is not None
@@ -1160,6 +1161,14 @@ async def proactive_feedback(request:Request):
         raise HTTPException(400,'Expected notice_id and verdict important or not_important')
     owner,_,profile,_=identity(request)
     return await feature(proactive.add_email_feedback,mobile,owner,profile,value['notice_id'],value['verdict'],timeout=15,value_error_status=400,lookup_message='This item is no longer available.')
+
+@router.get('/mobile/proactive/alerts')
+async def proactive_alerts(session_id:str,request:Request,before:int=0,limit:int=50):
+    # The alerts Beacon posted into one owned chat, with the owner's verdict on each; the chat shows them as messages.
+    owner,provider,profile,_=identity(request)
+    await feature(native.verify,owner,provider,profile,session_id,timeout=6)
+    result=await feature(proactive.email_alerts,mobile,owner,profile,session_id,before or None,limit,timeout=8,value_error_status=400)
+    return JSONResponse(result,headers={'Cache-Control':'no-store'})
 
 @router.delete('/mobile/proactive/learned')
 async def proactive_learned_delete(request:Request):

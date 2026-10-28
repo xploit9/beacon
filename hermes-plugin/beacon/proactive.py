@@ -805,7 +805,7 @@ def record_email_check(profile, job_id, args, *, setup=None):
             or type(args.get("ok")) is not bool):
         raise ValueError("checked_until, boolean ok, and note are required")
     from beacon_observers import reason_text
-    note = reason_text(args["note"], 120)
+    note = reason_text(args["note"], 400)[:120]
     checked = _checked_instant(args["checked_until"])
     now = time.time()
     if checked.timestamp() > now:
@@ -1156,6 +1156,37 @@ def add_email_feedback(mobile, owner, profile, notice_id, verdict):
                              (call_log_id,owner,profile,verdict))
         raise
     return {"ok": True}
+
+
+def email_alerts(mobile, owner, profile, conversation, before=None, limit=50):
+    """The alerts posted into one chat, newest first. An alert's verdict is the learned note feedback saved for it, so a
+    choice survives reopening and restart; a deleted note makes the alert open again. Alerts last as long as their notice."""
+    if before is not None and (type(before) is not int or before < 1):
+        raise ValueError("before must be an alert cursor")
+    limit = max(1, min(int(limit), 100))
+    with mobile.LOCK, mobile.connect() as conn:
+        rows = conn.execute(
+            "SELECT n.seq,n.id,n.reason,n.created,n.expires,(SELECT value FROM meta WHERE key=?||n.id) AS rule "
+            "FROM notices n WHERE n.owner=? AND n.profile=? AND n.conversation=? AND n.kind='task_result' "
+            "AND (? IS NULL OR n.seq<?) AND EXISTS (SELECT 1 FROM meta WHERE key=?||n.id) ORDER BY n.seq DESC LIMIT ?",
+            (EMAIL_RULE_PREFIX, owner, profile, conversation, before, before, EMAIL_NOTICE_PREFIX, limit + 1)).fetchall()
+    saved = learned_notes(mobile, owner, profile)
+    alerts = []
+    for row in rows[:limit]:
+        try:
+            source = source_name(json.loads(row["rule"]).get("source", "email")) if row["rule"] else "email"
+        except (AttributeError, TypeError, ValueError):
+            source = "email"
+        try:
+            notes = _learned_notes(row["reason"] or "")
+        except ValueError:
+            notes = {}
+        prefix = IMPORTANCE_PREFIX + source + ": "
+        alerts.append({"notice_id": row["id"], "text": row["reason"] or "", "source": source.title(),
+                       "created_at": row["created"], "expires_at": int(row["expires"]),
+                       "verdict": next((verdict for verdict, note in notes.items() if prefix + note in saved), "")})
+    return {"session_id": conversation, "profile": profile, "alerts": alerts,
+            "next": str(rows[limit - 1]["seq"]) if len(rows) > limit else ""}
 
 
 def delete_learned(mobile, owner, profile, note):

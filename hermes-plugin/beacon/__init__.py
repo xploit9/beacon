@@ -382,7 +382,8 @@ def _mail_provider_read(tool_name,profile):
 
 
 _DESTINATION_FIELDS={'url','uri','urls','link','href','host','hostname','domain','endpoint','server','webhook','feed',
-                     'address','remote','target','targets','fetch_url','callback'}
+                     'address','remote','target','targets','fetch_url','callback',
+                     'to','cc','bcc','recipient','recipients','send_to','reply_to','forward_to','share_with','notify'}
 _MAIL_PROVIDER_WORDS={'mail','email','gmail','outlook','inbox','mailbox','himalaya','imap','proton','fastmail',
                       'icloud','zoho','yahoo','exchange'}
 _MAIL_SEARCH_OPERATORS={'from','to','cc','bcc','subject','filename','label','after','before','newer','older',
@@ -404,6 +405,11 @@ def _host_like(value):
 def _scheme_less_destination(text,field=None,allow_mail_queries=False):
     for token in re.findall(r'''[^\s"'<>]+''',text):
         token=token.strip(',;()[]{}')
+        # An address (a Google account or a calendar id such as en.usa#holiday@group.v.calendar.google.com) names who to
+        # read, not where to send: only a destination field makes it a link out. With a path or port it falls through below.
+        if re.fullmatch(r'[^@/?:\\]+@[A-Za-z0-9.-]+',token) and _host_like(token.rsplit('@',1)[1]):
+            if isinstance(field,str) and field.casefold() in _DESTINATION_FIELDS: return True
+            continue
         prefix,separator,rest=token.partition(':')
         if separator and prefix.isalpha():
             if (allow_mail_queries and prefix.casefold() in _MAIL_SEARCH_OPERATORS
@@ -625,7 +631,7 @@ def register(ctx):
     ctx.register_tool(name='beacon_events_checked',toolset='beacon-mailbox',
         description='Record how far the owned read-only Proactive watch checked all connected sources. A failed check never advances its cursor.',
         schema={'name':'beacon_events_checked','parameters':{'type':'object','properties':{
-            'checked_until':{'type':['string','number']},'ok':{'type':'boolean'},'note':{'type':'string','maxLength':120}},
+            'checked_until':{'type':['string','number']},'ok':{'type':'boolean'},'note':{'type':'string','maxLength':400}},
             'required':['checked_until','ok','note'],'additionalProperties':False}},
         handler=events_checked)
     ctx.register_tool(name='beacon_email_notice',toolset='beacon-mailbox',
@@ -639,7 +645,7 @@ def register(ctx):
     ctx.register_tool(name='beacon_email_checked',toolset='beacon-mailbox',
         description='Compatibility alias for beacon_events_checked. Only effective in the owned Proactive watch session.',
         schema={'name':'beacon_email_checked','parameters':{'type':'object','properties':{
-            'checked_until':{'type':['string','number']},'ok':{'type':'boolean'},'note':{'type':'string','maxLength':120}},
+            'checked_until':{'type':['string','number']},'ok':{'type':'boolean'},'note':{'type':'string','maxLength':400}},
             'required':['checked_until','ok','note'],'additionalProperties':False}},
         handler=email_checked)
 

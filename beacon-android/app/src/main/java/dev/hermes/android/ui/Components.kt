@@ -13,6 +13,7 @@ import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalUriHandler
@@ -46,6 +47,12 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.R
 import dev.hermes.android.core.*
+import dev.hermes.android.updates.PluginInstallFailure
+import dev.hermes.android.updates.PluginInstallHub
+import dev.hermes.android.updates.PluginInstallStage
+import dev.hermes.android.updates.PluginInstallUi
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
@@ -185,22 +192,93 @@ internal enum class BeaconMotionMode { Pulse, Sweep, Ripple }
     }
 }
 
-@Composable internal fun MissingBeaconPluginState(modifier: Modifier = Modifier, compact: Boolean = false, update: Boolean = false) {
+private val NoInstall = MutableStateFlow(PluginInstallUi()).asStateFlow()
+
+@Composable private fun installFailureText(failure: PluginInstallFailure?): String = when (failure) {
+    PluginInstallFailure.SignIn -> uiText("Sign in with Hermes again, then try again.")
+    PluginInstallFailure.Denied -> uiText("Hermes only lets its owner add Beacon.")
+    PluginInstallFailure.Offline -> uiText("Can't reach Hermes. Check your connection, then try again.")
+    PluginInstallFailure.Unsupported -> uiText("This Hermes can't add plugins from the app.")
+    PluginInstallFailure.Busy -> uiText("Hermes is busy. Wait a moment and try again.")
+    PluginInstallFailure.NotYet, PluginInstallFailure.GatewayDown -> uiText("Hermes isn't answering yet. Try again in a moment.")
+    PluginInstallFailure.Error, null -> uiText("Hermes couldn't do that. Try again.")
+}
+
+/**
+ * "Add Beacon to your Hermes": the owner confirms, Hermes installs Beacon from GitHub, and a restart is offered only when Hermes says its
+ * gateway needs one. [update] is a Beacon too old for this app, which opens the update screen. Where no install can be reached (previews,
+ * tests) the button opens the install steps instead. [illustration] is false where the screen already has its own picture, as in setup.
+ */
+@Composable internal fun MissingBeaconPluginState(modifier: Modifier = Modifier, compact: Boolean = false, update: Boolean = false, illustration: Boolean = true) {
     val uriHandler = LocalUriHandler.current
+    val install = PluginInstallHub.controller
+    val progress by (install?.state ?: NoInstall).collectAsStateWithLifecycle()
+    var confirming by rememberSaveable { mutableStateOf(false) }
+    // A finished install is shown once; the next time the card appears it starts fresh.
+    DisposableEffect(install) { onDispose { install?.let { if (it.state.value.stage == PluginInstallStage.Done) it.reset() } } }
+    val link = { uriHandler.openUri(BEACON_PLUGIN_INSTALL_URL) }
+    val buttonHeight = Modifier.heightIn(min = 48.dp)
+    val centered = androidx.compose.ui.text.style.TextAlign.Center
     Column(
         modifier.fillMaxWidth().padding(if (compact) 8.dp else 24.dp),
         horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 14.dp),
     ) {
-        Box(Modifier.testTag("missing-plugin-illustration").size(if (compact) 64.dp else 108.dp), contentAlignment = androidx.compose.ui.Alignment.Center) {
+        if (illustration) Box(Modifier.testTag("missing-plugin-illustration").size(if (compact) 64.dp else 108.dp), contentAlignment = androidx.compose.ui.Alignment.Center) {
             BeaconSignal(BeaconMotionMode.Sweep, size = if (compact) 64.dp else 108.dp)
             BeaconMark(size = if (compact) 36.dp else 60.dp)
         }
-        Text(uiText(if (update) "Update Beacon on your Hermes" else "Add Beacon to your Hermes"), style = if (compact) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.titleMedium, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
-        Button(onClick = { uriHandler.openUri(BEACON_PLUGIN_INSTALL_URL) }, modifier = Modifier.heightIn(min = 48.dp).testTag("missing-plugin-install")) {
-            Text(uiText(if (update) "Update Beacon" else "Install Beacon"))
+        Text(when {
+            progress.stage == PluginInstallStage.Done -> uiText("Beacon is ready on your Hermes.")
+            progress.stage == PluginInstallStage.NeedsRestart || progress.stage == PluginInstallStage.Restarting -> uiText("Restart Hermes to finish")
+            update -> uiText("Update Beacon on your Hermes")
+            else -> uiText("Add Beacon to your Hermes")
+        }, Modifier.semantics { liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite }, style = if (compact) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.titleMedium, textAlign = centered)
+        when (progress.stage) {
+            PluginInstallStage.Idle -> Button(
+                onClick = { if (install == null) link() else if (update) install.openUpdates() else confirming = true },
+                modifier = buttonHeight.testTag("missing-plugin-install"),
+            ) { Text(uiText(if (update) "Update Beacon" else "Install Beacon")) }
+            PluginInstallStage.Installing, PluginInstallStage.Checking, PluginInstallStage.Restarting -> Button(onClick = {}, enabled = false, modifier = buttonHeight.testTag("missing-plugin-working")) {
+                CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+                Text(when (progress.stage) {
+                    PluginInstallStage.Checking -> uiText("Checking…")
+                    PluginInstallStage.Restarting -> uiText("Restarting…")
+                    else -> uiText("Installing…")
+                })
+            }
+            PluginInstallStage.NeedsRestart -> {
+                Text(uiText(if (progress.busy) "Hermes is working right now. Restarting stops that work." else "Restarting stops any reply or scheduled task that is running."),
+                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = centered)
+                progress.failure?.let { Text(installFailureText(it), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error, textAlign = centered) }
+                Button(onClick = { install?.restart() }, modifier = buttonHeight.testTag("missing-plugin-restart")) { Text(uiText("Restart Hermes")) }
+                TextButton(onClick = { install?.dismiss() }, modifier = buttonHeight.testTag("missing-plugin-not-now")) { Text(uiText("Not now")) }
+            }
+            PluginInstallStage.Failed -> {
+                Text(installFailureText(progress.failure), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error, textAlign = centered,
+                    modifier = Modifier.semantics { liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite })
+                // A Hermes without the install route cannot be retried into one: the steps are its only way.
+                if (progress.failure == PluginInstallFailure.Unsupported) Button(onClick = link, modifier = buttonHeight.testTag("missing-plugin-steps")) { Text(uiText("How to install")) }
+                // Beacon is installed and answers; only the restarted gateway is late, so the owner can wait or move on.
+                else if (progress.failure == PluginInstallFailure.GatewayDown) {
+                    Button(onClick = { install?.retry() }, modifier = buttonHeight.testTag("missing-plugin-retry")) { Text(uiText("Try again")) }
+                    TextButton(onClick = { install?.dismiss() }, modifier = buttonHeight.testTag("missing-plugin-not-now")) { Text(uiText("Not now")) }
+                } else {
+                    Button(onClick = { install?.retry() }, modifier = buttonHeight.testTag("missing-plugin-retry")) { Text(uiText("Try again")) }
+                    TextButton(onClick = link, modifier = buttonHeight.testTag("missing-plugin-steps")) { Text(uiText("How to install")) }
+                }
+            }
+            PluginInstallStage.Done -> Unit
         }
     }
+    if (confirming && install != null) AlertDialog(
+        onDismissRequest = { confirming = false },
+        title = { Text(uiText("Add Beacon to your Hermes")) },
+        text = { Text(uiText("Hermes will download Beacon from github.com/xploit9/beacon and turn it on.")) },
+        confirmButton = { TextButton(onClick = { confirming = false; install.install() }, modifier = Modifier.testTag("missing-plugin-confirm")) { Text(uiText("Install Beacon")) } },
+        dismissButton = { TextButton(onClick = { confirming = false }) { Text(uiText("Cancel")) } },
+    )
 }
 
 /** A null [icon] drops the trailing mark, for a row that acts at once instead of opening something. */

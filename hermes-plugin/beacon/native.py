@@ -89,7 +89,10 @@ def conversation_snapshot(owner, provider, profile, stored):
                 and (row.get('profile_home') or None) == expected_home
                 and not row.get('_finalized')]
         if len(live) > 1:
-            raise RuntimeError('Native conversation identity is ambiguous')
+            # A lazy status probe opens its own live row beside the chat's runtime; every row here is the owner's own,
+            # so read the one doing work, then one with an agent, then the oldest.
+            live.sort(key=lambda item: (not (item[1].get('running') or item[1].get('inflight') or item[1].get('queued')),
+                                        item[1].get('agent') is None))
         sid, active = live[0] if live else ('', {})
         running = bool(active.get('running') or active.get('inflight') or active.get('queued'))
         ephemeral = list(active.get('history') or [])

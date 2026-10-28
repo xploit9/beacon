@@ -131,6 +131,7 @@ import org.json.JSONObject
     fun batteryOptimized()=!context.getSystemService(android.os.PowerManager::class.java).isIgnoringBatteryOptimizations(context.packageName)
     var restricted by remember { mutableStateOf(backgroundRestricted()) }
     var optimized by remember { mutableStateOf(batteryOptimized()) }
+    val phoneMaker = remember { thisPhoneStrictMaker() }
     val liveUpdatesSettings = remember(context) { Intent("android.settings.MANAGE_APP_PROMOTED_NOTIFICATIONS").putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName).takeIf { android.os.Build.VERSION.SDK_INT >= 36 && it.resolveActivity(context.packageManager) != null } }
     androidx.lifecycle.compose.LifecycleResumeEffect(ownerScope) {
         target = vm.client?.scope?.let { vm.app.push.registeredTarget(it) }
@@ -318,12 +319,17 @@ import org.json.JSONObject
                 if (optimized && !restricted) { if (!requestBackgroundUse(context)) vm.notice(backgroundHint) }
                 else runCatching { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}"))) }.onFailure { vm.notice(appSettingsHint) }
             }
+            // Honor, Huawei, Xiaomi, OPPO, vivo and Samsung stop background apps in their own manager, even after the battery exemption.
+            if (phoneMaker != null) {
+                rowDivider()
+                ActionRow(uiText("Allow auto-launch"), uiText("So calls arrive even when Beacon is closed."), Icons.AutoMirrored.Rounded.OpenInNew) {
+                    if (!openMakerBackgroundSettings(context)) vm.notice(appSettingsHint)
+                }
+            }
             rowDivider()
             ActionRow(uiText("Schedules"), uiText("Check-up calls and scheduled jobs"), Icons.AutoMirrored.Rounded.KeyboardArrowRight) { vm.tab("Tasks") }
             Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(uiText("After a force stop, open Beacon once to receive calls again."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                if (android.os.Build.MANUFACTURER.equals("HONOR", ignoreCase = true) || android.os.Build.MANUFACTURER.equals("HUAWEI", ignoreCase = true))
-                    Text(uiText("On Honor and Huawei phones, also allow Beacon to run in the background in the battery settings."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         } }
         // Last: the one destructive setting, in a card with its own title.

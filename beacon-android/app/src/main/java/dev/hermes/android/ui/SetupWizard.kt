@@ -69,7 +69,7 @@ internal fun handleSetupPermissionResult(granted: Boolean, advance: () -> Unit, 
 
 internal fun setupNeedsBackgroundExemption(isIgnoringBatteryOptimizations: Boolean): Boolean = !isIgnoringBatteryOptimizations
 
-/** Keep connected: one switch and, while Android still restricts Beacon, the one-tap background action. */
+/** Keep connected: one switch and, while Android still restricts Beacon, the one-tap background action; strict phone makers get one more step after it. */
 @Composable
 internal fun KeepConnectedSetupGroup(
     keepConnected: Boolean,
@@ -77,6 +77,8 @@ internal fun KeepConnectedSetupGroup(
     backgroundActionVisible: Boolean,
     onKeepConnectedChange: (Boolean) -> Unit,
     onOpenBackgroundSettings: () -> Unit,
+    autoLaunchVisible: Boolean = false,
+    onOpenAutoLaunch: () -> Unit = {},
 ) {
     Column(
         Modifier.fillMaxWidth().testTag("setup-keep-connected-group"),
@@ -98,6 +100,14 @@ internal fun KeepConnectedSetupGroup(
             Icon(Icons.AutoMirrored.Rounded.OpenInNew, null)
             Spacer(Modifier.width(8.dp))
             Text(uiText("Allow Beacon to run in the background"))
+        }
+        if (autoLaunchVisible) OutlinedButton(
+            onClick = onOpenAutoLaunch,
+            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("setup-auto-launch"),
+        ) {
+            Icon(Icons.AutoMirrored.Rounded.OpenInNew, null)
+            Spacer(Modifier.width(8.dp))
+            Text(uiText("Allow auto-launch"))
         }
     }
 }
@@ -162,6 +172,7 @@ fun SetupWizard(vm: BeaconViewModel, modifier: Modifier = Modifier, externalLink
         onReopen = vm::reopenSetupWizard,
         onCancel = { vm.cancelSetupWizard(); onExternalLinkCleared() },
         onOpenBackgroundSettings = { if (!requestBackgroundUse(context)) vm.notice(backgroundHint) },
+        onOpenAutoLaunch = { if (!openMakerBackgroundSettings(context)) vm.notice(backgroundHint) },
     )
 }
 
@@ -178,6 +189,7 @@ internal fun SetupWizardScreen(
     onVoiceKeySaved: () -> Unit = {},
     onVoicePage: (String) -> Unit = {},
     onOpenBackgroundSettings: () -> Unit = {},
+    onOpenAutoLaunch: () -> Unit = {},
     externalLinkOrigin: String? = null,
     onSkipVoiceSetup: () -> Unit = onAdvancePermission,
     ownerName: String = "",
@@ -399,6 +411,8 @@ internal fun SetupWizardScreen(
                 step, uiText("You're connected"), modifier, assistantText("Beacon is ready."),
                 content = {
                     SetupStatusLine(state.setupPluginMessage, error = false)
+                    // The message above clears once Beacon is there; until then the same install action as everywhere else.
+                    if (state.setupPluginMessage.isNotBlank()) MissingBeaconPluginState(compact = true, illustration = false)
                     SetupContainer {
                         KeepConnectedSetupGroup(
                             keepConnected = keepConnected,
@@ -406,6 +420,8 @@ internal fun SetupWizardScreen(
                             backgroundActionVisible = setupNeedsBackgroundExemption(ignoringBatteryOptimizations),
                             onKeepConnectedChange = { enabled -> keepConnected = enabled; if (enabled) requestKeepConnectedNotifications() },
                             onOpenBackgroundSettings = onOpenBackgroundSettings,
+                            autoLaunchVisible = !setupNeedsBackgroundExemption(ignoringBatteryOptimizations) && thisPhoneStrictMaker() != null,
+                            onOpenAutoLaunch = onOpenAutoLaunch,
                         )
                     }
                 },

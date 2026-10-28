@@ -2247,6 +2247,10 @@ def test_v4_email_checked_notepad_is_profile_scoped_and_health_expires(harness, 
     assert notes[("work-watch", "checked_until")] == "2026-10-20T01:30:00Z"
     api.proactive.record_email_check("work", "work-watch", {
         "checked_until": "2026-10-20T02:00:00Z", "ok": False, "note": "Read failed"})
+    # A longer note than the status shows is accepted (the tool schema allows 400) and kept to 120 characters.
+    api.proactive.record_email_check("work", "work-watch", {
+        "checked_until": "2026-10-20T02:00:00Z", "ok": False, "note": "Calendar read failed " + "x" * 180})
+    assert len(json.loads(notes[("work-watch", "last_result")])["message"]) == 120
     assert notes[("work-watch", "checked_until")] == "2026-10-20T01:30:00Z"
     # A local time sent with Z lands in the future; the error gives the real UTC time so the watch can retry.
     with pytest.raises(ValueError, match="it is now 2026-10-20T12:00:00Z"):

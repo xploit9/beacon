@@ -13,6 +13,7 @@ import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
@@ -447,6 +448,8 @@ class KeepConnectedService : Service() {
             private fun networkChanged() {
                 android.os.Handler(mainLooper).post {
                     if (activeInstance === this@KeepConnectedService && isEnabled(this@KeepConnectedService)) {
+                        // The reconnecting line says "back online" only while there is no network, so it follows the network too.
+                        updateNotification()
                         val origin = pollOrigin
                         val owner = pollOwner
                         val provider = pollProvider
@@ -592,7 +595,11 @@ class KeepConnectedService : Service() {
                 onEvent = { profile, event ->
                     if (event.optString("kind") == "incoming_call") deliverIncomingCall(app, origin, owner, profile, nativeProvider, event)
                     else if (app.push.bindKeepConnectedSource(Scope(origin, owner, profile, nativeProvider = nativeProvider), event.optString("source_ref"))) {
-                        receivePush(this, keepConnectedPushData(event))
+                        val data = keepConnectedPushData(event)
+                        receivePush(this, data)
+                        // This service already holds a live connection, so the real text replaces the placeholder now; the
+                        // deferred preview job, which strict phones may hold back for a long time, is only the fallback.
+                        serviceScope.launch { runCatching { refreshNotificationPreview(this@KeepConnectedService, data.getValue("source_ref"), data.getValue("event_id"), data.getValue("conversation_ref"), data.getValue("kind")) } }
                     }
                 },
                 profileLabel = { profile -> profileDisplayNames[profile] ?: profile },
@@ -652,7 +659,7 @@ class KeepConnectedService : Service() {
 
     private fun connectionNotification(context: Context): android.app.Notification {
         val status = status(context)
-        val (title, body) = keepConnectedText(status, dev.hermes.android.data.currentAssistantName)
+        val (title, body) = keepConnectedNotificationText(status, dev.hermes.android.data.currentAssistantName, failureReason(context), hasNetwork(context))
         val stop = Intent(context, KeepConnectedService::class.java)
             .setAction(ACTION_STOP)
             .setData(Uri.parse("beacon://keep-connected/stop/${stopToken(context)}"))
@@ -662,7 +669,7 @@ class KeepConnectedService : Service() {
             .setSmallIcon(R.drawable.ic_beacon_notification)
             .setContentTitle(title)
             .setContentText(body)
-            .setStyle(NotificationCompat.BigTextStyle().bigText("$title — $body"))
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
             .setContentIntent(openAppPendingIntent(context, 1))
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -671,6 +678,12 @@ class KeepConnectedService : Service() {
             .addAction(0, "Stop", stopPending)
             .build()
     }
+
+    /** True unless Android reports no usable network; an unreadable answer counts as online so the line never blames a missing network. */
+    private fun hasNetwork(context: Context): Boolean = runCatching {
+        val connectivity = context.getSystemService(ConnectivityManager::class.java)
+        connectivity.getNetworkCapabilities(connectivity.activeNetwork)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+    }.getOrDefault(true)
 
     private fun updateNotification() {
         if (!promoted) return
@@ -850,4 +863,24 @@ internal fun keepConnectedText(status: String, assistant: String): Pair<String, 
     KeepConnectedService.STATUS_SIGNED_OUT -> "Signed out" to "Sign in again so $assistant can call you."
     KeepConnectedService.STATUS_OFF -> "Keep connected is off" to "Turn it on in Settings › Notifications so $assistant can call you."
     else -> "Connected" to "$assistant can call you."
+}
+
+/** What the notification shows now: with a network, a reconnecting line says why in short words; with none, it keeps the generic line. */
+internal fun keepConnectedNotificationText(status: String, assistant: String, reason: String, online: Boolean): Pair<String, String> =
+    if (status == KeepConnectedService.STATUS_RECONNECTING && online) "Reconnecting…" to keepConnectedReasonText(reason)
+    else keepConnectedText(status, assistant)
+
+/** The stored [keepConnectedFailureReason] in user words. The tests run every reason through it, so a reworded reason shows up there. */
+internal fun keepConnectedReasonText(reason: String): String {
+    // A status ends the reason ("… (403)"); a profile name in the middle can't pass for one.
+    val status = reason.substringAfterLast('(', "").removeSuffix(")").toIntOrNull()
+    return when {
+        reason.isBlank() -> "Retrying…"
+        reason == "Hermes sign-in expired" || status == 401 -> "Sign in again"
+        reason == "Hermes did not answer in time" -> "Hermes didn't answer. Retrying…"
+        reason == "Could not reach Hermes" -> "Can't reach Hermes. Retrying…"
+        status == 403 || status == 409 -> "Hermes refused the connection. Retrying…"
+        status == 404 -> "Check the Beacon plugin on Hermes."
+        else -> "Hermes had a problem. Retrying…"
+    }
 }

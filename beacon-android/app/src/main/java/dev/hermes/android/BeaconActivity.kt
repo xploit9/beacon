@@ -72,11 +72,15 @@ class BeaconActivity : ComponentActivity() {
     private var updateToken by mutableStateOf<String?>(null)
     private var pendingConnectionLink by mutableStateOf<String?>(null)
     private var externalConnectionLinkOrigin by mutableStateOf<String?>(null)
+    // Set when the overlay screen opens, so the next return can tell a locked setting from one the user left off.
+    private var overlayAsked = false
+    private var overlayHint by mutableStateOf(false)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         // The call-id extra is stripped once read, so a recreation before the call view opens must keep the pending return.
         pendingReturn = savedInstanceState?.getString("pending_return").orEmpty()
+        overlayAsked = savedInstanceState?.getBoolean("overlay_asked") == true
         push(intent)
         setContent {
             val model: BeaconViewModel = viewModel()
@@ -143,6 +147,15 @@ class BeaconActivity : ComponentActivity() {
                 BeaconRoot(model, externalConnectionLinkOrigin) { externalConnectionLinkOrigin = null }
                 IncomingCallSheet(model, permissionSource.isNotBlank(), answer)
                 dev.hermes.android.updates.AppUpdateHost(model.app.updates)
+                if (overlayHint) AlertDialog(
+                    onDismissRequest = { overlayHint = false },
+                    title = { Text(uiText("Allow call bubble")) },
+                    text = { Text(uiText("If the switch was greyed out, open App info, tap ⋮ › Allow restricted settings, then try again.")) },
+                    confirmButton = {
+                        TextButton(onClick = { overlayHint = false; if (!openAppInfo(this@BeaconActivity)) model.notice("Open Beacon’s app settings in Android") }) { Text(uiText("Open App info")) }
+                    },
+                    dismissButton = { TextButton(onClick = { overlayHint = false }) { Text(uiText("Cancel")) } },
+                )
                 if (pendingConnectionLink != null && pendingConnectionOrigin != null && !ui.restoringSession && hasKnownOrigin) {
                     val cancelConnectionLink = {
                         pendingConnectionLink = null
@@ -171,13 +184,19 @@ class BeaconActivity : ComponentActivity() {
     fun allowFloatingCall(expectedId: String) {
         val calls=(application as BeaconApplication).calls
         if (!calls.state.value.active || calls.state.value.callId != expectedId) return
-        try { startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))) }
+        try { startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))); overlayAsked = true }
         catch (_: RuntimeException) { vm?.notice("Floating calls aren't available; use the call notification.") }
     }
     override fun onStart() { super.onStart(); (application as BeaconApplication).calls.let { it.uiVisible = true; if (it.state.value.active) it.resumeWindow() }; vm?.foreground(true) }
-    override fun onResume() { super.onResume(); NativeAuth.onActivityResumed(); (application as BeaconApplication).calls.refreshOverlayPermission() }
+    override fun onResume() { super.onResume(); NativeAuth.onActivityResumed(); (application as BeaconApplication).calls.refreshOverlayPermission(); checkOverlayAnswer() }
+    /** Back from the overlay screen: a file install that is still not allowed was locked by Android, not declined. */
+    private fun checkOverlayAnswer() {
+        if (!overlayAsked) return
+        overlayAsked = false
+        overlayHint = overlayNeedsRestrictedAllow(android.os.Build.VERSION.SDK_INT, installPackageSource(this), Settings.canDrawOverlays(this))
+    }
     override fun onStop() { (application as BeaconApplication).calls.uiVisible = false; vm?.foreground(false); super.onStop() }
-    override fun onSaveInstanceState(outState: Bundle) { super.onSaveInstanceState(outState); outState.putString("pending_return", pendingReturn) }
+    override fun onSaveInstanceState(outState: Bundle) { super.onSaveInstanceState(outState); outState.putString("pending_return", pendingReturn); outState.putBoolean("overlay_asked", overlayAsked) }
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); setIntent(intent); push(intent) }
     private fun push(intent: Intent?) {
         intent?.data?.takeIf { it.scheme.equals("beacon", true) && it.host.equals("connect", true) }?.let {

@@ -44,6 +44,7 @@ class ProactiveSettingsTest {
         assertEquals(ProactiveHealthState.Checking, proactiveHealthState(null, true))
         assertEquals(ProactiveHealthState.Ok, proactiveHealthState(json("health" to json("state" to "ok")), false))
         assertEquals(ProactiveHealthState.NotYet, proactiveHealthState(json("health" to json("state" to "unknown")), false))
+        assertEquals(ProactiveHealthState.Failed, proactiveHealthState(json("health" to json("state" to "error")), false))
     }
 
     @Test fun learnedNotesIgnoreBlankEntriesAndMissingLists() {

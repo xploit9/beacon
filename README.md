@@ -15,6 +15,7 @@ Or download [`beacon_install.py`](https://raw.githubusercontent.com/xploit9/beac
 
 **2. On your phone**, download the latest `Beacon-*.apk` from [Releases](https://github.com/xploit9/beacon/releases/latest) and install
 it. Open it, paste your Hermes link (also shown on the dashboard's **Beacon** tab), sign in with Hermes, and follow the setup wizard.
+If you skipped step 1, Beacon can install its plugin from the app once you are connected.
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/05bc3b64-e9d7-48b2-94e7-0661e322d950" width="31%" alt="Beacon chat">

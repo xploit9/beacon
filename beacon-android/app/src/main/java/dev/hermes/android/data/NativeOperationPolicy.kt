@@ -16,6 +16,10 @@ internal object NativeOperationPolicy {
     private val toolPath = Regex("/api/tools/toolsets/[A-Za-z0-9_.%~-]+")
     private val mcpPath = Regex("/api/mcp/servers/[A-Za-z0-9_.%~-]+/(?:test|enabled)")
     private const val beaconPluginUpdatePath = "/api/dashboard/agent-plugins/beacon/update"
+    // Beacon's own install from the app, and the gateway restart that finishes it: both POST only, both asked of the owner first.
+    private const val beaconPluginInstallPath = "/api/dashboard/agent-plugins/install"
+    private const val beaconPluginEnablePath = "/api/dashboard/agent-plugins/beacon/enable"
+    private const val gatewayRestartPath = "/api/gateway/restart"
     private const val deviceLinkPath = "/api/plugins/beacon/devices/link"
     private const val devicesPath = "/api/plugins/beacon/devices"
     private val devicePath = Regex("/api/plugins/beacon/devices/[A-Za-z0-9_-]{1,128}")
@@ -26,7 +30,7 @@ internal object NativeOperationPolicy {
     // The /api/plugins/beacon/* namespace is the optional extension's own routes, not upstream API.
     fun direct(path: String, method: String): Boolean {
         if (path == "/api/files/upload-stream") return method == "POST"
-        if (path == beaconPluginUpdatePath) return method == "POST"
+        if (path == beaconPluginUpdatePath || path == beaconPluginInstallPath || path == beaconPluginEnablePath || path == gatewayRestartPath) return method == "POST"
         if (path == "/api/plugins/beacon/sessions/pin") return method == "POST"
         if (path == deviceLinkPath) return method == "POST"
         if (path == devicesPath) return method == "GET"

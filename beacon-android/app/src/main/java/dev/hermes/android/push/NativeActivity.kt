@@ -49,7 +49,7 @@ fun presentNativeActivity(context: Context, source: String, event: String, activ
     if (kind == "activity_end") { finishNativeActivity(context,tag); return }
     if (!ongoingNativeKind(kind) || expires <= System.currentTimeMillis() / 1000 || dismissed(context, tag)) return
     ensureActivityChannels(manager)
-    val channel = if(kind in setOf("approval","clarify")) promptNotificationChannel(manager) else notificationChannel(kind)
+    val channel = if(kind in setOf("approval","clarify")) promptNotificationChannel(manager) else alertingChannel(manager, notificationChannel(kind))
     val tap = Intent(context, BeaconActivity::class.java).setData(android.net.Uri.parse("hermes://activity/${"$source\u0000$event".digest()}"))
         .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP).putExtra("push_source", source).putExtra("push_event", event)
     val fallback = notificationFallback(kind)

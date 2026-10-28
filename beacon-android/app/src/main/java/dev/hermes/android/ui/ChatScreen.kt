@@ -585,7 +585,14 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     val preferences by vm.preferences.collectAsStateWithLifecycle()
     val chatState by vm.chat.collectAsStateWithLifecycle()
     val composerDraft by vm.composer.collectAsStateWithLifecycle()
-    val messages = remember(chatState.messages, chatState.callMessages, chatState.sessionId) { dev.hermes.android.voice.interleaveCallMessages(visibleTranscriptMessages(chatState.messages), chatState.callMessages.map { Message("call:${it.eventId}", it.role, it.text, sessionId = chatState.sessionId, recordedAt = it.at) }) }
+    // Saved call turns and alerts sit among the messages by the time they happened.
+    val messages = remember(chatState.messages, chatState.callMessages, chatState.alerts, chatState.sessionId) {
+        dev.hermes.android.voice.interleaveCallMessages(
+            dev.hermes.android.voice.interleaveCallMessages(visibleTranscriptMessages(chatState.messages), chatState.callMessages.map { Message("call:${it.eventId}", it.role, it.text, sessionId = chatState.sessionId, recordedAt = it.at) }),
+            chatState.alerts.map { Message("alert:${it.noticeId}", "assistant", it.text, sessionId = chatState.sessionId, recordedAt = it.createdAt) },
+        )
+    }
+    val alertsByMessageId = remember(chatState.alerts) { chatState.alerts.associateBy { "alert:${it.noticeId}" } }
     val callTranscriptGroups = remember(chatState.callMessages) { groupCallTranscriptEvents(chatState.callMessages) }
     val callIdByMessageId = remember(messages) {
         messages.mapNotNull { message ->
@@ -606,10 +613,6 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     val taskResultKey = "task-result:${taskResultScope.key}"
     val taskResultData = profileDefaults[taskResultKey]
     val taskResult = taskResultData?.string("reason").orEmpty()
-    val taskResultNoticeId = taskResultData?.string("notice_id").orEmpty()
-    val taskResultIsEmailAlert = taskResultData?.optBoolean("email_alert") == true && taskResultNoticeId.isNotBlank()
-    var taskFeedbackSent by remember(taskResult, taskResultNoticeId, chat.sessionId) { mutableStateOf(taskResultData?.optBoolean("feedback_sent") == true) }
-    var taskFeedbackSending by remember(taskResult, taskResultNoticeId, chat.sessionId) { mutableStateOf(false) }
     val foldedToolResults = remember(chat.raw, chat.messages) { foldToolResults(chat.raw.rows("messages"), chat.messages) }
     val toolResultTitles = remember(chat.raw) { toolResultTitles(chat.raw.rows("messages")) }
     val call by vm.app.calls.state.collectAsStateWithLifecycle()
@@ -691,21 +694,21 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
         }.toMap()
     }
     val scope = rememberCoroutineScope()
-    fun sendTaskFeedback(verdict: String) {
-        if (taskFeedbackSending || !taskResultIsEmailAlert || verdict !in setOf("important", "not_important")) return
+    var alertsSending by remember(chat.sessionId) { mutableStateOf(emptySet<String>()) }
+    fun sendAlertFeedback(noticeId: String, verdict: String) {
+        if (noticeId in alertsSending || verdict !in setOf("important", "not_important")) return
         val source = vm.client ?: return
         val client = try { source.forAuthorizedProfile(ui.profile) } catch (_: Throwable) { vm.notice("Couldn't send feedback. Try again."); return }
-        taskFeedbackSending = true
+        alertsSending = alertsSending + noticeId
         scope.launch {
             try {
-                client.call("$PROACTIVE_SETTINGS_PATH/feedback", mapOf("profile" to ui.profile), method = "POST", data = json("notice_id" to taskResultNoticeId, "verdict" to verdict))
-                vm.clearTaskResult(taskResultScope, taskResultNoticeId)
-                taskFeedbackSent = true
+                client.call("$PROACTIVE_SETTINGS_PATH/feedback", mapOf("profile" to ui.profile), method = "POST", data = json("notice_id" to noticeId, "verdict" to verdict))
+                vm.alertChosen(taskResultScope, noticeId, verdict)
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
                 if (isMissingBeaconPluginRoute(error)) vm.storeData(proactiveKey, JSONObject().put("_pluginUpdateRequired", true))
                 else vm.notice(proactiveErrorMessage(error, "Couldn't send feedback. Try again."))
-            } finally { client.closeNative(); taskFeedbackSending = false }
+            } finally { client.closeNative(); alertsSending = alertsSending - noticeId }
         }
     }
     LaunchedEffect(promptSignature, promptText, promptMemory) {
@@ -795,13 +798,13 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
         }
     }
     // The reply being written and the message being sent join the run before them, as their stored forms will.
-    val groups = remember(visibleMessages, dayStarts, callGroupByFirstMessageId, liveShown, liveBubble, sendingShown) {
+    val groups = remember(visibleMessages, dayStarts, callGroupByFirstMessageId, alertsByMessageId, liveShown, liveBubble, sendingShown) {
         bubbleGroups(
             visibleMessages.map { it.value } + listOfNotNull(
                 Message(LIVE_REPLY_ID, "assistant", if (liveBubble) "live" else "").takeIf { liveShown },
                 Message(SENDING_MESSAGE_ID, "user", "sending").takeIf { sendingShown },
             ),
-            dayStarts.keys, callGroupByFirstMessageId.keys,
+            dayStarts.keys, callGroupByFirstMessageId.keys + alertsByMessageId.keys,
         )
     }
     // The newest line and the viewed mark of this chat, for the chat list's preview and unread dot.
@@ -918,6 +921,21 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
             callHistoryTargetId = ""
         }
     }
+    val alertFocus by vm.alertFocus.collectAsStateWithLifecycle()
+    LaunchedEffect(list, alertFocus, chat.sessionId, chat.projectionReady, visibleMessages) {
+        val target = alertFocus ?: return@LaunchedEffect
+        if (target.first.session != chat.sessionId || !chat.projectionReady) return@LaunchedEffect
+        // Until the alert is in the chat the scroll waits; the view model drops it once the newest read does not find it.
+        val index = visibleMessages.indexOfFirst { it.value.id == "alert:${target.second}" }
+        if (index < 0) return@LaunchedEffect
+        showSearch = false
+        search = ""
+        follow = false
+        withFrameNanos { }
+        snapshotFlow { list.layoutInfo.totalItemsCount }.first { it > index }
+        list.animateScrollToItem(index)
+        vm.consumeAlertFocus(target)
+    }
     val conversationEntry = remember { Animatable(1f) }
     LaunchedEffect(chat.sessionId, beacon, motionEnabled) {
         if (motionEnabled) { conversationEntry.snapTo(.35f); conversationEntry.animateTo(1f, tween(180, easing = FastOutSlowInEasing)) }
@@ -996,20 +1014,13 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                 ) {
                     Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(uiText(if (taskResultIsEmailAlert) "Important update" else "Task result"), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
-                            IconButton(onClick = { vm.clearTaskResult(taskResultScope, taskResultNoticeId, dismiss = true) }, modifier = Modifier.testTag("task-result-dismiss")) {
+                            Text(uiText("Task result"), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+                            IconButton(onClick = { vm.dismissTaskResult(taskResultScope) }, modifier = Modifier.testTag("task-result-dismiss")) {
                                 Icon(Icons.Rounded.Close, contentDescription = uiText("Dismiss"))
                             }
                         }
                         Column(Modifier.heightIn(max = 240.dp).verticalScroll(rememberScrollState())) {
                             Markdown(taskResult, vm, taskResultScope, interactive = false)
-                        }
-                        if (pluginStatus == "available" && taskResultIsEmailAlert) {
-                            if (taskFeedbackSent) Text(assistantText("Thanks — Beacon will remember."), Modifier.padding(start = 12.dp, bottom = 8.dp).testTag("task-result-feedback-sent"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            else Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                                TextButton(onClick = { sendTaskFeedback("important") }, enabled = !taskFeedbackSending && ui.connected && vm.client != null, modifier = Modifier.testTag("task-result-feedback-important")) { Text(uiText("Important")) }
-                                TextButton(onClick = { sendTaskFeedback("not_important") }, enabled = !taskFeedbackSending && ui.connected && vm.client != null, modifier = Modifier.testTag("task-result-feedback-not-important")) { Text(uiText("Not important")) }
-                            }
                         }
                     }
                 }
@@ -1046,10 +1057,15 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                     items(visibleMessages, key = { (_, message) -> callGroupByFirstMessageId[message.id]?.let { "call:${it.callId}" } ?: message.id }) { (index, message) ->
                         dayStarts[message.id]?.let { DateChip(uiText(it)) }
                         val group = callGroupByFirstMessageId[message.id]
+                        val alert = alertsByMessageId[message.id]
                         if (group != null) {
                             val metadata = callMetadata[group.callId]
                             CallTranscriptCard(group.callId, group.lines, metadata?.durationSeconds, metadata?.provider,
                                 assistantName = LocalAssistantName.current, modifier = Modifier.fillMaxWidth().padding(top = 10.dp), searchQuery = search)
+                        } else if (alert != null) {
+                            AlertRow(alert, groups[message.id] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax, vm, taskResultScope,
+                                canChoose = pluginStatus == "available" && ui.connected && vm.client != null && alert.noticeId !in alertsSending && alert.expiresAt > System.currentTimeMillis() / 1000,
+                                onChoose = { sendAlertFeedback(alert.noticeId, it) })
                         } else MessageRow(vm, message, transcriptIndex[message.id] ?: index, groups[message.id] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax, toolResultsByCallId = foldedToolResults.byCallId, resultTitle = toolResultTitles[message.id].orEmpty(), onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) })
                     }
                     if (liveShown) item("live") {
@@ -1543,6 +1559,28 @@ private const val SENDING_MESSAGE_ID = "sending-message"
         if (time != null) Text(time, Modifier.testTag("message-time:$messageId"), style = nativeMetadataStyle(), color = LocalContentColor.current.copy(alpha = .7f))
         else if (reserve) Text(" ", style = nativeMetadataStyle())
         if (tick != null) SendTickIcon(tick)
+    }
+}
+
+/** An email alert as Beacon's own message: its source over the words, then Important / Not important until the owner chooses. [canChoose] is false while sending, offline or once the alert has expired. */
+@Composable private fun AlertRow(alert: ChatAlert, group: BubbleGroup, bubbleMax: Dp, vm: BeaconViewModel, scope: Scope, canChoose: Boolean, onChoose: (String) -> Unit) {
+    val id = "alert:${alert.noticeId}"
+    Column(Modifier.fillMaxWidth().padding(top = if (group.startsRun) 10.dp else 3.dp).testTag("message-row:$id"), horizontalAlignment = Alignment.Start) {
+        ChatBubble(own = false, group, bubbleMax, Modifier.testTag("alert-message:${alert.noticeId}")) {
+            Row(Modifier.padding(bottom = 2.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                Icon(Icons.Rounded.Notifications, null, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.primary)
+                Text(alert.source.ifBlank { uiText("Important update") }, Modifier.testTag("alert-label:${alert.noticeId}"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+            }
+            BubbleText(alert.text, vm, scope, interactive = false)
+            if (alert.verdict.isNotBlank()) Text(
+                uiText(if (alert.verdict == "important") "Important" else "Not important") + " · " + assistantText("Thanks — Beacon will remember."),
+                Modifier.padding(top = 4.dp).testTag("alert-verdict:${alert.noticeId}"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            ) else if (alert.expiresAt > System.currentTimeMillis() / 1000) Row(Modifier.padding(top = 2.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                TextButton(onClick = { onChoose("important") }, enabled = canChoose, modifier = Modifier.testTag("alert-important:${alert.noticeId}")) { Text(uiText("Important")) }
+                TextButton(onClick = { onChoose("not_important") }, enabled = canChoose, modifier = Modifier.testTag("alert-not-important:${alert.noticeId}")) { Text(uiText("Not important")) }
+            }
+            BubbleMeta(alert.createdAt, id, null)
+        }
     }
 }
 

@@ -65,6 +65,18 @@ def test_only_exact_owned_live_draft_can_be_read_without_persisting(reader):
     assert server._sessions == {'runtime': live} and calls == []
 
 
+def test_a_probe_row_beside_the_chat_runtime_reads_the_running_one(reader):
+    native, server, _, _ = reader
+    owned = {'profile_home': '/profiles/default', 'auth_user_id': 'basic:owner', 'session_key': 'owned'}
+    server._sessions['probe'] = dict(owned, agent=None, running=False)
+    server._sessions['runtime'] = dict(owned, agent=object(), running=True, title='Live title')
+    value = native.conversation_snapshot('owner', 'basic', 'default', 'owned')
+    assert value['runtime_session_id'] == 'runtime' and value['active_stream_id'] == 'runtime'
+    assert value['messages'][0]['_row_id'] == 42  # the saved reply still feeds the notification preview
+    server._sessions['runtime']['running'] = False
+    assert native.conversation_snapshot('owner', 'basic', 'default', 'owned')['runtime_session_id'] == 'runtime'
+
+
 def test_idle_history_does_not_attach_open_requests_to_saved_transcript(reader):
     native, server, _, _ = reader
     live = {'session_key': 'owned', 'profile_home': '/profiles/default', 'auth_user_id': 'basic:owner', 'running': False}

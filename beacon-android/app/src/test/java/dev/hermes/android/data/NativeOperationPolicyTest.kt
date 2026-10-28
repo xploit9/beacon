@@ -116,9 +116,10 @@ class NativeOperationPolicyTest {
         assertTrue(NativeOperationPolicy.direct(path, "POST"))
         for (method in listOf("GET", "PUT", "PATCH", "DELETE", "post"))
             assertFalse("$method $path", NativeOperationPolicy.direct(path, method))
+        // Beacon's own install and enable are allowed for the in-app install (PluginInstallTest); its other actions stay out.
         for (other in listOf(
             "/api/dashboard/agent-plugins/other/update",
-            "/api/dashboard/agent-plugins/beacon/enable",
+            "/api/dashboard/agent-plugins/beacon/disable",
             "/api/dashboard/agent-plugins/beacon/update/",
         )) assertFalse("POST $other", NativeOperationPolicy.direct(other, "POST"))
     }

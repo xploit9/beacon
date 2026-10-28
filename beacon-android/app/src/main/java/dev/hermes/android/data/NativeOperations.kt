@@ -61,14 +61,17 @@ private const val HISTORY_WINDOW = 500
 private const val MAX_COMPRESSION_CHAIN = 512
 private const val OPTIONAL_VOICE_HISTORY_TIMEOUT_MS = 1_500L
 
-internal suspend fun BeaconClient.recoveredNativeSessionStatus(id: String): String? {
+/** One lazy resume of [id]: the runtime Hermes holds for it (the stream id) and that runtime's turn status; null when the answer is not about this conversation. */
+internal suspend fun BeaconClient.recoveredNativeSession(id: String): Pair<String, String?>? {
     if (!id.matches(storedSessionId)) return null
     // A resumed socket may bind a different runtime id than the stale ChatState stream id.
     // Lazy: a stored conversation resumes as usual; one Hermes no longer holds answers 4007 (unknown) instead of a new ownerless row.
     val binding = nativeSession(id, lazy = true)
     if (binding.scope != scope || binding.storedSessionId != id) return null
-    return nativeSessionStatus(id, binding.runtimeSessionId)
+    return binding.runtimeSessionId to nativeSessionStatus(id, binding.runtimeSessionId)
 }
+
+internal suspend fun BeaconClient.recoveredNativeSessionStatus(id: String): String? = recoveredNativeSession(id)?.second
 
 internal class NativeOperations(private val c: BeaconClient) {
     suspend fun call(path: String, q: Map<String, String>, method: String, body: JSONObject?, maxBytes: Int): JSONObject {
