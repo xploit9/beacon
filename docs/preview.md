@@ -4,7 +4,7 @@ The preview is Beacon's debug build for testing. It installs separately from the
 
 ## Stable channel
 - The `stable` build type has application ID `dev.hermes.android.stable` and launcher label "Beacon", so it installs beside production and the preview.
-- The current source builds stable version code `123`, version `1.1.13`. It inherits release minification and is not debuggable; this identifies the source configuration, not a newly accepted or published binary.
+- The current source builds stable version code `124`, version `1.1.14`. It inherits release minification and is not debuggable; this identifies the source configuration, not a newly accepted or published binary.
 - A stable APK is unsigned unless `beaconStableSigning` (or `BEACON_STABLE_SIGNING`) points to an external properties file with the four Android signing fields. Never store that file or its keystore in this repository. The stable signer is separate from production.
 - Release assets are named `Beacon-<version>.apk` and `Beacon-<version>.json`; Settings **App updates** asks the public GitHub release itself and verifies the APK before installation.
 
@@ -14,7 +14,7 @@ Stable builds check the latest GitHub release themselves and notify you when a n
 ## What the preview is
 - It is the existing `debug` build type. Nothing else is added (no product flavors, no new dependencies).
 - Application ID `dev.hermes.android.debug`, so it installs **next to** production `dev.hermes.android` and never upgrades it.
-- The current source version name is `1.1.13-preview`. The launcher label is "Beacon Preview" (set only in `app/src/debug/AndroidManifest.xml`); the release label stays "Beacon".
+- The current source version name is `1.1.14-preview`. The launcher label is "Beacon Preview" (set only in `app/src/debug/AndroidManifest.xml`); the release label stays "Beacon".
 - It is signed with the local Android debug key, not the production signer. Android will never accept it as an update to production, and production cannot update it.
 - It is a debuggable build. `src/debug/res/xml/fixture_network_security.xml` allows cleartext only to `10.0.2.2` for the local crash reporter, and trusts the bundled test-fixture CA (`beacon_fixture_ca.pem`) through `debug-overrides`. Use the preview only on your own test devices.
 

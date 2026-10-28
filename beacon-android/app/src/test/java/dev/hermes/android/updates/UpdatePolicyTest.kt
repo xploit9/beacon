@@ -51,6 +51,14 @@ class UpdatePolicyTest {
         assertFalse(sameCodeDifferentBytes(23, "c".repeat(64), release))
     }
 
+    @Test fun aReleaseOlderThanOneAlreadySeenIsNotOffered() {
+        assertFalse(olderThanSeen(0, release))
+        assertFalse(olderThanSeen(22, release))
+        assertFalse(olderThanSeen(21, release))
+        // A newer one was published and withdrawn: this older version could carry bytes that were never published.
+        assertTrue(olderThanSeen(23, release))
+    }
+
     @Test fun releasesSurviveTheirPhoneLocalCopy() {
         assertEquals(release, Release.decode(release.encode()))
         assertNull(Release.decode(null))

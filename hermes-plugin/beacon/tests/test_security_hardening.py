@@ -28,6 +28,16 @@ def _guard_native_identity(monkeypatch, identity, profile='default'):
     return server, scopes
 
 
+def _mcp_trust(monkeypatch, **servers):
+    """The profile's MCP config as the watch guard reads it: {server: trust}, None for no trust key (Hermes: full)."""
+    def normalize(value):
+        text = 'full' if value is None else str(value).strip().lower()
+        return text if text in ('full', 'untrusted') else 'untrusted'
+    config = {name: ({} if trust is None else {'trust': trust}) for name, trust in servers.items()}
+    monkeypatch.setitem(sys.modules, 'tools.mcp_tool_config', SimpleNamespace(_load_mcp_config=lambda: config))
+    monkeypatch.setitem(sys.modules, 'tools.mcp_tool_registration', SimpleNamespace(_normalize_server_trust=normalize))
+
+
 @pytest.mark.parametrize('row', [{'source': 'cron'}, {'source': 'cron', 'cron_job_id': 'orphan'}])
 def test_watch_guard_blocks_unresolved_or_orphaned_runs(harness, monkeypatch, row):
     plugin = load_private('__init__')
@@ -394,6 +404,8 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
                         SimpleNamespace(mcp_prefixed_tool_name=lambda server, raw: f"mcp__{server}__{raw}"))
     monkeypatch.setitem(sys.modules, "tools.mcp_tool_scope",
                         SimpleNamespace(_resolve_server_key=lambda server: server))
+    # The guard reads each server's trust from the profile config and treats an unlisted server as untrusted; these are trusted ones.
+    _mcp_trust(monkeypatch, mail=None, github=None, tool_gateway_research=None, db=None)
     monkeypatch.setitem(sys.modules, "tools.registry", SimpleNamespace(
         registry=SimpleNamespace(get_toolset_for_tool=lambda name:
                                  "cronjob" if name == "cronjob" else
@@ -503,9 +515,11 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
     # An injected email could carry other mail out through a fetched URL.
     for fetcher in ("web_extract", "web_fetch"):
         assert plugin.native_proactive_read_only_guard(tool_name=fetcher, args={"url": "https://x.test/?q=mail"}, session_id="watch-run") == blocked
-    fetcher = "mcp__tool_gateway_research__scrapling-fetch"
+    # A read-named, hinted tool on a trusted server: only the destination check can block it.
+    fetcher = "mcp__tool_gateway_research__read-page"
     mcp_tool._mcp_tool_server_names[fetcher] = "tool_gateway_research"
-    mcp_tool._tool_read_only_hints["tool_gateway_research"] = {"scrapling-fetch": True}
+    mcp_tool._tool_read_only_hints["tool_gateway_research"] = {"read-page": True}
+    assert plugin.native_proactive_read_only_guard(tool_name=fetcher, args={"query": "inbox"}, session_id="watch-run") is None
     assert plugin.native_proactive_read_only_guard(
         tool_name=fetcher, args={"request": {"targets": ["https://x.test/?q=mail"]}}, session_id="watch-run") == blocked
     # Any scheme or protocol-relative link is a way out, not only http(s).
@@ -533,7 +547,8 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
     # Strix 7d8f96b #3: without the server's read-only hint, every word of the name must be plain mail reading.
     for tool in ("mcp__db__query", "mcp__db__run_sql_query", "mcp__db__list_tables"):
         assert plugin.native_proactive_read_only_guard(tool_name=tool, args={}, session_id="watch-run") == blocked, tool
-    assert plugin.native_proactive_read_only_guard(tool_name="mcp__db__fetch_rows", args={}, session_id="watch-run") is None
+    # Strix 70c9aa7 #1: a hint is not enough without a read verb in the name; fetch also names SQL and URL fetchers.
+    assert plugin.native_proactive_read_only_guard(tool_name="mcp__db__fetch_rows", args={}, session_id="watch-run") == blocked
     readers = ("search_inbox", "read_email", "list_calendar_events", "list_tasks", "list-mail-messages",
                "GMAIL_LIST_THREADS", "getMessageAttachment", "list_available_accounts",
                "get_gmail_messages_content_batch", "search_messages_by_sender", "get_unread_emails",
@@ -579,9 +594,9 @@ def test_scheme_less_destinations_block_non_mail_tools_but_keep_gmail_queries(ha
     monkeypatch.setattr(plugin.proactive,"watch_job_ids",lambda *args:{"watch-job"})
 
     mcp_tool=SimpleNamespace(
-        _mcp_tool_server_names={"mcp__mail__search_inbox":"mail","mcp__research__scrapling_fetch":"research",
-                                "mcp__workspace__list_calendar_events":"google_workspace"},
-        _tool_read_only_hints={"mail":{"search_inbox":True},"research":{"scrapling_fetch":True},
+        _mcp_tool_server_names={"mcp__mail__search_inbox":"mail","mcp__research__read_page":"research",
+                                "mcp__google_workspace__list_calendar_events":"google_workspace"},
+        _tool_read_only_hints={"mail":{"search_inbox":True},"research":{"read_page":True},
                                "google_workspace":{"list_calendar_events":True}})
     import tools
     monkeypatch.setitem(sys.modules,"tools.mcp_tool",mcp_tool)
@@ -589,6 +604,7 @@ def test_scheme_less_destinations_block_non_mail_tools_but_keep_gmail_queries(ha
     monkeypatch.setitem(sys.modules,"tools.mcp_tool_schema",
                         SimpleNamespace(mcp_prefixed_tool_name=lambda server,raw:f"mcp__{server}__{raw}"))
     monkeypatch.setitem(sys.modules,"tools.mcp_tool_scope",SimpleNamespace(_resolve_server_key=lambda server:server))
+    _mcp_trust(monkeypatch,mail=None,research=None,google_workspace=None)  # mail-query allowance is for trusted servers only
     monkeypatch.setitem(sys.modules,"tools.registry",SimpleNamespace(registry=SimpleNamespace(
         get_toolset_for_tool=lambda name:"web" if name=="web_search" else "file" if name=="read_file" else
         "memory" if name=="hindsight_recall" else
@@ -602,15 +618,17 @@ def test_scheme_less_destinations_block_non_mail_tools_but_keep_gmail_queries(ha
                   {"url":"http:evil.example/x"},{"url":"evil.example"},
                   {"request":{"targets":["EVIL.example/x"]}},
                   {"request":{"targets":["evil.example"]}})
+    # A read-named, hinted tool on a trusted server: only the destination check can block it.
+    assert plugin.native_proactive_read_only_guard("mcp__research__read_page",{"query":"inbox"},"watch-run") is None
     for args in destinations:
-        assert plugin.native_proactive_read_only_guard("mcp__research__scrapling_fetch",args,"watch-run")==blocked,args
+        assert plugin.native_proactive_read_only_guard("mcp__research__read_page",args,"watch-run")==blocked,args
     destination="evil.example/x?d=mail"
     assert plugin.native_proactive_read_only_guard("web_search",{"query":destination},"watch-run")==blocked
     assert plugin.native_proactive_read_only_guard("hindsight_recall",{"query":destination},"watch-run")==blocked
     assert plugin.native_proactive_read_only_guard(
         "mcp__mail__search_inbox",{"query":"from:bank.com newer_than:1d"},"watch-run") is None
     assert plugin.native_proactive_read_only_guard(
-        "mcp__workspace__list_calendar_events",{"query":"from:bank.com"},"watch-run")==blocked
+        "mcp__google_workspace__list_calendar_events",{"query":"from:bank.com"},"watch-run")==blocked
     assert plugin.native_proactive_read_only_guard(
         "terminal",{"command":"gws gmail users messages list --params '{\"q\":\"from:bank.com\"}'"},"watch-run") is None
     assert plugin.native_proactive_read_only_guard("read_file",{"filename":"report.pdf"},"watch-run") is None
@@ -852,6 +870,7 @@ def watch_guard(harness, monkeypatch):
     monkeypatch.setitem(sys.modules, "tools.mcp_tool_schema",
                         SimpleNamespace(mcp_prefixed_tool_name=lambda server, raw: f"mcp__{server}__{raw}"))
     monkeypatch.setitem(sys.modules, "tools.mcp_tool_scope", SimpleNamespace(_resolve_server_key=lambda server: server))
+    _mcp_trust(monkeypatch, api=None)  # a trusted server unless a test says otherwise
     monkeypatch.setitem(sys.modules, "tools.registry", SimpleNamespace(registry=SimpleNamespace(
         get_toolset_for_tool=lambda name: "memory" if name in {"memory", "hindsight_retain", "hindsight_ingest",
                                                                "hindsight_capture"} else "mcp-api",

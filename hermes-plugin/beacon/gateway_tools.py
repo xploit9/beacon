@@ -226,10 +226,13 @@ WRITE_WORDS = frozenset({
     'unstar','download','export','attach','respond','rsvp','confirm','dismiss','clear','reset',
     'assign','subscribe','react','sync','publish','change','hide','unhide','purge','tag','untag',
     'categorize','report','unmark','untrash','unarchive','unlabel','unmute','unsnooze','unblock',
-    'empty','reschedule','revoke','trigger','install','edit','enable','disable','pause','resume','schedule'})
+    'empty','reschedule','revoke','trigger','install','edit','enable','disable','pause','resume','schedule',
+    'message','ping','alert','comment','escalate','triage','process','truncate','rotate','suspend','terminate',
+    'drop','rebuild','reindex','kill','restart','reboot','rollback','revert','resend','ban'})
+# 'and', 'or' and 'then' chain a second action; they are not WRITE_WORDS because a read action may say "list or search".
 UNSAFE_NAME_WORDS = WRITE_WORDS | frozenset({
     'exec','sql','call','invoke','eval','shell','command','script','http','request',
-    'and','then','book','reserve','purchase','buy','checkout','complete','finish',
+    'and','or','then','book','reserve','purchase','buy','checkout','complete','finish',
     'resolve','deliver','dispatch','erase','discard','destroy','wipe','grant','refund',
     'redeem','settle','enrol','enroll','register','unregister','upgrade','downgrade',
     'unfollow','unlink','unlock','detach','disconnect','connect','topup','claim','vote',
@@ -237,8 +240,10 @@ UNSAFE_NAME_WORDS = WRITE_WORDS | frozenset({
 # query, fetch and check also name SQL runners and URL fetchers, so they do not count as reads by name alone.
 READ_NAME_WORDS = frozenset({'get','list','search','read','find','view','show','describe','lookup'})
 # Words of the lists above that are also plain nouns: after a leading read verb they name a thing, not an action
-# (get_pull_request, get_commit, get_workflow_run).
-NOUN_NAME_WORDS = frozenset({'request','call','commit','run','label','report','draft','tag','change','schedule'})
+# (get_pull_request, get_commit, get_workflow_run, get_message). The added verbs ping, escalate, triage, truncate, rotate,
+# suspend and terminate are not nouns, so they write even after a read verb.
+NOUN_NAME_WORDS = frozenset({'request','call','commit','run','label','report','draft','tag','change','schedule',
+                             'message','alert','comment','process'})
 ACTION_NAME_WORDS = UNSAFE_NAME_WORDS - NOUN_NAME_WORDS
 
 
@@ -248,7 +253,7 @@ def name_words(text):
 
 def name_writes(raw):
     """A tool name that carries a write. After a leading read verb only a real action counts: get_pull_request reads,
-    get_and_delete_x writes ('and' chains a second action)."""
+    get_and_delete_x and get_or_call_user write ('and', 'or' and 'then' chain a second action)."""
     words=name_words(raw)
     return bool(set(words)&(ACTION_NAME_WORDS if words and words[0] in READ_NAME_WORDS else UNSAFE_NAME_WORDS))
 

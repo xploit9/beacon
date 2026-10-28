@@ -190,6 +190,14 @@ def test_a_read_only_tool_naming_a_write_in_its_action_still_needs_approval(gate
     ('send_report','full',True,False),
     ('run_workflow','full',True,False),
     ('get_pull_request','untrusted',True,False),
+    # Strix 70c9aa7 #2: 'or' chains a second action, the added write verbs ask, and an added noun after a read verb still reads.
+    ('get_or_call_user','full',True,False),
+    ('list_or_run','full',True,False),
+    ('message_user','full',True,False),
+    ('rotate_secret','full',True,False),
+    ('get_message','full',True,True),
+    ('get_process','full',True,True),
+    ('get_message','untrusted',True,False),
 ],ids=lambda value:str(value))
 def test_a_servers_read_only_annotation_needs_a_name_that_agrees(gateway,monkeypatch,raw,trust,annotated,expected):
     api,backend,_=gateway
@@ -221,6 +229,46 @@ def test_a_servers_read_only_annotation_needs_a_name_that_agrees(gateway,monkeyp
     assert (receipt['status']=='needs_approval')==(not expected)
     if expected: assert settled(api,'r1')['status']=='completed'
     else: assert not backend.calls
+
+
+ADDED_WRITE_VERBS=('message','ping','alert','comment','escalate','triage','process','truncate','rotate','suspend','terminate',
+                   'drop','rebuild','reindex','kill','restart','reboot','rollback','revert','resend','ban')
+ADDED_NOUNS=('message','alert','comment','process')
+
+
+# Strix 70c9aa7 #2: these verbs were missing from the lists, so a name or an action built from them read as a read.
+@pytest.mark.parametrize('verb',ADDED_WRITE_VERBS)
+def test_each_added_write_verb_writes_as_a_tool_name_and_as_an_action(verb):
+    assert g.name_writes(f'{verb}_target') and not g.mcp_reads_by_name(f'{verb}_target','full')
+    assert g.writes_by_action({'action':verb}) and g.writes_by_action({'Operation':verb.upper()})
+    assert g.name_writes(f'get_and_{verb}') and g.name_writes(f'search_or_{verb}')
+
+
+@pytest.mark.parametrize('verb',[word for word in ADDED_WRITE_VERBS if word not in ADDED_NOUNS])
+def test_an_added_verb_that_is_not_a_noun_still_writes_after_a_leading_read_verb(verb):
+    assert g.name_writes(f'get_{verb}') and g.name_writes(f'list_{verb}_status')
+
+
+@pytest.mark.parametrize('name',['get_message','getMessage','get_comment','list_comments','get_process','get_alert',
+                                 'read_message_thread','search_messages'])
+def test_an_added_noun_after_a_leading_read_verb_is_a_thing_not_an_action(name):
+    assert not g.name_writes(name) and g.mcp_reads_by_name(name,'full')
+
+
+def test_an_untrusted_server_counts_an_added_noun_as_a_write_like_every_other_noun():
+    assert not g.mcp_reads_by_name('get_message','untrusted') and not g.mcp_reads_by_name('get_comment','untrusted')
+    assert g.mcp_reads_by_name('list_comments','untrusted')
+
+
+# 'get_x_or_delete_y' already wrote through 'delete'; the others read before 'or' chained, because call and run are nouns.
+@pytest.mark.parametrize('name',['get_or_call_user','get_or_run_pipeline','list_or_run','getOrCallUser','get_x_or_delete_y',
+                                 'search_or_message_user'])
+def test_or_chains_a_second_action_like_and_and_then(name):
+    assert g.name_writes(name) and not g.mcp_reads_by_name(name,'full') and not g.mcp_reads_by_name(name,'untrusted')
+
+
+def test_or_in_an_action_argument_is_not_a_write_by_itself():
+    assert not g.writes_by_action({'action':'list or search'}) and g.writes_by_action({'action':'list or delete'})
 
 
 def test_deny_expiry_and_reconfiguration_never_execute(gateway):

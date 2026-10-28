@@ -325,6 +325,16 @@ def _plain_mail_read(raw_name):
     reads=bool(words&read_words) or ('fetch' in words and bool(words&_FETCHED_MAIL_WORDS))
     return reads and words<=read_words|_MAIL_NAME_WORDS|{'fetch'}
 
+def _mcp_server_trust(server_name):
+    # Read like the call gateway, from the profile's MCP config (call inside its profile scope); anything unreadable is untrusted.
+    try:
+        from tools.mcp_tool_config import _load_mcp_config
+        from tools.mcp_tool_registration import _normalize_server_trust
+        config=_load_mcp_config().get(server_name)
+        return _normalize_server_trust(config.get('trust')) if isinstance(config,dict) else 'untrusted'
+    except Exception:
+        return 'untrusted'
+
 def _mcp_tool_entry(tool_name,profile):
     try:
         from hermes_cli.web_server_profiles import _profile_scope
@@ -335,9 +345,10 @@ def _mcp_tool_entry(tool_name,profile):
         if not isinstance(server_name,str) or not server_name: return None
         with _profile_scope(profile):
             hints=mcp_tool._tool_read_only_hints.get(_resolve_server_key(server_name),{}) or {}
+            trust=_mcp_server_trust(server_name)
         for raw_name,hint in hints.items():
             if mcp_prefixed_tool_name(server_name,raw_name)==tool_name:
-                return raw_name,hint,server_name
+                return raw_name,hint,server_name,trust
     except Exception:
         return None
     return None
@@ -346,10 +357,15 @@ def _mcp_tool_entry(tool_name,profile):
 def _mcp_read_only(tool_name,profile):
     entry=_mcp_tool_entry(tool_name,profile)
     if not entry: return False
-    raw_name,hint,_=entry
-    # Hermes accepts unannotated mail reads by name, but a read word never excuses a possible write verb.
-    # The guard takes the server's read-only hint whatever the server's trust; the name rule only catches honest mistakes.
-    return not _gateway_tools().name_writes(raw_name) and (hint is True or _plain_mail_read(raw_name))
+    raw_name,hint,_,trust=entry
+    # Hermes asks the owner about an untrusted server's tool that lacks its own read-only hint, so the unannotated mail read
+    # by name stands on a trusted server only. A plain mail name is a closed read/mail vocabulary, which needs no name_writes
+    # check (and must not trip on the mail noun 'message').
+    if trust!='untrusted' and _plain_mail_read(raw_name): return True
+    # The hint is the server's own claim, and a watch runs unattended over mail it did not write, so the name must also hold a
+    # read word: a deny-list alone kept missing verbs (cleanup, deploy_*, fetch_rows). An untrusted server also bars nouns
+    # (the call gateway's rule). shortcut: a read word plus a write verb on no list still passes; add such verbs to WRITE_WORDS.
+    return hint is True and _named_read_only(raw_name) and _gateway_tools().mcp_reads_by_name(raw_name,trust)
 
 def _reads_by_method(args,schema):
     return _gateway_tools().reads_by_method(args,schema)
@@ -357,12 +373,12 @@ def _reads_by_method(args,schema):
 def _mail_provider_read(tool_name,profile):
     entry=_mcp_tool_entry(tool_name,profile)
     if not entry: return False
-    raw_name,_,server_name=entry
+    raw_name,_,server_name,trust=entry
     words=_tool_words(raw_name)
     providers=_tool_words(server_name)
-    return (_plain_mail_read(raw_name) and bool(words&_FETCHED_MAIL_WORDS)
-            and bool((words|providers)&_MAIL_PROVIDER_WORDS)
-            and not _gateway_tools().name_writes(raw_name))
+    # The mail-query allowance rests on the tool's name, so an untrusted server (whose names may lie) never gets it.
+    return (trust!='untrusted' and _plain_mail_read(raw_name) and bool(words&_FETCHED_MAIL_WORDS)
+            and bool((words|providers)&_MAIL_PROVIDER_WORDS))
 
 
 _DESTINATION_FIELDS={'url','uri','urls','link','href','host','hostname','domain','endpoint','server','webhook','feed',

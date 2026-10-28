@@ -201,6 +201,22 @@ class UpdateMigrationDeviceTest {
         if (app.packageManager.canRequestPackageInstalls()) assertEquals(UpdateFailure.Verification, settled.failure) else assertEquals(UpdatePhase.NeedsPermission, settled.phase)
     }
 
+    @Test fun aReleaseOlderThanOneAlreadySeenIsNeitherOfferedNorKeptForTheNextStart() = runBlocking {
+        val github = FakeGitHub(code = installedCode + 2, name = "99.0.2")
+        val manager = manager(github)
+        manager.backgroundCheck()
+        assertEquals(installedCode + 2, manager.state.value.release?.version)
+        // The newer release is withdrawn and an older one, with bytes never published before, takes its place.
+        github.code = installedCode + 1; github.name = "99.0.1"; github.digest = "c".repeat(64); github.etag = "\"v2\""
+        dueAgain()
+        manager.backgroundCheck()
+        assertNull(manager.state.value.release)
+        assertNull(manager.state.value.failure)
+        assertFalse(prefs.contains("release"))
+        // A restart reads the stored release back without asking GitHub, as the install after Android's permission screen does.
+        assertNull(manager(github).state.value.release)
+    }
+
     @Test fun anUpdateTapDownloadsTheReleaseGitHubHasNowAndNotTheOneFromTheLastCheck() = runBlocking {
         val sessions = sessionsBefore
         val github = FakeGitHub()

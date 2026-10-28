@@ -17,6 +17,9 @@ fun newerRelease(release: Release, packageName: String, installedVersion: Long, 
 internal fun sameCodeDifferentBytes(seenCode: Long, seenSha: String, release: Release): Boolean =
     seenCode != 0L && release.version == seenCode && !release.sha.equals(seenSha, true)
 
+/** A release older than one already seen is never offered, so a withdrawn version cannot make way for bytes never published. */
+internal fun olderThanSeen(seenCode: Long, release: Release): Boolean = seenCode != 0L && release.version < seenCode
+
 internal const val UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60_000L
 internal const val UPDATE_OFFER_REFRESH_MS = 30 * 60_000L
 private const val UPDATE_RETRY_MS = 15 * 60_000L

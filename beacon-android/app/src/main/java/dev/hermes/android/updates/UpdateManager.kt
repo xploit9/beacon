@@ -135,7 +135,7 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
                 clearPending()
             }
         }
-        val latest = Release.decode(prefs.getString("release", null))?.takeIf { it.packageName == app.packageName }
+        val latest = Release.decode(prefs.getString("release", null))?.takeIf { it.packageName == app.packageName && !olderThanSeen(prefs.getLong("seen_code", 0), it) }
         val updated = prefs.getString("updated_name", null)?.takeIf(String::isNotBlank)?.let { UpdatedNotice(it, prefs.getString("updated_notes", "").orEmpty()) }
         publish { copy(latest = latest, release = latest?.takeIf { it.version > installed }, checkedAt = prefs.getLong("last_check", 0), updated = updated) }
     }
@@ -201,7 +201,8 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
             val edit = prefs.edit().putLong("last_check", now)
             if (found is LatestRelease.Found) {
                 edit.putString("etag", found.etag.orEmpty())
-                if (latest != null) edit.putString("release", latest.encode()) else edit.remove("release")
+                // Only what vet accepted is kept: a start-up offer and the permission-return install read this back unchecked.
+                if (vetted != null) edit.putString("release", vetted.encode()) else edit.remove("release")
             }
             edit.commit()
         }
@@ -215,12 +216,14 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
         return if (error is UpdateException && !network || error is IllegalArgumentException || error is IllegalStateException) UpdateFailure.CheckVerification else UpdateFailure.Check
     }
 
-    /** Fails closed: returns the release for this build, null when it is for another package, and throws when it is not trustworthy. */
+    /** Fails closed: returns the release for this build, null when it is for another package or older than one already seen, and throws when it is not trustworthy. */
     private fun vet(candidate: Release): Release? {
         if (candidate.packageName != app.packageName) return null
         try { newerRelease(candidate, app.packageName, updater.installedVersion(), updater.signer()) }
         catch (error: IllegalArgumentException) { throw UpdateException(UpdateException.Kind.Verification, error.message.orEmpty(), error) }
         synchronized(lock) {
+            // Only the highest version's bytes are pinned, so an older one than that is not offered at all.
+            if (olderThanSeen(prefs.getLong("seen_code", 0), candidate)) return null
             if (sameCodeDifferentBytes(prefs.getLong("seen_code", 0), prefs.getString("seen_sha", "").orEmpty(), candidate))
                 throw UpdateException(UpdateException.Kind.Verification, "A published Beacon version cannot be replaced with different APK bytes.")
             if (candidate.version >= prefs.getLong("seen_code", 0)) prefs.edit().putLong("seen_code", candidate.version).putString("seen_sha", candidate.sha).commit()
