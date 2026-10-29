@@ -124,6 +124,29 @@ class NativeOperationPolicyTest {
         )) assertFalse("POST $other", NativeOperationPolicy.direct(other, "POST"))
     }
 
+    @Test fun profilesCanBeListedCreatedDescribedAndDeletedAndNothingElse() {
+        assertTrue(NativeOperationPolicy.direct("/api/profiles", "GET"))
+        assertTrue(NativeOperationPolicy.direct("/api/profiles", "POST"))
+        for (method in listOf("PUT", "PATCH", "DELETE", "post")) assertFalse("$method /api/profiles", NativeOperationPolicy.direct("/api/profiles", method))
+        // The sticky "active profile" is read-only: choosing a profile goes through the profile switch.
+        assertTrue(NativeOperationPolicy.direct("/api/profiles/active", "GET"))
+        for (method in listOf("POST", "PUT", "PATCH", "DELETE")) assertFalse("$method /api/profiles/active", NativeOperationPolicy.direct("/api/profiles/active", method))
+
+        for (name in listOf("coder", "my-bot_2", "a", "9lives", "x".repeat(64))) {
+            assertTrue("DELETE $name", NativeOperationPolicy.direct("/api/profiles/$name", "DELETE"))
+            assertTrue("PUT $name role", NativeOperationPolicy.direct("/api/profiles/$name/description", "PUT"))
+            for (method in listOf("GET", "POST", "PUT", "PATCH", "delete")) assertFalse("$method $name", NativeOperationPolicy.direct("/api/profiles/$name", method))
+            for (method in listOf("GET", "POST", "PATCH", "DELETE")) assertFalse("$method $name role", NativeOperationPolicy.direct("/api/profiles/$name/description", method))
+        }
+        // The built-in profile cannot be deleted from here (its role can be set); anything that is not a plain profile id is refused.
+        assertFalse(NativeOperationPolicy.direct("/api/profiles/default", "DELETE"))
+        assertTrue(NativeOperationPolicy.direct("/api/profiles/default/description", "PUT"))
+        for (path in listOf(
+            "/api/profiles/", "/api/profiles/Coder", "/api/profiles/-x", "/api/profiles/_x", "/api/profiles/x y", "/api/profiles/..", "/api/profiles/../auth/me",
+            "/api/profiles/a/b", "/api/profiles/${"x".repeat(65)}", "/api/profiles/coder/soul", "/api/profiles/coder/description/extra", "/api/profiles/sessions/pull-requests",
+        )) for (method in listOf("GET", "POST", "PUT", "PATCH", "DELETE")) assertFalse("$method $path", NativeOperationPolicy.direct(path, method))
+    }
+
     @Test fun deviceRoutesAllowOnlyTheirDeclaredMethods() {
         assertTrue(NativeOperationPolicy.direct("/api/plugins/beacon/devices/link", "POST"))
         assertTrue(NativeOperationPolicy.direct("/api/plugins/beacon/devices", "GET"))

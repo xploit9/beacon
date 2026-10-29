@@ -88,7 +88,7 @@ import dev.hermes.android.data.BeaconClient
                                 val entries = if (showHidden) allEntries else allEntries.filterNot { it.string("name").startsWith(".") }
                                 if (allEntries.isEmpty()) item { EmptyState(uiText("This folder is empty"), uiText("Create or upload a file to start working here."), Icons.Rounded.FolderOpen, action = if (actual.isNotBlank()) uiText("Create file") else "", onAction = createFile) }
                                 else if (entries.isEmpty()) item { EmptyState(uiText("Only hidden items here"), uiText("Show hidden files to see them."), Icons.Rounded.VisibilityOff, action = uiText("Show hidden files"), onAction = { showHidden = true }) }
-                                items(entries, key = { it.getString("path") }) { file ->
+                                items(entries, key = ::fileRowKey) { file ->
                                     val path = file.getString("path")
                                     val folder = file.optBoolean("is_directory")
                                     var actions by remember(path) { mutableStateOf(false) }
@@ -150,3 +150,7 @@ import dev.hermes.android.data.BeaconClient
         } }, confirmButton = { TextButton(onClick = { review = false; vm.acceptEditorBase() }) { Text(uiText("Use my draft")) } },
         dismissButton = { TextButton(onClick = { review = false }) { Text(uiText("Back to editor")) } })
 }
+
+/** A file or folder row's list key. Windows shortcut folders (My Documents, Application Data) are listed under the path of the
+ *  folder they point to, so a path alone repeats in one listing and a lazy list throws on the duplicate key while scrolling. */
+internal fun fileRowKey(row: org.json.JSONObject): String = row.string("path") + "\u0000" + row.string("name")

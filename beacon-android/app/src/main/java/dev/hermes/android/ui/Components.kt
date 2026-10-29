@@ -119,11 +119,11 @@ fun formBody(form: ActionForm): JSONObject {
 }
 val LocalOpenNavigationMenu = staticCompositionLocalOf<(() -> Unit)?> { null }
 
-@Composable fun Header(title: String, subtitle: String = "", back: (() -> Unit)? = null, menu: (() -> Unit)? = null, actions: @Composable RowScope.() -> Unit = {}) {
+@Composable fun Header(title: String, subtitle: String = "", back: (() -> Unit)? = null, menu: (() -> Unit)? = null, liveSubtitle: Boolean = false, actions: @Composable RowScope.() -> Unit = {}) {
     Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
         menu?.takeIf { back == null }?.let { toggle -> IconButton(onClick = toggle, modifier = Modifier.testTag("navigation-toggle")) { Icon(Icons.Rounded.Menu, uiText(if (LocalPersistentNavigation.current) "Hide navigation" else "Show navigation")) } }
         if (back != null) IconButton(onClick = back) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, uiText("Back")) }
-        Column(Modifier.weight(1f)) { Text(title, Modifier.semantics { heading() }, style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis); if (subtitle.isNotBlank()) Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
+        Column(Modifier.weight(1f)) { Text(title, Modifier.semantics { heading() }, style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis); if (subtitle.isNotBlank()) Text(subtitle, if (liveSubtitle) Modifier.semantics { liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite } else Modifier, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
         actions()
     }
 }
@@ -434,7 +434,6 @@ internal fun bubbleShape(own: Boolean, joinedTop: Boolean, tail: Boolean): Round
     thread: Boolean = false,
     streaming: Boolean = false,
     selected: Boolean = false,
-    beacon: Boolean = false,
 ) {
     val scheme = MaterialTheme.colorScheme
     val unreadLabel = uiText("Unread reply")
@@ -443,7 +442,7 @@ internal fun bubbleShape(own: Boolean, joinedTop: Boolean, tail: Boolean): Round
             .then(if (unread) Modifier.semantics { stateDescription = unreadLabel } else Modifier),
         verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
     ) {
-        ChatAvatar(title, id, size = 48.dp, beacon = beacon)
+        ChatAvatar(title, id, size = 48.dp)
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {

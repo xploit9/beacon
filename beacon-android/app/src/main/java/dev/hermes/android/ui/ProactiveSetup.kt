@@ -53,6 +53,7 @@ import java.util.Locale
 
 private val proactiveTimePattern = Regex("(?:[01]\\d|2[0-3]):[0-5]\\d")
 private val proactiveHealthTime = DateTimeFormatter.ofPattern("HH:mm")
+private val proactiveHealthDay = DateTimeFormatter.ofPattern("d MMM, HH:mm")
 
 internal fun proactiveSettingsBody(
     enabled: Boolean,
@@ -86,29 +87,25 @@ internal fun proactiveCallsUnavailable(proactive: JSONObject?, delivery: String,
     return (0 until rules.length()).any { rules.optJSONObject(it)?.string("action") == "call" }
 }
 
-internal fun proactiveHealthText(proactive: JSONObject): String {
-    val health = proactive.optJSONObject("health") ?: JSONObject()
-    return when (health.string("state", "unknown")) {
-        "ok" -> {
-            val checkedAt = health.optLong("checked_at")
-            if (checkedAt <= 0) "Checked"
-            else {
-                val timezone = runCatching { ZoneId.of(proactive.string("timezone")) }.getOrDefault(ZoneId.systemDefault())
-                "Checked ${Instant.ofEpochSecond(checkedAt).atZone(timezone).format(proactiveHealthTime)}"
-            }
-        }
-        "error" -> "Couldn't check: ${health.string("message").ifBlank { "Try again." }}"
-        else -> "Not checked yet"
-    }
-}
-
-internal enum class ProactiveHealthState { Checking, Ok, NotYet, Failed }
+internal enum class ProactiveHealthState { Checking, Ok, Quiet, NotYet, Failed }
 
 internal fun proactiveHealthState(proactive: JSONObject?, checking: Boolean): ProactiveHealthState = when {
     checking -> ProactiveHealthState.Checking
     proactive?.optJSONObject("health")?.string("state") == "ok" -> ProactiveHealthState.Ok
     proactive?.optJSONObject("health")?.string("state") == "error" -> ProactiveHealthState.Failed
+    // The watch rests in quiet hours; the plugin says so instead of letting the last check look overdue.
+    proactive?.optJSONObject("health")?.string("state") == "quiet" -> ProactiveHealthState.Quiet
     else -> ProactiveHealthState.NotYet
+}
+
+/** When the watch last checked, in Hermes' clock ("21:55"); null before the first check. */
+internal fun proactiveLastCheck(proactive: JSONObject?): String? {
+    val checkedAt = proactive?.optJSONObject("health")?.optLong("checked_at") ?: return null
+    if (checkedAt <= 0) return null
+    val timezone = runCatching { ZoneId.of(proactive.string("timezone")) }.getOrDefault(ZoneId.systemDefault())
+    val checked = Instant.ofEpochSecond(checkedAt).atZone(timezone)
+    // An old check carries its day, so an outage of days never reads as this afternoon.
+    return if (checked.toLocalDate() == java.time.LocalDate.now(timezone)) checked.format(proactiveHealthTime) else checked.format(proactiveHealthDay)
 }
 
 @Composable internal fun ProactiveHealthChip(state: ProactiveHealthState) {
@@ -119,11 +116,12 @@ internal fun proactiveHealthState(proactive: JSONObject?, checking: Boolean): Pr
             BeaconSignal(when (state) {
                 ProactiveHealthState.Checking -> BeaconMotionMode.Sweep
                 ProactiveHealthState.Ok -> BeaconMotionMode.Ripple
-                ProactiveHealthState.NotYet, ProactiveHealthState.Failed -> BeaconMotionMode.Pulse
+                ProactiveHealthState.Quiet, ProactiveHealthState.NotYet, ProactiveHealthState.Failed -> BeaconMotionMode.Pulse
             }, size = 18.dp, trigger = state)
             Text(when (state) {
                 ProactiveHealthState.Checking -> uiText("Checking")
                 ProactiveHealthState.Ok -> uiText("OK")
+                ProactiveHealthState.Quiet -> uiText("Quiet hours")
                 ProactiveHealthState.NotYet -> uiText("Not yet")
                 ProactiveHealthState.Failed -> uiText("Couldn't check")
             }, style = MaterialTheme.typography.labelMedium)

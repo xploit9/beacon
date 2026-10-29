@@ -26,7 +26,8 @@ DUPLICATE_ALERT = {"status": "duplicate", "message": "The owner already has this
 
 INSTRUCTION_MARKERS = ("ignore previous", "ignore all", "system prompt", "override policy", "new instructions",
                        "pre-approved", "preapproved", "send email", "mark as read", "tool_call")
-CALLBACK_REASON_CHARACTERS = re.compile(r"""[\w .,!?'"():;/@#&+$%€-]*\Z""", re.UNICODE)
+# Plain words, prices in common currencies and degrees; no markup or symbols that could carry instructions.
+CALLBACK_REASON_CHARACTERS = re.compile(r"""[\w .,!?'"():;/@#&+$%€£¥₹₩₽₺°-]*\Z""", re.UNICODE)
 
 
 def normalize_callback_text(value, limit=240):

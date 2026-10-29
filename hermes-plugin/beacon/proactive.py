@@ -759,9 +759,19 @@ def health(mobile, owner, profile, setup, now=None):
         state = result.get("state") if isinstance(result, dict) else None
         message = result.get("message") if isinstance(result, dict) else None
         now = time.time() if now is None else now
-        if (state not in ("ok", "error") or type(checked_at) not in (int, float)
-                or not isinstance(message, str) or not 0 <= now - checked_at <= setup["check_minutes"] * 120):
+        if state not in ("ok", "error") or type(checked_at) not in (int, float) or not isinstance(message, str):
             return {"state": "unknown", "checked_at": None, "message": "Not checked recently"}
+        if not 0 <= now - checked_at <= setup["check_minutes"] * 120:
+            # The watch rests in quiet hours: say so, with the last check, instead of an unexplained "not yet".
+            try:
+                from beacon_observers import _inside_quiet
+                # A night-call rule keeps the watch running all night, so an overdue check then is a failure, not rest.
+                quiet = bool(setup.get("quiet_start") and setup.get("quiet_end")) and                     not _night_call_rule(list_requests(mobile, owner, profile)) and                     _inside_quiet(datetime.fromtimestamp(now, profile_now(profile).tzinfo), setup)
+            except Exception:
+                quiet = False
+            if quiet:
+                return {"state": "quiet", "checked_at": checked_at, "last_state": state, "message": message[:120]}
+            return {"state": "unknown", "checked_at": checked_at, "message": "Not checked recently"}
         return {"state": state, "checked_at": checked_at, "message": message[:120]}
     except Exception:
         return {"state": "unknown", "checked_at": None, "message": "Not checked yet"}

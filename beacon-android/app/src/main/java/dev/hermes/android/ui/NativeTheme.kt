@@ -101,7 +101,7 @@ fun nativeRoleBackgrounds(scheme: ColorScheme): List<Color> {
     val glass = backdrops.map { nativeGlassFill(scheme).compositeOver(it) }
     return backdrops + glass + glass.map { Color.White.copy(alpha = nativeGlassHighlightAlpha(scheme)).compositeOver(it) }
 }
-private fun readableInk(color: Color, min: Float = 4.55f, backgrounds: (Color) -> List<Color>): Color {
+internal fun readableInk(color: Color, min: Float = 4.55f, backgrounds: (Color) -> List<Color>): Color {
     fun score(ink: Color) = backgrounds(ink).minOf { nativeContrast(ink, it) }
     if (score(color) >= min) return color
     val targets = listOf(Color.Black, Color.White).sortedByDescending(::score)

@@ -322,6 +322,30 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
     // One scroll owner keeps destinations, search, projects and history reachable with the IME.
     LazyColumn(modifier.background(MaterialTheme.colorScheme.surfaceContainer), contentPadding = PaddingValues(bottom = 16.dp)) {
         item("destinations") { beforeHistory() }
+        val loaded = ui.sessions.filter {
+            it.optBoolean("archived") == archived && (allProfiles || it.string("profile", ui.profile) == ui.profile) &&
+                (view == HistoryView.Threads || it.string("source") !in hidden)
+        }
+        // Beacon is the always-there agent: a presence card above History, not a row among the chats. Its tab keeps its conversation.
+        if (view != HistoryView.Threads && !archived && (search.isBlank() || assistantTitle.contains(search.trim(), ignoreCase = true))) item("beacon-row") {
+            val assistantRow = loaded.firstOrNull { ui.assistantSessionId.isNotBlank() && sessionRowId(it) == ui.assistantSessionId && it.string("profile", ui.profile) == preferences.assistantProfile }
+            val glance = glances.rows["${preferences.assistantProfile}:${ui.assistantSessionId}"]
+            val activity = assistantRow?.let(::rowActivityMillis) ?: 0L
+            val presence = rememberBeaconPresence(vm, ui.assistantSessionId, assistantRow?.string("active_stream_id").orEmpty().isNotBlank())
+            BeaconPresenceCard(
+                title = assistantTitle,
+                idle = assistantRow?.let { chatPreviewLine(it, glance, youLabel, oneMessage, manyMessages) }.orEmpty().ifBlank { uiText("Text and voice, together") },
+                presence = presence,
+                unread = chatUnread(activity, glance, glances.base[preferences.assistantProfile] ?: Long.MAX_VALUE, open = ui.tab == "Beacon"),
+                isOpen = ui.tab == "Beacon",
+                // The drawer stays composed while closed; its halo only moves when it can be seen.
+                animate = LocalPersistentNavigation.current || ui.showSessions,
+                onClick = { vm.navigate("Beacon") },
+                // Busy while it replies or already talks; the chat's own call button has the same rule.
+                canCall = presence == BeaconPresence.Idle && ui.connected && voiceCallsOffered(ui.bootstrap),
+                onCall = { vm.callBeacon() },
+            )
+        }
         item("history-header") {
             Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(uiText("History"), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -425,28 +449,8 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
                 it.optBoolean("threads") == (view == HistoryView.Threads) && it.optBoolean("all_profiles") == allProfiles &&
                 it.string("hidden_sources") == hidden.sorted().joinToString(",") && it.string("order") == order.key
         }?.rows("sessions")
-        val loaded = ui.sessions.filter {
-            it.optBoolean("archived") == archived && (allProfiles || it.string("profile", ui.profile) == ui.profile) &&
-                (view == HistoryView.Threads || it.string("source") !in hidden)
-        }
         val searched = historySearchRows(loaded, search, matches, ui.profile)
         val rows = historyRows(searched, view, order, ui.profile, preferences.assistantProfile, ui.assistantSessionId)
-        // The persistent assistant leads the list, like a pinned chat; its own tab keeps its conversation.
-        if (view != HistoryView.Threads && !archived && (search.isBlank() || assistantTitle.contains(search.trim(), ignoreCase = true))) item("beacon-row") {
-            val assistantRow = loaded.firstOrNull { ui.assistantSessionId.isNotBlank() && sessionRowId(it) == ui.assistantSessionId && it.string("profile", ui.profile) == preferences.assistantProfile }
-            val glance = glances.rows["${preferences.assistantProfile}:${ui.assistantSessionId}"]
-            val activity = assistantRow?.let(::rowActivityMillis) ?: 0L
-            val unread = chatUnread(activity, glance, glances.base[preferences.assistantProfile] ?: Long.MAX_VALUE, open = ui.tab == "Beacon")
-            // navigation-beacon is the tag of the drawer item this row replaces.
-            Box(Modifier.testTag("navigation-beacon")) {
-                ChatListRow(
-                    id = ui.assistantSessionId.ifBlank { "beacon" }, title = assistantTitle,
-                    preview = assistantRow?.let { chatPreviewLine(it, glance, youLabel, oneMessage, manyMessages) }.orEmpty().ifBlank { uiText("Text and voice, together") },
-                    time = chatListTime(activity, is24Hour = is24Hour), unread = unread, pinned = true, selected = ui.tab == "Beacon", beacon = true,
-                    modifier = Modifier.clickable { vm.navigate("Beacon") }.semantics { selected = ui.tab == "Beacon" }.testTag("history-beacon-row"),
-                )
-            }
-        }
         // Threads are channels you keep adding; once one exists, starting the next stays in sight (the drawer has New thread too).
         if (view == HistoryView.Threads && !archived && search.isBlank() && rows.isNotEmpty()) item("new-thread-row") {
             ListItem(headlineContent = { Text(uiText("New thread")) }, leadingContent = { Icon(Icons.Rounded.Add, null) },
@@ -1142,15 +1146,20 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                     if (navigationBack != null) IconButton(onClick = navigationBack, modifier = Modifier.testTag("bot-chat-back")) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, uiText("Back to bots")) }
                     else IconButton(onClick = LocalOpenNavigationMenu.current ?: { vm.toggleSessions(!ui.showSessions) }, modifier = Modifier.testTag("navigation-toggle")) { Icon(Icons.Rounded.Menu, uiText(if (LocalPersistentNavigation.current) "Hide navigation" else "Show navigation")) }
                     val headerTitle = titleOverride ?: if (beacon || activeHere) LocalAssistantName.current else chat.title
-                    ChatAvatar(headerTitle, chat.sessionId, size = 40.dp, beacon = beacon || activeHere, description = if (beacon || activeHere) assistantText("Beacon") else null)
+                    // The Beacon chat has its own header: the assistant's living mark and the card's status line. Other chats keep the generic one.
+                    val presence = if (beacon) beaconPresence(call.active, ready && chat.streamId.isNotBlank()) else BeaconPresence.Idle
+                    if (beacon) BeaconPresenceMark(headerTitle, presence, size = 48.dp, description = assistantText("Beacon"))
+                    else ChatAvatar(headerTitle, chat.sessionId, size = 40.dp, beacon = activeHere, description = if (activeHere) assistantText("Beacon") else null)
                     // The title opens the same chat menu as the dots.
                     Column(Modifier.weight(1f).padding(start = 10.dp).heightIn(min = 48.dp).clickable(enabled = ready, onClickLabel = uiText("Conversation actions")) { menu = true }.padding(vertical = 4.dp).testTag("chat-header-title"), verticalArrangement = Arrangement.Center) {
                         Text(plainTitle(headerTitle), Modifier.semantics { heading() }, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                         val headerModel = chatModelLabel(chat.raw.string("model"), profileDefaults["profile-defaults"]?.takeIf { it.string("profile") == ui.profile && recordError(it).isBlank() }?.string("model").orEmpty())
                         // Read from the cached project answer, so the project shows with the chat; nothing shows for a chat in no project.
                         val headerProject = chatProjectOf(profileDefaults["project-of:${chat.sessionId}"], chat.sessionId)
-                        val headerLine = chatHeaderLine(chat.streamId.isNotBlank(), chat.liveText.isNotBlank(), (beacon || activeHere) && call.active, headerModel, beacon || activeHere, headerProject?.string("name").orEmpty())
-                        if (headerLine.project.isNotBlank() || headerLine.text.isNotBlank()) ChatHeaderSubtitle(headerLine)
+                        // In the Beacon chat a running turn or a call is the status line; otherwise the usual project, model or tagline.
+                        val headerLine = chatHeaderLine(chat.streamId.isNotBlank() && !beacon, chat.liveText.isNotBlank(), activeHere && !beacon, headerModel, beacon || activeHere, headerProject?.string("name").orEmpty())
+                        if (presence != BeaconPresence.Idle) BeaconStatusText(beaconStatus(presence, ""), presence, MaterialTheme.typography.labelSmall, Modifier.testTag("beacon-header-status"))
+                        else if (headerLine.project.isNotBlank() || headerLine.text.isNotBlank()) ChatHeaderSubtitle(headerLine)
                     }
                     IconButton(onClick = { showSearch = !showSearch; if (activeHere && showSearch) showCallHistory = true }, enabled = canonical) { Icon(Icons.Rounded.Search, uiText("Search this conversation")) }
                     Box {

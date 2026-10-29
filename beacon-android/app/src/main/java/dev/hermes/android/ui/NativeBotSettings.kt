@@ -20,6 +20,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import dev.hermes.android.data.NativeBotsState
@@ -28,7 +29,8 @@ import kotlinx.coroutines.delay
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable fun NativeBotSettings(state: NativeBotsState, onOpen: (String) -> Unit, onBack: () -> Unit,
     onEditModel: () -> Unit, onModelDraft: (String, String) -> Unit, onSaveModel: () -> Unit, onCancel: () -> Unit,
-    onSettings: (String, String) -> Unit, onRefresh: () -> Unit, models: List<Pair<String, String>> = emptyList(), renderBehavior: @Composable (String) -> Unit = { SelectionContainer { Text(it, style = MaterialTheme.typography.bodyLarge) } }, profileLabel: (String) -> String = { it }) {
+    onSettings: (String, String) -> Unit, onRefresh: () -> Unit, models: List<Pair<String, String>> = emptyList(), renderBehavior: @Composable (String) -> Unit = { SelectionContainer { Text(it, style = MaterialTheme.typography.bodyLarge) } }, profileLabel: (String) -> String = { it },
+    onNewProfile: (() -> Unit)? = null, canDelete: (String) -> Boolean = { false }, onDelete: (String) -> Unit = {}) {
     var showBehavior by rememberSaveable(state.selected?.profile) { mutableStateOf(false) }
     var modelSearch by rememberSaveable(state.selected?.profile, state.editing) { mutableStateOf("") }
     var customModel by rememberSaveable(state.selected?.profile, state.editing) { mutableStateOf(false) }
@@ -39,6 +41,7 @@ import kotlinx.coroutines.delay
                 ProfileEntrance(0, motionEnabled) {
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text(uiText("Purpose, model and behavior for each profile."), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (onNewProfile != null && state.selected == null) Button(onClick = onNewProfile, enabled = !state.loading, modifier = Modifier.heightIn(min = 48.dp).testTag("new-profile")) { Icon(Icons.Rounded.Add, null); Spacer(Modifier.width(8.dp)); Text(uiText("New profile")) }
                     }
                 }
             }
@@ -56,7 +59,10 @@ import kotlinx.coroutines.delay
                                     Text(profileLabel(bot.profile), style = MaterialTheme.typography.titleMedium)
                                 }
                                 ProfileValue(Icons.Rounded.Flag, "Purpose", bot.purpose.ifBlank { uiText("Not set") })
-                                OutlinedButton(onClick = { onOpen(bot.profile) }, enabled = !state.loading) { Text(uiText("View profile")) }
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    OutlinedButton(onClick = { onOpen(bot.profile) }, enabled = !state.loading) { Text(uiText("View profile")) }
+                                    if (canDelete(bot.profile)) TextButton(onClick = { onDelete(bot.profile) }, enabled = !state.loading, modifier = Modifier.heightIn(min = 48.dp).testTag("delete-profile:${bot.profile}")) { Text(uiText("Delete profile"), color = MaterialTheme.colorScheme.error) }
+                                }
                             }
                         }
                     }
@@ -142,6 +148,9 @@ import kotlinx.coroutines.delay
                             ProfileAction("Profiles & model", ProfilesIcon) { onSettings(bot.profile, "Profiles & model") }
                         }
                     }
+                }
+                if (canDelete(bot.profile)) item {
+                    TextButton(onClick = { onDelete(bot.profile) }, enabled = !state.loading && !state.saving, modifier = Modifier.heightIn(min = 48.dp).testTag("delete-profile:${bot.profile}")) { Text(uiText("Delete profile"), color = MaterialTheme.colorScheme.error) }
                 }
             }
         }

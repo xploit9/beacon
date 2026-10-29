@@ -315,6 +315,12 @@ def _named_read_only(raw_name):
     gateway=_gateway_tools()
     return bool(_tool_words(raw_name)&gateway.READ_NAME_WORDS) and not gateway.name_writes(raw_name)
 
+def _health_name(raw_name):
+    """A health check (zotero_health) reads, but 'health' is a noun that says nothing about intent: it counts only beside the
+    MCP server's own read-only hint, and stays out of the shared read verbs, where it would relax nouns after it."""
+    gateway=_gateway_tools();words=gateway.name_words(raw_name)
+    return bool(words) and words[-1]=='health' and not set(words)&gateway.UNSAFE_NAME_WORDS
+
 # No calendar words: fetch_calendar and fetch_events usually name ICS feed fetchers that take a URL.
 _FETCHED_MAIL_WORDS={'email','emails','mail','mails','gmail','outlook','message','messages','msg','msgs','thread',
                      'threads','inbox','mailbox','attachment','attachments'}
@@ -364,8 +370,9 @@ def _mcp_read_only(tool_name,profile):
     if trust!='untrusted' and _plain_mail_read(raw_name): return True
     # The hint is the server's own claim, and a watch runs unattended over mail it did not write, so the name must also hold a
     # read word: a deny-list alone kept missing verbs (cleanup, deploy_*, fetch_rows). An untrusted server also bars nouns
-    # (the call gateway's rule). shortcut: a read word plus a write verb on no list still passes; add such verbs to WRITE_WORDS.
-    return hint is True and _named_read_only(raw_name) and _gateway_tools().mcp_reads_by_name(raw_name,trust)
+    # (the call gateway's rule). shortcut: a read word, or a *_health name, plus a write verb on no list still passes (repair_health);
+    # add such verbs to WRITE_WORDS.
+    return hint is True and (_named_read_only(raw_name) or _health_name(raw_name)) and _gateway_tools().mcp_reads_by_name(raw_name,trust)
 
 def _reads_by_method(args,schema):
     return _gateway_tools().reads_by_method(args,schema)

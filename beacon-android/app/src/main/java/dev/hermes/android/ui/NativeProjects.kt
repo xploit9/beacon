@@ -242,7 +242,7 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
                 else -> {
                     if (project.string("description").isNotBlank()) item { Text(project.string("description"), color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     item { Text(uiText("Linked folders"), Modifier.semantics { heading() }, style = MaterialTheme.typography.titleMedium) }
-                    items(project.rows("folders"), key = { it.getString("path") }) { folder ->
+                    items(project.rows("folders"), key = ::fileRowKey) { folder ->
                         var actions by remember { mutableStateOf(false) }
                         val path = folder.getString("path")
                         ListItem(headlineContent = { Text(folder.string("label").ifBlank { path.replace('\\', '/').substringAfterLast('/').ifBlank { path } }) },
@@ -361,7 +361,7 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
                     val folders = if (showHidden) allFolders else allFolders.filterNot { it.string("name").startsWith(".") }
                     if (allFolders.isEmpty()) item { Text(uiText("No subfolders"), Modifier.padding(vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     else if (folders.isEmpty()) item { Text(uiText("Only hidden folders here. Show hidden folders to see them."), Modifier.padding(vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                    items(folders, key = { it.getString("path") }) { row -> ActionRow(row.getString("name"), icon = Icons.Rounded.Folder) { directory = row.getString("path"); address = directory } }
+                    items(folders, key = ::fileRowKey) { row -> ActionRow(row.getString("name"), icon = Icons.Rounded.Folder) { directory = row.getString("path"); address = directory } }
                 }
             }
         }
@@ -434,7 +434,7 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
                             }
                         }
                     }
-                    items(if (scope == null) emptyList() else folders, key = { it.getString("path") }) { folder ->
+                    items(if (scope == null) emptyList() else folders, key = ::fileRowKey) { folder ->
                         ActionRow(folder.string("label").ifBlank { folder.getString("path") }, if (folder.optBoolean("is_primary")) uiText("Main folder") else "", icon = null) { assign(selected, folder.getString("path")) }
                     }
                 }

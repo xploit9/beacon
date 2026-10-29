@@ -3,6 +3,8 @@ import asyncio
 import hashlib
 import json
 import math
+import re
+import unicodedata
 from fastapi import APIRouter, HTTPException, Request
 
 CANONICAL_TITLE = 'Bot Chat'
@@ -10,6 +12,23 @@ CHAT_LOCK = asyncio.Lock()
 SPACE_PAGE_SIZE = 100
 SPACE_SCAN_PAGES = 10
 SPACE_SCAN_LIMIT = SPACE_PAGE_SIZE * SPACE_SCAN_PAGES
+
+
+RESERVED_HANDLES = frozenset({'all', 'everyone', 'user'})
+PLAIN_LETTERS = str.maketrans({'đ': 'd', 'ł': 'l', 'ø': 'o', 'ı': 'i', 'æ': 'ae', 'œ': 'oe', 'ð': 'd', 'þ': 'th'})
+
+
+def member_handle(title, profile, taken):
+    """How a bot is @mentioned in a shared space: by its own name, as in a group chat ("Code Wizard" is @code-wizard).
+    A name that cannot be a Hermes handle, or is taken, falls back to the profile rule (default is @hermes)."""
+    plain = ''.join(c for c in unicodedata.normalize('NFKD', title or '') if not unicodedata.combining(c))  # Müller is @muller
+    plain = plain.casefold().translate(PLAIN_LETTERS)  # Michał is @michal, Đức is @duc
+    name = re.sub(r'-{2,}', '-', re.sub(r'[^a-z0-9._:-]', '-', plain)).strip('-._:')[:64]
+    for handle in (name, 'hermes' if profile == 'default' else profile, profile):
+        if handle and handle not in RESERVED_HANDLES and handle not in taken:
+            taken.add(handle)
+            return handle
+    raise HTTPException(409, 'Two bots would get the same @name. Rename one in Hermes, then try again.')
 
 
 def space_id(owner, provider, profile, request_id=None):
@@ -70,7 +89,8 @@ def build_router(identity, body, native):
             meta = (row.get('ui_meta') or {}).get('hermes-bots') or {}
             if not isinstance(meta, dict):
                 meta = {}
-            rows.append({'profile': name, 'title': meta.get('title') or row.get('display_name') or name,
+            # The name the app shows (display_name) comes first, so a bot's @handle matches it.
+            rows.append({'profile': name, 'title': row.get('display_name') or meta.get('title') or name,
                          'description': row.get('description') or '', 'managed': bool(meta)})
         return owner, provider, profile, rows
 
@@ -157,7 +177,9 @@ def build_router(identity, body, native):
             offset = following
         else:
             raise HTTPException(409, f'Beacon checked {SPACE_SCAN_LIMIT:,} group rooms and stopped before creating a duplicate. Archive unused rooms in Hermes, then try again.')
-        members = [{'member_id': p, 'profile': p, 'handle': 'hermes' if p == 'default' else p,
+        titles = {row['profile']: row['title'] for row in bots}
+        handles = set()
+        members = [{'member_id': p, 'profile': p, 'handle': member_handle(titles.get(p), p, handles),
                     'target': {'kind': 'local', 'profile': p}} for p in chosen]
         return await rpc(owner, provider, profile, 'groups.create', room_id=rid, name='Shared space', members=members)
 

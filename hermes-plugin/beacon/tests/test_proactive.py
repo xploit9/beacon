@@ -4,7 +4,7 @@ import pytest
 import time
 from contextlib import nullcontext
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 import sys
@@ -2310,3 +2310,34 @@ def test_existing_non_email_rules_remain_enabled_and_unchanged(harness):
     migrated = api.proactive.list_requests(api.mobile, "owner", "default")
 
     assert migrated == rows
+
+
+def test_a_reason_can_carry_a_price_in_pounds_and_other_common_currencies():
+    # A watch alert about a bill was rejected twice for its pound sign (28 Oct 2026).
+    observers = load_private("observers")
+    assert observers.reason_text("FirstPort service charge of £412.60 is due on 1 Nov") == "FirstPort service charge of £412.60 is due on 1 Nov"
+    assert observers.reason_text("Fees: ¥1,200, ₹500, 21°C") == "Fees: ¥1,200, ₹500, 21°C"
+    with pytest.raises(ValueError):
+        observers.reason_text("Call me about <b>this</b>")
+
+
+def test_health_says_quiet_hours_with_the_last_check_instead_of_not_yet(harness, monkeypatch):
+    # At 23:31 the chip read "Not yet" although the last check (21:55) was fine; the watch rests 22:00-10:00 (28 Oct 2026).
+    api = harness[0]
+    dubai = timezone(timedelta(hours=4))
+    checked = datetime(2026, 10, 28, 21, 55, tzinfo=dubai).timestamp()
+    notes = {("work-watch", "last_result"): json.dumps({"state": "ok", "checked_at": checked, "message": "Checked"})}
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles", SimpleNamespace(_profile_scope=lambda profile: nullcontext()))
+    monkeypatch.setitem(sys.modules, "cron.notepad", SimpleNamespace(get_note=lambda job_id, key: notes.get((job_id, key))))
+    monkeypatch.setattr(api.proactive, "profile_now", lambda profile: datetime.now(dubai))
+    api.proactive._set_managed_id(api.mobile, "owner", "work", "watch_email", "work-watch")
+    setup = {"check_minutes": 15, "quiet_start": "22:00", "quiet_end": "10:00"}
+    night = datetime(2026, 10, 28, 23, 31, tzinfo=dubai).timestamp()
+    assert api.proactive.health(api.mobile, "owner", "work", setup, night) == {
+        "state": "quiet", "checked_at": checked, "last_state": "ok", "message": "Checked"}
+    # Outside quiet hours an overdue check is still unknown, now with when it last ran.
+    noon = datetime(2026, 10, 29, 12, 0, tzinfo=dubai).timestamp()
+    assert api.proactive.health(api.mobile, "owner", "work", setup, noon)["state"] == "unknown"
+    # A night-call rule keeps the watch running at night: an overdue check then is a failure, not quiet hours.
+    monkeypatch.setattr(api.proactive, "list_requests", lambda mobile, owner, profile: [{"enabled": True, "action": "call", "night": True}])
+    assert api.proactive.health(api.mobile, "owner", "work", setup, night)["state"] == "unknown"

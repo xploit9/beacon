@@ -13,7 +13,8 @@ import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Reads whose last good answer is kept on the phone: configuration lists, never messages or secrets (MCP server configs can carry env secrets, so they stay in memory). The one per-chat read is the chat's project. */
+/** Reads whose last good answer is kept on the phone: configuration lists, never messages or secrets (MCP server configs can carry env secrets, so they stay in memory). The one per-chat read is the chat's project.
+ *  Bot Mode also keeps its roster here with each group's newest line (140 characters), like a chat list's preview; the row is encrypted and cleared on sign-out. */
 val screenReadPaths = setOf(
     "/api/profiles", "/api/tools/toolsets", "/api/commands/catalog", "/api/projects", "/api/plugins/beacon/mobile/voice-settings",
     "/api/crons", "/api/crons/delivery-options", "/api/crons/history", "/api/plugins/beacon/mobile/tasks/capabilities",

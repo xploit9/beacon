@@ -9,8 +9,14 @@ import org.json.JSONObject
 import java.util.UUID
 
 data class BotModeBot(val profile: String, val title: String, val description: String)
-data class BotModeSpace(val id: String, val name: String)
-data class BotModeEvent(val id: String, val speaker: String, val text: String, val failed: Boolean = false)
+/** The newest message read in a space: who wrote it (a member id, or "You") and its text on one line. */
+data class BotModePreview(val speaker: String, val text: String)
+/** [members] are the bots' profiles, [updatedAt] is Hermes' last change in epoch seconds (0 when it sent none), [last] stays null until the space has been read on this phone. */
+data class BotModeSpace(val id: String, val name: String, val members: List<String> = emptyList(), val updatedAt: Long = 0L, val last: BotModePreview? = null)
+/** [at] is Hermes' event time in epoch seconds; 0 when it sent none. */
+data class BotModeEvent(val id: String, val speaker: String, val text: String, val failed: Boolean = false, val at: Long = 0L)
+/** A bot in a shared space. [id] is Hermes' member id (what events and typing name), [handle] is what an `@mention` addresses, [name] is blank unless Hermes set one. */
+data class BotModeMember(val id: String, val profile: String, val handle: String, val name: String = "")
 data class BotModeAction(val kind: String, val task: String, val member: String = "", val request: String = "", val generation: Int = 0, val description: String = "", val choices: List<String> = emptyList()) {
     fun payload(choice: String = ""): JSONObject {
         require(kind == "approval" && task.isNotBlank() && member.isNotBlank() && request.isNotBlank() && generation > 0) { "This action cannot be safely resolved in Beacon. Review the shared space in Hermes." }
@@ -25,7 +31,39 @@ data class NativeBotModeState(
     val loading: Boolean = false, val sending: Boolean = false, val error: String = "", val status: String = "",
     val canRename: Boolean = false, val canDelete: Boolean = false,
     val earlierEventsOmitted: Boolean = false, val moreSpaces: Boolean = false, val actions: List<BotModeAction> = emptyList(),
+    val roster: List<BotModeMember> = emptyList(), val typing: List<String> = emptyList(), val working: Boolean = false,
 )
+
+/** A room is read fast while a bot answers, so its "typing" and the reply show up promptly. */
+internal fun botModePollMillis(working: Boolean): Long = if (working) 1_000L else 3_000L
+
+/** The bots a new space gets: those picked plus the one in use (Hermes only lets a space's own bots open it), two to six of them, else null. */
+internal fun botModeChosen(selected: Set<String>, using: String): List<String>? =
+    (selected + using).filter(String::isNotBlank).distinct().sorted().takeIf { it.size in 2..6 }
+
+/** Hermes names a new space this; an owner's or the bots' name goes on with the rename route. */
+internal const val NEW_SPACE_NAME = "Shared space"
+
+internal fun botModePreview(events: List<BotModeEvent>): BotModePreview? =
+    events.lastOrNull { !it.failed }?.let { BotModePreview(it.speaker, it.text.replace(Regex("\\s+"), " ").trim().take(140)) }
+
+internal fun botModeSpaces(rows: List<JSONObject>, last: Map<String, BotModePreview>): List<BotModeSpace> = rows.map { row ->
+    val id = row.getString("room_id")
+    BotModeSpace(id, row.getString("name"), row.rows("members").map { it.string("profile") }.filter(String::isNotBlank),
+        (row.opt("updated_at") as? Number)?.toDouble()?.takeIf { it.isFinite() && it > 0 }?.toLong() ?: 0L, last[id])
+}
+
+internal fun botModeRoster(room: JSONObject?): List<BotModeMember> = room?.rows("members").orEmpty().mapNotNull { member ->
+    val profile = member.string("profile").ifBlank { return@mapNotNull null }
+    // Hermes' own handle rule for a default-profile member, for a room that sent none.
+    BotModeMember(member.string("member_id").ifBlank { profile }, profile, member.string("handle").ifBlank { if (profile == "default") "hermes" else profile }, member.string("display_name"))
+}
+
+/** Who is answering now: Hermes' `member_activity`, once per member. Empty on a Hermes that does not send it. */
+// Like Hermes' own group room: a bot waiting its turn is queued, not typing; only the one answering types.
+internal fun botModeTyping(data: JSONObject): List<String> =
+    data.optJSONObject("driver_status")?.rows("member_activity").orEmpty().filter { it.string("status") != "queued" }
+        .map { it.string("member_id") }.filter(String::isNotBlank).distinct()
 
 internal fun botModeDisbanded(data: JSONObject, id: String): Boolean {
     val receipt = data.optJSONObject("tombstone") ?: return false
@@ -71,18 +109,21 @@ internal fun botModeEvents(data: JSONObject): List<BotModeEvent> = data.rows("ev
             reason == "cancelled" -> "This bot’s turn was cancelled."
             else -> "This bot’s turn failed. Review its provider and model in Profiles."
         }
-        return@mapNotNull BotModeEvent(event.getString("event_id"), payload.getString("member_id"), readable, true)
+        return@mapNotNull BotModeEvent(event.getString("event_id"), payload.getString("member_id"), readable, true, eventSeconds(event))
     }
     val text = payload.string("text")
     if (kind !in setOf("message.user", "message.member") || text.isBlank()) return@mapNotNull null
-    BotModeEvent(event.getString("event_id"), if (kind == "message.user") "You" else payload.getString("member_id"), text)
+    BotModeEvent(event.getString("event_id"), if (kind == "message.user") "You" else payload.getString("member_id"), text, at = eventSeconds(event))
 }
+
+private fun eventSeconds(event: JSONObject): Long = (event.opt("created_at") as? Number)?.toDouble()?.takeIf { it.isFinite() && it > 0 }?.toLong() ?: 0L
 
 /** Chat rendering and tool approvals stay in the existing conversation controller. */
 class NativeBotModeController(
     private val scope: CoroutineScope, private val saved: SavedStateHandle,
     private val openChat: suspend (String, String) -> Unit,
     private val clock: () -> Long = { System.currentTimeMillis() },
+    private val screens: ScreenCache? = null,
     private val client: () -> BeaconClient?,
 ) {
     private val mutable = MutableStateFlow(NativeBotModeState())
@@ -95,6 +136,11 @@ class NativeBotModeController(
     private var backgroundRead = false
     private var rosterAt = 0L
     private var hasRoster = false
+    // The newest line read in each space, kept for the list; a space not opened on this phone yet has none.
+    private val last = HashMap<String, BotModePreview>()
+    // The list as last read, kept with those lines so Bot Mode opens already filled after a restart.
+    private var rosterRead: JSONObject? = null
+    private var rosterSaved = ""
     private val path = "/api/plugins/beacon/mobile/bot-mode"
     private fun key(space: String) = "bot-mode:${requireNotNull(root) { "Load Bot Mode before editing a draft" }.key}:$space"
     private fun operationKey(purpose: String, identity: String, legacy: String): String {
@@ -116,7 +162,7 @@ class NativeBotModeController(
     }
     private fun current(c: BeaconClient, token: Int): Boolean = source === c && token == generation &&
         client()?.let { it.scope.sameAccount(c.scope) } == true
-    fun clear() { ++generation; job?.cancel(); job = null; source?.closeNative(); source = null; accountClient = null; root = null; rosterAt = 0L; hasRoster = false; backgroundRead = false; mutable.value = NativeBotModeState() }
+    fun clear() { ++generation; job?.cancel(); job = null; source?.closeNative(); source = null; accountClient = null; root = null; rosterAt = 0L; hasRoster = false; backgroundRead = false; last.clear(); rosterRead = null; rosterSaved = ""; mutable.value = NativeBotModeState() }
     fun draft(text: String) {
         if (root == null || mutable.value.selectedSpace.isBlank()) { mutable.value = mutable.value.copy(error = "Open an authorized shared space before editing its draft"); return }
         mutable.value = mutable.value.copy(draft = text); saved[key(mutable.value.selectedSpace)] = text
@@ -128,6 +174,11 @@ class NativeBotModeController(
         if (profile == usingBot()) return
         if (profile in old || (old + usingBot()).size < 6) mutable.value = mutable.value.copy(selectedBots = if (profile in old) old - profile else old + profile)
     }
+    /** Opens a New chat with nobody picked yet, or with [first] already picked. */
+    fun startNewChat(first: String = "") { mutable.value = mutable.value.copy(selectedBots = setOf(first).filterTo(HashSet()) { it.isNotBlank() && it != usingBot() }, error = "") }
+    fun cancelNewChat() { mutable.value = mutable.value.copy(selectedBots = emptySet(), error = "") }
+    /** Bots or their roles changed on Hermes: read the list again now, not at the next 30-second refresh. */
+    fun rosterChanged() { rosterAt = 0L; if (job?.isActive != true || backgroundRead) refresh() }
     private fun launch(userAction: Boolean = true, action: suspend (BeaconClient, Int) -> Unit) {
         val live = client() ?: run { clear(); return }
         if (root?.let { !it.sameAccount(live.scope) } == true) clear()
@@ -156,32 +207,55 @@ class NativeBotModeController(
             catch (e: CancellationException) { throw e }
             catch (e: Exception) {
                 if (current(c, token)) {
-                    mutable.value = if (e is ApiFailure && e.status in setOf(401, 403)) mutable.value.copy(selectedSpace = "", events = emptyList(), actions = emptyList(), draft = "", status = "", error = e.message)
+                    mutable.value = if (e is ApiFailure && e.status in setOf(401, 403)) mutable.value.copy(selectedSpace = "", events = emptyList(), actions = emptyList(), roster = emptyList(), typing = emptyList(), working = false, draft = "", status = "", error = e.message)
                     else mutable.value.copy(error = e.message ?: "Native Bot Mode unavailable")
                 }
             }
             finally { if (current(c, token)) mutable.value = mutable.value.copy(loading = false, sending = false) }
         }
     }
+    private fun showRoster(result: JSONObject) {
+        mutable.value = mutable.value.copy(
+            bots = result.rows("bots").map { BotModeBot(it.getString("profile"), it.getString("title"), it.string("description")) },
+            spaces = botModeSpaces(result.rows("spaces"), last),
+            moreSpaces = result.optBoolean("has_more_spaces"),
+            canRename = result.optJSONObject("capabilities")?.optBoolean("rename") == true,
+            canDelete = result.optJSONObject("capabilities")?.optBoolean("delete") == true,
+        )
+    }
+    private fun saveRoster(c: BeaconClient) {
+        val read = rosterRead ?: return
+        val cache = screens ?: return
+        val previews = JSONObject().apply { last.forEach { (id, line) -> put(id, JSONObject().put("speaker", line.speaker).put("text", line.text)) } }
+        val value = JSONObject(read.toString()).put("previews", previews)
+        val text = value.toString()
+        val at = c.scope
+        if (text == rosterSaved && cache.exact(at, "bot-mode:roster") != null) return
+        rosterSaved = text
+        scope.launch(Dispatchers.Default) { try { cache.set(at, "bot-mode:roster", value) } catch (e: Exception) { if (e is CancellationException) throw e } }
+    }
     fun refresh(silent: Boolean = false) {
         launch(userAction = !silent) { c, token ->
+            if (!hasRoster && rosterRead == null) try {
+                screens?.open(c.scope)
+                screens?.get(c.scope, "bot-mode:roster")?.let { stored ->
+                    if (!current(c, token) || hasRoster) return@let
+                    stored.optJSONObject("previews")?.let { lines -> lines.keys().forEach { id -> lines.optJSONObject(id)?.let { last.putIfAbsent(id, BotModePreview(it.string("speaker"), it.string("text"))) } } }
+                    rosterRead = stored; showRoster(stored)
+                }
+            } catch (e: Exception) { if (e is CancellationException) throw e }
             val now = clock()
             if (!silent || !hasRoster || now < rosterAt || now - rosterAt >= 30_000L) {
                 val result = c.nativeRequest(path)
                 if (!current(c, token)) return@launch
-                mutable.value = mutable.value.copy(
-                    bots = result.rows("bots").map { BotModeBot(it.getString("profile"), it.getString("title"), it.string("description")) },
-                    spaces = result.rows("spaces").map { BotModeSpace(it.getString("room_id"), it.getString("name")) },
-                    moreSpaces = result.optBoolean("has_more_spaces"),
-                    canRename = result.optJSONObject("capabilities")?.optBoolean("rename") == true,
-                    canDelete = result.optJSONObject("capabilities")?.optBoolean("delete") == true,
-                )
+                showRoster(result)
+                rosterRead = result; saveRoster(c)
                 hasRoster = true; rosterAt = clock()
             }
             val selected = mutable.value.selectedSpace
             if (selected.isNotBlank() && mutable.value.activeBot == null) {
                 if (mutable.value.spaces.none { it.id == selected } && !mutable.value.moreSpaces) {
-                    mutable.value = mutable.value.copy(selectedSpace = "", events = emptyList(), actions = emptyList(), draft = "", status = "", error = "This shared space is no longer authorized or available. Its local draft is retained.")
+                    mutable.value = mutable.value.copy(selectedSpace = "", events = emptyList(), actions = emptyList(), roster = emptyList(), typing = emptyList(), working = false, draft = "", status = "", error = "This shared space is no longer authorized or available. Its local draft is retained.")
                 } else readSpace(c, token, selected)
             }
         }
@@ -193,24 +267,29 @@ class NativeBotModeController(
         val driver = data.optJSONObject("driver_status")
         val failed = driver?.optJSONObject("counts")?.optInt("failed", 0) ?: 0
         val room = data.optJSONObject("room")
+        val typing = botModeTyping(data)
+        val events = botModeEvents(data)
+        botModePreview(events)?.let { if (last[id] != it) { last[id] = it; saveRoster(c) } }
         mutable.value = mutable.value.copy(
+            roster = botModeRoster(room), typing = typing, working = typing.isNotEmpty() || driver?.optBoolean("working") == true,
             canRename = data.optJSONObject("capabilities")?.optBoolean("rename") == true,
             canDelete = data.optJSONObject("capabilities")?.optBoolean("delete") == true,
             members = room?.rows("members").orEmpty().map { it.string("profile") },
-            spaces = mutable.value.spaces.map { if (it.id == id && room != null) it.copy(name = room.string("name", it.name)) else it },
-            events = botModeEvents(data), earlierEventsOmitted = data.optBoolean("earlier_events_omitted"),
+            spaces = mutable.value.spaces.map { if (it.id == id) it.copy(name = room?.string("name", it.name) ?: it.name, last = last[id] ?: it.last, updatedAt = maxOf(it.updatedAt, events.maxOfOrNull { event -> event.at } ?: 0L)) else it },
+            events = events, earlierEventsOmitted = data.optBoolean("earlier_events_omitted"),
             actions = botModeActions(data),
             status = when { driver?.optBoolean("blocked") == true -> "Shared space needs your attention"; driver?.optBoolean("working") == true -> "Bots are discussing…"; failed > 0 -> "Shared space needs attention"; driver?.optBoolean("running") == true -> "Shared space is ready"; else -> "Shared-space worker is unavailable" } + if (failed > 0) " · $failed failed bot turn${if (failed == 1) "" else "s"}. Review the failures below." else "")
     }
     fun selectSpace(id: String) {
         back()
         launch { c, token ->
-            mutable.value = mutable.value.copy(selectedSpace = id, events = emptyList(), draft = saved.get<String>(key(id)).orEmpty(), error = "", status = "", actions = emptyList())
+            mutable.value = mutable.value.copy(selectedSpace = id, events = emptyList(), roster = emptyList(), typing = emptyList(), working = false, draft = saved.get<String>(key(id)).orEmpty(), error = "", status = "", actions = emptyList())
             readSpace(c, token, id)
         }
     }
-    fun createSpace() {
-        val chosen = (mutable.value.selectedBots + usingBot()).filter(String::isNotBlank).distinct().sorted()
+    /** Creates the space with the picked bots and the one in use. A non-blank [name] replaces Hermes' own "Shared space" through the rename route. */
+    fun createSpace(name: String = "") {
+        val chosen = botModeChosen(mutable.value.selectedBots, usingBot()) ?: run { mutable.value = mutable.value.copy(error = "Choose two to six bots."); return }
         launch { c, token ->
             val members = chosen.joinToString(",")
             val requestKey = operationKey("create", members, key("create:$members"))
@@ -220,14 +299,23 @@ class NativeBotModeController(
                 val room = data.getJSONObject("room")
                 val id = room.getString("room_id")
                 saved.remove<String>(requestKey)
-                mutable.value = mutable.value.copy(selectedSpace = id, spaces = (mutable.value.spaces + BotModeSpace(id, room.getString("name"))).distinctBy { it.id }, draft = saved.get<String>(key(id)).orEmpty())
+                var created = room.getString("name")
+                var unnamed = false
+                val wanted = name.trim().take(120)
+                // Only a space still carrying Hermes' own name is renamed: a retry that finds an older space must not overwrite its name.
+                if (wanted.isNotEmpty() && created == NEW_SPACE_NAME && wanted != created && !wanted.any { it.isISOControl() } && mutable.value.canRename) {
+                    try { created = c.nativeRequest("$path/space/$id/rename", "POST", json("name" to wanted, "expected_name" to created, "event_id" to UUID.randomUUID().toString())).getJSONObject("room").getString("name") }
+                    catch (e: CancellationException) { throw e }
+                    catch (_: Exception) { unnamed = true }
+                }
+                mutable.value = mutable.value.copy(selectedSpace = id, spaces = (listOf(BotModeSpace(id, created, chosen, clock() / 1000)) + mutable.value.spaces).distinctBy { it.id }, draft = saved.get<String>(key(id)).orEmpty())
                 readSpace(c, token, id)
+                if (unnamed && current(c, token)) mutable.value = mutable.value.copy(error = "The chat was created, but its name wasn't saved.")
             }
         }
     }
-    fun renameSpace(name: String) {
+    fun renameSpace(name: String, id: String = mutable.value.selectedSpace) {
         val state = mutable.value
-        val id = state.selectedSpace
         val original = state.spaces.firstOrNull { it.id == id }?.name ?: return
         if (name.isBlank() || name.length > 120 || name.any { it.isISOControl() }) {
             mutable.value = state.copy(error = "Enter a shared-space name of up to 120 characters"); return
@@ -238,16 +326,15 @@ class NativeBotModeController(
                 ?: json("name" to name.trim(), "expected_name" to original, "event_id" to UUID.randomUUID().toString()).also { saved[intentKey] = it.toString() }
             val result = c.nativeRequest("$path/space/$id/rename", "POST", intent).getJSONObject("room")
             require(result.getString("room_id") == id && result.getString("name") == name.trim()) { "The new name was not confirmed. Refresh before retrying." }
-            if (current(c, token) && mutable.value.selectedSpace == id) {
+            if (current(c, token)) {
                 saved.remove<String>(intentKey)
                 mutable.value = mutable.value.copy(spaces = mutable.value.spaces.map { if (it.id == id) it.copy(name = result.getString("name")) else it })
-                readSpace(c, token, id)
+                if (mutable.value.selectedSpace == id) readSpace(c, token, id)
             }
         }
     }
-    fun deleteSpace() {
+    fun deleteSpace(id: String = mutable.value.selectedSpace) {
         val before = mutable.value
-        val id = before.selectedSpace
         if (!before.canDelete) { mutable.value = before.copy(error = "Native shared-space deletion is unavailable. Refresh before trying again."); return }
         val name = before.spaces.firstOrNull { it.id == id }?.name ?: run { mutable.value = before.copy(error = "This space changed. Refresh before deleting."); return }
         launch { c, token ->
@@ -265,8 +352,10 @@ class NativeBotModeController(
                 throw e
             }
             if (current(c, token)) {
-                saved.remove<String>(intentKey); saved.remove<String>(key(id))
-                mutable.value = mutable.value.copy(selectedSpace = "", spaces = before.spaces.filterNot { it.id == id }, events = emptyList(), actions = emptyList(), members = emptyList(), draft = "", status = "")
+                saved.remove<String>(intentKey); saved.remove<String>(key(id)); last.remove(id)
+                val now = mutable.value
+                val rest = now.copy(spaces = now.spaces.filterNot { it.id == id })
+                mutable.value = if (now.selectedSpace != id) rest else rest.copy(selectedSpace = "", events = emptyList(), actions = emptyList(), members = emptyList(), roster = emptyList(), typing = emptyList(), working = false, draft = "", status = "")
             }
         }
     }
@@ -316,7 +405,7 @@ class NativeBotModeController(
     }
     fun home() {
         back()
-        mutable.value = mutable.value.copy(selectedSpace = "", events = emptyList(), actions = emptyList(), draft = "", status = "")
+        mutable.value = mutable.value.copy(selectedSpace = "", events = emptyList(), actions = emptyList(), roster = emptyList(), typing = emptyList(), working = false, draft = "", status = "")
     }
     fun back() {
         ++generation

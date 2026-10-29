@@ -110,3 +110,61 @@ def test_the_plain_mail_vocabulary_shares_only_the_message_noun_with_the_unsafe_
     plugin = load_private("__init__")
     gateway = plugin._gateway_tools()
     assert (plugin._MAIL_NAME_WORDS | gateway.READ_NAME_WORDS | {"fetch"}) & gateway.UNSAFE_NAME_WORDS == {"message"}
+
+
+@pytest.mark.parametrize("name", ["zotero_health", "mnemosyne_health"])
+def test_a_health_check_is_a_read_in_a_watch_run(watch_guard, name):
+    # Health checks were blocked as writes, which marked a good watch run as failed (28 Oct 2026).
+    plugin, _ = watch_guard
+    _serve({name: True})
+    assert _guard(plugin, name) is None
+
+
+def test_a_health_word_does_not_make_a_write_a_read(watch_guard):
+    plugin, _ = watch_guard
+    _serve({"set_health_alert": True})
+    assert _guard(plugin, "set_health_alert")["action"] == "block"
+
+
+@pytest.mark.parametrize("name", ["health_alert", "health_message", "health_comment"])
+def test_health_does_not_relax_the_rule_for_nouns_after_a_read_verb(watch_guard, name):
+    # 'health' is a noun: health_alert is a write, as it was before 'health' became a read word (review 2.138).
+    plugin, _ = watch_guard
+    _serve({name: True})
+    assert _guard(plugin, name)["action"] == "block"
+
+
+@pytest.mark.parametrize("name", ["delete_health", "health_reset", "reset_health", "send_health", "health_check_and_delete", "health_repair"])
+def test_a_write_named_after_health_stays_blocked_even_with_the_read_only_hint(watch_guard, name):
+    plugin, _ = watch_guard
+    _serve({name: True})
+    assert _guard(plugin, name)["action"] == "block", name
+
+
+def test_a_health_name_reads_only_beside_the_servers_own_hint(watch_guard, monkeypatch):
+    plugin, _ = watch_guard
+    blocked = {"action": "block", "message": plugin._READ_ONLY_MESSAGE}
+    # Without a hint, or as a Hermes or plugin tool with no hint at all, a health name is not a read (review 2.144).
+    _serve({"zotero_health": False})
+    assert _guard(plugin, "zotero_health") == blocked
+    # An untrusted server's health check stays behind the owner's approval, as every noun does there.
+    _serve({"zotero_health": True})
+    _mcp_trust(monkeypatch, api="untrusted")
+    assert _guard(plugin, "zotero_health") == blocked
+
+
+def test_the_call_gateway_keeps_its_own_rule_for_health_names(harness):
+    gateway = load_private("__init__")._gateway_tools()
+    assert gateway.name_writes("health_alert")
+    assert not gateway.mcp_reads_by_name("zotero_health", "untrusted")
+
+
+def test_a_native_tool_named_after_health_never_reads_in_a_watch(watch_guard, monkeypatch):
+    # A Hermes or plugin tool has no server hint, so a health name alone must not release it (review 2.144).
+    plugin, _ = watch_guard
+    monkeypatch.setitem(sys.modules, "tools.registry", SimpleNamespace(registry=SimpleNamespace(get_toolset_for_tool=lambda name: "native")))
+    blocked = {"action": "block", "message": plugin._READ_ONLY_MESSAGE}
+    for name in ("repair_health", "zotero_health", "log_health", "refresh_health"):
+        assert plugin.native_proactive_read_only_guard(tool_name=name, args={}, session_id="watch-run") == blocked, name
+    # Control: the native branch is live, so the blocks above come from the name rule.
+    assert plugin.native_proactive_read_only_guard(tool_name="skill_view", args={}, session_id="watch-run") is None

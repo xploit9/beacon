@@ -1,12 +1,14 @@
 package dev.hermes.android.ui
 
 import dev.hermes.android.core.rows
+import dev.hermes.android.core.string
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -92,6 +94,9 @@ import kotlinx.coroutines.launch
     val profileLoading = ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
     val state by vm.phoneSettings.bots.collectAsStateWithLifecycle()
     val models by vm.phoneSettings.botModels.collectAsStateWithLifecycle()
+    val admin by vm.profileAdmin.state.collectAsStateWithLifecycle()
+    var creating by rememberSaveable { mutableStateOf(false) }
+    var deleting by rememberSaveable { mutableStateOf("") }
     var discard by remember { mutableStateOf<(() -> Unit)?>(null) }
     fun leave(action: () -> Unit) {
         if (!state.saving) {
@@ -102,6 +107,12 @@ import kotlinx.coroutines.launch
     val back = { leave { if (state.editing) vm.phoneSettings.editBot(false) else if (state.selected != null) vm.phoneSettings.closeBot() else vm.backFromSettings() } }
     BackHandler(onBack = back)
     LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, vm.client) { vm.phoneSettings.bind(); vm.phoneSettings.loadBots(); if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
+    // "Profile settings" on a bot in Bot Mode lands here with that profile asked for: show it once the list has loaded.
+    LaunchedEffect(admin.open, state.loading, state.profiles) {
+        if (admin.open.isNotBlank() && !state.loading && state.profiles.any { it.profile == admin.open }) { vm.phoneSettings.openBot(admin.open); vm.profileAdmin.opened() }
+    }
+    // A profile that was open and is no longer in the list (deleted here or on the computer) closes back to the list.
+    LaunchedEffect(state.profiles, state.loading) { state.selected?.profile?.let { open -> if (!state.loading && state.profiles.isNotEmpty() && state.profiles.none { it.profile == open }) vm.phoneSettings.closeBot() } }
     Column(Modifier.fillMaxSize()) {
         Header(uiText("Profiles"), back = back, menu = LocalOpenNavigationMenu.current)
         ProfileApprovalSettings(vm)
@@ -112,8 +123,15 @@ import kotlinx.coroutines.launch
                 if (vm.ui.value.profile == profile && vm.ui.value.tab == "More" && vm.ui.value.morePage in setOf("", "Profiles")) vm.more(settingsRoute(page))
             } }, onRefresh = { state.selected?.let { vm.phoneSettings.openBot(it.profile) } ?: vm.phoneSettings.loadBots() }, models = models,
             renderBehavior = { Markdown(it, vm) },
-            profileLabel = { profile -> profileDisplayLabel(profile, profileRows, profileLoading) })
+            profileLabel = { profile -> profileDisplayLabel(profile, profileRows, profileLoading) },
+            onNewProfile = { creating = true }, canDelete = vm::canDeleteProfile, onDelete = { deleting = it })
     }
+    if (creating) NewProfileDialog(profileRows.map { it.string("name") to profileDisplayName(it.string("name"), profileRows) }, admin,
+        onCreate = { name, from, role -> vm.profileAdmin.create(name, from, role, profileRows.map { it.string("name") }) }, onDismiss = { creating = false })
+    val deletable = deleting.isNotBlank() && vm.canDeleteProfile(deleting)
+    LaunchedEffect(deleting, deletable) { if (deleting.isNotBlank() && !deletable) deleting = "" }
+    if (deletable) DeleteProfileDialog(deleting, profileDisplayName(deleting, profileRows), bot = false, admin = admin, onDelete = { vm.deleteProfile(deleting) }, onDismiss = { deleting = "" })
+    LaunchedEffect(creating, deleting) { vm.profileAdmin.clearError() }
     discard?.let { action -> AlertDialog(onDismissRequest = { discard = null }, title = { Text(uiText("Discard model selection?")) },
         confirmButton = { TextButton(onClick = { discard = null; action() }) { Text(uiText("Discard")) } },
         dismissButton = { TextButton(onClick = { discard = null }) { Text(uiText("Keep editing")) } }) }

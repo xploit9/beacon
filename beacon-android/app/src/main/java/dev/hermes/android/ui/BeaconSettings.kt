@@ -268,6 +268,7 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
                                 Text(uiText("Watch status"), Modifier.weight(1f), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 ProactiveHealthChip(proactiveHealthState(proactive, checking))
                             }
+                            proactiveLastCheck(proactive)?.let { Text("${uiText("Last check")} $it", Modifier.testTag("proactive-last-check"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                             if (proactive?.optJSONObject("health")?.string("state") == "error")
                                 Text(uiText("Couldn't check just now. Try again later."), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                             Text(uiText("When something matters"), style = MaterialTheme.typography.titleMedium)

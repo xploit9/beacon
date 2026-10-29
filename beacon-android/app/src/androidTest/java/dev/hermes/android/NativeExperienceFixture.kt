@@ -700,6 +700,8 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             val rows = JSONArray().put(json("name" to "notes.md", "path" to "$current/notes.md", "is_directory" to false, "size" to 28))
             workspaceFiles.keys.sorted().forEach { rows.put(json("name" to it, "path" to "$current/$it", "is_directory" to false)) }
             rows.put(json("name" to "research", "path" to "$current/research", "is_directory" to true))
+            // Like Windows' My Documents: a shortcut listed under its target's path. The same path twice once crashed the list.
+            rows.put(json("name" to "Research shortcut", "path" to "$current/research", "is_directory" to true))
             rows.put(json("name" to ".cache", "path" to "$current/.cache", "is_directory" to true))
             if (holdNextFileList.getAndSet(false)) { fileListCaptured.countDown(); check(releaseFileList.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
             200 to json("entries" to rows, "path" to current, "parent" to "C:/", "can_change_path" to true)

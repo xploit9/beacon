@@ -641,13 +641,13 @@ class NativeExperienceUiTest {
     @Test fun sharedSpaceCreationSendRetryApprovalAndUnsupportedRecoveryKeepTheirIdentity() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.navigate("Bots") }
         await { vm.ui.value.botModeEnabled && !vm.ui.value.botModeSwitching && vm.botMode.state.value.bots.size == 2 && !vm.botMode.state.value.loading }
-        compose.onNodeWithContentDescription("New shared space").performClick()
+        compose.onNodeWithContentDescription("New chat").performClick()
         for (name in listOf("default", "coder")) {
-            val choice = compose.onNode(hasText(name) and hasAnyAncestor(hasTestTag("bot-mode-home"))).assertIsToggleable()
+            val choice = compose.onNode(hasText(name) and hasAnyAncestor(hasTestTag("new-chat-sheet"))).assertIsToggleable()
             if (name !in vm.botMode.state.value.selectedBots) choice.performScrollTo().performClick()
             choice.assertIsOn()
         }
-        compose.onNodeWithText("Create shared space").performScrollTo().performClick()
+        compose.onNodeWithTag("new-chat-start").performScrollTo().performClick()
         await { vm.botMode.state.value.selectedSpace == "fixture-room" && !vm.botMode.state.value.loading }
         fixture.rejectRoomSend = true
         compose.onNodeWithTag("bot-shared-composer").performTextInput("Plan the synthetic review")
@@ -3090,20 +3090,44 @@ class NativeExperienceUiTest {
         receipts += "New thread takes a name and an optional emoji; both become the Hermes title and the thread's avatar and header show them."
     }
 
-    @Test fun theBeaconChatLeadsTheListInTheSameRowStyleAsTheOthers() = withFixture { vm, _ ->
+    @Test fun theBeaconChatIsAPresenceCardAboveHistoryAndOpensItsTab() = withFixture { vm, _ ->
         compose.runOnIdle { vm.toggleSessions(true) }
         await { vm.ui.value.sessions.any { sessionRowId(it) == "chat-b" } && !vm.ui.value.historyLoading }
-        compose.onNodeWithTag("history-view-all").performScrollTo()
-        val filters = compose.onNodeWithTag("history-view-all").getUnclippedBoundsInRoot()
-        val beacon = compose.onNodeWithTag("history-beacon-row").getUnclippedBoundsInRoot()
-        val firstChat = compose.onNodeWithTag("history-row:chat-a").getUnclippedBoundsInRoot()
-        assertTrue("The Beacon row is the first of the list", filters.top < beacon.top && beacon.top < firstChat.top)
-        assertEquals("Same row height", (firstChat.bottom - firstChat.top).value, (beacon.bottom - beacon.top).value, 1f)
+        val name = vm.preferences.value.assistantName
+        val card = compose.onNodeWithTag("history-beacon-row").performScrollTo()
+        card.assertHeightIsAtLeast(72.dp).assert(hasContentDescription(name, substring = true))
+            .assert(SemanticsMatcher.expectValue(androidx.compose.ui.semantics.SemanticsProperties.Role, androidx.compose.ui.semantics.Role.Button))
+        // The assistant's name and one status line: no time, and no pin.
+        card.assertTextContains(name).assert(SemanticsMatcher("a name and a status line") { (it.config.getOrNull(androidx.compose.ui.semantics.SemanticsProperties.Text)?.size ?: 0) == 2 })
+        compose.onAllNodes(hasContentDescription("Pinned") and hasAnyAncestor(hasTestTag("history-beacon-row")), useUnmergedTree = true).assertCountEquals(0)
+        // Above the History header and its filters, not a row among the chats.
+        val bounds = card.getUnclippedBoundsInRoot()
+        assertTrue("The card sits above the History header", bounds.bottom <= compose.onNodeWithTag("history-search-toggle").getUnclippedBoundsInRoot().top)
+        assertTrue("The card sits above the filters", bounds.bottom <= compose.onNodeWithTag("history-view-all").getUnclippedBoundsInRoot().top)
         // Telegram rows: a title, then one line with what Hermes knows of the chat.
         compose.onNodeWithTag("history-row:chat-b").assert(SemanticsMatcher("a title and a preview line") { (it.config.getOrNull(androidx.compose.ui.semantics.SemanticsProperties.Text)?.size ?: 0) >= 2 })
-        compose.onNodeWithTag("history-beacon-row").performClick()
+        card.performClick()
         await { vm.ui.value.tab == "Beacon" }
-        receipts += "The Beacon chat is the first row of the history list in the same style as every chat row, and opens the Beacon tab."
+        receipts += "The Beacon chat is a presence card above History with the assistant's name and a status line, no pin or time, and opens the Beacon tab."
+    }
+
+    @Test fun theBeaconCardAndHeaderSayWhenTheAssistantIsWorking() = withFixture { vm, _ ->
+        assertEquals(BeaconPresence.OnCall, beaconPresence(onCall = true, working = true))
+        assertEquals(BeaconPresence.Working, beaconPresence(onCall = false, working = true))
+        assertEquals(BeaconPresence.Idle, beaconPresence(onCall = false, working = false))
+        compose.runOnIdle { vm.tab("Beacon") }
+        await { vm.ui.value.tab == "Beacon" && !vm.ui.value.beaconOpening && vm.chat.value.projectionReady }
+        compose.runOnIdle { vm.toggleSessions(true) }
+        // History learns the Beacon conversation's id, which is how the card tells its stream from another chat's.
+        await { vm.chat.value.sessionId.isNotBlank() && vm.ui.value.assistantSessionId == vm.chat.value.sessionId }
+        compose.onNodeWithTag("beacon-header-status", useUnmergedTree = true).assertDoesNotExist()
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "runtime-beacon", liveText = "") }
+        compose.onNodeWithTag("beacon-header-status", useUnmergedTree = true).assertTextEquals("Working…")
+        compose.onNodeWithTag("history-beacon-row").performScrollTo().assertTextContains("Working…")
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "", liveText = "") }
+        compose.onNodeWithTag("beacon-header-status", useUnmergedTree = true).assertDoesNotExist()
+        compose.onNode(hasText("Working…") and hasAnyAncestor(hasTestTag("history-beacon-row")), useUnmergedTree = true).assertDoesNotExist()
+        receipts += "The Beacon card and the Beacon chat header both say Working… while the assistant's chat streams, and return to the last message or tagline when it stops."
     }
 
     @Test fun aNewChatOffersStarterPromptsThatFillTheComposer() = withFixture { vm, fixture ->
@@ -4142,7 +4166,9 @@ class NativeExperienceUiTest {
             assertFalse(vm.chat.value.status.contains("Could not load"))
         }
         compose.onNodeWithTag("message-input").performClick().performTextInput("Native send while the plugin is down")
-        compose.onNodeWithTag("message-send").assertIsEnabled().performClick()
+        // Send enables once the history read settles; a loaded device can take a moment.
+        await { compose.onAllNodes(hasTestTag("message-send") and isEnabled()).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("message-send").performClick()
         await { fixture.requests.any { it.string("method") == "prompt.submit" } }
         val submit = fixture.requests.single { it.string("method") == "prompt.submit" }.getJSONObject("params")
         assertEquals("The native send resumes only the selected conversation", "runtime-chat-a", submit.string("session_id"))
@@ -4579,7 +4605,9 @@ class NativeExperienceUiTest {
         val queuedSubmitIndex = fixture.requests.indexOfLast { it.string("method") == "prompt.submit" }
         assertTrue("The terminal history refresh happens before the queued prompt", fixture.requests.toList().subList(requestsBeforeCompletion, queuedSubmitIndex).any { it.string("path") == "/api/sessions/chat-a/messages" })
         assertTrue("The final assistant reply is visible before another history poll", vm.chat.value.messages.any { it.text == "Completed answer" })
-        compose.onNodeWithText("Completed answer", useUnmergedTree = true).assertIsDisplayed()
+        // Once in the conversation; the closed drawer may preview the same line, so look in the transcript.
+        assertEquals(1, vm.chat.value.messages.count { it.text == "Completed answer" })
+        compose.onNode(hasText("Completed answer") and hasAnyAncestor(hasTestTag("conversation-transcript")), useUnmergedTree = true).assertIsDisplayed()
         await { vm.chat.value.queued.isEmpty() }
         receipts += "A real synthetic WebSocket failure preserves partial progress and the queued follow-up while native status is unknown; a replayed terminal event persists the final assistant row, refreshes history immediately, and only then advances the queue."
     }
@@ -4619,7 +4647,9 @@ class NativeExperienceUiTest {
 
             await { vm.chat.value.messages.any { it.text == "Completed while backgrounded" } &&
                 fixture.requests.count { it.string("method") == "prompt.submit" } == 2 && vm.chat.value.queued.isEmpty() }
-            compose.onNodeWithText("Completed while backgrounded", useUnmergedTree = true).assertIsDisplayed()
+            // Once in the conversation; the closed drawer's history row may preview the same line, so look in the transcript.
+            assertEquals(1, vm.chat.value.messages.count { it.text == "Completed while backgrounded" })
+            compose.onNode(hasText("Completed while backgrounded") and hasAnyAncestor(hasTestTag("conversation-transcript")), useUnmergedTree = true).assertIsDisplayed()
 
             await { fixture.streamSubscriptions.get() > subscriptionsBefore + 1 }
             fixture.nativeTurnStatus = "idle"

@@ -268,7 +268,9 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     val app = application as BeaconApplication
     internal val screens = ScreenCache(read = { app.cache.read(it, "screens") }, write = { scope, value -> app.cache.write(scope, "screens", value) }, drop = { app.cache.delete(it, "screens") }, jobs = viewModelScope)
     val phoneSettings = NativePhoneSettings(viewModelScope, saved, draftChanged = ::checkpointPhoneSettings, screens = screens) { client }
-    val botMode = NativeBotModeController(viewModelScope, saved, openChat = ::openBotChat) { client }
+    val botMode = NativeBotModeController(viewModelScope, saved, openChat = ::openBotChat, screens = screens) { client }
+    /** Makes, describes and deletes profiles for Settings › Profiles and Bot Mode. */
+    val profileAdmin = dev.hermes.android.data.NativeProfileAdmin(viewModelScope, { client }, ::profilesChanged)
     /** Beacon's own plugin install from the app; [pluginInstalled] runs when Beacon is ready on this Hermes. */
     internal val pluginInstall = dev.hermes.android.updates.PluginInstallController(viewModelScope, { client }, ::pluginInstalled, ::openAppUpdates)
     val preferences = app.preferences.data.map(AppPreferences::read).stateIn(viewModelScope, SharingStarted.Eagerly, AppPreferences())
@@ -356,7 +358,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     private var editorCheckpoint: Job? = null
     @Volatile var client: BeaconClient? = null
         private set(value) {
-            if (value == null || field?.scope?.let { !it.sameAccount(value.scope) } == true) { botMode.clear(); pluginInstall.reset() }
+            if (value == null || field?.scope?.let { !it.sameAccount(value.scope) } == true) { botMode.clear(); pluginInstall.reset(); profileAdmin.reset() }
             if (value != null && field?.scope?.let { !it.sameAccount(value.scope) } == true) {
                 normalModeReturn = null
                 _ui.update { it.copy(botModeEnabled = false, botModeSwitching = false) }
@@ -1532,6 +1534,27 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         loads[key] = job
         return job
     }
+    private var beaconCall: Job? = null
+    /** One tap from the drawer: open the Beacon chat, then hand it the request its own call button makes, so permission, voice key and errors are handled in one place. */
+    fun callBeacon() {
+        if (beaconCall?.isActive == true) return  // a second tap while Beacon opens is the same call
+        beaconCall = viewModelScope.launch {
+            navigate("Beacon")
+            // Ready by the same rule the chat uses before sending; leaving the tab while it opens cancels the call.
+            val opened = withTimeoutOrNull(10_000L) {
+                while (true) {
+                    if (_ui.value.tab != "Beacon" || !_ui.value.authenticated) return@withTimeoutOrNull ""
+                    if (!_ui.value.beaconOpening && _chat.value.sessionId.isNotBlank() && _chat.value.streamId.isBlank() && isBeaconConversation()) return@withTimeoutOrNull _chat.value.sessionId
+                    delay(100)
+                }
+                @Suppress("UNREACHABLE_CODE") ""
+            }
+            val active = client
+            if (opened == "") return@launch
+            if (opened == null || active == null) { notice("${dev.hermes.android.data.currentAssistantName} didn't open in time. Try again."); return@launch }
+            _voiceCallRequest.value = VoiceCallRequest(active.scope, opened)
+        }
+    }
     fun navigate(destination: String) {
         if (destination == "Bots") { toggleBotMode(); return }
         val route = dev.hermes.android.ui.navigationRoute(destination)
@@ -1778,6 +1801,28 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 notice(appErrorText(error))
             } finally { _ui.update { it.copy(botModeSwitching = false) }; if (enabling && _ui.value.botModeEnabled) botMode.resume() }
         }.also { modeTransition = it }
+    }
+    /** Never deleted from the app: Hermes' default, the profile in use, the assistant's, and the one leaving Bot Mode switches back to. */
+    fun canDeleteProfile(name: String): Boolean = profileDeletable(name, _ui.value.profile, preferences.value.assistantProfile, normalModeReturn?.string("profile").orEmpty())
+    fun deleteProfile(name: String) = profileAdmin.delete(name, preferences.value.assistantProfile, normalModeReturn?.string("profile").orEmpty())
+    /** A profile was made, described or deleted: every list that names profiles reads again, and a deleted profile's copies on this phone go. */
+    private fun profilesChanged(deleted: String, message: String) {
+        load("navigation-profiles", "/api/profiles", quiet = true)
+        phoneSettings.loadBots()
+        // Bot Mode is the plugin's; with it off, a plain Hermes is never asked.
+        if (_ui.value.botModeEnabled) botMode.rosterChanged()
+        notice(message)
+        val account = client?.scope ?: return
+        if (deleted.isBlank()) return
+        viewModelScope.launch {
+            for (kind in listOf("chat-glances", "conversation-index", "selected-session", "new-chat-shell", "initial-draft", "new-chat-attempt")) {
+                try { app.cache.delete(account.copy(profile = deleted, session = ""), kind) } catch (e: Exception) { if (e is CancellationException) throw e }
+            }
+            // Bot Mode opens from its cached roster; the one listing the deleted bot goes, here and in the deleted profile.
+            for (profile in setOf(account.profile, deleted)) try { screens.remove(account.copy(profile = profile, session = ""), "bot-mode:roster") } catch (e: Exception) { if (e is CancellationException) throw e }
+        }
+        // Delete is never offered for the profile in use; if it was removed from elsewhere meanwhile, leave it for the assistant's.
+        if (account.profile == deleted) switchProfile(preferences.value.assistantProfile)
     }
     fun showBotMode() {
         if (!_ui.value.botModeEnabled || _ui.value.botModeSwitching) return

@@ -472,3 +472,36 @@ def test_a_shared_space_must_include_the_bot_creating_it(harness):
     assert not any(c[2] in ('groups.list', 'groups.create') for c in calls)
     assert client.post('/mobile/bot-mode/space', json={'profiles': ['ops', 'default']}).status_code == 200
     assert any(c[2] == 'groups.create' for c in calls)
+
+
+def test_bots_are_mentioned_by_their_own_names():
+    # Grok Bot style: "Personal" is @personal, not @hermes; a name that cannot be a handle keeps Hermes' profile rule.
+    taken = set()
+    assert api.member_handle('Personal', 'default', taken) == 'personal'
+    assert api.member_handle('Code Wizard', 'coder', taken) == 'code-wizard'
+    assert api.member_handle('بحث', 'research', taken) == 'research'
+    assert api.member_handle('All', 'team', taken) == 'team'
+    assert api.member_handle('Personal', 'helper', taken) == 'helper'
+    assert api.member_handle('Hermes', 'default', set()) == 'hermes'
+    assert api.member_handle('Müller', 'm1', set()) == 'muller'
+    assert api.member_handle('Michał', 'm2', set()) == 'michal'
+    assert api.member_handle('Đức Kırmızı', 'm3', set()) == 'duc-kirmizi'
+    assert api.member_handle('Søren Ægir Œuvre Ðora Þór', 'm4', set()) == 'soren-aegir-oeuvre-dora-thor'
+    assert api.member_handle('Zoë', 'zoe2', {'zoe'}) == 'zoe2'
+    # Every candidate taken or reserved: nothing is created, and the owner is told why.
+    with pytest.raises(api.HTTPException) as refused:
+        api.member_handle('Coder', 'coder', {'coder'})
+    assert refused.value.status_code == 409 and '@name' in refused.value.detail
+    with pytest.raises(api.HTTPException):
+        api.member_handle('All', 'all', set())
+    assert all(api.re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]*', h) for h in taken)
+
+
+def test_a_new_room_names_its_members_by_title(harness):
+    client, calls, results = harness
+    results['profiles.list']['profiles'][1]['display_name'] = 'Code Wizard'
+    # A title stored before a rename never wins over the name the app shows.
+    results['profiles.list']['profiles'][1]['ui_meta'] = {'hermes-bots': {'title': 'Old name'}}
+    assert client.post('/mobile/bot-mode/space', json={'profiles': ['default', 'writer']}).status_code == 200
+    params = next(c[3] for c in calls if c[2] == 'groups.create')
+    assert [m['handle'] for m in params['members']] == ['hermes', 'code-wizard']

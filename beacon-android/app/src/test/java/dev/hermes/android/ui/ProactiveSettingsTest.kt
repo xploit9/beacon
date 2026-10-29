@@ -34,17 +34,19 @@ class ProactiveSettingsTest {
     }
 
     @Test fun healthUsesTheSingleWatchCheckStatusAndPlainWords() {
-        assertEquals("Checked 16:00", proactiveHealthText(json(
-            "timezone" to "Asia/Dubai", "health" to json("state" to "ok", "checked_at" to 1792497600L),
-        )))
-        assertEquals("Couldn't check: Sign in expired", proactiveHealthText(json(
-            "health" to json("state" to "error", "message" to "Sign in expired"),
-        )))
-        assertEquals("Not checked yet", proactiveHealthText(json("health" to json("state" to "unknown"))))
         assertEquals(ProactiveHealthState.Checking, proactiveHealthState(null, true))
         assertEquals(ProactiveHealthState.Ok, proactiveHealthState(json("health" to json("state" to "ok")), false))
         assertEquals(ProactiveHealthState.NotYet, proactiveHealthState(json("health" to json("state" to "unknown")), false))
         assertEquals(ProactiveHealthState.Failed, proactiveHealthState(json("health" to json("state" to "error")), false))
+        // At night the watch rests: "Quiet hours" with the last check, not "Not yet" (28 Oct 2026).
+        val quiet = json("timezone" to "Asia/Dubai", "health" to json("state" to "quiet", "checked_at" to 1792497600L, "last_state" to "ok"))
+        assertEquals(ProactiveHealthState.Quiet, proactiveHealthState(quiet, false))
+        // 1792497600 is 20 Oct 2026, 16:00 in Dubai: not today, so it carries its day.
+        assertEquals("20 Oct, 16:00", proactiveLastCheck(quiet))
+        val now = java.time.Instant.now().epochSecond
+        assertEquals(java.time.Instant.ofEpochSecond(now).atZone(java.time.ZoneId.of("Asia/Dubai")).format(java.time.format.DateTimeFormatter.ofPattern("HH:mm")),
+            proactiveLastCheck(json("timezone" to "Asia/Dubai", "health" to json("state" to "ok", "checked_at" to now))))
+        assertEquals(null, proactiveLastCheck(json("health" to json("state" to "unknown"))))
     }
 
     @Test fun learnedNotesIgnoreBlankEntriesAndMissingLists() {

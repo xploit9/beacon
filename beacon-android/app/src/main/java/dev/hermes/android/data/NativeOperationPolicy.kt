@@ -6,7 +6,7 @@ internal object NativeOperationPolicy {
         "/", "/api/auth/providers", "/auth/password-login", "/auth/logout", "/auth/native/authorize", "/auth/native/token", "/auth/native/refresh", "/api/auth/me", "/api/auth/ws-ticket", "/api/ws",
         "/api/skills", "/api/skills/content", "/api/skills/toggle", "/api/memory",
         "/api/status", "/api/logs", "/api/ops/checkpoints", "/api/hermes/update/check", "/api/mcp/servers",
-        "/api/model/info", "/api/model/options", "/api/model/set", "/api/profiles", "/api/profiles/active",
+        "/api/model/info", "/api/model/options", "/api/model/set",
         "/api/sessions", "/api/sessions/search",
         "/api/tools/toolsets", "/api/files", "/api/files/read", "/api/files/download", "/api/files/upload", "/api/files/mkdir",
         "/api/fs/list", "/api/fs/read-text", "/api/fs/write-text", "/api/fs/download", "/api/cron/jobs", "/api/cron/delivery-targets"
@@ -23,6 +23,9 @@ internal object NativeOperationPolicy {
     private const val deviceLinkPath = "/api/plugins/beacon/devices/link"
     private const val devicesPath = "/api/plugins/beacon/devices"
     private val devicePath = Regex("/api/plugins/beacon/devices/[A-Za-z0-9_-]{1,128}")
+    // Hermes' profile id (hermes_constants.PROFILE_ID_RE). Only the routes the app uses for profiles are open, each with its own method.
+    private val profilePath = Regex("/api/profiles/[a-z0-9][a-z0-9_-]{0,63}")
+    private val profileRolePath = Regex("/api/profiles/[a-z0-9][a-z0-9_-]{0,63}/description")
     // Supported upstream history reads only (latest-descendant verifies a compression chain); mutations stay in the native /api/ws RPC surface.
     private val sessionPath = Regex("/api/sessions/[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}(?:/(?:messages(?:/around)?|timeline|latest-descendant|mutation-snapshot))?")
     // Compatibility for stock Hermes without the optional gateway-safe pin route.
@@ -35,6 +38,9 @@ internal object NativeOperationPolicy {
         if (path == deviceLinkPath) return method == "POST"
         if (path == devicesPath) return method == "GET"
         if (path.startsWith("/api/plugins/beacon/devices/")) return method == "DELETE" && path.matches(devicePath)
+        if (path == "/api/profiles") return method == "GET" || method == "POST"
+        if (path == "/api/profiles/active") return method == "GET"
+        if (path.startsWith("/api/profiles/")) return method == "DELETE" && path != "/api/profiles/default" && path.matches(profilePath) || method == "PUT" && path.matches(profileRolePath)
         if ((path == "/api/sessions" || path.startsWith("/api/sessions/")) && method != "GET") return method == "PATCH" && path.matches(sessionFlagsPath)
         return path.startsWith("/api/plugins/beacon/") || path in paths || path.matches(cronPath) || path.matches(kanbanPath) || path.matches(toolPath) || path.matches(mcpPath) || path.matches(sessionPath)
     }
