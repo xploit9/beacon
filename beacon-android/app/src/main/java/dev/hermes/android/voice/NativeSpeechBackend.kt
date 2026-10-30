@@ -23,6 +23,7 @@ internal class NativeSpeechRenderer(
     private sealed class Rendered {
         data class Audio(val bytes: ByteArray) : Rendered()
         object MissingTranscript : Rendered()
+        object MissingAudio : Rendered()
         object Failed : Rendered()
     }
     private data class Playback(val generation: Long, val remaining: java.util.concurrent.atomic.AtomicInteger, val done: CompletableDeferred<Unit>)
@@ -44,7 +45,7 @@ internal class NativeSpeechRenderer(
                     catch (_: Exception) { Rendered.Failed }
                     if (!valid(line.generation)) break
                     if (result is Rendered.Audio) { bytes = result.bytes; break }
-                    if (result != Rendered.MissingTranscript || attempt == 1) break
+                    if (result !in setOf(Rendered.MissingTranscript,Rendered.MissingAudio) || attempt == 1) break
                 }
                 if (!valid(line.generation)) break
                 val rendered = bytes
@@ -214,9 +215,8 @@ internal class NativeSpeechRenderer(
                                 // The transcript is optional; when present it must still match the native text.
                                 if (awaitingGeminiIdle && content.opt("interactionStatus") != "IDLE") return
                                 val spoken = transcript.toString()
-                                if (buffer.size() == 0 || normalizeVoiceText(spoken).isNotEmpty() && !sameWords(text, spoken)) {
-                                    finish(Rendered.Failed); return
-                                }
+                                if (buffer.size() == 0) { finish(Rendered.MissingAudio); return }
+                                if (normalizeVoiceText(spoken).isNotEmpty() && !sameWords(text, spoken)) { finish(Rendered.Failed); return }
                                 finish(Rendered.Audio(buffer.toByteArray())); return
                             }
                             turnComplete = true
@@ -259,8 +259,27 @@ internal class NativeSpeechRenderer(
 
     private fun sameWords(expected: String, actual: String): Boolean {
         // Speech transcripts omit paired prose quotes; keep every word, sign and unmatched unit mark.
-        fun spoken(value: String) = normalizeVoiceText(value).replace(Regex("\u201c([^\u201c\u201d]*)\u201d")) { it.groupValues[1] }
+        fun spoken(value: String) = normalizeVoiceText(withoutProseEmphasis(value))
+            .replace(Regex("\u201c([^\u201c\u201d]*)\u201d")) { it.groupValues[1] }
+            .replace(Regex("""(?<![\p{L}\p{N}])"([^"]+)"(?![\p{L}\p{N}])""")) { it.groupValues[1] }
         return spoken(expected) == spoken(actual)
+    }
+    private fun withoutProseEmphasis(value: String): String {
+        // Use the existing Markdown dependency so code, escapes and literal operators stay intact.
+        val removed=mutableSetOf<Int>()
+        val document=org.commonmark.parser.Parser.builder()
+            .includeSourceSpans(org.commonmark.parser.IncludeSourceSpans.BLOCKS_AND_INLINES).build().parse(value)
+        document.accept(object:org.commonmark.node.AbstractVisitor() {
+            fun strip(node:org.commonmark.node.Node,delimiter:org.commonmark.node.Delimited) {
+                val first=node.sourceSpans.firstOrNull()?:return
+                val last=node.sourceSpans.last()
+                repeat(delimiter.openingDelimiter.length) { removed+=first.inputIndex+it }
+                repeat(delimiter.closingDelimiter.length) { removed+=last.inputIndex+last.length-1-it }
+            }
+            override fun visit(node:org.commonmark.node.StrongEmphasis) { strip(node,node);super.visit(node) }
+            override fun visit(node:org.commonmark.node.Emphasis) { strip(node,node);super.visit(node) }
+        })
+        return value.filterIndexed { index,_ -> index !in removed }
     }
     private fun chunks(text: String): List<String> {
         val result = mutableListOf<String>()
@@ -277,13 +296,53 @@ internal class NativeSpeechRenderer(
 
 internal fun normalizeVoiceText(value: String): String =
     // Android's ICU engine rejects Java's (?U) flag; explicit spaces work on both runtimes.
-    java.text.Normalizer.normalize(value, java.text.Normalizer.Form.NFC).replace(Regex("[\\s\\p{Z}\\u0085]+"), " ").trim()
+    java.text.Normalizer.normalize(value, java.text.Normalizer.Form.NFC).replace('\u2018','\'').replace('\u2019','\'')
+        .replace(Regex("[\\s\\p{Z}\\u0085]+"), " ").trim()
 
 internal class VoiceInputLimit : IllegalStateException("Voice turn limit reached")
 internal class VoiceInputUnconfirmed(message: String) : IllegalStateException(message)
 
 /** Provider item identities and Gemini's closed activity segment remain local to this call. */
 internal class VoiceFinalItems {
+    private val numericAddition=Regex("""(?<![\p{L}\p{N}_+.,/\\@'"`])\d+(?:\.\d+)?(?:\s*(?:\+|\bplus\b)\s*\d+(?:\.\d+)?)+(?![\p{L}\p{N}_+,/\\@'"`]|\.[\p{L}_])""")
+    private val plusSpacing=Regex("""\s*\+\s*""")
+    private val speechNumbers by lazy {
+        try { android.icu.text.MessageFormat("{0,spellout}",java.util.Locale.ENGLISH).formats?.firstOrNull() }
+        catch (_: Exception) { null }
+    }
+    private fun comparison(text:String)=numericAddition.replace(normalizeVoiceText(text).lowercase(java.util.Locale.ROOT)) {
+        plusSpacing.replace(it.value," plus ")
+    }
+    private fun numberWords(text:String):String {
+        val parser=speechNumbers?:return text
+        val result=StringBuilder();var at=0
+        fun opaque(char:Char)=char.isLetterOrDigit()||char in "_+.,/\\@-'\"`"
+        while(at<text.length) {
+            val char=text[at]
+            val close=when(char) { '"','\'','`' -> char; '\u201c' -> '\u201d'; '\u2018' -> '\u2019';else -> null }
+            if(close!=null&&(at==0||!text[at-1].isLetterOrDigit())) {
+                val end=text.indexOf(close,at+1)
+                if(end>=0) { result.append(text,at,end+1);at=end+1;continue }
+            }
+            if(char.isLetter()&&(at==0||!opaque(text[at-1]))&&!text.startsWith("plus",at)) {
+                val position=java.text.ParsePosition(at)
+                val value=try { parser.parseObject(text,position) as? Number } catch (_: Exception) { null }
+                val end=position.index
+                if(value!=null&&end>at&&(end==text.length||!opaque(text[end]))&&text.substring(at,end).all { it.isLetter()||it.isWhitespace()||it=='-' }) {
+                    result.append(value.toString());at=end;continue
+                }
+            }
+            result.append(char);at++
+        }
+        return result.toString()
+    }
+    private fun sameSpeech(input:String,echo:String):Boolean {
+        if(comparison(input)==comparison(echo)) return true
+        val left=numberWords(normalizeVoiceText(input).lowercase(java.util.Locale.ROOT))
+        val right=numberWords(normalizeVoiceText(echo).lowercase(java.util.Locale.ROOT))
+        if(!numericAddition.containsMatchIn(left)&&!numericAddition.containsMatchIn(right)) return false
+        return comparison(left)==comparison(right)
+    }
     private data class Segment(val id: String, var input: String = "", var echo: String = "", var ended: Boolean = false,
         var submitted: Boolean = false, var outputComplete: Boolean = false, var playbackComplete: Boolean = false, var completed: Boolean = false)
     private val seen = linkedSetOf<String>()
@@ -318,7 +377,8 @@ internal class VoiceFinalItems {
     }
     private fun candidate(current: Segment): Pair<String, String>? {
         if (current.submitted || !current.ended || !current.outputComplete || current.input.isBlank() || current.echo.isBlank()) return null
-        if (normalizeVoiceText(current.input) != normalizeVoiceText(current.echo)) return null
+        // ASR can write numeric '+' while its spoken echo writes 'plus'; submit the original input unchanged.
+        if (!sameSpeech(current.input,current.echo)) return null
         current.submitted = true; current.completed = true
         return reserve(current.id, current.input)
     }

@@ -16,7 +16,11 @@ Interrupting speech stops playback and leaves submitted Hermes work running. To 
 
 Provider keys stay encrypted on the phone. Microphone audio and text read aloud travel directly to the selected voice provider. Hermes receives native text requests and authorized shared camera or screen images. Native replies read aloud can contain private information, so choose a voice provider you trust.
 
+Beacon preserves the recognized request text. Its speech checks allow capitalization differences and a numeric addition written as `+` or spoken as “plus”; they do not rewrite the request. Changed words, values and literal identifiers remain unconfirmed. Unverified speech is withheld and reported, rather than automatically repeated.
+
 Speech is generated in an isolated session from the native reply or a fixed call prompt. Gemini can complete speech without a separate output transcript, which is optional in [Google's Live API](https://ai.google.dev/api/live). Supplied transcripts are checked before playback. Captions follow the native text submitted for speech and appear after playback is acknowledged.
+
+Speech comparisons accept apostrophe and prose-quote typography and omit Markdown emphasis markers. Literal code, operators and measurement marks remain checked; the saved native reply is unchanged.
 
 ## Saving and ending a call
 

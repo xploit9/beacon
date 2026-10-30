@@ -49,12 +49,18 @@ class VoiceLookupLiveTest {
                 loginLiveTest(app,auth.getString("origin"),auth)
                 withContext(Dispatchers.Main.immediate) { vm.connect(auth.getString("origin")) }.join()
             }
-            await { vm.ui.value.connected&&vm.client!=null }
+            await { vm.ui.value.connected&&vm.client!=null&&!vm.ui.value.restoringSession }
             client=requireNotNull(vm.client).detached()
-            withContext(Dispatchers.Main.immediate) { vm.newChat(json("title" to "Native voice backend verification")) }.join()
-            await { vm.chat.value.sessionId.isNotBlank()&&!vm.ui.value.newChatOpening }
-            session=vm.chat.value.sessionId
             rule.runOnIdle { vm.tab("Chat") }
+            await { vm.ui.value.tab=="Chat"&&!vm.ui.value.newChatOpening&&
+                (vm.chat.value.sessionId.isBlank()||vm.chat.value.projectionReady) }
+            val previousSession=vm.chat.value.sessionId
+            phases.put("phase","opening_native_chat")
+            withContext(Dispatchers.Main.immediate) { vm.newChat(json("title" to "Native voice backend verification")) }.join()
+            await { vm.chat.value.sessionId.isNotBlank()&&vm.chat.value.sessionId!=previousSession&&
+                vm.chat.value.projectionReady&&!vm.ui.value.newChatOpening&&
+                vm.authenticatedScope()?.session==vm.chat.value.sessionId }
+            session=vm.chat.value.sessionId
             phases.put("phase","connecting")
             rule.onNodeWithTag("chat-call-beacon").performClick()
             await(45_000) { app.calls.state.value.active&&app.calls.state.value.state in setOf("listening","speaking") }
@@ -141,7 +147,16 @@ class VoiceLookupLiveTest {
                     check(file.isFile&&file.length() in 2L..(rate*2L*60)&&file.length()%2L==0L) { "A bounded synthetic PCM16 fixture is required" }
                     file.readBytes()
                 } finally { if(file.exists()) check(file.delete()) }
-                try { stream(ByteArray(rate*2*600/1000));stream(fixture);stream(ByteArray(rate*2*2200/1000)) }
+                try {
+                    stream(ByteArray(rate*2*600/1000));stream(fixture);stream(ByteArray(rate*2*2200/1000))
+                    if(provider=="gemini") {
+                        val pendingInput=DirectVoice::class.java.getDeclaredField("microphone").apply { isAccessible=true }.get(direct) as kotlinx.coroutines.channels.Channel<*>
+                        @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+                        suspend fun drained() { await(5_000) { pendingInput.isEmpty } }
+                        drained()
+                        check(direct.send(GeminiWire.endAudio())) { "The synthetic input pause was not accepted" }
+                    }
+                }
                 finally { fixture.fill(0) }
                 phases.put("phase",kind+"_native_admission")
                 var job:JSONObject?=null

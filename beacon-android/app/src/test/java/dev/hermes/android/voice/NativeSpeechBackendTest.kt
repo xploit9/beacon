@@ -24,6 +24,95 @@ import kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn
 
 /** Network doubles preserve the real DirectVoice, native gateway and provider event paths. */
 class NativeSpeechBackendTest {
+    @Test(timeout = 12000) fun proseEmphasisIsNotSpokenButLiteralStarsRemainRequired() = runBlocking {
+        for ((native,spoken,allowed) in listOf(
+            Triple("One available skill is **hermes-agent**.","One available skill is hermes-agent.",true),
+            Triple("One available skill is _hermes-agent_.","One available skill is hermes-agent.",true),
+            Triple("Keep `**literal**` unchanged.","Keep `literal` unchanged.",false),
+            Triple("Calculate 2**3.","Calculate 2*3.",false),
+        )) {
+            val f=RenderFixture("grok")
+            try {
+                f.start(native);f.receive(renderPcm("grok"));f.receive(renderTranscript("grok",text=spoken));f.receive(renderDone("grok","completed"))
+                if(allowed) {
+                    assertTrue(native,waitFor { f.events.any { it.optString("text")==native } })
+                    assertEquals(1,f.audio.size)
+                } else { delay(100);assertTrue(native,f.audio.isEmpty()) }
+            } finally { f.close() }
+        }
+    }
+    @Test(timeout = 8000) fun apostropheTypographyKeepsTheNativeReplyAndMeasurementMark() = runBlocking {
+        val f=RenderFixture("grok")
+        try {
+            val native="Your preferred name is Maya. I didn\u2019t change anything."
+            f.start(native);f.receive(renderPcm("grok"))
+            f.receive(renderTranscript("grok",text="Your preferred name is Maya. I didn't change anything."))
+            f.receive(renderDone("grok","completed"))
+            assertTrue(waitFor { f.events.any { it.optString("text")==native } })
+            assertEquals(1,f.audio.size)
+            assertNotEquals(normalizeVoiceText("Height 6\u2019"),normalizeVoiceText("Height 6"))
+        } finally { f.close() }
+    }
+    @Test(timeout = 8000) fun completedGeminiSilenceRetriesOnlyTheReadOnlySpeechRender() = runBlocking {
+        val f=RenderFixture()
+        try {
+            f.start();f.receive(renderTranscript(text="<silence></silence>"));f.receive(renderDone())
+            assertTrue("A silent completed generation gets one new isolated render",waitFor { f.requestCount("Verified reply.")==2 })
+            assertTrue(f.audio.isEmpty());assertFalse(f.warned())
+            f.receive(renderPcm());f.receive(renderTranscript());f.receive(renderDone())
+            assertTrue(waitFor { f.events.any { it.optString("text")=="Verified reply." } })
+            assertEquals(1,f.audio.size);assertEquals(2,f.requestCount("Verified reply."));assertFalse(f.warned())
+        } finally { f.close() }
+    }
+    @Test(timeout = 8000) fun straightAndCurlyProseQuotesRenderTheSameNativeWords() = runBlocking {
+        val f=RenderFixture()
+        try {
+            val native="One available skill is \u201chermes-agent.\u201d"
+            f.start(native);f.receive(renderPcm())
+            f.receive(renderTranscript(text=" One available skill is \"hermes-agent.\""));f.receive(renderDone())
+            assertTrue("Quote typography must not reject the same native words",waitFor { f.audio.size==1 })
+            assertTrue(waitFor { f.events.any { it.optString("text")==native } })
+        } finally { f.close() }
+    }
+
+    @Test(timeout = 8000) fun doubleMeasurementMarksAreNotProseQuotes() = runBlocking {
+        val f=RenderFixture()
+        try {
+            f.start("Width 6\" and height 8\".");f.receive(renderPcm())
+            f.receive(renderTranscript(text="Width 6 and height 8."));f.receive(renderDone())
+            assertTrue(waitFor { f.warned() });assertTrue(f.audio.isEmpty())
+        } finally { f.close() }
+    }
+    @Test fun geminiNumericAdditionSpellingKeepsTheRecognizedInput() {
+        for((input,echo) in listOf("What is 2 + 3?" to "What is 2 plus 3?", "WHAT is 12.5 plus 3?" to "What is 12.5+3?", "Add 1+2+3" to "Add 1 plus 2 plus 3")) {
+            val ledger=VoiceFinalItems()
+            ledger.activityStart()
+            assertNull(ledger.accept(JSONObject().put("text",input),true))
+            assertNull(ledger.echo(JSONObject().put("text",echo)))
+            assertNull(ledger.activityEnd())
+            assertEquals(input,ledger.generationComplete()?.second)
+            assertNull("A spelling equivalence must not submit twice",ledger.generationComplete())
+        }
+    }
+
+    @Test fun geminiAdditionSpellingNeverChangesOperandsOperatorsOrIdentifiers() {
+        for((input,echo) in listOf(
+            "What is 2 + 3?" to "What is 2 plus 4?",
+            "What is 2 + 3?" to "What is 2 minus 3?",
+            "Read file2+3" to "Read file2 plus 3",
+            "Read 2+3.txt" to "Read 2 plus 3.txt",
+            "Read /2+3" to "Read /2 plus 3",
+            "Read file2+3+4" to "Read file2+3 plus 4",
+            "Read 2+3+4.txt" to "Read 2 plus 3+4.txt",
+            "Read '2+3'" to "Read '2 plus 3'",
+            "Do not send 2 + 3" to "Do send 2 plus 3",
+        )) {
+            val ledger=VoiceFinalItems()
+            ledger.activityStart();ledger.accept(JSONObject().put("text",input),true)
+            ledger.echo(JSONObject().put("text",echo));ledger.activityEnd()
+            assertNull(input,ledger.generationComplete())
+        }
+    }
     // The isolated renderer is exercised through its actual provider socket callbacks.
     private class RenderFixture(private val provider: String = "gemini") {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -495,8 +584,11 @@ class NativeSpeechBackendTest {
         }
         val empty = RenderFixture()
         try {
-            empty.start(); empty.receive(renderTranscript()); empty.receive(renderDone()); empty.closeSocket()
+            empty.start(); empty.receive(renderTranscript()); empty.receive(renderDone())
+            assertTrue(waitFor { empty.requestCount("Verified reply.")==2 })
+            empty.receive(renderTranscript()); empty.receive(renderDone())
             assertTrue(waitFor { empty.warned() }); assertTrue(empty.audio.isEmpty())
+            assertEquals("Empty speech retries are bounded",2,empty.requestCount("Verified reply."))
         } finally { empty.close() }
     }
 
@@ -1503,15 +1595,19 @@ class NativeSpeechBackendTest {
         } finally { f.close() }
     }
 
-    @Test(timeout = 12000) fun completedGeminiRenderWithoutPcmDoesNotPlayOrRetry() = runBlocking {
+    @Test(timeout = 12000) fun completedGeminiRenderWithoutPcmRetriesSpeechOnceWithoutRepeatingNativeWork() = runBlocking {
         val f=Fixture(authority=true)
         try {
             f.start();f.receive(geminiFinal("Check this"));assertTrue(waitFor { f.prompts().size==1 })
             f.admission=json("status" to "terminal","outcome" to "completed","admission_id" to "admission-1","ref" to json("session_id" to "stored"),"result" to json("final_response" to "Verified reply."))
             assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount("Verified reply.")==0) delay(10);true }==true)
             f.receiveRender(json("serverContent" to json("turnComplete" to true)))
+            assertTrue(waitFor { f.renderRequestCount("Verified reply.")==2 })
+            assertTrue(f.audio.isEmpty());assertEquals(1,f.prompts().size)
+            f.receiveRender(json("serverContent" to json("turnComplete" to true)))
             assertTrue(withTimeoutOrNull(6000) { while(f.events.none { it.optString("message").contains("could not safely read") }) delay(10);true }==true)
-            assertEquals(1,f.renderRequestCount("Verified reply."));assertTrue(f.audio.isEmpty())
+            assertEquals(2,f.renderRequestCount("Verified reply."));assertTrue(f.audio.isEmpty())
+            assertEquals("A speech retry never repeats the Hermes request",1,f.prompts().size)
         } finally { f.close() }
     }
 
