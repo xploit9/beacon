@@ -1,9 +1,67 @@
 import json
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
 from test_mobile import harness, reserve
+
+
+@pytest.mark.parametrize('memory_provider', ['builtin', 'profile-memory'])
+def test_native_backend_context_leaves_tools_and_memory_to_the_hermes_agent(harness, monkeypatch, memory_provider):
+    api, client, _, root, _ = harness
+    call_id = reserve(client)
+    voice = api.voice_context
+    reads = []
+    monkeypatch.setattr(voice, 'scoped', lambda profile, fn: fn(root))
+    monkeypatch.setattr(voice, 'config', lambda root: {'memory': {'provider': memory_provider}})
+    monkeypatch.setattr(voice, 'history', lambda *args: reads.append('history') or [])
+    monkeypatch.setattr(voice, 'personality', lambda *args: reads.append('personality') or 'Private native instructions')
+    monkeypatch.setattr(voice, 'builtin_memory', lambda *args: reads.append('memory') or 'Private native memory')
+    monkeypatch.setattr(voice, 'tool_catalogue', lambda *args: reads.append('tools') or 'Private native tool list')
+    monkeypatch.setattr(api.mobile, 'voice_history', lambda *args, **kwargs: reads.append('voice_archive') or {'events': []})
+    result = client.get(f'/api/plugins/beacon/mobile/calls/{call_id}/context', params={'backend': 'hermes'})
+    assert result.status_code == 200
+    value = result.json()
+    assert reads == []
+    assert value['backend'] == 'hermes'
+    assert value['profile'] == 'default' and value['selected_session_id'] == 'native-stored'
+    assert not value['tool_catalogue'] and not value['context_summary']
+    assert not any(value['capabilities'].get(name) for name in ('web_search', 'memory_recall', 'skills'))
+    assert all(text not in result.text for text in ('Private native instructions', 'Private native memory', 'Private native tool list'))
+    with api.mobile.connect() as db:
+        saved = json.loads(db.execute('SELECT voice_config FROM calls WHERE id=?', (call_id,)).fetchone()[0])
+    assert saved['backend'] == 'hermes'
+
+
+def test_native_backend_calls_do_not_run_a_parallel_voice_memory_workflow(harness, monkeypatch):
+    api, client, _, _, _ = harness
+    call_id = reserve(client)
+    with api.mobile.connect() as db:
+        db.execute('UPDATE calls SET voice_config=? WHERE id=?', (json.dumps({'backend': 'hermes'}), call_id))
+        row = dict(db.execute('SELECT * FROM calls WHERE id=?', (call_id,)).fetchone())
+    monkeypatch.setattr(api.voice_context, 'warm_recall', lambda *args: pytest.fail('Hermes owns recall for its native turn'))
+    monkeypatch.setattr(api.voice_context, 'hand_over_call', lambda *args: pytest.fail('Hermes owns retention for its native turn'))
+    released = []
+    monkeypatch.setattr(api.voice_context, 'end_call_memory', lambda call: released.append(call))
+    monkeypatch.setattr(api.threading, 'Thread', lambda target, **kwargs: SimpleNamespace(start=target))
+    api.warm_memory('owner', 'basic', row, {'events': [{'type': 'transcript', 'role': 'user', 'final': True, 'text': 'Fixture question'}]})
+    api.hand_over('owner', 'basic', row)
+    assert released == [call_id]
+
+
+def test_abandoned_native_backend_call_keeps_its_memory_workflow_during_sweep(harness, monkeypatch):
+    api, client, _, _, _ = harness
+    call_id = reserve(client)
+    with api.mobile.connect() as db:
+        db.execute('UPDATE calls SET voice_config=?,closed=1,status=?,ended=?,receipt=? WHERE id=?',
+                   (json.dumps({'backend': 'hermes'}), 'failed', time.time(), '{}', call_id))
+        db.execute('INSERT INTO timeline VALUES(?,?,?,?)',
+                   (call_id, 'fixture', 'fixture-digest', json.dumps({'type': 'transcript'})))
+    modes = []
+    monkeypatch.setattr(api, 'hand_over', lambda owner, provider, row: modes.append(api.uses_hermes_backend(row)))
+    api.sweep_unended_calls('owner', 'basic', 'default')
+    assert modes == [True]
 
 
 def test_admission_defers_optional_discovery_and_keeps_authoritative_context(harness, monkeypatch):

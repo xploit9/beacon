@@ -27,12 +27,13 @@ internal enum class PluginInstallFailure { SignIn, Denied, Offline, Unsupported,
 
 /**
  * [busy]: Hermes is working on a reply or task right now. [failure] with [PluginInstallStage.NeedsRestart]: the restart did not start,
- * and the offer stays.
+ * and the offer stays. [restartPending] retains a required or unknown restart decision while presence is not yet confirmed.
  */
 internal data class PluginInstallUi(
     val stage: PluginInstallStage = PluginInstallStage.Idle,
     val failure: PluginInstallFailure? = null,
     val busy: Boolean = false,
+    val restartPending: Boolean = false,
 ) {
     val working: Boolean get() = stage == PluginInstallStage.Installing || stage == PluginInstallStage.Checking || stage == PluginInstallStage.Restarting
 }
@@ -103,7 +104,7 @@ private suspend fun beaconAnswers(endpoint: PluginInstallEndpoint, pause: suspen
 }
 
 private suspend fun afterInstall(endpoint: PluginInstallEndpoint, restartFlagged: Boolean, pause: suspend (Long) -> Unit): PluginInstallUi {
-    if (!beaconAnswers(endpoint, pause)) return failed(PluginInstallFailure.NotYet)
+    if (!beaconAnswers(endpoint, pause)) return failed(PluginInstallFailure.NotYet).copy(restartPending = restartFlagged)
     if (!restartFlagged) return PluginInstallUi(PluginInstallStage.Done)
     val gateway = attempt { endpoint.gateway() }
     // A gateway that is not running loads Beacon when it starts; only a running one that missed Hermes' reload needs the restart.
@@ -129,13 +130,14 @@ internal suspend fun runPluginInstall(endpoint: PluginInstallEndpoint, pause: su
         return failed(installFailure(error))
     }
     if (!response.optBoolean("ok")) return failed(PluginInstallFailure.Error)
-    val flagged = response.optBoolean("restart_required") || (response.optJSONObject("activation")?.optJSONArray("missing_dependencies")?.length() ?: 0) > 0
+    // Missing or malformed restart status is unknown, not proof that the gateway reloaded.
+    val flagged = response.opt("restart_required") != false || (response.optJSONObject("activation")?.optJSONArray("missing_dependencies")?.length() ?: 0) > 0
     return afterInstall(endpoint, flagged, pause)
 }
 
 /** "Try again" after [PluginInstallFailure.NotYet]: only asks again, because installing twice would be refused as already there. */
-internal suspend fun runPluginCheck(endpoint: PluginInstallEndpoint, pause: suspend (Long) -> Unit = { delay(it) }): PluginInstallUi =
-    if (beaconAnswers(endpoint, pause)) PluginInstallUi(PluginInstallStage.Done) else failed(PluginInstallFailure.NotYet)
+internal suspend fun runPluginCheck(endpoint: PluginInstallEndpoint, restartPending: Boolean = false, pause: suspend (Long) -> Unit = { delay(it) }): PluginInstallUi =
+    afterInstall(endpoint, restartPending, pause)
 
 private suspend fun gatewayServing(endpoint: PluginInstallEndpoint, settle: Boolean, pause: suspend (Long) -> Unit): PluginInstallUi {
     if (settle) pause(RESTART_SETTLE_MS) // the old gateway may still report itself running
@@ -213,7 +215,7 @@ internal class PluginInstallController(
                 val endpoint = endpointFor(detached)
                 when (step) {
                     PluginInstallStep.Install -> runPluginInstall(endpoint)
-                    PluginInstallStep.Check -> runPluginCheck(endpoint)
+                    PluginInstallStep.Check -> runPluginCheck(endpoint, before.restartPending)
                     PluginInstallStep.Gateway -> runGatewayCheck(endpoint)
                     PluginInstallStep.Restart -> runPluginRestart(endpoint, before)
                 }

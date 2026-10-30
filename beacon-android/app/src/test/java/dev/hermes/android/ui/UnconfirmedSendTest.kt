@@ -6,7 +6,6 @@ import dev.hermes.android.Message
 import dev.hermes.android.QuietWindow
 import dev.hermes.android.STREAM_QUIET_MAX_MS
 import dev.hermes.android.SilentStream
-import dev.hermes.android.core.Draft
 import dev.hermes.android.core.json
 import dev.hermes.android.core.trustedOrigin
 import dev.hermes.android.historyRowOf
@@ -14,7 +13,6 @@ import dev.hermes.android.plainChatRequest
 import dev.hermes.android.reconnectOnNetworkReturn
 import dev.hermes.android.reusableEmptyChat
 import dev.hermes.android.sendArrived
-import dev.hermes.android.sentCopies
 import dev.hermes.android.silentStreamAction
 import org.junit.Assert.*
 import org.junit.Test
@@ -22,24 +20,12 @@ import org.junit.Test
 class UnconfirmedSendTest {
     private fun history(vararg rows: Pair<String, String>) = rows.mapIndexed { i, (role, text) -> Message("m$i", role, text) }
 
-    @Test fun historyHoldingOneMoreCopyProvesTheSendArrived() {
-        val before = sentCopies(history("user" to "hello", "assistant" to "hi"), "hello")
-        val after = history("user" to "hello", "assistant" to "hi", "user" to "hello ", "assistant" to "again")
-        assertEquals(1, before)
-        assertTrue(sendArrived(before, after, Draft("hello")))
-    }
-
-    @Test fun anEarlierIdenticalMessageIsNotTheSend() {
-        val same = history("user" to "continue", "assistant" to "ok")
-        assertFalse(sendArrived(sentCopies(same, "continue"), same, Draft("continue")))
-    }
-
-    @Test fun nothingIsProvedWithoutAStartingCountOrForAttachmentsAndBlankDrafts() {
-        val after = history("user" to "hello")
-        assertFalse(sendArrived(null, after, Draft("hello")))
-        assertFalse(sendArrived(0, after, Draft("hello", attachments = listOf(json("name" to "a.png")))))
-        assertFalse(sendArrived(0, history("user" to ""), Draft("  ")))
-        assertFalse(sendArrived(0, history("assistant" to "hello"), Draft("hello")))
+    @Test fun identicalTextCannotProveAnAnonymousSendArrived() {
+        val after = history("user" to "hello", "user" to "hello")
+        assertFalse(sendArrived("", after))
+        assertFalse(sendArrived("unrelated-row", after))
+        assertTrue(sendArrived("m1", after))
+        assertFalse(sendArrived("m0", history("assistant" to "hello")))
     }
 
     @Test fun savedHistoryOfASignedInAccountReconnectsWhenTheNetworkReturns() {

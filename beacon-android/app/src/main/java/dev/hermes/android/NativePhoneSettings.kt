@@ -9,7 +9,9 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
 /** Profile editors outlive their page; late responses never replace another account's draft. */
-class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: SavedStateHandle, private val draftChanged: () -> Unit = {}, private val screens: ScreenCache? = null, private val client: () -> BeaconClient?) {
+class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: SavedStateHandle, private val draftChanged: () -> Unit = {}, private val screens: ScreenCache? = null,
+    private val globalClient: (() -> BeaconClient?)? = null, private val authorizeProfile: suspend (BeaconClient, String) -> Unit = { _, _ -> },
+    private val profileFailure: (Throwable) -> Unit = {}, private val client: () -> BeaconClient?) {
     private val _skills = MutableStateFlow(NativeSkillsState())
     val skills = _skills.asStateFlow()
     private val _memory = MutableStateFlow(NativeMemoryState(""))
@@ -21,6 +23,9 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
     private val _botModels = MutableStateFlow<List<Pair<String, String>>>(emptyList())
     val botModels = _botModels.asStateFlow()
     var scopeKey: String = ""; private set
+    private var scopeAccount = ""
+    private var boundClient: BeaconClient? = null
+    private var bindingRevision = 0L
     private var skillJob: Job? = null
     private var memoryJob: Job? = null
     private var serverJob: Job? = null
@@ -34,6 +39,8 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         catch (e: CancellationException) { throw e }
         catch (_: Exception) { null }
     private fun updateKey(c: BeaconClient) = c.scope.copy(profile = "", session = "").key
+    private fun global() = if (globalClient == null) client() else globalClient.invoke()
+    private fun current(active: BeaconClient, revision: Long) = client() === active && boundClient === active && bindingRevision == revision && scopeKey == active.scope.key
     private suspend fun keepSkills(scope: Scope, api: NativeSkills) { api.snapshot?.let { cacheAttempt { screens?.set(scope, "settings:skills", it) } } }
 
     /** Original bases survive recovery; a restored draft never adopts a newer host revision. */
@@ -99,52 +106,64 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         draftChanged()
     }
 
-    fun bind() {
-        val key = client()?.scope?.key.orEmpty()
-        if (scopeKey == key) return
+    fun bind(force: Boolean = false) {
+        val next = client()
+        val key = next?.scope?.key.orEmpty()
+        if (!force && scopeKey == key && boundClient === next) return
+        ++bindingRevision
+        val account = next?.let(::updateKey).orEmpty()
+        val priorBots = _bots.value
+        val priorModels = _botModels.value
+        val sameAccount = account.isNotBlank() && account == scopeAccount
+        val carryBot = priorBots.takeIf { sameAccount && it.selected?.profile == next?.scope?.profile }
         if (_skills.value.editing) skillDrafts[scopeKey] = _skills.value.copy(loading = false, saving = false)
         if (_memory.value.editing.isNotBlank()) memoryDrafts[scopeKey] = _memory.value.copy(loading = false, saving = false)
-        if (_bots.value.editing) botDrafts[scopeKey] = _bots.value.copy(loading = false, saving = false)
+        if (_bots.value.editing && carryBot == null) botDrafts[scopeKey] = _bots.value.copy(loading = false, saving = false)
         skillJob?.cancel(); memoryJob?.cancel(); serverJob?.cancel(); botJob?.cancel()
-        scopeKey = key; skillsAt = 0L; memoryAt = 0L
+        scopeKey = key; scopeAccount = account; boundClient = next; skillsAt = 0L; memoryAt = 0L
         _skills.value = skillDrafts.remove(key) ?: NativeSkillsState(profile = client()?.auth?.profile.orEmpty())
         _memory.value = memoryDrafts.remove(key) ?: NativeMemoryState(key)
-        _bots.value = botDrafts.remove(key) ?: NativeBotsState(); _botModels.value = emptyList()
-        val host = client()?.let(::updateKey).orEmpty()
+        _bots.value = botDrafts.remove(key) ?: carryBot?.copy(loading = false, saving = false) ?: NativeBotsState(profiles = if (sameAccount) priorBots.profiles else emptyList())
+        _botModels.value = if (carryBot != null && _bots.value.selected?.profile == carryBot.selected?.profile) priorModels else emptyList()
+        val host = global()?.let(::updateKey).orEmpty()
         _server.value = NativeServerState(requestedActionId = saved["server-update:$host:id"] ?: "", requestedAt = saved["server-update:$host:at"] ?: "")
     }
 
     private fun skillsRequest(write: Boolean = false, block: suspend (NativeSkills) -> NativeSkillsState) {
         val active = client() ?: return
         bind()
+        val revision = bindingRevision
         if (_skills.value.saving) return
         skillJob?.cancel()
         _skills.update { it.copy(loading = !write, saving = write, error = null, notice = null) }
         skillJob = jobs.launch {
             val c = active.detached()
             try {
+                authorizeProfile(active, c.scope.profile)
+                if (!current(active, revision)) return@launch
                 val result = block(NativeSkills(c))
-                if (client() === active && scopeKey == c.scope.key) { _skills.value = result.copy(loading = false, saving = false); draftChanged() }
+                if (current(active, revision)) { _skills.value = result.copy(loading = false, saving = false); draftChanged() }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (client() === active) _skills.update { it.copy(loading = false, saving = false, error = appErrorText(e)) } }
+            catch (e: Exception) { if (current(active, revision)) { _skills.update { it.copy(loading = false, saving = false, error = appErrorText(e)) }; profileFailure(e) } }
             finally { c.closeNative() }
         }
     }
     fun loadSkills(force: Boolean = true) {
         val active = client() ?: return
         bind()
+        val revision = bindingRevision
         if (_skills.value.editing || !force && (skillJob?.isActive == true || startupReadFresh(skillsAt, System.currentTimeMillis()))) return
         skillsRequest { api ->
             val c = active
             if (!force && _skills.value.skills.isEmpty()) cacheAttempt {
                 screens?.get(c.scope, "settings:skills")?.let { stored ->
                     val cached = parseNativeSkills(stored.copy())
-                    if (client() === active && scopeKey == c.scope.key) _skills.update { it.copy(skills = cached) }
+                    if (current(active, revision)) _skills.update { it.copy(skills = cached) }
                 }
             }
             val list = api.list()
-            keepSkills(c.scope, api)
-            if (scopeKey == c.scope.key) skillsAt = System.currentTimeMillis()
+            if (current(active, revision)) keepSkills(c.scope, api)
+            if (current(active, revision)) skillsAt = System.currentTimeMillis()
             val old = _skills.value
             old.copy(skills = list, selected = list.firstOrNull { it.name == old.selected?.name }, notice = api.warnings.takeIf { it.isNotEmpty() }?.joinToString("\n"))
         }
@@ -158,11 +177,16 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
     fun skillDraft(value: String) { _skills.update { it.copy(draft = value) }; draftChanged() }
     fun skillEdit(editing: Boolean) { if (!_skills.value.saving && (!editing || !_skills.value.loading && _skills.value.content != null)) { _skills.update { it.copy(editing = editing, draft = if (editing) it.content?.content.orEmpty() else "", error = null) }; draftChanged() } }
     fun closeSkill() { if (!_skills.value.saving) { skillJob?.cancel(); _skills.update { it.copy(selected = null, content = null, editing = false, draft = "", loading = false, error = null) }; draftChanged() } }
-    fun toggleSkill(skill: NativeSkill, enabled: Boolean) = skillsRequest(true) { api ->
+    fun toggleSkill(skill: NativeSkill, enabled: Boolean) {
+      val active = client() ?: return
+      bind()
+      val revision = bindingRevision
+      skillsRequest(true) { api ->
         api.toggle(skill.name, enabled)
         val list = api.list()
-        client()?.let { keepSkills(it.scope, api) }
+        if (current(active, revision)) keepSkills(active.scope, api)
         _skills.value.copy(skills = list, selected = list.firstOrNull { it.name == _skills.value.selected?.name }, notice = "Saved. New chats use this change.")
+      }
     }
     fun saveSkill() {
         val original = _skills.value.content ?: return
@@ -177,30 +201,33 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
     fun loadMemory(force: Boolean = true) {
         val active = client() ?: return
         bind()
+        val revision = bindingRevision
         if (_memory.value.saving || _memory.value.editing.isNotBlank() || !force && (memoryJob?.isActive == true || startupReadFresh(memoryAt, System.currentTimeMillis()))) return
         memoryJob?.cancel()
         _memory.update { it.copy(loading = it.documents.isEmpty(), error = "", message = "") }
         memoryJob = jobs.launch {
             val c = active.detached()
             try {
+                authorizeProfile(active, c.scope.profile)
+                if (!current(active, revision)) return@launch
                 if (!force && _memory.value.documents.isEmpty()) cacheAttempt {
                     screens?.get(c.scope, "settings:memory")?.let { stored ->
                         val cached = stored.copy()
                         val value = NativeMemoryState.parse(c.scope.key, cached.getJSONObject("status"), cached.getJSONObject("notes"))
-                        if (client() === active && _memory.value.editing.isBlank()) _memory.value = value
+                        if (current(active, revision) && _memory.value.editing.isBlank()) _memory.value = value
                     }
                 }
                 val profile = mapOf("profile" to c.auth.profile)
                 val status = c.nativeGet("/api/memory", profile)
                 val notes = c.nativeGet("/api/plugins/beacon/memory/documents", profile)
                 val result = NativeMemoryState.parse(c.scope.key, status, notes)
-                if (client() === active) {
+                if (current(active, revision)) {
                     if (_memory.value.editing.isBlank()) { _memory.value = result; memoryAt = System.currentTimeMillis() }
                     else memoryAt = 0L
                 }
-                cacheAttempt { screens?.set(c.scope, "settings:memory", json("status" to status, "notes" to notes)) }
+                if (current(active, revision)) cacheAttempt { screens?.set(c.scope, "settings:memory", json("status" to status, "notes" to notes)) }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (client() === active) _memory.update { it.copy(loading = false, error = appErrorText(e)) } }
+            catch (e: Exception) { if (current(active, revision)) { _memory.update { it.copy(loading = false, error = appErrorText(e)) }; profileFailure(e) } }
             finally { c.closeNative() }
         }
     }
@@ -216,6 +243,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
     fun memoryDraft(value: String) { _memory.update { it.copy(draft = value) }; draftChanged() }
     fun saveMemory() {
         val active = client() ?: return
+        val revision = bindingRevision
         val state = _memory.value
         if (state.saving || state.scope != active.scope.key) return
         val document = state.documents.firstOrNull { it.target == state.editing } ?: return
@@ -223,21 +251,23 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         memoryJob = jobs.launch {
             val c = active.detached()
             try {
+                authorizeProfile(active, c.scope.profile)
+                if (!current(active, revision)) return@launch
                 val result = c.nativeGet("/api/plugins/beacon/memory/documents", mapOf("profile" to c.auth.profile), method = "PUT", data = document.saveBody(state.draft))
                 require(result.optBoolean("ok")) { "Memory save wasn't confirmed. Your draft is kept." }
                 val saved = result.getJSONObject("document")
                 val confirmed = NativeMemoryDocument(saved.getString("target"), saved.getString("content"), saved.getString("revision"), saved.getBoolean("enabled"), saved.getInt("limit"))
                 require(confirmed.target == document.target) { "Saved memory does not match this document" }
-                cacheAttempt { screens?.remove(c.scope, "settings:memory") }
-                if (client() === active) { memoryAt = System.currentTimeMillis(); _memory.update { it.copy(documents = it.documents.map { old -> if (old.target == confirmed.target) confirmed else old }, saving = false, editing = "", draft = "", message = "Notes saved. New chats use this change.") }; draftChanged() }
+                if (current(active, revision)) cacheAttempt { screens?.remove(c.scope, "settings:memory") }
+                if (current(active, revision)) { memoryAt = System.currentTimeMillis(); _memory.update { it.copy(documents = it.documents.map { old -> if (old.target == confirmed.target) confirmed else old }, saving = false, editing = "", draft = "", message = "Notes saved. New chats use this change.") }; draftChanged() }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (client() === active) _memory.update { it.copy(saving = false, error = appErrorText(e)) } }
+            catch (e: Exception) { if (current(active, revision)) { _memory.update { it.copy(saving = false, error = appErrorText(e)) }; profileFailure(e) } }
             finally { c.closeNative() }
         }
     }
 
     fun loadServer(page: String, force: Boolean = false) {
-        val active = client() ?: return
+        val active = global() ?: return
         bind(); serverJob?.cancel()
         _server.update { it.copy(loading = true, error = "") }
         serverJob = jobs.launch {
@@ -256,16 +286,16 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                     }
                     else -> error("Unknown server page")
                 }
-                if (client() === active) _server.value = result.copy(loading = false)
+                if (global() === active) _server.value = result.copy(loading = false)
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (client() === active) _server.update { it.copy(loading = false, error = appErrorText(e)) } }
+            catch (e: Exception) { if (global() === active) _server.update { it.copy(loading = false, error = appErrorText(e)) } }
             finally { c.closeNative() }
         }
     }
     fun logFile(value: String) { _server.update { it.copy(logFile = value) }; loadServer("Logs") }
     fun logSearch(value: String) { _server.update { it.copy(logSearch = value) } }
     fun clearReviewedUpdate() {
-        val c = client() ?: return
+        val c = global() ?: return
         if (!_server.value.canReviewUnknown) return
         serverJob?.cancel()
         val host = updateKey(c)
@@ -274,7 +304,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         loadServer("Server updates", force = true)
     }
     fun applyServerUpdate() {
-        val active = client() ?: return
+        val active = global() ?: return
         if (!_server.value.canApply) return
         val host = updateKey(active)
         _server.update { it.copy(applying = true, action = null, receipt = null, error = "") }
@@ -284,46 +314,48 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
             try {
                 val before = c.nativeGet("/api/plugins/beacon/admin/update/status")
                 if (before.optJSONObject("action")?.optBoolean("running") == true) {
-                    if (client() === active) _server.update { it.copy(action = before.optJSONObject("action"), applying = true, notice = "A server update is already running. Refresh to follow its status.") }
+                    if (global() === active) _server.update { it.copy(action = before.optJSONObject("action"), applying = true, notice = "A server update is already running. Refresh to follow its status.") }
                     return@launch
                 }
                 val baseline = before.getString("server_now")
                 saved["server-update:$host:at"] = baseline
                 saved["server-update:$host:id"] = ""
-                if (client() !== active) return@launch
+                if (global() !== active) return@launch
                 _server.update { it.copy(requestedAt = baseline, requestedActionId = "") }
                 val response = c.nativeGet("/api/plugins/beacon/admin/update", method = "POST", data = JSONObject())
                 if (!response.optBoolean("accepted")) {
                     saved["server-update:$host:at"] = ""
-                    if (client() === active) _server.update { it.copy(applying = response.optBoolean("already_running"), requestedAt = "", error = response.string("message", response.string("error", "Hermes refused this update."))) }
+                    if (global() === active) _server.update { it.copy(applying = response.optBoolean("already_running"), requestedAt = "", error = response.string("message", response.string("error", "Hermes refused this update."))) }
                     return@launch
                 }
                 val id = response.string("action_id")
                 saved["server-update:$host:id"] = id
                 saved["server-update:$host:at"] = response.getString("requested_at")
-                if (client() !== active) return@launch
+                if (global() !== active) return@launch
                 _server.update { it.copy(requestedActionId = id, requestedAt = response.getString("requested_at")) }
                 repeat(60) {
                     delay(2000)
                     try {
                         val result = c.nativeGet("/api/plugins/beacon/admin/update/status", mapOf("requested_at" to _server.value.requestedAt, "action_id" to id))
-                        if (client() !== active) return@launch
+                        if (global() !== active) return@launch
                         val next = _server.value.copy(action = result.optJSONObject("action"), receipt = result.optJSONObject("receipt"), error = "")
                         _server.value = next.copy(applying = next.outcome in setOf("running", "unconfirmed"))
                         if (!_server.value.applying) return@launch
                     } catch (e: CancellationException) { throw e }
-                    catch (_: Exception) { if (client() === active) _server.update { it.copy(notice = "Waiting for Hermes to reconnect. Refresh to check the update receipt.") } }
+                    catch (_: Exception) { if (global() === active) _server.update { it.copy(notice = "Waiting for Hermes to reconnect. Refresh to check the update receipt.") } }
                 }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (client() === active) _server.update { it.copy(error = "Update result is not confirmed. Refresh the update status before starting another update.") } }
+            catch (e: Exception) { if (global() === active) _server.update { it.copy(error = "Update result is not confirmed. Refresh the update status before starting another update.") } }
             finally { c.closeNative() }
         }
     }
 
     private fun botSummaries(response: JSONObject) = response.rows("bots").map { NativeBotSummary(it.getString("profile"), it.string("title", it.getString("profile")), it.string("purpose")) }
     fun loadBots(): Job? {
-        val active = client() ?: return null
+        val editor = client() ?: return null
+        val active = global() ?: return null
         bind(); if (_bots.value.saving || _bots.value.editing) return null
+        val revision = bindingRevision
         botJob?.cancel(); _bots.update { it.copy(loading = true, error = "") }
         botJob = jobs.launch {
             val c = active.detached()
@@ -331,57 +363,64 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                 if (_bots.value.profiles.isEmpty()) cacheAttempt {
                     screens?.get(c.scope, "settings:bots")?.let { stored ->
                         val cached = botSummaries(stored.copy())
-                        if (client() === active && _bots.value.profiles.isEmpty()) _bots.update { it.copy(profiles = cached) }
+                        if (current(editor, revision) && global() === active && _bots.value.profiles.isEmpty()) _bots.update { it.copy(profiles = cached) }
                     }
                 }
                 val response = c.nativeGet("/api/plugins/beacon/admin/bots")
                 val profiles = botSummaries(response)
-                cacheAttempt { screens?.set(c.scope, "settings:bots", response) }
-                if (client() === active) _bots.update { it.copy(profiles = profiles, loading = false) }
+                if (current(editor, revision) && global() === active) cacheAttempt { screens?.set(c.scope, "settings:bots", response) }
+                if (current(editor, revision) && global() === active) _bots.update { it.copy(profiles = profiles, loading = false) }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (client() === active) _bots.update { it.copy(loading = false, error = appErrorText(e)) } }
+            catch (e: Exception) { if (current(editor, revision) && global() === active) _bots.update { it.copy(loading = false, error = appErrorText(e)) } }
             finally { c.closeNative() }
         }
         return botJob
     }
-    fun openBot(profile: String) {
-        val active = client() ?: return
-        if (_bots.value.saving || _bots.value.profiles.none { it.profile == profile }) return
+    fun openBot(profile: String): Job? {
+        val active = client() ?: return null
+        val revision = bindingRevision
+        if (_bots.value.saving || _bots.value.profiles.none { it.profile == profile }) return null
         botJob?.cancel(); _bots.update { it.copy(loading = true, selected = null, editing = false, error = "", notice = "") }; _botModels.value = emptyList()
         botJob = jobs.launch {
             val c = active.detached()
             try {
+                authorizeProfile(active, profile)
+                if (!current(active, revision)) return@launch
                 c.bindProfile(profile)
                 val bot = NativeBot.parse(c.nativeGet("/api/plugins/beacon/admin/bot"))
                 require(bot.profile == profile) { "Bot response belongs to another profile" }
-                if (client() === active) _bots.update { it.copy(selected = bot) }
+                if (current(active, revision)) _bots.update { it.copy(selected = bot) }
                 val options = c.nativeGet("/api/model/options", mapOf("profile" to profile, "include_unconfigured" to "false"))
                 val choices = options.rows("providers").flatMap { row -> row.optJSONArray("models")?.strings().orEmpty().map { row.string("slug") to it } }.distinct()
-                if (client() === active && _bots.value.selected?.profile == profile) { _botModels.value = choices; _bots.update { it.copy(loading = false) } }
+                if (current(active, revision) && _bots.value.selected?.profile == profile) { _botModels.value = choices; _bots.update { it.copy(loading = false) } }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (client() === active) _bots.update { it.copy(loading = false, error = appErrorText(e)) } }
+            catch (e: Exception) { if (current(active, revision)) { _bots.update { it.copy(loading = false, error = appErrorText(e)) }; profileFailure(e) } }
             finally { c.closeNative() }
         }
+        return botJob
     }
     fun closeBot() { if (!_bots.value.saving) { botJob?.cancel(); _bots.update { it.copy(selected = null, editing = false, loading = false) }; draftChanged() } }
     fun editBot(editing: Boolean) { if (!_bots.value.saving && (!editing || !_bots.value.loading && _bots.value.selected != null)) { _bots.update { it.copy(editing = editing, draftProvider = it.selected?.provider.orEmpty(), draftModel = it.selected?.model.orEmpty(), error = "") }; draftChanged() } }
     fun botDraft(provider: String, model: String) { _bots.update { it.copy(draftProvider = provider, draftModel = model) }; draftChanged() }
     fun saveBot() {
         val active = client() ?: return
+        val revision = bindingRevision
         val state = _bots.value; val bot = state.selected ?: return
         if (state.saving) return
         _bots.update { it.copy(saving = true, error = "") }
         botJob = jobs.launch {
             val c = active.detached()
             try {
+                authorizeProfile(active, bot.profile)
+                if (!current(active, revision)) return@launch
                 c.bindProfile(bot.profile)
                 val response = c.nativeGet("/api/plugins/beacon/admin/bot", method = "PUT", data = bot.saveModel(state.draftProvider, state.draftModel))
                 require(response.optBoolean("ok")) { "Bot save was not confirmed" }
                 val confirmed = NativeBot.parse(response.getJSONObject("bot"))
                 require(confirmed.profile == bot.profile) { "Saved bot belongs to another profile" }
-                if (client() === active) { _bots.update { it.copy(selected = confirmed, saving = false, editing = false, notice = "Default model saved for new chats.") }; draftChanged() }
+                if (current(active, revision)) { _bots.update { it.copy(selected = confirmed, saving = false, editing = false, notice = "Default model saved for new chats.") }; draftChanged() }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (client() === active) _bots.update { it.copy(saving = false, error = appErrorText(e)) } }
+            catch (e: Exception) { if (current(active, revision)) { _bots.update { it.copy(saving = false, error = appErrorText(e)) }; profileFailure(e) } }
             finally { c.closeNative() }
         }
     }

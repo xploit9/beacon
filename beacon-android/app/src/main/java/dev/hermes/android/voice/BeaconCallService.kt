@@ -61,7 +61,7 @@ internal fun CallState.transcriptLabel(): String = when (transcriptStatus) {
 internal fun CallState.afterCleanupFailure(error: Throwable): CallState =
     if (error is ApiFailure && error.status == 404) this else copy(hostCleanupPending=true,error=listOf(this.error, "Call ended locally; PC call cleanup is unconfirmed").filter(String::isNotBlank).distinct().joinToString(" "))
 internal fun finishCallOnce(closed: AtomicBoolean, fence: () -> Unit = {}, finish: (Throwable?) -> Unit): Boolean {
-    if (!closed.compareAndSet(false, true)) return false
+    if (!synchronized(closed) { closed.compareAndSet(false, true) }) return false
     val fenceFailure = runCatching(fence).exceptionOrNull()
     finish(fenceFailure)
     return true
@@ -71,6 +71,18 @@ internal suspend fun awaitCallTeardown(destroyed: Deferred<Unit>, timeoutMillis:
     check(current()) { "Call start was cancelled" }
 }
 internal suspend fun finishTranscriptSyncForCleanup(finish: suspend () -> Boolean): Boolean = runCatching { finish() }.getOrDefault(false)
+internal suspend fun confirmHostCallCleanup(request: suspend (String) -> JSONObject): Boolean =
+    withTimeoutOrNull(20_000) {
+        repeat(2) {
+            for(method in listOf("DELETE","GET")) {
+                val receipt=try { withTimeoutOrNull(5_000) { request(method) } }
+                catch(error:CancellationException) { throw error }
+                catch(_:Exception) { null }
+                if(receipt?.optBoolean("closed")==true||receipt?.optString("status")=="closed") return@withTimeoutOrNull true
+            }
+        }
+        false
+    } ?: false
 internal fun CallState.afterOwnedCleanupFailure(error: Throwable, ownsCall: Boolean): CallState =
     if (ownsCall) afterCleanupFailure(error) else this
 internal fun CallState.afterTerminalControls(fenceFailure: Throwable?): CallState = copy(
@@ -203,7 +215,7 @@ class CallController(private val app: BeaconApplication) {
                 require(uiVisible) { "Open Beacon to finish answering ${dev.hermes.android.data.currentAssistantName}" }
             }
             spec = CallSpec(frozen, grant, incoming != null,voiceSettings)
-            _state.update { it.copy(conversationScope = frozen.scope.session(grant.getString("conversation_id")), callId = grant.getString("call_id"), voiceProvider = voiceSettings.provider, visionAvailable = voiceSettings.provider == "gemini").withOverlayPermission(android.provider.Settings.canDrawOverlays(app)) }
+            _state.update { it.copy(conversationScope = frozen.scope.session(grant.getString("conversation_id")), callId = grant.getString("call_id"), voiceProvider = voiceSettings.provider, visionAvailable = true).withOverlayPermission(android.provider.Settings.canDrawOverlays(app)) }
             ContextCompat.startForegroundService(app, Intent(app, BeaconCallService::class.java).setAction(BeaconCallService.START))
         } catch (e: Throwable) {
             if (generation == epoch.get()) { spec = null; _state.value = CallState(error = e.message.orEmpty()) }
@@ -388,7 +400,7 @@ class BeaconCallService : Service() {
                 val audio = NativePcm(scope,{ bytes,at ->
                     val intent=microphoneGate.snapshot()
                     if(directVoice?.pcm(bytes) { microphoneGate.current(intent)&&intent.enabled&&!closed.get() }!=true) app.calls.updateFrom(this@BeaconCallService) { it.copy(state="connecting") }
-                },{_,_ -> },::failure,::audioLevel,PcmQueue(),captureRate=if(voiceSettings.provider=="openai")48000 else 16000)
+                },{bytes,_ -> directVoice?.played(bytes.size) },::failure,::audioLevel,PcmQueue(),captureRate=if(voiceSettings.provider=="openai")48000 else 16000)
                 pcm=audio;audio.start(this@BeaconCallService);audio.mute(muted||held||closed.get())
                 if(closed.get()) return@admitCallTransport
                 visual=NativeVisual(this@BeaconCallService,Handler(mediaThread.looper),{
@@ -404,9 +416,10 @@ class BeaconCallService : Service() {
                     app.calls.updateFrom(this@BeaconCallService) { it.copy(error=reason) };camera(false);stopScreen()
                     directVoice?.setVisualState(source,"failed",reason)
                 },{ stopScreen() })
-                directVoice=DirectVoice(spec.client,spec.grant.getString("call_id"),spec.grant.getString("conversation_id"),scope,{bytes ->
+                val direct=DirectVoice(spec.client,spec.grant.getString("call_id"),spec.grant.getString("conversation_id"),scope,{bytes ->
                     if(!held&&!closed.get()) { if(!audio.enqueue(bytes)&&!closed.get()) { audio.interrupt();app.calls.updateFrom(this@BeaconCallService) { it.copy(error="Playback queue overflow; current speech was interrupted") } } }
-                },::directEvent,::failure,{ app.calls.state.value.transcripts.takeLast(10).joinToString("\n") { "${it.role}: ${it.text}" }.takeLast(6000) },voiceSettings,ownerName=ownerName).also { it.start() }
+                },::directEvent,::failure,voiceSettings,ownerName=ownerName,ownerFence=closed,ownerActive={ !closed.get() })
+                directVoice=direct;direct.start()
             } catch(e:Exception) { if(!closed.get()) failure("Native audio initialization failed") }
             }
         }
@@ -681,11 +694,12 @@ class BeaconCallService : Service() {
                 }
                 if(!transcriptClosed) app.calls.updateFrom(this@BeaconCallService) { it.copy(transcriptStatus="partial") }
                 spec?.let { pending ->
-                    val cleanup=withTimeoutOrNull(5000) { runCatching { pending.client.nativeRequest("/api/plugins/beacon/mobile/calls/${pending.grant.getString("call_id")}","DELETE",JSONObject().put("failed",failedConnection)) } }
-                    val receipt=cleanup?.getOrNull()
-                    val deleted=receipt?.optBoolean("closed")==true||receipt?.optString("status")=="closed"
+                    val deleted=confirmHostCallCleanup { method ->
+                        pending.client.nativeRequest("/api/plugins/beacon/mobile/calls/${pending.grant.getString("call_id")}",method,
+                            if(method=="DELETE") JSONObject().put("failed",failedConnection) else null)
+                    }
                     if(!transcriptClosed&&!deleted) {
-                        val failure=java.io.IOException("Host cleanup receipt unconfirmed",cleanup?.exceptionOrNull())
+                        val failure=java.io.IOException("Host cleanup receipt unconfirmed")
                         app.calls.updateFrom(this@BeaconCallService) { it.afterOwnedCleanupFailure(failure,app.calls.service===this@BeaconCallService) }
                     }
                     pending.client.closeNative()

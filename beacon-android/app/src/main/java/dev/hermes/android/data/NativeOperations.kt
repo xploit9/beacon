@@ -78,7 +78,7 @@ internal class NativeOperations(private val c: BeaconClient) {
         var keepCreatedSessionLive = false
         return try {
             dispatch(path, q, method, body, maxBytes).also { keepCreatedSessionLive = path == "/api/session/new" || path == "/api/beacon/open" }
-        } finally { if (!keepCreatedSessionLive) c.closeNative() }
+        } finally { if (!keepCreatedSessionLive && path != "/api/chat/steer") c.closeNative() }
     }
     /**
      * The chat's saved YOLO flag. Hermes persists it in the conversation's model_config (`yolo_mode`) and restores it on
@@ -178,34 +178,86 @@ internal class NativeOperations(private val c: BeaconClient) {
             }
             "/api/chat/start", "/api/chat/steer" -> {
                 require(path != "/api/chat/steer" || d.rows("attachments").isEmpty()) { "Guide accepts text only" }
-                val b = binding()
-                c.nativeReplay(beforePrompt = true)
+                val steer = path == "/api/chat/steer"
+                val lease = try {
+                    val b = if (steer) null else binding().also { c.nativeReplay(beforePrompt = true) }
+                    c.nativeTurnLease(sid(), if (steer) d.string("runtime_session_id").takeIf(String::isNotBlank)
+                        ?: throw NativeTurnNotSent("The running conversation is no longer available") else b?.runtimeSessionId)
+                } catch (e: Throwable) {
+                    if (e is CancellationException || e is NativeTurnNotSent) throw e
+                    throw NativeTurnNotSent("The conversation could not be prepared. The message is retained.", e)
+                }
+                val bound = lease.binding
+                if (bound.scope != c.scope || bound.storedSessionId != sid()) throw NativeTurnNotSent("Conversation identity changed")
                 val refs = mutableListOf<String>()
                 val receipts = JSONArray()
                 val queuedPaths = mutableListOf<String>()
+                val canonicalAttachments = JSONArray()
+                var promptAttempted = false
                 try {
+                if (!steer && !lease.authority && d.optBoolean("queued_model_snapshot") && d.string("model").isNotBlank()) {
+                    val info = c.nativeSessionSnapshot().optJSONObject("info") ?: JSONObject()
+                    val model = info.string("model")
+                    val provider = info.string("provider")
+                    if (model != d.string("model") || d.string("model_provider").isNotBlank() && provider != d.string("model_provider"))
+                        throw NativeTurnNotSent("The queued message's model changed. Select its saved model before sending it.")
+                }
                 for (attachment in d.rows("attachments")) {
-                    require(attachment.string("scope_key") == c.scope.session(b.storedSessionId).key) { "Attachment belongs to another conversation" }
+                    require(attachment.string("scope_key") == c.scope.session(bound.storedSessionId).key) { "Attachment belongs to another conversation" }
                     val data = attachment.getString("staged_base64")
                     val mime = attachment.string("mime")
-                    val receipt = if (mime.startsWith("image/")) {
+                    val receipt = if (lease.authority) {
+                        if (mime !in setOf("image/png", "image/jpeg", "image/gif", "image/webp"))
+                            throw NativeTurnNotSent("This server cannot send the queued attachment type. The message is kept on this phone.")
+                        val staged = c.nativeTurnRpc(lease, "image.attach_bytes", json("session_id" to bound.runtimeSessionId,
+                            "content_base64" to data, "filename" to attachment.string("name")))
+                        require(staged.optBoolean("attached") && staged.string("path").isNotBlank() && staged.string("mime") == mime) { "Native image staging was not confirmed" }
+                        canonicalAttachments.put(json("path" to staged.string("path"), "mime" to staged.string("mime")))
+                        staged
+                    } else if (mime.startsWith("image/")) {
                         require(attachment.getString("id").matches(Regex("[a-fA-F0-9-]{36}")) && validUploadName(attachment.getString("name"))) { "This staged attachment has an invalid filename or identity. Rename it without quotes, slashes, dollar signs, percent signs or control characters, then attach it again." }
-                        val uploadPath = workspacePath(b.storedSessionId, ".beacon-attachments/${attachment.getString("id")}-${attachment.getString("name")}")
+                        val uploadPath = workspacePath(bound.storedSessionId, ".beacon-attachments/${attachment.getString("id")}-${attachment.getString("name")}")
                         c.nativeRequest("/api/files/upload", "POST", json("path" to uploadPath, "data_url" to "data:$mime;base64,$data", "overwrite" to true))
                         queuedPaths.add(uploadPath)
-                        c.nativeRpc("image.attach", json("session_id" to b.runtimeSessionId, "path" to "\"$uploadPath\""))
-                    } else c.nativeRpc("file.attach", json("session_id" to b.runtimeSessionId, "data_url" to "data:$mime;base64,$data", "name" to attachment.string("name")))
+                        c.nativeTurnRpc(lease, "image.attach", json("session_id" to bound.runtimeSessionId, "path" to "\"$uploadPath\""))
+                    } else c.nativeTurnRpc(lease, "file.attach", json("session_id" to bound.runtimeSessionId, "data_url" to "data:$mime;base64,$data", "name" to attachment.string("name")))
                     require(receipt.optBoolean("attached")) { "Native attachment was not accepted" }
-                    receipt.string("path").takeIf { it.isNotBlank() && mime.startsWith("image/") }?.let(queuedPaths::add)
+                    if (!lease.authority) receipt.string("path").takeIf { it.isNotBlank() && mime.startsWith("image/") }?.let(queuedPaths::add)
                     receipts.put(receipt.copy().put("id", attachment.string("id")).put("name", attachment.string("name")).put("mime", mime))
-                    receipt.string("ref_text").takeIf { it.isNotBlank() }?.let(refs::add)
+                    if (!lease.authority) receipt.string("ref_text").takeIf { it.isNotBlank() }?.let(refs::add)
                 }
                 val text = (listOf(d.string("message", d.string("text"))) + refs).joinToString("\n")
-                val result = c.nativeRpc(if (path == "/api/chat/steer") "session.steer" else "prompt.submit", json("session_id" to b.runtimeSessionId, "text" to text))
-                require(result.string("status") in setOf("streaming", "queued", "steered", "redirected")) { "Native prompt was not accepted" }
-                return result.put("accepted", true).put("session_id", b.storedSessionId).put("stream_id", b.runtimeSessionId).put("attachment_receipts", receipts)
+                val params = json("session_id" to bound.runtimeSessionId, "text" to text)
+                if (!steer && d.optBoolean("queued_model_snapshot")) params.put("queued", true)
+                if (!steer && lease.authority) {
+                    val submission = d.string("client_request_id").takeIf(String::isNotBlank) ?: throw NativeTurnNotSent("A saved submission identity is required")
+                    params.put("submission_id", submission)
+                    if (canonicalAttachments.length() > 0) params.put("attachments", canonicalAttachments)
+                    if (d.optBoolean("queued_model_snapshot") && d.string("model").isNotBlank()) params.put("model_override", json("model" to d.string("model")).apply {
+                        d.string("model_provider").takeIf(String::isNotBlank)?.let { put("provider", it) }
+                    })
+                }
+                promptAttempted = true
+                val result = c.nativeTurnRpc(lease, if (steer) "session.steer" else "prompt.submit", params)
+                val rowId = result.opt("user_row_id")
+                require(rowId == null || rowId == JSONObject.NULL || rowId is Number && rowId.toLong() > 0) { "Native row identity is not confirmed" }
+                if (steer) {
+                    require(result.string("status") in setOf("queued", "rejected")) { "The guidance outcome is unknown" }
+                    result.put("safe_to_queue", result.string("status") == "rejected" && (!lease.authority || result.opt("delivered") == false))
+                } else if (lease.authority) {
+                    require(result.optJSONObject("ref")?.string("session_id") == bound.storedSessionId && result.string("admission_id").isNotBlank() &&
+                        result.string("status") in setOf("queued", "started", "unknown", "terminal")) { "Native admission identity is not confirmed" }
+                } else require(result.string("status") in setOf("streaming", "queued")) { "Native prompt outcome is unknown" }
+                return result.put("accepted", result.string("status") in setOf("streaming", "queued", "started", "terminal"))
+                    .put("session_id", bound.storedSessionId).put("stream_id", bound.runtimeSessionId).put("attachment_receipts", receipts)
                 } catch (error: Throwable) {
-                    kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) { for (queuedPath in queuedPaths) runCatching { c.nativeRpc("image.detach", json("session_id" to b.runtimeSessionId, "path" to queuedPath)) } }
+                    if (!promptAttempted || error is NativeTurnNotSent || requestNeverSent(error)) kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                        for (queuedPath in queuedPaths.distinct()) runCatching { c.nativeTurnRpc(lease, "image.detach", json("session_id" to bound.runtimeSessionId, "path" to queuedPath)) }
+                    }
+                    if (!promptAttempted && error !is CancellationException && error !is NativeTurnNotSent) throw NativeTurnNotSent("The message was not sent. Its draft is retained.", error)
+                    if (steer && error is ApiFailure && ((!lease.authority && error.status == 4010) ||
+                            (lease.authority && error.detail in setOf("unsupported_control", "execution_not_ready", "stale_generation"))))
+                        throw NativeTurnNotSent("Guidance was not accepted. The message is retained.", error)
                     throw error
                 }
             }
@@ -664,6 +716,7 @@ internal class NativeOperations(private val c: BeaconClient) {
         if (path == "/api/chat/stream") c.nativeReplay(lastId) else c.nativeReplay(beforePrompt = true)
         c.nativeEvents { raw ->
             val params = raw.optJSONObject("params") ?: JSONObject()
+            if (params.string("type") == "gateway.ready") return@nativeEvents
             val payload = (params.optJSONObject("payload") ?: params).copy().put("session_id", b.storedSessionId)
             val type = if (raw.optString("method") == "reconciliation.required") { params.optJSONObject("history")?.let { payload.put("session", sessionProjection(it, b)) }; if (path == "/api/session/stream") "session_updated" else "state_saved" } else when (params.string("type", raw.string("method"))) {
                 "message.delta" -> "token"

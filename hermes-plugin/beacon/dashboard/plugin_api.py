@@ -316,17 +316,21 @@ async def save_voice_settings(request:Request):
         conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(voice_models.preference_key(owner,profile),value['provider']))
         conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(voice_models.options_key(owner,profile,value['provider']),json.dumps(options)))
     return await voice_settings(request)
+def uses_hermes_backend(row):
+    return json.loads(row.get('voice_config') or '{}').get('backend')=='hermes'
+
 def hand_over(owner,provider,row,failed=False):
     """A finished call's spoken exchanges go to the profile's Hermes memory, off the request path and once per call; a failed call only lets go of its memory provider."""
     def run():
         try:
-            if failed: voice_context.end_call_memory(row['id'])
+            if failed or uses_hermes_backend(row): voice_context.end_call_memory(row['id'])
             else: voice_context.hand_over_call(owner,provider,row['profile'],row['conversation'],row['id'])
         except Exception: pass  # Like Hermes' own turn sync, memory is best effort and never fails the call.
     threading.Thread(target=run,name='beacon-call-hand-over',daemon=True).start()
 _warmed=set()
 def warm_memory(owner,provider,row,value):
     """The owner's first final words start the memory provider's recall in the background, once per call."""
+    if uses_hermes_backend(row): return
     words=next((e['text'] for e in value['events'] if e.get('type')=='transcript' and e.get('role')=='user'
                 and e.get('final') is True and isinstance(e.get('text'),str) and e['text'].strip()),'')
     if not words or row['id'] in _warmed: return
@@ -344,7 +348,7 @@ def sweep_unended_calls(owner,provider,profile):
     if now<_swept_until.get(key,0): return
     _swept_until[key]=now+60
     with mobile.connect() as conn:
-        rows=conn.execute("""SELECT c.id,c.profile,c.conversation FROM calls c
+        rows=conn.execute("""SELECT c.id,c.profile,c.conversation,c.voice_config FROM calls c
             WHERE c.owner=? AND c.profile=? AND c.closed=1 AND c.status='failed' AND c.ended>?
               AND COALESCE(json_extract(c.receipt,'$.failed'),0)!=1
               AND EXISTS(SELECT 1 FROM timeline t WHERE t.call_id=c.id AND json_extract(t.payload,'$.type')='transcript')
@@ -437,24 +441,32 @@ async def finalize(call_id:str,request:Request):
 async def jobs(call_id:str,request:Request):
     value=await body(request,4096);owner,provider,row,cfg=await call(request,call_id,True)
     for name in ('stored_session_id','runtime_session_id','request_id'): safely(mobile.ident,value.get(name))
+    if uses_hermes_backend(row) and value['stored_session_id']!=row['conversation']:
+        raise HTTPException(409,'Native job belongs to another conversation')
     history=await asyncio.to_thread(safely,native.verify,owner,provider,row['profile'],value['stored_session_id'],value['runtime_session_id'])
     user_row_id=value.get('user_row_id')
     if type(user_row_id) is not int or not any(m.get('role')=='user' and m.get('row_id',m.get('_row_id'))==user_row_id for m in history.get('messages',[])):
         raise HTTPException(409,'Actual prompt.submit user_row_id required')
-    from tui_gateway import event_replay
+    epoch=native_replay_epoch()
+    if epoch is None: raise HTTPException(503,'Native replay unavailable')
     jid=uuid.uuid4().hex
     title=value.get('title','Hermes work')
     if not isinstance(title,str) or len(title)>120: raise HTTPException(400,'Invalid title')
+    try: await asyncio.to_thread(watch,owner,provider,row['profile'])
+    except Exception: pass  # The accepted native turn still needs its own watch.
     with mobile.LOCK,mobile.connect() as conn:
+        current=safely(mobile.owned,conn,call_id,owner,row['profile'],True)
+        if uses_hermes_backend(current) and value['stored_session_id']!=current['conversation']:
+            raise HTTPException(409,'Native job belongs to another conversation')
         existing=conn.execute('SELECT * FROM jobs WHERE owner=? AND profile=? AND request=?',(owner,row['profile'],value['request_id'])).fetchone()
         if existing:
-            if existing['runtime']!=value['runtime_session_id'] or existing['stored']!=value['stored_session_id'] or existing['call_id']!=call_id: raise HTTPException(409,'Conflicting job registration')
+            if existing['runtime']!=value['runtime_session_id'] or existing['stored']!=value['stored_session_id'] or existing['call_id']!=call_id or existing['seq']!=user_row_id: raise HTTPException(409,'Conflicting job registration')
             return job_status(dict(existing))
-        if conn.execute("SELECT COUNT(*) FROM jobs WHERE owner=? AND profile=? AND status IN ('watching','needs_input')",(owner,row['profile'])).fetchone()[0]>=512: raise HTTPException(409,'Native watch capacity reached')
+        if conn.execute("SELECT COUNT(*) FROM jobs WHERE owner=? AND profile=? AND epoch=? AND status IN ('watching','needs_input')",(owner,row['profile'],epoch)).fetchone()[0]>=512: raise HTTPException(409,'Native watch capacity reached')
         if conn.execute('SELECT COUNT(*) FROM jobs WHERE call_id=?',(call_id,)).fetchone()[0]>=64: raise HTTPException(409,'Job linkage capacity reached')
-        if conn.execute("SELECT 1 FROM jobs WHERE (runtime=? AND status IN ('watching','needs_input')) OR (owner=? AND profile=? AND stored=? AND seq=?)",(value['runtime_session_id'],owner,row['profile'],value['stored_session_id'],user_row_id)).fetchone(): raise HTTPException(409,'One watched prompt per runtime session')
+        if conn.execute('SELECT 1 FROM jobs WHERE owner=? AND profile=? AND stored=? AND seq=?',(owner,row['profile'],value['stored_session_id'],user_row_id)).fetchone(): raise HTTPException(409,'Native user row already linked')
         conn.execute('INSERT INTO jobs(id,call_id,owner,profile,stored,runtime,request,title,callback,epoch,seq,status,history_updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
-            (jid,call_id,owner,row['profile'],value['stored_session_id'],value['runtime_session_id'],value['request_id'],title,int(value.get('callback') is True),event_replay.replay_epoch(),user_row_id,'watching',time.time()))
+            (jid,call_id,owner,row['profile'],value['stored_session_id'],value['runtime_session_id'],value['request_id'],title,int(value.get('callback') is True),epoch,user_row_id,'watching',time.time()))
     return {'job_id':jid,'status':'working','user_row_id':user_row_id,'request_id':value['request_id'],'stored_session_id':value['stored_session_id'],'runtime_session_id':value['runtime_session_id']}
 @router.post('/mobile/calls/{call_id}/callback')
 async def callback(call_id:str,request:Request):
@@ -468,27 +480,70 @@ async def callback(call_id:str,request:Request):
         for r in rows: conn.execute('UPDATE jobs SET callback=1,history_updated=? WHERE id=?',(time.time(),r['id']))
     await asyncio.to_thread(watch,owner,provider,row['profile'])
     return {'subscribed':True,'job_ids':[r['id'] for r in rows]}
+_UNCONFIRMED_JOB_ERROR='Native Hermes turn outcome is unconfirmed; review the native session before retrying.'
+_PENDING_JOB_ERROR='Native Hermes outcome is unconfirmed; monitoring continues. Do not retry automatically.'
+_MISSING_SESSION_ERROR='Native Hermes session no longer exists'
+
+def native_replay_epoch():
+    try:
+        from tui_gateway import event_replay
+        epoch=event_replay.replay_epoch()
+        return epoch if isinstance(epoch,str) and epoch else None
+    except Exception: return None
+
 def job_status(job):
     mapped={'watching':'working','completed':'done','callback_pending':'done','failed':'failed','cancelled':'cancelled','needs_input':'needs_input'}
     result={'job_id':job['id'],'request_id':job['request'],'stored_session_id':job['stored'],'runtime_session_id':job['runtime'],'user_row_id':job['seq'],'status':mapped.get(job['status'],'working')}
+    missing=job.get('error','').partition('\n')[0]==_MISSING_SESSION_ERROR
+    if job.get('status') in ('watching','needs_input') and (not (epoch:=native_replay_epoch()) or job.get('epoch')!=epoch):
+        result.update(status='uncertain',error_code='native_turn_unconfirmed',error=_UNCONFIRMED_JOB_ERROR)
+        return result
+    if job.get('status')=='failed' and (job.get('error')==_UNCONFIRMED_JOB_ERROR or missing):
+        result.update(status='uncertain',error_code='native_turn_unconfirmed')
+    elif job.get('status')=='watching' and job.get('error')==_PENDING_JOB_ERROR:
+        result.update(status='uncertain',error_code='native_turn_pending_confirmation',will_continue=True)
     if job.get('result'): result['result']=job['result']
-    if job.get('error'): result['error']=job['error']
+    if job.get('error'): result['error']=_MISSING_SESSION_ERROR if missing else job['error']
     return result
 def call_status(row,owner):
     with mobile.connect() as conn:
         jobs=[job_status(dict(j)) for j in conn.execute('SELECT * FROM jobs WHERE call_id=? AND owner=?',(row['id'],owner))]
-    return {**mobile.status(row),'status':'closed' if row['closed'] else 'active','jobs':jobs}
+    return {**mobile.status(row),'status':'closed' if row['closed'] else 'active','job_linkage':'row_bound','jobs':jobs}
+def unconfirm_job(job_id):
+    with mobile.LOCK,mobile.connect() as conn:
+        conn.execute("UPDATE jobs SET status='failed',error=?,history_updated=? WHERE id=? AND status IN ('watching','needs_input')",(_UNCONFIRMED_JOB_ERROR,time.time(),job_id))
+
+def watch_pending(job_id,pending,uncertain):
+    marker=_PENDING_JOB_ERROR if uncertain and not pending else ''
+    with mobile.LOCK,mobile.connect() as conn:
+        conn.execute("UPDATE jobs SET status=?,error=CASE WHEN ?<>'' THEN ? WHEN error=? THEN '' ELSE error END,history_updated=? WHERE id=? AND status IN ('watching','needs_input')",('needs_input' if pending else 'watching',marker,marker,_PENDING_JOB_ERROR,time.time(),job_id))
+        mobile.prune_notices(conn)
+
 def watch(owner,provider,profile):
     try: activity.sync(mobile,native,owner,provider,profile)
     except (ImportError,AttributeError,RuntimeError): pass  # Native runtime or store unavailable: never invent or settle activity.
-    with mobile.connect() as conn: rows=[dict(r) for r in conn.execute("SELECT * FROM jobs WHERE owner=? AND profile=? AND (status IN ('watching','needs_input') OR (status='completed' AND callback=1)) ORDER BY rowid LIMIT 512",(owner,profile))]
+    epoch=native_replay_epoch()
+    with mobile.connect() as conn: rows=[dict(r) for r in conn.execute("SELECT * FROM jobs WHERE owner=? AND profile=? AND ((epoch=? AND status IN ('watching','needs_input')) OR (status='completed' AND callback=1)) ORDER BY rowid LIMIT 512",(owner,profile,epoch))]
     for job in rows:
         if job['status'] in ('watching','needs_input'):
+            stage='binding'
             try:
                 native.verify(owner,provider,profile,job['stored'],job['runtime'],False)
                 from tui_gateway import server,event_replay
                 with server._sessions_lock:
                     record=server._sessions.get(job['runtime'],{})
+                # Native emits its normal terminal event before clearing running under this lock.
+                idle=False;uncertain_pending=True
+                if lock:=record.get('history_lock'):
+                    with lock:
+                        inflight=record.get('inflight_turn')
+                        terminal_inflight=isinstance(inflight,dict) and inflight.get('streaming') is False and inflight.get('status')=='error'
+                        queued=bool(record.get('queued_prompt') or record.get('queued_prompts'))
+                        active_inflight=isinstance(inflight,dict) and inflight.get('streaming') is True
+                        idle=(record.get('running') is False and not record.get('lazy') and not queued
+                              and (inflight is None or terminal_inflight))
+                        uncertain_pending=bool(record.get('lazy') or (not idle and record.get('running') is not True
+                                                and not queued and not active_inflight))
                 # Native completion includes a persisted_turn receipt anchored to the
                 # actual user row. Older completion and unrelated prompts never match.
                 proof=None
@@ -497,34 +552,51 @@ def watch(owner,provider,profile):
                         payload=event.get('payload',{})
                         if event.get('type')=='message.complete' and payload.get('persisted_turn',{}).get('user_row_id')==job['seq']:
                             proof=payload
+                if not proof and idle:
+                    unconfirm_job(job['id'])
+                    continue
                 if not proof:
                     try:
                         from tui_gateway import server_requests
                         staged=record.get('_submit_user_row') or {}
                         pending=server_requests.open_requests(job['runtime']) if staged.get('_row_id')==job['seq'] else []
                     except (ImportError,AttributeError): pending=[]
-                    with mobile.LOCK,mobile.connect() as conn:
-                        conn.execute("UPDATE jobs SET status=?,history_updated=? WHERE id=? AND status IN ('watching','needs_input')",('needs_input' if pending else 'watching',time.time(),job['id']))
-                        mobile.prune_notices(conn)
+                    watch_pending(job['id'],bool(pending),uncertain_pending)
                     continue
                 terminal={'complete':'completed','error':'failed','interrupted':'cancelled','cancelled':'cancelled'}.get(proof.get('status'))
-                if not terminal: continue
+                if not terminal:
+                    if idle: unconfirm_job(job['id'])
+                    else: watch_pending(job['id'],False,uncertain_pending)
+                    continue
                 receipt=proof.get('persisted_turn',{})
                 if terminal=='completed':
+                    stage='history'
                     history=native.verify(owner,provider,profile,job['stored'],job['runtime'],True)
                     final_id=receipt.get('final_assistant_row_id')
                     final=next((m for m in history.get('messages',[]) if m.get('row_id',m.get('_row_id'))==final_id and m.get('role')=='assistant'),None)
-                    if type(final_id) is not int or final_id<=0 or not final: continue
+                    if type(final_id) is not int or final_id<=0 or not final:
+                        if idle: unconfirm_job(job['id'])
+                        else: watch_pending(job['id'],False,uncertain_pending)
+                        continue
                     text=final.get('text',final.get('content',''))
                 else: text=''
                 with mobile.LOCK,mobile.connect() as conn:
                     updated=conn.execute("UPDATE jobs SET status=?,result=?,error=?,history_updated=? WHERE id=? AND status IN ('watching','needs_input')",(terminal,text[:65536],('Native Hermes turn failed; review the native session.' if terminal=='failed' else ''),time.time(),job['id']))
                 if not updated.rowcount: continue
-            except LookupError:
+            except LookupError as exc:
+                reason={'Native stored conversation not owned':'stored_owner','Native session not owned':'runtime_owner',
+                        'Native runtime unavailable':'runtime_missing',
+                        'Native profile mismatch':'profile','Native session is not a compression continuation':'lineage',
+                        'Native compression lineage not owned':'lineage_owner',
+                        'Native session unavailable or forbidden':'rpc'}.get(str(exc),'unclassified')
+                logging.getLogger(__name__).warning('Beacon native watch verification refused: stage=%s reason=%s',stage,reason)
                 with mobile.LOCK,mobile.connect() as conn:
-                    conn.execute("UPDATE jobs SET status='failed',error='Native Hermes session no longer exists',history_updated=? WHERE id=? AND status IN ('watching','needs_input')",(time.time(),job['id']))
+                    # Profile-routed logs may be unavailable; retain only fixed labels with the verdict.
+                    conn.execute("UPDATE jobs SET status='failed',error=?,history_updated=? WHERE id=? AND status IN ('watching','needs_input')",(_MISSING_SESSION_ERROR+'\n'+stage+':'+reason,time.time(),job['id']))
                 continue
-            except Exception: continue
+            except Exception:
+                watch_pending(job['id'],False,True)
+                continue
         with mobile.LOCK,mobile.connect() as conn:
             current=conn.execute('SELECT * FROM jobs WHERE id=?',(job['id'],)).fetchone()
             ended=conn.execute('SELECT closed FROM calls WHERE id=?',(job['call_id'],)).fetchone()
@@ -1043,7 +1115,17 @@ async def get_context(call_id:str,request:Request):
     display=display[:120] if isinstance(display,str) else ''
     owner_name=getattr(request,'query_params',{}).get('owner_name','')
     if not voice_context.valid_owner_name(owner_name): raise HTTPException(400,'Invalid owner name')
-    result=await feature(voice_context.context,owner,provider,row['profile'],row['conversation'],call_id,display,owner_name.strip(),timeout=8)
+    backend=getattr(request,'query_params',{}).get('backend','direct')
+    if backend not in ('direct','hermes'): raise HTTPException(400,'Invalid voice backend')
+    args=(owner,provider,row['profile'],row['conversation'],call_id,display,owner_name.strip())
+    if backend=='hermes':
+        args+= (True,)
+        if not row['closed']:
+            selection=json.loads(row['voice_config']);selection['backend']='hermes'
+            with mobile.LOCK,mobile.connect() as conn:
+                conn.execute('UPDATE calls SET voice_config=? WHERE id=? AND owner=? AND profile=?',
+                             (json.dumps(selection),call_id,owner,row['profile']))
+    result=await feature(voice_context.context,*args,timeout=8)
     callback=result.get('callback')
     reason=callback.get('reason','') if isinstance(callback,dict) else ''
     result['reason']=reason if isinstance(reason,str) else ''

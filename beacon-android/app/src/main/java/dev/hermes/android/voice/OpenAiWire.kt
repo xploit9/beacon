@@ -51,6 +51,7 @@ internal class OpenAiWire {
                 ?.optJSONObject("voiceConfig")?.optJSONObject("prebuiltVoiceConfig")?.optString("voiceName")
                 ?.takeIf(VOICES::contains) ?: DEFAULT_VOICE
             val instructions = source.getJSONObject("systemInstruction").getJSONArray("parts").getJSONObject(0).getString("text")
+            val tools = GrokWire.functionTools(source)
             return JSONObject().put("type", "session.update").put("session", JSONObject()
                 .put("type", "realtime")
                 .put("model", model)
@@ -60,12 +61,12 @@ internal class OpenAiWire {
                     .put("input", JSONObject()
                         .put("format", JSONObject().put("type", "audio/pcm").put("rate", 24000))
                         .put("transcription", JSONObject().put("model", "gpt-4o-transcribe"))
-                        .put("turn_detection", JSONObject().put("type", "semantic_vad")))
+                        .put("turn_detection", JSONObject().put("type", "semantic_vad").put("create_response", false)))
                     .put("output", JSONObject()
                         .put("format", JSONObject().put("type", "audio/pcm").put("rate", 24000))
                         .put("voice", voice)))
-                .put("tools", GrokWire.functionTools(source))
-                .put("tool_choice", "auto"))
+                .put("tools", tools)
+                .put("tool_choice", if (tools.length() == 0) "none" else "auto"))
         }
 
         fun audio(base64: String) = JSONObject().put("type", "input_audio_buffer.append").put("audio", base64)

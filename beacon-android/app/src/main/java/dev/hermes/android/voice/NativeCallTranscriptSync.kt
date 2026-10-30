@@ -33,14 +33,20 @@ internal class NativeCallTranscriptSync(private val request:suspend (String,Stri
         var drained=false
         try {
             for((route,body) in if(index==0) important else pending) {
-                val receipt=requestReceipt(route,body,8000)
-                if(receipt?.optBoolean("stored")!=true) { gap=true;report("partial") }
-                else report(if(gap) "partial" else "syncing")
+                var receipt=requestReceipt(route,body,8000)
+                if(index==0) {
+                    // Keep the same event identity through a transient outage. Finalization bounds the drain.
+                    while(receipt?.optBoolean("stored")!=true) {
+                        report("syncing");delay(500)
+                        receipt=requestReceipt(route,body,8000)
+                    }
+                    report(if(gap) "partial" else "syncing")
+                }
             }
             drained=true
         } catch(error:CancellationException) { throw error }
-        catch(error:Throwable) { gap=true;report("partial") }
-        finally { if(!drained) gap=true }
+        catch(error:Throwable) { if(index==0) { gap=true;report("partial") } }
+        finally { if(!drained&&index==0) gap=true }
     } }
     private fun report(value:String) { statuses.trySend(value) }
     private suspend fun requestReceipt(route:String,body:JSONObject,timeout:Long):JSONObject?=withTimeoutOrNull(timeout) {
@@ -85,7 +91,7 @@ internal class NativeCallTranscriptSync(private val request:suspend (String,Stri
             partialTranscripts.remove(key)
         }
         val queue=if(copy.optString("type")=="media_diagnostic") pending else important
-        if(!queue.trySend("events" to JSONObject().put("events",JSONArray().put(copy))).isSuccess) { gap=true;report("partial") }
+        if(!queue.trySend("events" to JSONObject().put("events",JSONArray().put(copy))).isSuccess&&queue===important) { gap=true;report("partial") }
     }
     suspend fun finish(failed:Boolean=false):Boolean {
         val first=synchronized(this) {
@@ -101,7 +107,8 @@ internal class NativeCallTranscriptSync(private val request:suspend (String,Stri
         }
         if(!first) return finalized.await()
         try {
-            if(withTimeoutOrNull(15000) { workers.joinAll();true }!=true) { gap=true;workers.forEach { it.cancel() } }
+            if(withTimeoutOrNull(15000) { workers.first().join();true }!=true) { gap=true;workers.first().cancel() }
+            workers.drop(1).forEach { it.cancel() }
             val receipt=requestReceipt("finalize",JSONObject().put("incomplete",gap).put("failed",failed),15000)
             val state=receipt?.optString("transcript_status","finalizing")?:"unavailable"
             val closed=receipt?.optBoolean("closed")==true||receipt?.optString("status")=="closed"

@@ -129,7 +129,7 @@ class RealtimeProvidersTest {
         assertEquals(24000, output.getJSONObject("format").getInt("rate"))
         assertEquals("marin", output.getString("voice"))
         assertEquals("auto", session.getString("tool_choice"))
-        assertTrue(session.getString("instructions").contains("when the owner asks again, try the relevant tool in this call"))
+        assertTrue(session.getString("instructions").contains("Every owner request goes to hermes_work"))
         assertTrue((0 until session.getJSONArray("tools").length()).any {
             session.getJSONArray("tools").getJSONObject(it).getString("name") == "hermes_work"
         })

@@ -12,12 +12,18 @@ class SettingsSearchTest {
         )
         for (query in listOf("proactive", "alerts", "watch", "What needs you")) assertTrue(matches("Assistant", query))
         assertTrue(matches("Voice & calls", "API key"))
+        for (query in listOf("steer", "queue", "replying")) assertTrue(matches("Chat", query))
         assertTrue(matches("Devices", "linked"))
         assertEquals("Name and profile", settingsDescriptions.getValue("Assistant"))
         assertEquals("Voice provider and calls", settingsDescriptions.getValue("Voice & calls"))
         assertEquals("Connection", settingsRoute("Devices"))
     }
 
+    @Test fun checkupSearchOpensAssistantSettings() {
+        for (query in listOf("check-up calls", "checkup", "scheduled calls")) {
+            assertTrue("Assistant should match $query", settingsSearchMatches(settingsLabel("Assistant"), settingsDescriptions.getValue("Assistant"), query))
+        }
+    }
     @Test fun searchesVisibleLabelAndDescriptionWithoutChangingRoute() {
         assertEquals("Chat", settingsLabel("Settings"))
         assertEquals("Voice & calls", settingsLabel("Beacon"))

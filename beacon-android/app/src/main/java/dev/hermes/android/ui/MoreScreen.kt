@@ -217,6 +217,8 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
 
 @Composable fun MoreScreen(vm: BeaconViewModel) {
     val ui by vm.ui.collectAsStateWithLifecycle()
+    val restoringProfile by vm.settingsProfileRestoring.collectAsStateWithLifecycle()
+    LaunchedEffect(vm, restoringProfile, ui.connected, ui.owner, ui.profile, ui.morePage, vm.client) { if (ui.connected && restoringProfile) vm.restoreSettingsProfile() }
     val page = normalizeSettingsPage(ui.morePage)
     val pluginStatus = ui.bootstrap.optJSONObject("optional_features")?.optString("plugin").orEmpty()
     BoxWithConstraints(Modifier.fillMaxSize()) {
@@ -262,6 +264,17 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
         }
         return
     }
+    val restoringProfile by vm.settingsProfileRestoring.collectAsStateWithLifecycle()
+    val restoreError by vm.settingsProfileRestoreError.collectAsStateWithLifecycle()
+    if (restoringProfile && page in setOf("Skills", "Memory", "Profiles")) {
+        androidx.activity.compose.BackHandler { vm.backFromSettings() }
+        Column(Modifier.fillMaxSize()) {
+            Header(uiText(settingsLabel(page)), back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current)
+            if (restoreError.isBlank()) LinearProgressIndicator(Modifier.fillMaxWidth())
+            else EmptyState(uiText("Profile settings"), uiText(restoreError), action = uiText("Retry"), onAction = vm::restoreSettingsProfile)
+        }
+        return
+    }
     LaunchedEffect(page) { if (page.startsWith("category:") && page.removePrefix("category:") !in settingsCategories.keys && page != "category:Advanced") vm.tab("More") }
     when {
         page in setOf("Skills", "Memory") -> NativePhonePreferences(vm, page)
@@ -292,10 +305,13 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
 
 @Composable private fun NativeChatPreferences(vm: BeaconViewModel) {
     val data by vm.data.collectAsStateWithLifecycle()
+    val preferences by vm.preferences.collectAsStateWithLifecycle()
+    val busyOverride by vm.busySendOverride.collectAsStateWithLifecycle()
     val settings = data["profile-settings"] ?: LocalBeaconSettings.current
     Column(Modifier.fillMaxSize()) {
         Header(uiText(settingsLabel("Settings")), back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current)
         LazyColumn(contentPadding = PaddingValues(SettingsPagePadding), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            item { Choice(assistantText("While Beacon is replying"), busyOverride ?: preferences.busySendAction, listOf("steer", "queue"), { vm.setBusySendAction(it) }, optionLabels = mapOf("steer" to "Steer", "queue" to "Queue"), enabled = preferences.busySendLoaded) }
             item { Choice("Send shortcut", settings.string("send_key", "enter"), listOf("enter", "ctrl_enter"), { vm.nativePreferences(json("send_key" to it)) }, optionLabels = mapOf("enter" to "Enter", "ctrl_enter" to "Ctrl + Enter")) }
             item { LabeledToggle(uiText("Format your messages"), settings.optBoolean("render_user_markdown", true), { vm.nativePreferences(json("render_user_markdown" to it)) }) }
             item { LabeledToggle(uiText("Show thinking"), settings.optBoolean("show_thinking", true), { vm.nativePreferences(json("show_thinking" to it)) }) }

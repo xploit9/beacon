@@ -184,23 +184,52 @@ class ReattachRunDeviceTest {
         assertEquals("Settling reads history; it never sends the prompt again", 1, promptSubmits(fixture))
     }
 
-    // A message queued behind the reply goes back in the box after a cold settle; it is never sent by itself.
-    @Test fun aQueuedMessageReturnsToTheComposerUnsentAfterAColdSettle() = withFixture { fixture ->
+    @Test fun queuedMessagesResumeFifoAfterColdSettleAndAuthoritativeIdle() = withFixture { fixture ->
         fixture.persistTerminalMessages = true
         val store = ViewModelStore()
         val first = newViewModel(store, fixture, fixture.client, "chat-a")
         compose.runOnIdle { first.composer(TextFieldValue("Plan the trip while I am away.")); first.send() }
         await(first, fixture, "Prompt not delivered") { promptSubmits(fixture) == 1 && first.chat.value.streamId == runtime }
         val queued = "Also check the weather there."
+        val later = "Then check the forecast tomorrow."
         compose.runOnIdle { first.composer(TextFieldValue(queued)); first.queue() }
-        await(first, fixture, "Queued message not saved") { runBlocking { app.cache.read(fixture.scope.session("chat-a"), "draft") }?.contains(queued) == true }
+        await(first, fixture, "First queued message missing") { first.chat.value.queued.size == 1 }
+        compose.runOnIdle { first.composer(TextFieldValue(later)); first.queue() }
+        await(first, fixture, "Second queued message missing") { first.chat.value.queued.size == 2 }
+        val ids = first.chat.value.queued.map { it.id }
+        val newerDraft = "Keep my newer draft"
+        compose.runOnIdle { first.composer(TextFieldValue(newerDraft)) }
+        runBlocking { first.checkpointNow() }
         compose.runOnUiThread { store.clear(); fixture.client.closeNative() }
         fixture.nativeTurnStatus = "idle"
         fixture.retainNativeEvent(runtime, "message.complete", json("text" to reply))
+        fixture.holdActiveListAcknowledgement = true
+        val mark = fixture.requests.size
         val vm = restart(fixture) { it.selectSession("chat-a") }
-        await(vm, fixture, "Reply not settled") { !marked(fixture, "chat-a") && vm.chat.value.messages.any { it.text == reply } && vm.composer.value.text == queued }
-        assertTrue("The queued message left the queue for the box", vm.chat.value.queued.isEmpty())
-        assertEquals("Nothing was sent by itself", 1, promptSubmits(fixture))
+        try {
+            await(vm, fixture, "Completed history not restored") { vm.chat.value.messages.any { it.text == reply } }
+            await(vm, fixture, "Scoped idle not requested") { fixture.requests.drop(mark).any { it.string("method") == "session.active_list" } }
+            val probe = fixture.requests.drop(mark).last { it.string("method") == "session.active_list" }.getJSONObject("params")
+            assertEquals(runtime, probe.string("current_session_id"))
+            assertEquals(fixture.scope.profile, probe.string("profile"))
+            assertEquals("No FIFO send before the idle response", 1, promptSubmits(fixture))
+        } finally { fixture.releaseCreateAcknowledgement() }
+        await(vm, fixture, "First queued message not submitted") { promptSubmits(fixture) == 2 }
+        await(vm, fixture, "First queued receipt not retained") { vm.chat.value.queued.firstOrNull()?.state == "sent" }
+        val submissions = fixture.requests.filter { it.string("method") == "prompt.submit" }
+        val next = submissions.last().getJSONObject("params")
+        assertEquals(queued, next.string("text"))
+        assertEquals(runtime, next.string("session_id"))
+        assertEquals(fixture.scope.profile, next.string("profile"))
+        assertTrue(next.optBoolean("queued"))
+        assertEquals(ids, vm.chat.value.queued.map { it.id })
+        val sent = vm.chat.value.queued.first()
+        assertTrue("The sent item retains its exact row receipt", sent.rowId.isNotBlank())
+        await(vm, fixture, "Acknowledged row not projected") { vm.chat.value.messages.any { it.role == "user" && it.id == sent.rowId } }
+        assertEquals(sent.rowId, vm.chat.value.messages.single { it.role == "user" && it.text == queued }.id)
+        assertEquals("The next FIFO item still waits", "queued", vm.chat.value.queued[1].state)
+        assertEquals(newerDraft, vm.composer.value.text)
+        assertEquals("No duplicate or second FIFO submission", 2, promptSubmits(fixture))
     }
 
     // The other call site of the same reattach: the app returning to the foreground with the chat already open.

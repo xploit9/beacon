@@ -1,6 +1,7 @@
 """Native RPC adapter. Uses the same identity-stamped dispatcher as /api/ws."""
 import threading
 import uuid
+import logging
 
 class ReplyTransport:
     def __init__(self, owner,provider):
@@ -19,7 +20,11 @@ def rpc(owner,provider,method,params):
     if result is None:
         if not transport.done.wait(20): raise RuntimeError('Native RPC timeout')
         result=transport.response
-    if not result or 'error' in result: raise LookupError('Native session unavailable or forbidden')
+    if not result or 'error' in result:
+        error=result.get('error') if isinstance(result,dict) else None
+        code=error.get('code') if isinstance(error,dict) else None
+        logging.getLogger(__name__).warning('Beacon native RPC refused: code=%s',code if type(code) is int and -32768<=code<=65535 else 'unavailable')
+        raise LookupError('Native session unavailable or forbidden')
     return result['result']
 
 def verify(owner,provider,profile,stored,runtime=None,history=True):
@@ -30,16 +35,41 @@ def verify(owner,provider,profile,stored,runtime=None,history=True):
         stored_row=db.get_session(stored)
         if not stored_row or stored_row.get('user_id')!=provider+':'+owner:
             raise LookupError('Native stored conversation not owned')
-    if runtime:
+        if not runtime: return stored_row
+        requested_home=server._profile_home(profile)
+        expected_home=str(requested_home) if requested_home else None
         with server._sessions_lock:
             record=server._sessions.get(runtime)
-            if not record or record.get('session_key')!=stored or server._session_auth_user_id(record)!=provider+':'+owner:
+            if not record: raise LookupError('Native runtime unavailable')
+            if server._session_auth_user_id(record)!=provider+':'+owner:
                 raise LookupError('Native session not owned')
-            requested_home=server._profile_home(profile)
-            if (record.get('profile_home') or None)!=(str(requested_home) if requested_home else None):
+            if (record.get('profile_home') or None)!=expected_home:
                 raise LookupError('Native profile mismatch')
-        return rpc(owner,provider,'session.history',{'profile':profile,'session_id':runtime}) if history else stored_row
-    return stored_row
+            current=record.get('session_key')
+        if current!=stored:
+            try: chain=db.get_compression_chain(stored)
+            except Exception as exc:
+                raise RuntimeError('Native compression lineage unavailable') from exc
+            if not isinstance(chain,list) or not chain or chain[0]!=stored or current not in chain:
+                raise LookupError('Native session is not a compression continuation')
+            for sid in chain[:chain.index(current)+1]:
+                try: segment=db.get_session(sid)
+                except Exception as exc: raise RuntimeError('Native compression lineage unavailable') from exc
+                if not segment or segment.get('user_id')!=provider+':'+owner:
+                    raise LookupError('Native compression lineage not owned')
+        with server._sessions_lock:
+            if (server._sessions.get(runtime) is not record or record.get('session_key')!=current
+                    or server._session_auth_user_id(record)!=provider+':'+owner
+                    or (record.get('profile_home') or None)!=expected_home):
+                raise RuntimeError('Native runtime changed during verification')
+    result=rpc(owner,provider,'session.history',{'profile':profile,'session_id':runtime}) if history else stored_row
+    with server._sessions_lock:
+        if (server._sessions.get(runtime) is not record or record.get('session_key')!=current
+                or server._session_auth_user_id(record)!=provider+':'+owner
+                or (record.get('profile_home') or None)!=expected_home):
+            raise RuntimeError('Native runtime changed during verification')
+    return result
+
 
 def reserve_conversation(owner,provider,profile,stored):
     """Persist an already-owned live draft without changing its conversation identity."""

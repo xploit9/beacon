@@ -8,7 +8,10 @@ import java.net.URI
 /** Only the provider protocol differs; ownership, tool authority and queues live in DirectVoice. */
 internal class GrokWire(private val providerName: String = "Grok") {
     private val calls=linkedMapOf<String,String>()
-    private val inputSnapshots=linkedMapOf<String,String>()
+    private val inputSnapshots=linkedMapOf<String,String>() // OpenAI's existing snapshot handling.
+    private enum class InputState { ACTIVE, COMMITTED, CLOSED }
+    private val grokInputs=linkedMapOf<String,InputState>()
+    private var activeGrokInput:String?=null
     private val outputTranscriptItems=linkedSetOf<String>()
     private val argumentDeltas=linkedMapOf<String,String>()
     private val emittedCalls=linkedSetOf<String>()
@@ -104,7 +107,10 @@ internal class GrokWire(private val providerName: String = "Grok") {
         }
         frame.optJSONObject("realtimeInput")?.let { input ->
             input.optJSONObject("audio")?.let { return listOf(JSONObject().put("type","input_audio_buffer.append").put("audio",it.getString("data"))) }
-            if(input.optBoolean("audioStreamEnd")) return listOf(JSONObject().put("type","input_audio_buffer.clear"))
+            if(input.optBoolean("audioStreamEnd")) {
+                if(providerName=="Grok") clearGrokInputs()
+                return listOf(JSONObject().put("type","input_audio_buffer.clear"))
+            }
             return emptyList()
         }
         val result=mutableListOf<JSONObject>()
@@ -147,16 +153,29 @@ internal class GrokWire(private val providerName: String = "Grok") {
         when(frame.optString("type")) {
             "session.updated" -> return JSONObject().put("setupComplete",JSONObject())
             "response.created" -> { responding=true;return null }
-            "input_audio_buffer.speech_started" -> content.put("interrupted",true)
+            "input_audio_buffer.speech_started" -> {
+                if(providerName=="Grok") startGrokInput(frame)
+                content.put("interrupted",true)
+            }
+            "input_audio_buffer.committed" -> { if(providerName=="Grok") commitGrokInput(frame);return null }
+            "input_audio_buffer.cleared" -> { if(providerName=="Grok") clearGrokInputs();return null }
+            "conversation.item.input_audio_transcription.updated" -> {
+                if(providerName!="Grok") return null
+                content.put("inputTranscription",grokTranscription(frame,false)?:return null)
+            }
             "response.output_audio.delta","response.audio.delta" -> content.put("modelTurn",JSONObject().put("parts",JSONArray().put(JSONObject().put("inlineData",JSONObject().put("mimeType","audio/pcm;rate=24000").put("data",frame.getString("delta"))))))
             "conversation.item.input_audio_transcription.completed" -> {
-                val item=frame.getString("item_id");require(item.isNotBlank()&&item.length<=200)
-                val key=item+":"+frame.optInt("content_index",0);val text=frame.getString("transcript")
-                if(inputSnapshots[key]==text) return null
-                inputSnapshots[key]=text
-                if(inputSnapshots.size>128) inputSnapshots.remove(inputSnapshots.keys.first())
-                content.put("inputTranscription",JSONObject().put("text",text)
-                    .put("item_id",item).put("content_index",frame.optInt("content_index",0)).put("final",true))
+                if(providerName=="Grok") {
+                    content.put("inputTranscription",grokTranscription(frame,true)?:return null)
+                } else {
+                    val item=frame.getString("item_id");require(item.isNotBlank()&&item.length<=200)
+                    val key=item+":"+frame.optInt("content_index",0);val text=frame.getString("transcript")
+                    if(inputSnapshots[key]==text) return null
+                    inputSnapshots[key]=text
+                    if(inputSnapshots.size>128) inputSnapshots.remove(inputSnapshots.keys.first())
+                    content.put("inputTranscription",JSONObject().put("text",text)
+                        .put("item_id",item).put("content_index",frame.optInt("content_index",0)).put("final",true))
+                }
             }
             "response.output_audio_transcript.delta","response.audio_transcript.delta" -> {
                 frame.optString("item_id").takeIf(String::isNotBlank)?.let(::rememberOutputTranscript)
@@ -213,6 +232,60 @@ internal class GrokWire(private val providerName: String = "Grok") {
         return JSONObject().put("serverContent",content).apply {
             if(functionCalls.length()>0) put("toolCall",JSONObject().put("functionCalls",functionCalls))
         }
+    }
+
+    // xAI sends cumulative in-progress "completed" events before the committed utterance.
+    // IDs are retained for the socket lifetime so old or cleared items cannot be reactivated.
+    private fun grokItem(frame:JSONObject):String? = (frame.opt("item_id") as? String)
+        ?.takeIf { it.isNotBlank() && it.length<=200 }
+
+    private fun startGrokInput(frame:JSONObject) {
+        val item=grokItem(frame)
+        if(item==null) {
+            activeGrokInput?.let { grokInputs[it]=InputState.CLOSED }
+            activeGrokInput=null
+            return
+        }
+        if(item in grokInputs) return
+        if(grokInputs.size>=512) throw VoiceInputLimit()
+        activeGrokInput?.let { grokInputs[it]=InputState.CLOSED }
+        grokInputs[item]=InputState.ACTIVE
+        activeGrokInput=item
+    }
+
+    private fun commitGrokInput(frame:JSONObject) {
+        val item=grokItem(frame)?:return
+        if(activeGrokInput!=item || grokInputs[item]!=InputState.ACTIVE) return
+        grokInputs[item]=InputState.COMMITTED
+        activeGrokInput=null
+    }
+
+    private fun clearGrokInputs() {
+        activeGrokInput?.let { grokInputs[it]=InputState.CLOSED }
+        activeGrokInput=null
+    }
+
+    private fun grokTranscription(frame:JSONObject,completedEvent:Boolean):JSONObject? {
+        val item=grokItem(frame)?:return null
+        val state=grokInputs[item]?:return null
+        if(state==InputState.CLOSED) return null
+        // One Grok microphone item is a single audio part; other layouts are not proven safe.
+        val index=frame.opt("content_index") as? Number ?:return null
+        if(index.toDouble()!=0.0) return null
+        val text=frame.opt("transcript") as? String ?:return null
+        if(text.length>16000) throw VoiceInputUnconfirmed("Speech exceeded the safe request limit and was not sent.")
+        val status=frame.opt("status") as? String
+        if(completedEvent && status !in setOf("in_progress","completed")) {
+            if(state==InputState.COMMITTED) {
+                grokInputs[item]=InputState.CLOSED
+                throw VoiceInputUnconfirmed("Speech completion could not be verified; the request was not sent.")
+            }
+            return null
+        }
+        val final=completedEvent && status=="completed" && state==InputState.COMMITTED
+        if(final) grokInputs[item]=InputState.CLOSED
+        if(text.isBlank()) return null
+        return JSONObject().put("text",text).put("item_id",item).put("content_index",0).put("final",final)
     }
 
     private fun decodeCall(frame:JSONObject):JSONObject? {

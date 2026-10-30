@@ -6,6 +6,139 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class GrokWireTest {
+    private fun input(type:String,item:String)=JSONObject().put("type",type).put("item_id",item)
+    private fun transcription(item:String,text:String,status:String?="completed",index:Int=0):JSONObject =
+        input("conversation.item.input_audio_transcription.completed",item).put("content_index",index).put("transcript",text)
+            .apply { if(status!=null) put("status",status) }
+
+    private fun assertNotFinal(frame:JSONObject?) {
+        assertFalse(frame?.optJSONObject("serverContent")?.optJSONObject("inputTranscription")?.optBoolean("final") == true)
+    }
+
+    @Test fun inProgressCompletionsWaitForTheMatchingCommittedFinal() {
+        val wire=GrokWire();val id="owner-1"
+        wire.inbound(input("input_audio_buffer.speech_started",id))
+        for(text in listOf("Without","Without using any tools","Without using any tools what is two plus three?")) {
+            assertNotFinal(wire.inbound(input("conversation.item.input_audio_transcription.updated",id).put("transcript",text).put("content_index",0)))
+            assertNotFinal(wire.inbound(transcription(id,text,"in_progress")))
+        }
+        wire.inbound(input("input_audio_buffer.speech_stopped",id))
+        val full="Without using any tools what is two plus three?"
+        assertNotFinal(wire.inbound(transcription(id,full,"in_progress")))
+        assertNull(wire.inbound(input("input_audio_buffer.committed",id)))
+        val committed=wire.inbound(transcription(id,full))!!.getJSONObject("serverContent").getJSONObject("inputTranscription")
+        assertEquals(full,committed.getString("text"));assertEquals(id,committed.getString("item_id"))
+        assertTrue(committed.getBoolean("final"))
+        assertNull("A duplicate completed item must not be emitted twice",wire.inbound(transcription(id,full)))
+    }
+
+    @Test fun completedBeforeCommitDoesNotPoisonTheLaterIdenticalFinal() {
+        val wire=GrokWire();val id="owner-2"
+        wire.inbound(input("input_audio_buffer.speech_started",id))
+        assertNotFinal(wire.inbound(transcription(id,"Full request")))
+        wire.inbound(input("input_audio_buffer.committed",id))
+        assertEquals("Full request",wire.inbound(transcription(id,"Full request"))!!.getJSONObject("serverContent").getJSONObject("inputTranscription").getString("text"))
+    }
+
+    @Test fun newerSpeechAndForeignCommitsCannotFinishTheAbandonedItem() {
+        val wire=GrokWire()
+        wire.inbound(input("input_audio_buffer.speech_started","one"))
+        wire.inbound(input("input_audio_buffer.speech_started","two"))
+        wire.inbound(input("input_audio_buffer.committed","one"))
+        assertNull("A stale commit cannot make an abandoned item actionable",wire.inbound(transcription("one","stale partial")))
+        wire.inbound(input("input_audio_buffer.committed","two"))
+        assertEquals("actual request",wire.inbound(transcription("two","actual request"))!!.getJSONObject("serverContent").getJSONObject("inputTranscription").getString("text"))
+    }
+
+    @Test fun aCommittedItemMayFinishAfterTheNextItemStarts() {
+        val wire=GrokWire()
+        wire.inbound(input("input_audio_buffer.speech_started","one"))
+        wire.inbound(input("input_audio_buffer.committed","one"))
+        wire.inbound(input("input_audio_buffer.speech_started","two"))
+        assertEquals("first request",wire.inbound(transcription("one","first request"))!!.getJSONObject("serverContent").getJSONObject("inputTranscription").getString("text"))
+        wire.inbound(input("input_audio_buffer.committed","two"))
+        assertEquals("second request",wire.inbound(transcription("two","second request"))!!.getJSONObject("serverContent").getJSONObject("inputTranscription").getString("text"))
+    }
+
+    @Test fun clearAndReconnectCannotReviveThePriorItem() {
+        val before=GrokWire()
+        before.inbound(input("input_audio_buffer.speech_started","one"))
+        before.inbound(JSONObject().put("type","input_audio_buffer.cleared"))
+        assertNull("A cleared pending item cannot later be admitted",before.inbound(transcription("one","old")))
+        before.inbound(input("input_audio_buffer.speech_started","one"))
+        before.inbound(input("input_audio_buffer.committed","one"))
+        assertNull("A stale start cannot reactivate a cleared identity",before.inbound(transcription("one","old")))
+        val after=GrokWire()
+        after.inbound(input("input_audio_buffer.committed","one"))
+        assertNull("A new socket cannot inherit another socket's item",after.inbound(transcription("one","old")))
+        val outbound=GrokWire()
+        outbound.inbound(input("input_audio_buffer.speech_started","two"))
+        assertEquals("input_audio_buffer.clear",outbound.outbound(GeminiWire.endAudio()).single().getString("type"))
+        assertNull("A client clear invalidates pending input before its acknowledgement",outbound.inbound(transcription("two","old")))
+    }
+
+    @Test fun clearDiscardsOnlyUncommittedAudioWhileEarlierCommitCanFinish() {
+        for(clientClear in listOf(false,true)) {
+            val wire=GrokWire()
+            wire.inbound(input("input_audio_buffer.speech_started","committed"))
+            wire.inbound(input("input_audio_buffer.committed","committed"))
+            wire.inbound(input("input_audio_buffer.speech_started","still-speaking"))
+            if(clientClear) wire.outbound(GeminiWire.endAudio()) else wire.inbound(JSONObject().put("type","input_audio_buffer.cleared"))
+            val finished=wire.inbound(transcription("committed","finished request"))
+                ?.optJSONObject("serverContent")?.optJSONObject("inputTranscription")
+            assertNotNull("Clear must preserve the already committed item",finished)
+            assertTrue(finished!!.getBoolean("final"))
+            assertEquals("finished request",finished.getString("text"))
+            assertNull("The retained item may finish only once",wire.inbound(transcription("committed","finished request")))
+            wire.inbound(input("input_audio_buffer.committed","still-speaking"))
+            assertNull("The uncommitted cleared item cannot become actionable",wire.inbound(transcription("still-speaking","partial")))
+        }
+    }
+
+    @Test fun malformedNewSpeechCannotFinishThePreviousUncommittedItem() {
+        val wire=GrokWire()
+        wire.inbound(input("input_audio_buffer.speech_started","one"))
+        wire.inbound(JSONObject().put("type","input_audio_buffer.speech_started"))
+        wire.inbound(input("input_audio_buffer.committed","one"))
+        assertNull(wire.inbound(transcription("one","old partial")))
+    }
+
+    @Test fun missingOrUnknownFinalStatusCannotBeTreatedAsACompletedUtterance() {
+        for(status in listOf(null,"mystery","in_progress")) {
+            val wire=GrokWire();wire.inbound(input("input_audio_buffer.speech_started","one"));wire.inbound(input("input_audio_buffer.committed","one"))
+            assertNotFinal(runCatching { wire.inbound(transcription("one","do work",status)) }.getOrNull())
+        }
+    }
+
+    @Test fun oneCommittedAudioItemCannotProduceMultipleNativeTurns() {
+        val wire=GrokWire();val id="same"
+        wire.inbound(input("input_audio_buffer.speech_started",id));wire.inbound(input("input_audio_buffer.committed",id))
+        assertNull("A nonzero content part cannot stand in for an entire audio item",wire.inbound(transcription(id,"part only",index=1)))
+        assertNotNull(wire.inbound(transcription(id,"whole",index=0)))
+        assertNull(wire.inbound(transcription(id,"another part",index=1)))
+        wire.inbound(input("input_audio_buffer.speech_started",id));wire.inbound(input("input_audio_buffer.committed",id))
+        assertNull("A changed snapshot must not resubmit an already handled item",wire.inbound(transcription(id,"different")))
+    }
+
+    @Test fun outstandingCommittedItemLimitFailsClosedWithoutEvictingAnEarlierItem() {
+        val wire=GrokWire()
+        repeat(512) { i ->
+            val id="pending-$i";wire.inbound(input("input_audio_buffer.speech_started",id));wire.inbound(input("input_audio_buffer.committed",id))
+        }
+        val overflow=runCatching {
+            wire.inbound(input("input_audio_buffer.speech_started","overflow"))
+            wire.inbound(input("input_audio_buffer.committed","overflow"))
+        }.exceptionOrNull()
+        assertTrue("Outstanding committed items must be bounded without dropping old identities",overflow is VoiceInputLimit)
+    }
+
+    @Test fun openAiBridgeAcceptsItsOwnFinalWithoutGrokStatusOrCommit() {
+        val wire=GrokWire("OpenAI")
+        val result=wire.inbound(transcription("openai-item","OpenAI request",status=null))!!
+            .getJSONObject("serverContent").getJSONObject("inputTranscription")
+        assertEquals("OpenAI request",result.getString("text"));assertTrue(result.getBoolean("final"))
+    }
+
     @Test fun endpointPinsProviderAndNeverAcceptsEmbeddedCredentials() {
         assertEquals("wss://api.x.ai/v1/realtime",GrokWire.endpoint("wss://api.x.ai/v1/realtime"))
         for(url in listOf("ws://api.x.ai/v1/realtime","wss://api.x.ai.evil/v1/realtime","wss://secret@api.x.ai/v1/realtime","wss://api.x.ai/v1/realtime?token=secret","wss://api.x.ai/v1/realtime#secret","wss://api.x.ai:444/v1/realtime","wss://api.x.ai/v1/other")) assertTrue(url,runCatching { GrokWire.endpoint(url) }.isFailure)
@@ -18,7 +151,7 @@ class GrokWireTest {
     @Test fun setupReusesExactConsentInstructionsAndToolsWithCompatiblePcm() {
         val setup=GrokWire().outbound(GeminiWire.setup("grok-voice-latest","eve",null)).single().getJSONObject("session")
         assertEquals("eve",setup.getString("voice"));assertTrue(setup.getString("instructions").contains("never approve your own request"))
-        assertTrue(setup.getString("instructions").contains("when the owner asks again, try the relevant tool in this call"))
+        assertTrue(setup.getString("instructions").contains("Every owner request goes to hermes_work"))
         assertTrue(setup.getString("instructions").contains("no camera or screen input"))
         assertEquals(16000,setup.getJSONObject("audio").getJSONObject("input").getJSONObject("format").getInt("rate"))
         assertEquals(24000,setup.getJSONObject("audio").getJSONObject("output").getJSONObject("format").getInt("rate"))

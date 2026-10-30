@@ -12,7 +12,8 @@ internal fun settingsLabel(route: String): String = when (route) {
 // \p{Z} adds Unicode separators (no-break, ideographic, line/paragraph) that \s alone misses on the JVM.
 private val searchWhitespace = Regex("[\\s\\p{Z}]+")
 private val settingsSearchKeywords = mapOf(
-    "Assistant" to "What needs you proactive alerts watch",
+    "Assistant" to "What needs you proactive alerts watch check-up checkup scheduled calls",
+    "Chat" to "while replying steer queue",
     "Voice & calls" to "API key",
     "Devices" to "phones linked",
 )
@@ -90,7 +91,7 @@ internal val settingsThemeLabels = mapOf("system" to "Follow device", "dark" to 
 
 /** The hub's fixed texts, which reach uiText through variables: row names and descriptions, section and category titles, theme names. */
 internal val SettingsStrings = (settingsSearchRoutes.map(::settingsLabel) + settingsDescriptions.values + settingsHubSections.keys.filter(String::isNotBlank) +
-    settingsCategories.keys + settingsThemeLabels.values + listOf("Tools and services", "Settings")).distinct()
+    settingsCategories.keys + settingsThemeLabels.values + listOf("Tools and services", "Settings", "Steer", "Queue")).distinct()
 
 /**
  * Values the overview may summarize. Blank or null means unknown on this phone, and unknown values produce no summary,

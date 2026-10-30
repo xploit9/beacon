@@ -11,8 +11,10 @@ class NativeVoiceReadTest {
             .put("capabilities",JSONObject().put("skills",true).put("profile_context",true))
         val setup=GeminiWire.setup("model","voice","existing-session-handle",fresh).getJSONObject("setup")
         assertEquals("existing-session-handle",setup.getJSONObject("sessionResumption").getString("handle"))
-        assertTrue(setup.getJSONObject("systemInstruction").toString().contains("Fresh native preferences"))
-        assertTrue(setup.getJSONArray("tools").toString().contains("hermes_skills"))
+        assertFalse(setup.getJSONObject("systemInstruction").toString().contains("Fresh native preferences"))
+        assertTrue(setup.getJSONObject("systemInstruction").toString().contains("original"))
+        assertTrue(setup.getJSONArray("tools").toString().contains("hermes_work"))
+        assertFalse(setup.getJSONArray("tools").toString().contains("hermes_skills"))
     }
     @Test fun nativeReadsRejectProfileOverridesAndKeepContextQueryClientOwned() {
         val read=GeminiWire.nativeRead("hermes_context",JSONObject())
@@ -31,18 +33,17 @@ class NativeVoiceReadTest {
             assertTrue(args.toString(),runCatching { GeminiWire.nativeRead("hermes_skills",args) }.isFailure)
         assertTrue(runCatching { GeminiWire.nativeRead("invented_read",JSONObject()) }.isFailure)
     }
-    @Test fun bothProvidersDeclareOnlyAvailableSkillsAndArgumentFreeContext() {
+    @Test fun bothProvidersKeepTheNativeBackendWhenCapabilitiesChange() {
         val context=JSONObject().put("profile","original").put("capabilities",JSONObject().put("skills",true).put("profile_context",true))
         val gemini=GeminiWire.setup("model","",null,context).getJSONObject("setup")
         fun names(rows:JSONArray)=(0 until rows.length()).associate { rows.getJSONObject(it).getString("name") to rows.getJSONObject(it) }
         val declared=names(gemini.getJSONArray("tools").getJSONObject(0).getJSONArray("functionDeclarations"))
-        assertEquals(setOf("query","name"),declared.getValue("hermes_skills").getJSONObject("parameters").getJSONObject("properties").keys().asSequence().toSet())
-        assertEquals(0,declared.getValue("hermes_context").getJSONObject("parameters").getJSONObject("properties").length())
+        assertEquals(setOf("text"),declared.getValue("hermes_work").getJSONObject("parameters").getJSONObject("properties").keys().asSequence().toSet())
         val grok=names(GrokWire.setup(gemini,"eve").getJSONObject("session").getJSONArray("tools"))
-        assertEquals("object",grok.getValue("hermes_context").getJSONObject("parameters").getString("type"))
-        assertTrue(grok.keys.containsAll(listOf("hermes_skills","hermes_context","invoke_tool")))
+        assertEquals("object",grok.getValue("hermes_work").getJSONObject("parameters").getString("type"))
+        assertEquals(setOf("hermes_work","hermes_callback","hermes_cancel","get_visual_state"),grok.keys)
         val instruction=gemini.getJSONObject("systemInstruction").getJSONArray("parts").getJSONObject(0).getString("text")
-        for(text in listOf("original native Hermes profile","read the exact named skill","never approve your own request","invent missing tools")) assertTrue(text,instruction.contains(text))
+        for(text in listOf("Every owner request goes to hermes_work","Hermes chooses its own tools, memory and skills","never approve your own request")) assertTrue(text,instruction.contains(text))
         val unavailable=names(GeminiWire.setup("model","",null).getJSONObject("setup").getJSONArray("tools").getJSONObject(0).getJSONArray("functionDeclarations"))
         assertFalse("hermes_skills" in unavailable);assertFalse("hermes_context" in unavailable)
     }

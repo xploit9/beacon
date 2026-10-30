@@ -59,7 +59,6 @@ internal val ScheduleStateStrings = listOf("Paused", "Completed", "Running", "Fa
     val profileRows = profileCatalog?.rows("profiles").orEmpty()
     val profileLoading = ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
     var selected by rememberSaveable(ui.profile) { mutableStateOf("") }
-    var showPresets by rememberSaveable(ui.profile) { mutableStateOf(false) }
     var showCompleted by rememberSaveable(ui.profile) { mutableStateOf(false) }
     val actionScope = rememberCoroutineScope()
     var pending by remember(ui.profile) { mutableStateOf("") }
@@ -74,9 +73,6 @@ internal val ScheduleStateStrings = listOf("Paused", "Completed", "Running", "Fa
     val format = rememberScheduleFormat()
     val deliveries = data["cron-delivery"]?.rows("targets").orEmpty()
     val deliveryWords = DeliveryNameStrings.associateWith { uiText(it) }
-    val checkupTitle = assistantText("Check-up calls")
-    val checkupExplanation = assistantText("Beacon calls you 3-4 times a day between 10:00 and 22:00. Your phone's Do Not Disturb still applies.")
-    val checkupAction = uiText("Turn on")
     val deleteTitle = uiText("Delete schedule")
     val deleteExplanation = uiText("This schedule will be removed.")
     val deleteAction = uiText("Delete")
@@ -84,17 +80,7 @@ internal val ScheduleStateStrings = listOf("Paused", "Completed", "Running", "Fa
     LazyColumn(modifier.fillMaxSize().testTag("schedules-list"), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         if (gatewayNeedsAttention) item { Text(uiText("Schedules aren't running. Start Hermes on your computer."), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error) }
         item { Button(onClick = { cronForm(vm, null, deliveries, timezone, refresh, format = format) }) { Icon(Icons.Rounded.Add, null); Text(uiText("Create schedule"), Modifier.padding(start = 8.dp)) } }
-        item {
-            timezone.takeIf(String::isNotBlank)?.let { Text("${uiText("Times in")} $it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-            TextButton(onClick = { showPresets = !showPresets }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Check-up calls")); Icon(if (showPresets) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, null) }
-            if (showPresets) {
-            if (capabilities == null) LinearProgressIndicator(Modifier.fillMaxWidth())
-            else if (recordError(capabilities).isNotBlank()) { Text(uiText("Check-up setup isn't available. Check your network, then retry."), color = MaterialTheme.colorScheme.error); OutlinedButton(onClick = refresh, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Retry")) } }
-
-            OutlinedButton(enabled = capabilities?.optBoolean("checkups_ready") == true, onClick = { vm.openForm(ActionForm(checkupTitle, "/api/plugins/beacon/mobile/tasks/checkups", emptyList(), explanation = checkupExplanation, actionLabel = checkupAction, onResult = { refresh() })) }) { Text(checkupAction) }
-            if (capabilities != null && recordError(capabilities).isBlank() && !capabilities.optBoolean("checkups_ready")) Text(uiText("Set up scheduled callbacks on your computer to enable check-up calls."), style = MaterialTheme.typography.bodySmall)
-            }
-        }
+        item { timezone.takeIf(String::isNotBlank)?.let { Text("${uiText("Times in")} $it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) } }
         if (crons?.optBoolean("cron_unavailable") == true) item { EmptyState(uiText("Schedules are unavailable"), assistantText("Schedules aren't enabled for your Beacon. Check the connection in Settings."), Icons.Rounded.EventBusy) }
         if (crons?.has("_error") == true) item { Column { Text(uiText("Couldn't load schedules. Check your network, then retry."), color = MaterialTheme.colorScheme.error); OutlinedButton(onClick = refresh, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Retry")) } } }
         if (crons == null) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
@@ -148,7 +134,7 @@ internal val ScheduleStateStrings = listOf("Paused", "Completed", "Running", "Fa
     }
     if (job.optBoolean("no_agent")) Text(uiText("Script schedules don't create a chat per run."), style = MaterialTheme.typography.bodySmall)
 }
-/** "Completed schedules (3)": closed until opened, like Check-up calls. */
+/** "Completed schedules (3)": closed until opened. */
 @Composable internal fun CompletedHeader(count: Int, expanded: Boolean, title: String, onToggle: () -> Unit) {
     TextButton(onClick = onToggle, modifier = Modifier.heightIn(min = 48.dp).testTag("completed-schedules")) { Text("$title ($count)"); Icon(if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, null) }
 }

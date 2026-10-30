@@ -503,10 +503,9 @@ class NativeExperienceUiTest {
         await { fixture.jobs.containsKey("task-new") && vm.form.value == null }
         assertEquals("Owned schedule fixture", fixture.jobs.getValue("task-new").string("name"))
         assertEquals("every 2h", fixture.jobs.getValue("task-new").string("schedule"))
-        clickText("Check-up calls")
-        compose.onNodeWithText("Turn on").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithText("Check-up calls").assertDoesNotExist()
         compose.onNodeWithText("Create vetted mail task").assertDoesNotExist()
-        receipts += "Schedule create, pause, resume, run/cancel, history/result and delete use actual controls; check-up calls respect their prerequisites and the retired mail preset is absent."
+        receipts += "Schedule create, pause, resume, run/cancel, history/result and delete use actual controls; check-up creation and the retired mail preset are absent from Schedules."
         capture("audit-schedule-workflow")
     }
 
@@ -2254,16 +2253,16 @@ class NativeExperienceUiTest {
         await { !vm.ui.value.showSessions }
         assertEquals("Keep this draft during navigation", vm.composer.value.text)
         receipts += "Navigation open/close preserves draft and selected session."
+        runBlocking { vm.setBusySendAction("queue").join() }
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "runtime-chat-a", liveText = "Preparing the comparison.") }
         compose.onNodeWithTag("message-send").assertIsEnabled().assertIsDisplayed().assertContentDescriptionEquals("Queue")
         val viewport = compose.onNodeWithTag("experience-viewport").fetchSemanticsNode().boundsInRoot
         val send = compose.onNodeWithTag("message-send").fetchSemanticsNode().boundsInRoot
         assertTrue("Queue must stay inside the usable window", send.left >= viewport.left && send.right <= viewport.right && send.bottom <= viewport.bottom)
         compose.onNodeWithTag("message-send").performClick()
-        assertEquals(1, vm.chat.value.queued.size)
-        assertTrue(vm.composer.value.text.isBlank())
+        await { vm.chat.value.queued.size == 1 && vm.composer.value.text.isBlank() }
         assertTrue("Queue must not dispatch another prompt", fixture.requests.none { it.string("method") == "prompt.submit" })
-        receipts += "Busy primary queues locally; no prompt dispatched."
+        receipts += "Saved Queue preference queues the busy primary locally; no prompt dispatched."
         // With the draft now empty and the turn still streaming, the trailing voice slot becomes Stop, in the same 42dp footprint.
         compose.onNodeWithTag("message-stop").assertIsDisplayed().assertIsEnabled()
         compose.onNodeWithTag("message-send").assertDoesNotExist()
@@ -2464,19 +2463,24 @@ class NativeExperienceUiTest {
         // Live tool events carry no clock time, so none is invented for them. A terminal result beats the sibling's stale running status.
         compose.onNode(card("List files, Completed, 0.3s"), useUnmergedTree = true).assertExists()
         receipts += "A live running preview keeps its spinner and Status: Running, while a live tool with a result is Completed even if its status still says running."
+        runBlocking { vm.setBusySendAction("queue").join() }
         compose.runOnIdle { vm.composer(TextFieldValue("Then update the notes.")) }
         compose.onNodeWithTag("message-send").assertIsEnabled().assertContentDescriptionEquals("Queue").performClick()
         await { vm.chat.value.queued.size == 1 }
-        compose.onNodeWithText(queuedHeading(1), useUnmergedTree = true).assertExists()
+        val queuedId = vm.chat.value.queued.single().id
+        reveal(hasTestTag("queued-message:$queuedId"), towardOlder = false)
+        compose.onNodeWithText("Queued on this phone", useUnmergedTree = true).assertExists()
         compose.onNodeWithTag("message-stop").assertIsDisplayed().assertIsEnabled()
         assertBackgroundStripExcludesReplyActivity()
-        compose.onNodeWithTag("composer-queue").assertIsDisplayed()
+        compose.onNodeWithTag("composer-queue").assertDoesNotExist()
         closeKeyboard()
         compose.onNodeWithContentDescription("Conversation actions").performClick()
         compose.onNodeWithText("Message queue", useUnmergedTree = true).assertExists()
         androidx.test.espresso.Espresso.pressBack()
         await { compose.onAllNodesWithTag("conversation-actions-menu").fetchSemanticsNodes().isEmpty() }
-        compose.onNodeWithContentDescription("Remove queued message").performScrollTo().performClick()
+        reveal(hasTestTag("queued-message:$queuedId"), towardOlder = false)
+        compose.onNodeWithTag("queued-actions:$queuedId").performClick()
+        compose.onNodeWithText("Remove queued message").performClick()
         await { vm.chat.value.queued.isEmpty() }
         compose.runOnIdle {
             flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = json("approval_id" to "ref-approval", "description" to "Run the synthetic build task", "command" to "gradle assembleDebug", "choices" to JSONArray().put("once").put("deny")))
@@ -4297,7 +4301,7 @@ class NativeExperienceUiTest {
         receipts += "A new chat whose first reply nothing followed asks Hermes after a quiet spell, finds the runtime gone, and settles the finished turn from history without leaving the app."
     }
 
-    @Test fun aSendFoundInHistoryClearsTheFirstPromptMarkersLikeAnAcceptedOne() = withFixture { vm, fixture ->
+    @Test fun matchingHistoryTextDoesNotSettleAFirstSendWithoutItsAcknowledgement() = withFixture { vm, fixture ->
         val owner = fixture.scope
         var shellId = ""
         try {
@@ -4327,14 +4331,24 @@ class NativeExperienceUiTest {
             try {
                 compose.runOnIdle { vm.composer(TextFieldValue("First words")); vm.send() }
                 await { fixture.requests.any { it.string("method") == "prompt.submit" } }
-                // Hermes saved the prompt, but its acknowledgement never arrives: the receipt check finds it in history.
+                // The row is visible, but its identity is not known until the held acknowledgement arrives.
                 compose.runOnIdle { vm.reconcileSend() }
-                await { vm.chat.value.uncertain.isBlank() && vm.chat.value.messages.any { it.text == "First words" } }
-                // A send settled from history saves the chat too, so its project is read again once.
+                await { vm.chat.value.status.contains("unknown", ignoreCase = true) && vm.chat.value.messages.any { it.text == "First words" } }
+                assertTrue("Equal text is not a receipt", vm.chat.value.uncertain.isNotBlank())
+                val historyRowId = vm.chat.value.messages.single { it.role == "user" && it.text == "First words" }.id
+                assertTrue("The history row itself has an identity", historyRowId.isNotBlank())
+                assertTrue("The creating-client marker remains until delivery is proved", created.contains(shell.key))
+                assertEquals("1", runBlocking { app.cache.read(shell, "client-created-shell") })
+                assertEquals(shellId, shells[owner.key])
+                assertEquals(shellId, runBlocking { app.cache.read(owner, "new-chat-shell") })
+                assertEquals("No uncertain prompt is replayed", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
+                fixture.releasePromptAcknowledgement()
+                await { vm.chat.value.uncertain.isBlank() && vm.chat.value.streamId.isNotBlank() }
+                assertEquals("The acknowledged row is shown exactly once", historyRowId, vm.chat.value.messages.single { it.role == "user" && it.text == "First words" }.id)
                 await { projectReads() == projectReadsBefore + 1 }
                 Thread.sleep(500); compose.waitForIdle()
                 assertEquals("One project read, not one per update", projectReadsBefore + 1, projectReads())
-                assertFalse("The creating-client marker ends once Hermes holds the prompt", created.contains(shell.key))
+                assertFalse("The exact acknowledgement releases the creating-client marker", created.contains(shell.key))
                 assertNull(runBlocking { app.cache.read(shell, "client-created-shell") })
                 assertNull(shells[owner.key])
                 assertNull(runBlocking { app.cache.read(owner, "new-chat-shell") })
@@ -4344,7 +4358,7 @@ class NativeExperienceUiTest {
             } finally { fixture.releasePromptAcknowledgement() }
             await { vm.chat.value.streamId.isNotBlank() }
             assertEquals("The settled send is not sent again", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
-            receipts += "A first prompt found in history by the receipt check clears the new-chat markers exactly as an acknowledged one does."
+            receipts += "Matching history text leaves a first send uncertain until its actual acknowledgement clears the new-chat markers."
         } finally {
             runBlocking {
                 listOf("new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session", "conversation-index").forEach { app.cache.delete(owner, it) }
@@ -4603,12 +4617,19 @@ class NativeExperienceUiTest {
         fixture.interruptActiveNativeStream()
         await { fixture.requests.count { it.string("method") == "prompt.submit" } == 2 }
         val queuedSubmitIndex = fixture.requests.indexOfLast { it.string("method") == "prompt.submit" }
-        assertTrue("The terminal history refresh happens before the queued prompt", fixture.requests.toList().subList(requestsBeforeCompletion, queuedSubmitIndex).any { it.string("path") == "/api/sessions/chat-a/messages" })
+        val beforeQueuedSubmit = fixture.requests.toList().subList(requestsBeforeCompletion, queuedSubmitIndex)
+        assertTrue("The terminal history refresh happens before the queued prompt", beforeQueuedSubmit.any { it.string("path") == "/api/sessions/chat-a/messages" })
+        assertTrue("The FIFO send follows a scoped status read", beforeQueuedSubmit.any { it.string("method") == "session.active_list" && it.getJSONObject("params").string("current_session_id") == "runtime-chat-a" && it.getJSONObject("params").string("profile") == fixture.scope.profile })
+        assertTrue("The completed fixture turn reported idle", fixture.nativeStatusProbes.contains("idle"))
         assertTrue("The final assistant reply is visible before another history poll", vm.chat.value.messages.any { it.text == "Completed answer" })
         // Once in the conversation; the closed drawer may preview the same line, so look in the transcript.
         assertEquals(1, vm.chat.value.messages.count { it.text == "Completed answer" })
         compose.onNode(hasText("Completed answer") and hasAnyAncestor(hasTestTag("conversation-transcript")), useUnmergedTree = true).assertIsDisplayed()
-        await { vm.chat.value.queued.isEmpty() }
+        await { vm.chat.value.queued.singleOrNull()?.state == "sent" }
+        val retained = vm.chat.value.queued.single()
+        assertTrue("The sent queue record carries the exact row identity", retained.rowId.isNotBlank())
+        assertEquals(retained.rowId, vm.chat.value.messages.single { it.role == "user" && it.text == "Queued follow-up" }.id)
+        assertEquals("The follow-up is submitted once", 2, fixture.requests.count { it.string("method") == "prompt.submit" })
         receipts += "A real synthetic WebSocket failure preserves partial progress and the queued follow-up while native status is unknown; a replayed terminal event persists the final assistant row, refreshes history immediately, and only then advances the queue."
     }
 
@@ -4643,10 +4664,24 @@ class NativeExperienceUiTest {
             fixture.nativeTurnStatus = "idle"
             fixture.resumeRuntimeSessionIds[vm.chat.value.sessionId] = "$firstRuntime-resumed"
             fixture.retainNativeEvent(firstRuntime, "message.complete", json("text" to "Completed while backgrounded"))
+            val beforeResume = fixture.requests.size
             compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.RESUMED)
 
-            await { vm.chat.value.messages.any { it.text == "Completed while backgrounded" } &&
-                fixture.requests.count { it.string("method") == "prompt.submit" } == 2 && vm.chat.value.queued.isEmpty() }
+            try { await { vm.chat.value.messages.any { it.text == "Completed while backgrounded" } } }
+            catch (error: Throwable) { throw AssertionError("Background reply missing: status=${vm.chat.value.status} requests=${recentCalls(fixture)}", error) }
+            try { await { fixture.requests.count { it.string("method") == "prompt.submit" } == 2 } }
+            catch (error: Throwable) { throw AssertionError("Queued follow-up not submitted: status=${vm.chat.value.status} queued=${vm.chat.value.queued.map { it.state }} probes=${fixture.nativeStatusProbes} requests=${recentCalls(fixture)}", error) }
+            val queuedSubmitIndex = fixture.requests.indexOfLast { it.string("method") == "prompt.submit" }
+            assertTrue("Resume asks about the scoped runtime before the FIFO send", fixture.requests.toList().subList(beforeResume, queuedSubmitIndex).any {
+                it.string("method") == "session.active_list" && it.getJSONObject("params").string("current_session_id") == "$firstRuntime-resumed" && it.getJSONObject("params").string("profile") == fixture.scope.profile
+            })
+            assertTrue("The resumed fixture turn reported idle", fixture.nativeStatusProbes.contains("idle"))
+            await { vm.chat.value.queued.singleOrNull()?.state == "sent" }
+            val retained = vm.chat.value.queued.single()
+            assertTrue("The retained follow-up has an exact row receipt", retained.rowId.isNotBlank())
+            await { vm.chat.value.messages.any { it.role == "user" && it.id == retained.rowId } }
+            assertEquals(retained.rowId, vm.chat.value.messages.single { it.role == "user" && it.text == "Queued follow-up" }.id)
+            assertEquals("The queued follow-up is sent once", 2, fixture.requests.count { it.string("method") == "prompt.submit" })
             // Once in the conversation; the closed drawer's history row may preview the same line, so look in the transcript.
             assertEquals(1, vm.chat.value.messages.count { it.text == "Completed while backgrounded" })
             compose.onNode(hasText("Completed while backgrounded") and hasAnyAncestor(hasTestTag("conversation-transcript")), useUnmergedTree = true).assertIsDisplayed()

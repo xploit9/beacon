@@ -721,7 +721,7 @@ class SetupWizardUiTest {
             compose.onNodeWithTag("voice-key-test").assertIsNotEnabled()
             compose.onNodeWithTag("voice-key-get").assertIsDisplayed()
             // The call-sharing note sits on the page where the key is handed over.
-            compose.onNodeWithText("During a call, Beacon sends your assistant's instructions", substring = true).assertIsDisplayed()
+            compose.onNodeWithText("Your voice provider receives your speech", substring = true).assertIsDisplayed()
             compose.onNodeWithTag("voice-provider-key").performTextInput("not-a-real-key")
             compose.onNodeWithTag("voice-key-test").assertIsEnabled()
             compose.onNodeWithTag("voice-page-back").assertIsDisplayed()

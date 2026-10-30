@@ -133,6 +133,7 @@ class AuditR8aGatewayTest {
                 }
             }
             listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Fixture").build())
+            listener.onMessage(socket, json("jsonrpc" to "2.0", "method" to "event", "params" to json("type" to "gateway.ready", "payload" to json())).toString())
             return socket
         }
     }

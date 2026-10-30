@@ -6,21 +6,30 @@ import org.junit.Test
 
 class ProviderTranscriptTest {
     private fun item(id:String,text:String):CallTranscript {
-        val normalized=GrokWire().inbound(JSONObject().put("type","conversation.item.input_audio_transcription.completed")
-            .put("event_id",java.util.UUID.randomUUID().toString()).put("item_id",id).put("content_index",0).put("transcript",text))!!
+        val wire=GrokWire()
+        wire.inbound(JSONObject().put("type","input_audio_buffer.speech_started").put("item_id",id))
+        wire.inbound(JSONObject().put("type","input_audio_buffer.committed").put("item_id",id))
+        val normalized=wire.inbound(JSONObject().put("type","conversation.item.input_audio_transcription.completed")
+            .put("event_id",java.util.UUID.randomUUID().toString()).put("item_id",id).put("content_index",0).put("transcript",text).put("status","completed"))!!
             .getJSONObject("serverContent").getJSONObject("inputTranscription")
         val event=JSONObject().put("type","transcript").put("role","user").put("provider_item",normalized.getString("item_id"))
             .put("content_index",normalized.getInt("content_index")).put("text",normalized.getString("text"))
         return CallTranscript.from(providerTranscript(event,"call","session",100)!!,"session","call")!!
     }
-    @Test fun replayIsSuppressedByItemIdentityWithoutDiscardingCorrections() {
+    @Test fun partialCorrectionsDoNotPoisonTheCommittedFinalOrReemitIt() {
         val wire=GrokWire()
-        fun frame(item:String,text:String)=JSONObject().put("type","conversation.item.input_audio_transcription.completed")
-            .put("item_id",item).put("content_index",0).put("transcript",text)
-        assertNotNull(wire.inbound(frame("one","yes")))
-        assertNull(wire.inbound(frame("one","yes")))
-        assertNotNull(wire.inbound(frame("one","yes please")))
-        assertNotNull(wire.inbound(frame("two","yes please")))
+        fun event(type:String,item:String)=JSONObject().put("type",type).put("item_id",item)
+        fun frame(item:String,text:String,status:String)=event("conversation.item.input_audio_transcription.completed",item)
+            .put("content_index",0).put("transcript",text).put("status",status)
+        wire.inbound(event("input_audio_buffer.speech_started","one"))
+        val first=wire.inbound(frame("one","yes","in_progress"))!!.getJSONObject("serverContent").getJSONObject("inputTranscription")
+        val correction=wire.inbound(frame("one","yes please","in_progress"))!!.getJSONObject("serverContent").getJSONObject("inputTranscription")
+        assertFalse(first.getBoolean("final"));assertFalse(correction.getBoolean("final"));assertEquals("yes please",correction.getString("text"))
+        wire.inbound(event("input_audio_buffer.committed","one"))
+        assertTrue(wire.inbound(frame("one","yes please","completed"))!!.getJSONObject("serverContent").getJSONObject("inputTranscription").getBoolean("final"))
+        assertNull(wire.inbound(frame("one","yes please","completed")))
+        wire.inbound(event("input_audio_buffer.speech_started","two"));wire.inbound(event("input_audio_buffer.committed","two"))
+        assertNotNull(wire.inbound(frame("two","yes please","completed")))
     }
     @Test fun replayAndCumulativeCorrectionsReplaceOneItem() {
         var rows=emptyList<CallTranscript>()

@@ -19,6 +19,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.core.*
 import dev.hermes.android.data.nativeApprovalModes
+import dev.hermes.android.data.appErrorText
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 
@@ -132,34 +134,68 @@ internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: S
 @Composable internal fun ProfileApprovalSettings(vm: BeaconViewModel) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
-    val refreshing by vm.refreshing.collectAsStateWithLifecycle()
-    val pending by vm.conversationPending.collectAsStateWithLifecycle()
-    val active = vm.client
+    val target by vm.settingsProfile.collectAsStateWithLifecycle()
+    val selecting by vm.settingsProfileSelecting.collectAsStateWithLifecycle()
+    val active = vm.settingsProfileClient()
+    val version = vm.settingsProfileVersion()
     val scope = rememberCoroutineScope()
-    var saving by remember(active, ui.profile) { mutableStateOf(false) }
-    val busy = saving || "${active?.scope?.key}|/api/profile/approval-mode" in pending
+    var saving by remember(active, version) { mutableStateOf(false) }
+    var loading by remember(active, version) { mutableStateOf(false) }
+    var failed by remember(active, version) { mutableStateOf(false) }
+    var readGeneration by remember(active, version) { mutableIntStateOf(0) }
+    val busy = saving || selecting
     val key = "profile:approvals"
     val value = data[key]?.takeIf { it.string("scope_key") == active?.scope?.key }
-    val loading = key in refreshing
     val updatedNotice = uiText("Profile approvals updated")
-    fun refresh() { vm.load(key, "/api/profile/approval-mode") }
-    LaunchedEffect(active, ui.profile, ui.connected) { if (ui.connected) refresh() }
+    fun refresh() {
+        val captured = active ?: return
+        val generation = ++readGeneration
+        loading = true; failed = false
+        scope.launch {
+            val c = captured.detached()
+            try {
+                vm.authorizeSettingsProfile(captured, captured.scope.profile)
+                if (!vm.settingsProfileCurrent(captured, version) || generation != readGeneration) return@launch
+                val result = c.get("/api/profile/approval-mode")
+                if (vm.settingsProfileCurrent(captured, version) && generation == readGeneration) vm.storeData(key, result)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                if (vm.settingsProfileCurrent(captured, version) && generation == readGeneration) { failed = true; vm.profileSettingsFailure(e) }
+            } finally {
+                c.closeNative()
+                if (vm.settingsProfileCurrent(captured, version) && generation == readGeneration) loading = false
+            }
+        }
+    }
+    LaunchedEffect(active, version, target, ui.connected) { if (ui.connected) refresh() }
     Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp).testTag("profile-approvals")) {
         Text(uiText("Approvals for all chats"), style = MaterialTheme.typography.titleMedium)
         Text(uiText("Chats follow this profile unless a chat skips approvals."), style = MaterialTheme.typography.bodySmall)
-        if (busy || value == null && recordError(data[key]).isBlank()) LinearProgressIndicator(Modifier.fillMaxWidth())
+        if (busy || loading || value == null && !failed) LinearProgressIndicator(Modifier.fillMaxWidth())
         if (value?.string("value") == "off") Text(uiText("Approvals are off for this profile"), color = MaterialTheme.colorScheme.error)
-        if (recordError(data[key]).isNotBlank()) TextButton(onClick = { refresh() }) { Text(uiText("Couldn't load approvals. Retry")) }
+        if (failed) TextButton(onClick = { refresh() }) { Text(uiText("Couldn't load approvals. Retry")) }
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             listOf("manual", "smart").forEach { mode ->
-                FilterChip(selected = value?.string("value") == mode, enabled = active != null && value != null && !loading && !busy,
+                FilterChip(selected = value?.string("value") == mode, enabled = active != null && value != null && !loading && !busy && !failed,
                     modifier = Modifier.testTag("profile-approval-$mode"), label = { Text(uiText(approvalChoiceLabel(mode))) }, onClick = {
-                        if (active != null && vm.client === active && !saving) {
+                        if (active != null && vm.settingsProfileCurrent(active, version) && !saving) {
                             saving = true
-                            val job = vm.action("/api/profile/approval-mode", json("mode" to mode, "scope_key" to active.scope.key), refresh = false, successNotice = updatedNotice) { _, result ->
-                                vm.storeData(key, result); vm.loadChatApprovals()
+                            ++readGeneration
+                            scope.launch {
+                                val c = active.detached()
+                                try {
+                                    vm.authorizeSettingsProfile(active, active.scope.profile)
+                                    if (!vm.settingsProfileCurrent(active, version)) return@launch
+                                    val result = c.post("/api/profile/approval-mode", json("mode" to mode, "scope_key" to active.scope.key))
+                                    if (vm.settingsProfileCurrent(active, version)) { vm.storeData(key, result); vm.notice(updatedNotice) }
+                                } catch (e: Exception) {
+                                    if (e is CancellationException) throw e
+                                    if (vm.settingsProfileCurrent(active, version)) { vm.profileSettingsFailure(e); if (vm.settingsProfileCurrent(active, version)) vm.notice(appErrorText(e)) }
+                                } finally {
+                                    c.closeNative()
+                                    if (vm.settingsProfileCurrent(active, version)) { saving = false; loading = false }
+                                }
                             }
-                            scope.launch { try { job.join() } finally { saving = false } }
                         }
                     })
             }

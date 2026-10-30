@@ -23,7 +23,7 @@ data class AppPreferences(
     val theme: String = "system", val skin: String = "default", val historyHiddenSources: Set<String> = emptySet(), val historyOrder: String = "recent",
     val assistantName: String = DEFAULT_ASSISTANT_NAME, val ownerName: String = "", val assistantProfile: String = DEFAULT_ASSISTANT_PROFILE,
     /** Blank = the profile's default model. */
-    val assistantModel: String = "", val assistantProvider: String = "",
+    val assistantModel: String = "", val assistantProvider: String = "", val busySendAction: String = "steer", val busySendLoaded: Boolean = false,
 ) {
     companion object {
         fun read(p: Preferences) = AppPreferences(
@@ -32,6 +32,7 @@ data class AppPreferences(
             assistantNameOf(p[stringPreferencesKey("assistant_name")]), ownerNameOf(p[stringPreferencesKey("owner_name")]),
             p[stringPreferencesKey("assistant_profile")]?.takeIf(String::isNotBlank) ?: DEFAULT_ASSISTANT_PROFILE,
             p[stringPreferencesKey("assistant_model")].orEmpty(), p[stringPreferencesKey("assistant_provider")].orEmpty(),
+            p[stringPreferencesKey("busy_send_action")]?.takeIf { it in setOf("steer", "queue") } ?: "steer", true,
         )
     }
 }

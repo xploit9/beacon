@@ -4,6 +4,9 @@ import dev.hermes.android.data.ApiFailure
 import dev.hermes.android.data.NativeAuthExpiredException
 import dev.hermes.android.data.NativeOperationPolicy
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runTest
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -17,7 +20,7 @@ import java.net.UnknownHostException
 
 class PluginInstallTest {
     private class Fake(
-        private val answer: () -> JSONObject = { JSONObject().put("ok", true) },
+        private val answer: () -> JSONObject = { JSONObject().put("ok", true).put("restart_required", false) },
         private val presence: List<Boolean> = listOf(true),
         private val gateways: List<GatewayStatus?> = listOf(GatewayStatus(running = true, busy = false)),
         private val failure: Exception? = null,
@@ -152,7 +155,7 @@ class PluginInstallTest {
         assertEquals(1, installed.installs)
         assertEquals(done, install(Fake(failure = SocketTimeoutException("Read timed out"), gateways = listOf(GatewayStatus(running = false, busy = false)))))
         val missing = Fake(failure = SocketTimeoutException("Read timed out"), presence = listOf(false))
-        assertEquals(failed(PluginInstallFailure.NotYet), install(missing))
+        assertEquals(failed(PluginInstallFailure.NotYet).copy(restartPending = true), install(missing))
     }
 
     @Test fun installThenRestartThenAvailable() {
@@ -232,6 +235,87 @@ class PluginInstallTest {
     }
 
     private fun signedIn() = dev.hermes.android.data.BeaconClient(dev.hermes.android.data.AuthContext("https://native.example", emptyList(), "owner", "default", backend = "hermes-dashboard"), null, persistContext = false)
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun slowPresenceRetryRetainsTheRestartOfferWithoutReinstalling() = runTest {
+        val endpoint = Fake(answer = ::needsRestart, presence = List(8) { false } + true,
+            gateways = listOf(GatewayStatus(running = true, busy = true)))
+        var finished = 0
+        val controller = PluginInstallController(this, ::signedIn, { finished++ }, {}, { endpoint })
+        controller.install(); advanceUntilIdle()
+        assertEquals(PluginInstallFailure.NotYet, controller.state.value.failure)
+        assertEquals(0, finished)
+        controller.retry(); advanceUntilIdle()
+        assertEquals(PluginInstallUi(PluginInstallStage.NeedsRestart, busy = true), controller.state.value)
+        assertEquals(0, finished)
+        assertEquals(1, endpoint.installs)
+        assertEquals(0, endpoint.restarts)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun slowPresenceRetryWithoutRestartRequirementFinishes() = runTest {
+        val endpoint = Fake(presence = List(8) { false } + true)
+        var finished = 0
+        val controller = PluginInstallController(this, ::signedIn, { finished++ }, {}, { endpoint })
+        controller.install(); advanceUntilIdle()
+        assertEquals(PluginInstallFailure.NotYet, controller.state.value.failure)
+        assertEquals(0, finished)
+        controller.retry(); advanceUntilIdle()
+        assertEquals(done, controller.state.value)
+        assertEquals(1, finished)
+        assertEquals(1, endpoint.installs)
+        assertEquals(0, endpoint.restarts)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun unknownRestartDecisionSurvivesRepeatedRetriesAndResetClearsIt() = runTest {
+        val endpoint = Fake(answer = { JSONObject().put("ok", true) }, presence = List(16) { false } + true,
+            gateways = listOf(null))
+        var finished = 0
+        val controller = PluginInstallController(this, ::signedIn, { finished++ }, {}, { endpoint })
+        controller.install(); advanceUntilIdle()
+        assertEquals(failed(PluginInstallFailure.NotYet).copy(restartPending = true), controller.state.value)
+        controller.retry(); advanceUntilIdle()
+        assertEquals(failed(PluginInstallFailure.NotYet).copy(restartPending = true), controller.state.value)
+        controller.retry(); advanceUntilIdle()
+        assertEquals(PluginInstallUi(PluginInstallStage.NeedsRestart), controller.state.value)
+        assertEquals(0, finished)
+        assertEquals(1, endpoint.installs)
+        assertEquals(0, endpoint.restarts)
+        controller.reset()
+        assertEquals(PluginInstallUi(), controller.state.value)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun slowPresenceWithGatewayStoppedCompletesWithoutRestart() = runTest {
+        val endpoint = Fake(answer = ::needsRestart, presence = List(8) { false } + true,
+            gateways = listOf(GatewayStatus(running = false, busy = false)))
+        var finished = 0
+        val controller = PluginInstallController(this, ::signedIn, { finished++ }, {}, { endpoint })
+        controller.install(); advanceUntilIdle()
+        controller.retry(); advanceUntilIdle()
+        assertEquals(done, controller.state.value)
+        assertEquals(1, finished)
+        assertEquals(1, endpoint.installs)
+        assertEquals(0, endpoint.restarts)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun slowPresenceAfterLostReplyOrEnableStillOffersRestart() = runTest {
+        for (failure in listOf(SocketTimeoutException("Read timed out"), ApiFailure(400, "exists"))) {
+            val endpoint = Fake(failure = failure, presence = List(8) { false } + true)
+            var finished = 0
+            val controller = PluginInstallController(this, ::signedIn, { finished++ }, {}, { endpoint })
+            controller.install(); advanceUntilIdle()
+            assertEquals(failed(PluginInstallFailure.NotYet).copy(restartPending = true), controller.state.value)
+            controller.retry(); advanceUntilIdle()
+            assertEquals(PluginInstallUi(PluginInstallStage.NeedsRestart), controller.state.value)
+            assertEquals(0, finished)
+            assertEquals(1, endpoint.installs)
+            assertEquals(if (failure is ApiFailure) 1 else 0, endpoint.enables)
+            assertEquals(0, endpoint.restarts)
+        }
+    }
 
     @Test fun aSecondTapWhileAnInstallRunsStartsNothing() {
         val hold = kotlinx.coroutines.CompletableDeferred<Unit>()

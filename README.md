@@ -38,7 +38,8 @@ The voice is Grok; the caller's side is synthetic speech. Screens and videos com
 ## What Beacon does
 
 - **A chat that feels like a messenger.** Grouped bubbles, date chips, long-press to copy, quote, share or read aloud,
-  and `/` for Hermes commands. Longer runs of steps fold into one line.
+  and `/` for Hermes commands. Longer runs of steps fold into one line. Messages sent during a reply appear in the
+  transcript immediately. Choose Steer or Queue in Settings > Chat, or use `/queue message` to queue that message.
 - **Threads as channels.** Give a thread a name and an emoji, point a scheduled task at it, and each result arrives
   there as a post. Reply and the answer builds on it ([how threads work](docs/threads.md)).
 - **Projects.** Add a chat to a project from its menu. It works in the project's folder and shows the project at the top.
@@ -51,6 +52,8 @@ The voice is Grok; the caller's side is synthetic speech. Screens and videos com
 - **What needs you.** Beacon watches what your Hermes can reach and tells you, or calls you, when something matters.
   Write rules like "Call me if a client moves a meeting" and teach it with Important / Not important.
 - **All of Hermes.** Profiles, skills, memory, schedules, files, Kanban and Bot Mode, with screens that open ready.
+  Editing a profile in Settings keeps the active chat profile; switch chats' profiles from the top drawer selector.
+  Check-up calls are in Settings > Assistant.
 - **Updates from GitHub.** Beacon tells you when a release is out; tap Update for the app and the Hermes plugin.
 - **Foldables.** On a wide screen, the chat list and the chat sit side by side.
 - **Your language.** The app follows your phone's language in 16 languages, including right-to-left Arabic.
@@ -155,8 +158,8 @@ See and remove linked phones in Settings › Connection, or on the dashboard's *
 - Beacon requires an HTTPS dashboard and uses secure WebSockets for live sessions.
 - The plugin checks your signed-in Hermes owner and profile before acting.
 - Voice provider keys are encrypted on the phone and sent only to the selected provider.
-- During a call, Beacon sends your assistant's instructions, memory notes, recent chat, tool results and any camera or screen you share to the voice provider you choose.
-- Call audio is not retained. Call history is saved as text, and a finished call's text is passed to your Hermes memory provider like a chat.
+- Voice requests use the active Hermes conversation and its configured model, memory, tools and approvals. The voice provider receives microphone audio and the text Beacon reads aloud; shared camera or screen images go to Hermes.
+- Call audio is not retained. Call history is saved as text, and native conversation turns follow Hermes's normal memory and retention rules.
 - Beacon's call and task retention setting does not remove Hermes conversations, memories or files.
 - Beacon checks the public GitHub release for updates on its own, without signing in, so GitHub sees the phone's address.
 

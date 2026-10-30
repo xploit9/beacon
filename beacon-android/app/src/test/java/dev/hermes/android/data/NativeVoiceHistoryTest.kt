@@ -11,9 +11,12 @@ class NativeVoiceHistoryTest {
     private val scope = Scope("https://native.example", "owner", "work", "stored-a")
     private fun archive() = json("session_id" to scope.session, "profile" to scope.profile, "events" to JSONArray().put(json("call_id" to "call-a", "event_id" to "call-a:user:1", "session_id" to scope.session, "role" to "user", "text" to "Archived voice", "final" to true)))
     private fun providerEvent(item: String, turn: Int, text: String, callId: String = "call-a"): JSONObject {
-        val input = requireNotNull(GrokWire().inbound(json(
+        val wire = GrokWire()
+        wire.inbound(json("type" to "input_audio_buffer.speech_started", "item_id" to item))
+        wire.inbound(json("type" to "input_audio_buffer.committed", "item_id" to item))
+        val input = requireNotNull(wire.inbound(json(
             "type" to "conversation.item.input_audio_transcription.completed", "event_id" to java.util.UUID.randomUUID().toString(),
-            "item_id" to item, "content_index" to 0, "transcript" to text,
+            "item_id" to item, "content_index" to 0, "transcript" to text, "status" to "completed",
         ))).getJSONObject("serverContent").getJSONObject("inputTranscription")
         // DirectVoice forwards the provider item; BeaconCallService supplies its numeric turn.
         return requireNotNull(providerTranscript(json("type" to "transcript", "role" to "user",

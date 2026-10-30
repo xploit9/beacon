@@ -551,7 +551,10 @@ internal fun chatHeaderSubtitle(streaming: Boolean, hasReplyText: Boolean, inCal
 }
 
 /** Fixed texts the chat shows through variables: tool outcomes and the header's status line. */
-internal val ChatStrings = ToolOutcome.entries.map(::toolOutcomeLabel) + listOf("typing…", "thinking…", "Voice conversation")
+internal val ChatStrings = ToolOutcome.entries.map(::toolOutcomeLabel) + listOf("typing…", "thinking…", "Voice conversation",
+    "Queued on this phone", "Sending guidance", "Sending", "Accepted; delivery pending", "Finished; check history",
+    "Turn failed; check history", "Turn interrupted; check history", "Queued message canceled", "Message rejected", "Sent", "Send outcome unknown",
+    "Will send after this reply", "Run command", "Steer", "Queue")
 
 /** The header's second line: the chat's project, then what [chatHeaderSubtitle] says. Hermes status (thinking, typing, a call) takes the line over from the project. */
 internal data class ChatHeaderLine(val project: String, val text: String)
@@ -590,9 +593,10 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     val chatState by vm.chat.collectAsStateWithLifecycle()
     val composerDraft by vm.composer.collectAsStateWithLifecycle()
     // Saved call turns and alerts sit among the messages by the time they happened.
-    val messages = remember(chatState.messages, chatState.callMessages, chatState.alerts, chatState.sessionId) {
+    val messages = remember(chatState.messages, chatState.callMessages, chatState.alerts, chatState.sessionId, chatState.queued) {
+        val localTimes = chatState.queued.filter { it.rowId.isNotBlank() }.associate { it.rowId to it.createdAt }
         dev.hermes.android.voice.interleaveCallMessages(
-            dev.hermes.android.voice.interleaveCallMessages(visibleTranscriptMessages(chatState.messages), chatState.callMessages.map { Message("call:${it.eventId}", it.role, it.text, sessionId = chatState.sessionId, recordedAt = it.at) }),
+            dev.hermes.android.voice.interleaveCallMessages(visibleTranscriptMessages(chatState.messages).map { row -> localTimes[row.id]?.let { row.copy(recordedAt = it) } ?: row }, chatState.callMessages.map { Message("call:${it.eventId}", it.role, it.text, sessionId = chatState.sessionId, recordedAt = it.at) }),
             chatState.alerts.map { Message("alert:${it.noticeId}", "assistant", it.text, sessionId = chatState.sessionId, recordedAt = it.createdAt) },
         )
     }
@@ -966,8 +970,8 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                     anchorRestored = true
                 }
             }
-            LaunchedEffect(anchorRestored, follow, search, chat.messages.size, visibleMessages.size, chat.liveText, chat.callMessages) {
-                if (anchorRestored && follow && search.isBlank() && chat.messages.isNotEmpty()) {
+            LaunchedEffect(anchorRestored, follow, search, chat.messages.size, visibleMessages.size, chat.liveText, chat.callMessages, chat.queued.size) {
+                if (anchorRestored && follow && search.isBlank() && (chat.messages.isNotEmpty() || chat.queued.isNotEmpty())) {
                     if (chat.anchor > 0 || chat.anchorOffset > 0 || chat.anchorId.isNotBlank()) vm.anchor(0, 0, "")
                     // Markdown, media and fold layouts can grow after the first measurement.
                     // Keep following their measured tail, rather than only the incoming text/count.
@@ -1070,7 +1074,7 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                             AlertRow(alert, groups[message.id] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax, vm, taskResultScope,
                                 canChoose = pluginStatus == "available" && ui.connected && vm.client != null && alert.noticeId !in alertsSending && alert.expiresAt > System.currentTimeMillis() / 1000,
                                 onChoose = { sendAlertFeedback(alert.noticeId, it) })
-                        } else MessageRow(vm, message, transcriptIndex[message.id] ?: index, groups[message.id] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax, toolResultsByCallId = foldedToolResults.byCallId, resultTitle = toolResultTitles[message.id].orEmpty(), onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) })
+                        } else MessageRow(vm, message, transcriptIndex[message.id] ?: index, groups[message.id] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax, toolResultsByCallId = foldedToolResults.byCallId, resultTitle = toolResultTitles[message.id].orEmpty(), confirmedLocalId = chat.queued.firstOrNull { it.state == "sent" && it.rowId == message.id }?.id, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) })
                     }
                     if (liveShown) item("live") {
                         // Same bubble and spacing as the stored reply, so replacing this row does not move the text.
@@ -1084,6 +1088,12 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                             }
                             Box(Modifier.widthIn(max = bubbleMax)) { MessageActivity(chat.liveReasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), chat.liveTools, "", streaming = true, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }, vm = vm, scope = vm.authenticatedScope()?.session(chat.sessionId)) }
                         }
+                    }
+                    items(chat.queued.filter { queued ->
+                        (queued.rowId.isBlank() || chat.messages.none { it.id == queued.rowId }) &&
+                            (search.isBlank() || queued.text.contains(search, ignoreCase = true))
+                    }, key = { "queued:${it.id}" }) { queued ->
+                        QueuedMessageRow(vm, queued, bubbleMax, canDismiss = chat.uncertain != queued.id)
                     }
                     chat.approval?.let { p -> item("approval:${p.string("approval_id", p.string("id"))}") {
                         val exactBeaconAction = p.string("approval_id").startsWith("beacon-cf:")
@@ -1112,7 +1122,7 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                     ) { Icon(Icons.Rounded.ExpandMore, uiText("Scroll to latest"), Modifier.size(24.dp)) }
                 }
             }
-            if (ready && chat.uncertain.isNotBlank() && !chatSendInFlight(chat)) Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp).testTag("send-unconfirmed"), horizontalAlignment = Alignment.End) {
+            if (ready && chat.uncertain.isNotBlank() && chat.status != "Sending") Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp).testTag("send-unconfirmed"), horizontalAlignment = Alignment.End) {
                 // Where the message sits in the transcript: not confirmed, with the choices below.
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     SendTickIcon(SendTick.Unconfirmed)
@@ -1186,7 +1196,10 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                                 titles.filterNot { permanentBotChat && it == "New conversation" }.forEach { actionItem(it) }
                             }
                             HorizontalDivider()
-                            if (chat.queued.isNotEmpty() || chat.uncertain.isNotBlank()) DropdownMenuItem({ Text(uiText("Message queue")) }, { menu = false; composerDetails = true }, enabled = !activeHere)
+                            if (chat.queued.isNotEmpty() || chat.uncertain.isNotBlank()) DropdownMenuItem({ Text(uiText("Message queue")) }, {
+                                menu = false; follow = true
+                                scope.launch { list.scrollToItem((list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0)) }
+                            }, enabled = !activeHere)
                             if (composerDraft.text.startsWith("/")) DropdownMenuItem({ Text(uiText(if (chat.streamId.isNotBlank()) "Queue as text" else "Send as text")) }, { menu = false; if (chat.streamId.isNotBlank()) vm.queue() else vm.send() }, enabled = canonical && !activeHere && chat.uncertain.isBlank())
                             if (canonical && !activeHere && chat.streamId.isBlank()) ConversationProjectItem(vm, chat.sessionId, onAdd = { projects = true }, onDone = { menu = false }, onOpen = { openProjectFromChat(vm, it) })
                             if (canonical && chat.messages.isNotEmpty()) DropdownMenuItem({ Text(uiText("Share conversation")) }, { menu = false
@@ -1251,6 +1264,9 @@ internal fun acceptsInitialConversationEdit(
     val ui by vm.ui.collectAsStateWithLifecycle()
     val chat by vm.chat.collectAsStateWithLifecycle()
     val draft by vm.composer.collectAsStateWithLifecycle()
+    val preferences by vm.preferences.collectAsStateWithLifecycle()
+    val busyOverride by vm.busySendOverride.collectAsStateWithLifecycle()
+    val busyAction = busyOverride ?: preferences.busySendAction
     val settings = LocalBeaconSettings.current
     val readOnly = chat.raw.optBoolean("read_only") || chat.raw.optBoolean("is_read_only")
     val canonical = chat.sessionId.isNotBlank()
@@ -1263,11 +1279,16 @@ internal fun acceptsInitialConversationEdit(
     val inputScope = vm.authenticatedScope()
     val mobileCommands = mobileSlashCommands(data["slash:catalog"]?.rows("commands").orEmpty())
     val commandName = nativeSlashName(draft.text, mobileCommands.map { it.string("name") })
+    val explicitQueue = Regex("^/queue(?=\\s|$)", RegexOption.IGNORE_CASE).find(draft.text)
     val submit: () -> Unit = {
         if (preparing.isNotEmpty()) vm.notice("Finish or remove attachments before sending")
+        else if (explicitQueue != null) {
+            val payload = draft.text.substring(explicitQueue.range.last + 1).trimStart()
+            if (payload.isBlank()) vm.notice("Usage: /queue <message>") else vm.queue(payload)
+        }
         else if (draft.text.startsWith("/") && (data["slash:catalog"] == null || recordError(data["slash:catalog"]).isNotBlank())) vm.notice("Wait for commands to load or retry the command list.")
         else if (commandName != null) vm.runSlashCommand(draft.text.substringBefore(' ').removePrefix("/"), draft.text.substringAfter(' ', ""))
-        else if (chat.streamId.isNotBlank()) vm.queue() else vm.send()
+        else vm.send()
     }
     val changeDraft: (TextFieldValue) -> Unit = { value ->
         val currentScope = vm.authenticatedScope()
@@ -1399,19 +1420,17 @@ internal fun acceptsInitialConversationEdit(
             // Relay-style composer surface: one pill with a hairline border.
             Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh, border = BorderStroke(if (inputFocused) 2.dp else 1.dp, if (inputFocused) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant)) {
                 Column(Modifier.padding(horizontal = 6.dp, vertical = 3.dp)) {
-                    if (chat.queued.isNotEmpty()) LazyColumn(Modifier.fillMaxWidth().heightIn(max = 144.dp).testTag("composer-queue"), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        item(key = "queue-heading") { Text(queuedHeading(chat.queued.size, uiText("1 message will send after this reply"), uiText("{0} messages will send after this reply")), Modifier.padding(horizontal = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                        itemsIndexed(chat.queued) { index, queued -> Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Text(queued.text.ifBlank { uiText("Attachment") } + if (queued.attachments.isNotEmpty()) " · " + uiText(if (queued.attachments.size == 1) "1 file" else "{0} files").replace("{0}", "${queued.attachments.size}") else "", Modifier.weight(1f).padding(horizontal = 8.dp), style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-                            IconButton(onClick = { vm.removeQueued(index) }, modifier = Modifier.size(48.dp)) { Icon(Icons.Rounded.Close, uiText("Remove queued message")) }
-                        } }
-                    }
                     if (files.isNotEmpty() || preparing.isNotEmpty()) Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).testTag("composer-attachments"), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         files.forEachIndexed { index, file -> PendingAttachmentChip(file, onClick = { onDetails(true) }, onRemove = { vm.removeAttachment(index) }) }
                         preparing.forEach { file -> InputChip(selected = false, onClick = { onDetails(true) }, label = { Text(attachmentPreparationLabel(file.string("name"), file.string("status"), uiText(file.string("error")), uiText("Upload failed. Remove and attach again."), uiText("Preparing…")), maxLines = 2) }, leadingIcon = { if (file.string("status") != "error") CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp) else Icon(Icons.Rounded.ErrorOutline, uiText("Upload failed")) }, trailingIcon = { IconButton(onClick = { vm.dismissAttachmentPreparation(file.string("id")) }, Modifier.size(48.dp)) { Icon(Icons.Rounded.Close, uiText("Remove") + " " + file.string("name")) } }, modifier = Modifier.heightIn(min = 48.dp).widthIn(max = 280.dp)) }
                     }
                     // A visible state pill, so Queue vs. Guide does not depend on the trailing icon alone.
-                    if (streaming && !voiceAction) Text(uiText("Will send after this reply"), Modifier.padding(horizontal = 8.dp, vertical = 2.dp).clip(RoundedCornerShape(999.dp)).background(MaterialTheme.colorScheme.secondaryContainer).padding(horizontal = 8.dp, vertical = 3.dp).testTag("composer-queue-caption"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSecondaryContainer)
+                    if (streaming && !voiceAction) Text(uiText(when {
+                        explicitQueue != null -> "Will send after this reply"
+                        draft.text.startsWith("/") -> "Run command"
+                        files.isNotEmpty() || busyAction == "queue" -> "Will send after this reply"
+                        else -> "Steer"
+                    }), Modifier.padding(horizontal = 8.dp, vertical = 2.dp).clip(RoundedCornerShape(999.dp)).background(MaterialTheme.colorScheme.secondaryContainer).padding(horizontal = 8.dp, vertical = 3.dp).testTag("composer-queue-caption"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSecondaryContainer)
                     // In flight the transcript shows the message; the draft stays held (not shown twice) until Hermes accepts it.
                     // Edits are ignored rather than the field made read-only: read-only ends the input session and drops the keyboard.
                     val imagePasteReceiver = ReceiveContentListener { content ->
@@ -1501,7 +1520,7 @@ internal fun acceptsInitialConversationEdit(
                         } else if (voiceAction) {
                             FilledIconButton(onClick = onCall, shape = CircleShape, modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("chat-call-beacon"), enabled = callAvailable && canonical && !callActive && !readOnly && chat.streamId.isBlank() && voiceCallsOffered(ui.bootstrap)) { Icon(Icons.Rounded.GraphicEq, assistantText("Talk to Beacon in this conversation"), Modifier.size(composerActionIconSize)) }
                         } else {
-                            FilledIconButton(onClick = submit, shape = CircleShape, modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("message-send"), enabled = editable && preparing.isEmpty() && chat.uncertain.isBlank() && !callActive && !readOnly) { Icon(Icons.Rounded.ArrowUpward, uiText(if (commandName != null) "Run command" else if (chat.streamId.isNotBlank()) "Queue" else "Send"), Modifier.size(composerActionIconSize)) }
+                            FilledIconButton(onClick = submit, shape = CircleShape, modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("message-send"), enabled = editable && preparing.isEmpty() && chat.uncertain.isBlank() && !callActive && !readOnly) { Icon(Icons.Rounded.ArrowUpward, uiText(if (explicitQueue != null) "Queue" else if (commandName != null) "Run command" else if (chat.streamId.isNotBlank() && (busyAction == "queue" || files.isNotEmpty()) || chat.streamId.isBlank() && chat.queued.any { it.kind == "queue" && it.state !in setOf("sent", "settled") }) "Queue" else if (chat.streamId.isNotBlank()) "Steer" else "Send"), Modifier.size(composerActionIconSize)) }
                         }
                     }
                 }
@@ -1521,9 +1540,8 @@ internal fun acceptsInitialConversationEdit(
             }
 
             preparing.forEach { file -> Text(attachmentPreparationLabel(file.string("name"), file.string("status"), uiText(file.string("error")), uiText("Upload failed. Remove and attach again."), uiText("Preparing…"))) }
-            if (files.isEmpty() && preparing.isEmpty() && chat.queued.isEmpty()) Text(uiText("No attachments or queued messages"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (files.isEmpty() && preparing.isEmpty()) Text(uiText("No attachments"), color = MaterialTheme.colorScheme.onSurfaceVariant)
             files.forEachIndexed { index, file -> Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { Text(file.string("name", file.string("filename", uiText("Attachment"))), Modifier.weight(1f)); IconButton(onClick = { vm.removeAttachment(index) }) { Icon(Icons.Rounded.Close, uiText("Remove attachment")) } } }
-            chat.queued.forEachIndexed { index, queued -> Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { Text(uiText("Queued") + ": ${queued.text}${if (queued.attachments.isNotEmpty()) " · " + uiText(if (queued.attachments.size == 1) "1 file" else "{0} files").replace("{0}", "${queued.attachments.size}") else ""}", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall); IconButton(onClick = { vm.removeQueued(index) }) { Icon(Icons.Rounded.Close, uiText("Remove queued message")) } } }
         }
     }
 }
@@ -1593,7 +1611,54 @@ private const val SENDING_MESSAGE_ID = "sending-message"
     }
 }
 
-@Composable private fun MessageRow(vm: BeaconViewModel, message: Message, index: Int, group: BubbleGroup, bubbleMax: Dp, toolResultsByCallId: Map<String, FoldedToolResult> = emptyMap(), resultTitle: String = "", onToolExpanded: (Boolean) -> Unit = {}) {
+@Composable private fun QueuedMessageRow(vm: BeaconViewModel, message: QueuedMessage, bubbleMax: Dp, canDismiss: Boolean) {
+    var menu by remember(message.id) { mutableStateOf(false) }
+    val editable = message.state == "queued"
+    val dismissible = canDismiss && message.state in setOf("accepted", "unknown", "settled")
+    val status = when (message.state) {
+        "queued" -> "Queued on this phone"
+        "sending" -> if (message.kind == "steer") "Sending guidance" else "Sending"
+        "accepted" -> "Accepted; delivery pending"
+        "settled" -> when (message.outcome) {
+            "failed" -> "Turn failed; check history"
+            "interrupted" -> "Turn interrupted; check history"
+            "cancelled" -> "Queued message canceled"
+            "rejected" -> "Message rejected"
+            else -> "Finished; check history"
+        }
+        "sent" -> "Sent"
+        else -> "Send outcome unknown"
+    }
+    Row(Modifier.fillMaxWidth().padding(top = 10.dp).testTag("queued-message:${message.id}"), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+        if (editable || dismissible) Box {
+            IconButton(onClick = { menu = true }, modifier = Modifier.testTag("queued-actions:${message.id}")) { Icon(Icons.Rounded.MoreVert, uiText("Message actions")) }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                if (editable) {
+                    DropdownMenuItem(text = { Text(uiText("Retry queued message")) }, onClick = { menu = false; vm.retryQueued(message.id) })
+                    DropdownMenuItem(text = { Text(uiText("Edit queued message")) }, onClick = { menu = false; vm.editQueued(message.id) })
+                    DropdownMenuItem(text = { Text(uiText("Remove queued message")) }, onClick = { menu = false; vm.removeQueued(message.id) })
+                } else {
+                    if (message.admissionId.isNotBlank()) DropdownMenuItem(text = { Text(uiText("Check receipt")) }, onClick = { menu = false; vm.checkQueuedReceipt(message.id) })
+                    if (message.state in setOf("accepted", "unknown")) DropdownMenuItem(text = { Text(uiText("Resend")) }, onClick = { menu = false; vm.openForm(resendLocalForm(vm, message.id)) })
+                    DropdownMenuItem(text = { Text(uiText("Remove local message")) }, onClick = { menu = false; vm.removeUnresolvedLocalMessage(message.id) })
+                }
+            }
+        }
+        ChatBubble(own = true, BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax) {
+            if (message.text.isNotBlank()) SelectionContainer { Text(message.text, style = MaterialTheme.typography.bodyLarge) }
+            message.attachments.forEach { attachment ->
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Icon(Icons.Rounded.AttachFile, null, Modifier.size(16.dp))
+                    Text(attachment.string("name", uiText("Attachment")), style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            Text(uiText(status), Modifier.semantics { liveRegion = LiveRegionMode.Polite }, style = MaterialTheme.typography.labelSmall)
+            BubbleMeta(message.createdAt, message.id, if (message.state == "sending") SendTick.Sending else if (message.state == "sent") SendTick.Sent else null)
+        }
+    }
+}
+
+@Composable private fun MessageRow(vm: BeaconViewModel, message: Message, index: Int, group: BubbleGroup, bubbleMax: Dp, toolResultsByCallId: Map<String, FoldedToolResult> = emptyMap(), resultTitle: String = "", confirmedLocalId: String? = null, onToolExpanded: (Boolean) -> Unit = {}) {
     val context = LocalContext.current
     val origin = vm.authenticatedScope()?.session(message.sessionId.ifBlank { vm.chat.value.sessionId })
     val settings = LocalBeaconSettings.current
@@ -1632,6 +1697,7 @@ private const val SENDING_MESSAGE_ID = "sending-message"
             DropdownMenuItem({ Text(uiText("Copy source")) }, { actions = false; copySource(displayText) }, leadingIcon = { Icon(Icons.Rounded.Code, null, Modifier.testTag("copy-source-icon")) }, modifier = Modifier.testTag("copy-source-action"))
             DropdownMenuItem({ Text(uiText("Branch from here")) }, { actions = false; vm.sessionAction("/api/session/branch", json("keep_count" to index + 1)) { o -> branchSessionId(o).takeIf(String::isNotBlank)?.let { id -> vm.selectSession(id, titleHint = branchTitle(o)); vm.refreshSessions(); vm.notice("Branched into a new conversation") } } }, leadingIcon = { Icon(Icons.AutoMirrored.Rounded.CallSplit, null) })
             if (own) DropdownMenuItem({ Text(uiText("Edit and branch")) }, { actions = false; vm.sessionAction("/api/session/branch", json("keep_count" to index)) { o -> (o.optJSONObject("session") ?: o).string("session_id").takeIf(String::isNotBlank)?.let { vm.selectSession(it, message.text, titleHint = branchTitle(o)); vm.refreshSessions() } } }, leadingIcon = { Icon(Icons.Rounded.Edit, null) })
+            if (confirmedLocalId != null) DropdownMenuItem({ Text(uiText("Remove saved local copy")) }, { actions = false; vm.removeConfirmedLocalCopy(confirmedLocalId) })
         }
     }
     Column(
@@ -1988,10 +2054,11 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
 }
 
 /** A send Hermes has not answered yet; an unknown outcome is shown separately, once the request has failed or been interrupted. */
-internal fun chatSendInFlight(chat: ChatState): Boolean = chat.uncertain.isNotBlank() && chat.status == "Sending"
+internal fun chatSendInFlight(chat: ChatState): Boolean = chat.uncertain.isNotBlank() && chat.status == "Sending" && chat.queued.none { it.id == chat.uncertain }
 
 /** The confirmation before a resend of a message whose delivery is unconfirmed; one place for the row and the details sheet. */
 private fun resendForm(vm: BeaconViewModel) = ActionForm("Resend retained draft", "", emptyList(), explanation = "The earlier delivery is unconfirmed. Resending may create a duplicate if it already arrived.", actionLabel = "Resend", onResult = { vm.reviewPendingSend(resend = true) })
+private fun resendLocalForm(vm: BeaconViewModel, id: String) = ActionForm("Resend retained message", "", emptyList(), explanation = "The earlier delivery is unconfirmed. Resending may create a duplicate if it already arrived.", actionLabel = "Resend", onResult = { vm.resendUnresolved(id) })
 
 /** The message being sent, as its stored bubble will look (with a clock tick), so its arrival does not shift the list. */
 @Composable private fun SendingMessage(text: String, group: BubbleGroup, bubbleMax: Dp) {
@@ -2002,10 +2069,6 @@ private fun resendForm(vm: BeaconViewModel) = ActionForm("Resend retained draft"
         }
     }
 }
-
-/** "2 messages will send after this reply"; [one] and [many] are the translated templates, and {0} is the count. */
-internal fun queuedHeading(count: Int, one: String = "1 message will send after this reply", many: String = "{0} messages will send after this reply"): String =
-    (if (count == 1) one else many).replace("{0}", "$count")
 
 /** Compact summary of background work, separate from the current reply's transcript activity. */
 @Composable internal fun ChatActivityStrip(activity: BackgroundActivitySummary, onClick: () -> Unit) {

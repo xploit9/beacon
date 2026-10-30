@@ -327,7 +327,7 @@ import org.json.JSONObject
                 }
             }
             rowDivider()
-            ActionRow(uiText("Schedules"), uiText("Check-up calls and scheduled jobs"), Icons.AutoMirrored.Rounded.KeyboardArrowRight) { vm.tab("Tasks") }
+            ActionRow(uiText("Schedules"), uiText("scheduled jobs"), Icons.AutoMirrored.Rounded.KeyboardArrowRight) { vm.tab("Tasks") }
             Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(uiText("After a force stop, open Beacon once to receive calls again."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }

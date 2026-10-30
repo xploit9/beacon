@@ -488,7 +488,7 @@ def test_job_receipt_rejects_old_completion_and_reports_done(harness,monkeypatch
     events=[]
     replay=SimpleNamespace(replay_epoch=lambda:'epoch-one',events_since=lambda *args:events)
     import threading
-    native_server=SimpleNamespace(_sessions_lock=threading.RLock(),_sessions={'runtime':{'running':False}})
+    native_server=SimpleNamespace(_sessions_lock=threading.RLock(),_sessions={'runtime':{'running':True,'history_lock':threading.RLock()}})
     monkeypatch.setitem(sys.modules,'tui_gateway',SimpleNamespace(event_replay=replay,server=native_server))
     body={'stored_session_id':'native-stored','runtime_session_id':'runtime','request_id':'request','title':'fixture','user_row_id':10,'callback':True}
     url=f'/api/plugins/beacon/mobile/calls/{cid}'

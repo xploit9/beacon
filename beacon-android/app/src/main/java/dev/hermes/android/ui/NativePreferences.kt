@@ -18,7 +18,7 @@ internal val nativeAliases = mapOf("Conversations" to "Sessions", "Spaces" to "W
 private val whitespace = Regex("\\s+")
 internal fun normalized(value: String) = value.lowercase().replace("…", "...").replace(whitespace, " ").trim()
 
-/** Bundled translations are data from the same frozen catalog as Hermes WebUI. Content stays verbatim. */
+/** Bundled Hermes WebUI translations plus Beacon interface text. Message content stays verbatim. */
 @Composable fun NativeLocalization(language: String, content: @Composable () -> Unit) {
     val context = LocalContext.current
     val app = context.applicationContext as dev.hermes.android.BeaconApplication

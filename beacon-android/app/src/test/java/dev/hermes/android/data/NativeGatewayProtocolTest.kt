@@ -115,6 +115,7 @@ class NativeGatewayProtocolTest {
                 }
             }
             listener.onOpen(ws, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Switching Protocols").build())
+            listener.onMessage(ws, json("jsonrpc" to "2.0", "method" to "event", "params" to json("type" to "gateway.ready", "payload" to json())).toString())
             return ws
         }
         fun event(session: String, seq: Int) = listener.onMessage(ws, json("method" to "event", "params" to json("session_id" to session, "seq" to seq, "type" to "message.delta", "payload" to json("text" to "x"))).toString())
@@ -455,9 +456,10 @@ class NativeGatewayProtocolTest {
     }
     @Test fun guideUsesNativeCorrectionAndNeverPromptSubmit() = runBlocking<Unit> {
         val wire = Wire(); val c = client(wire)
-        assertTrue(c.post("/api/chat/steer", json("session_id" to "stored-a", "text" to "correction")).getBoolean("accepted"))
+        val binding = c.nativeSession("stored-a")
+        assertTrue(c.post("/api/chat/steer", json("session_id" to "stored-a", "runtime_session_id" to binding.runtimeSessionId, "text" to "correction")).getBoolean("accepted"))
         val before = wire.sent.size
-        assertTrue(runCatching { c.post("/api/chat/steer", json("session_id" to "stored-a", "text" to "correction", "attachments" to JSONArray().put(json("id" to "media")))) }.isFailure)
+        assertTrue(runCatching { c.post("/api/chat/steer", json("session_id" to "stored-a", "runtime_session_id" to binding.runtimeSessionId, "text" to "correction", "attachments" to JSONArray().put(json("id" to "media")))) }.isFailure)
         assertEquals(before, wire.sent.size)
         assertTrue(wire.sent.any { it.getString("method") == "session.steer" })
         assertTrue(wire.sent.none { it.getString("method") == "prompt.submit" })
@@ -518,7 +520,7 @@ class NativeGatewayProtocolTest {
         wire.event("foreign-runtime", 1); wire.event("runtime-a", 1); wire.event("runtime-a", 2)
         val received = mutableListOf<Long>()
         val stop = IOException("fixture-stop")
-        try { gateway.events { frame -> val seq = frame.getJSONObject("params").getLong("seq"); received.add(seq); if (seq == 2L) throw stop } } catch (e: IOException) { assertSame(stop, e) }
+        try { gateway.events { frame -> if (frame.optJSONObject("params")?.optString("type") != "gateway.ready") { val seq = frame.getJSONObject("params").getLong("seq"); received.add(seq); if (seq == 2L) throw stop } } } catch (e: IOException) { assertSame(stop, e) }
         assertEquals(listOf(1L, 2L), received)
         assertEquals("android", wire.sent.first { it.getString("method") == "session.resume" }.getJSONObject("params").getString("source"))
         gateway.close()
@@ -586,7 +588,7 @@ class NativeGatewayProtocolTest {
             .put(json("session_id" to "runtime-a", "seq" to 3, "type" to "message.delta", "payload" to json("text" to "current")))
         gateway.prepareReplay()
         val types = mutableListOf<String>(); val stop = IOException("fixture-stop")
-        try { gateway.events { frame -> val type = frame.getJSONObject("params").getString("type"); types.add(type); if (type == "message.delta") throw stop } } catch (e: IOException) { assertSame(stop, e) }
+        try { gateway.events { frame -> val type = frame.getJSONObject("params").getString("type"); if (type != "gateway.ready") { types.add(type); if (type == "message.delta") throw stop } } } catch (e: IOException) { assertSame(stop, e) }
         assertEquals(listOf("message.start", "message.delta"), types)
         gateway.close()
     }
@@ -601,7 +603,7 @@ class NativeGatewayProtocolTest {
     @Test fun overflowCannotLoseConnectionTermination() = runBlocking<Unit> {
         val wire = Wire(); val gateway = NativeGateway(client(), wire)
         val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
-        val collector = async { runCatching { gateway.events { entered.complete(Unit); release.await() } }.exceptionOrNull() }
+        val collector = async { runCatching { gateway.events { if (it.optJSONObject("params")?.optString("type") != "gateway.ready") { entered.complete(Unit); release.await() } } }.exceptionOrNull() }
         while (wire.requests.isEmpty()) yield()
         wire.event("unbound", 1); entered.await()
         repeat(257) { wire.event("unbound", it + 2) }
@@ -635,7 +637,7 @@ class NativeGatewayProtocolTest {
     @Test fun onlyOneCollectorOwnsEachConnectionAndUnboundSequencesNeverFetchNullHistory() = runBlocking<Unit> {
         val wire = Wire(); val gateway = NativeGateway(client(), wire)
         val received = CompletableDeferred<Unit>()
-        val collector = async { runCatching { gateway.events { if (it.getJSONObject("params").getInt("seq") == 4) received.complete(Unit) } }.exceptionOrNull() }
+        val collector = async { runCatching { gateway.events { if (it.optJSONObject("params")?.optString("type") != "gateway.ready" && it.getJSONObject("params").getInt("seq") == 4) received.complete(Unit) } }.exceptionOrNull() }
         while (wire.requests.isEmpty()) yield()
         assertTrue(runCatching { gateway.events { } }.exceptionOrNull() is IllegalStateException)
         wire.event("unbound", 1); wire.event("unbound", 4)

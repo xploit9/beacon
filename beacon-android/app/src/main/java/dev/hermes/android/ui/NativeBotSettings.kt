@@ -60,7 +60,7 @@ import kotlinx.coroutines.delay
                                 }
                                 ProfileValue(Icons.Rounded.Flag, "Purpose", bot.purpose.ifBlank { uiText("Not set") })
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    OutlinedButton(onClick = { onOpen(bot.profile) }, enabled = !state.loading) { Text(uiText("View profile")) }
+                                    OutlinedButton(onClick = { onOpen(bot.profile) }, enabled = !state.loading, modifier = Modifier.testTag("profile-open:${bot.profile}")) { Text(uiText("View profile")) }
                                     if (canDelete(bot.profile)) TextButton(onClick = { onDelete(bot.profile) }, enabled = !state.loading, modifier = Modifier.heightIn(min = 48.dp).testTag("delete-profile:${bot.profile}")) { Text(uiText("Delete profile"), color = MaterialTheme.colorScheme.error) }
                                 }
                             }

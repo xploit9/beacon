@@ -19,7 +19,7 @@ internal suspend fun loginLiveTest(app: BeaconApplication, origin: String, crede
 }
 
 /** Synthetic in-process native protocol fixture. No socket, service, model, mailbox or sensor. */
-internal class NativeExperienceFixture : WebSocket.Factory {
+internal class NativeExperienceFixture(private val ownerName: String = "synthetic-owner") : WebSocket.Factory {
     private class FixtureRpcFailure(val code: Int, message: String) : RuntimeException(message)
     val requests = CopyOnWriteArrayList<JSONObject>()
     val sessions = ConcurrentHashMap<String, JSONObject>()
@@ -40,6 +40,20 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var toolEnabled = true
     @Volatile var connectionEnabled = true
     @Volatile var profileModel = "synthetic-model"
+    @Volatile var profileIsolationBots = false
+    @Volatile var profileCatalogUnavailable = false
+    val isolationModels = ConcurrentHashMap(mapOf("default" to "default-model", "coder" to "coder-model", "academic" to "academic-model"))
+    val isolationSkills = ConcurrentHashMap(mapOf("default" to "Default instructions", "coder" to "Coder instructions", "academic" to "Academic instructions"))
+    val isolationSkillEnabled = ConcurrentHashMap(mapOf("default" to true, "coder" to true, "academic" to false))
+    val isolationMemory = ConcurrentHashMap<String, ConcurrentHashMap<String, String>>().apply {
+        for (profile in listOf("default", "coder", "academic")) put(profile, ConcurrentHashMap(mapOf("memory" to "$profile notes", "user" to "$profile owner")))
+    }
+    val isolationApprovals = ConcurrentHashMap(mapOf("default" to "manual", "coder" to "smart", "academic" to "manual"))
+    val rejectedProfiles = ConcurrentHashMap.newKeySet<String>()
+    @Volatile var holdMemoryProfile = ""
+    val memoryReadCaptured = java.util.concurrent.CountDownLatch(1)
+    val releaseMemoryRead = java.util.concurrent.CountDownLatch(1)
+    val memoryReadReturned = java.util.concurrent.CountDownLatch(1)
     @Volatile var reasoningEffort = "medium"
     val sessionReasoning = ConcurrentHashMap<String, String>()
     @Volatile var updateApplied = false
@@ -162,6 +176,9 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         return event
     }
     @Volatile var cronFailure: String? = null
+    @Volatile var checkupCapabilities: JSONObject? = null
+    @Volatile var checkupCapabilitiesFailure = false
+    @Volatile var checkupPostEnabled = false
     @Volatile var historyFailure = false
     @Volatile var projectLookupFailure = false
     /** Chats Hermes has no saved row for yet (an unsent chat): their REST read is a 404, as on real Hermes. */
@@ -180,6 +197,21 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     @Volatile var fileWrites = 0
     @Volatile var holdCreateAcknowledgement = false
     @Volatile var holdPromptAcknowledgement = false
+    @Volatile var holdSteerAcknowledgement = false
+    @Volatile var steerStatus = "steered"
+    @Volatile var steerFailureCode: Int? = null
+    @Volatile var canonicalAuthority = false
+    @Volatile var omitCanonicalResumeProfile = false
+    @Volatile var omitCanonicalInfoProfile = false
+    @Volatile var admissionReceiptStatus = "queued"
+    @Volatile var admissionReceiptOutcome = ""
+    @Volatile var admissionReceiptRefOverride: String? = null
+    @Volatile var admissionReceiptProfileOverride: String? = null
+    @Volatile var admissionReceiptIdOverride: String? = null
+    @Volatile var holdReceiptAcknowledgement = false
+    @Volatile var holdActiveListAcknowledgement = false
+    val queueNextCanonicalSubmission = java.util.concurrent.atomic.AtomicBoolean(false)
+    val canonicalAdmissions = ConcurrentHashMap<String, JSONObject>()
     @Volatile var holdConfigAcknowledgement = false
     @Volatile var holdBranchAcknowledgement = false
     @Volatile var afterNextHistoryPage: (() -> Unit)? = null
@@ -198,10 +230,17 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     private val nativeServerRequestSequence = AtomicInteger()
     val nativeServerResponses = CopyOnWriteArrayList<JSONObject>()
     private val pendingNativeStreams = ConcurrentHashMap.newKeySet<String>()
+    private val nativeSocketSequence = AtomicInteger()
+    private val replayReads = ConcurrentHashMap<WebSocket, AtomicInteger>()
+    val nativeSocketMethods = CopyOnWriteArrayList<Pair<Int, String>>()
+    val liveCollectorSubscriptions = AtomicInteger()
+    @Volatile var liveCollectorSocketId = 0
+        private set
     private val runtimeStoredSessionIds = ConcurrentHashMap<String, String>()
     private val currentRuntimeSessionIds = ConcurrentHashMap<String, String>()
     val streamSubscriptions = AtomicInteger()
     @Volatile var nativeTurnStatus = "idle"
+    val nativeStatusProbes = CopyOnWriteArrayList<String>()
     @Volatile var refuseConnection = false
     val refusedConnections = java.util.concurrent.atomic.AtomicInteger()
     /** Stored id -> runtime id a later `session.resume` of that conversation binds (other conversations keep their own). */
@@ -223,8 +262,19 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     private val nativeEventSequence = AtomicInteger()
     fun releasePromptAcknowledgement() = releaseCreateAcknowledgement()
     fun releaseCreateAcknowledgement() {
-        val queued = synchronized(delayedCreates) { holdCreateAcknowledgement = false; holdPromptAcknowledgement = false; holdConfigAcknowledgement = false; holdBranchAcknowledgement = false; delayedCreates.toList().also { delayedCreates.clear() } }
+        val queued = synchronized(delayedCreates) { holdCreateAcknowledgement = false; holdPromptAcknowledgement = false; holdSteerAcknowledgement = false; holdReceiptAcknowledgement = false; holdActiveListAcknowledgement = false; holdConfigAcknowledgement = false; holdBranchAcknowledgement = false; delayedCreates.toList().also { delayedCreates.clear() } }
         queued.forEach { it() }
+    }
+    fun setCanonicalAdmission(id: String, status: String, outcome: String = "") {
+        require(status in setOf("queued", "started", "unknown", "terminal"))
+        val current = requireNotNull(canonicalAdmissions[id])
+        canonicalAdmissions[id] = current.copy().put("status", status).put("outcome", outcome.ifBlank { JSONObject.NULL })
+        nativeTurnStatus = when (status) { "queued" -> "starting"; "started" -> "working"; "terminal" -> "idle"; else -> "unknown" }
+    }
+    private fun canonicalProfileId(profile: String) = when (profile) {
+        "default" -> "synthetic-authority-alpha"
+        "coder" -> "synthetic-authority-beta"
+        else -> "synthetic-authority-$profile"
     }
     fun installCustomTabSeam() {
         callbackFailure = null
@@ -292,6 +342,11 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         check(openNativeServerRequests.putIfAbsent(id, frame.copy().apply { remove("jsonrpc") }) == null) { "Duplicate synthetic server request id: $id" }
         listener.onMessage(socket, frame.toString())
     }
+    fun retainNativeServerRequestForReplay(sessionId: String, method: String, id: String, payload: JSONObject) {
+        require(sessionId.isNotBlank() && method in setOf("approval", "clarify") && id.isNotBlank())
+        val frame = json("id" to id, "method" to method, "params" to payload.copy().put("session_id", sessionId))
+        check(openNativeServerRequests.putIfAbsent(id, frame) == null) { "Duplicate synthetic server request id: $id" }
+    }
     fun interruptActiveNativeStream() {
         val (listener, socket) = awaitActiveNativeSocket(0)
         activeNativeListener = null
@@ -299,7 +354,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         activeNativeSessionId = null
         listener.onFailure(socket, java.io.IOException("Synthetic native WebSocket interruption"), null)
     }
-    val scope = Scope("https://ui-fixture.invalid", "synthetic-owner", "default", nativeProvider = "fixture")
+    val scope = Scope("https://ui-fixture.invalid", ownerName, "default", nativeProvider = "fixture")
     // Saved screen answers outlive a case; each case starts from what its own fixture serves.
     init {
         val app = androidx.test.core.app.ApplicationProvider.getApplicationContext<BeaconApplication>()
@@ -337,7 +392,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             }
             if (request.url.encodedPath == "/api/plugins/beacon/devices/link") deviceLinkHadAuthorization = request.header("Authorization") != null
             val profileQuery = if (request.url.encodedPath.startsWith("/api/plugins/beacon/")) "beacon_profile" else "profile"
-            val profile = request.url.queryParameter(profileQuery) ?: "default"
+            val profile = request.url.queryParameter(profileQuery) ?: if (profileIsolationBots) body.string("profile", "default") else "default"
             requests += if (request.url.encodedPath.startsWith("/auth/native/")) json(
                 "path" to request.url.encodedPath,
                 "method" to request.method,
@@ -348,6 +403,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             val outage = pluginStatus?.takeIf { request.url.encodedPath.startsWith("/api/plugins/beacon/") }
             val (status, result) = if (expired) 401 to json("error" to "session_expired")
                 else if (outage != null) outage to json("detail" to "Synthetic optional plugin outage")
+                else if (profileIsolationBots && profile in rejectedProfiles && request.url.encodedPath != "/api/profiles") 403 to json("detail" to "Synthetic profile access denied")
                 else http(request.url.encodedPath, request.method, body, profile, request.url.queryParameter("path").orEmpty(), request.url.queryParameter("include_archived") == "1" || request.url.queryParameter("archived") == "only", request.url)
             Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(status).message("Synthetic fixture")
                 .body(result.toString().toResponseBody("application/json".toMediaType())).build()
@@ -457,7 +513,8 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             pairedDevices.removeAll { it.string("device_id") == id }
             200 to json("ok" to true)
         }
-        path == "/api/profiles" -> 200 to json("profiles" to JSONArray(notificationProfiles.map { id -> json("name" to id).apply { profileDisplayNames[id]?.let { put("display_name", it) } } }))
+        path == "/api/profiles" -> if (profileCatalogUnavailable) 404 to json("detail" to "Synthetic catalog unavailable")
+            else 200 to json("profiles" to JSONArray(notificationProfiles.map { id -> json("name" to id).apply { profileDisplayNames[id]?.let { put("display_name", it) } } }))
         path == "/api/profiles/active" -> 200 to json("current" to profile, "active" to profile)
         path == "/api/plugins/beacon/mobile/proactive" -> {
             if (proactiveRouteMissing) return 404 to json("detail" to "Unknown route")
@@ -654,28 +711,38 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         path == "/api/mcp/servers" -> 200 to json("servers" to JSONArray().put(json("name" to "fixture_mcp", "enabled" to connectionEnabled, "transport" to "stdio", "source" to "config")))
         path == "/api/mcp/servers/fixture_mcp/enabled" -> { connectionEnabled = body.getBoolean("enabled"); 200 to json("ok" to true) }
         path == "/api/mcp/servers/fixture_mcp/test" -> 200 to json("ok" to true, "tools" to JSONArray().put(json("name" to "read_fixture")))
-        path == "/api/plugins/beacon/mobile/skills" -> 200 to json("items" to JSONArray().put(json("name" to "travel-planning", "description" to "Plan a trip from verified information", "enabled" to skillEnabled, "essential" to false, "requirements" to JSONArray(), "category" to "travel", "provenance" to "local")))
-        path == "/api/skills/toggle" -> { skillEnabled = body.getBoolean("enabled"); 200 to json("ok" to true, "name" to "travel-planning", "enabled" to skillEnabled) }
+        path == "/api/plugins/beacon/mobile/skills" -> 200 to json("items" to JSONArray().put(json("name" to "travel-planning", "description" to "Plan a trip from verified information", "enabled" to if (profileIsolationBots) isolationSkillEnabled.getValue(profile) else skillEnabled, "essential" to false, "requirements" to JSONArray(), "category" to "travel", "provenance" to "local")))
+        path == "/api/skills/toggle" -> {
+            val enabled = body.getBoolean("enabled")
+            if (profileIsolationBots) isolationSkillEnabled[profile] = enabled else skillEnabled = enabled
+            200 to json("ok" to true, "name" to "travel-planning", "enabled" to enabled)
+        }
         path == "/api/plugins/beacon/mobile/skills/content" -> {
             if (method == "PUT") {
                 if (rejectSkillSave) return 409 to json("detail" to "Instructions changed. Your draft is retained.")
-                skillText = body.getString("content")
+                if (profileIsolationBots) isolationSkills[profile] = body.getString("content") else skillText = body.getString("content")
                 200 to json("success" to true)
-            } else 200 to json("name" to "travel-planning", "content" to skillText, "revision" to "a".repeat(64))
+            } else 200 to json("name" to "travel-planning", "content" to if (profileIsolationBots) isolationSkills.getValue(profile) else skillText, "revision" to "a".repeat(64))
         }
         path == "/api/memory" -> 200 to json("active" to "builtin", "providers" to JSONArray())
         path == "/api/plugins/beacon/memory/documents" -> {
-            fun document(target: String) = json("target" to target, "content" to memoryNotes.getValue(target), "revision" to "a".repeat(64), "enabled" to true, "limit" to 8000)
+            val notes = if (profileIsolationBots) isolationMemory.getValue(profile) else memoryNotes
+            fun document(target: String) = json("target" to target, "content" to notes.getValue(target), "revision" to "a".repeat(64), "enabled" to true, "limit" to 8000)
             if (method == "PUT") {
                 if (rejectMemorySave) return 409 to json("detail" to "Notes changed. Review before saving.")
-                val target = body.getString("target"); check(memoryNotes.containsKey(target)); memoryNotes[target] = body.getString("content")
+                val target = body.getString("target"); check(notes.containsKey(target)); notes[target] = body.getString("content")
                 200 to json("ok" to true, "document" to document(target))
-            } else 200 to json("documents" to JSONArray(listOf("memory", "user").map(::document)))
+            } else {
+                if (holdMemoryProfile == profile) { holdMemoryProfile = ""; memoryReadCaptured.countDown(); check(releaseMemoryRead.await(10, java.util.concurrent.TimeUnit.SECONDS)); memoryReadReturned.countDown() }
+                200 to json("documents" to JSONArray(listOf("memory", "user").map(::document)))
+            }
         }
-        path == "/api/plugins/beacon/admin/bots" -> 200 to json("bots" to JSONArray().put(json("profile" to "default", "title" to "Personal", "purpose" to "Synthetic assistant")))
+        path == "/api/plugins/beacon/admin/bots" -> 200 to json("bots" to JSONArray().put(json("profile" to "default", "title" to "Personal", "purpose" to "Synthetic assistant")).apply {
+            if (profileIsolationBots) notificationProfiles.filter { it != "default" }.forEach { put(json("profile" to it, "title" to it, "purpose" to "$it assistant")) }
+        })
         path == "/api/plugins/beacon/admin/bot" -> {
-            if (method == "PUT") profileModel = body.getString("model")
-            val bot = json("profile" to profile, "title" to "Personal", "description" to "Synthetic assistant", "soul" to "Check sources before answering.", "provider" to "fixture", "model" to profileModel, "revision" to "a".repeat(64))
+            if (method == "PUT") { if (profileIsolationBots) isolationModels[profile] = body.getString("model") else profileModel = body.getString("model") }
+            val bot = json("profile" to profile, "title" to "Personal", "description" to "Synthetic assistant", "soul" to "Check sources before answering.", "provider" to "fixture", "model" to if (profileIsolationBots) isolationModels.getValue(profile) else profileModel, "revision" to "a".repeat(64))
             200 to if (method == "PUT") json("ok" to true, "bot" to bot) else bot
         }
         path == "/api/status" -> 200 to json("version" to "fixture", "overall" to "ok", "gateway_state" to "connected", "active_agents" to 0, "components" to json("gateway" to json("status" to "ok", "state" to "connected")))
@@ -771,7 +838,9 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         }
         path.endsWith("/voice-history") -> 200 to json("session_id" to path.substringBeforeLast('/').substringAfterLast('/'), "profile" to scope.profile, "events" to JSONArray())
         path.endsWith("/notifications/status") -> 200 to json("android_configured" to false, "targets" to JSONArray(), "delivery" to json("pending" to 0), "available" to false)
-        path.endsWith("/tasks/capabilities") -> 200 to json("timezone" to "Asia/Dubai", "random_checkups" to false)
+        path.endsWith("/tasks/capabilities") -> if (checkupCapabilitiesFailure) 503 to json("detail" to "Synthetic capabilities unavailable")
+            else 200 to (checkupCapabilities?.copy() ?: json("timezone" to "Asia/Dubai", "random_checkups" to false))
+        path == "/api/plugins/beacon/mobile/tasks/checkups" && method == "POST" && checkupPostEnabled -> 200 to json("ok" to true)
         path == "/api/plugins/beacon/mobile/bootstrap" -> 200 to json("contract_version" to 2, "backend" to "hermes-dashboard", "owner_id" to scope.owner, "profile" to profile, "voice" to json("available" to false)).apply {
             bootstrapPluginStatus?.let { put("optional_features", json("plugin" to it)) }
         }
@@ -779,6 +848,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
     } }
     override fun newWebSocket(request: Request, listener: WebSocketListener): WebSocket {
         check(request.url.host == "ui-fixture.invalid")
+        val socketId = nativeSocketSequence.incrementAndGet()
         val socket = object : WebSocket {
             override fun request() = request
             override fun queueSize() = 0L
@@ -797,6 +867,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 requests += frame.copy()
                 try {
                     val method = frame.getString("method")
+                    nativeSocketMethods.add(socketId to method)
                     val params = frame.optJSONObject("params") ?: JSONObject()
                     if (method == "client.capabilities") {
                         serverRequestCapabilities[this] = params.optBoolean("server_requests")
@@ -820,12 +891,13 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                         return true
                     }
                     val deferred = synchronized(delayedCreates) {
-                        if (holdCreateAcknowledgement && method == "session.create" || holdPromptAcknowledgement && method == "prompt.submit" ||
+                        if (holdCreateAcknowledgement && method == "session.create" || holdPromptAcknowledgement && method == "prompt.submit" || holdSteerAcknowledgement && method == "session.steer" || holdReceiptAcknowledgement && method == "prompt.receipt" || holdActiveListAcknowledgement && method == "session.active_list" ||
                             holdConfigAcknowledgement && method == "config.set" || holdBranchAcknowledgement && method == "session.branch") { delayedCreates += { listener.onMessage(this, response) }; true } else false
                     }
                     if (!deferred) listener.onMessage(this, response)
                     if (!deferred && method == "session.events.since") {
                         val runtimeSessionId = params.string("session_id")
+                        val reads = replayReads.computeIfAbsent(this) { AtomicInteger() }.incrementAndGet()
                         if (pendingNativeStreams.remove(runtimeSessionId)) {
                             activeNativeListener = listener
                             activeNativeSocket = this
@@ -835,6 +907,10 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                             // Like Hermes, live events go to the latest subscriber of the runtime (a reconnect re-subscribes on a new socket).
                             activeNativeListener = listener
                             activeNativeSocket = this
+                        }
+                        if (reads == 2 && runtimeSessionId == activeNativeSessionId) {
+                            liveCollectorSocketId = socketId
+                            liveCollectorSubscriptions.incrementAndGet()
                         }
                     }
                 } catch (error: FixtureRpcFailure) {
@@ -848,11 +924,15 @@ internal class NativeExperienceFixture : WebSocket.Factory {
         }
         // Like a network that is down: the connection never opens, so nothing can have been sent.
         if (refuseConnection) { refusedConnections.incrementAndGet(); listener.onFailure(socket, java.net.ConnectException("Synthetic connection refused"), null) }
-        else listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Synthetic wire").build())
+        else {
+            listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Synthetic wire").build())
+            listener.onMessage(socket, json("jsonrpc" to "2.0", "method" to "event", "params" to json("type" to "gateway.ready", "payload" to json("session_authority" to canonicalAuthority))).toString())
+        }
         return socket
     }
     private fun rpc(method: String, params: JSONObject): JSONObject {
-        check(params.string("profile") in setOf("default", "coder"))
+        check(params.string("profile") in if (profileIsolationBots) notificationProfiles else listOf("default", "coder"))
+        if (profileIsolationBots && params.string("profile") in rejectedProfiles) throw FixtureRpcFailure(403, "Synthetic profile access denied")
         if (method != "session.resume" && params.string("session_id") in reapedRuntimes) throw FixtureRpcFailure(4001, "session not found")
         val id = params.string("session_id").let { runtimeStoredSessionIds[it] ?: it.removePrefix("runtime-") }
         return when (method) {
@@ -885,11 +965,18 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 if (profileSessionIds[params.string("profile")]?.contains(id) == false) throw IllegalArgumentException("Synthetic session missing")
                 val row = sessions[id] ?: unpromptedShells.remove(id)?.also { sessions[id] = it }
                 row?.copy()?.apply {
-                    val runtime = resumeRuntimeSessionIds[id] ?: string("session_id")
+                    val runtime = if (canonicalAuthority) id else resumeRuntimeSessionIds[id] ?: string("session_id")
                     put("session_id", runtime)
                     runtimeStoredSessionIds[runtime] = id
                     currentRuntimeSessionIds[id] = runtime
                     put("session_key", id); remove("stored_session_id"); getJSONObject("info").put("stored_session_id", id); if (omitResumeYolo) getJSONObject("info").remove("yolo")
+                    if (canonicalAuthority) {
+                        remove("session_key"); getJSONObject("info").remove("stored_session_id")
+                        put("stored_session_id", id).put("execution_generation", 7).put("running", nativeTurnStatus in setOf("working", "waiting"))
+                        getJSONObject("info").put("profile_name", params.string("profile")).apply {
+                            if (omitCanonicalResumeProfile) remove("profile_id") else put("profile_id", canonicalProfileId(params.string("profile")))
+                        }
+                    }
                     put("messages_omitted", params.optBoolean("omit_messages"))
                     put("messages", JSONArray(if (params.optBoolean("omit_messages")) emptyList<JSONObject>() else rows("messages").map { message -> message.copy().apply {
                         put("text", nativeDisplayText(message, params.optBoolean("inline_images", true)))
@@ -900,6 +987,12 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                     ?: throw IllegalArgumentException("Synthetic session missing")
             }
             "session.history" -> { require(!historyFailure) { "Synthetic history unavailable" }; sessions[id]?.copy()?.apply { put("session_key", id); remove("stored_session_id"); getJSONObject("info").put("stored_session_id", id) } ?: throw IllegalArgumentException("Synthetic session missing") }
+            "session.info" -> {
+                require(canonicalAuthority && sessions.containsKey(id)) { "Synthetic session missing" }
+                json("source" to "android", "lazy" to true, "desktop_protocol" to "hermes-gateway-v1", "profile_name" to params.string("profile")).apply {
+                    if (!omitCanonicalInfoProfile) put("profile_id", canonicalProfileId(params.string("profile")))
+                }
+            }
             "session.create" -> { val key = "new-${sequence.incrementAndGet()}"; history(key, if (dropCreateTitle) "" else params.string("title", "New conversation"), JSONArray()).also { row ->
                 row.getJSONObject("info").put("source", params.string("source")).put("model", params.string("model", profileModel))
                 runtimeStoredSessionIds[row.string("session_id")] = key
@@ -910,15 +1003,18 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 "events" to JSONArray(nativeEvents.filter { it.optLong("seq") > params.optLong("last_seen", 0) }),
                 "open_requests" to JSONArray(openNativeServerRequests.values.filter { it.optJSONObject("params")?.string("session_id") == params.string("session_id") }))
             "session.active_list" -> {
-                if (nativeStatusFailure) throw IllegalArgumentException("Synthetic active status unavailable")
+                if (nativeStatusFailure) { nativeStatusProbes.add("failed"); throw IllegalArgumentException("Synthetic active status unavailable") }
+                val observedStatus = nativeTurnStatus
                 val runtime = params.optString("current_session_id")
                 terminalOnActiveList?.takeIf { runtime.isNotBlank() }?.let { payload ->
                     terminalOnActiveList = null
                     retainNativeEvent(runtime, "message.complete", payload)
+                    nativeTurnStatus = "idle"
                 }
                 val stored = runtimeStoredSessionIds[runtime] ?: runtime.takeIf { it.startsWith("runtime-") }?.removePrefix("runtime-")
                 val rows = JSONArray()
-                if (stored != null && sessions.containsKey(stored) && currentRuntimeSessionIds[stored]?.let { it == runtime } != false) rows.put(json("id" to runtime, "session_key" to stored, "status" to nativeTurnStatus))
+                if (stored != null && sessions.containsKey(stored) && currentRuntimeSessionIds[stored]?.let { it == runtime } != false) rows.put(json("id" to runtime, "session_key" to stored, "status" to observedStatus))
+                nativeStatusProbes.add(observedStatus)
                 json("sessions" to rows)
             }
             "session.usage" -> json("input_tokens" to 100, "output_tokens" to 20, "context_window" to 32000)
@@ -944,7 +1040,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
             "session.compress" -> json("status" to "aborted")
             "session.undo" -> { sessions.getValue(id).put("messages", JSONArray()); json("ok" to true) }
             "config.get" -> if (params.string("key") == "provider") json("model" to profileModel, "provider" to "fixture")
-                else json("value" to when (params.string("key")) { "approvals.mode" -> approvalMode; "reasoning" -> params.string("session_id").takeIf(String::isNotBlank)?.let { sessionReasoning[id] } ?: reasoningEffort; else -> reasoningEffort })
+                else json("value" to when (params.string("key")) { "approvals.mode" -> if (profileIsolationBots) isolationApprovals.getValue(params.string("profile")) else approvalMode; "reasoning" -> params.string("session_id").takeIf(String::isNotBlank)?.let { sessionReasoning[id] } ?: reasoningEffort; else -> reasoningEffort })
             "config.set" -> {
                 val key = params.string("key")
                 val value = params.string("value")
@@ -966,7 +1062,7 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 if (key == "approvals.mode") {
                     require(!rejectApprovalWrite) { "Synthetic approval write refused" }
                     require(value in nativeApprovalModes)
-                    approvalMode = value
+                    if (profileIsolationBots) isolationApprovals[params.string("profile")] = value else approvalMode = value
                 }
                 if (key == "yolo") {
                     // Like Hermes: the live flag and the saved model_config.yolo_mode change together.
@@ -983,12 +1079,31 @@ internal class NativeExperienceFixture : WebSocket.Factory {
                 json("pairs" to JSONArray().apply { repeat(commandDistractors) { put(JSONArray().put("/candidate$it").put("The help text describes another command")) } }.put(JSONArray().put("/help").put("Show available commands")).put(JSONArray().put("/model").put("Choose a model")))
             }
             "prompt.submit" -> {
-                nativeTurnStatus = "working"
                 val rowId = sequence.incrementAndGet()
-                if (persistTerminalMessages) sessions[id]?.optJSONArray("messages")?.put(json("role" to "user", "text" to params.string("text"), "row_id" to rowId))
-                json("status" to "streaming", "user_row_id" to rowId)
+                if (canonicalAuthority) {
+                    require(params.string("submission_id").isNotBlank()) { "Canonical submission identity is required" }
+                    val status = if (queueNextCanonicalSubmission.getAndSet(false)) "queued" else "started"
+                    val admission = "admission-$rowId"
+                    val result = json("admission_id" to admission, "ref" to json("profile_id" to canonicalProfileId(params.string("profile")), "session_id" to id),
+                        "sequence" to rowId, "status" to status, "outcome" to null, "authority_epoch" to 1, "execution_generation" to if (status == "started") 7 else null)
+                    canonicalAdmissions[admission] = result.copy()
+                    nativeTurnStatus = if (status == "queued") "starting" else "working"
+                    result
+                } else {
+                    nativeTurnStatus = "working"
+                    if (persistTerminalMessages) sessions[id]?.optJSONArray("messages")?.put(json("role" to "user", "text" to params.string("text"), "row_id" to rowId))
+                    json("status" to "streaming", "user_row_id" to rowId)
+                }
             }
-            "session.steer" -> json("status" to "steered", "accepted" to true)
+            "session.steer" -> { steerFailureCode?.let { throw FixtureRpcFailure(it, "Synthetic steer refusal") }; json("status" to steerStatus, "accepted" to (steerStatus != "rejected")) }
+            "prompt.receipt" -> (canonicalAdmissions[params.string("admission_id")]?.copy()?.also {
+                require(it.getJSONObject("ref").string("session_id") == id) { "Synthetic admission belongs to another session" }
+            } ?: json("status" to admissionReceiptStatus, "outcome" to admissionReceiptOutcome, "admission_id" to params.string("admission_id"), "ref" to json("profile_id" to canonicalProfileId(params.string("profile")), "session_id" to id))).apply {
+                    admissionReceiptIdOverride?.let { put("admission_id", it) }
+                    val ref = getJSONObject("ref")
+                    admissionReceiptRefOverride?.let { ref.put("session_id", it) }
+                    admissionReceiptProfileOverride?.let { ref.put("profile_id", it) }
+                }
             "session.interrupt" -> json("ok" to true)
             else -> throw IllegalArgumentException("Synthetic fixture has no response for $method")
         }

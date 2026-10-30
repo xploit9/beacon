@@ -54,9 +54,6 @@ class UxChatCoreTest {
     }
 
     @Test fun countsKeepTheNumberInsideTheTemplate() {
-        assertEquals("1 message will send after this reply", queuedHeading(1))
-        assertEquals("3 messages will send after this reply", queuedHeading(3))
-        assertEquals("Wartende Nachrichten: 2", queuedHeading(2, many = "Wartende Nachrichten: {0}"))
         assertEquals("1 message", chatPreviewLine(JSONObject().put("message_count", 1), null))
         assertEquals("Nachrichten: 3", chatPreviewLine(JSONObject().put("message_count", 3), null, "Tú", manyMessages = "Nachrichten: {0}"))
     }

@@ -63,6 +63,7 @@ class NativeGatewayTest {
                 }
             }
             listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Fixture").build())
+            listener.onMessage(socket, json("jsonrpc" to "2.0", "method" to "event", "params" to json("type" to "gateway.ready", "payload" to json())).toString())
             return socket
         }
     }
@@ -120,6 +121,7 @@ class NativeGatewayTest {
                 // Like Hermes, prompts keep going to the subscribed stream socket, not to a later per-action socket.
                 if (!eventsReady.isCompleted) { currentSocket = socket; currentListener = listener }
                 listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Fixture").build())
+                listener.onMessage(socket, json("jsonrpc" to "2.0", "method" to "event", "params" to json("type" to "gateway.ready", "payload" to json())).toString())
                 socket
             }) { builder ->
                 builder.addInterceptor { chain ->
@@ -183,7 +185,7 @@ class NativeGatewayTest {
             "params" to json("session_id" to "phone-runtime", "request_id" to "approval-during-resume-queue", "choices" to JSONArray().put("once")))
         val binding = fixture.client.nativeSession(stored)
         val events = Channel<JSONObject>(Channel.UNLIMITED)
-        val collector = launch { fixture.client.nativeEvents { events.send(it) } }
+        val collector = launch { fixture.client.nativeEvents { if (it.optJSONObject("params")?.optString("type") != "gateway.ready") events.send(it) } }
         try {
             withTimeout(5_000) { fixture.eventsReady.await() }
             assertEquals("approval", withTimeout(5_000) { events.receive() }.string("method"))
@@ -203,7 +205,7 @@ class NativeGatewayTest {
         val stored = "20261019_001507_a4cbef"
         val binding = fixture.client.nativeSession(stored)
         val events = Channel<JSONObject>(Channel.UNLIMITED)
-        val collector = launch { fixture.client.nativeEvents { events.send(it) } }
+        val collector = launch { fixture.client.nativeEvents { if (it.optJSONObject("params")?.optString("type") != "gateway.ready") events.send(it) } }
         try {
             withTimeout(5_000) { fixture.eventsReady.await() }
             fixture.emitServerRequest("approval", 41, json("session_id" to binding.runtimeSessionId, "request_id" to "approval-queue-41", "choices" to JSONArray().put("once").put("deny")))
@@ -255,7 +257,7 @@ class NativeGatewayTest {
         val stored = "20261019_001507_a4cbef"
         val binding = fixture.client.nativeSession(stored)
         val events = Channel<JSONObject>(Channel.UNLIMITED)
-        val collector = launch { fixture.client.nativeEvents { events.send(it) } }
+        val collector = launch { fixture.client.nativeEvents { if (it.optJSONObject("params")?.optString("type") != "gateway.ready") events.send(it) } }
         try {
             withTimeout(5_000) { fixture.eventsReady.await() }
             val unsupported = listOf(
@@ -424,6 +426,7 @@ class NativeGatewayTest {
                 }
             }
             listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Native").build())
+            listener.onMessage(socket, json("jsonrpc" to "2.0", "method" to "event", "params" to json("type" to "gateway.ready", "payload" to json())).toString())
             return socket
           }
         }

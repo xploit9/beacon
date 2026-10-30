@@ -7,6 +7,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.*
 import org.json.JSONObject
+import org.json.JSONArray
 import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -34,6 +35,12 @@ private data class NativeServerRequest(
 
 data class NativeSessionBinding(val scope: Scope, val storedSessionId: String, val runtimeSessionId: String)
 
+internal class NativeTurnNotSent(message: String, cause: Throwable? = null) : IOException(message, cause)
+internal class NativeTurnLease internal constructor(
+    val binding: NativeSessionBinding, val authority: Boolean,
+    internal val gateway: NativeGateway, internal val connectionToken: Any, internal val cursorToken: Any,
+)
+
 internal fun nativeSessionBinding(scope: Scope, result: JSONObject): NativeSessionBinding {
     // Create and unpersisted resume use stored_session_id; persisted resume uses session_key.
     val identities = listOf("stored_session_id", "session_key").map { result.string(it) }.filter { it.isNotBlank() }.distinct()
@@ -60,6 +67,7 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         val serverRequests = linkedMapOf<String, NativeServerRequest>()
         val retiredServerRequests = linkedSetOf<NativeRequestIdentity>()
         val ready = CompletableDeferred<Unit>()
+        val sessionAuthority = CompletableDeferred<Boolean?>()
         @Volatile var socket: WebSocket? = null
         @Volatile var failure: IOException? = null
     }
@@ -106,6 +114,17 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
                     val frame = runCatching { JSONObject(text) }.getOrNull() ?: return
                     val id = frame.optString("id")
                     val method = frame.optString("method")
+                    val event = frame.optJSONObject("params")
+                    if (method == "event" && event?.optString("type") == "gateway.ready") {
+                        val payload = event.optJSONObject("payload")
+                        val capability = payload?.opt("session_authority")
+                        mine.sessionAuthority.complete(when {
+                            payload == null -> null
+                            !payload.has("session_authority") -> false
+                            capability is Boolean -> capability
+                            else -> null
+                        })
+                    }
                     if (!frame.has("method") && id.isNotBlank()) mine.pending.remove(id)?.complete(frame)
                     else if (method == "approval" || method == "clarify") {
                         // A prompt can precede the session.resume acknowledgement that installs its owner binding.
@@ -134,29 +153,165 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
     private fun terminate(mine: Connection, error: IOException) {
         synchronized(lifecycle) { if (connection === mine) connection = null; if (mine.failure == null) mine.failure = error }
         mine.ready.completeExceptionally(error)
+        mine.sessionAuthority.complete(null)
         mine.pending.values.forEach { it.completeExceptionally(unknown(error)) }; mine.pending.clear()
         // Channel closure cannot be dropped when the queue is full and wakes an idle collector.
         mine.frames.close(error)
     }
     private fun unknown(cause: Throwable) = IOException(NATIVE_OUTCOME_UNKNOWN, cause)
-    suspend fun rpc(method: String, params: JSONObject): JSONObject {
-        val mine = connect()
+    suspend fun rpc(method: String, params: JSONObject): JSONObject = rpcOn(connect(), method, params)
+
+    private suspend fun rpcOn(mine: Connection, method: String, params: JSONObject, normalizeLegacyCreateSource: Boolean = false,
+        sendGuard: (() -> Unit)? = null, sendLock: Any? = null): JSONObject {
+        if (connection !== mine) {
+            if (sendGuard != null) throw NativeTurnNotSent("Native connection changed before the request")
+            throw IOException("Native connection changed before request")
+        }
         val id = UUID.randomUUID().toString(); val result = CompletableDeferred<JSONObject>()
         mine.pending[id] = result
         try {
-            mine.failure?.let { throw unknown(it) }
-            val wireParams = params.copy().put("profile", client.auth.profile)
-            // Keep required history, without retransmitting legacy inline photos beyond the frame cap.
-            if (method == "session.resume") wireParams.put("source", "android").put("inline_images", false)
-            if (mine.socket?.send(json("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to wireParams).toString()) != true) throw unknown(IOException("Native connection unavailable"))
+            mine.failure?.let { if (sendGuard != null) throw NativeTurnNotSent("Native connection changed before the request", it) else throw unknown(it) }
+            val requestScope = client.scope
+            val wireParams = params.copy().put("profile", requestScope.profile)
+            var canonicalCreate = false
+            if (method == "session.resume" || method == "session.create") {
+                // Create and resume fields differ between Hermes authorities; wait for this socket's ready event.
+                val authority = withTimeoutOrNull(4000) { mine.sessionAuthority.await() }
+                    ?: throw IOException("Native gateway readiness is unavailable")
+                if (connection !== mine || mine.failure != null || client.scope != requestScope) throw IOException("Native connection or conversation scope changed before request")
+                if (method == "session.resume") {
+                    wireParams.put("source", "android")
+                    if (authority) {
+                        if (wireParams.has("lazy") && wireParams.opt("lazy") != false)
+                            throw IOException("Native authority does not offer lazy session recovery")
+                        wireParams.remove("lazy")
+                        wireParams.remove("eager_build")
+                        wireParams.remove("close_on_disconnect")
+                        wireParams.remove("inline_images")
+                    } else {
+                        // Keep required history, without retransmitting legacy inline photos beyond the frame cap.
+                        wireParams.put("inline_images", false)
+                    }
+                } else if (authority) {
+                    canonicalCreate = true
+                    val source = wireParams.string("source")
+                    if (source in THREAD_SOURCES) throw IOException("Native authority cannot create this thread type")
+                    if (source == "android") wireParams.remove("source")
+                    if (wireParams.has("close_on_disconnect")) {
+                        if (wireParams.opt("close_on_disconnect") != false) throw IOException("Native authority cannot apply this disconnect policy")
+                        wireParams.remove("close_on_disconnect")
+                    }
+                } else if (normalizeLegacyCreateSource) {
+                    wireParams.put("source", if (wireParams.string("source") == BEACON_THREAD_SOURCE) BEACON_THREAD_SOURCE else "android")
+                }
+            }
+            currentCoroutineContext().ensureActive()
+            val frame = json("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to wireParams).toString()
+            val sent = if (sendGuard == null) mine.socket?.send(frame) else synchronized(lifecycle) {
+                val guardedSend = {
+                    sendGuard()
+                    try { mine.socket?.send(frame) } catch (e: Exception) { throw unknown(e) }
+                }
+                if (sendLock == null) guardedSend() else synchronized(sendLock) { guardedSend() }
+            }
+            if (sent != true) throw unknown(IOException("Native connection unavailable"))
             val response = try { withTimeout(rpcTimeoutMs) { result.await() } } catch (e: TimeoutCancellationException) { currentCoroutineContext().ensureActive(); throw unknown(e) }
             response.optJSONObject("error")?.let {
                 // 4001: Hermes no longer holds this runtime (reaped or evicted). Nothing may keep addressing it; the next use resumes the stored conversation.
-                if (it.optInt("code", 500) == 4001 && it.optString("message") == "session not found") forget(params.string("session_id"))
+                if (method !in setOf("session.activate", "session.resume") && it.optInt("code", 500) == 4001 && it.optString("message") == "session not found") forget(params.string("session_id"))
                 throw ApiFailure(it.optInt("code", 500), it.optString("message", "Native operation failed"))
             }
-            return response.optJSONObject("result") ?: JSONObject().put("value", response.opt("result"))
+            val output = response.optJSONObject("result") ?: JSONObject().put("value", response.opt("result"))
+            if (canonicalCreate) {
+                try {
+                    require(output.opt("session_id") is String && output.opt("stored_session_id") is String) { "Canonical create returned invalid identities" }
+                    val binding = nativeSessionBinding(requestScope, output)
+                    require(binding.runtimeSessionId == binding.storedSessionId) { "Canonical create returned conflicting identities" }
+                    output.optJSONObject("info")?.let { info ->
+                        if (info.has("profile_name") && !info.isNull("profile_name"))
+                            require(info.opt("profile_name") is String && info.opt("profile_name") == requestScope.profile) { "Canonical create returned a different profile" }
+                    }
+                } catch (e: IllegalArgumentException) {
+                    throw unknown(e)
+                }
+            }
+            return output
         } finally { mine.pending.remove(id) }
+    }
+
+    /** Stage visual evidence and submit on one socket; a legacy file reference never uses the shared image queue. */
+    suspend fun voiceSubmit(binding: NativeSessionBinding, params: JSONObject, jpeg: String?, legacyJobCapacity: Boolean,
+        sendLock: Any, callOwned: () -> Boolean, markAttempt: () -> Boolean, permitted: () -> Boolean): JSONObject {
+        val mine = connect()
+        fun bound(): Boolean = binding.scope == client.scope && synchronized(cursorLock) {
+            cursor?.let { it.binding == binding && it.connection === mine && it.live() } == true
+        }
+        if (!bound()) return JSONObject().put("status", "not_sent").put("reason", "gateway_unconfirmed")
+        val authority = withTimeoutOrNull(4000) { mine.sessionAuthority.await() }
+            ?: return JSONObject().put("status", "not_sent").put("reason", "gateway_unconfirmed")
+        if (!bound()) return JSONObject().put("status", "not_sent").put("reason", "gateway_unconfirmed")
+        if (!authority && !legacyJobCapacity) return JSONObject().put("status", "not_sent").put("reason", "job_capacity")
+        val request = params.copy()
+        if (!authority) {
+            // The legacy prompt contract forbids canonical admission identities.
+            request.remove("submission_id")
+            request.remove("input_id")
+        }
+        var visual = "none"
+        var stageRefusal = "gateway_unconfirmed"
+        fun guardStage() {
+            if (!callOwned()) { stageRefusal = "call_ended"; throw NativeTurnNotSent("Call ended before native staging") }
+            if (!bound()) throw NativeTurnNotSent("Native conversation changed before staging")
+            if (!permitted()) { stageRefusal = "visual_unavailable"; throw NativeTurnNotSent("Visual permission changed before staging") }
+            if (!callOwned()) { stageRefusal = "call_ended"; throw NativeTurnNotSent("Call ended before native staging") }
+            if (!bound()) throw NativeTurnNotSent("Native conversation changed before staging")
+        }
+        if (jpeg != null && permitted()) {
+            try {
+                if (authority) {
+                    val staged = rpcOn(mine, "image.attach_bytes", json("session_id" to binding.runtimeSessionId,
+                        "content_base64" to jpeg, "filename" to "voice-frame.jpg"), sendGuard = ::guardStage, sendLock = sendLock)
+                    require(staged.optBoolean("attached") && staged.string("path").isNotBlank() && staged.string("mime") == "image/jpeg") { "Native image staging was not confirmed" }
+                    if (permitted() && bound()) {
+                        request.put("attachments", JSONArray().put(json("path" to staged.string("path"), "mime" to "image/jpeg")))
+                        visual = "image"
+                    } else visual = "unavailable"
+                } else {
+                    val staged = rpcOn(mine, "file.attach", json("session_id" to binding.runtimeSessionId,
+                        "data_url" to "data:image/jpeg;base64,$jpeg", "name" to "voice-frame.jpg"), sendGuard = ::guardStage, sendLock = sendLock)
+                    val ref = staged.string("ref_text")
+                    require(staged.optBoolean("attached") && ref.startsWith("@file:") && ref.length <= 2048 && ref.none { it == '\n' || it == '\r' || it == '\u0000' }) { "Native file staging was not confirmed" }
+                    if (permitted() && bound()) {
+                        request.put("text", request.getString("text") + "\n" + ref)
+                        visual = "file_reference"
+                    } else visual = "unavailable"
+                }
+            } catch (e: NativeTurnNotSent) {
+                if (stageRefusal != "visual_unavailable") return JSONObject().put("status", "not_sent").put("reason", stageRefusal)
+                visual = "unavailable"
+            } catch (e: ApiFailure) {
+                visual = "unavailable"
+            }
+        } else if (jpeg != null) visual = "unavailable"
+        if (!bound()) return JSONObject().put("status", "not_sent").put("reason", "gateway_unconfirmed")
+        if (visual == "unavailable") request.put("text", request.getString("text") + "\n[The current shared image could not be attached.]")
+        var notSentReason = "gateway_unconfirmed"
+        val result = try {
+            rpcOn(mine, "prompt.submit", request, sendGuard = {
+                if (!callOwned()) { notSentReason = "call_ended"; throw NativeTurnNotSent("Call ended before native submission") }
+                if (!bound() || !markAttempt()) throw NativeTurnNotSent("Native conversation changed before submission")
+            }, sendLock = sendLock)
+        } catch (e: NativeTurnNotSent) {
+            return JSONObject().put("status", "not_sent").put("reason", notSentReason)
+        } catch (e: ApiFailure) {
+            // The legacy dispatcher emits this specific extra-field refusal before invoking the handler.
+            if (!authority && e.status == 4000 && e.message.orEmpty().startsWith("invalid params for prompt.submit: "))
+                return JSONObject().put("status", "not_sent").put("reason", "native_invalid_params")
+            throw e
+        }
+        if (result.optString("status") !in setOf("streaming", "queued", "steered", "redirected", "started", "terminal", "unknown"))
+            throw IOException("Native prompt admission was not confirmed")
+        return result.put("voice_visual", visual).put("voice_authority", authority)
     }
 
     /** The live connection of this gateway that received [requestId] for its bound conversation, if any. */
@@ -336,14 +491,111 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
     /** The runtime this gateway holds right now: empty once its socket has closed, so a poller never names a runtime Hermes may have reaped. */
     internal fun sessionSnapshot(): JSONObject = synchronized(cursorLock) { if (cursor?.live() == true) sessionState.copy() else JSONObject() }
     private fun forget(runtime: String) { if (runtime.isNotBlank()) synchronized(cursorLock) { if (cursor?.binding?.runtimeSessionId == runtime) { cursor = null; sessionState = JSONObject() } } }
-    // shortcut: the binding takes the connection current at bind time, so a socket that died and was replaced between the reply and here looks live; pass the reply's own connection from rpc if that window ever shows up.
-    private fun bind(result: JSONObject): NativeSessionBinding = nativeSessionBinding(client.scope, result).also { synchronized(cursorLock) { sessionState = result.copy(); cursor = Cursor(it, connection) } }
-    suspend fun create(params: JSONObject): NativeSessionBinding = sessionLock.withLock { bind(rpc("session.create", params.copy().put("source", if (params.string("source") == BEACON_THREAD_SOURCE) BEACON_THREAD_SOURCE else "android").put("close_on_disconnect", false))) }
+    private fun bind(result: JSONObject, mine: Connection, scope: Scope): NativeSessionBinding {
+        val binding = nativeSessionBinding(scope, result)
+        synchronized(lifecycle) {
+            check(connection === mine && mine.failure == null && client.scope == scope) { "Native connection or conversation scope changed" }
+            synchronized(cursorLock) { sessionState = result.copy(); cursor = Cursor(binding, mine) }
+        }
+        return binding
+    }
+    suspend fun create(params: JSONObject): NativeSessionBinding = sessionLock.withLock {
+        val scope = client.scope
+        val mine = connect()
+        val requested = params.copy().apply { if (!has("source")) put("source", "android") }.put("close_on_disconnect", false)
+        bind(rpcOn(mine, "session.create", requested, normalizeLegacyCreateSource = true), mine, scope)
+    }
     /** [lazy]: reattach a live unsent shell or answer 4007, never let Hermes materialize an ownerless row for a runtime that is gone. */
     suspend fun session(stored: String?, lazy: Boolean = false): NativeSessionBinding = sessionLock.withLock {
         synchronized(cursorLock) { cursor }?.takeIf { it.live() && it.binding.scope == client.scope && (stored == it.binding.storedSessionId || stored == it.binding.runtimeSessionId) }?.let { return@withLock it.binding }
-        bind(rpc(if (stored.isNullOrBlank()) "session.create" else "session.resume", if (stored.isNullOrBlank()) json("source" to "android", "close_on_disconnect" to false) else json("session_id" to stored, "close_on_disconnect" to false, "omit_messages" to false).apply { if (lazy && !stored.isNullOrBlank()) put("lazy", true) }))
+        val scope = client.scope
+        val mine = connect()
+        val result = rpcOn(mine, if (stored.isNullOrBlank()) "session.create" else "session.resume", if (stored.isNullOrBlank()) json("source" to "android", "close_on_disconnect" to false) else json("session_id" to stored, "close_on_disconnect" to false, "omit_messages" to false).apply { if (lazy && !stored.isNullOrBlank()) put("lazy", true) })
+        bind(result, mine, scope)
     }
+    /** Reattach the original live runtime before replay; replay alone never creates a viewer. */
+    private suspend fun recoverCursorLocked(mine: Connection): Cursor? {
+        val previous = synchronized(cursorLock) { cursor } ?: return null
+        if (previous.connection === mine && previous.live()) return previous
+        val binding = previous.binding
+        require(binding.scope == client.scope) { "Native conversation scope changed" }
+        val originalAuthority = previous.connection?.let { withTimeoutOrNull(4000) { it.sessionAuthority.await() } }
+            ?: throw IOException("Original native gateway readiness is unavailable")
+        val authority = withTimeoutOrNull(4000) { mine.sessionAuthority.await() }
+            ?: throw IOException("Native gateway readiness is unavailable")
+        if (authority != originalAuthority) throw IOException("Native gateway authority changed")
+        val result = if (authority) {
+            rpcOn(mine, "session.resume", json("session_id" to binding.storedSessionId, "omit_messages" to true))
+        } else {
+            rpcOn(mine, "session.activate", json("session_id" to binding.runtimeSessionId, "omit_messages" to true))
+        }
+        if (nativeSessionBinding(binding.scope, result) != binding) throw IOException("Native recovery identity changed")
+        currentCoroutineContext().ensureActive()
+        return synchronized(lifecycle) {
+            check(connection === mine && mine.failure == null && client.scope == binding.scope) { "Native connection or conversation scope changed" }
+            synchronized(cursorLock) {
+                check(cursor === previous) { "Native conversation changed during recovery" }
+                Cursor(binding, mine, previous.sequence, previous.epoch).also { cursor = it; sessionState = result.copy() }
+            }
+        }
+    }
+    /** Capture only a currently bound stream; never resume or move it while preparing a turn. */
+    suspend fun turnLease(storedSessionId: String, expectedRuntimeSessionId: String? = null): NativeTurnLease {
+        val snapshot = synchronized(cursorLock) { cursor } ?: throw NativeTurnNotSent("Native conversation is not attached")
+        val mine = snapshot.connection ?: throw NativeTurnNotSent("Native conversation is not attached")
+        fun bound() = snapshot.live() && snapshot.binding.scope == client.scope &&
+            snapshot.binding.storedSessionId == storedSessionId &&
+            (expectedRuntimeSessionId == null || snapshot.binding.runtimeSessionId == expectedRuntimeSessionId) &&
+            synchronized(cursorLock) { cursor === snapshot }
+        if (!bound()) throw NativeTurnNotSent("Native conversation changed before the request")
+        val authority = withTimeoutOrNull(4000) { mine.sessionAuthority.await() }
+            ?: throw NativeTurnNotSent("Native gateway readiness is unavailable")
+        return synchronized(lifecycle) {
+            if (!bound()) throw NativeTurnNotSent("Native conversation changed before the request")
+            NativeTurnLease(snapshot.binding, authority, this, mine, snapshot)
+        }
+    }
+
+    /** Pin every operation to the connection and cursor captured before attachment or mutation. */
+    suspend fun turnRpc(lease: NativeTurnLease, method: String, params: JSONObject): JSONObject {
+        val mine = lease.connectionToken as? Connection ?: throw NativeTurnNotSent("Native operation has no connection")
+        val snapshot = lease.cursorToken as? Cursor ?: throw NativeTurnNotSent("Native operation has no conversation")
+        fun bound() {
+            if (lease.gateway !== this || snapshot.connection !== mine || snapshot.binding != lease.binding ||
+                !snapshot.live() || lease.binding.scope != client.scope || synchronized(cursorLock) { cursor !== snapshot })
+                throw NativeTurnNotSent("Native conversation changed before the request")
+        }
+        if (params.opt("session_id") !is String || params.opt("session_id") != lease.binding.runtimeSessionId)
+            throw NativeTurnNotSent("Native request belongs to another conversation")
+        if (method == "session.steer" && params.has("execution_generation"))
+            throw NativeTurnNotSent("Native turn generation must be verified")
+        synchronized(lifecycle) { bound() }
+        val wire = params.copy()
+        if (method == "session.steer" && lease.authority) {
+            val result = try {
+                rpcOn(mine, "session.resume", json("session_id" to lease.binding.storedSessionId, "omit_messages" to true), sendGuard = ::bound)
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) { throw NativeTurnNotSent("Native turn generation is unavailable", e) }
+            try {
+                require(result.opt("session_id") is String && result.opt("stored_session_id") is String)
+                require(nativeSessionBinding(lease.binding.scope, result) == lease.binding)
+                result.optJSONObject("info")?.let { info ->
+                    if (info.has("profile_name") && !info.isNull("profile_name"))
+                        require(info.opt("profile_name") is String && info.opt("profile_name") == lease.binding.scope.profile)
+                }
+                require(result.opt("running") == true)
+                val generation = when (val value = result.opt("execution_generation")) {
+                    is Int -> value.toLong()
+                    is Long -> value
+                    else -> throw IllegalArgumentException("Invalid native turn generation")
+                }
+                require(generation >= 0)
+                wire.put("execution_generation", generation)
+            } catch (e: IllegalArgumentException) { throw NativeTurnNotSent("Native turn generation is unavailable", e) }
+        }
+        return rpcOn(mine, method, wire, sendGuard = ::bound)
+    }
+
     private suspend fun reconciliationHistory(binding: NativeSessionBinding): JSONObject {
         require(binding.scope == client.scope) { "Conversation scope changed" }
         // session.history has no compact-image option; reuse the scoped, bounded REST projection.
@@ -352,10 +604,12 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         }
     }
     suspend fun prepareReplay(lastId: String = "", beforePrompt: Boolean = false) = sessionLock.withLock {
-        val snapshot = synchronized(cursorLock) { cursor } ?: return@withLock
+        if (synchronized(cursorLock) { cursor } == null) return@withLock
         check(!consuming.get()) { "Prepare replay before starting the native event collector" }
+        val mine = connect()
+        val snapshot = recoverCursorLocked(mine) ?: return@withLock
         val b = snapshot.binding
-        val replay = rpc("session.events.since", json("session_id" to b.runtimeSessionId, "last_seen" to 0))
+        val replay = rpcOn(mine, "session.events.since", json("session_id" to b.runtimeSessionId, "last_seen" to 0))
         synchronized(cursorLock) {
             if (cursor === snapshot) {
                 snapshot.epoch = replay.string("epoch")
@@ -368,11 +622,11 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         var mine: Connection? = null
         try {
             mine = connect()
-            val snapshot = synchronized(cursorLock) { cursor }
+            val snapshot = sessionLock.withLock { recoverCursorLocked(mine) }
             if (snapshot != null) {
                 val b = snapshot.binding
                 val seen = synchronized(cursorLock) { snapshot.sequence }
-                val replay = rpc("session.events.since", json("session_id" to b.runtimeSessionId, "last_seen" to seen))
+                val replay = rpcOn(mine, "session.events.since", json("session_id" to b.runtimeSessionId, "last_seen" to seen))
                 mine.failure?.let { throw it }
                 val nextEpoch = replay.string("epoch")
                 val reconcile = synchronized(cursorLock) { cursor === snapshot && (replay.optBoolean("truncated") || snapshot.epoch.isNotBlank() && nextEpoch != snapshot.epoch) }

@@ -7,6 +7,79 @@ import org.junit.Test
 import java.util.Collections
 
 class NativeCallTranscriptSyncTest {
+    @Test fun aTransientCaptionUploadFailureRetriesTheSameEventBeforeFinalizing()=runBlocking {
+        val attempts=mutableListOf<String>();var terminal:JSONObject?=null
+        val worker=CoroutineScope(SupervisorJob()+Dispatchers.IO)
+        val sync=NativeCallTranscriptSync({path,_,body ->
+            if(path.endsWith("events")) {
+                attempts.add(body.toString())
+                if(attempts.size<=2) throw java.io.IOException("Synthetic temporary disconnect")
+            } else terminal=JSONObject(body.toString())
+            JSONObject().put("stored",true).put("closed",true).put("transcript_status","saved")
+        },"retry-caption",worker,{})
+        try {
+            sync.event(JSONObject().put("event_id","caption").put("turn_id","1").put("type","transcript")
+                .put("role","user").put("text","Fixture words").put("final",true).put("at_ms",1))
+            assertTrue(sync.finish())
+            assertEquals(3,attempts.size);assertEquals(1,attempts.toSet().size)
+            assertFalse(terminal!!.getBoolean("incomplete"))
+        } finally { worker.cancel() }
+    }
+
+    @Test fun stalledDiagnosticsCannotDelaySavingTheFinalCaption()=runBlocking {
+        val entered=CompletableDeferred<Unit>()
+        val worker=CoroutineScope(SupervisorJob()+Dispatchers.IO)
+        val sync=NativeCallTranscriptSync({path,_,body ->
+            if(path.endsWith("events")&&body!!.getJSONArray("events").getJSONObject(0).optString("type")=="media_diagnostic") {
+                entered.complete(Unit);awaitCancellation()
+            }
+            JSONObject().put("stored",true).put("closed",true).put("transcript_status","saved")
+        },"stalled-diagnostics",worker,{})
+        try {
+            sync.event(JSONObject().put("event_id","telemetry").put("turn_id","1").put("type","media_diagnostic").put("at_ms",1))
+            entered.await()
+            sync.event(JSONObject().put("event_id","caption").put("turn_id","1").put("type","transcript")
+                .put("role","assistant").put("text","Fixture answer").put("final",true).put("at_ms",2))
+            assertTrue(withTimeout(3000) { sync.finish() })
+        } finally { worker.cancel() }
+    }
+    @Test fun cleanupReadsTheOwnedReceiptWhenTheCloseResponseWasLost()=runBlocking {
+        val methods=mutableListOf<String>()
+        assertTrue(confirmHostCallCleanup { method ->
+            methods.add(method)
+            if(method=="DELETE") throw java.io.IOException("Synthetic lost close receipt")
+            JSONObject().put("closed",true)
+        })
+        assertEquals(listOf("DELETE","GET"),methods)
+    }
+
+    @Test fun cleanupDoesNotClaimAnActiveOrInaccessibleHostCallHasClosed()=runBlocking {
+        assertFalse(confirmHostCallCleanup { method ->
+            if(method=="DELETE") throw java.io.IOException("Synthetic offline host")
+            JSONObject().put("closed",false).put("status","active")
+        })
+        assertFalse(confirmHostCallCleanup { throw dev.hermes.android.data.ApiFailure(403,"Synthetic foreign call",plugin=true) })
+    }
+    @Test fun lostMediaDiagnosticsDoNotClaimThatSavedWordsAreMissing()=runBlocking {
+        var terminal:JSONObject?=null
+        val statuses=Collections.synchronizedList(mutableListOf<String>())
+        val worker=CoroutineScope(SupervisorJob()+Dispatchers.IO)
+        val sync=NativeCallTranscriptSync({path,_,body ->
+            if(path.endsWith("events")&&body!!.getJSONArray("events").getJSONObject(0).optString("type")=="media_diagnostic")
+                throw java.io.IOException("Synthetic diagnostic receipt lost")
+            if(path.endsWith("finalize")) terminal=JSONObject(body.toString())
+            JSONObject().put("stored",true).put("closed",true).put("transcript_status","saved")
+        },"diagnostics",worker,{statuses.add(it)})
+        try {
+            sync.event(JSONObject().put("event_id","words").put("turn_id","1").put("type","transcript")
+                .put("role","assistant").put("text","Saved fixture words").put("final",true).put("at_ms",1))
+            sync.event(JSONObject().put("event_id","telemetry").put("turn_id","1").put("type","media_diagnostic").put("at_ms",2))
+            assertTrue(sync.finish())
+            assertFalse(terminal!!.getBoolean("incomplete"))
+            assertFalse(statuses.contains("partial"))
+            assertEquals("saved",statuses.last())
+        } finally { worker.cancel() }
+    }
     @Test fun neverConnectedFailureFinalizesAnEmptyArchiveAndRetriesTheSameSafeFlag()=runBlocking {
         val attempts=mutableListOf<String>()
         val worker=CoroutineScope(SupervisorJob()+Dispatchers.IO)
@@ -67,13 +140,17 @@ class NativeCallTranscriptSyncTest {
     }
 
     // Same normalization and caption envelope as DirectVoice/BeaconCallService; no provider connection.
-    private fun providerItem(wire:GrokWire,item:String,text:String,turn:String="3",at:Long=10,index:Int=0):JSONObject? {
+    private fun providerCaption(item:String,text:String,turn:String="3",at:Long=10,index:Int=0):JSONObject? =
+        providerTranscript(JSONObject().put("type","transcript").put("role","user")
+            .put("provider_item",item).put("content_index",index).put("text",text).put("final",true).put("turn_id",turn),"captions","session",at)
+
+    private fun providerItem(wire:GrokWire,item:String,text:String,turn:String="3",at:Long=10):JSONObject? {
+        wire.inbound(JSONObject().put("type","input_audio_buffer.speech_started").put("item_id",item))
+        wire.inbound(JSONObject().put("type","input_audio_buffer.committed").put("item_id",item))
         val input=wire.inbound(JSONObject().put("type","conversation.item.input_audio_transcription.completed")
-            .put("item_id",item).put("content_index",index).put("transcript",text))
+            .put("item_id",item).put("content_index",0).put("transcript",text).put("status","completed"))
             ?.getJSONObject("serverContent")?.getJSONObject("inputTranscription") ?: return null
-        return providerTranscript(JSONObject().put("type","transcript").put("role","user")
-            .put("provider_item",input.getString("item_id")).put("content_index",input.getInt("content_index"))
-            .put("text",input.getString("text")).put("final",input.getBoolean("final")).put("turn_id",turn),"captions","session",at)
+        return providerCaption(input.getString("item_id"),input.getString("text"),turn,at,input.getInt("content_index"))
     }
 
     @Test fun distinctGrokItemsKeepDisplayIdentityWhileEveryVersionHasItsOwnReceipt()=runBlocking {
@@ -90,9 +167,10 @@ class NativeCallTranscriptSyncTest {
             assertNull(providerItem(wire,"one","yes"))
             val second=providerItem(wire,"two","yes",at=20)!!
             sync.event(second)
-            val correction=providerItem(wire,"one","yes please",turn="4",at=30)!!
+            // The sync layer also handles independently supplied caption revisions and content identities.
+            val correction=providerCaption("one","yes please",turn="4",at=30)!!
             sync.event(correction)
-            val nextContent=providerItem(wire,"one","yes",at=40,index=1)!!
+            val nextContent=providerCaption("one","yes",at=40,index=1)!!
             sync.event(nextContent)
             assertTrue(sync.finish())
             assertEquals(listOf(first,second,correction,nextContent).map { it.getString("event_id") },requests.map { it.optString("display_event_id") })

@@ -13,6 +13,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.SmartToy
+import androidx.compose.material.icons.rounded.ExpandLess
+import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
@@ -74,6 +76,7 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
 @Composable internal fun AssistantSettings(vm: BeaconViewModel) {
     val prefs by vm.preferences.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
+    val refreshing by vm.refreshing.collectAsStateWithLifecycle()
     val ui by vm.ui.collectAsStateWithLifecycle()
     var name by remember(prefs.assistantName) { mutableStateOf(prefs.assistantName) }
     var ownerName by remember(prefs.ownerName) { mutableStateOf(prefs.ownerName) }
@@ -209,6 +212,22 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
     // "provider\tmodel" keys; blank = the profile's default. The saved pick stays listed even before the list loads.
     val models = data["picker:models"]?.rows("groups").orEmpty().flatMap { group -> group.rows("models").map { group.string("provider_id") + "\t" + it.string("id") to group.string("provider") + " · " + it.string("label", it.string("id")) } }.toMap()
     val selectedModel = if (prefs.assistantModel.isBlank()) "" else prefs.assistantProvider + "\t" + prefs.assistantModel
+    // Check-ups stay bound to the active client, independently of the assistant chat profile.
+    val activeScope = vm.client?.scope?.takeIf { it.origin == ui.origin && it.owner == ui.owner && it.profile == ui.profile }
+    val checkupKey = activeScope?.let { "checkup-capabilities:${it.key}" }
+    val checkupCapabilities = checkupKey?.let { data[it] }
+    var checkupsExpanded by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf(false) }
+    fun refreshCheckups() {
+        if (checkupKey != null) {
+            vm.storeData(checkupKey, JSONObject().put("_loading", true))
+            vm.load(checkupKey, "/api/plugins/beacon/mobile/tasks/capabilities", quiet = true)
+        }
+    }
+    LaunchedEffect(checkupKey, ui.connected, vm.client) { if (ui.connected) refreshCheckups() }
+    val activeProfileLabel = profileDisplayLabel(ui.profile, profileRows, profileLoading)
+    val checkupTitle = assistantText("Check-up calls")
+    val checkupExplanation = assistantText("Beacon calls you 3-4 times a day between 10:00 and 22:00. Your phone's Do Not Disturb still applies.")
+    val checkupAction = uiText("Turn on")
     LazyColumn(Modifier.testTag("assistant-settings"), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
             Glass(Modifier.fillMaxWidth()) {
@@ -224,6 +243,30 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
                     Choice("Model", selectedModel, voiceOptionsWithSelected(listOf("") + models.keys, selectedModel), { key -> vm.setAssistantModel(key.substringAfter('\t', ""), if (key.isBlank()) "" else key.substringBefore('\t')) },
                         Modifier.fillMaxWidth().testTag("assistant-model"), optionLabels = mapOf("" to "Profile default") + models + (selectedModel to (models[selectedModel] ?: prefs.assistantModel)).takeIf { selectedModel.isNotBlank() }.let { listOfNotNull(it).toMap() })
                     Text(uiText("Its chat always uses this profile and model. Your other chats keep theirs."), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+        item {
+            Glass(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { checkupsExpanded = !checkupsExpanded }, modifier = Modifier.heightIn(min = 48.dp)) {
+                        Text(checkupTitle)
+                        Icon(if (checkupsExpanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, null)
+                    }
+                    if (checkupsExpanded) {
+                        Text(uiText("Profile") + ": " + activeProfileLabel, style = MaterialTheme.typography.bodySmall)
+                        val error = !ui.connected || activeScope == null || recordError(checkupCapabilities).isNotBlank()
+                        val loading = !error && (checkupCapabilities == null || checkupCapabilities.optBoolean("_loading") || (checkupKey != null && checkupKey in refreshing))
+                        if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
+                        else if (error) {
+                            Text(uiText("Check-up setup isn't available. Check your network, then retry."), color = MaterialTheme.colorScheme.error)
+                            OutlinedButton(onClick = { refreshCheckups() }, enabled = ui.connected && activeScope != null, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Retry")) }
+                        }
+                        OutlinedButton(enabled = !loading && !error && checkupCapabilities?.optBoolean("checkups_ready") == true,
+                            onClick = { vm.openForm(ActionForm(checkupTitle, "/api/plugins/beacon/mobile/tasks/checkups", emptyList(), explanation = checkupExplanation, actionLabel = checkupAction, onResult = { refreshCheckups(); refreshSchedules(vm) })) }) { Text(checkupAction) }
+                        if (!loading && !error && checkupCapabilities?.optBoolean("checkups_ready") != true)
+                            Text(uiText("Set up scheduled callbacks on your computer to enable check-up calls."), style = MaterialTheme.typography.bodySmall)
+                    }
                 }
             }
         }

@@ -165,8 +165,15 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
             LoopbackSessionRecord(parseLoopbackSessionToken(html), auth.origin, "local")
         }
     }
-    private val native = NativeGateway(this, socketFactory ?: http)
+    private val native = NativeGateway(this, socketFactory ?: http.newBuilder().readTimeout(0, TimeUnit.MILLISECONDS).pingInterval(30, TimeUnit.SECONDS).build())
     suspend fun nativeRpc(method: String, params: JSONObject = JSONObject()): JSONObject = native.rpc(method, params)
+    internal suspend fun nativeTurnLease(storedSessionId: String, expectedRuntimeSessionId: String? = null): NativeTurnLease =
+        native.turnLease(storedSessionId, expectedRuntimeSessionId)
+    internal suspend fun nativeTurnRpc(lease: NativeTurnLease, method: String, params: JSONObject): JSONObject =
+        native.turnRpc(lease, method, params)
+    internal suspend fun nativeVoiceSubmit(binding: NativeSessionBinding, params: JSONObject, jpeg: String?, legacyJobCapacity: Boolean,
+        sendLock: Any, callOwned: () -> Boolean, markAttempt: () -> Boolean, permitted: () -> Boolean): JSONObject =
+        native.voiceSubmit(binding, params, jpeg, legacyJobCapacity, sendLock, callOwned, markAttempt, permitted)
     internal fun nativeAnswerServerRequest(method: String, requestId: String, sessionId: String, payload: JSONObject): JSONObject =
         native.answerServerRequest(method, requestId, sessionId, payload)
     suspend fun nativeRequest(path: String, method: String = "GET", body: JSONObject? = null, params: Map<String, String> = emptyMap()): JSONObject {
@@ -180,7 +187,7 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
     }
     suspend fun nativeCallContext(callId: String, ownerName: String = ""): JSONObject = kotlinx.coroutines.withTimeout(20_000) {
         val path = "/api/plugins/beacon/mobile/calls/$callId/context"
-        val params = mapOf("owner_name" to ownerName)
+        val params = mapOf("owner_name" to ownerName, "backend" to "hermes")
         try { nativeRequest(path, params = params) }
         catch (error: ApiFailure) {
             if (error.status !in setOf(429, 502, 503, 504)) throw error
@@ -522,8 +529,12 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         // The ViewModel removed local authority before push cleanup; this old client must not erase a newer sign-in.
     }
     suspend fun stream(path: String, query: Map<String, String>, lastId: String = "", onEvent: suspend (SseEvent) -> Unit) {
+        detached().nativeStream(path, query, lastId, onEvent)
+    }
+    /** Consume on a dedicated client so busy-turn controls address its live connection. */
+    internal suspend fun nativeStream(path: String, query: Map<String, String>, lastId: String = "", onEvent: suspend (SseEvent) -> Unit) {
         require(path in setOf("/api/chat/stream", "/api/session/stream")) { "Streaming this capability is unavailable in native Hermes" }
-        NativeOperations(detached()).stream(path, query, lastId, onEvent)
+        NativeOperations(this).stream(path, query, lastId, onEvent)
     }
     suspend fun upload(path: String, file: File, name: String, mime: String, sessionId: String, directory: String = "."): JSONObject = withContext(Dispatchers.IO) {
         operationLock.withLock {

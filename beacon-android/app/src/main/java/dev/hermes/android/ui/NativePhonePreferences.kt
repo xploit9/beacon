@@ -12,12 +12,15 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewModelScope
 import dev.hermes.android.BeaconViewModel
-import kotlinx.coroutines.launch
 
 @Composable internal fun NativePhonePreferences(vm: BeaconViewModel, page: String) {
     val ui by vm.ui.collectAsStateWithLifecycle()
+    val data by vm.data.collectAsStateWithLifecycle()
+    val target by vm.settingsProfile.collectAsStateWithLifecycle()
+    val profileClient = vm.settingsProfileClient()
+    val profile = target.ifBlank { ui.profile }
+    val profileName = profileDisplayName(profile, data["navigation-profiles"]?.rows("profiles").orEmpty())
     val editor = vm.phoneSettings
     val skills by editor.skills.collectAsStateWithLifecycle()
     val memory by editor.memory.collectAsStateWithLifecycle()
@@ -34,16 +37,16 @@ import kotlinx.coroutines.launch
         }
     }
     BackHandler(onBack = back)
-    LaunchedEffect(page, ui.origin, ui.owner, ui.profile, ui.connected, vm.client) {
+    LaunchedEffect(page, ui.origin, ui.owner, ui.profile, ui.connected, vm.client, target, profileClient) {
         editor.bind()
         if (page == "Skills") editor.loadSkills(force = false) else editor.loadMemory(force = false)
     }
     Column(Modifier.fillMaxSize()) {
-        Header(uiText(settingsLabel(page)), back = if (page == "Memory" || page == "Skills" && skills.selected == null) null else back, menu = LocalOpenNavigationMenu.current) {
-            if (page == "Memory") IconButton(onClick = { editor.loadMemory() }, enabled = vm.client != null && !memory.loading && !memory.saving && memory.editing.isBlank()) { Icon(Icons.Rounded.Refresh, uiText("Refresh memory")) }
-            else IconButton(onClick = { skills.selected?.let(editor::openSkill) ?: editor.loadSkills() }, enabled = vm.client != null && !skills.loading && !skills.saving && !skills.editing) { Icon(Icons.Rounded.Refresh, uiText("Refresh skills")) }
+        Header(uiText(settingsLabel(page)), subtitle = if (profileName.isBlank()) "" else "${uiText("Profile")} · $profileName", back = if (page == "Memory" || page == "Skills" && skills.selected == null) null else back, menu = LocalOpenNavigationMenu.current) {
+            if (page == "Memory") IconButton(onClick = { editor.loadMemory() }, enabled = profileClient != null && !memory.loading && !memory.saving && memory.editing.isBlank()) { Icon(Icons.Rounded.Refresh, uiText("Refresh memory")) }
+            else IconButton(onClick = { skills.selected?.let(editor::openSkill) ?: editor.loadSkills() }, enabled = profileClient != null && !skills.loading && !skills.saving && !skills.editing) { Icon(Icons.Rounded.Refresh, uiText("Refresh skills")) }
         }
-        if (editor.scopeKey != vm.client?.scope?.key) LinearProgressIndicator(Modifier.fillMaxWidth())
+        if (editor.scopeKey != profileClient?.scope?.key) LinearProgressIndicator(Modifier.fillMaxWidth())
         else if (page == "Skills") NativeSkillsScreen(skills, editor::skillSearch, editor::openSkill,
             onBack = { leave(editor::closeSkill) }, onToggle = editor::toggleSkill,
             onEdit = { editing -> if (editing) editor.skillEdit(true) else leave { editor.skillEdit(false) } },
@@ -93,6 +96,8 @@ import kotlinx.coroutines.launch
     val profileRows = profileCatalog?.rows("profiles").orEmpty()
     val profileLoading = ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
     val state by vm.phoneSettings.bots.collectAsStateWithLifecycle()
+    val target by vm.settingsProfile.collectAsStateWithLifecycle()
+    val selecting by vm.settingsProfileSelecting.collectAsStateWithLifecycle()
     val models by vm.phoneSettings.botModels.collectAsStateWithLifecycle()
     val admin by vm.profileAdmin.state.collectAsStateWithLifecycle()
     var creating by rememberSaveable { mutableStateOf(false) }
@@ -104,24 +109,27 @@ import kotlinx.coroutines.launch
             if (changed) discard = action else action()
         }
     }
-    val back = { leave { if (state.editing) vm.phoneSettings.editBot(false) else if (state.selected != null) vm.phoneSettings.closeBot() else vm.backFromSettings() } }
+    val back = { leave { if (state.editing) vm.phoneSettings.editBot(false) else if (state.selected != null) vm.closeSettingsProfile() else vm.backFromSettings() } }
     BackHandler(onBack = back)
     LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, vm.client) { vm.phoneSettings.bind(); vm.phoneSettings.loadBots(); if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     // "Profile settings" on a bot in Bot Mode lands here with that profile asked for: show it once the list has loaded.
     LaunchedEffect(admin.open, state.loading, state.profiles) {
-        if (admin.open.isNotBlank() && !state.loading && state.profiles.any { it.profile == admin.open }) { vm.phoneSettings.openBot(admin.open); vm.profileAdmin.opened() }
+        if (admin.open.isNotBlank() && !state.loading && state.profiles.any { it.profile == admin.open }) { val profile = admin.open; vm.profileAdmin.opened(); vm.inspectSettingsProfile(profile) }
+    }
+    // Older recoverable model drafts were stored under the chat profile even when they edited another profile.
+    LaunchedEffect(state.selected?.profile, state.editing, target, selecting) {
+        val selected = state.selected?.profile
+        if (state.editing && selected != null && selected != target.ifBlank { ui.profile } && !selecting) vm.inspectSettingsProfile(selected)
     }
     // A profile that was open and is no longer in the list (deleted here or on the computer) closes back to the list.
-    LaunchedEffect(state.profiles, state.loading) { state.selected?.profile?.let { open -> if (!state.loading && state.profiles.isNotEmpty() && state.profiles.none { it.profile == open }) vm.phoneSettings.closeBot() } }
+    LaunchedEffect(state.profiles, state.loading) { state.selected?.profile?.let { open -> if (!state.loading && state.profiles.isNotEmpty() && state.profiles.none { it.profile == open }) vm.closeSettingsProfile() } }
     Column(Modifier.fillMaxSize()) {
         Header(uiText("Profiles"), back = back, menu = LocalOpenNavigationMenu.current)
         ProfileApprovalSettings(vm)
-        NativeBotSettings(state, vm.phoneSettings::openBot, { leave(vm.phoneSettings::closeBot) }, { vm.phoneSettings.editBot(true) },
+        NativeBotSettings(if (selecting) state.copy(loading = true) else state, { vm.inspectSettingsProfile(it) }, { leave(vm::closeSettingsProfile) }, { vm.phoneSettings.editBot(true) },
             vm.phoneSettings::botDraft, vm.phoneSettings::saveBot, { leave { vm.phoneSettings.editBot(false) } },
-            onSettings = { profile, page -> vm.viewModelScope.launch {
-                if (profile != vm.ui.value.profile) vm.switchProfile(profile).join()
-                if (vm.ui.value.profile == profile && vm.ui.value.tab == "More" && vm.ui.value.morePage in setOf("", "Profiles")) vm.more(settingsRoute(page))
-            } }, onRefresh = { state.selected?.let { vm.phoneSettings.openBot(it.profile) } ?: vm.phoneSettings.loadBots() }, models = models,
+            onSettings = { profile, page -> leave { if (state.editing) vm.phoneSettings.editBot(false); vm.openSettingsProfileTool(profile, settingsRoute(page)) } },
+            onRefresh = { state.selected?.let { vm.phoneSettings.openBot(it.profile) } ?: vm.phoneSettings.loadBots() }, models = models,
             renderBehavior = { Markdown(it, vm) },
             profileLabel = { profile -> profileDisplayLabel(profile, profileRows, profileLoading) },
             onNewProfile = { creating = true }, canDelete = vm::canDeleteProfile, onDelete = { deleting = it })

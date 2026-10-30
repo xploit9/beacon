@@ -64,7 +64,11 @@ Compatibility notification fields: target registration returns target.id/target_
 
 Target revocation also supports DELETE `/mobile/notifications/targets/{target_id}?profile=` for existing Android revoke flows. A target must name a linked phone with `X-Beacon-Device-ID`; a missing or unknown ID gets 403 `device_required` and a removed phone gets 403 `device_removed`. Pushes go only to targets of phones that are still linked. Removing a phone does not end its Hermes sign-in. With Hermes' built-in login, set a new `dashboard.basic_auth.secret` (or `HERMES_DASHBOARD_BASIC_AUTH_SECRET`, which wins over the config when it is set) and restart the dashboard; that signs every phone out, so sign in again on the ones you keep.
 
-## Native voice context and quick lookups
+## Native Hermes voice backend
+
+Current Beacon voice calls submit ordinary requests into the attached native Hermes conversation. Its configured model, tools, MCP workflow, skills, memory provider and approvals remain authoritative. The realtime provider handles speech. GET `/mobile/calls/{id}/context?backend=hermes` supplies the bound profile, greeting, language and callback reference data without loading a parallel tool catalogue or copying native memory/history into the speech interface. The call records this mode so recall, retention and abandoned-call recovery stay with the native Hermes agent.
+
+The quick-lookup routes below remain compatible with older released clients. Current voice requests use native `prompt.submit`, owner-bound job linkage and native results. See [voice calls](../../docs/voice-calls.md).
 
 GET `/mobile/calls/{id}/context` returns the selected profile, system instruction, bounded conversation and voice history, personality, memory, callback context, greeting, tool catalogue and capability status. History, memory and callback results are reference data, not authorization. Native secret redaction runs before context leaves the host; the route does not start a voice-provider session.
 

@@ -13,6 +13,51 @@ import org.junit.Test
 import java.util.concurrent.CopyOnWriteArrayList
 
 class NativePhoneSettingsTest {
+    @Test(timeout = 10_000) fun lateMemoryReadCannotReplaceAnotherProfileOrAccount() = runBlocking {
+        val captured = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val returned = java.util.concurrent.CountDownLatch(1)
+        val requests = CopyOnWriteArrayList<String>()
+        fun client(origin: String, owner: String, profile: String) = BeaconClient(AuthContext(origin, emptyList(), owner = owner, profile = profile), null) { builder ->
+            builder.addInterceptor { chain ->
+                val request = chain.request()
+                val scopedProfile = request.url.queryParameter("beacon_profile") ?: request.url.queryParameter("profile").orEmpty()
+                val identity = "${request.url.host}/$scopedProfile"
+                requests += "${request.url.encodedPath}:$identity"
+                if (request.url.encodedPath.endsWith("/memory/documents") && identity == "first.example/coder") {
+                    captured.countDown(); try { check(release.await(5, java.util.concurrent.TimeUnit.SECONDS)) } finally { returned.countDown() }
+                }
+                val result = if (request.url.encodedPath == "/api/memory") json("active" to "builtin") else
+                    json("documents" to org.json.JSONArray().put(json("target" to "memory", "content" to identity, "revision" to "a".repeat(64), "enabled" to true, "limit" to 2000)))
+                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("Fixture").body(result.toString().toResponseBody("application/json".toMediaType())).build()
+            }
+        }
+        val first = client("https://first.example", "owner", "coder")
+        val second = client("https://first.example", "owner", "writer")
+        val otherAccount = client("https://second.example", "another-owner", "writer")
+        val active = java.util.concurrent.atomic.AtomicReference(first)
+        val worker = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val editor = NativePhoneSettings(worker, SavedStateHandle()) { active.get() }
+            editor.loadMemory()
+            assertTrue(withContext(Dispatchers.IO) { captured.await(3, java.util.concurrent.TimeUnit.SECONDS) })
+            active.set(second); editor.bind(); editor.loadMemory()
+            withTimeout(5000) { editor.memory.first { !it.loading && it.documents.singleOrNull()?.content == "first.example/writer" } }
+            active.set(otherAccount); editor.bind(); editor.loadMemory()
+            withTimeout(5000) { editor.memory.first { !it.loading && it.documents.singleOrNull()?.content == "second.example/writer" } }
+            release.countDown()
+            assertTrue(withContext(Dispatchers.IO) { returned.await(3, java.util.concurrent.TimeUnit.SECONDS) })
+            worker.coroutineContext[Job]!!.children.toList().joinAll()
+            assertEquals(otherAccount.scope.key, editor.memory.value.scope)
+            assertEquals("second.example/writer", editor.memory.value.documents.single().content)
+            assertTrue(requests.any { it.endsWith("first.example/coder") })
+            assertTrue(requests.any { it.endsWith("first.example/writer") })
+            assertTrue(requests.any { it.endsWith("second.example/writer") })
+        } finally {
+            release.countDown(); worker.cancel(); first.closeNative(); second.closeNative(); otherAccount.closeNative()
+        }
+    }
+
     @Test(timeout = 10_000) fun editingVisibleMemoryWhileRefreshingPreservesTheDraftAndBase() = runBlocking<Unit> {
         val entered = java.util.concurrent.CountDownLatch(1)
         val release = java.util.concurrent.CountDownLatch(1)
@@ -156,6 +201,28 @@ class NativePhoneSettingsTest {
             assertEquals("newer notes", controller.memory.value.draft)
             assertEquals("newer-model", controller.bots.value.draftModel)
         } finally { worker.cancel(); client.closeNative(); first.closeNative() }
+    }
+
+    @Test fun legacyOtherProfileModelDraftMovesWithoutTakingChatProfileNotes() {
+        val first = BeaconClient(AuthContext("https://native.example", emptyList(), owner = "owner"))
+        val academic = first.forAuthorizedProfile("academic")
+        var active = first
+        val worker = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        try {
+            val editor = NativePhoneSettings(worker, SavedStateHandle()) { active }
+            editor.bind(); editor.restoreDraft(draftFixture(first.scope.key))
+            active = academic; editor.bind()
+            assertEquals(academic.scope.key, editor.snapshotDraft().getString("scope"))
+            assertEquals("academic", editor.bots.value.selected?.profile)
+            assertEquals("original-model", editor.bots.value.selected?.model)
+            assertEquals("edited-model", editor.bots.value.draftModel)
+            assertTrue(editor.bots.value.editing)
+            assertEquals("", editor.memory.value.editing)
+            assertFalse(editor.skills.value.editing)
+            active = first; editor.bind()
+            assertEquals("edited notes", editor.memory.value.draft)
+            assertEquals("edited instructions", editor.skills.value.draft)
+        } finally { worker.cancel(); academic.closeNative(); first.closeNative() }
     }
     @Test fun memoryConflictPreservesDraftAndSuccessfulReadbackBecomesBaseline() = runBlocking {
         val requests = CopyOnWriteArrayList<Request>()

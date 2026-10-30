@@ -60,14 +60,30 @@ class ReplayCursor(private val stream: String, last: String = "") {
     }
 }
 
-data class QueuedMessage(val text: String, val attachments: List<JSONObject> = emptyList(), val model: String = "", val provider: String = "") {
-    fun encode(): JSONObject = json("text" to text, "attachments" to JSONArray(attachments), "model" to model, "provider" to provider)
+data class QueuedMessage(
+    val text: String, val attachments: List<JSONObject> = emptyList(), val model: String = "", val provider: String = "",
+    val id: String = UUID.randomUUID().toString(), val createdAt: Long = System.currentTimeMillis(),
+    val state: String = "queued", val kind: String = "queue", val rowId: String = "", val admissionId: String = "", val outcome: String = "", val submissionId: String = id,
+) {
+    fun encode(): JSONObject = json("text" to text, "attachments" to JSONArray(attachments), "model" to model, "provider" to provider,
+        "id" to id, "created_at" to createdAt, "state" to state, "kind" to kind, "row_id" to rowId, "admission_id" to admissionId, "outcome" to outcome, "submission_id" to submissionId)
+    companion object {
+        fun decode(item: Any?): QueuedMessage {
+            if (item !is JSONObject) return QueuedMessage(item?.toString().orEmpty(), createdAt = 0L)
+            val state = item.string("state", "queued").let { if (it in setOf("saving", "sending")) "unknown" else it }
+                .takeIf { it in setOf("queued", "accepted", "unknown", "sent", "settled") } ?: "unknown"
+            val id = item.string("id").ifBlank { UUID.randomUUID().toString() }
+            return QueuedMessage(item.string("text"), item.rows("attachments"), item.string("model"), item.string("provider"),
+                id, item.optLong("created_at").coerceAtLeast(0), state, item.string("kind").takeIf { it in setOf("queue", "steer") } ?: "queue",
+                item.string("row_id"), item.string("admission_id"), item.string("outcome"), item.string("submission_id").ifBlank { id })
+        }
+    }
 }
 data class Draft(val text: String = "", val selectionStart: Int = 0, val selectionEnd: Int = 0, val attachments: List<JSONObject> = emptyList(), val queued: List<QueuedMessage> = emptyList(), val anchor: Int = 0, val anchorOffset: Int = 0, val anchorId: String = "") {
     fun encode(): String = json("text" to text, "start" to selectionStart, "end" to selectionEnd, "attachments" to JSONArray(attachments), "queue" to JSONArray(queued.map { it.encode() }), "anchor" to anchor, "anchor_offset" to anchorOffset, "anchor_id" to anchorId).toString()
     fun afterAccepted(sent: Draft): Draft = if (text == sent.text && attachments.map { it.toString() } == sent.attachments.map { it.toString() }) copy(text = "", selectionStart = 0, selectionEnd = 0, attachments = emptyList()) else this
     companion object {
-        fun decode(raw: String): Draft { val o = JSONObject(raw); val t = o.string("text"); val queue = o.optJSONArray("queue"); val queued = (0 until (queue?.length() ?: 0)).map { i -> val item = queue?.opt(i); if (item is JSONObject) QueuedMessage(item.string("text"), item.rows("attachments"), item.string("model"), item.string("provider")) else QueuedMessage(item?.toString().orEmpty()) }; return Draft(t, o.optInt("start").coerceIn(0, t.length), o.optInt("end").coerceIn(0, t.length), o.rows("attachments"), queued, o.optInt("anchor").coerceAtLeast(0), o.optInt("anchor_offset").coerceAtLeast(0), o.string("anchor_id")) }
+        fun decode(raw: String): Draft { val o = JSONObject(raw); val t = o.string("text"); val queue = o.optJSONArray("queue"); val queued = (0 until (queue?.length() ?: 0)).map { i -> QueuedMessage.decode(queue?.opt(i)) }; return Draft(t, o.optInt("start").coerceIn(0, t.length), o.optInt("end").coerceIn(0, t.length), o.rows("attachments"), queued, o.optInt("anchor").coerceAtLeast(0), o.optInt("anchor_offset").coerceAtLeast(0), o.string("anchor_id")) }
     }
 }
 
@@ -85,9 +101,20 @@ sealed interface SendReceipt {
     }
 }
 
-data class PendingSend(val id: String, val scope: Scope, val draft: Draft, val state: String = "uncertain") {
-    fun encode(): String = json("id" to id, "draft" to draft.encode()).toString()
-    companion object { fun create(scope: Scope, draft: Draft) = PendingSend(UUID.randomUUID().toString(), scope, draft) }
+data class PendingSend(val id: String, val scope: Scope, val draft: Draft, val state: String = "uncertain",
+    val createdAt: Long = System.currentTimeMillis(), val model: String = "", val provider: String = "", val queued: Boolean = false,
+    val rowId: String = "", val admissionId: String = "", val submissionId: String = id) {
+    fun encode(): String = json("id" to id, "draft" to draft.encode(), "state" to state, "created_at" to createdAt,
+        "model" to model, "provider" to provider, "queued" to queued, "row_id" to rowId, "admission_id" to admissionId, "submission_id" to submissionId).toString()
+    companion object {
+        fun create(scope: Scope, draft: Draft, queued: QueuedMessage? = null): PendingSend {
+            val id = queued?.id ?: UUID.randomUUID().toString()
+            return PendingSend(id, scope, draft, createdAt = queued?.createdAt ?: System.currentTimeMillis(), model = queued?.model.orEmpty(),
+                provider = queued?.provider.orEmpty(), queued = queued != null, submissionId = queued?.submissionId ?: id)
+        }
+        fun decode(scope: Scope, raw: String): PendingSend = JSONObject(raw).let { o -> PendingSend(o.getString("id"), scope, Draft.decode(o.getString("draft")),
+            o.string("state", "uncertain"), o.optLong("created_at").coerceAtLeast(0), o.string("model"), o.string("provider"), o.optBoolean("queued"), o.string("row_id"), o.string("admission_id"), o.string("submission_id").ifBlank { o.getString("id") }) }
+    }
 }
 
 const val MAX_UPDATE_APK_BYTES = 256L * 1024 * 1024
