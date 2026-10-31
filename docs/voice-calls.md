@@ -20,9 +20,13 @@ Provider keys stay encrypted on the phone. Microphone audio and text read aloud 
 
 Beacon preserves the recognized request text. Its speech checks allow capitalization differences and a numeric addition written as `+` or spoken as “plus”; they do not rewrite the request. Changed words, values and literal identifiers remain unconfirmed. Unverified speech is withheld and reported, rather than automatically repeated.
 
-Speech is generated in an isolated session from the native reply or a fixed call prompt. Gemini can complete speech without a separate output transcript, which is optional in [Google's Live API](https://ai.google.dev/api/live). Supplied transcripts are checked before playback. Captions follow the native text submitted for speech and appear after playback is acknowledged.
+Speech is generated in isolation from the native reply or a fixed call prompt. With Gemini, the selected Live model listens; spoken replies use `gemini-3.8-flash-lite-tts` with the same phone-held key and selected voice. This dedicated [read-aloud API](https://ai.google.dev/gemini-api/docs/speech-generation) receives the original text separately from speaking style. Only completed, bounded raw audio is played. It does not return an independent recognized transcript; playback relies on its synthesis contract. Provider vocal tags and pronunciation can affect the audio. Grok and OpenAI supplied transcripts remain checked before playback. Captions retain the native text and appear after playback is acknowledged.
 
-Speech comparisons accept apostrophe and prose-quote typography and omit Markdown emphasis markers. Literal code, operators and measurement marks remain checked; the saved native reply is unchanged.
+Where a provider supplies a speech transcript, comparisons accept apostrophe and prose-quote typography and omit Markdown emphasis markers. Literal code, operators and measurement marks remain checked; the saved native reply is unchanged.
+
+An interrupted speech connection or a temporary service failure can retry one unplayed speech render. This repeats only the voice provider readout and never resubmits the Hermes request. Partial audio from the failed attempt is discarded; mismatched supplied transcripts, certificate failures, malformed responses and policy rejections remain blocked.
+
+Speech failures record a fixed diagnostic category, provider, attempt, timing and bounded transport codes. These receipts contain no reply text, names, text hashes, provider messages, keys or audio. On hangup, queued speech failures can drain after text within the existing shared teardown budget. A failed diagnostic upload does not make saved words incomplete. Physical-phone behavior still needs checking on the installed build; emulator speech and connection timings are separate measurements.
 
 ## Saving and ending a call
 

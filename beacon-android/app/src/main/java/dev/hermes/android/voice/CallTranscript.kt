@@ -6,6 +6,19 @@ import dev.hermes.android.core.string
 import dev.hermes.android.core.Scope
 import org.json.JSONObject
 
+internal val speechDiagnosticTurns = setOf(
+    "speech-ready", "speech-close", "speech-transport", "speech-provider-error", "speech-send",
+    "speech-protocol", "speech-status", "speech-tool-attempt", "speech-interrupted", "speech-timeout",
+    "speech-invalid-audio", "speech-invalid-transcript", "speech-missing-audio", "speech-missing-transcript",
+    "speech-transcript-mismatch",
+)
+
+internal fun directDiagnosticTurnId(value: JSONObject): String =
+    value.string("turn_id").takeIf { value.string("stream") == "assistant" && it in speechDiagnosticTurns } ?: "connection"
+
+internal fun isSpeechFailureDiagnostic(value: JSONObject): Boolean =
+    value.string("type") == "media_diagnostic" && directDiagnosticTurnId(value) !in setOf("connection", "speech-ready")
+
 data class CallTranscript(val eventId: String, val role: String, val text: String, val final: Boolean = true, val messageId: String = "", val interrupted: Boolean = false, val at: Long = 0L, val turnId: String = "") {
     companion object {
         fun from(value: JSONObject, sessionId: String, callId: String): CallTranscript? {

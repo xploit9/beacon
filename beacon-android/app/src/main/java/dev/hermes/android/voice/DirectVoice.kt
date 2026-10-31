@@ -119,7 +119,7 @@ internal suspend fun testVoiceProvider(provider:String,apiKey:String,model:Strin
 internal class DirectVoice(private val client:BeaconClient,private val callId:String,private val selectedSession:String,private val scope:CoroutineScope,
     private val audio:(ByteArray)->Unit,private val event:(JSONObject)->Unit,private val failure:(String)->Unit,
     private val credentials:VoiceSessionCredentials,private val providerSocketFactory:WebSocket.Factory?=null,private val ownerName:String="",stallAfterMs:Long=20_000,
-    private val ownerFence:Any=Any(),private val ownerActive:()->Boolean={true}) {
+    private val ownerFence:Any=Any(),private val ownerActive:()->Boolean={true},private val providerCallFactory:Call.Factory?=null) {
     // Deliberately separate from authenticated Hermes HTTP: no cookie jar, interceptors, or copied headers.
     private val provider=credentials.provider
     private val providerHttp=OkHttpClient.Builder().cookieJar(CookieJar.NO_COOKIES).followRedirects(false).followSslRedirects(false).pingInterval(20,TimeUnit.SECONDS).build()
@@ -134,7 +134,8 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
     private val visual=NativeVoiceVisual()
     private val finalItems=VoiceFinalItems()
     @Volatile private var lastNativeReply=""
-    private val renderer=NativeSpeechRenderer(credentials,providerSocketFactory?:providerHttp,scope,{ callOwned() && ready },audio,event,{ stall.playing(it) })
+    private val renderer=NativeSpeechRenderer(credentials,providerSocketFactory?:providerHttp,scope,{ callOwned() && ready },audio,event,{ stall.playing(it) },
+        providerCallFactory ?: if(providerSocketFactory==null) providerHttp else providerSocketFactory as? Call.Factory)
     private val toolReceipts=mutableMapOf<String,JSONObject>()
     private val submissionLock=Mutex()
     private val reported=mutableSetOf<String>()

@@ -28,6 +28,62 @@ import java.io.File
 class VoiceConnectionLiveTest {
     @get:Rule val rule = createAndroidComposeRule<BeaconActivity>()
 
+    private suspend fun checkNativeReply(app: BeaconApplication, client: BeaconClient, call: String): JSONObject {
+        val service = requireNotNull(app.calls.service)
+        service.mute(true)
+        val direct = BeaconCallService::class.java.getDeclaredField("directVoice").apply { isAccessible = true }.get(service) as DirectVoice
+        val credentials = requireNotNull(VoiceKeyStore(app).session("gemini"))
+        val http = okhttp3.OkHttpClient.Builder().cookieJar(okhttp3.CookieJar.NO_COOKIES)
+            .followRedirects(false).followSslRedirects(false).callTimeout(30, java.util.concurrent.TimeUnit.SECONDS).build()
+        suspend fun jobs() = client.nativeRequest("/api/plugins/beacon/mobile/calls/$call").getJSONArray("jobs")
+        suspend fun await(condition: suspend () -> Boolean) = withTimeout(120_000) { while (!condition()) delay(100) }
+        suspend fun stream(bytes: ByteArray) {
+            for (offset in bytes.indices step 640) {
+                check(direct.pcm(bytes.copyOfRange(offset, minOf(offset + 640, bytes.size))) { true })
+                delay(20)
+            }
+        }
+        try {
+            assertEquals("An untouched QA call must have no native requests", 0, jobs().length())
+            delay(10_000)
+            val source = withContext(Dispatchers.IO) {
+                http.newCall(GeminiSpeech.request(credentials, "What is two plus three? Answer briefly.")).execute().use { response ->
+                    check(response.isSuccessful)
+                    val value = requireNotNull(response.body).bytes(); check(value.size <= GeminiSpeech.MAX_JSON_BYTES)
+                    GeminiSpeech.pcm(JSONObject(value.toString(Charsets.UTF_8)))
+                }
+            }
+            val input = ByteArray(source.size / 2 * 2 / 3 * 2)
+            for (index in 0 until input.size / 2) {
+                val at = index * 3 / 2 * 2
+                input[index * 2] = source[at]; input[index * 2 + 1] = source[at + 1]
+            }
+            source.fill(0)
+            try { stream(ByteArray(19200)); stream(input); stream(ByteArray(70400)) } finally { input.fill(0) }
+            val queue = DirectVoice::class.java.getDeclaredField("microphone").apply { isAccessible = true }.get(direct) as kotlinx.coroutines.channels.Channel<*>
+            @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+            suspend fun drained() = withTimeout(5000) { while (!queue.isEmpty) delay(10) }
+            drained(); check(direct.send(GeminiWire.endAudio()))
+            await { jobs().length() == 1 }
+            val ownerText = app.calls.state.value.transcripts.filter { it.role == "user" && it.final }.joinToString(" ") { it.text }
+            assertTrue(Regex("(?i)\\b(?:two|2)\\b").containsMatchIn(ownerText) && Regex("(?i)\\b(?:three|3)\\b").containsMatchIn(ownerText))
+            var result = ""
+            await {
+                val all = jobs(); assertEquals("A readout must never replay native work", 1, all.length())
+                val job = all.getJSONObject(0)
+                check(job.optString("status") !in setOf("failed", "cancelled"))
+                if (job.optString("status") in setOf("done", "completed")) result = job.getString("result")
+                result.isNotBlank()
+            }
+            assertTrue("The native arithmetic result must be relevant", Regex("(?i)\\b(?:five|5)\\b").containsMatchIn(result))
+            await { app.calls.state.value.transcripts.filter { it.role == "assistant" && it.final }.joinToString(" ") { it.text }.contains(result) }
+            return JSONObject().put("native_jobs", jobs().length()).put("native_result_presented", true).put("synthetic_input", true)
+        } finally {
+            withContext(NonCancellable + Dispatchers.IO) {
+                http.dispatcher.cancelAll(); http.connectionPool.evictAll(); http.dispatcher.executorService.shutdown()
+            }
+        }
+    }
     @Test(timeout = 240_000) fun geminiCallsMeasureTapToReady() = exercise("gemini")
     @Test(timeout = 240_000) fun grokCallsMeasureTapToReady() = exercise("grok")
 
@@ -71,10 +127,15 @@ class VoiceConnectionLiveTest {
                 phase = "call ${it + 1}"
                 rule.waitForIdle()
                 val started = SystemClock.elapsedRealtime()
+                val previousCall = app.calls.state.value.callId
+                val previousError = app.calls.state.value.error
+                var attemptStarted = false
                 rule.onNodeWithTag("chat-call-beacon").performClick()
                 await(45_000) {
-                    check(app.calls.state.value.error.isBlank()) { "Voice connection failed: ${app.calls.state.value.failureReason}" }
-                    app.calls.state.value.active && app.calls.state.value.state in setOf("listening", "speaking")
+                    val state = app.calls.state.value
+                    if (state.active || state.callId != previousCall || state.error != previousError) attemptStarted = true
+                    if (attemptStarted) check(state.error.isBlank()) { "Voice connection failed: ${state.failureReason}" }
+                    attemptStarted && state.active && state.state in setOf("listening", "speaking")
                 }
                 val elapsed = SystemClock.elapsedRealtime() - started
                 call = app.calls.state.value.callId
@@ -84,6 +145,14 @@ class VoiceConnectionLiveTest {
                 assertEquals("hermes", context.getString("backend"))
                 assertEquals(client.auth.profile, context.getString("profile"))
                 assertEquals(session, context.getString("selected_session_id"))
+                await(45_000) {
+                    check(app.calls.state.value.error.isBlank()) { "Greeting failed: ${app.calls.state.value.failureReason}" }
+                    app.calls.state.value.transcripts.any { it.role == "assistant" && it.text.isNotBlank() }
+                }
+                val expected = context.optString("greeting").take(160).ifBlank { "I'm here." }
+                assertTrue("The actual service must present its complete greeting", app.calls.state.value.transcripts.any { it.role == "assistant" && it.text == expected })
+                samples.getJSONObject(samples.length() - 1).put("greeting_presented_ms", SystemClock.elapsedRealtime() - started)
+                if (provider == "gemini" && it == 0) samples.getJSONObject(samples.length() - 1).put("native_reply", checkNativeReply(app, client, call))
                 app.calls.hangup()
                 await { !app.calls.state.value.active && app.calls.service == null }
                 client.nativeRequest("/api/plugins/beacon/mobile/calls/$call", "DELETE")

@@ -24,6 +24,129 @@ import kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn
 
 /** Network doubles preserve the real DirectVoice, native gateway and provider event paths. */
 class NativeSpeechBackendTest {
+    @Test(timeout = 15000) fun retryableSpeechCloseQuarantinesOldFramesAndPlaysOnlyTheCompletedRetry() = runBlocking {
+        for (code in listOf(1011, 1012, 1013, 1014)) {
+            val f = RenderFixture()
+            try {
+                f.start(); f.receive(renderPcm())
+                f.closeWithCode(code, "SYNTHETIC_PRIVATE_CLOSE_DETAIL")
+                assertTrue("Close $code must reach the bounded speech retry", waitFor { f.requestCount("Verified reply.") == 2 })
+                f.receive(renderTranscript(text = "Wrong old reply."), 0); f.receive(renderDone(), 0)
+                assertTrue(f.audio.isEmpty())
+                f.receive(renderPcm()); f.receive(renderTranscript()); f.receive(renderDone())
+                assertTrue(waitFor { f.events.any { it.optString("text") == "Verified reply." } })
+                assertEquals(1, f.audio.size); assertEquals(2, f.requestCount("Verified reply."))
+                val diagnostic = f.events.single { it.optString("turn_id") == "speech-close" }
+                assertEquals(code, diagnostic.getInt("close_code")); assertEquals("assistant", diagnostic.getString("stream"))
+                assertFalse(f.events.toString().contains("SYNTHETIC_PRIVATE_CLOSE_DETAIL"))
+            } finally { f.close() }
+        }
+    }
+
+    @Test(timeout = 8000) fun repeatedSpeechCloseStopsAfterTwoAttemptsAndPolicyCloseDoesNotRetry() = runBlocking {
+        val f = RenderFixture()
+        try {
+            f.start(); f.closeWithCode(1011)
+            assertTrue(waitFor { f.requestCount("Verified reply.") == 2 })
+            f.closeWithCode(1011)
+            assertTrue(waitFor { f.events.any { it.optString("type") == "warning" } })
+            assertEquals(2, f.requestCount("Verified reply.")); assertTrue(f.audio.isEmpty())
+            assertFalse(f.events.any { it.optString("message").contains("Your reply is in") })
+        } finally { f.close() }
+        val policy = RenderFixture()
+        try {
+            policy.start(); policy.closeWithCode(1008, "SYNTHETIC_PRIVATE_POLICY_DETAIL")
+            assertTrue(waitFor { policy.events.any { it.optString("type") == "warning" } })
+            assertEquals(1, policy.requestCount("Verified reply.")); assertTrue(policy.audio.isEmpty())
+            assertFalse(policy.events.toString().contains("SYNTHETIC_PRIVATE_POLICY_DETAIL"))
+        } finally { policy.close() }
+    }
+
+    @Test(timeout = 8000) fun speechBackoffCannotOpenANewSocketAfterOwnershipEnds() = runBlocking {
+        val f = RenderFixture()
+        try {
+            f.start(); f.closeWithCode(1011); f.owner.set(false)
+            delay(600)
+            assertEquals(1, f.requestCount("Verified reply.")); assertTrue(f.audio.isEmpty())
+        } finally { f.close() }
+    }
+
+    @Test(timeout = 8000) fun speechMismatchHasPrivateDiagnosticAndSuccessfulCancellationHasNone() = runBlocking {
+        val mismatch = RenderFixture()
+        try {
+            mismatch.start("Good afternoon, Maya. What can I do for you?"); mismatch.receive(renderPcm())
+            mismatch.receive(renderTranscript(text = "Good afternoon Maya. What can I do for you?")); mismatch.receive(renderDone()); mismatch.closeSocket()
+            assertTrue(waitFor { mismatch.warned() }); assertTrue(mismatch.audio.isEmpty())
+            assertTrue(mismatch.events.any { it.optString("turn_id") == "speech-close" })
+            val diagnostic = mismatch.events.single { it.optString("turn_id") == "speech-close" }
+            assertFalse(diagnostic.has("text")); assertFalse(diagnostic.has("message")); assertFalse(diagnostic.has("hash"))
+            assertEquals("invalid_response", diagnostic.getString("error_code"))
+        } finally { mismatch.close() }
+        val good = RenderFixture()
+        try {
+            good.start(); good.receive(renderPcm()); good.receive(renderTranscript()); good.receive(renderDone())
+            assertTrue(waitFor { good.audio.size == 1 })
+            good.fail(java.io.IOException("Synthetic completed socket cancel"))
+            assertTrue(good.events.none { it.optString("stage") in setOf("provider_error", "voice_error") })
+            assertEquals(1, good.requestCount("Verified reply."))
+        } finally { good.close() }
+    }
+
+    @Test(timeout = 8000) fun temporarySpeechDisconnectRetriesOnlyTheUnplayedRenderOnce() = runBlocking {
+        val f = RenderFixture()
+        try {
+            f.start(); f.receive(renderPcm())
+            f.fail(java.io.IOException("Synthetic speech disconnect"))
+            assertTrue("A temporary socket failure must retry the isolated speech read", waitFor { f.requestCount("Verified reply.") == 2 })
+            assertTrue("An incomplete attempt must never play", f.audio.isEmpty())
+            f.receive(renderPcm()); f.receive(renderTranscript()); f.receive(renderDone())
+            assertTrue(waitFor { f.events.any { it.optString("text") == "Verified reply." } })
+            assertEquals(1, f.audio.size)
+            assertEquals(2, f.requestCount("Verified reply."))
+            assertFalse(f.warned())
+        } finally { f.close() }
+    }
+
+    @Test(timeout = 8000) fun speechRateLimitRetriesOnceThenExplainsTheProviderLimit() = runBlocking {
+        val f = RenderFixture()
+        try {
+            f.start(); f.fail(java.io.IOException("Synthetic upgrade refusal"), 429)
+            assertTrue(waitFor { f.requestCount("Verified reply.") == 2 })
+            f.fail(java.io.IOException("Synthetic upgrade refusal"), 429)
+            assertTrue(waitFor { f.events.any { it.optString("message").contains("provider is busy") } })
+            assertEquals(2, f.requestCount("Verified reply.")); assertTrue(f.audio.isEmpty())
+        } finally { f.close() }
+    }
+
+    @Test(timeout = 8000) fun rejectedSpeechCredentialsAreNotRetriedOrExposed() = runBlocking {
+        val f = RenderFixture()
+        try {
+            f.start(); f.fail(java.io.IOException("SYNTHETIC_PRIVATE_PROVIDER_DETAIL"), 401)
+            assertTrue(waitFor { f.events.any { it.optString("message").contains("speech session could not start") } })
+            assertEquals(1, f.requestCount("Verified reply.")); assertTrue(f.audio.isEmpty())
+            assertFalse(f.events.toString().contains("SYNTHETIC_PRIVATE_PROVIDER_DETAIL"))
+            assertFalse(f.events.filter { it.optString("type") == "warning" }.toString().contains("401"))
+            assertEquals("http_401", f.events.single { it.optString("turn_id") == "speech-transport" }.getString("error_code"))
+        } finally { f.close() }
+    }
+
+    @Test(timeout = 8000) fun speechRetryStillRejectsChangedWordsAndCertificateFailures() = runBlocking {
+        val f = RenderFixture()
+        try {
+            f.start(); f.fail(java.io.IOException("Synthetic disconnect"))
+            assertTrue(waitFor { f.requestCount("Verified reply.") == 2 })
+            f.receive(renderPcm()); f.receive(renderTranscript(text = "Unverified reply.")); f.receive(renderDone()); f.closeSocket()
+            assertTrue(waitFor { f.warned() }); assertTrue(f.audio.isEmpty())
+            assertEquals(2, f.requestCount("Verified reply."))
+        } finally { f.close() }
+        val rejected = RenderFixture()
+        try {
+            rejected.start(); rejected.fail(javax.net.ssl.SSLPeerUnverifiedException("Synthetic certificate refusal"))
+            assertTrue(waitFor { rejected.warned() }); assertTrue(rejected.audio.isEmpty())
+            assertEquals(1, rejected.requestCount("Verified reply."))
+        } finally { rejected.close() }
+    }
+
     @Test(timeout = 12000) fun proseEmphasisIsNotSpokenButLiteralStarsRemainRequired() = runBlocking {
         for ((native,spoken,allowed) in listOf(
             Triple("One available skill is **hermes-agent**.","One available skill is hermes-agent.",true),
@@ -53,17 +176,6 @@ class NativeSpeechBackendTest {
             assertNotEquals(normalizeVoiceText("Height 6\u2019"),normalizeVoiceText("Height 6"))
         } finally { f.close() }
     }
-    @Test(timeout = 8000) fun completedGeminiSilenceRetriesOnlyTheReadOnlySpeechRender() = runBlocking {
-        val f=RenderFixture()
-        try {
-            f.start();f.receive(renderTranscript(text="<silence></silence>"));f.receive(renderDone())
-            assertTrue("A silent completed generation gets one new isolated render",waitFor { f.requestCount("Verified reply.")==2 })
-            assertTrue(f.audio.isEmpty());assertFalse(f.warned())
-            f.receive(renderPcm());f.receive(renderTranscript());f.receive(renderDone())
-            assertTrue(waitFor { f.events.any { it.optString("text")=="Verified reply." } })
-            assertEquals(1,f.audio.size);assertEquals(2,f.requestCount("Verified reply."));assertFalse(f.warned())
-        } finally { f.close() }
-    }
     @Test(timeout = 8000) fun straightAndCurlyProseQuotesRenderTheSameNativeWords() = runBlocking {
         val f=RenderFixture()
         try {
@@ -79,10 +191,11 @@ class NativeSpeechBackendTest {
         val f=RenderFixture()
         try {
             f.start("Width 6\" and height 8\".");f.receive(renderPcm())
-            f.receive(renderTranscript(text="Width 6 and height 8."));f.receive(renderDone())
+            f.receive(renderTranscript(text="Width 6 and height 8."));f.receive(renderDone()); f.closeSocket()
             assertTrue(waitFor { f.warned() });assertTrue(f.audio.isEmpty())
         } finally { f.close() }
     }
+
     @Test fun geminiNumericAdditionSpellingKeepsTheRecognizedInput() {
         for((input,echo) in listOf("What is 2 + 3?" to "What is 2 plus 3?", "WHAT is 12.5 plus 3?" to "What is 12.5+3?", "Add 1+2+3" to "Add 1 plus 2 plus 3")) {
             val ledger=VoiceFinalItems()
@@ -114,7 +227,7 @@ class NativeSpeechBackendTest {
         }
     }
     // The isolated renderer is exercised through its actual provider socket callbacks.
-    private class RenderFixture(private val provider: String = "gemini") {
+    private class RenderFixture(private val provider: String = "grok") {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val sockets = CopyOnWriteArrayList<Pair<WebSocket, WebSocketListener>>()
         val frames = CopyOnWriteArrayList<JSONObject>()
@@ -166,10 +279,19 @@ class NativeSpeechBackendTest {
             listener.onMessage(socket, frame.toString())
         }
         fun closeSocket() { val (socket, listener) = sockets.last(); listener.onClosed(socket, 1000, "Fixture") }
+        fun closeWithCode(code: Int, reason: String = "Fixture") {
+            val (socket, listener) = sockets.last()
+            listener.onClosing(socket, code, reason); listener.onClosed(socket, code, reason)
+        }
+        fun fail(error: Throwable, code: Int? = null) {
+            val (socket, listener) = sockets.last()
+            val response = code?.let { Response.Builder().request(socket.request()).protocol(Protocol.HTTP_1_1).code(it).message("Fixture").build() }
+            listener.onFailure(socket, error, response)
+        }
         fun warned() = events.any { it.optString("message").contains("could not safely read") }
         fun close() { renderer.close(); scope.cancel() }
     }
-    private class Fixture(provider: String = "gemini", private val authority: Boolean = false, stallAfterMs: Long = 20000, sendGatewayReady: Boolean = true,
+    private class Fixture(private val provider: String = "gemini", private val authority: Boolean = false, stallAfterMs: Long = 20000, sendGatewayReady: Boolean = true,
         private val ownerFence: Any = Any(), private val ownerActive: () -> Boolean = { true }) {
         val runtime = if (authority) "stored" else "runtime"
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -178,6 +300,7 @@ class NativeSpeechBackendTest {
         val providerSockets = CopyOnWriteArrayList<Pair<WebSocket, WebSocketListener>>()
         val inputSockets = CopyOnWriteArrayList<Pair<WebSocket, WebSocketListener>>()
         val providerFrames = CopyOnWriteArrayList<JSONObject>()
+        val tts = SpeechHttpFixture()
         val nativeFrames = CopyOnWriteArrayList<JSONObject>()
         val nativeSockets = CopyOnWriteArrayList<Pair<WebSocket, WebSocketListener>>()
         @Volatile var autoGatewayReady = sendGatewayReady
@@ -339,13 +462,13 @@ class NativeSpeechBackendTest {
         lateinit var voice: DirectVoice
         init {
             voice = DirectVoice(client, "call", "stored", scope, { bytes -> audio += bytes; if(autoPlay) voice.played(bytes.size) }, { events += it }, { events += json("type" to "failure", "message" to it) },
-                credentials = VoiceSessionCredentials(provider, "fixture-key", defaultVoiceModel(provider), defaultVoiceName(provider), "balanced"), providerSocketFactory = speech, stallAfterMs = stallAfterMs, ownerFence = ownerFence, ownerActive = ownerActive)
+                credentials = VoiceSessionCredentials(provider, "fixture-key", defaultVoiceModel(provider), defaultVoiceName(provider), "balanced"), providerSocketFactory = speech, stallAfterMs = stallAfterMs, ownerFence = ownerFence, ownerActive = ownerActive, providerCallFactory = tts)
         }
 
         suspend fun start() {
             voice.start()
             assertTrue("Provider was not admitted", waitFor { events.any { it.optString("state") == "listening" } })
-            assertTrue("Greeting render was not started", waitFor { renderSockets().isNotEmpty() })
+            assertTrue("Greeting render was not started", waitFor { if (provider == "gemini") tts.requests.isNotEmpty() else renderSockets().isNotEmpty() })
         }
         fun gatewayReady(index: Int, canonical: Boolean) {
             val (socket,listener)=nativeSockets[index]
@@ -357,13 +480,8 @@ class NativeSpeechBackendTest {
             listener.onMessage(socket, frame.toString())
         }
         fun renderSockets() = providerSockets.filter { pair -> inputSockets.none { it.first === pair.first } }
-        fun renderRequestCount(text:String) = providerFrames.count {
-            it.optJSONObject("realtimeInput")?.optString("text")==text || it.optJSONObject("clientContent")?.toString()?.contains(text)==true
-        }
-        fun receiveRender(frame: JSONObject) {
-            val (socket, listener) = renderSockets().last()
-            listener.onMessage(socket, frame.toString())
-        }
+        fun renderRequestCount(text: String) = if (provider == "gemini") tts.requests.indices.count { tts.text(it) == text }
+            else providerFrames.count { it.optJSONObject("item")?.optJSONArray("content")?.optJSONObject(0)?.optString("text") == text }
         fun prompts() = nativeFrames.filter { it.optString("method") == "prompt.submit" }
         @Suppress("UNCHECKED_CAST")
         fun pendingVoiceJob(): Job {
@@ -383,225 +501,14 @@ class NativeSpeechBackendTest {
         private fun openAiFinal(id: String, text: String) = json("type" to "conversation.item.input_audio_transcription.completed", "item_id" to id, "content_index" to 0, "transcript" to text)
     }
 
-    private fun renderPcm(provider: String = "gemini", data: String = "AAE=") = if (provider == "gemini")
-        json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("inlineData" to json("mimeType" to "audio/pcm;rate=24000", "data" to data))))))
-    else json("type" to "response.output_audio.delta", "delta" to data)
+    private fun renderPcm(provider: String = "grok", data: String = "AAE=") =
+        json("type" to "response.output_audio.delta", "delta" to data)
 
-    private fun renderTranscript(provider: String = "gemini", text: String = "Verified reply.") = if (provider == "gemini")
-        json("serverContent" to json("outputTranscription" to json("text" to text)))
-    else json("type" to "response.output_audio_transcript.done", "item_id" to "output-one", "transcript" to text)
+    private fun renderTranscript(provider: String = "grok", text: String = "Verified reply.") =
+        json("type" to "response.output_audio_transcript.done", "item_id" to "output-one", "transcript" to text)
 
-    private fun renderDone(provider: String = "gemini", status: String? = "IDLE") = if (provider == "gemini")
-        json("serverContent" to json("turnComplete" to true).apply { if (status != null) put("interactionStatus", status) })
-    else json("type" to "response.done", "response" to JSONObject().apply { if (status != null) put("status", status) })
-
-    @Test(timeout = 8000) fun geminiRenderSetupIsAudioOnlyWithoutToolsOrResumption() = runBlocking {
-        val f = RenderFixture()
-        try {
-            f.start()
-            val setup = f.frames.first { it.has("setup") }.getJSONObject("setup")
-            val modalities = setup.getJSONObject("generationConfig").getJSONArray("responseModalities")
-            assertEquals(1, modalities.length()); assertEquals("AUDIO", modalities.getString(0))
-            assertTrue(setup.has("outputAudioTranscription"))
-            assertFalse(setup.has("inputAudioTranscription")); assertFalse(setup.has("tools"))
-            assertFalse(setup.has("sessionResumption")); assertFalse(setup.has("contextWindowCompression"))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 8000) fun geminiCompletedAudioWithoutTranscriptPlaysOnceAndCaptionsAfterPresentation() = runBlocking {
-        val f = RenderFixture()
-        try {
-            f.autoPlay = false; f.start("5")
-            f.receive(renderPcm())
-            assertTrue("PCM is held until the owned render completes", f.audio.isEmpty())
-            f.receive(renderDone())
-            assertTrue("A completed Gemini render need not contain an output transcript", waitFor { f.audio.size == 1 })
-            assertArrayEquals(byteArrayOf(0, 1), f.audio.single().copyOfRange(0, 2))
-            assertTrue("The native text is not captioned before presentation", f.events.none { it.optString("role") == "assistant" })
-            f.renderer.played(f.audio.single().size)
-            assertTrue(waitFor { f.events.any { it.optString("role") == "assistant" && it.optString("text") == "5" } })
-            assertEquals("A missing optional transcript must not retry", 1, f.requestCount("5"))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 8000) fun geminiLegacyTurnCompleteWithoutStatusStillAllowsOptionalTranscript() = runBlocking {
-        val f = RenderFixture()
-        try {
-            f.start(); f.receive(renderPcm()); f.receive(renderDone(status = null))
-            assertTrue("An absent legacy status is distinct from an explicit nonterminal status", waitFor { f.audio.size == 1 })
-            assertEquals(1, f.requestCount("Verified reply."))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 8000) fun geminiTranscriptionObjectWithoutTextRemainsOptional() = runBlocking {
-        val f = RenderFixture()
-        try {
-            f.start(); f.receive(renderPcm()); f.receive(json("serverContent" to json("outputTranscription" to json())))
-            f.receive(renderDone()); assertTrue(waitFor { f.audio.size == 1 })
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 12000) fun geminiBlankTranscriptRemainsOptionalAndDoesNotPoisonLaterText() = runBlocking {
-        for (blank in listOf("", "   ", "\u00a0")) {
-            val f = RenderFixture()
-            try {
-                f.start(); f.receive(renderPcm()); f.receive(renderTranscript(text = blank)); f.receive(renderDone())
-                assertTrue("Blank text is an absent transcript", waitFor { f.audio.size == 1 })
-            } finally { f.close() }
-        }
-        val followed = RenderFixture()
-        try {
-            followed.start(); followed.receive(renderPcm()); followed.receive(renderTranscript(text = ""))
-            followed.receive(renderTranscript()); followed.receive(renderDone())
-            assertTrue("An empty fragment must not poison later matching text", waitFor { followed.audio.size == 1 })
-        } finally { followed.close() }
-    }
-
-    @Test(timeout = 10000) fun geminiMalformedTranscriptCannotBypassTheMismatchGuard() = runBlocking {
-        val supplied = listOf(
-            json("outputTranscription" to json("text" to 42)),
-            json("outputTranscription" to json("text" to JSONObject.NULL)),
-            json("outputTranscription" to JSONObject.NULL),
-        )
-        for (content in supplied) {
-            val f = RenderFixture()
-            try {
-                f.start(); f.receive(renderPcm()); f.receive(json("serverContent" to content)); f.receive(renderDone()); f.closeSocket()
-                assertTrue(waitFor { f.audio.isNotEmpty() || f.warned() })
-                assertTrue("A supplied invalid transcript is not an absent transcript", f.audio.isEmpty())
-            } finally { f.close() }
-        }
-    }
-
-    @Test(timeout = 12000) fun geminiMissingOutputTranscriptStillRendersTheVerifiedNativeReply() = runBlocking {
-        val f = Fixture(authority = true)
-        try {
-            f.start(); f.receive(geminiFinal("What is two plus three?"))
-            assertTrue(waitFor { f.prompts().size == 1 })
-            f.admission = json("status" to "terminal", "outcome" to "completed", "admission_id" to "admission-1", "ref" to json("session_id" to "stored"), "result" to json("final_response" to "5"))
-            assertTrue(withTimeoutOrNull(6000) { while (f.renderRequestCount("5") == 0) delay(10); true } == true)
-            f.receiveRender(renderPcm()); f.receiveRender(renderDone())
-            assertTrue("The native result must reach the speaker without an optional transcript", waitFor { f.audio.size == 1 })
-            assertTrue(waitFor { f.events.any { it.optString("role") == "assistant" && it.optString("text") == "5" } })
-            assertEquals(1, f.renderRequestCount("5")); assertEquals(1, f.prompts().size)
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 12000) fun geminiExplicitNonterminalOrUnknownInteractionNeverReleasesAudio() = runBlocking {
-        for (status in listOf("IN_PROGRESS", "INTERACTION_STATUS_UNSPECIFIED", "FUTURE_VALUE", 42, JSONObject.NULL)) {
-            val f = RenderFixture()
-            try {
-                f.start(); f.receive(renderPcm()); f.receive(renderTranscript())
-                f.receive(json("serverContent" to json("turnComplete" to true, "interactionStatus" to status)))
-                withTimeoutOrNull(1000) { while (f.audio.isEmpty() && !f.warned()) delay(10) }
-                assertTrue("$status is not a successful render completion", f.audio.isEmpty())
-            } finally { f.close() }
-        }
-    }
-
-    @Test(timeout = 8000) fun geminiInProgressWaitsForIdleBeforePlayingAndCaptioning() = runBlocking {
-        val f = RenderFixture()
-        try {
-            f.autoPlay = false; f.start()
-            f.receive(renderPcm()); f.receive(renderTranscript()); f.receive(renderDone(status = "IN_PROGRESS"))
-            delay(150)
-            assertTrue("IN_PROGRESS holds audio until a terminal status", f.audio.isEmpty())
-            assertTrue(f.events.none { it.optString("role") == "assistant" })
-            assertFalse("IN_PROGRESS is not a render failure", f.warned())
-            f.receive(renderDone(status = null)); delay(150)
-            assertTrue("An absent status cannot resolve an explicit IN_PROGRESS", f.audio.isEmpty())
-            assertFalse(f.warned())
-            f.receive(renderDone(status = "IDLE"))
-            assertTrue("A later IDLE completes the same owned render", waitFor { f.audio.size == 1 })
-            assertTrue(f.events.none { it.optString("role") == "assistant" })
-            f.renderer.played(f.audio.single().size)
-            assertTrue(waitFor { f.events.any { it.optString("role") == "assistant" && it.optString("text") == "Verified reply." } })
-            assertEquals(1, f.requestCount("Verified reply."))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 8000) fun geminiErrorFrameInvalidatesTheWholeRender() = runBlocking {
-        val f = RenderFixture()
-        try {
-            f.start(); f.receive(json("error" to json("code" to 500, "message" to "fixture")))
-            f.receive(renderPcm()); f.receive(renderTranscript()); f.receive(renderDone())
-            assertTrue(waitFor { f.audio.isNotEmpty() || f.warned() })
-            assertTrue("An error cannot authorize later rendered PCM", f.audio.isEmpty())
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 12000) fun geminiToolAttemptsInvalidateTheWholeRender() = runBlocking {
-        val bad = listOf(
-            json("toolCall" to json("functionCalls" to JSONArray().put(json("id" to "call", "name" to "do_work", "args" to json())))),
-            json("toolCallCancellation" to json("ids" to JSONArray().put("call"))),
-            json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("functionCall" to json("name" to "do_work", "args" to json())))))),
-            json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("functionResponse" to json("name" to "do_work", "response" to json())))))),
-            json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("executableCode" to json("language" to "PYTHON", "code" to "pass")))))),
-            json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("codeExecutionResult" to json("outcome" to "OK")))))),
-        )
-        for (frame in bad) {
-            val f = RenderFixture()
-            try {
-                f.start(); f.receive(frame); f.receive(renderPcm()); f.receive(renderTranscript()); f.receive(renderDone())
-                assertTrue(waitFor { f.audio.isNotEmpty() || f.warned() })
-                assertTrue("A tool attempt cannot authorize rendered PCM", f.audio.isEmpty())
-            } finally { f.close() }
-        }
-    }
-
-    @Test(timeout = 8000) fun geminiSuppliedConflictingTranscriptStillSilencesTheRender() = runBlocking {
-        val f = RenderFixture()
-        try {
-            f.start(); f.receive(renderPcm()); f.receive(renderTranscript(text = "Different reply.")); f.receive(renderDone())
-            f.closeSocket()
-            assertTrue(waitFor { f.warned() })
-            assertTrue(f.audio.isEmpty()); assertEquals(1, f.requestCount("Verified reply."))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 10000) fun geminiInterruptedOrForeignRenderNeverReleasesAudio() = runBlocking {
-        for (interrupt in listOf(true, false)) {
-            val f = RenderFixture()
-            try {
-                f.start(); f.receive(renderPcm())
-                if (interrupt) f.receive(json("serverContent" to json("interrupted" to true))) else f.owner.set(false)
-                f.receive(renderTranscript()); f.receive(renderDone())
-                delay(150)
-                assertTrue("Interrupted or foreign generations must remain silent", f.audio.isEmpty())
-                assertTrue(f.events.none { it.optString("role") == "assistant" })
-            } finally { f.close() }
-        }
-    }
-
-    @Test(timeout = 12000) fun geminiEmptyMalformedAndOversizedPcmCannotPlay() = runBlocking {
-        val badData = listOf("", "AA==", "not base64!", java.util.Base64.getEncoder().encodeToString(ByteArray(192002)))
-        for (data in badData) {
-            val f = RenderFixture()
-            try {
-                f.start(); f.receive(renderPcm(data = data)); f.receive(renderTranscript()); f.receive(renderDone()); f.closeSocket()
-                assertTrue(waitFor { f.warned() }); assertTrue("Invalid PCM must stay silent", f.audio.isEmpty())
-            } finally { f.close() }
-        }
-        val empty = RenderFixture()
-        try {
-            empty.start(); empty.receive(renderTranscript()); empty.receive(renderDone())
-            assertTrue(waitFor { empty.requestCount("Verified reply.")==2 })
-            empty.receive(renderTranscript()); empty.receive(renderDone())
-            assertTrue(waitFor { empty.warned() }); assertTrue(empty.audio.isEmpty())
-            assertEquals("Empty speech retries are bounded",2,empty.requestCount("Verified reply."))
-        } finally { empty.close() }
-    }
-
-    @Test(timeout = 10000) fun geminiAggregatePcmLimitRejectsAnOversizedRender() = runBlocking {
-        val f = RenderFixture()
-        try {
-            f.start()
-            val chunk = java.util.Base64.getEncoder().encodeToString(ByteArray(192000))
-            repeat(16) { f.receive(renderPcm(data = chunk)) }
-            f.receive(renderDone())
-            assertTrue(waitFor { f.warned() }); assertTrue(f.audio.isEmpty())
-        } finally { f.close() }
-    }
+    private fun renderDone(provider: String = "grok", status: String? = "completed") =
+        json("type" to "response.done", "response" to JSONObject().apply { if (status != null) put("status", status) })
 
     @Test(timeout = 15000) fun otherProviderUnsuccessfulResponseDoneCannotReleaseMatchingAudio() = runBlocking {
         for (provider in listOf("grok", "openai")) for (status in listOf(null, "incomplete", "in_progress", "cancelled", "failed")) {
@@ -1040,39 +947,29 @@ class NativeSpeechBackendTest {
         } finally { f.close() }
     }
 
-    @Test(timeout = 12000) fun onlyMatchingAudioForAnOwnedCanonicalReplyIsReleased() = runBlocking {
+    @Test(timeout = 12000) fun onlyCompletedSynthesisForAnOwnedCanonicalReplyIsReleased() = runBlocking {
         val f = Fixture(authority = true)
         try {
             f.start(); f.receive(geminiFinal("Check this"))
             assertTrue(waitFor { f.prompts().size == 1 })
             f.admission = json("status" to "terminal", "outcome" to "completed", "admission_id" to "admission-1", "ref" to json("session_id" to "stored"), "result" to json("final_response" to "Hermes verified it."))
             assertTrue("Verified native result should create a separate rendering session", withTimeoutOrNull(6000) { while(f.renderRequestCount("Hermes verified it.")==0) delay(10); true } == true)
-            f.receiveRender(json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("inlineData" to json("mimeType" to "audio/pcm;rate=24000", "data" to "AAE=")))))))
-            f.receiveRender(json("serverContent" to json("outputTranscription" to json("text" to "Hermes verified it.", "finished" to true))))
-            f.receiveRender(json("serverContent" to json("turnComplete" to true)))
-            assertTrue("Only the checked render may play", waitFor { f.audio.size == 1 })
+            f.tts.respond()
+            assertTrue("Only the completed owned synthesis may play", waitFor { f.audio.size == 1 })
             assertArrayEquals(byteArrayOf(0, 1), f.audio.single().copyOfRange(0,2))
             assertTrue(f.audio.single().drop(2).all { it == 0.toByte() })
         } finally { f.close() }
     }
 
     private suspend fun checkNativeSpeech(expected: String, spoken: String, playable: Boolean) {
-        val f = Fixture(authority = true)
+        val f = RenderFixture()
         try {
-            f.start(); f.receive(geminiFinal("Check this"))
-            assertTrue(waitFor { f.prompts().size == 1 })
-            f.admission = json("status" to "terminal", "outcome" to "completed", "admission_id" to "admission-1", "ref" to json("session_id" to "stored"), "result" to json("final_response" to expected))
-            assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount(expected)==0) delay(10); true } == true)
-            f.receiveRender(json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("inlineData" to json("mimeType" to "audio/pcm;rate=24000", "data" to "AAE=")))))))
-            f.receiveRender(json("serverContent" to json("outputTranscription" to json("text" to spoken))))
-            f.receiveRender(json("serverContent" to json("turnComplete" to true)))
+            f.start(expected); f.receive(renderPcm()); f.receive(renderTranscript(text = spoken)); f.receive(renderDone())
             if (playable) {
-                assertTrue("Unspoken quotation marks must not silence the native reply", waitFor { f.audio.isNotEmpty() })
-                assertTrue(waitFor { f.events.any { it.optString("role")=="assistant" && it.optString("text")==expected } })
+                assertTrue("Equivalent prose must retain the native caption", waitFor { f.events.any { it.optString("text") == expected } })
+                assertEquals(1, f.audio.size)
             } else {
-                val (socket,listener)=f.renderSockets().last();listener.onClosed(socket,1000,"Fixture")
-                assertTrue(waitFor { f.events.any { it.optString("message").contains("could not safely read") } })
-                assertTrue(f.audio.isEmpty())
+                f.closeSocket(); assertTrue(waitFor { f.warned() }); assertTrue(f.audio.isEmpty())
             }
         } finally { f.close() }
     }
@@ -1092,20 +989,8 @@ class NativeSpeechBackendTest {
         ).forEach { (expected,spoken) -> checkNativeSpeech(expected,spoken,false) }
     }
 
-    @Test(timeout = 12000) fun rendererThatAddsWordsIsSilenced() = runBlocking {
-        val f = Fixture(authority = true)
-        try {
-            f.start(); f.receive(geminiFinal("Check this"))
-            assertTrue(waitFor { f.prompts().size == 1 })
-            f.admission = json("status" to "terminal", "outcome" to "completed", "admission_id" to "admission-1", "ref" to json("session_id" to "stored"), "result" to json("final_response" to "Hermes verified it."))
-            assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount("Hermes verified it.")==0) delay(10); true } == true)
-            f.receiveRender(json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("inlineData" to json("mimeType" to "audio/pcm;rate=24000", "data" to "AAE=")))))))
-            f.receiveRender(json("serverContent" to json("outputTranscription" to json("text" to "Hermes verified it and sent the money."))))
-            f.receiveRender(json("serverContent" to json("turnComplete" to true)))
-            val (socket,listener)=f.renderSockets().last();listener.onClosed(socket,1000,"Fixture")
-            assertTrue(waitFor { f.events.any { it.optString("message").contains("could not safely read") } })
-            assertTrue(f.audio.isEmpty())
-        } finally { f.close() }
+    @Test(timeout = 8000) fun rendererThatAddsWordsIsSilenced() = runBlocking {
+        checkNativeSpeech("Hermes verified it.", "Hermes verified it and sent the money.", false)
     }
 
     @Test fun geminiExplicitFinalityNeverDependsOnTheModelName() {
@@ -1136,9 +1021,9 @@ class NativeSpeechBackendTest {
             f.start();f.receive(geminiFinal("Check this"));assertTrue(waitFor { f.prompts().size==1 })
             f.admission=json("status" to "terminal","outcome" to "completed","admission_id" to "admission-1","ref" to json("session_id" to "stored"),"result" to json("final_response" to "Hermes verified it."))
             assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount("Hermes verified it.")==0) delay(10);true }==true)
-            f.receiveRender(json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("inlineData" to json("mimeType" to "audio/pcm;rate=24000","data" to "AAE=")))))))
+            val stale = f.tts.requests.last()
             f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receiveRender(json("serverContent" to json("outputTranscription" to json("text" to "Hermes verified it."),"turnComplete" to true)))
+            stale.respond(SpeechHttpFixture.pcm())
             delay(150);assertTrue(f.audio.isEmpty())
         } finally { f.close() }
     }
@@ -1153,8 +1038,7 @@ class NativeSpeechBackendTest {
                 "status" to "uncertain","error_code" to "native_turn_pending_confirmation","will_continue" to true))
             val pendingText="Your request is still pending; its outcome is not yet confirmed."
             assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount(pendingText)==0) delay(10);true }==true)
-            f.receiveRender(json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("inlineData" to json("mimeType" to "audio/pcm;rate=24000","data" to "AAE=")))))))
-            f.receiveRender(json("serverContent" to json("outputTranscription" to json("text" to pendingText),"turnComplete" to true)))
+            f.tts.respond()
             assertTrue(waitFor { f.audio.size==1 })
             f.jobs=JSONArray().put(json("job_id" to "job-1","request_id" to requestId,"stored_session_id" to "stored","runtime_session_id" to "runtime",
                 "status" to "done","result" to "A verified final reply."))
@@ -1168,8 +1052,7 @@ class NativeSpeechBackendTest {
             f.autoPlay=false;f.start();f.receive(geminiFinal("Check this"));assertTrue(waitFor { f.prompts().size==1 })
             f.admission=json("status" to "terminal","outcome" to "completed","admission_id" to "admission-1","ref" to json("session_id" to "stored"),"result" to json("final_response" to "Hermes verified it."))
             assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount("Hermes verified it.")==0) delay(10);true }==true)
-            f.receiveRender(json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("inlineData" to json("mimeType" to "audio/pcm;rate=24000","data" to "AAE=")))))))
-            f.receiveRender(json("serverContent" to json("outputTranscription" to json("text" to "Hermes verified it."),"turnComplete" to true)))
+            f.tts.respond()
             assertTrue(waitFor { f.audio.size==1 })
             assertTrue(f.events.none { it.optString("role")=="assistant" && it.optString("text")=="Hermes verified it." })
             f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
@@ -1185,9 +1068,7 @@ class NativeSpeechBackendTest {
             f.autoPlay=false;f.start();f.receive(geminiFinal("Check this"));assertTrue(waitFor { f.prompts().size==1 })
             f.admission=json("status" to "terminal","outcome" to "completed","admission_id" to "admission-1","ref" to json("session_id" to "stored"),"result" to json("final_response" to "Hermes verified it."))
             assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount("Hermes verified it.")==0) delay(10);true }==true)
-            val pcm=java.util.Base64.getEncoder().encodeToString(ByteArray(48000))
-            repeat(3) { f.receiveRender(json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("inlineData" to json("mimeType" to "audio/pcm;rate=24000","data" to pcm))))))) }
-            f.receiveRender(json("serverContent" to json("outputTranscription" to json("text" to "Hermes verified it."),"turnComplete" to true)))
+            f.tts.respond(SpeechHttpFixture.pcm(java.util.Base64.getEncoder().encodeToString(ByteArray(144000))))
             assertTrue(waitFor { f.audio.size==2 });delay(100)
             assertEquals("At most two seconds can be outstanding",2,f.audio.size)
             assertTrue(f.events.none { it.optString("role")=="assistant" && it.optString("text")=="Hermes verified it." })
@@ -1517,46 +1398,21 @@ class NativeSpeechBackendTest {
         } finally { f.close() }
     }
 
-    @Test(timeout = 12000) fun spokenNativeReplyAcceptsOnlyCanonicalUnicodeAndWhitespaceEquivalence() = runBlocking {
-        val f=Fixture(authority=true)
+    @Test(timeout = 8000) fun spokenNativeReplyAcceptsOnlyCanonicalUnicodeAndWhitespaceEquivalence() = runBlocking {
+        checkNativeSpeech("Caf\u00e9 balance", "Cafe\u0301\u00a0balance", true)
+    }
+
+    @Test(timeout = 8000) fun matchingRenderTranscriptBeforeTurnCompleteStillReleasesAudio() = runBlocking {
+        val f = RenderFixture()
         try {
-            f.start();f.receive(geminiFinal("Check this"));assertTrue(waitFor { f.prompts().size==1 })
-            f.admission=json("status" to "terminal","outcome" to "completed","admission_id" to "admission-1","ref" to json("session_id" to "stored"),"result" to json("final_response" to "Café balance"))
-            assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount("Caf\u00e9 balance")==0) delay(10);true }==true)
-            f.receiveRender(json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("inlineData" to json("mimeType" to "audio/pcm;rate=24000","data" to "AAE=")))))))
-            f.receiveRender(json("serverContent" to json("outputTranscription" to json("text" to "Café balance"),"turnComplete" to true)))
-            assertTrue("Canonical Unicode and spacing describe the same text",waitFor { f.audio.size==1 })
+            f.start(); f.receive(renderPcm()); f.receive(renderTranscript()); delay(100)
+            assertTrue("PCM must wait for response completion", f.audio.isEmpty())
+            f.receive(renderDone()); assertTrue(waitFor { f.audio.size == 1 })
         } finally { f.close() }
     }
 
-    @Test(timeout = 12000) fun matchingRenderTranscriptBeforeTurnCompleteStillReleasesAudio() = runBlocking {
-        val f=Fixture(authority=true)
-        try {
-            f.start();f.receive(geminiFinal("Check this"));assertTrue(waitFor { f.prompts().size==1 })
-            f.admission=json("status" to "terminal","outcome" to "completed","admission_id" to "admission-1","ref" to json("session_id" to "stored"),"result" to json("final_response" to "Verified reply."))
-            assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount("Verified reply.")==0) delay(10);true }==true)
-            f.receiveRender(json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("inlineData" to json("mimeType" to "audio/pcm;rate=24000","data" to "AAE=")))))))
-            f.receiveRender(json("serverContent" to json("outputTranscription" to json("text" to "Verified reply."))))
-            f.receiveRender(json("serverContent" to json("generationComplete" to true)))
-            delay(150);assertTrue("PCM must wait for the turn to complete",f.audio.isEmpty())
-            f.receiveRender(json("serverContent" to json("turnComplete" to true)))
-            assertTrue("A matching supplied transcription permits the completed render",waitFor { f.audio.size==1 })
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 12000) fun mismatchedRenderTranscriptBeforeTurnCompleteNeverPlaysPcm() = runBlocking {
-        val f=Fixture(authority=true)
-        try {
-            f.start();f.receive(geminiFinal("Check this"));assertTrue(waitFor { f.prompts().size==1 })
-            f.admission=json("status" to "terminal","outcome" to "completed","admission_id" to "admission-1","ref" to json("session_id" to "stored"),"result" to json("final_response" to "Verified reply."))
-            assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount("Verified reply.")==0) delay(10);true }==true)
-            f.receiveRender(json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("inlineData" to json("mimeType" to "audio/pcm;rate=24000","data" to "AAE=")))))))
-            f.receiveRender(json("serverContent" to json("generationComplete" to true)))
-            f.receiveRender(json("serverContent" to json("outputTranscription" to json("text" to "Verified reply and extra words."))))
-            f.receiveRender(json("serverContent" to json("turnComplete" to true)))
-            assertTrue(waitFor { f.events.any { it.optString("message").contains("could not safely read") } })
-            assertTrue("A mismatched transcript never releases PCM",f.audio.isEmpty())
-        } finally { f.close() }
+    @Test(timeout = 8000) fun mismatchedRenderTranscriptBeforeTurnCompleteNeverPlaysPcm() = runBlocking {
+        checkNativeSpeech("Verified reply.", "Verified reply and extra words.", false)
     }
 
     @Test(timeout = 10000) fun geminiInputCanArriveAfterTheClosedSegmentGenerationCompletes() = runBlocking {
@@ -1572,56 +1428,25 @@ class NativeSpeechBackendTest {
         } finally { f.close() }
     }
 
-    @Test(timeout = 8000) fun geminiRendererUsesRealtimeTextForItsIsolatedSpeechRequest() = runBlocking {
-        val f=Fixture()
+    @Test(timeout = 12000) fun temporaryGeminiHttpFailureRetriesSpeechWithoutRepeatingNativeWork() = runBlocking {
+        val f = Fixture(authority = true)
         try {
-            f.start()
-            assertTrue("The selected Gemini render session must receive realtime text",waitFor {
-                f.providerFrames.any { it.optJSONObject("realtimeInput")?.optString("text")=="I'm here." }
-            })
+            f.start(); f.receive(geminiFinal("Check this")); assertTrue(waitFor { f.prompts().size == 1 })
+            f.admission = json("status" to "terminal", "outcome" to "completed", "admission_id" to "admission-1", "ref" to json("session_id" to "stored"), "result" to json("final_response" to "Verified reply."))
+            assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount("Verified reply.") == 0) delay(10); true } == true)
+            val old = f.tts.requests.last(); old.respond(JSONObject(), 503)
+            assertTrue(waitFor { f.renderRequestCount("Verified reply.") == 2 })
+            old.respond(SpeechHttpFixture.pcm()); assertTrue(f.audio.isEmpty())
+            f.tts.respond(); assertTrue(waitFor { f.audio.size == 1 })
+            assertEquals("An isolated speech retry must not repeat native work", 1, f.prompts().size)
         } finally { f.close() }
     }
 
-    @Test(timeout = 12000) fun completedGeminiRenderWithoutTranscriptDoesNotRetry() = runBlocking {
-        val f=Fixture(authority=true)
+    @Test(timeout = 8000) fun aNonemptyMismatchedRenderDoesNotRetryOrPlay() = runBlocking {
+        val f = RenderFixture()
         try {
-            f.start();f.receive(geminiFinal("Check this"));assertTrue(waitFor { f.prompts().size==1 })
-            f.admission=json("status" to "terminal","outcome" to "completed","admission_id" to "admission-1","ref" to json("session_id" to "stored"),"result" to json("final_response" to "Verified reply."))
-            assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount("Verified reply.")==0) delay(10);true }==true)
-            f.receiveRender(json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("inlineData" to json("mimeType" to "audio/pcm;rate=24000","data" to "AAE=")))))))
-            f.receiveRender(json("serverContent" to json("turnComplete" to true)))
-            assertTrue(waitFor { f.audio.size==1 });delay(100)
-            assertEquals(1,f.renderRequestCount("Verified reply."))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 12000) fun completedGeminiRenderWithoutPcmRetriesSpeechOnceWithoutRepeatingNativeWork() = runBlocking {
-        val f=Fixture(authority=true)
-        try {
-            f.start();f.receive(geminiFinal("Check this"));assertTrue(waitFor { f.prompts().size==1 })
-            f.admission=json("status" to "terminal","outcome" to "completed","admission_id" to "admission-1","ref" to json("session_id" to "stored"),"result" to json("final_response" to "Verified reply."))
-            assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount("Verified reply.")==0) delay(10);true }==true)
-            f.receiveRender(json("serverContent" to json("turnComplete" to true)))
-            assertTrue(waitFor { f.renderRequestCount("Verified reply.")==2 })
-            assertTrue(f.audio.isEmpty());assertEquals(1,f.prompts().size)
-            f.receiveRender(json("serverContent" to json("turnComplete" to true)))
-            assertTrue(withTimeoutOrNull(6000) { while(f.events.none { it.optString("message").contains("could not safely read") }) delay(10);true }==true)
-            assertEquals(2,f.renderRequestCount("Verified reply."));assertTrue(f.audio.isEmpty())
-            assertEquals("A speech retry never repeats the Hermes request",1,f.prompts().size)
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 12000) fun aNonemptyMismatchedRenderDoesNotRetryOrPlay() = runBlocking {
-        val f=Fixture(authority=true)
-        try {
-            f.start();f.receive(geminiFinal("Check this"));assertTrue(waitFor { f.prompts().size==1 })
-            f.admission=json("status" to "terminal","outcome" to "completed","admission_id" to "admission-1","ref" to json("session_id" to "stored"),"result" to json("final_response" to "Verified reply."))
-            assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount("Verified reply.")==0) delay(10);true }==true)
-            f.receiveRender(json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("inlineData" to json("mimeType" to "audio/pcm;rate=24000","data" to "AAE=")))))))
-            f.receiveRender(json("serverContent" to json("outputTranscription" to json("text" to "A different answer."),"turnComplete" to true)))
-            val (socket,listener)=f.renderSockets().last();listener.onClosed(socket,1000,"Fixture")
-            assertTrue(waitFor { f.events.any { it.optString("message").contains("could not safely read") } })
-            assertEquals(1,f.renderRequestCount("Verified reply."));assertTrue(f.audio.isEmpty())
+            f.start(); f.receive(renderPcm()); f.receive(renderTranscript(text = "A different answer.")); f.receive(renderDone()); f.closeSocket()
+            assertTrue(waitFor { f.warned() }); assertTrue(f.audio.isEmpty()); assertEquals(1, f.requestCount("Verified reply."))
         } finally { f.close() }
     }
 

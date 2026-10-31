@@ -7,6 +7,85 @@ import org.junit.Test
 import java.util.Collections
 
 class NativeCallTranscriptSyncTest {
+    @Test(timeout = 23000) fun speechDiagnosticDrainSharesTheTextBudgetWithoutMarkingSavedWordsIncomplete() = runBlocking {
+        val entered = CompletableDeferred<Unit>(); val savedCaption = CompletableDeferred<Unit>()
+        val attempts = java.util.concurrent.atomic.AtomicInteger(); var terminal: JSONObject? = null
+        val worker = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val sync = NativeCallTranscriptSync({ path, _, body ->
+            if (path.endsWith("events")) {
+                if (body!!.getJSONArray("events").getJSONObject(0).optString("type") == "media_diagnostic") {
+                    entered.complete(Unit); awaitCancellation()
+                } else {
+                    if (attempts.incrementAndGet() <= 2) { delay(2500); throw java.io.IOException("Synthetic text retry") }
+                    savedCaption.complete(Unit)
+                }
+            } else terminal = JSONObject(body.toString())
+            JSONObject().put("stored", true).put("closed", true).put("transcript_status", "saved")
+        }, "speech-budget", worker, {})
+        try {
+            repeat(6) { index -> sync.event(JSONObject().put("event_id", "diagnostic-$index").put("turn_id", "speech-close")
+                .put("stream", "assistant").put("type", "media_diagnostic").put("at_ms", index)) }
+            withTimeout(2000) { entered.await() }
+            sync.event(JSONObject().put("event_id", "caption").put("turn_id", "1").put("type", "transcript")
+                .put("role", "assistant").put("text", "Saved fixture words").put("final", true).put("at_ms", 7))
+            val started = System.nanoTime()
+            assertTrue(withTimeout(20000) { sync.finish() })
+            val elapsed = (System.nanoTime() - started) / 1_000_000
+            assertTrue("Use the existing shared drain deadline: $elapsed ms", elapsed in 14000..18500)
+            assertTrue(savedCaption.isCompleted); assertFalse(terminal!!.getBoolean("incomplete"))
+        } finally { worker.cancel() }
+    }
+
+    @Test(timeout = 8000) fun hangupDrainsSpeechFailureWithoutBlockingTheFinalCaption() = runBlocking {
+        val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>(); val caption = CompletableDeferred<Unit>()
+        val diagnostic = CompletableDeferred<Unit>(); var terminal: JSONObject? = null
+        val worker = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val sync = NativeCallTranscriptSync({ path, _, body ->
+            if (path.endsWith("events")) {
+                if (body!!.getJSONArray("events").getJSONObject(0).optString("type") == "media_diagnostic") {
+                    entered.complete(Unit); release.await(); diagnostic.complete(Unit)
+                } else caption.complete(Unit)
+            } else terminal = JSONObject(body.toString())
+            JSONObject().put("stored", true).put("closed", true).put("transcript_status", "saved")
+        }, "speech-drain", worker, {})
+        try {
+            sync.event(JSONObject().put("event_id", "diagnostic").put("turn_id", "speech-close")
+                .put("stream", "assistant").put("type", "media_diagnostic").put("stage", "provider_error").put("at_ms", 1))
+            withTimeout(2000) { entered.await() }
+            sync.event(JSONObject().put("event_id", "caption").put("turn_id", "1").put("type", "transcript")
+                .put("role", "assistant").put("text", "Fixture answer").put("final", true).put("at_ms", 2))
+            val closing = async { sync.finish() }
+            withTimeout(2000) { caption.await() }; delay(100)
+            assertFalse("Finalization must not overtake the accepted speech failure", closing.isCompleted)
+            assertNull(terminal)
+            release.complete(Unit)
+            assertTrue(withTimeout(2000) { closing.await() }); assertTrue(diagnostic.isCompleted)
+            assertFalse(terminal!!.getBoolean("incomplete"))
+        } finally { release.complete(Unit); worker.cancel() }
+    }
+
+    @Test(timeout = 8000) fun lostSpeechFailureDoesNotMakeSavedWordsIncomplete() = runBlocking {
+        val entered = CompletableDeferred<Unit>(); var terminal: JSONObject? = null
+        val attempts = java.util.concurrent.atomic.AtomicInteger()
+        val worker = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val sync = NativeCallTranscriptSync({ path, _, body ->
+            if (path.endsWith("events") && body!!.getJSONArray("events").getJSONObject(0).optString("type") == "media_diagnostic") {
+                attempts.incrementAndGet(); entered.complete(Unit); throw java.io.IOException("Synthetic lost diagnostic")
+            }
+            if (path.endsWith("finalize")) terminal = JSONObject(body.toString())
+            JSONObject().put("stored", true).put("closed", true).put("transcript_status", "saved")
+        }, "speech-lost", worker, {})
+        try {
+            sync.event(JSONObject().put("event_id", "diagnostic").put("turn_id", "speech-close")
+                .put("stream", "assistant").put("type", "media_diagnostic").put("at_ms", 1))
+            withTimeout(2000) { entered.await() }
+            sync.event(JSONObject().put("event_id", "caption").put("turn_id", "1").put("type", "transcript")
+                .put("role", "assistant").put("text", "Saved fixture words").put("final", true).put("at_ms", 2))
+            assertTrue(withTimeout(3000) { sync.finish() })
+            assertEquals(2, attempts.get()); assertFalse(terminal!!.getBoolean("incomplete"))
+        } finally { worker.cancel() }
+    }
+
     @Test fun aTransientCaptionUploadFailureRetriesTheSameEventBeforeFinalizing()=runBlocking {
         val attempts=mutableListOf<String>();var terminal:JSONObject?=null
         val worker=CoroutineScope(SupervisorJob()+Dispatchers.IO)

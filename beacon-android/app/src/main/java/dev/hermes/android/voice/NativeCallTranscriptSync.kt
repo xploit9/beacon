@@ -21,6 +21,7 @@ internal class NativeCallTranscriptSync(private val request:suspend (String,Stri
     private var accepting=true
     @Volatile private var gap=false
     @Volatile private var statusFailed=false
+    @Volatile private var speechFailurePending=false
     private val statusJob=background.launch {
         for(value in statuses) {
             try { status(if((gap||statusFailed)&&value !in setOf("unavailable","failed")) "partial" else value) }
@@ -91,7 +92,9 @@ internal class NativeCallTranscriptSync(private val request:suspend (String,Stri
             partialTranscripts.remove(key)
         }
         val queue=if(copy.optString("type")=="media_diagnostic") pending else important
-        if(!queue.trySend("events" to JSONObject().put("events",JSONArray().put(copy))).isSuccess&&queue===important) { gap=true;report("partial") }
+        val accepted=queue.trySend("events" to JSONObject().put("events",JSONArray().put(copy))).isSuccess
+        if(accepted&&queue===pending&&isSpeechFailureDiagnostic(copy)) speechFailurePending=true
+        if(!accepted&&queue===important) { gap=true;report("partial") }
     }
     suspend fun finish(failed:Boolean=false):Boolean {
         val first=synchronized(this) {
@@ -107,7 +110,12 @@ internal class NativeCallTranscriptSync(private val request:suspend (String,Stri
         }
         if(!first) return finalized.await()
         try {
+            val drainStarted=System.nanoTime()
             if(withTimeoutOrNull(15000) { workers.first().join();true }!=true) { gap=true;workers.first().cancel() }
+            if(speechFailurePending) {
+                val remaining=(15000L-(System.nanoTime()-drainStarted)/1_000_000).coerceAtLeast(0)
+                withTimeoutOrNull(remaining) { workers.drop(1).joinAll() }
+            }
             workers.drop(1).forEach { it.cancel() }
             val receipt=requestReceipt("finalize",JSONObject().put("incomplete",gap).put("failed",failed),15000)
             val state=receipt?.optString("transcript_status","finalizing")?:"unavailable"

@@ -566,6 +566,7 @@ internal fun voiceChoicesPage(
                     }
                 }
                 val models = (listOf(openingModel) + catalog?.models.orEmpty().ifEmpty { listOf(defaultVoiceModel(provider)) } + selection.model).distinct()
+                if (provider == "gemini") Text(uiText("The selected Live model listens. Spoken replies use Gemini 3.8 Flash-Lite TTS with the same key and voice."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 if (models.size > 1) {
                     val shownModels = visibleOptions(models, selection.model, moreModels, 4)
                     VoiceOptionGroup(uiText("Model")) {

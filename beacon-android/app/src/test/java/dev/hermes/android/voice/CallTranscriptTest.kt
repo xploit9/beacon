@@ -8,6 +8,19 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CallTranscriptTest {
+    @Test fun speechDiagnosticsKeepOnlyCodeControlledAssistantIdentities() {
+        for (kind in speechDiagnosticTurns) {
+            assertEquals(kind, directDiagnosticTurnId(json("turn_id" to kind, "stream" to "assistant")))
+        }
+        assertEquals("connection", directDiagnosticTurnId(json("turn_id" to "speech-close", "stream" to "user")))
+        assertEquals("connection", directDiagnosticTurnId(json("turn_id" to "private-owner-value", "stream" to "assistant")))
+        assertEquals("connection", directDiagnosticTurnId(json("stage" to "provider_ready")))
+        assertEquals("connection", directDiagnosticTurnId(json("turn_id" to "speech-close")))
+        assertTrue(isSpeechFailureDiagnostic(json("type" to "media_diagnostic", "turn_id" to "speech-close", "stream" to "assistant")))
+        assertFalse(isSpeechFailureDiagnostic(json("type" to "media_diagnostic", "turn_id" to "speech-ready", "stream" to "assistant")))
+        assertFalse(isSpeechFailureDiagnostic(json("type" to "transcript", "turn_id" to "speech-close", "stream" to "assistant")))
+    }
+
     @Test fun lateProviderInputTranscriptionStaysBeforeItsReplyByTurnId() {
         val answer = CallTranscript("call:assistant:7", "assistant", "Here is the answer", turnId = "7")
         val question = CallTranscript("call:user:provider-item", "user", "What is the question?", turnId = "7")

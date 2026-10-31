@@ -456,7 +456,7 @@ class BeaconCallService : Service() {
             }
             "media_diagnostic" -> {
                 val receipt=JSONObject(value.toString()).put("event_id",java.util.UUID.randomUUID().toString())
-                    .put("turn_id","connection").put("at_ms",pcm?.clock()?:0)
+                    .put("turn_id",directDiagnosticTurnId(value)).put("at_ms",pcm?.clock()?:0)
                 transcriptSync?.event(receipt)
             }
             "tool_receipt" -> {
