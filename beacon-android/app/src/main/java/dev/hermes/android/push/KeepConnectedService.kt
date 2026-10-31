@@ -17,6 +17,7 @@ import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import dev.hermes.android.BuildConfig
@@ -65,6 +66,24 @@ private class KeepConnectedProfilesException : IOException()
 internal const val KEEP_CONNECTED_LONG_POLL_SECONDS = 25
 internal const val KEEP_CONNECTED_POLL_TIMEOUT_MILLIS = 35_000L
 internal const val KEEP_CONNECTED_MAX_PROFILE_POLLS = 8
+internal const val KEEP_CONNECTED_CPU_LEASE_MILLIS = 120_000L
+internal const val KEEP_CONNECTED_CPU_RENEW_MILLIS = 30_000L
+internal const val KEEP_CONNECTED_RESPONSE_FRESH_MILLIS = 90_000L
+
+/** The foreground connection also gives due update checks an opportunity while Android defers jobs. */
+internal suspend fun keepConnectedUpdateChecks(check: suspend () -> Unit) {
+    while (currentCoroutineContext().isActive) {
+        try { check() }
+        catch (error: CancellationException) { throw error }
+        catch (_: Exception) { /* The next due check retries; alert delivery has its own coroutine. */ }
+        delay(60_000)
+    }
+}
+
+internal fun freshKeepConnectedStatus(stored: String, lastResponse: Long, now: Long): String =
+    if (stored == KeepConnectedService.STATUS_CONNECTED &&
+        (lastResponse <= 0 || now < lastResponse || now - lastResponse > KEEP_CONNECTED_RESPONSE_FRESH_MILLIS))
+        KeepConnectedService.STATUS_RECONNECTING else stored
 
 internal fun parseKeepConnectedPage(response: JSONObject, after: Long): KeepConnectedPage {
     val rows = response.optJSONArray("events") ?: throw KeepConnectedPageException()
@@ -425,6 +444,31 @@ class KeepConnectedService : Service() {
     private var pollProvider: String? = null
     private var promoted = false
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var awakeJob: kotlinx.coroutines.Job? = null
+    private var updatesJob: kotlinx.coroutines.Job? = null
+
+    private fun protectBackgroundDelivery() {
+        if (!promoted) return
+        if (!hasNetwork(this)) { awakeJob?.cancel(); awakeJob = null; return }
+        if (awakeJob?.isActive == true) return
+        awakeJob = serviceScope.launch {
+            val wake = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:notifications")
+                .apply { setReferenceCounted(false) }
+            try {
+                while (currentCoroutineContext().isActive) {
+                    wake.acquire(KEEP_CONNECTED_CPU_LEASE_MILLIS)
+                    if (preferences(this@KeepConnectedService).getString(KEY_STATUS, STATUS_OFF) == STATUS_CONNECTED && status(this@KeepConnectedService) != STATUS_CONNECTED) {
+                        setStatus(this@KeepConnectedService, STATUS_RECONNECTING, failureReason(this@KeepConnectedService))
+                    }
+                    delay(KEEP_CONNECTED_CPU_RENEW_MILLIS)
+                }
+            } catch (error: CancellationException) { throw error }
+            catch (error: Exception) {
+                setStatus(this@KeepConnectedService, STATUS_RECONNECTING, keepConnectedFailureReason("", error))
+                stopSelf()
+            } finally { if (wake.isHeld) wake.release() }
+        }
+    }
 
     private fun restartPoll(origin: String, owner: String, nativeProvider: String) {
         val previous = pollJob
@@ -448,12 +492,16 @@ class KeepConnectedService : Service() {
             private fun networkChanged() {
                 android.os.Handler(mainLooper).post {
                     if (activeInstance === this@KeepConnectedService && isEnabled(this@KeepConnectedService)) {
+                        protectBackgroundDelivery()
                         // The reconnecting line says "back online" only while there is no network, so it follows the network too.
                         updateNotification()
                         val origin = pollOrigin
                         val owner = pollOwner
                         val provider = pollProvider
-                        if (origin != null && owner != null && provider != null) restartPoll(origin, owner, provider)
+                        if (origin != null && owner != null && provider != null) {
+                            setStatus(this@KeepConnectedService, STATUS_RECONNECTING)
+                            restartPoll(origin, owner, provider)
+                        }
                     }
                 }
             }
@@ -485,17 +533,24 @@ class KeepConnectedService : Service() {
             stopSelfResult(startId)
             return START_NOT_STICKY
         }
+        protectBackgroundDelivery()
+        if (updatesJob?.isActive != true) updatesJob = serviceScope.launch {
+            keepConnectedUpdateChecks { (application as BeaconApplication).updates.backgroundCheck() }
+        }
         val prefs = preferences(this)
         val origin = prefs.getString(KEY_ORIGIN, "").orEmpty()
         val owner = prefs.getString(KEY_OWNER, "").orEmpty()
         val provider = prefs.getString(KEY_NATIVE_PROVIDER, "").orEmpty()
         if (keepConnectedLoopNeedsRestart(pollJob?.isActive == true, pollOrigin, pollOwner, origin, owner, pollProvider, provider)) {
+            setStatus(this, STATUS_STARTING)
             restartPoll(origin, owner, provider)
         }
         return START_STICKY
     }
 
     override fun onDestroy() {
+        awakeJob?.cancel()
+        updatesJob?.cancel()
         pollJob?.cancel()
         networkCallback?.let { runCatching { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(it) } }
         networkCallback = null
@@ -579,7 +634,7 @@ class KeepConnectedService : Service() {
                         maxBytes = 1_048_576,
                         timeoutMillis = KEEP_CONNECTED_POLL_TIMEOUT_MILLIS,
                     )
-                    parseKeepConnectedPage(response, after)
+                    parseKeepConnectedPage(response, after).also { prefs.edit().putLong(KEY_LAST_RESPONSE, SystemClock.elapsedRealtime()).apply() }
                 },
                 initialize = { profile, after ->
                     val response = requireNotNull(client).nativeGetForProfile(
@@ -589,7 +644,7 @@ class KeepConnectedService : Service() {
                         query = mapOf("after" to after.toString(), "wait" to "0", "package" to BuildConfig.APPLICATION_ID),
                         maxBytes = 1_048_576,
                     )
-                    parseKeepConnectedPage(response, after)
+                    parseKeepConnectedPage(response, after).also { prefs.edit().putLong(KEY_LAST_RESPONSE, SystemClock.elapsedRealtime()).apply() }
                 },
                 signedInProfile = { client?.auth?.profile.orEmpty() },
                 onEvent = { profile, event ->
@@ -693,6 +748,7 @@ class KeepConnectedService : Service() {
     companion object {
         const val PREFS = "keep-connected"
         const val KEY_ENABLED = "enabled"
+        const val KEY_LAST_RESPONSE = "last_response_elapsed"
         const val KEY_ORIGIN = "origin"
         const val KEY_OWNER = "owner"
         const val KEY_NATIVE_PROVIDER = "native_provider"
@@ -716,7 +772,10 @@ class KeepConnectedService : Service() {
 
         private fun preferences(context: Context) = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         fun isEnabled(context: Context): Boolean = preferences(context).getBoolean(KEY_ENABLED, false)
-        fun status(context: Context): String = preferences(context).getString(KEY_STATUS, STATUS_OFF) ?: STATUS_OFF
+        fun status(context: Context): String {
+            val prefs = preferences(context)
+            return freshKeepConnectedStatus(prefs.getString(KEY_STATUS, STATUS_OFF) ?: STATUS_OFF, prefs.getLong(KEY_LAST_RESPONSE, 0), SystemClock.elapsedRealtime())
+        }
         fun failureReason(context: Context): String = preferences(context).getString(KEY_REASON, "").orEmpty()
         fun isEnabledFor(context: Context, scope: Scope): Boolean {
             val prefs = preferences(context)

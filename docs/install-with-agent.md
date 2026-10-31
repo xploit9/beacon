@@ -19,6 +19,12 @@ The installer selects the Hermes home and profile (it asks when more than one co
 
 Install the latest app from [GitHub Releases](https://github.com/xploit9/beacon/releases/latest), paste the link and sign in with Hermes. Signing in links the phone.
 
+## Background alerts
+
+Enable **Keep connected** in Notifications and allow Android notifications and background use. This uses Android's foreground service and a renewable, time-bounded CPU wake lock while online, so the connection can receive alerts with the screen asleep. It does not keep the screen on. Turning Keep connected off or losing the network releases that protection; keeping a live connection uses battery.
+
+The connection indicator requires a recent valid response and expires when responses stop. Update checks retain their normal cadence; an already verified update whose notification was blocked can be announced after notifications are allowed without waiting for another network check. Pending installer confirmations remain protected. Android's notification permission, channel settings and force-stop rules remain authoritative.
+
 ## Coming from Hermes Relay?
 
 Beacon replaces the Hermes Relay plugin and does not remove it for you. Before installing, back up `hermes-relay` outside the `plugins` folder, check the copy, then use Hermes' own commands to remove that plugin and only the scheduled jobs it created. Write down each job (name and schedule) before you remove it, and if you can't tell whose a job is, leave it. Leave your conversations, memories, other jobs and credentials alone. Skip this if you never used Hermes Relay.

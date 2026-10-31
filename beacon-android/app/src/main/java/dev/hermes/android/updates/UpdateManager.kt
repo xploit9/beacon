@@ -170,14 +170,24 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     /** "Check for updates": always asks GitHub. */
     internal fun checkNow() { if (selfUpdates) scope.launch { runCheck(force = true, visible = true) } }
 
+    private fun installerPending(): Boolean = _state.value.phase in setOf(UpdatePhase.Installing, UpdatePhase.NeedsPermission) || prefs.getInt("pending_session_id", -1) >= 0
+
     private suspend fun runCheck(force: Boolean, visible: Boolean, window: Long = UPDATE_CHECK_INTERVAL_MS) {
         val now = System.currentTimeMillis()
         synchronized(lock) {
-            if (job?.isActive == true || !updateCheckDue(prefs.getLong("last_check", 0), now, force, prefs.getLong("last_attempt", 0), window) || !checking.tryLock()) return
+            if (job?.isActive == true || !checking.tryLock()) return
         }
-        // An install waiting on Android keeps its own state on screen.
-        if (visible) publish { if (phase == UpdatePhase.Idle || phase == UpdatePhase.Available || phase == UpdatePhase.Failed) copy(phase = UpdatePhase.Checking, failure = null) else this }
         try {
+            if (!updateCheckDue(prefs.getLong("last_check", 0), now, force, prefs.getLong("last_attempt", 0), window)) {
+                synchronized(lock) {
+                    if (job?.isActive != true && !installerPending()) {
+                        Release.decode(prefs.getString("release", null))?.let(::vet)?.takeIf { it.version > updater.installedVersion() }?.let(::notifyRelease)
+                    }
+                }
+                return
+            }
+            // An install waiting on Android keeps its own state on screen.
+            if (visible) publish { if (phase == UpdatePhase.Idle || phase == UpdatePhase.Available || phase == UpdatePhase.Failed) copy(phase = UpdatePhase.Checking, failure = null) else this }
             fetchLatest(now, visible)?.let(::notifyRelease)
         } catch (error: CancellationException) { throw error }
         catch (error: Exception) { if (visible) fail(checkFailure(error)) }
@@ -207,7 +217,7 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
             edit.commit()
         }
         publish { copy(latest = vetted, release = release, checkedAt = now, failure = null, phase = if (visible && (phase == UpdatePhase.Checking || phase == UpdatePhase.Failed)) UpdatePhase.Idle else phase) }
-        if (release == null) synchronized(lock) { notifications.cancel(NOTIFICATION_ID); prefs.edit().remove("notification_token").commit() }
+        if (release == null) synchronized(lock) { if (!installerPending()) { notifications.cancel(NOTIFICATION_ID); prefs.edit().remove("notification_token").commit() } }
         return release
     }
 
@@ -235,8 +245,10 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     private fun stillVerifies(release: Release) = runCatching { vet(release) }.getOrNull() != null
 
     private fun notifyRelease(release: Release) {
-        if (!updateNotificationDue(release.version, prefs.getLong("notified_version", 0))) return
-        if (postNotification(release)) prefs.edit().putLong("notified_version", release.version).commit()
+        synchronized(lock) {
+            if (job?.isActive == true || installerPending() || !updateNotificationDue(release.version, prefs.getLong("notified_version", 0))) return
+            if (postNotification(release)) prefs.edit().putLong("notified_version", release.version).commit()
+        }
     }
 
     /** A notification can be shown now: Android 13's permission, notifications on, and the update channel not muted. */

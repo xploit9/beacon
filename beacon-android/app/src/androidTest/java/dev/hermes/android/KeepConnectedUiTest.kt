@@ -105,6 +105,27 @@ class KeepConnectedUiTest {
         }
     }
 
+    @Test fun cachedConnectedStatusExpiresWhenNotificationResponsesStop() {
+        val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
+        val prefs = app.getSharedPreferences(KeepConnectedService.PREFS, Context.MODE_PRIVATE)
+        val before = prefs.all.toMap()
+        try {
+            KeepConnectedService.setEnabled(app, null, false)
+            compose.waitForIdle()
+            val now = android.os.SystemClock.elapsedRealtime()
+            check(prefs.edit().putBoolean(KeepConnectedService.KEY_ENABLED, true).putString(KeepConnectedService.KEY_STATUS, KeepConnectedService.STATUS_CONNECTED)
+                .putLong("last_response_elapsed", now - 120_000).commit())
+            assertEquals(KeepConnectedService.STATUS_RECONNECTING, KeepConnectedService.status(app))
+            check(prefs.edit().putLong("last_response_elapsed", android.os.SystemClock.elapsedRealtime()).commit())
+            assertEquals(KeepConnectedService.STATUS_CONNECTED, KeepConnectedService.status(app))
+            check(prefs.edit().putLong("last_response_elapsed", now + 3_600_000).commit())
+            assertEquals(KeepConnectedService.STATUS_RECONNECTING, KeepConnectedService.status(app))
+        } finally {
+            restoreSharedPreferences(prefs, before)
+            if (before[KeepConnectedService.KEY_ENABLED] == true) KeepConnectedService.startIfEnabled(app)
+        }
+    }
+
     @Test fun enablingPollsFixtureTaskResultsAndCallsThroughTheirNativePaths() = runBlocking {
         val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
         val uiAutomation = InstrumentationRegistry.getInstrumentation().uiAutomation
@@ -216,11 +237,47 @@ class KeepConnectedUiTest {
             compose.waitUntil(15_000) {
                 KeepConnectedService.status(app) == KeepConnectedService.STATUS_CONNECTED && fixtureCursors.all(keepPrefs::contains)
             }
-            val taskResultEvent = fixture.emitTaskResult()
-            testEvents += taskResultEvent
-            val taskResultKey = notificationKey(taskResultEvent)
-            compose.waitUntil(15_000) { manager.activeNotifications.count { it.tag == taskResultKey && it.id == 1 } == 1 }
-            assertEquals(1, manager.activeNotifications.count { it.tag == taskResultKey && it.id == 1 })
+            fun deliveryCpuHeld(): Boolean = uiAutomation.executeShellCommand("dumpsys power").use { descriptor ->
+                java.io.FileInputStream(descriptor.fileDescriptor).bufferedReader().readLines().any {
+                    it.contains("PARTIAL_WAKE_LOCK") && it.contains("${app.packageName}:notifications")
+                }
+            }
+            assertTrue("Keep connected must protect notification polling while the screen sleeps", deliveryCpuHeld())
+            fun shell(command: String): String = uiAutomation.executeShellCommand(command).use { descriptor ->
+                java.io.FileInputStream(descriptor.fileDescriptor).bufferedReader().readText().trim()
+            }
+            val wifiWasOn = shell("settings get global wifi_on") in setOf("1", "2")
+            val mobileWasOn = shell("settings get global mobile_data") != "0"
+            val connectivity = app.getSystemService(android.net.ConnectivityManager::class.java)
+            try {
+                shell("svc wifi disable"); shell("svc data disable")
+                compose.waitUntil(15_000) { connectivity.activeNetwork == null }
+                compose.waitUntil(5_000) { !deliveryCpuHeld() }
+            } finally {
+                shell("svc wifi ${if (wifiWasOn) "enable" else "disable"}")
+                shell("svc data ${if (mobileWasOn) "enable" else "disable"}")
+            }
+            compose.waitUntil(20_000) { connectivity.activeNetwork != null && deliveryCpuHeld() }
+            val power = app.getSystemService(android.os.PowerManager::class.java)
+            val wasInteractive = power.isInteractive
+            val wasExempt = power.isIgnoringBatteryOptimizations(app.packageName)
+            try {
+                if (!wasExempt) shell("dumpsys deviceidle whitelist +${app.packageName}")
+                shell("input keyevent KEYCODE_SLEEP")
+                compose.waitUntil(5_000) { !power.isInteractive }
+                shell("dumpsys deviceidle force-idle")
+                assertTrue("Fixture must enter actual Android idle mode", power.isDeviceIdleMode)
+                val taskResultEvent = fixture.emitTaskResult()
+                testEvents += taskResultEvent
+                val taskResultKey = notificationKey(taskResultEvent)
+                compose.waitUntil(15_000) { manager.activeNotifications.count { it.tag == taskResultKey && it.id == 1 } == 1 }
+                assertEquals("An alert must arrive during idle without reopening Beacon", 1, manager.activeNotifications.count { it.tag == taskResultKey && it.id == 1 })
+                assertTrue(deliveryCpuHeld())
+            } finally {
+                shell("dumpsys deviceidle unforce")
+                if (!wasExempt) shell("dumpsys deviceidle whitelist -${app.packageName}")
+                if (wasInteractive) { shell("input keyevent KEYCODE_WAKEUP"); shell("wm dismiss-keyguard") }
+            }
             assertTrue(manager.activeNotifications.none { it.tag == notificationKey(olderEvent) })
 
             val answerEvent = fixture.emitIncomingCall(conversationId = "chat-b")
@@ -291,6 +348,7 @@ class KeepConnectedUiTest {
             compose.waitUntil(10_000) { app.push.ringingInvitation(optOutSource, optOutEvent.getString("event_id")) != null }
             assertFalse(app.push.binding(optOutSource)!!.optBoolean("keep_connected"))
             KeepConnectedService.setEnabled(app, null, false)
+            compose.waitUntil(5_000) { !deliveryCpuHeld() }
             assertNull(app.push.ringingInvitation(optOutSource, optOutEvent.getString("event_id")))
             assertFalse(app.push.authorizeKeepConnectedAction(optOutSource, optOutEvent.getString("event_id"), "answer"))
 

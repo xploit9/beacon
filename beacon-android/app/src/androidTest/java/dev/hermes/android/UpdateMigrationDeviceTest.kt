@@ -174,6 +174,62 @@ class UpdateMigrationDeviceTest {
         } finally { system.cancel(4202) }
     }
 
+    @Test fun aBlockedUpdateAlertRetriesFromVerifiedCacheBeforeAnotherNetworkCheck() = runBlocking {
+        val system = notifications()
+        check(!posted(system)) { "An existing update notification must not be replaced by the test" }
+        val github = FakeGitHub()
+        val manager = manager(github)
+        val sessions = sessionsBefore
+        try {
+            manager.backgroundCheck()
+            assertTrue(posted(system))
+            val requests = github.paths.size
+            system.cancel(4202)
+            // This is the state left when the fetch succeeds but permission or the channel blocks posting.
+            assertTrue(prefs.edit().remove("notified_version").remove("notification_token").remove("notification_version").commit())
+            val restored = manager(github)
+            restored.backgroundCheck()
+            assertTrue("A permitted pending update must not wait six hours for another fetch", posted(system))
+            assertEquals(requests, github.paths.size)
+            val firstPost = system.activeNotifications.single { it.id == 4202 && it.tag == null }.postTime
+            restored.backgroundCheck()
+            assertEquals(firstPost, system.activeNotifications.single { it.id == 4202 && it.tag == null }.postTime)
+            assertEquals(0, github.requests(".apk"))
+            assertEquals(sessions, sessionsBefore)
+            assertEquals(0, installerOpened.get())
+        } finally { system.cancel(4202) }
+    }
+
+    @Test fun cachedAlertRecoveryProtectsInstallerPromptsAndReplacedMetadata() = runBlocking {
+        val system = notifications()
+        check(!posted(system)) { "An existing update notification must not be replaced by the test" }
+        val github = FakeGitHub()
+        val manager = manager(github)
+        try {
+            manager.backgroundCheck()
+            system.cancel(4202)
+            assertTrue(prefs.edit().remove("notified_version").putInt("pending_session_id", 12345).commit())
+            val prompt = NotificationCompat.Builder(app, UpdateManager.CHANNEL).setSmallIcon(R.drawable.ic_beacon_notification).setContentTitle("Synthetic installer confirmation").build()
+            system.notify(4202, prompt)
+            withTimeout(5_000) { while (!posted(system)) kotlinx.coroutines.delay(25) }
+            val requests = github.paths.size
+            manager.backgroundCheck()
+            assertEquals("Synthetic installer confirmation", system.activeNotifications.single { it.id == 4202 }.notification.extras.getString(android.app.Notification.EXTRA_TITLE))
+            assertEquals(requests, github.paths.size)
+            dueAgain()
+            manager.backgroundCheck()
+            assertEquals("A due release check must not replace an installer confirmation", 0L, prefs.getLong("notified_version", 0))
+            assertEquals("Synthetic installer confirmation", system.activeNotifications.single { it.id == 4202 }.notification.extras.getString(android.app.Notification.EXTRA_TITLE))
+            val afterDue = github.paths.size
+            system.cancel(4202)
+            val cached = requireNotNull(dev.hermes.android.core.Release.decode(prefs.getString("release", null)))
+            assertTrue(prefs.edit().remove("pending_session_id").putString("release", cached.copy(sha = "d".repeat(64)).encode()).commit())
+            manager(github).backgroundCheck()
+            assertFalse("A replaced cached version must never be announced", posted(system))
+            assertEquals(afterDue, github.paths.size)
+        } finally { system.cancel(4202) }
+    }
+
     @Test fun anApkThatIsNotThisAppSignedByItsOwnerFailsVerificationAndLeavesNothingBehind() = runBlocking {
         val sessions = sessionsBefore
         val manager = manager(FakeGitHub())

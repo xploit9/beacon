@@ -14,6 +14,10 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.SocketPolicy
@@ -28,6 +32,33 @@ import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
 
 class KeepConnectedTest {
+    @Test fun connectedRequiresARecentValidNotificationResponse() {
+        val connected = KeepConnectedService.STATUS_CONNECTED
+        val reconnecting = KeepConnectedService.STATUS_RECONNECTING
+        assertEquals(reconnecting, freshKeepConnectedStatus(connected, 0, 200_000))
+        assertEquals(connected, freshKeepConnectedStatus(connected, 100_000, 190_000))
+        assertEquals(reconnecting, freshKeepConnectedStatus(connected, 100_000, 190_001))
+        assertEquals(reconnecting, freshKeepConnectedStatus(connected, 200_000, 100_000))
+        for (state in listOf(KeepConnectedService.STATUS_OFF, KeepConnectedService.STATUS_STARTING, KeepConnectedService.STATUS_SIGNED_OUT)) {
+            assertEquals(state, freshKeepConnectedStatus(state, 0, 200_000))
+        }
+    }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test fun dueUpdateWorkerSurvivesNetworkFailureAndStopsWithTheService() = runTest {
+        var checks = 0
+        val worker = launch { keepConnectedUpdateChecks { if (++checks == 1) throw IOException("offline") } }
+        runCurrent()
+        assertEquals(1, checks)
+        advanceTimeBy(59_999); runCurrent()
+        assertEquals(1, checks)
+        advanceTimeBy(1); runCurrent()
+        assertEquals(2, checks)
+        worker.cancelAndJoin()
+        advanceTimeBy(60_000); runCurrent()
+        assertEquals(2, checks)
+    }
+
     private fun client(server: MockWebServer, readTimeoutMillis: Long = 60_000): BeaconClient =
         BeaconClient(AuthContext("https://native.example", emptyList(), owner = "owner", profile = "default", backend = "hermes-dashboard"), null, persistContext = false) { builder ->
             builder.readTimeout(readTimeoutMillis, TimeUnit.MILLISECONDS)
