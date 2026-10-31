@@ -14,7 +14,7 @@ The installer selects the Hermes home and profile (it asks when more than one co
 
 1. Choose the Hermes home and profile that run your dashboard; ask if more than one could be it.
 2. Install with `hermes -p <profile> plugins install xploit9/beacon/hermes-plugin/beacon --enable`, or update with `hermes -p <profile> plugins update beacon`. Let Hermes' security scan and prompts run unchanged.
-3. Ask before restarting the dashboard, then restart it the way it runs: its scheduled task or service, or `hermes -p <profile> dashboard --stop` then `hermes -p <profile> dashboard`. Start it the same way if it isn't running.
+3. Restart the selected dashboard through its actual scheduled task, service or verified manual process, preserving its home, profile and port. Use native idle and lifecycle safeguards before stopping it; obtain approval if the owner has not already authorized the restart. The broad `dashboard --stop` command can stop other dashboards on the machine.
 4. Give the dashboard a public HTTPS address; that address is the link you paste into Beacon. No address yet? Tailscale Serve is the easy route: run `tailscale serve --bg 9119` (your dashboard's port), then save the HTTPS address it shows with `hermes -p <profile> config set dashboard.public_url https://<your machine's Tailscale name>`. `python beacon_install.py --tailscale` does both.
 
 Install the latest app from [GitHub Releases](https://github.com/xploit9/beacon/releases/latest), paste the link and sign in with Hermes. Signing in links the phone.
@@ -24,6 +24,8 @@ Install the latest app from [GitHub Releases](https://github.com/xploit9/beacon/
 Enable **Keep connected** in Notifications and allow Android notifications and background use. This uses Android's foreground service and a renewable, time-bounded CPU wake lock while online, so the connection can receive alerts with the screen asleep. It does not keep the screen on. Turning Keep connected off or losing the network releases that protection; keeping a live connection uses battery.
 
 The connection indicator requires a recent valid response and expires when responses stop. Update checks retain their normal cadence; an already verified update whose notification was blocked can be announced after notifications are allowed without waiting for another network check. Pending installer confirmations remain protected. Android's notification permission, channel settings and force-stop rules remain authoritative.
+
+Voice startup also depends on the dashboard loading the installed plugin. Its authenticated `/api/plugins/beacon/mobile/plugin/version` response reports `running` and `installed`; differing versions need a dashboard restart, even after the gateway restarts. An older loaded voice implementation can otherwise keep timing out after the update. A `502` from a saved connection address also requires checking that address's configured dashboard port is actually listening.
 
 ## Coming from Hermes Relay?
 
