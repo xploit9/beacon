@@ -265,6 +265,51 @@ def test_tailscale_timeout_is_a_clear_installer_failure(installer, tmp_path, mon
         installer._configure_tailscale('hermes', tmp_path, 'default', 9119, allow=True)
 
 
+def test_public_url_is_configured_before_dashboard_restart(installer, tmp_path, monkeypatch):
+    from argparse import Namespace
+    events = []
+    monkeypatch.setattr(installer.shutil, 'which', lambda name: 'hermes')
+    monkeypatch.setattr(installer, '_select_home', lambda home: tmp_path)
+    monkeypatch.setattr(installer, '_select_profile', lambda home, profile: 'default')
+    monkeypatch.setattr(installer, '_plugin_names', lambda *args: {'beacon'})
+    monkeypatch.setattr(installer, '_dashboard_running', lambda *args: True)
+    monkeypatch.setattr(installer, '_dashboard_port', lambda *args: 9119)
+    monkeypatch.setattr(installer, '_public_url', lambda *args: None)
+    monkeypatch.setattr(installer, '_run_stream', lambda *args: None)
+    monkeypatch.setattr(installer, '_configure_tailscale', lambda *args: events.append('configure') or 'https://beacon.example.test')
+    monkeypatch.setattr(installer, '_restart_dashboard', lambda *args: events.append(('restart', args[-1])))
+    assert installer._install(Namespace(home=None, profile=None, dry_run=False, yes=True, tailscale=True)) == 0
+    assert events == ['configure', ('restart', 'https://beacon.example.test')]
+
+
+def test_declining_restart_does_not_publish_new_route(installer, tmp_path, monkeypatch):
+    from argparse import Namespace
+    events = []
+    monkeypatch.setattr(installer.shutil, 'which', lambda name: 'hermes')
+    monkeypatch.setattr(installer, '_select_home', lambda home: tmp_path)
+    monkeypatch.setattr(installer, '_select_profile', lambda home, profile: 'default')
+    monkeypatch.setattr(installer, '_plugin_names', lambda *args: {'beacon'})
+    monkeypatch.setattr(installer, '_dashboard_running', lambda *args: True)
+    monkeypatch.setattr(installer, '_dashboard_port', lambda *args: 9119)
+    monkeypatch.setattr(installer, '_public_url', lambda *args: None)
+    monkeypatch.setattr(installer, '_run_stream', lambda *args: None)
+    monkeypatch.setattr(installer, '_yes_no', lambda prompt: False)
+    monkeypatch.setattr(installer, '_configure_tailscale', lambda *args: events.append('configure') or 'https://beacon.example.test')
+    monkeypatch.setattr(installer, '_restart_dashboard', lambda *args: events.append('restart'))
+    assert installer._install(Namespace(home=None, profile=None, dry_run=False, yes=False, tailscale=True)) == 1
+    assert events == []
+
+
+def test_restart_probe_requires_configured_public_route(installer, monkeypatch):
+    clock = iter([0, 0, 2])
+    checked = []
+    monkeypatch.setattr(installer.time, 'monotonic', lambda: next(clock))
+    monkeypatch.setattr(installer.time, 'sleep', lambda delay: None)
+    monkeypatch.setattr(installer, '_route_status', lambda url: checked.append(url) or (200 if url.startswith('http://') else None))
+    assert not installer._wait_for_beacon_route(9119, 'https://beacon.example.test', None, seconds=1)
+    assert any(url.startswith('https://beacon.example.test/') for url in checked)
+
+
 @pytest.mark.parametrize('status,ready', [(200, True), (401, False), (404, False)])
 def test_restart_probe_needs_a_public_beacon_route_not_a_generic_auth_response(installer, monkeypatch, status, ready):
     clock = iter([0, 0, 2])

@@ -17,7 +17,7 @@ def recall_env(harness, monkeypatch):
     active_profile = contextvars.ContextVar('recall_profile', default=None)
 
     @contextlib.contextmanager
-    def profile_scope(record):
+    def profile_scope(record, **kwargs):
         token = active_profile.set(record.get('profile_home') or str(root))
         try:
             yield

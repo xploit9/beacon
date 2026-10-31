@@ -162,8 +162,8 @@ import java.time.format.FormatStyle
                 onAction = onReview.takeIf { plugin.status == PluginStatus.NeedsReview })
         }
     }
-    if (release != null || plugin.status in setOf(PluginStatus.Available, PluginStatus.Busy, PluginStatus.Failed)) {
-        Button(onClick = onUpdate, enabled = !callBusy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("update-primary")) { Text(uiText("Update")) }
+    if (release != null || plugin.status in setOf(PluginStatus.Available, PluginStatus.Busy, PluginStatus.Failed, PluginStatus.Restart)) {
+        Button(onClick = onUpdate, enabled = !callBusy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("update-primary")) { Text(uiText(if (release == null && plugin.status == PluginStatus.Restart) "Restart Hermes" else "Update")) }
         if (callBusy) Text(uiText(UpdateFailure.Call.text), Modifier.testTag("update-call-busy"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }

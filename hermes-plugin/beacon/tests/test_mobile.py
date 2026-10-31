@@ -698,7 +698,7 @@ def test_native_context_is_read_only_bounded_profile_data(harness,monkeypatch):
     @contextmanager
     def db(params):yield SimpleNamespace(get_messages=lambda *args,**kwargs:rows[-kwargs['limit']:])
     @contextmanager
-    def scope(record):yield
+    def scope(record, **kwargs):yield
     manager=SimpleNamespace(get_provider=lambda name:None)
     server=SimpleNamespace(_profile_home=lambda profile:root,_session_profile_runtime_scope=scope,_profile_db=db,_sessions_lock=threading.RLock(),_sessions={})
     monkeypatch.setitem(sys.modules,'tui_gateway',SimpleNamespace(server=server))

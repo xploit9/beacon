@@ -824,7 +824,7 @@ def test_launch_profile_scope_uses_the_resolver_home_not_the_live_env(harness, m
     voice_context = load_private("voice_context")
     launch = tmp_path / "launch"
     server = SimpleNamespace(_profile_home=lambda profile: None, _hermes_home=launch,
-                             _session_profile_runtime_scope=lambda scope: nullcontext())
+                             _session_profile_runtime_scope=lambda scope, **kwargs: nullcontext())
     monkeypatch.setitem(sys.modules, "tui_gateway", SimpleNamespace(server=server))
     # Hermes repoints HERMES_HOME while it deletes a profile; the launch profile's notes must not follow it.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-being-deleted"))

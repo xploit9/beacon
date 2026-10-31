@@ -15,7 +15,7 @@ import kotlinx.coroutines.withContext
 internal val licenseDocuments = listOf(
     "hermes-LICENSE.txt", "conduit-LICENSE.txt", "androidsvg-LICENSE.txt",
     "androidsvg-NOTICE.txt", "jlatexmath-LICENSE.txt", "jlatexmath-COPYING.txt", "rich/MERMAID-LICENSE",
-    "rich/JSOUP-LICENSE", "rich/CORE-JS-LICENSE", "hermes-mobile-app-LICENSE.txt", "hermes-relay-LICENSE.txt",
+    "rich/JSOUP-LICENSE", "rich/KATEX-LICENSE", "rich/CORE-JS-LICENSE", "hermes-mobile-app-LICENSE.txt", "hermes-relay-LICENSE.txt",
 )
 
 @Composable fun LicenseScreen(vm: BeaconViewModel) {
@@ -26,6 +26,7 @@ internal val licenseDocuments = listOf(
         Text(uiText("Beacon and native rendering libraries"), style = MaterialTheme.typography.titleLarge)
         Text("Beacon Android · GPL-3.0-only. Complete corresponding source: https://github.com/xploit9/beacon.", style = MaterialTheme.typography.bodySmall) // verbatim
         Text("Mermaid 11.17.2 · MIT. Source: https://github.com/mermaid-js/mermaid. Bundled offline diagram grammar and renderer.", style = MaterialTheme.typography.bodySmall) // verbatim
+        Text("KaTeX 0.18.2 · MIT. Source: https://github.com/KaTeX/KaTeX. Bundled offline math in Mermaid diagrams.", style = MaterialTheme.typography.bodySmall) // verbatim
         Text("jsoup 1.23.2 · MIT. Source: https://jsoup.org. Parses offline HTML before isolated previews.", style = MaterialTheme.typography.bodySmall) // verbatim
         Text("core-js 3.50.0 · MIT. Source: https://github.com/zloirock/core-js. Selected compatibility functions for the isolated diagram renderer.", style = MaterialTheme.typography.bodySmall) // verbatim
         Text("Reference design: omarqaterge/hermes-mobile-app · MIT. Source: https://github.com/omarqaterge/hermes-mobile-app, revision 2d5c5881764c218c4393567f8698db670fb9ad7e. Profile selector, navigation and rich content ideas are implemented in native Compose.", style = MaterialTheme.typography.bodySmall) // verbatim

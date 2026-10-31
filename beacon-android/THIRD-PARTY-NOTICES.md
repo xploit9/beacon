@@ -8,7 +8,7 @@ The native math renderer is `ru.noties:jlatexmath-android:0.2.0`, Copyright its 
 
 Native static SVG previews use `com.caverock:androidsvg-aar:1.4`, Copyright Paul LeBeau, Cave Rock Software Ltd., under Apache-2.0. Its license and notice are bundled at `app/src/main/assets/licenses/androidsvg-LICENSE.txt` and `androidsvg-NOTICE.txt`. Project: https://github.com/BigBadaboom/androidsvg.
 
-jsoup, Mermaid and core-js use the MIT License; their licenses are bundled at `app/src/main/assets/rich`. The hermes-mobile-app reference design (MIT) license is at `app/src/main/assets/licenses`. All of them are shown with the other notices in Settings > Licenses.
+jsoup, Mermaid, KaTeX and core-js use the MIT License; their licenses are bundled at `app/src/main/assets/rich`. Mermaid's offline bundle includes KaTeX 0.18.2, Copyright (c) 2013-2020 Khan Academy and other contributors; its full notice is `KATEX-LICENSE`. The hermes-mobile-app reference design (MIT) license is at `app/src/main/assets/licenses`. All of them are shown with the other notices in Settings > Licenses.
 
 Build dependencies and their versions are listed in `app/build.gradle.kts`. No upstream brand assets or proprietary system font are copied into this app.
 

@@ -5,6 +5,66 @@ import pytest
 from fastapi import HTTPException
 from test_mobile import harness
 
+
+def test_plugin_gateway_restart_uses_safe_native_helper_and_selected_profile(harness, monkeypatch):
+    host, client, _, _, app = harness
+    app.include_router(api.build_router(host.identity, host.body), prefix='/api/plugins/beacon-restart-fixture')
+    calls = []
+    async def status(): return {'pid': None, 'running': False, 'exit_code': None}
+    monkeypatch.setattr(api, 'native_plugin_restart_status', status, raising=False)
+    monkeypatch.setattr(api, 'native_plugin_restart', lambda profile: calls.append(profile) or {'restart_started': True, 'restart_pid': 123}, raising=False)
+    response = client.post('/api/plugins/beacon-restart-fixture/admin/plugin/restart', json={})
+    assert response.status_code == 200
+    assert response.json() == {'restart_started': True, 'restart_pid': 123}
+    assert calls == ['default']
+
+
+def test_plugin_restart_does_not_credit_a_recent_completed_restart(harness, monkeypatch):
+    host, client, _, _, app = harness
+    app.include_router(api.build_router(host.identity, host.body), prefix='/api/plugins/beacon-restart-fixture')
+    async def status(): return {'pid': 123, 'running': False, 'exit_code': 0}
+    monkeypatch.setattr(api, 'native_plugin_restart_status', status, raising=False)
+    monkeypatch.setattr(api, 'native_plugin_restart', lambda profile: {'restart_started': True, 'restart_pid': 123}, raising=False)
+    response = client.post('/api/plugins/beacon-restart-fixture/admin/plugin/restart', json={})
+    assert response.status_code == 200
+    assert response.json()['restart_started'] is False
+
+
+def test_native_plugin_restart_delegates_without_forcing_or_patching_native(monkeypatch):
+    from types import SimpleNamespace
+    calls = []
+    monkeypatch.setitem(sys.modules, 'hermes_cli.web_server_gateway', SimpleNamespace(
+        _restart_gateway_after=lambda profile, **kwargs: calls.append((profile, kwargs)) or {'restart_started': False}))
+    assert api.native_plugin_restart('work') == {'restart_started': False}
+    assert calls == [('work', {'what': 'Beacon plugin update', 'label': 'Beacon plugin update'})]
+
+
+def test_plugin_gateway_restart_refuses_an_active_call_or_foreign_owner(harness, monkeypatch):
+    from test_mobile import reserve
+    host, client, _, _, app = harness
+    app.include_router(api.build_router(host.identity, host.body), prefix='/api/plugins/beacon-restart-fixture')
+    monkeypatch.setattr(api, 'native_plugin_restart', lambda profile: pytest.fail('No restart before admission'), raising=False)
+    call_id = reserve(client)
+    assert client.post('/api/plugins/beacon-restart-fixture/admin/plugin/restart', json={}).status_code == 409
+    with host.mobile.connect() as conn:
+        conn.execute('UPDATE calls SET closed=1 WHERE id=?', (call_id,))
+    client.headers['x-fixture-owner'] = 'foreign'
+    assert client.post('/api/plugins/beacon-restart-fixture/admin/plugin/restart', json={}).status_code == 403
+    client.headers.pop('x-fixture-owner')
+    assert client.post('/api/plugins/beacon-restart-fixture/admin/plugin/restart', json={}).status_code == 401
+
+
+@pytest.mark.parametrize('pid,running,exit_code,completed', [(123, False, 0, True), (124, False, 0, False), (123, True, None, False), (123, False, 1, False), (None, False, None, False)])
+def test_plugin_restart_completion_is_bound_to_the_actual_native_action(harness, monkeypatch, pid, running, exit_code, completed):
+    host, client, _, _, app = harness
+    app.include_router(api.build_router(host.identity, host.body), prefix='/api/plugins/beacon-restart-fixture')
+    async def status(): return {'pid': pid, 'running': running, 'exit_code': exit_code, 'lines': ['not exposed']}
+    monkeypatch.setattr(api, 'native_plugin_restart_status', status, raising=False)
+    response = client.get('/api/plugins/beacon-restart-fixture/admin/plugin/restart/status', params={'pid': 123})
+    assert response.status_code == 200
+    assert response.json()['completed'] is completed
+    assert 'lines' not in response.json()
+
 spec = importlib.util.spec_from_file_location('test_admin_api_module', Path(__file__).resolve().parents[1] / 'admin_api.py')
 api = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(api)
@@ -176,10 +236,6 @@ def test_update_helper_server_clock_scope_and_old_receipts(harness, monkeypatch)
                 'receipt': {'receipt': {'started_at': '2020-01-01T00:00:00Z', 'finished_at': '2020-01-01T00:01:00Z', 'outcome': 'success'}}}
     monkeypatch.setattr(api, 'native_update', start)
     monkeypatch.setattr(api, 'native_update_status', status)
-    # A tapped Update clears what Hermes' guards would stop on before the native update starts (never real processes here).
-    running = []
-    monkeypatch.setattr(api, 'set_aside_stale_gateway_pids', lambda: calls.append('repair') or ['cybercb'])
-    monkeypatch.setattr(api, 'update_in_progress', lambda: bool(running))
     app.include_router(api.build_router(host.identity, host.body), prefix='/api/plugins/beacon-update-fixture')
     url = '/api/plugins/beacon-update-fixture/admin/update'
     result = client.post(url).json()
@@ -198,11 +254,7 @@ def test_update_helper_server_clock_scope_and_old_receipts(harness, monkeypatch)
     client.headers['x-fixture-owner'] = 'foreign'
     assert client.post(url).status_code == 403
     assert client.get(url + '/status').status_code == 403
-    assert calls == ['repair', 'start', 'repair'], 'a foreign caller clears nothing'
-    # While an update runs (even one a restarted dashboard forgot), a tap clears nothing and only reaches the native de-dup.
-    running.append(True)
-    client.post(url)
-    assert calls == ['repair', 'start', 'repair']
+    assert calls == ['start'], 'a foreign caller cannot start an update'
     del client.headers['x-fixture-owner']
     assert client.post(url).status_code == 401
 
@@ -243,39 +295,22 @@ def _gateway_modules(monkeypatch, tmp_path, live_pids, lock_pid=6500):
     return {p.name: p.path for p in profiles}
 
 
-def test_a_stale_gateway_pid_beside_another_gateways_lock_is_set_aside(monkeypatch, tmp_path):
+def test_update_leaves_gateway_pid_for_native_preflight(harness, monkeypatch, tmp_path):
     import json as _json
-    homes = _gateway_modules(monkeypatch, tmp_path, live_pids={6500, 777})
-    (homes['default'] / 'gateway.pid').write_text(_json.dumps({'pid': 6500}))   # the live holder itself: fine
-    (homes['cybercb'] / 'gateway.pid').write_text(_json.dumps({'pid': 67256}))  # exited a month ago: blocks every update
-    (homes['coder'] / 'gateway.pid').write_text(_json.dumps({'pid': 777}))      # alive, though Hermes disagrees: not ours to touch
-    assert api.set_aside_stale_gateway_pids() == ['cybercb']
-    assert not (homes['cybercb'] / 'gateway.pid').exists()
-    assert len(list(homes['cybercb'].glob('gateway.pid.stale-*'))) == 1
-    assert (homes['default'] / 'gateway.pid').exists() and (homes['coder'] / 'gateway.pid').exists()
-    # A PID another process reuses now (other start time) and an unreadable file are as stale as a dead one.
-    (homes['cybercb'] / 'gateway.pid').write_text(_json.dumps({'pid': 777, 'start_time': 5.0}))
-    (homes['default'] / 'gateway.pid').write_text('not json')
-    assert sorted(api.set_aside_stale_gateway_pids()) == ['cybercb', 'default']
-    assert len(list(homes['cybercb'].glob('gateway.pid.stale-*'))) == 2, 'each set-aside keeps its own copy'
-
-
-def test_a_set_aside_that_does_not_satisfy_hermes_is_put_back(monkeypatch, tmp_path):
-    import json as _json
-    homes = _gateway_modules(monkeypatch, tmp_path, live_pids=set())
-    (homes['cybercb'] / 'gateway.pid').write_text(_json.dumps({'pid': 67256}))
-    def still_refuses(pid_path): raise RuntimeError('gateway identity is not live')
-    sys.modules['gateway.status'].get_running_pid_identity_strict = still_refuses
-    assert api.set_aside_stale_gateway_pids() == []
-    assert (homes['cybercb'] / 'gateway.pid').exists() and not list(homes['cybercb'].glob('gateway.pid.stale-*'))
-
-
-
-def test_the_hermes_under_test_still_has_the_gateway_helpers_the_repair_uses():
-    # The repair turns itself off (with a warning) if Hermes renames these; this fails the installed and upstream runs first.
-    status = pytest.importorskip('gateway.status')
-    for name in ('get_running_pid_identity_strict', '_read_pid_record', '_live_pid_from_record'):
-        assert callable(getattr(status, name, None)), name
+    host, client, _, _, app = harness
+    homes = _gateway_modules(monkeypatch, tmp_path, live_pids={6500})
+    pid_path = homes['cybercb'] / 'gateway.pid'
+    original = _json.dumps({'pid': 67256})
+    pid_path.write_text(original)
+    async def native_preflight():
+        return {'ok': False, 'error': 'Could not inspect gateway PID' if pid_path.exists() else 'unexpected removal'}
+    monkeypatch.setattr(api, 'native_update', native_preflight)
+    monkeypatch.setattr(api, 'update_in_progress', lambda: False)
+    app.include_router(api.build_router(host.identity, host.body), prefix='/api/plugins/beacon-pid-fixture')
+    result = client.post('/api/plugins/beacon-pid-fixture/admin/update').json()
+    assert result['error'] == 'Could not inspect gateway PID'
+    assert pid_path.read_text() == original
+    assert not list(pid_path.parent.glob('gateway.pid.stale-*'))
 
 
 def test_update_in_progress_asks_hermes_for_its_marker_and_checkout_lock(monkeypatch):

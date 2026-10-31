@@ -7,10 +7,18 @@ import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
 import java.io.IOException
+import dev.hermes.android.data.AuthContext
+import dev.hermes.android.data.BeaconClient
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.ResponseBody.Companion.toResponseBody
 
 class PluginUpdateStateTest {
-    private class Fake(private val reads: List<PluginVersions>, private val answer: () -> JSONObject = { JSONObject().put("ok", true) }, private val failure: Exception? = null) : PluginEndpoint {
+    private class Fake(private val reads: List<PluginVersions>, private val answer: () -> JSONObject = { JSONObject().put("ok", true) }, private val failure: Exception? = null, val restartConfirmed: Boolean = false) : PluginEndpoint {
         var read = 0
+        var restarts = 0
+        override suspend fun restart(): Boolean { restarts++; return restartConfirmed }
         var accepted = emptyList<Boolean>()
         override suspend fun version(): PluginVersions = reads[minOf(read++, reads.lastIndex)]
         override suspend fun update(acceptCapabilities: Boolean): JSONObject {
@@ -20,6 +28,91 @@ class PluginUpdateStateTest {
         }
     }
     private fun versions(running: String, installed: String = running) = PluginVersions(running, installed)
+
+    @Test(timeout = 8000) fun theSafeRestartWaitsForItsActionAndAReadyGateway() = runBlocking {
+        val paths = mutableListOf<String>()
+        var gatewayReads = 0
+        val client = BeaconClient(AuthContext("https://native.example", emptyList(), "owner", "default", backend = "hermes-dashboard"), null) { builder ->
+            builder.addInterceptor { chain ->
+                val request = chain.request(); paths += request.url.encodedPath
+                val value = when (request.url.encodedPath) {
+                    "/api/plugins/beacon/admin/plugin/restart" -> { assertEquals("POST", request.method); "{\"restart_started\":true,\"restart_pid\":123}" }
+                    "/api/plugins/beacon/admin/plugin/restart/status" -> { assertEquals("123", request.url.queryParameter("pid")); "{\"pid\":123,\"completed\":true}" }
+                    "/api/status" -> if (++gatewayReads == 1) "{\"gateway_running\":false}" else "{\"gateway_running\":true,\"gateway_state\":\"running\"}"
+                    else -> error("Unexpected request")
+                }
+                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("Fixture").body(value.toResponseBody("application/json".toMediaType())).build()
+            }
+        }
+        try {
+            assertTrue(HermesPluginUpdater(client).restart())
+            assertEquals(2, gatewayReads)
+            assertEquals(1, paths.count { it == "/api/plugins/beacon/admin/plugin/restart" })
+            assertFalse(paths.contains("/api/gateway/restart"))
+        } finally { client.closeNative() }
+    }
+
+    @Test(timeout = 5000) fun aRefusedOrUnrelatedRestartNeverUsesTheForceEndpoint() = runBlocking {
+        for (accepted in listOf(false, true)) {
+            var posts = 0
+            val client = BeaconClient(AuthContext("https://native.example", emptyList(), "owner", "default", backend = "hermes-dashboard"), null) { builder ->
+                builder.addInterceptor { chain ->
+                    val request = chain.request()
+                    val value = when (request.url.encodedPath) {
+                        "/api/plugins/beacon/admin/plugin/restart" -> { posts++; "{\"restart_started\":$accepted,\"restart_pid\":123}" }
+                        "/api/plugins/beacon/admin/plugin/restart/status" -> "{\"pid\":124,\"completed\":true}"
+                        else -> error("No force restart or unrelated success is allowed")
+                    }
+                    Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("Fixture").body(value.toResponseBody("application/json".toMediaType())).build()
+                }
+            }
+            try { assertFalse(HermesPluginUpdater(client).restart()); assertEquals(1, posts) }
+            finally { client.closeNative() }
+        }
+    }
+
+    @Test fun aSavedRestartCanRetryAfterTheDashboardAlreadyReloaded() = runBlocking {
+        val endpoint = Fake(listOf(versions("1.1.3")), restartConfirmed = true)
+        assertEquals(PluginStatus.Updated, runPluginUpdate(endpoint, "1.1.3", false, restartOnly = true) {}.status)
+        assertTrue(endpoint.accepted.isEmpty())
+        assertEquals(1, endpoint.restarts)
+    }
+
+    @Test fun anInterruptedUpdateStillInstallsTheTargetBeforeRestarting() = runBlocking {
+        val endpoint = Fake(listOf(versions("1.1.1"), versions("1.1.3")), restartConfirmed = true)
+        assertEquals(PluginStatus.Updated, runPluginUpdate(endpoint, "1.1.3", false, restartOnly = true) {}.status)
+        assertEquals(listOf(false), endpoint.accepted)
+        assertEquals(0, endpoint.restarts)
+    }
+
+    @Test fun finishingAnOlderPendingRestartLeavesTheNewReleaseAvailable() {
+        val endpoint = Fake(listOf(versions("1.1.0", "1.1.1"), versions("1.1.1")), restartConfirmed = true)
+        assertEquals(PluginStatus.Available, updateWith(endpoint).status)
+        assertTrue(endpoint.accepted.isEmpty())
+        assertEquals(1, endpoint.restarts)
+    }
+
+    @Test fun aSuccessfulUpdateRestartsTheGatewayBeforeReportingUpdated() {
+        val endpoint = Fake(listOf(versions("1.1.1"), versions("1.1.1", "1.1.3"), versions("1.1.3")),
+            { JSONObject().put("ok", true).put("restart_required", true) }, restartConfirmed = true)
+        assertEquals(PluginStatus.Updated, updateWith(endpoint).status)
+        assertEquals(1, endpoint.restarts)
+        assertEquals(listOf(false), endpoint.accepted)
+    }
+
+    @Test fun pendingRestartRetriesDoNotInstallThePluginAgain() {
+        val endpoint = Fake(listOf(versions("1.1.1", "1.1.3"), versions("1.1.3")), restartConfirmed = true)
+        assertEquals(PluginStatus.Updated, updateWith(endpoint).status)
+        assertTrue(endpoint.accepted.isEmpty())
+        assertEquals(1, endpoint.restarts)
+    }
+
+    @Test fun aRefusedRestartStaysPendingInsteadOfClaimingUpdated() {
+        val endpoint = Fake(listOf(versions("1.1.1", "1.1.3")), restartConfirmed = false)
+        assertEquals(PluginStatus.Restart, updateWith(endpoint).status)
+        assertEquals(1, endpoint.restarts)
+        assertTrue(endpoint.accepted.isEmpty())
+    }
     private fun updateWith(endpoint: Fake, target: String = "1.1.3", accept: Boolean = false, pauses: MutableList<Long> = mutableListOf()) =
         runBlocking { runPluginUpdate(endpoint, target, accept) { pauses += it } }
 

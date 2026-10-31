@@ -123,56 +123,6 @@ def summaries(allowed):
                       'purpose': row['description']} for row in rows]}
 
 
-def set_aside_stale_gateway_pids():
-    """Hermes' updater stops at "Could not inspect gateway PID" when a profile's gateway.pid names a process that is gone
-    (or whose PID another process reuses now) while another gateway holds that profile's lock: one gateway serving several
-    profiles writes their locks, not their PID files, so every later update stops there too. Such a file is stale and is set
-    aside; it goes back if Hermes' own strict check still refuses, and a newer file written meanwhile always wins."""
-    import logging, os, time
-    from pathlib import Path
-    try:
-        from gateway import status
-        from hermes_cli.profiles import list_profiles
-        strict, read_record, live_pid = status.get_running_pid_identity_strict, status._read_pid_record, status._live_pid_from_record
-    except Exception as error:
-        logging.getLogger(__name__).warning('Beacon cannot check gateway files before an update: %s', type(error).__name__)
-        return []
-    moved = []
-    for profile in list_profiles(lazy_skill_count=True):
-        pid_path = Path(profile.path) / 'gateway.pid'
-        try:
-            if not pid_path.is_file():
-                continue
-            try:
-                strict(pid_path)
-                continue  # Hermes accepts it
-            except Exception:
-                pass
-            try:
-                record = read_record(pid_path)
-            except Exception:
-                record = None
-            # Hermes' own liveness rule (PID alive and its start time matches): a live gateway's file is never touched.
-            if record and live_pid(record) is not None:
-                continue
-            aside = pid_path.with_name(f'gateway.pid.stale-{time.time_ns()}')
-            os.replace(pid_path, aside)
-            try:
-                strict(pid_path)
-            except Exception:
-                try:
-                    os.rename(aside, pid_path)  # not the case this repair understands; never over a newer file
-                except OSError:
-                    pass
-                continue
-            moved.append(profile.name)
-        except Exception:
-            continue
-    if moved:
-        logging.getLogger(__name__).info('Beacon set aside stale gateway files before an update: %s', ', '.join(moved))
-    return moved
-
-
 try:  # loaded now: mid-update the checkout under this process is being replaced
     from hermes_cli.update_lock import update_in_progress as _native_update_in_progress
 except Exception:
@@ -207,6 +157,16 @@ async def native_update_status():
     return {'action': action, 'receipt': receipt}
 
 
+def native_plugin_restart(profile):
+    from hermes_cli.web_server_gateway import _restart_gateway_after
+    return _restart_gateway_after(profile, what='Beacon plugin update', label='Beacon plugin update')
+
+
+async def native_plugin_restart_status():
+    from hermes_cli.web_routers.actions import get_action_status
+    return await get_action_status('gateway-restart', lines=1)
+
+
 def current_receipt(state, requested_at, action_id):
     from datetime import datetime
     if not requested_at:
@@ -230,6 +190,37 @@ _update_gate = asyncio.Lock()
 def build_router(identity, read_body):
     router = APIRouter()
 
+    @router.post('/admin/plugin/restart')
+    async def restart_plugin(request: Request):
+        import sys
+        mobile = sys.modules['beacon_mobile']
+        identity(request, owner_only=True)
+        owner, _, profile, _ = identity(request)
+        with mobile.LOCK, mobile.connect() as conn:
+            if mobile.active_calls(conn, owner):
+                raise HTTPException(409, 'End your call before restarting Hermes')
+        try:
+            before = await native_plugin_restart_status()
+            result = await asyncio.to_thread(native_plugin_restart, profile)
+            # Hermes coalesces recent restarts; an action predating this update cannot certify it.
+            if before.get('pid') and result.get('restart_pid') == before['pid']:
+                return {**result, 'restart_started': False}
+            return result
+        except Exception:
+            raise HTTPException(503, 'Hermes could not start the gateway restart') from None
+
+    @router.get('/admin/plugin/restart/status')
+    async def plugin_restart_status(request: Request, pid: int):
+        identity(request, owner_only=True)
+        if pid <= 0:
+            raise HTTPException(400, 'Invalid restart identity')
+        action = await native_plugin_restart_status()
+        matched = action.get('pid') == pid
+        ended = matched and action.get('running') is False
+        return {'pid': pid, 'running': matched and action.get('running') is True,
+                'completed': ended and action.get('exit_code') == 0,
+                'failed': ended and isinstance(action.get('exit_code'), int) and action['exit_code'] != 0}
+
     @router.get('/admin/model-capabilities')
     async def capabilities(request: Request, model: str, provider: str = ''):
         _, _, profile, _ = identity(request)
@@ -244,11 +235,7 @@ def build_router(identity, read_body):
     async def start_update(request: Request):
         from datetime import datetime, timezone
         identity(request, owner_only=True)
-        # Clear the stale gateway files Hermes' updater would stop on, unless an update already runs; the native action then
-        # owns admission, spawning and already-running de-duplication.
         async with _update_gate:
-            if not await asyncio.to_thread(update_in_progress):
-                await asyncio.to_thread(set_aside_stale_gateway_pids)
             requested_at = datetime.now(timezone.utc).isoformat()
             result = await native_update()
         if result.get('already_running'):

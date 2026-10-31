@@ -165,21 +165,21 @@ def schedule(mobile,native,owner,provider,row,cfg,value,now=None):
     key='scheduled-callback:'+hashlib.sha256((owner+'\0'+profile+'\0'+request).encode()).hexdigest()
     with mobile.LOCK:
         with mobile.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
             _prune_expired(conn,now.timestamp())
             existing=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
-        if existing:
-            record=json.loads(existing[0])
-            if (now-datetime.fromisoformat(record['scheduled_at'])).total_seconds()>=CALLBACK_WINDOW_SECONDS:
-                raise ValueError('Callback request expired')
-            if record['fingerprint']!=fingerprint or record['conversation']!=stored: raise ValueError('Callback request_id already used for another request')
-        else:
-            if row.get('closed'): raise ValueError('Call ended before callback request was accepted')
-            target=target_time(value,now)
-            record={'fingerprint':fingerprint,'conversation':stored,'owner':owner,'provider':provider,'profile':profile,'reason':reason,'scheduled_at':target.isoformat(),'request_id':request,'status':'preparing'}
-            with mobile.connect() as conn:
-                conn.execute('INSERT OR IGNORE INTO meta VALUES(?,?)',(key,json.dumps(record).encode()))
-                record=json.loads(conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()[0])
-            if record['fingerprint']!=fingerprint or record['conversation']!=stored: raise ValueError('Callback request_id already used for another request')
+            if existing:
+                record=json.loads(existing[0])
+                if (now-datetime.fromisoformat(record['scheduled_at'])).total_seconds()>=CALLBACK_WINDOW_SECONDS:
+                    raise ValueError('Callback request expired')
+                if record['fingerprint']!=fingerprint or record['conversation']!=stored: raise ValueError('Callback request_id already used for another request')
+            else:
+                try: current=mobile.owned(conn,row['id'],owner,profile,True)
+                except (KeyError,LookupError,ValueError): raise ValueError('Call ended before callback request was accepted') from None
+                if current['conversation']!=stored: raise ValueError('Call ended before callback request was accepted')
+                target=target_time(value,now)
+                record={'fingerprint':fingerprint,'conversation':stored,'owner':owner,'provider':provider,'profile':profile,'reason':reason,'scheduled_at':target.isoformat(),'request_id':request,'status':'preparing'}
+                conn.execute('INSERT INTO meta VALUES(?,?)',(key,json.dumps(record).encode()))
         if record['status']=='scheduled':
             return {k:record[k] for k in ('status','request_id','job_id','scheduled_at')} | {'timezone':timezone_name,'conversation_id':stored}
     # Persist intent before native creation. A crash/timeout can be reconciled by its stable name.

@@ -16,6 +16,10 @@ def env(tmp_path,monkeypatch):
     monkeypatch.setattr(m,'time',SimpleNamespace(time=lambda:NOW.timestamp()))
     cfg={'owner_id':'owner','owner_provider':'basic','profiles':['default'],'scheduled_callbacks_enabled':True}
     monkeypatch.setattr(m,'settings',lambda profile=None:cfg)
+    with m.connect() as conn:
+        for profile in ('default','work'):
+            conn.execute('INSERT INTO calls(id,owner,profile,conversation,created) VALUES(?,?,?,?,?)',
+                         ('fixture-'+profile,'owner',profile,'owned',NOW.timestamp()-301))
     jobs=[]
     def create(model,profile):
         job={**vars(model),'id':'native'+str(len(jobs))};jobs.append(job);return job
@@ -28,7 +32,7 @@ def env(tmp_path,monkeypatch):
     monkeypatch.setitem(sys.modules,'beacon_proactive',proactive)
     return cb,m,native,cfg,jobs,tmp_path
 NOW=datetime(2026,10,16,19,tzinfo=ZoneInfo('UTC'))
-ROW={'profile':'default','conversation':'owned','closed':0}
+ROW={'id':'fixture-default','profile':'default','conversation':'owned','closed':0}
 VALUE={'request_id':'stable','reason':'Requested reminder','delay_seconds':60}
 def test_schedule_native_one_shot_replay_after_call_end(env):
     cb,m,n,cfg,jobs,tmp=env
@@ -136,7 +140,9 @@ def test_stale_or_changed_authority_does_not_ring(env):
     cb,m,n,cfg,jobs,tmp=env;cb.schedule(m,n,'owner','basic',ROW,cfg,VALUE,NOW)
     with m.connect() as c:key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]
     assert cb.deliver(m,n,key,NOW+timedelta(seconds=180))['status']=='skipped_expired'
-    cb.schedule(m,n,'owner','basic',ROW,cfg,{**VALUE,'request_id':'changed-authority'},NOW)
+    call_id=m.reserve('owner','default','owned')['call_id']
+    with m.connect() as c: current=m.owned(c,call_id,'owner')
+    cb.schedule(m,n,'owner','basic',current,cfg,{**VALUE,'request_id':'changed-authority'},NOW)
     with m.connect() as c:key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%' AND key!=?",(key,)).fetchone()[0]
     cfg['scheduled_callbacks_enabled']=False
     with pytest.raises(ValueError):cb.deliver(m,n,key,NOW+timedelta(seconds=60))
@@ -261,7 +267,7 @@ def test_prune_expired_uses_age_for_foreign_markers_and_keeps_unreadable_rows(en
 def test_late_script_records_one_owned_missed_callback_without_ringing(env,profile):
     cb,m,n,cfg,_,_=env
     cfg['profiles']=['default','work']
-    cb.schedule(m,n,'owner','basic',{**ROW,'profile':profile},cfg,VALUE,NOW)
+    cb.schedule(m,n,'owner','basic',{**ROW,'id':'fixture-'+profile,'profile':profile},cfg,VALUE,NOW)
     with m.connect() as c:key=c.execute("SELECT key FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]
     late=NOW+timedelta(seconds=180)
     assert cb.deliver(m,n,key,late)['status']=='skipped_expired'
@@ -452,3 +458,37 @@ def test_poll_callback_recovery_is_bounded_and_retains_marker_lifetime(env):
     with m.connect() as c:
         assert c.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]==1
         assert c.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'missed-callback:%'").fetchone()[0]==1
+
+@pytest.mark.parametrize('boundary',['closed','expired','closed_during_verify'])
+def test_new_schedule_requires_live_durable_call_admission(env,boundary):
+    cb,m,n,cfg,jobs,_=env
+    call_id=m.reserve('owner','default','owned')['call_id']
+    with m.connect() as conn:
+        row=m.owned(conn,call_id,'owner')
+        if boundary=='closed': conn.execute('UPDATE calls SET closed=1 WHERE id=?',(call_id,))
+        if boundary=='expired': conn.execute('UPDATE calls SET created=? WHERE id=?',(NOW.timestamp()-5*3600,call_id))
+    if boundary=='closed_during_verify':
+        def close_during_verify(*args):
+            with m.LOCK,m.connect() as conn: conn.execute('UPDATE calls SET closed=1 WHERE id=?',(call_id,))
+            return {}
+        n.verify=close_during_verify
+    with pytest.raises(ValueError): cb.schedule(m,n,'owner','basic',row,cfg,VALUE,NOW)
+    assert jobs==[]
+    with m.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()[0]==0
+
+
+def test_schedule_accepted_before_hangup_finishes_and_receipt_remains_readable(env):
+    cb,m,n,cfg,jobs,_=env
+    call_id=m.reserve('owner','default','owned')['call_id']
+    with m.connect() as conn: row=m.owned(conn,call_id,'owner')
+    cron=sys.modules['hermes_cli.web_server_cron']
+    def close_after_acceptance(*args):
+        with m.LOCK,m.connect() as conn: conn.execute('UPDATE calls SET closed=1 WHERE id=?',(call_id,))
+        return jobs
+    cron._call_cron_for_profile=close_after_acceptance
+    first=cb.schedule(m,n,'owner','basic',row,cfg,VALUE,NOW)
+    with m.connect() as conn: closed=m.owned(conn,call_id,'owner')
+    assert closed['closed']==1
+    assert cb.schedule(m,n,'owner','basic',closed,cfg,VALUE,NOW)==first
+    assert first['status']=='scheduled' and len(jobs)==1

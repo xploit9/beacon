@@ -21,7 +21,7 @@ internal data class PluginRow(val status: PluginStatus = PluginStatus.Hidden, va
         PluginStatus.Updating -> "Updating…"
         PluginStatus.Updated -> "Updated"
         PluginStatus.NeedsReview -> "Review changes"
-        PluginStatus.Restart -> "Restart Hermes on your PC to finish."
+        PluginStatus.Restart -> "Restart Hermes"
         PluginStatus.Busy -> "Hermes is busy. Try again later."
         PluginStatus.Failed -> "Couldn't update. Try again."
         PluginStatus.Hidden -> ""
@@ -61,6 +61,22 @@ internal fun pluginRowFor(probe: PluginProbe, target: String): PluginRow = when 
 internal interface PluginEndpoint {
     suspend fun version(): PluginVersions
     suspend fun update(acceptCapabilities: Boolean): JSONObject
+    /** False means refused, unsupported or not yet confirmed; no forced restart fallback. */
+    suspend fun restart(): Boolean = false
+}
+
+private suspend fun restartUpdatedPlugin(endpoint: PluginEndpoint, installed: String, target: String): PluginRow {
+    val pending = PluginRow(PluginStatus.Restart, installed, target)
+    return try {
+        if (!endpoint.restart()) return pending
+        val current = endpoint.version()
+        when {
+            current.restartRequired -> pending
+            olderVersion(current.installed, target) -> PluginRow(PluginStatus.Available, current.installed, target)
+            else -> PluginRow(PluginStatus.Updated, current.installed, target)
+        }
+    } catch (error: CancellationException) { throw error }
+    catch (_: Exception) { pending }
 }
 
 /** Reads the plugin version; a 404 on the version route is an older plugin, a 403 means this account is not the owner. */
@@ -79,12 +95,12 @@ catch (error: Exception) {
  * Runs Hermes' own updater once and says how the plugin row ends. It never throws (so the app update that follows
  * is never blocked) and never installs a plugin Hermes asked the owner to review.
  */
-internal suspend fun runPluginUpdate(endpoint: PluginEndpoint, target: String, accept: Boolean, pause: suspend (Long) -> Unit = { delay(it) }): PluginRow {
+internal suspend fun runPluginUpdate(endpoint: PluginEndpoint, target: String, accept: Boolean, restartOnly: Boolean = false, pause: suspend (Long) -> Unit = { delay(it) }): PluginRow {
     var before: PluginVersions? = null
     try {
         before = runCatching { endpoint.version() }.getOrNull()
         val current = before
-        if (current != null && current.restartRequired) return PluginRow(PluginStatus.Restart, current.installed, target)
+        if (current?.restartRequired == true || restartOnly && current != null && !olderVersion(current.installed, target)) return restartUpdatedPlugin(endpoint, current?.installed.orEmpty(), target)
         val response = endpoint.update(accept)
         if (response.optBoolean("scan_blocked")) return PluginRow(PluginStatus.NeedsReview, before?.installed.orEmpty(), target)
         if (response.optBoolean("consent_required")) {
@@ -102,8 +118,8 @@ internal suspend fun runPluginUpdate(endpoint: PluginEndpoint, target: String, a
             }
         }
         val done = latest ?: return PluginRow(PluginStatus.Failed, before?.installed.orEmpty(), target)
+        if (response.optBoolean("restart_required") || done.restartRequired) return restartUpdatedPlugin(endpoint, done.installed, target)
         return PluginRow(when {
-            response.optBoolean("restart_required") || done.restartRequired -> PluginStatus.Restart
             olderVersion(done.installed, target) -> PluginStatus.Failed
             else -> PluginStatus.Updated
         }, done.installed, target)

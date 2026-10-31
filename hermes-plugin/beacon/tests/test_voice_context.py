@@ -1,4 +1,6 @@
 import json
+from contextlib import contextmanager
+from datetime import datetime, timezone
 import sys
 import time
 from types import SimpleNamespace
@@ -7,13 +9,53 @@ import pytest
 from test_mobile import harness, reserve
 
 
+@pytest.mark.parametrize('native_backend', [True, False])
+def test_native_startup_skips_external_secret_resolution_and_reuses_bound_clock(harness, monkeypatch, native_backend):
+    api, client, _, root, _ = harness
+    call_id = reserve(client)
+    voice = api.voice_context
+    scopes, active, clocks = [], [], []
+
+    @contextmanager
+    def runtime_scope(record, *, hydrate_secrets=True):
+        scopes.append((record, hydrate_secrets))
+        active.append(record['profile_home'])
+        try:
+            yield
+        finally:
+            active.pop()
+
+    def clock(kind):
+        assert active == [str(root)]
+        clocks.append(kind)
+        return datetime(2026, 10, 30, 18, 0, tzinfo=timezone.utc)
+
+    server = SimpleNamespace(_profile_home=lambda profile: root, _session_profile_runtime_scope=runtime_scope)
+    monkeypatch.setitem(sys.modules, 'tui_gateway', SimpleNamespace(server=server))
+    monkeypatch.setitem(sys.modules, 'hermes_time', SimpleNamespace(now=lambda: clock('bound')))
+    monkeypatch.setitem(sys.modules, 'beacon_proactive', SimpleNamespace(profile_now=lambda profile: clock('profile')))
+    monkeypatch.setattr(voice.native, 'verify', lambda *args: None)
+    monkeypatch.setattr(voice, 'history', lambda *args: [])
+    monkeypatch.setattr(voice, 'tool_catalogue', lambda *args: '')
+    monkeypatch.setattr(voice, 'config', lambda path: {})
+    monkeypatch.setattr(voice, 'personality', lambda path: '')
+    monkeypatch.setattr(voice, 'builtin_memory', lambda *args: '')
+    monkeypatch.setattr(voice, 'owner_name_in_memory', lambda *args: 'Maya')
+    result = voice.context('owner', 'basic', 'work', 'native-stored', call_id, native_backend=native_backend)
+    assert scopes == [({'profile_home': str(root)}, not native_backend)]
+    assert clocks == ['bound' if native_backend else 'profile']
+    assert active == []
+    assert result['profile'] == 'work' and result['selected_session_id'] == 'native-stored'
+    assert result['greeting'].startswith('Good evening, Maya.')
+
+
 @pytest.mark.parametrize('memory_provider', ['builtin', 'profile-memory'])
 def test_native_backend_context_leaves_tools_and_memory_to_the_hermes_agent(harness, monkeypatch, memory_provider):
     api, client, _, root, _ = harness
     call_id = reserve(client)
     voice = api.voice_context
     reads = []
-    monkeypatch.setattr(voice, 'scoped', lambda profile, fn: fn(root))
+    monkeypatch.setattr(voice, 'scoped', lambda profile, fn, **kwargs: fn(root))
     monkeypatch.setattr(voice, 'config', lambda root: {'memory': {'provider': memory_provider}})
     monkeypatch.setattr(voice, 'history', lambda *args: reads.append('history') or [])
     monkeypatch.setattr(voice, 'personality', lambda *args: reads.append('personality') or 'Private native instructions')

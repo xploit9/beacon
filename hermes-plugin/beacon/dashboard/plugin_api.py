@@ -473,6 +473,8 @@ async def callback(call_id:str,request:Request):
     value=await body(request,1024);owner,provider,row,_=await call(request,call_id)
     if value.get('scope','latest') not in ('latest','all'): raise HTTPException(400,'Invalid callback scope')
     with mobile.LOCK,mobile.connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        safely(mobile.owned,conn,call_id,owner,row['profile'],True)
         rows=conn.execute('SELECT * FROM jobs WHERE call_id=? AND owner=? ORDER BY rowid DESC',(call_id,owner)).fetchall()
         if value.get('job_id'): rows=[r for r in rows if r['id']==value['job_id']]
         elif value.get('scope','latest')=='latest': rows=rows[:1]

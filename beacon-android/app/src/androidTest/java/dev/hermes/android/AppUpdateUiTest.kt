@@ -126,6 +126,18 @@ class AppUpdateUiTest {
         compose.onAllNodesWithTag("update-row-plugin").assertCountEquals(0)
     }
 
+    @Test fun aPendingPluginRestartCanBeFinishedFromTheApp() {
+        show(AppUpdateUi(phase = UpdatePhase.Available, latest = release, plugin = PluginRow(PluginStatus.Restart, "1.1.3", "1.1.3")))
+        compose.onNodeWithTag("update-primary").assertTextEquals("Restart Hermes").assertIsEnabled().performClick()
+        assertEquals(1, updates)
+    }
+
+    @Test fun anActiveCallAlsoDisablesThePluginRestart() {
+        show(AppUpdateUi(phase = UpdatePhase.Available, latest = release, plugin = PluginRow(PluginStatus.Restart, "1.1.3", "1.1.3")), callBusy = true)
+        compose.onNodeWithTag("update-primary").assertTextEquals("Restart Hermes").assertIsNotEnabled()
+        compose.onNodeWithTag("update-call-busy").assertIsDisplayed()
+    }
+
     @Test fun aPluginThatNeedsReviewNeverBlocksTheAppUpdate() {
         show(available(PluginRow(PluginStatus.NeedsReview, "1.1.1", "1.1.3", listOf("Reads files"))))
         compose.onNodeWithTag("update-row-plugin-action").performScrollTo().assertTextEquals("Review changes").performClick()

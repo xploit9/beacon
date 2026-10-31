@@ -506,7 +506,7 @@ def native_proactive_read_only_guard(tool_name=None,args=None,session_id=None,**
     outlives Proactive being turned off or its jobs being rebuilt (Hermes does not stop it)."""
     blocked={'action':'block','message':_READ_ONLY_MESSAGE}
     if not session_id: return None
-    cfg={};profile=None;row=None;configured=True  # an unreadable config counts as configured
+    cfg={};profile=None;row=None;configured=True  # settings exceptions stay conservative; an empty result has no owner
     try:
         cfg=mobile.settings();configured=bool(cfg.get('owner_id'))
         profile=current_profile(cfg)
@@ -581,6 +581,9 @@ def _watch_tool_guard(tool_name,args,profile):
     if tool_name in _BLOCKED_PROACTIVE_TOOLS:
         return {'action':'block','message':_READ_ONLY_MESSAGE}
     args=args if isinstance(args,dict) else {}
+    # The native tool can select another profile explicitly or through a profile/session link.
+    if tool_name=='session_search' and (args.get('profile') not in (None,'') or '/' in str(args.get('session_id') or '')):
+        return {'action':'block','message':'Proactive watches only search conversations in their current profile.'}
     argument_words=set()
     for field in ('action','operation'):
         value=args.get(field)

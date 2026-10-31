@@ -3,5 +3,5 @@
   "private": true,
   "dependencies": { "mermaid": "11.17.2", "dompurify": "3.4.17" },
   "devDependencies": { "esbuild": "0.28.2" },
-  "overrides": { "dompurify": "3.4.17" }
+  "overrides": { "dompurify": "3.4.17", "katex": "0.18.2" }
 }

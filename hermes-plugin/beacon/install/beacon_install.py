@@ -304,7 +304,7 @@ def _wait_for_beacon_route(port: int, public_url: str | None, process: subproces
     while time.monotonic() < deadline:
         if process is not None and process.poll() is not None:
             return False
-        if _route_status(local) == 200 or (public != local and _route_status(public) == 200):
+        if _route_status(public) == 200:
             if previous_pids is None or _dashboard_pids(hermes, home, profile, port) - previous_pids:
                 return True
         time.sleep(1)
@@ -522,20 +522,21 @@ def _install(args: argparse.Namespace) -> int:
         _run_stream(hermes, home, profile, "plugins", "install", INSTALL_SOURCE, "--enable")
     _line(True, "Beacon plugin installation completed")
 
+    public_url = _public_url(hermes, home, profile)
+    port = _dashboard_port(hermes, home, profile)
+    restart = False
     if running:
         print(f"Restart commands for this Hermes profile:\n  hermes -p {profile} dashboard --stop\n  hermes -p {profile} dashboard --no-open")
         restart = args.yes or _yes_no("Restart the dashboard now? [y/N] (an agent: ask the owner, then rerun with --yes) ")
-        if restart:
-            public_url = _public_url(hermes, home, profile)
-            _restart_dashboard(hermes, home, profile, _dashboard_port(hermes, home, profile), public_url)
-        else:
+        if not restart:
             _line(True, "Dashboard restart was declined")
     else:
         _line(True, "Selected Hermes dashboard is not running; restart skipped")
 
-    public_url = _public_url(hermes, home, profile)
-    if not _is_https_url(public_url):
-        public_url = _configure_tailscale(hermes, home, profile, _dashboard_port(hermes, home, profile), args.tailscale)
+    if not _is_https_url(public_url) and (not running or restart):
+        public_url = _configure_tailscale(hermes, home, profile, port, args.tailscale)
+    if restart:
+        _restart_dashboard(hermes, home, profile, port, public_url)
     ready = _is_https_url(public_url)
     if ready:
         print(f"Paste this link into Beacon: {public_url}")

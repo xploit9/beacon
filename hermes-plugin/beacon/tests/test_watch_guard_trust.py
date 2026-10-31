@@ -19,6 +19,32 @@ def _guard(plugin, name, args=None):
     return plugin.native_proactive_read_only_guard(tool_name="mcp__api__" + name, args=args or {}, session_id="watch-run")
 
 
+@pytest.mark.parametrize("args", [
+    {"query": "topic", "profile": "other"},
+    {"query": "topic", "profile": "default"},
+    {"query": "topic", "profile": []},
+    {"session_id": "other/session-a"},
+    {"session_id": "@session:other/session-a"},
+])
+def test_watch_session_search_cannot_select_a_profile(watch_guard, monkeypatch, args):
+    plugin, _ = watch_guard
+    monkeypatch.setitem(sys.modules, "tools.registry", SimpleNamespace(registry=SimpleNamespace(
+        get_toolset_for_tool=lambda name: "session_search", get_schema=lambda name: None)))
+    result = plugin.native_proactive_read_only_guard("session_search", args, "watch-run")
+    assert isinstance(result, dict) and result.get("action") == "block"
+
+
+@pytest.mark.parametrize("args", [
+    {"query": "topic"}, {"query": "topic", "profile": None},
+    {"query": "topic", "profile": ""}, {"session_id": "session-a"},
+])
+def test_watch_session_search_keeps_implicit_current_profile_reads(watch_guard, monkeypatch, args):
+    plugin, _ = watch_guard
+    monkeypatch.setitem(sys.modules, "tools.registry", SimpleNamespace(registry=SimpleNamespace(
+        get_toolset_for_tool=lambda name: "session_search", get_schema=lambda name: None)))
+    assert plugin.native_proactive_read_only_guard("session_search", args, "watch-run") is None
+
+
 # Before the fix the server's hint alone released any name with no listed write word, on every server. A watch runs
 # unattended, so the name must hold a read word on a trusted server too; on an untrusted one it may not hold a noun either.
 @pytest.mark.parametrize("trust, noun_runs", [(None, True), ("full", True), ("untrusted", False)])

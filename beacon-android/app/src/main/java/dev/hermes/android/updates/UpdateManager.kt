@@ -261,6 +261,9 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     }
 
     /** The plugin row of the update screen: read what Hermes runs. [absent] is the sign-in's own word that the plugin is not installed. */
+    private fun restartKey(client: BeaconClient) = "plugin_restart_" + client.scope.copy(session = "").key
+    private fun restartPending(client: BeaconClient) = prefs.getBoolean(restartKey(client), false)
+
     internal fun refreshPlugin(client: BeaconClient?, absent: Boolean) {
         scope.launch {
             if (job?.isActive == true) return@launch
@@ -269,7 +272,12 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
             probe = PluginProbe.Checking
             publish { this }
             val detached = client.detached()
-            try { probe = probePlugin(HermesPluginUpdater(detached)) }
+            try {
+                probe = probePlugin(HermesPluginUpdater(detached))
+                val read = probe as? PluginProbe.Read
+                val target = _state.value.latest?.pluginVersion.orEmpty()
+                if (restartPending(detached) && read != null && !olderVersion(read.versions.installed, target)) pluginResult = pluginRowFor(read, target).copy(status = PluginStatus.Restart)
+            }
             finally { detached.closeNative(); if (probe == PluginProbe.Checking) probe = PluginProbe.None; publish { this } }
         }
     }
@@ -338,7 +346,7 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
             if (client != null && !pluginAbsent && selfUpdates) {
                 probe = probePlugin(HermesPluginUpdater(client))
                 publish { this }
-                if (_state.value.plugin.status == PluginStatus.Available) pluginStep(client, accept = false)
+                if (restartPending(client) || _state.value.plugin.status in setOf(PluginStatus.Available, PluginStatus.Restart)) pluginStep(client, accept = false)
             }
             if (release == null) { publish { copy(phase = UpdatePhase.Idle) }; return }
             install(pendingFor(release) ?: download(release))
@@ -355,9 +363,13 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     /** Hermes' own updater; whatever it answers lands on the plugin row, and the app update goes on. */
     private suspend fun pluginStep(client: BeaconClient, accept: Boolean) {
         val target = _state.value.latest?.pluginVersion.orEmpty()
+        val restartOnly = restartPending(client)
+        // Keep the recovery step before either native mutation, including cancellation or process death.
+        check(prefs.edit().putBoolean(restartKey(client), true).commit()) { "Plugin restart state could not be saved" }
         pluginResult = PluginRow(PluginStatus.Updating, _state.value.plugin.installed, target)
         publish { this }
-        val row = runPluginUpdate(HermesPluginUpdater(client), target, accept)
+        val row = runPluginUpdate(HermesPluginUpdater(client), target, accept, restartOnly = restartOnly)
+        check(prefs.edit().putBoolean(restartKey(client), row.status in setOf(PluginStatus.Restart, PluginStatus.Busy, PluginStatus.Failed)).commit()) { "Plugin restart state could not be saved" }
         pluginResult = row.takeIf { it.status != PluginStatus.Hidden }
         if (row.status == PluginStatus.Hidden) probe = PluginProbe.None
         publish { this }

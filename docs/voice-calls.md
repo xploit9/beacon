@@ -2,6 +2,8 @@
 
 Voice requests go to the same Hermes conversation as text chat. Hermes uses that conversation's configured model, profile, instructions, memory, tools and approvals. Your chosen realtime provider handles speech.
 
+Call setup reads only the profile metadata needed for the greeting and admission. It skips external secret-provider resolution and reuses the profile's already bound clock. The native Hermes agent still resolves its own credentials when work needs them. Connection becomes ready after the scoped context and speech provider confirm setup; network/provider latency and safe cleanup of an earlier call can still delay it.
+
 ## Tools and memory
 
 - Ask naturally, as you would in the chat. Hermes chooses the tools and skills enabled in your installation, including its connected MCP servers and their normal discovery workflows.
@@ -23,6 +25,8 @@ Speech is generated in an isolated session from the native reply or a fixed call
 Speech comparisons accept apostrophe and prose-quote typography and omit Markdown emphasis markers. Literal code, operators and measurement marks remain checked; the saved native reply is unchanged.
 
 ## Saving and ending a call
+
+Plugin updates from Settings include a gateway restart when Hermes requires it. Beacon waits for native restart completion and a serving gateway before reporting success. Active calls and native work can defer the restart; use the saved **Restart Hermes** action in the app to retry without reinstalling the plugin.
 
 Beacon keeps text transcripts and call metadata, with no retained call audio. Text uploads retry with the same event identity after a temporary disconnect. Diagnostic uploads cannot turn a saved transcript into a missing-text warning.
 
