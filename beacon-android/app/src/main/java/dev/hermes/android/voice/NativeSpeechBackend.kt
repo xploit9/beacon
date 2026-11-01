@@ -19,17 +19,9 @@ internal class NativeSpeechRenderer(
     private val event: (JSONObject) -> Unit,
     private val playing: (Long) -> Unit,
     private val http: Call.Factory? = null,
-    // A prefetch renders before presentation is allowed, so it needs call ownership but never readiness.
-    private val renderable: () -> Boolean = owned,
-    // The opening line ends presented (true) or failed before presenting (false); its first bytes come from played().
-    private val openingEnded: (Boolean) -> Unit = {},
     elapsedMs: (() -> Long)? = null,
-    private val openingRenderMs: Long = OPENING_RENDER_MS,
-    // A one-part opening line's checked audio, so the phone can keep the greeting for the next call's tap.
-    private val openingRendered: (String, ByteArray) -> Unit = { _, _ -> },
 ) {
-    // An opening line carries its render deadline; every other line has none.
-    private data class Line(val generation: Long, val text: String, val deadline: Long? = null)
+    private data class Line(val generation: Long, val text: String)
     private sealed class Rendered {
         data class Audio(val bytes: ByteArray) : Rendered()
         object MissingTranscript : Rendered()
@@ -38,11 +30,11 @@ internal class NativeSpeechRenderer(
         object ProviderRejected : Rendered()
         object Failed : Rendered()
     }
-    private data class Playback(val generation: Long, val remaining: java.util.concurrent.atomic.AtomicInteger, val done: CompletableDeferred<Unit>, val opening: Boolean = false)
-    /** Audio rendered ahead of its line, in memory only; used for the same generation and exact text, otherwise discarded. */
+    private data class Playback(val generation: Long, val remaining: java.util.concurrent.atomic.AtomicInteger, val done: CompletableDeferred<Unit>)
+    /** The next part's audio, rendered while this one plays; used for the same generation and exact text, otherwise discarded. */
     private class Prefetch(val generation: Long, val text: String, val result: Deferred<Rendered>)
-    /** A render is live while its generation is current and its gate holds: presentation needs `owned`, a prefetch `renderable`. */
-    private data class Gate(val token: Long, val prefetch: Boolean)
+    /** A render is live while its generation is current and the call owns it. */
+    private data class Gate(val token: Long)
     private val generation = AtomicLong()
     private val startedAt = System.nanoTime()
     private val since: () -> Long = elapsedMs ?: { (System.nanoTime() - startedAt) / 1_000_000 }
@@ -73,10 +65,8 @@ internal class NativeSpeechRenderer(
                         else -> "Voice could not safely read the reply. Open the attached conversation."
                     }
                     event(JSONObject().put("type", "warning").put("message", message))
-                    if (line.deadline != null) openingEnded(false)
                     break
                 }
-                if (line.deadline != null && parts.size == 1) openingRendered(part, rendered)
                 // Render the following part while this one plays; interrupt() discards it with its generation.
                 val following = parts.getOrNull(index + 1)?.let { line.generation to it }
                     ?: (next ?: lines.tryReceive().getOrNull())?.also { next = it }?.let { it.generation to chunks(it.text).firstOrNull() }
@@ -90,7 +80,7 @@ internal class NativeSpeechRenderer(
                     val end = minOf(offset + 48000, playable.size)
                     val chunk = playable.copyOfRange(offset, end)
                     val duration = chunk.size / 2 * 1000L / GeminiWire.OUTPUT_RATE
-                    val item = Playback(line.generation, java.util.concurrent.atomic.AtomicInteger(chunk.size), CompletableDeferred(), line.deadline != null)
+                    val item = Playback(line.generation, java.util.concurrent.atomic.AtomicInteger(chunk.size), CompletableDeferred())
                     val released = synchronized(fence) {
                         if (!valid(line.generation)) false else {
                             playbacks.add(item); pending.addLast(item)
@@ -113,60 +103,35 @@ internal class NativeSpeechRenderer(
                     }
                     if (!presentedAll) break
                 }
-                val finished = synchronized(fence) { if (presentedAll && offset == playable.size && pending.isEmpty() && valid(line.generation)) {
+                synchronized(fence) { if (presentedAll && offset == playable.size && pending.isEmpty() && valid(line.generation)) {
                     event(JSONObject().put("type", "transcript").put("role", "assistant").put("text", part).put("final", false))
                     event(JSONObject().put("type", "turn_complete"))
-                    true
-                } else false }
-                if (finished && line.deadline != null && index == parts.lastIndex) openingEnded(true)
+                } }
             }
         }
     }
     private fun valid(token: Long) = owned() && token == generation.get()
-    private fun live(gate: Gate) = gate.token == generation.get() && if (gate.prefetch) renderable() else owned()
-    private fun now() = System.nanoTime() / 1_000_000
-    /** [opening] marks the call's greeting: its render, prefetched or not, must finish within [openingRenderMs]. */
-    fun say(text: String, opening: Boolean = false): Boolean {
+    private fun live(gate: Gate) = gate.token == generation.get() && owned()
+    /** Reads Hermes' verified [text] aloud; the call's greeting is the live model's own, never rendered here. */
+    fun say(text: String): Boolean {
         if (text.isBlank() || !owned()) return false
         val bounded = if (text.length > 12000) text.take(12000) + " The rest is in the attached conversation." else text
-        return lines.trySend(Line(generation.get(), bounded, if (opening) now() + openingRenderMs else null)).isSuccess
+        return lines.trySend(Line(generation.get(), bounded)).isSuccess
     }
-    /** Starts rendering [text] before it is said. Nothing is presented until say() queues the same text in this generation. */
-    fun prefetch(text: String): Boolean = prefetch(generation.get(), text)
     private fun prefetch(token: Long, text: String): Boolean {
-        val part = chunks(text).singleOrNull() ?: return false
         synchronized(fence) {
-            if (token != generation.get() || !renderable()) return false
-            prefetched?.let { if (it.generation == token && it.text == part) return true; it.result.cancel() }
-            prefetched = Prefetch(token, part, scope.async { renderChecked(Gate(token, prefetch = true), part) })
+            if (token != generation.get() || !owned()) return false
+            prefetched?.let { if (it.generation == token && it.text == text) return true; it.result.cancel() }
+            prefetched = Prefetch(token, text, scope.async { renderChecked(Gate(token), text) })
         }
         return true
-    }
-    /** The prefetched line's checked audio, or null when it failed or was replaced or dropped. Nothing is presented. */
-    suspend fun prefetchedAudio(): ByteArray? {
-        val slot = synchronized(fence) { prefetched } ?: return null
-        val result = try { slot.result.await() } catch (e: CancellationException) { currentCoroutineContext().ensureActive(); null }
-        return (result as? Rendered.Audio)?.bytes
-    }
-    /** Takes over [early]'s prefetch, started before this renderer existed. Returns its job, or null when nothing was taken. */
-    fun adopt(early: NativeSpeechRenderer): Job? {
-        val taken = synchronized(early.fence) { early.prefetched.also { early.prefetched = null } } ?: return null
-        synchronized(fence) {
-            if (!renderable() || prefetched != null) { taken.result.cancel(); return null }
-            prefetched = Prefetch(generation.get(), taken.text, taken.result)
-        }
-        return taken.result
     }
     private suspend fun obtain(line: Line, part: String): Rendered {
         val slot = synchronized(fence) { prefetched.also { prefetched = null } }
         val ahead = slot?.takeIf { it.generation == line.generation && it.text == part }?.result
         if (ahead == null) slot?.result?.cancel()
-        suspend fun rendered(): Rendered = if (ahead == null) renderChecked(Gate(line.generation, prefetch = false), part) else
+        return if (ahead == null) renderChecked(Gate(line.generation), part) else
             try { ahead.await() } catch (e: CancellationException) { currentCoroutineContext().ensureActive(); Rendered.Failed } catch (_: Exception) { Rendered.Failed }
-        val deadline = line.deadline ?: return rendered()
-        return withTimeoutOrNull((deadline - now()).coerceAtLeast(1)) { rendered() } ?: run {
-            ahead?.cancel(); diagnostic(Gate(line.generation, prefetch = false), "speech-timeout", 0, "timeout"); Rendered.Failed
-        }
     }
     private suspend fun renderChecked(gate: Gate, part: String): Rendered {
         var failure: Rendered = Rendered.Failed
@@ -188,23 +153,20 @@ internal class NativeSpeechRenderer(
         }
         return failure
     }
-    /** Returns whether any of the [count] presented bytes belong to the opening line. */
+    /** Counts [count] presented bytes against the lines being read. */
     // NativePcm calls this while holding its own lock, so it must never take the render fence.
-    fun played(count: Int): Boolean {
+    fun played(count: Int) {
         var left = count
-        var opening = false
         val token = generation.get()
         while (left > 0) {
-            val current = playbacks.peek() ?: return opening
-            if (current.generation != token) return opening
+            val current = playbacks.peek() ?: return
+            if (current.generation != token) return
             val available = current.remaining.get()
             val consumed = minOf(left, available)
             if (!current.remaining.compareAndSet(available, available - consumed)) continue
             left -= consumed
-            if (current.opening && consumed > 0) opening = true
             if (available == consumed) { playbacks.remove(current); current.done.complete(Unit) }
         }
-        return opening
     }
     fun interrupt() = synchronized(fence) {
         generation.incrementAndGet(); waiting?.complete(Rendered.Failed)
@@ -476,44 +438,6 @@ internal class NativeSpeechRenderer(
         return result
     }
 }
-
-/**
- * The grant's greeting, rendered while the call service, Telecom and audio start. Memory only and never presented by
- * itself: the call's renderer adopts it (same text, same checks, presented only once ready) or it is dropped.
- */
-internal class OpeningPrefetch(credentials: VoiceSessionCredentials, val text: String, elapsedMs: () -> Long,
-    sockets: WebSocket.Factory? = null, http: Call.Factory? = null) {
-    private val client = OkHttpClient.Builder().cookieJar(CookieJar.NO_COOKIES).followRedirects(false).followSslRedirects(false).build()
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val dropped = java.util.concurrent.atomic.AtomicBoolean(false)
-    private val pending = ArrayList<JSONObject>()
-    private var sink: ((JSONObject) -> Unit)? = null
-    internal val renderer = NativeSpeechRenderer(credentials, sockets ?: client, scope, { false }, {}, ::diagnostic, {}, http ?: client,
-        renderable = { !dropped.get() }, elapsedMs = elapsedMs)
-    init { renderer.prefetch(text) }
-    /** The finished render (greeting cache refresh), or null; it is never presented by itself. */
-    suspend fun audio(): ByteArray? = renderer.prefetchedAudio()
-    // Content-free render diagnostics wait for the call's timeline; nothing else (e.g. its own interrupt) reaches the call.
-    private fun diagnostic(value: JSONObject) {
-        if (value.optString("type") != "media_diagnostic") return
-        val target = synchronized(pending) { sink ?: run { if (pending.size < 8) pending.add(value); null } }
-        target?.invoke(value)
-    }
-    fun attach(to: (JSONObject) -> Unit) {
-        val held = synchronized(pending) { sink = to; pending.toList().also { pending.clear() } }
-        held.forEach(to)
-    }
-    fun drop() {
-        if (!dropped.compareAndSet(false, true)) return
-        renderer.close(); scope.cancel()
-        client.dispatcher.executorService.shutdown()
-        // drop() can run on the main thread; evicting pooled TLS sockets writes to the network.
-        kotlin.concurrent.thread(name = "beacon-opening-close") { client.connectionPool.evictAll() }
-    }
-}
-
-/** The greeting gets this long from provider readiness to rendered audio before the existing failure handling. */
-internal const val OPENING_RENDER_MS = 8000L
 
 internal fun normalizeVoiceText(value: String): String =
     // Android's ICU engine rejects Java's (?U) flag; explicit spaces work on both runtimes.

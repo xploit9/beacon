@@ -65,10 +65,14 @@ class VisualTourDeviceTest {
             lateinit var saved: kotlinx.coroutines.Job
             compose.runOnIdle { saved = vm.nativePreferences(json("theme" to theme, "reduced_motion" to true)) }
             runBlocking { saved.join() }
+            // A refresh in flight from the previous case can land after the save: wait until the theme is really applied.
+            compose.waitUntil(30_000) { vm.preferences.value.theme == theme }
         }
         var index = 0
         fun screen(name: String, open: BeaconViewModel.() -> Unit) {
             compose.runOnIdle { vm.open() }
+            // Never capture a case in the wrong theme: fail instead (the light case was once captured dark).
+            args.getString("tourTheme")?.let { theme -> check(vm.preferences.value.theme == theme) { "Theme drifted to ${vm.preferences.value.theme} before $name" } }
             capture(++index, name)
         }
         screen("Chat") { tab("Chat") }

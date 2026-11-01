@@ -55,13 +55,19 @@ internal fun openAssistantSettings(context: Context): Boolean {
     return state
 }
 
-/** Settings › Assistant: one row that says whether Beacon answers the phone's assist gesture; [onOpen] goes to Android's picker. */
+/**
+ * Settings › Assistant: one row that says whether Beacon answers the phone's assist gesture and what that gives; [onOpen] goes to
+ * Android's picker. The gesture itself differs between phones, so the row never names one. Android's picker lists the app as
+ * Beacon whatever the assistant is called, so that is the name the row asks the owner to choose.
+ */
 @Composable internal fun PhoneAssistantSection(state: PhoneAssistantState, onOpen: () -> Unit) {
     val active = state == PhoneAssistantState.Active
     SettingsSection(testTag = "phone-assistant-section") {
         SettingsNavRow(uiText("Phone assistant"), onOpen,
-            icon = Icons.Rounded.AutoAwesome, status = if (active) SettingsStatus.Ok else SettingsStatus.Off,
-            statusLabel = if (active) uiText("Active") else uiText("Not set"), external = true, testTag = "phone-assistant")
+            icon = Icons.Rounded.AutoAwesome, value = if (active) uiText("Opens over any app") else uiText("Choose Beacon to open it over any app"),
+            // Not set, the line already says what to do: a "Not set" pill beside it only squeezed it ("to open it over …").
+            valueMaxLines = 2, status = if (active) SettingsStatus.Ok else null,
+            statusLabel = if (active) uiText("Active") else "", external = true, valueTestTag = "phone-assistant-value", testTag = "phone-assistant")
     }
 }
 
@@ -81,6 +87,11 @@ internal fun openAssistantSettings(context: Context): Boolean {
         assistantRole = assistantRole,
     )
     val handled by androidx.compose.runtime.rememberUpdatedState(onHandled)
+    val activity = androidx.activity.compose.LocalActivity.current
+    // The overlay's buttons name what they open; the gesture itself starts the call. A restarted process reads it from the intent.
+    val target = androidx.compose.runtime.remember(issuedAt) {
+        issuedAt?.let { at -> AssistGestures.target(at) ?: activity?.intent?.let { assistTargetOf(it.getStringExtra(EXTRA_ASSIST_PURPOSE), it.getStringExtra(EXTRA_ASSIST_SESSION), it.getStringExtra(EXTRA_ASSIST_PROFILE)) } } ?: AssistTarget()
+    }
     LaunchedEffect(issuedAt, readiness) {
         val at = issuedAt ?: return@LaunchedEffect
         var step = assistStep(readiness, at, System.currentTimeMillis())
@@ -90,12 +101,16 @@ internal fun openAssistantSettings(context: Context): Boolean {
             step = AssistStep.Expired
         }
         handled()
-        when (step) {
-            AssistStep.Call -> vm.callBeacon()
-            AssistStep.ShowCall -> vm.openCurrentCall()
-            AssistStep.OpenChat -> vm.navigate("Beacon")
-            AssistStep.Expired -> vm.notice("$currentAssistantName didn't open in time. Try again.")
-            AssistStep.SignIn, AssistStep.Wait -> Unit
+        when (assistAction(step, target.purpose)) {
+            AssistAction.StartCall -> vm.callBeacon()
+            AssistAction.ShowCall -> vm.openCurrentCall()
+            AssistAction.OpenAssistant -> vm.navigate("Beacon")
+            AssistAction.OpenChat -> {
+                vm.tab("Chat")
+                vm.openConversation(org.json.JSONObject().put("session_id", target.session).put("profile", target.profile))
+            }
+            AssistAction.Expired -> vm.notice("$currentAssistantName didn't open in time. Try again.")
+            AssistAction.None -> Unit
         }
     }
 }

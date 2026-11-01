@@ -178,7 +178,7 @@ class ProactiveUiTest {
         fixture.proactiveRouteMissing = true
         compose.runOnIdle { vm.more("Assistant") }
         await { vm.data.value[proactiveKey(fixture)]?.optBoolean("_pluginUpdateRequired") == true }
-        compose.onNodeWithText("Update Beacon on your Hermes").assertExists()
+        compose.onNodeWithText("Update the Beacon plugin").assertExists()
         compose.onNodeWithText("Retry").assertDoesNotExist()
 
         fixture.proactiveRouteMissing = false

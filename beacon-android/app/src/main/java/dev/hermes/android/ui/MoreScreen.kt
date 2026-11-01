@@ -28,6 +28,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.AppState
@@ -177,8 +178,9 @@ private fun JSONObject?.loadedRecord() = this?.takeIf { recordError(it).isBlank(
 /** The one pending plugin step the hub's App updates row points at, or blank when the plugin needs nothing. */
 internal fun pluginActionWord(plugin: PluginRow): String = when {
     !plugin.actionable -> ""
-    plugin.status == PluginStatus.Restart -> "Restart Hermes"
-    else -> "Update Hermes plugin"
+    plugin.status in setOf(PluginStatus.Restart, PluginStatus.Waiting, PluginStatus.RestartFailed) -> "Restart Hermes"
+    plugin.status == PluginStatus.DashboardFailed -> "Restart dashboard"
+    else -> "Update the Beacon plugin"
 }
 
 /** Reads the same local state as the focused pages, so a summary never claims more than the page it opens will show. */
@@ -357,18 +359,19 @@ private fun choiceTags(label: String, options: List<String>) = options.associate
         SettingsList(refreshing = record?.optBoolean("_loading") == true, testTag = "chat-preferences") {
             if (failed) item { SettingsSection(testTag = "chat-preferences-error") { SettingsErrorRow(uiText("Couldn't load chat settings"), null, "") } }
             item {
-                SettingsSection(uiText("Sending")) {
+                SettingsSection(uiText("When you send"), testTag = "settings-section:Sending") {
+                    // The stored values stay steer and queue, and the option tags keep the old English label, so saved choices and tests still find them.
                     SettingsChoiceRow(
-                        assistantText("While Beacon is replying"), busyOverride ?: preferences.busySendAction, busyOptions, { vm.setBusySendAction(it) },
-                        icon = Icons.AutoMirrored.Rounded.CallSplit, optionLabels = mapOf("steer" to "Steer", "queue" to "Queue"),
+                        assistantText("If you send while Beacon replies"), busyOverride ?: preferences.busySendAction, busyOptions, { vm.setBusySendAction(it) },
+                        icon = Icons.AutoMirrored.Rounded.CallSplit, optionLabels = mapOf("steer" to "Change the reply", "queue" to "Send after"),
                         optionIcons = mapOf("steer" to Icons.AutoMirrored.Rounded.CallSplit, "queue" to Icons.AutoMirrored.Rounded.PlaylistAdd),
-                        optionTestTags = choiceTags("While Beacon is replying", busyOptions), enabled = preferences.busySendLoaded, style = ChoiceStyle.Segmented,
+                        optionTestTags = choiceTags("While Beacon is replying", busyOptions), enabled = preferences.busySendLoaded, style = ChoiceStyle.Segmented, fitSegments = true,
                     )
                     SettingsDivider()
                     SettingsChoiceRow(
                         uiText("Send shortcut"), settings.string("send_key", "enter"), keyOptions, { vm.nativePreferences(json("send_key" to it)) },
                         icon = Icons.Rounded.Keyboard, optionLabels = mapOf("enter" to "Enter", "ctrl_enter" to "Ctrl + Enter"),
-                        optionTestTags = choiceTags("Send shortcut", keyOptions), enabled = !failed, style = ChoiceStyle.Segmented,
+                        optionTestTags = choiceTags("Send shortcut", keyOptions), enabled = !failed, style = ChoiceStyle.Segmented, fitSegments = true,
                     )
                 }
             }
@@ -469,6 +472,8 @@ internal fun settingsHost(address: String): String {
         item {
             SettingsStatusHero(
                 status, title, line = if (verdict == ConnectionVerdict.Offline) uiText("Check your network") else host, lineTestTag = "connection-host",
+                // An address is read from both ends: one line, the middle cut, so the port always shows.
+                lineMaxLines = 1, lineOverflow = TextOverflow.MiddleEllipsis,
                 meta = if (ui.owner.isBlank() && profileName.isBlank()) null else ({
                     if (ui.owner.isNotBlank()) SettingsBadge(ui.owner, testTag = "connection-account")
                     if (profileName.isNotBlank()) SettingsBadge(profileName, testTag = "connection-profile")
@@ -479,7 +484,7 @@ internal fun settingsHost(address: String): String {
         item {
             SettingsSection(uiText("Server"), testTag = "settings-section:Server") {
                 Column(Modifier.animateContentSize(tween(if (motion) 200 else 0))) {
-                    SettingsNavRow(uiText("Server address"), { editing = !editing }, icon = Icons.Rounded.Dns, value = host, valueTestTag = "connection-server-value", testTag = "connection-server-row")
+                    SettingsNavRow(uiText("Server address"), { editing = !editing }, icon = Icons.Rounded.Dns, value = host, valueTestTag = "connection-server-value", testTag = "connection-server-row", valueOverflow = TextOverflow.MiddleEllipsis)
                     if (ui.error.isNotBlank()) { SettingsDivider(); SettingsErrorRow(uiText(ui.error), null, "", Modifier.testTag("connection-error")) }
                     if (editing) {
                         SettingsDivider()
@@ -491,6 +496,7 @@ internal fun settingsHost(address: String): String {
                 }
             }
         }
+        item { PluginHealthSection(vm, pluginAbsent) }
         item { DevicesSettingsSection(vm, pluginAbsent) }
         item {
             SettingsSection(testTag = "settings-section:sign-out") {
@@ -511,9 +517,13 @@ internal fun settingsHost(address: String): String {
 
 @Composable private fun AppearanceSettings(vm: BeaconViewModel) {
     val prefs by vm.preferences.collectAsStateWithLifecycle()
+    AppearanceContent(prefs.theme, prefs.skin, rememberAppearanceSwatches(), { vm.nativePreferences(json("theme" to it)) }, { vm.nativePreferences(json("skin" to it)) })
+}
+
+/** One tile per colour style, each in that style's own accent and background for the current theme; neutral tiles show until the palettes are read. */
+@Composable internal fun rememberAppearanceSwatches(): List<SettingsSwatch> {
     val context = LocalContext.current
     val dark = MaterialTheme.colorScheme.background.luminance() < .5f
-    // Each style's own accent and background for the current theme; the swatches show neutral tiles until they are read.
     val colors by produceState<Map<String, Pair<Color, Color>>>(emptyMap(), dark) {
         value = withContext(Dispatchers.Default) {
             runCatching {
@@ -525,23 +535,26 @@ internal fun settingsHost(address: String): String {
             }.getOrDefault(emptyMap())
         }
     }
+    return NativeSkins.map { skin -> SettingsSwatch(skin, uiText(skinLabels.getValue(skin)), colors[skin]?.first, colors[skin]?.second) }
+}
+
+/** The Appearance page: the theme (System, Dark, Light) and the colour style. Text size, language, text direction and motion follow the phone's own settings. */
+@Composable internal fun AppearanceContent(theme: String, skin: String, swatches: List<SettingsSwatch>, onTheme: (String) -> Unit, onSkin: (String) -> Unit) {
     val themes = listOf("system", "dark", "light")
-    val swatches = NativeSkins.map { skin -> SettingsSwatch(skin, uiText(skinLabels.getValue(skin)), colors[skin]?.first, colors[skin]?.second) }
-    // Text size, language, text direction and motion follow the phone's own settings.
     SettingsList(testTag = "appearance-settings") {
         item {
             SettingsSection(testTag = "settings-section:Theme") {
                 SettingsChoiceRow(
-                    uiText("Theme"), prefs.theme, themes, { vm.nativePreferences(json("theme" to it)) },
+                    uiText("Theme"), theme, themes, onTheme,
                     icon = Icons.Rounded.Palette, optionLabels = settingsThemeLabels,
                     optionIcons = mapOf("system" to Icons.Rounded.BrightnessAuto, "dark" to Icons.Rounded.DarkMode, "light" to Icons.Rounded.LightMode),
-                    optionTestTags = choiceTags("Theme", themes), style = ChoiceStyle.Segmented,
+                    optionTestTags = choiceTags("Theme", themes), style = ChoiceStyle.Auto, fitSegments = true,
                 )
             }
         }
         item {
             SettingsSection(uiText("Color style"), testTag = "settings-section:Color style") {
-                SettingsSwatchPicker(swatches, prefs.skin, { vm.nativePreferences(json("skin" to it)) })
+                SettingsSwatchPicker(swatches, skin, onSkin)
             }
         }
     }

@@ -437,7 +437,8 @@ class SetupWizardUiTest {
                 }
                 compose.onNodeWithTag("setup-finish").assertDoesNotExist()
                 compose.onNodeWithTag("message-input").assertIsDisplayed().assertTextContains("Keep this unfinished message")
-                compose.onNodeWithText("Earlier native answer").assertIsDisplayed()
+                // The chat's own transcript shows it; a history row or another screen may preview the same words.
+                compose.onNode(androidx.compose.ui.test.hasText("Earlier native answer") and hasAnyAncestor(androidx.compose.ui.test.hasTestTag("transcript-layer"))).assertIsDisplayed()
             }
             compose.waitUntil(5_000) { runBlocking { app.preferences.data.first()[booleanPreferencesKey("setup_active")] == false } }
         } finally {
@@ -564,7 +565,8 @@ class SetupWizardUiTest {
         assertEquals(1, probes)
         assertEquals(pendingOrigin, probedOrigin)
         assertEquals(activeOrigin, state.origin)
-        compose.onNodeWithText("Close setup").performClick()
+        // Close setup is the header X, labelled for TalkBack.
+        compose.onNodeWithContentDescription("Close setup").performClick()
         assertTrue(cancelled)
         assertEquals(activeOrigin, state.origin)
     }

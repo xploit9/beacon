@@ -216,6 +216,11 @@ internal fun pinSelectedModel(models: List<JSONObject>, selectedId: String, inCu
     }
 }
 
+/** The chips a loading reasoning control draws: as many as the usual levels, each as wide and tall as a loaded chip. */
+internal const val ReasoningSkeletonChips = 4
+internal val ReasoningSkeletonWidth = 72.dp
+internal val ReasoningSkeletonHeight = 32.dp
+
 /** The chat's model with its provider, and the reasoning level as segments that apply on tap. Spoken as one line; the segments stay separate controls. */
 @Composable private fun CurrentModelCard(
     model: String, provider: String, applying: Boolean, options: List<String>, effort: String, reasoningLoading: Boolean, reasoningFailed: Boolean,
@@ -241,7 +246,16 @@ internal fun pinSelectedModel(models: List<JSONObject>, selectedId: String, inCu
                 }
             }
             reasoningFailed -> { SettingsDivider(); SettingsErrorRow(uiText("Couldn't load reasoning"), onRetry, uiText("Retry")) }
-            reasoningLoading -> Box(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 16.dp).height(48.dp).clip(RoundedCornerShape(24.dp)).background(MaterialTheme.colorScheme.onSurface.copy(alpha = .06f)).testTag("reasoning-loading"))
+            // The label and four chip-shaped blocks, the shape the loaded control has, so nothing jumps when it arrives.
+            reasoningLoading -> {
+                SettingsDivider()
+                Column(Modifier.fillMaxWidth().padding(16.dp).testTag("reasoning-loading"), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(uiText("Reasoning"), style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        repeat(ReasoningSkeletonChips) { Box(Modifier.size(width = ReasoningSkeletonWidth, height = ReasoningSkeletonHeight).clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.onSurface.copy(alpha = .06f))) }
+                    }
+                }
+            }
             automatic -> { SettingsDivider(); Text(uiText("This model manages reasoning automatically."), Modifier.padding(16.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         }
     }
@@ -281,9 +295,9 @@ internal val reasoningLevels = listOf("none", "minimal", "low", "medium", "high"
 /** The reasoning words and sentences reach uiText through variables, so the translation test reads them from here. */
 internal val ReasoningStrings = (reasoningLevels.map(::reasoningLevelLabel) + reasoningLevels.map(::reasoningLevelDescription) + reasoningLevelDescription("")).distinct()
 
-@Composable private fun ReasoningSkeleton() {
+@Composable internal fun ReasoningSkeleton() {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().testTag("reasoning-skeleton")) {
-        BeaconSignal(BeaconMotionMode.Sweep, size = 28.dp)
+        BeaconDustCore(28.dp)
         repeat(3) { index ->
             Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth().heightIn(min = 64.dp)) {
                 Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
@@ -315,6 +329,10 @@ internal fun sessionUsageFigures(usage: JSONObject): SessionUsageFigures {
         consumed = consumed,
     )
 }
+
+/** Hermes sent no token figures for a chat that holds replies: input and output are both zero or missing. */
+internal fun sessionUsageUnreported(figures: SessionUsageFigures, hasReplies: Boolean): Boolean =
+    hasReplies && (figures.input ?: 0L) == 0L && (figures.output ?: 0L) == 0L
 
 /** Whether a usage record holds anything to show: a key that is not a marker (`_…`) or the server's own error, success or message fields, with a value. */
 internal fun sessionUsageReadable(usage: JSONObject): Boolean = usage.keys().asSequence().any { key ->
@@ -390,13 +408,18 @@ internal fun formatTokenCount(value: Long, locale: Locale = Locale.getDefault())
                     if (index > 0) SettingsDivider()
                     val name = row.string("name").removePrefix("/")
                     // Choosing a command prepares it in Chat for review; it is never sent from here.
-                    CommandRow(name, row.string("description")) { vm.tab("Chat"); vm.composer(TextFieldValue("/$name ")) }
+                    CommandRow(name, commandDescriptionText(name, row.string("description"))) { vm.tab("Chat"); vm.composer(TextFieldValue("/$name ")) }
                 }
             } }
             error.isBlank() -> item { SettingsSection { SettingsEmpty(uiText("No matching commands"), Icons.Rounded.SearchOff, action = if (query.isBlank()) null else SettingsAction(uiText("Clear search"), { onQuery("") })) } }
         }
     }
 }
+
+/** A built-in command has the app's own short description, which goes through uiText; a custom command keeps the description it came with. */
+internal fun isBuiltInCommand(name: String): Boolean = slashCommandText(name, "") in SlashCommandStrings
+
+@Composable private fun commandDescriptionText(name: String, description: String): String = if (isBuiltInCommand(name)) uiText(description) else description
 
 @Composable internal fun CommandRow(name: String, description: String, onClick: () -> Unit) {
     Row(Modifier.fillMaxWidth().heightIn(min = SettingsKit.RowMinHeightTwoLine).clickable(role = Role.Button, onClick = onClick).padding(horizontal = 16.dp, vertical = 12.dp),
@@ -428,12 +451,15 @@ internal fun formatTokenCount(value: Long, locale: Locale = Locale.getDefault())
                 val figures = sessionUsageFigures(usage)
                 val line = listOf(chat.raw.string("model_provider"), chat.raw.string("model").ifBlank { usage.string("model") }).filter { it.isNotBlank() }.joinToString(" · ")
                 item { SettingsStatusHero(null, chat.title.ifBlank { uiText("Session usage") }, line = line, icon = Icons.Rounded.BarChart, testTag = "usage-hero") }
-                if (figures.input != null || figures.output != null || figures.window != null || figures.percent != null) item { SettingsSection(testTag = "usage-figures") {
+                // "0 in, 0 out" under a chat full of replies is Hermes not counting, not the chat using nothing.
+                val unreported = sessionUsageUnreported(figures, chat.messages.any { it.role == "assistant" })
+                if (unreported || figures.input != null || figures.output != null || figures.window != null || figures.percent != null) item { SettingsSection(testTag = "usage-figures") {
                     val metrics = listOfNotNull(
-                        figures.input?.let { uiText("Input") to formatTokenCount(it) },
-                        figures.output?.let { uiText("Output") to formatTokenCount(it) },
+                        figures.input?.takeUnless { unreported }?.let { uiText("Tokens in") to formatTokenCount(it) },
+                        figures.output?.takeUnless { unreported }?.let { uiText("Tokens out") to formatTokenCount(it) },
                         figures.window?.let { uiText("Context") to formatTokenCount(it) },
                     )
+                    if (unreported) SettingsValueRow(uiText("Hermes didn't report usage for this chat."), icon = Icons.Rounded.Info, testTag = "usage-unreported")
                     if (metrics.isNotEmpty()) SettingsMetricRow(metrics)
                     figures.percent?.let { percent ->
                         Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 16.dp, top = if (metrics.isEmpty()) 16.dp else 0.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {

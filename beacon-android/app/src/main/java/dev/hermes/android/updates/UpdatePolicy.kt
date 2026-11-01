@@ -80,9 +80,12 @@ internal fun formatSize(bytes: Long): String =
 
 internal fun progressPercent(done: Long, total: Long): Int = if (total <= 0) 0 else (done * 100 / total).toInt().coerceIn(0, 100)
 
+/** "13 of 31 MB": the figures alone, for a hero whose checklist already shows the percent on the download step. [of] is "{0} of {1}" in the phone's language. */
+internal fun progressSizeLine(done: Long, total: Long, of: String = "{0} of {1}"): String =
+    of.replace("{0}", megabytes(done, total < 10L * 1024 * 1024)).replace("{1}", formatSize(total))
+
 /** "42% · 13 of 31 MB" */
-internal fun progressLine(done: Long, total: Long): String =
-    "${progressPercent(done, total)}% · ${megabytes(done, total < 10L * 1024 * 1024)} of ${formatSize(total)}"
+internal fun progressLine(done: Long, total: Long, of: String = "{0} of {1}"): String = "${progressPercent(done, total)}% · ${progressSizeLine(done, total, of)}"
 
 /** "just now", "5 min ago", "3 h ago", "2 d ago"; blank when never checked. The screen passes the words in the phone's language. */
 internal fun checkedAgo(lastCheck: Long, now: Long, justNow: String = "just now", minutesAgo: String = "{0} min ago",

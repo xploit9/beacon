@@ -136,11 +136,20 @@ class AssistLaunchTest {
         assertEquals(listOf("android.intent.category.DEFAULT"), filter.children("category").map { it.android("name") })
     }
 
-    @Test fun nothingIsClaimedForTheHeadsetVoiceButtonOrAsAVoiceService() {
-        // VOICE_COMMAND would make Android ask which app to use for every headset button hold; the assist action is enough to be listed.
+    @Test fun nothingIsClaimedForTheHeadsetVoiceButtonAndOnlyAndroidCanBindTheAssistant() {
+        // VOICE_COMMAND would make Android ask which app to use for every headset button hold; the assistant is enough to be listed.
         assertTrue(activities().none { "android.intent.action.VOICE_COMMAND" in it.actions() })
-        val application = manifest().children("application").single()
-        assertTrue(application.children("service").none { it.android("permission") == "android.permission.BIND_VOICE_INTERACTION" })
+        val services = manifest().children("application").single().children("service")
+        // Beacon's own overlay (lane assist-overlay): the voice interaction service and its session service only Android may bind.
+        val assistant = services.filter { "android.service.voice.VoiceInteractionService" in it.actions() }
+        assertEquals(listOf(".assist.BeaconVoiceInteractionService"), assistant.map { it.android("name") })
+        val guarded = services.filter { it.android("permission") == "android.permission.BIND_VOICE_INTERACTION" }.map { it.android("name") }
+        assertEquals(setOf(".assist.BeaconVoiceInteractionService", ".assist.BeaconAssistSessionService"), guarded.toSet())
+        // The recognizer Android requires beside it answers only the speech recognition interface: other apps' speech input must
+        // still reach it, and Android's RecognitionService refuses callers without the microphone permission.
+        val recognizer = services.single { it.android("name") == ".assist.BeaconRecognitionService" }
+        assertEquals(listOf("android.speech.RecognitionService"), recognizer.actions())
+        assertEquals("true", recognizer.android("exported"))
     }
 
     @Test fun noNewPermissionIsRequestedForTheAssistantRole() {

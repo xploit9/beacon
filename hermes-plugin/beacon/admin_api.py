@@ -1,9 +1,14 @@
 """Authorized bot reading and revision-protected native model selection."""
 import asyncio
 import hashlib
+import importlib.util
 import json
+from pathlib import Path
 import re
+import sys
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse
+from starlette.background import BackgroundTask
 
 
 def revision(value):
@@ -172,6 +177,17 @@ async def native_plugin_restart_status():
     return await get_action_status('gateway-restart', lines=1)
 
 
+def dashboard_restarter():
+    """The dashboard-restart module, loaded like the dashboard loads its siblings (this file's own directory, under a stable name)."""
+    module = sys.modules.get('beacon_dashboard_restart')
+    if module is None:
+        spec = importlib.util.spec_from_file_location('beacon_dashboard_restart', Path(__file__).resolve().parent / 'dashboard_restart.py')
+        module = importlib.util.module_from_spec(spec)
+        sys.modules['beacon_dashboard_restart'] = module
+        spec.loader.exec_module(module)
+    return module
+
+
 def current_receipt(state, requested_at, action_id):
     from datetime import datetime
     if not requested_at:
@@ -227,6 +243,35 @@ def build_router(identity, read_body):
         return {'pid': pid, 'running': matched and action.get('running') is True,
                 'completed': ended and action.get('exit_code') == 0,
                 'failed': ended and isinstance(action.get('exit_code'), int) and action['exit_code'] != 0}
+
+    @router.post('/admin/dashboard/restart')
+    async def restart_dashboard(request: Request):
+        """Restart the dashboard serving this request, from a helper that outlives it. The answer goes out first; the helper stops nothing before that."""
+        mobile = sys.modules['beacon_mobile']
+        owner, _, _, cfg = identity(request, owner_only=True)
+        with mobile.LOCK, mobile.connect() as conn:
+            if mobile.active_calls(conn, owner):
+                raise HTTPException(409, 'End your call before restarting Hermes')
+        # Hermes' own update replaces its code and restarts what it must; stopping the dashboard under it would only get in the way.
+        if await asyncio.to_thread(update_in_progress):
+            return {'restart_started': False, 'restart_error_code': 'live_sessions'}
+        restarter = dashboard_restarter()
+        server = request.scope.get('server')
+        payload, start = await asyncio.to_thread(restarter.begin, mobile.home(), server[1] if server else None, cfg['profiles'][0])
+        return JSONResponse(payload, background=BackgroundTask(start) if start else None)
+
+    @router.get('/admin/dashboard/restart/status')
+    async def dashboard_restart_status(request: Request, id: str):
+        mobile = sys.modules['beacon_mobile']
+        identity(request, owner_only=True)
+        if not re.fullmatch(r'[0-9a-f]{32}', id):
+            raise HTTPException(400, 'Invalid restart identity')
+        restarter = dashboard_restarter()
+        try:
+            host = restarter.Host()
+        except ImportError:
+            host = None
+        return restarter.public_status(restarter.read_status(restarter.status_path(mobile.home())), id, host)
 
     @router.get('/admin/model-capabilities')
     async def capabilities(request: Request, model: str, provider: str = ''):

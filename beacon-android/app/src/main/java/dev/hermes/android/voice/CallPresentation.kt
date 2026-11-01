@@ -36,7 +36,7 @@ internal fun callStatusLabel(call: CallState): String {
 internal val CallStrings = listOf(
     "Call on hold", "Connecting", "Thinking", "Speaking", "Muted", "Listening", "Idle", "Ending",
     "Some of this call wasn't saved to the chat", "Saving to the chat", "Saved to the chat",
-    "Call history unavailable",
+    "Call history unavailable", CALL_DROPPED, CALL_VOICE_STOPPED,
 )
 internal fun callTimerLabel(startedAtMillis: Long, nowMillis: Long): String {
     val elapsedSeconds = if (startedAtMillis > 0) ((nowMillis - startedAtMillis).coerceAtLeast(0) / 1000) else 0

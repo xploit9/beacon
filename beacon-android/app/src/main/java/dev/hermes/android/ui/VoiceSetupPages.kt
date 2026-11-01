@@ -490,7 +490,8 @@ internal fun voiceChoicesPage(
                         moreLabel = uiText("More voices ({0})").replace("{0}", "$hiddenVoices"), moreTestTag = "voice-more-voices", expanded = moreVoices, onExpand = { moreVoices = true })
                 }
                 SettingsSection(uiText("Personality")) {
-                    SettingsOptionCards(personalities, selection.personality, { id -> pick(selection.copy(personality = id)) }, columns = 3)
+                    // Three cards side by side break their names at large text; one column keeps every word whole.
+                    SettingsOptionCards(personalities, selection.personality, { id -> pick(selection.copy(personality = id)) }, columns = if (isLargeText(androidx.compose.ui.platform.LocalDensity.current.fontScale)) 1 else 3)
                 }
                 val models = (listOf(openingModel) + catalog?.models.orEmpty().ifEmpty { listOf(defaultVoiceModel(provider)) } + selection.model).distinct()
                 SettingsSection(uiText("Model")) {

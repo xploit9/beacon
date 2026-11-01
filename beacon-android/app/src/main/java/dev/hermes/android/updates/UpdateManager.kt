@@ -42,7 +42,7 @@ import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.util.UUID
 
-internal enum class UpdatePhase { Idle, Checking, Available, Downloading, NeedsPermission, Installing, Failed }
+internal enum class UpdatePhase { Idle, Checking, Available, Downloading, Verifying, NeedsPermission, Installing, Failed }
 
 /** Each failure is one short sentence; [retriesCheck] says whether "Try again" asks GitHub again or repeats the update. */
 internal enum class UpdateFailure(val text: String, val retriesCheck: Boolean = false) {
@@ -74,6 +74,10 @@ internal data class AppUpdateUi(
     val plugin: PluginRow = PluginRow(),
     val updated: UpdatedNotice? = null,
     val supported: Boolean = true,
+    /** The Beacon plugin's checklist while it updates, and as it ended; empty when no plugin update has run on this screen. */
+    val pluginSteps: List<StepRow> = emptyList(),
+    /** The app's own checklist: downloading, verifying and installing. */
+    val appSteps: List<StepRow> = emptyList(),
 ) {
     /** A plugin action waits for the owner (an update, a restart, or a plugin newer than the app): what the settings hub reads beside App updates. */
     val pluginPending: Boolean get() = plugin.attention
@@ -96,6 +100,9 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     private val notifications get() = app.getSystemService(NotificationManager::class.java)
     private val _state = MutableStateFlow(AppUpdateUi(supported = selfUpdates))
     internal val state: StateFlow<AppUpdateUi> = _state.asStateFlow()
+    // Every change in these lists is something that really happened to the update: a reply, a finished download, a version read.
+    private val pluginSteps = StepTracker { rows -> _state.update { it.copy(pluginSteps = rows) } }
+    private val appSteps = StepTracker { rows -> _state.update { it.copy(appSteps = rows) } }
     private var job: Job? = null
     // Held by every GitHub check, including the one an Update tap starts, so only one runs at a time.
     private val checking = Mutex()
@@ -119,6 +126,14 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     private fun fail(failure: UpdateFailure) {
         // A failed update may have nothing on screen to show it (signed out); the next check posts the notice again.
         if (!failure.retriesCheck) synchronized(lock) { prefs.edit().remove("notified_version").commit() }
+        // The step that was running is the one that failed; a failure before any step (a check, a call) marks none.
+        val failed = appSteps.rows.active?.step ?: when (failure) {
+            UpdateFailure.Download -> UpdateStep.AppDownload
+            UpdateFailure.Verification -> UpdateStep.AppVerify
+            UpdateFailure.Install -> UpdateStep.AppInstall
+            else -> null
+        }
+        if (failed != null && appSteps.rows.isNotEmpty()) appSteps.fail(failed, failure.text)
         publish { copy(phase = UpdatePhase.Failed, failure = failure) }
     }
 
@@ -280,11 +295,12 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
         return true
     }
 
-    /** The plugin row of the update screen: read what Hermes runs. [absent] is the sign-in's own word that the plugin is not installed. */
+    /** The Beacon plugin row of the update screen: read what Hermes runs. [absent] is the sign-in's own word that the plugin is not installed. */
     private fun scopeKey(client: BeaconClient) = client.scope.copy(session = "").key
     private fun restartKey(client: BeaconClient) = "plugin_restart_" + scopeKey(client)
     private fun waitKey(client: BeaconClient) = "plugin_restart_wait_" + scopeKey(client)
     private fun memoKey(client: BeaconClient) = "plugin_restart_memo_" + scopeKey(client)
+    private fun dashboardKey(client: BeaconClient) = "plugin_dashboard_failed_" + scopeKey(client)
     private fun restartPending(client: BeaconClient) = prefs.getBoolean(restartKey(client), false)
     /** Hermes refused the restart because it was working, so the phone retries it once Hermes is idle. */
     private fun restartWaiting(client: BeaconClient) = restartPending(client) && prefs.getBoolean(waitKey(client), false)
@@ -293,9 +309,14 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
         if (it.completed && System.currentTimeMillis() - it.at !in 0..RESTART_DONE_MEMORY_MS) it.copy(completed = false) else it
     }
     private fun saveMemo(client: BeaconClient, memo: RestartMemo) { synchronized(lock) { prefs.edit().putString(memoKey(client), memo.encode()).commit() } }
+    /** The dashboard restart this phone asked for failed: the dashboard can restart itself, so the app offers that restart again. */
+    private fun dashboardFailed(client: BeaconClient) = prefs.getBoolean(dashboardKey(client), false)
+    private fun saveDashboardFailed(client: BeaconClient, failed: Boolean) {
+        synchronized(lock) { prefs.edit().apply { if (failed) putBoolean(dashboardKey(client), true) else remove(dashboardKey(client)) }.commit() }
+    }
     /** The restart is over (the versions agree): drop the flag, the waiting mark and the remembered pid. */
     private fun forgetRestart(client: BeaconClient) {
-        synchronized(lock) { prefs.edit().remove(restartKey(client)).remove(waitKey(client)).remove(memoKey(client)).commit() }
+        synchronized(lock) { prefs.edit().remove(restartKey(client)).remove(waitKey(client)).remove(memoKey(client)).remove(dashboardKey(client)).commit() }
         restartMemoSeen = RestartMemo()
     }
 
@@ -306,16 +327,30 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     private fun settledPluginRow(client: BeaconClient, read: PluginProbe.Read, target: String): PluginRow? {
         val memo = restartMemo(client)
         restartMemoSeen = memo
-        val facts = pluginRowFor(read, target, memo)
+        val plain = pluginRowFor(read, target, memo)
+        // A dashboard that failed to restart stays one the app can restart again, until the versions say otherwise.
+        val failedBefore = dashboardFailed(client)
+        if (failedBefore && plain.status != PluginStatus.DashboardRestart) saveDashboardFailed(client, false)
+        val facts = plain.afterDashboardFailure(failedBefore)
         val flagged = restartPending(client)
         val gatewayKnown = read.versions.gateway.isNotBlank()
-        if (facts.status !in setOf(PluginStatus.Restart, PluginStatus.DashboardRestart) && memo != RestartMemo()) saveMemo(client, RestartMemo())
+        if (facts.status !in setOf(PluginStatus.Restart, PluginStatus.DashboardRestart, PluginStatus.DashboardFailed) && memo != RestartMemo()) saveMemo(client, RestartMemo())
         return when {
+            facts.status == PluginStatus.DashboardFailed -> facts
             facts.status == PluginStatus.Restart && restartWaiting(client) -> facts.copy(status = PluginStatus.Waiting)
             flagged && gatewayKnown && facts.status == PluginStatus.UpToDate -> { forgetRestart(client); null }
             flagged && !gatewayKnown && facts.status == PluginStatus.UpToDate -> facts.copy(status = if (restartWaiting(client)) PluginStatus.Waiting else PluginStatus.Restart)
             else -> null
         }
+    }
+
+    /**
+     * The update screen was opened: a checklist left by an update that has ended belongs to that visit, not to this one. Reading Hermes again
+     * (which also happens when the connection comes back after the dashboard restarts) keeps it, so the end of the update stays on screen.
+     */
+    internal fun screenOpened() {
+        synchronized(lock) { if (job?.isActive == true) return }
+        pluginSteps.clear(); appSteps.clear()
     }
 
     internal fun refreshPlugin(client: BeaconClient?, absent: Boolean) {
@@ -412,6 +447,7 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
         if (callActive()) return fail(UpdateFailure.Call)
         // Coming back from Android's permission page the verified file is already here: no download to show.
         if (_state.value.phase != UpdatePhase.NeedsPermission) publish { copy(phase = UpdatePhase.Downloading, downloaded = 0, failure = null) }
+        else appSteps.rows.takeIf { it.isNotEmpty() }?.let { appSteps.done(UpdateStep.AppDownload); appSteps.done(UpdateStep.AppVerify) }
         try {
             // The newest release goes first, so the plugin step and the download below are for it and not for the last check's answer.
             val release = try {
@@ -419,15 +455,28 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
                 else _state.value.release
             } catch (error: CancellationException) { throw error }
             catch (error: Exception) { return fail(checkFailure(error)) }
+            if (_state.value.phase != UpdatePhase.NeedsPermission) {
+                pluginSteps.clear()
+                // The app's steps wait their turn: the plugin goes first, then the download.
+                if (release != null) appSteps.plan(UpdateStep.AppDownload, UpdateStep.AppVerify, UpdateStep.AppInstall) else appSteps.clear()
+            }
             if (client != null && !pluginAbsent && selfUpdates) {
                 probe = probePlugin(HermesPluginUpdater(client))
                 publish { this }
-                if (restartPending(client) || _state.value.plugin.status in setOf(PluginStatus.Available, PluginStatus.Restart, PluginStatus.Waiting, PluginStatus.RestartFailed)) pluginStep(client, accept = false)
+                if (restartPending(client) || _state.value.plugin.status in setOf(PluginStatus.Available, PluginStatus.Restart, PluginStatus.Waiting, PluginStatus.RestartFailed,
+                        PluginStatus.DashboardFailed)) pluginStep(client, accept = false)
             }
             if (release == null) { publish { copy(phase = UpdatePhase.Idle) }; return }
-            install(pendingFor(release) ?: download(release))
+            val retained = pendingFor(release)
+            // A verified download kept from an earlier tap needs neither step again.
+            if (retained != null) { appSteps.done(UpdateStep.AppDownload); appSteps.done(UpdateStep.AppVerify) }
+            install(retained ?: download(release))
         } catch (error: CancellationException) {
+            pluginSteps.clear(); appSteps.clear()
+            // Cancelling never stops Hermes: the plugin row reads what Hermes has now, not the update that was being watched.
+            pluginResult = null
             publish { copy(phase = UpdatePhase.Idle, downloaded = 0) }
+            refreshPlugin(client, pluginAbsent)
             throw error
         } catch (error: UpdateException) {
             fail(if (error.kind == UpdateException.Kind.Verification) UpdateFailure.Verification else UpdateFailure.Download)
@@ -436,7 +485,7 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
         }
     }
 
-    /** Hermes' own updater; whatever it answers lands on the plugin row, and the app update goes on. */
+    /** Hermes' own updater; whatever it answers lands on the plugin row, and the app update goes on. Hermes carries on if the phone stops watching. */
     private suspend fun pluginStep(client: BeaconClient, accept: Boolean) {
         val target = _state.value.latest?.pluginVersion.orEmpty()
         val restartOnly = restartPending(client)
@@ -444,9 +493,12 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
         check(prefs.edit().putBoolean(restartKey(client), true).commit()) { "Plugin restart state could not be saved" }
         pluginResult = PluginRow(PluginStatus.Updating, _state.value.plugin.installed, target)
         publish { this }
-        val row = runPluginUpdate(HermesPluginUpdater(client), target, accept, restartOnly = restartOnly,
-            memo = restartMemo(client), remember = { saveMemo(client, it) })
+        val row = try {
+            runPluginUpdate(HermesPluginUpdater(client), target, accept, restartOnly = restartOnly,
+                memo = restartMemo(client), remember = { saveMemo(client, it) }, steps = pluginSteps)
+        } catch (error: CancellationException) { pluginResult = null; throw error }
         check(prefs.edit().putBoolean(restartKey(client), row.status in RESTART_KEPT).putBoolean(waitKey(client), row.status == PluginStatus.Waiting).commit()) { "Plugin restart state could not be saved" }
+        saveDashboardFailed(client, row.status == PluginStatus.DashboardFailed)
         restartMemoSeen = restartMemo(client)
         pluginResult = row.takeIf { it.status != PluginStatus.Hidden }
         if (row.status == PluginStatus.Hidden) probe = PluginProbe.None
@@ -480,12 +532,17 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
         prunePartialUpdates(dir)
         val part = File(dir, "${UUID.randomUUID()}.part")
         var lastPublished = 0L
+        appSteps.active(UpdateStep.AppDownload)
         try {
             releases.download(release, part) { bytes ->
                 val now = System.currentTimeMillis()
                 if (bytes == release.size || now - lastPublished >= 120) { lastPublished = now; _state.update { it.copy(downloaded = bytes) } }
             }
+            // Every byte is here; now the file is checked against the release's size and hash.
+            appSteps.done(UpdateStep.AppDownload); appSteps.active(UpdateStep.AppVerify)
+            publish { copy(phase = UpdatePhase.Verifying) }
             updater.verifyDownloaded(part, release)
+            appSteps.done(UpdateStep.AppVerify)
             currentCoroutineContext().ensureActive()
             val artifact = File(dir, "Beacon-${release.version}-${release.sha.take(16)}.apk")
             artifact.delete()
@@ -512,6 +569,7 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
             return
         }
         publish { copy(phase = UpdatePhase.Installing, failure = null) }
+        appSteps.active(UpdateStep.AppInstall)
         try {
             updater.installSession(file, ::resultIntent) { id -> synchronized(lock) { prefs.edit().putInt("pending_session_id", id).commit() } }
         } catch (error: IllegalArgumentException) {
@@ -548,7 +606,7 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
                 }
             }
             // The user said no in Android's prompt: the verified file stays, Update offers it again.
-            PackageInstaller.STATUS_FAILURE_ABORTED -> { forgetSession(); publish { copy(phase = UpdatePhase.Idle) } }
+            PackageInstaller.STATUS_FAILURE_ABORTED -> { forgetSession(); appSteps.clear(); publish { copy(phase = UpdatePhase.Idle) } }
             else -> { forgetSession(); fail(UpdateFailure.Install) }
         }
     }
@@ -575,7 +633,7 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
         /** A restart that finished explains a dashboard still on old code for a day; after that only the reported versions count. */
         private const val RESTART_DONE_MEMORY_MS = 24 * 60 * 60_000L
         /** Rows whose restart is still owed: the recovery flag stays until one finishes. */
-        private val RESTART_KEPT = setOf(PluginStatus.Restart, PluginStatus.Busy, PluginStatus.Failed, PluginStatus.Waiting, PluginStatus.RestartFailed)
+        private val RESTART_KEPT = setOf(PluginStatus.Restart, PluginStatus.Busy, PluginStatus.Failed, PluginStatus.Waiting, PluginStatus.RestartFailed, PluginStatus.DashboardFailed)
         fun validToken(token: String): Boolean = validUpdateToken(token)
     }
 }

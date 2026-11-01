@@ -3,12 +3,16 @@ package dev.hermes.android.updates
 import dev.hermes.android.core.PLUGIN_VERSION_PATTERN
 import dev.hermes.android.data.ApiFailure
 import dev.hermes.android.data.BeaconClient
+import dev.hermes.android.data.NativeAuthExpiredException
 import org.json.JSONObject
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 
 internal class HermesPluginUpdater(private val client: BeaconClient, private val clock: () -> Long = System::currentTimeMillis) : PluginEndpoint {
+    /** How the dashboard restart's polling waits between asks; tests shorten it. */
+    internal var pause: suspend (Long) -> Unit = { delay(it) }
+
     override suspend fun version(): PluginVersions {
         val response = client.nativeRequest("/api/plugins/beacon/mobile/plugin/version")
         // "gateway" is the version the Hermes gateway loaded; a plugin that predates it sends nothing, and "" means Hermes does not know.
@@ -74,5 +78,51 @@ internal class HermesPluginUpdater(private val client: BeaconClient, private val
             RestartResult.Failed -> result.also { remember(RestartMemo()) }
             else -> result
         }
+    }
+
+    /**
+     * The plugin's own helper restarts the dashboard and records each step in a file the new dashboard reads, so the phone asks
+     * the same route before, during and after. A plugin without the route answers 404 and leaves the restart to the owner.
+     */
+    override suspend fun restartDashboard(onReconnecting: (Boolean) -> Unit): DashboardRestartResult {
+        try {
+            val response = try { client.nativeRequest(DASHBOARD_RESTART, "POST", JSONObject()) }
+            catch (error: ApiFailure) {
+                return when (error.status) { 404, 405 -> DashboardRestartResult.Unsupported; 409 -> DashboardRestartResult.Call; else -> DashboardRestartResult.Failed }
+            }
+            val code = response.optString("restart_error_code")
+            val id = response.optString("restart_id")
+            return when {
+                code == "live_sessions" -> DashboardRestartResult.Waiting
+                code == "unsupported" -> DashboardRestartResult.Unsupported
+                // A restart this phone (or another) already started is joined, not started twice.
+                id.isNotBlank() && (response.optBoolean("restart_started") || code == "in_progress") -> awaitDashboard(id, onReconnecting)
+                else -> DashboardRestartResult.Failed
+            }
+        } catch (error: CancellationException) { throw error }
+        catch (_: Exception) { return DashboardRestartResult.Failed }
+    }
+
+    /** Asks for the restart's steps once a second (the dashboard is down for part of it, and answers again when it is back) until it ends or two and a half minutes pass. */
+    private suspend fun awaitDashboard(id: String, onReconnecting: (Boolean) -> Unit): DashboardRestartResult {
+        repeat(DASHBOARD_POLLS) {
+            pause(1000)
+            val status = try { client.nativeRequest(DASHBOARD_STATUS, params = mapOf("id" to id)).also { onReconnecting(false) } }
+            catch (error: CancellationException) { throw error }
+            catch (_: NativeAuthExpiredException) { return DashboardRestartResult.Failed }
+            catch (_: Exception) { onReconnecting(true); return@repeat }
+            when (status.optString("state")) {
+                "completed" -> return DashboardRestartResult.Completed
+                "failed" -> return if (status.optString("reason") == "live_sessions") DashboardRestartResult.Waiting else DashboardRestartResult.Failed
+                "unknown" -> return DashboardRestartResult.Failed
+            }
+        }
+        return DashboardRestartResult.Failed
+    }
+
+    private companion object {
+        const val DASHBOARD_RESTART = "/api/plugins/beacon/admin/dashboard/restart"
+        const val DASHBOARD_STATUS = "/api/plugins/beacon/admin/dashboard/restart/status"
+        const val DASHBOARD_POLLS = 150
     }
 }

@@ -736,6 +736,9 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     }
     private val nativePreferencesLock = Mutex()
     fun nativePreferences(values: JSONObject) = viewModelScope.launch {
+        // Theme and color style belong to this phone: they apply signed out, offline or mid-reconnect, never dropped.
+        if (values.has("theme") || values.has("skin"))
+            app.preferences.edit { prefs -> values.keys().forEach { key -> if (key in setOf("theme", "skin")) prefs[stringPreferencesKey(key)] = values.opt(key)?.toString().orEmpty() } }
         val owner = client?.scope ?: cachedOwnerScope ?: return@launch
         try { nativePreferencesLock.withLock {
         val chat = app.cache.read(owner, "chat-preferences")?.let(::JSONObject) ?: json("render_user_markdown" to true, "send_key" to "enter")
@@ -745,7 +748,6 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         }
         app.cache.write(owner, "chat-preferences", chat.toString(), true)
         if ((client?.scope ?: cachedOwnerScope) == owner) storeData("profile-settings", chat)
-        app.preferences.edit { prefs -> values.keys().forEach { key -> if (key in setOf("theme", "skin")) prefs[stringPreferencesKey(key)] = values.opt(key)?.toString().orEmpty() } }
         } } catch (e: Exception) { if (e is CancellationException) throw e; if ((client?.scope ?: cachedOwnerScope) == owner) fail(e) }
     }
     fun loadSlashCatalog(force: Boolean = false) = load("slash:catalog", "/api/commands/catalog", force = force)

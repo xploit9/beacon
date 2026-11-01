@@ -220,7 +220,7 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
                     if (projects.isEmpty()) item {
                         Glass(Modifier.fillMaxWidth()) {
                             Column(Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                                BeaconSignal(BeaconMotionMode.Sweep, size = 56.dp)
+                                BeaconDustCore(56.dp)
                                 Text(uiText("Your projects"), Modifier.semantics { heading() }, style = MaterialTheme.typography.titleLarge)
                                 Text(uiText("Create a project to keep related chats and folders together."), color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 Button(onClick = { edit() }) { Text(uiText("New project")) }

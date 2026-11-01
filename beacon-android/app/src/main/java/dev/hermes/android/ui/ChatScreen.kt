@@ -570,7 +570,7 @@ internal fun transcriptStatusShown(status: String, streaming: Boolean, connected
 internal val ChatStrings get() = ToolOutcome.entries.map(::toolOutcomeLabel) + friendlyToolNames.values + listOf("typing…", "thinking…", "Voice conversation",
     "Queued on this phone", "Sending guidance", "Sending", "Accepted; delivery pending", "Finished; check history",
     "Turn failed; check history", "Turn interrupted; check history", "Queued message canceled", "Message rejected", "Sent", "Send outcome unknown",
-    "Will send after this reply", "Run command", "Steer", "Queue")
+    "Will send after this reply", "Run command", "Change the reply", "Send after")
 
 /** The header's second line: the chat's project, then what [chatHeaderSubtitle] says. Hermes status (thinking, typing, a call) takes the line over from the project. */
 internal data class ChatHeaderLine(val project: String, val text: String)
@@ -1459,7 +1459,7 @@ internal fun acceptsInitialConversationEdit(
                         val name = "/${command.string("name").removePrefix("/")}"
                         Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(enabled = editable && !readOnly) { val text = "$name "; changeDraft(TextFieldValue(text, androidx.compose.ui.text.TextRange(text.length))) }.padding(horizontal = 14.dp), verticalAlignment = Alignment.CenterVertically) {
                             Text(name, style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold).contentDirection(), maxLines = 1)
-                            Text(command.string("description"), Modifier.weight(1f).padding(start = 10.dp), style = MaterialTheme.typography.bodySmall.contentDirection(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                            Text(command.string("description").let { if (isBuiltInCommand(command.string("name"))) uiText(it) else it }, Modifier.weight(1f).padding(start = 10.dp), style = MaterialTheme.typography.bodySmall.contentDirection(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                         }
                     }
                     if (commands.isEmpty()) item { Text(uiText(if (catalog == null) "Loading commands…" else if (draft.text.contains(' ')) "Review arguments, then run command" else "No matching commands"), Modifier.padding(14.dp), style = MaterialTheme.typography.bodySmall) }
@@ -1481,7 +1481,7 @@ internal fun acceptsInitialConversationEdit(
                         explicitQueue != null -> "Will send after this reply"
                         draft.text.startsWith("/") -> "Run command"
                         files.isNotEmpty() || busyAction == "queue" -> "Will send after this reply"
-                        else -> "Steer"
+                        else -> "Change the reply"
                     }), Modifier.padding(horizontal = 8.dp, vertical = 2.dp).clip(RoundedCornerShape(999.dp)).background(MaterialTheme.colorScheme.secondaryContainer).padding(horizontal = 8.dp, vertical = 3.dp).testTag("composer-queue-caption"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSecondaryContainer)
                     // In flight the transcript shows the message; the draft stays held (not shown twice) until Hermes accepts it.
                     // Edits are ignored rather than the field made read-only: read-only ends the input session and drops the keyboard.
@@ -1578,9 +1578,12 @@ internal fun acceptsInitialConversationEdit(
                             // The trailing slot morphs to Stop, so the bar never widens during a turn.
                             OutlinedIconButton(onClick = { vm.cancel() }, shape = CircleShape, border = BorderStroke(1.dp, MaterialTheme.colorScheme.error), modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("message-stop")) { Icon(Icons.Rounded.Stop, uiText("Stop"), Modifier.size(composerActionIconSize), tint = MaterialTheme.colorScheme.error) }
                         } else if (voiceAction) {
-                            FilledIconButton(onClick = onCall, shape = CircleShape, modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("chat-call-beacon"), enabled = callAvailable && canonical && !callActive && !readOnly && chat.streamId.isBlank() && voiceCallsOffered(ui.bootstrap)) { Icon(Icons.Rounded.GraphicEq, assistantText("Talk to Beacon in this conversation"), Modifier.size(composerActionIconSize)) }
+                            val callEnabled = callAvailable && canonical && !callActive && !readOnly && chat.streamId.isBlank() && voiceCallsOffered(ui.bootstrap)
+                            // While the Call button shows, this conversation's call is kept ready: a tap connects at once.
+                            val callPress = dev.hermes.android.voice.rememberCallEntryPrewarm(vm.client, chat.sessionId, callEnabled)
+                            FilledIconButton(onClick = onCall, shape = CircleShape, modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("chat-call-beacon"), enabled = callEnabled, interactionSource = callPress) { Icon(Icons.Rounded.GraphicEq, assistantText("Talk to Beacon in this conversation"), Modifier.size(composerActionIconSize)) }
                         } else {
-                            FilledIconButton(onClick = submit, shape = CircleShape, modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("message-send"), enabled = editable && preparing.isEmpty() && chat.uncertain.isBlank() && !callActive && !readOnly) { Icon(Icons.Rounded.ArrowUpward, uiText(if (explicitQueue != null) "Queue" else if (commandName != null) "Run command" else if (chat.streamId.isNotBlank() && (busyAction == "queue" || files.isNotEmpty()) || chat.streamId.isBlank() && chat.queued.any { it.kind == "queue" && it.state !in setOf("sent", "settled") }) "Queue" else if (chat.streamId.isNotBlank()) "Steer" else "Send"), Modifier.size(composerActionIconSize)) }
+                            FilledIconButton(onClick = submit, shape = CircleShape, modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("message-send"), enabled = editable && preparing.isEmpty() && chat.uncertain.isBlank() && !callActive && !readOnly) { Icon(Icons.Rounded.ArrowUpward, uiText(if (explicitQueue != null) "Send after" else if (commandName != null) "Run command" else if (chat.streamId.isNotBlank() && (busyAction == "queue" || files.isNotEmpty()) || chat.streamId.isBlank() && chat.queued.any { it.kind == "queue" && it.state !in setOf("sent", "settled") }) "Send after" else if (chat.streamId.isNotBlank()) "Change the reply" else "Send"), Modifier.size(composerActionIconSize)) }
                         }
                     }
                 }

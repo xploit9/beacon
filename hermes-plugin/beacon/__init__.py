@@ -629,6 +629,24 @@ def _record_gateway_plugin_version():
         if version: mobile.record_gateway_plugin_version(version)
     except Exception: pass  # a status note never blocks the plugin from loading
 
+def _restart_stale_dashboard():
+    # An update restarts the gateway with the new plugin, but the dashboard keeps the plugin it imported until it restarts, and that
+    # old code cannot restart itself: the gateway hands such a dashboard to the restart helper. Never blocks the plugin from loading.
+    try:
+        if not _is_gateway_process(): return
+        import time
+        written=max((ROOT/name).stat().st_mtime for name in ('plugin.yaml','dashboard/plugin_api.py'))
+        def call_open():
+            with mobile.connect() as conn:
+                return conn.execute('SELECT COUNT(*) FROM calls WHERE closed=0 AND COALESCE(seen,created)>=?',
+                                    (time.time()-mobile.STALE_CALL_SECONDS,)).fetchone()[0]>0
+        restarter=sys.modules.get('beacon_dashboard_restart')
+        if restarter is None:
+            spec=importlib.util.spec_from_file_location('beacon_dashboard_restart',ROOT/'dashboard_restart.py')
+            restarter=importlib.util.module_from_spec(spec);sys.modules['beacon_dashboard_restart']=restarter;spec.loader.exec_module(restarter)
+        restarter.restart_stale(mobile.home(),written,call_open=call_open)
+    except Exception: pass
+
 def register(ctx):
     global _ctx
     _ctx=ctx
@@ -682,3 +700,4 @@ def register(ctx):
     if callable(getattr(ctx,'on_unload',None)): ctx.on_unload(pause_proactive_jobs)
     phone_delivery.register(ctx)
     _record_gateway_plugin_version()
+    _restart_stale_dashboard()

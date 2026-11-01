@@ -59,7 +59,8 @@ class HermesSettingsUiTest {
         compose.onNodeWithText("Delete profile").assertDoesNotExist()
         compose.onAllNodesWithText("Active").assertCountEquals(1)
         compose.onNodeWithText("Daily help").assertIsDisplayed()
-        compose.onNodeWithText("No purpose").assertIsDisplayed()
+        // A profile with no description shows only its name (UX-48): "No purpose" read as a judgement.
+        compose.onNodeWithText("No purpose").assertDoesNotExist()
         compose.onNodeWithTag("profile-open:default").assertHasClickAction().assertHeightIsAtLeast(48.dp)
         compose.onNodeWithTag("profile-open:work").performScrollTo().performClick()
         assertEquals("work", opened)

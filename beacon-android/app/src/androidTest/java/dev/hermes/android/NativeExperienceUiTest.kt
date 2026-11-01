@@ -540,7 +540,10 @@ class NativeExperienceUiTest {
         val list = compose.onNodeWithTag("schedules-list")
         // A daily job reads as words, with no cron code and no hidden comment.
         list.performScrollToNode(hasTestTag("schedule-card:task-daily"))
-        compose.onNodeWithText(dailyText, useUnmergedTree = true).assertExists()
+        // The card is written in the phone's clock (UX-38): the expectation is read the same way, never as a fixed Dubai clock.
+        val cardText = scheduleCardClock(json("kind" to "cron", "expr" to "0 8 * * *"), "0 8 * * *", "Asia/Dubai", java.time.ZoneId.systemDefault(),
+            java.time.Instant.parse("2026-10-29T04:00:00Z"), dev.hermes.android.tasks.ScheduleFormat(android.text.format.DateFormat.is24HourFormat(app))).description
+        compose.onNodeWithText(cardText, useUnmergedTree = true).assertExists()
         compose.onAllNodesWithText("0 8 * * *", substring = true, useUnmergedTree = true).assertCountEquals(0)
         compose.onAllNodesWithText("hidden note", substring = true, useUnmergedTree = true).assertCountEquals(0)
         // A callback is titled Callback, shows no hash and has no Edit; Delete stays.
@@ -2285,7 +2288,7 @@ class NativeExperienceUiTest {
         receipts += "Navigation open/close preserves draft and selected session."
         runBlocking { vm.setBusySendAction("queue").join() }
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "runtime-chat-a", liveText = "Preparing the comparison.") }
-        compose.onNodeWithTag("message-send").assertIsEnabled().assertIsDisplayed().assertContentDescriptionEquals("Queue")
+        compose.onNodeWithTag("message-send").assertIsEnabled().assertIsDisplayed().assertContentDescriptionEquals("Send after")
         val viewport = compose.onNodeWithTag("experience-viewport").fetchSemanticsNode().boundsInRoot
         val send = compose.onNodeWithTag("message-send").fetchSemanticsNode().boundsInRoot
         assertTrue("Queue must stay inside the usable window", send.left >= viewport.left && send.right <= viewport.right && send.bottom <= viewport.bottom)
@@ -2495,7 +2498,7 @@ class NativeExperienceUiTest {
         receipts += "A live running preview keeps its spinner and Status: Running, while a live tool with a result is Completed even if its status still says running."
         runBlocking { vm.setBusySendAction("queue").join() }
         compose.runOnIdle { vm.composer(TextFieldValue("Then update the notes.")) }
-        compose.onNodeWithTag("message-send").assertIsEnabled().assertContentDescriptionEquals("Queue").performClick()
+        compose.onNodeWithTag("message-send").assertIsEnabled().assertContentDescriptionEquals("Send after").performClick()
         await { vm.chat.value.queued.size == 1 }
         val queuedId = vm.chat.value.queued.single().id
         reveal(hasTestTag("queued-message:$queuedId"), towardOlder = false)
@@ -2713,7 +2716,7 @@ class NativeExperienceUiTest {
         compose.runOnIdle { vm.more("Notifications") }
         assertFalse("The preview build does not configure Firebase push", app.firebaseConfigured)
         compose.onNodeWithText(keepConnectedStatus).assertIsDisplayed()
-        compose.onNodeWithText("Calls and alerts arrive through Keep connected.").assertIsDisplayed()
+        compose.onNodeWithText(if (keepConnectedEnabled) "Even when Beacon is closed" else "Turn it on to get calls and alerts while Beacon is closed.").assertIsDisplayed()
         compose.onNodeWithText("Notifications for this profile").assertDoesNotExist()
         compose.onNodeWithText("Send a test notification").assertDoesNotExist()
         compose.onNodeWithText("Proactive calls").assertDoesNotExist()

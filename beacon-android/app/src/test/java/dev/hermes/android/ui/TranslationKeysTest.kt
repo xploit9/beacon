@@ -5,6 +5,8 @@ import dev.hermes.android.tasks.DeliveryNameStrings
 import dev.hermes.android.tasks.ScheduleBuilderStrings
 import dev.hermes.android.updates.PluginRowStrings
 import dev.hermes.android.updates.UpdateFailureStrings
+import dev.hermes.android.voice.CallFailureStrings
+import dev.hermes.android.voice.CallStrings
 import dev.hermes.android.voice.CallToolStrings
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -165,7 +167,7 @@ class TranslationKeysTest {
             "BackgroundActivityStrings" to BackgroundActivityStrings, "ChatStrings" to ChatStrings, "ConversationStrings" to ConversationStrings,
             "HistoryStrings" to HistoryStrings, "KanbanStrings" to KanbanStrings, "SettingsStrings" to SettingsStrings, "settingsSummary" to settingsSummaryTexts(),
             "ScheduleStateStrings" to ScheduleStateStrings, "ApprovalStrings" to ApprovalStrings, "NavigationStrings" to NavigationStrings,
-            "UpdateFailureStrings" to UpdateFailureStrings, "PluginRowStrings" to PluginRowStrings, "CallToolStrings" to CallToolStrings,
+            "UpdateFailureStrings" to UpdateFailureStrings, "PluginRowStrings" to PluginRowStrings, "CallToolStrings" to CallToolStrings, "CallStrings" to CallStrings, "CallFailureStrings" to CallFailureStrings,
             "ErrorStrings" to ErrorStrings, "DeliveryNameStrings" to DeliveryNameStrings, "ScheduleBuilderStrings" to ScheduleBuilderStrings, "HistoryRetentionStrings" to HistoryRetentionStrings, "VoiceStyleStrings" to VoiceStyleStrings,
         )
         lists.forEach { (name, texts) -> assertTrue("$name is empty, so nothing is checked.", texts.isNotEmpty()) }

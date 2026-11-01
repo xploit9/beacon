@@ -136,6 +136,19 @@ class PluginUpdateStateTest {
         assertEquals(PluginStatus.Restart, updateWith(stuck).status)
     }
 
+    @Test fun aDashboardTooOldToRestartItselfIsWaitedForWhileTheGatewayRestartsIt() {
+        // The old dashboard has no restart route; the gateway, started with the new plugin, restarts it and the phone waits for that.
+        val old = versions("1.1.1", "1.1.3")
+        val endpoint = Fake(listOf(old, old, old, old, versions("1.1.3", "1.1.3")), restartResult = RestartResult.Completed)
+        val pauses = mutableListOf<Long>()
+        assertEquals(PluginRow(PluginStatus.Updated, "1.1.3", "1.1.3"), updateWith(endpoint, pauses = pauses))
+        assertEquals("polled every two seconds until the new dashboard answered", listOf(2000L, 2000L), pauses.filter { it == 2000L })
+        // A dashboard that never comes back new still ends with the honest manual line, after the wait.
+        val never = mutableListOf<Long>()
+        assertEquals(PluginStatus.DashboardRestart, updateWith(Fake(listOf(old), restartResult = RestartResult.Completed), pauses = never).status)
+        assertEquals(GATEWAY_LED_RESTART_MS, never.filter { it == 2000L }.sum())
+    }
+
     @Test fun onlyTheDashboardBeingOldNeverAsksForAGatewayRestart() {
         val dashboardOnly = Fake(listOf(versions("1.1.1", "1.1.3").copy(gateway = "1.1.3")))
         assertEquals(PluginRow(PluginStatus.DashboardRestart, "1.1.3", "1.1.3"), updateWith(dashboardOnly))
@@ -292,12 +305,18 @@ class PluginUpdateStateTest {
     }
 
     @Test fun rowWordsAreShortAndActionsAreOnlyOfferedWhereTheyHelp() {
-        PluginStatus.entries.forEach { assertTrue(PluginRow(it).text.length <= 48) }
+        PluginStatus.entries.forEach { assertTrue(PluginRow(it).text.length <= 60) }
         assertEquals("Hermes is busy — restarts when it's idle", PluginRow(PluginStatus.Waiting).text)
-        assertEquals("Restart the Hermes dashboard on your computer", PluginRow(PluginStatus.DashboardRestart).text)
-        assertEquals("Hermes plugin is newer than this app", PluginRow(PluginStatus.Newer).text)
+        assertEquals("Restart the Hermes dashboard on your computer.", PluginRow(PluginStatus.DashboardRestart).text)
+        assertEquals("The Beacon plugin is newer than this app. Update the app.", PluginRow(PluginStatus.Newer).text)
+        assertEquals("The plugin is updated. The Hermes dashboard didn't restart.", PluginRow(PluginStatus.DashboardFailed).text)
+        assertEquals("Hermes gateway didn't restart", PluginRow(PluginStatus.RestartFailed).text)
+        // The button beside a failure says Try again, so the sentence does not.
+        PluginStatus.entries.forEach { assertFalse(it.name, PluginRow(it).text.contains("Try again") && it != PluginStatus.Busy) }
         assertTrue(PluginRow(PluginStatus.Waiting).actionable)
         assertTrue(PluginRow(PluginStatus.RestartFailed).actionable)
+        assertTrue(PluginRow(PluginStatus.DashboardFailed).actionable)
+        assertTrue(PluginRow(PluginStatus.DashboardFailed).restartPending)
         assertTrue(PluginRow(PluginStatus.Waiting).restartPending)
         assertFalse(PluginRow(PluginStatus.Available).restartPending)
         assertTrue(PluginRow(PluginStatus.Available).actionable)

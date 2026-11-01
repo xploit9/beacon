@@ -387,11 +387,14 @@ def _systemd_dashboard_unit(home: Path, profile: str, port: int, pids: set[int])
     return 'hermes-dashboard'
 
 
-def _detached(command: list[str], home: Path) -> subprocess.Popen[bytes]:
+def _detached(command: list[str], home: Path, *, cwd: str | None = None,
+              log_name: str = "beacon-install-dashboard.log") -> subprocess.Popen[bytes]:
     """Start the dashboard so it keeps running after this installer (and the agent's shell) exits."""
     logs = home / "logs"
-    log = open(logs / "beacon-install-dashboard.log", "ab") if logs.is_dir() else subprocess.DEVNULL
+    log = open(logs / log_name, "ab") if logs.is_dir() else subprocess.DEVNULL
     options: dict = {"env": _env(home), "stdin": subprocess.DEVNULL, "stdout": log, "stderr": subprocess.STDOUT}
+    if cwd:
+        options["cwd"] = cwd
     if sys.platform == "win32":
         options["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED_PROCESS | NEW_PROCESS_GROUP | NO_WINDOW
     else:

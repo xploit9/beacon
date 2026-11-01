@@ -627,12 +627,103 @@ def opening_name(display_name,owner_name,remembered):
 
 
 def grant_greeting(profile,display_name,owner_name=''):
-    """The opening line of an ordinary (not callback) call, ready when the call is granted: the name and clock rules of context()'s native path."""
+    """The opening line of an ordinary (not callback) call, kept for older phones; current phones let the live model greet.
+    The name and clock rules of context()'s native path, from cached profile reads."""
     def load(root):
-        try: remembered=owner_name_in_memory(root,config(root))
+        try: remembered=cached_owner_name(root,cached_config(root))
         except Exception: remembered=''
         return greeting_for(opening_name(display_name,owner_name,remembered),local_time(profile,bound=True),False)[:160]
     return scoped(profile,load,hydrate_secrets=False)
+
+
+# Profile files the call paths read on every call, kept until the file changes. The reader's identity is part of the
+# key, so a replaced reader (another Hermes build, or a test double) never sees an older reader's value.
+_PROFILE_READS={}
+_PROFILE_READS_LOCK=threading.Lock()
+
+
+def _stamp(path):
+    try:
+        found=path.stat()
+        return found.st_mtime_ns,found.st_size
+    except OSError:
+        return None
+
+
+def _cached_read(kind,reader,root,paths,load):
+    key=(kind,id(reader),str(root))
+    stamp=tuple(_stamp(path) for path in paths)
+    with _PROFILE_READS_LOCK: hit=_PROFILE_READS.get(key)
+    if hit is not None and hit[0]==stamp: return hit[1]
+    value=load()
+    with _PROFILE_READS_LOCK:
+        if len(_PROFILE_READS)>=64 and key not in _PROFILE_READS: _PROFILE_READS.pop(next(iter(_PROFILE_READS)))
+        _PROFILE_READS[key]=(stamp,value)
+    return value
+
+
+def cached_config(root):
+    """config(root), parsed again only when config.yaml changes; callers get their own copy."""
+    import copy
+    return copy.deepcopy(_cached_read('config',config,root,(root/'config.yaml',),lambda: config(root)))
+
+
+def cached_owner_name(root,cfg):
+    """owner_name_in_memory(root,cfg), read again only when USER.md or config.yaml changes."""
+    return _cached_read('owner-name',owner_name_in_memory,root,(root/'config.yaml',root/'memories'/'USER.md'),
+                        lambda: owner_name_in_memory(root,cfg))
+
+
+# A call entry on the phone (the chat's Call button, the assistant overlay) keeps this context fresh before the tap, so
+# the tap never waits for it. Only the newest conversation of an owner's profile is kept; call-bound fields (call id,
+# callback) are bound when the call is admitted.
+SESSION_CONTEXT_SECONDS=60
+SESSION_CONTEXTS={}
+SESSION_CONTEXTS_LOCK=threading.Lock()
+
+
+def _clock(): return time.monotonic()
+
+
+def _owned_live_draft(owner,provider,profile,stored):
+    """The owner's open, not yet saved chat (a new chat before its first message), by the rule the grant reserves it with."""
+    from tui_gateway import server
+    home=server._profile_home(profile)
+    expected_home=str(home) if home else None
+    with server._sessions_lock:
+        return any(record.get('session_key')==stored and server._session_auth_user_id(record)==provider+':'+owner
+                   and (record.get('profile_home') or None)==expected_home and not record.get('_finalized')
+                   for record in server._sessions.values())
+
+
+def _verify_saved_or_draft(owner,provider,profile,stored):
+    try: return native.verify(owner,provider,profile,stored)
+    except LookupError:
+        if _owned_live_draft(owner,provider,profile,stored): return {}
+        raise
+
+
+def session_context(owner,provider,profile,stored,display_name='',owner_name=''):
+    key=(owner,provider,profile,stored,display_name,owner_name)
+    started=_clock()
+    with SESSION_CONTEXTS_LOCK:
+        hit=SESSION_CONTEXTS.get(key)
+        if hit is not None and started<hit[0]: return json.loads(hit[1])
+    # A new chat is read before its first message saves it: the call entry shows as soon as the chat opens.
+    value=context(owner,provider,profile,stored,'',display_name,owner_name,native_backend=True,verify=_verify_saved_or_draft)
+    value['callback']={}
+    value['context'].pop('callback_reason',None);value['context'].pop('callback_result',None)
+    with SESSION_CONTEXTS_LOCK:
+        # Another conversation of this owner's profile replaces the old one: the phone keeps one call entry warm.
+        for old in [k for k in SESSION_CONTEXTS if k[:3]==key[:3] and k!=key]: SESSION_CONTEXTS.pop(old,None)
+        if len(SESSION_CONTEXTS)>=32 and key not in SESSION_CONTEXTS: SESSION_CONTEXTS.pop(next(iter(SESSION_CONTEXTS)))
+        SESSION_CONTEXTS[key]=(started+SESSION_CONTEXT_SECONDS,json.dumps(value))
+    return value
+
+
+def forget_session_contexts(owner,profile):
+    with SESSION_CONTEXTS_LOCK:
+        for old in [k for k in SESSION_CONTEXTS if k[0]==owner and k[2]==profile]: SESSION_CONTEXTS.pop(old,None)
 
 
 # The phone allows the call context 8 s; a cold process spends seconds on MCP discovery, so the hint waits briefly
@@ -661,21 +752,22 @@ def tool_catalogue(profile, wait=None):
         return ''
 
 
-def context(owner,provider,profile,stored,call_id,display_name='',owner_name='',native_backend=False):
+def context(owner,provider,profile,stored,call_id,display_name='',owner_name='',native_backend=False,verify=None):
     # history verifies ownership before any profile data is loaded.
     if native_backend:
-        native.verify(owner,provider,profile,stored)
+        (verify or native.verify)(owner,provider,profile,stored)
         messages=[]
     else:
         messages=history(owner,provider,profile,stored)
     catalogue='' if native_backend else tool_catalogue(profile)
     def load(root):
-        cfg=config(root);details={}
+        # The native path runs on every call start: its profile reads come from the change-checked cache.
+        cfg=cached_config(root) if native_backend else config(root);details={}
         try: soul='' if native_backend else personality(root)
         except Exception: soul='';details['personality']='unavailable'
         try: memory='' if native_backend else builtin_memory(root,cfg)
         except Exception: memory='';details['memory']='unavailable'
-        try: remembered=owner_name_in_memory(root,cfg)
+        try: remembered=cached_owner_name(root,cfg) if native_backend else owner_name_in_memory(root,cfg)
         except Exception: remembered=''
         section=cfg.get('memory')
         name=str(section.get('provider') or '') if isinstance(section,dict) else ''
@@ -710,6 +802,8 @@ def context(owner,provider,profile,stored,call_id,display_name='',owner_name='',
         greeting=greeting_for(greeting_name,clock,bool(callback))
         return {'backend':'hermes' if native_backend else 'direct','profile':profile,'selected_session_id':stored,'system_instruction':'' if native_backend else instruction,'context_summary':summary,
                 'tool_catalogue':catalogue,'greeting':greeting,'greeting_plan':greeting_plan(greeting_name,zone),'owner_first_name':first_name,'callback':callback,
+                # The profile's clock zone: the live model's opening takes the owner's time of day from it at the tap.
+                'zone':zone,
                 'context':{'history':messages,'personality':soul,'memory':memory,**({'callback_reason':{'untrusted_text':callback.get('reason')},'callback_result':callback.get('result','')} if callback else {}),**({'language':language} if language else {})},
                 'configured_memory_provider':name if external_memory_configured(cfg) else 'builtin' if memory else None,
                 'capabilities':{'profile_context':True} if native_backend else {'web_search':True,'memory_recall':bool(memory or external_memory_configured(cfg)),'skills':True,'profile_context':True},

@@ -90,7 +90,7 @@ internal fun beaconPresence(onCall: Boolean, working: Boolean): BeaconPresence =
 }
 
 /**
- * The assistant's mark in its halo: a slow pulse while idle, an orbiting point while it works or is on a call. BeaconSignal is
+ * The assistant's mark in its halo: a slow pulse while idle, the turning gold dust core while it works or is on a call. Both are
  * still when the phone removes animations; [animate] is false while the mark is off screen.
  */
 @Composable internal fun BeaconPresenceMark(
@@ -101,12 +101,11 @@ internal fun beaconPresence(onCall: Boolean, working: Boolean): BeaconPresence =
     val avatar = size * .72f
     val avatarRadius = with(LocalDensity.current) { avatar.toPx() / 2f }
     Box(modifier.size(size), contentAlignment = Alignment.Center) {
-        if (animate) BeaconSignal(
-            if (presence == BeaconPresence.Idle) BeaconMotionMode.Pulse else BeaconMotionMode.Sweep,
-            // The avatar's disc is see-through, so the signal's own ring and dot are cut away behind it; only the halo shows around it.
-            Modifier.drawWithContent { clipPath(Path().apply { addOval(Rect(center, avatarRadius)) }, ClipOp.Difference) { this@drawWithContent.drawContent() } },
-            size,
-        )
+        // The avatar's disc is see-through, so the signal's own ring and dot are cut away behind it; only the halo shows around it.
+        val halo = Modifier.drawWithContent { val content = this; clipPath(Path().apply { addOval(Rect(center, avatarRadius)) }, ClipOp.Difference) { content.drawContent() } }
+        if (animate) {
+            if (presence == BeaconPresence.Idle) BeaconSignal(BeaconMotionMode.Pulse, halo, size) else BeaconDustCore(size, halo)
+        }
         ChatAvatar(title, "beacon", size = avatar, beacon = true, description = description)
         // Where the avatar's rim meets its top-right, cut from the card by a ring of the card's own surface.
         if (unread) Box(Modifier.align(Alignment.TopEnd).padding(top = size * .14f, end = size * .14f).size(12.dp)

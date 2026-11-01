@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Beacon as the phone's digital assistant: its own overlay session for the assist gesture, from the lock screen too. -->
+<voice-interaction-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:sessionService="dev.hermes.android.assist.BeaconAssistSessionService"
+    android:recognitionService="dev.hermes.android.assist.BeaconRecognitionService"
+    android:supportsAssist="true"
+    android:supportsLaunchVoiceAssistFromKeyguard="true"
+    android:supportsLocalInteraction="false" />

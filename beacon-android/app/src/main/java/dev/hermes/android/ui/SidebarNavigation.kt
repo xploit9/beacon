@@ -152,14 +152,20 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
                     onManage = { profilesOpen = false; vm.more("Profiles") },
                 )
             }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { vm.tab("Chat"); vm.newChat() }, modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("navigation-new-chat"), shape = RoundedCornerShape(14.dp), enabled = !ui.newChatOpening) {
-                    Icon(Icons.Rounded.Add, null); Spacer(Modifier.width(8.dp)); Text(uiText(if (ui.newChatOpening) "Opening chat…" else "New chat"))
-                }
-                FilledTonalButton(onClick = { naming = true }, modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("navigation-new-thread"), shape = RoundedCornerShape(14.dp), enabled = !ui.newChatOpening) {
-                    Icon(Icons.Rounded.Forum, null); Spacer(Modifier.width(8.dp)); Text(uiText("New thread"))
+            // At large text the two buttons stack full width, so "New thread" never wraps beside "New chat".
+            val stacked = isLargeText(LocalDensity.current.fontScale)
+            val newChat: @Composable (Modifier) -> Unit = { modifier ->
+                Button(onClick = { vm.tab("Chat"); vm.newChat() }, modifier = modifier.heightIn(min = 48.dp).testTag("navigation-new-chat"), shape = RoundedCornerShape(14.dp), enabled = !ui.newChatOpening) {
+                    Icon(Icons.Rounded.Add, null); Spacer(Modifier.width(8.dp)); Text(uiText(if (ui.newChatOpening) "Opening chat…" else "New chat"), maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
+            val newThread: @Composable (Modifier) -> Unit = { modifier ->
+                FilledTonalButton(onClick = { naming = true }, modifier = modifier.heightIn(min = 48.dp).testTag("navigation-new-thread"), shape = RoundedCornerShape(14.dp), enabled = !ui.newChatOpening) {
+                    Icon(Icons.Rounded.Forum, null); Spacer(Modifier.width(8.dp)); Text(uiText("New thread"), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+            if (stacked) Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) { newChat(Modifier.fillMaxWidth()); newThread(Modifier.fillMaxWidth()) }
+            else Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { newChat(Modifier.weight(1f)); newThread(Modifier.weight(1f)) }
         }
         if (updateReady) UpdateReadyChip(onClick = vm::openAppUpdates)
         BoxWithConstraints(Modifier.fillMaxWidth()) {

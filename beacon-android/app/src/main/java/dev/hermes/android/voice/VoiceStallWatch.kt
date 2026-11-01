@@ -3,7 +3,7 @@ package dev.hermes.android.voice
 import org.json.JSONObject
 
 /** The provider took the owner's turn or a tool result and never answered, on every retry. */
-internal class VoiceStalled:java.net.SocketTimeoutException("Voice stopped answering and couldn't recover. Try calling again.")
+internal class VoiceStalled:java.net.SocketTimeoutException(CALL_VOICE_STOPPED)
 
 /**
  * Notices a provider session that stopped answering while the call still says "Listening". Silence alone is normal

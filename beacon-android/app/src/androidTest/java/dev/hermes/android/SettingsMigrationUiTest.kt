@@ -213,7 +213,7 @@ class SettingsMigrationUiTest {
         shown("Notifications & Keep connected").assertTextContains("Alerts and calls")
         assertTrue("Reading a summary must not open a route", host.opened.isEmpty())
         compose.runOnIdle { host.pluginAbsent = true }
-        compose.onNodeWithText("Add Beacon to your Hermes").assertIsDisplayed()
+        compose.onNodeWithText("Add the Beacon plugin to Hermes").assertIsDisplayed()
         compose.runOnIdle { host.pluginAbsent = false }
         compose.onNodeWithText("Calls need the Beacon plugin on your Hermes.").assertDoesNotExist()
     }

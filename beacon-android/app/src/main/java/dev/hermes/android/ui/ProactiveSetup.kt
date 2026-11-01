@@ -102,7 +102,8 @@ internal fun proactiveHealthStatus(state: ProactiveHealthState): SettingsStatus 
         ProactiveHealthState.Checking -> uiText("Checking")
         ProactiveHealthState.Ok -> uiText("OK")
         ProactiveHealthState.Quiet -> uiText("Quiet hours")
-        ProactiveHealthState.NotYet -> uiText("Not yet")
+        // Beside an ON switch, "Not yet" read as "not turned on yet"; this says the watch has not looked, and "Checked {0}" takes over after a run.
+        ProactiveHealthState.NotYet -> uiText("Hasn't checked yet")
         ProactiveHealthState.Failed -> uiText("Couldn't check")
     }, modifier, testTag = "proactive-health-${state.name.lowercase()}")
 }

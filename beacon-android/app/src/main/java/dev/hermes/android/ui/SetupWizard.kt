@@ -45,6 +45,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -53,6 +54,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -65,6 +67,15 @@ import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.core.trustedOrigin
 import dev.hermes.android.data.VoiceKeyStore
 import dev.hermes.android.push.KeepConnectedService
+import dev.hermes.android.updates.PluginInstallController
+import dev.hermes.android.updates.PluginInstallHub
+import dev.hermes.android.updates.PluginInstallStage
+import dev.hermes.android.updates.PluginInstallUi
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+private val NoPluginInstall = MutableStateFlow(PluginInstallUi()).asStateFlow()
 
 internal fun handleSetupPermissionResult(granted: Boolean, advance: () -> Unit, denied: () -> Unit) {
     if (granted) advance() else denied()
@@ -205,6 +216,7 @@ internal fun SetupWizardScreen(
     onSkipVoiceSetup: () -> Unit = onAdvancePermission,
     ownerName: String = "",
     onOwnerNameChange: (String) -> Unit = {},
+    pluginInstall: PluginInstallController? = PluginInstallHub.controller,
 ) {
     val context = LocalContext.current
     SetupSystemBars()
@@ -222,6 +234,21 @@ internal fun SetupWizardScreen(
     // The provider chosen on the first voice page, for the key page after it; empty means the saved one.
     var voiceKeyProvider by rememberSaveable { mutableStateOf("") }
     var keyWorks by rememberSaveable { mutableStateOf(false) }
+
+    // Beacon on this Hermes: after sign-in the plugin page comes first when the probe says it is absent, and the owner moves past it once per Hermes.
+    val uriHandler = LocalUriHandler.current
+    val installUi by (pluginInstall?.state ?: NoPluginInstall).collectAsStateWithLifecycle()
+    val pluginPhase = setupPluginPhase(state.bootstrap)
+    var pluginHandled by rememberSaveable(initialAddress) { mutableStateOf(false) }
+    var pluginRestartSeen by rememberSaveable(initialAddress) { mutableStateOf(false) }
+    var pluginCheckTimedOut by remember(initialAddress) { mutableStateOf(false) }
+    LaunchedEffect(installUi.stage) { if (installUi.stage == PluginInstallStage.NeedsRestart || installUi.stage == PluginInstallStage.Restarting) pluginRestartSeen = true }
+    LaunchedEffect(pluginPhase, state.authenticated, initialAddress) {
+        if (pluginPhase == SetupPluginPhase.Checking && state.authenticated) { delay(SETUP_PLUGIN_CHECK_MS); pluginCheckTimedOut = true }
+    }
+    val shownStep = if (setupPluginStepShown(state.setupStep, state.authenticated, pluginPhase, installUi, pluginHandled, pluginCheckTimedOut)) "plugin" else state.setupStep
+    // Without an install to reach (previews, tests) the button opens the PC steps instead.
+    val openPcSteps = { uriHandler.openUri(BEACON_PC_INSTALL_URL) }
 
     fun updateAddress(value: String) { address = value.take(4096) }
     fun pasteAddress() {
@@ -298,7 +325,7 @@ internal fun SetupWizardScreen(
     }
 
     AnimatedContent(
-        targetState = state.setupStep,
+        targetState = shownStep,
         transitionSpec = {
             if (motionEnabled) fadeIn(tween(200)) togetherWith fadeOut(tween(180))
             else EnterTransition.None togetherWith ExitTransition.None
@@ -306,11 +333,13 @@ internal fun SetupWizardScreen(
         label = "setup-step",
     ) { current ->
         val step = setupStepNumber(current)
-        CompositionLocalProvider(LocalSetupStep provides current) { when (current) {
+        // One X in the header of every page that has somewhere to go back to: not before the first sign-in, and not on the last page, whose button finishes setup.
+        val close = if (state.authenticated && current != "done") SetupClose(enabled = !state.loading, onClose = onCancel) else null
+        CompositionLocalProvider(LocalSetupStep provides current, LocalSetupClose provides close) { when (current) {
             "probe" -> SetupShell(
                 step, if (state.loading) uiText("Checking the connection…") else uiText("Check the connection"), modifier, visibleOrigin,
                 content = {
-                    if (state.loading) Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { BeaconSignal(BeaconMotionMode.Sweep, size = 40.dp) }
+                    if (state.loading) Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { BeaconDustCore(40.dp) }
                     else {
                         SetupStatusLine(state.error, error = true)
                         SetupStatusLine(state.notice, error = false)
@@ -320,7 +349,6 @@ internal fun SetupWizardScreen(
                     if (!state.loading) {
                         SetupPrimaryButton(uiText("Retry"), { onProbe(visibleOrigin) }, Modifier.testTag("setup-probe-retry"))
                         SetupTextAction(uiText("Change address"), { onReopen(visibleOrigin) })
-                        if (state.authenticated) SetupTextAction(uiText("Close setup"), onCancel)
                     }
                 },
             )
@@ -335,22 +363,34 @@ internal fun SetupWizardScreen(
                 actions = {
                     SetupPrimaryButton(uiText("Sign in with Hermes"), { onSignIn(context) }, Modifier.testTag("setup-signin"), enabled = !state.loading, loading = state.loading)
                     SetupTextAction(uiText("Use another server"), { onReopen(visibleOrigin) }, enabled = !state.loading)
-                    if (state.authenticated && !state.loading) SetupTextAction(uiText("Close setup"), onCancel)
                 },
             )
+            "plugin" -> CompositionLocalProvider(LocalSetupStep provides "signin") {
+                SetupPluginStepPage(
+                    modifier = modifier, phase = pluginPhase, install = installUi, restartSeen = pluginRestartSeen,
+                    onInstall = { if (pluginInstall == null) openPcSteps() else pluginInstall.install() },
+                    onRetry = { pluginInstall?.retry() },
+                    onRestart = { pluginInstall?.restart() },
+                    onNotNow = { pluginHandled = true; pluginInstall?.dismiss() },
+                    onContinue = { pluginHandled = true; pluginInstall?.reset() },
+                    onSkip = { pluginHandled = true },
+                    onPcInstead = openPcSteps,
+                    onCancel = onCancel,
+                    // The sign-in that ended is renewed the way the sign-in page does it; the failed install is cleared, so the offer is there again afterwards.
+                    onSignIn = { pluginInstall?.reset(); onSignIn(context) },
+                )
+            }
             "unsupported" -> SetupShell(
                 step, uiText("Update needed"), modifier, uiText("This Hermes needs an update before phones can sign in."),
                 content = {},
                 actions = {
                     SetupTextAction(uiText("Use another server"), { onReopen(visibleOrigin) })
-                    if (state.authenticated) SetupTextAction(uiText("Close setup"), onCancel)
                 },
             )
             "voice-provider" -> {
                 val page = voiceProviderPage(
                     onContinue = { provider, hasKey -> if (hasKey) onAdvancePermission() else { voiceKeyProvider = provider; onVoicePage("voice-key") } },
                     onSkip = onSkipVoiceSetup,
-                    onClose = onCancel.takeIf { state.authenticated },
                 )
                 SetupShell(step, uiText("Choose a voice provider"), modifier, uiText("Calls use your own account. Change it later in Settings."), page.content, page.actions)
             }
@@ -414,7 +454,6 @@ internal fun SetupWizardScreen(
                             Modifier.testTag("setup-permission-primary"), enabled = !state.loading,
                         )
                         SetupTextAction(uiText("Skip for now"), onAdvancePermission, Modifier.testTag("setup-permission-skip"))
-                        if (state.authenticated) SetupTextAction(uiText("Close setup"), onCancel)
                     },
                 )
             }
@@ -468,7 +507,6 @@ internal fun SetupWizardScreen(
                 },
                 actions = {
                     SetupPrimaryButton(uiText("Continue"), { onProbe(address) }, Modifier.testTag("setup-connect"), enabled = canContinue)
-                    if (state.authenticated) SetupTextAction(uiText("Close setup"), onCancel)
                 },
             )
         } }

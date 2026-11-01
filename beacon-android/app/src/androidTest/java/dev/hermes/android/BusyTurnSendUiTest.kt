@@ -409,8 +409,8 @@ class BusyTurnSendUiTest {
         assertNotSame(fixture.client, streamClient)
         fixture.holdSteerAcknowledgement = true
         compose.onNodeWithTag("message-input").performTextInput("Please be concise")
-        compose.onNodeWithTag("composer-queue-caption").assertTextEquals("Steer")
-        compose.onNodeWithTag("message-send").assertContentDescriptionEquals("Steer").performClick()
+        compose.onNodeWithTag("composer-queue-caption").assertTextEquals("Change the reply")
+        compose.onNodeWithTag("message-send").assertContentDescriptionEquals("Change the reply").performClick()
         compose.waitUntil(15_000) { fixture.requests.any { it.string("method") == "session.steer" } }
         val sent = fixture.requests.single { it.string("method") == "session.steer" }.getJSONObject("params")
         assertEquals("runtime-chat-a", sent.string("session_id")); assertEquals("default", sent.string("profile")); assertEquals("Please be concise", sent.string("text"))
@@ -453,7 +453,7 @@ class BusyTurnSendUiTest {
             vm.more("Settings")
             showSettings.value = true
         }
-        compose.onNodeWithText("While Beacon is replying").assertExists()
+        compose.onNodeWithText("If you send while Beacon replies").assertExists()
         // Both choices are on screen as segments: Steer starts selected, so Queue is one tap.
         compose.onNodeWithTag("choice-option:While Beacon is replying:steer").assertIsSelected()
         compose.onNodeWithTag("choice-option:While Beacon is replying:queue").performClick()
@@ -473,7 +473,7 @@ class BusyTurnSendUiTest {
         startTurn(vm, fixture)
         repeat(2) {
             compose.onNodeWithTag("message-input").performTextInput("Same follow-up")
-            compose.onNodeWithTag("message-send").assertContentDescriptionEquals("Queue").performClick()
+            compose.onNodeWithTag("message-send").assertContentDescriptionEquals("Send after").performClick()
             compose.waitUntil(15_000) { vm.chat.value.queued.size == it + 1 && vm.composer.value.text.isBlank() }
         }
         val ids = vm.chat.value.queued.map { it.id }

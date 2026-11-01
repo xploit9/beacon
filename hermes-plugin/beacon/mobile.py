@@ -608,6 +608,9 @@ def reserve(owner, profile, conversation, voice=None):
 def status(row):
     return {'call_id':row['id'],'conversation_id':row['conversation'],'profile':row['profile'],'closed':bool(row['closed']),'recording_status':'disabled','transcript_status':row['status'],**json.loads(row['receipt']),'audio_available':False}
 
+# The call-start stages the phone reports, in order: a failed call names the one that did not finish.
+CALL_STAGES = ('grant_sent','grant_ok','context_sent','context_ok','provider_open','provider_setup_ok','mic_streaming','first_model_audio')
+DIAGNOSTIC_STAGES = ('capture_started','capture_stopped','playout_started','playout_stopped','capture_error','playout_error','media_timeout','timestamp_overlap_corrected','voice_connecting','context_ready','token_ready','token_error','provider_key_ready','provider_ready','provider_error','voice_error')+CALL_STAGES
 EVENT_TYPES = {'transcript','interruption','capture_started','capture_stopped','playout_started','playout_stopped','upload_gap','state','media_diagnostic','job_link','visual_state','tool_receipt'}
 def events(call_id,owner,body):
     rows=body.get('events')
@@ -615,14 +618,16 @@ def events(call_id,owner,body):
     clean=[]
     for item in rows:
         if not isinstance(item,dict) or item.get('type') not in EVENT_TYPES: raise ValueError('Unsupported event')
-        row={k:item[k] for k in ('event_id','display_event_id','turn_id','type','role','text','final','interrupted','at_ms','stream','sequence','state','stage','elapsed_ms','count','total_corrected_ms','source','frames_sent','request_id','tool_name','status','error_code','provider','attempt','close_code','cause_class') if k in item}
+        row={k:item[k] for k in ('event_id','display_event_id','turn_id','type','role','text','final','interrupted','at_ms','stream','sequence','state','stage','elapsed_ms','count','total_corrected_ms','source','frames_sent','request_id','tool_name','status','error_code','provider','attempt','close_code','cause_class','failed_stage','warm') if k in item}
         ident(row.get('event_id')); ident(row.get('turn_id','none')); finite(row.get('at_ms'))
-        if any(k in row for k in ('provider','attempt','close_code','cause_class')):
+        if any(k in row for k in ('provider','attempt','close_code','cause_class','failed_stage','warm')):
             if row['type']!='media_diagnostic': raise ValueError('Unexpected transport diagnostic')
             if 'provider' in row and row['provider'] not in ('gemini','grok','openai'): raise ValueError('Invalid diagnostic provider')
             if 'attempt' in row and (type(row['attempt']) is not int or not 0<=row['attempt']<=10): raise ValueError('Invalid diagnostic attempt')
             if 'close_code' in row and (type(row['close_code']) is not int or not 0<=row['close_code']<=4999): raise ValueError('Invalid diagnostic close code')
             if 'cause_class' in row and row['cause_class'] not in ('ssl_handshake','ssl_peer','ssl_protocol','ssl_transport','socket_timeout','dns','connect','eof','io','other'): raise ValueError('Invalid diagnostic cause')
+            if 'failed_stage' in row and row['failed_stage'] not in CALL_STAGES: raise ValueError('Invalid diagnostic stage')
+            if 'warm' in row and type(row['warm']) is not bool: raise ValueError('Invalid diagnostic flag')
         if 'role' in row and row['role'] not in ('user','assistant'): raise ValueError('Invalid role')
         if 'text' in row and (row['type']!='transcript' or not isinstance(row['text'],str) or len(row['text'])>8192): raise ValueError('Invalid transcript')
         for k in ('final','interrupted'):
@@ -645,7 +650,7 @@ def events(call_id,owner,body):
             if not isinstance(row.get('tool_name'),str) or not 1<=len(row['tool_name'])<=200: raise ValueError('Invalid tool name')
             if row.get('status') not in ('ready','running','needs_approval','completed','failed','denied','expired','uncertain','cancelled','unavailable','not_sent','submission_unconfirmed'): raise ValueError('Invalid tool receipt status')
         elif any(k in row for k in ('request_id','tool_name','status')): raise ValueError('Unexpected tool evidence')
-        if 'stage' in row and row['stage'] not in ('capture_started','capture_stopped','playout_started','playout_stopped','capture_error','playout_error','media_timeout','timestamp_overlap_corrected','voice_connecting','context_ready','token_ready','token_error','provider_key_ready','provider_ready','provider_error','voice_error'): raise ValueError('Invalid stage')
+        if 'stage' in row and row['stage'] not in DIAGNOSTIC_STAGES: raise ValueError('Invalid stage')
         if 'error_code' in row:
             codes=r'http_[45][0-9]{2}|timeout|dns|tls|network|invalid_response'
             if row['type']=='tool_receipt': codes+='|tool_http_failure|admission_rejected|memory_lookup_busy|memory_lookup_timeout|memory_lookup_failed'

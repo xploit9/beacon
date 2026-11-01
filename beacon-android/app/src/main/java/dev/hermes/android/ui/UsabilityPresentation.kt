@@ -149,13 +149,37 @@ internal fun mobileSlashCommands(commands: List<JSONObject>): List<JSONObject> =
     if (text == command.string("description")) command else JSONObject(command.toString()).put("description", text)
 }
 
-/** Short user text for the commands people use most; the other commands keep Hermes' own words. */
+/**
+ * Short user text for every built-in command of Hermes' registry that its command catalog offers to a client (the catalog leaves out the
+ * gateway-only ones: start, topic, discard, pause, approve, deny, sethome, commands, restart, platform). Only commands the owner wrote
+ * (quick commands, plugin commands, skills) keep Hermes' own words.
+ */
 private val slashCommandTexts = mapOf(
     "new" to "New chat", "reset" to "New chat", "clear" to "Start fresh", "history" to "Show history", "save" to "Export chat",
     "retry" to "Try again", "undo" to "Undo last turn", "title" to "Rename chat", "branch" to "Branch chat", "fork" to "Branch chat",
     "compress" to "Shorten history", "stop" to "Stop reply", "status" to "Show status", "model" to "Change model", "usage" to "Show usage",
-    "help" to "Show commands", "queue" to "Queue a message", "background" to "Run in background", "reasoning" to "Set reasoning level",
+    "help" to "Show commands", "queue" to "Queue a message", "background" to "Run in background", "bg" to "Run in background", "reasoning" to "Set reasoning level",
     "skills" to "Browse skills", "tools" to "Choose tools",
+    "prompt" to "Write a prompt in your editor", "handoff" to "Hand off to a messaging app", "worktree" to "Manage git worktrees",
+    "rollback" to "Restore a saved checkpoint", "snapshot" to "Save or restore a snapshot", "export" to "Export a profile", "import" to "Import a profile",
+    "btw" to "Ask a side question", "agents" to "Show active agents", "journey" to "Open the learning timeline", "steer" to "Guide the reply in progress",
+    "goal" to "Set a standing goal", "heartbeat" to "Repeat a prompt when idle", "refine" to "Save lessons from this chat", "review" to "Get an independent review",
+    "loop" to "Repeat a prompt on a schedule", "plan" to "Write a plan without running it", "moa" to "Ask several models at once", "subgoal" to "Refine the current goal",
+    "egress" to "Show network proxy status", "context" to "Show context usage", "whoami" to "Show your command access", "profile" to "Show the active profile",
+    "resume" to "Resume a saved chat", "sessions" to "Browse past chats", "config" to "Show settings", "codex-runtime" to "Switch the Codex runtime",
+    "personality" to "Choose a personality", "statusbar" to "Show or hide the status bar", "battery" to "Show or hide the battery meter", "timestamps" to "Show or hide timestamps",
+    "diff" to "Show code changes", "verbose" to "Change tool progress detail", "focus" to "Switch focus view", "footer" to "Show or hide the reply footer",
+    "yolo" to "Skip approval prompts", "approvals" to "Set the approval mode", "fast" to "Turn fast mode on or off", "skin" to "Change the theme",
+    "indicator" to "Change the busy indicator", "voice" to "Turn voice mode on or off", "wake" to "Turn the wake word on or off", "busy" to "Set how messages act while busy",
+    "autoprune" to "Clean up old chats automatically", "toolsets" to "List available tools", "memory" to "Review memory changes", "bundles" to "List skill bundles",
+    "pet" to "Show or hide your pet", "hatch" to "Create a new pet", "learn" to "Learn a skill from anything", "init" to "Create project instructions",
+    "cron" to "Manage schedules", "suggestions" to "Review suggested automations", "blueprint" to "Set up an automation", "curator" to "Tidy up skills",
+    "kanban" to "Open the task board", "reload" to "Reload environment settings", "reload-mcp" to "Reload MCP servers", "reload-skills" to "Reload skills",
+    "browser" to "Connect your browser", "plugins" to "List installed plugins", "palette" to "Open the command palette", "subscription" to "Manage your plan",
+    "login" to "Sign in to your Nous account", "topup" to "Show balance and billing", "insights" to "Show usage insights", "platforms" to "Show messaging platforms",
+    "copy" to "Copy the last reply", "paste" to "Attach a clipboard image", "image" to "Attach an image", "update" to "Update Hermes",
+    "version" to "Show the Hermes version", "debug" to "Share a debug report", "quit" to "Exit", "density" to "Switch compact view",
+    "logs" to "Show recent logs", "mouse" to "Set mouse tracking",
 )
 
 /** The fixed texts the command rows show through uiText: each short text above. */

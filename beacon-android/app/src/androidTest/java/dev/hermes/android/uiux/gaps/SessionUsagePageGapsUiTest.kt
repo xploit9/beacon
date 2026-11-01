@@ -78,7 +78,7 @@ class SessionUsagePageGapsUiTest {
         compose.onNodeWithText("Synthetic chat").assertIsDisplayed()
         compose.onNodeWithText("example · synthetic-model").assertIsDisplayed()
         compose.onNodeWithTag("usage-figures").assertIsDisplayed()
-        for ((label, value) in listOf("Input" to formatTokenCount(1234), "Output" to formatTokenCount(560), "Context" to formatTokenCount(32000))) {
+        for ((label, value) in listOf("Tokens in" to formatTokenCount(1234), "Tokens out" to formatTokenCount(560), "Context" to formatTokenCount(32000))) {
             compose.onNodeWithText(value).assertIsDisplayed()
             compose.onNodeWithText(label).assertIsDisplayed()
         }

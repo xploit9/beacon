@@ -63,7 +63,7 @@ class AssistDeviceTest {
             return
         }
         compose.onNodeWithTag("phone-assistant").assertIsDisplayed().assertTextContains("Phone assistant")
-        compose.onNodeWithText(if (state == PhoneAssistantState.Active) "Active" else "Not set").assertIsDisplayed()
+        compose.onNodeWithText(if (state == PhoneAssistantState.Active) "Active" else "Choose Beacon to open it over any app").assertIsDisplayed()
         compose.onNodeWithTag("phone-assistant").performClick()
         assertEquals(1, opened)
     }

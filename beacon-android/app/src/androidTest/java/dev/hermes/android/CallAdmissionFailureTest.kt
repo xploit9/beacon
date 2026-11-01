@@ -58,12 +58,24 @@ class CallAdmissionFailureTest {
     }
 
     @Test fun invalidatedReservationNeverStartsTheServiceOrBecomesFailed() = runBlocking {
+        // A call without a conversation waits for its admission before anything starts.
         fixture {
             onReserve = { app.calls.hangup() }
-            begin()
+            begin(conversationId = null)
             assertEquals(0, serviceStarts)
             assertCloses(failed = false)
             assertNull(app.calls.spec)
+        }
+    }
+
+    @Test fun aCallEndedWhileItsParallelAdmissionRunsIsReleasedNonfailedAndLeftEnded() = runBlocking {
+        // A conversation call is admitted alongside its voice connection, so its service may already be starting.
+        fixture {
+            onReserve = { app.calls.hangup() }
+            begin()
+            assertCloses(failed = false)
+            assertNull(app.calls.spec)
+            assertFalse(app.calls.state.value.active)
         }
     }
 
@@ -242,14 +254,14 @@ class CallAdmissionFailureTest {
             setField(app, "cipher\$delegate", lazyOf(cipher))
         }
 
-        suspend fun begin() = withContext(Dispatchers.Main.immediate) {
+        suspend fun begin(conversationId: String? = "synthetic-chat") = withContext(Dispatchers.Main.immediate) {
             // Exercise the reservation/start catch without consulting the owner's VoiceKeyStore.
             suspendCoroutineUninterceptedOrReturn<Unit> { continuation ->
                 // start(client, incoming, conversationId, voiceSettings, tappedAt, continuation)
                 val method = CallController::class.java.declaredMethods.single { it.name == "start" && it.parameterTypes.size == 6 }
                 method.isAccessible = true
                 try {
-                    method.invoke(app.calls, client, null, "synthetic-chat",
+                    method.invoke(app.calls, client, null, conversationId,
                         VoiceSessionCredentials("gemini", "synthetic-unused-provider-key", "synthetic-model", "synthetic-voice", "balanced"),
                         android.os.SystemClock.elapsedRealtime(), continuation)
                 } catch (error: InvocationTargetException) { throw error.targetException }

@@ -58,7 +58,7 @@ class DirectVoiceStartupTest {
 
     // The reconnect context read now runs beside its provider socket; a failed read fails that attempt, never admits it.
     @Test(timeout=8000) fun failedReconnectContextReadUsesTheReconnectBudgetWithoutAdmittingItsSocket() = runBlocking {
-        val contexts=AtomicInteger();val asrConnections=AtomicInteger()
+        val contexts=AtomicInteger();val asrConnections=AtomicInteger();val sockets=AtomicInteger()
         val reconnected=CompletableDeferred<Unit>();val failure=CompletableDeferred<String>()
         val admittedOn=java.util.concurrent.CopyOnWriteArrayList<Int>()
         val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
@@ -66,16 +66,17 @@ class DirectVoiceStartupTest {
         val factory=providerFactory(true,onSetup={ socket,listener,frame ->
             val instruction=frame.getJSONObject("setup").getJSONObject("systemInstruction").getJSONArray("parts").getJSONObject(0).getString("text")
             if(instruction.startsWith("Transcribe") && asrConnections.incrementAndGet()==1) listener.onFailure(socket,java.io.IOException("Network handover"),null)
-        })
+        },onRequest={ sockets.incrementAndGet() })
         val voice=DirectVoice(client,"call","stored",scope,{}, {
-            if(it.optString("state")=="listening") { admittedOn+=asrConnections.get();if(asrConnections.get()==3) reconnected.complete(Unit) }
+            if(it.optString("state")=="listening") { admittedOn+=sockets.get();if(sockets.get()==3) reconnected.complete(Unit) }
         }, { failure.complete(it) },credentials=credentials(),providerSocketFactory=factory)
         try {
             voice.start()
             assertTrue("A failed context read must use the reconnect budget",withTimeoutOrNull(5000) { reconnected.await();true }==true)
             assertFalse("The call must stay alive",failure.isCompleted)
             assertEquals(3,contexts.get())
-            assertEquals(3,asrConnections.get())
+            assertEquals("Three sockets; the one beside the failed read never sends its setup",3,sockets.get())
+            assertEquals(2,asrConnections.get())
             assertFalse("The socket beside the failed context read must never be admitted",2 in admittedOn)
         } finally { voice.close();scope.cancel();client.closeNative() }
     }
@@ -289,7 +290,7 @@ class DirectVoiceStartupTest {
             voice.start()
             val message=withTimeout(25000) { failed.await() }
             val elapsed=(System.nanoTime()-start)/1_000_000
-            assertTrue(message,message.contains("20 seconds"))
+            assertEquals("A provider that never answers setup is named as the failed stage",CALL_VOICE_NO_ANSWER,message)
             assertTrue("Elapsed $elapsed ms",elapsed in 19000..24000)
             assertTrue(connections.get() in 1..3)
         } finally { voice.close();scope.cancel();client.closeNative() }
@@ -327,7 +328,7 @@ class DirectVoiceStartupTest {
         val voice = DirectVoice(client, "call", "stored", scope, {}, { events+=it }, { failed.complete(it) },credentials=credentials(),providerSocketFactory=providerFactory(true) { connections.incrementAndGet() })
         try {
             voice.start()
-            assertEquals("Call context unavailable; reconnect to Hermes and retry",withTimeout(3000) { failed.await() })
+            assertEquals(CALL_HERMES_NO_ANSWER,withTimeout(3000) { failed.await() })
             assertTrue(connections.get() <= 1)
             assertTrue(events.none { it.optString("state") in setOf("listening","thinking") })
             assertTrue(events.none { it.optString("stage")=="provider_ready" })
@@ -347,8 +348,8 @@ class DirectVoiceStartupTest {
         }
         val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
         val voice=DirectVoice(client,"call","stored",scope,{}, {}, {},credentials=credentials())
-        val method=DirectVoice::class.java.getDeclaredMethod("refreshContext",java.lang.Long.TYPE,Continuation::class.java).apply { isAccessible=true }
-        suspend fun refresh()=suspendCoroutineUninterceptedOrReturn<Unit> { continuation -> method.invoke(voice,3000L,continuation) }
+        val method=DirectVoice::class.java.getDeclaredMethod("refreshContext",java.lang.Long.TYPE,java.lang.Boolean.TYPE,Continuation::class.java).apply { isAccessible=true }
+        suspend fun refresh()=suspendCoroutineUninterceptedOrReturn<Unit> { continuation -> method.invoke(voice,3000L,false,continuation) }
         val context=DirectVoice::class.java.getDeclaredField("context").apply { isAccessible=true }
         val ready=DirectVoice::class.java.getDeclaredField("contextReady").apply { isAccessible=true }
         try {

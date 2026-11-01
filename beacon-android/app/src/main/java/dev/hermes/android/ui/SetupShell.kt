@@ -17,16 +17,21 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -42,12 +47,10 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.LiveRegionMode
@@ -58,6 +61,7 @@ import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTag
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowInsetsControllerCompat
 
@@ -93,10 +97,9 @@ private val SetupSurface = Color(0xff10232d)
 private val SetupSurfaceHighest = Color(0xff1b303b)
 private val SetupInk = Color(0xfff4f0e3)
 private val SetupMuted = Color(0xffb3c3ca)
-
-/** Brightens [color] just enough to read at 4.5:1 on [background]; a light-mode brown or red would not. */
-internal fun readableOnSea(color: Color, background: Color): Color =
-    (0..20).firstNotNullOfOrNull { step -> lerp(color, Color.White, step / 20f).takeIf { nativeContrast(it, background) >= 4.5f } } ?: Color.White
+// The wizard keeps the dark theme's gold and error red in both system themes (default skin, dark: accent #E7B579, error #F2A49C), so it looks the same either way.
+private val SetupGold = Color(0xffe7b579)
+private val SetupError = Color(0xfff2a49c)
 
 internal fun setupColorScheme(base: ColorScheme): ColorScheme = base.copy(
     background = SetupSea, onBackground = SetupInk,
@@ -104,10 +107,16 @@ internal fun setupColorScheme(base: ColorScheme): ColorScheme = base.copy(
     surfaceContainerLowest = Color(0xff0b1d27), surfaceContainerLow = SetupSurface,
     surfaceContainer = SetupSurface, surfaceContainerHigh = Color(0xff142934), surfaceContainerHighest = SetupSurfaceHighest,
     outline = SetupMuted.copy(alpha = .62f), outlineVariant = SetupMuted.copy(alpha = .3f),
-    primary = readableOnSea(base.primary, SetupSurfaceHighest), onPrimary = SetupSea,
-    error = readableOnSea(base.error, SetupSurfaceHighest),
+    primary = SetupGold, onPrimary = SetupSea,
+    error = SetupError, onError = SetupSea,
     primaryContainer = Color(0xff35412c), onPrimaryContainer = SetupInk,
 )
+
+/** What the header's Close setup button does and whether it can right now. Null where there is nothing to close back to (before the first sign-in). */
+internal class SetupClose(val enabled: Boolean, val onClose: () -> Unit)
+
+/** The wizard sets this once, so every setup page gets the same X in its header instead of its own text link. */
+internal val LocalSetupClose = compositionLocalOf<SetupClose?> { null }
 
 /** The wizard and the call screen are dark in both themes, so the clock, battery and gesture bar draw light on them; the app's bars come back when they close. */
 @Composable
@@ -204,8 +213,14 @@ private fun SetupHeader(step: Int, progress: Float) {
                 BeaconSignal(BeaconMotionMode.Pulse, Modifier.testTag("setup-beacon-glow"), 48.dp)
                 BeaconMark(size = 28.dp, contentDescription = assistantText("Beacon"))
             }
-            Text(uiText("Beacon"), Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+            Text(uiText("Beacon"), Modifier.weight(1f), style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(uiText("Step {0} of {1}").replace("{0}", "$step").replace("{1}", "$SETUP_STEPS"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            LocalSetupClose.current?.let { close ->
+                IconButton(
+                    close.onClose, Modifier.size(48.dp).testTag("setup-close"), enabled = close.enabled,
+                    colors = IconButtonDefaults.iconButtonColors(contentColor = MaterialTheme.colorScheme.onSurfaceVariant, disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .38f)),
+                ) { Icon(Icons.Rounded.Close, uiText("Close setup")) }
+            }
         }
         // The step text names the step; the bar fills a little more on every page of step 3.
         Row(Modifier.fillMaxWidth().clearAndSetSemantics {
@@ -237,19 +252,25 @@ internal fun SetupStatusLine(message: String, error: Boolean, modifier: Modifier
     if (message.isBlank()) return
     val tint = if (error) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
     Row(modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Icon(if (error) Icons.Rounded.ErrorOutline else Icons.Rounded.Info, null, Modifier.padding(top = 2.dp).size(16.dp), tint = tint)
-        Text(uiText(message), Modifier.weight(1f).semantics { liveRegion = LiveRegionMode.Polite }, style = MaterialTheme.typography.bodySmall, color = tint)
+        Icon(if (error) Icons.Rounded.ErrorOutline else Icons.Rounded.Info, null, Modifier.padding(top = 2.dp).size(18.dp), tint = tint)
+        // The one line that says what went wrong: body size, not caption size.
+        Text(uiText(message), Modifier.weight(1f).semantics { liveRegion = LiveRegionMode.Polite }, style = MaterialTheme.typography.bodyMedium, color = tint)
     }
 }
 
 @Composable
 internal fun SetupPrimaryButton(text: String, onClick: () -> Unit, modifier: Modifier = Modifier, enabled: Boolean = true, loading: Boolean = false) {
-    Button(onClick, modifier.fillMaxWidth().heightIn(min = 52.dp), enabled = enabled) {
-        // The label stays (hidden) while loading, so TalkBack still names the button and it keeps its size.
-        Box(contentAlignment = Alignment.Center) {
-            Text(text, Modifier.alpha(if (loading) 0f else 1f))
-            if (loading) BeaconSignal(BeaconMotionMode.Sweep, size = 20.dp)
-        }
+    val scheme = MaterialTheme.colorScheme
+    // While it works the button keeps its label beside a turning dust core and is not tappable, but it does not take the grey disabled look.
+    Button(
+        onClick, modifier.fillMaxWidth().heightIn(min = 52.dp), enabled = enabled && !loading,
+        colors = ButtonDefaults.buttonColors(
+            disabledContainerColor = if (loading) scheme.primary.copy(alpha = .24f) else scheme.onSurface.copy(alpha = .12f),
+            disabledContentColor = if (loading) scheme.onSurface else scheme.onSurface.copy(alpha = .38f),
+        ),
+    ) {
+        if (loading) { BeaconDustCore(18.dp); Spacer(Modifier.width(10.dp)) }
+        Text(text)
     }
 }
 

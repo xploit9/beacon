@@ -117,7 +117,7 @@ class AppUpdateUiTest {
         compose.onNodeWithTag("update-meta").assertIsDisplayed()
         reveal("update-row-plugin")
         compose.onNodeWithTag("update-row-app").assertTextContains("1.1.2 → 1.1.3").assertTextContains("Ready to update")
-        compose.onNodeWithText("Hermes plugin").assertIsDisplayed()
+        compose.onNodeWithText("Beacon plugin").assertIsDisplayed()
         compose.onNodeWithText("1.1.1 → 1.1.3").assertIsDisplayed()
         compose.onAllNodesWithTag("update-row-plugin").assertCountEquals(1)
         capture("available")
@@ -182,20 +182,21 @@ class AppUpdateUiTest {
     @Test fun aRestartThatFinishedLeavesTheDashboardRestartToTheOwner() {
         show(pluginOnly(PluginRow(PluginStatus.DashboardRestart, "1.1.3", "1.1.3")))
         compose.onAllNodesWithText("Restart needed").onFirst().assertIsDisplayed()
-        compose.onNodeWithText("Restart the Hermes dashboard on your computer").assertIsDisplayed()
+        compose.onNodeWithText("Restart the Hermes dashboard on your computer.").assertIsDisplayed()
+        compose.onNodeWithTag("update-restart-how").assertTextEquals("How")
         compose.onAllNodesWithTag("update-primary").assertCountEquals(0)
     }
 
     @Test fun aFailedRestartOffersTryAgain() {
         show(pluginOnly(PluginRow(PluginStatus.RestartFailed, "1.1.3", "1.1.3")))
-        compose.onNodeWithText("Couldn't restart Hermes. Try again.").assertIsDisplayed()
+        compose.onNodeWithText("Hermes gateway didn't restart").assertIsDisplayed()
         compose.onNodeWithTag("update-primary").assertTextEquals("Try again").performClick()
         assertEquals(1, updates)
     }
 
     @Test fun aPluginNewerThanTheAppIsAttentionNotUpToDate() {
         show(AppUpdateUi(checkedAt = now - 60_000, latest = release, plugin = PluginRow(PluginStatus.Newer, "1.2.0", "1.1.3"), phase = UpdatePhase.Available))
-        compose.onNodeWithText("Hermes plugin is newer than this app").assertIsDisplayed()
+        compose.onNodeWithText("The Beacon plugin is newer than this app. Update the app.").assertIsDisplayed()
         compose.onAllNodesWithText("Newer than app").onFirst().assertIsDisplayed()
         compose.onAllNodesWithTag("update-primary").assertCountEquals(0)
         compose.onAllNodesWithText("You're up to date").assertCountEquals(0)
@@ -234,8 +235,9 @@ class AppUpdateUiTest {
 
     @Test fun thePluginStepComesFirstAndSaysSo() {
         show(AppUpdateUi(phase = UpdatePhase.Downloading, release = release, latest = release, plugin = PluginRow(PluginStatus.Updating, "1.1.1", "1.1.3")))
-        compose.onNodeWithText("Updating the Hermes plugin…").assertIsDisplayed()
-        compose.onNodeWithTag("update-cancel").assertIsEnabled()
+        compose.onNodeWithText("Updating the Beacon plugin…").assertIsDisplayed()
+        // Hermes carries on installing whatever the phone does, so the plugin step offers no Cancel.
+        compose.onAllNodesWithTag("update-cancel").assertCountEquals(0)
     }
 
     @Test fun installingShowsProgressWhileAndroidAsks() {

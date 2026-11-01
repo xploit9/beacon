@@ -468,7 +468,10 @@ class NativeSpeechBackendTest {
         suspend fun start() {
             voice.start()
             assertTrue("Provider was not admitted", waitFor { events.any { it.optString("state") == "listening" } })
-            assertTrue("Greeting render was not started", waitFor { if (provider == "gemini") tts.requests.isNotEmpty() else renderSockets().isNotEmpty() })
+            // The greeting is the live model's own speech: nothing is rendered until Hermes has a verified reply.
+            assertTrue("No greeting is rendered", tts.requests.isEmpty() && renderSockets().isEmpty())
+            // The live model finishes its greeting turn; the frames each test sends next are the owner's turn.
+            receive(if (provider == "gemini") json("serverContent" to json("turnComplete" to true)) else json("type" to "response.done", "response" to json("status" to "completed")))
         }
         fun gatewayReady(index: Int, canonical: Boolean) {
             val (socket,listener)=nativeSockets[index]
@@ -996,13 +999,16 @@ class NativeSpeechBackendTest {
     @Test(timeout = 8000) fun prefetchedOtherProviderSpeechStillNeedsTheExactTranscript() = runBlocking {
         val f = RenderFixture()
         try {
-            assertTrue(f.renderer.prefetch("Verified reply."))
-            assertTrue(waitFor { f.requestCount("Verified reply.") == 1 })
+            f.autoPlay = false
+            assertTrue(f.renderer.say("First line.")); assertTrue(f.renderer.say("Verified reply."))
+            assertTrue(waitFor { f.requestCount("First line.") == 1 })
+            f.receive(renderPcm()); f.receive(renderTranscript(text = "First line.")); f.receive(renderDone())
+            assertTrue("The next line renders while this one plays", waitFor { f.requestCount("Verified reply.") == 1 })
             f.receive(renderPcm()); f.receive(renderTranscript(text = "Verified reply and more.")); f.receive(renderDone()); f.closeSocket()
-            assertTrue(f.renderer.say("Verified reply."))
+            f.renderer.played(24000)
             assertTrue(waitFor { f.warned() })
-            assertTrue("A mismatched prefetch never plays", f.audio.isEmpty())
-            assertEquals("The prefetch is not rendered again", 1, f.requestCount("Verified reply."))
+            assertEquals("A mismatched read-ahead never plays", 1, f.audio.size)
+            assertEquals("The read-ahead is not rendered again", 1, f.requestCount("Verified reply."))
         } finally { f.close() }
     }
 

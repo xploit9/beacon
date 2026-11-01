@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Beacon's recognizer only passes requests on to the phone's own, so it is never offered as the default one. -->
+<recognition-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:selectableAsDefault="false" />

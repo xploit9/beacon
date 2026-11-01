@@ -66,14 +66,16 @@ class SettingsKitTest {
     @Test fun everyStillStateHasAGlyphAndOnlyWorkingSweeps() {
         SettingsStatus.entries.filter { it != SettingsStatus.Working }.forEach { assertNotNull(it.name, settingsStatusIcon(it)) }
         assertNull(settingsStatusIcon(SettingsStatus.Working))
-        assertEquals(BeaconMotionMode.Sweep, settingsStatusMotion(SettingsStatus.Working))
+        assertNull("Working is the gold dust core, not a signal mode", settingsStatusMotion(SettingsStatus.Working))
         assertEquals(BeaconMotionMode.Pulse, settingsStatusMotion(SettingsStatus.Attention))
         assertEquals(BeaconMotionMode.Ripple, settingsStatusMotion(SettingsStatus.Ok))
     }
 
     @Test fun autoChoiceUsesSegmentsOnlyForTwoToFourShortOptionsAtNormalSize() {
         assertEquals(ChoiceStyle.Segmented, resolveChoiceStyle(ChoiceStyle.Auto, listOf("Notify", "Call"), 1f))
-        assertEquals(ChoiceStyle.Segmented, resolveChoiceStyle(ChoiceStyle.Auto, listOf("Follow device", "Dark", "Light"), 1.3f))
+        // 1.3× is where "Follow device" broke mid-word (UX-39), so Auto opens a menu from 1.3 up.
+        assertEquals(ChoiceStyle.Segmented, resolveChoiceStyle(ChoiceStyle.Auto, listOf("Follow device", "Dark", "Light"), 1.29f))
+        assertEquals(ChoiceStyle.Menu, resolveChoiceStyle(ChoiceStyle.Auto, listOf("Follow device", "Dark", "Light"), 1.3f))
         assertEquals(ChoiceStyle.Segmented, resolveChoiceStyle(ChoiceStyle.Auto, listOf("Forever", "1 year", "90 days", "30 days"), 1f))
         assertEquals(ChoiceStyle.Menu, resolveChoiceStyle(ChoiceStyle.Auto, listOf("Only"), 1f))
         assertEquals(ChoiceStyle.Menu, resolveChoiceStyle(ChoiceStyle.Auto, listOf("a", "b", "c", "d", "e"), 1f))

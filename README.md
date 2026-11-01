@@ -1,4 +1,8 @@
-# Beacon
+<p align="center">
+  <img src="docs/images/beacon-icon.png" width="96" height="96" alt="Beacon app icon">
+</p>
+
+<h1 align="center">Beacon</h1>
 
 **Your own Hermes, in your pocket.** Beacon is the Android app for a self-hosted
 [Hermes Agent](https://github.com/NousResearch/hermes-agent): one always-on assistant chat, topic threads that take
@@ -7,15 +11,41 @@ The assistant is named Beacon by default; rename it in Settings › Assistant.
 
 ## Install
 
-**1. On the PC that runs Hermes**, give your coding agent (Codex, Claude Code, or Hermes itself) this prompt:
+**Install the app, paste your Hermes link, sign in. The app installs the Beacon plugin for you.** Download the latest `Beacon-*.apk` from [Releases](https://github.com/xploit9/beacon/releases/latest) and open it on your phone (Android asks once to allow installs from your browser or Files app). The setup wizard then sets up your voice key, permissions and Keep connected.
+
+Your phone reaches Hermes over a private HTTPS address, such as `https://<your-pc>.<your-tailnet>.ts.net`, and that address is the link you paste.
+
+### No HTTPS address yet?
+
+Paste this prompt into your AI agent (Codex, Claude Code, or Hermes itself) on the PC that runs Hermes. It sets up Tailscale (free), puts your dashboard on a private HTTPS address and tells you when to install the app:
+
+```text
+Get my PC ready for the Beacon app: put my Hermes dashboard on a private HTTPS address with Tailscale. Do each step yourself and ask me only when a step needs me. Do not install the Beacon plugin; the Beacon app does that on its own.
+
+1. Install Tailscale on this PC unless `tailscale version` already works.
+   - Windows: `winget install -e --id Tailscale.Tailscale` (or https://tailscale.com/download/windows). If `tailscale` is not found afterwards, use `C:\Program Files\Tailscale\tailscale.exe`.
+   - macOS: install the Tailscale app from https://tailscale.com/download/mac.
+   - Linux: `curl -fsSL https://tailscale.com/install.sh | sh`, then `sudo tailscale up`.
+2. Sign this PC in to my Tailscale account (Windows and macOS: open the Tailscale app; Linux: the link `tailscale up` prints). Wait until `tailscale status` shows this PC connected.
+3. Ask me to open https://login.tailscale.com/admin/dns, make sure MagicDNS is on, and choose Enable HTTPS under HTTPS Certificates. Wait until I say it is done.
+4. Find the port my Hermes dashboard listens on (9119 unless I changed it) and check that http://127.0.0.1:<port>/api/status answers. If the dashboard is not running, tell me and stop.
+5. Run `tailscale serve --bg <port>`, then `tailscale serve status` to read the HTTPS address. It looks like https://<your-pc>.<your-tailnet>.ts.net
+6. Save it with `hermes config set dashboard.public_url <that address>` (use `hermes -p <profile> config set ...` if my dashboard runs under a named profile).
+7. Check that `curl -fsS <that address>/api/status` answers with Hermes' status. Fix anything that fails before you go on, and ask me before you restart the dashboard.
+8. Tell me to install Tailscale on my phone (Google Play), sign in with the same account and leave it connected.
+
+Never ask for or print passwords, tokens, Tailscale keys or API keys, and never modify Hermes core. When every step has passed, finish with this message, with the real address filled in:
+
+You're ready. Install the Beacon app on your phone, paste this link, and the app installs the Beacon plugin and walks you through the rest: <address>
+```
+
+### Alternative: set up from the PC
+
+Prefer to install the Beacon plugin from the PC first? Give your agent this prompt:
 
 > Install Beacon on my Hermes: download https://raw.githubusercontent.com/xploit9/beacon/main/hermes-plugin/beacon/install/beacon_install.py and run it with Python. Whenever it stops to ask something, it names a flag — ask me, then rerun it with that flag. Show me the link it prints at the end. Never print or store passwords, tokens or API keys, and never modify Hermes core.
 
-Or download [`beacon_install.py`](https://raw.githubusercontent.com/xploit9/beacon/main/hermes-plugin/beacon/install/beacon_install.py) and run `python beacon_install.py` yourself. It picks your Hermes home and profile, installs Beacon, restarts the dashboard if you say yes, and prints the link for your phone. The link needs an HTTPS address for your dashboard; if you have none, the installer can set one up with Tailscale. Manual steps: [docs/install-with-agent.md](docs/install-with-agent.md).
-
-**2. On your phone**, download the latest `Beacon-*.apk` from [Releases](https://github.com/xploit9/beacon/releases/latest) and install
-it. Open it, paste your Hermes link (also shown on the dashboard's **Beacon** tab), sign in with Hermes, and follow the setup wizard.
-If you skipped step 1, Beacon can install its plugin from the app once you are connected.
+Or download [`beacon_install.py`](https://raw.githubusercontent.com/xploit9/beacon/main/hermes-plugin/beacon/install/beacon_install.py) and run `python beacon_install.py` yourself. It picks your Hermes home and profile, installs Beacon, restarts the dashboard if you say yes, and prints the link for your phone. It can also set up the HTTPS address with Tailscale (`--tailscale`). Manual steps: [docs/install-with-agent.md](docs/install-with-agent.md).
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/05bc3b64-e9d7-48b2-94e7-0661e322d950" width="31%" alt="Beacon chat">
@@ -144,6 +174,15 @@ tap away.
 ## Manage phones
 
 See and remove linked phones in Settings › Connection, or on the dashboard's **Beacon** tab.
+
+## Restart the Hermes dashboard
+
+An update restarts the Hermes dashboard for you. If Beacon says the dashboard didn't restart, restart it on the computer that runs Hermes:
+
+1. Close the running dashboard (press `Ctrl+C` in its terminal, or stop it in your service manager).
+2. Start it again with `hermes dashboard` (`hermes -p <profile> dashboard` for a named profile).
+
+Then open Settings › App updates in Beacon and tap **Try again**.
 
 ## Requirements
 

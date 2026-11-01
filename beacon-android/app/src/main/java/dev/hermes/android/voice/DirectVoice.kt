@@ -116,20 +116,58 @@ internal suspend fun testVoiceProvider(provider:String,apiKey:String,model:Strin
     }
 }
 
-internal class DirectVoice(private val client:BeaconClient,private val callId:String,private val selectedSession:String,private val scope:CoroutineScope,
+/** What the owner reads when a call cannot connect: the stage that did not finish says whose side failed. */
+internal const val CALL_HERMES_NO_ANSWER = "Hermes didn't answer. Try again."
+internal const val CALL_VOICE_NO_ANSWER = "The voice service didn't answer. Try again."
+internal const val CALL_SIGN_IN_EXPIRED = "Your sign-in expired. Sign in again to call."
+internal const val CALL_MIC_FAILED = "The microphone didn't start. Try again."
+internal const val CALL_DROPPED = "The call dropped. Call again."
+internal const val CALL_VOICE_STOPPED = "Voice stopped answering. Call again."
+/** The call-start stages, in order; a failed start reports the first one that did not finish. */
+internal val CALL_START_STAGES = listOf("grant_ok", "context_ok", "provider_setup_ok", "mic_streaming")
+internal fun callFailureText(stage: String, error: Throwable?): String = when {
+    error is ApiFailure && error.status in setOf(401, 403) -> CALL_SIGN_IN_EXPIRED
+    stage == "grant_ok" || stage == "context_ok" -> CALL_HERMES_NO_ANSWER
+    stage == "mic_streaming" -> CALL_MIC_FAILED
+    else -> CALL_VOICE_NO_ANSWER
+}
+/** Hermes refused or never answered the call's admission; the service ends the call with the grant's own reason. */
+internal class CallAdmissionFailed(cause: Throwable) : Exception(cause)
+
+internal class DirectVoice(private val client:BeaconClient,callId:String,private val selectedSession:String,private val scope:CoroutineScope,
     private val audio:(ByteArray)->Unit,private val event:(JSONObject)->Unit,private val failure:(String)->Unit,
     private val credentials:VoiceSessionCredentials,private val providerSocketFactory:WebSocket.Factory?=null,private val ownerName:String="",stallAfterMs:Long=20_000,
     private val ownerFence:Any=Any(),private val ownerActive:()->Boolean={true},private val providerCallFactory:Call.Factory?=null,
-    private val opening:OpeningPrefetch?=null,private val clock:()->Long={ System.nanoTime()/1_000_000 },tappedAt:Long=0,
-    private val greeting:CallGreeting?=null) {
+    private val clock:()->Long={ System.nanoTime()/1_000_000 },tappedAt:Long=0,
+    /** A live session opened before the tap with this conversation's context; the call takes it over. */
+    private val warm:LiveSession?=null,
+    /** This conversation's context read before the tap; without it the call reads it now. */
+    private val prefetched:JSONObject?=null,
+    /** Hermes' admission (the grant), running alongside the voice connection; tools and call reads wait for it. */
+    admission:Deferred<JSONObject>?=null,
+    /** A callback the owner answered: its context carries the call-bound reason and result. */
+    private val callback:Boolean=false,
+    /** The call streams the phone's microphone: it is connected only once that stream reaches the session. */
+    private val streamsMicrophone:Boolean=false) {
     // One call clock: every diagnostic's elapsed_ms counts from the owner's tap when the service supplies it.
     private val origin=tappedAt.takeIf { it>0 }?:clock()
     private fun elapsedMs()=clock()-origin
+    @Volatile private var callId=callId
+    private val admission:Deferred<JSONObject> = admission ?: CompletableDeferred(JSONObject().put("call_id",callId))
     // Deliberately separate from authenticated Hermes HTTP: no cookie jar, interceptors, or copied headers.
     private val provider=credentials.provider
     private val providerHttp=OkHttpClient.Builder().cookieJar(CookieJar.NO_COOKIES).followRedirects(false).followSslRedirects(false).pingInterval(20,TimeUnit.SECONDS).build()
     private val epoch=AtomicLong();@Volatile private var socket:WebSocket?=null
-    private data class Outbound(val json:String,val permitted:()->Boolean,val control:Boolean=false)
+    @Volatile private var typedTurn:((String)->Boolean)?=null
+    /** The owner's typed words as a user turn of the admitted live session; false when no session took them. */
+    fun sendText(text:String):Boolean {
+        val words=text.trim().take(4000)
+        if(words.isEmpty()||stopped||!ready) return false
+        val sent=typedTurn?.invoke(words)==true
+        if(sent) event(JSONObject().put("type","transcript").put("role","user").put("text",words).put("final",true))
+        return sent
+    }
+    private data class Outbound(val json:String,val permitted:()->Boolean,val control:Boolean=false,val mic:Boolean=false)
     // A session that took the owner's speech or a tool result and never answered is replaced; what it was owed is said again.
     private val stall=VoiceStallWatch(limit=stallAfterMs);private val stallPoll=(stallAfterMs/4).coerceIn(50,1000)
     private var run:Job?=null;private val microphone=Channel<Outbound>(20)
@@ -139,11 +177,9 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
     private val visual=NativeVoiceVisual()
     private val finalItems=VoiceFinalItems()
     @Volatile private var lastNativeReply=""
-    // Presentation needs readiness; a greeting prefetch needs only this call's ownership.
+    // Reads Hermes' verified replies aloud; the greeting is the live model's own speech, never rendered here.
     private val renderer=NativeSpeechRenderer(credentials,providerSocketFactory?:providerHttp,scope,{ callOwned() && ready },audio,event,{ stall.playing(it) },
-        providerCallFactory ?: if(providerSocketFactory==null) providerHttp else providerSocketFactory as? Call.Factory,
-        renderable={ callOwned() },openingEnded={ openingEnded(it) },elapsedMs={ elapsedMs() },
-        openingRendered={ text,pcm -> greeting?.rendered(text,pcm) })
+        providerCallFactory ?: if(providerSocketFactory==null) providerHttp else providerSocketFactory as? Call.Factory,elapsedMs={ elapsedMs() })
     private val toolReceipts=mutableMapOf<String,JSONObject>()
     private val submissionLock=Mutex()
     private val reported=mutableSetOf<String>()
@@ -156,9 +192,28 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
     private val callScope=client.scope
     private val toolJobs=mutableMapOf<Job,String>()
     @Volatile private var contextReady=false
+    // An older plugin has no conversation context route: the call reads its own context once Hermes admitted it.
+    @Volatile private var callContextOnly=callback
     // A setup the provider refused (bad key, unknown model): retrying cannot help, so the call ends with the reason.
     @Volatile private var providerRejection:String?=null
     private val connectingSince=System.nanoTime()
+    // Connected = the provider answered setup, the microphone streams into it and Hermes admitted the call. Until then the call shows connecting.
+    @Volatile private var admitted=false;@Volatile private var micStreaming=false;@Volatile private var connected=false
+    private val stages=java.util.concurrent.ConcurrentHashMap<String,Long>()
+    // The live model's greeting: its turn is open from the start note until the model finishes it or the owner talks over it.
+    private val greetingLock=Any()
+    @Volatile private var greetingOpen=false
+    private var greetingHeard=false // guarded by greetingLock: the model's greeting audio has arrived
+    private var greetingCut=false // guarded by greetingLock
+    private val greetingText=StringBuilder() // guarded by greetingLock
+    private var streamEndHeld=false // guarded by greetingLock: a mute during the greeting, sent once it ends
+    private val heldGreeting=ArrayList<ByteArray>() // guarded by greetingLock: audio that arrived before the call connected
+    private val greetingOutstanding=java.util.concurrent.atomic.AtomicLong()
+    private val greetingPresented=java.util.concurrent.atomic.AtomicBoolean()
+    /** When the live model's first greeting audio reached the phone, on the tap clock (-1 before); live timing reads it. */
+    @Volatile internal var greetingArrivedMs=-1L; private set
+    @Volatile private var warmUsed=false
+    @Volatile private var running=false
     private fun admissionBudget(maximum:Long):Long {
         if(greeted) return maximum
         val left=20000-(System.nanoTime()-connectingSince)/1000000
@@ -173,96 +228,174 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
         is java.io.IOException -> "network"
         else -> "invalid_response"
     }
-    /** [at] is a phase that happened earlier on the tap clock; [cached] marks the greeting heard from the phone's cache. */
-    private fun diagnostic(stage:String,error:Throwable?=null,closeCode:Int?=null,at:Long?=null,cached:Boolean=false) {
+    /** [at] is a phase that happened earlier on the tap clock; [warm] marks work done before the tap; [failed] names the stage a failed call did not finish. */
+    private fun diagnostic(stage:String,error:Throwable?=null,closeCode:Int?=null,at:Long?=null,warm:Boolean?=null,failed:String?=null) {
         if(stopped) return
         event(JSONObject().put("type","media_diagnostic").put("stage",stage)
             .put("elapsed_ms",at?:elapsedMs()).put("provider",provider).put("attempt",reconnects.failures).apply {
-                if(cached) put("greeting","cached")
+                warm?.let { put("warm",it) }
+                failed?.let { put("failed_stage",it) }
                 error?.let { put("error_code",errorCode(it));put("cause_class",voiceTransportCause(it)) }
                 closeCode?.takeIf { it in 1000..4999 }?.let { put("close_code",it) }
             })
     }
-    init { require(voiceProviderSupported(provider)&&credentials.apiKey.isNotBlank()) }
-    private fun providerRequest():VoiceProviderRequest = when(provider) {
-        "gemini" -> GeminiWire.request(credentials.apiKey)
-        "grok" -> GrokWire.request(credentials.apiKey,credentials.model)
-        else -> OpenAiWire.request(credentials.apiKey,credentials.model)
+    /** Reports a call-start stage once, at its first occurrence. */
+    private fun stage(name:String,at:Long=elapsedMs(),warm:Boolean?=null) {
+        if(stages.putIfAbsent(name,at)==null) diagnostic(name,at=at,warm=warm)
     }
+    private fun failedStage():String = CALL_START_STAGES.firstOrNull { !stages.containsKey(it) } ?: "first_model_audio"
+    init {
+        require(voiceProviderSupported(provider)&&credentials.apiKey.isNotBlank())
+        this.admission.invokeOnCompletion { error ->
+            if(error!=null) return@invokeOnCompletion
+            this.callId=this.admission.getCompleted().optString("call_id",this.callId)
+            stages.putIfAbsent("grant_ok",elapsedMs())
+            admitted=true
+            if(!stopped&&running) { startPolling();checkConnected() }
+        }
+    }
+    private fun providerRequest():VoiceProviderRequest = liveProviderRequest(credentials)
     private fun newProviderSocket(request:VoiceProviderRequest,listener:WebSocketListener):WebSocket =
         providerSocketFactory?.newWebSocket(request.rawRequest(),listener)?:providerHttp.newWebSocket(request.rawRequest(),listener)
-    private suspend fun refreshContext(timeout:Long) {
+    /** Hermes' admission of this call; a refused grant ends the attempt quietly, as the service ends the call with its reason. */
+    private suspend fun admittedCall():String {
+        try { admission.await() } catch(error:CancellationException) { currentCoroutineContext().ensureActive();throw CallAdmissionFailed(error) }
+        catch(error:Exception) { throw CallAdmissionFailed(error) }
+        return callId
+    }
+    private fun checkedContext(value:JSONObject):JSONObject {
+        require(client.scope==callScope&&value.optString("profile")==callScope.profile&&value.optString("selected_session_id")==selectedSession&&selectedSession.isNotBlank()) { "Native call context scope mismatch" }
+        return value
+    }
+    /** The conversation's context from the plugin's conversation route; an older plugin's call route once Hermes admitted the call. */
+    private suspend fun readContext():JSONObject {
+        if(!callContextOnly) try { return client.nativeVoiceContext(selectedSession,ownerName) }
+        // An older plugin has no such route ("Not Found"); a chat the grant is still saving is not readable yet. Both read the call's own context once admitted.
+        catch(error:ApiFailure) { if(error.status!=404) throw error;callContextOnly=true }
+        return client.nativeCallContext(admittedCall(),ownerName)
+    }
+    private suspend fun refreshContext(timeout:Long,first:Boolean) {
         // A read in flight keeps the last verdict; admission waits for this read's own result.
         try {
-            val fresh=withTimeout(timeout) { client.nativeCallContext(callId,ownerName) }
-            require(client.scope==callScope&&fresh.optString("profile")==callScope.profile&&fresh.optString("selected_session_id")==selectedSession&&selectedSession.isNotBlank()) { "Native call context scope mismatch" }
+            val known=if(first) prefetched?.takeIf { contextMatches(it,callScope.session(selectedSession)) } else null
+            if(first&&known!=null) { context=checkedContext(known);contextReady=true;stage("context_ok",warm=true);return }
+            if(first) stage("context_sent")
+            val fresh=checkedContext(withTimeout(timeout) { readContext() })
             context=fresh;contextReady=true
+            if(first) stage("context_ok")
         } catch(error:Throwable) { contextReady=false;throw error }
     }
     private class ContextLoad(val result:Deferred<Throwable?>,val reconnect:Boolean)
     private class ContextFailed(val error:Throwable):Exception()
     /** Reads the scoped context alongside the provider socket; resolves to null when verified, else to the error. */
     private fun CoroutineScope.loadContext(timeout:Long,reconnect:Boolean)=ContextLoad(async {
-        try {
-            refreshContext(timeout)
-            if(!reconnect) { diagnostic("context_ready");startPolling();greeting?.observed(context,openingText()) }
-            // A greeting heard since the tap needs no render; one that could not play falls back at admission.
-            if(!greeted&&greeting?.early?.available!=true) renderer.prefetch(openingText())
-            null
-        } catch(error:CancellationException) { currentCoroutineContext().ensureActive();error }
+        try { refreshContext(timeout,first=!reconnect);null }
+        catch(error:CancellationException) { currentCoroutineContext().ensureActive();error }
         catch(error:Exception) { error }
     },reconnect)
-    /** True once verified; false lets a reconnect retry; otherwise the call ends with the existing context message. */
+    /** True once verified; false lets a reconnect retry; otherwise the call ends with the context's reason. */
     private fun contextAdmits(load:ContextLoad,error:Throwable?):Boolean = when {
         error==null -> true
+        error is CallAdmissionFailed -> throw error
         load.reconnect&&(error is TimeoutCancellationException||error is java.io.IOException) -> false
         else -> throw ContextFailed(error)
     }
-    private fun contextFailure(error:Throwable) {
-        diagnostic("voice_error",error)
-        if(!stopped) failure(if(error is TimeoutCancellationException) "Call context timed out; reconnect to Hermes and retry" else "Call context unavailable; reconnect to Hermes and retry")
-    }
-    private fun openingText()=context.optString("greeting").take(160).ifBlank { "I'm here." }
-    // The greeting shows as thinking from admission until its first presented audio, then listening.
-    private val openingLock=Any()
-    @Volatile private var openingStage=0 // 0 waiting, 1 audio presented, 2 settled
-    private var openingThinking=false // guarded by openingLock
-    private fun openingWait() = synchronized(openingLock) {
-        if(openingStage==0&&!openingThinking&&!stopped) { openingThinking=true;event(JSONObject().put("type","state").put("state","thinking")) }
-    }
-    private fun openingAudio(at:Long?=null) {
-        synchronized(openingLock) {
-            if(openingStage!=0||stopped) return
-            openingStage=1;diagnostic("playout_started",at=at,cached=at!=null)
-            if(openingThinking) event(JSONObject().put("type","state").put("state","listening"))
-        }
-    }
-    private fun openingEnded(presented:Boolean,cached:Boolean=false) {
-        if(presented) openingAudio()
-        synchronized(openingLock) {
-            if(openingStage==2||stopped) return
-            if(presented) diagnostic("playout_stopped",at=if(cached) greeting?.early?.endedMs?.takeIf { it>=0 } else null,cached=cached)
-            else if(openingStage==0&&openingThinking) event(JSONObject().put("type","state").put("state","listening"))
-            openingStage=2
-        }
-    }
-    private fun openWithRenderer() { openingWait();if(!renderer.say(openingText(),opening=true)) openingEnded(false) }
-    /** The cached line heard since the tap has ended: in full it is this call's greeting; one that never played hands the opening back. */
-    private fun earlyEnded(result:Int) {
+    /** The call failed before or after connecting: the diagnostic names the unfinished stage and is uploaded before the call is released. */
+    private fun fail(error:Throwable,stage:String=failedStage()) {
+        diagnostic("voice_error",error,failed=stage)
         if(stopped) return
-        when(result) {
-            EarlyGreeting.DONE -> {
-                event(JSONObject().put("type","transcript").put("role","assistant").put("text",greeting?.early?.text.orEmpty()).put("final",false))
-                event(JSONObject().put("type","turn_complete"))
-                openingEnded(true,cached=true)
-            }
-            EarlyGreeting.FAILED -> openWithRenderer()
-            // Cut by the owner talking or by the call: like an interrupted line, nothing more is said.
-            else -> {}
-        }
+        failure(when {
+            error is VoiceProviderRejected || error is VoiceStalled -> error.message.orEmpty()
+            connected -> CALL_DROPPED
+            else -> callFailureText(stage,error)
+        })
     }
-    // The owner talking stops whatever is speaking, the cached greeting included.
-    private fun bargeIn() { greeting?.early?.stop();renderer.interrupt() }
+    /** Every condition of a connected call holds: the call leaves connecting, and the greeting heard so far plays. */
+    private fun checkConnected() {
+        val flush=synchronized(greetingLock) {
+            if(connected||!ready||streamsMicrophone&&!micStreaming||!admitted||stopped) return
+            connected=true
+            heldGreeting.toList().also { heldGreeting.clear() }
+        }
+        // The greeting the live model already sent plays at once, so the first state after connecting is its speech.
+        event(JSONObject().put("type","state").put("state",if(flush.isEmpty()) "listening" else "speaking"))
+        flush.forEach(::presentGreeting)
+    }
+    private fun presentGreeting(pcm:ByteArray) {
+        greetingOutstanding.addAndGet(pcm.size.toLong())
+        stall.playing(pcm.size/2*1000L/GeminiWire.OUTPUT_RATE)
+        audio(pcm)
+    }
+    /** One frame of the live model's greeting turn: its audio, its words, and its end. */
+    private fun greetingFrame(content:JSONObject) {
+        content.optJSONObject("modelTurn")?.optJSONArray("parts")?.let { parts ->
+            for(i in 0 until parts.length()) parts.optJSONObject(i)?.optJSONObject("inlineData")?.let { data ->
+                val pcm=try { java.util.Base64.getDecoder().decode(data.optString("data")) } catch(_:Exception) { null }
+                if(pcm!=null&&GeminiWire.validAudio(data.optString("mimeType"),pcm.size)) greetingAudio(pcm)
+            }
+        }
+        content.optJSONObject("outputTranscription")?.let { words -> synchronized(greetingLock) {
+            if(greetingCut) return@synchronized
+            val text=words.optString("text")
+            if(words.optBoolean("final")&&provider!="gemini") greetingText.setLength(0)
+            if(greetingText.length+text.length<=1000) greetingText.append(text)
+        } }
+        if(content.optBoolean("interrupted")) endGreeting(cut=true)
+        else if(content.optBoolean("turnComplete")) endGreeting(cut=false)
+    }
+    private fun greetingAudio(pcm:ByteArray) {
+        val present=synchronized(greetingLock) {
+            if(greetingCut||stopped||!greetingOpen) return
+            if(!greetingHeard) greetingArrivedMs=elapsedMs()
+            greetingHeard=true
+            if(connected) true else { if(heldGreeting.sumOf { it.size }+pcm.size<=60*48000) heldGreeting+=pcm;false }
+        }
+        if(present) presentGreeting(pcm)
+    }
+    private fun endGreeting(cut:Boolean) {
+        val words=synchronized(greetingLock) {
+            if(!greetingOpen) return
+            greetingOpen=false
+            // Words are shown only for a greeting the owner heard.
+            val said=if(cut||greetingCut||!greetingHeard) "" else greetingText.toString().trim()
+            greetingText.setLength(0);heldGreeting.clear()
+            said
+        }
+        if(stopped) return
+        if(synchronized(greetingLock) { streamEndHeld.also { streamEndHeld=false } }) controls.trySend(Outbound(GeminiWire.endAudio().toString(),{ true },control=true))
+        if(words.isNotBlank()) {
+            event(JSONObject().put("type","transcript").put("role","assistant").put("text",words).put("final",false))
+            event(JSONObject().put("type","turn_complete"))
+        }
+        if(greetingPresented.get()) diagnostic("playout_stopped")
+        // A callback the owner asked for: Hermes' verified result follows the live model's greeting.
+        context.optJSONObject("callback")?.optString("result")?.take(6000)?.takeIf { it.isNotBlank() }?.let { lastNativeReply=it;if(ready) renderer.say(it) }
+    }
+    /** The greeting turn opens when the start note is sent: at the tap for a warm session, at admission otherwise. */
+    private fun beginGreeting() = synchronized(greetingLock) {
+        if(!greetingOpen) { greetingOpen=true;greetingHeard=false;greetingCut=false;greetingText.setLength(0) }
+    }
+    /** Opens the greeting turn and sends the start note unless the warm session already sent it at the tap. */
+    private fun openGreeting(ws:WebSocket,adopted:LiveSession?,send:(WebSocket,String)->Boolean) {
+        beginGreeting()
+        if(adopted==null||!adopted.cueRequested) {
+            val cue=JSONObject().put("clientContent",JSONObject().put("turns",org.json.JSONArray().put(JSONObject().put("role","user")
+                .put("parts",org.json.JSONArray().put(JSONObject().put("text",liveStartCue(context)))))).put("turnComplete",true))
+            if(!send(ws,cue.toString())) { endGreeting(cut=true);return }
+        }
+        // A model that never answers the note leaves the turn closed, so the owner's speech is never mistaken for the greeting.
+        scope.launch { delay(10_000);if(synchronized(greetingLock) { greetingOpen&&!greetingHeard }) { diagnostic("media_timeout");endGreeting(cut=true) } }
+    }
+    // The owner talking stops whatever is speaking, the live greeting included.
+    private fun bargeIn() {
+        val close=synchronized(greetingLock) {
+            heldGreeting.clear();greetingOutstanding.set(0)
+            if(!greetingOpen) false else { greetingCut=true;!greetingHeard }
+        }
+        if(close) endGreeting(cut=true)
+        else if(greetingOpen) scope.launch { delay(1500);if(greetingOpen) endGreeting(cut=true) }
+        renderer.interrupt()
+    }
     private fun ensureNativeEvents() = synchronized(this) {
         if(stopped || nativeEvents?.isActive==true) return@synchronized
         nativeEvents=scope.launch {
@@ -307,7 +440,8 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
             if(renderer.say(text)) synchronized(toolReceipts) { toolReceipts[id]?.put("receipt_reported",state+":"+outcome) }
         }
     }
-    private fun startPolling() {
+    private fun startPolling() = synchronized(toolJobs) {
+            if(polling!=null||stopped) return@synchronized
             polling=scope.launch { while(isActive&&!stopped) {
                 delay(3000)
                 pollNativeAdmissions()
@@ -349,11 +483,13 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
     }
     fun start() {
         if(!callOwned()) return
-        // The grant's greeting may already be rendering; this renderer takes it over and keeps its diagnostics.
-        opening?.let { early ->
-            early.attach { if(!stopped) event(it) }
-            renderer.adopt(early.renderer)?.invokeOnCompletion { early.drop() } ?: early.drop()
+        // A call that is not connected within the admission budget ends, naming the stage that did not finish.
+        scope.launch {
+            delay((20_000-elapsedMs()).coerceAtLeast(0))
+            if(!connected&&!stopped&&callOwned()) { run?.cancel();fail(java.net.SocketTimeoutException("Call did not connect")) }
         }
+        running=true
+        if(admitted) startPolling()
         run=scope.launch {
         try {
             if(!callOwned()) return@launch
@@ -376,7 +512,9 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
                 diagnostic("provider_key_ready")
                 val grok=if(provider=="grok") GrokWire() else null
                 val openAi=if(provider=="openai") OpenAiWire() else null
-                val request=providerRequest()
+                // The first attempt takes the session opened before the tap; a session that died meanwhile is never reused.
+                val adopted=warm?.takeIf { !warmUsed&&!greeted&&!it.dead }
+                if(!warmUsed) { warmUsed=true;if(adopted==null) warm?.close() }
                 fun sendFrames(ws:WebSocket,json:String):Boolean {
                     val frame=JSONObject(json)
                     val frames=when {
@@ -386,21 +524,12 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
                     }
                     return frames.all { ws.send(it.toString()) }
                 }
-                val setupSeen=CompletableDeferred<Unit>();val ended=CompletableDeferred<Unit>()
+                val setupSeen=CompletableDeferred<Unit>();val ended=CompletableDeferred<Unit>();val opened=CompletableDeferred<Unit>()
                 var ownerSpeaking=false
                 var codecDrain:Job?=null
                 val socketFence=Any()
-                val resumption:String?=null
                 if(finalItems.reconnect()) event(JSONObject().put("type","warning").put("message","Speech could not be confirmed; the request was not sent. Check the attached conversation before repeating."))
-                val geminiSetup=GeminiWire.setup(credentials.model,credentials.voice,resumption).apply {
-                    getJSONObject("setup").apply {
-                        remove("sessionResumption");remove("contextWindowCompression")
-                        put("systemInstruction",JSONObject().put("parts",org.json.JSONArray().put(JSONObject().put("text","Transcribe the owner's speech. Repeat only the exact words spoken; never answer, interpret, or call functions."))))
-                        if(provider=="gemini") remove("tools") else put("tools",org.json.JSONArray().put(JSONObject().put("functionDeclarations",org.json.JSONArray())))
-                    }
-                }
-                val setup=(if(openAi!=null) OpenAiWire.setup(geminiSetup) else geminiSetup).toString()
-                val ws=newProviderSocket(request,object:WebSocketListener() {
+                val listener=object:WebSocketListener() {
                     fun current()=voiceProviderCurrent(generation,epoch.get(),stopped,ended.isCompleted)
                     fun commit(final:Pair<String,String>?) {
                         if(final==null) return
@@ -429,7 +558,10 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
                         }
                     }
                     override fun onOpen(ws:WebSocket,response:Response) {
-                        if(!current()) ws.cancel() else if(!sendFrames(ws,setup)) { ended.complete(Unit);ws.cancel() }
+                        if(!current()) { ws.cancel();return }
+                        stage("provider_open",at=adopted?.let { (it.socketOpenAt-origin).coerceAtLeast(0) }?:elapsedMs(),warm=adopted?.let { it.socketOpenAt<origin })
+                        // A session opened before the tap already sent its setup; this socket sends it once the context is verified.
+                        if(adopted==null) opened.complete(Unit)
                     }
                     override fun onMessage(ws:WebSocket,text:String) {
                         synchronized(socketFence) {
@@ -445,7 +577,10 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
                             if(!current()) return
                             (grok?.continueResponse()?:openAi?.continueResponse())?.let { if(!ws.send(it.toString())) { ended.complete(Unit);ws.cancel();return } }
                             // Readiness never precedes setupComplete; admission below also waits for the verified context.
-                            if(frame.has("setupComplete")) setupSeen.complete(Unit)
+                            if(frame.has("setupComplete")) {
+                                stage("provider_setup_ok",at=adopted?.setupAt?.takeIf { it>=0 }?.let { (it-origin).coerceAtLeast(0) }?:elapsedMs(),warm=adopted?.let { it.setupAt in 0 until origin })
+                                setupSeen.complete(Unit)
+                            }
                             if(frame.has("goAway")) { ended.complete(Unit);ws.close(1000,"Reconnect");return }
                             when(frame.optJSONObject("voiceActivity")?.optString("type")) {
                                 "ACTIVITY_START" -> { ownerSpeaking=true;bargeIn();if(provider=="gemini") finalItems.activityStart() }
@@ -455,9 +590,12 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
                                 if(content.optJSONObject("interimInputTranscription")?.optString("text")?.isNotBlank()==true && !ownerSpeaking) {
                                     ownerSpeaking=true;bargeIn()
                                 }
-                                if(content.optBoolean("interrupted")) { stall.interrupted();bargeIn();if(provider=="gemini") finalItems.interrupted() }
+                                // The live model's greeting turn is its own speech, never the owner's words echoed back for checking.
+                                val greetingTurn=greetingOpen
+                                if(greetingTurn) greetingFrame(content)
+                                if(content.optBoolean("interrupted")) { stall.interrupted();bargeIn();if(provider=="gemini"&&!greetingTurn) finalItems.interrupted() }
                                 content.optJSONObject("inputTranscription")?.let { commit(finalItems.accept(it,provider=="gemini")) }
-                                if(provider=="gemini") {
+                                if(provider=="gemini"&&!greetingTurn) {
                                     content.optJSONObject("outputTranscription")?.let { commit(finalItems.echo(it)) }
                                     if(content.optBoolean("generationComplete") && !content.optBoolean("interrupted")) {
                                         commit(finalItems.generationComplete())
@@ -490,34 +628,35 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
                     override fun onClosing(ws:WebSocket,code:Int,reason:String) { ws.close(1000,null);if(current()) { if(!greeted&&code in setOf(1007,1008)) providerRejection=reason;diagnostic("provider_error",closeCode=code);ended.complete(Unit) } }
                     override fun onFailure(ws:WebSocket,t:Throwable,response:Response?) { if(current()) { if(!greeted) providerRejection=when(response?.code) { 401,403 -> "key";400 -> "model";else -> null };diagnostic("provider_error",response?.code?.takeIf { it in 400..599 }?.let { ApiFailure(it,"") } ?: t);ended.complete(Unit) } }
                     override fun onClosed(ws:WebSocket,code:Int,reason:String) { if(current()) { if(!greeted&&code in setOf(1007,1008)) providerRejection=reason;diagnostic("provider_error",closeCode=code);ended.complete(Unit) } }
-                })
+                }
+                // A warm session's greeting may already be arriving: its turn is open before the held frames are read.
+                if(adopted?.cueRequested==true) beginGreeting()
+                val ws=adopted?.attach(listener)?:newProviderSocket(providerRequest(),listener)
                 socket=ws
+                // The setup carries this conversation's verified context, so it waits for that read; the socket's handshake does not.
+                val setupSender=if(adopted!=null) null else launch {
+                    opened.await()
+                    if(load.result.await()!=null) return@launch
+                    if(voiceProviderCurrent(generation,epoch.get(),stopped,ended.isCompleted)&&!sendFrames(ws,liveSetup(credentials,context).toString())) { ended.complete(Unit);ws.cancel() }
+                }
                 var fatal=false
                 fun admit():Boolean = synchronized(socketFence) {
                     if(!voiceProviderCurrent(generation,epoch.get(),stopped,ended.isCompleted)) return@synchronized false
                     ready=true
                     reconnects.admitted()
+                    // A typed turn rides this session's own wire, like the start note; a later socket replaces it.
+                    typedTurn={ words -> socket===ws&&sendFrames(ws,JSONObject().put("clientContent",JSONObject().put("turns",org.json.JSONArray().put(JSONObject().put("role","user")
+                        .put("parts",org.json.JSONArray().put(JSONObject().put("text",words))))).put("turnComplete",true)).toString()) }
                     diagnostic("provider_ready")
-                    // The microphone is live from here on.
-                    event(JSONObject().put("type","state").put("state","listening"))
-                    if(!greeted) {
-                        greeted=true
-                        // A line heard since the tap is this call's one greeting; otherwise it renders now, as before.
-                        // Honest wait: until the greeting's first audio (or its end) the call shows thinking.
-                        if(greeting?.early?.join({ openingAudio(at=it) },::earlyEnded)==true) openingWait()
-                        else openWithRenderer()
-                        context.optJSONObject("callback")?.let { callback ->
-                            val reason=callback.optString("reason").take(240)
-                            val result=callback.optString("result").take(6000)
-                            if(reason.isNotBlank()) renderer.say("I'm calling about $reason")
-                            if(result.isNotBlank()) { lastNativeReply=result;renderer.say(result) }
-                        }
-                    }
+                    // The microphone is live from here on; the call reads as connected once it streams and Hermes admitted it.
+                    if(!greeted) { greeted=true;openGreeting(ws,adopted) { socket,json -> sendFrames(socket,json) } }
+                    else if(connected) event(JSONObject().put("type","state").put("state","listening"))
                     true
                 }
                 try {
-                    if(directAdmissionAttempt(admissionBudget(12000),{ it is ContextFailed }) { awaitSetup(setupSeen,ended,load);true }!=true) { reconnects.failed();continue }
+                    if(directAdmissionAttempt(admissionBudget(12000),{ it is ContextFailed||it is CallAdmissionFailed }) { awaitSetup(setupSeen,ended,load);true }!=true) { reconnects.failed();continue }
                     if(!contextAdmits(load,load.result.await())||!admit()) { reconnects.failed();continue }
+                    checkConnected()
                     val writer=launch { while(isActive) {
                         // Control receipts get the first bounded queue; PCM producers never wait.
                         val next=retryControl?.also { retryControl=null } ?: nextDirectFrame(controls,microphone,visualFrames)
@@ -527,6 +666,7 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
                             if(next.control) retryControl=next
                             ended.complete(Unit);break
                         }
+                        if(next.mic&&!micStreaming) { micStreaming=true;stage("mic_streaming");checkConnected() }
                     } }
                     val watchdog=launch { while(isActive) {
                         delay(stallPoll)
@@ -536,14 +676,16 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
                     ended.await();watchdog.cancel();writer.cancelAndJoin()
                 } catch(e:CancellationException) { throw e }
                 catch(e:ContextFailed) { fatal=true;throw e }
+                catch(e:CallAdmissionFailed) { fatal=true;throw e }
                 catch(e:Exception) { /* Reconnect with the same phone-held key and refreshed Hermes context. */ }
                 // A fatal context failure ends the call next (close() discards the renderer), so it shows no interim state.
-                finally { codecDrain?.cancel();epoch.compareAndSet(generation,generation+1);ready=false;if(!fatal) renderer.interrupt();ws.cancel();if(!stopped&&!fatal) event(JSONObject().put("type","state").put("state","reconnecting")) }
+                finally { setupSender?.cancel();codecDrain?.cancel();epoch.compareAndSet(generation,generation+1);ready=false;if(!fatal) renderer.interrupt();endGreeting(cut=true);ws.cancel();if(!stopped&&!fatal) event(JSONObject().put("type","state").put("state","reconnecting")) }
                 reconnects.failed()
             }
-        } catch(e:ContextFailed) { contextFailure(e.error) }
-        catch(e:TimeoutCancellationException) { currentCoroutineContext().ensureActive();diagnostic("voice_error",e);if(!stopped) failure(if(!contextReady) "Call context timed out; reconnect to Hermes and retry" else "Direct voice admission timed out") }
-        catch(e:CancellationException) { throw e } catch(e:Exception) { diagnostic("voice_error",e);if(!stopped) failure(if(e is VoiceProviderRejected||e is VoiceStalled) e.message.orEmpty() else if(!greeted && e is java.net.SocketTimeoutException) "Voice did not connect within 20 seconds. Check the connection and try again." else if(!contextReady) "Call context unavailable; reconnect to Hermes and retry" else "Lost the voice connection and couldn't restore it. Try calling again.") }
+        } catch(e:CallAdmissionFailed) { /* The service ends the call with Hermes' own reason for refusing it. */ }
+        catch(e:ContextFailed) { if(e.error !is CallAdmissionFailed) fail(e.error,"context_ok") }
+        catch(e:TimeoutCancellationException) { currentCoroutineContext().ensureActive();fail(e) }
+        catch(e:CancellationException) { throw e } catch(e:Exception) { fail(e) }
     } }
     private fun launchTool(call:JSONObject,generation:Long) {
         val job=scope.launch(start=CoroutineStart.LAZY) { tool(call,generation) }
@@ -565,15 +707,33 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
             if(!verified) load.result.onAwait { if(!contextAdmits(load,it)) error("Call context retry");verified=true }
         }
     }
-    // NativePcm reports presented bytes under its own lock, so the opening's phase events leave that thread.
-    fun played(bytes:Int) { if(renderer.played(bytes)&&openingStage==0) scope.launch { openingAudio() } }
-    fun send(value:JSONObject):Boolean = ready&&!stopped&&controls.trySend(Outbound(value.toString(),{ true },control=true)).isSuccess
+    // NativePcm reports presented bytes under its own lock and in queue order: the greeting's come first, then the lines being read.
+    fun played(bytes:Int) {
+        var left=bytes.toLong()
+        while(true) {
+            val owed=greetingOutstanding.get()
+            if(owed<=0) break
+            val taken=minOf(owed,left)
+            if(!greetingOutstanding.compareAndSet(owed,owed-taken)) continue
+            left-=taken
+            if(taken>0&&greetingPresented.compareAndSet(false,true)) { val at=elapsedMs();scope.launch { stage("first_model_audio",at);diagnostic("playout_started",at=at) } }
+            break
+        }
+        if(left>0) renderer.played(left.toInt())
+    }
+    fun send(value:JSONObject):Boolean {
+        // Grok and OpenAI clear the input buffer on mute, which also cancels the live greeting: it waits for the greeting's end.
+        val streamEnd=value.optJSONObject("realtimeInput")?.optBoolean("audioStreamEnd")==true
+        val hold=provider!="gemini"&&streamEnd&&synchronized(greetingLock) { (greetingOpen&&!greetingCut).also { if(it) streamEndHeld=true } }
+        if(hold) return ready&&!stopped
+        return ready&&!stopped&&controls.trySend(Outbound(value.toString(),{ true },control=true)).isSuccess
+    }
     fun pcm(bytes:ByteArray,permitted:()->Boolean):Boolean {
         if(!ready||stopped||!permitted()) return false
         stall.speech(voiceLoud(bytes),bytes.size/2*1000L/(if(provider=="openai") GeminiWire.OUTPUT_RATE else GeminiWire.INPUT_RATE))
         val encoded=java.util.Base64.getEncoder().encodeToString(bytes)
         val frame=if(provider=="openai") OpenAiWire.audio(encoded) else GeminiWire.audio(encoded)
-        return microphone.trySend(Outbound(frame.toString(),permitted)).isSuccess
+        return microphone.trySend(Outbound(frame.toString(),permitted,mic=true)).isSuccess
     }
     fun setVisualState(source:String,state:String,reason:String="") { visual.update(source,state,reason)?.let(event) }
     fun image(bytes:ByteArray,permitted:()->Boolean,onSent:()->Unit={},onDropped:()->Unit={}):Boolean {
@@ -614,6 +774,10 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
         if(name !in setOf("hermes_work","hermes_callback","hermes_cancel","get_visual_state")) {
             toolResponse(id,name,JSONObject().put("status","unsupported").put("message","Send the request to Hermes in the attached conversation. No separate voice tool was run."))
             return
+        }
+        // Every Hermes action belongs to the admitted call; none runs before Hermes admitted it.
+        try { admittedCall() } catch(_:CallAdmissionFailed) {
+            event(JSONObject().put("type","warning").put("message","That request was not sent. Please try again."));return
         }
         val requestId=java.util.UUID.nameUUIDFromBytes((callId+":"+id).toByteArray(Charsets.UTF_8)).toString()
         val readOnly=directToolIsReadOnly(name)
@@ -738,7 +902,9 @@ internal class DirectVoice(private val client:BeaconClient,private val callId:St
                     toolReceipts.values.count(::outcomeUnknownAtCallEnd))
             }
         }
-        epoch.incrementAndGet();ready=false;renderer.close();opening?.drop();greeting?.early?.stop();visual.clear()
+        epoch.incrementAndGet();ready=false;renderer.close();visual.clear()
+        synchronized(greetingLock) { greetingOpen=false;heldGreeting.clear() }
+        if(!warmUsed) { warmUsed=true;warm?.close() }
         // Stop local reads/idle waits; accepted native writes still settle their receipt once.
         val localJobs=synchronized(toolJobs) { toolJobs.filterValues { id -> synchronized(toolReceipts) { directToolMayCancel(toolReceipts[id]?.optString("status")) } }.keys.toList() }
         localJobs.forEach(Job::cancel)

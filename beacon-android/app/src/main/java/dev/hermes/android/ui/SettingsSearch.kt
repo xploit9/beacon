@@ -3,7 +3,8 @@ package dev.hermes.android.ui
 internal fun settingsLabel(route: String): String = when (route) {
     "Settings" -> "Chat"
     "Beacon" -> "Voice & calls"
-    "Notifications" -> "Notifications & Keep connected"
+    // Keep connected is the first thing on the page, so the page and its hub row are simply Notifications; search still finds them by Keep connected.
+    "Notifications", "Notifications & Keep connected" -> "Notifications"
     "Licenses" -> "About & licenses"
     "Tools & commands" -> "Tools"
     else -> route
@@ -13,11 +14,11 @@ internal fun settingsLabel(route: String): String = when (route) {
 private val searchWhitespace = Regex("[\\s\\p{Z}]+")
 // The old, longer descriptions, kept as search words so the shorter row text loses no match.
 private val settingsSearchKeywords = mapOf(
-    "Connection" to "Server, signed-in account, and phones address sign out",
+    "Connection" to "Server, signed-in account, and phones address sign out plugin health",
     "Assistant" to "What needs you proactive alerts watch check-up checkup scheduled calls",
-    "Chat" to "while replying steer queue",
+    "Chat" to "while replying steer queue change the reply send after",
     "Voice & calls" to "API key Voice provider and calls",
-    "Notifications & Keep connected" to "Notification delivery",
+    "Notifications" to "Notification delivery keep connected",
     "Devices" to "Manage linked phones",
     "Appearance" to "Theme and color style dark light",
     "Memory" to "What Hermes knows about you",
@@ -109,18 +110,18 @@ internal fun normalizeSettingsPage(page: String): String = when (page) {
     else -> page
 }
 
-internal val settingsThemeLabels = mapOf("system" to "Follow device", "dark" to "Dark", "light" to "Light")
+internal val settingsThemeLabels = mapOf("system" to "System", "dark" to "Dark", "light" to "Light")
 
 /** The short pill words of the hub rows, which reach uiText through a summary part rather than a literal. */
 internal val settingsPillWords = listOf("Connected", "Offline", "Sign in", "Key saved", "Add key", "Keep connected on", "Keep connected off", "Update ready", "Update available",
-    "Update Hermes plugin", "Restart Hermes", "Healthy", "Needs attention", "Failed", "Reconnecting…", "{0} on", "{0} servers", "1 server", "{0} profiles")
+    "Update the Beacon plugin", "Restart Hermes", "Restart dashboard", "Healthy", "Needs attention", "Failed", "Reconnecting…", "{0} on", "{0} servers", "1 server", "{0} profiles")
 
 /**
  * The fixed texts that reach uiText through variables and so are checked by the translation test: the hub's row names and descriptions, section and
  * category titles, theme names and search words, the reasoning words and sentences, the offline and default error texts and the call card's title words.
  */
 internal val SettingsStrings = (settingsSearchRoutes.map(::settingsLabel) + settingsDescriptions.values + settingsHubSections.keys.filter(String::isNotBlank) +
-    settingsCategories.keys + settingsThemeLabels.values + listOf("Tools and services", "Settings", "Steer", "Queue") + settingsPillWords + settingsSearchKeywords.values +
+    settingsCategories.keys + settingsThemeLabels.values + listOf("Tools and services", "Settings", "Change the reply", "Send after") + settingsPillWords + settingsSearchKeywords.values +
     ReasoningStrings + listOf(OfflineReadError, DefaultReadError) + CallTitleStrings).distinct()
 
 /**
@@ -142,7 +143,7 @@ internal data class SettingsSnapshot(
     val assistantName: String = "", val assistantProfile: String = "",
     /** The signed-in account, verbatim. */ val account: String = "",
     /** True once an address is saved but its sign-in is gone. */ val signedOut: Boolean = false,
-    /** "Update Hermes plugin" or "Restart Hermes" while the update screen has a pending plugin step, else blank. */ val pluginAction: String = "",
+    /** "Update the Beacon plugin", "Restart Hermes" or "Restart dashboard" while the update screen has a pending plugin step, else blank. */ val pluginAction: String = "",
     val profileCount: Int? = null, val skillsOn: Int? = null, val toolsOn: Int? = null, val mcpServers: Int? = null,
     val serverHealthy: Boolean? = null, /** Hermes' own overall word ("ok", "degraded", …); wins over [serverHealthy] and maps like the Health page. */ val serverOverall: String = "", val serverUpdateAvailable: Boolean? = null, val checkpointSize: String = "",
 )

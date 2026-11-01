@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Key
@@ -17,6 +18,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -98,8 +100,17 @@ private fun LazyListScope.skillList(
     } }
     item(key = "search") { OutlinedTextField(value = state.search, onValueChange = onSearch, label = { Text(uiText("Search skills")) }, leadingIcon = { Icon(Icons.Rounded.Search, null) }, singleLine = true, modifier = Modifier.fillMaxWidth()) }
     item(key = "filter") {
-        SegmentedChoice("skills", filter, listOf("all", "on", "setup"), listOf(uiText("All"), uiText("Enabled"), uiText("Needs setup")), onFilter,
-            testTags = mapOf("all" to "skills-filter-all", "on" to "skills-filter-on", "setup" to "skills-filter-needs-setup"))
+        val ids = listOf("all", "on", "setup")
+        val labels = listOf(uiText("All"), uiText("Enabled"), uiText("Needs setup"))
+        val tags = mapOf("all" to "skills-filter-all", "on" to "skills-filter-on", "setup" to "skills-filter-needs-setup")
+        // Three segments cut their words at large text; wrapping chips keep every word whole (the pattern ReasoningChoice uses).
+        if (isLargeText(LocalDensity.current.fontScale)) FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            ids.forEachIndexed { index, id ->
+                FilterChip(selected = filter == id, onClick = { if (filter != id) onFilter(id) }, label = { Text(labels[index]) },
+                    leadingIcon = if (filter == id) ({ Icon(Icons.Rounded.Check, null, Modifier.size(FilterChipDefaults.IconSize)) }) else null,
+                    modifier = Modifier.heightIn(min = 48.dp).testTag(tags.getValue(id)))
+            }
+        } else SegmentedChoice("skills", filter, ids, labels, onFilter, testTags = tags)
     }
     val visible = all.filter { skillMatches(it, filter, state.search) }
     if (visible.isEmpty() && !state.loading) item(key = "empty") { SettingsSection {

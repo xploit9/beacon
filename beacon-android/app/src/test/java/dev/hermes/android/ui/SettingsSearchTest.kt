@@ -131,7 +131,7 @@ class SettingsSearchTest {
         // Two facts at most, so a hub row stays on one line.
         assertEquals("Ctrl + Enter to send · Thinking shown", summary("Chat", known))
         assertEquals("Dark · Graphite", summary("Appearance", known))
-        assertEquals("Follow device · Beacon", summary("Appearance", SettingsSnapshot(theme = "system", colorStyle = "default")))
+        assertEquals("System · Beacon",summary("Appearance", SettingsSnapshot(theme = "system", colorStyle = "default")))
         assertEquals("0.4.14", summary("App updates", known))
         assertEquals("Nova · coder", summary("Assistant", known.copy(assistantName = "Nova", assistantProfile = "coder")))
         assertEquals("Version · 0.4.14", summary("About & licenses", known))

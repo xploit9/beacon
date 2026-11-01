@@ -52,6 +52,145 @@ internal val ScheduleStateStrings = listOf("Paused", "Completed", "Running", "Fa
             .align(androidx.compose.ui.Alignment.CenterHorizontally))
     }
 }
+/**
+ * One schedule card's times, all in one clock. [zone] is the clock Next and Last are written in: the phone's, or Hermes' when the rule
+ * cannot move to the phone's clock without changing its meaning ([zoneNamed]). [inHermesClock] is the rule in Hermes' clock, kept for a
+ * second line only when it reads differently from [description].
+ */
+internal class ScheduleCardClock(val description: String, val inHermesClock: String?, val zone: java.time.ZoneId, val zoneLabel: String, val zoneNamed: Boolean)
+
+/** Hermes' zone as people say it when no localized name is known: "Europe/Lisbon" is "Lisbon". */
+internal fun scheduleZoneCity(zoneId: String): String = zoneId.substringAfterLast('/').replace('_', ' ')
+
+/**
+ * Hermes' zone named in the app's language ("لشبونة" in Arabic): the localized exemplar city that [exemplar] gives for the zone, else the IANA city.
+ * [exemplar] is the ICU lookup, passed in so the rule runs without the Android runtime.
+ */
+internal fun scheduleZoneName(zoneId: String, exemplar: (String) -> String? = { null }): String =
+    runCatching { exemplar(zoneId) }.getOrNull()?.trim()?.takeIf { it.isNotEmpty() } ?: scheduleZoneCity(zoneId)
+
+/** The zone namer for [locale], on Android's ICU zone names (the exemplar location name, e.g. the city a zone is known by). */
+internal fun scheduleZoneNamer(locale: java.util.Locale): (String) -> String {
+    val names = runCatching { android.icu.text.TimeZoneNames.getInstance(locale) }.getOrNull()
+    return { zoneId -> scheduleZoneName(zoneId) { names?.getExemplarLocationName(it) } }
+}
+
+/** The zone namer for the app language, which is the phone's language when the app has it (see [nativeLanguageFor]). */
+@Composable internal fun rememberScheduleZoneNamer(): (String) -> String {
+    val language = nativeLanguageFor(androidx.compose.ui.platform.LocalConfiguration.current.locales[0])
+    return remember(language) { scheduleZoneNamer(java.util.Locale.forLanguageTag(language)) }
+}
+
+/** [text] with Hermes' zone after it, through the phone-language template "{0} ({1})". */
+internal fun scheduleZoneNamed(text: String, label: String, template: String): String = template.replace("{0}", text).replace("{1}", label)
+
+/** The instant a card's rule is read at: the next run when there is one, so the description agrees with the Next line; else [now]. */
+internal fun scheduleReference(nextRunAt: String, now: java.time.Instant): java.time.Instant =
+    runCatching { java.time.OffsetDateTime.parse(nextRunAt).toInstant() }.getOrDefault(now)
+
+/** A next run under an hour away reads "in 3 min" or "Due now" and carries no clock, so it needs no zone name. */
+internal fun scheduleNextIsRelative(nextRunAt: String, now: java.time.Instant): Boolean =
+    runCatching { java.time.Duration.between(now, java.time.OffsetDateTime.parse(nextRunAt).toInstant()).seconds < 3600 }.getOrDefault(true)
+
+private sealed interface PhoneClock {
+    /** The rule in the phone's clock. */
+    class Moved(val schedule: JSONObject) : PhoneClock
+    /** The rule holds no clock time, so it reads the same anywhere. */
+    object Same : PhoneClock
+    /** The rule has a clock time that cannot move (a day rule across midnight, a window that wraps): it stays in Hermes' clock. */
+    object Fixed : PhoneClock
+}
+
+private val plainCronNumbers = Regex("\\d+(,\\d+)*")
+
+// A star, a number or a-b, each with an optional step, and comma lists of those.
+private fun cronNumbers(field: String, low: Int, high: Int): List<Int>? = field.split(',').flatMap { item ->
+    val range = item.substringBefore('/')
+    val gap = item.substringAfter('/', "1").toIntOrNull()?.takeIf { it >= 1 } ?: return null
+    val (from, to) = when {
+        range == "*" -> low to high
+        '-' in range -> (range.substringBefore('-').toIntOrNull() ?: return null) to (range.substringAfter('-').toIntOrNull() ?: return null)
+        else -> if ('/' in item) return null else (range.toIntOrNull() ?: return null).let { it to it }
+    }
+    if (from < low || to > high || from > to) return null
+    (from..to step gap).toList()
+}.distinct().sorted().takeIf { it.isNotEmpty() }
+
+/** A schedule object as the phone's clock reads it, read at [reference] so a daylight-saving change in either zone is the one that applies to that run. */
+private fun moveToPhoneClock(schedule: JSONObject?, hermes: java.time.ZoneId, phone: java.time.ZoneId, reference: java.time.Instant): PhoneClock = if (schedule == null) PhoneClock.Same else when (schedule.string("kind")) {
+    "once" -> {
+        val runAt = schedule.string("run_at")
+        // A timestamp without an offset is Hermes' wall clock; with the offset written in, the describer can read it in any zone.
+        val at = runCatching { java.time.OffsetDateTime.parse(runAt) }.getOrNull()
+            ?: runCatching { java.time.LocalDateTime.parse(runAt.take(19)).atZone(hermes).toOffsetDateTime() }.getOrNull()
+        if (at == null) PhoneClock.Same else PhoneClock.Moved(JSONObject(schedule.toString()).put("run_at", at.toString()))
+    }
+    "cron" -> moveCronToPhoneClock(schedule.string("expr", schedule.string("expression")), hermes, phone, reference)
+    else -> PhoneClock.Same
+}
+
+private fun moveCronToPhoneClock(expr: String, hermes: java.time.ZoneId, phone: java.time.ZoneId, reference: java.time.Instant): PhoneClock {
+    // What the describer cannot put in words shows no clock time either way.
+    if (describeCron(expr, ScheduleFormat()) == null) return PhoneClock.Same
+    val p = expr.trim().split(Regex("\\s+")).takeIf { it.size == 5 } ?: return PhoneClock.Same
+    val minutes = cronNumbers(p[0], 0, 59) ?: return PhoneClock.Same
+    val hours = cronNumbers(p[1], 0, 23) ?: return PhoneClock.Same
+    val date = reference.atZone(hermes).toLocalDate()
+    val dayRule = p[2] != "*" || p[4] != "*"
+    // Every time of day the rule fires, as the phone's clock reads it on the day of the reference run, and how many days that moves it.
+    class Fired(val hour: Int, val minute: Int, val originalMinute: Int, val days: Long)
+    val fired = hours.flatMap { h -> minutes.map { m ->
+        val at = java.time.ZonedDateTime.of(date, java.time.LocalTime.of(h, m), hermes).withZoneSameInstant(phone)
+        Fired(at.hour, at.minute, m, java.time.temporal.ChronoUnit.DAYS.between(date, at.toLocalDate()))
+    } }
+    val crossesMidnight = fired.any { it.days != 0L }
+    val rest = "${p[2]} ${p[3]} ${p[4]}"
+    val rewritten: String = when {
+        // A few fixed times a day ("8:00", "9:00, 17:00"): each moves on its own.
+        plainCronNumbers.matches(p[0]) && plainCronNumbers.matches(p[1]) && (minutes.size == 1 || hours.size == 1) -> {
+            if (dayRule && crossesMidnight) return PhoneClock.Fixed
+            val times = fired.map { it.hour to it.minute }.distinct().sortedWith(compareBy({ it.first }, { it.second }))
+            when {
+                times.map { it.second }.distinct().size == 1 -> "${times[0].second} ${times.map { it.first }.joinToString(",")} $rest"
+                times.map { it.first }.distinct().size == 1 -> "${times.map { it.second }.joinToString(",")} ${times[0].first} $rest"
+                else -> return PhoneClock.Fixed
+            }
+        }
+        // Every few minutes all day names no time of day.
+        hours.size == 24 && minutes.size > 1 -> return PhoneClock.Same
+        // Hourly at a minute past: only the minute moves.
+        hours.size == 24 -> {
+            if (dayRule && crossesMidnight) return PhoneClock.Fixed
+            "${fired.map { it.minute }.distinct().singleOrNull() ?: return PhoneClock.Fixed} * $rest"
+        }
+        // A window of hours moves as a whole, never wrapping past midnight and never off its minutes.
+        else -> {
+            if (crossesMidnight || fired.any { it.minute != it.originalMinute }) return PhoneClock.Fixed
+            "${p[0]} ${fired.map { it.hour }.distinct().sorted().joinToString(",")} $rest"
+        }
+    }
+    // A rewritten rule the describer cannot read would show less than the original did.
+    if (describeCron(rewritten, ScheduleFormat()) == null) return PhoneClock.Fixed
+    return PhoneClock.Moved(json("kind" to "cron", "expr" to rewritten))
+}
+
+/**
+ * A schedule card's rule and clock (UX-38): every time on the card in the phone's zone, Hermes' zone only on a second line and only when it
+ * differs, and a rule that cannot be converted kept whole in Hermes' zone, named. A blank or unknown [hermesZoneId] (no plugin) changes nothing.
+ */
+internal fun scheduleCardClock(schedule: JSONObject?, display: String, hermesZoneId: String, phone: java.time.ZoneId, reference: java.time.Instant, f: ScheduleFormat = ScheduleFormat(), zoneName: (String) -> String = ::scheduleZoneCity): ScheduleCardClock {
+    val own = describeSchedule(schedule, display, hermesZoneId, f)
+    val city = zoneName(hermesZoneId)
+    val hermes = runCatching { java.time.ZoneId.of(hermesZoneId) }.getOrNull()
+    if (hermes == null || hermes.rules.getOffset(reference) == phone.rules.getOffset(reference)) return ScheduleCardClock(own, null, phone, city, false)
+    val rule = schedule?.takeIf { it.string("kind") in setOf("interval", "once", "cron") } ?: scheduleObject(display)
+    return when (val moved = moveToPhoneClock(rule, hermes, phone, reference)) {
+        PhoneClock.Same -> ScheduleCardClock(own, null, phone, city, false)
+        PhoneClock.Fixed -> ScheduleCardClock(own, null, hermes, city, true)
+        is PhoneClock.Moved -> describeSchedule(moved.schedule, "", phone.id, f).let { mine -> ScheduleCardClock(mine, own.takeIf { it != mine }, phone, city, false) }
+    }
+}
+
 /** The phone's own words for "when it runs next", already translated. */
 @Composable internal fun rememberScheduleWhen(): ScheduleWhenWords {
     val due = uiText("Due now"); val minutes = uiText("in {0} min"); val today = uiText("Today {0}"); val tomorrow = uiText("Tomorrow {0}")
@@ -136,6 +275,7 @@ internal val ScheduleStateStrings = listOf("Paused", "Completed", "Running", "Fa
     val format = rememberScheduleFormat()
     val whenWords = rememberScheduleWhen()
     val phoneZone = remember { java.time.ZoneId.systemDefault() }
+    val zoneName = rememberScheduleZoneNamer()
     // Read once per fresh list, so a row's relative time is as old as the data under it.
     val now = remember(crons) { java.time.Instant.now() }
     val deliveries = data["cron-delivery"]?.rows("targets").orEmpty()
@@ -149,12 +289,12 @@ internal val ScheduleStateStrings = listOf("Paused", "Completed", "Running", "Fa
     val lastTemplate = uiText("Last: {0}")
     val notScheduled = uiText("Not scheduled")
     val noRun = uiText("No recorded run")
+    val inZoneTemplate = uiText("{0} in {1}")
+    val zoneNamedTemplate = uiText("{0} ({1})")
     Box(modifier.fillMaxSize()) {
     LazyColumn(Modifier.fillMaxSize().testTag("schedules-list"), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         if (gatewayNeedsAttention) item { Glass { SettingsErrorRow(uiText("Schedules aren't running. Start Hermes on your computer."), null, "") } }
         item { Button(onClick = { cronForm(vm, null, deliveries, timezone, refresh, format = format) }, Modifier.heightIn(min = 48.dp)) { Icon(Icons.Rounded.Add, null); Text(uiText("Create schedule"), Modifier.padding(start = 8.dp)) } }
-        // The descriptions below speak in Hermes' clock; say so only when it is not the phone's.
-        if (scheduleZoneDiffers(timezone, phoneZone, now)) item { Text(uiText("Times in {0}").replace("{0}", timezone), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         if (crons?.optBoolean("cron_unavailable") == true) item { EmptyState(uiText("Schedules are unavailable"), uiText("Schedules aren't enabled. Check the connection in Settings."), Icons.Rounded.EventBusy) }
         if (crons?.has("_error") == true) item { Glass { SettingsErrorRow(uiText("Couldn't load schedules. Check your network, then retry."), refresh, uiText("Retry")) } }
         if (crons == null) item { Glass { SettingsSkeletonRows(3) } }
@@ -176,10 +316,15 @@ internal val ScheduleStateStrings = listOf("Paused", "Completed", "Running", "Fa
                         onDelete = { delete(id) })
                 }
                 Column(Modifier.padding(end = 12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    // One clock for the whole card: the phone's, with Hermes' time on a second line when it differs.
+                    val clock = scheduleCardClock(job.optJSONObject("schedule"), scheduleDisplay(job), timezone, phoneZone, scheduleReference(job.string("next_run_at"), now), format, zoneName)
+                    val named: (String) -> String = { text -> if (clock.zoneNamed) scheduleZoneNamed(text, clock.zoneLabel, zoneNamedTemplate) else text }
                     scheduleBody(job, callbackReason(capabilities, id), format.text).takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.bodyMedium.contentDirection(), maxLines = 2, overflow = TextOverflow.Ellipsis) }
-                    describeSchedule(job.optJSONObject("schedule"), scheduleDisplay(job), timezone, format).takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, maxLines = 2, overflow = TextOverflow.Ellipsis) }
-                    Text(nextTemplate.replace("{0}", scheduleNextRun(job.string("next_run_at"), notScheduled, whenWords, now, phoneZone, format.is24Hour)), Modifier.testTag("schedule-next:$id"), style = MaterialTheme.typography.bodyMedium)
-                    Text(job.string("last_run_at").takeIf(String::isNotBlank)?.let { lastTemplate.replace("{0}", scheduleTime(it, phoneZone.id, noRun, format.is24Hour)) } ?: noRun, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    clock.description.takeIf(String::isNotBlank)?.let { Text(named(it), Modifier.testTag("schedule-description:$id"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, maxLines = 2, overflow = TextOverflow.Ellipsis) }
+                    clock.inHermesClock?.let { Text(scheduleZoneNamed(it, clock.zoneLabel, inZoneTemplate), Modifier.testTag("schedule-hermes-clock:$id"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis) }
+                    val nextText = scheduleNextRun(job.string("next_run_at"), notScheduled, whenWords, now, clock.zone, format.is24Hour)
+                    Text(nextTemplate.replace("{0}", if (scheduleNextIsRelative(job.string("next_run_at"), now)) nextText else named(nextText)), Modifier.testTag("schedule-next:$id"), style = MaterialTheme.typography.bodyMedium)
+                    Text(job.string("last_run_at").takeIf(String::isNotBlank)?.let { lastTemplate.replace("{0}", named(scheduleTime(it, clock.zone.id, noRun, format.is24Hour))) } ?: noRun, Modifier.testTag("schedule-last:$id"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     // A callback saves its result nowhere the owner picks, so its target is not worth a word.
                     listOfNotNull(profileDisplayLabel(job.string("profile", ui.profile), profileRows, profileLoading), deliveryLabel(job.string("deliver", "local"), deliveryNames(deliveries), deliveryWords).takeUnless { callback }).joinToString(" · ")
                         .takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.bodySmall.contentDirection(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis) }

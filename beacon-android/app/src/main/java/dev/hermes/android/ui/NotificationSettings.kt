@@ -377,7 +377,7 @@ private const val PUSH_TEST_PATH = "/api/plugins/beacon/mobile/notifications/tes
                 else -> uiText("Calls and alerts on")
             }
             val line = when {
-                !firebase -> uiText("Calls and alerts arrive through Keep connected.")
+                !firebase -> if (keepConnectedEnabled) uiText("Even when Beacon is closed") else uiText("Turn it on to get calls and alerts while Beacon is closed.")
                 state == DeliveryState.Unreachable -> uiText("Check your network")
                 state == DeliveryState.Limited -> uiText("Allow background use")
                 state == DeliveryState.Unconfirmed -> uiText("Send a test alert")

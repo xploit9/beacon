@@ -29,7 +29,7 @@ def _stale(module):
     seen=getattr(module,'_beacon_mtime',None)
     try: return seen is not None and seen!=Path(module.__file__).stat().st_mtime_ns
     except (OSError,TypeError): return True
-_MODULE_NAMES=('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_tools','gateway_api','bot_mode_api','observers','callbacks','callback_api','call_history_api','proactive','compat')
+_MODULE_NAMES=('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_tools','gateway_api','bot_mode_api','observers','callbacks','callback_api','call_history_api','proactive','compat','health_api')
 # Only purge the siblings loaded here; other plugin entry points may still serve live work.
 if any(_stale(sys.modules.get('beacon_'+name)) for name in _MODULE_NAMES):
     for name in _MODULE_NAMES: sys.modules.pop('beacon_'+name,None)
@@ -1144,6 +1144,23 @@ async def get_context(call_id:str,request:Request):
     if not result.get('greeting'): result['greeting']="I'm calling about your saved Hermes update." if callback else "I'm here."
     if display: result['owner_display_name']=display
     return result
+_SESSION_ID=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}')
+@router.get('/mobile/voice/context')
+async def voice_session_context(request:Request):
+    """The call context of the selected profile and conversation, before any call exists: the phone keeps it fresh
+    while a call entry is on screen, so a tap never waits for it. Call-bound fields arrive with the grant."""
+    owner,provider,profile,cfg=identity(request)
+    stored=request.query_params.get('session','')
+    if not _SESSION_ID.fullmatch(stored): raise HTTPException(400,'Invalid conversation')
+    owner_name=request.query_params.get('owner_name','')
+    if not voice_context.valid_owner_name(owner_name): raise HTTPException(400,'Invalid owner name')
+    display=getattr(request.state.session,'display_name',None)
+    display=display[:120] if isinstance(display,str) else ''
+    result=await feature(voice_context.session_context,owner,provider,profile,stored,display,owner_name.strip(),timeout=8)
+    if not result.get('greeting'): result['greeting']="I'm here."
+    result['reason']=''
+    if display: result['owner_display_name']=display
+    return result
 @router.post('/mobile/calls/{call_id}/search')
 async def quick_search(call_id:str,request:Request):
     owner,provider,row,query=await query_body(request,call_id,'search')
@@ -1323,4 +1340,5 @@ async def proactive_request_delete(request_id:str,request:Request):
 
 router.include_router(sys.modules['beacon_callback_api'].build_router(call,body,feature,mobile,native,sys.modules['beacon_callbacks']))
 router.include_router(sys.modules['beacon_call_history_api'].build_router(identity,mobile))
+router.include_router(sys.modules['beacon_health_api'].build_router(identity))
 

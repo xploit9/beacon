@@ -13,26 +13,72 @@ internal const val ASSIST_WINDOW_MILLIS = 30_000L
 /** Whether a gesture made at [issuedAt] can still be served at [now]. */
 internal fun assistFresh(issuedAt: Long, now: Long): Boolean = now - issuedAt in 0..ASSIST_WINDOW_MILLIS
 
+/** The overlay's own hand-offs: the same token also names what the app opens. Read only after a token was taken, never alone. */
+internal const val EXTRA_ASSIST_PURPOSE = "dev.hermes.android.extra.ASSIST_PURPOSE"
+internal const val EXTRA_ASSIST_SESSION = "dev.hermes.android.extra.ASSIST_SESSION"
+internal const val EXTRA_ASSIST_PROFILE = "dev.hermes.android.extra.ASSIST_PROFILE"
+
+/** What a gesture asks the app to do once it is ready. The assist gesture itself is [Call]; the overlay's buttons are the others. */
+internal enum class AssistPurpose { Call, OpenAssistant, ShowCall, OpenChat }
+
+/** One hand-off: its purpose and, for [AssistPurpose.OpenChat], the conversation to open. */
+internal data class AssistTarget(val purpose: AssistPurpose = AssistPurpose.Call, val session: String = "", val profile: String = "")
+
 /** Tokens the entry activity has issued in this process and BeaconActivity has not yet taken. An outside app cannot guess one. */
 internal object AssistGestures {
-    private val issued = LinkedHashMap<String, Long>()
+    private class Issued(val at: Long, val target: AssistTarget)
+    private val issued = LinkedHashMap<String, Issued>()
+    /** What each taken gesture asked for, by the time [take] returned; the activity keeps only that time across a recreation. */
+    private val taken = LinkedHashMap<Long, AssistTarget>()
     private var counter = 0L
 
     /** A new token for one gesture; only the last few are kept. */
-    @Synchronized fun issue(now: Long = System.currentTimeMillis()): String {
+    @Synchronized fun issue(now: Long = System.currentTimeMillis(), target: AssistTarget = AssistTarget()): String {
         val token = "${now.toString(36)}-${(++counter).toString(36)}-${java.util.UUID.randomUUID()}"
-        issued[token] = now
+        issued[token] = Issued(now, target)
         while (issued.size > 8) issued.remove(issued.keys.first())
         return token
     }
 
     /** The time the gesture was made, once. Null for an unknown, already taken or too old token. */
     @Synchronized fun take(token: String?, now: Long = System.currentTimeMillis()): Long? {
-        val at = token?.let { issued.remove(it) } ?: return null
-        return at.takeIf { assistFresh(it, now) }
+        val entry = token?.let { issued.remove(it) } ?: return null
+        if (!assistFresh(entry.at, now)) return null
+        taken[entry.at] = entry.target
+        while (taken.size > 8) taken.remove(taken.keys.first())
+        return entry.at
     }
 
-    @Synchronized fun clear() { issued.clear() }
+    /** What the gesture taken at [at] asked for; null once this process no longer knows it. */
+    @Synchronized fun target(at: Long): AssistTarget? = taken[at]
+
+    @Synchronized fun clear() { issued.clear(); taken.clear() }
+}
+
+/** The purpose an overlay intent carried. Only used after the process restarted and forgot the token it issued. */
+internal fun assistTargetOf(purpose: String?, session: String?, profile: String?): AssistTarget? {
+    val known = AssistPurpose.entries.firstOrNull { it.name == purpose } ?: return null
+    return AssistTarget(known, session.orEmpty(), profile.orEmpty())
+}
+
+/** What the app does for one served gesture. */
+internal enum class AssistAction { StartCall, ShowCall, OpenAssistant, OpenChat, Expired, None }
+
+/**
+ * The routing step decides whether anything may happen; the purpose decides what. A running call always comes first, except for
+ * another chat the owner chose; nothing but the gesture itself ever starts a call.
+ */
+internal fun assistAction(step: AssistStep, purpose: AssistPurpose): AssistAction = when (step) {
+    AssistStep.Call -> when (purpose) {
+        AssistPurpose.Call -> AssistAction.StartCall
+        AssistPurpose.OpenChat -> AssistAction.OpenChat
+        // No call is running any more: the assistant's chat, which holds what the call said.
+        AssistPurpose.OpenAssistant, AssistPurpose.ShowCall -> AssistAction.OpenAssistant
+    }
+    AssistStep.ShowCall -> if (purpose == AssistPurpose.OpenChat) AssistAction.OpenChat else AssistAction.ShowCall
+    AssistStep.OpenChat -> if (purpose == AssistPurpose.OpenChat) AssistAction.OpenChat else AssistAction.OpenAssistant
+    AssistStep.Expired -> AssistAction.Expired
+    AssistStep.SignIn, AssistStep.Wait -> AssistAction.None
 }
 
 /** What the app knows when a gesture arrives. */

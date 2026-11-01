@@ -263,20 +263,13 @@ private fun poleChannel(rgb: Int, shift: Int) = ((rgb shr shift) and 255) / 255f
         if (!motionAllowed) return@LaunchedEffect
         // An infinite animation, like rememberInfiniteTransition: UI tests can idle while the clock runs itself.
         var last = withInfiniteAnimationFrameNanos { it }
-        var pending = 0f
         while (true) {
             val now = withInfiniteAnimationFrameNanos { it }
-            pending += (now - last).coerceIn(0L, 100_000_000L) / 1_000_000_000f
-            last = now
             val v = talk.value
-            // Silent drift is slow, so about 15 fps is enough and the loop sleeps between steps; talking gets every frame.
-            if (v < .01f && !voiceMotionActive(energy.value, true, true)) {
-                if (pending < .066f) { kotlinx.coroutines.delay(((.066f - pending) * 1000).toLong().coerceAtLeast(1)); continue }
-            }
-            // Talking runs the clock faster, so the strands stir while someone speaks.
-            time.floatValue += pending * presenceStir(v)
+            // Every frame, silent drift too, so the strands glide; talking runs the clock faster, so they stir while someone speaks.
+            time.floatValue += frameSeconds(now - last) * presenceStir(v)
+            last = now
             field.step(time.floatValue, v)
-            pending = 0f
         }
     }
 

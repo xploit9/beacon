@@ -508,9 +508,9 @@ internal fun DevicesSettingsSection(vm: BeaconViewModel, pluginAbsent: Boolean) 
     // Words the callbacks below show are translated here, where uiText can run.
     val tooManyPhones = uiText("Too many phones. Remove one below.")
     val couldntAddPhone = uiText("Couldn't add this phone. Try again.")
-    val finishSetup = uiText("Finish setting up Beacon on your Hermes dashboard, then retry.")
+    val finishSetup = uiText("Finish setting up the Beacon plugin, then retry.")
     // The devices route is missing: a Beacon plugin older than this app.
-    val pluginMissing = uiText("Update Beacon on your Hermes")
+    val pluginMissing = uiText("Update the Beacon plugin")
     val couldntLoad = uiText("Couldn't load devices. Check your connection and try again.")
     val couldntRemove = uiText("Couldn't remove this device. Try again.")
 

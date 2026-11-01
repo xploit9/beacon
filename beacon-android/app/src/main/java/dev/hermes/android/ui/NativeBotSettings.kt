@@ -73,7 +73,8 @@ internal fun profileModelsMatching(models: List<Pair<String, String>>, query: St
                             state.profiles.forEachIndexed { index, summary ->
                                 if (index > 0 || shown) SettingsDivider()
                                 val active = activeProfile.isNotBlank() && summary.profile == activeProfile
-                                SettingsNavRow(profileLabel(summary.profile), { onOpen(summary.profile) }, icon = ProfilesIcon, value = summary.purpose.ifBlank { uiText("No purpose") },
+                                // A profile with no description shows only its name: "No purpose" read as a judgement.
+                                SettingsNavRow(profileLabel(summary.profile), { onOpen(summary.profile) }, icon = ProfilesIcon, value = summary.purpose,
                                     status = if (active) SettingsStatus.Ok else null, statusLabel = if (active) uiText("Active") else "", enabled = !state.loading, testTag = "profile-open:${summary.profile}")
                             }
                             if (onNewProfile != null) {
@@ -87,7 +88,7 @@ internal fun profileModelsMatching(models: List<Pair<String, String>>, query: St
                 val active = activeProfile.isNotBlank() && bot.profile == activeProfile
                 item(key = "hero") {
                     ProfileEntrance(0, motionEnabled) {
-                        SettingsStatusHero(status = null, title = profileLabel(bot.profile), line = bot.description.ifBlank { uiText("No purpose") }, icon = ProfilesIcon,
+                        SettingsStatusHero(status = null, title = profileLabel(bot.profile), line = bot.description, icon = ProfilesIcon,
                             meta = if (active) ({ SettingsStatusPill(SettingsStatus.Ok, uiText("Active")) }) else null, testTag = "profile-hero")
                     }
                 }

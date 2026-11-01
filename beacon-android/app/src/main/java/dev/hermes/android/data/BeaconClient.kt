@@ -196,6 +196,9 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
             nativeRequest(path, params = params)
         }
     }
+    /** The call context of [storedSessionId] before any call exists; an older plugin answers 404 and the call reads it after the grant. */
+    suspend fun nativeVoiceContext(storedSessionId: String, ownerName: String = ""): JSONObject =
+        nativeRequest("/api/plugins/beacon/mobile/voice/context", params = mapOf("session" to storedSessionId, "owner_name" to ownerName))
     internal suspend fun nativeReplay(lastId: String = "", beforePrompt: Boolean = false) = native.prepareReplay(lastId, beforePrompt)
     internal suspend fun nativeCreate(params: JSONObject): NativeSessionBinding = native.create(params)
     internal fun nativeSessionSnapshot() = native.sessionSnapshot()

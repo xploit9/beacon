@@ -26,7 +26,6 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.geometry.Offset
@@ -143,7 +142,8 @@ val LocalOpenNavigationMenu = staticCompositionLocalOf<(() -> Unit)?> { null }
 
 private const val BEACON_PLUGIN_INSTALL_URL = "https://github.com/xploit9/beacon#install"
 
-internal enum class BeaconMotionMode { Pulse, Sweep, Ripple }
+/** The signal's two motions. Working has no mode of its own: it is the gold dust core ([BeaconDustCore]), the one glyph for "busy". */
+internal enum class BeaconMotionMode { Pulse, Ripple }
 
 @Composable internal fun BeaconMark(modifier: Modifier = Modifier, size: androidx.compose.ui.unit.Dp = 24.dp, contentDescription: String? = null) {
     Icon(painterResource(R.drawable.ic_beacon), contentDescription, modifier.size(size), tint = MaterialTheme.colorScheme.primary)
@@ -153,9 +153,7 @@ internal enum class BeaconMotionMode { Pulse, Sweep, Ripple }
     val motionEnabled = rememberNativeMotionEnabled()
     val phase = if (motionEnabled && mode != BeaconMotionMode.Ripple) {
         val transition = rememberInfiniteTransition(label = "beacon-${mode.name}")
-        val spec: InfiniteRepeatableSpec<Float> = if (mode == BeaconMotionMode.Pulse)
-            infiniteRepeatable(tween(2200, easing = FastOutSlowInEasing), RepeatMode.Reverse)
-        else infiniteRepeatable(tween(2400, easing = LinearEasing), RepeatMode.Restart)
+        val spec: InfiniteRepeatableSpec<Float> = infiniteRepeatable(tween(2200, easing = FastOutSlowInEasing), RepeatMode.Reverse)
         val value by transition.animateFloat(0f, 1f, spec, label = "beacon-phase-${mode.name}")
         value
     } else 0f
@@ -177,13 +175,6 @@ internal enum class BeaconMotionMode { Pulse, Sweep, Ripple }
                 drawCircle(color.copy(alpha = .12f + .12f * phase), radius * (1.05f + .2f * phase), center)
                 drawCircle(color.copy(alpha = .62f), radius * .72f, center, style = Stroke(stroke))
                 drawCircle(color.copy(alpha = .95f), radius * (.16f + .05f * phase), center)
-            }
-            BeaconMotionMode.Sweep -> {
-                drawCircle(color.copy(alpha = .18f), radius, center, style = Stroke(stroke))
-                val angle = phase * (Math.PI * 2).toFloat() - Math.PI.toFloat() / 2f
-                val end = Offset(center.x + kotlin.math.cos(angle) * radius, center.y + kotlin.math.sin(angle) * radius)
-                drawLine(color.copy(alpha = .34f), center, end, strokeWidth = stroke * 2.5f, cap = StrokeCap.Round)
-                drawCircle(color, stroke * 1.4f, end)
             }
             BeaconMotionMode.Ripple -> {
                 val progress = if (motionEnabled) ripple.value else 1f
@@ -208,7 +199,7 @@ private val NoInstall = MutableStateFlow(PluginInstallUi()).asStateFlow()
 }
 
 /**
- * "Add Beacon to your Hermes": the owner confirms, Hermes installs Beacon from GitHub, and a restart is offered only when Hermes says its
+ * "Add the Beacon plugin to Hermes": the owner confirms, Hermes installs the plugin from GitHub, and a restart is offered only when Hermes says its
  * gateway needs one. [update] is a Beacon too old for this app, which opens the update screen. Where no install can be reached (previews,
  * tests) the button opens the install steps instead. [illustration] is false where the screen already has its own picture, as in setup.
  */
@@ -228,14 +219,14 @@ private val NoInstall = MutableStateFlow(PluginInstallUi()).asStateFlow()
         verticalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 14.dp),
     ) {
         if (illustration) Box(Modifier.testTag("missing-plugin-illustration").size(if (compact) 64.dp else 108.dp), contentAlignment = androidx.compose.ui.Alignment.Center) {
-            BeaconSignal(BeaconMotionMode.Sweep, size = if (compact) 64.dp else 108.dp)
+            BeaconDustCore(if (compact) 64.dp else 108.dp)
             BeaconMark(size = if (compact) 36.dp else 60.dp)
         }
         Text(when {
-            progress.stage == PluginInstallStage.Done -> uiText("Beacon is ready on your Hermes.")
+            progress.stage == PluginInstallStage.Done -> uiText("The Beacon plugin is ready.")
             progress.stage == PluginInstallStage.NeedsRestart || progress.stage == PluginInstallStage.Restarting -> uiText("Restart Hermes to finish")
-            update -> uiText("Update Beacon on your Hermes")
-            else -> uiText("Add Beacon to your Hermes")
+            update -> uiText("Update the Beacon plugin")
+            else -> uiText("Add the Beacon plugin to Hermes")
         }, Modifier.semantics { liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite }, style = if (compact) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.titleMedium, textAlign = centered)
         when (progress.stage) {
             PluginInstallStage.Idle -> Button(
@@ -277,8 +268,8 @@ private val NoInstall = MutableStateFlow(PluginInstallUi()).asStateFlow()
     }
     if (confirming && install != null) AlertDialog(
         onDismissRequest = { confirming = false },
-        title = { Text(uiText("Add Beacon to your Hermes")) },
-        text = { Text(uiText("Hermes will download Beacon from github.com/xploit9/beacon and turn it on.")) },
+        title = { Text(uiText("Add the Beacon plugin to Hermes")) },
+        text = { Text(uiText("Hermes downloads the Beacon plugin from GitHub and turns it on.")) },
         confirmButton = { TextButton(onClick = { confirming = false; install.install() }, modifier = Modifier.testTag("missing-plugin-confirm")) { Text(uiText("Install Beacon")) } },
         dismissButton = { TextButton(onClick = { confirming = false }) { Text(uiText("Cancel")) } },
     )
@@ -295,9 +286,13 @@ enum class ChoiceStyle { Auto, Segmented, Menu }
 /** The longest option label (after translation) that still fits a segment. */
 internal const val ChoiceSegmentMaxChars = 14
 
+/** From this font scale up, choices that sat side by side no longer fit: they stack, wrap or open as a menu so no word breaks. */
+internal const val LargeTextScale = 1.3f
+internal fun isLargeText(fontScale: Float): Boolean = fontScale >= LargeTextScale
+
 /** Auto shows segments for 2–4 short options at a normal font size; more, longer or larger options read better as a menu. */
 internal fun resolveChoiceStyle(style: ChoiceStyle, labels: List<String>, fontScale: Float): ChoiceStyle = when (style) {
-    ChoiceStyle.Auto -> if (labels.size in 2..4 && labels.all { it.length <= ChoiceSegmentMaxChars } && fontScale < 1.5f) ChoiceStyle.Segmented else ChoiceStyle.Menu
+    ChoiceStyle.Auto -> if (labels.size in 2..4 && labels.all { it.length <= ChoiceSegmentMaxChars } && !isLargeText(fontScale)) ChoiceStyle.Segmented else ChoiceStyle.Menu
     else -> style
 }
 

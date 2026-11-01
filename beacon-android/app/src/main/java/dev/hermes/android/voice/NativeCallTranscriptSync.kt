@@ -93,7 +93,8 @@ internal class NativeCallTranscriptSync(private val request:suspend (String,Stri
         }
         val queue=if(copy.optString("type")=="media_diagnostic") pending else important
         val accepted=queue.trySend("events" to JSONObject().put("events",JSONArray().put(copy))).isSuccess
-        if(accepted&&queue===pending&&isSpeechFailureDiagnostic(copy)) speechFailurePending=true
+        // A failed speech render or a failed call start must reach Hermes before the call is released: finish() waits for them.
+        if(accepted&&queue===pending&&(isSpeechFailureDiagnostic(copy)||copy.optString("stage")=="voice_error")) speechFailurePending=true
         if(!accepted&&queue===important) { gap=true;report("partial") }
     }
     suspend fun finish(failed:Boolean=false):Boolean {

@@ -77,6 +77,8 @@ internal fun appErrorText(error: Throwable): String = when (error) {
     is DeviceRemovedFailure -> "This phone was removed from Beacon on your PC. Add it again in Settings › Connection."
     is PairingFailure -> safeLocalErrorText(error.message.orEmpty())
     is java.io.IOException -> APP_CONNECTION_ERROR
+    // The call service already wrote this line for the owner, in their language.
+    is dev.hermes.android.voice.CallStartRefused -> error.message.orEmpty()
     else -> safeLocalErrorText(error.message.orEmpty())
 }
 

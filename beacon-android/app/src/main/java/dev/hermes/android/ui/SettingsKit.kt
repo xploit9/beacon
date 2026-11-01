@@ -46,6 +46,7 @@ import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -54,6 +55,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.isSpecified
 
 // The Settings kit (design-spec "Settings kit"): one Glass pane per section, rows with a tinted icon tile, real choice controls and
 // glyph-plus-word statuses. Every visible string arrives localized from the caller; choice option labels stay English and are
@@ -71,7 +73,17 @@ internal object SettingsKit {
     val DividerStart: Dp = 72.dp
     /** Smallest touch target of any interactive kit part. */
     val TouchMin: Dp = 48.dp
+    /** Smallest glyph in a status pill; it grows with the pill's label. */
+    val PillIconMin: Dp = 16.dp
+    /** What a segment spends besides its word: padding on both sides, the check and the gap after it. */
+    val SegmentChrome: Dp = 52.dp
 }
+
+/** The pill's glyph is one line of its label tall, so it grows with the text size, and is never below [SettingsKit.PillIconMin]. */
+internal fun settingsPillIconSize(labelLine: Dp): Dp = maxOf(labelLine, SettingsKit.PillIconMin)
+
+/** Whether [count] equal segments, the widest holding [widestLabel], fit side by side in [available]. */
+internal fun settingsSegmentsFit(widestLabel: Dp, count: Int, available: Dp): Boolean = count > 0 && widestLabel + SettingsKit.SegmentChrome <= available / count
 
 /** Where a setting stands: working, needs the user, failed, deliberately off or unknown, or still checking. */
 internal enum class SettingsStatus { Ok, Attention, Error, Off, Working }
@@ -113,7 +125,7 @@ internal fun settingsStatusPalette(scheme: ColorScheme): SettingsStatusPalette {
     return remember(scheme) { settingsStatusPalette(scheme) }
 }
 
-/** The still glyph of a state; Working has none because it shows the beacon's sweep instead. */
+/** The still glyph of a state; Working has none because it shows the turning gold dust core instead. */
 internal fun settingsStatusIcon(status: SettingsStatus): ImageVector? = when (status) {
     SettingsStatus.Ok -> Icons.Rounded.CheckCircle
     SettingsStatus.Attention -> Icons.Rounded.ErrorOutline
@@ -122,9 +134,9 @@ internal fun settingsStatusIcon(status: SettingsStatus): ImageVector? = when (st
     SettingsStatus.Working -> null
 }
 
-/** The beacon's motion for a state in the hero: sweep while checking, a pulse when something needs the user, one ripple on OK. */
-internal fun settingsStatusMotion(status: SettingsStatus): BeaconMotionMode = when (status) {
-    SettingsStatus.Working -> BeaconMotionMode.Sweep
+/** The beacon's motion for a state in the hero: a pulse when something needs the user, one ripple on OK. Null for Working, which is the gold dust core. */
+internal fun settingsStatusMotion(status: SettingsStatus): BeaconMotionMode? = when (status) {
+    SettingsStatus.Working -> null
     SettingsStatus.Attention -> BeaconMotionMode.Pulse
     else -> BeaconMotionMode.Ripple
 }
@@ -232,10 +244,12 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
 
 /** A state's glyph tinted with its ink: the beacon's motion when [signal], else the still icon (Working always moves). With reduced motion the still icon replaces the frozen beacon. */
 @Composable private fun SettingsStatusGlyph(status: SettingsStatus, size: Dp, ink: Color, signal: Boolean) {
+    val motion = settingsStatusMotion(status)
     if (settingsGlyphMoves(status, signal, rememberNativeMotionEnabled())) {
+        if (motion == null) BeaconDustCore(size, color = ink)
         // BeaconSignal paints with the theme's primary; a local theme lends it the status ink.
-        MaterialTheme(colorScheme = MaterialTheme.colorScheme.copy(primary = ink), typography = MaterialTheme.typography, shapes = MaterialTheme.shapes) {
-            BeaconSignal(settingsStatusMotion(status), size = size, trigger = status)
+        else MaterialTheme(colorScheme = MaterialTheme.colorScheme.copy(primary = ink), typography = MaterialTheme.typography, shapes = MaterialTheme.shapes) {
+            BeaconSignal(motion, size = size, trigger = status)
         }
     } else Icon(settingsStaticGlyph(status), null, Modifier.size(size), tint = ink)
 }
@@ -263,6 +277,9 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
     primary: SettingsAction? = null,
     secondary: SettingsAction? = null,
     lineTestTag: String = "",
+    /** One line with a middle ellipsis suits an address, which is read from both ends. */
+    lineMaxLines: Int = 3,
+    lineOverflow: TextOverflow = TextOverflow.Ellipsis,
     testTag: String = "settings-hero",
 ) {
     val scheme = MaterialTheme.colorScheme
@@ -283,7 +300,7 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(title, Modifier.semantics { heading(); liveRegion = LiveRegionMode.Polite }.testTag("$testTag-title"), style = MaterialTheme.typography.titleLarge, maxLines = 2, overflow = TextOverflow.Ellipsis)
                     if (line.isNotBlank()) Text(line, Modifier.semantics { liveRegion = LiveRegionMode.Polite }.kitTag(lineTestTag), style = MaterialTheme.typography.bodyMedium,
-                        color = scheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        color = scheme.onSurfaceVariant, maxLines = lineMaxLines, overflow = lineOverflow)
                 }
             }
             if (meta != null) FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp), content = meta)
@@ -304,13 +321,13 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
     }
 }
 
-@Composable private fun RowScope.SettingsRowText(label: String, value: String, status: SettingsStatus?, statusLabel: String, labelColor: Color, valueMaxLines: Int = 1, valueTestTag: String = "") {
+@Composable private fun RowScope.SettingsRowText(label: String, value: String, status: SettingsStatus?, statusLabel: String, labelColor: Color, valueMaxLines: Int = 1, valueTestTag: String = "", valueOverflow: TextOverflow = TextOverflow.Ellipsis) {
     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Text(label, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium, color = labelColor, maxLines = 2, overflow = TextOverflow.Ellipsis)
         val pill = status != null && statusLabel.isNotBlank()
         if (value.isNotBlank() || pill) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             if (value.isNotBlank()) Text(value, Modifier.weight(1f, fill = false).kitTag(valueTestTag), style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = valueMaxLines, overflow = TextOverflow.Ellipsis)
+                color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = valueMaxLines, overflow = valueOverflow)
             if (pill) SettingsStatusPill(status, statusLabel)
         }
     }
@@ -331,13 +348,17 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
     val twoLine = summary.isNotBlank() || (status != null && statusLabel.isNotBlank())
     SettingsRowFrame(icon, if (twoLine) SettingsKit.RowMinHeightTwoLine else SettingsKit.RowMinHeight,
         modifier.toggleable(checked, enabled = active, role = Role.Switch, onValueChange = onCheckedChange).kitTag(testTag), enabled = enabled) {
-        SettingsRowText(label, if (status != null && statusLabel.isNotBlank()) "" else summary, status, statusLabel, MaterialTheme.colorScheme.onSurface)
+        // A summary may take a second line rather than be cut ("Calls while Beacon is cl…" at large text).
+        SettingsRowText(label, if (status != null && statusLabel.isNotBlank()) "" else summary, status, statusLabel, MaterialTheme.colorScheme.onSurface, valueMaxLines = 2)
         if (busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
         Switch(checked, onCheckedChange = null, enabled = active)
     }
 }
 
-/** Opens a page ([external] = leaves Beacon, shown with OpenInNew). [selected] marks the open page in the two-pane layout. */
+/**
+ * Opens a page ([external] = leaves Beacon, shown with OpenInNew). [selected] marks the open page in the two-pane layout.
+ * [trailingIcon] replaces the chevron for a row that acts in place (a refresh glyph for "check again"); [valueOverflow] is how a long value is cut.
+ */
 @Composable internal fun SettingsNavRow(
     label: String, onClick: () -> Unit,
     modifier: Modifier = Modifier,
@@ -351,12 +372,15 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
     valueMaxLines: Int = 1,
     valueTestTag: String = "",
     testTag: String = "",
+    valueOverflow: TextOverflow = TextOverflow.Ellipsis,
+    trailingIcon: ImageVector? = null,
 ) {
     val interaction = if (selected == null) Modifier.clickable(enabled = enabled, role = Role.Button, onClick = onClick)
         else Modifier.selectable(selected = selected, enabled = enabled, role = Role.Button, onClick = onClick)
     SettingsRowFrame(icon, minHeight, modifier.background(if (selected == true) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent).then(interaction).kitTag(testTag), enabled = enabled) {
-        SettingsRowText(label, value, status, statusLabel, MaterialTheme.colorScheme.onSurface, valueMaxLines, valueTestTag)
-        Icon(if (external) Icons.AutoMirrored.Rounded.OpenInNew else Icons.AutoMirrored.Rounded.KeyboardArrowRight, null,
+        SettingsRowText(label, value, status, statusLabel, MaterialTheme.colorScheme.onSurface, valueMaxLines, valueTestTag, valueOverflow)
+        if (trailingIcon != null) Icon(trailingIcon, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        else Icon(if (external) Icons.AutoMirrored.Rounded.OpenInNew else Icons.AutoMirrored.Rounded.KeyboardArrowRight, null,
             Modifier.size(if (external) 18.dp else 20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
@@ -451,7 +475,8 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
 /**
  * A choice in a section card. [label] is shown as given (pass it through uiText) and names the option tags `choice-option:<label>:<option>`
  * unless [optionTestTags] overrides one; [optionLabels] are English and translated here, like [Choice]. Auto shows segments for 2–4 short
- * options at a normal font size, else a menu row whose anchor carries [anchorTestTag].
+ * options at a normal font size, else a menu row whose anchor carries [anchorTestTag]. With [fitSegments], segments that would cut a word on
+ * this width (a narrow phone, a long translation) become the menu row instead, so no option is ever shown truncated.
  */
 @Composable internal fun SettingsChoiceRow(
     label: String, selected: String, options: List<String>, onSelect: (String) -> Unit,
@@ -464,9 +489,33 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
     style: ChoiceStyle = ChoiceStyle.Auto,
     anchorTestTag: String = "",
     valueTestTag: String = "",
+    fitSegments: Boolean = false,
 ) {
     val labels = options.map { translatedChoiceLabel(it, optionLabels, true) }
-    if (resolveChoiceStyle(style, labels, LocalDensity.current.fontScale) == ChoiceStyle.Segmented) {
+    val segmented = resolveChoiceStyle(style, labels, LocalDensity.current.fontScale) == ChoiceStyle.Segmented
+    if (segmented && fitSegments) {
+        // The row pads 16dp on both sides; the width left is what the segments share.
+        BoxWithConstraints(modifier.fillMaxWidth()) {
+            val fits = settingsSegmentsFit(widestLabelWidth(labels), labels.size, maxWidth - 32.dp)
+            SettingsChoiceBody(label, selected, options, labels, onSelect, Modifier, icon, optionLabels, optionIcons, optionTestTags, enabled, fits, anchorTestTag, valueTestTag)
+        }
+    } else SettingsChoiceBody(label, selected, options, labels, onSelect, modifier, icon, optionLabels, optionIcons, optionTestTags, enabled, segmented, anchorTestTag, valueTestTag)
+}
+
+/** The width of the widest label in the segment's own text style, so the fit follows the language and the text size. */
+@Composable private fun widestLabelWidth(labels: List<String>): Dp {
+    val measurer = rememberTextMeasurer()
+    val style = MaterialTheme.typography.labelLarge
+    val widest = labels.maxOfOrNull { measurer.measure(it, style, maxLines = 1, softWrap = false).size.width } ?: 0
+    return with(LocalDensity.current) { widest.toDp() }
+}
+
+@Composable private fun SettingsChoiceBody(
+    label: String, selected: String, options: List<String>, labels: List<String>, onSelect: (String) -> Unit, modifier: Modifier, icon: ImageVector?,
+    optionLabels: Map<String, String>, optionIcons: Map<String, ImageVector>, optionTestTags: Map<String, String>, enabled: Boolean, segmented: Boolean,
+    anchorTestTag: String, valueTestTag: String,
+) {
+    if (segmented) {
         Column(modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                 icon?.let { SettingsIconTile(it) }
@@ -499,9 +548,11 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
  */
 @Composable internal fun SettingsStatusPill(status: SettingsStatus, label: String, modifier: Modifier = Modifier, testTag: String = "") {
     val ink = rememberSettingsStatusPalette().ink(status)
+    val style = MaterialTheme.typography.labelMedium
+    val line = with(LocalDensity.current) { (style.lineHeight.takeIf { it.isSpecified } ?: style.fontSize).toDp() }
     Row(modifier.clip(RoundedCornerShape(50)).background(ink.copy(alpha = SettingsStatusTint)).padding(horizontal = 10.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        SettingsStatusGlyph(status, 14.dp, ink, signal = false)
+        SettingsStatusGlyph(status, settingsPillIconSize(line), ink, signal = false)
         Text(label, Modifier.kitTag(testTag), style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium), color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
 }
@@ -560,7 +611,7 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
         val check: @Composable () -> Unit = { if (selected) Icon(Icons.Rounded.CheckCircle, null, Modifier.size(18.dp), tint = scheme.primary) }
         val text: @Composable ColumnScope.() -> Unit = {
             Text(option.label, style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            if (option.detail.isNotBlank()) Text(option.detail, style = MaterialTheme.typography.bodySmall, color = scheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (option.detail.isNotBlank()) Text(option.detail, style = MaterialTheme.typography.bodySmall, color = scheme.onSurfaceVariant, maxLines = if (grid) 2 else 1, overflow = TextOverflow.Ellipsis)
             if (option.badge.isNotBlank()) SettingsBadge(option.badge, Modifier.padding(top = 4.dp))
         }
         if (grid) Box(Modifier.alpha(if (enabled) 1f else .38f)) {

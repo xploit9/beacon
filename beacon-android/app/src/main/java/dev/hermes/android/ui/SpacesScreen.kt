@@ -18,8 +18,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.layout.SubcomposeLayout
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
@@ -27,6 +29,7 @@ import androidx.compose.ui.semantics.toggleableState
 import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.*
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -57,6 +60,42 @@ internal fun fileBreadcrumbs(path: String): List<FileCrumb> {
     parts.filter { it.isNotEmpty() }.forEach { part -> base = if (base.isEmpty() || base.endsWith(sep)) base + part else "$base$sep$part"; crumbs += FileCrumb(part, base) }
     return crumbs
 }
+
+/** A trail of chips: the [shown] folders, with the [hidden] levels above them folded into one "…" chip. */
+internal data class FileTrail(val hidden: List<FileCrumb>, val shown: List<FileCrumb>)
+
+/** Keeps the last [keep] levels visible. Folding a single level would only swap its name for "…", so a trail folds only when two or more would hide. */
+internal fun collapseFileTrail(trail: List<FileCrumb>, keep: Int = 2): FileTrail =
+    if (trail.size - keep >= 2) FileTrail(trail.dropLast(keep), trail.takeLast(keep)) else FileTrail(emptyList(), trail)
+
+/** How much of the trail the row shows, fullest first. */
+internal enum class TrailFold { Whole, HomeFolded, LastOnly }
+
+/** One fold of the trail: [menu] levels (and Home, when [homeInMenu]) behind the "…" chip, then the [shown] chips. */
+internal class FileTrailView(val menu: List<FileCrumb>, val homeInMenu: Boolean, val shown: List<FileCrumb>) {
+    val hasMenu: Boolean get() = homeInMenu || menu.isNotEmpty()
+}
+
+/** What [fold] of [trail] shows. Home folds into the "…" menu before any level the row keeps; a trail with no levels is only ever whole. */
+internal fun fileTrailView(trail: List<FileCrumb>, fold: TrailFold): FileTrailView {
+    val kept = collapseFileTrail(trail)
+    return when {
+        trail.isEmpty() || fold == TrailFold.Whole -> FileTrailView(kept.hidden, false, kept.shown)
+        fold == TrailFold.HomeFolded -> FileTrailView(kept.hidden, true, kept.shown)
+        else -> FileTrailView(trail.dropLast(1), true, trail.takeLast(1))
+    }
+}
+
+/** The folds worth measuring for [trail], fullest first; the last-level-only fold is left out when folding Home already leaves one level. */
+internal fun fileTrailFolds(trail: List<FileCrumb>): List<TrailFold> = when {
+    trail.isEmpty() -> listOf(TrailFold.Whole)
+    fileTrailView(trail, TrailFold.HomeFolded).shown.size > 1 -> TrailFold.entries
+    else -> listOf(TrailFold.Whole, TrailFold.HomeFolded)
+}
+
+/** The first of [folds] whose measured width ([widths], in the same order, in pixels) fits [available]; the last fold when none does. */
+internal fun chooseTrailFold(folds: List<TrailFold>, widths: List<Int>, available: Int): TrailFold =
+    folds.zip(widths).firstOrNull { (_, width) -> width <= available }?.first ?: folds.last()
 
 /** The server named by its address ("hermes.local"), without scheme, port or path; blank when the address holds no host. */
 internal fun serverHostLabel(origin: String): String =
@@ -150,17 +189,7 @@ internal fun fileModifiedMillis(row: JSONObject): Long {
                 val tree: @Composable (Modifier) -> Unit = { modifier ->
                     Box(modifier) {
                         Column(Modifier.fillMaxSize()) {
-                            val trail = remember(actual) { fileBreadcrumbs(actual) }
-                            val trailScroll = rememberScrollState()
-                            // The current folder is the last chip; keep it in view when the trail is long.
-                            LaunchedEffect(actual) { snapshotFlow { trailScroll.maxValue }.collect { trailScroll.scrollTo(it) } }
-                            Row(Modifier.fillMaxWidth().horizontalScroll(trailScroll).padding(horizontal = 12.dp, vertical = 4.dp).testTag("files-path"), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                FilterChip(selected = trail.isEmpty(), onClick = { changeDirectory("") }, label = { Text(uiText("Home")) }, leadingIcon = { Icon(Icons.Rounded.Home, null, Modifier.size(18.dp)) }, modifier = Modifier.testTag("files-crumb-home"))
-                                trail.forEachIndexed { index, crumb ->
-                                    Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    FilterChip(selected = index == trail.lastIndex, onClick = { if (index != trail.lastIndex) changeDirectory(crumb.path) }, label = { Text(crumb.label, style = LocalTextStyle.current.contentDirection(), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 160.dp)) }, modifier = Modifier.testTag("files-crumb:$index"))
-                                }
-                            }
+                            FileTrailRow(remember(actual) { fileBreadcrumbs(actual) }, ::changeDirectory)
                             Box(Modifier.weight(1f)) {
                                 LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 88.dp)) {
                                     if (record == null) item { Glass(Modifier.padding(16.dp)) { SettingsSkeletonRows(4) } }
@@ -212,6 +241,57 @@ internal fun fileModifiedMillis(row: JSONObject): Long {
         }
     }
 }
+/**
+ * The folder trail on one line. The fullest fold that the measured row fits is shown: Home folds into the "…" menu before a level
+ * is dropped, so a deep path reads "… › Documents › Atelier relaunch" from the leading edge. It scrolls, with a fade, only when even the last level does not fit.
+ */
+@Composable private fun FileTrailRow(trail: List<FileCrumb>, onOpen: (String) -> Unit) {
+    val folds = remember(trail) { fileTrailFolds(trail) }
+    val scroll = rememberScrollState()
+    SubcomposeLayout(Modifier.fillMaxWidth()) { constraints ->
+        // Each fold is measured as it would be drawn, with no width limit, fullest first, until one fits; those the row cannot hold are never placed.
+        val widths = mutableListOf<Int>()
+        for (fold in folds.dropLast(1)) {
+            widths += subcompose(fold) { TrailChips(trail, fileTrailView(trail, fold), onOpen, probe = true) }.maxOf { it.measure(Constraints()).width }
+            if (widths.last() <= constraints.maxWidth) break
+        }
+        val chosen = chooseTrailFold(folds, widths, constraints.maxWidth)
+        val row = subcompose("visible") {
+            Box(Modifier.fillMaxWidth().chipRowEdgeFade(scroll).horizontalScroll(scroll).testTag("files-path")) { TrailChips(trail, fileTrailView(trail, chosen), onOpen, probe = false) }
+        }.map { it.measure(constraints) }
+        layout(row.maxOf { it.width }, row.maxOf { it.height }) { row.forEach { it.place(0, 0) } }
+    }
+}
+
+/** The chips of one fold; [probe] draws the same chips with no tags or semantics, only to be measured. */
+@Composable private fun TrailChips(trail: List<FileCrumb>, view: FileTrailView, onOpen: (String) -> Unit, probe: Boolean) {
+    fun Modifier.tagged(tag: String) = if (probe) this else testTag(tag)
+    val arrow: @Composable () -> Unit = { Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant) }
+    Row((if (probe) Modifier.clearAndSetSemantics { } else Modifier).padding(horizontal = 12.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        if (!view.homeInMenu) FilterChip(selected = trail.isEmpty(), onClick = { onOpen("") }, label = { Text(uiText("Home")) }, leadingIcon = { Icon(Icons.Rounded.Home, null, Modifier.size(18.dp)) }, modifier = Modifier.tagged("files-crumb-home"))
+        if (view.hasMenu) {
+            if (!view.homeInMenu) arrow()
+            // The levels above the ones shown (and Home, once it folds) sit behind one chip that opens the full path.
+            var fullPath by remember { mutableStateOf(false) }
+            val fullPathLabel = uiText("Show full path")
+            Box {
+                FilterChip(selected = false, onClick = { fullPath = true }, label = { Text("…") }, modifier = Modifier.semantics { contentDescription = fullPathLabel }.tagged("files-crumb-more"))
+                DropdownMenu(fullPath, { fullPath = false }) {
+                    if (view.homeInMenu) DropdownMenuItem({ Text(uiText("Home")) }, { fullPath = false; onOpen("") }, Modifier.testTag("files-crumb-home-menu"), leadingIcon = { Icon(Icons.Rounded.Home, null) })
+                    view.menu.forEach { crumb ->
+                        DropdownMenuItem({ Text(crumb.label, style = LocalTextStyle.current.contentDirection(), maxLines = 1, overflow = TextOverflow.Ellipsis) }, { fullPath = false; onOpen(crumb.path) })
+                    }
+                }
+            }
+        }
+        view.shown.forEachIndexed { shownIndex, crumb ->
+            val index = trail.size - view.shown.size + shownIndex
+            arrow()
+            FilterChip(selected = index == trail.lastIndex, onClick = { if (index != trail.lastIndex) onOpen(crumb.path) }, label = { Text(crumb.label, style = LocalTextStyle.current.contentDirection(), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 160.dp)) }, modifier = Modifier.tagged("files-crumb:$index"))
+        }
+    }
+}
+
 @Composable private fun FileEditor(vm: BeaconViewModel, modifier: Modifier, back: () -> Unit) {
     val editor by vm.editor.collectAsStateWithLifecycle()
     var preview by rememberSaveable(editor.path) { mutableStateOf(false) }

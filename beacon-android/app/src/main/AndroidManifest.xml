@@ -25,6 +25,8 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <queries>
         <intent><action android:name="android.speech.action.RECOGNIZE_SPEECH" /></intent>
+        <!-- The phone's own speech recognizers: the assistant overlay's mic and Beacon's pass-through recognizer use them. -->
+        <intent><action android:name="android.speech.RecognitionService" /></intent>
         <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
         <!-- Each phone maker's own "run in background" screen (ui/BackgroundAccess.kt); Android 11+ hides these packages otherwise. -->
         <package android:name="com.hihonor.systemmanager" />
@@ -62,6 +64,23 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+        <!-- Beacon's own assistant: the assist gesture opens BeaconAssistSession over the current app or the lock screen, without
+             switching to the app. Only Android (holding BIND_VOICE_INTERACTION) can bind these two. The ASSIST activity above stays
+             as the fallback on phones that use an assist activity instead of a voice interaction service. -->
+        <service android:name=".assist.BeaconVoiceInteractionService" android:exported="true" android:label="Beacon" android:permission="android.permission.BIND_VOICE_INTERACTION">
+            <meta-data android:name="android.voice_interaction" android:resource="@xml/beacon_voice_interaction" />
+            <intent-filter><action android:name="android.service.voice.VoiceInteractionService" /></intent-filter>
+        </service>
+        <service android:name=".assist.BeaconAssistSessionService" android:exported="true" android:permission="android.permission.BIND_VOICE_INTERACTION" />
+        <!-- Android requires a recognizer beside an assistant. It records nothing itself: each request goes to the phone's own
+             recognizer. Other apps' speech input must keep reaching it, so it is exported; Android's base class and the service
+             itself refuse any caller without the microphone permission, and it is never offered as the default recognizer. -->
+        <service android:name=".assist.BeaconRecognitionService" android:exported="true" android:label="Beacon">
+            <intent-filter><action android:name="android.speech.RecognitionService" /></intent-filter>
+            <meta-data android:name="android.speech" android:resource="@xml/beacon_recognition" />
+        </service>
+        <!-- Asks the lock screen to unlock before the overlay opens anything private; draws nothing; only the overlay starts it. -->
+        <activity android:name=".assist.AssistUnlockActivity" android:exported="false" android:excludeFromRecents="true" android:taskAffinity="" android:showWhenLocked="true" android:theme="@android:style/Theme.Translucent.NoTitleBar" />
         <!-- Installed launcher component remains a technical compatibility alias. -->
         <activity-alias android:name=".MainActivity" android:targetActivity=".BeaconActivity" android:exported="true">
             <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>

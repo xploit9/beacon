@@ -24,7 +24,12 @@ import org.junit.Rule
 import org.junit.Test
 import java.io.File
 
-/** Measures the actual chat button -> Telecom service -> provider readiness, first greeting audio (cached or rendered) and greeting completion. */
+/**
+ * Measures a real call from the chat's Call button on the demo Hermes: one cold call (nothing prepared), then three warm
+ * calls (the Call button kept the conversation's context and a live session ready). Every stage is reported on the test's
+ * tap clock: Hermes' admission, the context, the provider's setup, the microphone streaming, and the first audio of the live
+ * model's own greeting. Fails when any audio is heard before the provider answered setup.
+ */
 class VoiceConnectionLiveTest {
     @get:Rule val rule = createAndroidComposeRule<BeaconActivity>()
 
@@ -46,6 +51,7 @@ class VoiceConnectionLiveTest {
         try {
             assertEquals("An untouched QA call must have no native requests", 0, jobs().length())
             delay(10_000)
+            // The owner's words are synthesized for the test only; the call itself never renders a greeting.
             val source = withContext(Dispatchers.IO) {
                 http.newCall(GeminiSpeech.request(credentials, "What is two plus three? Answer briefly.")).execute().use { response ->
                     check(response.isSuccessful)
@@ -84,8 +90,8 @@ class VoiceConnectionLiveTest {
             }
         }
     }
-    @Test(timeout = 240_000) fun geminiCallsMeasureTapToReady() = exercise("gemini")
-    @Test(timeout = 240_000) fun grokCallsMeasureTapToReady() = exercise("grok")
+    @Test(timeout = 300_000) fun geminiCallsMeasureTapToReady() = exercise("gemini")
+    @Test(timeout = 300_000) fun grokCallsMeasureTapToReady() = exercise("grok")
 
     private fun exercise(provider: String) = runBlocking<Unit> {
         val args = InstrumentationRegistry.getArguments()
@@ -123,62 +129,89 @@ class VoiceConnectionLiveTest {
             await { vm.chat.value.sessionId.isNotBlank() && vm.chat.value.sessionId != previousSession &&
                 vm.chat.value.projectionReady && !vm.ui.value.newChatOpening && vm.authenticatedScope()?.session == vm.chat.value.sessionId }
             session = vm.chat.value.sessionId
-            repeat(3) {
-                phase = "call ${it + 1}"
+            val target = client.scope.session(session)
+            repeat(4) { index ->
+                val warm = index > 0
+                phase = if (warm) "warm call $index" else "cold call"
                 rule.waitForIdle()
-                val started = SystemClock.elapsedRealtime()
+                if (warm) {
+                    // The Call button on screen keeps this conversation's call ready.
+                    phase = "warm call $index (prewarm: waiting)"
+                    try { withTimeout(30_000) { while (!app.calls.prewarm.ready(target)) { phase = "warm call $index (prewarm: ${app.calls.prewarm.status}; sources ${VoicePrewarm.sources()})"; delay(50) } } }
+                    catch (error: TimeoutCancellationException) { throw AssertionError("The Call button did not keep the call ready: $phase", error) }
+                    phase = "warm call $index"
+                } else {
+                    // Cold: no prepared context or session; the call reads and connects everything after the tap.
+                    app.calls.prewarm.paused = true; app.calls.prewarm.forget(); app.calls.prewarm.changed()
+                    delay(500); app.calls.prewarm.forget()
+                }
                 val previousCall = app.calls.state.value.callId
                 val previousError = app.calls.state.value.error
                 var attemptStarted = false
-                rule.onNodeWithTag("chat-call-beacon").performClick()
-                // Three separate phases on the tap clock: provider admitted (thinking/listening), first greeting audio, greeting complete.
-                var firstAudio = 0L
-                var thinking = false
-                fun observeAudio() {
+                var firstHeard = -1L
+                fun observe() {
                     val state = app.calls.state.value
-                    if (state.active && state.state == "thinking") thinking = true
-                    // First presented greeting bytes end "thinking"; a remote level marks speech directly.
-                    if (firstAudio == 0L && state.active && (state.remoteSpeaking || state.state == "speaking" || thinking && state.state == "listening"))
-                        firstAudio = SystemClock.elapsedRealtime() - started
+                    if (firstHeard < 0 && state.active && (state.remoteSpeaking || (state.remoteAudioLevel ?: 0f) > 0f)) firstHeard = SystemClock.elapsedRealtime()
                 }
+                val started = SystemClock.elapsedRealtime()
+                rule.onNodeWithTag("chat-call-beacon").performClick()
                 await(45_000) {
                     val state = app.calls.state.value
                     if (state.active || state.callId != previousCall || state.error != previousError) attemptStarted = true
-                    if (attemptStarted) check(state.error.isBlank()) { "Voice connection failed: ${state.failureReason}" }
-                    observeAudio()
-                    attemptStarted && state.active && state.state in setOf("thinking", "listening", "speaking")
+                    if (attemptStarted) check(state.error.isBlank()) { "Voice connection failed: ${state.failureReason} ${state.error}" }
+                    observe()
+                    attemptStarted && state.active && state.callId.isNotBlank() && state.state in setOf("listening", "speaking")
                 }
-                val elapsed = SystemClock.elapsedRealtime() - started
+                val connected = SystemClock.elapsedRealtime() - started
                 call = app.calls.state.value.callId
-                samples.put(JSONObject().put("ready_ms", elapsed).put("provider", app.calls.state.value.voiceProvider))
                 assertEquals(provider, app.calls.state.value.voiceProvider)
+                fun stageAt(name: String): Long? = app.calls.stageLog.firstOrNull { it.optString("stage") == name }?.optLong("elapsed_ms")
+                fun trace() = app.calls.stageLog.joinToString(" ") { it.optString("stage") + "@" + it.optLong("elapsed_ms") +
+                    listOf("error_code", "close_code", "cause_class", "failed_stage").mapNotNull { key -> it.opt(key)?.let { value -> "/$key=$value" } }.joinToString("") }
+                try { withTimeout(45_000) { while (stageAt("first_model_audio") == null) { observe(); delay(20) } } }
+                catch (error: TimeoutCancellationException) { throw AssertionError("No greeting audio ($phase): ${trace()}", error) }
+                await(45_000) {
+                    check(app.calls.state.value.error.isBlank()) { "Greeting failed: ${app.calls.state.value.failureReason}" }
+                    observe()
+                    app.calls.state.value.transcripts.any { it.role == "assistant" && it.text.isNotBlank() }
+                }
+                val complete = SystemClock.elapsedRealtime() - started
+                // The controller's tap is a few milliseconds after the test's click; stages are moved onto the click's clock.
+                val offset = app.calls.tappedAt - started
+                val sample = JSONObject().put("provider", provider).put("warm", warm).put("ready_ms", connected)
+                    .put("tap_offset_ms", offset).put("greeting_complete_ms", complete)
+                for (name in listOf("grant_sent", "grant_ok", "context_sent", "context_ok", "provider_open", "provider_setup_ok", "mic_streaming", "first_model_audio"))
+                    stageAt(name)?.let { sample.put(name + "_ms", it + offset) }
+                app.calls.stageLog.firstOrNull { it.optString("stage") == "provider_setup_ok" }?.optBoolean("warm")?.let { sample.put("provider_warm", it) }
+                if (firstHeard >= 0) sample.put("first_heard_ms", firstHeard - started)
+                // When the model's first greeting audio reached the phone, before the playback buffer filled.
+                (app.calls.service?.let { BeaconCallService::class.java.getDeclaredField("directVoice").apply { isAccessible = true }.get(it) as? DirectVoice })
+                    ?.greetingArrivedMs?.takeIf { it >= 0 }?.let { sample.put("first_model_audio_arrived_ms", it + offset) }
+                // When the start note went to a warm session (touch-down or the call's claim), on the test's clock.
+                (app.calls.service?.let { BeaconCallService::class.java.getDeclaredField("directVoice").apply { isAccessible = true }.get(it) as? DirectVoice })
+                    ?.let { DirectVoice::class.java.getDeclaredField("warm").apply { isAccessible = true }.get(it) as? LiveSession }
+                    ?.cueSentAt?.takeIf { it > 0 }?.let { sample.put("start_note_sent_ms", it - started) }
+                sample.put("greeting_words", app.calls.state.value.transcripts.first { it.role == "assistant" && it.text.isNotBlank() }.text.length)
+                samples.put(sample)
+                val setup = sample.optLong("provider_setup_ok_ms", -1)
+                assertTrue("Every stage was reported: $sample", listOf("grant_ok_ms", "context_ok_ms", "provider_setup_ok_ms", "mic_streaming_ms", "first_model_audio_ms").all(sample::has))
+                assertTrue("The greeting is the live model's audio, after its setup: $sample", sample.getLong("first_model_audio_ms") >= setup)
+                assertTrue("Nothing is heard before the provider answered setup: $sample", firstHeard < 0 || firstHeard - started >= setup)
                 val context = client.nativeCallContext(call)
                 assertEquals("hermes", context.getString("backend"))
                 assertEquals(client.auth.profile, context.getString("profile"))
                 assertEquals(session, context.getString("selected_session_id"))
-                await(45_000) {
-                    check(app.calls.state.value.error.isBlank()) { "Greeting failed: ${app.calls.state.value.failureReason}" }
-                    observeAudio()
-                    app.calls.state.value.transcripts.any { it.role == "assistant" && it.text.isNotBlank() }
-                }
-                val complete = SystemClock.elapsedRealtime() - started
-                val expected = context.optString("greeting").take(160).ifBlank { "I'm here." }
-                assertTrue("The actual service must present its complete greeting", app.calls.state.value.transcripts.any { it.role == "assistant" && it.text == expected })
-                assertTrue("First greeting audio must be observed before the greeting completes", firstAudio in 1..complete)
-                samples.getJSONObject(samples.length() - 1).put("first_audio_ms", firstAudio).put("greeting_complete_ms", complete)
-                // Whether the phone's cached greeting was heard, and its first presented frame on the call's own tap clock.
-                app.calls.greeting?.firstAudioMs?.let { frame ->
-                    samples.getJSONObject(samples.length() - 1).put("cached_greeting", frame >= 0).apply { if (frame >= 0) put("cached_first_frame_ms", frame) }
-                }
-                if (provider == "gemini" && it == 0) samples.getJSONObject(samples.length() - 1).put("native_reply", checkNativeReply(app, client, call))
+                if (provider == "gemini" && index == 0) sample.put("native_reply", checkNativeReply(app, client, call))
                 app.calls.hangup()
                 await { !app.calls.state.value.active && app.calls.service == null }
                 client.nativeRequest("/api/plugins/beacon/mobile/calls/$call", "DELETE")
                 call = ""
+                if (!warm) { app.calls.prewarm.paused = false; app.calls.prewarm.changed() }
             }
-            assertEquals(3, samples.length())
+            assertEquals(4, samples.length())
         } finally {
             withContext(NonCancellable) {
+                app.calls.prewarm.paused = false
                 app.calls.hangup()
                 withTimeoutOrNull(60_000) { while (app.calls.service != null) delay(100) }
                 if (call.isNotBlank()) runCatching { client?.nativeRequest("/api/plugins/beacon/mobile/calls/$call", "DELETE") }
