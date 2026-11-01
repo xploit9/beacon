@@ -43,10 +43,11 @@ import dev.hermes.android.BeaconViewModel
     }
     Column(Modifier.fillMaxSize()) {
         Header(uiText(settingsLabel(page)), subtitle = if (profileName.isBlank()) "" else "${uiText("Profile")} · $profileName", back = if (page == "Memory" || page == "Skills" && skills.selected == null) null else back, menu = LocalOpenNavigationMenu.current) {
-            if (page == "Memory") IconButton(onClick = { editor.loadMemory() }, enabled = profileClient != null && !memory.loading && !memory.saving && memory.editing.isBlank()) { Icon(Icons.Rounded.Refresh, uiText("Refresh memory")) }
-            else IconButton(onClick = { skills.selected?.let(editor::openSkill) ?: editor.loadSkills() }, enabled = profileClient != null && !skills.loading && !skills.saving && !skills.editing) { Icon(Icons.Rounded.Refresh, uiText("Refresh skills")) }
+            if (page == "Memory") SettingsIconButton(Icons.Rounded.Refresh, uiText("Refresh memory"), { editor.loadMemory() }, enabled = profileClient != null && !memory.loading && !memory.saving && memory.editing.isBlank())
+            else SettingsIconButton(Icons.Rounded.Refresh, uiText("Refresh skills"), { skills.selected?.let(editor::openSkill) ?: editor.loadSkills() }, enabled = profileClient != null && !skills.loading && !skills.saving && !skills.editing)
         }
-        if (editor.scopeKey != profileClient?.scope?.key) LinearProgressIndicator(Modifier.fillMaxWidth())
+        // The editor is still binding to this profile: a placeholder page with the thin bar, not a lone progress line.
+        if (editor.scopeKey != profileClient?.scope?.key) SettingsList(refreshing = true, testTag = "settings-binding") { item { SettingsSection(testTag = "settings-binding-section") { SettingsSkeletonRows(3) } } }
         else if (page == "Skills") NativeSkillsScreen(skills, editor::skillSearch, editor::openSkill,
             onBack = { leave(editor::closeSkill) }, onToggle = editor::toggleSkill,
             onEdit = { editing -> if (editing) editor.skillEdit(true) else leave { editor.skillEdit(false) } },
@@ -71,9 +72,7 @@ import dev.hermes.android.BeaconViewModel
     LaunchedEffect(page, ui.origin, ui.owner, ui.profile, ui.connected, vm.client) { vm.phoneSettings.bind(); vm.phoneSettings.loadServer(page) }
     Column(Modifier.fillMaxSize()) {
         Header(uiText(settingsLabel(page)), back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current, actions = {
-            IconButton(onClick = { vm.phoneSettings.loadServer(page) }, enabled = !state.loading) {
-                Icon(Icons.Rounded.Refresh, uiText(if (page == "Server updates") "Refresh update status" else "Refresh"))
-            }
+            SettingsIconButton(Icons.Rounded.Refresh, uiText(if (page == "Server updates") "Refresh update status" else "Refresh"), { vm.phoneSettings.loadServer(page) }, enabled = !state.loading)
         })
         NativeServerSettings(page, state, { vm.phoneSettings.loadServer(page, force = true) },
             onApplyUpdate = { if (vm.app.calls.state.value.active) vm.notice(callBlocksUpdate) else confirm = true },
@@ -125,14 +124,14 @@ import dev.hermes.android.BeaconViewModel
     LaunchedEffect(state.profiles, state.loading) { state.selected?.profile?.let { open -> if (!state.loading && state.profiles.isNotEmpty() && state.profiles.none { it.profile == open }) vm.closeSettingsProfile() } }
     Column(Modifier.fillMaxSize()) {
         Header(uiText("Profiles"), back = back, menu = LocalOpenNavigationMenu.current)
-        ProfileApprovalSettings(vm)
         NativeBotSettings(if (selecting) state.copy(loading = true) else state, { vm.inspectSettingsProfile(it) }, { leave(vm::closeSettingsProfile) }, { vm.phoneSettings.editBot(true) },
             vm.phoneSettings::botDraft, vm.phoneSettings::saveBot, { leave { vm.phoneSettings.editBot(false) } },
             onSettings = { profile, page -> leave { if (state.editing) vm.phoneSettings.editBot(false); vm.openSettingsProfileTool(profile, settingsRoute(page)) } },
             onRefresh = { state.selected?.let { vm.phoneSettings.openBot(it.profile) } ?: vm.phoneSettings.loadBots() }, models = models,
             renderBehavior = { Markdown(it, vm) },
             profileLabel = { profile -> profileDisplayLabel(profile, profileRows, profileLoading) },
-            onNewProfile = { creating = true }, canDelete = vm::canDeleteProfile, onDelete = { deleting = it })
+            onNewProfile = { creating = true }, canDelete = vm::canDeleteProfile, onDelete = { deleting = it },
+            activeProfile = ui.profile, approvals = { ProfileApprovalSettings(vm) })
     }
     if (creating) NewProfileDialog(profileRows.map { it.string("name") to profileDisplayName(it.string("name"), profileRows) }, admin,
         onCreate = { name, from, role -> vm.profileAdmin.create(name, from, role, profileRows.map { it.string("name") }) }, onDismiss = { creating = false })

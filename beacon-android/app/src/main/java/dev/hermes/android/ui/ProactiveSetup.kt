@@ -1,40 +1,21 @@
 package dev.hermes.android.ui
 
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Icon
-import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TimePicker
 import androidx.compose.material3.rememberTimePickerState
 import androidx.compose.runtime.Composable
-import androidx.compose.ui.Alignment
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.focus.focusProperties
-import androidx.compose.ui.semantics.clearAndSetSemantics
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.semantics.Role
-import androidx.compose.foundation.clickable
 import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.beaconOwnerSetupMessage
 import dev.hermes.android.core.json
@@ -108,25 +89,22 @@ internal fun proactiveLastCheck(proactive: JSONObject?): String? {
     return if (checked.toLocalDate() == java.time.LocalDate.now(timezone)) checked.format(proactiveHealthTime) else checked.format(proactiveHealthDay)
 }
 
-@Composable internal fun ProactiveHealthChip(state: ProactiveHealthState) {
-    Surface(shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.surfaceContainerHigh,
-        modifier = Modifier.testTag("proactive-health-${state.name.lowercase()}")) {
-        Row(Modifier.padding(horizontal = 10.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            BeaconSignal(when (state) {
-                ProactiveHealthState.Checking -> BeaconMotionMode.Sweep
-                ProactiveHealthState.Ok -> BeaconMotionMode.Ripple
-                ProactiveHealthState.Quiet, ProactiveHealthState.NotYet, ProactiveHealthState.Failed -> BeaconMotionMode.Pulse
-            }, size = 18.dp, trigger = state)
-            Text(when (state) {
-                ProactiveHealthState.Checking -> uiText("Checking")
-                ProactiveHealthState.Ok -> uiText("OK")
-                ProactiveHealthState.Quiet -> uiText("Quiet hours")
-                ProactiveHealthState.NotYet -> uiText("Not yet")
-                ProactiveHealthState.Failed -> uiText("Couldn't check")
-            }, style = MaterialTheme.typography.labelMedium)
-        }
-    }
+/** How a watch state reads as a Settings status: checking moves, OK is good, quiet and not-yet are off, a failed check is an error. */
+internal fun proactiveHealthStatus(state: ProactiveHealthState): SettingsStatus = when (state) {
+    ProactiveHealthState.Checking -> SettingsStatus.Working
+    ProactiveHealthState.Ok -> SettingsStatus.Ok
+    ProactiveHealthState.Quiet, ProactiveHealthState.NotYet -> SettingsStatus.Off
+    ProactiveHealthState.Failed -> SettingsStatus.Error
+}
+
+@Composable internal fun ProactiveHealthChip(state: ProactiveHealthState, modifier: Modifier = Modifier) {
+    SettingsStatusPill(proactiveHealthStatus(state), when (state) {
+        ProactiveHealthState.Checking -> uiText("Checking")
+        ProactiveHealthState.Ok -> uiText("OK")
+        ProactiveHealthState.Quiet -> uiText("Quiet hours")
+        ProactiveHealthState.NotYet -> uiText("Not yet")
+        ProactiveHealthState.Failed -> uiText("Couldn't check")
+    }, modifier, testTag = "proactive-health-${state.name.lowercase()}")
 }
 
 internal fun proactiveErrorMessage(error: Throwable, fallback: String): String =
@@ -168,11 +146,17 @@ internal suspend fun fetchProactiveSettings(source: BeaconClient, profile: Strin
 internal fun proactiveClockLabel(value: String, pattern: String, locale: Locale = Locale.getDefault()): String =
     runCatching { LocalTime.parse(value).format(DateTimeFormatter.ofPattern(pattern, locale)) }.getOrDefault(value)
 
+/**
+ * A quiet-hours time as a Settings row whose value is the time the way the phone writes it; a tap opens the clock. [tagLabel] keeps
+ * the row's test tags (`proactive-time-<tagLabel>`, `proactive-time-confirm-<tagLabel>`) fixed whatever the visible label says.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable internal fun ProactiveTimePicker(
     label: String,
     value: String,
     enabled: Boolean,
+    icon: ImageVector,
+    tagLabel: String = label,
     onChange: (String) -> Unit,
 ) {
     var open by remember(label, value) { mutableStateOf(false) }
@@ -185,15 +169,8 @@ internal fun proactiveClockLabel(value: String, pattern: String, locale: Locale 
             is24Hour = is24Hour,
         )
     }
-    // Same look as Choice: a read-only field with the label above the time and a clock at the end.
     val time = proactiveClockLabel(value, nativeClockPattern(Locale.getDefault(), is24Hour))
-    androidx.compose.foundation.layout.Box(Modifier.fillMaxWidth()) {
-        androidx.compose.material3.OutlinedTextField(time, {}, readOnly = true, enabled = enabled, singleLine = true, label = { Text(label) },
-            trailingIcon = { Icon(Icons.Rounded.Schedule, null) }, modifier = Modifier.fillMaxWidth().focusProperties { canFocus = false }.clearAndSetSemantics {})
-        // A read-only field takes no taps, so a layer over it opens the picker and reads as one button.
-        androidx.compose.foundation.layout.Box(Modifier.matchParentSize().clickable(enabled = enabled, role = Role.Button) { open = true }
-            .semantics { contentDescription = "$label: $time" }.testTag("proactive-time-$label"))
-    }
+    SettingsNavRow(label, { open = true }, icon = icon, value = time, enabled = enabled, testTag = "proactive-time-$tagLabel")
     if (open) AlertDialog(
         onDismissRequest = { open = false },
         title = { Text(label) },
@@ -202,7 +179,7 @@ internal fun proactiveClockLabel(value: String, pattern: String, locale: Locale 
             TextButton(onClick = {
                 onChange("%02d:%02d".format(state.hour, state.minute))
                 open = false
-            }, modifier = Modifier.testTag("proactive-time-confirm-$label")) { Text(uiText("OK")) }
+            }, modifier = Modifier.testTag("proactive-time-confirm-$tagLabel")) { Text(uiText("OK")) }
         },
         dismissButton = { TextButton(onClick = { open = false }) { Text(uiText("Cancel")) } },
     )
@@ -214,7 +191,7 @@ internal fun openProactiveRuleForm(vm: BeaconViewModel, profile: String, explana
             Field("text", "Your rule", FieldType.MULTILINE, required = true),
             Field("signal", "Source", FieldType.CHOICE, options = listOf("anything") + sources,
                 optionLabels = mapOf("anything" to "Anything")),
-            Field("action", "When it happens", FieldType.CHOICE, options = listOf("notify", "call"), optionLabels = mapOf("notify" to "Notify", "call" to "Call")),
+            Field("action", "When it matches", FieldType.CHOICE, options = listOf("notify", "call"), optionLabels = mapOf("notify" to "Notify", "call" to "Call")),
             Field("night", "Even at night", FieldType.BOOLEAN),
         ),
         seed = json("signal" to "anything", "action" to "notify", "night" to false),

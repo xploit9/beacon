@@ -29,6 +29,20 @@ class RedesignNavigationTest {
             assertTrue(rows.all { it.size == columns })
         }
     }
+    @Test fun aLargeFontKeepsFourTilesAndMoreHoldsTheRest() {
+        assertFalse(navigationCompact(1.1f))
+        assertTrue(navigationCompact(1.15f))
+        assertEquals(listOf(listOf("Cron", "Files"), listOf("Projects", "Settings")), navigationRows(navigationColumns(320f, 1.3f), 1.3f))
+        assertEquals(listOf("Skills", "Memory", "Bots", "Kanban"), navigationMore(1.3f))
+        assertEquals(navigationTiles.sorted(), (navigationShown(1.3f) + navigationMore(1.3f)).sorted())
+        // At a normal size nothing sits under More.
+        assertEquals(navigationTiles, navigationShown(1f))
+        assertTrue(navigationMore(1f).isEmpty())
+    }
+    @Test fun theBotsTileIsAPlainDestinationThatReadsBots() {
+        assertEquals("Bots", navigationLabel("Bots"))
+        assertEquals(navigationTiles.map(::navigationLabel), NavigationStrings)
+    }
     @Test fun projectSessionsRejectForeignHiddenAndUnlistedSessions() {
         assertTrue(nativeProjectSessionAllowed("stored:1", "personal", "personal", setOf("stored:1"), false))
         assertTrue(nativeProjectSessionAllowed("stored:1", "", "personal", setOf("stored:1"), false))

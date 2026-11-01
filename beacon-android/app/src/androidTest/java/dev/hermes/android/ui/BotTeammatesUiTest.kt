@@ -119,7 +119,7 @@ class BotTeammatesUiTest {
     @Test fun newChatTakesTwoToSixBotsAndTheOneInUseIsAlwaysIn() {
         sheet()
         compose.onNodeWithTag("new-chat-sheet").assertIsDisplayed()
-        compose.onNodeWithText("New chat").assertIsDisplayed()
+        compose.onNodeWithText("New space").assertIsDisplayed()
         // The bot in use is ticked and cannot be unticked; with no one else picked there is no group yet.
         compose.onNodeWithTag("new-chat-bot:default").assertIsOn().assertIsNotEnabled()
         compose.onNodeWithTag("new-chat-start").assertIsNotEnabled()

@@ -28,7 +28,29 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import dev.hermes.android.core.rows
+import dev.hermes.android.core.string
+import dev.hermes.android.voice.INCOMING_RING_SECONDS
+import dev.hermes.android.voice.IncomingRingtoneService
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.onSizeChanged
@@ -46,6 +68,11 @@ import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.hermes.android.assist.ACTION_ASSIST_CALL
+import dev.hermes.android.assist.AssistGestures
+import dev.hermes.android.assist.AssistLaunchEffect
+import dev.hermes.android.assist.EXTRA_ASSIST_TOKEN
+import dev.hermes.android.assist.assistFresh
 import dev.hermes.android.data.NativeAuth
 import dev.hermes.android.ui.*
 import dev.hermes.android.voice.CallState
@@ -75,12 +102,15 @@ class BeaconActivity : ComponentActivity() {
     // Set when the overlay screen opens, so the next return can tell a locked setting from one the user left off.
     private var overlayAsked = false
     private var overlayHint by mutableStateOf(false)
+    // When the phone's assist gesture was made, until it has been served; kept across a recreation, never served twice.
+    private var assistAt by mutableStateOf<Long?>(null)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         // The call-id extra is stripped once read, so a recreation before the call view opens must keep the pending return.
         pendingReturn = savedInstanceState?.getString("pending_return").orEmpty()
         overlayAsked = savedInstanceState?.getBoolean("overlay_asked") == true
+        assistAt = savedInstanceState?.getLong("assist_at")?.takeIf { assistFresh(it, System.currentTimeMillis()) }
         push(intent)
         setContent {
             val model: BeaconViewModel = viewModel()
@@ -135,6 +165,7 @@ class BeaconActivity : ComponentActivity() {
                 }
             }
             LaunchedEffect(model, initialPush) { initialPush?.let { push -> initialPush = null; if (push.third in setOf("answer","callback")) callFromNotification(push.first, push.second, push.third) else model.handlePush(push.first, push.second) } }
+            AssistLaunchEffect(model, assistAt) { assistAt = null }
             val dark = when (preferences.theme) { "dark" -> true; "light" -> false; else -> isSystemInDarkTheme() }
             LaunchedEffect(dark) {
                 enableEdgeToEdge(
@@ -146,11 +177,13 @@ class BeaconActivity : ComponentActivity() {
             CompositionLocalProvider(LocalBeaconSettings provides (data["profile-settings"] ?: emptySettings), LocalAssistantName provides preferences.assistantName) { NativeLocalization(nativeLanguageFor(LocalConfiguration.current.locales[0])) { BeaconTheme(dark, preferences.skin) { NativeWindowLayout(this@BeaconActivity) {
                 BeaconRoot(model, externalConnectionLinkOrigin) { externalConnectionLinkOrigin = null }
                 IncomingCallSheet(model, permissionSource.isNotBlank(), answer)
-                dev.hermes.android.updates.AppUpdateHost(model.app.updates)
+                CallBubbleAskHost(call)
+                // With the client, a plugin restart that waited for Hermes to go idle is retried whenever Beacon is in front.
+                dev.hermes.android.updates.AppUpdateHost(model.app.updates, model.client, ui.bootstrap.optJSONObject("optional_features")?.optString("plugin") == "absent")
                 if (overlayHint) AlertDialog(
                     onDismissRequest = { overlayHint = false },
                     title = { Text(uiText("Allow call bubble")) },
-                    text = { Text(uiText("If the switch was greyed out, open App info, tap ⋮ › Allow restricted settings, then try again.")) },
+                    text = { Text(uiText("Greyed out? In App info tap ⋮ › Allow restricted settings.")) },
                     confirmButton = {
                         TextButton(onClick = { overlayHint = false; if (!openAppInfo(this@BeaconActivity)) model.notice("Open Beacon’s app settings in Android") }) { Text(uiText("Open App info")) }
                     },
@@ -184,6 +217,10 @@ class BeaconActivity : ComponentActivity() {
     fun allowFloatingCall(expectedId: String) {
         val calls=(application as BeaconApplication).calls
         if (!calls.state.value.active || calls.state.value.callId != expectedId) return
+        openCallBubbleSettings()
+    }
+    /** The overlay permission screen for the call bubble; also opened from the one question asked after a call. */
+    fun openCallBubbleSettings() {
         try { startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))); overlayAsked = true }
         catch (_: RuntimeException) { vm?.notice("Floating calls aren't available; use the call notification.") }
     }
@@ -196,9 +233,16 @@ class BeaconActivity : ComponentActivity() {
         overlayHint = overlayNeedsRestrictedAllow(android.os.Build.VERSION.SDK_INT, installPackageSource(this), Settings.canDrawOverlays(this))
     }
     override fun onStop() { (application as BeaconApplication).calls.uiVisible = false; vm?.foreground(false); super.onStop() }
-    override fun onSaveInstanceState(outState: Bundle) { super.onSaveInstanceState(outState); outState.putString("pending_return", pendingReturn); outState.putBoolean("overlay_asked", overlayAsked) }
+    override fun onSaveInstanceState(outState: Bundle) { super.onSaveInstanceState(outState); outState.putString("pending_return", pendingReturn); outState.putBoolean("overlay_asked", overlayAsked); assistAt?.let { outState.putLong("assist_at", it) } }
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); setIntent(intent); push(intent) }
     private fun push(intent: Intent?) {
+        // The phone's assist gesture: the token is single-use and the extra is stripped, so a recreation cannot start a second call.
+        if (intent?.action == ACTION_ASSIST_CALL) {
+            val token = intent.getStringExtra(EXTRA_ASSIST_TOKEN)
+            intent.removeExtra(EXTRA_ASSIST_TOKEN)
+            intent.action = null
+            AssistGestures.take(token)?.let { assistAt = it }
+        }
         intent?.data?.takeIf { it.scheme.equals("beacon", true) && it.host.equals("connect", true) }?.let {
             pendingConnectionLink = sanitizeExternalConnectLink(it)
             intent?.data = null
@@ -249,6 +293,16 @@ internal fun NativeFeedbackEffect(
     }
 }
 
+/** How long a swiped-away call can still be taken back. A decline is sent to Hermes and cannot be undone, so it is sent when this window closes. */
+internal const val INCOMING_UNDO_MILLIS = 8_000L
+private val IncomingDeclineRed = Color(0xffc62f2a)
+private val IncomingAnswerGreen = Color(0xff2e7d4f)
+
+/** The reason Hermes gave for the call that is ringing, from the owner's own call list (the ringing event shows there as an active incoming call). */
+internal fun incomingReasonFromHistory(history: org.json.JSONObject, event: String): String =
+    history.rows("calls").firstOrNull { it.string("id") == event && it.string("direction") == "incoming" }
+        ?.string("reason")?.replace(Regex("\\s+"), " ")?.trim()?.take(120).orEmpty()
+
 @Composable internal fun IncomingCallSheet(vm: BeaconViewModel, requestingPermission: Boolean, onAnswer: (String, String) -> Unit) {
     val invite by vm.app.push.incoming.collectAsStateWithLifecycle()
     val ui by vm.ui.collectAsStateWithLifecycle()
@@ -262,18 +316,101 @@ internal fun NativeFeedbackEffect(
         vm.app.push.expireInvitation(pending.source, pending.event)
     }
     val pending = invite?.takeIf { remaining > 0 && vm.app.push.permitsIncoming(it.source) }
-    if (pending != null && ui.authenticated && !call.active) {
-        ModalBottomSheet(onDismissRequest = { vm.app.push.dismissInvitation(pending.source, pending.event) }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag("beacon-incoming-sheet"), sheetMaxWidth = 560.dp, containerColor = MaterialTheme.colorScheme.surfaceContainer) {
-            Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Icon(Icons.Rounded.Call, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(32.dp))
-                    Text(assistantText("Beacon is calling"), Modifier.semantics { liveRegion = LiveRegionMode.Assertive }, style = MaterialTheme.typography.headlineSmall)
+    // The call a swipe-down has declined for now: hidden at once, declined for real when the Undo window closes.
+    var swiped by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(pending?.key) { if (swiped != null && swiped != pending?.key) swiped = null }
+    val snackbar = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+    val latestInvite by rememberUpdatedState(invite)
+    val latestRemaining by rememberUpdatedState(remaining)
+    val declinedText = uiText("Call declined.")
+    val undoText = uiText("Undo")
+    val reason by produceState("", pending?.key) {
+        value = ""
+        val item = pending ?: return@produceState
+        val client = vm.client?.detached() ?: return@produceState
+        val profile = vm.authenticatedScope()?.profile ?: return@produceState
+        value = try { incomingReasonFromHistory(client.get("/api/plugins/beacon/mobile/calls", mapOf("profile" to profile, "limit" to "10")), item.event) }
+        catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+        catch (_: Exception) { "" }
+    }
+    if (pending != null && ui.authenticated && !call.active && swiped != pending.key) {
+        ModalBottomSheet(
+            onDismissRequest = {
+                val item = pending
+                swiped = item.key
+                IncomingRingtoneService.silence(item.source, item.event)
+                scope.launch {
+                    val window = minOf(latestRemaining, INCOMING_UNDO_MILLIS)
+                    val result = withTimeoutOrNull(window) { snackbar.showSnackbar(declinedText, actionLabel = undoText, duration = SnackbarDuration.Indefinite) }
+                    if (result == SnackbarResult.ActionPerformed) swiped = null
+                    else if (latestInvite?.key == item.key && latestRemaining > 0) vm.declineIncoming(item.source, item.event)
                 }
-                ui.error.ifBlank { call.error }.takeIf { it.isNotBlank() }?.let { Text(it, Modifier.semantics { liveRegion = LiveRegionMode.Polite }, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium) }
-                Button(onClick = { onAnswer(pending.source, pending.event) }, enabled = !requestingPermission && !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("beacon-incoming-answer")) { Icon(Icons.Rounded.Call, null); Spacer(Modifier.width(8.dp)); Text(when { requestingPermission -> uiText("Waiting for microphone permission"); busy -> uiText("Please wait"); else -> uiText("Answer") }) }
-                OutlinedButton(onClick = { vm.declineIncoming(pending.source, pending.event) }, enabled = !requestingPermission && !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("beacon-incoming-decline")) { Icon(Icons.Rounded.CallEnd, null); Spacer(Modifier.width(8.dp)); Text(uiText("Decline")) }
-            }
+            },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag("beacon-incoming-sheet"), sheetMaxWidth = 560.dp, containerColor = MaterialTheme.colorScheme.surfaceContainer,
+        ) {
+            IncomingCallContent(
+                reason = reason,
+                ringFraction = (remaining / (INCOMING_RING_SECONDS * 1000f)).coerceIn(0f, 1f),
+                error = ui.error.ifBlank { call.error },
+                answerLabel = when { requestingPermission -> uiText("Waiting for microphone permission"); busy -> uiText("Please wait"); else -> uiText("Answer") },
+                enabled = !requestingPermission && !busy,
+                onAnswer = { onAnswer(pending.source, pending.event) },
+                onDecline = { vm.declineIncoming(pending.source, pending.event) },
+            )
         }
+    }
+    Box(Modifier.fillMaxSize().navigationBarsPadding(), contentAlignment = androidx.compose.ui.Alignment.BottomCenter) { SnackbarHost(snackbar, Modifier.testTag("beacon-incoming-undo")) }
+}
+
+/** The Beacon mark inside a thin countdown ring, the reason when there is one, and a round Decline (red) next to a round Answer (green). */
+@Composable internal fun IncomingCallContent(
+    reason: String,
+    ringFraction: Float,
+    error: String,
+    answerLabel: String,
+    enabled: Boolean,
+    onAnswer: () -> Unit,
+    onDecline: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val motion = rememberNativeMotionEnabled()
+    val ring = if (motion) animateFloatAsState(ringFraction, tween(250, easing = LinearEasing), label = "incoming-ring").value else ringFraction
+    val track = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .5f)
+    val ink = MaterialTheme.colorScheme.primary
+    Column(modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 24.dp),
+        horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Box(Modifier.size(112.dp).testTag("beacon-incoming-presence"), contentAlignment = androidx.compose.ui.Alignment.Center) {
+            BeaconSignal(BeaconMotionMode.Pulse, Modifier.testTag("beacon-incoming-pulse"), 96.dp)
+            Canvas(Modifier.fillMaxSize().testTag("beacon-incoming-ring")) {
+                val stroke = 3.dp.toPx()
+                val inset = stroke / 2
+                val box = Size(size.width - stroke, size.height - stroke)
+                drawArc(track, 0f, 360f, false, Offset(inset, inset), box, style = Stroke(stroke))
+                drawArc(ink, -90f, 360f * ring, false, Offset(inset, inset), box, style = Stroke(stroke, cap = StrokeCap.Round))
+            }
+            BeaconMark(size = 40.dp)
+        }
+        Text(assistantText("Beacon is calling"), Modifier.semantics { liveRegion = LiveRegionMode.Assertive }, style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center)
+        if (reason.isNotBlank()) Text(reason, Modifier.testTag("beacon-incoming-reason"), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (error.isNotBlank()) Text(error, Modifier.semantics { liveRegion = LiveRegionMode.Polite }, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
+        Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = androidx.compose.ui.Alignment.Top) {
+            IncomingRoundButton(uiText("Decline"), Icons.Rounded.CallEnd, IncomingDeclineRed, enabled, "beacon-incoming-decline", onDecline)
+            IncomingRoundButton(answerLabel, Icons.Rounded.Call, IncomingAnswerGreen, enabled, "beacon-incoming-answer", onAnswer)
+        }
+    }
+}
+
+/** A 72dp round button with its word underneath; the whole column is the one tap target. */
+@Composable private fun IncomingRoundButton(label: String, icon: ImageVector, container: Color, enabled: Boolean, tag: String, onClick: () -> Unit) {
+    Column(
+        Modifier.widthIn(min = 96.dp, max = 160.dp).clip(RoundedCornerShape(20.dp)).clickable(enabled = enabled, role = Role.Button, onClick = onClick).padding(4.dp).testTag(tag),
+        horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Box(Modifier.size(72.dp).clip(CircleShape).background(container.copy(alpha = if (enabled) 1f else .4f)), contentAlignment = androidx.compose.ui.Alignment.Center) {
+            Icon(icon, null, Modifier.size(32.dp), tint = Color.White)
+        }
+        Text(label, style = MaterialTheme.typography.labelLarge, maxLines = 2, textAlign = TextAlign.Center)
     }
 }
 
@@ -388,9 +525,10 @@ internal fun NativeFeedbackEffect(
                 // The shell owns system/IME space; descendants receive already-consumed insets.
                 CompositionLocalProvider(LocalOpenNavigationMenu provides openMenu) {
                     Column(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Brush.linearGradient(nativeAmbientColors(MaterialTheme.colorScheme))).padding(padding).padding(bottom = feedbackReserve).consumeWindowInsets(padding)) {
-                        if (!ui.connected) Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth()) {
-                            Row(Modifier.padding(start = 16.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                                Text(if (ui.loading) uiText("Reconnecting…") else uiText("Offline · showing saved chats"), Modifier.weight(1f), style = MaterialTheme.typography.labelMedium)
+                        if (!ui.connected) Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth().testTag("beacon-offline-banner")) {
+                            Row(Modifier.padding(start = 16.dp).heightIn(min = 48.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                if (ui.loading) BeaconSignal(BeaconMotionMode.Sweep, size = 18.dp) else Icon(Icons.Rounded.CloudOff, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(if (ui.loading) uiText("Reconnecting…") else uiText("Offline · showing saved chats"), Modifier.weight(1f).semantics { liveRegion = LiveRegionMode.Polite }, style = MaterialTheme.typography.labelMedium)
                                 TextButton(enabled = !ui.loading, onClick = { vm.connect(ui.origin) }) { Text(uiText("Reconnect")) }
                             }
                         }
@@ -398,7 +536,7 @@ internal fun NativeFeedbackEffect(
                         Box(Modifier.weight(1f).then(modeMotion)) {
                         if (vm.client == null && !ui.loading && ui.tab in setOf("Tasks", "Spaces", "Projects", "Kanban")) {
                             Header(when(ui.tab) { "Tasks" -> uiText("Schedules"); "Spaces" -> uiText("Files"); else -> uiText(ui.tab) }, menu = openMenu)
-                            EmptyState(uiText("Reconnect to Hermes"), uiText("Check your network, then retry. Your drafts remain saved on this phone."), action = uiText("Reconnect"), onAction = { vm.connect(ui.origin) })
+                            EmptyState(uiText("Reconnect to Hermes"), uiText("Check your network, then retry. Your saved drafts stay on this phone."), action = uiText("Reconnect"), onAction = { vm.connect(ui.origin) })
                         } else when (ui.tab) { "Beacon" -> ChatScreen(vm, beacon = true, onComposerHeight = { composerHeightPx = it }); "Chat" -> ChatScreen(vm, onComposerHeight = { composerHeightPx = it }); "Tasks" -> TasksScreen(vm); "Spaces" -> SpacesScreen(vm); "Projects" -> NativeProjectsScreen(vm); "Kanban" -> KanbanScreen(vm); else -> MoreScreen(vm) }
                         }
                     }

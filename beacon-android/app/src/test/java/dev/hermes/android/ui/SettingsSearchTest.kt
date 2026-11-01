@@ -15,7 +15,7 @@ class SettingsSearchTest {
         for (query in listOf("steer", "queue", "replying")) assertTrue(matches("Chat", query))
         assertTrue(matches("Devices", "linked"))
         assertEquals("Name and profile", settingsDescriptions.getValue("Assistant"))
-        assertEquals("Voice provider and calls", settingsDescriptions.getValue("Voice & calls"))
+        assertEquals("Voice and provider", settingsDescriptions.getValue("Voice & calls"))
         assertEquals("Connection", settingsRoute("Devices"))
     }
 
@@ -34,8 +34,8 @@ class SettingsSearchTest {
         assertTrue(settingsSearchMatches("Tools & MCP", "Tool groups and MCP servers", "tools & mcp"))
         assertFalse(settingsSearchMatches(settingsLabel("Chat"), chatDescription, "camera"))
         assertFalse(settingsSearchMatches(settingsLabel("Chat"), chatDescription, "sending camera"))
-        assertTrue(settingsSearchMatches("Appearance", "Theme and color style", " "))
-        assertTrue(settingsSearchMatches("Appearance", "Theme and color style", " appearance "))
+        assertTrue(settingsSearchMatches("Appearance", "Theme and colors", " "))
+        assertTrue(settingsSearchMatches("Appearance", "Theme and colors", " appearance "))
         assertTrue(modelSearchMatches("provider", "model", "Configured model", " model "))
     }
     @Test fun connectionSearchFindsPairedDevices() {
@@ -127,17 +127,17 @@ class SettingsSearchTest {
         )
         assertEquals("Connected · work", summary("Connection", known))
         assertEquals("Connection needs attention · work", summary("Connection", known.copy(connected = false)))
-        assertEquals("Active profile · work", summary("Profiles & model", known))
+        assertEquals("work", summary("Profiles & model", known))
         // Two facts at most, so a hub row stays on one line.
         assertEquals("Ctrl + Enter to send · Thinking shown", summary("Chat", known))
         assertEquals("Dark · Graphite", summary("Appearance", known))
         assertEquals("Follow device · Beacon", summary("Appearance", SettingsSnapshot(theme = "system", colorStyle = "default")))
-        assertEquals("Installed · 0.4.14", summary("App updates", known))
+        assertEquals("0.4.14", summary("App updates", known))
         assertEquals("Nova · coder", summary("Assistant", known.copy(assistantName = "Nova", assistantProfile = "coder")))
         assertEquals("Version · 0.4.14", summary("About & licenses", known))
         assertEquals("Version · 0.4.14", summary("About & licenses", known.copy(updateName = "0.4.15")))
         assertEquals("Update available · 0.4.15", summary("App updates", known.copy(updateName = "0.4.15")))
-        assertEquals("Update ready to install", summary("App updates", known.copy(updateName = "0.4.15", updateReady = true)))
+        assertEquals("Update ready to install · 0.4.15", summary("App updates", known.copy(updateName = "0.4.15", updateReady = true)))
         assertEquals("Gemini Live · Key saved", summary("Voice & calls", known))
         assertEquals("Keep connected on", summary("Notifications & Keep connected", known))
         assertEquals("Keep connected off", summary("Notifications & Keep connected", known.copy(keepConnectedEnabled = false)))
@@ -150,7 +150,7 @@ class SettingsSearchTest {
     }
     @Test fun userDataStaysVerbatimWhileFixedWordsTranslate() {
         val parts = settingsSummary("Profiles & model", SettingsSnapshot(profile = "Settings"))
-        assertEquals(listOf(SettingsSummaryPart("Active profile", true), SettingsSummaryPart("Settings", false)), parts)
+        assertEquals(listOf(SettingsSummaryPart("Settings", false)), parts)
         assertTrue(settingsSummary("App updates", SettingsSnapshot(installedVersion = "0.4.14")).last().let { !it.translate && it.text == "0.4.14" })
     }
     @Test fun colorStyleTranslatesLikeTheAppearancePicker() {

@@ -8,6 +8,7 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
@@ -22,6 +23,7 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.Groups
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -109,9 +111,13 @@ internal fun mentionHandles(roster: List<BotModeMember>): Set<String> = roster.m
 /** The half-typed name after an `@` that ends [before] (the text up to the cursor), or null when no mention is being typed. */
 internal fun mentionQuery(before: String): String? = typingMention.find(before)?.groupValues?.get(1)
 
-/** The chips offered above the composer: each bot's handle, then `all`, narrowed by what follows a typed `@`. */
-internal fun mentionChips(roster: List<BotModeMember>, query: String?): List<String> =
-    (roster.map { it.handle } + "all").distinct().filter { query == null || it.startsWith(query, ignoreCase = true) }
+/** A chip above the composer: the bot's name and avatar on screen, its handle in the message. [profile] is blank for `@all`. */
+internal data class MentionChip(val handle: String, val label: String, val profile: String)
+
+/** The chips offered above the composer: each bot by its display name, then everyone, narrowed by what follows a typed `@` (its handle or its name). */
+internal fun mentionChips(roster: List<BotModeMember>, query: String?, profiles: List<JSONObject> = emptyList(), everyone: String = "Everyone"): List<MentionChip> =
+    (roster.map { MentionChip(it.handle, spaceMemberTitle(it.id, roster, profiles), it.profile) } + MentionChip("all", everyone, "")).distinctBy { it.handle }
+        .filter { query == null || it.handle.startsWith(query, ignoreCase = true) || it.label.startsWith(query, ignoreCase = true) }
 
 /** [text] with `@handle ` in place of the selection (or of a half-typed `@ha`), and where the cursor goes. */
 internal fun insertMention(text: String, selectionStart: Int, selectionEnd: Int, handle: String): Pair<String, Int> {
@@ -165,7 +171,7 @@ private class Arrival {
 @Composable private fun SpaceAvatarStack(roster: List<BotModeMember>, profiles: List<JSONObject>) {
     if (roster.isEmpty()) return
     val ring = MaterialTheme.colorScheme.background
-    val label = uiText("Members") + ": " + roster.joinToString(", ") { spaceMemberTitle(it.id, roster, profiles) }
+    val label = uiText("Members: {0}").replace("{0}", roster.joinToString(", ") { spaceMemberTitle(it.id, roster, profiles) })
     Row(Modifier.padding(end = 4.dp).clearAndSetSemantics { contentDescription = label }.testTag("space-avatars"), horizontalArrangement = Arrangement.spacedBy((-8).dp), verticalAlignment = Alignment.CenterVertically) {
         roster.take(4).forEach { ChatAvatar(spaceMemberTitle(it.id, roster, profiles), it.profile, Modifier.border(2.dp, ring, CircleShape), size = 28.dp) }
         if (roster.size > 4) Box(Modifier.size(28.dp).clip(CircleShape).background(MaterialTheme.colorScheme.surfaceVariant).border(2.dp, ring, CircleShape), contentAlignment = Alignment.Center) {
@@ -219,7 +225,7 @@ private class Arrival {
     if (!routine && state.status.isNotBlank() || failed) SpaceBanner(if (routine) "" else uiText(state.status), failed, onReviewProfiles)
     LazyColumn(Modifier.weight(1f).fillMaxWidth().testTag("space-list"), state = list, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)) {
         if (state.earlierEventsOmitted) item("earlier") { Text(uiText("Showing the latest messages."), Modifier.fillMaxWidth().padding(vertical = 8.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = androidx.compose.ui.text.style.TextAlign.Center) }
-        if (rows.isEmpty() && !state.loading) item("empty") { Text(uiText("Send the bots a task to start the discussion."), Modifier.fillMaxWidth().padding(32.dp), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = androidx.compose.ui.text.style.TextAlign.Center) }
+        if (rows.isEmpty() && !state.loading) item("empty") { SpaceEmpty(state.roster, profiles) }
         items(rows, key = { it.key }) { row ->
             when (row) {
                 is SpaceDayRow -> DateChip(uiText(row.label))
@@ -247,7 +253,7 @@ private class Arrival {
         if (more > 0) item("typing-more") { Text(uiText("and {0} more").replace("{0}", "$more"), Modifier.padding(start = 44.dp, top = 4.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
     }
     // Your own message always comes into view, even after you scrolled up to read.
-    SpaceComposer(state, field, { value -> if (value.text != field.text) onDraft(value.text); field = value }, focus, mention) { follow = true; onSend() }
+    SpaceComposer(state, profiles, field, { value -> if (value.text != field.text) onDraft(value.text); field = value }, focus, mention) { follow = true; onSend() }
 }
 
 @Composable private fun SpaceBanner(status: String, failed: Boolean, onReview: () -> Unit) {
@@ -345,7 +351,7 @@ private class Arrival {
             if (action.kind == "approval") {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Icon(Icons.Rounded.Info, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.primary)
-                    Text("$member ${uiText("needs permission")}", style = MaterialTheme.typography.titleMedium)
+                    Text(uiText("{0} needs permission").replace("{0}", member), style = MaterialTheme.typography.titleMedium)
                 }
                 SelectionContainer { Text(action.description.ifBlank { uiText("Tool approval requested") }) }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -359,19 +365,36 @@ private class Arrival {
     }
 }
 
-@Composable private fun SpaceComposer(state: NativeBotModeState, field: TextFieldValue, onField: (TextFieldValue) -> Unit, focus: FocusRequester, onMention: (String) -> Unit, onSend: () -> Unit) {
+/** The group's empty page: the bots' avatars over the shared empty state, so the space looks inhabited before the first message. */
+@Composable private fun SpaceEmpty(roster: List<BotModeMember>, profiles: List<JSONObject>) {
+    Column(Modifier.fillMaxWidth().padding(top = 24.dp).testTag("space-empty"), horizontalAlignment = Alignment.CenterHorizontally) {
+        if (roster.isNotEmpty()) GroupAvatars(roster.map { spaceMemberTitle(it.id, roster, profiles) to it.profile }, size = 56.dp)
+        EmptyState(uiText("No messages yet"), uiText("Send the bots a task to start the discussion."), icon = null, centered = true)
+    }
+}
+
+/** The same composer as the main chat: a rounded surface, a primary edge while focused and a borderless field, with the mention chips on top. */
+@Composable private fun SpaceComposer(state: NativeBotModeState, profiles: List<JSONObject>, field: TextFieldValue, onField: (TextFieldValue) -> Unit, focus: FocusRequester, onMention: (String) -> Unit, onSend: () -> Unit) {
     var focused by remember { mutableStateOf(false) }
-    val chips = mentionChips(state.roster, mentionQuery(field.text.substring(0, field.selection.min)))
-    Surface(tonalElevation = 2.dp) {
-        Column {
-            if ((focused || field.text.isBlank()) && chips.isNotEmpty()) {
-                Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = SettingsPagePadding).padding(top = 8.dp).testTag("space-chips"), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    chips.forEach { handle -> AssistChip(onClick = { onMention(handle) }, label = { Text("@$handle") }, enabled = !state.sending, modifier = Modifier.testTag("space-chip:$handle")) }
+    val scheme = MaterialTheme.colorScheme
+    val chips = mentionChips(state.roster, mentionQuery(field.text.substring(0, field.selection.min)), profiles, uiText("Everyone"))
+    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
+        Surface(Modifier.widthIn(max = 840.dp).fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), shape = RoundedCornerShape(24.dp), color = scheme.surfaceContainerHigh,
+            border = BorderStroke(if (focused) 2.dp else 1.dp, if (focused) scheme.primary else scheme.outlineVariant)) {
+            Column(Modifier.padding(horizontal = 6.dp, vertical = 3.dp)) {
+                if ((focused || field.text.isBlank()) && chips.isNotEmpty()) {
+                    Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 6.dp).padding(top = 4.dp).testTag("space-chips"), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        chips.forEach { chip ->
+                            AssistChip(onClick = { onMention(chip.handle) }, label = { Text(chip.label, maxLines = 1) }, enabled = !state.sending, modifier = Modifier.testTag("space-chip:${chip.handle}"),
+                                leadingIcon = { if (chip.profile.isBlank()) Icon(Icons.Rounded.Groups, null, Modifier.size(AssistChipDefaults.IconSize)) else ChatAvatar(chip.label, chip.profile, size = 24.dp) })
+                        }
+                    }
                 }
+                OutlinedTextField(field, onField, placeholder = { Text(uiText("Message the shared space")) }, shape = RoundedCornerShape(18.dp), maxLines = 6, enabled = !state.sending,
+                    colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = Color.Transparent, disabledBorderColor = Color.Transparent),
+                    trailingIcon = { FilledIconButton(onClick = onSend, enabled = !state.loading && !state.sending && state.draft.isNotBlank(), shape = CircleShape, modifier = Modifier.testTag("bot-shared-send")) { Icon(Icons.Rounded.ArrowUpward, uiText(if (state.sending) "Sending…" else "Send")) } },
+                    modifier = Modifier.fillMaxWidth().focusRequester(focus).onFocusChanged { focused = it.hasFocus }.testTag("bot-shared-composer"))
             }
-            OutlinedTextField(field, onField, placeholder = { Text(uiText("Message the shared space")) }, shape = RoundedCornerShape(24.dp), maxLines = 6, enabled = !state.sending,
-                trailingIcon = { FilledIconButton(onClick = onSend, enabled = !state.loading && !state.sending && state.draft.isNotBlank(), shape = CircleShape, modifier = Modifier.testTag("bot-shared-send")) { Icon(Icons.Rounded.ArrowUpward, uiText(if (state.sending) "Sending…" else "Send")) } },
-                modifier = Modifier.fillMaxWidth().padding(horizontal = SettingsPagePadding, vertical = 12.dp).focusRequester(focus).onFocusChanged { focused = it.hasFocus }.testTag("bot-shared-composer"))
         }
     }
 }

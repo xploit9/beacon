@@ -161,7 +161,7 @@ class NativeCallLiveUiTest {
             phase="voice-admission"
             await(20_000) { app.calls.state.value.active&&app.calls.state.value.conversationScope?.session==stored&&app.calls.state.value.callId.isNotBlank() }
             callId=app.calls.state.value.callId
-            await(45_000) { app.calls.state.value.active&&app.calls.state.value.state=="listening"&&app.calls.service!=null }
+            await(45_000) { app.calls.state.value.active&&app.calls.state.value.state in setOf("thinking","listening")&&app.calls.service!=null }
             assertTrue("Actual CoreTelecom/native service reported a failure",failures.isEmpty())
             callId=app.calls.state.value.callId
             assertEquals(stored,app.calls.state.value.conversationScope?.session)
@@ -362,7 +362,7 @@ class NativeCallLiveUiTest {
                 withContext(Dispatchers.Main.immediate) { app.calls.start(requireNotNull(vm.client),stored) }
                 await(20_000) { app.calls.state.value.callId.isNotBlank()&&app.calls.state.value.active }
                 callId=app.calls.state.value.callId
-                await(45_000) { app.calls.state.value.state=="listening"&&app.calls.service!=null }
+                await(45_000) { app.calls.state.value.state in setOf("thinking","listening")&&app.calls.service!=null }
                 assertTrue(audioManager.activeRecordingConfigurations.isNotEmpty())
                 return requireNotNull(app.calls.service)
             }

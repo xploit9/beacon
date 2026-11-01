@@ -2,7 +2,7 @@
 
 Voice requests go to the same Hermes conversation as text chat. Hermes uses that conversation's configured model, profile, instructions, memory, tools and approvals. Your chosen realtime provider handles speech.
 
-Call setup reads only the profile metadata needed for the greeting and admission. It skips external secret-provider resolution and reuses the profile's already bound clock. The native Hermes agent still resolves its own credentials when work needs them. Connection becomes ready after the scoped context and speech provider confirm setup; network/provider latency and safe cleanup of an earlier call can still delay it.
+Call setup reads only the profile metadata needed for the greeting and admission. It skips external secret-provider resolution and reuses the profile's already bound clock. The native Hermes agent still resolves its own credentials when work needs them. An ordinary call's grant response also carries the opening `greeting` (same rules as the context endpoint, absent for callbacks and whenever it cannot be built quickly); the context endpoint stays authoritative. Connection becomes ready after the scoped context and speech provider confirm setup; network/provider latency and safe cleanup of an earlier call can still delay it.
 
 ## Tools and memory
 
@@ -30,7 +30,7 @@ Speech failures record a fixed diagnostic category, provider, attempt, timing an
 
 ## Saving and ending a call
 
-Plugin updates from Settings include a gateway restart when Hermes requires it. Beacon waits for native restart completion and a serving gateway before reporting success. Active calls and native work can defer the restart; use the saved **Restart Hermes** action in the app to retry without reinstalling the plugin.
+Plugin updates from Settings include a gateway restart when Hermes requires it. Beacon waits for native restart completion and a serving gateway before reporting success. Active calls and native work can defer the restart; use the saved **Restart Hermes** action in the app to retry without reinstalling the plugin. A restart that did not start says why in `restart_error_code`: `live_sessions` (Hermes refused while chats are running), `stale` (it was an earlier restart, not a new one) or `failed`; an active call still answers 409.
 
 Beacon keeps text transcripts and call metadata, with no retained call audio. Text uploads retry with the same event identity after a temporary disconnect. Diagnostic uploads cannot turn a saved transcript into a missing-text warning.
 

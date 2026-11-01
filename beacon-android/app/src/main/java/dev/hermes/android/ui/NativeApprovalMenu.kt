@@ -2,7 +2,9 @@ package dev.hermes.android.ui
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.AutoMode
 import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.FrontHand
 import androidx.compose.material.icons.rounded.GppBad
 import androidx.compose.material.icons.rounded.GppGood
 import androidx.compose.material.icons.rounded.GppMaybe
@@ -168,40 +170,51 @@ internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: S
         }
     }
     LaunchedEffect(active, version, target, ui.connected) { if (ui.connected) refresh() }
-    Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp).testTag("profile-approvals")) {
-        Text(uiText("Approvals for all chats"), style = MaterialTheme.typography.titleMedium)
-        Text(uiText("Chats follow this profile unless a chat skips approvals."), style = MaterialTheme.typography.bodySmall)
-        if (busy || loading || value == null && !failed) LinearProgressIndicator(Modifier.fillMaxWidth())
-        if (value?.string("value") == "off") Text(uiText("Approvals are off for this profile"), color = MaterialTheme.colorScheme.error)
-        if (failed) TextButton(onClick = { refresh() }) { Text(uiText("Couldn't load approvals. Retry")) }
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            listOf("manual", "smart").forEach { mode ->
-                FilterChip(selected = value?.string("value") == mode, enabled = active != null && value != null && !loading && !busy && !failed,
-                    modifier = Modifier.testTag("profile-approval-$mode"), label = { Text(uiText(approvalChoiceLabel(mode))) }, onClick = {
-                        if (active != null && vm.settingsProfileCurrent(active, version) && !saving) {
-                            saving = true
-                            ++readGeneration
-                            scope.launch {
-                                val c = active.detached()
-                                try {
-                                    vm.authorizeSettingsProfile(active, active.scope.profile)
-                                    if (!vm.settingsProfileCurrent(active, version)) return@launch
-                                    val result = c.post("/api/profile/approval-mode", json("mode" to mode, "scope_key" to active.scope.key))
-                                    if (vm.settingsProfileCurrent(active, version)) { vm.storeData(key, result); vm.notice(updatedNotice) }
-                                } catch (e: Exception) {
-                                    if (e is CancellationException) throw e
-                                    if (vm.settingsProfileCurrent(active, version)) { vm.profileSettingsFailure(e); if (vm.settingsProfileCurrent(active, version)) vm.notice(appErrorText(e)) }
-                                } finally {
-                                    c.closeNative()
-                                    if (vm.settingsProfileCurrent(active, version)) { saving = false; loading = false }
-                                }
-                            }
-                        }
-                    })
+    fun save(mode: String) {
+        if (active != null && vm.settingsProfileCurrent(active, version) && !saving) {
+            saving = true
+            ++readGeneration
+            scope.launch {
+                val c = active.detached()
+                try {
+                    vm.authorizeSettingsProfile(active, active.scope.profile)
+                    if (!vm.settingsProfileCurrent(active, version)) return@launch
+                    val result = c.post("/api/profile/approval-mode", json("mode" to mode, "scope_key" to active.scope.key))
+                    if (vm.settingsProfileCurrent(active, version)) { vm.storeData(key, result); vm.notice(updatedNotice) }
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    if (vm.settingsProfileCurrent(active, version)) { vm.profileSettingsFailure(e); if (vm.settingsProfileCurrent(active, version)) vm.notice(appErrorText(e)) }
+                } finally {
+                    c.closeNative()
+                    if (vm.settingsProfileCurrent(active, version)) { saving = false; loading = false }
+                }
+            }
+        }
+    }
+    val mode = value?.string("value").orEmpty()
+    SettingsSection(title = uiText("Approvals"), testTag = "profile-approvals") {
+        when {
+            // Nothing read yet for this profile: Retry replaces the choice; the first read shows a placeholder, never a bare spinner.
+            value == null && failed -> SettingsErrorRow(uiText("Couldn't load approvals"), { refresh() }, uiText("Retry"), retryTestTag = "profile-approvals-retry")
+            value == null -> SettingsSkeletonRows(1)
+            else -> {
+                if (busy || loading) LinearProgressIndicator(Modifier.fillMaxWidth().height(2.dp).testTag("profile-approvals-loading"))
+                if (failed) { SettingsErrorRow(uiText("Couldn't load approvals"), { refresh() }, uiText("Retry"), retryTestTag = "profile-approvals-retry"); SettingsDivider() }
+                // "Off" is not a segment, so neither shows selected; choosing Manual or Auto turns approvals back on.
+                if (profileApprovalsOff(mode)) Row(Modifier.fillMaxWidth().padding(start = 16.dp, top = 12.dp, end = 16.dp)) { SettingsStatusPill(SettingsStatus.Error, uiText("Approvals off"), testTag = "profile-approvals-off") }
+                SettingsChoiceRow(uiText("Approvals for all chats"), mode, ProfileApprovalChoices, ::save, icon = Icons.Rounded.FrontHand,
+                    optionLabels = ProfileApprovalChoices.associateWith(::approvalChoiceLabel),
+                    optionIcons = mapOf("manual" to Icons.Rounded.FrontHand, "smart" to Icons.Rounded.AutoMode),
+                    optionTestTags = ProfileApprovalChoices.associateWith { "profile-approval-$it" },
+                    enabled = active != null && !loading && !busy && !failed, style = ChoiceStyle.Segmented)
             }
         }
     }
 }
+
+/** The two modes the Settings choice offers; a stored "off" stays recoverable by picking either. */
+internal val ProfileApprovalChoices = listOf("manual", "smart")
+internal fun profileApprovalsOff(mode: String): Boolean = mode == "off"
 
 internal fun approvalChoiceLabel(choice: String): String = when (choice) {
     "manual" -> "Manual"

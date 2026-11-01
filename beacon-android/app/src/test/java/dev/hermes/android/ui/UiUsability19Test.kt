@@ -15,6 +15,16 @@ class UiUsability19Test {
         assertEquals("provider/Model_ID-v1", choiceDisplayLabel("provider/Model_ID-v1", emptyMap(), true))
     }
 
+    @Test fun slashCommandsShowNoUsageOrParentheticalMechanics() {
+        val commands = listOf(
+            dev.hermes.android.core.json("name" to "new", "description" to "Start a new session (fresh session ID + history) (usage: /new [name])"),
+            dev.hermes.android.core.json("name" to "plugin-thing", "description" to "Do a thing (usage: /plugin-thing <x>)"),
+        )
+        val shown = mobileSlashCommands(commands).map { it.getString("description") }
+        assertEquals(listOf("New chat", "Do a thing"), shown)
+        assertTrue(shown.none { it.contains("(usage:") })
+    }
+
     @Test fun composerBlurCannotChangeTheDraftDuringCallOrAfterScopeChange() {
         val originalClient = Any()
         assertTrue(acceptsComposerEdit(originalClient, originalClient, "owner/profile/session", "owner/profile/session", false))

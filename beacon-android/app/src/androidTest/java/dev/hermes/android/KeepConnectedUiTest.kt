@@ -5,12 +5,12 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
-import android.content.pm.PackageManager
 import android.media.AudioManager
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.assertIsOn
+import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
@@ -129,8 +129,6 @@ class KeepConnectedUiTest {
     @Test fun enablingPollsFixtureTaskResultsAndCallsThroughTheirNativePaths() = runBlocking {
         val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
         val uiAutomation = InstrumentationRegistry.getInstrumentation().uiAutomation
-        val hadNotifications = android.os.Build.VERSION.SDK_INT < 33 || app.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
-        val hadRecordAudio = app.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         val fixture = NativeExperienceFixture()
         val scope = fixture.scope
         val priorBeacon = app.cache.read(scope, "beacon-session")
@@ -237,6 +235,8 @@ class KeepConnectedUiTest {
             compose.waitUntil(15_000) {
                 KeepConnectedService.status(app) == KeepConnectedService.STATUS_CONNECTED && fixtureCursors.all(keepPrefs::contains)
             }
+            // The page shows the same state as a pill, not as a line of text.
+            compose.waitUntil(10_000) { runCatching { compose.onNodeWithTag("keep-connected-status").assertTextContains("Connected"); true }.getOrDefault(false) }
             fun deliveryCpuHeld(): Boolean = uiAutomation.executeShellCommand("dumpsys power").use { descriptor ->
                 java.io.FileInputStream(descriptor.fileDescriptor).bufferedReader().readLines().any {
                     it.contains("PARTIAL_WAKE_LOCK") && it.contains("${app.packageName}:notifications")
@@ -252,7 +252,12 @@ class KeepConnectedUiTest {
             try {
                 shell("svc wifi disable"); shell("svc data disable")
                 compose.waitUntil(15_000) { connectivity.activeNetwork == null }
-                compose.waitUntil(5_000) { !deliveryCpuHeld() }
+                try { compose.waitUntil(5_000) { !deliveryCpuHeld() } } catch (timeout: androidx.compose.ui.test.ComposeTimeoutException) {
+                    // Say what still holds the CPU, so a failure here can be told apart from a slow callback.
+                    val held = uiAutomation.executeShellCommand("dumpsys power").use { d -> java.io.FileInputStream(d.fileDescriptor).bufferedReader().readLines().filter { it.contains("${app.packageName}:notifications") } }
+                    val capabilities = runCatching { connectivity.getNetworkCapabilities(connectivity.activeNetwork) }
+                    throw AssertionError("CPU still held offline: network=${connectivity.activeNetwork} capabilities=$capabilities status=${KeepConnectedService.status(app)} lines=$held", timeout)
+                }
             } finally {
                 shell("svc wifi ${if (wifiWasOn) "enable" else "disable"}")
                 shell("svc data ${if (mobileWasOn) "enable" else "disable"}")
@@ -410,8 +415,8 @@ class KeepConnectedUiTest {
             restoreSharedPreferences(voicePrefs, voiceBefore)
             audio.setStreamVolume(AudioManager.STREAM_RING, beforeVolume, 0)
             if (keepBefore[KeepConnectedService.KEY_ENABLED] == true) KeepConnectedService.startIfEnabled(app)
-            if (android.os.Build.VERSION.SDK_INT >= 33 && !hadNotifications) runCatching { uiAutomation.revokeRuntimePermission(app.packageName, Manifest.permission.POST_NOTIFICATIONS) }
-            if (!hadRecordAudio) runCatching { uiAutomation.revokeRuntimePermission(app.packageName, Manifest.permission.RECORD_AUDIO) }
+            // Revoking a runtime permission kills this process and ends the whole instrumentation run, so the runner puts
+            // POST_NOTIFICATIONS and RECORD_AUDIO back to their state before the run once the app has stopped.
         }
     }
 }

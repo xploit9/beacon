@@ -2,6 +2,7 @@ package dev.hermes.android.ui
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.clickable
+import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -117,6 +118,8 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
     val projectUpdated = uiText("Project updated")
     val folderLinked = uiText("Folder linked")
     val deleteConsequence = uiText("Its conversations and files on your computer will remain.")
+    val you = uiText("You"); val oneMessage = uiText("1 message"); val manyMessages = uiText("{0} messages")
+    val is24Hour = android.text.format.DateFormat.is24HourFormat(androidx.compose.ui.platform.LocalContext.current)
     LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, vm.client, selected) { vm.loadNativeProjects(selected) }
     BackHandler(selected.isNotBlank()) { selected = "" }
     val key = if (selected.isBlank()) "native-projects" else "native-project:$selected"
@@ -210,8 +213,8 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
         ) {
             LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 when {
-                record == null || record.optBoolean("_loading") -> item { BeaconSignal(BeaconMotionMode.Sweep, Modifier.fillMaxWidth().wrapContentWidth(), 32.dp) }
-                record.string("_error").isNotBlank() -> item { Text(uiText("Couldn't load projects. Check your connection and try again."), color = MaterialTheme.colorScheme.error); OutlinedButton(onClick = { vm.loadNativeProjects(selected) }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Retry")) } }
+                record == null || record.optBoolean("_loading") -> item { Glass(Modifier.testTag("projects-skeleton")) { SettingsSkeletonRows(3) } }
+                record.string("_error").isNotBlank() -> item { Glass { SettingsErrorRow(uiText("Couldn't load projects. Check your connection and try again."), { vm.loadNativeProjects(selected) }, uiText("Retry"), retryTestTag = "projects-retry") } }
                 selected.isBlank() -> {
                     val projects = record.rows("projects").filterNot { it.optBoolean("archived") }
                     if (projects.isEmpty()) item {
@@ -224,16 +227,12 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
                             }
                         }
                     }
-                    items(projects, key = { it.getString("id") }) { value ->
-                        // Clipped to the card's shape, so the ripple stays inside it.
-                        Glass(Modifier.fillMaxWidth().clip(RoundedCornerShape(26.dp)).clickable(role = Role.Button) { selected = value.getString("id") }) {
-                            Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                                Icon(Icons.Rounded.FolderOpen, null, tint = MaterialTheme.colorScheme.primary)
-                                Column(Modifier.weight(1f)) {
-                                    Text(value.string("name").ifBlank { uiText("Project") }, style = MaterialTheme.typography.titleMedium)
-                                    Text(value.string("description").ifBlank { folderSummary(value.rows("folders").size) }, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                }
-                                Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (projects.isNotEmpty()) item(key = "project-rows") {
+                        SettingsSection(testTag = "project-list") {
+                            projects.forEachIndexed { index, value ->
+                                if (index > 0) SettingsDivider()
+                                SettingsNavRow(value.string("name").ifBlank { uiText("Project") }, { selected = value.getString("id") }, icon = Icons.Rounded.FolderOpen,
+                                    value = value.string("description").ifBlank { folderSummary(value.rows("folders").size) }, testTag = "project-row:${value.getString("id")}")
                             }
                         }
                     }
@@ -241,45 +240,45 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
                 project == null -> item { EmptyState(uiText("Project not found"), uiText("It may have been removed on another device."), action = uiText("All projects"), onAction = { selected = "" }) }
                 else -> {
                     if (project.string("description").isNotBlank()) item { Text(project.string("description"), color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                    item { Text(uiText("Linked folders"), Modifier.semantics { heading() }, style = MaterialTheme.typography.titleMedium) }
-                    items(project.rows("folders"), key = ::fileRowKey) { folder ->
-                        var actions by remember { mutableStateOf(false) }
-                        val path = folder.getString("path")
-                        ListItem(headlineContent = { Text(folder.string("label").ifBlank { path.replace('\\', '/').substringAfterLast('/').ifBlank { path } }) },
-                            supportingContent = { Text((if (folder.optBoolean("is_primary")) uiText("Main folder") + " · " else "") + path) },
-                            leadingContent = { Icon(Icons.Rounded.Folder, null) }, modifier = Modifier.clickable { vm.browsePcFolder(path) },
-                            colors = ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent),
-                            trailingContent = { Box {
-                                IconButton(onClick = { actions = true }) { Icon(Icons.Rounded.MoreVert, uiText("Folder actions")) }
-                                DropdownMenu(actions, { actions = false }) {
-                                    if (!folder.optBoolean("is_primary")) DropdownMenuItem({ Text(uiText("Use as main folder")) }, onClick = { actions = false; vm.action("/api/projects/folders/primary", json("id" to selected, "path" to path), refresh = false, onSuccess = { _, _ -> vm.loadNativeProjects(selected) }) })
-                                    DropdownMenuItem({ Text(uiText("Unlink folder")) }, onClick = { actions = false
-                                        vm.openForm(ActionForm("Unlink folder?", "/api/projects/folders/remove", emptyList(), seed = json("id" to selected, "path" to path),
-                                            explanation = "Files stay on your computer. Chats in this folder may appear outside this project.", actionLabel = "Unlink", onResult = { vm.loadNativeProjects(selected); refreshOpenChatProject(vm) }, destructive = true))
-                                    })
-                                }
-                            } })
-                    }
-                    item { OutlinedButton(onClick = { folderPicker = true }, modifier = Modifier.heightIn(min = 48.dp)) { Icon(Icons.Rounded.Add, null); Text(uiText("Link computer folder"), Modifier.padding(start = 8.dp)) } }
-                    item { Text(uiText("Conversations"), Modifier.padding(top = 12.dp).semantics { heading() }, style = MaterialTheme.typography.titleMedium) }
+                    item { SettingsSection(uiText("Linked folders")) {
+                        project.rows("folders").forEach { folder ->
+                            val path = folder.getString("path")
+                            val primary = folder.optBoolean("is_primary")
+                            ProjectFolderRow(folder.string("label").ifBlank { path.replace('\\', '/').trimEnd('/').substringAfterLast('/').ifBlank { path } }, path, primary,
+                                onOpen = { vm.browsePcFolder(path) },
+                                onMakeMain = if (primary) null else ({ vm.action("/api/projects/folders/primary", json("id" to selected, "path" to path), refresh = false, onSuccess = { _, _ -> vm.loadNativeProjects(selected) }) }),
+                                onUnlink = {
+                                    vm.openForm(ActionForm("Unlink folder?", "/api/projects/folders/remove", emptyList(), seed = json("id" to selected, "path" to path),
+                                        explanation = "Files stay on your computer. Chats in this folder may appear outside this project.", actionLabel = "Unlink", onResult = { vm.loadNativeProjects(selected); refreshOpenChatProject(vm) }, destructive = true))
+                                })
+                            SettingsDivider()
+                        }
+                        SettingsActionRow(uiText("Link computer folder"), { folderPicker = true }, icon = Icons.Rounded.Add, testTag = "project-link-folder-row")
+                    } }
                     val tree = record.optJSONObject("tree")
                     val allowed = tree?.optJSONArray("sessionIds")?.strings().orEmpty().toSet()
                     val rows = (tree?.rows("repos").orEmpty().flatMap { it.rows("groups").flatMap { group -> group.rows("sessions") } } + tree?.rows("previewSessions").orEmpty())
                         .filter { nativeProjectSessionAllowed(it.string("id", it.string("session_id")), it.string("profile"), ui.profile, allowed, it.optBoolean("archived")) }.distinctBy { it.string("id", it.string("session_id")) }
-                    if (rows.isEmpty()) item { Text(uiText("Open a chat’s menu and choose Add to project to move it here."), color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                    items(rows, key = { it.string("id", it.string("session_id")) }) { row ->
-                        var actions by remember { mutableStateOf(false) }
-                        val sessionId = row.string("id", row.string("session_id"))
-                        // The same row as the drawer's chat list, with the project's own menu beside it.
-                        Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                            ChatListRow(sessionId, row.string("title").ifBlank { uiText("Untitled conversation") }, preview = "", time = "",
-                                modifier = Modifier.weight(1f).clickable { vm.tab("Chat"); vm.selectSession(sessionId) })
-                            Box {
-                                IconButton({ actions = true }) { Icon(Icons.Rounded.MoreVert, uiText("Chat project actions")) }
-                                DropdownMenu(actions, { actions = false }) { DropdownMenuItem({ Text(uiText("Remove from project")) }, { actions = false; detach(row) }) }
+                    item { SettingsSection(uiText("Conversations"), testTag = "project-conversations") {
+                        if (rows.isEmpty()) SettingsEmpty(uiText("Open a chat’s menu and choose Add to project to move it here."), Icons.Rounded.ChatBubbleOutline)
+                        rows.forEach { row ->
+                            val sessionId = row.string("id", row.string("session_id"))
+                            var actions by remember(sessionId) { mutableStateOf(false) }
+                            // The drawer's History row for this chat, when the phone has it, gives the same preview and time.
+                            val history = ui.sessions.firstOrNull { it.string("id", it.string("session_id")) == sessionId } ?: row
+                            val preview = chatPreviewLine(history, null, you, oneMessage, manyMessages)
+                            val time = rowActivityMillis(history).takeIf { it > 0 }?.let { chatListTime(it, is24Hour = is24Hour) }.orEmpty()
+                            // The same row as the drawer's chat list, with the project's own menu beside it.
+                            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                                ChatListRow(sessionId, row.string("title").ifBlank { uiText("Untitled conversation") }, preview = preview, time = time,
+                                    modifier = Modifier.weight(1f).clickable { vm.tab("Chat"); vm.selectSession(sessionId) })
+                                Box {
+                                    SettingsIconButton(Icons.Rounded.MoreVert, uiText("Chat project actions"), { actions = true })
+                                    DropdownMenu(actions, { actions = false }) { DropdownMenuItem({ Text(uiText("Remove from project")) }, { actions = false; detach(row) }) }
+                                }
                             }
                         }
-                    }
+                    } }
                 }
                 }
             }
@@ -328,6 +327,32 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
     }
 }
 
+/** A linked folder by its name, with a Main chip on the main one. Tapping the row shows the path and a way to open it in Files. */
+@Composable private fun ProjectFolderRow(name: String, path: String, primary: Boolean, onOpen: () -> Unit, onMakeMain: (() -> Unit)?, onUnlink: () -> Unit) {
+    var showPath by rememberSaveable(path) { mutableStateOf(false) }
+    var actions by remember(path) { mutableStateOf(false) }
+    val reveal = uiText("Show path")
+    Column(Modifier.fillMaxWidth().animateContentSize(androidx.compose.animation.core.tween(if (rememberNativeMotionEnabled()) 200 else 0)).testTag("project-folder:$name")) {
+        Row(Modifier.fillMaxWidth().heightIn(min = SettingsKit.RowMinHeight).clickable(onClickLabel = reveal, role = Role.Button) { showPath = !showPath }.padding(start = 16.dp, top = 4.dp, end = 4.dp, bottom = 4.dp),
+            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            SettingsIconTile(Icons.Rounded.Folder)
+            Text(name, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge, fontWeight = androidx.compose.ui.text.font.FontWeight.Medium, maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+            if (primary) SettingsBadge(uiText("Main"), testTag = "project-folder-main")
+            Box {
+                SettingsIconButton(Icons.Rounded.MoreVert, uiText("Folder actions"), { actions = true })
+                DropdownMenu(actions, { actions = false }) {
+                    if (onMakeMain != null) DropdownMenuItem({ Text(uiText("Use as main folder")) }, onClick = { actions = false; onMakeMain() })
+                    DropdownMenuItem({ Text(uiText("Unlink folder")) }, onClick = { actions = false; onUnlink() })
+                }
+            }
+        }
+        if (showPath) Column(Modifier.padding(start = SettingsKit.DividerStart, end = 16.dp, bottom = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            androidx.compose.foundation.text.selection.SelectionContainer { Text(path, Modifier.testTag("project-folder-path"), style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            TextButton(onClick = onOpen, modifier = Modifier.heightIn(min = 48.dp)) { Icon(Icons.Rounded.FolderOpen, null, Modifier.size(18.dp)); Text(uiText("Open in Files"), Modifier.padding(start = 6.dp)) }
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable internal fun PcFolderPicker(vm: BeaconViewModel, title: String, onDismiss: () -> Unit, onChoose: (String) -> Unit) {
     val ui by vm.ui.collectAsStateWithLifecycle()
@@ -354,8 +379,8 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
             }
             Button(onClick = { record?.getString("path")?.let(onChoose) }, enabled = record != null && !record.has("_error") && record.string("path").isNotBlank(), modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp)) { Text(uiText("Use this folder")) }
             LazyColumn(Modifier.weight(1f)) {
-                if (record == null) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
-                else if (record.has("_error")) item { Text(uiText("Couldn't load this folder. Check your connection and try again."), color = MaterialTheme.colorScheme.error); TextButton(onClick = { vm.load("project-folder", "/api/pc/files", mapOf("path" to directory)) }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Retry")) } }
+                if (record == null) item { Glass { SettingsSkeletonRows(3) } }
+                else if (record.has("_error")) item { Glass { SettingsErrorRow(uiText("Couldn't load this folder. Check your connection and try again."), { vm.load("project-folder", "/api/pc/files", mapOf("path" to directory)) }, uiText("Retry")) } }
                 else {
                     val allFolders = record.rows("entries").filter { it.optBoolean("is_directory") }
                     val folders = if (showHidden) allFolders else allFolders.filterNot { it.string("name").startsWith(".") }
@@ -406,7 +431,7 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
             if (scope != null && current != null) TextButton({
                 onDismiss()
                 removeChatFromProject(vm, sessionId, current)
-            }, enabled = !saving, modifier = Modifier.heightIn(min = 48.dp)) { Icon(Icons.Rounded.FolderOff, null); Text(uiText("Remove from") + " " + current.string("name"), Modifier.padding(start = 8.dp)) }
+            }, enabled = !saving, modifier = Modifier.heightIn(min = 48.dp)) { Icon(Icons.Rounded.FolderOff, null); Text(uiText("Remove from {0}").replace("{0}", current.string("name")), Modifier.padding(start = 8.dp)) }
             LazyColumn(Modifier.weight(1f, fill = false)) {
                 if (record == null || record.optBoolean("_loading")) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
                 else if (record.has("_error")) item { Text(uiText("Couldn't load projects. Check your connection and try again."), color = MaterialTheme.colorScheme.error); TextButton(onClick = { vm.loadNativeProjects() }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Retry")) } }

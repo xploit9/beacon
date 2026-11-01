@@ -408,6 +408,7 @@ class SetupWizardUiTest {
             for (rerun in listOf(false, true)) {
                 if (rerun) {
                     compose.runOnIdle { vm.more("Connection") }
+                    compose.onNodeWithTag("connection-server-row").performScrollTo().performClick()
                     compose.onNodeWithText("Change server").performScrollTo().performClick()
                     // Seed completed auth/voice prerequisites; keep the real completion callback and root routing.
                     compose.runOnIdle { flow<AppState>(vm, "_ui").value = vm.ui.value.copy(setupStep = "done") }
@@ -640,6 +641,10 @@ class SetupWizardUiTest {
         assertEquals(4, setupStepNumber("done"))
     }
 
+    /** The bar's position as the wizard reports it: it fills a little more on every page of step 3. */
+    private fun setupBarPosition(): Float =
+        compose.onNodeWithTag("setup-progress").fetchSemanticsNode().config[androidx.compose.ui.semantics.SemanticsProperties.ProgressBarRangeInfo].current
+
     @Test fun voiceSetupMovesProviderToKeyToChoicesAndBack() {
         val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
         val store = VoiceKeyStore(app)
@@ -668,6 +673,7 @@ class SetupWizardUiTest {
             // Provider: the saved provider is preselected and Continue is always on.
             compose.onNodeWithText("Choose a voice provider").assertIsDisplayed()
             compose.onNodeWithText("Step 3 of 4").assertIsDisplayed()
+            val providerBar = setupBarPosition()
             compose.onNodeWithTag("voice-model-gemini").assertIsSelected()
             compose.onNodeWithTag("voice-model-grok").performClick()
             compose.onNodeWithTag("voice-model-grok").assertIsSelected()
@@ -676,6 +682,7 @@ class SetupWizardUiTest {
             // Key: a provider without a key asks for it, and nothing was committed yet.
             compose.waitUntil(5_000) { state.setupStep == "voice-key" }
             compose.onNodeWithText("Add your Grok key").assertIsDisplayed()
+            assertTrue("the bar moves forward on the key page", setupBarPosition() > providerBar)
             compose.onNodeWithTag("voice-provider-key").assertIsDisplayed()
             assertEquals("gemini", store.settings().provider)
             // Back returns to the providers with the choice kept in the store, not changed.
@@ -689,6 +696,7 @@ class SetupWizardUiTest {
             compose.onNodeWithTag("setup-voice-continue").performClick()
             compose.waitUntil(5_000) { state.setupStep == "voice-customize" }
             compose.onNodeWithText("Make it yours").assertIsDisplayed()
+            assertTrue("and again on the choices page", setupBarPosition() > providerBar)
             assertEquals("grok", store.settings().provider)
             // Back from the choices returns to the providers; Continue again skips the key page.
             compose.onNodeWithTag("voice-page-back").performClick()
@@ -721,7 +729,7 @@ class SetupWizardUiTest {
             compose.onNodeWithTag("voice-key-test").assertIsNotEnabled()
             compose.onNodeWithTag("voice-key-get").assertIsDisplayed()
             // The call-sharing note sits on the page where the key is handed over.
-            compose.onNodeWithText("Your voice provider receives your speech", substring = true).assertIsDisplayed()
+            compose.onNodeWithText("Your provider hears you and speaks the replies").assertIsDisplayed()
             compose.onNodeWithTag("voice-provider-key").performTextInput("not-a-real-key")
             compose.onNodeWithTag("voice-key-test").assertIsEnabled()
             compose.onNodeWithTag("voice-page-back").assertIsDisplayed()
@@ -746,7 +754,7 @@ class SetupWizardUiTest {
                     onProbe = {}, onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {})
             } } }
             // A stray paste over a working key is not saved when the page closes; Test key is what replaces it.
-            compose.waitUntil(5_000) { compose.onAllNodesWithText("Paste a new key to replace it.", substring = true).fetchSemanticsNodes().isNotEmpty() }
+            compose.waitUntil(5_000) { compose.onAllNodesWithText("Saved").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithTag("voice-provider-key").performTextInput("stray-clipboard-text")
             compose.runOnUiThread { shown = false }
             compose.waitForIdle()

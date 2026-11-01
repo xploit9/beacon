@@ -124,6 +124,9 @@ class GitHubReleasesTest {
             metadata(digest = sha.uppercase()),
             metadata(digest = "abc"),
             metadata(plugin = "1.1"),
+            // One release is one version: a plugin that differs from the app is refused, older or newer.
+            metadata(plugin = "1.1.2"),
+            metadata(plugin = "1.1.4"),
             metadata(code = 20),
             metadata(size = 0),
             metadata(size = apk.size + 1), // the API lists a different size for the APK

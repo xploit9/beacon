@@ -62,18 +62,18 @@ class GrokCallLiveUiTest {
             phase="settings-load"
             withContext(Dispatchers.Main.immediate) { vm.tab("More");vm.more("Beacon") }
             rule.waitForIdle()
+            rule.onNodeWithTag("voice-provider-change").performScrollTo().performClick()
             rule.onNodeWithTag("voice-model-grok").performScrollTo().performClick()
+            rule.onNodeWithTag("setup-voice-continue").performScrollTo().performClick()
             phase="settings-save"
             await { voiceStore.settings().provider=="grok" }
             rule.onNodeWithTag("voice-model-grok").assertIsSelected()
             val grokBefore=voiceStore.settings("grok")
             val targetVoice=if(grokBefore.voice=="ara") "eve" else "ara"
             val targetPersonality=if(grokBefore.personality=="warm") "balanced" else "warm"
-            rule.onNode(hasText("Voice") and hasText("${grokBefore.voice}")).performScrollTo().performClick()
-            rule.onNodeWithText(targetVoice).performClick()
+            rule.onNodeWithTag("voice-option-voice-$targetVoice").performScrollTo().performClick()
             await { voiceStore.settings("grok").voice==targetVoice }
-            rule.onNode(hasText("Personality") and hasText("${grokBefore.personality.replaceFirstChar { it.uppercase() }}")).performScrollTo().performClick()
-            rule.onNodeWithText(targetPersonality.replaceFirstChar { it.uppercase() }).performClick()
+            rule.onNodeWithTag("voice-option-personality-$targetPersonality").performScrollTo().performClick()
             await { voiceStore.settings("grok").personality==targetPersonality }
             phase="create-chat"
             withContext(Dispatchers.Main.immediate) { vm.newChat(json("title" to "Grok call verification")) }.join()

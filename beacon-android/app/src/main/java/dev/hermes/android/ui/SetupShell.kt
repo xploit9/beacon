@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -31,8 +32,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
@@ -47,10 +51,13 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTag
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowInsetsControllerCompat
 
@@ -66,6 +73,19 @@ internal fun setupStepNumber(step: String): Int = when (step) {
     "done" -> 4
     else -> 3
 }
+
+/** The pages of step 3 (voice, then permissions) in the order the wizard shows them; the bar moves one page at a time inside that step. */
+internal val SETUP_CALL_PAGES = listOf("voice-provider", "voice-key", "voice-customize", "permission-microphone", "permission-notifications", "permission-full-screen")
+
+/** How far through the whole wizard [step] is, counted in steps: the steps before it, plus its share of step 3's pages. */
+internal fun setupProgress(step: String): Float {
+    val number = setupStepNumber(step)
+    val page = SETUP_CALL_PAGES.indexOf(step)
+    return if (page < 0) number.toFloat() else (number - 1) + (page + 1) / SETUP_CALL_PAGES.size.toFloat()
+}
+
+/** The wizard step being shown, so the shell can place its bar without every page passing it down. */
+internal val LocalSetupStep = compositionLocalOf { "" }
 
 /** The wizard's branded dark surface, used in both system themes. */
 internal val SetupSea = Color(0xff07151e)
@@ -135,6 +155,8 @@ internal fun SetupShell(
 ) {
     SetupSeaTheme {
         val glow = MaterialTheme.colorScheme.primary
+        val key = LocalSetupStep.current
+        val progress = if (key.isBlank()) step.toFloat() else setupProgress(key)
         Box(Modifier.fillMaxSize().background(SetupSea)) {
             Canvas(Modifier.fillMaxSize()) {
                 drawRect(Brush.radialGradient(
@@ -150,7 +172,7 @@ internal fun SetupShell(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(32.dp)) {
-                        SetupHeader(step)
+                        SetupHeader(step, progress)
                         SetupTitle(title, body)
                     }
                     Surface(Modifier.weight(1.2f), shape = MaterialTheme.shapes.extraLarge, color = MaterialTheme.colorScheme.surfaceContainerHigh) {
@@ -160,7 +182,7 @@ internal fun SetupShell(
                         }
                     }
                 } else Column(Modifier.widthIn(max = 480.dp).fillMaxSize().padding(start = 24.dp, end = 24.dp, top = 16.dp, bottom = 24.dp)) {
-                    SetupHeader(step)
+                    SetupHeader(step, progress)
                     Spacer(Modifier.height(32.dp))
                     Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(24.dp)) {
                         SetupTitle(title, body)
@@ -174,7 +196,8 @@ internal fun SetupShell(
 }
 
 @Composable
-private fun SetupHeader(step: Int) {
+private fun SetupHeader(step: Int, progress: Float) {
+    val motion = rememberNativeMotionEnabled()
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
@@ -184,13 +207,17 @@ private fun SetupHeader(step: Int) {
             Text(uiText("Beacon"), Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
             Text(uiText("Step {0} of {1}").replace("{0}", "$step").replace("{1}", "$SETUP_STEPS"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        // Decorative: the step text carries the meaning.
-        Row(Modifier.fillMaxWidth().clearAndSetSemantics {}, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        // The step text names the step; the bar fills a little more on every page of step 3.
+        Row(Modifier.fillMaxWidth().clearAndSetSemantics {
+            testTag = "setup-progress"
+            progressBarRangeInfo = ProgressBarRangeInfo(progress.coerceIn(0f, SETUP_STEPS.toFloat()), 0f..SETUP_STEPS.toFloat())
+        }, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             repeat(SETUP_STEPS) { index ->
-                Box(
-                    Modifier.weight(1f).height(4.dp).clip(RoundedCornerShape(2.dp))
-                        .background(if (index < step) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant),
-                )
+                val fill = (progress - index).coerceIn(0f, 1f)
+                val shown = if (motion) animateFloatAsState(fill, tween(280), label = "setup-progress-$index").value else fill
+                Box(Modifier.weight(1f).height(4.dp).clip(RoundedCornerShape(2.dp)).background(MaterialTheme.colorScheme.surfaceVariant)) {
+                    Box(Modifier.fillMaxHeight().fillMaxWidth(shown).background(MaterialTheme.colorScheme.primary))
+                }
             }
         }
     }

@@ -10,7 +10,7 @@ def test_plugin_version_reports_imported_and_current_manifest_versions(harness,m
     response=client.get('/api/plugins/beacon/mobile/plugin/version')
 
     assert response.status_code==200
-    assert response.json()=={'running':'2.4.0','installed':'2.5.0'}
+    assert response.json()=={'running':'2.4.0','installed':'2.5.0','gateway':''}
     client.headers['x-fixture-owner']='foreign'
     assert client.get('/api/plugins/beacon/mobile/plugin/version').status_code==403
     client.headers.pop('x-fixture-owner')

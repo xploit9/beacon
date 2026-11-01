@@ -544,8 +544,9 @@ def history(owner,provider,profile,stored):
         if remaining<=0: break
     return list(reversed(output))
 
-def local_time(profile,*,bound=False):
-    """The owner's date and time on the profile's own clock; a voice model has no clock of its own."""
+def profile_clock(profile,*,bound=False):
+    """One read of the profile's own clock: the owner's date and time (a voice model has no clock of its own) and the
+    zone the phone plans greetings in; ('','') when the profile has no clock."""
     try:
         if bound:
             import hermes_time
@@ -553,9 +554,26 @@ def local_time(profile,*,bound=False):
         else:
             now=sys.modules['beacon_proactive'].profile_now(profile)
         zone=getattr(now.tzinfo,'key',None) or now.tzname() or ''
-        return now.strftime('%A %d %B %Y, %H:%M')+(' ('+zone+')' if zone else '')
+        text=now.strftime('%A %d %B %Y, %H:%M')+(' ('+zone+')' if zone else '')
+    except Exception:
+        return '',''
+    return text,_zone_id(now)
+
+
+def _zone_id(now):
+    """An IANA zone, else the clock's UTC offset as '+04:00'; Android reads either."""
+    try:
+        key=getattr(now.tzinfo,'key',None)
+        if isinstance(key,str) and key: return key
+        minutes=int(now.utcoffset().total_seconds()//60)
+        return ('-' if minutes<0 else '+')+f'{abs(minutes)//60:02d}:{abs(minutes)%60:02d}'
     except Exception:
         return ''
+
+
+def local_time(profile,*,bound=False):
+    """The owner's date and time on the profile's own clock; a voice model has no clock of its own."""
+    return profile_clock(profile,bound=bound)[0]
 
 
 GENERIC_OWNER_NAMES = {'hermes','admin','root','user','owner','default','beacon','test'}
@@ -590,6 +608,31 @@ def greeting_for(display_name,clock,callback):
     if hour<5: return f"Hi{', '+name if name else ''}. What can I do for you?"
     part='morning' if hour<12 else 'afternoon' if hour<17 else 'evening'
     return f"Good {part}{', '+name if name else ''}. What can I do for you?"
+
+
+def greeting_plan(display_name,zone):
+    """An ordinary call's opening line for each part of the profile's day, so the phone has the next call's greeting
+    ready before the tap. Built by greeting_for itself; without a profile clock its one line holds all day."""
+    if not zone: return {'zone':'UTC','variants':[{'from_hour':0,'text':greeting_for(display_name,'',False)[:160]}]}
+    variants=[]
+    for hour in range(24):
+        text=greeting_for(display_name,f'{hour:02d}:00',False)[:160]
+        if not variants or variants[-1]['text']!=text: variants.append({'from_hour':hour,'text':text})
+    return {'zone':zone,'variants':variants}
+
+
+def opening_name(display_name,owner_name,remembered):
+    """The name the owner typed in Beacon wins; else the one Hermes' USER.md holds; else the sign-in name."""
+    return (owner_name.strip() if valid_owner_name(owner_name) else '') or remembered or display_name
+
+
+def grant_greeting(profile,display_name,owner_name=''):
+    """The opening line of an ordinary (not callback) call, ready when the call is granted: the name and clock rules of context()'s native path."""
+    def load(root):
+        try: remembered=owner_name_in_memory(root,config(root))
+        except Exception: remembered=''
+        return greeting_for(opening_name(display_name,owner_name,remembered),local_time(profile,bound=True),False)[:160]
+    return scoped(profile,load,hydrate_secrets=False)
 
 
 # The phone allows the call context 8 s; a cold process spends seconds on MCP discovery, so the hint waits briefly
@@ -660,15 +703,13 @@ def context(owner,provider,profile,stored,call_id,display_name='',owner_name='',
         if soul: instruction+='\n\nProfile personality:\n'+soul
         if language: instruction+='\nPreferred spoken language: '+language
         # Native setup reads metadata under the existing profile scope; no provider secrets are needed.
-        clock=local_time(profile,bound=True) if native_backend else local_time(profile)
+        clock,zone=profile_clock(profile,bound=True) if native_backend else profile_clock(profile)
         if clock: instruction+='\nCurrent local time for the owner: '+clock
-        # The name the owner typed in Beacon wins; else the one Hermes' USER.md holds; else the sign-in name.
-        preferred_name=(owner_name.strip() if valid_owner_name(owner_name) else '') or remembered
-        greeting_name=preferred_name or display_name
+        greeting_name=opening_name(display_name,owner_name,remembered)
         first_name=_owner_first_name(greeting_name)
         greeting=greeting_for(greeting_name,clock,bool(callback))
         return {'backend':'hermes' if native_backend else 'direct','profile':profile,'selected_session_id':stored,'system_instruction':'' if native_backend else instruction,'context_summary':summary,
-                'tool_catalogue':catalogue,'greeting':greeting,'owner_first_name':first_name,'callback':callback,
+                'tool_catalogue':catalogue,'greeting':greeting,'greeting_plan':greeting_plan(greeting_name,zone),'owner_first_name':first_name,'callback':callback,
                 'context':{'history':messages,'personality':soul,'memory':memory,**({'callback_reason':{'untrusted_text':callback.get('reason')},'callback_result':callback.get('result','')} if callback else {}),**({'language':language} if language else {})},
                 'configured_memory_provider':name if external_memory_configured(cfg) else 'builtin' if memory else None,
                 'capabilities':{'profile_context':True} if native_backend else {'web_search':True,'memory_recall':bool(memory or external_memory_configured(cfg)),'skills':True,'profile_context':True},

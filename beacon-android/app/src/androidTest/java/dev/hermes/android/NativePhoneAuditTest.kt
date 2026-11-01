@@ -73,9 +73,9 @@ class NativePhoneAuditTest {
             assertNull(vm.phoneSettings.skills.value.error)
             capture("skills")
             field("Search skills").performTextReplacement("hermes-agent")
-            compose.onAllNodesWithText("Read & adjust").onFirst().performScrollTo().performClick()
+            compose.onNodeWithTag("skill-row-hermes-agent").performScrollTo().performClick()
             waitFor { vm.phoneSettings.skills.value.content != null && !vm.phoneSettings.skills.value.loading }
-            click("Adjust instructions")
+            click("Edit instructions")
             field("Skill instructions").performTextReplacement("Unsaved phone audit draft")
             click("Cancel")
             compose.onNodeWithText("Keep editing").performClick()
@@ -103,14 +103,14 @@ class NativePhoneAuditTest {
             navigate("Settings"); click("Profiles")
             waitFor { vm.phoneSettings.bots.value.profiles.isNotEmpty() && !vm.phoneSettings.bots.value.loading }
             capture("profiles")
-            compose.onAllNodesWithText("View profile").onFirst().performScrollTo().performClick()
+            compose.onNodeWithTag("profile-open:default").performScrollTo().performClick()
             waitFor { vm.phoneSettings.bots.value.selected != null && !vm.phoneSettings.bots.value.loading }
-            click("Change default model")
+            click("Model")
             waitFor { vm.phoneSettings.botModels.value.isNotEmpty() }
             field("Search models or providers").performTextReplacement("no-model-matches-audit")
-            compose.onNodeWithText("No models match this search.").assertExists()
+            compose.onNodeWithText("No matching models").assertExists()
             androidx.test.espresso.Espresso.closeSoftKeyboard()
-            click("Cancel edit")
+            click("Cancel")
             steps.add("Profile purpose/model reader, configured search and cancel")
 
             navigate("Settings")
@@ -124,7 +124,7 @@ class NativePhoneAuditTest {
             assertEquals("", recordError(vm.data.value["native-mcp"]))
             field("Search MCP servers").performTextReplacement("tool_gateway_research")
             androidx.test.espresso.Espresso.closeSoftKeyboard()
-            click("Test server")
+            click("Test")
             waitFor { vm.data.value["mcp-test:tool_gateway_research"] != null }
             assertTrue(vm.data.value.getValue("mcp-test:tool_gateway_research").optBoolean("ok"))
             capture("connections")

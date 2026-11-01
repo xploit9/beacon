@@ -57,7 +57,14 @@ class CallHistoryUiTest {
                 "duration_s" to 83, "provider" to "gemini", "conversation_id" to "chat-a", "reason" to null, "has_transcript" to true,
                 "email_notice_id" to "email-notice-42"))
             .put(json("id" to "call-history-missed", "direction" to "incoming", "state" to "missed", "started_at" to now - 60,
-                "duration_s" to null, "provider" to null, "conversation_id" to "chat-b", "reason" to "No answer", "has_transcript" to false)), "next" to null)
+                "duration_s" to null, "provider" to null, "conversation_id" to "chat-b", "reason" to "No answer", "has_transcript" to false))
+            // Three short redials a little earlier in the same conversation: one row, "3 attempts".
+            .put(json("id" to "call-history-redial-3", "direction" to "outgoing", "state" to "completed", "started_at" to now - 3600,
+                "duration_s" to 6, "provider" to "gemini", "conversation_id" to "chat-a", "reason" to null, "has_transcript" to false))
+            .put(json("id" to "call-history-redial-2", "direction" to "outgoing", "state" to "completed", "started_at" to now - 3620,
+                "duration_s" to 5, "provider" to "gemini", "conversation_id" to "chat-a", "reason" to null, "has_transcript" to false))
+            .put(json("id" to "call-history-redial-1", "direction" to "outgoing", "state" to "completed", "started_at" to now - 3640,
+                "duration_s" to 7, "provider" to "gemini", "conversation_id" to "chat-a", "reason" to null, "has_transcript" to false)), "next" to null)
         val messages = buildList {
             (1..45).forEach { index ->
                 if (index == 23) add(Message("stored-call-row", "user", "Transcript from completed call", sessionId = "chat-a"))
@@ -107,11 +114,22 @@ class CallHistoryUiTest {
             compose.onNodeWithTag("call-history-open").performClick()
             compose.waitUntil(10_000) {
                 fixture.requests.any { it.string("path") == "/api/plugins/beacon/mobile/calls" && it.string("profile") == "default" } &&
-                    compose.onAllNodesWithText("Outgoing call").fetchSemanticsNodes().isNotEmpty()
+                    compose.onAllNodesWithTag("call-history-row:$callId").fetchSemanticsNodes().isNotEmpty()
             }
-            compose.onNodeWithText("Outgoing call").assertExists()
-            compose.onNodeWithText("Missed call").assertExists()
-            compose.onNodeWithText(" · 1:23 · Gemini", substring = true).assertExists()
+            // A row is titled by its reason, else the first thing the user said, else its direction.
+            compose.onNodeWithTag("call-history-row:$callId").assert(
+                hasText("Outgoing call", substring = true) or hasText("Transcript from completed call", substring = true))
+            compose.onNodeWithTag("call-history-row:call-history-missed").assert(hasText("No answer", substring = true))
+            // The engine name lives in the opened call, not in the row.
+            compose.onNodeWithTag("call-history-row:$callId").assert(hasText(" · 1:23", substring = true))
+            compose.onAllNodesWithText("Gemini", substring = true).assertCountEquals(0)
+            // Repeated short redials are one row; it opens into the individual attempts.
+            compose.onNodeWithTag("call-history-group:call-history-redial-3").assert(hasText("3 attempts", substring = true))
+            compose.onAllNodesWithTag("call-history-row:call-history-redial-2").assertCountEquals(0)
+            compose.onNodeWithTag("call-history-group:call-history-redial-3").performClick()
+            for (redial in 1..3) compose.onNodeWithTag("call-history-row:call-history-redial-$redial").assertExists()
+            compose.onNodeWithTag("call-history-group:call-history-redial-3").performClick()
+            compose.onAllNodesWithTag("call-history-row:call-history-redial-2").assertCountEquals(0)
             fixture.proactiveFeedbackStatusCode = 503
             compose.onNodeWithTag("call-history-feedback-not-important:$callId").performClick()
             compose.waitUntil(5_000) { compose.onAllNodesWithText("Couldn't save your choice. Try again.").fetchSemanticsNodes().isNotEmpty() }
@@ -149,7 +167,7 @@ class CallHistoryUiTest {
 
             compose.onNodeWithContentDescription("Conversation actions").performClick()
             compose.onNodeWithTag("call-history-open").performClick()
-            compose.waitUntil(10_000) { compose.onAllNodesWithText("Missed call").fetchSemanticsNodes().isNotEmpty() }
+            compose.waitUntil(10_000) { compose.onAllNodesWithTag("call-history-row:call-history-missed").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithTag("call-history-row:call-history-missed").performClick()
             compose.waitUntil(5_000) { vm.chat.value.sessionId == "chat-b" }
         } finally {

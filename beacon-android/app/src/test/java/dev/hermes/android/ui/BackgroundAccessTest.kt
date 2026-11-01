@@ -57,6 +57,28 @@ class BackgroundAccessTest {
         assertFalse("store", overlayNeedsRestrictedAllow(36, PackageInstaller.PACKAGE_SOURCE_STORE, overlayGranted = false))
     }
 
+    @Test fun aStrictMakerPhoneGetsAllThreeStepsInOrderAndOtherPhonesOnlyWhatAndroidShows() {
+        assertEquals(listOf(BackgroundStep.Battery, BackgroundStep.AutoLaunch, BackgroundStep.Background), backgroundSteps(StrictMaker.HONOR))
+        StrictMaker.entries.forEach { assertEquals(it.name, BackgroundStep.entries, backgroundSteps(it)) }
+        assertEquals(listOf(BackgroundStep.Battery, BackgroundStep.Background), backgroundSteps(null))
+    }
+
+    @Test fun theMakersAutoLaunchScreenCannotBeReadSoItClaimsNoResult() {
+        // Nothing here asserts what MagicOS or any other maker does; only the two states Android itself reports have an answer.
+        listOf(true, false).forEach { optimized -> listOf(true, false).forEach { restricted -> assertNull(backgroundStepLimited(BackgroundStep.AutoLaunch, optimized, restricted)) } }
+        assertEquals(true, backgroundStepLimited(BackgroundStep.Battery, optimized = true, restricted = false))
+        assertEquals(false, backgroundStepLimited(BackgroundStep.Battery, optimized = false, restricted = true))
+        assertEquals(true, backgroundStepLimited(BackgroundStep.Background, optimized = false, restricted = true))
+        assertEquals(false, backgroundStepLimited(BackgroundStep.Background, optimized = true, restricted = false))
+    }
+
+    @Test fun theNextStepIsTheFirstReadableOneThatStillLimitsBeacon() {
+        assertEquals(BackgroundStep.Battery, nextBackgroundStep(optimized = true, restricted = true))
+        assertEquals(BackgroundStep.Battery, nextBackgroundStep(optimized = true, restricted = false))
+        assertEquals(BackgroundStep.Background, nextBackgroundStep(optimized = false, restricted = true))
+        assertNull("nothing Android reports limits Beacon", nextBackgroundStep(optimized = false, restricted = false))
+    }
+
     @Test fun theManifestQueriesNameEveryPackageABackgroundScreenStartsIn() {
         // Android 11+ hides a package the manifest does not list, so a missing entry makes that maker's screen fall through to App info.
         val manifest = listOf("src/main", "app/src/main", "beacon-android/app/src/main").map { File(it, "AndroidManifest.xml") }.firstOrNull { it.isFile }

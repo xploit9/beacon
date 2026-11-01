@@ -133,7 +133,7 @@ class ChatScreenCallTranscriptUiTest {
             compose.onNodeWithContentDescription("Search this conversation").performClick()
             compose.onNode(hasSetTextAction() and hasText("Find in conversation")).performTextInput("orchid")
             compose.onNodeWithTag("call-transcript-card:call-one").assertIsDisplayed()
-            compose.onNodeWithTag("call-transcript-card:call-two").assertDoesNotExist()
+            compose.onNodeWithTag("search-count").assertTextEquals("1 of 1")
             // Release review 1.1.2: a search shows its matching line even when the card is collapsed.
             compose.onNodeWithText("Hidden orchid clue").assertExists()
         } finally {

@@ -42,6 +42,9 @@ class BeaconApplication : Application() {
             if (dev.hermes.android.ui.nativeLanguageFor(java.util.Locale.getDefault()) != "en") launch { readTranslations() }
             launch { preferences.data.collect { dev.hermes.android.data.currentAssistantName = dev.hermes.android.data.AppPreferences.read(it).assistantName } }
             runCatching { push.reconcileIncomingDeadlines() }
+            // Why the last process ended (Android keeps only a few), then Keep connected back on if the owner wants it and Android stopped it.
+            runCatching { dev.hermes.android.push.DeliveryLog.recordProcessExit(this@BeaconApplication) }
+            runCatching { dev.hermes.android.push.KeepConnectedService.startIfEnabled(this@BeaconApplication) }
             runCatching { cache.trim() }
             runCatching { java.io.File(cacheDir, "camera").listFiles()?.filter { it.isFile && it.lastModified() < staleBefore }?.forEach { it.delete() } }
             // Only temporary content created by this client, within its private cache directory.

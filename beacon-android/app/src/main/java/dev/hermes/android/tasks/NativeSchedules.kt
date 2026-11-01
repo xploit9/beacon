@@ -18,6 +18,56 @@ internal fun scheduleTime(value: String, timezone: String, empty: String, is24Ho
         java.text.SimpleDateFormat(pattern, locale).also { it.timeZone = zone }.format(java.util.Date.from(time.toInstant()))
     }.getOrDefault("Time unavailable")
 }
+/** Whole-phrase templates for [scheduleNextRun] in the phone's language; {0} is a number of minutes or a clock time. */
+internal class ScheduleWhenWords(val due: String = "Due now", val minutes: String = "in {0} min", val today: String = "Today {0}", val tomorrow: String = "Tomorrow {0}")
+
+/**
+ * When a schedule runs next, in the phone's own zone and clock: "in 3 min" within the hour, then "Today 3:45 PM", "Tomorrow 8:00",
+ * the weekday inside a week, else the date. [empty] stands for a job with no next run.
+ */
+internal fun scheduleNextRun(
+    value: String, empty: String, words: ScheduleWhenWords = ScheduleWhenWords(), now: java.time.Instant = java.time.Instant.now(),
+    zone: java.time.ZoneId = java.time.ZoneId.systemDefault(), is24Hour: Boolean = true, locale: java.util.Locale = java.util.Locale.getDefault(),
+): String {
+    if (value.isBlank()) return empty
+    return runCatching {
+        val at = java.time.OffsetDateTime.parse(value).toInstant()
+        val seconds = java.time.Duration.between(now, at).seconds
+        if (seconds <= 0) return@runCatching words.due
+        if (seconds < 3600) return@runCatching words.minutes.replace("{0}", "${(seconds + 59) / 60}")
+        val day = at.atZone(zone).toLocalDate()
+        val days = java.time.temporal.ChronoUnit.DAYS.between(now.atZone(zone).toLocalDate(), day)
+        fun format(pattern: String) = java.text.SimpleDateFormat(pattern, locale).also { it.timeZone = java.util.TimeZone.getTimeZone(zone) }.format(java.util.Date.from(at))
+        val clock = format(nativeClockPattern(locale, is24Hour))
+        when {
+            days == 0L -> words.today.replace("{0}", clock)
+            days == 1L -> words.tomorrow.replace("{0}", clock)
+            days in 2L..6L -> format("EEE ${nativeClockPattern(locale, is24Hour)}")
+            else -> format(nativeDayPattern(locale, withYear = day.year != now.atZone(zone).year, withWeekday = false) + ", " + nativeClockPattern(locale, is24Hour))
+        }
+    }.getOrDefault("Time unavailable")
+}
+
+/** Hermes' zone only matters on screen when its clock differs from the phone's: same offset right now, or no zone sent, means no note. */
+internal fun scheduleZoneDiffers(serverZone: String, phoneZone: java.time.ZoneId = java.time.ZoneId.systemDefault(), now: java.time.Instant = java.time.Instant.now()): Boolean {
+    if (serverZone.isBlank()) return false
+    return runCatching { java.time.ZoneId.of(serverZone).rules.getOffset(now) != phoneZone.rules.getOffset(now) }.getOrDefault(true)
+}
+
+/** What a schedule card's status chip shows; the screen names each through uiText. */
+internal enum class ScheduleChip {
+    Active, Paused, Failed, Running, Completed, Unconfirmed;
+    companion object {
+        fun of(job: JSONObject): ScheduleChip = when (scheduleState(job)) {
+            "Paused" -> Paused
+            "Completed" -> Completed
+            "Running" -> Running
+            "Failed" -> Failed
+            "Waiting" -> Active
+            else -> Unconfirmed
+        }
+    }
+}
 internal val editableScheduleFields = setOf("name", "prompt", "schedule", "deliver", "skills", "model", "provider")
 internal fun schedulePayload(body: JSONObject): JSONObject = JSONObject().apply { editableScheduleFields.forEach { key -> if (body.has(key) && !body.isNull(key)) put(key, body.opt(key)) } }
 internal fun scheduleUpdates(body: JSONObject): JSONObject = schedulePayload(body).apply {

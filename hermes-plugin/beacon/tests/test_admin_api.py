@@ -30,6 +30,55 @@ def test_plugin_restart_does_not_credit_a_recent_completed_restart(harness, monk
     assert response.json()['restart_started'] is False
 
 
+LIVE_SESSIONS_REFUSAL = ('Refusing to restart the gateway: 2 live session(s) would be interrupted.\n'
+                         '  Let them finish, or interrupt them deliberately:\n'
+                         '    POST /api/gateway/restart?interrupt=true   # interrupts 2 live session(s)')
+
+
+def _restart(harness, monkeypatch, native, before=None):
+    host, client, _, _, app = harness
+    app.include_router(api.build_router(host.identity, host.body), prefix='/api/plugins/beacon-restart-fixture')
+    async def status(): return before or {'pid': None, 'running': False, 'exit_code': None}
+    monkeypatch.setattr(api, 'native_plugin_restart_status', status, raising=False)
+    monkeypatch.setattr(api, 'native_plugin_restart', native, raising=False)
+    return client.post('/api/plugins/beacon-restart-fixture/admin/plugin/restart', json={})
+
+
+def test_a_restart_hermes_refuses_for_live_sessions_says_so_and_keeps_its_text(harness, monkeypatch):
+    response = _restart(harness, monkeypatch, lambda profile: {'restart_started': False, 'restart_error': LIVE_SESSIONS_REFUSAL})
+    assert response.status_code == 200
+    assert response.json() == {'restart_started': False, 'restart_error': LIVE_SESSIONS_REFUSAL, 'restart_error_code': 'live_sessions'}
+
+
+@pytest.mark.parametrize('result', [{'restart_started': False, 'restart_error': 'spawn failed'},
+                                    {'restart_started': False, 'restart_error': ''},
+                                    {'restart_started': False}])
+def test_any_other_refused_restart_is_a_failed_restart(harness, monkeypatch, result):
+    response = _restart(harness, monkeypatch, lambda profile: dict(result))
+    assert response.status_code == 200
+    assert response.json() == {**result, 'restart_error_code': 'failed'}
+
+
+def test_a_restart_that_is_only_an_earlier_one_is_stale_not_started(harness, monkeypatch):
+    response = _restart(harness, monkeypatch, lambda profile: {'restart_started': True, 'restart_pid': 123, 'restart_action': 'gateway-restart'},
+                        before={'pid': 123, 'running': False, 'exit_code': 0})
+    assert response.status_code == 200
+    assert response.json() == {'restart_started': False, 'restart_pid': 123, 'restart_action': 'gateway-restart', 'restart_error_code': 'stale'}
+
+
+def test_a_started_restart_carries_no_error_code(harness, monkeypatch):
+    response = _restart(harness, monkeypatch, lambda profile: {'restart_started': True, 'restart_pid': 124, 'restart_action': 'gateway-restart'},
+                        before={'pid': 123, 'running': False, 'exit_code': 0})
+    assert response.json() == {'restart_started': True, 'restart_pid': 124, 'restart_action': 'gateway-restart'}
+
+
+def test_a_restart_hermes_cannot_start_still_answers_503_without_a_code(harness, monkeypatch):
+    def broken(profile): raise RuntimeError('private detail')
+    response = _restart(harness, monkeypatch, broken)
+    assert response.status_code == 503
+    assert response.json() == {'detail': 'Hermes could not start the gateway restart'}
+
+
 def test_native_plugin_restart_delegates_without_forcing_or_patching_native(monkeypatch):
     from types import SimpleNamespace
     calls = []

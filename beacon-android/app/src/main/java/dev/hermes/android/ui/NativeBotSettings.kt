@@ -1,184 +1,194 @@
+@file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class, androidx.compose.material3.ExperimentalMaterial3Api::class)
 package dev.hermes.android.ui
 
+import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.selection.selectable
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
-import androidx.compose.material.icons.automirrored.rounded.Launch
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import dev.hermes.android.data.NativeBotsState
 import kotlinx.coroutines.delay
 
-@OptIn(ExperimentalMaterial3Api::class)
+/** Models shown before "More models": the rest wait behind one button, and the chosen model always stays on screen. */
+internal const val ProfileModelsCollapsed = 8
+
+/** The id [SettingsOptionCards] keeps for one provider/model pair. */
+internal fun profileModelOptionId(provider: String, model: String) = "$provider:$model"
+
+/** The models that match a search typed over "provider model"; blank shows all, repeats show once. */
+internal fun profileModelsMatching(models: List<Pair<String, String>>, query: String): List<Pair<String, String>> =
+    models.distinct().filter { query.isBlank() || "${it.first} ${it.second}".contains(query, ignoreCase = true) }
+
+/**
+ * Profiles: a list of profile rows, and for one profile a hero with its default model, behavior and shortcuts.
+ * [approvals] is the profile's approval choice; it sits first in the list and under the hero on a profile, where it applies to that profile.
+ */
 @Composable fun NativeBotSettings(state: NativeBotsState, onOpen: (String) -> Unit, onBack: () -> Unit,
     onEditModel: () -> Unit, onModelDraft: (String, String) -> Unit, onSaveModel: () -> Unit, onCancel: () -> Unit,
     onSettings: (String, String) -> Unit, onRefresh: () -> Unit, models: List<Pair<String, String>> = emptyList(), renderBehavior: @Composable (String) -> Unit = { SelectionContainer { Text(it, style = MaterialTheme.typography.bodyLarge) } }, profileLabel: (String) -> String = { it },
-    onNewProfile: (() -> Unit)? = null, canDelete: (String) -> Boolean = { false }, onDelete: (String) -> Unit = {}) {
+    onNewProfile: (() -> Unit)? = null, canDelete: (String) -> Boolean = { false }, onDelete: (String) -> Unit = {},
+    activeProfile: String = "", approvals: (@Composable () -> Unit)? = null) {
     var showBehavior by rememberSaveable(state.selected?.profile) { mutableStateOf(false) }
     var modelSearch by rememberSaveable(state.selected?.profile, state.editing) { mutableStateOf("") }
     var customModel by rememberSaveable(state.selected?.profile, state.editing) { mutableStateOf(false) }
+    var moreModels by rememberSaveable(state.selected?.profile, state.editing) { mutableStateOf(false) }
+    // The pull-down spinner is only for a pull; a load that starts by itself shows the thin bar over the rows already there.
+    var pulled by remember { mutableStateOf(false) }
+    LaunchedEffect(state.loading) { if (!state.loading) pulled = false }
     val motionEnabled = rememberNativeMotionEnabled()
-    PullToRefreshBox(isRefreshing = state.loading, onRefresh = { if (!state.saving && !state.editing) onRefresh() }, modifier = Modifier.fillMaxSize()) {
-        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(SettingsPagePadding), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            item {
-                ProfileEntrance(0, motionEnabled) {
-                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(uiText("Purpose, model and behavior for each profile."), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        if (onNewProfile != null && state.selected == null) Button(onClick = onNewProfile, enabled = !state.loading, modifier = Modifier.heightIn(min = 48.dp).testTag("new-profile")) { Icon(Icons.Rounded.Add, null); Spacer(Modifier.width(8.dp)); Text(uiText("New profile")) }
-                    }
-                }
-            }
-            if (state.loading || state.saving) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
-            if (state.error.isNotBlank()) item { Text(uiText(state.error), color = MaterialTheme.colorScheme.error) }
-            if (state.notice.isNotBlank()) item { Text(uiText(state.notice)) }
-            if (state.selected == null) {
-                if (!state.loading && state.profiles.isEmpty()) item { EmptyState(uiText("No profiles"), uiText("Pull down to check again."), ProfilesIcon, action = uiText("Refresh"), onAction = onRefresh) }
-                itemsIndexed(state.profiles, key = { _, bot -> bot.profile }) { index, bot ->
-                    ProfileEntrance(index + 1, motionEnabled) {
-                        Glass(Modifier.fillMaxWidth()) {
-                            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                    Icon(ProfilesIcon, null, tint = MaterialTheme.colorScheme.primary)
-                                    Text(profileLabel(bot.profile), style = MaterialTheme.typography.titleMedium)
-                                }
-                                ProfileValue(Icons.Rounded.Flag, "Purpose", bot.purpose.ifBlank { uiText("Not set") })
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    OutlinedButton(onClick = { onOpen(bot.profile) }, enabled = !state.loading, modifier = Modifier.testTag("profile-open:${bot.profile}")) { Text(uiText("View profile")) }
-                                    if (canDelete(bot.profile)) TextButton(onClick = { onDelete(bot.profile) }, enabled = !state.loading, modifier = Modifier.heightIn(min = 48.dp).testTag("delete-profile:${bot.profile}")) { Text(uiText("Delete profile"), color = MaterialTheme.colorScheme.error) }
-                                }
+    val retry = if (state.editing || state.saving) null else onRefresh
+    PullToRefreshBox(isRefreshing = pulled && state.loading, onRefresh = { if (!state.saving && !state.editing) { pulled = true; onRefresh() } }, modifier = Modifier.fillMaxSize()) {
+        SettingsList(refreshing = state.loading || state.saving, testTag = "profiles-list") {
+            val bot = state.selected
+            if (bot == null) {
+                if (approvals != null) item(key = "approvals") { ProfileEntrance(0, motionEnabled) { approvals() } }
+                item(key = "profiles") {
+                    ProfileEntrance(1, motionEnabled) {
+                        // Not "Profiles": the page header already says that, and a Settings page shows its title once.
+                        SettingsSection(title = uiText("Your profiles"), testTag = "profiles-section") {
+                            val shown = state.error.isNotBlank() || state.notice.isNotBlank()
+                            ProfileFeedback(state, retry)
+                            if (state.profiles.isEmpty()) when {
+                                state.loading -> SettingsSkeletonRows(3)
+                                state.error.isBlank() -> SettingsEmpty(uiText("No profiles"), ProfilesIcon, action = SettingsAction(uiText("Refresh"), onRefresh))
+                            }
+                            state.profiles.forEachIndexed { index, summary ->
+                                if (index > 0 || shown) SettingsDivider()
+                                val active = activeProfile.isNotBlank() && summary.profile == activeProfile
+                                SettingsNavRow(profileLabel(summary.profile), { onOpen(summary.profile) }, icon = ProfilesIcon, value = summary.purpose.ifBlank { uiText("No purpose") },
+                                    status = if (active) SettingsStatus.Ok else null, statusLabel = if (active) uiText("Active") else "", enabled = !state.loading, testTag = "profile-open:${summary.profile}")
+                            }
+                            if (onNewProfile != null) {
+                                if (state.profiles.isNotEmpty() || shown) SettingsDivider()
+                                SettingsActionRow(uiText("New profile"), onNewProfile, icon = Icons.Rounded.Add, enabled = !state.loading, testTag = "new-profile")
                             }
                         }
                     }
                 }
             } else {
-                val bot = state.selected
-                item {
+                val active = activeProfile.isNotBlank() && bot.profile == activeProfile
+                item(key = "hero") {
                     ProfileEntrance(0, motionEnabled) {
-                        Glass(Modifier.fillMaxWidth()) {
-                            Column(Modifier.fillMaxWidth().padding(16.dp)) {
-                                Text(profileLabel(bot.profile), style = MaterialTheme.typography.titleLarge)
-                                Text(uiText("Profile settings"), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
-                        }
+                        SettingsStatusHero(status = null, title = profileLabel(bot.profile), line = bot.description.ifBlank { uiText("No purpose") }, icon = ProfilesIcon,
+                            meta = if (active) ({ SettingsStatusPill(SettingsStatus.Ok, uiText("Active")) }) else null, testTag = "profile-hero")
                     }
                 }
-                item {
-                    ProfileEntrance(1, motionEnabled) {
-                        ProfileCard(Icons.Rounded.Flag, "Purpose") {
-                            SelectionContainer { Text(bot.description.ifBlank { uiText("No purpose set.") }) }
-                        }
-                    }
-                }
-                item {
+                if (approvals != null) item(key = "approvals") { ProfileEntrance(1, motionEnabled) { approvals() } }
+                item(key = "model") {
                     ProfileEntrance(2, motionEnabled) {
-                        ProfileCard(Icons.Rounded.Memory, "Default model") {
-                            Text("${bot.provider.ifBlank { uiText("Provider not set") }} · ${bot.model.ifBlank { uiText("Model not set") }}", style = MaterialTheme.typography.bodyLarge)
-                            Text("${uiText("Used for new chats in")} ${profileLabel(bot.profile)}", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            if (!state.editing) OutlinedButton(onClick = onEditModel, enabled = !state.loading) { Text(uiText("Change default model")) }
-                        }
-                    }
-                }
-                if (state.editing) {
-                    item {
-                        ProfileEntrance(3, motionEnabled) {
-                            ProfileCard(Icons.Rounded.Tune, "Change default model") {
-                                Text("${uiText("Selected")}: ${state.draftProvider} · ${state.draftModel}")
-                                OutlinedTextField(modelSearch, { modelSearch = it }, label = { Text(uiText("Search models or providers")) }, modifier = Modifier.fillMaxWidth(), singleLine = true, enabled = !state.saving)
+                        SettingsSection(title = uiText("Default model"), footer = if (state.editing && models.isEmpty()) uiText("Set up a provider on your computer") else "", testTag = "profile-model-section") {
+                            ProfileFeedback(state, retry)
+                            if (!state.editing) {
+                                if (state.error.isNotBlank() || state.notice.isNotBlank()) SettingsDivider()
+                                SettingsNavRow(uiText("Model"), onEditModel, icon = Icons.Rounded.Memory,
+                                    value = "${bot.provider.ifBlank { uiText("Provider not set") }} · ${bot.model.ifBlank { uiText("Model not set") }}", enabled = !state.loading, testTag = "profile-model")
+                            } else {
+                                if (state.error.isNotBlank()) SettingsDivider()
+                                ModelEditor(state, bot.provider, bot.model, models, modelSearch, { modelSearch = it }, moreModels, { moreModels = true }, customModel, { customModel = !customModel }, onModelDraft, onSaveModel, onCancel)
                             }
                         }
                     }
-                    val visible = models.distinct().filter { modelSearch.isBlank() || "${it.first} ${it.second}".contains(modelSearch, ignoreCase = true) }
-                    if (visible.isEmpty()) item {
-                        if (models.isEmpty()) EmptyState(uiText("No models available"), uiText("Set up a provider for this profile on your computer."), Icons.Rounded.Memory)
-                        else EmptyState(uiText("No matching models"), uiText("Try another search."), Icons.Rounded.SearchOff, action = uiText("Clear search"), onAction = { modelSearch = "" })
-                    }
-                    itemsIndexed(visible, key = { _, model -> "${model.first}:${model.second}" }) { _, (provider, model) ->
-                        val chosen = provider == state.draftProvider && model == state.draftModel
-                        ListItem(headlineContent = { Text(model) }, supportingContent = { Text(provider) },
-                            trailingContent = { if (chosen) Icon(Icons.Rounded.Check, null, tint = MaterialTheme.colorScheme.primary) },
-                            colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-                            modifier = Modifier.fillMaxWidth().heightIn(min = 64.dp).selectable(selected = chosen, enabled = !state.saving, role = Role.RadioButton) { onModelDraft(provider, model) })
-                    }
-                    item {
-                        ProfileCard(Icons.Rounded.Edit, "Configured model ID") {
-                            OutlinedButton(onClick = { customModel = !customModel }, enabled = !state.saving, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText(if (customModel) "Hide custom model entry" else "Enter a configured model ID")) }
-                            if (customModel) {
-                                OutlinedTextField(state.draftProvider, { onModelDraft(it, state.draftModel) }, label = { Text(uiText("Configured provider ID")) }, modifier = Modifier.fillMaxWidth(), singleLine = true, enabled = !state.saving)
-                                OutlinedTextField(state.draftModel, { onModelDraft(state.draftProvider, it) }, label = { Text(uiText("Model ID")) }, modifier = Modifier.fillMaxWidth(), singleLine = true, enabled = !state.saving)
+                }
+                item(key = "behavior") {
+                    ProfileEntrance(3, motionEnabled) {
+                        SettingsSection(title = uiText("Behavior"), testTag = "profile-behavior-section") {
+                            Column(Modifier.animateContentSize(tween(if (motionEnabled) 200 else 0))) {
+                                SettingsExpandRow(uiText("Instructions"), showBehavior, { showBehavior = !showBehavior }, icon = Icons.Rounded.Description, testTag = "profile-instructions")
+                                if (showBehavior) Box(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 16.dp)) { renderBehavior(bot.soul.ifBlank { uiText("No instructions") }) }
                             }
-                            Text(uiText("The server checks this profile's configured providers."), style = MaterialTheme.typography.bodyMedium)
-                            Button(onClick = onSaveModel, enabled = !state.saving && state.draftModel.isNotBlank() && state.draftProvider.isNotBlank() && (state.draftModel != bot.model || state.draftProvider != bot.provider)) { Text(uiText("Save default model")) }
-                            TextButton(onClick = onCancel, enabled = !state.saving, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Cancel edit")) }
                         }
                     }
                 }
-                item {
+                item(key = "profile-tools") {
                     ProfileEntrance(4, motionEnabled) {
-                        ProfileCard(Icons.Rounded.Description, "Behavior instructions") {
-                            TextButton(onClick = { showBehavior = !showBehavior }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText(if (showBehavior) "Hide behavior instructions" else "Read behavior instructions")) }
-                            if (showBehavior) {
-                                renderBehavior(bot.soul.ifBlank { uiText("No behavior instructions are set.") })
-                                Text(uiText("Read-only profile instructions."), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
+                        SettingsSection(title = uiText("For this profile"), testTag = "profile-tools-section") {
+                            SettingsNavRow(uiText("Skills"), { onSettings(bot.profile, "Skills") }, icon = SkillsIcon, minHeight = SettingsKit.RowMinHeight, testTag = "profile-skills")
+                            SettingsDivider()
+                            SettingsNavRow(uiText("Memory"), { onSettings(bot.profile, "Memory") }, icon = MemoryIcon, minHeight = SettingsKit.RowMinHeight, testTag = "profile-memory")
                         }
                     }
                 }
-                item {
+                if (canDelete(bot.profile)) item(key = "delete") {
                     ProfileEntrance(5, motionEnabled) {
-                        ProfileCard(Icons.AutoMirrored.Rounded.Launch, "Profile tools") {
-                            ProfileAction("Skills for this profile", SkillsIcon) { onSettings(bot.profile, "Skills") }
-                            ProfileAction("Memory for this profile", MemoryIcon) { onSettings(bot.profile, "Memory") }
-                            ProfileAction("Profiles & model", ProfilesIcon) { onSettings(bot.profile, "Profiles & model") }
+                        SettingsSection(testTag = "profile-delete-section") {
+                            SettingsDestructiveRow(uiText("Delete profile"), { onDelete(bot.profile) }, enabled = !state.loading && !state.saving, testTag = "delete-profile:${bot.profile}")
                         }
                     }
                 }
-                if (canDelete(bot.profile)) item {
-                    TextButton(onClick = { onDelete(bot.profile) }, enabled = !state.loading && !state.saving, modifier = Modifier.heightIn(min = 48.dp).testTag("delete-profile:${bot.profile}")) { Text(uiText("Delete profile"), color = MaterialTheme.colorScheme.error) }
-                }
             }
         }
     }
 }
 
-@Composable private fun ProfileCard(icon: ImageVector, title: String, content: @Composable ColumnScope.() -> Unit) {
-    Glass(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Icon(icon, null, tint = MaterialTheme.colorScheme.primary)
-                Text(uiText(title), style = MaterialTheme.typography.titleMedium)
-            }
-            content()
-        }
+/** The error (with Retry when a reload is safe) and the last saved notice, at the top of the section they are about. */
+@Composable private fun ColumnScope.ProfileFeedback(state: NativeBotsState, onRetry: (() -> Unit)?) {
+    if (state.error.isNotBlank()) SettingsErrorRow(uiText(state.error), onRetry, uiText("Retry"), retryTestTag = "profile-retry")
+    if (state.notice.isNotBlank()) {
+        if (state.error.isNotBlank()) SettingsDivider()
+        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) { SettingsStatusPill(SettingsStatus.Ok, uiText(state.notice), testTag = "profile-notice") }
     }
 }
 
-@Composable private fun ProfileValue(icon: ImageVector, title: String, value: String) {
-    Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        Icon(icon, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
-        Column { Text(uiText(title), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant); Text(value, style = MaterialTheme.typography.bodyMedium) }
+/** Choosing the default model: search, a card per model, an optional model-ID entry, then Save and Cancel. */
+@Composable private fun ColumnScope.ModelEditor(
+    state: NativeBotsState, savedProvider: String, savedModel: String, models: List<Pair<String, String>>, search: String, onSearch: (String) -> Unit,
+    expanded: Boolean, onExpand: () -> Unit, custom: Boolean, onToggleCustom: () -> Unit,
+    onModelDraft: (String, String) -> Unit, onSave: () -> Unit, onCancel: () -> Unit,
+) {
+    val visible = profileModelsMatching(models, search)
+    OutlinedTextField(search, onSearch, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp).testTag("profile-model-search"), label = { Text(uiText("Search models or providers")) },
+        leadingIcon = { Icon(Icons.Rounded.Search, null) }, singleLine = true, enabled = !state.saving)
+    if (visible.isEmpty()) {
+        if (models.isEmpty()) SettingsEmpty(uiText("No models available"), Icons.Rounded.Memory)
+        else SettingsEmpty(uiText("No matching models"), Icons.Rounded.SearchOff, action = SettingsAction(uiText("Clear search"), { onSearch("") }))
+    } else {
+        val options = visible.map { (provider, model) -> SettingsOption(profileModelOptionId(provider, model), model, provider, testTag = "profile-model-option:$provider:$model") }
+        val selected = profileModelOptionId(state.draftProvider, state.draftModel)
+        val hidden = options.size - settingsOptionsShown(options, selected, expanded, ProfileModelsCollapsed).size
+        SettingsOptionCards(options, selected, onSelect = { id -> visible.firstOrNull { profileModelOptionId(it.first, it.second) == id }?.let { onModelDraft(it.first, it.second) } },
+            enabled = !state.saving, collapsedCount = ProfileModelsCollapsed, moreLabel = uiText("More models ({0})").replace("{0}", "$hidden"),
+            moreTestTag = "profile-more-models", expanded = expanded, onExpand = onExpand)
+    }
+    SettingsDivider()
+    SettingsActionRow(uiText(if (custom) "Hide model ID" else "Use a model ID"), onToggleCustom, icon = Icons.Rounded.Edit, enabled = !state.saving, testTag = "profile-model-custom")
+    if (custom) Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        OutlinedTextField(state.draftProvider, { onModelDraft(it, state.draftModel) }, Modifier.fillMaxWidth(), label = { Text(uiText("Configured provider ID")) }, singleLine = true, enabled = !state.saving)
+        OutlinedTextField(state.draftModel, { onModelDraft(state.draftProvider, it) }, Modifier.fillMaxWidth(), label = { Text(uiText("Model ID")) }, singleLine = true, enabled = !state.saving)
+    }
+    FlowRow(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Button(onClick = onSave, enabled = !state.saving && state.draftModel.isNotBlank() && state.draftProvider.isNotBlank() && (state.draftModel != savedModel || state.draftProvider != savedProvider),
+            modifier = Modifier.heightIn(min = SettingsKit.TouchMin).testTag("profile-model-save")) { Text(uiText("Save default model")) }
+        TextButton(onClick = onCancel, enabled = !state.saving, modifier = Modifier.heightIn(min = SettingsKit.TouchMin).testTag("profile-model-cancel")) { Text(uiText("Cancel")) }
     }
 }
 
-@Composable private fun ProfileAction(label: String, icon: ImageVector, onClick: () -> Unit) {
-    OutlinedButton(onClick = onClick, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
-        Icon(icon, null); Spacer(Modifier.width(10.dp)); Text(uiText(label), Modifier.weight(1f)); Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, null)
+/** A row that opens and closes something right under it (a profile's instructions): the chevron points down or up and TalkBack hears Expanded or Collapsed. */
+@Composable private fun SettingsExpandRow(label: String, expanded: Boolean, onToggle: () -> Unit, modifier: Modifier = Modifier, icon: ImageVector? = null, testTag: String = "") {
+    val stateText = uiText(if (expanded) "Expanded" else "Collapsed")
+    val tagged = if (testTag.isBlank()) modifier else modifier.testTag(testTag)
+    Row(tagged.fillMaxWidth().heightIn(min = SettingsKit.RowMinHeight).clickable(role = Role.Button, onClick = onToggle).semantics { stateDescription = stateText }
+        .padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+        if (icon != null) SettingsIconTile(icon)
+        Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        Icon(if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 

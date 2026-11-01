@@ -56,6 +56,21 @@ class HistoryFiltersTest {
         assertEquals(historyRowKey(json("id" to "shared", "profile" to "default"), "default"), historyRowKey(json("id" to "shared"), "default"))
     }
 
+    @Test fun assistantConversationIsHiddenEvenWhenItsProfileIdDiffersOnlyByCaseOrIsMissing() {
+        val rows = listOf(
+            json("id" to "assistant", "profile" to "Coder "),
+            json("session_id" to "assistant", "profile" to ""),
+            json("id" to "chat", "profile" to "coder"),
+        )
+        val shown = historyRows(rows, HistoryView.All, HistoryOrder.Recent, currentProfile = "coder", assistantProfile = "coder", assistantSessionId = "assistant")
+        assertEquals(listOf("chat"), shown.map { it.getString("id") })
+    }
+
+    @Test fun cronPostPreviewsDropTheLabelWhetherOrNotTheLineBreakSurvived() {
+        assertEquals("Patch PHP urgently", chatPreviewText("[Cron delivery: Morning security brief] - Patch PHP urgently"))
+        assertEquals("Patch PHP urgently", chatPreviewText("[Cron delivery: Morning security brief]\n- Patch PHP urgently"))
+    }
+
     @Test fun sourceFilterOffersListedAndHiddenSourcesButNotThreadsOrCron() {
         val offered = historySources(rows + json("id" to "f", "source" to "cron"), hidden = setOf("discord"))
         assertEquals(listOf("android", "discord", "telegram", "webui"), offered)

@@ -26,6 +26,15 @@ class CallPresentationTest {
         assertTrue(call.copy(userSpeaking=true,localAudioLevel=.7f).voiceAmplitude() > 0f)
         assertTrue(call.copy(state="speaking",remoteAudioLevel=.7f).voiceAmplitude() >= .7f)
     }
+    @Test fun theGreetingWaitReusesTheTranslatedThinkingLabelWithoutInventingSpeech() {
+        val waiting=call.copy(state="thinking")
+        assertEquals("Thinking",callStatusLabel(waiting))
+        assertTrue("No new label: the existing translated one",callStatusLabel(waiting) in CallStrings)
+        assertEquals(0f,waiting.voiceAmplitude(),0f)
+        assertEquals("The microphone stays live while the greeting renders","Listen",waiting.chipLabel())
+        assertEquals("Speaking",callStatusLabel(waiting.copy(state="speaking",remoteSpeaking=true)))
+        assertEquals("Listening",callStatusLabel(waiting.copy(state="listening")))
+    }
     @Test fun captionProjectionPreservesCanonicalTextAndHidesAtEnd() {
         val values=listOf(CallTranscript("user","user","Current caller text",false),CallTranscript("bot","assistant","Current assistant text",false))
         assertEquals("Current caller text",call.copy(transcripts=values).latestCaption("user"))

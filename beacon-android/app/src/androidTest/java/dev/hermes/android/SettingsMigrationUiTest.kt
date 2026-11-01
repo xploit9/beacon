@@ -102,12 +102,14 @@ class SettingsMigrationUiTest {
     }
     @Test fun phoneShowsRelayOrderedHubRowsAndLiveSummaries() {
         show(widthDp = PhoneWidthDp)
-        shown("Connection").assertTextContains("Connected · work")
+        shown("Connection").assertTextContains("work")
+        shown("Connection").assertTextContains("Connected")
         shown("Chat").assertTextContains("Ctrl + Enter to send · Thinking shown")
-        shown("Voice & calls").assertTextContains("Gemini Live · Key saved")
+        shown("Voice & calls").assertTextContains("Gemini Live")
+        shown("Voice & calls").assertTextContains("Key saved")
         shown("Appearance").assertTextContains("Dark · Graphite")
-        shown("Profiles & model").assertTextContains("Active profile · work")
-        shown("App updates").assertTextContains("Installed · 0.4.14")
+        shown("Profiles & model").assertTextContains("work")
+        shown("App updates").assertTextContains("0.4.14")
         shown("About & licenses").assertTextContains("Version · 0.4.14")
         val positions = settingsHubRoutes.map { shown(it).fetchSemanticsNode().positionInRoot }
         assertTrue("The hub uses one column", positions.all { it.x == positions.first().x })
@@ -195,18 +197,20 @@ class SettingsMigrationUiTest {
 
     @Test fun summariesKeepUnknownsHonestAndExplainTheMissingPlugin() {
         val host = show(widthDp = PhoneWidthDp, snapshot = null)
-        shown("Appearance").assertTextContains("Theme and color style")
+        shown("Appearance").assertTextContains("Theme and colors")
         shown("Chat").assertTextContains("Sending and display")
-        shown("Connection").assertTextContains("Server, signed-in account, and phones")
+        shown("Connection").assertTextContains("Server, account, phones")
         compose.runOnIdle { host.snapshot = known }
         shown("Appearance").assertTextContains("Dark · Graphite")
         shown("Chat").assertTextContains("Ctrl + Enter to send · Thinking shown")
         compose.runOnIdle { host.snapshot = known.copy(theme = "light", updateName = "0.4.15") }
         shown("Appearance").assertTextContains("Light · Graphite")
-        shown("App updates").assertTextContains("Update available · 0.4.15")
+        shown("App updates").assertTextContains("Update available")
+        shown("App updates").assertTextContains("0.4.15")
         compose.runOnIdle { host.snapshot = known.copy(connected = false) }
-        shown("Connection").assertTextContains("Connection needs attention · work")
-        shown("Notifications & Keep connected").assertTextContains("Notification delivery")
+        shown("Connection").assertTextContains("Offline")
+        shown("Connection").assertTextContains("work")
+        shown("Notifications & Keep connected").assertTextContains("Alerts and calls")
         assertTrue("Reading a summary must not open a route", host.opened.isEmpty())
         compose.runOnIdle { host.pluginAbsent = true }
         compose.onNodeWithText("Add Beacon to your Hermes").assertIsDisplayed()
@@ -226,15 +230,18 @@ class SettingsMigrationUiTest {
         for (record in unavailable) {
             compose.runOnIdle { host.snapshot = known.withLoaded(record) }
             shown("Chat").assertTextContains("Sending and display")
-            shown("Voice & calls").assertTextContains("Gemini Live · Key saved")
+            shown("Voice & calls").assertTextContains("Gemini Live")
+            shown("Voice & calls").assertTextContains("Key saved")
             shown("Appearance").assertTextContains("Dark · Graphite")
         }
         compose.runOnIdle { host.snapshot = known.withLoaded(json("send_key" to "shift+enter")) }
         shown("Chat").assertTextContains("Shift + Enter to send")
-        shown("Voice & calls").assertTextContains("Gemini Live · Key saved")
+        shown("Voice & calls").assertTextContains("Gemini Live")
+        shown("Voice & calls").assertTextContains("Key saved")
         compose.runOnIdle { host.snapshot = known.copy(voiceProviderId = "grok", voiceKeySaved = false).withLoaded(json("send_key" to "enter")) }
         shown("Chat").assertTextContains("Enter to send")
-        shown("Voice & calls").assertTextContains("Grok · Add key")
+        shown("Voice & calls").assertTextContains("Grok")
+        shown("Voice & calls").assertTextContains("Add key")
         assertTrue(host.opened.isEmpty())
     }
 
@@ -254,11 +261,13 @@ class SettingsMigrationUiTest {
         val voiceStore = VoiceKeyStore(context)
         val store = ViewModelStore()
         var mounted by mutableStateOf(true)
-        fun summary(text: String) {
+        // The provider is the row's value and the key state its pill, so both must show on the one row.
+        fun summary(provider: String, pill: String) {
             compose.waitUntil(5_000) {
-                compose.onAllNodes(hasTestTag("settings-row:Beacon") and hasText(text)).fetchSemanticsNodes().size == 1
+                compose.onAllNodes(hasTestTag("settings-row:Beacon") and hasText(provider) and hasText(pill)).fetchSemanticsNodes().size == 1
             }
-            shown("Voice & calls").assertTextContains(text)
+            shown("Voice & calls").assertTextContains(provider)
+            shown("Voice & calls").assertTextContains(pill)
         }
         try {
             runBlocking { app.preferences.edit { it[originKey] = "" } }
@@ -283,15 +292,15 @@ class SettingsMigrationUiTest {
             compose.waitUntil(5_000) { vm.ui.value.origin.isBlank() && !vm.ui.value.restoringSession }
             compose.onNodeWithTag("settings-wide-list").assertIsDisplayed()
             compose.onNodeWithTag("settings-wide-detail").assertIsDisplayed()
-            summary("Gemini Live · Key saved")
+            summary("Gemini Live", "Key saved")
             voiceStore.setSelection(voiceStore.settings("grok"))
-            summary("Grok · Add key")
+            summary("Grok", "Add key")
             voiceStore.saveKey("grok", "synthetic-grok-key")
-            summary("Grok · Key saved")
+            summary("Grok", "Key saved")
             voiceStore.removeKey("grok")
-            summary("Grok · Add key")
+            summary("Grok", "Add key")
             voiceStore.setSelection(voiceStore.settings("gemini"))
-            summary("Gemini Live · Key saved")
+            summary("Gemini Live", "Key saved")
             assertEquals(geminiCiphertext, voicePreferences.getString("key.gemini", null))
             assertFalse(voicePreferences.contains("key.grok"))
         } finally {

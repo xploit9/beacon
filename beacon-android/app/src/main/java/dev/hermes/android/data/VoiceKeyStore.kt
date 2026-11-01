@@ -33,6 +33,8 @@ internal class VoiceSessionCredentials(
     val model: String,
     val voice: String,
     val personality: String,
+    /** Changes whenever a phone key is saved or removed, so greetings rendered under the old key are not reused. */
+    val keyRevision: Long = 0,
 ) {
     val personalityInstruction: String
         get() = when (personality) {
@@ -103,11 +105,20 @@ internal class VoiceKeyStore private constructor(
         }
         val encrypted = encrypt(normalized.toByteArray(StandardCharsets.UTF_8), "voice-key:$provider")
         check(write("key.$provider", Base64.getEncoder().encodeToString(encrypted))) { "Voice key could not be saved" }
+        keyChanged()
     }
 
     fun removeKey(provider: String) {
         require(voiceProviderSupported(provider)) { "Unsupported voice provider" }
         check(write("key.$provider", null)) { "Voice key could not be removed" }
+        keyChanged()
+    }
+
+    fun keyRevision(): Long = read("key.revision")?.toLongOrNull() ?: 0
+
+    private fun keyChanged() {
+        write("key.revision", (keyRevision() + 1).toString())
+        changes.value++
     }
 
     fun settings(providerOverride: String? = null): VoicePreferences {
@@ -129,13 +140,14 @@ internal class VoiceKeyStore private constructor(
         check(write("model." + value.provider, value.model)) { "Voice model could not be saved" }
         check(write("voice." + value.provider, value.voice)) { "Voice could not be saved" }
         check(write("personality." + value.provider, value.personality)) { "Voice personality could not be saved" }
+        changes.value++
     }
 
     fun session(provider: String = settings().provider): VoiceSessionCredentials? {
         require(voiceProviderSupported(provider)) { "Unsupported voice provider" }
         val apiKey = key(provider) ?: return null
         val selection = settings(provider)
-        return VoiceSessionCredentials(provider, apiKey, selection.model, selection.voice, selection.personality)
+        return VoiceSessionCredentials(provider, apiKey, selection.model, selection.voice, selection.personality, keyRevision())
     }
 
     private fun validVoiceOption(value: String) =
@@ -143,6 +155,8 @@ internal class VoiceKeyStore private constructor(
 
     companion object {
         const val PREFS = "voice-private"
+        /** Counts key and voice selection changes in this process; the call greeting cache refreshes on it. */
+        internal val changes = kotlinx.coroutines.flow.MutableStateFlow(0L)
         private val VOICE_PERSONALITIES = setOf("balanced", "concise", "warm")
     }
 }

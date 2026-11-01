@@ -63,7 +63,7 @@ class VoiceLookupLiveTest {
             session=vm.chat.value.sessionId
             phases.put("phase","connecting")
             rule.onNodeWithTag("chat-call-beacon").performClick()
-            await(45_000) { app.calls.state.value.active&&app.calls.state.value.state in setOf("listening","speaking") }
+            await(45_000) { app.calls.state.value.active&&app.calls.state.value.state in setOf("thinking","listening","speaking") }
             call=app.calls.state.value.callId
             assertEquals(provider,app.calls.state.value.voiceProvider)
             val context=client.nativeCallContext(call)

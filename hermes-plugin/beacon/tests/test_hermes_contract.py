@@ -73,6 +73,19 @@ def test_every_hermes_name_the_plugin_uses_exists(hermes):
     assert compat.missing(compat.needs(), hermes) == []
 
 
+def test_hermes_still_words_its_live_session_refusal_the_way_the_restart_code_reads_it(hermes):
+    # admin_api.restart_error_code tells `live_sessions` from `failed` by this wording; a Hermes that rewords it needs a new match.
+    guards = hermes.joinpath('hermes_cli', 'gateway_lifecycle_guards.py').read_text(encoding='utf-8-sig')
+    assert 'live session' in guards
+    assert "'restart_error'" in hermes.joinpath('hermes_cli', 'web_server_gateway.py').read_text(encoding='utf-8-sig').replace('"', "'")
+
+
+def test_hermes_still_launches_its_gateway_as_gateway_run(hermes):
+    # __init__._is_gateway_process records the gateway's plugin version only for a process launched as `gateway run`.
+    main = hermes.joinpath('hermes_cli', 'main.py').read_text(encoding='utf-8-sig')
+    assert re.search(r'def _argv_is_gateway_run\(.*\n.*"gateway".*"run"', main)
+
+
 def test_the_check_names_a_renamed_hermes_function(hermes):
     compat = _compat()
     present = (('tui_gateway.server', None, '_sessions', 'native.py', False),)

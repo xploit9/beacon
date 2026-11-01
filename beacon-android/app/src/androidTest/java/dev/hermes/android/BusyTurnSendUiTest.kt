@@ -454,7 +454,8 @@ class BusyTurnSendUiTest {
             showSettings.value = true
         }
         compose.onNodeWithText("While Beacon is replying").assertExists()
-        compose.onNodeWithText("Steer").performClick()
+        // Both choices are on screen as segments: Steer starts selected, so Queue is one tap.
+        compose.onNodeWithTag("choice-option:While Beacon is replying:steer").assertIsSelected()
         compose.onNodeWithTag("choice-option:While Beacon is replying:queue").performClick()
         compose.waitUntil(15_000) { vm.preferences.value.busySendAction == "queue" }
         val recreatedStore = ViewModelStore()
@@ -556,7 +557,8 @@ class BusyTurnSendUiTest {
         compose.onNodeWithTag("message-send").performClick()
         compose.waitUntil(15_000) { fixture.requests.any { it.string("method") == "session.steer" } }
         compose.runOnIdle { vm.switchProfile("coder") }
-        compose.waitUntil(30_000) { vm.ui.value.profile == "coder" && vm.client?.scope?.profile == "coder" }
+        // The coder chat opens a moment after the switch; the late reply is released only once its scope exists.
+        compose.waitUntil(30_000) { vm.ui.value.profile == "coder" && vm.client?.scope?.profile == "coder" && vm.authenticatedScope()?.profile == "coder" }
         val currentScope = vm.authenticatedScope()
         fixture.releasePromptAcknowledgement()
         compose.waitForIdle()

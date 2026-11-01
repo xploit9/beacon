@@ -12,15 +12,17 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.SemanticsActions
-import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.performSemanticsAction
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.datastore.preferences.core.booleanPreferencesKey
@@ -100,12 +102,16 @@ class LaneR8KWideLayoutTest {
         .apply { isAccessible = true }.get(vm) as MutableStateFlow<Map<String, JSONObject>>
 
     private fun assertSingleUnclippedLine(text: String) {
-        val layouts = mutableListOf<TextLayoutResult>()
-        compose.onNodeWithText(text, useUnmergedTree = true)
-            .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(layouts) }
-        assertEquals("Expected one layout for $text", 1, layouts.size)
-        assertEquals("$text wraps", 1, layouts.single().lineCount)
-        assertTrue("$text is ellipsized", !layouts.single().isLineEllipsized(0))
+        val nodes = compose.onAllNodesWithText(text, useUnmergedTree = true)
+        val count = nodes.fetchSemanticsNodes().size
+        assertTrue("Expected a label $text", count > 0)
+        for (index in 0 until count) {
+            val layouts = mutableListOf<TextLayoutResult>()
+            nodes[index].performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(layouts) }
+            assertEquals("Expected one layout for $text #$index", 1, layouts.size)
+            assertEquals("$text #$index wraps", 1, layouts.single().lineCount)
+            assertTrue("$text #$index is ellipsized", !layouts.single().isLineEllipsized(0))
+        }
     }
 
     @Test fun settingsUsesAListAndCappedDetailAtTheTargetWindow() = withViewModel { vm ->
@@ -144,11 +150,16 @@ class LaneR8KWideLayoutTest {
             } }
         }
         fun assertDrawer(fontScaleValue: Float, panelTag: String) {
-            compose.onNodeWithTag("navigation-bots").assertTextEquals("Bot Mode")
+            if (fontScaleValue > 1f) {
+                // At large text Bots moves under More; Chats stays on the drawer switch.
+                compose.onNodeWithTag("navigation-more").assertExists()
+                compose.onAllNodesWithTag("navigation-bots").assertCountEquals(0)
+            } else compose.onNodeWithTag("navigation-bots").assertTextEquals("Bots")
             compose.onNodeWithTag("history-view-all").assertTextEquals("All")
             compose.onNodeWithTag("history-view-pinned").assertTextEquals("Pinned")
             compose.onNodeWithTag("history-threads").assertTextEquals("Threads")
-            listOf("Bot Mode", "All", "Pinned", "Threads").forEach(::assertSingleUnclippedLine)
+            val labels = if (fontScaleValue > 1f) listOf("Chats", "All", "Pinned", "Threads") else listOf("Bots", "Chats", "All", "Pinned", "Threads")
+            labels.forEach(::assertSingleUnclippedLine)
             compose.onNodeWithTag(panelTag).assertIsDisplayed()
             val panelWidth = widthDp(panelTag)
             assertTrue("Drawer is narrower than 320 dp at font scale $fontScaleValue: $panelWidth", panelWidth >= 320f)
@@ -172,7 +183,7 @@ class LaneR8KWideLayoutTest {
         assertTrue("Files content exceeds 720 dp: ${widthDp("files-content")}", widthDp("files-content") <= 720f)
     }
 
-    @Test fun filesPathEllipsizesOnOneLineAtPhoneWidth() = withViewModel { vm ->
+    @Test fun filesPathStaysOneScrollableRowAtPhoneWidth() = withViewModel { vm ->
         val path = "C:\\Users\\someone\\Documents\\very-long-project-name\\nested\\last-folder"
         data(vm).value = mapOf("files" to JSONObject().put("_requested_path", "").put("path", path).put("entries", JSONArray()))
         compose.setContent {
@@ -182,10 +193,7 @@ class LaneR8KWideLayoutTest {
         }
         compose.waitForIdle()
         compose.onNodeWithTag("files-path", useUnmergedTree = true).assertIsDisplayed()
-        val layouts = mutableListOf<TextLayoutResult>()
-        compose.onNodeWithTag("files-path", useUnmergedTree = true)
-            .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(layouts) }
-        assertEquals(1, layouts.single().lineCount)
-        assertTrue("Long Files path should ellipsize rather than wrap", layouts.single().isLineEllipsized(0))
+        // The trail is one row that scrolls sideways and opens at its last folder, so the deepest level stays on screen.
+        compose.onNodeWithTag("files-crumb:6", useUnmergedTree = true).assertIsDisplayed()
     }
 }

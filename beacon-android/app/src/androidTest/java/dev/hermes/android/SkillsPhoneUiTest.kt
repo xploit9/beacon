@@ -28,11 +28,17 @@ class SkillsPhoneUiTest {
                 NativeSkillsScreen(state, { state = state.copy(search = it) }, {}, {}, { _, _ -> }, {}, {}, {}, {})
             }
         }
-        compose.onNodeWithText("2 installed · 1 enabled · 1 need setup").assertExists()
-        compose.onNode(hasText("Needs setup") and isSelectable()).performScrollTo().performClick()
-        compose.onNodeWithText("needs-skill").assertExists()
-        compose.onNodeWithText("ready-skill").assertDoesNotExist()
-        compose.onNodeWithTag("skill-row-needs-skill").performScrollTo().assertTextContains("Needs setup")
+        // The counts are figures with labels, not a sentence.
+        compose.onNode(hasText("Installed") and hasText("2")).assertExists()
+        compose.onNode(hasText("Enabled") and hasText("1") and !isSelectable()).assertExists()
+        compose.onNode(hasText("Need setup") and hasText("1")).assertExists()
+        compose.onNodeWithTag("skills-filter-needs-setup").performScrollTo().performClick()
+        compose.onNodeWithTag("skills-filter-needs-setup").assertIsSelected()
+        compose.onNodeWithTag("skill-row-needs-skill").assertExists()
+        compose.onNodeWithTag("skill-row-ready-skill").assertDoesNotExist()
+        // Rows read as names; the slug stays the test tag and the switch's description.
+        compose.onNodeWithText("Needs Skill").assertExists()
+        compose.onNode(hasText("Needs setup") and hasAnyAncestor(hasTestTag("skill-row-needs-skill")), useUnmergedTree = true).assertExists()
         compose.onNodeWithText("Enabled · Setup ready").assertDoesNotExist()
         compose.runOnIdle {
             state = state.copy(selected = needs, content = NativeSkillContent(needs.name, "Original"), editing = true, draft = (1..1000).joinToString("\n") { "Instruction $it" })
@@ -62,9 +68,9 @@ class SkillsPhoneUiTest {
         compose.onNodeWithTag("skill-row-inbox").assertExists()
         compose.onNodeWithText("Enabled · Setup ready").assertDoesNotExist()
         compose.onNodeWithText("Read & adjust").assertDoesNotExist()
-        compose.onNodeWithText("inbox").performClick()
+        compose.onNodeWithTag("skill-row-inbox").performClick()
         compose.onNodeWithText("Sign in to the work inbox first.").assertExists()
-        compose.onNodeWithText("Adjust instructions").performScrollTo().performClick()
+        compose.onNodeWithText("Edit instructions").performScrollTo().performClick()
         compose.onNodeWithText("Skill instructions").performScrollTo().performTextReplacement("Use the shared work inbox.")
         compose.onNodeWithText("Save instructions").performScrollTo().performClick()
         compose.runOnIdle { assertEquals("Use the shared work inbox.", saved) }

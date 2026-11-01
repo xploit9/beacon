@@ -37,6 +37,12 @@ class BotTeammatesTest {
         assertEquals("Vous: Salut", spacePreview(BotModeSpace("r", "Room", last = BotModePreview("You", "Salut")), name, "Vous"))
         assertEquals("Default, Coder", spacePreview(BotModeSpace("r", "Room", listOf("default", "coder")), name, "You"))
         assertEquals("", spacePreview(BotModeSpace("r", "Room"), name, "You"))
+        // A space named after its bots would repeat itself, so the line counts them; any other name keeps the bots' names.
+        assertEquals("2 bots", spacePreview(BotModeSpace("r", "Default, Coder", listOf("default", "coder")), name, "You", "{0} bots"))
+        assertEquals("2 Bots", spacePreview(BotModeSpace("r", " default, coder ", listOf("default", "coder")), name, "You", "{0} Bots"))
+        assertEquals("", spacePreview(BotModeSpace("r", "Default, Coder", listOf("default", "coder")), name, "You"))
+        assertEquals("Default, Coder", spacePreview(BotModeSpace("r", "Launch plan", listOf("default", "coder")), name, "You", "{0} bots"))
+        assertEquals("You: Plan it", spacePreview(BotModeSpace("r", "Default, Coder", listOf("default", "coder"), last = BotModePreview("You", "Plan it")), name, "You", "{0} bots"))
     }
 
     @Test fun newChatSuggestsTheNamesOfTheBotsInTheOrderTheyAreListed() {

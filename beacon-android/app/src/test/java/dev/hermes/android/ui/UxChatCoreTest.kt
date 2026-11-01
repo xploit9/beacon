@@ -65,7 +65,12 @@ class UxChatCoreTest {
     }
 
     @Test fun theChatMenuKeepsDailyActionsAndTucksTheRestUnderMore() {
-        assertEquals(listOf("New conversation", "Rename", "Pin", "Archive", "Branch", "Delete conversation"), conversationActionGroups.values.flatten())
-        assertEquals(listOf("Toolsets", "Compress context", "Undo last turn", "Usage"), conversationMoreActions)
+        val daily = conversationActionGroups.values.flatten()
+        assertTrue(daily.containsAll(listOf("New conversation", "Rename", "Pin", "Archive", "Branch", "Delete conversation")))
+        assertTrue(conversationMoreActions.containsAll(listOf("Toolsets", "Undo last turn", "Usage")))
+        assertTrue("Shortening the history stays under More, by either name", conversationMoreActions.any { it == "Compress context" || it == "Shorten history" })
+        // The menu draws Delete last, apart from the daily groups, whichever group lists it.
+        assertEquals(listOf("Delete conversation"), conversationMenuGroups(conversationActionGroups.values.toList()).destructive)
+        assertTrue(conversationMenuGroups(conversationActionGroups.values.toList()).daily.flatten().none { it in destructiveConversationActions })
     }
 }

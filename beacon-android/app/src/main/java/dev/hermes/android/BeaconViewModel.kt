@@ -203,6 +203,33 @@ internal fun pendingPrompt(event: JSONObject): JSONObject? = event.optJSONObject
 // Hermes stores model-switch steering as user rows, so the reserved prefix identifies it.
 internal fun visibleTranscriptMessages(messages: List<Message>): List<Message> =
     messages.filterNot { it.text.trimStart().startsWith("[System:") }
+
+/** How many of the newest rows a chat-list preview reads, at most how many bytes, and for how many of the top chats. */
+internal const val PREVIEW_READ_WINDOW = 8
+internal const val PREVIEW_READ_MAX_BYTES = 1024 * 1024
+internal const val PREVIEW_PREFETCH_ROWS = 20
+private const val PREVIEW_SKEW_MS = 2_000L
+private val previewSessionId = Regex("[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}")
+
+/**
+ * The top [limit] chats of [profile] whose list line needs a read: no stored line yet, or a line older than the chat's activity.
+ * A chat with no messages has nothing to read; [readAt] gives the activity this run already read a chat at, so it is read once per change.
+ */
+internal fun previewPrefetchTargets(rows: List<JSONObject>, glances: dev.hermes.android.ui.ChatGlances, profile: String, limit: Int = PREVIEW_PREFETCH_ROWS, readAt: (String) -> Long?): List<JSONObject> =
+    rows.asSequence().filter { it.string("profile", profile) == profile }.take(limit).filter { row ->
+        val id = sessionRowId(row)
+        val activity = dev.hermes.android.ui.rowActivityMillis(row)
+        val glance = glances.rows["$profile:$id"]
+        id.matches(previewSessionId) && row.optInt("message_count", 1) > 0 && readAt(id) != activity &&
+            (glance == null || glance.preview.isBlank() || activity > glance.at + PREVIEW_SKEW_MS)
+    }.toList()
+
+/** [glances] with the newest line read for a chat; a blank line, or one older than the line already stored, changes nothing. Read marks stay as they are. */
+internal fun withPrefetchedPreview(glances: dev.hermes.android.ui.ChatGlances, profile: String, id: String, line: String, role: String, at: Long): dev.hermes.android.ui.ChatGlances {
+    val old = glances.rows["$profile:$id"]
+    if (line.isBlank() || old != null && old.preview.isNotBlank() && old.at > at) return glances
+    return glances.viewed(profile, id, line, role, at, seen = 0L)
+}
 // The send receipt holds the draft as JSON inside JSON, so it is the largest local checkpoint of the attachments.
 internal fun attachmentFitsLocalCheckpoint(send: PendingSend): Boolean =
     send.encode().toByteArray().size.toLong() + APP_CIPHER_OVERHEAD <= LOCAL_CHECKPOINT_LIMIT_BYTES
@@ -2182,6 +2209,9 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     // Profiles whose name this run has already put in the account row; cleared wherever glanceLoaded is.
     private val glanceRecorded = HashSet<String>()
     private var glanceWrite: Job? = null
+    // Per row ("profile scope key:id"), the list activity whose newest line this run has already read.
+    private val previewsRead = HashMap<String, Long>()
+    private var previewPrefetch: Job? = null
     /** Loads a profile's stored glances once per account; a different account starts empty. Unreadable storage is the same as none. */
     private suspend fun openGlances(profileScope: Scope) = glanceLock.withLock {
         val account = profileScope.copy(profile = "", session = "").key
@@ -2224,6 +2254,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     private suspend fun forgetGlances(scope: Scope) {
         val account = scope.copy(profile = "", session = "")
         val listed = _data.value["navigation-profiles"]?.rows("profiles").orEmpty().map { it.string("name") }
+        // A preview read still running must not bring a line back after the wipe.
+        previewPrefetch?.cancelAndJoin(); previewsRead.clear()
         var wiped = true
         val stored = glanceLock.withLock {
             // No write may be running while the account row is read, or it could name a profile the wipe then misses.
@@ -2261,6 +2293,45 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             val before = _glances.value
             val after = before.viewed(profileScope.profile, sessionId, line, role, at, maxOf(at, row?.let(::rowActivityMillis) ?: 0L))
             if (after !== before) { _glances.value = after; queueGlanceWrite(profileScope) }
+        }
+    }
+    /**
+     * The chat list shows each chat's newest line, not Hermes' first prompt: for the top rows whose stored line is missing or
+     * older than their activity, read only the newest few messages, in the background, into the same encrypted glances the list
+     * opens with. Nothing shows while it runs, read marks are untouched, and a failed read keeps the line already shown.
+     */
+    private fun prefetchPreviews(source: BeaconClient, scope: Scope, rows: List<JSONObject>, current: () -> Boolean) {
+        val profileScope = scope.copy(session = "")
+        previewPrefetch?.cancel()
+        previewPrefetch = viewModelScope.launch {
+            openGlances(profileScope)
+            val wanted = previewPrefetchTargets(rows, _glances.value, profileScope.profile) { id -> previewsRead["${profileScope.key}:$id"] }
+            if (wanted.isEmpty()) return@launch
+            val reader = source.detached()
+            try {
+                for (row in wanted) {
+                    if (!current()) return@launch
+                    val id = sessionRowId(row)
+                    val page = try {
+                        reader.nativeGet("/api/sessions/$id/messages", mapOf("profile" to profileScope.profile, "order" to "latest", "limit" to "$PREVIEW_READ_WINDOW", "offset" to "0", "inline_images" to "false"), maxBytes = PREVIEW_READ_MAX_BYTES)
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        // A sign-in that ended stops the reads; any other failure only skips this row until the next list refresh.
+                        if (endsSignIn(e)) return@launch else continue
+                    }
+                    if (!current() || page.string("profile").let { it.isNotBlank() && it != profileScope.profile }) continue
+                    val messages = page.rows("messages").mapIndexed { index, item -> Message.from(item, index, id) }
+                    val latest = visibleTranscriptMessages(messages).lastOrNull { it.role == "user" || it.role == "assistant" && it.text.isNotBlank() }
+                    previewsRead["${profileScope.key}:$id"] = rowActivityMillis(row)
+                    val (line, role) = dev.hermes.android.ui.chatListLine(latest)
+                    val at = latest?.let { epochMillis(it.recordedAt) } ?: 0L
+                    val account = profileScope.copy(profile = "").key
+                    var changed = false
+                    // Another account's glances are never written; a chat opened meanwhile keeps the newer line it noted.
+                    _glances.update { now -> if (now.account != account) now else withPrefetchedPreview(now, profileScope.profile, id, line, role, at).also { changed = it !== now } }
+                    if (changed) queueGlanceWrite(profileScope)
+                }
+            } finally { reader.closeNative() }
         }
     }
     /** The first full list of a profile is the baseline: chats already there are not "new" on a fresh install. */
@@ -2346,6 +2417,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 if (!allProfiles && query.isBlank() && !archived && !threads) {
                     app.cache.write(scope, "conversation-index", json("sessions" to JSONArray(rows)).toString())
                     noteIndexListed(scope, rows)
+                    prefetchPreviews(c, scope, rows) { client === active && generation == originGeneration && _ui.value.authenticated }
                 }
             }
 
@@ -4176,7 +4248,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     fun ensureLoaded(key: String, path: String, query: Map<String, String> = emptyMap()): Job = load(key, path, query, force = false, quiet = true)
     /** A [quiet] read warms data nobody asked for yet: a failure stays on its key and never raises the app-wide error (an expired sign-in still does). */
     fun load(key: String, path: String, query: Map<String, String> = emptyMap(), force: Boolean = true, quiet: Boolean = false): Job {
-        val active = client ?: return viewModelScope.launch { storeData(key, (_data.value[key]?.copy() ?: JSONObject()).apply { remove("_loading"); put("_error", "Reconnect to refresh this page.") }) }
+        val active = client ?: return viewModelScope.launch { storeData(key, (_data.value[key]?.copy() ?: JSONObject()).apply { remove("_loading"); put("_error", dev.hermes.android.ui.OfflineReadError) }) }
         val c = active.detached(); val scope = c.scope; val generation = originGeneration
         val request = "${scope.key}:$generation:$path:${query.toSortedMap()}"
         if (loadRequests[key] == request) loads[key]?.takeIf { it.isActive }?.let { return it }

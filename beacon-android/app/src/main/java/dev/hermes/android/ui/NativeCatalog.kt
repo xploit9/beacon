@@ -1,32 +1,42 @@
+@file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class, androidx.compose.material3.ExperimentalMaterial3Api::class)
 package dev.hermes.android.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.ui.platform.testTag
-import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.SearchOff
-import androidx.compose.material.icons.rounded.Check
-import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
+import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.core.*
-import org.json.JSONArray
 import org.json.JSONObject
+import java.text.NumberFormat
+import java.util.Locale
 
 /** The picker group whose slug, or a name Hermes lists for it (custom providers carry `aliases`), is [name]; blank when none. */
 internal fun pickerGroupNamed(groups: List<JSONObject>, name: String): String =
@@ -41,7 +51,16 @@ internal fun currentPickerProvider(groups: List<JSONObject>, provider: String, m
         .ifBlank { groups.filter { g -> model.isNotBlank() && (g.rows("models") + g.rows("extra_models")).any { it.string("id") == model } }.singleOrNull()?.string("provider_id").orEmpty() }
 }
 
-@OptIn(ExperimentalMaterial3Api::class) // SegmentedButton, as in ChatScreen
+/** The one place the composer chip (and any other control) opens the model sheet: current model, reasoning level and every provider's models. */
+internal fun openModelPicker(vm: BeaconViewModel) = vm.openCatalog("Model & provider")
+
+/** A provider's section label without its qualifier: "OpenAI Codex (ChatGPT subscription)" reads "OpenAI Codex". */
+internal fun shortProviderLabel(label: String): String = label.substringBefore(" (").substringBefore(" — ").substringBefore(" – ").trim().ifBlank { label.trim() }
+
+/** The chat's model leads its own provider's list; every other order stays as Hermes sent it. */
+internal fun pinSelectedModel(models: List<JSONObject>, selectedId: String, inCurrentProvider: Boolean): List<JSONObject> =
+    if (!inCurrentProvider || selectedId.isBlank()) models else models.sortedBy { it.string("id") != selectedId }
+
 @Composable fun NativeCatalog(vm: BeaconViewModel, containedActions: Boolean = false) {
     val kind by vm.catalog.collectAsStateWithLifecycle()
     if (kind.isBlank()) return
@@ -54,13 +73,13 @@ internal fun currentPickerProvider(groups: List<JSONObject>, provider: String, m
     val scopeKey = vm.client?.scope?.session(chat.sessionId)?.key
     val modelPending = modelSaving.isNotBlank() || "$scopeKey|/api/session/update" in pending
     val reasoningPending = reasoningSaving || "$scopeKey|/api/reasoning" in pending
-    var query by rememberSaveable(kind, chat.sessionId) { mutableStateOf("") }
     var toolsMcp by rememberSaveable(kind, chat.sessionId) { mutableStateOf(false) }
+    val assistant = LocalAssistantName.current
     Dialog(vm::closeCatalog, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface(Modifier.widthIn(max = if (kind == "Toolsets") 560.dp else 900.dp).fillMaxWidth().fillMaxHeight(if (kind == "Toolsets") .8f else .92f).padding(12.dp), shape = MaterialTheme.shapes.extraLarge, color = MaterialTheme.colorScheme.surface.copy(alpha = 1f)) {
             Column(Modifier.fillMaxSize()) {
-                // Toolsets belong to the profile, not to this chat, so the chat's title is not shown under them.
-                Header(uiText(if (kind == "Toolsets") "Tools" else kind), if (kind == "Toolsets") "" else chat.title, actions = {
+                // Toolsets belong to the profile, not to this chat, so the chat's title is not shown under them. The Beacon conversation is named for the assistant, not for its Hermes session title.
+                Header(uiText(if (kind == "Toolsets") "Tools" else kind), if (kind == "Toolsets") "" else if (vm.isBeaconConversation()) assistant else chat.title, actions = {
                     if (kind == "Reasoning" || kind == "Model & provider") IconButton(
                         onClick = { vm.openCatalog(kind) },
                         enabled = if (kind == "Reasoning") !reasoningPending && "picker:reasoning" !in refreshing else !modelPending && "picker:models" !in refreshing,
@@ -70,69 +89,11 @@ internal fun currentPickerProvider(groups: List<JSONObject>, provider: String, m
                     IconButton(onClick = vm::closeCatalog) { Icon(Icons.Rounded.Close, uiText("Close picker")) }
                 })
                 when (kind) {
-                    "Model & provider" -> {
-                        val catalog = data["picker:models"]
-                        val loading = catalog == null // a cached list is shown while the refresh runs
-                        val catalogGroups = catalog?.rows("groups").orEmpty()
-                        val chatProvider = chat.raw.string("model_provider")
-                        // Hermes may report a running chat's provider under another name than its picker row; Hermes then says which row it means.
-                        val askHermes = chatProvider.isNotBlank() && chat.raw.string("runtime_session_id").isNotBlank() && catalogGroups.isNotEmpty() && pickerGroupNamed(catalogGroups, chatProvider).isBlank()
-                        LaunchedEffect(askHermes, chat.sessionId, chatProvider) {
-                            if (askHermes) vm.load("picker:model-current", "/api/model/current", mapOf("session_id" to chat.sessionId), quiet = true)
-                        }
-                        val hermesRow = data["picker:model-current"]?.takeIf { it.string("scope_key") == vm.client?.scope?.key && it.string("session_id") == chat.sessionId && it.string("provider") == chatProvider }?.string("provider_id").orEmpty()
-                        val currentProvider = currentPickerProvider(catalogGroups, chatProvider, chat.raw.string("model"), hermesRow)
-                        val groups = remember(catalog, query, currentProvider) { catalog?.rows("groups").orEmpty().map { group ->
-                            val provider = group.string("provider", group.string("label", group.string("provider_id")))
-                            group to (group.rows("models") + group.rows("extra_models")).distinctBy { it.string("id") }.filter { modelSearchMatches(provider, it.string("id"), it.string("label"), query) }
-                        }.filter { it.second.isNotEmpty() }.sortedBy { it.first.string("provider_id") != currentProvider } }
-                        OutlinedTextField(query, { query = it }, label = { Text(uiText("Search model or provider")) }, singleLine = true, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp))
-                        LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(16.dp)) {
-                            if (loading) item { LinearProgressIndicator(Modifier.fillMaxWidth().testTag("models-loading")) }
-                            if (modelPending && modelSaving.isBlank()) item { LinearProgressIndicator(Modifier.fillMaxWidth()); Text(uiText("Applying model…")) }
-                            groups.forEach { (group, models) ->
-                                val provider = group.string("provider_id")
-                                val label = group.string("provider", group.string("label", provider))
-                                if (models.isNotEmpty()) {
-                                    item { Text(label, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(vertical = 12.dp)) }
-                                    items(models, key = { provider to it.string("id") }) { model ->
-                                        val id = model.string("id")
-                                        val title = model.string("label", id)
-                                        val selected = chat.raw.string("model") == id && currentProvider == provider
-                                        ListItem(headlineContent = { Text(title) },
-                                            supportingContent = if (modelSubtitle(title, id).isNotBlank()) ({ Text(id, style = MaterialTheme.typography.bodySmall) }) else null,
-                                            trailingContent = { when {
-                                                modelSaving == "$provider:$id" -> CircularProgressIndicator(Modifier.size(24.dp).testTag("model-applying"), strokeWidth = 2.dp)
-                                                selected -> Icon(Icons.Rounded.Check, uiText("Selected"), tint = MaterialTheme.colorScheme.primary)
-                                            } },
-                                            modifier = Modifier.testTag("model:$provider:$id").semantics { this.selected = selected }.clickable(enabled = !loading && !modelPending) { vm.pickModel(id, provider) }.heightIn(min = 64.dp))
-                                    }
-                                }
-                            }
-                            item {
-                                if (catalog != null && !loading && recordError(catalog).isBlank() && groups.isEmpty()) EmptyState(uiText("No matching models"), uiText("Try another search."), Icons.Rounded.SearchOff, action = if (query.isBlank()) "" else uiText("Clear search"), onAction = { query = "" })
-                                if (recordError(catalog).isNotBlank()) Text(uiText("Couldn't load models. Tap refresh to try again."), color = MaterialTheme.colorScheme.error)
-                                val customModelTitle = uiText("Custom model"); val modelLabel = uiText("Model"); val providerIdLabel = uiText("Provider ID")
-                                val enterCustomModel = { vm.closeCatalog(); vm.openForm(ActionForm(customModelTitle, "/api/session/update", listOf(Field("model", modelLabel, required = true), Field("model_provider", providerIdLabel)), json("session_id" to chat.sessionId))) }
-                                if (!loading) {
-                                    if (containedActions) OutlinedButton(onClick = enterCustomModel, enabled = !modelPending, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Enter a configured model ID")) }
-                                    else TextButton(onClick = enterCustomModel, enabled = !modelPending) { Text(uiText("Enter a configured model ID")) }
-                                }
-                            }
-                        }
-                    }
+                    "Model & provider" -> ModelPickerBody(vm, containedActions)
                     // The same pages as Settings > Tools & MCP; the Tools page already says its changes apply to new chats.
                     "Toolsets" -> Column(Modifier.fillMaxSize().testTag("chat-toolsets")) {
-                        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
-                            listOf(false to "Tools", true to "MCP servers").forEachIndexed { index, (mcp, label) ->
-                                SegmentedButton(
-                                    selected = toolsMcp == mcp,
-                                    onClick = { toolsMcp = mcp },
-                                    shape = SegmentedButtonDefaults.itemShape(index, 2),
-                                    modifier = Modifier.heightIn(min = 48.dp).testTag(if (mcp) "chat-toolsets-mcp" else "chat-toolsets-tools"),
-                                ) { Text(uiText(label), maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
-                            }
-                        }
+                        SegmentedChoice("Tools", if (toolsMcp) "mcp" else "tools", listOf("tools", "mcp"), listOf(uiText("Tools"), uiText("MCP servers")), { toolsMcp = it == "mcp" },
+                            Modifier.padding(horizontal = 20.dp), testTags = mapOf("tools" to "chat-toolsets-tools", "mcp" to "chat-toolsets-mcp"))
                         if (toolsMcp) Text(uiText("Changes apply to this profile's new chats."), Modifier.padding(start = 16.dp, top = 12.dp, end = 16.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         // One scroller inside the sheet: the page's own list fills this bounded box.
                         Box(Modifier.weight(1f).fillMaxWidth()) { NativeToolSettings(vm, mcp = toolsMcp, containedActions = true) }
@@ -141,19 +102,160 @@ internal fun currentPickerProvider(groups: List<JSONObject>, provider: String, m
                         val value = data["picker:reasoning"]
                         val options = value?.optJSONArray("options")?.strings().orEmpty()
                         var level by remember(value?.toString()) { mutableStateOf(value?.string("value").orEmpty().takeIf { it in options }.orEmpty()) }
-                        Column(Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                            Text(uiText("Choose a reasoning level for this conversation."), style = MaterialTheme.typography.bodyLarge)
+                        Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             if (value == null || "picker:reasoning" in refreshing) ReasoningSkeleton()
-                            else if (recordError(value).isNotBlank()) Text(uiText("Reasoning options are unavailable. Your current setting is unchanged."), color = MaterialTheme.colorScheme.error)
+                            else if (recordError(value).isNotBlank()) SettingsSection { SettingsErrorRow(uiText("Couldn't load reasoning"), { vm.openCatalog("Reasoning") }, uiText("Retry")) }
                             else if (options.isNotEmpty()) {
-                                value.string("value").takeIf(String::isNotBlank)?.let { Text("${uiText("Current")}: ${uiText(reasoningLevelLabel(it))}", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                                options.forEach { option -> ReasoningLevelOption(option, level == option, enabled = !reasoningPending) { level = option } }
-                                Button(onClick = { vm.setReasoning(level) }, enabled = !reasoningPending && level in options, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text(uiText(if (reasoningPending) "Applying…" else "Apply to conversation")) }
-                            } else if (value.optBoolean("known")) Text(uiText("This model manages reasoning automatically."))
-                            else Text(uiText("No reasoning choices are available."), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                if (reasoningPending) SettingsStatusPill(SettingsStatus.Working, uiText("Applying…"))
+                                // A tap applies the level: there is no second step.
+                                SettingsSection { SettingsOptionCards(
+                                    options.map { SettingsOption(it, uiText(reasoningLevelLabel(it)), uiText(reasoningLevelDescription(it)), testTag = "reasoning-level:$it") },
+                                    selected = level, onSelect = { option -> level = option; vm.setReasoning(option) }, enabled = !reasoningPending,
+                                ) }
+                            } else if (value.optBoolean("known")) SettingsSection { SettingsEmpty(uiText("This model manages reasoning automatically."), Icons.Rounded.Psychology) }
+                            else SettingsSection { SettingsEmpty(uiText("No reasoning choices are available."), Icons.Rounded.Psychology) }
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/** Model sheet: the chat's model and reasoning level on top, then every provider's models with the chosen one first. */
+@Suppress("UNUSED_PARAMETER")
+@Composable private fun ColumnScope.ModelPickerBody(vm: BeaconViewModel, containedActions: Boolean) {
+    val data by vm.data.collectAsStateWithLifecycle()
+    val refreshing by vm.refreshing.collectAsStateWithLifecycle()
+    val chat by vm.chat.collectAsStateWithLifecycle()
+    val reasoningSaving by vm.reasoningSaving.collectAsStateWithLifecycle()
+    val modelSaving by vm.modelSaving.collectAsStateWithLifecycle()
+    val pending by vm.conversationPending.collectAsStateWithLifecycle()
+    val scopeKey = vm.client?.scope?.session(chat.sessionId)?.key
+    val modelPending = modelSaving.isNotBlank() || "$scopeKey|/api/session/update" in pending
+    val reasoningPending = reasoningSaving || "$scopeKey|/api/reasoning" in pending
+    var query by rememberSaveable(chat.sessionId) { mutableStateOf("") }
+    val catalog = data["picker:models"]
+    val loading = catalog == null // a cached list is shown while the refresh runs
+    val catalogGroups = catalog?.rows("groups").orEmpty()
+    val chatModel = chat.raw.string("model")
+    val chatProvider = chat.raw.string("model_provider")
+    // Hermes may report a running chat's provider under another name than its picker row; Hermes then says which row it means.
+    val askHermes = chatProvider.isNotBlank() && chat.raw.string("runtime_session_id").isNotBlank() && catalogGroups.isNotEmpty() && pickerGroupNamed(catalogGroups, chatProvider).isBlank()
+    LaunchedEffect(askHermes, chat.sessionId, chatProvider) {
+        if (askHermes) vm.load("picker:model-current", "/api/model/current", mapOf("session_id" to chat.sessionId), quiet = true)
+    }
+    // The reasoning choices belong to the chat's model; they load beside the models so the level can be changed from the same sheet.
+    LaunchedEffect(chat.sessionId, chatModel, chatProvider) {
+        if (chat.sessionId.isNotBlank()) vm.load("picker:reasoning", if (vm.isBeaconConversation()) "/api/mobile/beacon/reasoning" else "/api/reasoning", mapOf("session_id" to chat.sessionId, "model" to chatModel, "provider" to chatProvider), quiet = true)
+    }
+    val hermesRow = data["picker:model-current"]?.takeIf { it.string("scope_key") == vm.client?.scope?.key && it.string("session_id") == chat.sessionId && it.string("provider") == chatProvider }?.string("provider_id").orEmpty()
+    val currentProvider = currentPickerProvider(catalogGroups, chatProvider, chatModel, hermesRow)
+    val groups = remember(catalog, query, currentProvider, chatModel) { catalog?.rows("groups").orEmpty().map { group ->
+        val provider = group.string("provider", group.string("label", group.string("provider_id")))
+        group to pinSelectedModel((group.rows("models") + group.rows("extra_models")).distinctBy { it.string("id") }.filter { modelSearchMatches(provider, it.string("id"), it.string("label"), query) }, chatModel, group.string("provider_id") == currentProvider)
+    }.filter { it.second.isNotEmpty() }.sortedBy { it.first.string("provider_id") != currentProvider } }
+    val reasoning = data["picker:reasoning"]
+    val options = reasoning?.optJSONArray("options")?.strings().orEmpty()
+    val effort = chat.sessionReasoningEffort.ifBlank { chat.raw.string("reasoning_effort", chat.raw.string("reasoning")) }.ifBlank { reasoning?.string("value").orEmpty() }
+    val currentGroup = catalogGroups.firstOrNull { it.string("provider_id") == currentProvider }
+    val currentTitle = currentGroup?.let { g -> (g.rows("models") + g.rows("extra_models")).firstOrNull { it.string("id") == chatModel }?.string("label") }?.takeIf { it.isNotBlank() } ?: chatModel
+    val currentProviderLabel = currentGroup?.let { shortProviderLabel(it.string("provider", it.string("label", it.string("provider_id")))) } ?: chatProvider
+    OutlinedTextField(query, { query = it }, label = { Text(uiText("Search model or provider")) }, leadingIcon = { Icon(Icons.Rounded.Search, null) }, singleLine = true, modifier = Modifier.fillMaxWidth().padding(start = 16.dp, top = 4.dp, end = 16.dp))
+    SettingsList(Modifier.weight(1f), refreshing = (modelPending && modelSaving.isBlank()) || (!loading && "picker:models" in refreshing)) {
+        if (query.isBlank()) item(key = "current") {
+            CurrentModelCard(
+                model = currentTitle, provider = currentProviderLabel, applying = modelPending && modelSaving.isBlank(),
+                options = options, effort = effort, reasoningLoading = (reasoning == null && chat.sessionId.isNotBlank()) || ("picker:reasoning" in refreshing && options.isEmpty()),
+                reasoningFailed = reasoning != null && recordError(reasoning).isNotBlank(), automatic = reasoning != null && options.isEmpty() && reasoning.optBoolean("known"),
+                reasoningPending = reasoningPending, onEffort = vm::setReasoning, onRetry = { vm.openCatalog("Model & provider") },
+            )
+        }
+        if (loading) item(key = "loading") { SettingsSection { Box(Modifier.testTag("models-loading")) { SettingsSkeletonRows(5) } } }
+        else if (recordError(catalog).isNotBlank()) item(key = "error") { SettingsSection { SettingsErrorRow(uiText("Couldn't load models"), { vm.openCatalog("Model & provider") }, uiText("Retry")) } }
+        groups.forEach { (group, models) ->
+            val provider = group.string("provider_id")
+            val label = shortProviderLabel(group.string("provider", group.string("label", provider)))
+            item(key = "provider:$provider") {
+                SettingsSection(title = label) {
+                    models.forEachIndexed { index, model ->
+                        val id = model.string("id")
+                        val title = model.string("label", id)
+                        if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f))
+                        ModelRow(title, modelSubtitle(title, id), selected = chatModel == id && currentProvider == provider, applying = modelSaving == "$provider:$id",
+                            enabled = !loading && !modelPending, tag = "model:$provider:$id") { vm.pickModel(id, provider) }
+                    }
+                }
+            }
+        }
+        if (catalog != null && recordError(catalog).isBlank() && groups.isEmpty()) item(key = "empty") {
+            SettingsSection { SettingsEmpty(uiText("No matching models"), Icons.Rounded.SearchOff, action = if (query.isBlank()) null else SettingsAction(uiText("Clear search"), { query = "" })) }
+        }
+        if (!loading) item(key = "custom") {
+            val customModelTitle = uiText("Custom model"); val modelLabel = uiText("Model"); val providerIdLabel = uiText("Provider ID")
+            val enterCustomModel = { vm.closeCatalog(); vm.openForm(ActionForm(customModelTitle, "/api/session/update", listOf(Field("model", modelLabel, required = true), Field("model_provider", providerIdLabel)), json("session_id" to chat.sessionId))) }
+            SettingsSection { SettingsActionRow(uiText("Enter a configured model ID"), enterCustomModel, icon = Icons.Rounded.Add, enabled = !modelPending) }
+        }
+    }
+}
+
+/** A model in a provider's list: its name, its id when that differs, and a check (or a spinner while it is being applied). */
+@Composable internal fun ModelRow(title: String, subtitle: String, selected: Boolean, applying: Boolean, enabled: Boolean, tag: String, onPick: () -> Unit) {
+    val scheme = MaterialTheme.colorScheme
+    Row(Modifier.fillMaxWidth().background(if (selected) scheme.primaryContainer.copy(alpha = .35f) else Color.Transparent).testTag(tag).semantics { this.selected = selected }
+        .clickable(enabled = enabled) { onPick() }.heightIn(min = 64.dp).padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            if (subtitle.isNotBlank()) Text(subtitle, style = MaterialTheme.typography.bodySmall, color = scheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        when {
+            applying -> CircularProgressIndicator(Modifier.size(24.dp).testTag("model-applying"), strokeWidth = 2.dp)
+            selected -> Icon(Icons.Rounded.Check, uiText("Selected"), tint = scheme.primary)
+        }
+    }
+}
+
+/** The chat's model with its provider, and the reasoning level as segments that apply on tap. Spoken as one line; the segments stay separate controls. */
+@Composable private fun CurrentModelCard(
+    model: String, provider: String, applying: Boolean, options: List<String>, effort: String, reasoningLoading: Boolean, reasoningFailed: Boolean,
+    automatic: Boolean, reasoningPending: Boolean, onEffort: (String) -> Unit, onRetry: () -> Unit,
+) {
+    val title = model.ifBlank { uiText("Profile default") }
+    val spoken = listOf("${uiText("Current")}: $title", provider).filter { it.isNotBlank() }.joinToString(", ")
+    SettingsSection(title = uiText("Current"), testTag = "model-current") {
+        Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            SettingsIconTile(Icons.Rounded.Memory)
+            Column(Modifier.weight(1f).clearAndSetSemantics { contentDescription = spoken }, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(title, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                if (provider.isNotBlank()) Text(provider, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            if (applying) SettingsStatusPill(SettingsStatus.Working, uiText("Applying model…"))
+        }
+        when {
+            options.isNotEmpty() -> {
+                SettingsDivider()
+                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(uiText("Reasoning"), style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+                    ReasoningChoice(options, effort, enabled = !reasoningPending, onPick = onEffort)
+                }
+            }
+            reasoningFailed -> { SettingsDivider(); SettingsErrorRow(uiText("Couldn't load reasoning"), onRetry, uiText("Retry")) }
+            reasoningLoading -> Box(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 16.dp).height(48.dp).clip(RoundedCornerShape(24.dp)).background(MaterialTheme.colorScheme.onSurface.copy(alpha = .06f)).testTag("reasoning-loading"))
+            automatic -> { SettingsDivider(); Text(uiText("This model manages reasoning automatically."), Modifier.padding(16.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        }
+    }
+}
+
+/** Two to four short levels read best as segments; a longer or larger set wraps as chips. Both keep the tag `reasoning-level:<level>`. */
+@Composable private fun ReasoningChoice(options: List<String>, selected: String, enabled: Boolean, onPick: (String) -> Unit) {
+    val labels = options.map { uiText(reasoningLevelLabel(it)) }
+    if (options.size in 2..4 && labels.all { it.length <= 12 } && LocalDensity.current.fontScale < 1.3f) {
+        SegmentedChoice("reasoning", selected, options, labels, onPick, enabled = enabled, testTags = options.associateWith { "reasoning-level:$it" })
+    } else {
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            options.forEachIndexed { index, option ->
+                FilterChip(selected = option == selected, onClick = { if (option != selected) onPick(option) }, enabled = enabled, label = { Text(labels[index]) }, modifier = Modifier.testTag("reasoning-level:$option"))
             }
         }
     }
@@ -173,24 +275,11 @@ internal fun reasoningLevelDescription(level: String): String = when (level.lowe
     else -> "Use the model's default reasoning"
 }
 
-@Composable private fun ReasoningLevelOption(level: String, selected: Boolean, enabled: Boolean, onSelect: () -> Unit) {
-    Surface(
-        onClick = onSelect,
-        enabled = enabled,
-        shape = RoundedCornerShape(16.dp),
-        color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
-        border = androidx.compose.foundation.BorderStroke(1.dp, if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant),
-        modifier = Modifier.fillMaxWidth().heightIn(min = 64.dp).testTag("reasoning-level:$level"),
-    ) {
-        Row(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-            RadioButton(selected, onClick = null, enabled = enabled)
-            Column(Modifier.padding(start = 8.dp)) {
-                Text(uiText(reasoningLevelLabel(level)), style = MaterialTheme.typography.titleSmall)
-                Text(uiText(reasoningLevelDescription(level)), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
-    }
-}
+/** The levels Hermes names; a provider's own level shows as its capitalised word. */
+internal val reasoningLevels = listOf("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+
+/** The reasoning words and sentences reach uiText through variables, so the translation test reads them from here. */
+internal val ReasoningStrings = (reasoningLevels.map(::reasoningLevelLabel) + reasoningLevels.map(::reasoningLevelDescription) + reasoningLevelDescription("")).distinct()
 
 @Composable private fun ReasoningSkeleton() {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().testTag("reasoning-skeleton")) {
@@ -206,48 +295,161 @@ internal fun reasoningLevelDescription(level: String): String = when (level.lowe
     }
 }
 
+/** A session's token figures, read from whichever names Hermes uses; the keys it consumed are left out of the Details view. */
+internal data class SessionUsageFigures(val input: Long?, val output: Long?, val window: Long?, val used: Long?, val consumed: Set<String>) {
+    /** Share of the context window in use, 0–100; null without both figures. */
+    val percent: Int? get() = if (used != null && window != null && window > 0) (used * 100 / window).toInt().coerceIn(0, 100) else null
+}
+
+internal fun sessionUsageFigures(usage: JSONObject): SessionUsageFigures {
+    val consumed = mutableSetOf<String>()
+    fun number(vararg keys: String): Long? = keys.firstNotNullOfOrNull { key ->
+        val raw = usage.opt(key)
+        (raw as? Number)?.toLong()?.also { consumed += key } ?: (raw as? String)?.toLongOrNull()?.also { consumed += key }
+    }
+    return SessionUsageFigures(
+        input = number("input_tokens", "input", "prompt_tokens", "prompt"),
+        output = number("output_tokens", "output", "completion_tokens", "completion"),
+        window = number("context_window", "context_max", "max_context", "context_length"),
+        used = number("context_usage", "context_used", "total_tokens", "total"),
+        consumed = consumed,
+    )
+}
+
+/** Whether a usage record holds anything to show: a key that is not a marker (`_…`) or the server's own error, success or message fields, with a value. */
+internal fun sessionUsageReadable(usage: JSONObject): Boolean = usage.keys().asSequence().any { key ->
+    !key.startsWith('_') && key !in setOf("error", "success", "message") && usage.opt(key).let { it != null && it != JSONObject.NULL && it.toString().isNotBlank() }
+}
+
+/** 100 → "100", 1,234 → "1.2K", 32,000 → "32K", 1,200,000 → "1.2M". */
+internal fun formatTokenCount(value: Long, locale: Locale = Locale.getDefault()): String {
+    val number = NumberFormat.getNumberInstance(locale).apply { maximumFractionDigits = 1 }
+    return when {
+        value < 1_000 -> number.format(value)
+        value < 10_000 -> number.format(value / 1_000.0) + "K"
+        value < 1_000_000 -> NumberFormat.getIntegerInstance(locale).format(value / 1_000) + "K"
+        else -> number.format(value / 1_000_000.0) + "M"
+    }
+}
+
 /** Each administration destination has a native operation or a concrete reader. */
 @Composable fun NativeAdministration(vm: BeaconViewModel, page: String) {
-    val data by vm.data.collectAsStateWithLifecycle()
     val ui by vm.ui.collectAsStateWithLifecycle()
     val chat by vm.chat.collectAsStateWithLifecycle()
     val refreshing by vm.refreshing.collectAsStateWithLifecycle()
     var query by rememberSaveable(page, ui.origin, ui.owner, ui.profile) { mutableStateOf("") }
+    val usageKey = "native-usage:${ui.profile}:${chat.sessionId}"
     LaunchedEffect(page, ui.origin, ui.owner, ui.profile, chat.sessionId) {
         if (page == "Commands") vm.loadSlashCatalog()
-        if (page == "Session usage") vm.load("native-usage:${ui.profile}:${chat.sessionId}", "/api/session/usage", mapOf("session_id" to chat.sessionId))
+        if (page == "Session usage" && chat.sessionId.isNotBlank()) vm.load(usageKey, "/api/session/usage", mapOf("session_id" to chat.sessionId))
     }
     Column(Modifier.fillMaxSize()) {
         Header(uiText(settingsLabel(page)), back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current, actions = {
             if (page == "Commands") IconButton(onClick = { vm.loadSlashCatalog(force = true) }, enabled = "slash:catalog" !in refreshing) { Icon(Icons.Rounded.Refresh, uiText("Refresh commands")) }
-            if (page == "Session usage") IconButton(onClick = { vm.load("native-usage:${ui.profile}:${chat.sessionId}", "/api/session/usage", mapOf("session_id" to chat.sessionId)) }, enabled = "native-usage:${ui.profile}:${chat.sessionId}" !in refreshing) { Icon(Icons.Rounded.Refresh, uiText("Refresh usage")) }
+            if (page == "Session usage") IconButton(onClick = { vm.load(usageKey, "/api/session/usage", mapOf("session_id" to chat.sessionId)) }, enabled = chat.sessionId.isNotBlank() && usageKey !in refreshing) { Icon(Icons.Rounded.Refresh, uiText("Refresh usage")) }
         })
         when (page) {
             "Tools & commands" -> NativeToolSettings(vm, containedActions = true)
             "MCP servers" -> NativeToolSettings(vm, mcp = true, containedActions = true)
-            "Providers & models" -> Column(Modifier.padding(SettingsPagePadding), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                Text(uiText("Model for this chat"))
-                if (chat.sessionId.isBlank()) Text(uiText("Pick a chat first"), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                else {
-                    Text(chat.title, style = MaterialTheme.typography.titleMedium)
-                    Text(chat.raw.string("model").ifBlank { uiText("Uses the profile default") })
-                }
-                Button(onClick = { vm.openCatalog("Model & provider") }, enabled = chat.sessionId.isNotBlank()) { Text(uiText("Change conversation model")) }
-                OutlinedButton(onClick = { vm.more("Profiles") }) { Text(uiText("Manage profile defaults")) }
-            }
-            "Commands" -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(SettingsPagePadding), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                item { Text(uiText("Choose a command to prepare it in Chat. Review it before sending.")); OutlinedTextField(query, { query = it }, label = { Text(uiText("Search commands")) }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
-                val catalog = data["slash:catalog"]
-                if (catalog == null) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
-                if (recordError(catalog).isNotBlank()) item { Text(uiText(recordError(catalog)), color = MaterialTheme.colorScheme.error) }
-                val commands = mobileSlashCommands(catalog?.rows("commands").orEmpty()).filter { query.isBlank() || (it.string("name") + it.string("description")).contains(query, true) }
-                if (catalog != null && commands.isEmpty()) item { EmptyState(uiText("No matching commands"), uiText("Try another search."), Icons.Rounded.SearchOff, action = if (query.isBlank()) "" else uiText("Clear search"), onAction = { query = "" }) }
-                items(commands) { row -> ActionRow("/${row.string("name")}", row.string("description")) { vm.tab("Chat"); vm.composer(androidx.compose.ui.text.input.TextFieldValue("/${row.string("name").removePrefix("/")} ")) } }
-            }
-            "Session usage" -> LazyColumn(contentPadding = PaddingValues(SettingsPagePadding)) {
-                item { val usage = data["native-usage:${ui.profile}:${chat.sessionId}"]; if (usage == null) LinearProgressIndicator(Modifier.fillMaxWidth()) else if (recordError(usage).isNotBlank()) Text(uiText(recordError(usage)), color = MaterialTheme.colorScheme.error) else StructuredRead(usage) }
-            }
+            "Providers & models" -> ProvidersModelsPage(vm)
+            "Commands" -> CommandsPage(vm, query) { query = it }
+            "Session usage" -> SessionUsagePage(vm, usageKey)
             else -> LaunchedEffect(page) { vm.tab("More") }
+        }
+    }
+}
+
+/** Two rows: this chat's model, and the profile defaults it falls back to. */
+@Composable private fun ProvidersModelsPage(vm: BeaconViewModel) {
+    val chat by vm.chat.collectAsStateWithLifecycle()
+    val hasChat = chat.sessionId.isNotBlank()
+    SettingsList(testTag = "providers-page") {
+        item { SettingsSection(title = uiText("This chat")) {
+            SettingsNavRow(uiText("Model"), { openModelPicker(vm) }, icon = Icons.Rounded.Memory, enabled = hasChat,
+                value = if (!hasChat) uiText("Open a chat first") else chat.raw.string("model").ifBlank { uiText("Profile default") }, testTag = "providers-this-chat")
+        } }
+        item { SettingsSection(title = uiText("Defaults")) {
+            SettingsNavRow(uiText("Profile defaults"), { vm.more("Profiles") }, icon = Icons.Rounded.SmartToy, testTag = "providers-profile-defaults")
+        } }
+    }
+}
+
+@Composable private fun CommandsPage(vm: BeaconViewModel, query: String, onQuery: (String) -> Unit) {
+    val data by vm.data.collectAsStateWithLifecycle()
+    val refreshing by vm.refreshing.collectAsStateWithLifecycle()
+    val catalog = data["slash:catalog"]
+    val error = recordError(catalog)
+    val commands = remember(catalog, query) { mobileSlashCommands(catalog?.rows("commands").orEmpty()).filter { query.isBlank() || (it.string("name") + it.string("description")).contains(query, true) } }
+    SettingsList(refreshing = catalog != null && "slash:catalog" in refreshing, testTag = "commands-page") {
+        item { OutlinedTextField(query, onQuery, label = { Text(uiText("Search commands")) }, leadingIcon = { Icon(Icons.Rounded.Search, null) }, singleLine = true, modifier = Modifier.fillMaxWidth()) }
+        if (error.isNotBlank()) item { SettingsSection { SettingsErrorRow(uiText(error), { vm.loadSlashCatalog(force = true) }, uiText("Retry")) } }
+        when {
+            catalog == null -> item { SettingsSection { SettingsSkeletonRows(4) } }
+            commands.isNotEmpty() -> item { SettingsSection(testTag = "commands-list") {
+                commands.forEachIndexed { index, row ->
+                    if (index > 0) SettingsDivider()
+                    val name = row.string("name").removePrefix("/")
+                    // Choosing a command prepares it in Chat for review; it is never sent from here.
+                    CommandRow(name, row.string("description")) { vm.tab("Chat"); vm.composer(TextFieldValue("/$name ")) }
+                }
+            } }
+            error.isBlank() -> item { SettingsSection { SettingsEmpty(uiText("No matching commands"), Icons.Rounded.SearchOff, action = if (query.isBlank()) null else SettingsAction(uiText("Clear search"), { onQuery("") })) } }
+        }
+    }
+}
+
+@Composable internal fun CommandRow(name: String, description: String, onClick: () -> Unit) {
+    Row(Modifier.fillMaxWidth().heightIn(min = SettingsKit.RowMinHeightTwoLine).clickable(role = Role.Button, onClick = onClick).padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+        SettingsIconTile(Icons.Rounded.Terminal)
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("/$name", style = MaterialTheme.typography.bodyLarge.copy(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Medium).contentDirection(), maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (description.isNotBlank()) Text(description, style = MaterialTheme.typography.bodyMedium.contentDirection(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+/** The open chat's token use as figures and a context bar; keys it does not know sit behind Details. */
+@Composable private fun SessionUsagePage(vm: BeaconViewModel, usageKey: String) {
+    val data by vm.data.collectAsStateWithLifecycle()
+    val refreshing by vm.refreshing.collectAsStateWithLifecycle()
+    val chat by vm.chat.collectAsStateWithLifecycle()
+    val usage = data[usageKey]
+    val error = recordError(usage)
+    var details by rememberSaveable(usageKey) { mutableStateOf(false) }
+    val reload = { vm.load(usageKey, "/api/session/usage", mapOf("session_id" to chat.sessionId)); Unit }
+    SettingsList(refreshing = usage != null && usageKey in refreshing, testTag = "usage-page") {
+        when {
+            chat.sessionId.isBlank() -> item { SettingsSection { SettingsEmpty(uiText("Open a chat first"), Icons.Rounded.ChatBubbleOutline) } }
+            usage == null -> item { SettingsSection { SettingsSkeletonRows(3) } }
+            error.isNotBlank() && !sessionUsageReadable(usage) -> item { SettingsSection { SettingsErrorRow(uiText(error), reload, uiText("Retry")) } }
+            else -> {
+                val figures = sessionUsageFigures(usage)
+                val line = listOf(chat.raw.string("model_provider"), chat.raw.string("model").ifBlank { usage.string("model") }).filter { it.isNotBlank() }.joinToString(" · ")
+                item { SettingsStatusHero(null, chat.title.ifBlank { uiText("Session usage") }, line = line, icon = Icons.Rounded.BarChart, testTag = "usage-hero") }
+                if (figures.input != null || figures.output != null || figures.window != null || figures.percent != null) item { SettingsSection(testTag = "usage-figures") {
+                    val metrics = listOfNotNull(
+                        figures.input?.let { uiText("Input") to formatTokenCount(it) },
+                        figures.output?.let { uiText("Output") to formatTokenCount(it) },
+                        figures.window?.let { uiText("Context") to formatTokenCount(it) },
+                    )
+                    if (metrics.isNotEmpty()) SettingsMetricRow(metrics)
+                    figures.percent?.let { percent ->
+                        Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 16.dp, top = if (metrics.isEmpty()) 16.dp else 0.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            LinearProgressIndicator(progress = { percent / 100f }, modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)).testTag("usage-context-bar"))
+                            Text(uiText("{0}% of context").replace("{0}", "$percent"), style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                } }
+                val extra = usage.keys().asSequence().filter { !it.startsWith('_') && it != "error" && it !in figures.consumed && usage.opt(it).let { v -> v != null && v != JSONObject.NULL && v.toString().isNotBlank() } }.toList()
+                if (extra.isNotEmpty()) item { SettingsSection(testTag = "usage-details") {
+                    SettingsActionRow(uiText("Details"), { details = !details }, icon = Icons.Rounded.Info)
+                    if (details) Box(Modifier.fillMaxWidth().padding(16.dp)) { StructuredRead(JSONObject(usage, extra.toTypedArray())) }
+                } }
+                // A failed refresh keeps the figures already read; its error sits under them.
+                if (error.isNotBlank()) item(key = "refresh-error") { SettingsSection { SettingsErrorRow(uiText(error), reload, uiText("Retry")) } }
+            }
         }
     }
 }

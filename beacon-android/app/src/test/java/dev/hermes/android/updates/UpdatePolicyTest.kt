@@ -80,6 +80,32 @@ class UpdatePolicyTest {
         assertTrue(updateCheckDue(1_000, now, true, lastAttempt = now))
     }
 
+    @Test fun aLiveKeepConnectedChecksEveryThirtyMinutesAndEverythingElseKeepsTheSixHourSchedule() {
+        val minute = 60_000L
+        val hour = 60 * minute
+        assertEquals(6 * hour, checkWindow(offered = false, onUpdateScreen = false))
+        assertEquals(6 * hour, checkWindow(offered = true, onUpdateScreen = false))
+        assertEquals(30 * minute, checkWindow(offered = true, onUpdateScreen = true))
+        assertEquals(30 * minute, checkWindow(offered = false, onUpdateScreen = false, keepConnected = true))
+        assertEquals(30 * minute, checkWindow(offered = true, onUpdateScreen = true, keepConnected = true))
+        val window = checkWindow(offered = false, onUpdateScreen = false, keepConnected = true)
+        // Keep connected asks every minute; the 30-minute window makes only one of those a request, and a failed attempt still waits 15 minutes.
+        assertFalse(updateCheckDue(1_000, 1_000 + 30 * minute - 1, false, window = window))
+        assertTrue(updateCheckDue(1_000, 1_000 + 30 * minute, false, window = window))
+        assertFalse(updateCheckDue(1_000, 1_000 + 30 * minute, false, lastAttempt = 1_000 + 30 * minute - 14 * minute, window = window))
+        // Without Keep connected the same moment is not yet due.
+        assertFalse(updateCheckDue(1_000, 1_000 + 30 * minute, false, window = checkWindow(false, false)))
+    }
+
+    @Test fun keepConnectedCountsOnlyWhenEnabledAndConnected() {
+        assertTrue(keepConnectedLive(enabled = true, status = "connected"))
+        assertFalse(keepConnectedLive(enabled = true, status = "reconnecting"))
+        assertFalse(keepConnectedLive(enabled = true, status = "starting"))
+        assertFalse(keepConnectedLive(enabled = true, status = "signed_out"))
+        assertFalse(keepConnectedLive(enabled = false, status = "connected"))
+        assertFalse(keepConnectedLive(enabled = false, status = "off"))
+    }
+
     @Test fun oneNotificationPerVersion() {
         assertTrue(updateNotificationDue(3, 0))
         assertFalse(updateNotificationDue(3, 3))

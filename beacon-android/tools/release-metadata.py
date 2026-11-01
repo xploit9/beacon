@@ -93,12 +93,16 @@ def metadata_for_apk(apk_path, aapt, apksigner):
     if version_code<=20 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}',version_name):
         raise ReleaseMetadataError('The stable APK version is invalid.')
     if len(digests)!=1: raise ReleaseMetadataError('The stable APK must have one verified signing identity.')
+    # One release version: the APK and the Beacon plugin it ships with are always published under the same number.
+    plugin_version=_plugin_version()
+    if version_name!=plugin_version:
+        raise ReleaseMetadataError(f'The stable APK version {version_name} differs from the Beacon plugin version {plugin_version}.')
     return {
         'artifact_filename':f'Beacon-{version_name}.apk',
         'package_name':identity[1],
         'version_code':version_code,
         'version_name':version_name,
-        'plugin_version':_plugin_version(),
+        'plugin_version':plugin_version,
         'certificate_sha256':digests[0].lower(),
         'sha256':_sha256(apk),
         'size_bytes':size,

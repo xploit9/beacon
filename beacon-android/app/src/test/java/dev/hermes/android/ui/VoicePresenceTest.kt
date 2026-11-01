@@ -204,4 +204,12 @@ class VoicePresenceTest {
         assertEquals(0xFFFFFFFFL.toInt(), presenceArgb(pole, .5f, 1f, 1f))
         assertEquals(0, presenceArgb(pole, .5f, 0f, 0f) ushr 24)
     }
+
+    @Test fun theCachedGreetingMovesTheDustWhileTheCallStillConnects() {
+        val connecting = CallState(active = true, state = "connecting")
+        assertEquals(SphereState.Idle, presenceState(connecting))
+        assertEquals(SphereState.Speaking, presenceState(connecting.copy(remoteSpeaking = true)))
+        assertEquals(SphereState.Idle, presenceState(connecting.copy(remoteSpeaking = true, held = true)))
+        assertEquals(SphereState.Idle, presenceState(connecting.copy(state = "reconnecting", remoteSpeaking = true)))
+    }
 }

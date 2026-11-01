@@ -1,40 +1,33 @@
 @file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 package dev.hermes.android.ui
 
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.border
-import androidx.compose.foundation.selection.selectable
-import androidx.compose.foundation.selection.selectableGroup
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
+import android.text.format.Formatter
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.rounded.CallSplit
+import androidx.compose.material.icons.automirrored.rounded.Logout
+import androidx.compose.material.icons.automirrored.rounded.Notes
+import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.heading
-import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.AppState
@@ -44,6 +37,8 @@ import dev.hermes.android.core.*
 import dev.hermes.android.data.VoiceKeyStore
 import dev.hermes.android.push.KeepConnectedService
 import dev.hermes.android.updates.AppUpdateScreen
+import dev.hermes.android.updates.PluginRow
+import dev.hermes.android.updates.PluginStatus
 import dev.hermes.android.updates.UpdatePhase
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -71,12 +66,18 @@ private fun settingsIcon(name: String): ImageVector = when (name) {
     "Chat", "Settings" -> Icons.Rounded.ChatBubbleOutline
     "Notifications & Keep connected", "Notifications" -> Icons.Rounded.NotificationsNone
     "App updates" -> Icons.Rounded.SystemUpdate
-    "Server", "Health", "Logs", "Server updates", "Session checkpoints" -> Icons.Rounded.SettingsSuggest
+    "Server" -> Icons.Rounded.SettingsSuggest
+    "Health" -> Icons.Rounded.MonitorHeart
+    "Logs" -> Icons.AutoMirrored.Rounded.Notes
+    "Server updates" -> Icons.Rounded.SystemUpdateAlt
+    "Session checkpoints" -> Icons.Rounded.Restore
     "Profiles & model", "Profiles" -> ProfilesIcon
     "Providers & models" -> Icons.Rounded.Tune
-    "Tools & MCP", "Tools & commands", "MCP servers" -> Icons.Rounded.Build
+    "Tools & MCP", "Tools & commands" -> Icons.Rounded.Build
+    "MCP servers" -> Icons.Rounded.Hub
     "About & licenses", "Licenses" -> Icons.Rounded.Info
     "Connections", "Connection" -> Icons.Rounded.Link
+    "Devices" -> Icons.Rounded.PhoneAndroid
     "Skills" -> SkillsIcon
     "Memory" -> MemoryIcon
     else -> Icons.Rounded.FolderOpen
@@ -86,22 +87,18 @@ private fun settingsIcon(name: String): ImageVector = when (name) {
 internal val SettingsRowMinHeight = 78.dp
 
 /** The overview's row summaries: fixed words through [uiText], user data (profile, version, language name) verbatim. */
-@Composable internal fun localizedSettingsSummaries(snapshot: SettingsSnapshot): Map<String, String> =
-    settingsSearchRoutes.associateWith { route -> settingsSummary(route, snapshot).map { if (it.translate) uiText(it.text) else it.text }.joinSummary() }
+@Composable internal fun localizedSettingsSummaries(snapshot: SettingsSnapshot): Map<String, SettingsRowSummary> =
+    settingsSearchRoutes.associateWith { route -> settingsRowSummary(settingsSummary(route, snapshot)) { uiText(it) } }
 
-/** [summary] is the row's current value, already localized; a row without one keeps its static description. */
-@Composable private fun SettingsRow(name: String, summary: String = "", compatibilityTag: String? = null, selected: Boolean? = null, onClick: () -> Unit) {
-    val detail = summary.ifBlank { uiText(settingsDescriptions[name].orEmpty()) }
-    val rowModifier = if (selected == null) Modifier.clickable(role = Role.Button, onClick = onClick)
-    else Modifier.selectable(selected = selected, role = Role.Button, onClick = onClick)
-    // One clickable node: ListItem merges its own text, so a wrapping clickable would be an unlabeled button for TalkBack.
-    ListItem(
-        headlineContent = { Text(uiText(settingsLabel(name)), style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium) },
-        supportingContent = if (detail.isBlank()) null else ({ Text(detail, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }),
-        leadingContent = { Surface(shape = RoundedCornerShape(13.dp), color = MaterialTheme.colorScheme.primary.copy(alpha = .09f)) { Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) { Icon(settingsIcon(name), null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(21.dp)) } } },
-        trailingContent = { Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp)) },
-        colors = ListItemDefaults.colors(containerColor = if (selected == true) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent),
-        modifier = rowModifier.fillMaxWidth().heightIn(min = SettingsRowMinHeight).testTag(compatibilityTag ?: "settings-row:$name"),
+/** [summary] is the row's current value and state pill, already localized; a row with neither keeps its static description. */
+@Composable private fun SettingsRow(name: String, summary: SettingsRowSummary, compatibilityTag: String? = null, selected: Boolean? = null, onClick: () -> Unit) {
+    val pill = summary.status != null && summary.statusLabel.isNotBlank()
+    SettingsNavRow(
+        label = uiText(settingsLabel(name)), onClick = onClick, icon = settingsIcon(name),
+        value = summary.value.ifBlank { if (pill) "" else uiText(settingsDescriptions[name].orEmpty()) },
+        status = summary.status.takeIf { pill }, statusLabel = summary.statusLabel,
+        selected = selected, minHeight = SettingsRowMinHeight, valueMaxLines = 2,
+        testTag = compatibilityTag ?: "settings-row:$name",
     )
 }
 /** Tags older tests and saved routes rely on for renamed hub rows. */
@@ -113,24 +110,26 @@ private fun hubCompatibilityTag(name: String): String? = when (name) {
     "Profiles & model" -> "settings-row:Profiles"
     else -> null
 }
-@Composable private fun SettingsGroup(title: String, names: List<String>, summaries: Map<String, String>, modifier: Modifier = Modifier, selectedPage: String? = null, onOpen: (String) -> Unit) {
-    Column(modifier.testTag("settings-group:$title"), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        if (title.isNotBlank()) Text(uiText(title), Modifier.padding(start = 4.dp), style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Glass { Column { names.forEachIndexed { index, name ->
-            if (index > 0) HorizontalDivider(Modifier.padding(start = 72.dp, end = 16.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f))
-            SettingsRow(name, summaries[name].orEmpty(), hubCompatibilityTag(name), selected = selectedPage?.let { settingsRoute(name) == it }) { onOpen(settingsRoute(name)) }
-        } } }
+@Composable private fun SettingsRows(names: List<String>, summaries: Map<String, SettingsRowSummary>, selectedPage: String?, onOpen: (String) -> Unit, tagged: Boolean = true) {
+    names.forEachIndexed { index, name ->
+        if (index > 0) SettingsDivider()
+        SettingsRow(name, summaries[name] ?: SettingsRowSummary(), if (tagged) hubCompatibilityTag(name) else null, selected = selectedPage?.let { settingsRoute(name) == it }) { onOpen(settingsRoute(name)) }
     }
+}
+@Composable private fun SettingsGroup(title: String, names: List<String>, summaries: Map<String, SettingsRowSummary>, modifier: Modifier = Modifier, selectedPage: String? = null, onOpen: (String) -> Unit) {
+    SettingsSection(if (title.isBlank()) "" else uiText(title), modifier, testTag = "settings-group:$title") { SettingsRows(names, summaries, selectedPage, onOpen) }
 }
 /**
  * Stateless Settings overview: current values at a glance, one tap to the focused page. [onOpen] receives the exact
- * `BeaconViewModel.more` argument, [summaries] maps a row name to its localized current value (absent = no summary).
+ * `BeaconViewModel.more` argument, [summaries] maps a row name to its localized value and pill (absent = the row's description).
  */
-@Composable internal fun SettingsOverview(summaries: Map<String, String>, onOpen: (String) -> Unit, category: String = "", selectedPage: String? = null) {
+@Composable internal fun SettingsOverview(summaries: Map<String, SettingsRowSummary>, onOpen: (String) -> Unit, category: String = "", selectedPage: String? = null) {
     var query by rememberSaveable(category) { mutableStateOf("") }
-    val matches = settingsSearchRoutes.filter { settingsSearchMatches(uiText(settingsLabel(it)), uiText(settingsDescriptions[it].orEmpty()), query) }
+    val matches = settingsSearchRoutes.filter { route ->
+        settingsRowMatches(route, uiText(settingsLabel(route)), uiText(settingsDescriptions[route].orEmpty()), settingsKeywordsOf(route).takeIf(String::isNotBlank)?.let { uiText(it) }.orEmpty(), query)
+    }
     val focus = LocalFocusManager.current
-    LazyColumn(Modifier.fillMaxSize().testTag("settings-overview"), contentPadding = PaddingValues(start = SettingsPagePadding, end = SettingsPagePadding, bottom = 32.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
+    SettingsList(testTag = "settings-overview") {
         item {
             OutlinedTextField(query, { query = it }, singleLine = true, placeholder = { Text(uiText("Search settings")) }, leadingIcon = { Icon(Icons.Rounded.Search, null) },
                 trailingIcon = { if (query.isNotEmpty()) IconButton(onClick = { query = "" }) { Icon(Icons.Rounded.Close, uiText("Clear search")) } },
@@ -138,14 +137,19 @@ private fun hubCompatibilityTag(name: String): String? = when (name) {
                 shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth().testTag("settings-search"))
         }
         if (query.isNotBlank()) {
-            item { if (matches.isEmpty()) EmptyState(uiText("No matching settings"), uiText("Try another word."), Icons.Rounded.SearchOff, action = uiText("Clear search"), onAction = { query = "" }) else Glass { Column { matches.forEach { name -> SettingsRow(name, summaries[name].orEmpty(), selected = selectedPage?.let { settingsRoute(name) == it }) { onOpen(settingsRoute(name)) } } } } }
+            item {
+                SettingsSection(testTag = "settings-results") {
+                    if (matches.isEmpty()) SettingsEmpty(uiText("No matching settings"), Icons.Rounded.SearchOff, action = SettingsAction(uiText("Clear search"), { query = "" }))
+                    else SettingsRows(matches, summaries, selectedPage, onOpen, tagged = false)
+                }
+            }
         } else if (category == "Advanced") {
             item { SettingsGroup("Tools and services", settingsCategories.keys.toList(), summaries, selectedPage = selectedPage, onOpen = onOpen) }
         } else if (category.isNotBlank()) {
-            item { Glass { Column { settingsCategories[category].orEmpty().forEachIndexed { index, name -> if (index > 0) HorizontalDivider(Modifier.padding(start = 72.dp, end = 16.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f)); SettingsRow(name, summaries[name].orEmpty(), selected = selectedPage?.let { settingsRoute(name) == it }) { onOpen(settingsRoute(name)) } } } } }
+            item { SettingsSection(testTag = "settings-category:$category") { SettingsRows(settingsCategories[category].orEmpty(), summaries, selectedPage, onOpen, tagged = false) } }
         } else {
             // One item: every hub row stays composed, so scroll-to and screen readers reach all of them.
-            item { Column(verticalArrangement = Arrangement.spacedBy(20.dp)) { settingsHubSections.forEach { (title, names) -> SettingsGroup(title, names, summaries, selectedPage = selectedPage, onOpen = onOpen) } } }
+            item { Column(verticalArrangement = Arrangement.spacedBy(SettingsKit.SectionGap)) { settingsHubSections.forEach { (title, names) -> SettingsGroup(title, names, summaries, selectedPage = selectedPage, onOpen = onOpen) } } }
         }
     }
 }
@@ -167,12 +171,24 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
     )
 }
 
+/** A cached list record that is loaded and not failed; anything else is unknown, never an empty count. */
+private fun JSONObject?.loadedRecord() = this?.takeIf { recordError(it).isBlank() && !it.optBoolean("_loading") }
+
+/** The one pending plugin step the hub's App updates row points at, or blank when the plugin needs nothing. */
+internal fun pluginActionWord(plugin: PluginRow): String = when {
+    !plugin.actionable -> ""
+    plugin.status == PluginStatus.Restart -> "Restart Hermes"
+    else -> "Update Hermes plugin"
+}
+
 /** Reads the same local state as the focused pages, so a summary never claims more than the page it opens will show. */
 @Composable private fun SettingsHome(vm: BeaconViewModel, category: String = "", selectedPage: String? = null) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val prefs by vm.preferences.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
     val update by vm.app.updates.state.collectAsStateWithLifecycle()
+    val skills by vm.phoneSettings.skills.collectAsStateWithLifecycle()
+    val server by vm.phoneSettings.server.collectAsStateWithLifecycle()
     val profileCatalog = data["navigation-profiles"]
     val profileRows = profileCatalog?.rows("profiles").orEmpty()
     val profileLoading = ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
@@ -203,13 +219,26 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
             }.getOrNull()
         }
     }
+    val tools = data["native-tools"].loadedRecord()?.rows("items")
+    val mcp = data["native-mcp"].loadedRecord()?.rows("servers")
+    val checkpointSize = if (server.checkpointBytes > 0) Formatter.formatShortFileSize(context, server.checkpointBytes) else ""
+    // The Connection page's own verdict decides the row too, so the two never disagree.
+    val verdict = connectionVerdict(ui.connected, ui.loading || ui.restoringSession, ui.authenticated, ui.origin.isNotBlank())
     val snapshot = SettingsSnapshot(
-        connected = ui.connected, profile = profileDisplayLabel(ui.profile, profileRows, profileLoading),
+        connected = ui.connected, connecting = verdict == ConnectionVerdict.Checking, profile = if (profileLoading) "" else profileDisplayName(ui.profile, profileRows),
         theme = prefs.theme, colorStyle = prefs.skin,
         installedVersion = BuildConfig.VERSION_NAME, updateName = update.release?.name.orEmpty(), updateReady = update.phase == UpdatePhase.NeedsPermission || update.phase == UpdatePhase.Installing,
         voiceProviderId = phoneVoice?.first.orEmpty(), voiceKeySaved = phoneVoice?.second,
         keepConnectedEnabled = keepConnectedEnabled,
         assistantName = prefs.assistantName, assistantProfile = profileDisplayLabel(prefs.assistantProfile, profileRows, profileLoading),
+        account = ui.owner, signedOut = verdict == ConnectionVerdict.SignedOut,
+        pluginAction = pluginActionWord(update.plugin),
+        profileCount = profileRows.size.takeIf { !profileLoading && profileRows.isNotEmpty() },
+        skillsOn = skills.skills.takeIf { it.isNotEmpty() && skills.profile == ui.profile }?.count { it.enabled },
+        toolsOn = tools?.count { it.optBoolean("enabled") }, mcpServers = mcp?.size,
+        serverOverall = server.overall,
+        serverUpdateAvailable = server.update?.optBoolean("update_available"),
+        checkpointSize = checkpointSize,
     ).withLoaded(data["profile-settings"])
     val summaries = localizedSettingsSummaries(snapshot)
     SettingsOverview(summaries, { vm.more(it) }, category, selectedPage)
@@ -246,32 +275,40 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
     NativeCatalog(vm, containedActions = true)
 }
 
+/** A route's header with the body below it, for the states that replace a page (missing plugin, reconnect, restoring). */
+@Composable private fun SettingsStatePage(vm: BeaconViewModel, page: String, back: Boolean = true, refreshing: Boolean = false, content: LazyListScope.() -> Unit) {
+    androidx.activity.compose.BackHandler { vm.backFromSettings() }
+    Column(Modifier.fillMaxSize()) {
+        Header(uiText(settingsLabel(page)), back = if (back) ({ vm.backFromSettings() }) else null, menu = LocalOpenNavigationMenu.current)
+        SettingsList(Modifier.weight(1f), refreshing = refreshing, content = content)
+    }
+}
+
 @Composable private fun MoreSettingsRoute(vm: BeaconViewModel, ui: AppState, page: String, pluginStatus: String) {
     if (settingsNeedsBeaconPlugin(page, pluginStatus)) {
-        androidx.activity.compose.BackHandler { vm.backFromSettings() }
-        Column(Modifier.fillMaxSize()) {
-            Header(uiText(settingsLabel(page)), back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current)
-            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = androidx.compose.ui.Alignment.Center) { MissingBeaconPluginState() }
-        }
+        SettingsStatePage(vm, page) { item { SettingsSection(testTag = "settings-plugin-missing") { MissingBeaconPluginState(compact = true) } } }
         return
     }
     val remotePage = page in (settingsCategories.values.flatten() + listOf("Skills", "Memory", "Beacon", "Notifications", "Bots", "Profiles", "Commands", "Session usage")) && page !in setOf("Beacon", "App updates")
     if (remotePage && vm.client == null && !ui.loading) {
-        androidx.activity.compose.BackHandler { vm.backFromSettings() }
-        Column(Modifier.fillMaxSize()) {
-            Header(uiText(settingsLabel(page)), back = if (page in setOf("Skills", "Memory", "Bots")) null else ({ vm.backFromSettings() }), menu = LocalOpenNavigationMenu.current)
-            EmptyState(uiText("Reconnect to Hermes"), uiText("Check your network, then retry. Your saved drafts stay on this phone."), action = uiText("Reconnect"), onAction = { vm.connect(ui.origin) })
+        SettingsStatePage(vm, page, back = page !in setOf("Skills", "Memory", "Bots")) {
+            item {
+                SettingsStatusHero(SettingsStatus.Error, uiText("Reconnect to Hermes"), line = uiText("Check your network"),
+                    primary = SettingsAction(uiText("Reconnect"), { vm.connect(ui.origin) }, testTag = "settings-reconnect"))
+            }
         }
         return
     }
     val restoringProfile by vm.settingsProfileRestoring.collectAsStateWithLifecycle()
     val restoreError by vm.settingsProfileRestoreError.collectAsStateWithLifecycle()
     if (restoringProfile && page in setOf("Skills", "Memory", "Profiles")) {
-        androidx.activity.compose.BackHandler { vm.backFromSettings() }
-        Column(Modifier.fillMaxSize()) {
-            Header(uiText(settingsLabel(page)), back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current)
-            if (restoreError.isBlank()) LinearProgressIndicator(Modifier.fillMaxWidth())
-            else EmptyState(uiText("Profile settings"), uiText(restoreError), action = uiText("Retry"), onAction = vm::restoreSettingsProfile)
+        SettingsStatePage(vm, page, refreshing = restoreError.isBlank()) {
+            item {
+                SettingsSection(uiText("Profile settings"), testTag = "settings-restoring") {
+                    if (restoreError.isBlank()) SettingsSkeletonRows(2)
+                    else SettingsErrorRow(uiText(restoreError), vm::restoreSettingsProfile, uiText("Retry"), retryTestTag = "settings-restore-retry")
+                }
+            }
         }
         return
     }
@@ -303,20 +340,49 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
     }
 }
 
+/** The option tags tests and saved layouts know: English label and stored value, whatever language or assistant name the row shows. */
+private fun choiceTags(label: String, options: List<String>) = options.associateWith { "choice-option:$label:$it" }
+
 @Composable private fun NativeChatPreferences(vm: BeaconViewModel) {
     val data by vm.data.collectAsStateWithLifecycle()
     val preferences by vm.preferences.collectAsStateWithLifecycle()
     val busyOverride by vm.busySendOverride.collectAsStateWithLifecycle()
-    val settings = data["profile-settings"] ?: LocalBeaconSettings.current
+    val record = data["profile-settings"]
+    val settings = record ?: LocalBeaconSettings.current
+    val failed = recordError(record).isNotBlank()
+    val busyOptions = listOf("steer", "queue")
+    val keyOptions = listOf("enter", "ctrl_enter")
     Column(Modifier.fillMaxSize()) {
         Header(uiText(settingsLabel("Settings")), back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current)
-        LazyColumn(contentPadding = PaddingValues(SettingsPagePadding), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            item { Choice(assistantText("While Beacon is replying"), busyOverride ?: preferences.busySendAction, listOf("steer", "queue"), { vm.setBusySendAction(it) }, optionLabels = mapOf("steer" to "Steer", "queue" to "Queue"), enabled = preferences.busySendLoaded) }
-            item { Choice("Send shortcut", settings.string("send_key", "enter"), listOf("enter", "ctrl_enter"), { vm.nativePreferences(json("send_key" to it)) }, optionLabels = mapOf("enter" to "Enter", "ctrl_enter" to "Ctrl + Enter")) }
-            item { LabeledToggle(uiText("Format your messages"), settings.optBoolean("render_user_markdown", true), { vm.nativePreferences(json("render_user_markdown" to it)) }) }
-            item { LabeledToggle(uiText("Show thinking"), settings.optBoolean("show_thinking", true), { vm.nativePreferences(json("show_thinking" to it)) }) }
-            item { LabeledToggle(uiText("Auto-follow streaming"), settings.optBoolean("auto_scroll_follow", true), { vm.nativePreferences(json("auto_scroll_follow" to it)) }) }
-            item { LabeledToggle(uiText("Background animation"), settings.optBoolean("animate_background", true), { vm.nativePreferences(json("animate_background" to it)) }) }
+        SettingsList(refreshing = record?.optBoolean("_loading") == true, testTag = "chat-preferences") {
+            if (failed) item { SettingsSection(testTag = "chat-preferences-error") { SettingsErrorRow(uiText("Couldn't load chat settings"), null, "") } }
+            item {
+                SettingsSection(uiText("Sending")) {
+                    SettingsChoiceRow(
+                        assistantText("While Beacon is replying"), busyOverride ?: preferences.busySendAction, busyOptions, { vm.setBusySendAction(it) },
+                        icon = Icons.AutoMirrored.Rounded.CallSplit, optionLabels = mapOf("steer" to "Steer", "queue" to "Queue"),
+                        optionIcons = mapOf("steer" to Icons.AutoMirrored.Rounded.CallSplit, "queue" to Icons.AutoMirrored.Rounded.PlaylistAdd),
+                        optionTestTags = choiceTags("While Beacon is replying", busyOptions), enabled = preferences.busySendLoaded, style = ChoiceStyle.Segmented,
+                    )
+                    SettingsDivider()
+                    SettingsChoiceRow(
+                        uiText("Send shortcut"), settings.string("send_key", "enter"), keyOptions, { vm.nativePreferences(json("send_key" to it)) },
+                        icon = Icons.Rounded.Keyboard, optionLabels = mapOf("enter" to "Enter", "ctrl_enter" to "Ctrl + Enter"),
+                        optionTestTags = choiceTags("Send shortcut", keyOptions), enabled = !failed, style = ChoiceStyle.Segmented,
+                    )
+                }
+            }
+            item {
+                SettingsSection(uiText("Display")) {
+                    SettingsSwitchRow(uiText("Format your messages"), settings.optBoolean("render_user_markdown", true), { vm.nativePreferences(json("render_user_markdown" to it)) }, icon = Icons.Rounded.TextFormat, enabled = !failed, testTag = "chat-pref-format")
+                    SettingsDivider()
+                    SettingsSwitchRow(uiText("Show thinking"), settings.optBoolean("show_thinking", true), { vm.nativePreferences(json("show_thinking" to it)) }, icon = Icons.Rounded.Psychology, enabled = !failed, testTag = "chat-pref-thinking")
+                    SettingsDivider()
+                    SettingsSwitchRow(uiText("Follow new replies"), settings.optBoolean("auto_scroll_follow", true), { vm.nativePreferences(json("auto_scroll_follow" to it)) }, icon = Icons.Rounded.VerticalAlignBottom, enabled = !failed, testTag = "chat-pref-follow")
+                    SettingsDivider()
+                    SettingsSwitchRow(uiText("Background animation"), settings.optBoolean("animate_background", true), { vm.nativePreferences(json("animate_background" to it)) }, icon = Icons.Rounded.AutoAwesome, enabled = !failed, testTag = "chat-pref-animation")
+                }
+            }
         }
     }
 }
@@ -324,12 +390,14 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
 @Composable fun StructuredRead(value: JSONObject, depth: Int = 0) {
     val keys = remember(value) { value.keys().asSequence().filter { !it.startsWith('_') && !privateStructuredKey(it) }.toList() }
     var visible by remember(value) { mutableIntStateOf(24) }
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         keys.take(visible).forEach { key ->
             val item = value.opt(key)
             if (item != JSONObject.NULL && item != null && (item is JSONObject || item is JSONArray || item.toString().isNotBlank())) {
-                Text(key.replace('_', ' ').replaceFirstChar(Char::titlecase), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                StructuredReadValue(item, depth + 1)
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(key.replace('_', ' ').replaceFirstChar(Char::titlecase), style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    StructuredReadValue(item, depth + 1)
+                }
             }
         }
         if (visible < keys.size) TextButton(onClick = { visible += 24 }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Show more")) }
@@ -342,7 +410,7 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
             var expanded by remember(value) { mutableStateOf(depth <= 1) }
             Column {
                 TextButton(onClick = { expanded = !expanded }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText(if (expanded) "Hide details" else "Show details")) }
-                if (expanded) StructuredRead(value, depth)
+                if (expanded) Box(Modifier.padding(start = 12.dp)) { StructuredRead(value, depth) }
             }
         }
         value is JSONArray -> Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -351,8 +419,22 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
             (0 until minOf(value.length(), visible)).forEach { index -> StructuredReadValue(value.opt(index) ?: "", depth + 1) }
             if (visible < value.length()) TextButton(onClick = { visible += 24 }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Show more")) }
         }
-        else -> SelectionContainer { Text(value.toString(), style = MaterialTheme.typography.bodyMedium) }
+        else -> SelectionContainer { Text(value.toString(), style = MaterialTheme.typography.bodyLarge) }
     }
+}
+
+/** Where the phone stands with Hermes. Signed out and checking get their own verdicts so "Offline" never blames the network for a missing sign-in. */
+internal enum class ConnectionVerdict { Connected, Checking, SignedOut, Offline }
+internal fun connectionVerdict(connected: Boolean, working: Boolean, authenticated: Boolean, hasAddress: Boolean): ConnectionVerdict = when {
+    connected -> ConnectionVerdict.Connected
+    working -> ConnectionVerdict.Checking
+    hasAddress && !authenticated -> ConnectionVerdict.SignedOut
+    else -> ConnectionVerdict.Offline
+}
+/** The address without its scheme or path, as people say it; a value that is not a URL is returned as typed. */
+internal fun settingsHost(address: String): String {
+    val trimmed = address.trim()
+    return runCatching { java.net.URI(trimmed).authority }.getOrNull()?.takeIf(String::isNotBlank) ?: trimmed.removeSuffix("/")
 }
 
 @Composable private fun ConnectionSettings(vm: BeaconViewModel, pluginAbsent: Boolean) {
@@ -360,24 +442,62 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
     val data by vm.data.collectAsStateWithLifecycle()
     val profileCatalog = data["navigation-profiles"]
     val profileRows = profileCatalog?.rows("profiles").orEmpty()
-    val profileLabel = profileDisplayLabel(ui.profile, profileRows, ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading")))
+    val profileLoading = ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
+    val profileName = if (profileLoading) "" else profileDisplayName(ui.profile, profileRows)
     LaunchedEffect(ui.origin, ui.owner, ui.connected) { if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     var origin by rememberSaveable(ui.origin) { mutableStateOf(ui.origin) }
+    var editing by rememberSaveable(ui.origin) { mutableStateOf(false) }
     val signOutTitle = uiText("Sign out of Beacon")
     val signOutExplanation = uiText("Remove the saved Hermes sign-in from this phone. Your encrypted drafts stay here.")
     val signOutLabel = uiText("Sign out")
-    Column(Modifier.fillMaxSize().imePadding().verticalScroll(rememberScrollState()).padding(SettingsPagePadding), verticalArrangement = Arrangement.spacedBy(20.dp)) {
-        Glass(Modifier.fillMaxWidth()) { Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text(uiText(if (ui.connected) "Connected" else "Connection needs attention"), style = MaterialTheme.typography.titleLarge)
-            Text("${uiText("Signed-in account")} · ${ui.owner.ifBlank { uiText("Not signed in") }}", style = MaterialTheme.typography.bodyLarge)
-            Text("${uiText("Profile")} · $profileLabel", style = MaterialTheme.typography.bodyLarge)
-            if (!ui.connected) Text(uiText("Check your network, then retry."), color = MaterialTheme.colorScheme.onSurfaceVariant)
-        } }
-        OutlinedTextField(origin, { origin = it }, label = { Text(uiText("Server address")) }, supportingText = { Text(uiText("Your Hermes address, starting with https://")) }, enabled = !ui.loading, modifier = Modifier.fillMaxWidth(), singleLine = true)
-        if (ui.error.isNotBlank()) Text(uiText(ui.error), color = MaterialTheme.colorScheme.error)
-        OutlinedButton(onClick = { vm.reopenSetupWizard(origin) }, enabled = !ui.loading && origin.isNotBlank(), modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text(uiText("Change server")) }
-        OutlinedButton(onClick = { vm.openForm(ActionForm(signOutTitle, "", emptyList(), explanation = signOutExplanation, actionLabel = signOutLabel, onResult = { vm.logout() })) }, modifier = Modifier.heightIn(min = 48.dp), colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text(signOutLabel) }
-        DevicesSettingsSection(vm, pluginAbsent)
+    val host = settingsHost(ui.origin)
+    val verdict = connectionVerdict(ui.connected, ui.loading || ui.restoringSession, ui.authenticated, ui.origin.isNotBlank())
+    val status = when (verdict) {
+        ConnectionVerdict.Connected -> SettingsStatus.Ok
+        ConnectionVerdict.Checking -> SettingsStatus.Working
+        ConnectionVerdict.SignedOut -> SettingsStatus.Attention
+        ConnectionVerdict.Offline -> SettingsStatus.Error
+    }
+    val title = uiText(when (verdict) {
+        ConnectionVerdict.Connected -> "Connected"
+        ConnectionVerdict.Checking -> "Reconnecting…"
+        ConnectionVerdict.SignedOut -> "Signed out"
+        ConnectionVerdict.Offline -> "Can't reach Hermes"
+    })
+    val motion = rememberNativeMotionEnabled()
+    SettingsList(testTag = "settings-connection-page") {
+        item {
+            SettingsStatusHero(
+                status, title, line = if (verdict == ConnectionVerdict.Offline) uiText("Check your network") else host, lineTestTag = "connection-host",
+                meta = if (ui.owner.isBlank() && profileName.isBlank()) null else ({
+                    if (ui.owner.isNotBlank()) SettingsBadge(ui.owner, testTag = "connection-account")
+                    if (profileName.isNotBlank()) SettingsBadge(profileName, testTag = "connection-profile")
+                }),
+                primary = if (verdict == ConnectionVerdict.Connected) null else SettingsAction(uiText("Reconnect"), { vm.connect(ui.origin) }, enabled = ui.origin.isNotBlank(), loading = verdict == ConnectionVerdict.Checking, testTag = "connection-reconnect"),
+            )
+        }
+        item {
+            SettingsSection(uiText("Server"), testTag = "settings-section:Server") {
+                Column(Modifier.animateContentSize(tween(if (motion) 200 else 0))) {
+                    SettingsNavRow(uiText("Server address"), { editing = !editing }, icon = Icons.Rounded.Dns, value = host, valueTestTag = "connection-server-value", testTag = "connection-server-row")
+                    if (ui.error.isNotBlank()) { SettingsDivider(); SettingsErrorRow(uiText(ui.error), null, "", Modifier.testTag("connection-error")) }
+                    if (editing) {
+                        SettingsDivider()
+                        SettingsTextFieldRow(uiText("Server address"), origin, { origin = it }, placeholder = "https://…", enabled = !ui.loading, fieldTestTag = "connection-address")
+                        Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 12.dp), horizontalArrangement = Arrangement.End) {
+                            FilledTonalButton(onClick = { vm.reopenSetupWizard(origin) }, enabled = !ui.loading && origin.isNotBlank(), modifier = Modifier.heightIn(min = 48.dp).testTag("connection-change-server")) { Text(uiText("Change server")) }
+                        }
+                    }
+                }
+            }
+        }
+        item { DevicesSettingsSection(vm, pluginAbsent) }
+        item {
+            SettingsSection(testTag = "settings-section:sign-out") {
+                SettingsDestructiveRow(signOutLabel, { vm.openForm(ActionForm(signOutTitle, "", emptyList(), explanation = signOutExplanation, actionLabel = signOutLabel, onResult = { vm.logout() })) },
+                    icon = Icons.AutoMirrored.Rounded.Logout, testTag = "connection-sign-out")
+            }
+        }
     }
 }
 /** Settings > App updates. The state lives in [dev.hermes.android.updates.UpdateManager], so a download goes on while this page is closed. */
@@ -393,8 +513,8 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
     val prefs by vm.preferences.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val dark = MaterialTheme.colorScheme.background.luminance() < .5f
-    // Each style's own primary and background for the current theme; rows show without dots until they are read.
-    val dots by produceState<Map<String, Pair<Color, Color>>>(emptyMap(), dark) {
+    // Each style's own accent and background for the current theme; the swatches show neutral tiles until they are read.
+    val colors by produceState<Map<String, Pair<Color, Color>>>(emptyMap(), dark) {
         value = withContext(Dispatchers.Default) {
             runCatching {
                 val palettes = context.assets.open("native-skins.json").bufferedReader().use { JSONObject(it.readText()) }
@@ -405,26 +525,24 @@ internal fun SettingsSnapshot.withLoaded(chat: JSONObject?): SettingsSnapshot {
             }.getOrDefault(emptyMap())
         }
     }
+    val themes = listOf("system", "dark", "light")
+    val swatches = NativeSkins.map { skin -> SettingsSwatch(skin, uiText(skinLabels.getValue(skin)), colors[skin]?.first, colors[skin]?.second) }
     // Text size, language, text direction and motion follow the phone's own settings.
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(SettingsPagePadding), verticalArrangement = Arrangement.spacedBy(20.dp)) {
-        item { Glass { Column(Modifier.padding(20.dp)) {
-            Choice("Theme", prefs.theme, listOf("system", "dark", "light"), { vm.nativePreferences(json("theme" to it)) }, optionLabels = settingsThemeLabels)
-        } } }
-        item { Text(uiText("Color style"), Modifier.padding(start = 4.dp).semantics { heading() }, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-        item { Glass { Column(Modifier.selectableGroup()) { NativeSkins.forEachIndexed { index, skin ->
-            if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f))
-            val chosen = skin == prefs.skin
-            ListItem(
-                headlineContent = { Text(uiText(skinLabels.getValue(skin)), style = MaterialTheme.typography.bodyLarge) },
-                leadingContent = { Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    val colors = dots[skin]
-                    if (colors == null) Spacer(Modifier.width(40.dp))
-                    else listOf(colors.first, colors.second).forEach { dot -> Box(Modifier.size(18.dp).clip(CircleShape).background(dot).border(1.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape)) }
-                } },
-                trailingContent = { if (chosen) Icon(Icons.Rounded.Check, null, tint = MaterialTheme.colorScheme.primary) },
-                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-                modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp).selectable(selected = chosen, role = Role.RadioButton) { vm.nativePreferences(json("skin" to skin)) }.testTag("skin-option:$skin"),
-            )
-        } } } }
+    SettingsList(testTag = "appearance-settings") {
+        item {
+            SettingsSection(testTag = "settings-section:Theme") {
+                SettingsChoiceRow(
+                    uiText("Theme"), prefs.theme, themes, { vm.nativePreferences(json("theme" to it)) },
+                    icon = Icons.Rounded.Palette, optionLabels = settingsThemeLabels,
+                    optionIcons = mapOf("system" to Icons.Rounded.BrightnessAuto, "dark" to Icons.Rounded.DarkMode, "light" to Icons.Rounded.LightMode),
+                    optionTestTags = choiceTags("Theme", themes), style = ChoiceStyle.Segmented,
+                )
+            }
+        }
+        item {
+            SettingsSection(uiText("Color style"), testTag = "settings-section:Color style") {
+                SettingsSwatchPicker(swatches, prefs.skin, { vm.nativePreferences(json("skin" to it)) })
+            }
+        }
     }
 }

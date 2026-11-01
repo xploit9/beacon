@@ -291,6 +291,35 @@ def connect():
     with LOCK: return _connect()
 
 
+def read_plugin_version(path):
+    """The version a plugin.yaml names, or '' when it is missing or unreadable."""
+    try:
+        import yaml
+        value=yaml.safe_load(Path(path).read_text(encoding='utf-8-sig'))
+        version=value.get('version') if isinstance(value,dict) else None
+        return version.strip() if isinstance(version,str) else ''
+    except Exception: return ''
+
+
+GATEWAY_VERSION_KEY='gateway_plugin_version'
+
+def record_gateway_plugin_version(version,pid=None,at=None):
+    """The gateway process notes which plugin version it loaded; the dashboard has its own, so the phone reads both."""
+    value=json.dumps({'version':version,'pid':os.getpid() if pid is None else pid,'at':int(time.time() if at is None else at)})
+    with LOCK,connect() as conn:
+        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(GATEWAY_VERSION_KEY,value))
+
+
+def gateway_plugin_version():
+    """The version the gateway recorded at its last plugin load, '' when none or unreadable."""
+    try:
+        with connect() as conn:
+            row=conn.execute('SELECT value FROM meta WHERE key=?',(GATEWAY_VERSION_KEY,)).fetchone()
+        version=json.loads(row[0]).get('version') if row else ''
+    except Exception: return ''
+    return version.strip() if isinstance(version,str) else ''
+
+
 def dashboard_connect_info():
     try:
         from hermes_cli.dashboard_auth.prefix import resolve_public_url

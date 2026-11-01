@@ -52,9 +52,72 @@ internal val ScheduleStateStrings = listOf("Paused", "Completed", "Running", "Fa
             .align(androidx.compose.ui.Alignment.CenterHorizontally))
     }
 }
+/** The phone's own words for "when it runs next", already translated. */
+@Composable internal fun rememberScheduleWhen(): ScheduleWhenWords {
+    val due = uiText("Due now"); val minutes = uiText("in {0} min"); val today = uiText("Today {0}"); val tomorrow = uiText("Tomorrow {0}")
+    return remember(due, minutes, today, tomorrow) { ScheduleWhenWords(due, minutes, today, tomorrow) }
+}
+
+/** A schedule's state as a glyph-plus-word pill: Active (Waiting while the scheduler is stopped), Paused, Failed or Running. */
+@Composable internal fun ScheduleStatusChip(job: JSONObject, modifier: Modifier = Modifier) {
+    val chip = ScheduleChip.of(job)
+    // Under a stopped scheduler a job would run but cannot: it waits, it is not Active (the banner above says why).
+    val stalled = chip == ScheduleChip.Active && scheduleGatewayNeedsAttention(job)
+    val status = if (stalled) SettingsStatus.Attention else when (chip) {
+        ScheduleChip.Active -> SettingsStatus.Ok
+        ScheduleChip.Paused, ScheduleChip.Completed -> SettingsStatus.Off
+        ScheduleChip.Failed -> SettingsStatus.Error
+        ScheduleChip.Running -> SettingsStatus.Working
+        ScheduleChip.Unconfirmed -> SettingsStatus.Attention
+    }
+    val word = uiText(if (stalled) "Waiting" else when (chip) {
+        ScheduleChip.Active -> "Active"
+        ScheduleChip.Paused -> "Paused"
+        ScheduleChip.Failed -> "Failed"
+        ScheduleChip.Running -> "Running"
+        ScheduleChip.Completed -> "Completed"
+        ScheduleChip.Unconfirmed -> "Execution unconfirmed"
+    })
+    SettingsStatusPill(status, word, modifier.testTag("schedule-status:${job.string("id")}"))
+}
+
+/** Edit, run history, pause or resume, and delete (last, in red) behind one overflow button; each does what its icon button used to. */
+@Composable internal fun ScheduleMenu(id: String, paused: Boolean, ended: Boolean, canEdit: Boolean, enabled: Boolean, onPause: () -> Unit, onEdit: () -> Unit, onHistory: (() -> Unit)?, onDelete: () -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    val error = MaterialTheme.colorScheme.error
+    Box {
+        SettingsIconButton(Icons.Rounded.MoreVert, uiText("Schedule actions"), { open = true }, Modifier.testTag("schedule-menu:$id"))
+        DropdownMenu(open, { open = false }) {
+            if (canEdit) DropdownMenuItem({ Text(uiText("Edit")) }, { open = false; onEdit() }, Modifier.testTag("schedule-action:$id:edit"), leadingIcon = { Icon(Icons.Rounded.Edit, null) }, enabled = enabled)
+            if (onHistory != null) DropdownMenuItem({ Text(uiText("Run history")) }, { open = false; onHistory() }, Modifier.testTag("schedule-action:$id:history"), leadingIcon = { Icon(Icons.Rounded.History, null) })
+            DropdownMenuItem({ Text(uiText(if (paused) "Resume" else "Pause")) }, { open = false; onPause() }, Modifier.testTag("schedule-action:$id:pause"),
+                leadingIcon = { Icon(if (paused) Icons.Rounded.PlayArrow else Icons.Rounded.Pause, null) }, enabled = enabled && !ended)
+            HorizontalDivider()
+            DropdownMenuItem({ Text(uiText("Delete"), color = error) }, { open = false; onDelete() }, Modifier.testTag("schedule-action:$id:delete"), leadingIcon = { Icon(Icons.Rounded.Delete, null, tint = error) }, enabled = enabled)
+        }
+    }
+}
+
+/** One labeled Run now: it opens the same confirmation the lightning-bolt icon did. */
+@Composable internal fun ScheduleRunNow(id: String, enabled: Boolean, onClick: () -> Unit) {
+    TextButton(onClick, Modifier.heightIn(min = 48.dp).testTag("schedule-run:$id"), enabled = enabled) {
+        Icon(Icons.Rounded.Bolt, null, Modifier.size(18.dp)); Text(uiText("Run now"), Modifier.padding(start = 6.dp))
+    }
+}
+
+/** A result that could not be delivered: the error glyph and Hermes' words, never colour alone. */
+@Composable internal fun ScheduleDeliveryError(text: String) {
+    val ink = rememberSettingsStatusPalette().error
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = androidx.compose.ui.Alignment.Top) {
+        Icon(Icons.Rounded.Error, null, Modifier.size(16.dp).padding(top = 2.dp), tint = ink)
+        Text(text, style = MaterialTheme.typography.bodySmall, color = ink, maxLines = 2, overflow = TextOverflow.Ellipsis)
+    }
+}
+
 @Composable private fun Schedules(vm: BeaconViewModel, modifier: Modifier) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
+    val refreshing by vm.refreshing.collectAsStateWithLifecycle()
     val profileCatalog = data["navigation-profiles"]
     val profileRows = profileCatalog?.rows("profiles").orEmpty()
     val profileLoading = ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
@@ -71,44 +134,60 @@ internal val ScheduleStateStrings = listOf("Paused", "Completed", "Running", "Fa
     val capabilities = data["task-capabilities"]
     val timezone = capabilities?.string("timezone").orEmpty()
     val format = rememberScheduleFormat()
+    val whenWords = rememberScheduleWhen()
+    val phoneZone = remember { java.time.ZoneId.systemDefault() }
+    // Read once per fresh list, so a row's relative time is as old as the data under it.
+    val now = remember(crons) { java.time.Instant.now() }
     val deliveries = data["cron-delivery"]?.rows("targets").orEmpty()
     val deliveryWords = DeliveryNameStrings.associateWith { uiText(it) }
     val deleteTitle = uiText("Delete schedule")
     val deleteExplanation = uiText("This schedule will be removed.")
     val deleteAction = uiText("Delete")
     val delete: (String) -> Unit = { id -> vm.openForm(ActionForm(deleteTitle, "/api/crons/delete", emptyList(), json("job_id" to id), explanation = deleteExplanation, actionLabel = deleteAction, onResult = { refresh() }, destructive = true)) }
-    LazyColumn(modifier.fillMaxSize().testTag("schedules-list"), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        if (gatewayNeedsAttention) item { Text(uiText("Schedules aren't running. Start Hermes on your computer."), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error) }
-        item { Button(onClick = { cronForm(vm, null, deliveries, timezone, refresh, format = format) }) { Icon(Icons.Rounded.Add, null); Text(uiText("Create schedule"), Modifier.padding(start = 8.dp)) } }
-        item { timezone.takeIf(String::isNotBlank)?.let { Text("${uiText("Times in")} $it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) } }
-        if (crons?.optBoolean("cron_unavailable") == true) item { EmptyState(uiText("Schedules are unavailable"), assistantText("Schedules aren't enabled for your Beacon. Check the connection in Settings."), Icons.Rounded.EventBusy) }
-        if (crons?.has("_error") == true) item { Column { Text(uiText("Couldn't load schedules. Check your network, then retry."), color = MaterialTheme.colorScheme.error); OutlinedButton(onClick = refresh, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Retry")) } } }
-        if (crons == null) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+    val nextTemplate = uiText("Next: {0}")
+    val ranTemplate = uiText("Ran {0}")
+    val lastTemplate = uiText("Last: {0}")
+    val notScheduled = uiText("Not scheduled")
+    val noRun = uiText("No recorded run")
+    Box(modifier.fillMaxSize()) {
+    LazyColumn(Modifier.fillMaxSize().testTag("schedules-list"), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        if (gatewayNeedsAttention) item { Glass { SettingsErrorRow(uiText("Schedules aren't running. Start Hermes on your computer."), null, "") } }
+        item { Button(onClick = { cronForm(vm, null, deliveries, timezone, refresh, format = format) }, Modifier.heightIn(min = 48.dp)) { Icon(Icons.Rounded.Add, null); Text(uiText("Create schedule"), Modifier.padding(start = 8.dp)) } }
+        // The descriptions below speak in Hermes' clock; say so only when it is not the phone's.
+        if (scheduleZoneDiffers(timezone, phoneZone, now)) item { Text(uiText("Times in {0}").replace("{0}", timezone), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        if (crons?.optBoolean("cron_unavailable") == true) item { EmptyState(uiText("Schedules are unavailable"), uiText("Schedules aren't enabled. Check the connection in Settings."), Icons.Rounded.EventBusy) }
+        if (crons?.has("_error") == true) item { Glass { SettingsErrorRow(uiText("Couldn't load schedules. Check your network, then retry."), refresh, uiText("Retry")) } }
+        if (crons == null) item { Glass { SettingsSkeletonRows(3) } }
         items(active, key = { it.string("id") }) { job ->
             val id = job.string("id")
             val callback = scheduleIsCallback(job)
-            Glass(Modifier.testTag("schedule-card:$id")) { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(scheduleTitle(job, uiText("Untitled schedule"), format.text("Callback")), style = MaterialTheme.typography.titleMedium)
-                scheduleBody(job, callbackReason(capabilities, id), format.text).takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.bodyMedium, maxLines = if (selected == id) Int.MAX_VALUE else 3) }
-                describeSchedule(job.optJSONObject("schedule"), scheduleDisplay(job), timezone, format).takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary) }
-                // A callback saves its result nowhere the owner picks, so its target is not worth a word.
-                Text(listOfNotNull(uiText(scheduleState(job)), profileDisplayLabel(job.string("profile", ui.profile), profileRows, profileLoading), deliveryLabel(job.string("deliver", "local"), deliveryNames(deliveries), deliveryWords).takeUnless { callback }).joinToString(" · "), style = MaterialTheme.typography.bodySmall)
-                Text("${uiText("Next")}: ${scheduleTime(job.string("next_run_at"), timezone, uiText("Not scheduled"), format.is24Hour)}", style = MaterialTheme.typography.bodySmall)
-                Text("${uiText("Last")}: ${scheduleTime(job.string("last_run_at"), timezone, uiText("No recorded run"), format.is24Hour)}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                scheduleDeliveryError(job).takeIf { it.isNotBlank() }?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
-                if (pending == id) LinearProgressIndicator(Modifier.fillMaxWidth())
-                // Same actions, order and icons as the Hermes dashboard's cron page (web/src/pages/CronPage.tsx), plus run history. A callback is the plugin's, so it has no Edit.
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                    val paused = schedulePaused(job)
-                    IconButton(enabled = pending.isBlank() && !scheduleEnded(job), onClick = { pending = id; actionScope.launch { pauseSchedule(vm, job, refresh).join(); pending = "" } }) {
-                        Icon(if (paused) Icons.Rounded.PlayArrow else Icons.Rounded.Pause, uiText(if (paused) "Resume" else "Pause"))
+            val paused = schedulePaused(job)
+            val idle = pending.isBlank()
+            Glass(Modifier.testTag("schedule-card:$id")) { Column(Modifier.padding(start = 16.dp, top = 16.dp, end = 4.dp, bottom = 4.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(Modifier.padding(end = 0.dp), verticalAlignment = androidx.compose.ui.Alignment.Top, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Column(Modifier.weight(1f).padding(top = 4.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(scheduleTitle(job, uiText("Untitled schedule"), format.text("Callback")), style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        ScheduleStatusChip(job)
                     }
-                    IconButton(enabled = pending.isBlank(), onClick = { runSchedule(vm, job, refresh) }) { Icon(Icons.Rounded.Bolt, uiText("Run")) }
-                    if (!callback) IconButton(enabled = pending.isBlank(), onClick = { cronForm(vm, job, deliveries, timezone, refresh, format = format) }) { Icon(Icons.Rounded.Edit, uiText("Edit")) }
-                    IconButton(onClick = { selected = if (selected == id) "" else id }) { Icon(Icons.Rounded.History, uiText("Run history"), tint = if (selected == id) MaterialTheme.colorScheme.primary else LocalContentColor.current) }
-                    IconButton(enabled = pending.isBlank(), onClick = { delete(id) }) { Icon(Icons.Rounded.Delete, uiText("Delete"), tint = if (pending.isBlank()) MaterialTheme.colorScheme.error else LocalContentColor.current) }
+                    ScheduleMenu(id, paused, scheduleEnded(job), !callback, idle,
+                        onPause = { pending = id; actionScope.launch { pauseSchedule(vm, job, refresh).join(); pending = "" } },
+                        onEdit = { cronForm(vm, job, deliveries, timezone, refresh, format = format) },
+                        onHistory = { selected = if (selected == id) "" else id },
+                        onDelete = { delete(id) })
                 }
-                if (selected == id) RunHistory(vm, job, data["cron-history:$id"])
+                Column(Modifier.padding(end = 12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    scheduleBody(job, callbackReason(capabilities, id), format.text).takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.bodyMedium.contentDirection(), maxLines = 2, overflow = TextOverflow.Ellipsis) }
+                    describeSchedule(job.optJSONObject("schedule"), scheduleDisplay(job), timezone, format).takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, maxLines = 2, overflow = TextOverflow.Ellipsis) }
+                    Text(nextTemplate.replace("{0}", scheduleNextRun(job.string("next_run_at"), notScheduled, whenWords, now, phoneZone, format.is24Hour)), Modifier.testTag("schedule-next:$id"), style = MaterialTheme.typography.bodyMedium)
+                    Text(job.string("last_run_at").takeIf(String::isNotBlank)?.let { lastTemplate.replace("{0}", scheduleTime(it, phoneZone.id, noRun, format.is24Hour)) } ?: noRun, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    // A callback saves its result nowhere the owner picks, so its target is not worth a word.
+                    listOfNotNull(profileDisplayLabel(job.string("profile", ui.profile), profileRows, profileLoading), deliveryLabel(job.string("deliver", "local"), deliveryNames(deliveries), deliveryWords).takeUnless { callback }).joinToString(" · ")
+                        .takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.bodySmall.contentDirection(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                    scheduleDeliveryError(job).takeIf { it.isNotBlank() }?.let { ScheduleDeliveryError(it) }
+                    if (pending == id) LinearProgressIndicator(Modifier.fillMaxWidth())
+                }
+                ScheduleRunNow(id, idle) { runSchedule(vm, job, refresh) }
+                if (selected == id) Column(Modifier.padding(end = 12.dp, bottom = 8.dp)) { RunHistory(vm, job, data["cron-history:$id"]) }
             } }
         }
         if (completed.isNotEmpty()) {
@@ -116,11 +195,14 @@ internal val ScheduleStateStrings = listOf("Paused", "Completed", "Running", "Fa
             if (showCompleted) items(completed, key = { it.string("id") }) { job ->
                 val id = job.string("id")
                 CompletedScheduleRow(id, scheduleTitle(job, uiText("Untitled schedule"), format.text("Callback")), if (scheduleIsCallback(job)) callbackReason(capabilities, id) else "",
-                    job.string("last_run_at").takeIf(String::isNotBlank)?.let { "${format.text("Ran")} ${scheduleTime(it, timezone, "", format.is24Hour)}" } ?: uiText("No recorded run"),
+                    job.string("last_run_at").takeIf(String::isNotBlank)?.let { ranTemplate.replace("{0}", scheduleTime(it, phoneZone.id, "", format.is24Hour)) } ?: noRun,
                     onHistory = { selected = if (selected == id) "" else id }, historyOpen = selected == id, onDelete = { delete(id) }) { RunHistory(vm, job, data["cron-history:$id"]) }
             }
         }
         if (crons != null && !crons.has("_error") && crons.rows("jobs").isEmpty() && !crons.optBoolean("cron_unavailable")) item { EmptyState(uiText("Nothing scheduled yet"), assistantText("Choose what Beacon should do and when."), Icons.Rounded.EventNote) }
+    }
+    // A background refresh over rows already shown: a thin bar, never a blank page.
+    if (crons != null && "crons" in refreshing) LinearProgressIndicator(Modifier.fillMaxWidth().height(2.dp).align(androidx.compose.ui.Alignment.TopCenter).testTag("schedules-refreshing"))
     }
 }
 /** One run per line, each opening the conversation it made. */
@@ -143,8 +225,8 @@ internal val ScheduleStateStrings = listOf("Paused", "Completed", "Running", "Fa
     Glass(Modifier.testTag("completed-schedule:$id")) { Column(Modifier.padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp)) {
         Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text(title, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                if (reason.isNotBlank()) Text(reason, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(title, style = MaterialTheme.typography.titleSmall.contentDirection(), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (reason.isNotBlank()) Text(reason, style = MaterialTheme.typography.bodySmall.contentDirection(), maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(ran, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             if (onHistory != null) IconButton(onClick = onHistory) { Icon(Icons.Rounded.History, uiText("Run history"), tint = if (historyOpen) MaterialTheme.colorScheme.primary else LocalContentColor.current) }

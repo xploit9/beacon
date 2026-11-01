@@ -106,7 +106,10 @@ internal class GitHubReleases(
     private fun assetUrl(asset: JSONObject): HttpUrl =
         asset.string("browser_download_url").toHttpUrlOrNull()?.takeIf { permitted(it, assetHosts) } ?: throw verification("The release points to an address Beacon does not download from")
 
-    /** The rules for `Beacon-<version>.json` (written by tools/release-metadata.py), plus the API's asset size as a second witness. */
+    /**
+     * The rules for `Beacon-<version>.json` (written by tools/release-metadata.py), plus the API's asset size as a second witness.
+     * One release is one version of the app and of the Hermes plugin, so a plugin version that differs from the app's is refused.
+     */
     private fun checkMetadata(metadata: JSONObject, versionName: String, apiSize: Long) {
         fun text(key: String) = metadata.opt(key) as? String ?: ""
         fun whole(key: String): Long? = (metadata.opt(key) as? Number)?.takeIf { it.toDouble() == it.toLong().toDouble() }?.toLong()
@@ -114,7 +117,8 @@ internal class GitHubReleases(
         val size = whole("size_bytes")
         val sound = VERSION_NAME.matches(versionName) && text("version_name") == versionName && text("artifact_filename") == "Beacon-$versionName.apk" &&
             text("package_name").isNotBlank() && code != null && code > 20 && size != null && size in 1..MAX_UPDATE_APK_BYTES && (apiSize <= 0 || apiSize == size) &&
-            STORED_SHA.matches(text("sha256")) && SIGNER_SHA.matches(text("certificate_sha256")) && PLUGIN_VERSION_PATTERN.matches(text("plugin_version"))
+            STORED_SHA.matches(text("sha256")) && SIGNER_SHA.matches(text("certificate_sha256")) && PLUGIN_VERSION_PATTERN.matches(text("plugin_version")) &&
+            text("plugin_version") == versionName
         if (!sound) throw verification("The release metadata does not describe a Beacon update")
     }
 

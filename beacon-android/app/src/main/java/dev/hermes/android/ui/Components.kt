@@ -10,6 +10,7 @@ import androidx.compose.animation.core.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -111,8 +112,10 @@ fun formBody(form: ActionForm): JSONObject {
         }) { content() }
     }
 }
-@Composable fun LabeledToggle(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit, description: String = "", checkbox: Boolean = false, enabled: Boolean = true) {
+/** [icon] adds the Settings icon tile in front of the label. */
+@Composable fun LabeledToggle(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit, description: String = "", checkbox: Boolean = false, enabled: Boolean = true, icon: ImageVector? = null) {
     Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).semantics(mergeDescendants = true) {}.toggleable(checked, enabled = enabled, role = if (checkbox) Role.Checkbox else Role.Switch, onValueChange = onCheckedChange), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+        if (icon != null) { SettingsIconTile(icon); Spacer(Modifier.width(16.dp)) }
         Column(Modifier.weight(1f).padding(end = 12.dp)) { Text(label, style = MaterialTheme.typography.bodyLarge); if (description.isNotBlank()) Text(description, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         if (checkbox) Checkbox(checked, onCheckedChange = null, enabled = enabled) else Switch(checked, onCheckedChange = null, enabled = enabled)
     }
@@ -281,13 +284,56 @@ private val NoInstall = MutableStateFlow(PluginInstallUi()).asStateFlow()
     )
 }
 
-/** A null [icon] drops the trailing mark, for a row that acts at once instead of opening something. */
-@Composable fun ActionRow(label: String, description: String = "", icon: ImageVector? = Icons.AutoMirrored.Rounded.KeyboardArrowRight, onClick: () -> Unit) {
-    ListItem(headlineContent = { Text(label) }, supportingContent = if (description.isBlank()) null else ({ Text(description) }), trailingContent = if (icon == null) null else ({ Icon(icon, null) }), modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).heightIn(min = 64.dp), colors = ListItemDefaults.colors(containerColor = Color.Transparent))
+/** A null [icon] drops the trailing mark, for a row that acts at once instead of opening something. [leadingIcon] adds the Settings icon tile; [external] marks a row that leaves Beacon. */
+@Composable fun ActionRow(label: String, description: String = "", icon: ImageVector? = Icons.AutoMirrored.Rounded.KeyboardArrowRight, leadingIcon: ImageVector? = null, external: Boolean = false, onClick: () -> Unit) {
+    val trailing = if (external) Icons.AutoMirrored.Rounded.OpenInNew else icon
+    ListItem(headlineContent = { Text(label) }, supportingContent = if (description.isBlank()) null else ({ Text(description) }), leadingContent = if (leadingIcon == null) null else ({ SettingsIconTile(leadingIcon) }), trailingContent = if (trailing == null) null else ({ Icon(trailing, null) }), modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).heightIn(min = 64.dp), colors = ListItemDefaults.colors(containerColor = Color.Transparent))
 }
-/** A form select: a read-only field like its neighbours, whose anchor carries the dropdown role and expanded state. A long value wraps to a second line. */
+/** How a choice is drawn: Menu is the classic select, Segmented shows every option at once, Auto picks by [resolveChoiceStyle]. */
+enum class ChoiceStyle { Auto, Segmented, Menu }
+
+/** The longest option label (after translation) that still fits a segment. */
+internal const val ChoiceSegmentMaxChars = 14
+
+/** Auto shows segments for 2–4 short options at a normal font size; more, longer or larger options read better as a menu. */
+internal fun resolveChoiceStyle(style: ChoiceStyle, labels: List<String>, fontScale: Float): ChoiceStyle = when (style) {
+    ChoiceStyle.Auto -> if (labels.size in 2..4 && labels.all { it.length <= ChoiceSegmentMaxChars } && fontScale < 1.5f) ChoiceStyle.Segmented else ChoiceStyle.Menu
+    else -> style
+}
+
+/** Every option as one segment; each keeps the select's tag `choice-option:<label>:<option>` unless [testTags] names another. */
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable fun Choice(label: String, selected: String, options: List<String>, onSelect: (String) -> Unit, modifier: Modifier = Modifier, optionLabels: Map<String, String> = emptyMap(), enabled: Boolean = true) {
+@Composable internal fun SegmentedChoice(label: String, selected: String, options: List<String>, labels: List<String>, onSelect: (String) -> Unit, modifier: Modifier = Modifier, enabled: Boolean = true, icons: Map<String, ImageVector> = emptyMap(), testTags: Map<String, String> = emptyMap()) {
+    SingleChoiceSegmentedButtonRow(modifier.fillMaxWidth()) {
+        options.forEachIndexed { index, option ->
+            val chosen = option == selected
+            val icon = icons[option]
+            SegmentedButton(
+                selected = chosen,
+                onClick = { if (!chosen) onSelect(option) },
+                shape = SegmentedButtonDefaults.itemShape(index, options.size),
+                enabled = enabled,
+                modifier = Modifier.heightIn(min = 48.dp).testTag(testTags[option] ?: "choice-option:$label:$option"),
+                // The chosen segment always wears the check (Material's own cue), so the choice reads at a glance in dark themes too.
+                icon = { if (icon != null && !chosen) Icon(icon, null, Modifier.size(SegmentedButtonDefaults.IconSize)) else SegmentedButtonDefaults.Icon(chosen) },
+            ) { Text(labels.getOrElse(index) { option }, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
+        }
+    }
+}
+
+/** A form select: a read-only field like its neighbours, whose anchor carries the dropdown role and expanded state. A long value wraps to a second line. [style] Menu (the default) keeps exactly that; Segmented or Auto may show the options as segments under the label. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable fun Choice(label: String, selected: String, options: List<String>, onSelect: (String) -> Unit, modifier: Modifier = Modifier, optionLabels: Map<String, String> = emptyMap(), enabled: Boolean = true, style: ChoiceStyle = ChoiceStyle.Menu) {
+    if (style != ChoiceStyle.Menu) {
+        val labels = options.map { translatedChoiceLabel(it, optionLabels, true) }
+        if (resolveChoiceStyle(style, labels, LocalDensity.current.fontScale) == ChoiceStyle.Segmented) {
+            Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(uiText(label), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                SegmentedChoice(label, selected, options, labels, onSelect, enabled = enabled)
+            }
+            return
+        }
+    }
     var expanded by remember { mutableStateOf(false) }
     LaunchedEffect(enabled) { if (!enabled) expanded = false }
     ExposedDropdownMenuBox(expanded, { expanded = enabled && it }, modifier) {
@@ -296,7 +342,7 @@ private val NoInstall = MutableStateFlow(PluginInstallUi()).asStateFlow()
         ExposedDropdownMenu(expanded, { expanded = false }) { options.forEach { option -> DropdownMenuItem(text = { Text(translatedChoiceLabel(option, optionLabels, true)) }, enabled = enabled, onClick = { expanded = false; onSelect(option) }, modifier = Modifier.testTag("choice-option:$label:$option")) } }
     }
 }
-@Composable private fun translatedChoiceLabel(value: String, labels: Map<String, String>, offered: Boolean): String {
+@Composable internal fun translatedChoiceLabel(value: String, labels: Map<String, String>, offered: Boolean): String {
     val text = choiceDisplayLabel(value, labels, offered)
     return if (value.isBlank() || labels[value]?.isNotBlank() == true) uiText(text) else text
 }
@@ -446,13 +492,13 @@ internal fun bubbleShape(own: Boolean, joinedTop: Boolean, tail: Boolean): Round
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                Text(plainTitle(title), Modifier.weight(1f), style = MaterialTheme.typography.titleMedium.copy(fontWeight = if (unread) FontWeight.Bold else FontWeight.Medium), maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                Text(plainTitle(title), Modifier.weight(1f), style = MaterialTheme.typography.titleMedium.copy(fontWeight = if (unread) FontWeight.Bold else FontWeight.Medium).contentDirection(), maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                 if (pinned) Icon(Icons.Rounded.PushPin, uiText("Pinned"), Modifier.padding(start = 6.dp).size(14.dp), tint = scheme.onSurfaceVariant)
                 else if (thread) ThreadSpoolGlyph(Modifier.padding(start = 6.dp).size(14.dp), tint = scheme.onSurfaceVariant)
                 if (time.isNotBlank()) Text(time, Modifier.padding(start = 6.dp), style = nativeMetadataStyle(), color = if (unread) scheme.primary else scheme.onSurfaceVariant, maxLines = 1)
             }
             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                Text(preview, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, color = scheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                Text(preview, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium.contentDirection(), color = scheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                 if (streaming) CircularProgressIndicator(Modifier.padding(start = 8.dp).size(14.dp), strokeWidth = 2.dp)
                 else if (unread) Box(Modifier.padding(start = 8.dp).size(10.dp).clip(CircleShape).background(scheme.primary).testTag("unread-dot"))
             }

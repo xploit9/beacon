@@ -54,10 +54,10 @@ class SharedSpaceChatTest {
     }
 
     @Test fun theChipsFollowTheMentionBeingTyped() {
-        assertEquals(listOf("coder", "academic", "hermes", "all"), mentionChips(roster, null))
-        assertEquals(listOf("academic", "all"), mentionChips(roster, "a"))
-        assertEquals(listOf("coder"), mentionChips(roster, "CO"))
-        assertEquals(emptyList<String>(), mentionChips(roster, "zz"))
+        assertEquals(listOf("coder", "academic", "hermes", "all"), mentionChips(roster, null).map { it.handle })
+        assertEquals(listOf("academic", "all"), mentionChips(roster, "a").map { it.handle })
+        assertEquals(listOf("coder"), mentionChips(roster, "CO").map { it.handle })
+        assertEquals(emptyList<String>(), mentionChips(roster, "zz").map { it.handle })
         assertEquals("", mentionQuery("hello @"))
         assertEquals("ac", mentionQuery("hello @ac"))
         assertNull(mentionQuery("hello @ac and"))
@@ -81,5 +81,23 @@ class SharedSpaceChatTest {
         assertEquals("academic", spaceMemberTitle("m2", named, emptyList()))
         assertEquals("academic", spaceMemberTitle("academic", named, emptyList()))
         assertEquals("ghost", spaceMemberTitle("ghost", named, emptyList()))
+    }
+
+    @Test fun aChipShowsTheBotsDisplayNameButInsertsItsHandle() {
+        val profiles = listOf(org.json.JSONObject().put("name", "default").put("display_name", "Personal"), org.json.JSONObject().put("name", "coder").put("display_name", "Code profile"))
+        val chips = mentionChips(roster, null, profiles, "Everyone")
+        assertEquals(listOf("Code profile", "academic", "Personal", "Everyone"), chips.map { it.label })
+        // The Personal bot is `@hermes` to Hermes; the owner sees Personal and the message still says @hermes.
+        val personal = chips.first { it.label == "Personal" }
+        assertEquals("hermes", personal.handle)
+        assertEquals("default", personal.profile)
+        assertEquals("hi @hermes " to 11, insertMention("hi", 2, 2, personal.handle))
+        // Everyone is `@all` and has no avatar of its own.
+        assertEquals(MentionChip("all", "Everyone", ""), chips.last())
+        // What is typed after the @ matches the name as well as the handle.
+        assertEquals(listOf("hermes"), mentionChips(roster, "pers", profiles).map { it.handle })
+        assertEquals(listOf("coder"), mentionChips(roster, "code", profiles).map { it.handle })
+        // A name set for the member in the room wins over the profile's.
+        assertEquals("Code Wizard", mentionChips(listOf(BotModeMember("m1", "coder", "coder", "Code Wizard")), null, profiles).first().label)
     }
 }

@@ -25,7 +25,7 @@ Enable **Keep connected** in Notifications and allow Android notifications and b
 
 The connection indicator requires a recent valid response and expires when responses stop. Update checks retain their normal cadence; an already verified update whose notification was blocked can be announced after notifications are allowed without waiting for another network check. Pending installer confirmations remain protected. Android's notification permission, channel settings and force-stop rules remain authoritative.
 
-Voice startup also depends on the dashboard loading the installed plugin. Its authenticated `/api/plugins/beacon/mobile/plugin/version` response reports `running` and `installed`; differing versions need a dashboard restart, even after the gateway restarts. An older loaded voice implementation can otherwise keep timing out after the update. A `502` from a saved connection address also requires checking that address's configured dashboard port is actually listening.
+Voice startup also depends on the dashboard loading the installed plugin. Its authenticated `/api/plugins/beacon/mobile/plugin/version` response reports `running` (the dashboard), `gateway` (the version the gateway loaded, empty until it has loaded the plugin) and `installed`; a `running` that differs from `installed` needs a dashboard restart, even after the gateway restarts. An older loaded voice implementation can otherwise keep timing out after the update. A `502` from a saved connection address also requires checking that address's configured dashboard port is actually listening.
 
 ## Coming from Hermes Relay?
 

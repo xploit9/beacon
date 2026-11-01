@@ -34,6 +34,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ContentPaste
+import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.SettingsInputAntenna
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -42,6 +44,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -69,7 +72,7 @@ internal fun handleSetupPermissionResult(granted: Boolean, advance: () -> Unit, 
 
 internal fun setupNeedsBackgroundExemption(isIgnoringBatteryOptimizations: Boolean): Boolean = !isIgnoringBatteryOptimizations
 
-/** Keep connected: one switch and, while Android still restricts Beacon, the one-tap background action; strict phone makers get one more step after it. */
+/** Keep connected: one line and a switch, with the details one tap away behind the info icon; while Android still restricts Beacon, the one-tap background action follows, and strict phone makers get one more step after it. */
 @Composable
 internal fun KeepConnectedSetupGroup(
     keepConnected: Boolean,
@@ -80,18 +83,26 @@ internal fun KeepConnectedSetupGroup(
     autoLaunchVisible: Boolean = false,
     onOpenAutoLaunch: () -> Unit = {},
 ) {
+    var showDetails by rememberSaveable { mutableStateOf(false) }
     Column(
         Modifier.fillMaxWidth().testTag("setup-keep-connected-group"),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            Column(Modifier.weight(1f).padding(end = 16.dp)) {
+            SettingsIconTile(Icons.Rounded.SettingsInputAntenna)
+            Column(Modifier.weight(1f).padding(start = 12.dp, end = 4.dp)) {
                 Text(uiText("Keep connected"), style = MaterialTheme.typography.titleMedium)
-                Text(uiText("Let Hermes reach this phone for incoming calls while Beacon is closed."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Text(uiText("Shows a quiet notification and uses some battery."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(uiText("Calls even when Beacon is closed"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            IconButton(onClick = { showDetails = !showDetails }, modifier = Modifier.testTag("setup-keep-connected-info")) {
+                Icon(Icons.Rounded.Info, uiText("Details"), tint = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Switch(checked = keepConnected, onCheckedChange = onKeepConnectedChange, modifier = Modifier.testTag("setup-keep-connected"))
         }
+        if (showDetails) Text(
+            uiText("Let Hermes reach this phone for incoming calls while Beacon is closed.") + " " + uiText("Shows a quiet notification and uses some battery."),
+            Modifier.testTag("setup-keep-connected-details"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         if (keepConnected && !notificationAllowed) Text(uiText("Allow notifications so incoming call alerts can appear."), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
         if (backgroundActionVisible) OutlinedButton(
             onClick = onOpenBackgroundSettings,
@@ -221,7 +232,7 @@ internal fun SetupWizardScreen(
     val microphoneLabel = uiText("Microphone")
     val notificationsLabel = uiText("Notifications")
     val fullScreenLabel = uiText("Full-screen call alerts")
-    val fullScreenStillOff = uiText("Full-screen call alerts are still off. Open settings again or skip for now.")
+    val fullScreenStillOff = uiText("Full-screen alerts are still off. Open settings or skip.")
     val permissionBlocked = uiText("{0} permission is blocked. Open app settings or skip for now.")
     val permissionNotGranted = uiText("{0} permission wasn't granted. You can try again or skip for now.")
     var permissionDenied by rememberSaveable(state.setupStep) { mutableStateOf(false) }
@@ -295,7 +306,7 @@ internal fun SetupWizardScreen(
         label = "setup-step",
     ) { current ->
         val step = setupStepNumber(current)
-        when (current) {
+        CompositionLocalProvider(LocalSetupStep provides current) { when (current) {
             "probe" -> SetupShell(
                 step, if (state.loading) uiText("Checking the connection…") else uiText("Check the connection"), modifier, visibleOrigin,
                 content = {
@@ -341,7 +352,7 @@ internal fun SetupWizardScreen(
                     onSkip = onSkipVoiceSetup,
                     onClose = onCancel.takeIf { state.authenticated },
                 )
-                SetupShell(step, uiText("Choose a voice provider"), modifier, uiText("Calls use your own account. You can add or change this later in Settings."), page.content, page.actions)
+                SetupShell(step, uiText("Choose a voice provider"), modifier, uiText("Calls use your own account. Change it later in Settings."), page.content, page.actions)
             }
             "voice-key" -> {
                 val provider = voiceKeyProvider.ifBlank { VoiceKeyStore(context.applicationContext).settings().provider }
@@ -460,6 +471,6 @@ internal fun SetupWizardScreen(
                     if (state.authenticated) SetupTextAction(uiText("Close setup"), onCancel)
                 },
             )
-        }
+        } }
     }
 }

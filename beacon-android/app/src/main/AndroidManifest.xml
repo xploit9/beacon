@@ -55,6 +55,13 @@
                 <data android:scheme="${applicationId}" android:host="auth" android:path="/complete" />
             </intent-filter>
         </activity>
+        <!-- The phone's assist gesture. An exported ASSIST activity is what lists Beacon under Settings > Default digital assistant app; it draws nothing and hands off to BeaconActivity. -->
+        <activity android:name=".assist.AssistEntryActivity" android:exported="true" android:excludeFromRecents="true" android:noHistory="true" android:taskAffinity="" android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.ASSIST" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
         <!-- Installed launcher component remains a technical compatibility alias. -->
         <activity-alias android:name=".MainActivity" android:targetActivity=".BeaconActivity" android:exported="true">
             <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>

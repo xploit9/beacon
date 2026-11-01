@@ -1,12 +1,16 @@
 @file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 package dev.hermes.android.ui
 
-import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.Key
+import androidx.compose.material.icons.rounded.PowerSettingsNew
+import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.SearchOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -16,9 +20,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.unit.dp
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
 import dev.hermes.android.data.NativeSkill
 import dev.hermes.android.data.NativeSkillContent
 
@@ -29,6 +36,31 @@ data class NativeSkillsState(
     val saving: Boolean = false, val error: String? = null, val notice: String? = null,
 )
 
+/** The two notices a successful save puts in [NativeSkillsState.notice] (NativePhoneSettings writes them). Any other notice is a warning from the server and never reads as success. */
+internal const val SkillsSavedNotice = "Saved. New chats use this change."
+internal const val SkillInstructionsSavedNotice = "Instructions saved. New chats use this change."
+internal fun skillNoticeIsSuccess(notice: String): Boolean = notice == SkillsSavedNotice || notice == SkillInstructionsSavedNotice
+
+/** "apple-notes" reads "Apple Notes": skills are stored under slugs, people read names. */
+internal fun skillDisplayName(name: String): String =
+    name.split('-', '_').filter(String::isNotBlank).joinToString(" ") { it.replaceFirstChar(Char::titlecase) }.ifBlank { name }
+
+/** The filter ids are "all", "on" (enabled) and "setup" (needs setup); a search matches the name as stored, as shown, the description and the category. */
+internal fun skillMatches(skill: NativeSkill, filter: String, search: String): Boolean =
+    (filter == "all" || filter == "on" && skill.enabled || filter == "setup" && skill.requirements.isNotEmpty()) &&
+        (search.isBlank() || "${skill.name} ${skillDisplayName(skill.name)} ${skill.description} ${skill.category}".contains(search.trim(), ignoreCase = true))
+
+/**
+ * The skills as sections: enabled first, then by name. With two or more categories each category is a section (the key is the
+ * category, blank for "Other"); with one the list is a single section whose key is null.
+ */
+internal fun skillSections(skills: List<NativeSkill>): List<Pair<String?, List<NativeSkill>>> {
+    val ordered = skills.sortedWith(compareByDescending<NativeSkill> { it.enabled }.thenBy { it.name.lowercase() })
+    val byCategory = ordered.groupBy { it.category.trim().lowercase() }
+    if (byCategory.size <= 1) return listOf(null to ordered)
+    return byCategory.entries.sortedWith(compareBy({ it.key.isBlank() }, { it.key })).map { it.key to it.value }
+}
+
 /** Body only: the shared shell owns the toolbar, Back handling, and system insets. */
 @Composable fun NativeSkillsScreen(
     state: NativeSkillsState, onSearch: (String) -> Unit, onOpen: (NativeSkill) -> Unit,
@@ -38,56 +70,101 @@ data class NativeSkillsState(
 ) {
     val busy = state.loading || state.saving
     val enableLabel = uiText("Enable")
-    var filter by rememberSaveable(state.profile) { mutableStateOf("All") }
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(SettingsPagePadding), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        item {
-            if (state.selected == null) {
-                Text(uiText("{0} installed · {1} enabled · {2} need setup").replace("{0}", "${state.skills.size}").replace("{1}", "${state.skills.count { it.enabled }}").replace("{2}", "${state.skills.count { it.requirements.isNotEmpty() }}"), style = MaterialTheme.typography.titleMedium)
-                Text(uiText("Changes apply to new sessions."), color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
-        if (busy) item { LinearProgressIndicator(Modifier.fillMaxWidth()); if (state.saving) Text(uiText("Saving skill…")) }
-        state.notice?.let { notice -> item { Text(uiText(notice)) } }
-        state.error?.let { error -> item { Text(uiText(error), color = MaterialTheme.colorScheme.error); OutlinedButton(onClick = onRetry, enabled = !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Retry")) } } }
-        if (state.selected == null) {
-            item { OutlinedTextField(value = state.search, onValueChange = onSearch, label = { Text(uiText("Search skills")) }, singleLine = true, modifier = Modifier.fillMaxWidth()) }
-            item { FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf("All", "Enabled", "Needs setup").forEach { choice -> FilterChip(selected = filter == choice, onClick = { filter = choice }, label = { Text(uiText(choice)) }) } } }
-            val visible = state.skills.filter {
-                (filter == "All" || filter == "Enabled" && it.enabled || filter == "Needs setup" && it.requirements.isNotEmpty()) &&
-                    (state.search.isBlank() || "${it.name} ${it.description} ${it.category}".contains(state.search, ignoreCase = true))
-            }.sortedWith(compareByDescending<NativeSkill> { it.enabled }.thenBy { it.name.lowercase() })
-            if (visible.isEmpty() && !state.loading) item {
-                if (state.search.isNotBlank() || filter != "All") EmptyState(uiText("No matching skills"), uiText("Try another search or filter."), Icons.Rounded.SearchOff, action = uiText("Clear search"), onAction = { onSearch(""); filter = "All" })
-                else EmptyState(uiText("No skills yet"), uiText("Skills installed for this profile show up here."), SkillsIcon)
-            }
-            items(visible, key = { it.name }) { skill ->
-                Column(Modifier.fillMaxWidth()) {
-                    Row(Modifier.fillMaxWidth().clickable(enabled = !busy, role = Role.Button) { onOpen(skill) }.padding(vertical = 10.dp).testTag("skill-row-${skill.name}"), verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text(skill.name, style = MaterialTheme.typography.titleMedium)
-                            Text(skill.description.ifBlank { uiText("Read this skill for setup instructions.") }, maxLines = 3, overflow = TextOverflow.Ellipsis)
-                            val status = listOfNotNull(uiText("Essential").takeIf { skill.essential }, uiText("Needs setup").takeIf { skill.requirements.isNotEmpty() }).joinToString(" · ")
-                            if (status.isNotBlank()) Text(status, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                        Switch(checked = skill.enabled, onCheckedChange = { onToggle(skill, it) }, enabled = !busy && !skill.essential, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "${enableLabel} ${skill.name}" })
-                    }
-                    HorizontalDivider()
-                }
-            }
-        } else {
-            val skill = state.selected
-            item { Text(skill.name, style = MaterialTheme.typography.headlineSmall) }
-            item { Text(skill.description); Text(uiText(if (skill.requirements.isEmpty()) "Setup ready" else "Setup needed"), style = MaterialTheme.typography.titleMedium); if (skill.requirements.isNotEmpty()) Text(skill.requirements.joinToString("\n")); Text(uiText("Based on what the skill says it needs."), color = MaterialTheme.colorScheme.onSurfaceVariant); Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text(uiText(if (skill.essential) "Essential · always enabled" else if (skill.enabled) "Enabled" else "Disabled"), modifier = Modifier.weight(1f)); Switch(checked = skill.enabled, onCheckedChange = { onToggle(skill, it) }, enabled = !busy && !skill.essential, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "${enableLabel} ${skill.name}" }) } }
-            state.content?.let { content ->
-                if (state.editing) {
-                    item { Text(uiText("Adjust instructions"), style = MaterialTheme.typography.titleMedium); Text(uiText("Replaces this skill's instructions for new chats.")) }
-                    item { OutlinedTextField(value = state.draft, onValueChange = onDraft, enabled = !state.saving, label = { Text(uiText("Skill instructions")) }, minLines = 8, maxLines = 16, modifier = Modifier.fillMaxWidth()) }
-                    item { Column { Button(onClick = onSave, enabled = !busy && state.draft.isNotBlank() && state.draft != content.content, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text(uiText("Save instructions")) }; TextButton(onClick = { onEdit(false) }, enabled = !state.saving, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Cancel")) } } }
-                } else {
-                    item { OutlinedButton(onClick = { onEdit(true) }, enabled = !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Adjust instructions")) } }
-                    item { renderInstructions(content.content) }
+    var filter by rememberSaveable(state.profile) { mutableStateOf("all") }
+    val selected = state.selected
+    // Cached skills stay on screen while a refresh or save runs; the thin bar is the only sign of it.
+    SettingsList(refreshing = busy && (state.skills.isNotEmpty() || selected != null), testTag = "skills-page") {
+        state.notice?.takeIf { it.isNotBlank() }?.let { notice -> item(key = "notice") {
+            if (skillNoticeIsSuccess(notice)) SettingsStatusPill(SettingsStatus.Ok, uiText(notice))
+            else SettingsSection { SettingsValueRow(uiText(notice), icon = Icons.Rounded.ErrorOutline) }
+        } }
+        if (state.saving) item(key = "saving") { SettingsStatusPill(SettingsStatus.Working, uiText("Saving skill…")) }
+        // While instructions are being edited, a failed save shows beside the Save button, where the owner is looking.
+        val editingInstructions = selected != null && state.editing && state.content != null
+        state.error?.takeUnless { editingInstructions }?.let { error -> item(key = "error") { SettingsSection { SettingsErrorRow(uiText(error), if (busy) null else onRetry, uiText("Retry")) } } }
+        if (selected == null) skillList(state, filter, { filter = it }, busy, enableLabel, onSearch, onOpen, onToggle)
+        else skillDetail(selected, state, busy, enableLabel, onToggle, onEdit, onDraft, onSave, renderInstructions)
+    }
+}
+
+private fun LazyListScope.skillList(
+    state: NativeSkillsState, filter: String, onFilter: (String) -> Unit, busy: Boolean, enableLabel: String,
+    onSearch: (String) -> Unit, onOpen: (NativeSkill) -> Unit, onToggle: (NativeSkill, Boolean) -> Unit,
+) {
+    val all = state.skills
+    if (all.isEmpty() && state.loading) { item(key = "skeleton") { SettingsSection { SettingsSkeletonRows(4) } }; return }
+    item(key = "counts") { SettingsSection(testTag = "skills-counts") {
+        SettingsMetricRow(listOf(uiText("Installed") to "${all.size}", uiText("Enabled") to "${all.count { it.enabled }}", uiText("Need setup") to "${all.count { it.requirements.isNotEmpty() }}"))
+    } }
+    item(key = "search") { OutlinedTextField(value = state.search, onValueChange = onSearch, label = { Text(uiText("Search skills")) }, leadingIcon = { Icon(Icons.Rounded.Search, null) }, singleLine = true, modifier = Modifier.fillMaxWidth()) }
+    item(key = "filter") {
+        SegmentedChoice("skills", filter, listOf("all", "on", "setup"), listOf(uiText("All"), uiText("Enabled"), uiText("Needs setup")), onFilter,
+            testTags = mapOf("all" to "skills-filter-all", "on" to "skills-filter-on", "setup" to "skills-filter-needs-setup"))
+    }
+    val visible = all.filter { skillMatches(it, filter, state.search) }
+    if (visible.isEmpty() && !state.loading) item(key = "empty") { SettingsSection {
+        if (state.search.isNotBlank() || filter != "all") SettingsEmpty(uiText("No matching skills"), Icons.Rounded.SearchOff, action = SettingsAction(uiText("Clear search"), { onSearch(""); onFilter("all") }))
+        else SettingsEmpty(uiText("No skills yet"), SkillsIcon)
+    } }
+    skillSections(visible).filter { it.second.isNotEmpty() }.forEach { (category, skills) ->
+        item(key = "section:${category.orEmpty()}:${category == null}") {
+            SettingsSection(title = when { category == null -> ""; category.isBlank() -> uiText("Other"); else -> skillDisplayName(category) }) {
+                skills.forEachIndexed { index, skill ->
+                    if (index > 0) SettingsDivider()
+                    SkillRow(skill, busy, enableLabel, { onOpen(skill) }) { onToggle(skill, it) }
                 }
             }
         }
     }
+}
+
+/** A skill: its name, one line of description and, when it can't work yet, a "Needs setup" pill. The row opens it; the switch is its own target. */
+@Composable private fun SkillRow(skill: NativeSkill, busy: Boolean, enableLabel: String, onOpen: () -> Unit, onToggle: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth().heightIn(min = 72.dp).clickable(enabled = !busy, role = Role.Button, onClick = onOpen).padding(start = 16.dp, top = 12.dp, end = 8.dp, bottom = 12.dp).testTag("skill-row-${skill.name}"),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+        SettingsIconTile(SkillsIcon)
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(skillDisplayName(skill.name), style = MaterialTheme.typography.bodyLarge.contentDirection(), fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(skill.description.ifBlank { uiText("No description") }, style = MaterialTheme.typography.bodyMedium.contentDirection(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (skill.requirements.isNotEmpty()) SettingsStatusPill(SettingsStatus.Attention, uiText("Needs setup"))
+            else if (skill.essential) SettingsStatusPill(SettingsStatus.Off, uiText("Always on"))
+        }
+        Switch(checked = skill.enabled, onCheckedChange = onToggle, enabled = !busy && !skill.essential, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "$enableLabel ${skill.name}" })
+    }
+}
+
+private fun LazyListScope.skillDetail(
+    skill: NativeSkill, state: NativeSkillsState, busy: Boolean, enableLabel: String, onToggle: (NativeSkill, Boolean) -> Unit,
+    onEdit: (Boolean) -> Unit, onDraft: (String) -> Unit, onSave: () -> Unit, renderInstructions: @Composable (String) -> Unit,
+) {
+    val ready = skill.requirements.isEmpty()
+    val status = if (ready) SettingsStatus.Ok else SettingsStatus.Attention
+    item(key = "hero") {
+        SettingsStatusHero(status, skillDisplayName(skill.name), line = skill.description.ifBlank { uiText("No description") },
+            meta = { SettingsStatusPill(status, uiText(if (ready) "Ready" else "Needs setup")) }, testTag = "skill-hero")
+    }
+    item(key = "enabled") { SettingsSection {
+        SettingsSwitchRow(uiText("Enabled"), skill.enabled, { onToggle(skill, it) }, Modifier.semantics { contentDescription = "$enableLabel ${skill.name}" }, icon = Icons.Rounded.PowerSettingsNew,
+            summary = if (skill.essential) uiText("Always on") else "", enabled = !busy && !skill.essential, testTag = "skill-enabled")
+    } }
+    if (!ready) item(key = "needs") { SettingsSection(title = uiText("Needs"), testTag = "skill-needs") {
+        skill.requirements.forEachIndexed { index, requirement ->
+            if (index > 0) SettingsDivider()
+            SettingsValueRow(requirement, icon = Icons.Rounded.Key)
+        }
+    } }
+    val content = state.content
+    if (content != null) item(key = "instructions") { SettingsSection(title = uiText("Instructions")) {
+        if (state.editing) Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            OutlinedTextField(value = state.draft, onValueChange = onDraft, enabled = !state.saving, label = { Text(uiText("Skill instructions")) }, minLines = 8, maxLines = 16, modifier = Modifier.fillMaxWidth())
+            state.error?.let { error -> SettingsErrorRow(uiText(error), null, uiText("Retry"), Modifier.semantics { liveRegion = LiveRegionMode.Polite }) }
+            Button(onClick = onSave, enabled = !busy && state.draft.isNotBlank() && state.draft != content.content, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text(uiText("Save instructions")) }
+            TextButton(onClick = { onEdit(false) }, enabled = !state.saving, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Cancel")) }
+        } else {
+            Box(Modifier.fillMaxWidth().padding(16.dp)) { renderInstructions(content.content) }
+            SettingsDivider()
+            SettingsActionRow(uiText("Edit instructions"), { onEdit(true) }, icon = Icons.Rounded.Edit, enabled = !busy, testTag = "skill-edit")
+        }
+    } }
+    else if (state.loading) item(key = "instructions-loading") { SettingsSection(title = uiText("Instructions")) { SettingsSkeletonRows(2) } }
 }

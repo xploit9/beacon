@@ -90,8 +90,8 @@ class SettingsProfileIsolationUiTest {
         await { vm.phoneSettings.bots.value.profiles.any { it.profile == "coder" } && !vm.phoneSettings.bots.value.loading }
         compose.runOnIdle { vm.phoneSettings.openBot("coder") }
         await { vm.phoneSettings.bots.value.selected?.profile == "coder" && !vm.phoneSettings.bots.value.loading }
-        scrollTo(hasText("Skills for this profile"))
-        compose.onNodeWithText("Skills for this profile", useUnmergedTree = true).performClick()
+        scrollTo(hasTestTag("profile-skills"))
+        compose.onNodeWithTag("profile-skills").performClick()
         await { vm.ui.value.morePage == "Skills" || vm.ui.value.profile == "coder" }
 
         assertEquals("default", vm.ui.value.profile)
@@ -116,8 +116,8 @@ class SettingsProfileIsolationUiTest {
             compose.runOnIdle { vm.phoneSettings.editBot(true); vm.phoneSettings.botDraft("fixture", "$profile-updated"); vm.phoneSettings.saveBot() }
             await { fixture.isolationModels[profile] == "$profile-updated" && !vm.phoneSettings.bots.value.saving }
 
-            scrollTo(hasText("Skills for this profile"))
-            compose.onNodeWithText("Skills for this profile", useUnmergedTree = true).performClick()
+            scrollTo(hasTestTag("profile-skills"))
+            compose.onNodeWithTag("profile-skills").performClick()
             await { vm.ui.value.morePage == "Skills" && vm.phoneSettings.skills.value.skills.isNotEmpty() && !vm.phoneSettings.skills.value.loading }
             val skill = vm.phoneSettings.skills.value.skills.single()
             compose.runOnIdle { vm.phoneSettings.openSkill(skill) }
@@ -128,8 +128,8 @@ class SettingsProfileIsolationUiTest {
             back(); await { vm.phoneSettings.skills.value.selected == null }
             back(); await { vm.ui.value.morePage == "Profiles" && vm.phoneSettings.bots.value.selected?.profile == profile && !vm.phoneSettings.bots.value.loading }
 
-            scrollTo(hasText("Memory for this profile"))
-            compose.onNodeWithText("Memory for this profile", useUnmergedTree = true).performClick()
+            scrollTo(hasTestTag("profile-memory"))
+            compose.onNodeWithTag("profile-memory").performClick()
             await { vm.ui.value.morePage == "Memory" && vm.phoneSettings.memory.value.documents.isNotEmpty() && !vm.phoneSettings.memory.value.loading }
             assertEquals("$profile notes", vm.phoneSettings.memory.value.documents.first { it.target == "memory" }.content)
             compose.runOnIdle { vm.phoneSettings.editMemory("memory"); vm.phoneSettings.memoryDraft("$profile saved notes"); vm.phoneSettings.saveMemory() }
@@ -164,13 +164,13 @@ class SettingsProfileIsolationUiTest {
         scrollTo(hasTestTag("profile-open:coder")); compose.onNodeWithTag("profile-open:coder").performClick()
         await { vm.phoneSettings.bots.value.selected?.profile == "coder" && !vm.phoneSettings.bots.value.loading }
         fixture.holdMemoryProfile = "coder"
-        scrollTo(hasText("Memory for this profile")); compose.onNodeWithText("Memory for this profile", useUnmergedTree = true).performClick()
+        scrollTo(hasTestTag("profile-memory")); compose.onNodeWithTag("profile-memory").performClick()
         await { fixture.memoryReadCaptured.count == 0L }
         back(); await { vm.ui.value.morePage == "Profiles" && vm.phoneSettings.bots.value.selected?.profile == "coder" }
         back(); await { vm.phoneSettings.bots.value.selected == null && !vm.settingsProfileSelecting.value }
         scrollTo(hasTestTag("profile-open:academic")); compose.onNodeWithTag("profile-open:academic").performClick()
         await { vm.phoneSettings.bots.value.selected?.profile == "academic" && !vm.phoneSettings.bots.value.loading }
-        scrollTo(hasText("Memory for this profile")); compose.onNodeWithText("Memory for this profile", useUnmergedTree = true).performClick()
+        scrollTo(hasTestTag("profile-memory")); compose.onNodeWithTag("profile-memory").performClick()
         await { vm.phoneSettings.memory.value.documents.any { it.content == "academic notes" } && !vm.phoneSettings.memory.value.loading }
         fixture.releaseMemoryRead.countDown()
         await { fixture.memoryReadReturned.count == 0L }
@@ -212,7 +212,7 @@ class SettingsProfileIsolationUiTest {
         await { vm.phoneSettings.bots.value.profiles.size == 3 && !vm.phoneSettings.bots.value.loading }
         scrollTo(hasTestTag("profile-open:coder")); compose.onNodeWithTag("profile-open:coder").performClick()
         await { vm.phoneSettings.bots.value.selected?.profile == "coder" && !vm.phoneSettings.bots.value.loading }
-        scrollTo(hasText("Memory for this profile")); compose.onNodeWithText("Memory for this profile", useUnmergedTree = true).performClick()
+        scrollTo(hasTestTag("profile-memory")); compose.onNodeWithTag("profile-memory").performClick()
         await { vm.phoneSettings.memory.value.documents.any { it.content == "coder notes" } && !vm.phoneSettings.memory.value.loading }
         compose.runOnIdle { vm.phoneSettings.editMemory("memory"); vm.phoneSettings.memoryDraft("recoverable coder draft") }
         back(); compose.onNodeWithText("Keep editing").performClick()
@@ -229,7 +229,7 @@ class SettingsProfileIsolationUiTest {
         await { vm.phoneSettings.bots.value.profiles.size == 3 && !vm.phoneSettings.bots.value.loading }
         scrollTo(hasTestTag("profile-open:coder")); compose.onNodeWithTag("profile-open:coder").performClick()
         await { vm.phoneSettings.bots.value.selected?.profile == "coder" && !vm.phoneSettings.bots.value.loading }
-        scrollTo(hasText("Memory for this profile")); compose.onNodeWithText("Memory for this profile", useUnmergedTree = true).performClick()
+        scrollTo(hasTestTag("profile-memory")); compose.onNodeWithTag("profile-memory").performClick()
         await { vm.phoneSettings.memory.value.documents.any { it.content == "coder notes" } && !vm.phoneSettings.memory.value.loading }
         compose.runOnIdle { vm.phoneSettings.editMemory("memory"); vm.phoneSettings.memoryDraft("draft before sign-out"); vm.logout() }
         await { !vm.ui.value.authenticated && vm.client == null }
@@ -244,7 +244,7 @@ class SettingsProfileIsolationUiTest {
         await { vm.phoneSettings.bots.value.profiles.size == 3 && !vm.phoneSettings.bots.value.loading }
         scrollTo(hasTestTag("profile-open:coder")); compose.onNodeWithTag("profile-open:coder").performClick()
         await { vm.phoneSettings.bots.value.selected?.profile == "coder" && !vm.phoneSettings.bots.value.loading }
-        scrollTo(hasText("Memory for this profile")); compose.onNodeWithText("Memory for this profile", useUnmergedTree = true).performClick()
+        scrollTo(hasTestTag("profile-memory")); compose.onNodeWithTag("profile-memory").performClick()
         await { vm.phoneSettings.memory.value.documents.any { it.content == "coder notes" } && !vm.phoneSettings.memory.value.loading }
         compose.runOnIdle { vm.phoneSettings.editMemory("memory"); vm.phoneSettings.memoryDraft("recreated coder draft") }
         val coder = fixture.scope.copy(profile = "coder")
@@ -276,7 +276,7 @@ class SettingsProfileIsolationUiTest {
         await { vm.phoneSettings.bots.value.profiles.size == 3 && !vm.phoneSettings.bots.value.loading }
         scrollTo(hasTestTag("profile-open:coder")); compose.onNodeWithTag("profile-open:coder").performClick()
         await { vm.phoneSettings.bots.value.selected?.profile == "coder" && !vm.phoneSettings.bots.value.loading }
-        scrollTo(hasText("Memory for this profile")); compose.onNodeWithText("Memory for this profile", useUnmergedTree = true).performClick()
+        scrollTo(hasTestTag("profile-memory")); compose.onNodeWithTag("profile-memory").performClick()
         await { vm.phoneSettings.memory.value.documents.any { it.content == "coder notes" } && !vm.phoneSettings.memory.value.loading }
         val saved = BeaconViewModel::class.java.getDeclaredField("saved").apply { isAccessible = true }.get(vm) as SavedStateHandle
         val originalClient = vm.client

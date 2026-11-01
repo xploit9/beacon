@@ -51,9 +51,10 @@ class ProactiveUiTest {
         await { compose.onAllNodes(hasText("Profile") and hasText("Code profile")).fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("coder", substring = false).assertDoesNotExist()
 
-        compose.onNodeWithText("What needs you · Code profile").assertExists()
-        compose.onNodeWithText("Beacon tells you what needs your attention.").assertExists()
-        compose.onNodeWithTag("assistant-proactive-toggle").performScrollTo().performClick()
+        // The section names the profile it watches for in a badge beside its heading.
+        compose.onNode(hasText("Code profile") and hasAnyAncestor(hasTestTag("settings-section:What needs you"))).assertExists()
+        compose.onNodeWithText("Beacon tells you what needs your attention.").assertDoesNotExist()
+        compose.onNodeWithTag("assistant-proactive-toggle").performScrollTo().assertIsOff().assertTextContains("Watch for me").performClick()
         await { fixture.proactiveEnabled["coder"] == true && vm.data.value[proactiveKey(fixture)]?.optBoolean("enabled") == true }
 
         assertEquals("notify", fixture.proactiveDelivery["coder"])
@@ -64,12 +65,15 @@ class ProactiveUiTest {
         assertEquals("coder", write.string("profile"))
         assertEquals(setOf("enabled"), write.getJSONObject("body").keys().asSequence().toSet())
         assertTrue(write.getJSONObject("body").getBoolean("enabled"))
-        // R6P watches every connected source, not only incoming email.
-        compose.onNodeWithText("When something matters").assertExists()
-        compose.onNode(hasText("Delivery") and hasText("Notify")).assertExists()
-        compose.onNode(hasText("Check every") and hasText("15 min")).assertExists()
-        compose.onNodeWithTag("proactive-time-Quiet hours start").performScrollTo().performClick()
+        // R6P watches every connected source, not only incoming email. Delivery and the interval are segments, not dropdowns.
+        compose.onNodeWithTag("assistant-proactive-toggle").assertIsOn()
+        compose.onNodeWithTag("choice-option:Delivery:notify").performScrollTo().assertIsSelected()
+        compose.onNodeWithTag("choice-option:Delivery:call").assertIsNotSelected()
+        compose.onNodeWithTag("choice-option:Check every:15").performScrollTo().assertIsSelected()
+        compose.onNodeWithTag("proactive-time-Quiet hours start").performScrollTo().assertTextContains("Quiet from").performClick()
         compose.onNodeWithTag("proactive-time-confirm-Quiet hours start").assertExists()
+        compose.onNodeWithText("Cancel").performClick()
+        compose.onNodeWithTag("proactive-time-Quiet hours end").performScrollTo().assertTextContains("Quiet until")
         compose.onNodeWithText("Run a brief now").assertDoesNotExist()
         compose.onNodeWithTag("assistant-settings").performScrollToNode(hasText("What Beacon learned"))
         compose.onNodeWithText("What Beacon learned").assertExists()
@@ -80,12 +84,10 @@ class ProactiveUiTest {
         compose.runOnIdle { vm.more("Assistant") }
         await { vm.data.value[proactiveKey(fixture)]?.optBoolean("enabled") == true }
 
-        // Each choice saves as soon as it is picked.
-        compose.onNode(hasText("Delivery") and hasText("Notify")).performScrollTo().performClick()
-        compose.onNodeWithTag("choice-option:Delivery:call").performClick()
+        // Each choice saves as soon as its segment is tapped; there is no dropdown to open first.
+        compose.onNodeWithTag("choice-option:Delivery:call").performScrollTo().performClick()
         await { fixture.proactiveDelivery["coder"] == "call" }
-        compose.onNode(hasText("Check every") and hasText("15 min")).performScrollTo().performClick()
-        compose.onNodeWithTag("choice-option:Check every:5").performClick()
+        compose.onNodeWithTag("choice-option:Check every:5").performScrollTo().performClick()
         await { fixture.proactiveDelivery["coder"] == "call" && fixture.proactiveCheckMinutes["coder"] == 5 }
         val settingsWrite = fixture.requests.last { it.string("path") == PROACTIVE_SETTINGS_PATH && it.string("method") == "PUT" }
         assertEquals("coder", settingsWrite.string("profile"))
@@ -146,11 +148,10 @@ class ProactiveUiTest {
         await { vm.data.value[proactiveKey(fixture)]?.optBoolean("enabled") == true }
         fixture.proactiveSaveStatusCode = 503
 
-        compose.onNode(hasText("Delivery") and hasText("Notify")).performScrollTo().performClick()
-        compose.onNodeWithTag("choice-option:Delivery:call").performClick()
+        compose.onNodeWithTag("choice-option:Delivery:call").performScrollTo().performClick()
         await { compose.onAllNodesWithText("Settings change refused").fetchSemanticsNodes().isNotEmpty() }
-        compose.onNode(hasText("Delivery") and hasText("Notify")).assertExists()
-        compose.onNode(hasText("Delivery") and hasText("Call")).assertDoesNotExist()
+        compose.onNodeWithTag("choice-option:Delivery:notify").assertIsSelected()
+        compose.onNodeWithTag("choice-option:Delivery:call").assertIsNotSelected()
         assertEquals("notify", fixture.proactiveDelivery["coder"])
     }
 
@@ -169,7 +170,8 @@ class ProactiveUiTest {
         val removal = fixture.requests.last { it.string("path") == "$PROACTIVE_SETTINGS_PATH/learned" && it.string("method") == "DELETE" }
         assertEquals("coder", removal.string("profile"))
         assertEquals("Client moved the review", removal.getJSONObject("body").string("note"))
-        compose.onNodeWithText("Mark alerts as Important or Not important to teach Beacon.").assertExists()
+        compose.onNodeWithTag("proactive-learned-empty").assertExists()
+        compose.onNodeWithText("Rate alerts to teach Beacon").assertExists()
     }
 
     @Test fun missingPluginShowsUpdateHelpAndOtherFailuresShowDetailAndRetry() = withFixture { vm, fixture ->
@@ -197,7 +199,8 @@ class ProactiveUiTest {
         compose.onNodeWithTag("proactive-prompt-settings").performClick()
         await { vm.ui.value.tab == "More" && vm.ui.value.morePage == "Assistant" }
         // The profile label depends on cached display names; check that this opens Proactive settings.
-        await { compose.onAllNodesWithText("What needs you · ", substring = true).fetchSemanticsNodes().isNotEmpty() }
+        await { compose.onAllNodesWithTag("assistant-proactive-toggle").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("What needs you").assertExists()
         assertFalse(fixture.proactiveEnabled["coder"] == true)
     }
 

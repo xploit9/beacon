@@ -616,6 +616,19 @@ def _watch_tool_guard(tool_name,args,profile):
     return {'action':'block','message':_READ_ONLY_MESSAGE}
 
 
+def _is_gateway_process():
+    # Hermes' own launch test (`hermes [-p profile] gateway run`). The _HERMES_GATEWAY marker is inherited by a dashboard or CLI that
+    # merely imports gateway.run, and the PID file may not exist yet while plugins load, so neither says which process this is.
+    argv=sys.argv[1:]
+    return any(first=='gateway' and second=='run' for first,second in zip(argv,argv[1:]))
+
+def _record_gateway_plugin_version():
+    # register() runs in every Hermes process; only the gateway may say which plugin version the gateway loaded.
+    try:
+        version=mobile.read_plugin_version(ROOT/'plugin.yaml') if _is_gateway_process() else ''
+        if version: mobile.record_gateway_plugin_version(version)
+    except Exception: pass  # a status note never blocks the plugin from loading
+
 def register(ctx):
     global _ctx
     _ctx=ctx
@@ -668,3 +681,4 @@ def register(ctx):
     # Cleanup runs before the guard is removed because native registrations unwind in reverse order.
     if callable(getattr(ctx,'on_unload',None)): ctx.on_unload(pause_proactive_jobs)
     phone_delivery.register(ctx)
+    _record_gateway_plugin_version()

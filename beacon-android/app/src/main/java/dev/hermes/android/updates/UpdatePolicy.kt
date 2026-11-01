@@ -3,6 +3,7 @@ package dev.hermes.android.updates
 import android.app.ActivityManager
 import dev.hermes.android.core.PLUGIN_VERSION_PATTERN
 import dev.hermes.android.core.Release
+import dev.hermes.android.push.KeepConnectedService
 import java.util.Locale
 
 /** Validate trust even when the latest release is already installed. */
@@ -30,8 +31,15 @@ internal fun updateCheckDue(lastCheck: Long, now: Long, force: Boolean, lastAtte
     return force || aged(lastCheck, window) && aged(lastAttempt, UPDATE_RETRY_MS)
 }
 
-/** Opening the update screen on an offer refreshes it after 30 minutes; every other check keeps the 6-hour schedule. */
-internal fun checkWindow(offered: Boolean, onUpdateScreen: Boolean): Long = if (offered && onUpdateScreen) UPDATE_OFFER_REFRESH_MS else UPDATE_CHECK_INTERVAL_MS
+/**
+ * Opening the update screen on an offer refreshes it after 30 minutes, and so does every check while Keep connected is live (its
+ * foreground connection keeps the process alive, and the stored ETag makes a repeat check free); the rest keep the 6-hour schedule.
+ */
+internal fun checkWindow(offered: Boolean, onUpdateScreen: Boolean, keepConnected: Boolean = false): Long =
+    if (keepConnected || offered && onUpdateScreen) UPDATE_OFFER_REFRESH_MS else UPDATE_CHECK_INTERVAL_MS
+
+/** Keep connected is on and its last answer from Hermes is fresh; both are read from its public state, never changed here. */
+internal fun keepConnectedLive(enabled: Boolean, status: String): Boolean = enabled && status == KeepConnectedService.STATUS_CONNECTED
 
 /**
  * The release an Update tap goes on with: what [ask] (GitHub's latest, vetted; null when nothing is newer) answers now, never the

@@ -62,7 +62,10 @@ internal fun presencePoles(state: SphereState): PresencePoles = when (state) {
 internal fun presenceState(call: CallState): SphereState = when {
     !call.active -> SphereState.Idle
     call.error.isNotBlank() -> SphereState.Error
-    call.held || call.state == "connecting" || call.state == "reconnecting" -> SphereState.Idle
+    call.held -> SphereState.Idle
+    // The cached greeting plays from the tap while the call still connects: the dust talks with it.
+    call.state == "connecting" && call.remoteSpeaking -> SphereState.Speaking
+    call.state == "connecting" || call.state == "reconnecting" -> SphereState.Idle
     call.toolReceipts.any { it.statusLabel() != null } || call.state == "thinking" -> SphereState.Thinking
     call.remoteSpeaking || call.state == "speaking" -> SphereState.Speaking
     call.muted -> SphereState.Idle

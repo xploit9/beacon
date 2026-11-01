@@ -83,6 +83,21 @@ suspend fun refreshNotificationPreview(context: Context, source: String, event: 
     }
 }
 
+/** How long the FCM thread waits for the real text before the job takes over. */
+internal const val INLINE_PREVIEW_MILLIS = 8_000L
+
+/** The real text now, from the thread that received the push; false when it failed or ran out of time, so the caller queues the job instead. */
+internal suspend fun refreshNotificationPreviewInline(context: Context, source: String, event: String, conversation: String, kind: String): Boolean = try {
+    withTimeout(INLINE_PREVIEW_MILLIS) { refreshNotificationPreview(context, source, event, conversation, kind) }
+    true
+} catch (error: TimeoutCancellationException) {
+    false
+} catch (error: CancellationException) {
+    throw error
+} catch (_: Exception) {
+    false
+}
+
 // shortcut: only a notification posted by an earlier build still carries these buttons; delete this, enqueueFeedback and NativeActivityReceiver's ACTION_EMAIL_FEEDBACK branch once none can remain.
 private suspend fun sendEmailFeedback(context: Context, source: String, event: String, verdict: String) {
     if (!validOpaque(source) || !validOpaque(event) || !validEmailVerdict(verdict)) return

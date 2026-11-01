@@ -11,6 +11,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.BeaconViewModel
@@ -33,6 +34,11 @@ internal fun threadJobs(jobs: List<JSONObject>, threadId: String): List<JSONObje
     val jobs = threadJobs(crons?.rows("jobs").orEmpty(), threadId)
     val (active, completed) = splitSchedules(jobs)
     val format = rememberScheduleFormat()
+    val whenWords = rememberScheduleWhen()
+    val phoneZone = remember { java.time.ZoneId.systemDefault() }
+    val now = remember(crons) { java.time.Instant.now() }
+    val nextTemplate = uiText("Next: {0}")
+    val ranTemplate = uiText("Ran {0}")
     var showCompleted by rememberSaveable(ui.profile, threadId) { mutableStateOf(false) }
     val refresh: () -> Unit = { refreshSchedules(vm) }
     var pending by remember(threadId) { mutableStateOf("") }
@@ -53,36 +59,39 @@ internal fun threadJobs(jobs: List<JSONObject>, threadId: String): List<JSONObje
             if (needsPlugin) MissingBeaconPluginState(compact = true)
             else Button(onClick = { cronForm(vm, null, targets, timezone, refresh, deliver = threadTarget(threadId), format = format) }, modifier = Modifier.heightIn(min = 48.dp)) { Icon(Icons.Rounded.Add, null); Text(uiText("Add scheduled post"), Modifier.padding(start = 8.dp)) }
             when {
-                crons == null -> LinearProgressIndicator(Modifier.fillMaxWidth())
-                crons.has("_error") -> Column { Text(uiText("Couldn't load scheduled posts. Check your connection and try again."), color = MaterialTheme.colorScheme.error); OutlinedButton(onClick = refresh, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Retry")) } }
-                jobs.isEmpty() -> Text(uiText("Nothing posts here yet. Add a task and its results show up in this thread."), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                crons == null -> Glass { SettingsSkeletonRows(2) }
+                crons.has("_error") -> Glass { SettingsErrorRow(uiText("Couldn't load scheduled posts. Check your connection and try again."), refresh, uiText("Retry")) }
+                jobs.isEmpty() -> Text(uiText("Nothing posts here yet. Add a task to start."), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 else -> LazyColumn(Modifier.weight(1f, fill = false), contentPadding = PaddingValues(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     items(active, key = { it.string("id") }) { job ->
                         val id = job.string("id")
                         val paused = schedulePaused(job)
-                        Glass { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Text(scheduleTitle(job, uiText("Scheduled task"), format.text("Callback")), style = MaterialTheme.typography.titleMedium)
-                            describeSchedule(job.optJSONObject("schedule"), scheduleDisplay(job), timezone, format).takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary) }
-                            Text("${uiText(scheduleState(job))} · ${uiText("Next")}: ${scheduleTime(job.string("next_run_at"), timezone, uiText("Not scheduled"), format.is24Hour)}", style = MaterialTheme.typography.bodySmall)
-                            scheduleDeliveryError(job).takeIf { it.isNotBlank() }?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
-                            if (pending == id) LinearProgressIndicator(Modifier.fillMaxWidth())
-                            FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                                IconButton(enabled = pending.isBlank() && !scheduleEnded(job), onClick = { pending = id; actionScope.launch { pauseSchedule(vm, job, refresh).join(); pending = "" } }) {
-                                    Icon(if (paused) Icons.Rounded.PlayArrow else Icons.Rounded.Pause, uiText(if (paused) "Resume" else "Pause"))
+                        Glass { Column(Modifier.padding(start = 16.dp, top = 16.dp, end = 4.dp, bottom = 4.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Column(Modifier.weight(1f).padding(top = 4.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Text(scheduleTitle(job, uiText("Scheduled task"), format.text("Callback")), style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                    ScheduleStatusChip(job)
                                 }
-                                TextButton(enabled = pending.isBlank(), onClick = { runSchedule(vm, job, refresh) }, modifier = Modifier.heightIn(min = 48.dp)) { Icon(Icons.Rounded.Bolt, null, Modifier.size(18.dp)); Text(uiText("Run now"), Modifier.padding(start = 6.dp)) }
-                                IconButton(enabled = pending.isBlank(), onClick = { cronForm(vm, job, targets, timezone, refresh, format = format) }) { Icon(Icons.Rounded.Edit, uiText("Edit")) }
-                                IconButton(enabled = pending.isBlank(), onClick = { delete(id) }) {
-                                    Icon(Icons.Rounded.Delete, uiText("Delete"), tint = if (pending.isBlank()) MaterialTheme.colorScheme.error else LocalContentColor.current)
-                                }
+                                ScheduleMenu(id, paused, scheduleEnded(job), true, pending.isBlank(),
+                                    onPause = { pending = id; actionScope.launch { pauseSchedule(vm, job, refresh).join(); pending = "" } },
+                                    onEdit = { cronForm(vm, job, targets, timezone, refresh, format = format) },
+                                    onHistory = null,
+                                    onDelete = { delete(id) })
                             }
+                            Column(Modifier.padding(end = 12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                describeSchedule(job.optJSONObject("schedule"), scheduleDisplay(job), timezone, format).takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, maxLines = 2, overflow = TextOverflow.Ellipsis) }
+                                Text(nextTemplate.replace("{0}", scheduleNextRun(job.string("next_run_at"), uiText("Not scheduled"), whenWords, now, phoneZone, format.is24Hour)), style = MaterialTheme.typography.bodyMedium)
+                                scheduleDeliveryError(job).takeIf { it.isNotBlank() }?.let { ScheduleDeliveryError(it) }
+                                if (pending == id) LinearProgressIndicator(Modifier.fillMaxWidth())
+                            }
+                            ScheduleRunNow(id, pending.isBlank()) { runSchedule(vm, job, refresh) }
                         } }
                     }
                     if (completed.isNotEmpty()) {
                         item(key = "completed-schedules") { CompletedHeader(completed.size, showCompleted, format.text("Completed schedules")) { showCompleted = !showCompleted } }
                         if (showCompleted) items(completed, key = { it.string("id") }) { job ->
                             CompletedScheduleRow(job.string("id"), scheduleTitle(job, uiText("Scheduled task"), format.text("Callback")), "",
-                                job.string("last_run_at").takeIf(String::isNotBlank)?.let { "${format.text("Ran")} ${scheduleTime(it, timezone, "", format.is24Hour)}" } ?: uiText("No recorded run"),
+                                job.string("last_run_at").takeIf(String::isNotBlank)?.let { ranTemplate.replace("{0}", scheduleTime(it, phoneZone.id, "", format.is24Hour)) } ?: uiText("No recorded run"),
                                 onHistory = null, historyOpen = false, onDelete = { delete(job.string("id")) })
                         }
                     }

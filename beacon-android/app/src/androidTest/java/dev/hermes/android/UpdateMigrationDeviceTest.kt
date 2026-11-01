@@ -80,7 +80,7 @@ class UpdateMigrationDeviceTest {
                 JSONObject().put("name", "Beacon-$name.json").put("browser_download_url", assetUrl("Beacon-$name.json")).put("size", 10).put("state", "uploaded"),
                 JSONObject().put("name", "Beacon-$name.apk").put("browser_download_url", assetUrl("Beacon-$name.apk")).put("size", apk.size).put("state", "uploaded"))))
         private fun metadata() = JSONObject().put("package_name", target.packageName).put("version_name", name).put("version_code", code).put("artifact_filename", "Beacon-$name.apk")
-            .put("size_bytes", apk.size).put("sha256", sha).put("certificate_sha256", signer).put("plugin_version", "1.1.3")
+            .put("size_bytes", apk.size).put("sha256", sha).put("certificate_sha256", signer).put("plugin_version", name)
         override fun intercept(chain: Interceptor.Chain): Response {
             val request = chain.request()
             val path = request.url.encodedPath
@@ -155,7 +155,7 @@ class UpdateMigrationDeviceTest {
             assertEquals(UpdatePhase.Available, offered.phase)
             assertEquals(installedCode + 1, offered.release?.version)
             assertEquals("99.0.0", offered.release?.name)
-            assertEquals("1.1.3", offered.release?.pluginVersion)
+            assertEquals("99.0.0", offered.release?.pluginVersion)
             assertTrue(offered.checkedAt > 0)
             assertEquals(installedCode + 1, prefs.getLong("notified_version", 0))
             assertTrue(posted(system))

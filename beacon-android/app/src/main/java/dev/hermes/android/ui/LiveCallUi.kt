@@ -198,17 +198,19 @@ internal data class CallUiActions(
     }
 }
 
-@Composable private fun CallControlLabel(text: String, show: Boolean) {
-    // The button already carries this name; reading the caption as well would make every control two TalkBack stops.
-    if (show) Text(text, Modifier.clearAndSetSemantics {}, color = CallText, style = MaterialTheme.typography.labelMedium,
-        maxLines = 2, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+/** One short word under a control. The button carries the full name, so TalkBack does not read the caption a second time. */
+@Composable private fun CallControlLabel(text: String) {
+    if (text.isNotBlank()) Text(text, Modifier.clearAndSetSemantics {}, color = CallText, style = MaterialTheme.typography.labelMedium,
+        maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
 }
 
-/** A caption stays beside each control up to this text size; beyond it the five columns are too narrow and the icons carry the names. */
-private const val CallLabelMaxFontScale = 1.6f
-
+/**
+ * A round call control. [caption] is a single word kept visible at any text size; [description] is the full name for TalkBack.
+ * Hang up is larger, red, and has no caption: the red phone is its own label.
+ */
 @Composable private fun CallControl(
-    label: String,
+    caption: String,
+    description: String,
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     tag: String,
     enabled: Boolean,
@@ -217,20 +219,20 @@ private const val CallLabelMaxFontScale = 1.6f
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     hangup: Boolean = false,
-    showLabel: Boolean = true,
+    size: Dp = CallControlSize,
 ) {
     val state = stateDescription
-    val button = Modifier.size(48.dp).testTag(tag).semantics { this.stateDescription = state }
+    val button = Modifier.size(size).testTag(tag).semantics { this.stateDescription = state }
     Column(modifier, horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
         if (hangup) FilledIconButton(
             onClick, button, enabled = enabled,
             colors = IconButtonDefaults.filledIconButtonColors(
-                containerColor = Color(0xff9f3d3d),
+                containerColor = CallHangupRed,
                 contentColor = CallText,
                 disabledContainerColor = CallControl.copy(alpha = .55f),
                 disabledContentColor = CallMuted,
             ),
-        ) { Icon(icon, label) }
+        ) { Icon(icon, description, Modifier.size(size / 2)) }
         else FilledIconToggleButton(
             selected, { onClick() }, button, enabled = enabled,
             colors = IconButtonDefaults.filledIconToggleButtonColors(
@@ -241,12 +243,12 @@ private const val CallLabelMaxFontScale = 1.6f
                 checkedContainerColor = CallGoldBright,
                 checkedContentColor = CallBackground,
             ),
-        ) { Icon(icon, label) }
-        CallControlLabel(label, showLabel)
+        ) { Icon(icon, description) }
+        CallControlLabel(caption)
     }
 }
 
-@Composable private fun CallSpeakerControl(call: CallState, actions: CallUiActions, modifier: Modifier = Modifier, showLabel: Boolean = true) {
+@Composable private fun CallSpeakerControl(call: CallState, actions: CallUiActions, modifier: Modifier = Modifier) {
     var routes by remember(call.callId) { mutableStateOf(false) }
     val speakerLabel = uiText("Speaker")
     val routeLabel = call.routes.firstOrNull { it.id == call.route }?.name ?: uiText("Audio output")
@@ -254,7 +256,7 @@ private const val CallLabelMaxFontScale = 1.6f
         Box {
             FilledIconButton(
                 { routes = true },
-                Modifier.size(48.dp).testTag("beacon-speaker").semantics {
+                Modifier.size(CallControlSize).testTag("beacon-speaker").semantics {
                     contentDescription = speakerLabel
                     stateDescription = routeLabel
                 },
@@ -271,21 +273,32 @@ private const val CallLabelMaxFontScale = 1.6f
                 }
             }
         }
-        CallControlLabel(speakerLabel, showLabel)
+        CallControlLabel(speakerLabel)
     }
 }
 
+private val CallControlSize = 56.dp
+private val CallSecondarySize = 48.dp
+private val CallHangupSize = 68.dp
+
+/**
+ * Camera and screen share sit in a quiet group on top; Mute and Speaker are the main controls and the large red Hang up comes last.
+ * The call bubble permission is not asked here: it is asked once after the call ([CallBubbleAskHost]).
+ */
 @Composable internal fun LiveCallDock(call: CallState, actions: CallUiActions, motionEnabled: Boolean, modifier: Modifier = Modifier) {
-    val labels = LocalDensity.current.fontScale <= CallLabelMaxFontScale
     val cameraOn = call.cameraSharing || call.cameraBusy || call.cameraStopPending
     val screenOn = call.screenSharing || call.screenBusy || call.screenStopPending
     Column(
-        modifier.background(CallSurface.copy(alpha = .98f), RoundedCornerShape(26.dp)).padding(horizontal = 10.dp, vertical = 12.dp),
+        modifier.background(CallSurface.copy(alpha = .98f), RoundedCornerShape(26.dp)).padding(horizontal = 12.dp, vertical = 14.dp).testTag("beacon-call-dock"),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.Top) {
+        Row(
+            Modifier.background(CallSurfaceRaised.copy(alpha = .5f), RoundedCornerShape(20.dp)).padding(horizontal = 14.dp, vertical = 8.dp).testTag("beacon-call-share-group"),
+            horizontalArrangement = Arrangement.spacedBy(20.dp), verticalAlignment = Alignment.Top,
+        ) {
             CallControl(
+                uiText("Camera"),
                 if (cameraOn) uiText("Stop camera") else uiText("Camera"),
                 if (cameraOn) Icons.Rounded.VideocamOff else Icons.Rounded.Videocam,
                 "beacon-camera",
@@ -293,10 +306,25 @@ private const val CallLabelMaxFontScale = 1.6f
                 call.cameraSharing,
                 if (call.cameraStopPending) uiText("Camera stop unconfirmed. Retry stopping.") else if (call.cameraBusy) uiText("Camera changing") else if (call.cameraSharing) uiText("Camera sharing") else uiText("Camera stopped"),
                 actions.camera,
-                Modifier.weight(1f),
-                showLabel = labels,
+                Modifier.widthIn(min = 64.dp),
+                size = CallSecondarySize,
             )
             CallControl(
+                uiText("Share"),
+                if (screenOn) uiText("Stop sharing") else uiText("Share screen"),
+                if (screenOn) Icons.Rounded.StopScreenShare else Icons.Rounded.ScreenShare,
+                "beacon-share-screen",
+                call.active && (screenOn || !call.held && call.state != "connecting" && !call.cameraStopPending),
+                call.screenSharing,
+                if (call.screenStopPending) uiText("Screen stop unconfirmed. Retry stopping.") else if (call.screenSharing) uiText("Screen sharing") else uiText("Screen stopped"),
+                actions.screen,
+                Modifier.widthIn(min = 64.dp),
+                size = CallSecondarySize,
+            )
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
+            CallControl(
+                if (call.muted) uiText("Unmute") else uiText("Mute"),
                 if (call.muted) uiText("Unmute") else uiText("Mute"),
                 if (call.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic,
                 "beacon-mute",
@@ -305,21 +333,10 @@ private const val CallLabelMaxFontScale = 1.6f
                 if (call.muted) uiText("Microphone muted") else uiText("Microphone active"),
                 actions.mute,
                 Modifier.weight(1f),
-                showLabel = labels,
             )
-            CallSpeakerControl(call, actions, Modifier.weight(1f), labels)
+            CallSpeakerControl(call, actions, Modifier.weight(1f))
             CallControl(
-                if (screenOn) uiText("Stop sharing") else uiText("Share screen"),
-                if (screenOn) Icons.Rounded.StopScreenShare else Icons.Rounded.ScreenShare,
-                "beacon-share-screen",
-                call.active && (screenOn || !call.held && call.state != "connecting" && !call.cameraStopPending),
-                call.screenSharing,
-                if (call.screenStopPending) uiText("Screen stop unconfirmed. Retry stopping.") else if (call.screenSharing) uiText("Screen sharing") else uiText("Screen stopped"),
-                actions.screen,
-                Modifier.weight(1f),
-                showLabel = labels,
-            )
-            CallControl(
+                "",
                 uiText("Hang up"),
                 Icons.Rounded.CallEnd,
                 "beacon-hang-up",
@@ -329,25 +346,53 @@ private const val CallLabelMaxFontScale = 1.6f
                 actions.end,
                 Modifier.weight(1f),
                 hangup = true,
-                showLabel = labels,
+                size = CallHangupSize,
             )
         }
-        if (call.overlayPermissionMissing) AssistChip(
-            onClick = actions.allowBubble,
-            label = { Text(uiText("Allow call bubble")) },
-            leadingIcon = { Icon(Icons.Rounded.Call, null) },
-            modifier = Modifier.heightIn(min = 48.dp).testTag("beacon-allow-bubble"),
-            colors = AssistChipDefaults.assistChipColors(
-                containerColor = CallSurfaceRaised,
-                labelColor = CallGoldBright,
-                leadingIconContentColor = CallGoldBright,
-            ),
-        )
         if (call.contextNotice.isNotBlank()) Text(
             call.contextNotice, style = MaterialTheme.typography.bodySmall, color = CallMuted,
             modifier = Modifier.widthIn(max = 520.dp).heightIn(max = 120.dp).verticalScroll(rememberScrollState())
                 .padding(horizontal = 12.dp, vertical = 8.dp).testTag("beacon-context-notice").semantics { liveRegion = LiveRegionMode.Polite },
         )
+    }
+}
+
+/** True once: a call that ran without the bubble permission has just ended and the question was never asked. */
+internal fun shouldAskCallBubble(wasActive: Boolean, bubbleWasMissing: Boolean, active: Boolean, alreadyAsked: Boolean): Boolean =
+    wasActive && !active && bubbleWasMissing && !alreadyAsked
+
+/** After such a call: one short question, remembered so it is never asked again. */
+@Composable internal fun CallBubbleAsk(call: CallState, asked: Boolean, onAsked: () -> Unit, onAllow: () -> Unit) {
+    var wasActive by remember { mutableStateOf(call.active) }
+    var missing by remember { mutableStateOf(call.active && call.overlayPermissionMissing) }
+    var show by remember { mutableStateOf(false) }
+    LaunchedEffect(call.active, call.overlayPermissionMissing, asked) {
+        if (call.active) missing = missing || call.overlayPermissionMissing
+        if (shouldAskCallBubble(wasActive, missing, call.active, asked)) show = true
+        if (!call.active) missing = false
+        wasActive = call.active
+    }
+    if (show) {
+        val close = { show = false; onAsked() }
+        AlertDialog(
+            onDismissRequest = close,
+            icon = { Icon(Icons.Rounded.Call, null) },
+            title = { Text(uiText("Allow call bubble")) },
+            text = { Text(uiText("Show calls in a floating bubble.")) },
+            confirmButton = { TextButton(onClick = { close(); onAllow() }, modifier = Modifier.heightIn(min = 48.dp).testTag("beacon-allow-bubble")) { Text(uiText("Allow")) } },
+            dismissButton = { TextButton(onClick = close, modifier = Modifier.heightIn(min = 48.dp).testTag("beacon-allow-bubble-skip")) { Text(uiText("Not now")) } },
+            modifier = Modifier.testTag("beacon-allow-bubble-dialog"),
+        )
+    }
+}
+
+/** Hosts [CallBubbleAsk] for the app: the answer is stored once on this phone and the permission screen opens through the activity. */
+@Composable internal fun CallBubbleAskHost(call: CallState) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val prefs = remember(context) { context.getSharedPreferences("beacon_call_ui", android.content.Context.MODE_PRIVATE) }
+    var asked by remember(prefs) { mutableStateOf(prefs.getBoolean("bubble_asked", false)) }
+    CallBubbleAsk(call, asked, onAsked = { asked = true; prefs.edit().putBoolean("bubble_asked", true).apply() }) {
+        (context as? dev.hermes.android.BeaconActivity)?.openCallBubbleSettings()
     }
 }
 
@@ -367,11 +412,8 @@ private const val CallLabelMaxFontScale = 1.6f
             Text(callStatusText(call), Modifier.testTag("beacon-call-status"), color = CallGoldBright, style = MaterialTheme.typography.labelMedium,
                 maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
         }
-        Column(horizontalAlignment = Alignment.End) {
-            Text(callTimerLabel(call.startedAt, now), Modifier.testTag("beacon-call-timer"), color = CallText,
-                style = MaterialTheme.typography.titleMedium.copy(fontFeatureSettings = "tnum"))
-            Text(uiText("Call time"), style = MaterialTheme.typography.labelSmall, color = CallMuted)
-        }
+        Text(callTimerLabel(call.startedAt, now), Modifier.testTag("beacon-call-timer"), color = CallText,
+            style = MaterialTheme.typography.titleMedium.copy(fontFeatureSettings = "tnum"))
         FilledTonalIconButton(
             onConversation,
             Modifier.size(48.dp).testTag("beacon-view-conversation"),
@@ -464,6 +506,7 @@ private const val CallLabelMaxFontScale = 1.6f
 
 internal val CallBackground = Color(0xff080d15)
 private val CallSurface = Color(0xff101a2b)
+private val CallHangupRed = Color(0xffb83a36)
 private val CallSurfaceRaised = Color(0xff1b2940)
 private val CallControl = Color(0xff202e45)
 private val CallText = Color(0xfff5f4f0)

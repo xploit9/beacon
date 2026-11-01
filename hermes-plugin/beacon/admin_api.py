@@ -157,6 +157,11 @@ async def native_update_status():
     return {'action': action, 'receipt': receipt}
 
 
+def restart_error_code(result):
+    """Why Hermes did not restart: `live_sessions` is its refusal while chats are running, anything else is `failed`."""
+    return 'live_sessions' if 'live session' in str(result.get('restart_error') or '').casefold() else 'failed'
+
+
 def native_plugin_restart(profile):
     from hermes_cli.web_server_gateway import _restart_gateway_after
     return _restart_gateway_after(profile, what='Beacon plugin update', label='Beacon plugin update')
@@ -204,7 +209,9 @@ def build_router(identity, read_body):
             result = await asyncio.to_thread(native_plugin_restart, profile)
             # Hermes coalesces recent restarts; an action predating this update cannot certify it.
             if before.get('pid') and result.get('restart_pid') == before['pid']:
-                return {**result, 'restart_started': False}
+                return {**result, 'restart_started': False, 'restart_error_code': 'stale'}
+            if result.get('restart_started') is False:
+                return {**result, 'restart_error_code': restart_error_code(result)}
             return result
         except Exception:
             raise HTTPException(503, 'Hermes could not start the gateway restart') from None

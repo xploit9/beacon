@@ -245,11 +245,13 @@ class CallAdmissionFailureTest {
         suspend fun begin() = withContext(Dispatchers.Main.immediate) {
             // Exercise the reservation/start catch without consulting the owner's VoiceKeyStore.
             suspendCoroutineUninterceptedOrReturn<Unit> { continuation ->
-                val method = CallController::class.java.declaredMethods.single { it.name == "start" && it.parameterTypes.size == 5 }
+                // start(client, incoming, conversationId, voiceSettings, tappedAt, continuation)
+                val method = CallController::class.java.declaredMethods.single { it.name == "start" && it.parameterTypes.size == 6 }
                 method.isAccessible = true
                 try {
                     method.invoke(app.calls, client, null, "synthetic-chat",
-                        VoiceSessionCredentials("gemini", "synthetic-unused-provider-key", "synthetic-model", "synthetic-voice", "balanced"), continuation)
+                        VoiceSessionCredentials("gemini", "synthetic-unused-provider-key", "synthetic-model", "synthetic-voice", "balanced"),
+                        android.os.SystemClock.elapsedRealtime(), continuation)
                 } catch (error: InvocationTargetException) { throw error.targetException }
             }
         }

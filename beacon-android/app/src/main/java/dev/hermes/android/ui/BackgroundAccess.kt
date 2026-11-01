@@ -71,6 +71,24 @@ internal fun openMakerBackgroundSettings(context: Context): Boolean {
     return openAppInfo(context)
 }
 
+/** The steps of keeping Beacon running, in the order to work through them: the battery allowance, the maker's auto-launch, then Android's background setting. */
+internal enum class BackgroundStep { Battery, AutoLaunch, Background }
+
+/** A phone from a strict maker gets all three steps; any other phone has only the two Android itself can show. */
+internal fun backgroundSteps(maker: StrictMaker?): List<BackgroundStep> =
+    if (maker == null) listOf(BackgroundStep.Battery, BackgroundStep.Background) else BackgroundStep.entries
+
+/** Whether Android reports [step] as limiting Beacon; null when only the maker's own screen knows (it cannot be read, so no result is claimed). */
+internal fun backgroundStepLimited(step: BackgroundStep, optimized: Boolean, restricted: Boolean): Boolean? = when (step) {
+    BackgroundStep.Battery -> optimized
+    BackgroundStep.AutoLaunch -> null
+    BackgroundStep.Background -> restricted
+}
+
+/** The first readable step that still limits Beacon, or null when every one Android can report is allowed. */
+internal fun nextBackgroundStep(optimized: Boolean, restricted: Boolean): BackgroundStep? =
+    listOf(BackgroundStep.Battery, BackgroundStep.Background).firstOrNull { backgroundStepLimited(it, optimized, restricted) == true }
+
 internal fun openAppInfo(context: Context): Boolean =
     runCatching { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}"))) }.isSuccess
 

@@ -56,9 +56,11 @@ class DirectVoiceStartupTest {
         } finally { voice.close();scope.cancel();client.closeNative() }
     }
 
-    @Test(timeout=8000) fun failedReconnectContextReadRetriesBeforeOpeningAnotherProviderSocket() = runBlocking {
+    // The reconnect context read now runs beside its provider socket; a failed read fails that attempt, never admits it.
+    @Test(timeout=8000) fun failedReconnectContextReadUsesTheReconnectBudgetWithoutAdmittingItsSocket() = runBlocking {
         val contexts=AtomicInteger();val asrConnections=AtomicInteger()
         val reconnected=CompletableDeferred<Unit>();val failure=CompletableDeferred<String>()
+        val admittedOn=java.util.concurrent.CopyOnWriteArrayList<Int>()
         val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
         val client=client("stored",contextRead={ if(contexts.incrementAndGet()==2) throw java.io.IOException("Network handover") })
         val factory=providerFactory(true,onSetup={ socket,listener,frame ->
@@ -66,14 +68,15 @@ class DirectVoiceStartupTest {
             if(instruction.startsWith("Transcribe") && asrConnections.incrementAndGet()==1) listener.onFailure(socket,java.io.IOException("Network handover"),null)
         })
         val voice=DirectVoice(client,"call","stored",scope,{}, {
-            if(asrConnections.get()==2&&it.optString("state")=="listening") reconnected.complete(Unit)
+            if(it.optString("state")=="listening") { admittedOn+=asrConnections.get();if(asrConnections.get()==3) reconnected.complete(Unit) }
         }, { failure.complete(it) },credentials=credentials(),providerSocketFactory=factory)
         try {
             voice.start()
             assertTrue("A failed context read must use the reconnect budget",withTimeoutOrNull(5000) { reconnected.await();true }==true)
             assertFalse("The call must stay alive",failure.isCompleted)
             assertEquals(3,contexts.get())
-            assertEquals(2,asrConnections.get())
+            assertEquals(3,asrConnections.get())
+            assertFalse("The socket beside the failed context read must never be admitted",2 in admittedOn)
         } finally { voice.close();scope.cancel();client.closeNative() }
     }
 
@@ -81,7 +84,9 @@ class DirectVoiceStartupTest {
         for(provider in listOf("grok","openai")) for(code in listOf(400,401,403)) {
             val connections=AtomicInteger();val failed=CompletableDeferred<String>()
             val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
-            val client=client("stored")
+            // The context stays pending, so a Grok/OpenAI greeting prefetch cannot open a second socket through this factory mid-assertion.
+            val context=java.util.concurrent.CountDownLatch(1)
+            val client=client("stored",contextRead={ context.await(5,java.util.concurrent.TimeUnit.SECONDS) })
             val factory=rejectedProviderFactory(connections) { socket,listener ->
                 listener.onFailure(socket,java.io.IOException("Upgrade refused"),Response.Builder().request(socket.request()).protocol(Protocol.HTTP_1_1).code(code).message("Rejected").build())
             }
@@ -90,7 +95,7 @@ class DirectVoiceStartupTest {
                 voice.start()
                 assertEquals("$provider HTTP $code",providerRejectionMessage(provider,if(code==400) "model" else "key"),withTimeout(1000) { failed.await() })
                 assertEquals(1,connections.get())
-            } finally { voice.close();scope.cancel();client.closeNative() }
+            } finally { voice.close();context.countDown();scope.cancel();client.closeNative() }
         }
     }
 
@@ -98,7 +103,8 @@ class DirectVoiceStartupTest {
         for(provider in listOf("grok","openai")) for(code in listOf(1007,1008)) {
             val connections=AtomicInteger();val failed=CompletableDeferred<String>()
             val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
-            val client=client("stored")
+            val context=java.util.concurrent.CountDownLatch(1)
+            val client=client("stored",contextRead={ context.await(5,java.util.concurrent.TimeUnit.SECONDS) })
             val reason=if(code==1008) "Invalid API key" else "Unknown model"
             val factory=rejectedProviderFactory(connections) { socket,listener ->
                 listener.onClosed(socket,code,reason)
@@ -108,7 +114,7 @@ class DirectVoiceStartupTest {
                 voice.start()
                 assertEquals(providerRejectionMessage(provider,reason),withTimeout(1000) { failed.await() })
                 assertEquals(1,connections.get())
-            } finally { voice.close();scope.cancel();client.closeNative() }
+            } finally { voice.close();context.countDown();scope.cancel();client.closeNative() }
         }
     }
 
@@ -289,30 +295,43 @@ class DirectVoiceStartupTest {
         } finally { voice.close();scope.cancel();client.closeNative() }
     }
 
-    @Test fun providerAdmissionUsesThePhoneKeyAfterOneScopedContextRead() = runBlocking {
+    @Test fun providerSocketOpensWhileTheScopedContextIsPendingAndAdmissionWaitsForIt() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        val contexts=AtomicInteger();val nativeTickets=AtomicInteger();val connections=AtomicInteger();val firstContext=CompletableDeferred<Int>()
-        val client = client("stored",contextRead={contexts.incrementAndGet()},nativeAdmission={nativeTickets.incrementAndGet()})
-        val voice = DirectVoice(client, "call", "stored", scope, {}, {}, {},credentials=credentials(),providerSocketFactory=providerFactory(true) { connections.incrementAndGet();firstContext.complete(contexts.get()) })
+        val contexts=AtomicInteger();val nativeTickets=AtomicInteger();val connections=AtomicInteger()
+        val release=java.util.concurrent.CountDownLatch(1)
+        val events=java.util.concurrent.CopyOnWriteArrayList<JSONObject>()
+        val client = client("stored",contextRead={ contexts.incrementAndGet();release.await(3,java.util.concurrent.TimeUnit.SECONDS) },nativeAdmission={nativeTickets.incrementAndGet()})
+        val voice = DirectVoice(client, "call", "stored", scope, {}, { events+=it }, {},credentials=credentials(),providerSocketFactory=providerFactory(true) { connections.incrementAndGet() })
         try {
             voice.start()
-            assertEquals("Provider admission must not wait for an unrelated Hermes model", true,withTimeoutOrNull(3000) { firstContext.await();true })
-            assertEquals("The scoped context is read before opening the direct provider socket",1,firstContext.await())
-            assertTrue(connections.get()>=1)
+            assertEquals("The provider socket must not wait for the Hermes context", true,withTimeoutOrNull(2000) { while(connections.get()==0) delay(5);true })
+            delay(150)
+            assertEquals("The context read is still pending",1,contexts.get())
+            assertFalse("Owner audio waits for the scoped context",voice.pcm(ByteArray(640)) { true })
+            assertTrue("Admission waits for the scoped context",events.none { it.optString("state") in setOf("listening","thinking") })
+            release.countDown()
+            assertEquals(true,withTimeoutOrNull(3000) { while(events.none { it.optString("state")=="listening" }) delay(5);true })
+            assertTrue("Owner audio flows once admitted",voice.pcm(ByteArray(640)) { true })
+            assertEquals("One scoped context read",1,contexts.get())
             delay(100);assertEquals("Direct voice must not open a native events socket without delegated jobs",0,nativeTickets.get())
-        } finally { voice.close(); scope.cancel(); client.closeNative() }
+        } finally { release.countDown(); voice.close(); scope.cancel(); client.closeNative() }
     }
 
-    @Test fun mismatchedConversationCannotRequestProviderCredentials() = runBlocking {
+    // With the socket in parallel a mismatched scope may open the phone-key socket, but it is never admitted.
+    @Test fun mismatchedConversationNeverAdmitsTheProviderOrTheMicrophone() = runBlocking {
         val connections = AtomicInteger()
-        val failed = CompletableDeferred<Unit>()
+        val failed = CompletableDeferred<String>()
+        val events=java.util.concurrent.CopyOnWriteArrayList<JSONObject>()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val client = client("someone-else")
-        val voice = DirectVoice(client, "call", "stored", scope, {}, {}, { failed.complete(Unit) },credentials=credentials(),providerSocketFactory=providerFactory(true) { connections.incrementAndGet() })
+        val voice = DirectVoice(client, "call", "stored", scope, {}, { events+=it }, { failed.complete(it) },credentials=credentials(),providerSocketFactory=providerFactory(true) { connections.incrementAndGet() })
         try {
             voice.start()
-            withTimeout(3000) { failed.await() }
-            assertEquals(0, connections.get())
+            assertEquals("Call context unavailable; reconnect to Hermes and retry",withTimeout(3000) { failed.await() })
+            assertTrue(connections.get() <= 1)
+            assertTrue(events.none { it.optString("state") in setOf("listening","thinking") })
+            assertTrue(events.none { it.optString("stage")=="provider_ready" })
+            assertFalse(voice.pcm(ByteArray(640)) { true })
         } finally { voice.close(); scope.cancel(); client.closeNative() }
     }
 

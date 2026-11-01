@@ -72,11 +72,23 @@ internal fun historySources(rows: List<JSONObject>, hidden: Set<String>): List<S
     (rows.map { it.string("source").trim().lowercase(Locale.ROOT) }.filter(String::isNotBlank) + hidden)
         .filterNot { it == "cron" || isThreadSource(it) }.distinct().sortedBy { historySourceLabel(it).lowercase(Locale.ROOT) }
 
+/** A profile id as the list compares it: Hermes ids are matched without case or stray spaces. */
+internal fun historyProfileKey(profile: String): String = profile.trim().lowercase(Locale.ROOT)
+
+/**
+ * The assistant's own session: the row whose session id is [assistantSessionId] inside the assistant's profile. A row with no
+ * profile belongs to the profile the list is loaded for ([currentProfile]), and ids differing only in case or spacing are one
+ * profile, so the session never shows as an ordinary chat next to Beacon's card.
+ */
+internal fun isAssistantSessionRow(row: JSONObject, currentProfile: String, assistantProfile: String, assistantSessionId: String): Boolean {
+    if (assistantSessionId.isBlank() || sessionRowId(row) != assistantSessionId) return false
+    val rowProfile = historyProfileKey(row.string("profile").ifBlank { currentProfile })
+    return rowProfile == historyProfileKey(assistantProfile.ifBlank { currentProfile })
+}
+
 /** The rows a view shows, in the chosen order (pinned first, as Relay does). */
 internal fun historyRows(rows: List<JSONObject>, view: HistoryView, order: HistoryOrder, currentProfile: String = "", assistantProfile: String = "", assistantSessionId: String = ""): List<JSONObject> {
-    val visible = rows.filterNot { row ->
-        assistantSessionId.isNotBlank() && row.string("profile", currentProfile) == assistantProfile && sessionRowId(row) == assistantSessionId
-    }
+    val visible = rows.filterNot { isAssistantSessionRow(it, currentProfile, assistantProfile, assistantSessionId) }
     val shown = when (view) {
         HistoryView.All -> visible
         HistoryView.Threads -> visible.filter { isThreadSource(it.string("source")) }
@@ -242,10 +254,14 @@ internal fun chatListLine(latest: dev.hermes.android.Message?): Pair<String, Str
     return line to if (post != null) "assistant" else latest.role
 }
 
+// A list preview is one line: Hermes has already folded the label's line break into a space, so the post can follow the label
+// directly or after a bullet. The bubble keeps its stricter pattern (cronDeliveryLabel), which needs the line break.
+private val previewCronLabel = Regex("^\\[Cron delivery: [^\\]\\n]{1,200}]\\s*(?:[-–—:•]\\s*)?")
+
 /** One line of a message for a list: Markdown marks and line breaks gone, bounded. */
 internal fun chatPreviewText(raw: String): String {
     // Hermes labels a scheduled post "[Cron delivery: <job>]"; the list shows the post itself.
-    val unlabelled = raw.trimStart().let { trimmed -> cronDeliveryLabel.find(trimmed)?.let { trimmed.substring(it.range.last + 1) } ?: raw }
+    val unlabelled = raw.trimStart().let { trimmed -> previewCronLabel.find(trimmed)?.let { trimmed.substring(it.range.last + 1) } ?: raw }
     // Like the bubble: an attached or generated file shows as its safe name, never its path on the computer.
     val named = mediaReference.replace(unlabelled) { match -> match.groupValues.drop(1).first { it.isNotEmpty() }.trimEnd('/', '\\').substringAfterLast('/').substringAfterLast('\\') }
     val text = historyAttachmentPresentation(named).let { shown -> shown.text.ifBlank { shown.attachments.firstOrNull()?.name.orEmpty() } }

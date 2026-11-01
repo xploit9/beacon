@@ -46,9 +46,9 @@ import org.json.JSONObject
     BotModeDialogs(vm, dialog)
     LazyColumn(modifier.background(MaterialTheme.colorScheme.surfaceContainer).testTag("bot-mode-sidebar"), contentPadding = PaddingValues(bottom = 16.dp)) {
         item("destinations") { beforeRoster() }
-        if (state.loading && state.bots.isEmpty() && state.spaces.isEmpty()) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+        if (state.loading && state.bots.isEmpty() && state.spaces.isEmpty()) item { Glass(Modifier.padding(12.dp)) { SettingsSkeletonRows(2) } }
         if (state.error.isNotBlank() && !(ui.tab == "More" && ui.morePage == "Bots")) item {
-            Column(Modifier.padding(16.dp)) { Text(uiText(state.error), color = MaterialTheme.colorScheme.error); OutlinedButton(onClick = { vm.showBotMode() }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Review Bot Mode")) } }
+            Glass(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) { SettingsErrorRow(uiText(state.error), { vm.showBotMode() }, uiText("Review Bot Mode"), retryTestTag = "bot-mode-review") }
         }
         item {
             RosterHeader(uiText("Bots"), uiText("New bot"), "bot-mode-sidebar-new-bot", end = {
@@ -60,18 +60,19 @@ import org.json.JSONObject
             TeammateRow(botName(bot, profileRows), bot.profile, botRole(bot, profileRows), state.activeBot?.profile == bot.profile,
                 botActions(vm, bot, vm.canDeleteProfile(bot.profile), dialog), "bot-row-${bot.profile}") { vm.openBot(bot) }
         }
-        item { RosterHeader(uiText("Shared spaces"), uiText("New chat"), "bot-mode-sidebar-new-chat") { vm.botMode.startNewChat(); dialog.value = "newChat:" } }
+        item { RosterHeader(uiText("Shared spaces"), uiText("New space"), "bot-mode-sidebar-new-chat") { vm.botMode.startNewChat(); dialog.value = "newChat:" } }
         items(state.spaces, key = { "space:${it.id}" }) { space ->
             GroupRow(vm, space, profileRows, state, you, is24Hour, dialog, "bot-space-${space.id}", isOpen = state.activeBot == null && state.selectedSpace == space.id)
         }
         if (state.spaces.isEmpty() && !state.loading) item { Text(uiText("No shared spaces yet"), Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.bodySmall) }
-        if (state.moreSpaces) item { Text(uiText("Showing your most recent shared spaces."), Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.bodySmall) }
+        if (state.moreSpaces) item { Text(uiText("Recent spaces"), Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
     }
 }
 
 @Composable private fun GroupRow(vm: BeaconViewModel, space: BotModeSpace, profileRows: List<JSONObject>, state: NativeBotModeState, you: String, is24Hour: Boolean, dialog: MutableState<String>, tag: String, isOpen: Boolean) {
     val name = { profile: String -> profileDisplayName(profile, profileRows) }
-    SpaceListRow(space.name, space.members.map { name(it) to it }, spacePreview(space, name, you), chatListTime(space.updatedAt * 1000, is24Hour = is24Hour), isOpen,
+    val botCount = uiText("{0} bots")
+    SpaceListRow(space.name, space.members.map { name(it) to it }, spacePreview(space, name, you, botCount), chatListTime(space.updatedAt * 1000, is24Hour = is24Hour), isOpen,
         spaceActions(vm, space, state.canRename, state.canDelete, dialog), tag) { vm.openBotSpace(space.id) }
 }
 
@@ -100,11 +101,10 @@ import org.json.JSONObject
         else Column(Modifier.fillMaxSize()) {
             Header("$botName · ${uiText("Bot Chat")}", menu = LocalOpenNavigationMenu.current)
             if (state.loading) {
-                LinearProgressIndicator(Modifier.fillMaxWidth())
-                Text(uiText("Opening Bot Chat…"), Modifier.padding(SettingsPagePadding))
+                val opening = uiText("Opening Bot Chat…")
+                Glass(Modifier.padding(SettingsPagePadding).semantics { contentDescription = opening }) { SettingsSkeletonRows(2) }
             } else {
-                Text(if (state.error.isBlank()) uiText("This Bot Chat could not be opened.") else uiText(state.error), Modifier.padding(SettingsPagePadding), color = MaterialTheme.colorScheme.error)
-                OutlinedButton({ controller.openBot(bot) }, Modifier.padding(horizontal = 12.dp).heightIn(min = 48.dp)) { Text(uiText("Retry")) }
+                Glass(Modifier.padding(SettingsPagePadding)) { SettingsErrorRow(if (state.error.isBlank()) uiText("This Bot Chat could not be opened.") else uiText(state.error), { controller.openBot(bot) }, uiText("Retry"), retryTestTag = "bot-chat-retry") }
             }
         }
         return
@@ -115,7 +115,7 @@ import org.json.JSONObject
     val dialog = rememberSaveable(owner.origin, owner.owner) { mutableStateOf("") }
     val is24Hour = android.text.format.DateFormat.is24HourFormat(LocalContext.current)
     val you = uiText("You")
-    val newChatLabel = uiText("New chat")
+    val newChatLabel = uiText("New space")
     val openNewChat = { controller.startNewChat(); dialog.value = "newChat:" }
     BotModeDialogs(vm, dialog)
     val headerActions: @Composable RowScope.() -> Unit = {
@@ -130,21 +130,23 @@ import org.json.JSONObject
         } else {
             IconButton(onClick = { controller.refresh() }, enabled = !state.loading) { Icon(Icons.Rounded.Refresh, uiText("Refresh Bot Mode")) }
             FilledTonalButton(onClick = openNewChat, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = newChatLabel }.testTag("bot-mode-new-chat")) {
-                Icon(Icons.Rounded.Add, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text(uiText("New"))
+                Icon(Icons.Rounded.Add, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text(newChatLabel)
             }
         }
     }
     Column(Modifier.fillMaxSize().imePadding().testTag(if (shared) "bot-mode-shared" else "bot-mode-home")) {
         if (shared) SharedSpaceHeader(spaceName, state, profileRows, LocalOpenNavigationMenu.current, headerActions)
         else Header(uiText("Bot Mode"), menu = LocalOpenNavigationMenu.current, actions = headerActions)
-        if (state.loading && state.events.isEmpty() && (shared || state.bots.isEmpty())) LinearProgressIndicator(Modifier.fillMaxWidth())
+        // Roster or room already shown: a thin bar while it refreshes; the skeleton is for the first read only.
+        if (state.loading && (shared && state.events.isEmpty() || !shared && state.bots.isNotEmpty())) LinearProgressIndicator(Modifier.fillMaxWidth().height(2.dp))
         if (state.error.isNotBlank()) {
-            Text(uiText(state.error), color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(horizontal = SettingsPagePadding))
+            Glass(Modifier.padding(horizontal = SettingsPagePadding, vertical = 4.dp)) { SettingsErrorRow(uiText(state.error), { controller.refresh() }, uiText("Retry"), retryTestTag = "bot-mode-retry") }
         }
         if (shared) SharedSpaceChat(state, profileRows, controller::draft, controller::send, controller::action, { vm.more("Profiles") }) { text, eventId ->
             Markdown(text, vm, origin = null, documentKey = "room:${state.selectedSpace}:$eventId")
         }
         else LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(bottom = 24.dp)) {
+            if (state.loading && state.bots.isEmpty()) item { Glass(Modifier.padding(horizontal = SettingsPagePadding, vertical = 8.dp)) { SettingsSkeletonRows(3) } }
             item { RosterHeader(uiText("Bots"), uiText("New bot"), "bot-mode-new-bot") { dialog.value = "newBot:" } }
             if (state.bots.isEmpty() && !state.loading) item { EmptyState(uiText("No bots available"), uiText("Refresh to check again."), ProfilesIcon, action = uiText("Refresh"), onAction = { controller.refresh() }) }
             items(state.bots, key = { "teammate:${it.profile}" }) { member ->
@@ -156,7 +158,7 @@ import org.json.JSONObject
             items(state.spaces, key = { "overview-space:${it.id}" }) { space ->
                 GroupRow(vm, space, profileRows, state, you, is24Hour, dialog, "space-row:${space.id}", isOpen = false)
             }
-            if (state.moreSpaces) item { Text(uiText("Showing your most recent shared spaces."), Modifier.padding(horizontal = SettingsPagePadding), style = MaterialTheme.typography.bodySmall) }
+            if (state.moreSpaces) item { Text(uiText("Recent spaces"), Modifier.padding(horizontal = SettingsPagePadding), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         }
     }
 }
@@ -173,7 +175,7 @@ import org.json.JSONObject
             OutlinedTextField(draftName, { draftName = it.take(120) }, label = { Text(uiText("Name")) }, singleLine = true, enabled = !state.loading, modifier = Modifier.testTag("shared-space-name"))
             Text(uiText("Bots"), style = MaterialTheme.typography.titleSmall)
             Text(members.joinToString(", ") { profileDisplayName(it, profiles) })
-            Text(uiText("Bots can't be changed in an existing space. Create another space with the bots you need."))
+            Text(uiText("Bots can't be changed in a space. Create another space."))
             TextButton(onCreateAnother, enabled = !state.loading, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Create another space")) }
             if (!state.canRename) Text(uiText("Renaming isn't available for this space."))
             if (state.error.isNotBlank()) Text(uiText(state.error), color = MaterialTheme.colorScheme.error)
@@ -195,7 +197,7 @@ import org.json.JSONObject
                     Column { Text(name, style = MaterialTheme.typography.titleMedium); if (role.isNotBlank()) Text(role, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                 }
             }
-            Text(uiText("Bots can't be changed in an existing space. Create another space with the bots you need."), style = MaterialTheme.typography.bodySmall)
+            Text(uiText("Bots can't be changed in a space. Create another space."), style = MaterialTheme.typography.bodySmall)
         } },
         confirmButton = { TextButton(onClick = onDismiss, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Close")) } })
 }
@@ -206,7 +208,7 @@ import org.json.JSONObject
     // The space left the list: it is deleted.
     LaunchedEffect(space == null) { if (space == null) onDismiss() }
     AlertDialog(onDismissRequest = { if (!state.loading) onDismiss() }, title = { Text(uiText("Delete shared space?")) },
-        text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { Text(space?.name.orEmpty(), style = MaterialTheme.typography.titleMedium); Text(uiText("Its bots stop and it leaves your list. Hermes may keep its history for a while. Your Bot Chats stay.")); if (state.error.isNotBlank()) Text(uiText(state.error), color = MaterialTheme.colorScheme.error) } },
+        text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { Text(space?.name.orEmpty(), style = MaterialTheme.typography.titleMedium); Text(uiText("Delete removes the space from your list and stops its bots. Hermes may keep its history for a while. Your Bot Chats stay.")); if (state.error.isNotBlank()) Text(uiText(state.error), color = MaterialTheme.colorScheme.error) } },
         confirmButton = { TextButton({ onDelete() }, enabled = !state.loading && state.canDelete) { Text(uiText(if (state.loading) "Deleting…" else "Delete space"), color = MaterialTheme.colorScheme.error) } },
         dismissButton = { TextButton({ onDismiss() }, enabled = !state.loading) { Text(uiText("Cancel")) } })
 }

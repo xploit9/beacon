@@ -69,6 +69,7 @@ internal const val KEEP_CONNECTED_MAX_PROFILE_POLLS = 8
 internal const val KEEP_CONNECTED_CPU_LEASE_MILLIS = 120_000L
 internal const val KEEP_CONNECTED_CPU_RENEW_MILLIS = 30_000L
 internal const val KEEP_CONNECTED_RESPONSE_FRESH_MILLIS = 90_000L
+internal const val KEEP_CONNECTED_HELD_RETRY_MILLIS = 30_000L
 
 /** The foreground connection also gives due update checks an opportunity while Android defers jobs. */
 internal suspend fun keepConnectedUpdateChecks(check: suspend () -> Unit) {
@@ -104,7 +105,11 @@ internal fun parseKeepConnectedPage(response: JSONObject, after: Long): KeepConn
 
 internal fun keepConnectedPushData(event: JSONObject): Map<String, String> =
     listOf("source_ref", "event_id", "conversation_ref", "kind", "activity_ref", "expires_at")
-        .associateWith(event::optString)
+        .associateWith(event::optString) + eventCreatedAt(event)
+
+/** C-A: the server row's `created` (epoch seconds, a float) becomes `created_at`, whole seconds; an older Hermes sends none and the alert counts as new. */
+private fun eventCreatedAt(event: JSONObject): Map<String, String> =
+    event.optDouble("created", Double.NaN).takeIf { it.isFinite() && it > 0 }?.let { mapOf("created_at" to it.toLong().toString()) }.orEmpty()
 
 internal fun keepConnectedFailureReason(profile: String, error: Throwable, profileLabel: String = profile): String = when (error) {
     is NativeAuthExpiredException -> "Hermes sign-in expired"
@@ -179,6 +184,10 @@ internal class KeepConnectedPoller(
     private val onEvent: suspend (String, JSONObject) -> Unit,
     private val initialize: suspend (String, Long) -> KeepConnectedPage = poll,
     private val profileLabel: (String) -> String = { it },
+    /** False while Android would drop what a poll returns; the page is then left unread, so nothing is lost. */
+    private val canPresent: () -> Boolean = { true },
+    /** How many events wait unread because they cannot be shown now; 0 once a page is delivered. */
+    private val onBacklog: (Int) -> Unit = {},
 ) {
     private data class ProfileFailure(val attempts: Int, val retryAtMillis: Long, val reason: String)
     private data class ProfilePollResult(val profile: String, val failure: Exception?, val completedAtMillis: Long)
@@ -301,13 +310,26 @@ internal class KeepConnectedPoller(
                 return ProfilePollResult(profile, null, nowMillis())
             }
             val after = savedCursor
+            var held = false
             val page = permits.withPermit {
                 val result = poll(profile, after)
                 if (result.nextCursor < 0 || (!result.reset && result.nextCursor < after) || result.events.size > 100) throw KeepConnectedPageException()
+                if (result.events.isNotEmpty() && !canPresent()) {
+                    // F17: alerts that cannot be shown stay on Hermes; the cursor waits so they arrive, quietly, once they can.
+                    held = true
+                    onBacklog(result.events.size)
+                    return@withPermit result
+                }
                 result.events.forEach { onEvent(profile, it) }
+                if (result.events.isNotEmpty()) onBacklog(0)
                 if (result.reset) cursors.reset(origin, owner, profile, result.nextCursor)
                 else cursors.advance(origin, owner, profile, result.nextCursor)
                 result
+            }
+            if (held) {
+                // The same page would return at once, so wait before asking again.
+                delay(KEEP_CONNECTED_HELD_RETRY_MILLIS)
+                return ProfilePollResult(profile, null, nowMillis())
             }
             if (page.events.isEmpty() || page.nextCursor == after) {
                 // Avoid spinning if an empty or non-advancing long poll returns before the 500 ms minimum cycle.
@@ -444,12 +466,18 @@ class KeepConnectedService : Service() {
     private var pollProvider: String? = null
     private var promoted = false
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    // The default network as its callback last reported it. Asking ConnectivityManager right after onLost can still
+    // return the network just lost, and no later callback would correct it, so the CPU lease would outlive the network.
+    @Volatile private var callbackNetwork: Network? = null
+    @Volatile private var callbackHeard = false
     private var awakeJob: kotlinx.coroutines.Job? = null
     private var updatesJob: kotlinx.coroutines.Job? = null
 
+    private fun online(): Boolean = if (callbackHeard) callbackNetwork != null else hasNetwork(this)
+
     private fun protectBackgroundDelivery() {
         if (!promoted) return
-        if (!hasNetwork(this)) { awakeJob?.cancel(); awakeJob = null; return }
+        if (!online()) { awakeJob?.cancel(); awakeJob = null; return }
         if (awakeJob?.isActive == true) return
         awakeJob = serviceScope.launch {
             val wake = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:notifications")
@@ -487,8 +515,8 @@ class KeepConnectedService : Service() {
         activeInstance = this
         val connectivity = getSystemService(ConnectivityManager::class.java) ?: return
         val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) = networkChanged()
-            override fun onLost(network: Network) = networkChanged()
+            override fun onAvailable(network: Network) { callbackNetwork = network; callbackHeard = true; networkChanged() }
+            override fun onLost(network: Network) { if (callbackNetwork == network) callbackNetwork = null; callbackHeard = true; networkChanged() }
             private fun networkChanged() {
                 android.os.Handler(mainLooper).post {
                     if (activeInstance === this@KeepConnectedService && isEnabled(this@KeepConnectedService)) {
@@ -522,7 +550,8 @@ class KeepConnectedService : Service() {
             }
             return START_STICKY
         }
-        if (!isEnabled(this)) {
+        startPending.set(false)
+        if (stopRequested.getAndSet(false) || !isEnabled(this)) {
             // A startForegroundService() start must promote before it stops, or Android crashes the app.
             if (promote()) stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelfResult(startId)
@@ -634,7 +663,7 @@ class KeepConnectedService : Service() {
                         maxBytes = 1_048_576,
                         timeoutMillis = KEEP_CONNECTED_POLL_TIMEOUT_MILLIS,
                     )
-                    parseKeepConnectedPage(response, after).also { prefs.edit().putLong(KEY_LAST_RESPONSE, SystemClock.elapsedRealtime()).apply() }
+                    parseKeepConnectedPage(response, after).also { prefs.edit().putLong(KEY_LAST_RESPONSE, SystemClock.elapsedRealtime()).putLong(KEY_HEARD_AT, System.currentTimeMillis()).apply() }
                 },
                 initialize = { profile, after ->
                     val response = requireNotNull(client).nativeGetForProfile(
@@ -644,7 +673,7 @@ class KeepConnectedService : Service() {
                         query = mapOf("after" to after.toString(), "wait" to "0", "package" to BuildConfig.APPLICATION_ID),
                         maxBytes = 1_048_576,
                     )
-                    parseKeepConnectedPage(response, after).also { prefs.edit().putLong(KEY_LAST_RESPONSE, SystemClock.elapsedRealtime()).apply() }
+                    parseKeepConnectedPage(response, after).also { prefs.edit().putLong(KEY_LAST_RESPONSE, SystemClock.elapsedRealtime()).putLong(KEY_HEARD_AT, System.currentTimeMillis()).apply() }
                 },
                 signedInProfile = { client?.auth?.profile.orEmpty() },
                 onEvent = { profile, event ->
@@ -658,6 +687,8 @@ class KeepConnectedService : Service() {
                     }
                 },
                 profileLabel = { profile -> profileDisplayNames[profile] ?: profile },
+                canPresent = { androidx.core.app.NotificationManagerCompat.from(this).areNotificationsEnabled() },
+                onBacklog = { held -> DeliveryLog.setHeld(this, held) },
             )
         try {
             while (currentCoroutineContext().isActive && isEnabledFor(this, Scope(origin, owner, "default", nativeProvider = nativeProvider))) {
@@ -749,6 +780,8 @@ class KeepConnectedService : Service() {
         const val PREFS = "keep-connected"
         const val KEY_ENABLED = "enabled"
         const val KEY_LAST_RESPONSE = "last_response_elapsed"
+        /** Wall-clock time of the last answer from Hermes, for "Heard from Hermes"; the elapsed key above decides freshness. */
+        const val KEY_HEARD_AT = "heard_at"
         const val KEY_ORIGIN = "origin"
         const val KEY_OWNER = "owner"
         const val KEY_NATIVE_PROVIDER = "native_provider"
@@ -788,7 +821,7 @@ class KeepConnectedService : Service() {
             if (!enabled) {
                 disablePreference(context)
                 (context.applicationContext as? BeaconApplication)?.push?.invalidateKeepConnectedInvitations()
-                context.applicationContext.stopService(Intent(context.applicationContext, KeepConnectedService::class.java))
+                requestStop(context)
                 return
             }
             val current = requireNotNull(auth) { "Sign in with Hermes before enabling Keep connected" }
@@ -799,6 +832,11 @@ class KeepConnectedService : Service() {
                 .putString(KEY_OWNER, current.owner).putString(KEY_NATIVE_PROVIDER, current.nativeProvider).putString(KEY_STATUS, STATUS_STARTING).putString(KEY_REASON, "")
                 .putString(KEY_STOP_TOKEN, UUID.randomUUID().toString()).commit()) { "Could not enable Keep connected" }
             start(context)
+        }
+
+        /** A push woke this process: if Keep connected is on but Android stopped it, start it again (it needs no app open). */
+        fun rearmFromPush(context: Context) {
+            if (isEnabled(context) && activeInstance == null) startIfEnabled(context)
         }
 
         fun startIfEnabled(context: Context) {
@@ -819,7 +857,7 @@ class KeepConnectedService : Service() {
                 if (keepConnectedAwaitsVerification(savedProvider, origin, owner, scope, auth.owner)) {
                     postSignInNotification(context, "Open Beacon", "Open Beacon once to keep receiving calls.", "Open Beacon")
                 } else cancelSignInNotification(context)
-                context.applicationContext.stopService(Intent(context.applicationContext, KeepConnectedService::class.java))
+                requestStop(context)
                 return
             }
             ensureStopToken(context)
@@ -828,22 +866,42 @@ class KeepConnectedService : Service() {
         }
 
         fun onUserSignedOut(context: Context, origin: String) {
+            // Whoever signs in next is another owner as far as the delivery times go, whether or not Keep connected was on.
+            DeliveryLog.clearAccountTimes(context)
             val prefs = preferences(context)
             if (prefs.getString(KEY_ORIGIN, null) != origin) return
             setStatus(context, STATUS_SIGNED_OUT)
             (context.applicationContext as? BeaconApplication)?.push?.invalidateKeepConnectedInvitations()
             cancelSignInNotification(context)
-            context.applicationContext.stopService(Intent(context.applicationContext, KeepConnectedService::class.java))
+            requestStop(context)
         }
 
         internal fun createClient(app: BeaconApplication, auth: AuthContext): BeaconClient =
             clientFactoryForTest?.invoke(auth, app.auth) ?: BeaconClient(auth, app.auth, persistContext = false)
 
         private fun start(context: Context) {
+            startPending.set(true)
             try {
                 ContextCompat.startForegroundService(context.applicationContext, Intent(context.applicationContext, KeepConnectedService::class.java).setAction(ACTION_START))
             } catch (_: Exception) {
+                startPending.set(false)
                 setStatus(context, STATUS_RECONNECTING)
+            }
+        }
+
+        /** A start Android has not delivered yet; stopping the service then crashes the app, because it never promoted. */
+        private val startPending = java.util.concurrent.atomic.AtomicBoolean(false)
+        private val stopRequested = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        /**
+         * Stops the service. While a start is still on its way, the stop is left to [onStartCommand], which promotes first
+         * and then stops; stopping it from outside before that would make Android kill Beacon.
+         */
+        private fun requestStop(context: Context) {
+            stopRequested.set(true)
+            if (!startPending.get()) {
+                stopRequested.set(false)
+                context.applicationContext.stopService(Intent(context.applicationContext, KeepConnectedService::class.java))
             }
         }
 
@@ -941,5 +999,102 @@ internal fun keepConnectedReasonText(reason: String): String {
         status == 403 || status == 409 -> "Hermes refused the connection. Retrying…"
         status == 404 -> "Check the Beacon plugin on Hermes."
         else -> "Hermes had a problem. Retrying…"
+    }
+}
+
+/** Why the last Beacon process ended, in user words, only when it explains a stopped Keep connected; a crash or a normal exit explains nothing. */
+internal fun processStopLabel(reason: Int): String? = when (reason) {
+    android.app.ApplicationExitInfo.REASON_SIGNALED, android.app.ApplicationExitInfo.REASON_LOW_MEMORY,
+    android.app.ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE, android.app.ApplicationExitInfo.REASON_DEPENDENCY_DIED,
+    android.app.ApplicationExitInfo.REASON_OTHER, android.app.ApplicationExitInfo.REASON_FREEZER -> "Stopped by Android"
+    android.app.ApplicationExitInfo.REASON_USER_REQUESTED, android.app.ApplicationExitInfo.REASON_USER_STOPPED -> "Force-stopped"
+    else -> null
+}
+
+/** A stop is worth showing only while Keep connected is on and not connected, and only while it is recent. */
+internal fun explainingStop(stop: Pair<String, Long>?, keepConnectedEnabled: Boolean, keepConnectedStatus: String, now: Long): String? =
+    stop?.takeIf { keepConnectedEnabled && keepConnectedStatus != KeepConnectedService.STATUS_CONNECTED && now - it.second in 0..STOP_REMEMBERED_MILLIS }?.first
+
+internal const val STOP_REMEMBERED_MILLIS = 3 * 24 * 3_600_000L
+
+/**
+ * What this phone itself saw, kept locally with no server help: the last alert, the last answer from Hermes, a test's arrival, how many
+ * alerts wait because they could not be shown, when Firebase dropped some, and why the last process ended. Times are wall-clock milliseconds.
+ */
+internal object DeliveryLog {
+    private const val PREFS = "notification-delivery"
+    private const val KEY_LAST_ALERT = "last_alert_at"
+    private const val KEY_HEARD = "heard_at"
+    private const val KEY_TEST_EVENT = "test_event"
+    private const val KEY_TEST_AT = "test_at"
+    private const val KEY_HELD = "held"
+    private const val KEY_DROPPED = "dropped_at"
+    private const val KEY_STOP_LABEL = "stop_label"
+    private const val KEY_STOP_AT = "stop_at"
+    private fun prefs(context: Context) = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    /** An alert reached this phone on either path; a test also remembers its event id, which is what the Send a test button waits for. */
+    fun recordArrival(context: Context, kind: String, event: String, now: Long = System.currentTimeMillis()) {
+        val edit = prefs(context).edit().putLong(KEY_LAST_ALERT, now)
+        if (kind == "test") edit.putString(KEY_TEST_EVENT, event).putLong(KEY_TEST_AT, now)
+        edit.apply()
+    }
+    fun lastAlertAt(context: Context): Long = prefs(context).getLong(KEY_LAST_ALERT, 0)
+    fun testArrivedAt(context: Context, event: String): Long? {
+        val prefs = prefs(context)
+        return prefs.getLong(KEY_TEST_AT, 0).takeIf { event.isNotBlank() && prefs.getString(KEY_TEST_EVENT, null) == event && it > 0 }
+    }
+    fun markHeard(context: Context, now: Long = System.currentTimeMillis()) { prefs(context).edit().putLong(KEY_HEARD, now).apply() }
+    /** The newest sign of life from Hermes: a poll answer, a status read or an alert. */
+    fun heardAt(context: Context): Long = maxOf(
+        prefs(context).getLong(KEY_HEARD, 0), context.applicationContext.getSharedPreferences(KeepConnectedService.PREFS, Context.MODE_PRIVATE).getLong(KeepConnectedService.KEY_HEARD_AT, 0), lastAlertAt(context))
+    fun setHeld(context: Context, count: Int) { prefs(context).edit().putInt(KEY_HELD, count.coerceAtLeast(0)).apply() }
+    fun held(context: Context): Int = prefs(context).getInt(KEY_HELD, 0)
+    fun recordDropped(context: Context, now: Long = System.currentTimeMillis()) { prefs(context).edit().putLong(KEY_DROPPED, now).apply() }
+    fun droppedAt(context: Context): Long = prefs(context).getLong(KEY_DROPPED, 0)
+
+    /**
+     * Forgets what the previous account's alerts left behind (last alert, test event, held and dropped alerts, and the Keep connected poll's heard time),
+     * so the next owner does not read another account's times. Why the previous process stopped belongs to the phone and stays.
+     */
+    fun clearAccountTimes(context: Context) {
+        prefs(context).edit().remove(KEY_LAST_ALERT).remove(KEY_HEARD).remove(KEY_TEST_EVENT).remove(KEY_TEST_AT).remove(KEY_HELD).remove(KEY_DROPPED).apply()
+        context.applicationContext.getSharedPreferences(KeepConnectedService.PREFS, Context.MODE_PRIVATE).edit().remove(KeepConnectedService.KEY_HEARD_AT).apply()
+    }
+
+    /** Remembers why the previous process ended; Android keeps only a few, so this runs at every start. */
+    fun recordProcessExit(context: Context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        val newest = runCatching {
+            context.getSystemService(android.app.ActivityManager::class.java)?.getHistoricalProcessExitReasons(context.packageName, 0, 1)?.firstOrNull()
+        }.getOrNull() ?: return
+        val label = processStopLabel(newest.reason)
+        val edit = prefs(context).edit()
+        if (label == null) edit.remove(KEY_STOP_LABEL).remove(KEY_STOP_AT) else edit.putString(KEY_STOP_LABEL, label).putLong(KEY_STOP_AT, newest.timestamp)
+        edit.apply()
+    }
+    fun lastStop(context: Context): Pair<String, Long>? {
+        val prefs = prefs(context)
+        val label = prefs.getString(KEY_STOP_LABEL, null) ?: return null
+        return label to prefs.getLong(KEY_STOP_AT, 0)
+    }
+}
+
+/** How long the Send a test button waits for its own event to arrive on either path. */
+internal const val TEST_ARRIVAL_WAIT_MILLIS = 15_000L
+
+/** Waits for [arrivedAt] to report the test event, checking every [stepMillis]; null when [waitMillis] passes first. [delayFor] is replaceable so tests need no real time. */
+internal suspend fun awaitTestArrival(
+    waitMillis: Long = TEST_ARRIVAL_WAIT_MILLIS,
+    stepMillis: Long = 250,
+    delayFor: suspend (Long) -> Unit = { delay(it) },
+    arrivedAt: () -> Long?,
+): Long? {
+    var waited = 0L
+    while (true) {
+        arrivedAt()?.let { return it }
+        if (waited >= waitMillis) return null
+        delayFor(stepMillis)
+        waited += stepMillis
     }
 }

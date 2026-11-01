@@ -589,44 +589,133 @@ class BeaconMessagingService : FirebaseMessagingService() {
     override fun onNewToken(token: String) {
         app.push.tokenChanged(token)
     }
-    override fun onMessageReceived(message: RemoteMessage) { receivePush(this, message.data) }
+    override fun onMessageReceived(message: RemoteMessage) {
+        val preview = receivePush(this, message.data, null, deferPreview = true)
+        // A high-priority push may start a foreground service, so it also brings Keep connected back after Android stopped it.
+        runCatching { KeepConnectedService.rearmFromPush(this) }
+        // The real text now, from this thread; the job is the fallback when the fetch fails or takes too long.
+        if (preview != null && !runBlocking { refreshNotificationPreviewInline(this@BeaconMessagingService, preview.source, preview.event, preview.conversation, preview.kind) }) {
+            NotificationPreviewJob.enqueue(this, preview.source, preview.event, preview.conversation, preview.kind)
+        }
+    }
+    override fun onDeletedMessages() {
+        // Firebase dropped messages (over 100 stored, or past their lifetime). Keep connected catches up from its saved cursor; without it they are gone, so say so.
+        if (KeepConnectedService.isEnabled(this)) runCatching { KeepConnectedService.rearmFromPush(this) } else DeliveryLog.recordDropped(this)
+    }
     companion object {
         const val INCOMING_CHANNEL = "xara-incoming-call-v2"
     }
 }
 /** Same entry point for FCM and isolated native delivery checks. */
-fun receivePush(context: Context, data: Map<String, String>) = receivePush(context, data, null)
+fun receivePush(context: Context, data: Map<String, String>) { receivePush(context, data, null, deferPreview = false) }
 
 internal fun receiveKeepConnectedCall(context: Context, data: Map<String, String>, actionToken: String) {
     require(validOpaque(actionToken)) { "Invalid local call action token" }
-    receivePush(context, data, actionToken)
+    receivePush(context, data, actionToken, deferPreview = false)
 }
 
-private fun receivePush(context: Context, data: Map<String, String>, localActionToken: String?) {
+/** The real text of a posted alert, still to be fetched. */
+internal data class PreviewRequest(val source: String, val event: String, val conversation: String, val kind: String)
+
+internal const val ALERT_GROUP = "beacon-alerts"
+internal const val QUIET_ALERT_EXTRA = "beacon_quiet"
+private const val QUIET_SUMMARY_TAG = "beacon-quiet-summary"
+private const val QUIET_SUMMARY_ID = 5
+/** An alert older than this when it reaches the phone is history, not news. */
+internal const val OLD_ALERT_MILLIS = 120_000L
+/** More than this many loud alerts inside [BURST_WINDOW_MILLIS] and the rest arrive quietly. */
+internal const val BURST_ALERTS = 3
+internal const val BURST_WINDOW_MILLIS = 10_000L
+
+/** C-A `created_at` (whole epoch seconds) as milliseconds, never later than [now]; a missing or invalid value means the alert is new. */
+internal fun alertTimeMillis(createdAt: String?, now: Long): Long {
+    val seconds = createdAt?.toLongOrNull()?.takeIf { it > 0 } ?: return now
+    return minOf(runCatching { Math.multiplyExact(seconds, 1_000L) }.getOrDefault(now), now)
+}
+
+/**
+ * Whether an alert shows without sound or a heads-up. Questions and approvals keep alerting while they can still be answered
+ * (an unknown expiry counts as open); everything else goes quiet when it is old or part of a burst.
+ */
+internal fun arrivesQuietly(kind: String, alertMillis: Long, expiresAtSeconds: Long?, now: Long, loudRecently: Int): Boolean = when (kind) {
+    "approval", "clarify" -> expiresAtSeconds != null && expiresAtSeconds > 0 && expiresAtSeconds * 1_000L <= now
+    else -> now - alertMillis > OLD_ALERT_MILLIS || loudRecently >= BURST_ALERTS
+}
+
+/** How many alerts made noise lately, so a burst can be told from a single alert. */
+internal object AlertBurst {
+    private val loud = ArrayDeque<Long>()
+    @Synchronized fun recent(now: Long): Int { while (loud.isNotEmpty() && now - loud.first() > BURST_WINDOW_MILLIS) loud.removeFirst(); return loud.size }
+    @Synchronized fun note(now: Long) { loud.addLast(now) }
+}
+
+/** The quiet alerts showing, with the one just posted counted once (it may not be listed yet); one summary groups two or more of them. */
+internal fun quietAlertCount(active: Array<android.service.notification.StatusBarNotification>, justPosted: String): Int =
+    1 + active.count { it.id == 1 && it.tag != justPosted && it.notification.group == ALERT_GROUP && it.notification.extras.getBoolean(QUIET_ALERT_EXTRA) }
+
+/** Services have no Compose strings: the line comes from the same catalog, in the language of the phone. */
+internal fun serviceText(context: Context, english: String): String {
+    val language = dev.hermes.android.ui.nativeLanguageFor(java.util.Locale.getDefault())
+    if (language == "en") return english
+    val strings = runCatching { (context.applicationContext as BeaconApplication).readTranslations().optJSONObject(language) }.getOrNull() ?: return english
+    return strings.optString(dev.hermes.android.ui.normalized(english)).ifBlank { english }
+}
+
+private fun postQuietSummary(context: Context, manager: NotificationManager, justPosted: String) {
+    val count = quietAlertCount(manager.activeNotifications, justPosted)
+    if (count < 2) { manager.cancel(QUIET_SUMMARY_TAG, QUIET_SUMMARY_ID); return }
+    val open = PendingIntent.getActivity(context, 5, Intent(context, BeaconActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+    val summary = NotificationCompat.Builder(context, alertingChannel(manager, "hermes-messages")).setSmallIcon(R.drawable.ic_beacon_notification)
+        .setContentTitle(serviceText(context, "{0} alerts while you were away").replace("{0}", count.toString()))
+        .setGroup(ALERT_GROUP).setGroupSummary(true).setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_CHILDREN).setSilent(true)
+        .setOnlyAlertOnce(true).setAutoCancel(true).setContentIntent(open).build()
+    try { manager.notify(QUIET_SUMMARY_TAG, QUIET_SUMMARY_ID, summary) } catch (_: SecurityException) { /* Notification permission was revoked. */ }
+}
+
+/** Android drops a notification while the permission or the app switch is off; an alert it would drop must not be marked as seen. */
+private fun alertsPresentable(context: Context): Boolean =
+    (android.os.Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) &&
+        androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled()
+
+/**
+ * Shows [data] as an alert. With [deferPreview] the caller fetches the real text from the returned request (inline first, the job as
+ * the fallback); otherwise the job is queued here and null is returned.
+ */
+internal fun receivePush(context: Context, data: Map<String, String>, localActionToken: String?, deferPreview: Boolean): PreviewRequest? {
         val app = context.applicationContext as BeaconApplication
         val source = data["source_ref"].orEmpty()
         val event = data["event_id"].orEmpty()
-        if (!validOpaque(source) || !validOpaque(event) || !validOpaque(data["conversation_ref"].orEmpty()) || !app.push.permitsIncoming(source)) return
+        if (!validOpaque(source) || !validOpaque(event) || !validOpaque(data["conversation_ref"].orEmpty()) || !app.push.permitsIncoming(source)) return null
         val nativeKind = data["kind"].orEmpty()
         val activity = data["activity_ref"].orEmpty()
+        fun fetchPreview(kind: String): PreviewRequest? {
+            if (deferPreview) return PreviewRequest(source, event, data["conversation_ref"].orEmpty(), kind)
+            NotificationPreviewJob.enqueue(context, source, event, data["conversation_ref"].orEmpty(), kind)
+            return null
+        }
         if (validOpaque(activity) && (ongoingNativeKind(nativeKind) || nativeKind == "activity_end")) {
             presentNativeActivity(context, source, event, activity, nativeKind, data["expires_at"]?.toLongOrNull() ?: 0)
-            if (nativeKind != "activity_end") NotificationPreviewJob.enqueue(context, source, event, data["conversation_ref"].orEmpty(), nativeKind)
-            return
+            if (nativeKind == "activity_end") return null
+            DeliveryLog.recordArrival(context, nativeKind, event)
+            return fetchPreview(nativeKind)
         }
-        if (data["kind"] !in setOf("failure", "completion", "approval", "clarify", "task_result", "test", "incoming_call")) return
+        if (data["kind"] !in setOf("failure", "completion", "approval", "clarify", "task_result", "test", "incoming_call")) return null
         val incoming = data["kind"] == "incoming_call"
         var invite = if (incoming) IncomingCall(
             source, event, data["expires_at"]?.toLongOrNull() ?: 0,
             actionToken = localActionToken ?: java.util.UUID.randomUUID().toString(),
             conversation = data["conversation_ref"].orEmpty(),
         ) else null
-        if (incoming && (invite == null || !invite.valid() || !validOpaque(data["conversation_ref"].orEmpty()) || !app.push.permitsIncoming(source))) return
-        if (!incoming && !app.push.firstArrival(source, event)) return
+        if (incoming && (invite == null || !invite.valid() || !validOpaque(data["conversation_ref"].orEmpty()) || !app.push.permitsIncoming(source))) return null
+        val now = System.currentTimeMillis()
+        // An alert Android would drop is not marked seen, so Keep connected can still deliver it (quietly) once alerts can be shown.
+        if (!incoming && !alertsPresentable(context)) { DeliveryLog.recordDropped(context, now); return null }
+        if (!incoming && !app.push.firstArrival(source, event)) return null
         val ring = invite != null && app.push.saveInvitation(invite!!, requiresLocalKeepConnectedReceipt(localActionToken))
-        if (incoming && !ring) return
+        if (incoming && !ring) return null
         if (ring) invite = app.push.ringingInvitation(source, event)
-        if (android.os.Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
+        if (android.os.Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return null
         val manager = context.getSystemService(NotificationManager::class.java)
         ensureActivityChannels(manager)
         val activityChannel = if (incoming) incomingCallChannel(manager) else if(nativeKind in setOf("approval","clarify")) promptNotificationChannel(manager) else alertingChannel(manager, notificationChannel(nativeKind))
@@ -635,8 +724,19 @@ private fun receivePush(context: Context, data: Map<String, String>, localAction
         val pending = PendingIntent.getActivity(context, "$source:$event".hashCode(), intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val content = notificationFallback(data["kind"].orEmpty())
         val public = NotificationCompat.Builder(context, activityChannel).setSmallIcon(R.drawable.ic_beacon_notification).setContentTitle(content.first).setContentText("Open Beacon to view private activity.").build()
-        if (!incoming) try { manager.notify(routeKey, 1, NotificationCompat.Builder(context, activityChannel).setSmallIcon(R.drawable.ic_beacon_notification).setContentTitle(content.first).setContentText(content.second).setStyle(NotificationCompat.BigTextStyle().bigText(content.second)).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).setPublicVersion(public).setSilent(silentPushNotification(nativeKind, app.calls.uiVisible)).setContentIntent(pending).setAutoCancel(true).build()) } catch (_: SecurityException) { return }
+        if (!incoming) {
+            // The alert shows when it happened; an old one, or one of a burst, arrives quietly under a single summary.
+            val alertMillis = alertTimeMillis(data["created_at"], now)
+            val quiet = arrivesQuietly(nativeKind, alertMillis, data["expires_at"]?.toLongOrNull(), now, AlertBurst.recent(now))
+            val alert = NotificationCompat.Builder(context, activityChannel).setSmallIcon(R.drawable.ic_beacon_notification).setContentTitle(content.first).setContentText(content.second).setStyle(NotificationCompat.BigTextStyle().bigText(content.second)).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).setPublicVersion(public)
+                .setWhen(alertMillis).setShowWhen(true).setSilent(quiet || silentPushNotification(nativeKind, app.calls.uiVisible)).setContentIntent(pending).setAutoCancel(true)
+            if (quiet) alert.setGroup(ALERT_GROUP).addExtras(android.os.Bundle().apply { putBoolean(QUIET_ALERT_EXTRA, true) })
+            try { manager.notify(routeKey, 1, alert.build()) } catch (_: SecurityException) { return null }
+            if (quiet) postQuietSummary(context, manager, routeKey) else AlertBurst.note(now)
+            DeliveryLog.recordArrival(context, nativeKind, event, now)
+        }
         if (invite != null && ring) {
+            DeliveryLog.recordArrival(context, nativeKind, event, now)
             val invite = invite!!
             val assistantName = runBlocking { context.applicationContext.preferences.data.first().let(AppPreferences::read).assistantName }
             val incomingChannel = incomingCallChannel(manager)
@@ -678,10 +778,10 @@ private fun receivePush(context: Context, data: Map<String, String>, localAction
             } catch (error: RuntimeException) {
                 android.util.Log.w("BeaconRinging", "Phone-call foreground service rejected; posting the deadline-bound call card", error)
                 val fallback = if (options.fullScreenIntent) ringingNotification else notification(callStyle = false)
-                try { manager.notify(routeKey, 2, fallback) } catch (_: RuntimeException) { return }
+                try { manager.notify(routeKey, 2, fallback) } catch (_: RuntimeException) { return null }
             }
         }
-        NotificationPreviewJob.enqueue(context, source, event, data["conversation_ref"].orEmpty(), data["kind"].orEmpty())
+        return fetchPreview(data["kind"].orEmpty())
 }
 fun incomingCallChannel(manager: NotificationManager): String {
     manager.createNotificationChannel(NotificationChannel(BeaconMessagingService.INCOMING_CHANNEL, "Beacon incoming calls", NotificationManager.IMPORTANCE_HIGH).apply {

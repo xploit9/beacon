@@ -15,10 +15,11 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.ResponseBody.Companion.toResponseBody
 
 class PluginUpdateStateTest {
-    private class Fake(private val reads: List<PluginVersions>, private val answer: () -> JSONObject = { JSONObject().put("ok", true) }, private val failure: Exception? = null, val restartConfirmed: Boolean = false) : PluginEndpoint {
+    private class Fake(private val reads: List<PluginVersions>, private val answer: () -> JSONObject = { JSONObject().put("ok", true) }, private val failure: Exception? = null, val restartResult: RestartResult = RestartResult.Pending) : PluginEndpoint {
         var read = 0
         var restarts = 0
-        override suspend fun restart(): Boolean { restarts++; return restartConfirmed }
+        var memos = emptyList<RestartMemo>()
+        override suspend fun restart(last: RestartMemo, remember: (RestartMemo) -> Unit): RestartResult { restarts++; memos += last; return restartResult }
         var accepted = emptyList<Boolean>()
         override suspend fun version(): PluginVersions = reads[minOf(read++, reads.lastIndex)]
         override suspend fun update(acceptCapabilities: Boolean): JSONObject {
@@ -45,7 +46,7 @@ class PluginUpdateStateTest {
             }
         }
         try {
-            assertTrue(HermesPluginUpdater(client).restart())
+            assertEquals(RestartResult.Completed, HermesPluginUpdater(client).restart())
             assertEquals(2, gatewayReads)
             assertEquals(1, paths.count { it == "/api/plugins/beacon/admin/plugin/restart" })
             assertFalse(paths.contains("/api/gateway/restart"))
@@ -66,27 +67,27 @@ class PluginUpdateStateTest {
                     Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("Fixture").body(value.toResponseBody("application/json".toMediaType())).build()
                 }
             }
-            try { assertFalse(HermesPluginUpdater(client).restart()); assertEquals(1, posts) }
+            try { assertEquals(RestartResult.Failed, HermesPluginUpdater(client).restart()); assertEquals(1, posts) }
             finally { client.closeNative() }
         }
     }
 
     @Test fun aSavedRestartCanRetryAfterTheDashboardAlreadyReloaded() = runBlocking {
-        val endpoint = Fake(listOf(versions("1.1.3")), restartConfirmed = true)
+        val endpoint = Fake(listOf(versions("1.1.3")), restartResult = RestartResult.Completed)
         assertEquals(PluginStatus.Updated, runPluginUpdate(endpoint, "1.1.3", false, restartOnly = true) {}.status)
         assertTrue(endpoint.accepted.isEmpty())
         assertEquals(1, endpoint.restarts)
     }
 
     @Test fun anInterruptedUpdateStillInstallsTheTargetBeforeRestarting() = runBlocking {
-        val endpoint = Fake(listOf(versions("1.1.1"), versions("1.1.3")), restartConfirmed = true)
+        val endpoint = Fake(listOf(versions("1.1.1"), versions("1.1.3")), restartResult = RestartResult.Completed)
         assertEquals(PluginStatus.Updated, runPluginUpdate(endpoint, "1.1.3", false, restartOnly = true) {}.status)
         assertEquals(listOf(false), endpoint.accepted)
         assertEquals(0, endpoint.restarts)
     }
 
     @Test fun finishingAnOlderPendingRestartLeavesTheNewReleaseAvailable() {
-        val endpoint = Fake(listOf(versions("1.1.0", "1.1.1"), versions("1.1.1")), restartConfirmed = true)
+        val endpoint = Fake(listOf(versions("1.1.0", "1.1.1"), versions("1.1.1")), restartResult = RestartResult.Completed)
         assertEquals(PluginStatus.Available, updateWith(endpoint).status)
         assertTrue(endpoint.accepted.isEmpty())
         assertEquals(1, endpoint.restarts)
@@ -94,32 +95,119 @@ class PluginUpdateStateTest {
 
     @Test fun aSuccessfulUpdateRestartsTheGatewayBeforeReportingUpdated() {
         val endpoint = Fake(listOf(versions("1.1.1"), versions("1.1.1", "1.1.3"), versions("1.1.3")),
-            { JSONObject().put("ok", true).put("restart_required", true) }, restartConfirmed = true)
+            { JSONObject().put("ok", true).put("restart_required", true) }, restartResult = RestartResult.Completed)
         assertEquals(PluginStatus.Updated, updateWith(endpoint).status)
         assertEquals(1, endpoint.restarts)
         assertEquals(listOf(false), endpoint.accepted)
     }
 
     @Test fun pendingRestartRetriesDoNotInstallThePluginAgain() {
-        val endpoint = Fake(listOf(versions("1.1.1", "1.1.3"), versions("1.1.3")), restartConfirmed = true)
+        val endpoint = Fake(listOf(versions("1.1.1", "1.1.3"), versions("1.1.3")), restartResult = RestartResult.Completed)
         assertEquals(PluginStatus.Updated, updateWith(endpoint).status)
         assertTrue(endpoint.accepted.isEmpty())
         assertEquals(1, endpoint.restarts)
     }
 
-    @Test fun aRefusedRestartStaysPendingInsteadOfClaimingUpdated() {
-        val endpoint = Fake(listOf(versions("1.1.1", "1.1.3")), restartConfirmed = false)
+    @Test fun aRestartThatIsNotConfirmedStaysPendingInsteadOfClaimingUpdated() {
+        val endpoint = Fake(listOf(versions("1.1.1", "1.1.3")), restartResult = RestartResult.Pending)
         assertEquals(PluginStatus.Restart, updateWith(endpoint).status)
         assertEquals(1, endpoint.restarts)
         assertTrue(endpoint.accepted.isEmpty())
     }
+
+    @Test fun eachRefusalLandsOnItsOwnRowAndNeverClaimsUpdated() {
+        val expected = mapOf(RestartResult.Waiting to PluginStatus.Waiting, RestartResult.Call to PluginStatus.Busy,
+            RestartResult.Failed to PluginStatus.RestartFailed, RestartResult.Pending to PluginStatus.Restart)
+        expected.forEach { (result, status) -> assertEquals(result.name, status, updateWith(Fake(listOf(versions("1.1.1", "1.1.3")), restartResult = result)).status) }
+        // All of them stay actionable, so a later tap or an idle Hermes finishes the job.
+        expected.values.forEach { assertTrue(it.name, PluginRow(it).actionable) }
+    }
+
+    @Test fun aRestartThatFinishedButLeftTheDashboardOldSaysSoInsteadOfOfferingTheSameRestart() {
+        // The plugin cannot tell the gateway's version: after a completed restart a still-old dashboard is a dashboard restart.
+        val legacy = Fake(listOf(versions("1.1.1", "1.1.3"), versions("1.1.1", "1.1.3")), restartResult = RestartResult.Completed)
+        assertEquals(PluginRow(PluginStatus.DashboardRestart, "1.1.3", "1.1.3"), updateWith(legacy))
+        // A gateway that reports its version settles it: it loaded the new plugin, the dashboard did not.
+        val known = Fake(listOf(versions("1.1.1", "1.1.3").copy(gateway = "1.1.1"), versions("1.1.1", "1.1.3").copy(gateway = "1.1.3")), restartResult = RestartResult.Completed)
+        assertEquals(PluginStatus.DashboardRestart, updateWith(known).status)
+        assertEquals(1, known.restarts)
+        // The gateway still on the old plugin after its restart is still a gateway restart.
+        val stuck = Fake(listOf(versions("1.1.3", "1.1.3").copy(gateway = "1.1.1")), restartResult = RestartResult.Completed)
+        assertEquals(PluginStatus.Restart, updateWith(stuck).status)
+    }
+
+    @Test fun onlyTheDashboardBeingOldNeverAsksForAGatewayRestart() {
+        val dashboardOnly = Fake(listOf(versions("1.1.1", "1.1.3").copy(gateway = "1.1.3")))
+        assertEquals(PluginRow(PluginStatus.DashboardRestart, "1.1.3", "1.1.3"), updateWith(dashboardOnly))
+        assertEquals(0, dashboardOnly.restarts)
+        assertTrue(dashboardOnly.accepted.isEmpty())
+        // The phone's memory of a finished restart does the same when the gateway cannot be read.
+        val remembered = Fake(listOf(versions("1.1.1", "1.1.3")))
+        assertEquals(PluginStatus.DashboardRestart, runBlocking { runPluginUpdate(remembered, "1.1.3", false, memo = RestartMemo(7, 1, completed = true)) {} }.status)
+        assertEquals(0, remembered.restarts)
+    }
+
+    @Test fun aGatewayThatReportsTheNewPluginNeedsNoRestartEvenWithOneLeftPending() {
+        val endpoint = Fake(listOf(versions("1.1.3").copy(gateway = "1.1.3")))
+        assertEquals(PluginRow(PluginStatus.Updated, "1.1.3", "1.1.3"), runBlocking { runPluginUpdate(endpoint, "1.1.3", false, restartOnly = true) {} })
+        assertEquals(0, endpoint.restarts)
+    }
+
+    @Test fun theRestartAlreadyAskedForTravelsWithTheNextTapAndIsClearedByANewInstall() {
+        val memo = RestartMemo(123, 5_000)
+        val endpoint = Fake(listOf(versions("1.1.1", "1.1.3")), restartResult = RestartResult.Completed)
+        runBlocking { runPluginUpdate(endpoint, "1.1.3", false, memo = memo) {} }
+        assertEquals(listOf(memo), endpoint.memos)
+        // New files on disk make the earlier restart history irrelevant.
+        val remembered = mutableListOf<RestartMemo>()
+        val install = Fake(listOf(versions("1.1.1"), versions("1.1.3")))
+        runBlocking { runPluginUpdate(install, "1.1.3", false, memo = memo, remember = { remembered += it }) {} }
+        assertEquals(listOf(RestartMemo()), remembered)
+    }
+
+    @Test fun theGatewayVersionDecidesWhichProcessIsOldAndAPluginPastTheReleaseIsNewer() {
+        // Gateway still old although the dashboard reloaded: a gateway restart.
+        assertEquals(PluginStatus.Restart, pluginStatusFor(versions("1.1.3").copy(gateway = "1.1.1"), "1.1.3"))
+        assertEquals(PluginStatus.DashboardRestart, pluginStatusFor(versions("1.1.1", "1.1.3").copy(gateway = "1.1.3"), "1.1.3"))
+        assertEquals(PluginStatus.UpToDate, pluginStatusFor(versions("1.1.3").copy(gateway = "1.1.3"), "1.1.3"))
+        // The phone's own memory of a finished restart stands in when the gateway is unknown.
+        assertEquals(PluginStatus.Restart, pluginStatusFor(versions("1.1.1", "1.1.3"), "1.1.3"))
+        assertEquals(PluginStatus.DashboardRestart, pluginStatusFor(versions("1.1.1", "1.1.3"), "1.1.3", restartDone = true))
+        // One release is one version: a plugin past the release is never "Up to date".
+        assertEquals(PluginStatus.Newer, pluginStatusFor(versions("1.1.4"), "1.1.3"))
+        assertEquals(PluginRow(PluginStatus.Newer, "1.2.0", "1.1.3"), pluginRowFor(PluginProbe.Read(versions("1.2.0")), "1.1.3"))
+        assertTrue(PluginRow(PluginStatus.Newer).attention)
+        assertFalse(PluginRow(PluginStatus.Newer).actionable)
+        assertTrue(PluginRow(PluginStatus.DashboardRestart).attention)
+        assertFalse(PluginRow(PluginStatus.DashboardRestart).actionable)
+    }
+
+    @Test fun theRestartMemoSurvivesStorageAndExpires() {
+        val memo = RestartMemo(123, 1_000, completed = true)
+        assertEquals(memo, RestartMemo.decode(memo.encode()))
+        assertEquals("", RestartMemo().encode())
+        assertEquals(RestartMemo(), RestartMemo.decode(""))
+        assertEquals(RestartMemo(), RestartMemo.decode("not json"))
+        assertTrue(RestartMemo(123, 1_000).inFlight(1_000 + RestartMemo.RESTART_MEMORY_MS))
+        assertFalse(RestartMemo(123, 1_000).inFlight(1_001 + RestartMemo.RESTART_MEMORY_MS))
+        assertFalse(RestartMemo(123, 1_000, completed = true).inFlight(2_000))
+        assertFalse(RestartMemo(123, 5_000).inFlight(1_000))
+        assertFalse(RestartMemo(0, 1_000).inFlight(2_000))
+    }
+
+    @Test fun hermesCountsAsIdleOnlyWhenServingWithNothingRunning() {
+        assertTrue(hermesIdle(GatewayStatus(running = true, busy = false)))
+        assertFalse(hermesIdle(GatewayStatus(running = true, busy = true)))
+        assertFalse(hermesIdle(GatewayStatus(running = false, busy = false)))
+    }
+
     private fun updateWith(endpoint: Fake, target: String = "1.1.3", accept: Boolean = false, pauses: MutableList<Long> = mutableListOf()) =
         runBlocking { runPluginUpdate(endpoint, target, accept) { pauses += it } }
 
     @Test fun theRowComparesWhatHermesRunsWithWhatTheReleaseShips() {
         assertEquals(PluginStatus.Available, pluginStatusFor(versions("1.1.1"), "1.1.3"))
         assertEquals(PluginStatus.UpToDate, pluginStatusFor(versions("1.1.3"), "1.1.3"))
-        assertEquals(PluginStatus.UpToDate, pluginStatusFor(versions("1.2.0"), "1.1.3"))
+        assertEquals(PluginStatus.Newer, pluginStatusFor(versions("1.2.0"), "1.1.3"))
         // The files are new but Hermes still runs the old code.
         assertEquals(PluginStatus.Restart, pluginStatusFor(versions("1.1.1", "1.1.3"), "1.1.3"))
         // An odd version is never offered.
@@ -204,7 +292,14 @@ class PluginUpdateStateTest {
     }
 
     @Test fun rowWordsAreShortAndActionsAreOnlyOfferedWhereTheyHelp() {
-        PluginStatus.entries.forEach { assertTrue(PluginRow(it).text.length <= 40 || it == PluginStatus.Restart) }
+        PluginStatus.entries.forEach { assertTrue(PluginRow(it).text.length <= 48) }
+        assertEquals("Hermes is busy — restarts when it's idle", PluginRow(PluginStatus.Waiting).text)
+        assertEquals("Restart the Hermes dashboard on your computer", PluginRow(PluginStatus.DashboardRestart).text)
+        assertEquals("Hermes plugin is newer than this app", PluginRow(PluginStatus.Newer).text)
+        assertTrue(PluginRow(PluginStatus.Waiting).actionable)
+        assertTrue(PluginRow(PluginStatus.RestartFailed).actionable)
+        assertTrue(PluginRow(PluginStatus.Waiting).restartPending)
+        assertFalse(PluginRow(PluginStatus.Available).restartPending)
         assertTrue(PluginRow(PluginStatus.Available).actionable)
         assertTrue(PluginRow(PluginStatus.NeedsReview).actionable)
         assertFalse(PluginRow(PluginStatus.UpToDate).actionable)

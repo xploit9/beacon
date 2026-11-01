@@ -43,6 +43,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -66,6 +67,17 @@ import org.scilab.forge.jlatexmath.BeaconMathDefinitions
 import java.io.File
 import java.nio.ByteBuffer
 import okhttp3.HttpUrl.Companion.toHttpUrl
+
+/**
+ * What a person, the assistant or Hermes wrote reads in its own direction: the first strong character decides, so English inside the Arabic interface
+ * keeps its punctuation on the right side ("Call me now." not ".Call me now"). The interface's own labels keep the layout direction.
+ */
+internal fun androidx.compose.ui.text.TextStyle.contentDirection(): androidx.compose.ui.text.TextStyle = copy(textDirection = androidx.compose.ui.text.style.TextDirection.Content)
+
+/** Lines a rendered paragraph may take before it ends in an ellipsis; unbounded unless a card (a folded Memory note) asks for fewer. */
+internal val LocalMarkdownMaxLines = compositionLocalOf { Int.MAX_VALUE }
+/** Told when a paragraph was cut by [LocalMarkdownMaxLines], so the card can offer to open it. */
+internal val LocalMarkdownCut = compositionLocalOf<() -> Unit> { {} }
 
 @Composable fun Markdown(source: String, vm: BeaconViewModel, origin: Scope? = vm.authenticatedScope(), snapshots: Map<String, String> = emptyMap(), documentKey: String = "", interactive: Boolean = true) {
     val checklist = checklistReading(vm, origin, documentKey, source, interactive)
@@ -114,7 +126,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
             }
         }
         is HtmlBlock -> if(block.literal.trimStart().startsWith("<svg", ignoreCase=true)) SvgPreview(remember(block.literal) { block.literal.toByteArray(Charsets.UTF_8) }, uiText("Inline SVG"), origin?.key.orEmpty()) else RichSandbox(block.literal)
-        else -> if (block.plain().isNotBlank()) Text(block.plain(), style = MaterialTheme.typography.bodyLarge)
+        else -> if (block.plain().isNotBlank()) Text(block.plain(), style = MaterialTheme.typography.bodyLarge.contentDirection())
     }
 }
 @Composable private fun RichInline(node: Node, vm: BeaconViewModel, origin: Scope?, snapshots: Map<String, String>, style: TextStyle = MaterialTheme.typography.bodyLarge) {
@@ -176,7 +188,10 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
     } }.toMap()
     val annotated = inlineAnnotations(node, primary, ids, onLink, MaterialTheme.colorScheme.onSurface.copy(alpha = .08f))
     val prefix = if(node is org.commonmark.node.Paragraph && checklistItem(node.parent) != null) 4 else if(node is org.commonmark.node.Paragraph && node.parent is BlockQuote && calloutLabel(node.parent as BlockQuote) != null && node === node.parent.firstChild) Regex("^\\[![A-Za-z]+\\]\\s*").find(annotated.text)?.value?.length ?: 0 else 0
-    Text(if(prefix > 0 && annotated.length >= prefix) annotated.subSequence(prefix,annotated.length) else annotated, inlineContent = inline, style = style, modifier = Modifier.fillMaxWidth())
+    val maxLines = LocalMarkdownMaxLines.current
+    val cut = LocalMarkdownCut.current
+    Text(if(prefix > 0 && annotated.length >= prefix) annotated.subSequence(prefix,annotated.length) else annotated, inlineContent = inline, style = style.contentDirection(), modifier = Modifier.fillMaxWidth(),
+        maxLines = maxLines, overflow = if (maxLines == Int.MAX_VALUE) TextOverflow.Clip else TextOverflow.Ellipsis, onTextLayout = { if (it.hasVisualOverflow) cut() })
 }
 /** [vm], when given, lets a copy say "Copied". */
 @Composable fun CodeBlock(language: String, source: String, vm: BeaconViewModel? = null) {

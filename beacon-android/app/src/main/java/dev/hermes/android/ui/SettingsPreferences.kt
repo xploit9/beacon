@@ -14,11 +14,14 @@ internal val skinLabels = NativeSkins.associateWith { key -> if (key == "default
 
 internal fun displayedBoolean(field: Field, stored: String) = if (field.inverse) !stored.toBoolean() else stored.toBoolean()
 internal fun storedBoolean(field: Field, displayed: Boolean) = (if (field.inverse) !displayed else displayed).toString()
+/** The texts a page's error row can show without the server saying anything: the offline answer of `BeaconViewModel.load` and [recordError]'s default. Pages show them through uiText. */
+internal const val OfflineReadError = "Reconnect to refresh this page."
+internal const val DefaultReadError = "The server could not load this content. Try again."
 internal fun recordError(value: JSONObject?): String = when {
     value == null -> ""
     value.string("_error").isNotBlank() -> value.string("_error")
     value.has("error") && !value.isNull("error") && value.string("error").isNotBlank() -> value.string("error")
-    value.has("success") && !value.optBoolean("success") -> value.string("message", "The server could not load this content. Try again.")
+    value.has("success") && !value.optBoolean("success") -> value.string("message", DefaultReadError)
     else -> ""
 }
 

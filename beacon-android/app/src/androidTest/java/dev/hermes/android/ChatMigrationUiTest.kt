@@ -46,9 +46,11 @@ class ChatMigrationUiTest {
         compose.onNodeWithTag("tool-card-details").assertDoesNotExist()
         compose.onNodeWithTag("tool-card-toggle").assertHeightIsAtLeast(48.dp).performClick()
         compose.onNodeWithTag("tool-card-details").assertIsDisplayed()
-        compose.onNodeWithText("ls -la").assertIsDisplayed()
+        // A terminal shows its command as a prompt line ("$ ls -la") and then what it printed.
+        compose.onNodeWithTag("tool-card-command", useUnmergedTree = true).assertIsDisplayed()
+        compose.onNodeWithText("ls -la", substring = true).assertIsDisplayed()
         compose.onNodeWithText("total 0").assertIsDisplayed()
-        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertTextContains("Completed", substring = true)
+        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertContentDescriptionEquals("Completed")
         compose.onNodeWithTag("tool-card-toggle").performClick()
         compose.onNodeWithTag("tool-card-details").assertDoesNotExist()
     }
@@ -56,21 +58,21 @@ class ChatMigrationUiTest {
     @Test fun toolWithoutAResultIsNeverShownAsCompleted() {
         compose.setContent { MaterialTheme { ToolCard(tool("read_file")) } }
         compose.onNodeWithTag("tool-card-toggle").performClick()
-        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertTextContains("No result recorded", substring = true)
+        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertContentDescriptionEquals("No result recorded")
         compose.onAllNodesWithText("Status: Completed").assertCountEquals(0)
     }
 
     @Test fun failedToolShowsItsErrorFromIsError() {
         compose.setContent { MaterialTheme { ToolCard(tool("terminal", "is_error" to true, "result" to "exit 1")) } }
         compose.onNodeWithTag("tool-card-toggle").performClick()
-        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertTextContains("Failed", substring = true)
+        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertContentDescriptionEquals("Failed")
         compose.onNodeWithText("exit 1").assertIsDisplayed()
     }
 
     @Test fun isErrorFalseIsNotFailureAndEmptyExplicitCompletionIsCompleted() {
         compose.setContent { MaterialTheme { ToolCard(tool("terminal", "result" to "", "is_error" to false)) } }
         compose.onNodeWithTag("tool-card-toggle").performClick()
-        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertTextContains("Completed", substring = true)
+        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertContentDescriptionEquals("Completed")
         compose.onNodeWithTag("tool-card-empty-result", useUnmergedTree = true).assertIsDisplayed()
     }
 
@@ -85,8 +87,8 @@ class ChatMigrationUiTest {
         compose.onAllNodesWithTag("tool-card-toggle")[1].performClick()
         val statuses = compose.onAllNodesWithTag("tool-card-status", useUnmergedTree = true)
         statuses.assertCountEquals(2)
-        statuses[0].assertTextContains("No result recorded", substring = true)
-        statuses[1].assertTextContains("Running", substring = true)
+        statuses[0].assertContentDescriptionEquals("No result recorded")
+        statuses[1].assertContentDescriptionEquals("Running")
     }
 
     @Test fun storedRunningStatusWithNothingTerminalIsNoResultNotRunning() {
@@ -95,21 +97,21 @@ class ChatMigrationUiTest {
         compose.onAllNodesWithTag("tool-card-toggle")[0].performClick()
         compose.onAllNodesWithTag("tool-card-toggle")[1].performClick()
         val statuses = compose.onAllNodesWithTag("tool-card-status", useUnmergedTree = true)
-        statuses[0].assertTextContains("No result recorded", substring = true)
-        statuses[1].assertTextContains("No result recorded", substring = true)
+        statuses[0].assertContentDescriptionEquals("No result recorded")
+        statuses[1].assertContentDescriptionEquals("No result recorded")
     }
 
     @Test fun completionMergedIntoAStaleRunningStartIsCompleted() {
         compose.setContent { MaterialTheme { MessageActivity("", listOf(tool("terminal", "status" to "running", "result" to "total 0", "is_error" to false))) } }
         compose.onNodeWithTag("tool-card-toggle").performClick()
-        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertTextContains("Completed", substring = true)
+        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertContentDescriptionEquals("Completed")
     }
 
     @Test fun liveToolWithOnlyAPreviewStaysRunningAndLabelsItPartial() {
         compose.setContent { MaterialTheme { MessageActivity("", listOf(tool("terminal", "status" to "running", "preview" to "partial output")), status = "Working", streaming = true) } }
         compose.onNodeWithTag("tool-steps").performClick()
         compose.onNodeWithTag("tool-card-toggle").performClick()
-        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertTextContains("Running", substring = true)
+        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertContentDescriptionEquals("Running")
         compose.onNodeWithTag("tool-card-preview", useUnmergedTree = true).assertTextEquals("partial output")
         compose.onAllNodesWithTag("tool-card-result", useUnmergedTree = true).assertCountEquals(0)
     }
@@ -143,8 +145,8 @@ class ChatMigrationUiTest {
         compose.onAllNodesWithTag("tool-card-toggle")[1].performClick()
         val statuses = compose.onAllNodesWithTag("tool-card-status", useUnmergedTree = true)
         statuses.assertCountEquals(2)
-        statuses[0].assertTextContains("No result recorded", substring = true)
-        statuses[1].assertTextContains("Running", substring = true)
+        statuses[0].assertContentDescriptionEquals("No result recorded")
+        statuses[1].assertContentDescriptionEquals("Running")
     }
 
     @Test fun longResultIsReadableInFullWithNewlinesIntact() {
@@ -193,7 +195,7 @@ class ChatMigrationUiTest {
         compose.setContent { MaterialTheme { MessageActivity("", listOf(call), toolResultsByCallId = folded.byCallId, onCopyResult = { copied = it }) } }
         compose.onNode(hasTestTag("tool-card") and hasContentDescription("Terminal, Completed"), useUnmergedTree = true).assertExists()
         compose.onNodeWithTag("tool-card-toggle").performClick()
-        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertTextEquals("Status: Completed")
+        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertContentDescriptionEquals("Completed")
         compose.onNodeWithTag("tool-card-result", useUnmergedTree = true).assertTextEquals("saved output")
         compose.onNodeWithTag("tool-card-result-copy", useUnmergedTree = true).assertContentDescriptionEquals("Copy result").performClick()
         assertEquals("saved output", copied)
@@ -203,7 +205,7 @@ class ChatMigrationUiTest {
         compose.setContent { MaterialTheme { ToolCard(tool("delegate_task", "status" to "completed", "result" to """{"status":"dispatched"}""")) } }
         compose.onNodeWithTag("tool-card-meta", useUnmergedTree = true).assertTextEquals("Dispatched")
         compose.onNodeWithTag("tool-card-toggle").performClick()
-        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertTextContains("Dispatched", substring = true)
+        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertContentDescriptionEquals("Dispatched")
         compose.onAllNodesWithText("Status: Completed").assertCountEquals(0)
     }
 

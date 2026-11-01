@@ -49,9 +49,15 @@ internal fun botName(bot: BotModeBot, profiles: List<JSONObject>): String =
 internal fun botRole(bot: BotModeBot, profiles: List<JSONObject>): String =
     bot.description.trim().ifBlank { profiles.firstOrNull { it.string("name") == bot.profile }?.string("model").orEmpty().trim() }
 
-/** A group's second line: its newest message with the sender in front, else its bots' names until the group has been opened on this phone. */
-internal fun spacePreview(space: BotModeSpace, name: (String) -> String, you: String): String =
-    space.last?.let { "${if (it.speaker == "You") you else name(it.speaker)}: ${it.text}" } ?: space.members.joinToString(", ", transform = name)
+/**
+ * A group's second line: its newest message with the sender in front, else its bots' names until the group has been opened on this phone.
+ * A group named after its bots would repeat itself, so the line counts them instead ([bots] is the translated "{0} bots", blank for none).
+ */
+internal fun spacePreview(space: BotModeSpace, name: (String) -> String, you: String, bots: String = ""): String {
+    space.last?.let { return "${if (it.speaker == "You") you else name(it.speaker)}: ${it.text}" }
+    val members = space.members.joinToString(", ", transform = name)
+    return if (members.equals(space.name.trim(), ignoreCase = true)) bots.replace("{0}", "${space.members.size}") else members
+}
 
 /** What New chat suggests as the group's name when the owner types none. */
 internal fun newChatName(bots: List<NewChatBot>, selected: Set<String>, using: String): String =
@@ -98,10 +104,10 @@ internal class RowAction(val label: String, val tag: String, val danger: Boolean
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(name, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.Medium), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(name, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.Medium).contentDirection(), maxLines = 1, overflow = TextOverflow.Ellipsis)
                     if (time.isNotBlank()) Text(time, Modifier.padding(start = 6.dp), style = nativeMetadataStyle(), color = scheme.onSurfaceVariant, maxLines = 1)
                 }
-                Text(preview, style = MaterialTheme.typography.bodyMedium, color = scheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(preview, style = MaterialTheme.typography.bodyMedium.contentDirection(), color = scheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
         RowMenu(menu, { menu = false }, actions, "$tag-menu")
@@ -165,7 +171,7 @@ internal class RowAction(val label: String, val tag: String, val danger: Boolean
     val ready = botModeChosen(selected, using) != null && !loading
     ModalBottomSheet(onDismissRequest = { if (!loading) onDismiss() }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(Modifier.testTag("new-chat-sheet").imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            Text(uiText("New chat"), Modifier.semantics { heading() }, style = MaterialTheme.typography.titleLarge)
+            Text(uiText("New space"), Modifier.semantics { heading() }, style = MaterialTheme.typography.titleLarge)
             Text(uiText("Choose two to six bots."), color = MaterialTheme.colorScheme.onSurfaceVariant)
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 bots.forEach { bot ->

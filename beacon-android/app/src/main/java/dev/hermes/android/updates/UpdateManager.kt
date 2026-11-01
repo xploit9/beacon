@@ -24,6 +24,7 @@ import dev.hermes.android.R
 import dev.hermes.android.core.Release
 import dev.hermes.android.core.sha256
 import dev.hermes.android.data.BeaconClient
+import dev.hermes.android.push.KeepConnectedService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -73,7 +74,10 @@ internal data class AppUpdateUi(
     val plugin: PluginRow = PluginRow(),
     val updated: UpdatedNotice? = null,
     val supported: Boolean = true,
-)
+) {
+    /** A plugin action waits for the owner (an update, a restart, or a plugin newer than the app): what the settings hub reads beside App updates. */
+    val pluginPending: Boolean get() = plugin.attention
+}
 
 /**
  * Beacon updates itself from the public GitHub latest release, with no Hermes and no sign-in. A newer release posts one
@@ -97,6 +101,8 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     private val checking = Mutex()
     @Volatile private var probe: PluginProbe = PluginProbe.None
     @Volatile private var pluginResult: PluginRow? = null
+    // The restart this phone last asked Hermes for, as the plugin row reads it (a finished restart explains a still-old dashboard).
+    @Volatile private var restartMemoSeen = RestartMemo()
 
     init { migrate(); restore() }
 
@@ -104,9 +110,9 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     private fun publish(change: AppUpdateUi.() -> AppUpdateUi) {
         _state.update { current ->
             val next = current.change()
-            val row = pluginResult ?: pluginRowFor(probe, next.latest?.pluginVersion.orEmpty())
+            val row = pluginResult ?: pluginRowFor(probe, next.latest?.pluginVersion.orEmpty(), restartMemoSeen)
             val shown = next.copy(plugin = row)
-            if (shown.phase == UpdatePhase.Idle || shown.phase == UpdatePhase.Available) shown.copy(phase = if (shown.release != null || row.actionable) UpdatePhase.Available else UpdatePhase.Idle) else shown
+            if (shown.phase == UpdatePhase.Idle || shown.phase == UpdatePhase.Available) shown.copy(phase = if (shown.release != null || row.attention) UpdatePhase.Available else UpdatePhase.Idle) else shown
         }
     }
 
@@ -157,15 +163,17 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     }
 
     /** The periodic job. */
-    suspend fun backgroundCheck() { if (selfUpdates) runCheck(force = false, visible = false) }
+    suspend fun backgroundCheck() { if (selfUpdates) runCheck(force = false, visible = false, window = checkWindow(offered = false, onUpdateScreen = false, keepConnected = keepConnectedOn())) }
+    /** Keep connected's public state, read only: its connection also calls [backgroundCheck] every minute, so a live one checks every 30 minutes. */
+    private fun keepConnectedOn() = runCatching { keepConnectedLive(KeepConnectedService.isEnabled(app), KeepConnectedService.status(app)) }.getOrDefault(false)
     /**
-     * Beacon came to the foreground; checks only when the last check is older than 6 hours. An offer already on screen stays put
-     * while it refreshes behind it, and on the update screen ([onUpdateScreen]) that refresh is due after 30 minutes.
+     * Beacon came to the foreground; checks only when the last check is older than 6 hours (30 minutes while Keep connected is live).
+     * An offer already on screen stays put while it refreshes behind it, and on the update screen ([onUpdateScreen]) that refresh is due after 30 minutes.
      */
     internal fun checkIfDue(onUpdateScreen: Boolean = false) {
         if (!selfUpdates) return
         val offered = _state.value.phase == UpdatePhase.Available
-        scope.launch { runCheck(force = false, visible = !offered, window = checkWindow(offered, onUpdateScreen)) }
+        scope.launch { runCheck(force = false, visible = !offered, window = checkWindow(offered, onUpdateScreen, keepConnectedOn())) }
     }
     /** "Check for updates": always asks GitHub. */
     internal fun checkNow() { if (selfUpdates) scope.launch { runCheck(force = true, visible = true) } }
@@ -273,8 +281,42 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     }
 
     /** The plugin row of the update screen: read what Hermes runs. [absent] is the sign-in's own word that the plugin is not installed. */
-    private fun restartKey(client: BeaconClient) = "plugin_restart_" + client.scope.copy(session = "").key
+    private fun scopeKey(client: BeaconClient) = client.scope.copy(session = "").key
+    private fun restartKey(client: BeaconClient) = "plugin_restart_" + scopeKey(client)
+    private fun waitKey(client: BeaconClient) = "plugin_restart_wait_" + scopeKey(client)
+    private fun memoKey(client: BeaconClient) = "plugin_restart_memo_" + scopeKey(client)
     private fun restartPending(client: BeaconClient) = prefs.getBoolean(restartKey(client), false)
+    /** Hermes refused the restart because it was working, so the phone retries it once Hermes is idle. */
+    private fun restartWaiting(client: BeaconClient) = restartPending(client) && prefs.getBoolean(waitKey(client), false)
+    /** The restart already asked for; a finished one counts for a day, after which the versions speak for themselves. */
+    private fun restartMemo(client: BeaconClient): RestartMemo = RestartMemo.decode(prefs.getString(memoKey(client), null)).let {
+        if (it.completed && System.currentTimeMillis() - it.at !in 0..RESTART_DONE_MEMORY_MS) it.copy(completed = false) else it
+    }
+    private fun saveMemo(client: BeaconClient, memo: RestartMemo) { synchronized(lock) { prefs.edit().putString(memoKey(client), memo.encode()).commit() } }
+    /** The restart is over (the versions agree): drop the flag, the waiting mark and the remembered pid. */
+    private fun forgetRestart(client: BeaconClient) {
+        synchronized(lock) { prefs.edit().remove(restartKey(client)).remove(waitKey(client)).remove(memoKey(client)).commit() }
+        restartMemoSeen = RestartMemo()
+    }
+
+    /**
+     * What Hermes reports decides the row. Only a pending restart the phone remembers can differ: waiting for an idle Hermes, or, for a
+     * plugin too old to report its gateway, "Restart Hermes" while the versions look equal. Null means the reported versions speak for themselves.
+     */
+    private fun settledPluginRow(client: BeaconClient, read: PluginProbe.Read, target: String): PluginRow? {
+        val memo = restartMemo(client)
+        restartMemoSeen = memo
+        val facts = pluginRowFor(read, target, memo)
+        val flagged = restartPending(client)
+        val gatewayKnown = read.versions.gateway.isNotBlank()
+        if (facts.status !in setOf(PluginStatus.Restart, PluginStatus.DashboardRestart) && memo != RestartMemo()) saveMemo(client, RestartMemo())
+        return when {
+            facts.status == PluginStatus.Restart && restartWaiting(client) -> facts.copy(status = PluginStatus.Waiting)
+            flagged && gatewayKnown && facts.status == PluginStatus.UpToDate -> { forgetRestart(client); null }
+            flagged && !gatewayKnown && facts.status == PluginStatus.UpToDate -> facts.copy(status = if (restartWaiting(client)) PluginStatus.Waiting else PluginStatus.Restart)
+            else -> null
+        }
+    }
 
     internal fun refreshPlugin(client: BeaconClient?, absent: Boolean) {
         scope.launch {
@@ -288,10 +330,32 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
                 probe = probePlugin(HermesPluginUpdater(detached))
                 val read = probe as? PluginProbe.Read
                 val target = _state.value.latest?.pluginVersion.orEmpty()
-                if (restartPending(detached) && read != null && !olderVersion(read.versions.installed, target)) pluginResult = pluginRowFor(read, target).copy(status = PluginStatus.Restart)
+                // A step that began meanwhile (the idle retry) owns the row.
+                if (read != null && job?.isActive != true) pluginResult = settledPluginRow(detached, read, target)
             }
             finally { detached.closeNative(); if (probe == PluginProbe.Checking) probe = PluginProbe.None; publish { this } }
         }
+    }
+
+    /**
+     * Beacon is on screen with a restart waiting for Hermes to go idle: once Hermes reports idle it restarts, safely (never interrupting a
+     * session), and never during a call or beside an update already running.
+     */
+    internal fun retryWaitingRestart(client: BeaconClient?, pluginAbsent: Boolean) {
+        if (client == null || pluginAbsent || !selfUpdates || !restartWaiting(client)) return
+        val detached = client.detached()
+        synchronized(lock) {
+            if (job?.isActive == true) { detached.closeNative(); return }
+            job = scope.launch { try { runWaitingRestart(detached) } finally { detached.closeNative() } }
+        }
+    }
+
+    private suspend fun runWaitingRestart(client: BeaconClient) {
+        if (callActive()) return
+        val idle = try { hermesIdle(gatewayStatusOf(client.nativeRequest("/api/status"))) }
+        catch (error: CancellationException) { throw error }
+        catch (_: Exception) { false }
+        if (idle) pluginStep(client, accept = false)
     }
 
     /**
@@ -358,7 +422,7 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
             if (client != null && !pluginAbsent && selfUpdates) {
                 probe = probePlugin(HermesPluginUpdater(client))
                 publish { this }
-                if (restartPending(client) || _state.value.plugin.status in setOf(PluginStatus.Available, PluginStatus.Restart)) pluginStep(client, accept = false)
+                if (restartPending(client) || _state.value.plugin.status in setOf(PluginStatus.Available, PluginStatus.Restart, PluginStatus.Waiting, PluginStatus.RestartFailed)) pluginStep(client, accept = false)
             }
             if (release == null) { publish { copy(phase = UpdatePhase.Idle) }; return }
             install(pendingFor(release) ?: download(release))
@@ -380,8 +444,10 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
         check(prefs.edit().putBoolean(restartKey(client), true).commit()) { "Plugin restart state could not be saved" }
         pluginResult = PluginRow(PluginStatus.Updating, _state.value.plugin.installed, target)
         publish { this }
-        val row = runPluginUpdate(HermesPluginUpdater(client), target, accept, restartOnly = restartOnly)
-        check(prefs.edit().putBoolean(restartKey(client), row.status in setOf(PluginStatus.Restart, PluginStatus.Busy, PluginStatus.Failed)).commit()) { "Plugin restart state could not be saved" }
+        val row = runPluginUpdate(HermesPluginUpdater(client), target, accept, restartOnly = restartOnly,
+            memo = restartMemo(client), remember = { saveMemo(client, it) })
+        check(prefs.edit().putBoolean(restartKey(client), row.status in RESTART_KEPT).putBoolean(waitKey(client), row.status == PluginStatus.Waiting).commit()) { "Plugin restart state could not be saved" }
+        restartMemoSeen = restartMemo(client)
         pluginResult = row.takeIf { it.status != PluginStatus.Hidden }
         if (row.status == PluginStatus.Hidden) probe = PluginProbe.None
         publish { this }
@@ -506,6 +572,10 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
         private const val NOTIFICATION_ID = 4202
         private const val FORMAT = "format"
         private const val FORMAT_VERSION = 2
+        /** A restart that finished explains a dashboard still on old code for a day; after that only the reported versions count. */
+        private const val RESTART_DONE_MEMORY_MS = 24 * 60 * 60_000L
+        /** Rows whose restart is still owed: the recovery flag stays until one finishes. */
+        private val RESTART_KEPT = setOf(PluginStatus.Restart, PluginStatus.Busy, PluginStatus.Failed, PluginStatus.Waiting, PluginStatus.RestartFailed)
         fun validToken(token: String): Boolean = validUpdateToken(token)
     }
 }

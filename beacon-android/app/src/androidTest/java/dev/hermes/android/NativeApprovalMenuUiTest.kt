@@ -510,8 +510,25 @@ class NativeApprovalMenuUiTest {
         await { vm.data.value["profile:approvals"] != null }
         compose.onNodeWithTag("profile-approval-smart").performClick()
         await { fixture.approvalMode == "smart" && vm.data.value["profile:approvals"]?.string("value") == "smart" }
+        compose.onNodeWithTag("profile-approval-smart").assert(isSelected())
+        compose.onNodeWithTag("profile-approval-manual").assert(isNotSelected())
         assertTrue(fixture.sessions.getValue("chat-a").getJSONObject("info").getBoolean("yolo"))
         assertTrue(fixture.requests.filter { it.string("method") == "config.set" }.all { it.getJSONObject("params").string("key") == "approvals.mode" })
+    }
+
+    // Hermes can store "off", which is not a segment: the page says so and either segment turns approvals back on.
+    @Test fun profileApprovalsOffIsShownAndEitherSegmentTurnsThemBackOn() = withFixture(
+        content = { ProfileApprovalSettings(it) }, prepare = { _, fixture -> fixture.approvalMode = "off" },
+    ) { vm, fixture ->
+        await { vm.data.value["profile:approvals"] != null }
+        compose.onNodeWithTag("profile-approvals-off").assertIsDisplayed()
+        compose.onNodeWithText("Approvals off").assertIsDisplayed()
+        compose.onNodeWithTag("profile-approval-manual").assert(isNotSelected())
+        compose.onNodeWithTag("profile-approval-smart").assert(isNotSelected())
+        compose.onNodeWithTag("profile-approval-manual").assertHeightIsAtLeast(48.dp).performClick()
+        await { fixture.approvalMode == "manual" && vm.data.value["profile:approvals"]?.string("value") == "manual" }
+        compose.onNodeWithTag("profile-approval-manual").assert(isSelected())
+        compose.onNodeWithTag("profile-approvals-off").assertDoesNotExist()
     }
 
     @Test fun modelLoadingHidesTheCustomEntryAction() = withFixture(
@@ -583,7 +600,7 @@ class NativeApprovalMenuUiTest {
         compose.onNodeWithTag("chat-toolsets-mcp").assertHeightIsAtLeast(48.dp).assert(isNotSelected())
         await { vm.data.value["native-tools"] != null && "native-tools" !in vm.refreshing.value }
         compose.onNodeWithText("Web research").assertIsDisplayed()
-        compose.onNodeWithText("Browse chat commands").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Chat commands").performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("Change for all chats").assertDoesNotExist()
         compose.onNode(hasText("Web research") and isToggleable()).performClick()
         await { !fixture.toolEnabled && "native-tools" !in vm.refreshing.value }
@@ -604,8 +621,9 @@ class NativeApprovalMenuUiTest {
         compose.onNodeWithText("fixture_mcp").assertIsDisplayed()
         compose.onNodeWithText("Changes apply to this profile's new chats.").assertIsDisplayed()
         compose.onNodeWithText("Web research").assertDoesNotExist()
-        compose.onNodeWithText("Test server").performScrollTo().performClick()
+        compose.onNodeWithText("Test").performScrollTo().performClick()
         await { vm.data.value["mcp-test:fixture_mcp"] != null }
+        compose.onNodeWithText("1 tool").performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("View tools · 1").performScrollTo().performClick()
         compose.onNodeWithText("read_fixture").assertExists()
         compose.onNode(hasText("fixture_mcp") and isToggleable()).performClick()

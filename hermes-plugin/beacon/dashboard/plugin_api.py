@@ -25,14 +25,6 @@ _PRODUCTION_PACKAGE='dev.hermes.android'
 _STABLE_PACKAGE='dev.hermes.android.stable'
 _PREVIEW_PACKAGE='dev.hermes.android.debug'
 _SUPPORTED_PHONE_PACKAGES=(_PRODUCTION_PACKAGE,_STABLE_PACKAGE,_PREVIEW_PACKAGE)
-def _read_plugin_version(path):
-    try:
-        import yaml
-        value=yaml.safe_load(Path(path).read_text(encoding='utf-8-sig'))
-        version=value.get('version') if isinstance(value,dict) else None
-        return version.strip() if isinstance(version,str) else ''
-    except Exception: return ''
-_RUNNING_PLUGIN_VERSION=_read_plugin_version(ROOT/'plugin.yaml')
 def _stale(module):
     seen=getattr(module,'_beacon_mtime',None)
     try: return seen is not None and seen!=Path(module.__file__).stat().st_mtime_ns
@@ -51,6 +43,9 @@ mobile=sys.modules['beacon_mobile'];native=sys.modules['beacon_native'];voice_co
 activity=sys.modules['beacon_activity']
 voice_models=sys.modules['beacon_voice_models']
 proactive=sys.modules['beacon_proactive']
+# The version this dashboard process imported; /mobile/plugin/version reports it as `running`.
+_read_plugin_version=mobile.read_plugin_version
+_RUNNING_PLUGIN_VERSION=_read_plugin_version(ROOT/'plugin.yaml')
 @asynccontextmanager
 async def lifespan(app):
     await start_watcher()
@@ -397,7 +392,17 @@ async def calls(request:Request):
             if mobile.active_calls(conn,owner)>=mobile.MAX_ACTIVE_CALLS:
                 raise HTTPException(409,'Active call limit reached')
         conversation=await asyncio.to_thread(safely,native.create,owner,provider,profile)
-    return safely(mobile.reserve,owner,profile,conversation,selection)
+    result=safely(mobile.reserve,owner,profile,conversation,selection)
+    greeting=await grant_greeting(request,profile,value.get('owner_name'))
+    if greeting: result['greeting']=greeting
+    return result
+# The phone may start speaking this at once; the context call still supplies the authoritative line.
+GRANT_GREETING_TIMEOUT=1.5
+async def grant_greeting(request,profile,owner_name):
+    display=getattr(request.state.session,'display_name',None)
+    display=display[:120] if isinstance(display,str) else ''
+    try: return await feature(voice_context.grant_greeting,profile,display,owner_name,timeout=GRANT_GREETING_TIMEOUT)
+    except HTTPException: return ''  # a slow or unavailable profile never holds up the call
 @router.get('/mobile/calls/{call_id}')
 async def get_call(call_id:str,request:Request):
     owner,provider,row,cfg=await call(request,call_id)
@@ -958,6 +963,9 @@ def push(owner,profile):
     try: _push_devices(owner,profile)
     finally: mobile.PUSH_LOCK.release()
 
+def _epoch_text(value):
+    try: return str(int(value))
+    except (TypeError,ValueError,OverflowError): return ''
 def _push_devices(owner,profile):
     activate(owner,profile)
     cfg=mobile.settings();credentials=cfg.get('firebase_credentials')
@@ -983,6 +991,8 @@ def _push_devices(owner,profile):
                 accepted=0;error=''
                 try:
                     data={'type':row['kind'],'kind':row['kind'],'event_id':row['id'],'profile':profile,'owner_id':owner,'expires_at':str(int(row['expires'])),'activity_ref':row.get('activity_key',''),'title':notice_preview(row['kind'])[0],'body':notice_preview(row['kind'])[1],**mobile.refs(owner,profile,row['conversation'])}
+                    created=_epoch_text(row['created'])
+                    if created: data['created_at']=created  # when it happened, so a late delivery is not shown as new
                     messaging.send(messaging.Message(token=target['token'],data=data,android=messaging.AndroidConfig(priority='high',ttl=timedelta(seconds=max(1,row['expires']-time.time())))),app=app)
                     accepted=time.time()
                 except Exception as exc:
@@ -1001,7 +1011,7 @@ def _push_devices(owner,profile):
 @router.get('/mobile/plugin/version')
 async def plugin_version(request:Request):
     identity(request,owner_only=True)
-    return JSONResponse({'running':_RUNNING_PLUGIN_VERSION,'installed':_read_plugin_version(ROOT/'plugin.yaml')},headers={'Cache-Control':'no-store'})
+    return JSONResponse({'running':_RUNNING_PLUGIN_VERSION,'installed':_read_plugin_version(ROOT/'plugin.yaml'),'gateway':mobile.gateway_plugin_version()},headers={'Cache-Control':'no-store'})
 
 _watch_task=None
 _jobs_warming=set()

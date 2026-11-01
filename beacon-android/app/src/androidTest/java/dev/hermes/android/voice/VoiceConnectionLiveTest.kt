@@ -24,7 +24,7 @@ import org.junit.Rule
 import org.junit.Test
 import java.io.File
 
-/** Measures the actual chat button -> Telecom service -> authenticated provider readiness. */
+/** Measures the actual chat button -> Telecom service -> provider readiness, first greeting audio (cached or rendered) and greeting completion. */
 class VoiceConnectionLiveTest {
     @get:Rule val rule = createAndroidComposeRule<BeaconActivity>()
 
@@ -131,15 +131,26 @@ class VoiceConnectionLiveTest {
                 val previousError = app.calls.state.value.error
                 var attemptStarted = false
                 rule.onNodeWithTag("chat-call-beacon").performClick()
+                // Three separate phases on the tap clock: provider admitted (thinking/listening), first greeting audio, greeting complete.
+                var firstAudio = 0L
+                var thinking = false
+                fun observeAudio() {
+                    val state = app.calls.state.value
+                    if (state.active && state.state == "thinking") thinking = true
+                    // First presented greeting bytes end "thinking"; a remote level marks speech directly.
+                    if (firstAudio == 0L && state.active && (state.remoteSpeaking || state.state == "speaking" || thinking && state.state == "listening"))
+                        firstAudio = SystemClock.elapsedRealtime() - started
+                }
                 await(45_000) {
                     val state = app.calls.state.value
                     if (state.active || state.callId != previousCall || state.error != previousError) attemptStarted = true
                     if (attemptStarted) check(state.error.isBlank()) { "Voice connection failed: ${state.failureReason}" }
-                    attemptStarted && state.active && state.state in setOf("listening", "speaking")
+                    observeAudio()
+                    attemptStarted && state.active && state.state in setOf("thinking", "listening", "speaking")
                 }
                 val elapsed = SystemClock.elapsedRealtime() - started
                 call = app.calls.state.value.callId
-                samples.put(JSONObject().put("tap_ready_ms", elapsed).put("provider", app.calls.state.value.voiceProvider))
+                samples.put(JSONObject().put("ready_ms", elapsed).put("provider", app.calls.state.value.voiceProvider))
                 assertEquals(provider, app.calls.state.value.voiceProvider)
                 val context = client.nativeCallContext(call)
                 assertEquals("hermes", context.getString("backend"))
@@ -147,11 +158,18 @@ class VoiceConnectionLiveTest {
                 assertEquals(session, context.getString("selected_session_id"))
                 await(45_000) {
                     check(app.calls.state.value.error.isBlank()) { "Greeting failed: ${app.calls.state.value.failureReason}" }
+                    observeAudio()
                     app.calls.state.value.transcripts.any { it.role == "assistant" && it.text.isNotBlank() }
                 }
+                val complete = SystemClock.elapsedRealtime() - started
                 val expected = context.optString("greeting").take(160).ifBlank { "I'm here." }
                 assertTrue("The actual service must present its complete greeting", app.calls.state.value.transcripts.any { it.role == "assistant" && it.text == expected })
-                samples.getJSONObject(samples.length() - 1).put("greeting_presented_ms", SystemClock.elapsedRealtime() - started)
+                assertTrue("First greeting audio must be observed before the greeting completes", firstAudio in 1..complete)
+                samples.getJSONObject(samples.length() - 1).put("first_audio_ms", firstAudio).put("greeting_complete_ms", complete)
+                // Whether the phone's cached greeting was heard, and its first presented frame on the call's own tap clock.
+                app.calls.greeting?.firstAudioMs?.let { frame ->
+                    samples.getJSONObject(samples.length() - 1).put("cached_greeting", frame >= 0).apply { if (frame >= 0) put("cached_first_frame_ms", frame) }
+                }
                 if (provider == "gemini" && it == 0) samples.getJSONObject(samples.length() - 1).put("native_reply", checkNativeReply(app, client, call))
                 app.calls.hangup()
                 await { !app.calls.state.value.active && app.calls.service == null }

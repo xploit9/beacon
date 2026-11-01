@@ -993,6 +993,19 @@ class NativeSpeechBackendTest {
         checkNativeSpeech("Hermes verified it.", "Hermes verified it and sent the money.", false)
     }
 
+    @Test(timeout = 8000) fun prefetchedOtherProviderSpeechStillNeedsTheExactTranscript() = runBlocking {
+        val f = RenderFixture()
+        try {
+            assertTrue(f.renderer.prefetch("Verified reply."))
+            assertTrue(waitFor { f.requestCount("Verified reply.") == 1 })
+            f.receive(renderPcm()); f.receive(renderTranscript(text = "Verified reply and more.")); f.receive(renderDone()); f.closeSocket()
+            assertTrue(f.renderer.say("Verified reply."))
+            assertTrue(waitFor { f.warned() })
+            assertTrue("A mismatched prefetch never plays", f.audio.isEmpty())
+            assertEquals("The prefetch is not rendered again", 1, f.requestCount("Verified reply."))
+        } finally { f.close() }
+    }
+
     @Test fun geminiExplicitFinalityNeverDependsOnTheModelName() {
         val turns=VoiceFinalItems()
         assertNull(turns.accept(json("text" to "hel"),true))

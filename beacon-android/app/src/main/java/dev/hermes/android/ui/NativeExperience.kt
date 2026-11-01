@@ -48,9 +48,13 @@ internal fun groupCallTranscriptEvents(lines: List<CallTranscript>): List<CallTr
     CallTranscriptGroup(callId, orderCallTranscriptLines(events))
 }
 
-internal fun callTranscriptCardTitle(durationSeconds: Long?, provider: String?): String = buildList {
-    add("Call")
-    durationSeconds?.takeIf { it > 0 }?.let { add("${((it + 30) / 60).coerceAtLeast(1)} min") }
+/** The words the call card's title is built from; it shows them through [callTranscriptCardTitle]'s `localize`, so the translation test reads them from here. */
+internal val CallTitleStrings = listOf("Call", "{0} min")
+
+/** "Call · 3 min · Gemini": [localize] translates the fixed words ("Call", "{0} min"); provider names stay as they are. */
+internal inline fun callTranscriptCardTitle(durationSeconds: Long?, provider: String?, localize: (String) -> String = { it }): String = buildList {
+    add(localize("Call"))
+    durationSeconds?.takeIf { it > 0 }?.let { add(localize("{0} min").replace("{0}", "${((it + 30) / 60).coerceAtLeast(1)}")) }
     provider?.takeIf(String::isNotBlank)?.let {
         add(when (it.lowercase()) { "openai" -> "OpenAI"; "grok" -> "Grok"; "gemini" -> "Gemini"; else -> it.replaceFirstChar { char -> char.titlecase() } })
     }
@@ -80,7 +84,7 @@ internal fun CallTranscriptCard(
     ) {
         Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(callTranscriptCardTitle(durationSeconds, provider), Modifier.weight(1f),
+                Text(callTranscriptCardTitle(durationSeconds, provider) { uiText(it) }, Modifier.weight(1f),
                     style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurface)
                 if (ordered.size > 4 && !searchExpanded) TextButton(
                     onClick = { expanded = !expanded },
@@ -98,7 +102,7 @@ internal fun CallTranscriptCard(
                     ) {
                         Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                             Text(uiText(if (owner) "You" else assistantName), style = MaterialTheme.typography.labelSmall)
-                            Text(line.text, style = MaterialTheme.typography.bodyMedium,
+                            Text(line.text, style = MaterialTheme.typography.bodyMedium.contentDirection(),
                                 textAlign = TextAlign.Start,
                                 overflow = TextOverflow.Clip)
                         }
