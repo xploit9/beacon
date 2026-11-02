@@ -21,6 +21,9 @@ if observers is None:
     spec=importlib.util.spec_from_file_location(_OBSERVER_KEY,Path(__file__).with_name('observers.py'))
     observers=importlib.util.module_from_spec(spec);sys.modules[_OBSERVER_KEY]=observers;spec.loader.exec_module(observers)
 
+# Every scheduled-callback marker key starts with this; a key range reads just those meta rows (LIKE scans them all).
+_MARKER_RANGE=('scheduled-callback:','scheduled-callback;')
+
 def _profile_now(profile):
     key='beacon_proactive'
     if key not in sys.modules:
@@ -31,23 +34,23 @@ def _profile_now(profile):
 def _prune_expired(conn,now):
     cutoff=now-CALLBACK_MARKER_RETENTION_SECONDS-1
     # A deferred notice still needs its scheduling marker to reject late activation.
-    keys=conn.execute("""SELECT key,value FROM meta WHERE key LIKE 'scheduled-callback:%'
+    keys=conn.execute("""SELECT key,value FROM meta WHERE key>=? AND key<?
         AND CASE WHEN json_valid(CAST(value AS TEXT)) THEN
           CASE WHEN json_type(CAST(value AS TEXT),'$.scheduled_at')='text' THEN
             CAST(strftime('%s',json_extract(CAST(value AS TEXT),'$.scheduled_at')) AS REAL)<=?
             AND NOT EXISTS (SELECT 1 FROM deferred WHERE id=json_extract(CAST(meta.value AS TEXT),'$.delivered'))
           END
-        END ORDER BY rowid LIMIT ?""",(cutoff,CALLBACK_MARKER_PRUNE_BATCH)).fetchall()
+        END ORDER BY rowid LIMIT ?""",(*_MARKER_RANGE,cutoff,CALLBACK_MARKER_PRUNE_BATCH)).fetchall()
     conn.executemany('DELETE FROM meta WHERE key=?',
                      [(key,) for row in keys for key in (row[0],'missed-callback:'+row[0].split(':',1)[1],
                          'missed-callback:'+(json.loads(row[1]).get('delivered') or row[0].split(':',1)[1]))])
 
 
 def _delivered_record(conn,event):
-    return conn.execute("""SELECT value FROM meta WHERE key=? OR
-        CASE WHEN key LIKE 'scheduled-callback:%' AND json_valid(CAST(value AS TEXT)) THEN
-          json_extract(CAST(value AS TEXT),'$.delivered')=?
-        END LIMIT 1""",('scheduled-callback:'+event,event)).fetchone()
+    # Two index lookups (the marker itself, else the marker that delivered this id) instead of one scan of every meta row.
+    return conn.execute("""SELECT value FROM meta WHERE key=? UNION ALL SELECT value FROM meta WHERE key>=? AND key<? AND
+        CASE WHEN json_valid(CAST(value AS TEXT)) THEN json_extract(CAST(value AS TEXT),'$.delivered')=? END LIMIT 1""",
+        ('scheduled-callback:'+event,*_MARKER_RANGE,event)).fetchone()
 
 def _authority(cfg,row):
     return (cfg.get('scheduled_callbacks_enabled') is True and cfg.get('owner_id')==row['owner']
@@ -76,13 +79,13 @@ def prune_expired(mobile,native,owner,now=None):
     key='scheduled-callback-prune:'+hashlib.sha256(owner.encode('utf-8')).hexdigest()
     with mobile.LOCK,mobile.connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
-        candidates=conn.execute("""SELECT key,value FROM meta WHERE key LIKE 'scheduled-callback:%'
+        candidates=conn.execute("""SELECT key,value FROM meta WHERE key>=? AND key<?
             AND CASE WHEN json_valid(CAST(value AS TEXT)) THEN
               json_extract(CAST(value AS TEXT),'$.owner')=?
               AND json_extract(CAST(value AS TEXT),'$.status') IN ('scheduled','creating')
               AND json_extract(CAST(value AS TEXT),'$.delivered') IS NULL
               AND CAST(strftime('%s',json_extract(CAST(value AS TEXT),'$.scheduled_at')) AS REAL)<=?
-            END ORDER BY rowid LIMIT ?""",(owner,now-CALLBACK_WINDOW_SECONDS,CALLBACK_MARKER_PRUNE_BATCH)).fetchall()
+            END ORDER BY rowid LIMIT ?""",(*_MARKER_RANGE,owner,now-CALLBACK_WINDOW_SECONDS,CALLBACK_MARKER_PRUNE_BATCH)).fetchall()
         missed=sum(_missed(mobile,native,conn,row[0],json.loads(row[1]),instant) for row in candidates)
         row=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
         try: last=float(row[0].decode() if isinstance(row[0],bytes) else row[0]) if row else None
@@ -95,9 +98,9 @@ def prune_expired(mobile,native,owner,now=None):
 def reasons(mobile,owner,provider,profile,limit=100):
     """job id -> what the owner asked to be called about, for the owner's own scheduled callbacks on this profile."""
     with mobile.LOCK,mobile.connect() as conn:
-        rows=conn.execute("""SELECT value FROM meta WHERE key LIKE 'scheduled-callback:%' AND json_valid(CAST(value AS TEXT))
+        rows=conn.execute("""SELECT value FROM meta WHERE key>=? AND key<? AND json_valid(CAST(value AS TEXT))
             AND json_extract(CAST(value AS TEXT),'$.owner')=? AND json_extract(CAST(value AS TEXT),'$.provider')=?
-            AND json_extract(CAST(value AS TEXT),'$.profile')=? ORDER BY rowid DESC LIMIT ?""",(owner,provider,profile,limit)).fetchall()
+            AND json_extract(CAST(value AS TEXT),'$.profile')=? ORDER BY rowid DESC LIMIT ?""",(*_MARKER_RANGE,owner,provider,profile,limit)).fetchall()
     found={}
     for (value,) in rows:
         record=json.loads(value)

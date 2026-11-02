@@ -1312,3 +1312,49 @@ def test_memory_write_asks_each_time_and_a_refusal_is_a_clean_failure(gateway,in
     api.decide(SCOPE,'save',{'proposal_id':proposal['proposal']['id'],'decision':'approve'})
     receipt=settled(api,'save')
     assert receipt['status']=='failed' and receipt['result']['error']==result['error']
+
+
+def test_a_stale_tool_list_is_served_at_once_and_refreshed_behind_it(tmp_path,monkeypatch):
+    # Generic rows: whatever a profile has configured, a call never waits for a scan once a list exists.
+    rows=[{'name':'read_file','_toolset':'file','description':'Read a local file','read_only':True}]
+    scans=[];release=threading.Event()
+
+    class Backend:
+        def cache_key(self): return 'stale-cache'
+        def catalog(self,discover=True):
+            scans.append(discover)
+            if discover and len(scans)>1: release.wait(2)
+            return rows
+
+    api=g.Gateway(Mobile(tmp_path/'stale.sqlite'),lambda name,fn,**kwargs:fn(tmp_path),Backend())
+    assert api.prefetch('stale-profile')=='File: Read a local file'
+    assert scans==[True]
+    key=('stale-profile','stale-cache')
+    with g.CATALOG_LOCK: created,cached=g.CATALOG_CACHE[key]; g.CATALOG_CACHE[key]=(created-g.CATALOG_TTL-1,cached)
+    begin=time.perf_counter()
+    assert api.catalog('stale-profile',discover=False)==rows, 'the older list is served'
+    assert (time.perf_counter()-begin)<0.1, 'without waiting for the refresh'
+    release.set()
+    deadline=time.monotonic()+2
+    while len(scans)<2 and time.monotonic()<deadline: time.sleep(0.01)
+    assert scans==[True,True], 'and refreshed behind it'
+    with g.CATALOG_LOCK: g.CATALOG_CACHE[key]=(time.monotonic()-g.CATALOG_STALE_TTL-1,rows)
+    assert api._cached_catalog('stale-profile') is None, 'a list too old to trust is scanned again'
+
+
+def test_prefetch_is_the_first_scan_discover_waits_for(tmp_path):
+    started=threading.Event();release=threading.Event()
+
+    class Backend:
+        def cache_key(self): return 'first-scan'
+        def catalog(self,discover=True):
+            if discover: started.set();release.wait(2)
+            return [{'name':'search_files','_toolset':'file','description':'Search files','read_only':True}]
+
+    api=g.Gateway(Mobile(tmp_path/'first.sqlite'),lambda name,fn,**kwargs:fn(tmp_path),Backend())
+    worker=threading.Thread(target=api.prefetch,args=('first-profile',));worker.start()
+    assert started.wait(1)
+    assert g.CATALOG_FIRST_WARM.get('first-profile') is worker
+    assert api.warm_catalogue('first-profile') is False, 'a running prefetch is not scanned twice'
+    release.set();worker.join(2)
+    assert not worker.is_alive()

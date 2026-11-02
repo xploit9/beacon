@@ -10,8 +10,6 @@ import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.unit.dp
 import dev.hermes.android.core.json
-import dev.hermes.android.ui.DrawerMode
-import dev.hermes.android.ui.DrawerModeSwitch
 import dev.hermes.android.ui.ProfileSwitcherMenu
 import dev.hermes.android.ui.UpdateReadyChip
 import org.json.JSONArray
@@ -22,32 +20,6 @@ import org.junit.Test
 /** The drawer's new parts on their own: state is passed in and nothing here talks to Hermes or changes a setting. */
 class DrawerUiTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
-
-    private fun showSwitch(botMode: Boolean, switching: Boolean = false, taps: MutableList<DrawerMode> = mutableListOf()) {
-        compose.setContent { MaterialTheme { DrawerModeSwitch(botMode, switching, { taps += it }, Modifier.width(320.dp)) } }
-    }
-
-    @Test fun chatsIsChosenAndBotsEntersBotMode() {
-        val taps = mutableListOf<DrawerMode>()
-        showSwitch(botMode = false, taps = taps)
-        compose.onNodeWithTag("navigation-mode-chats").assertIsSelected().assertTextContains("Chats").assertHeightIsAtLeast(48.dp)
-        compose.onNodeWithTag("navigation-mode-bots").assertIsNotSelected().assertTextContains("Bots").performClick()
-        assertEquals(listOf(DrawerMode.Bots), taps)
-    }
-
-    @Test fun inBotModeBotsIsChosenChatsLeavesAndBotsGoesHome() {
-        val taps = mutableListOf<DrawerMode>()
-        showSwitch(botMode = true, taps = taps)
-        compose.onNodeWithTag("navigation-bot-mode-home").assertIsSelected().performClick()
-        compose.onNodeWithTag("navigation-leave-bot-mode").assertIsNotSelected().assertTextContains("Chats").performClick()
-        assertEquals(listOf(DrawerMode.Bots, DrawerMode.Chats), taps)
-    }
-
-    @Test fun bothSegmentsWaitWhileTheModeIsSwitching() {
-        showSwitch(botMode = false, switching = true)
-        compose.onNodeWithTag("navigation-mode-chats").assertIsNotEnabled()
-        compose.onNodeWithTag("navigation-mode-bots").assertIsNotEnabled()
-    }
 
     @Test fun theUpdateChipIsOneLabelledRowThatOpensTheUpdate() {
         var opened = 0

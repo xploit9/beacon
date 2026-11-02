@@ -79,7 +79,16 @@ internal fun beaconEmbers(width: Float, height: Float, spacing: Float, maxRadius
 internal fun nativeMotionAllowed(systemAnimationsEnabled: Boolean, lifecycleStarted: Boolean): Boolean =
     systemAnimationsEnabled && lifecycleStarted
 
-@Composable fun rememberNativeMotionEnabled(): Boolean {
+/** The theme root watches the animation setting once; every screen below reads this instead of registering its own observer. */
+private val LocalNativeMotion = compositionLocalOf<Boolean?> { null }
+
+@Composable private fun NativeMotionProvider(content: @Composable () -> Unit) {
+    CompositionLocalProvider(LocalNativeMotion provides observeNativeMotion(), content = content)
+}
+
+@Composable fun rememberNativeMotionEnabled(): Boolean = LocalNativeMotion.current ?: observeNativeMotion()
+
+@Composable private fun observeNativeMotion(): Boolean {
     val resolver = LocalContext.current.contentResolver
     val lifecycle by LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsState()
     fun enabled() = android.provider.Settings.Global.getFloat(resolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f) > 0f
@@ -151,6 +160,6 @@ fun nativeSkinColorScheme(values: JSONObject, dark: Boolean): ColorScheme {
     val base = Typography()
     val typography = base.copy(displayLarge = base.displayLarge.copy(fontFamily = family), displayMedium = base.displayMedium.copy(fontFamily = family), displaySmall = base.displaySmall.copy(fontFamily = family), headlineLarge = base.headlineLarge.copy(fontFamily = family), headlineMedium = base.headlineMedium.copy(fontFamily = family), headlineSmall = base.headlineSmall.copy(fontFamily = family), bodyLarge = base.bodyLarge.copy(fontFamily = family, fontWeight = weight, letterSpacing = spacing, fontSize = 16.sp, lineHeight = 23.sp), bodyMedium = base.bodyMedium.copy(fontFamily = family, fontWeight = weight, letterSpacing = spacing, fontSize = 15.sp, lineHeight = 22.sp), bodySmall = base.bodySmall.copy(fontFamily = family, letterSpacing = spacing), titleLarge = base.titleLarge.copy(fontFamily = family), titleMedium = base.titleMedium.copy(fontFamily = family), titleSmall = base.titleSmall.copy(fontFamily = family), labelLarge = base.labelLarge.copy(fontFamily = family), labelMedium = base.labelMedium.copy(fontFamily = family), labelSmall = base.labelSmall.copy(fontFamily = family))
     MaterialTheme(colorScheme = scheme, typography = typography, shapes = Shapes(small = androidx.compose.foundation.shape.RoundedCornerShape(10.dp), medium = androidx.compose.foundation.shape.RoundedCornerShape(16.dp), large = androidx.compose.foundation.shape.RoundedCornerShape(24.dp), extraLarge = androidx.compose.foundation.shape.RoundedCornerShape(28.dp))) {
-        CompositionLocalProvider(LocalContentColor provides scheme.onBackground, content = content)
+        CompositionLocalProvider(LocalContentColor provides scheme.onBackground) { NativeMotionProvider(content) }
     }
 }

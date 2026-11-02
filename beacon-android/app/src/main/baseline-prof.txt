@@ -1,0 +1,73 @@
+# Beacon's own startup profile, written by hand (no device generation): the code a cold start runs from process start to a usable chat,
+# and the settings home. H = hot (compiled ahead of time), S = runs at startup, P = runs just after. Libraries ship their own profiles,
+# which the build merges in. `*` matches inside one package segment, `**` across segments; the build expands them against the app's code.
+# Check with: python .unlazy/perf-1124-20261102/tools/check-profile.py (after assembleStable).
+
+# Process start: application, activity, the one ViewModel
+HSPLdev/hermes/android/BeaconApplication*;->**(**)**
+HSPLdev/hermes/android/BeaconActivity*;->**(**)**
+HSPLdev/hermes/android/ComposableSingletons$BeaconActivityKt*;->**(**)**
+HSPLdev/hermes/android/BeaconViewModel*;->**(**)**
+HSPLdev/hermes/android/NativePhoneSettings*;->**(**)**
+HSPLdev/hermes/android/core/**;->**(**)**
+
+# Storage, sign-in state and the connection the chat opens on
+HSPLdev/hermes/android/data/AppCipher*;->**(**)**
+HSPLdev/hermes/android/data/AppPreferences*;->**(**)**
+HSPLdev/hermes/android/data/AuthStore*;->**(**)**
+HSPLdev/hermes/android/data/ScopedCookies*;->**(**)**
+HSPLdev/hermes/android/data/CredentialEpoch*;->**(**)**
+HSPLdev/hermes/android/data/Projection*;->**(**)**
+HSPLdev/hermes/android/data/ScreenCache*;->**(**)**
+HSPLdev/hermes/android/data/SessionRestore*;->**(**)**
+HSPLdev/hermes/android/data/StartupPreload*;->**(**)**
+HSPLdev/hermes/android/data/DraftRetention*;->**(**)**
+HSPLdev/hermes/android/data/EditorDraft*;->**(**)**
+HSPLdev/hermes/android/data/BeaconClient*;->**(**)**
+HSPLdev/hermes/android/data/NativeGateway*;->**(**)**
+HSPLdev/hermes/android/data/NativeOperation*;->**(**)**
+HSPLdev/hermes/android/data/NativeAuth*;->**(**)**
+HSPLdev/hermes/android/data/NativePairing*;->**(**)**
+HSPLdev/hermes/android/data/NativeErrors*;->**(**)**
+
+# The chat screen and what it draws
+HSPLdev/hermes/android/ui/ChatScreen*;->**(**)**
+HSPLdev/hermes/android/ui/ComposableSingletons$ChatScreenKt*;->**(**)**
+HSPLdev/hermes/android/ui/Components*;->**(**)**
+HSPLdev/hermes/android/ui/ComposableSingletons$ComponentsKt*;->**(**)**
+HSPLdev/hermes/android/ui/SidebarNavigation*;->**(**)**
+HSPLdev/hermes/android/ui/ConversationMenu*;->**(**)**
+HSPLdev/hermes/android/ui/ConversationPosition*;->**(**)**
+HSPLdev/hermes/android/ui/NativeTheme*;->**(**)**
+HSPLdev/hermes/android/ui/NativeWindow*;->**(**)**
+HSPLdev/hermes/android/ui/NativeMarkdown*;->**(**)**
+HSPLdev/hermes/android/ui/NativeExperience*;->**(**)**
+HSPLdev/hermes/android/ui/NativeCatalog*;->**(**)**
+HSPLdev/hermes/android/ui/BeaconPresenceCard*;->**(**)**
+HSPLdev/hermes/android/ui/BeaconSignal*;->**(**)**
+HSPLdev/hermes/android/ui/DustCore*;->**(**)**
+HSPLdev/hermes/android/ui/VoicePresence*;->**(**)**
+HSPLdev/hermes/android/ui/UsabilityPresentation*;->**(**)**
+HSPLdev/hermes/android/ui/RichContent*;->**(**)**
+
+# Settings home and the screens one tap from it
+HPLdev/hermes/android/ui/MoreScreen*;->**(**)**
+HPLdev/hermes/android/ui/ComposableSingletons$MoreScreenKt*;->**(**)**
+HPLdev/hermes/android/ui/BeaconSettings*;->**(**)**
+HPLdev/hermes/android/ui/ComposableSingletons$BeaconSettingsKt*;->**(**)**
+HPLdev/hermes/android/ui/SettingsKit*;->**(**)**
+HPLdev/hermes/android/ui/SettingsPreferences*;->**(**)**
+HPLdev/hermes/android/ui/SettingsSearch*;->**(**)**
+HPLdev/hermes/android/ui/NativePreferences*;->**(**)**
+HPLdev/hermes/android/ui/NativePhonePreferences*;->**(**)**
+HPLdev/hermes/android/ui/NotificationSettings*;->**(**)**
+
+# Just after start: updates, push, Keep connected, calls readiness
+HPLdev/hermes/android/updates/UpdateManager*;->**(**)**
+HPLdev/hermes/android/updates/GitHubReleases*;->**(**)**
+HPLdev/hermes/android/updates/ApkUpdater*;->**(**)**
+HPLdev/hermes/android/push/PushManager*;->**(**)**
+HPLdev/hermes/android/push/PushRegistrationJob*;->**(**)**
+HPLdev/hermes/android/push/DeliveryLog*;->**(**)**
+HPLdev/hermes/android/push/KeepConnectedService*;->**(**)**
+HPLdev/hermes/android/voice/CallController*;->**(**)**

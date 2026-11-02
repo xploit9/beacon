@@ -16,7 +16,7 @@ class ProviderTranscriptTest {
             .put("content_index",normalized.getInt("content_index")).put("text",normalized.getString("text"))
         return CallTranscript.from(providerTranscript(event,"call","session",100)!!,"session","call")!!
     }
-    @Test fun partialCorrectionsDoNotPoisonTheCommittedFinalOrReemitIt() {
+    @Test fun cumulativeCorrectionsReplaceOneItemAndAnIdenticalSnapshotIsNotShownTwice() {
         val wire=GrokWire()
         fun event(type:String,item:String)=JSONObject().put("type",type).put("item_id",item)
         fun frame(item:String,text:String,status:String)=event("conversation.item.input_audio_transcription.completed",item)
@@ -24,11 +24,10 @@ class ProviderTranscriptTest {
         wire.inbound(event("input_audio_buffer.speech_started","one"))
         val first=wire.inbound(frame("one","yes","in_progress"))!!.getJSONObject("serverContent").getJSONObject("inputTranscription")
         val correction=wire.inbound(frame("one","yes please","in_progress"))!!.getJSONObject("serverContent").getJSONObject("inputTranscription")
-        assertFalse(first.getBoolean("final"));assertFalse(correction.getBoolean("final"));assertEquals("yes please",correction.getString("text"))
-        wire.inbound(event("input_audio_buffer.committed","one"))
-        assertTrue(wire.inbound(frame("one","yes please","completed"))!!.getJSONObject("serverContent").getJSONObject("inputTranscription").getBoolean("final"))
+        assertEquals("yes",first.getString("text"));assertEquals("yes please",correction.getString("text"))
+        assertEquals("One item keeps one identity",first.getString("item_id"),correction.getString("item_id"))
         assertNull(wire.inbound(frame("one","yes please","completed")))
-        wire.inbound(event("input_audio_buffer.speech_started","two"));wire.inbound(event("input_audio_buffer.committed","two"))
+        wire.inbound(event("input_audio_buffer.speech_started","two"))
         assertNotNull(wire.inbound(frame("two","yes please","completed")))
     }
     @Test fun replayAndCumulativeCorrectionsReplaceOneItem() {

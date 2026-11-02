@@ -1,32 +1,31 @@
-# Voice calls: your Hermes agent
+# Voice calls: tools and memory
 
-Voice requests go to the same Hermes conversation as text chat. Hermes uses that conversation's configured model, profile, instructions, memory, tools and approvals. Your chosen realtime provider handles speech.
+A call talks to your own Hermes profile. The voice model answers you itself, straight away, and uses what that profile has, following the same rules. Each tool it runs shows in the call, and the whole call appears in the chat as one call card.
 
-Call setup reads only the profile metadata needed for the greeting and admission. It skips external secret-provider resolution and reuses the profile's already bound clock. The native Hermes agent still resolves its own credentials when work needs them. An ordinary call's grant response also carries the opening `greeting` (same rules as the context endpoint, absent for callbacks and whenever it cannot be built quickly); the context endpoint stays authoritative. Connection becomes ready after the scoped context and speech provider confirm setup; network/provider latency and safe cleanup of an earlier call can still delay it.
+## Tools
 
-## Tools and memory
+- The assistant can use the tools your profile has: connected servers, files, web search and skills.
+- Looking something up runs at once. Anything that changes something asks you on the phone first, unless your chat or profile approvals say otherwise. Hermes' own tools ask every time; a connected server's tool can be allowed for the rest of the call. Memory is the exception, as in Hermes (below).
+- A few tools stay out of calls, because they do not fit a call. Longer work goes to Hermes with `hermes_work`.
+  - `clarify` asks in a chat prompt. On a call the assistant asks out loud.
+  - `delegate_task` starts helpers inside a running Hermes agent. `hermes_work` hands the task to a full run instead.
+  - `todo_list` keeps its list inside one running agent turn, so it would be lost when the call ends.
+  - The browser would need your approval for every click. Ask for it through `hermes_work`.
 
-- Ask naturally, as you would in the chat. Hermes chooses the tools and skills enabled in your installation, including its connected MCP servers and their normal discovery workflows.
-- Questions, searches, files, messages and memory requests all use the attached Hermes agent. Changing the profile's setup changes what that agent can do; no customer-specific voice configuration or training is needed.
-- Hermes owns memory recall and saving, including any configured memory provider. Its normal retention rules apply to native conversation turns.
-- Approvals and clarification use the attached Hermes conversation. Open the chat when an answer or approval is needed. Voice never approves an action for you.
-- A queued request is still pending. Beacon speaks the verified Hermes result when it arrives and keeps the conversation attached to its original profile.
+## Memory during a call
 
-## Call controls
+- The call starts with your profile's saved notes, the latest messages of this chat and earlier voice dialogue, all read before you tap so the call connects at once. If your notes in Hermes say your name, the assistant uses it, unless you set a name in Beacon.
+- "Remember that..." uses Hermes' own memory tool, with your Hermes limits and rules. Like in a Hermes chat, saving a memory doesn't ask on the phone.
+- If your profile uses a memory provider, its tools are available too, without asking, and a note you save is also passed to the provider, as in a chat.
+- Looking something up in memory (`hermes_memory`) stays quick and never changes anything. When you first speak, your memory provider starts looking in the background, so the lookup is often ready.
+- The assistant can look back at your earlier chats in this profile, the same ones your History shows.
 
-Interrupting speech stops playback and leaves submitted Hermes work running. To cancel that work, open the attached conversation and use Stop. Callback requests require a verified Beacon job link; Hermes servers that return only a native admission receipt currently cannot register these callbacks. Camera and screen sharing remain opt-in; a current visual claim requires a fresh frame that was actually sent.
+## During and after a call
 
-Provider keys stay encrypted on the phone. Microphone audio and text read aloud travel directly to the selected voice provider. Hermes receives native text requests and authorized shared camera or screen images. Native replies read aloud can contain private information, so choose a voice provider you trust.
-
-Beacon preserves the recognized request text. Its speech checks allow capitalization differences and a numeric addition written as `+` or spoken as “plus”; they do not rewrite the request. Changed words, values and literal identifiers remain unconfirmed. Unverified speech is withheld and reported, rather than automatically repeated.
-
-Speech is generated in isolation from the native reply or a fixed call prompt. With Gemini, the selected Live model listens; spoken replies use `gemini-3.8-flash-lite-tts` with the same phone-held key and selected voice. This dedicated [read-aloud API](https://ai.google.dev/gemini-api/docs/speech-generation) receives the original text separately from speaking style. Only completed, bounded raw audio is played. It does not return an independent recognized transcript; playback relies on its synthesis contract. Provider vocal tags and pronunciation can affect the audio. Grok and OpenAI supplied transcripts remain checked before playback. Captions retain the native text and appear after playback is acknowledged.
-
-Where a provider supplies a speech transcript, comparisons accept apostrophe and prose-quote typography and omit Markdown emphasis markers. Literal code, operators and measurement marks remain checked; the saved native reply is unchanged.
-
-An interrupted speech connection or a temporary service failure can retry one unplayed speech render. This repeats only the voice provider readout and never resubmits the Hermes request. Partial audio from the failed attempt is discarded; mismatched supplied transcripts, certificate failures, malformed responses and policy rejections remain blocked.
-
-Speech failures record a fixed diagnostic category, provider, attempt, timing and bounded transport codes. These receipts contain no reply text, names, text hashes, provider messages, keys or audio. On hangup, queued speech failures can drain after text within the existing shared teardown budget. A failed diagnostic upload does not make saved words incomplete. Physical-phone behavior still needs checking on the installed build; emulator speech and connection timings are separate measurements.
+- Replies in the chat you are calling from are not sent as notifications while the call is on; you hear and see them in the call.
+- The finished exchanges are given to your memory provider like chat turns, once per call and never twice. A reply you interrupted or that never finished is left out. No audio is kept.
+- Nothing is passed on when the call failed, when your profile has no memory provider, or when you turned off Hermes' memory tools for the API platform.
+- A call the phone never ended (for example the app was closed by force) is passed on a few minutes later, once Beacon closes it.
 
 ## Saving and ending a call
 
@@ -36,4 +35,4 @@ Beacon keeps text transcripts and call metadata, with no retained call audio. Te
 
 Ending a call stops local capture and playback first. Beacon then finalizes the text and confirms the PC-side close receipt, including reading back a close whose response was lost. If text or cleanup really remains unconfirmed, the app reports that limit.
 
-Older released clients keep their supported quick-lookup API behavior while they update. Current voice calls leave tool selection and memory processing to the native Hermes agent.
+Older released clients keep their supported quick-lookup API behavior while they update.

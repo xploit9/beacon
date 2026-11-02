@@ -1656,6 +1656,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         } catch (e: Throwable) { fail(e); return@launch }
         if (generation != originGeneration) return@launch
         (current?.scope ?: cached)?.let { forgetScreens(it) }
+        // Pictures and files shown for this account stay in memory only while it is signed in.
+        dev.hermes.android.ui.MediaCache.clear()
         val pushRevocations = runCatching { current?.let { app.push.prepareOwnerRevocation(it.scope) }.orEmpty() }
             .getOrElse {
                 notice("Signed out on this phone. Push notification cleanup could not be confirmed: ${appErrorText(it)}")

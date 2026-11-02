@@ -117,8 +117,8 @@ class AssistantVoiceSettingsUiTest {
             compose.onNodeWithTag("voice-option-personality-balanced").performScrollTo().assertTextContains("Everyday")
             compose.onNodeWithTag("voice-option-personality-concise").assertTextContains("Short answers")
             compose.onNodeWithTag("voice-option-personality-warm").assertTextContains("Friendly")
-            // The 1.1.21 disclosure stays as one value row.
-            compose.onNodeWithTag("voice-spoken-replies").performScrollTo().assertTextContains("Spoken replies").assertTextContains("Gemini 3.8 Flash Lite TTS")
+            // The chosen Live model speaks the replies itself: no separate speech model is shown.
+            compose.onAllNodesWithTag("voice-spoken-replies").assertCountEquals(0)
             compose.onAllNodesWithText("The selected Live model listens", substring = true).assertCountEquals(0)
             compose.onAllNodesWithText("Provider for one-tap calls", substring = true).assertCountEquals(0)
         } finally {

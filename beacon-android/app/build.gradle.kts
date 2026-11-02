@@ -37,8 +37,8 @@ android {
         applicationId = "dev.hermes.android"
         minSdk = 29
         targetSdk = 36
-        versionCode = 133
-        versionName = "1.1.23"
+        versionCode = 134
+        versionName = "1.1.24"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "DEFAULT_ORIGIN", quoted(owner.getProperty("native.origin", "")))
         buildConfigField("String", "FIREBASE_APP_ID", quoted(owner.getProperty("firebase.appId", "")))
@@ -76,6 +76,8 @@ android {
         }
         release {
             isMinifyEnabled = true
+            // The app looks no resource up by name (StartupBuildTest keeps it so), and its own resources are all named in code or XML.
+            isShrinkResources = true
             if (signing.isNotEmpty()) signingConfig = signingConfigs.getByName("owner")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
@@ -96,6 +98,8 @@ android {
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2025.10.01"))
     implementation("androidx.core:core-ktx:1.17.0")
+    // Installs src/main/baseline-prof.txt on first run; it was only a transitive dependency before.
+    implementation("androidx.profileinstaller:profileinstaller:1.4.1")
     implementation("androidx.activity:activity-compose:1.11.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.9.4")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.9.4")

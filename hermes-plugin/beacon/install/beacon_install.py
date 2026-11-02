@@ -402,6 +402,14 @@ def _detached(command: list[str], home: Path, *, cwd: str | None = None,
     return subprocess.Popen(command, **options)
 
 
+def _service_command(argv: list[str], capture: bool = False, timeout: int = 60) -> int:
+    """The return code of a scheduler or service command; one that hangs counts as failed after its timeout."""
+    try:
+        return subprocess.run(argv, capture_output=capture, check=False, timeout=timeout).returncode
+    except subprocess.TimeoutExpired:
+        return 1
+
+
 def _restart_dashboard(hermes: str, home: Path, profile: str, port: int, public_url: str | None) -> None:
     """Restart the way this dashboard is run: its scheduled task or systemd unit, else a detached relaunch."""
     previous_pids = _dashboard_pids(hermes, home, profile, port)
@@ -409,9 +417,9 @@ def _restart_dashboard(hermes: str, home: Path, profile: str, port: int, public_
     unit = None if task else _systemd_dashboard_unit(home,profile,port,previous_pids)
     process = None
     if task:
-        subprocess.run(["schtasks", "/end", "/tn", task], capture_output=True, check=False)
+        _service_command(["schtasks", "/end", "/tn", task], capture=True)
         _run_mutation(hermes, home, profile, "dashboard", "--stop")
-        started = not subprocess.run(["schtasks", "/run", "/tn", task], capture_output=True, check=False).returncode
+        started = not _service_command(["schtasks", "/run", "/tn", task], capture=True)
         # Custom tasks vary (some are supervisor scripts that can hang or exit 1), so a task that
         # doesn't bring Beacon back falls through to the detached relaunch below.
         if started and _wait_for_beacon_route(port, public_url, None, 45, profile=profile,
@@ -421,7 +429,7 @@ def _restart_dashboard(hermes: str, home: Path, profile: str, port: int, public_
             return
         _line(False, f"The scheduled task {task!r} did not bring the dashboard back; starting it in the background")
     if unit:
-        if subprocess.run(["systemctl", "--user", "restart", unit], check=False).returncode:
+        if _service_command(["systemctl", "--user", "restart", unit]):
             raise InstallError(f"systemctl could not restart {unit}.")
         _line(True, f"Restarted the {unit} service")
     else:

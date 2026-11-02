@@ -158,8 +158,9 @@ def _observe(cfg, owner, profile):
 
 
 async def _snapshot(cfg, owner, profile):
-    value = await asyncio.to_thread(_observe, cfg, owner, profile)
-    return {**value, 'calls': await _calls(cfg, owner, profile)}
+    # The file/database reads and the timed profile read do not depend on each other, so they run together.
+    value, calls = await asyncio.gather(asyncio.to_thread(_observe, cfg, owner, profile), _calls(cfg, owner, profile))
+    return {**value, 'calls': calls}
 
 
 def build_router(identity):

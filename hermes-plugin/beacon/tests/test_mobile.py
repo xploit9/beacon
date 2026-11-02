@@ -43,11 +43,14 @@ def harness(tmp_path,monkeypatch):
         return await call_next(request)
     app.include_router(api.router,prefix='/api/plugins/beacon')
     client=TestClient(app);client.headers['x-fixture-owner']='owner'
+    api.voice_context.TOOLS_READY.clear();api.voice_context.TOOLS_WARMING.clear()
     yield api,client,cfg,tmp_path,app
     # Background warm-ups and hand-overs finish before the fakes they use are undone; one still running then would import real Hermes.
-    one_shot={'beacon-voice-hint','beacon-catalog-warm','beacon-call-hand-over','beacon-call-recall','beacon-call-memory-release','beacon-call-memory-mirror','beacon-memory-recall'}
+    one_shot={'beacon-voice-hint','beacon-voice-tools','beacon-catalog-warm','beacon-call-hand-over','beacon-call-recall','beacon-call-memory-release','beacon-call-memory-mirror','beacon-memory-recall'}
     for thread in threading.enumerate():
         if thread.name in one_shot: thread.join(10)
+    # A tool list one test's warm-up built must not reach the next test's call brief.
+    api.voice_context.TOOLS_READY.clear();api.voice_context.TOOLS_WARMING.clear()
 
 def reserve(client):
     provider=client.get('/api/plugins/beacon/mobile/voice-settings?profile=default').json()['selected_provider']
@@ -717,7 +720,7 @@ def test_native_context_is_read_only_bounded_profile_data(harness,monkeypatch):
 
 def test_native_search_uses_configured_tool_and_clips_untrusted_evidence(harness,monkeypatch):
     api,c,cfg,tmp,app=harness;seen=[]
-    monkeypatch.setattr(api.voice_context,'scoped',lambda profile,fn:fn(tmp))
+    monkeypatch.setattr(api.voice_context,'scoped',lambda profile,fn,**kwargs:fn(tmp))
     def search(query,limit):
         seen.append((query,limit));return json.dumps({'success':True,'data':{'web':[{'title':'Fixture primary','url':'https://example.test/primary','description':'f'*9000},{'title':'Unsafe credentials','url':'https://user:password@example.test/private','description':'omit'},{'title':'Unsafe scheme','url':'file:///private','description':'omit'}]}})
     monkeypatch.setitem(sys.modules,'tools.web_tools',SimpleNamespace(web_search_tool=search))
@@ -729,7 +732,7 @@ def test_native_search_uses_configured_tool_and_clips_untrusted_evidence(harness
 
 def test_callback_context_uses_exact_verified_job_binding(harness,monkeypatch):
     api,c,cfg,tmp,app=harness;cid=reserve(c)
-    monkeypatch.setattr(api.voice_context,'scoped',lambda profile,fn:fn(tmp))
+    monkeypatch.setattr(api.voice_context,'scoped',lambda profile,fn,**kwargs:fn(tmp))
     monkeypatch.setattr(api.voice_context,'personality',lambda root:'fixture personality')
     monkeypatch.setattr(api.voice_context,'builtin_memory',lambda root,cfg:'fixture memory')
     monkeypatch.setattr(api.voice_context,'external_provider',lambda *args:(None,''))
@@ -1094,7 +1097,7 @@ def test_voice_history_truncates_latest_groups_and_text(harness):
 def test_voice_context_includes_prior_dialogue_as_reference(harness,monkeypatch):
     api,c,cfg,tmp,app=harness;old=reserve(c);api.mobile.events(old,'owner',{'events':[{'event_id':'spoken','turn_id':'1','type':'transcript','role':'user','text':'Earlier spoken fixture words','final':True,'at_ms':0}]});c.delete('/api/plugins/beacon/mobile/calls/'+old)
     new=reserve(c)
-    monkeypatch.setattr(api.voice_context,'scoped',lambda profile,fn:fn(tmp))
+    monkeypatch.setattr(api.voice_context,'scoped',lambda profile,fn,**kwargs:fn(tmp))
     monkeypatch.setattr(api.voice_context,'personality',lambda root:'fixture personality')
     monkeypatch.setattr(api.voice_context,'builtin_memory',lambda root,cfg:'fixture memory')
     monkeypatch.setattr(api.voice_context,'external_provider',lambda *args:(None,''))
@@ -1122,11 +1125,13 @@ def test_context_config_shapes_and_greeting_ascii(harness,monkeypatch):
         parsed=api.voice_context.config(tmp)
         assert isinstance(parsed,dict)
         assert api.voice_context.external_provider('owner','basic','default','native-stored',parsed)==(None,'')
-    monkeypatch.setattr(api.voice_context,'scoped',lambda profile,fn:fn(tmp))
+    monkeypatch.setattr(api.voice_context,'scoped',lambda profile,fn,**kwargs:fn(tmp))
     monkeypatch.setattr(api.voice_context,'personality',lambda root:'fixture')
     monkeypatch.setattr(api.voice_context,'builtin_memory',lambda root,cfg:'fixture')
     monkeypatch.setattr(api.voice_context,'history',lambda *args:[])
     monkeypatch.setattr(api.voice_context,'search_status',lambda:{'available':False})
+    # No profile clock: the greeting has no time of day.
+    monkeypatch.setitem(sys.modules,'hermes_time',SimpleNamespace(now=lambda:(_ for _ in ()).throw(RuntimeError('no clock'))))
     result=api.voice_context.context('owner','basic','default','native-stored',cid)
     assert result['greeting']=="I'm here." and result['greeting'].isascii()
     with api.mobile.connect() as conn:
@@ -1205,6 +1210,32 @@ def test_native_completion_is_owned_completed_and_deduplicated(harness,monkeypat
         assert float(conn.execute("SELECT value FROM meta WHERE key LIKE 'completion:%'").fetchone()[0])>0
     monkeypatch.setattr(api.native,'verify',lambda *args:(_ for _ in ()).throw(LookupError('Unowned')))
     with pytest.raises(LookupError): observer.completion(api.mobile,api.native,cfg,'default','foreign-chat','turn2',completed=True)
+    with api.mobile.connect() as conn: assert conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==1
+
+def test_a_reply_in_a_conversation_on_a_live_call_raises_no_alert(harness):
+    api,c,cfg,tmp,app=harness
+    observer=load_private('observers')
+    owner=cfg['owner_id']
+    with api.mobile.LOCK,api.mobile.connect() as conn:
+        conn.execute('INSERT INTO calls(id,owner,profile,conversation,created,closed) VALUES(?,?,?,?,?,0)',('live-call',owner,'default','owned-chat',time.time()))
+    # Spoken and shown in the call: no notification for this conversation while the call is live.
+    observer.completion(api.mobile,api.native,cfg,'default','owned-chat','turn',completed=True)
+    observer.completion(api.mobile,api.native,cfg,'default','owned-chat','turn-failed',failed=True)
+    with api.mobile.connect() as conn: assert conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==0
+    # Another conversation still alerts, and so does this one once the call has ended.
+    observer.completion(api.mobile,api.native,cfg,'default','other-chat','turn',completed=True)
+    with api.mobile.LOCK,api.mobile.connect() as conn: conn.execute("UPDATE calls SET closed=1 WHERE id='live-call'")
+    observer.completion(api.mobile,api.native,cfg,'default','owned-chat','turn-after',completed=True)
+    with api.mobile.connect() as conn:
+        assert sorted(r[0] for r in conn.execute('SELECT conversation FROM notices'))==['other-chat','owned-chat']
+
+def test_a_stale_open_call_does_not_silence_alerts(harness):
+    api,c,cfg,tmp,app=harness
+    observer=load_private('observers')
+    with api.mobile.LOCK,api.mobile.connect() as conn:
+        conn.execute('INSERT INTO calls(id,owner,profile,conversation,created,closed) VALUES(?,?,?,?,?,0)',
+                     ('stuck-call',cfg['owner_id'],'default','owned-chat',time.time()-api.mobile.STALE_CALL_SECONDS-60))
+    observer.completion(api.mobile,api.native,cfg,'default','owned-chat','turn',completed=True)
     with api.mobile.connect() as conn: assert conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==1
 
 def test_session_end_completion_without_turn_id_is_quiet(harness):
@@ -1339,7 +1370,7 @@ def test_voice_skill_reads_are_current_enabled_scoped_and_bounded(harness, monke
     rows = [{'name': 'web-search', 'description': 'Look up public sources', 'enabled': True, 'readiness': 'requirements_met', 'requirements': []},
             {'name': 'disabled', 'description': 'Do not offer', 'enabled': False, 'readiness': 'requirements_met', 'requirements': []}]
     seen = []
-    monkeypatch.setattr(api.voice_context, 'scoped', lambda profile, fn: seen.append(profile) or fn(tmp))
+    monkeypatch.setattr(api.voice_context, 'scoped', lambda profile,fn,**kwargs: seen.append(profile) or fn(tmp))
     monkeypatch.setitem(sys.modules, 'beacon_skills_api', SimpleNamespace(inventory=lambda root: {'items': rows}, document=lambda root, name: {'content': 'Read primary sources', 'revision': 'native-revision'}))
     assert [r['name'] for r in api.voice_context.skills('coder', 'public')['items']] == ['web-search']
     assert 'Read primary sources' in api.voice_context.skills('coder', name='web-search')['summary']
@@ -1353,7 +1384,7 @@ def test_voice_skill_reads_are_current_enabled_scoped_and_bounded(harness, monke
 def test_voice_memory_reports_a_missing_external_provider_as_failed(harness, monkeypatch):
     api, _, _, tmp, _ = harness
     (tmp / 'config.yaml').write_text('memory:\n  provider: mnemosyne-bridge\n', encoding='utf-8')
-    monkeypatch.setattr(api.voice_context, 'scoped', lambda profile, fn: fn(tmp))
+    monkeypatch.setattr(api.voice_context, 'scoped', lambda profile,fn,**kwargs: fn(tmp))
     monkeypatch.setattr(api.voice_context, 'external_provider', lambda *args: (None, 'mnemosyne-bridge'))
     monkeypatch.setattr(api.voice_context, 'builtin_memory', lambda *args: '')
     result = api.voice_context.recall('owner', 'basic', 'default', 'native-stored', 'current question')

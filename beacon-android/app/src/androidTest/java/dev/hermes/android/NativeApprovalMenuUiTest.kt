@@ -363,7 +363,7 @@ class NativeApprovalMenuUiTest {
                 assertTrue(resumes.isNotEmpty())
                 assertTrue(resumes.all { it.getJSONObject("params").let { p -> p.string("session_id") == "chat-b" && p.opt("inline_images") == false && p.opt("omit_messages") == false } })
                 assertTrue(fixture.requests.filter { it.has("params") && it.string("method") != "client.capabilities" }.all { it.getJSONObject("params").string("profile") == scope.profile })
-                assertTrue(fixture.requests.filter { it.has("path") }.all { it.string("profile") == scope.profile })
+                assertEquals("Every read names this profile", emptyList<String>(), fixture.requests.filter { it.has("path") && it.string("profile") != scope.profile }.map { it.string("path") + " profile=" + it.string("profile") })
                 assertTrue(fixture.requests.none { it.string("method") in setOf("prompt.submit", "session.create", "session.history", "session.events.since") })
                 assertTrue(vm.ui.value.error.isBlank())
             }

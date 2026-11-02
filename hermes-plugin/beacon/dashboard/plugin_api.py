@@ -132,6 +132,10 @@ def identity(request,profile=None,owner_only=False,allow_loopback=False):
     _check_device_request(request,owner,provider,profile)
     return owner,provider,profile,{**mobile.settings(profile),'profiles':profiles}
 
+async def identity_async(request,*args,**kwargs):
+    """identity() reads the config and SQLite (and may write); a handler runs it off the event loop so a slow disk never stalls other requests."""
+    return await asyncio.to_thread(identity,request,*args,**kwargs)
+
 def connect_info_url():
     try: return mobile.dashboard_connect_info()
     except ValueError: raise HTTPException(409,'A configured public HTTPS dashboard URL is required to connect a phone.') from None
@@ -166,13 +170,13 @@ async def connect_info(request:Request):
     enforce_request_policy(request)
     loopback=not bool(getattr(request.app.state,'auth_required',False))
     if not loopback: dashboard_identity(request,browser_only=True)
-    identity(request,owner_only=True,allow_loopback=loopback)
+    await identity_async(request,owner_only=True,allow_loopback=loopback)
     url,name=connect_info_url()
     return JSONResponse({'url':url,'name':name},headers={'Cache-Control':'no-store'})
 
 @router.post('/devices/link')
 async def link_device(request:Request):
-    owner,provider,_,cfg=identity(request,owner_only=True,allow_loopback=not bool(getattr(request.app.state,'auth_required',False)))
+    owner,provider,_,cfg=await identity_async(request,owner_only=True,allow_loopback=not bool(getattr(request.app.state,'auth_required',False)))
     value=await body(request,2048)
     if set(value)-{'device_name','device_id'}: raise HTTPException(400,'Invalid device link fields')
     try: result=await asyncio.to_thread(mobile.link_device,owner,provider,value.get('device_name'),value.get('device_id'))
@@ -182,12 +186,12 @@ async def link_device(request:Request):
 
 @router.get('/devices')
 async def devices(request:Request):
-    owner,_,_,cfg=identity(request,owner_only=True,allow_loopback=not bool(getattr(request.app.state,'auth_required',False)))
-    return {'devices':mobile.list_devices(owner),'profiles':cfg['profiles']}
+    owner,_,_,cfg=await identity_async(request,owner_only=True,allow_loopback=not bool(getattr(request.app.state,'auth_required',False)))
+    return {'devices':await asyncio.to_thread(mobile.list_devices,owner),'profiles':cfg['profiles']}
 
 @router.delete('/devices/{device_id}')
 async def remove_device(device_id:str,request:Request):
-    owner,_,_,_=identity(request,owner_only=True,allow_loopback=not bool(getattr(request.app.state,'auth_required',False)))
+    owner,_,_,_=await identity_async(request,owner_only=True,allow_loopback=not bool(getattr(request.app.state,'auth_required',False)))
     if not await asyncio.to_thread(mobile.remove_device,owner,device_id): raise HTTPException(404,'Device not found')
     return {'removed':True,'device_id':device_id}
 
@@ -206,7 +210,7 @@ async def register_assistant_conversation(request:Request):
     value=await body(request,1024)
     if set(value)!={'profile','session_id'} or not isinstance(value.get('profile'),str) or not isinstance(value.get('session_id'),str):
         raise HTTPException(400,'Profile and session_id are required')
-    owner,provider,profile,_=identity(request,value['profile'])
+    owner,provider,profile,_=await identity_async(request,value['profile'])
     try: await feature(native.verify,owner,provider,profile,value['session_id'],timeout=8)
     except HTTPException as exc:
         if exc.status_code==404: raise HTTPException(404,'Owned assistant conversation unavailable') from None
@@ -219,7 +223,7 @@ async def register_assistant_conversation(request:Request):
 @router.get('/mobile/assistant-conversation')
 async def assistant_conversation(request:Request):
     # A phone with no Beacon chat of its own adopts the account's registered one instead of starting another.
-    owner,provider,profile,cfg=identity(request)
+    owner,provider,profile,cfg=await identity_async(request)
     stored=cfg.get('scheduled_callback_conversation_id')
     if not isinstance(stored,str) or not stored: raise HTTPException(404,'No assistant conversation')
     await feature(native.verify,owner,provider,profile,stored,timeout=8,lookup_message='No assistant conversation')
@@ -275,24 +279,26 @@ router.include_router(sys.modules['beacon_gateway_api'].build_router(call,body,v
 
 @router.get('/mobile/bootstrap')
 async def bootstrap(request:Request):
-    owner,provider,profile,cfg=identity(request)
-    selection=voice_models.selected(mobile,owner,profile,cfg)
+    owner,provider,profile,cfg=await identity_async(request)
+    selection=await asyncio.to_thread(voice_models.selected,mobile,owner,profile,cfg)
     return {'contract_version':2,'backend':'hermes-dashboard','owner_id':owner,'profile':profile,
             'voice':{**selection,'available':True,'configured':True,'availability_scope':'plugin_enabled'},
             'capabilities':{'native_jobs':True,'pc_recording':False,'callbacks':cfg.get('callback_tool_enabled') is True and cfg.get('scheduled_callbacks_enabled') is True,'push':bool(cfg.get('firebase_credentials')),'permanent_recording_retention':False}}
 @router.get('/mobile/voice-settings')
 async def voice_settings(request:Request):
-    owner,_,profile,cfg=identity(request)
-    return {'selected_provider':voice_models.selected(mobile,owner,profile,cfg)['provider'],
-            'providers':voice_models.choices(cfg,mobile,owner,profile),'applies_to':'next_call'}
+    owner,_,profile,cfg=await identity_async(request)
+    def read():
+        return {'selected_provider':voice_models.selected(mobile,owner,profile,cfg)['provider'],
+                'providers':voice_models.choices(cfg,mobile,owner,profile),'applies_to':'next_call'}
+    return await asyncio.to_thread(read)
 @router.get('/mobile/history-retention')
 async def history_retention(request:Request):
-    owner,_,_,_=identity(request)
+    owner,_,_,_=await identity_async(request)
     days=await asyncio.to_thread(mobile.history_retention_days,owner)
     return JSONResponse({'history_retention_days':days},headers={'Cache-Control':'no-store'})
 @router.put('/mobile/history-retention')
 async def save_history_retention(request:Request):
-    owner,_,_,_=identity(request)
+    owner,_,_,_=await identity_async(request)
     value=await body(request,1024)
     days=value.get('history_retention_days')
     if set(value)!={'history_retention_days'} or type(days) is not int or days not in mobile.HISTORY_RETENTION_DAYS:
@@ -301,15 +307,17 @@ async def save_history_retention(request:Request):
     return JSONResponse({'history_retention_days':days},headers={'Cache-Control':'no-store'})
 @router.put('/mobile/voice-settings')
 async def save_voice_settings(request:Request):
-    owner,_,profile,cfg=identity(request);value=await body(request,1024)
+    owner,_,profile,cfg=await identity_async(request);value=await body(request,1024)
     if 'provider' not in value or set(value)-{'provider','voice','personality'} or value['provider'] not in voice_models.PROVIDERS:
         raise HTTPException(400,'Choose an available voice model')
     options=safely(voice_models.validate_options,value['provider'],value)
-    current=voice_models.provider_selection(mobile,owner,profile,cfg,value['provider'])
-    options={k:options.get(k,current[k]) for k in ('voice','personality')}
-    with mobile.LOCK,mobile.connect() as conn:
-        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(voice_models.preference_key(owner,profile),value['provider']))
-        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(voice_models.options_key(owner,profile,value['provider']),json.dumps(options)))
+    def save():
+        current=voice_models.provider_selection(mobile,owner,profile,cfg,value['provider'])
+        chosen={k:options.get(k,current[k]) for k in ('voice','personality')}
+        with mobile.LOCK,mobile.connect() as conn:
+            conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(voice_models.preference_key(owner,profile),value['provider']))
+            conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(voice_models.options_key(owner,profile,value['provider']),json.dumps(chosen)))
+    await asyncio.to_thread(save)
     return await voice_settings(request)
 def uses_hermes_backend(row):
     return json.loads(row.get('voice_config') or '{}').get('backend')=='hermes'
@@ -378,21 +386,23 @@ def flush_held_posts(owner,provider,profile):
         mobile.drop_held_post(owner,profile,row['key'])
 @router.post('/mobile/calls')
 async def calls(request:Request):
-    value=await body(request);owner,provider,profile,cfg=identity(request,value.get('profile'))
+    value=await body(request);owner,provider,profile,cfg=await identity_async(request,value.get('profile'))
     _client_key_mode(value)
     requested=value['voice_provider']
     if requested not in voice_models.PROVIDERS: raise HTTPException(400,'Unknown voice model')
-    selection=voice_models.provider_selection(mobile,owner,profile,cfg,requested)
+    selection=await asyncio.to_thread(voice_models.provider_selection,mobile,owner,profile,cfg,requested)
     conversation=value.get('conversation_id')
     if conversation:
         await asyncio.to_thread(reject_unowned_conversation,owner,provider,profile,conversation)
         await asyncio.to_thread(safely,native.reserve_conversation,owner,provider,profile,conversation)
     else:
-        with mobile.connect() as conn:
-            if mobile.active_calls(conn,owner)>=mobile.MAX_ACTIVE_CALLS:
-                raise HTTPException(409,'Active call limit reached')
+        def check_capacity():
+            with mobile.connect() as conn:
+                if mobile.active_calls(conn,owner)>=mobile.MAX_ACTIVE_CALLS:
+                    raise HTTPException(409,'Active call limit reached')
+        await asyncio.to_thread(check_capacity)
         conversation=await asyncio.to_thread(safely,native.create,owner,provider,profile)
-    result=safely(mobile.reserve,owner,profile,conversation,selection)
+    result=await asyncio.to_thread(safely,mobile.reserve,owner,profile,conversation,selection)
     greeting=await grant_greeting(request,profile,value.get('owner_name'))
     if greeting: result['greeting']=greeting
     return result
@@ -407,7 +417,7 @@ async def grant_greeting(request,profile,owner_name):
 async def get_call(call_id:str,request:Request):
     owner,provider,row,cfg=await call(request,call_id)
     await asyncio.to_thread(watch,owner,provider,row['profile'])
-    return call_status(row,owner)
+    return await asyncio.to_thread(call_status,row,owner)
 @router.delete('/mobile/calls/{call_id}')
 async def close_call(call_id:str,request:Request):
     owner,provider,row,cfg=await call(request,call_id)
@@ -415,14 +425,17 @@ async def close_call(call_id:str,request:Request):
     if set(value)-{'failed'} or type(value.get('failed',False)) is not bool:
         raise HTTPException(400,'Invalid call failure flag')
     ended=time.time()
-    with mobile.LOCK,mobile.connect() as conn:
-        row=mobile.owned(conn,call_id,owner)
-        receipt=json.loads(row['receipt'])
-        # A closed call keeps its verdict: a replayed close reports it and never rewrites it.
-        if value.get('failed') and not row['closed']: receipt['failed']=True
-        row['receipt']=json.dumps(receipt)
-        conn.execute('UPDATE calls SET closed=1,ended=COALESCE(ended,?),receipt=? WHERE id=? AND owner=? AND profile=?',
-                     (ended,row['receipt'],call_id,owner,row['profile']))
+    def close():
+        with mobile.LOCK,mobile.connect() as conn:
+            current=mobile.owned(conn,call_id,owner)
+            receipt=json.loads(current['receipt'])
+            # A closed call keeps its verdict: a replayed close reports it and never rewrites it.
+            if value.get('failed') and not current['closed']: receipt['failed']=True
+            current['receipt']=json.dumps(receipt)
+            conn.execute('UPDATE calls SET closed=1,ended=COALESCE(ended,?),receipt=? WHERE id=? AND owner=? AND profile=?',
+                         (ended,current['receipt'],call_id,owner,current['profile']))
+        return current
+    row=await asyncio.to_thread(close)
     await asyncio.to_thread(watch,owner,provider,row['profile'])
     row['closed']=1;row['ended']=row['ended'] or ended
     clear_lookup_counts(call_id)
@@ -459,32 +472,37 @@ async def jobs(call_id:str,request:Request):
     if not isinstance(title,str) or len(title)>120: raise HTTPException(400,'Invalid title')
     try: await asyncio.to_thread(watch,owner,provider,row['profile'])
     except Exception: pass  # The accepted native turn still needs its own watch.
-    with mobile.LOCK,mobile.connect() as conn:
-        current=safely(mobile.owned,conn,call_id,owner,row['profile'],True)
-        if uses_hermes_backend(current) and value['stored_session_id']!=current['conversation']:
-            raise HTTPException(409,'Native job belongs to another conversation')
-        existing=conn.execute('SELECT * FROM jobs WHERE owner=? AND profile=? AND request=?',(owner,row['profile'],value['request_id'])).fetchone()
-        if existing:
-            if existing['runtime']!=value['runtime_session_id'] or existing['stored']!=value['stored_session_id'] or existing['call_id']!=call_id or existing['seq']!=user_row_id: raise HTTPException(409,'Conflicting job registration')
-            return job_status(dict(existing))
-        if conn.execute("SELECT COUNT(*) FROM jobs WHERE owner=? AND profile=? AND epoch=? AND status IN ('watching','needs_input')",(owner,row['profile'],epoch)).fetchone()[0]>=512: raise HTTPException(409,'Native watch capacity reached')
-        if conn.execute('SELECT COUNT(*) FROM jobs WHERE call_id=?',(call_id,)).fetchone()[0]>=64: raise HTTPException(409,'Job linkage capacity reached')
-        if conn.execute('SELECT 1 FROM jobs WHERE owner=? AND profile=? AND stored=? AND seq=?',(owner,row['profile'],value['stored_session_id'],user_row_id)).fetchone(): raise HTTPException(409,'Native user row already linked')
-        conn.execute('INSERT INTO jobs(id,call_id,owner,profile,stored,runtime,request,title,callback,epoch,seq,status,history_updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
-            (jid,call_id,owner,row['profile'],value['stored_session_id'],value['runtime_session_id'],value['request_id'],title,int(value.get('callback') is True),epoch,user_row_id,'watching',time.time()))
-    return {'job_id':jid,'status':'working','user_row_id':user_row_id,'request_id':value['request_id'],'stored_session_id':value['stored_session_id'],'runtime_session_id':value['runtime_session_id']}
+    def register():
+        with mobile.LOCK,mobile.connect() as conn:
+            current=safely(mobile.owned,conn,call_id,owner,row['profile'],True)
+            if uses_hermes_backend(current) and value['stored_session_id']!=current['conversation']:
+                raise HTTPException(409,'Native job belongs to another conversation')
+            existing=conn.execute('SELECT * FROM jobs WHERE owner=? AND profile=? AND request=?',(owner,row['profile'],value['request_id'])).fetchone()
+            if existing:
+                if existing['runtime']!=value['runtime_session_id'] or existing['stored']!=value['stored_session_id'] or existing['call_id']!=call_id or existing['seq']!=user_row_id: raise HTTPException(409,'Conflicting job registration')
+                return job_status(dict(existing))
+            if conn.execute("SELECT COUNT(*) FROM jobs WHERE owner=? AND profile=? AND epoch=? AND status IN ('watching','needs_input')",(owner,row['profile'],epoch)).fetchone()[0]>=512: raise HTTPException(409,'Native watch capacity reached')
+            if conn.execute('SELECT COUNT(*) FROM jobs WHERE call_id=?',(call_id,)).fetchone()[0]>=64: raise HTTPException(409,'Job linkage capacity reached')
+            if conn.execute('SELECT 1 FROM jobs WHERE owner=? AND profile=? AND stored=? AND seq=?',(owner,row['profile'],value['stored_session_id'],user_row_id)).fetchone(): raise HTTPException(409,'Native user row already linked')
+            conn.execute('INSERT INTO jobs(id,call_id,owner,profile,stored,runtime,request,title,callback,epoch,seq,status,history_updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                (jid,call_id,owner,row['profile'],value['stored_session_id'],value['runtime_session_id'],value['request_id'],title,int(value.get('callback') is True),epoch,user_row_id,'watching',time.time()))
+        return {'job_id':jid,'status':'working','user_row_id':user_row_id,'request_id':value['request_id'],'stored_session_id':value['stored_session_id'],'runtime_session_id':value['runtime_session_id']}
+    return await asyncio.to_thread(register)
 @router.post('/mobile/calls/{call_id}/callback')
 async def callback(call_id:str,request:Request):
     value=await body(request,1024);owner,provider,row,_=await call(request,call_id)
     if value.get('scope','latest') not in ('latest','all'): raise HTTPException(400,'Invalid callback scope')
-    with mobile.LOCK,mobile.connect() as conn:
-        conn.execute('BEGIN IMMEDIATE')
-        safely(mobile.owned,conn,call_id,owner,row['profile'],True)
-        rows=conn.execute('SELECT * FROM jobs WHERE call_id=? AND owner=? ORDER BY rowid DESC',(call_id,owner)).fetchall()
-        if value.get('job_id'): rows=[r for r in rows if r['id']==value['job_id']]
-        elif value.get('scope','latest')=='latest': rows=rows[:1]
-        if not rows: raise HTTPException(404,'Owned native job unavailable')
-        for r in rows: conn.execute('UPDATE jobs SET callback=1,history_updated=? WHERE id=?',(time.time(),r['id']))
+    def subscribe():
+        with mobile.LOCK,mobile.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            safely(mobile.owned,conn,call_id,owner,row['profile'],True)
+            found=conn.execute('SELECT * FROM jobs WHERE call_id=? AND owner=? ORDER BY rowid DESC',(call_id,owner)).fetchall()
+            if value.get('job_id'): found=[r for r in found if r['id']==value['job_id']]
+            elif value.get('scope','latest')=='latest': found=found[:1]
+            if not found: raise HTTPException(404,'Owned native job unavailable')
+            for r in found: conn.execute('UPDATE jobs SET callback=1,history_updated=? WHERE id=?',(time.time(),r['id']))
+        return found
+    rows=await asyncio.to_thread(subscribe)
     await asyncio.to_thread(watch,owner,provider,row['profile'])
     return {'subscribed':True,'job_ids':[r['id'] for r in rows]}
 _UNCONFIRMED_JOB_ERROR='Native Hermes turn outcome is unconfirmed; review the native session before retrying.'
@@ -523,14 +541,15 @@ def unconfirm_job(job_id):
 def watch_pending(job_id,pending,uncertain):
     marker=_PENDING_JOB_ERROR if uncertain and not pending else ''
     with mobile.LOCK,mobile.connect() as conn:
+        # The watch pass prunes notices once, not once per waiting job.
         conn.execute("UPDATE jobs SET status=?,error=CASE WHEN ?<>'' THEN ? WHEN error=? THEN '' ELSE error END,history_updated=? WHERE id=? AND status IN ('watching','needs_input')",('needs_input' if pending else 'watching',marker,marker,_PENDING_JOB_ERROR,time.time(),job_id))
-        mobile.prune_notices(conn)
 
 def watch(owner,provider,profile):
     try: activity.sync(mobile,native,owner,provider,profile)
     except (ImportError,AttributeError,RuntimeError): pass  # Native runtime or store unavailable: never invent or settle activity.
     epoch=native_replay_epoch()
     with mobile.connect() as conn: rows=[dict(r) for r in conn.execute("SELECT * FROM jobs WHERE owner=? AND profile=? AND ((epoch=? AND status IN ('watching','needs_input')) OR (status='completed' AND callback=1)) ORDER BY rowid LIMIT 512",(owner,profile,epoch))]
+    settled=[]
     for job in rows:
         if job['status'] in ('watching','needs_input'):
             stage='binding'
@@ -604,23 +623,28 @@ def watch(owner,provider,profile):
             except Exception:
                 watch_pending(job['id'],False,True)
                 continue
+        settled.append(job)
+    if settled:
+        # One connection, one prune and one read of the settled jobs for the whole pass (not one of each per job).
         with mobile.LOCK,mobile.connect() as conn:
-            current=conn.execute('SELECT * FROM jobs WHERE id=?',(job['id'],)).fetchone()
-            ended=conn.execute('SELECT closed FROM calls WHERE id=?',(job['call_id'],)).fetchone()
             mobile.prune_notices(conn)
             active=mobile.active_calls(conn,owner)
-            capacity=conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]<10000
-            if current['status']=='completed' and current['callback'] and ended and ended[0] and not active and capacity:
-                nid=uuid.uuid4().hex
-                conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,job_id,reason) VALUES(?,?,?,?,?,?,?,?,?)',(nid,owner,profile,'incoming_call',job['stored'],time.time(),time.time()+120,job['id'],job['title']))
-                conn.execute("UPDATE jobs SET status='callback_pending',history_updated=? WHERE id=?",(time.time(),job['id']))
+            count=conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]
+            fresh={r['id']:r for r in conn.execute('SELECT j.id,j.status,j.callback,c.closed AS call_closed FROM jobs j LEFT JOIN calls c ON c.id=j.call_id WHERE j.id IN (%s)'%','.join('?'*len(settled)),[j['id'] for j in settled])}
+            for job in settled:
+                current=fresh.get(job['id'])
+                if current and current['status']=='completed' and current['callback'] and current['call_closed'] and not active and count<10000:
+                    nid=uuid.uuid4().hex
+                    conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,job_id,reason) VALUES(?,?,?,?,?,?,?,?,?)',(nid,owner,profile,'incoming_call',job['stored'],time.time(),time.time()+120,job['id'],job['title']))
+                    conn.execute("UPDATE jobs SET status='callback_pending',history_updated=? WHERE id=?",(time.time(),job['id']))
+                    count+=1
     activate(owner,profile)
 def task_clock(profile):
     now=proactive.profile_now(profile)
     return getattr(now.tzinfo,'key',None) or now.tzname()
 @router.get('/mobile/tasks/capabilities')
 async def task_capabilities(request:Request):
-    owner,provider,profile,cfg=identity(request)
+    owner,provider,profile,cfg=await identity_async(request)
     zone=await feature(task_clock,profile,timeout=8)
     ready=cfg.get('scheduled_callbacks_enabled') is True and bool(cfg.get('scheduled_callback_conversation_id')) and bool(zone)
     try: callbacks=await feature(sys.modules['beacon_callbacks'].reasons,mobile,owner,provider,profile,timeout=8)
@@ -630,7 +654,7 @@ async def task_capabilities(request:Request):
 async def create_checkups(request:Request):
     value=await body(request,1024)
     if value: raise HTTPException(400,'Check-up cadence is fixed to 3–4 daily opportunities in the profile local 10:00–22:00 window')
-    owner,provider,profile,cfg=identity(request)
+    owner,provider,profile,cfg=await identity_async(request)
     if cfg.get('scheduled_callbacks_enabled') is not True: raise HTTPException(409,'Scheduled callbacks are disabled on the host')
     stored=cfg.get('scheduled_callback_conversation_id')
     await feature(native.verify,owner,provider,profile,stored,timeout=8)
@@ -672,9 +696,11 @@ def _install_checkup_task(profile):
     return {'job':_create_cron_job_sync(CronJobCreate(name=name,schedule='every 1m',prompt='Owner-requested check-ups: 3–4 random opportunities in the profile local 10:00–22:00 window; missed/busy opportunities skipped.',deliver='local',script='beacon-checkups.py',no_agent=True),profile),'existing':False}
 @router.get('/mobile/notifications/targets')
 async def targets(request:Request):
-    owner,_,profile,_=identity(request)
-    with mobile.connect() as conn: rows=[dict(r) for r in conn.execute('SELECT id,profile,expires FROM targets WHERE owner=? AND profile=? AND '+mobile.ACTIVE_TARGET,(owner,profile))]
-    return {'targets':[{**r,'target_id':r['id'],'kind':'fcm','revoked':r['expires']<=time.time(),**mobile.refs(owner,profile)} for r in rows]}
+    owner,_,profile,_=await identity_async(request)
+    def read():
+        with mobile.connect() as conn: rows=[dict(r) for r in conn.execute('SELECT id,profile,expires FROM targets WHERE owner=? AND profile=? AND '+mobile.ACTIVE_TARGET,(owner,profile))]
+        return {'targets':[{**r,'target_id':r['id'],'kind':'fcm','revoked':r['expires']<=time.time(),**mobile.refs(owner,profile)} for r in rows]}
+    return await asyncio.to_thread(read)
 def firebase_sender_configured(cfg):
     credentials=cfg.get('firebase_credentials')
     if isinstance(credentials,dict): configured=credentials.get('type')=='service_account' and all(credentials.get(key) for key in ('project_id','client_email','private_key'))
@@ -688,29 +714,34 @@ def firebase_sender_configured(cfg):
 
 @router.get('/mobile/notifications/status')
 async def notification_status(request:Request):
-    owner,_,profile,cfg=identity(request)
+    owner,_,profile,cfg=await identity_async(request)
     result=await targets(request)
-    with mobile.connect() as conn:
-        pending=conn.execute("SELECT COUNT(*) FROM notices WHERE owner=? AND profile=? AND push='pending' AND state='pending' AND expires>?",(owner,profile,time.time())).fetchone()[0]
-        accepted=conn.execute("SELECT COUNT(*) FROM notices WHERE owner=? AND profile=? AND push='sent'",(owner,profile)).fetchone()[0]
-        failed=conn.execute("SELECT COUNT(*) FROM notice_deliveries d JOIN notices n ON n.id=d.event WHERE n.owner=? AND n.profile=? AND n.state='pending' AND n.expires>? AND d.accepted=0 AND d.last_error!=''",(owner,profile,time.time())).fetchone()[0]
+    def counts():
+        with mobile.connect() as conn:
+            pending=conn.execute("SELECT COUNT(*) FROM notices WHERE owner=? AND profile=? AND push='pending' AND state='pending' AND expires>?",(owner,profile,time.time())).fetchone()[0]
+            accepted=conn.execute("SELECT COUNT(*) FROM notices WHERE owner=? AND profile=? AND push='sent'",(owner,profile)).fetchone()[0]
+            failed=conn.execute("SELECT COUNT(*) FROM notice_deliveries d JOIN notices n ON n.id=d.event WHERE n.owner=? AND n.profile=? AND n.state='pending' AND n.expires>? AND d.accepted=0 AND d.last_error!=''",(owner,profile,time.time())).fetchone()[0]
+        return pending,accepted,failed
+    pending,accepted,failed=await asyncio.to_thread(counts)
     return {**result,'android_configured':firebase_sender_configured(cfg),'delivery':{'pending':pending,'sender_accepted':accepted,'device_delivery_confirmed':False,'last_error':'Some device deliveries need a retry.' if failed else ''},'producers':{'calls':True,'approvals':True,'messages':True,'tasks':True},'delivery_note':'Sender acceptance is not confirmation of device arrival.'}
 @router.post('/mobile/notifications/test')
 async def notification_test(request:Request):
     value=await body(request,1024)
-    owner,provider,profile,cfg=identity(request)
+    owner,provider,profile,cfg=await identity_async(request)
     if set(value)-{'kind','conversation_id'} or value.get('kind','fcm')!='fcm': raise HTTPException(400,'Only a synthetic FCM test is supported')
-    with mobile.connect() as conn:
-        if not conn.execute('SELECT 1 FROM targets WHERE owner=? AND profile=? AND expires>? AND '+mobile.ACTIVE_TARGET,(owner,profile,time.time())).fetchone(): raise HTTPException(409,'Register this phone before testing')
     # Test has its own opaque reference and never creates a chat/model run or callback.
     event_id=uuid.uuid4().hex
-    with mobile.LOCK,mobile.connect() as conn:
-        if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: raise HTTPException(409,'Notification capacity reached')
-        conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires) VALUES(?,?,?,?,?,?,?)',(event_id,owner,profile,'test','notification-test',time.time(),time.time()+300))
-    return {'event_id':event_id,'status':'queued','device_delivery_confirmed':False,**mobile.refs(owner,profile,'notification-test')}
+    def queue():
+        with mobile.connect() as conn:
+            if not conn.execute('SELECT 1 FROM targets WHERE owner=? AND profile=? AND expires>? AND '+mobile.ACTIVE_TARGET,(owner,profile,time.time())).fetchone(): raise HTTPException(409,'Register this phone before testing')
+        with mobile.LOCK,mobile.connect() as conn:
+            if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: raise HTTPException(409,'Notification capacity reached')
+            conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires) VALUES(?,?,?,?,?,?,?)',(event_id,owner,profile,'test','notification-test',time.time(),time.time()+300))
+        return {'event_id':event_id,'status':'queued','device_delivery_confirmed':False,**mobile.refs(owner,profile,'notification-test')}
+    return await asyncio.to_thread(queue)
 @router.post('/mobile/notifications/targets')
 async def target(request:Request):
-    value=await body(request,8192);owner,provider,profile,_=identity(request,value.get('profile'))
+    value=await body(request,8192);owner,provider,profile,_=await identity_async(request,value.get('profile'))
     device_id=request.headers.get('x-beacon-device-id')
     tok=value.get('token') or value.get('fcm_token')
     package=value.get('package_name',_PRODUCTION_PACKAGE)
@@ -718,34 +749,46 @@ async def target(request:Request):
     tid=value.get('id') or value.get('device_id') or hashlib.sha256((owner+':'+profile+':'+package+':'+str(tok)).encode()).hexdigest()
     safely(mobile.ident,tid)
     if not isinstance(tok,str) or not 20<=len(tok)<=4096 or any(ord(c)<32 for c in tok): raise HTTPException(400,'Invalid FCM target')
-    with mobile.LOCK,mobile.connect() as conn:
-        # Only a linked, active phone of the owner registers push, checked inside the registration lock so a concurrent removal cannot restore its token.
-        try: mobile.touch_device(owner,provider,profile,device_id,False,True)
-        except LookupError as exc: raise HTTPException(403,str(exc)) from None
-        conn.execute('DELETE FROM targets WHERE expires<=?',(time.time(),))
-        if conn.execute('SELECT COUNT(*) FROM targets').fetchone()[0]>=32 and not conn.execute('SELECT 1 FROM targets WHERE id=?',(tid,)).fetchone(): raise HTTPException(409,'Target capacity reached')
-        old=conn.execute('SELECT owner,profile,token FROM targets WHERE id=?',(tid,)).fetchone()
-        if old and (old['owner']!=owner or old['profile']!=profile): raise HTTPException(409,'Target already owned')
-        if old and old['token']!=tok: conn.execute('DELETE FROM notice_deliveries WHERE target=?',(tid,))
-        conn.execute('INSERT INTO targets VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET token=excluded.token,expires=excluded.expires,payload=excluded.payload',(tid,owner,profile,tok,time.time()+30*86400,json.dumps({'package_name':package,'device_id':device_id})))
-    return {'id':tid,'target_id':tid,'registered':True,'target':{'id':tid,'target_id':tid,**mobile.refs(owner,profile)},**mobile.refs(owner,profile)}
+    def register():
+        with mobile.LOCK,mobile.connect() as conn:
+            # Only a linked, active phone of the owner registers push, checked inside the registration lock so a concurrent removal cannot restore its token.
+            try: mobile.touch_device(owner,provider,profile,device_id,False,True)
+            except LookupError as exc: raise HTTPException(403,str(exc)) from None
+            conn.execute('DELETE FROM targets WHERE expires<=?',(time.time(),))
+            if conn.execute('SELECT COUNT(*) FROM targets').fetchone()[0]>=32 and not conn.execute('SELECT 1 FROM targets WHERE id=?',(tid,)).fetchone(): raise HTTPException(409,'Target capacity reached')
+            old=conn.execute('SELECT owner,profile,token FROM targets WHERE id=?',(tid,)).fetchone()
+            if old and (old['owner']!=owner or old['profile']!=profile): raise HTTPException(409,'Target already owned')
+            if old and old['token']!=tok: conn.execute('DELETE FROM notice_deliveries WHERE target=?',(tid,))
+            conn.execute('INSERT INTO targets VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET token=excluded.token,expires=excluded.expires,payload=excluded.payload',(tid,owner,profile,tok,time.time()+30*86400,json.dumps({'package_name':package,'device_id':device_id})))
+        return {'id':tid,'target_id':tid,'registered':True,'target':{'id':tid,'target_id':tid,**mobile.refs(owner,profile)},**mobile.refs(owner,profile)}
+    return await asyncio.to_thread(register)
 @router.delete('/mobile/notifications/targets')
 async def remove_target(request:Request):
-    value=await body(request,1024);owner,_,profile,_=identity(request)
-    with mobile.LOCK,mobile.connect() as conn: conn.execute('DELETE FROM targets WHERE id=? AND owner=? AND profile=?',(value.get('id',value.get('device_id')),owner,profile))
+    value=await body(request,1024);owner,_,profile,_=await identity_async(request)
+    def revoke():
+        with mobile.LOCK,mobile.connect() as conn: conn.execute('DELETE FROM targets WHERE id=? AND owner=? AND profile=?',(value.get('id',value.get('device_id')),owner,profile))
+    await asyncio.to_thread(revoke)
     return {'revoked':True}
 @router.delete('/mobile/notifications/targets/{target_id}')
 async def remove_target_id(target_id:str,request:Request):
-    owner,_,profile,_=identity(request)
-    with mobile.LOCK,mobile.connect() as conn:
-        conn.execute('DELETE FROM targets WHERE id=? AND owner=? AND profile=?',(target_id,owner,profile))
+    owner,_,profile,_=await identity_async(request)
+    def revoke():
+        with mobile.LOCK,mobile.connect() as conn:
+            conn.execute('DELETE FROM targets WHERE id=? AND owner=? AND profile=?',(target_id,owner,profile))
+    await asyncio.to_thread(revoke)
     return {'revoked':True,'target_id':target_id}
 @router.get('/mobile/notifications/events')
 async def notices(request:Request,after:int=0,wait:float=0):
-    owner,provider,profile,_=identity(request)
+    owner,provider,profile,_=await identity_async(request)
     if after<0: raise HTTPException(400,'Invalid cursor')
     duration=_bounded_event_wait(wait)
     async def snapshot():
+        # Long polls share one upkeep pass a second: the 3 s watcher already does the same work for every poller.
+        shared=(owner,profile)
+        if duration>0:
+            if time.monotonic()<_maintained_until.get(shared,0): return await asyncio.to_thread(_notices_after,owner,profile,after)
+            if len(_maintained_until)>=64: _maintained_until.clear()
+            _maintained_until[shared]=time.monotonic()+POLL_MAINTENANCE_SECONDS
         await asyncio.to_thread(mobile.prune_history,owner)
         await asyncio.to_thread(sys.modules['beacon_callbacks'].prune_expired,mobile,native,owner)
         await asyncio.to_thread(watch,owner,provider,profile)
@@ -757,18 +800,42 @@ async def notices(request:Request,after:int=0,wait:float=0):
         if reset: result['reset']=True
         return result
     loop=asyncio.get_running_loop();deadline=loop.time()+duration
-    while True:
-        remaining=deadline-loop.time()
-        if remaining<=0: break
-        await asyncio.sleep(min(1.0,remaining))
-        rows,reset,cursor=await asyncio.to_thread(_notices_after,owner,profile,after)
-        if rows or reset: break
-        after=cursor
-        if await request.is_disconnected(): break
+    probe=None;seen=None
+    try:
+        while True:
+            remaining=deadline-loop.time()
+            if remaining<=0: break
+            await asyncio.sleep(min(POLL_INTERVAL_SECONDS,remaining))
+            if probe is None:
+                # Read the version before the query: a commit that lands before it is seen by the query, a later one by the version.
+                probe=await asyncio.to_thread(mobile.connect,True)
+                seen=await asyncio.to_thread(_data_version,probe)
+            else:
+                current=await asyncio.to_thread(_data_version,probe)
+                if current==seen:
+                    # Nothing was committed since the last look, so the notices cannot have changed.
+                    if await request.is_disconnected(): break
+                    continue
+                seen=current
+            rows,reset,cursor=await asyncio.to_thread(_notices_after,owner,profile,after)
+            if rows or reset: break
+            after=cursor
+            if await request.is_disconnected(): break
+    finally:
+        if probe is not None:
+            try: probe.close()
+            except Exception: pass
     key=mobile.reference_key() if rows else None
     result={'events':[notice_wire(r,owner,key) for r in rows],'next_cursor':cursor}
     if reset: result['reset']=True
     return result
+
+_maintained_until={}
+POLL_MAINTENANCE_SECONDS=1.0
+POLL_INTERVAL_SECONDS=1.0
+def _data_version(conn):
+    # Changes whenever another connection commits to the database, which is how every notice is written.
+    return conn.execute('PRAGMA data_version').fetchone()[0]
 
 def _notices_after(owner,profile,after):
     with mobile.connect() as conn:
@@ -812,11 +879,13 @@ def notice_wire(row,owner,key=None):
     return {**row,'event_id':row['id'],'callback_id':row['id'],'owner_id':owner,'conversation_id':row['conversation'],'session_id':row['conversation'] if row['kind']!='test' else '', 'expires_at':int(row['expires']),'state':state,'title':title,'body':body,'activity_ref':row.get('activity_key',''),'preview':{'title':title,'body':body},**mobile.refs(owner,row['profile'],row['conversation'],key)}
 @router.get('/mobile/notifications/events/{event_id}')
 async def notice_detail(event_id:str,request:Request):
-    owner,provider,profile,cfg=identity(request)
-    with mobile.connect() as conn:
-        row=conn.execute('SELECT * FROM notices WHERE id=? AND owner=? AND profile=?',(event_id,owner,profile)).fetchone()
-    if not row: raise HTTPException(404,'Owned notification unavailable')
-    result=notice_wire(dict(row),owner)
+    owner,provider,profile,cfg=await identity_async(request)
+    def load():
+        with mobile.connect() as conn:
+            found=conn.execute('SELECT * FROM notices WHERE id=? AND owner=? AND profile=?',(event_id,owner,profile)).fetchone()
+        if not found: raise HTTPException(404,'Owned notification unavailable')
+        return found,notice_wire(dict(found),owner)
+    row,result=await asyncio.to_thread(load)
     if row['kind']=='completion' and row['conversation']:
         # The notification shows what the reply says; Android's lock-screen setting still hides it when locked.
         try:
@@ -826,9 +895,11 @@ async def notice_detail(event_id:str,request:Request):
         except Exception as exc:  # the generic text stays
             logging.getLogger(__name__).info('Beacon reply preview unavailable: %s',type(exc).__name__)
     if row['kind']=='task_result':
-        with mobile.connect() as conn:
-            email_alert=conn.execute('SELECT 1 FROM meta WHERE key=?',('proactive-email-notice:'+event_id,)).fetchone() is not None
-            source_row=conn.execute('SELECT value FROM meta WHERE key=?',('proactive-email-rule:'+event_id,)).fetchone() if email_alert else None
+        def email_marks():
+            with mobile.connect() as conn:
+                alert=conn.execute('SELECT 1 FROM meta WHERE key=?',('proactive-email-notice:'+event_id,)).fetchone() is not None
+                return alert,conn.execute('SELECT value FROM meta WHERE key=?',('proactive-email-rule:'+event_id,)).fetchone() if alert else None
+        email_alert,source_row=await asyncio.to_thread(email_marks)
         phone_job=row['job_id'] if isinstance(row['job_id'],str) else ''
         if email_alert:
             try: source=proactive.source_name(json.loads(source_row[0]).get('source')).title() if source_row else ''
@@ -854,12 +925,12 @@ async def notice_detail(event_id:str,request:Request):
 
 @router.post('/mobile/notifications/events/{event_id}/answer')
 async def activity_answer(event_id:str,request:Request):
-    value=await body(request,4096);owner,provider,profile,_=identity(request)
+    value=await body(request,4096);owner,provider,profile,_=await identity_async(request)
     return await asyncio.to_thread(safely,activity.answer,mobile,native,owner,provider,profile,event_id,value.get('answer'))
 
 @router.post('/mobile/callbacks/{invitation_id}/{action}')
 async def answer(invitation_id:str,action:str,request:Request):
-    value=await body(request,1024);owner,provider,profile,cfg=identity(request)
+    value=await body(request,1024);owner,provider,profile,cfg=await identity_async(request)
     if action not in ('answer','decline'): raise HTTPException(404,'Unknown callback action')
     if action=='answer': _client_key_mode(value)
     def peek():
@@ -873,11 +944,11 @@ async def answer(invitation_id:str,action:str,request:Request):
         await asyncio.to_thread(reject_unowned_conversation,owner,provider,profile,initial['conversation'])
         await asyncio.to_thread(safely,native.verify,owner,provider,profile,initial['conversation'])
     source=await asyncio.to_thread(mobile.refs,owner,profile)
-    selection=voice_models.selected(mobile,owner,profile,cfg)
+    selection=await asyncio.to_thread(voice_models.selected,mobile,owner,profile,cfg)
     if action=='answer':
         requested=value['voice_provider']
         if requested not in voice_models.PROVIDERS: raise HTTPException(400,'Unknown voice model')
-        selection=voice_models.provider_selection(mobile,owner,profile,cfg,requested)
+        selection=await asyncio.to_thread(voice_models.provider_selection,mobile,owner,profile,cfg,requested)
     def consume():
         with mobile.LOCK,mobile.connect() as conn:
             row=conn.execute('SELECT * FROM notices WHERE id=? AND owner=? AND profile=?',(invitation_id,owner,profile)).fetchone()
@@ -1010,8 +1081,9 @@ def _push_devices(owner,profile):
 
 @router.get('/mobile/plugin/version')
 async def plugin_version(request:Request):
-    identity(request,owner_only=True)
-    return JSONResponse({'running':_RUNNING_PLUGIN_VERSION,'installed':_read_plugin_version(ROOT/'plugin.yaml'),'gateway':mobile.gateway_plugin_version()},headers={'Cache-Control':'no-store'})
+    await identity_async(request,owner_only=True)
+    installed,gateway=await asyncio.to_thread(lambda:(_read_plugin_version(ROOT/'plugin.yaml'),mobile.gateway_plugin_version()))
+    return JSONResponse({'running':_RUNNING_PLUGIN_VERSION,'installed':installed,'gateway':gateway},headers={'Cache-Control':'no-store'})
 
 _watch_task=None
 _jobs_warming=set()
@@ -1028,6 +1100,8 @@ def _warm_profile(owner,profile):
         _jobs_retry_after.pop(key,None)
     finally:
         _jobs_warming.discard(key)
+_tools_next={}
+TOOLS_REFRESH_SECONDS=300
 async def start_watcher():
     global _watch_task
     async def loop():
@@ -1052,6 +1126,10 @@ async def start_watcher():
                         except Exception: pass
                         try: await asyncio.to_thread(flush_held_posts,cfg['owner_id'],cfg['owner_provider'],profile)
                         except Exception: pass
+                        # The call tool list is scanned once after a start and kept fresh, so no call ever waits for a scan.
+                        if time.monotonic()>=_tools_next.get(profile_key,0):
+                            _tools_next[profile_key]=time.monotonic()+TOOLS_REFRESH_SECONDS
+                            voice_context.prefetch_tools(profile)
             except Exception:
                 pass
             await asyncio.sleep(3)
@@ -1075,24 +1153,36 @@ async def stop_watcher():
         try: await _watch_task
         except asyncio.CancelledError: pass
         _watch_task=None
-_feature_pool=ThreadPoolExecutor(max_workers=4,thread_name_prefix='beacon-native-lookup')
-_feature_slots=threading.BoundedSemaphore(4)
+# Four lookups wait at once. A lookup that times out cannot be stopped, so its worker keeps running; up to eight such
+# abandoned workers are tolerated, with their results ignored, and past that new lookups are refused instead of piling up.
+_FEATURE_WAITING=4
+_FEATURE_ABANDONED=8
+_feature_pool=ThreadPoolExecutor(max_workers=_FEATURE_WAITING+_FEATURE_ABANDONED,thread_name_prefix='beacon-native-lookup')
+_feature_live=threading.BoundedSemaphore(_FEATURE_WAITING)
+_feature_slots=threading.BoundedSemaphore(_FEATURE_WAITING+_FEATURE_ABANDONED)
 _feature_counts={}
 def clear_lookup_counts(call_id):
     with mobile.LOCK:
         for key in list(_feature_counts):
             if key[0]==call_id: _feature_counts.pop(key,None)
 async def feature(fn,*args,timeout=12,value_error_status=409,lookup_message='Owned native context unavailable'):
-    if not _feature_slots.acquire(blocking=False): raise HTTPException(429,'Native lookup capacity busy')
+    if not _feature_live.acquire(blocking=False): raise HTTPException(429,'Native lookup capacity busy')
+    if not _feature_slots.acquire(blocking=False):
+        _feature_live.release();raise HTTPException(429,'Native lookup capacity busy')
+    waiting=[True];guard=threading.Lock()
+    def stop_waiting():
+        # The caller's place frees when it stops waiting (answer, timeout or cancel); the worker's slot frees when the worker exits.
+        with guard:
+            if waiting[0]: waiting[0]=False;_feature_live.release()
     context=contextvars.copy_context()
     def run():
         try: return context.run(fn,*args)
-        finally: _feature_slots.release()
+        finally: _feature_slots.release();stop_waiting()
     try: future=_feature_pool.submit(run)
     except Exception:
-        _feature_slots.release();raise HTTPException(503,'Native lookup unavailable') from None
+        _feature_slots.release();stop_waiting();raise HTTPException(503,'Native lookup unavailable') from None
     # A queued future cancelled before execution has no wrapper finally.
-    future.add_done_callback(lambda done: _feature_slots.release() if done.cancelled() else None)
+    future.add_done_callback(lambda done: (_feature_slots.release(),stop_waiting()) if done.cancelled() else None)
     try: return await asyncio.wait_for(asyncio.wrap_future(future),timeout=timeout)
     except asyncio.TimeoutError: raise HTTPException(504,'Native lookup timed out') from None
     except HTTPException: raise
@@ -1101,6 +1191,7 @@ async def feature(fn,*args,timeout=12,value_error_status=409,lookup_message='Own
     except Exception as exc:
         logging.getLogger(__name__).warning('Beacon native lookup %s failed: %s',getattr(fn,'__name__','?'),type(exc).__name__)
         raise HTTPException(503,'Native lookup unavailable') from None
+    finally: stop_waiting()
 def lookup_budget(call_id,kind):
     key=(call_id,kind)
     with mobile.LOCK:
@@ -1134,9 +1225,11 @@ async def get_context(call_id:str,request:Request):
         args+= (True,)
         if not row['closed']:
             selection=json.loads(row['voice_config']);selection['backend']='hermes'
-            with mobile.LOCK,mobile.connect() as conn:
-                conn.execute('UPDATE calls SET voice_config=? WHERE id=? AND owner=? AND profile=?',
-                             (json.dumps(selection),call_id,owner,row['profile']))
+            def mark_backend():
+                with mobile.LOCK,mobile.connect() as conn:
+                    conn.execute('UPDATE calls SET voice_config=? WHERE id=? AND owner=? AND profile=?',
+                                 (json.dumps(selection),call_id,owner,row['profile']))
+            await asyncio.to_thread(mark_backend)
     result=await feature(voice_context.context,*args,timeout=8)
     callback=result.get('callback')
     reason=callback.get('reason','') if isinstance(callback,dict) else ''
@@ -1149,7 +1242,7 @@ _SESSION_ID=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}')
 async def voice_session_context(request:Request):
     """The call context of the selected profile and conversation, before any call exists: the phone keeps it fresh
     while a call entry is on screen, so a tap never waits for it. Call-bound fields arrive with the grant."""
-    owner,provider,profile,cfg=identity(request)
+    owner,provider,profile,cfg=await identity_async(request)
     stored=request.query_params.get('session','')
     if not _SESSION_ID.fullmatch(stored): raise HTTPException(400,'Invalid conversation')
     owner_name=request.query_params.get('owner_name','')
@@ -1157,6 +1250,8 @@ async def voice_session_context(request:Request):
     display=getattr(request.state.session,'display_name',None)
     display=display[:120] if isinstance(display,str) else ''
     result=await feature(voice_context.session_context,owner,provider,profile,stored,display,owner_name.strip(),timeout=8)
+    # A call entry is on screen: have the profile's tools ready (in the background) before the owner asks for one.
+    voice_context.prefetch_tools(profile)
     if not result.get('greeting'): result['greeting']="I'm here."
     result['reason']=''
     if display: result['owner_display_name']=display
@@ -1188,28 +1283,28 @@ async def current_voice_profile(call_id:str,request:Request):
 @router.post('/mobile/projects')
 async def create_mobile_project(request:Request):
     value=await body(request,16384)
-    owner,provider,profile,cfg=identity(request)
+    owner,provider,profile,cfg=await identity_async(request)
     if set(value)-{'request_id','name','description'}:
         raise HTTPException(400,'Unexpected project fields')
     return await feature(native.create_project,owner,provider,profile,value.get('request_id'),value.get('name'),value.get('description',''),timeout=8)
 @router.post('/mobile/sessions/{stored_id}/reserve')
 async def reserve_chat(stored_id:str,request:Request):
     value=await body(request,1024)
-    owner,provider,profile,cfg=identity(request)
+    owner,provider,profile,cfg=await identity_async(request)
     if value or not 1<=len(stored_id)<=256:
         raise HTTPException(400,'Choose an existing conversation')
     await feature(native.reserve_conversation,owner,provider,profile,stored_id,timeout=6)
     return {'reserved':True,'stored_session_id':stored_id,'profile':profile}
 @router.get('/mobile/sessions')
 async def list_mobile_sessions(request:Request):
-    owner,provider,profile,cfg=identity(request)
+    owner,provider,profile,cfg=await identity_async(request)
     hidden=request.query_params.get('include_archived')=='1'
     result=await feature(native.conversation_list,owner,provider,profile,hidden,timeout=8)
     return JSONResponse(result,headers={'Cache-Control':'no-store'})
 @router.post('/sessions/pin')
 async def pin_session(request:Request):
     value=await body(request,4096)
-    owner,provider,profile,_=identity(request,value.get('profile'))
+    owner,provider,profile,_=await identity_async(request,value.get('profile'))
     if set(value)!={'session_id','pinned','profile'} or type(value.get('pinned')) is not bool:
         raise HTTPException(400,'Choose a conversation and pin state')
     session_id=value.get('session_id')
@@ -1233,20 +1328,20 @@ async def pin_session(request:Request):
 
 @router.get('/mobile/sessions/{stored_id}')
 async def read_mobile_session(stored_id:str,request:Request):
-    owner,provider,profile,cfg=identity(request)
+    owner,provider,profile,cfg=await identity_async(request)
     if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,256}',stored_id): raise HTTPException(400,'Choose an existing conversation')
     result=await feature(native.conversation_snapshot,owner,provider,profile,stored_id,timeout=8)
     return JSONResponse(result,headers={'Cache-Control':'no-store'})
 @router.get('/mobile/sessions/{stored_id}/voice-history')
 async def get_voice_history(stored_id:str,request:Request):
-    owner,provider,profile,cfg=identity(request)
+    owner,provider,profile,cfg=await identity_async(request)
     await feature(native.verify,owner,provider,profile,stored_id,timeout=6)
     result=await feature(mobile.voice_history,owner,profile,stored_id,timeout=8)
     return JSONResponse(result,headers={'Cache-Control':'no-store'})
 @router.get('/mobile/threads')
 async def list_threads(request:Request):
     # The chats a scheduled job can post into (`deliver: phone:<id>`); small and stable so the app can show a saved copy first.
-    owner,provider,profile,cfg=identity(request)
+    owner,provider,profile,cfg=await identity_async(request)
     threads=await feature(native.threads,owner,provider,profile,timeout=8)
     return JSONResponse({'threads':threads},headers={'Cache-Control':'no-store'})
 async def _proactive_source_labels(profile):
@@ -1257,9 +1352,11 @@ async def _proactive_source_labels(profile):
 
 @router.get('/mobile/proactive')
 async def proactive_status(request:Request):
-    owner,_,profile,_=identity(request)
-    result=await feature(proactive.status,mobile,owner,profile,timeout=8,lookup_message='This item is no longer available.')
-    result['sources']=await _proactive_source_labels(profile)
+    owner,_,profile,_=await identity_async(request)
+    # The saved status and the connected sources are independent lookups; they wait together, not one after the other.
+    result,labels=await asyncio.gather(feature(proactive.status,mobile,owner,profile,timeout=8,lookup_message='This item is no longer available.'),
+                                       _proactive_source_labels(profile))
+    result['sources']=labels
     return result
 
 @router.put('/mobile/proactive')
@@ -1272,7 +1369,7 @@ async def proactive_enabled(request:Request):
         allowed={'enabled','delivery','check_minutes','quiet_start','quiet_end','model','provider'}
         if set(value)-allowed or type(value.get('enabled')) is not bool:
             raise HTTPException(400,'Invalid Proactive setup fields')
-    owner,provider,profile,cfg=identity(request)
+    owner,provider,profile,cfg=await identity_async(request)
     if not toggle:
         try: proactive.validate_setup(value)
         except ValueError as exc: raise HTTPException(400,str(exc)) from None
@@ -1296,13 +1393,13 @@ async def proactive_feedback(request:Request):
     value=await body(request,1024)
     if set(value)!={'notice_id','verdict'} or value['verdict'] not in ('important','not_important'):
         raise HTTPException(400,'Expected notice_id and verdict important or not_important')
-    owner,_,profile,_=identity(request)
+    owner,_,profile,_=await identity_async(request)
     return await feature(proactive.add_email_feedback,mobile,owner,profile,value['notice_id'],value['verdict'],timeout=15,value_error_status=400,lookup_message='This item is no longer available.')
 
 @router.get('/mobile/proactive/alerts')
 async def proactive_alerts(session_id:str,request:Request,before:int=0,limit:int=50):
     # The alerts Beacon posted into one owned chat, with the owner's verdict on each; the chat shows them as messages.
-    owner,provider,profile,_=identity(request)
+    owner,provider,profile,_=await identity_async(request)
     await feature(native.verify,owner,provider,profile,session_id,timeout=6)
     result=await feature(proactive.email_alerts,mobile,owner,profile,session_id,before or None,limit,timeout=8,value_error_status=400)
     return JSONResponse(result,headers={'Cache-Control':'no-store'})
@@ -1311,7 +1408,7 @@ async def proactive_alerts(session_id:str,request:Request,before:int=0,limit:int
 async def proactive_learned_delete(request:Request):
     value=await body(request,2048)
     if set(value)!={'note'}: raise HTTPException(400,'Expected one learned note')
-    owner,_,profile,_=identity(request)
+    owner,_,profile,_=await identity_async(request)
     return await feature(proactive.delete_learned,mobile,owner,profile,value['note'],timeout=12,value_error_status=400,lookup_message='This item is no longer available.')
 
 @router.post('/mobile/proactive/requests')
@@ -1323,19 +1420,19 @@ async def proactive_request_create(request:Request):
     if not isinstance(text,str) or len(text)>300 or action not in ('notify','call'):
         raise HTTPException(400,'Request text and action are invalid')
     if type(night) is not bool: raise HTTPException(400,'Request night must be a boolean')
-    owner,_,profile,_=identity(request)
+    owner,_,profile,_=await identity_async(request)
     return await feature(proactive.create_request,mobile,owner,profile,text,action,signal,night,timeout=30,value_error_status=400,lookup_message='This item is no longer available.')
 
 @router.patch('/mobile/proactive/requests/{request_id}')
 async def proactive_request_patch(request_id:str,request:Request):
     value=await body(request,2048)
     if not value or set(value)-{'enabled','action','night'}: raise HTTPException(400,'Invalid Proactive request fields')
-    owner,_,profile,_=identity(request)
+    owner,_,profile,_=await identity_async(request)
     return await feature(proactive.patch_request,mobile,owner,profile,request_id,value,timeout=30,value_error_status=400,lookup_message='This item is no longer available.')
 
 @router.delete('/mobile/proactive/requests/{request_id}')
 async def proactive_request_delete(request_id:str,request:Request):
-    owner,_,profile,_=identity(request)
+    owner,_,profile,_=await identity_async(request)
     return await feature(proactive.delete_request,mobile,owner,profile,request_id,timeout=30,lookup_message='This item is no longer available.')
 
 router.include_router(sys.modules['beacon_callback_api'].build_router(call,body,feature,mobile,native,sys.modules['beacon_callbacks']))

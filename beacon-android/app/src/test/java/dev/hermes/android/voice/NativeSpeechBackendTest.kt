@@ -196,37 +196,6 @@ class NativeSpeechBackendTest {
         } finally { f.close() }
     }
 
-    @Test fun geminiNumericAdditionSpellingKeepsTheRecognizedInput() {
-        for((input,echo) in listOf("What is 2 + 3?" to "What is 2 plus 3?", "WHAT is 12.5 plus 3?" to "What is 12.5+3?", "Add 1+2+3" to "Add 1 plus 2 plus 3")) {
-            val ledger=VoiceFinalItems()
-            ledger.activityStart()
-            assertNull(ledger.accept(JSONObject().put("text",input),true))
-            assertNull(ledger.echo(JSONObject().put("text",echo)))
-            assertNull(ledger.activityEnd())
-            assertEquals(input,ledger.generationComplete()?.second)
-            assertNull("A spelling equivalence must not submit twice",ledger.generationComplete())
-        }
-    }
-
-    @Test fun geminiAdditionSpellingNeverChangesOperandsOperatorsOrIdentifiers() {
-        for((input,echo) in listOf(
-            "What is 2 + 3?" to "What is 2 plus 4?",
-            "What is 2 + 3?" to "What is 2 minus 3?",
-            "Read file2+3" to "Read file2 plus 3",
-            "Read 2+3.txt" to "Read 2 plus 3.txt",
-            "Read /2+3" to "Read /2 plus 3",
-            "Read file2+3+4" to "Read file2+3 plus 4",
-            "Read 2+3+4.txt" to "Read 2 plus 3+4.txt",
-            "Read '2+3'" to "Read '2 plus 3'",
-            "Do not send 2 + 3" to "Do send 2 plus 3",
-        )) {
-            val ledger=VoiceFinalItems()
-            ledger.activityStart();ledger.accept(JSONObject().put("text",input),true)
-            ledger.echo(JSONObject().put("text",echo));ledger.activityEnd()
-            assertNull(input,ledger.generationComplete())
-        }
-    }
-    // The isolated renderer is exercised through its actual provider socket callbacks.
     private class RenderFixture(private val provider: String = "grok") {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val sockets = CopyOnWriteArrayList<Pair<WebSocket, WebSocketListener>>()
@@ -300,7 +269,6 @@ class NativeSpeechBackendTest {
         val providerSockets = CopyOnWriteArrayList<Pair<WebSocket, WebSocketListener>>()
         val inputSockets = CopyOnWriteArrayList<Pair<WebSocket, WebSocketListener>>()
         val providerFrames = CopyOnWriteArrayList<JSONObject>()
-        val tts = SpeechHttpFixture()
         val nativeFrames = CopyOnWriteArrayList<JSONObject>()
         val nativeSockets = CopyOnWriteArrayList<Pair<WebSocket, WebSocketListener>>()
         @Volatile var autoGatewayReady = sendGatewayReady
@@ -446,9 +414,7 @@ class NativeSpeechBackendTest {
                 override fun cancel() = Unit
                 override fun send(text: String): Boolean {
                     val frame = JSONObject(text); providerFrames += frame
-                    val instructions = frame.optJSONObject("setup")?.optJSONObject("systemInstruction")?.optJSONArray("parts")?.optJSONObject(0)?.optString("text")
-                        ?: frame.optJSONObject("session")?.optString("instructions").orEmpty()
-                    val input = instructions.startsWith("Transcribe the owner's speech.")
+                    val input = frame.has("setup") || frame.optString("type") == "session.update"
                     if (input && inputSockets.none { it.first === this }) inputSockets += this to listener
                     if (frame.has("setup")) listener.onMessage(this, json("setupComplete" to json()).toString())
                     else if (frame.optString("type") == "session.update") listener.onMessage(this, json("type" to "session.updated").toString())
@@ -462,14 +428,12 @@ class NativeSpeechBackendTest {
         lateinit var voice: DirectVoice
         init {
             voice = DirectVoice(client, "call", "stored", scope, { bytes -> audio += bytes; if(autoPlay) voice.played(bytes.size) }, { events += it }, { events += json("type" to "failure", "message" to it) },
-                credentials = VoiceSessionCredentials(provider, "fixture-key", defaultVoiceModel(provider), defaultVoiceName(provider), "balanced"), providerSocketFactory = speech, stallAfterMs = stallAfterMs, ownerFence = ownerFence, ownerActive = ownerActive, providerCallFactory = tts)
+                credentials = VoiceSessionCredentials(provider, "fixture-key", defaultVoiceModel(provider), defaultVoiceName(provider), "balanced"), providerSocketFactory = speech, stallAfterMs = stallAfterMs, ownerFence = ownerFence, ownerActive = ownerActive)
         }
 
         suspend fun start() {
             voice.start()
             assertTrue("Provider was not admitted", waitFor { events.any { it.optString("state") == "listening" } })
-            // The greeting is the live model's own speech: nothing is rendered until Hermes has a verified reply.
-            assertTrue("No greeting is rendered", tts.requests.isEmpty() && renderSockets().isEmpty())
             // The live model finishes its greeting turn; the frames each test sends next are the owner's turn.
             receive(if (provider == "gemini") json("serverContent" to json("turnComplete" to true)) else json("type" to "response.done", "response" to json("status" to "completed")))
         }
@@ -482,9 +446,17 @@ class NativeSpeechBackendTest {
             val (socket, listener) = inputSockets[index]
             listener.onMessage(socket, frame.toString())
         }
-        fun renderSockets() = providerSockets.filter { pair -> inputSockets.none { it.first === pair.first } }
-        fun renderRequestCount(text: String) = if (provider == "gemini") tts.requests.indices.count { tts.text(it) == text }
-            else providerFrames.count { it.optJSONObject("item")?.optJSONArray("content")?.optJSONObject(0)?.optString("text") == text }
+        /** What the live model was answered for its tool calls, in the order sent. */
+        fun responses() = providerFrames.mapNotNull { it.optJSONObject("toolResponse")?.optJSONArray("functionResponses")?.optJSONObject(0)?.optJSONObject("response") }
+        fun answered(status: String) = responses().any { it.optString("status") == status }
+        /** How many times the live model was told [text] as a verified Hermes update. */
+        fun told(text: String) = providerFrames.count { it.toString().contains("Verified update from Hermes") && it.toString().contains(text) }
+        private var calls = 0
+        /** The live model calls [name]; the provider's own frame carries it. */
+        fun call(name: String, args: JSONObject, id: String = "call-${++calls}") = receive(
+            if (provider == "gemini") json("toolCall" to json("functionCalls" to JSONArray().put(json("id" to id, "name" to name, "args" to args))))
+            else json("type" to "response.function_call_arguments.done", "call_id" to id, "name" to name, "arguments" to args.toString()))
+        fun work(text: String, id: String = "work-${++calls}") = call("hermes_work", json("text" to text), id)
         fun prompts() = nativeFrames.filter { it.optString("method") == "prompt.submit" }
         @Suppress("UNCHECKED_CAST")
         fun pendingVoiceJob(): Job {
@@ -569,41 +541,11 @@ class NativeSpeechBackendTest {
         }
     }
 
-    @Test(timeout = 12000) fun grokPrematureCompletionsNeverSubmitUntilTheFullCommittedItem() = runBlocking {
-        val f = Fixture("grok")
-        fun event(type:String) = json("type" to type,"item_id" to "owner-1")
-        fun transcript(text:String,status:String) = event("conversation.item.input_audio_transcription.completed")
-            .put("content_index",0).put("transcript",text).put("status",status)
-        try {
-            f.start()
-            f.receive(event("input_audio_buffer.speech_started"))
-            for(text in listOf("Without","Without using any tools","Without using any tools what is two plus three?")) {
-                f.receive(event("conversation.item.input_audio_transcription.updated").put("content_index",0).put("transcript",text))
-                f.receive(transcript(text,"in_progress"))
-            }
-            f.receive(event("input_audio_buffer.speech_stopped"))
-            val full="Without using any tools what is two plus three?"
-            f.receive(transcript(full,"in_progress"))
-            assertFalse("No precommit provider snapshot may reach Hermes",
-                withTimeoutOrNull(1200) { while(f.prompts().isEmpty()) delay(10);true } == true)
-            f.receive(event("input_audio_buffer.committed"))
-            assertTrue("Commit alone does not invent a final transcript",f.prompts().isEmpty())
-            f.receive(transcript(full,"completed"))
-            assertTrue("The whole committed utterance reaches Hermes",waitFor { f.jobPosts.size==1 })
-            assertEquals(1,f.prompts().size)
-            assertEquals(full,f.prompts().single().getJSONObject("params").getString("text"))
-            f.receive(transcript(full,"completed"))
-            delay(150)
-            assertEquals("A duplicate final must not replay the native mutation",1,f.prompts().size)
-            assertEquals(1,f.jobPosts.size)
-        } finally { f.close() }
-    }
-
     @Test(timeout = 8000) fun strictLegacyPromptOmitsCanonicalIdsAndLinksActualUserRow() = runBlocking {
         val f = Fixture()
         try {
             f.strictPromptContract = true
-            f.start(); f.receive(geminiFinal("What is two plus three?"))
+            f.start(); f.work("What is two plus three?")
             assertTrue("The strict legacy handler must execute one request and link its row",
                 waitFor { f.jobPosts.isNotEmpty() || f.rejectedPrompts.isNotEmpty() })
             assertTrue("A strict 4000 rejection means no legacy handler ran", f.rejectedPrompts.isEmpty())
@@ -628,9 +570,9 @@ class NativeSpeechBackendTest {
         val f = Fixture(authority = true)
         try {
             f.strictCanonicalResume = true
-            f.start(); f.receive(geminiFinal("Check this"))
+            f.start(); f.work("Check this")
             assertTrue("Canonical resume must accept only its actual fields before submitting",
-                waitFor { f.prompts().isNotEmpty() || f.events.any { it.optString("message").contains("not sent") } })
+                waitFor { f.prompts().isNotEmpty() || f.answered("not_sent") })
             assertEquals(1, f.executedPrompts.size)
             val params = f.executedPrompts.single().getJSONObject("params")
             assertTrue(params.getString("submission_id").isNotBlank())
@@ -658,10 +600,10 @@ class NativeSpeechBackendTest {
         try {
             f.strictPromptContract = true
             f.approvalDelayMs = 17000
-            f.start(); f.receive(geminiFinal("Cold native request"))
+            f.start(); f.work("Cold native request")
             val outcome = withTimeoutOrNull(22000) {
                 while (f.jobPosts.isEmpty() && f.rejectedPrompts.isEmpty() &&
-                    f.events.none { it.optString("message").contains("not sent") }) delay(20)
+                    !f.answered("not_sent")) delay(20)
                 true
             }
             assertTrue("The native cold read must finish within the enclosing budget", outcome == true)
@@ -676,8 +618,8 @@ class NativeSpeechBackendTest {
         val f = Fixture()
         try {
             f.approvalError = 5032
-            f.start(); f.receive(geminiFinal("Do work"))
-            assertTrue(waitFor { f.events.any { it.optString("message").contains("not sent") } })
+            f.start(); f.work("Do work")
+            assertTrue(waitFor { f.answered("not_sent") })
             assertEquals(1, f.nativeFrames.count { it.optString("method") == "approval.pending" })
             assertTrue(f.prompts().isEmpty()); assertTrue(f.jobPosts.isEmpty())
         } finally { f.close() }
@@ -687,13 +629,12 @@ class NativeSpeechBackendTest {
         val f = Fixture()
         try {
             f.promptError = 4000
-            f.start(); f.receive(geminiFinal("Do work"))
-            assertTrue(waitFor { f.events.any { it.optString("message").contains("not sent") ||
-                it.optString("message").contains("could not confirm") } })
+            f.start(); f.work("Do work")
+            assertTrue(waitFor { (f.answered("not_sent") || f.answered("submission_unconfirmed")) })
             assertEquals(1, f.rejectedPrompts.size)
             assertTrue("The rejected request cannot run a handler", f.executedPrompts.isEmpty())
             assertTrue(f.jobPosts.isEmpty())
-            assertTrue("A legacy pre-handler validation refusal is definite", f.events.any { it.optString("message").contains("not sent") })
+            assertTrue("A legacy pre-handler validation refusal is definite", f.answered("not_sent"))
         } finally { f.close() }
     }
 
@@ -702,11 +643,11 @@ class NativeSpeechBackendTest {
         try {
             f.promptError = 4000
             f.promptErrorMessage = "Some other failure"
-            f.start(); f.receive(geminiFinal("Do work"))
-            assertTrue(waitFor { f.events.any { it.optString("message").contains("could not confirm") } })
+            f.start(); f.work("Do work")
+            assertTrue(waitFor { f.answered("submission_unconfirmed") })
             assertEquals(1, f.prompts().size)
             assertTrue(f.jobPosts.isEmpty())
-            assertTrue(f.events.none { it.optString("message").contains("not sent") })
+            assertTrue(!f.answered("not_sent"))
         } finally { f.close() }
     }
 
@@ -714,11 +655,11 @@ class NativeSpeechBackendTest {
         val f = Fixture(authority = true)
         try {
             f.promptError = 4000
-            f.start(); f.receive(geminiFinal("Do work"))
-            assertTrue(waitFor { f.events.any { it.optString("message").contains("could not confirm") } })
+            f.start(); f.work("Do work")
+            assertTrue(waitFor { f.answered("submission_unconfirmed") })
             assertEquals(1, f.prompts().size)
             assertTrue(f.jobPosts.isEmpty())
-            assertTrue(f.events.none { it.optString("message").contains("not sent") })
+            assertTrue(!f.answered("not_sent"))
         } finally { f.close() }
     }
 
@@ -726,59 +667,14 @@ class NativeSpeechBackendTest {
         val f = Fixture()
         try {
             f.dropPromptResponse = true
-            f.start(); f.receive(geminiFinal("Do work"))
-            assertTrue(waitFor { f.events.any { it.optString("message").contains("could not confirm") } })
+            f.start(); f.work("Do work")
+            assertTrue(waitFor { f.answered("submission_unconfirmed") })
             assertEquals(1, f.executedPrompts.size)
             assertEquals(1, f.prompts().size)
             assertTrue(f.jobPosts.isEmpty())
-            assertTrue(f.events.none { it.optString("message").contains("not sent") })
+            assertTrue(!f.answered("not_sent"))
         } finally { f.close() }
     }
-
-    @Test(timeout = 8000) fun finalOwnerSpeechIsSubmittedEvenWhenProviderNeverCallsAFunction() = runBlocking {
-        val f = Fixture()
-        try {
-            f.start()
-            f.receive(geminiFinal("What is in my calendar?"))
-            assertTrue("A final utterance must be submitted without relying on a provider tool call", waitFor { f.prompts().size == 1 })
-            val params = f.prompts().single().getJSONObject("params")
-            assertEquals("What is in my calendar?", params.getString("text"))
-            assertEquals("runtime", params.getString("session_id"))
-            assertEquals("default", params.getString("profile"))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 8000) fun providerAnswerBeforeNativeResultCannotBecomeTheAssistantTranscriptOrAudio() = runBlocking {
-        val f = Fixture()
-        try {
-            f.start()
-            f.receive(geminiFinal("What is in my calendar?"))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Your calendar is empty.", "finished" to true))))
-            f.receive(json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("inlineData" to json("mimeType" to "audio/pcm;rate=24000", "data" to "AAE=")))))))
-            delay(150)
-            assertTrue("An unverified provider answer must not become an assistant caption", f.events.none { it.optString("role") == "assistant" && it.optString("text").contains("calendar is empty") })
-            assertTrue("An unverified provider answer must not be played", f.audio.isEmpty())
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 12000) fun repeatedProviderItemAfterReconnectIsNotResubmittedButANewIdenticalUtteranceIs() = runBlocking {
-        val f = Fixture("openai")
-        try {
-            f.start()
-            f.receive(openAiFinal("item-one", "Check that"))
-            assertTrue("First final item must reach Hermes", waitFor { f.prompts().size == 1 })
-            val (socket, listener) = f.inputSockets.first()
-            listener.onFailure(socket, java.io.IOException("fixture disconnect"), null)
-            assertTrue("Provider must reconnect", waitFor { f.inputSockets.size >= 2 })
-            assertTrue("Provider must be admitted after reconnect", waitFor { f.events.count { it.optString("state") == "listening" } >= 2 })
-            f.receive(openAiFinal("item-one", "Check that"))
-            f.receive(openAiFinal("item-two", "Check that"))
-            assertTrue("A different final item must be submitted", waitFor { f.prompts().size >= 2 })
-            delay(200)
-            assertEquals("Replayed item must not run twice", 2, f.prompts().size)
-        } finally { f.close() }
-    }
-
 
     private suspend fun hangupDuringHeldStageDoesNotSubmit(authority: Boolean) {
         val f = Fixture(authority = authority)
@@ -787,7 +683,7 @@ class NativeSpeechBackendTest {
             val sent = CompletableDeferred<Unit>()
             assertTrue(f.voice.image(byteArrayOf(0xff.toByte(), 0xd8.toByte(), 0xff.toByte(), 0xd9.toByte()), { true }, onSent = { sent.complete(Unit) }))
             withTimeout(2000) { sent.await() }
-            f.receive(geminiFinal("What is visible?"))
+            f.work("What is visible?")
             withTimeout(3000) { f.stageHeld.await() }
             val job = f.pendingVoiceJob()
             val end = f.voice.close()
@@ -815,7 +711,7 @@ class NativeSpeechBackendTest {
                 f.holdStage = true; f.start(); f.voice.setVisualState("camera", "starting")
                 val sent = CompletableDeferred<Unit>()
                 assertTrue(f.voice.image(byteArrayOf(0xff.toByte(), 0xd8.toByte(), 0xff.toByte(), 0xd9.toByte()), { allowed.get() }, onSent = { sent.complete(Unit) }))
-                withTimeout(2000) { sent.await() }; f.receive(geminiFinal("What is visible?"))
+                withTimeout(2000) { sent.await() }; f.work("What is visible?")
                 withTimeout(3000) { f.stageHeld.await() }; val job = f.pendingVoiceJob()
                 if (revoke) allowed.set(false)
                 f.releaseStage.complete(Unit)
@@ -835,7 +731,7 @@ class NativeSpeechBackendTest {
         for (authority in listOf(false, true)) {
             val f = Fixture(authority = authority)
             try {
-                f.holdPrompt = true; f.start(); f.receive(geminiFinal("Do the task"))
+                f.holdPrompt = true; f.start(); f.work("Do the task")
                 withTimeout(3000) { f.promptHeld.await() }; val job = f.pendingVoiceJob()
                 val end = f.voice.close()
                 f.releasePrompt.complete(Unit); withTimeout(3000) { job.join() }
@@ -854,10 +750,10 @@ class NativeSpeechBackendTest {
             try {
                 f.dropStageResponse = true; f.start(); f.voice.setVisualState("camera", "starting")
                 assertTrue(f.voice.image(byteArrayOf(0xff.toByte(), 0xd8.toByte(), 0xff.toByte()), { true }))
-                f.receive(geminiFinal("What is visible?"))
-                assertTrue(waitFor { f.events.any { it.optString("message").contains("not sent") } })
+                f.work("What is visible?")
+                assertTrue(waitFor { f.answered("not_sent") })
                 assertTrue(f.prompts().isEmpty()); assertTrue(f.jobPosts.isEmpty())
-                assertTrue(f.events.none { it.optString("message").contains("could not confirm whether") })
+                assertTrue(!f.answered("submission_unconfirmed"))
             } finally { f.close() }
         }
     }
@@ -871,7 +767,7 @@ class NativeSpeechBackendTest {
             try {
                 f.holdStage = true; f.start(); f.voice.setVisualState("camera", "starting")
                 assertTrue(f.voice.image(byteArrayOf(0xff.toByte(), 0xd8.toByte(), 0xff.toByte()), { true }))
-                f.receive(geminiFinal("What is visible?")); withTimeout(3000) { f.stageHeld.await() }
+                f.work("What is visible?"); withTimeout(3000) { f.stageHeld.await() }
                 val job = f.pendingVoiceJob()
                 val hangup = async(Dispatchers.Default) {
                     finishCallOnce(closed, { fenceEntered.complete(Unit); releaseFence.await(3, java.util.concurrent.TimeUnit.SECONDS) }) { f.voice.close() }
@@ -904,7 +800,7 @@ class NativeSpeechBackendTest {
             val jpeg = byteArrayOf(0xff.toByte(), 0xd8.toByte(), 0xff.toByte(), 0xd9.toByte())
             assertTrue(f.voice.image(jpeg, { true }, onSent = { sent.complete(Unit) }))
             assertTrue("Captured frame was accepted", withTimeoutOrNull(2000) { sent.await(); true } == true)
-            f.receive(geminiFinal("What is on my camera?"))
+            f.work("What is on my camera?")
             assertTrue("Visual question must reach native Hermes", waitFor { f.prompts().size == 1 })
             val methods = f.nativeFrames.map { it.optString("method") }
             val attach = methods.indexOf("file.attach")
@@ -924,7 +820,7 @@ class NativeSpeechBackendTest {
             f.start(); f.voice.setVisualState("camera", "starting")
             val jpeg = byteArrayOf(0xff.toByte(), 0xd8.toByte(), 0xff.toByte(), 0xd9.toByte())
             assertTrue(f.voice.image(jpeg, { true }))
-            f.receive(geminiFinal("What is on my camera?"))
+            f.work("What is on my camera?")
             assertTrue(waitFor { f.prompts().size == 1 })
             val attach = f.nativeFrames.single { it.optString("method") == "image.attach_bytes" }.getJSONObject("params")
             assertEquals(java.util.Base64.getEncoder().encodeToString(jpeg), attach.getString("content_base64"))
@@ -943,24 +839,10 @@ class NativeSpeechBackendTest {
             f.start(); f.voice.setVisualState("camera", "starting")
             assertTrue(f.voice.image(byteArrayOf(0xff.toByte(), 0xd8.toByte(), 0xff.toByte()), { true }))
             f.voice.setVisualState("camera", "off")
-            f.receive(geminiFinal("What is visible?"))
+            f.work("What is visible?")
             assertTrue(waitFor { f.prompts().size == 1 })
             assertTrue(f.nativeFrames.none { it.optString("method") in setOf("image.attach_bytes", "file.attach") })
             assertFalse(f.prompts().single().getJSONObject("params").has("attachments"))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 12000) fun onlyCompletedSynthesisForAnOwnedCanonicalReplyIsReleased() = runBlocking {
-        val f = Fixture(authority = true)
-        try {
-            f.start(); f.receive(geminiFinal("Check this"))
-            assertTrue(waitFor { f.prompts().size == 1 })
-            f.admission = json("status" to "terminal", "outcome" to "completed", "admission_id" to "admission-1", "ref" to json("session_id" to "stored"), "result" to json("final_response" to "Hermes verified it."))
-            assertTrue("Verified native result should create a separate rendering session", withTimeoutOrNull(6000) { while(f.renderRequestCount("Hermes verified it.")==0) delay(10); true } == true)
-            f.tts.respond()
-            assertTrue("Only the completed owned synthesis may play", waitFor { f.audio.size == 1 })
-            assertArrayEquals(byteArrayOf(0, 1), f.audio.single().copyOfRange(0,2))
-            assertTrue(f.audio.single().drop(2).all { it == 0.toByte() })
         } finally { f.close() }
     }
 
@@ -1012,89 +894,19 @@ class NativeSpeechBackendTest {
         } finally { f.close() }
     }
 
-    @Test fun geminiExplicitFinalityNeverDependsOnTheModelName() {
-        val turns=VoiceFinalItems()
-        assertNull(turns.accept(json("text" to "hel"),true))
-        assertEquals("hello",turns.accept(json("text" to "lo", "finished" to true),true)?.second)
-        val partial=VoiceFinalItems()
-        assertNull(partial.accept(json("text" to "hel", "finished" to false),true))
-        assertEquals("hello",partial.accept(json("text" to "lo", "finished" to true),true)?.second)
-    }
-
     @Test(timeout = 8000) fun nativeWorkDoesNotTriggerTheSpeechProviderStallWatch() = runBlocking {
         val f=Fixture(authority=true,stallAfterMs=300)
         try {
             f.start()
             val speech=ByteArray(640).also { for(i in it.indices step 2) { it[i]=(8000 and 255).toByte();it[i+1]=(8000 shr 8).toByte() } }
             repeat(40) { f.voice.pcm(speech) { true };delay(20) }
-            f.receive(geminiFinal("Long native task"))
+            f.work("Long native task")
             assertTrue(waitFor { f.prompts().size==1 })
+            assertTrue(waitFor { f.answered("started") })
+            // The model says its piece about the hand-off; a pending native job is Hermes' to finish, not a stalled provider.
+            f.receive(json("serverContent" to json("turnComplete" to true)))
             delay(1200)
             assertEquals("A pending native admission is not a stalled speech provider",1,f.inputSockets.size)
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 12000) fun interruptionDiscardsAFormerRenderGeneration() = runBlocking {
-        val f=Fixture(authority=true)
-        try {
-            f.start();f.receive(geminiFinal("Check this"));assertTrue(waitFor { f.prompts().size==1 })
-            f.admission=json("status" to "terminal","outcome" to "completed","admission_id" to "admission-1","ref" to json("session_id" to "stored"),"result" to json("final_response" to "Hermes verified it."))
-            assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount("Hermes verified it.")==0) delay(10);true }==true)
-            val stale = f.tts.requests.last()
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            stale.respond(SpeechHttpFixture.pcm())
-            delay(150);assertTrue(f.audio.isEmpty())
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 18000) fun pendingUncertaintyCanRecoverToAVerifiedNativeReply() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start();f.receive(geminiFinal("Check the long task"))
-            assertTrue(waitFor { f.jobPosts.size==1 })
-            val requestId=f.jobPosts.single().getString("request_id")
-            f.jobs=JSONArray().put(json("job_id" to "job-1","request_id" to requestId,"stored_session_id" to "stored","runtime_session_id" to "runtime",
-                "status" to "uncertain","error_code" to "native_turn_pending_confirmation","will_continue" to true))
-            val pendingText="Your request is still pending; its outcome is not yet confirmed."
-            assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount(pendingText)==0) delay(10);true }==true)
-            f.tts.respond()
-            assertTrue(waitFor { f.audio.size==1 })
-            f.jobs=JSONArray().put(json("job_id" to "job-1","request_id" to requestId,"stored_session_id" to "stored","runtime_session_id" to "runtime",
-                "status" to "done","result" to "A verified final reply."))
-            assertTrue("A later verified result must still be rendered",withTimeoutOrNull(6000) { while(f.renderRequestCount("A verified final reply.")==0) delay(10);true }==true)
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 12000) fun bargeInDoesNotCaptionUnplayedAudioOrBlockTheNextRender() = runBlocking {
-        val f=Fixture(authority=true)
-        try {
-            f.autoPlay=false;f.start();f.receive(geminiFinal("Check this"));assertTrue(waitFor { f.prompts().size==1 })
-            f.admission=json("status" to "terminal","outcome" to "completed","admission_id" to "admission-1","ref" to json("session_id" to "stored"),"result" to json("final_response" to "Hermes verified it."))
-            assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount("Hermes verified it.")==0) delay(10);true }==true)
-            f.tts.respond()
-            assertTrue(waitFor { f.audio.size==1 })
-            assertTrue(f.events.none { it.optString("role")=="assistant" && it.optString("text")=="Hermes verified it." })
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(geminiFinal("repeat that"))
-            assertTrue("Interrupted playback must not hold the next render",waitFor { f.renderRequestCount("Hermes verified it.")>=2 })
-            assertTrue(f.events.none { it.optString("role")=="assistant" && it.optString("text")=="Hermes verified it." })
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 12000) fun playbackIsBoundedAndCaptionWaitsForPresentedPcm() = runBlocking {
-        val f=Fixture(authority=true)
-        try {
-            f.autoPlay=false;f.start();f.receive(geminiFinal("Check this"));assertTrue(waitFor { f.prompts().size==1 })
-            f.admission=json("status" to "terminal","outcome" to "completed","admission_id" to "admission-1","ref" to json("session_id" to "stored"),"result" to json("final_response" to "Hermes verified it."))
-            assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount("Hermes verified it.")==0) delay(10);true }==true)
-            f.tts.respond(SpeechHttpFixture.pcm(java.util.Base64.getEncoder().encodeToString(ByteArray(144000))))
-            assertTrue(waitFor { f.audio.size==2 });delay(100)
-            assertEquals("At most two seconds can be outstanding",2,f.audio.size)
-            assertTrue(f.events.none { it.optString("role")=="assistant" && it.optString("text")=="Hermes verified it." })
-            f.voice.played(48000);assertTrue(waitFor { f.audio.size==3 })
-            assertTrue(f.audio.all { it.size<=48000 })
-            f.voice.played(96000)
-            assertTrue(waitFor { f.events.any { it.optString("role")=="assistant" && it.optString("text")=="Hermes verified it." } })
         } finally { f.close() }
     }
 
@@ -1103,7 +915,7 @@ class NativeSpeechBackendTest {
         try {
             f.fileUnavailable=true;f.start();f.voice.setVisualState("screen","starting")
             assertTrue(f.voice.image(byteArrayOf(0xff.toByte(),0xd8.toByte(),0xff.toByte()),{ true }))
-            f.receive(geminiFinal("What is on my screen?"));assertTrue(waitFor { f.prompts().size==1 })
+            f.work("What is on my screen?");assertTrue(waitFor { f.prompts().size==1 })
             val params=f.prompts().single().getJSONObject("params")
             assertTrue(params.getString("text").contains("image could not be attached"))
             assertFalse(params.has("attachments"))
@@ -1117,7 +929,7 @@ class NativeSpeechBackendTest {
             f.start();f.voice.setVisualState("camera","starting")
             assertTrue(f.voice.image(byteArrayOf(0xff.toByte(),0xd8.toByte(),0xff.toByte()),{ allowed.get() }))
             f.onStage={ allowed.set(false) }
-            f.receive(geminiFinal("What is visible?"));assertTrue(waitFor { f.prompts().size==1 })
+            f.work("What is visible?");assertTrue(waitFor { f.prompts().size==1 })
             val params=f.prompts().single().getJSONObject("params")
             assertFalse(params.has("attachments"));assertTrue(params.getString("text").contains("image could not be attached"))
         } finally { f.close() }
@@ -1127,7 +939,7 @@ class NativeSpeechBackendTest {
     @Test(timeout = 15000) fun uncertainContinuingNativeJobRestartsTheLostCollectorWithoutAnotherPrompt() = runBlocking {
         val f = Fixture()
         try {
-            f.start(); f.receive(geminiFinal("First request")); assertTrue(waitFor { f.jobPosts.size == 1 })
+            f.start(); f.work("First request"); assertTrue(waitFor { f.jobPosts.size == 1 })
             val requestId = f.jobPosts.single().getString("request_id")
             f.jobs = JSONArray().put(json("job_id" to "job-1", "request_id" to requestId, "stored_session_id" to "stored",
                 "runtime_session_id" to "runtime", "status" to "uncertain", "will_continue" to true))
@@ -1145,7 +957,7 @@ class NativeSpeechBackendTest {
     @Test(timeout = 12000) fun terminalUncertainNativeJobDoesNotRestartTheLostCollector() = runBlocking {
         val f = Fixture()
         try {
-            f.start(); f.receive(geminiFinal("First request")); assertTrue(waitFor { f.jobPosts.size == 1 })
+            f.start(); f.work("First request"); assertTrue(waitFor { f.jobPosts.size == 1 })
             val requestId = f.jobPosts.single().getString("request_id")
             f.jobs = JSONArray().put(json("job_id" to "job-1", "request_id" to requestId, "stored_session_id" to "stored",
                 "runtime_session_id" to "runtime", "status" to "uncertain", "will_continue" to false))
@@ -1160,11 +972,11 @@ class NativeSpeechBackendTest {
     @Test(timeout = 10000) fun aFastFollowupWaitsUntilThePreviousWatchSettles() = runBlocking {
         val f=Fixture()
         try {
-            f.start();f.receive(geminiFinal("First request"));assertTrue(waitFor { f.jobPosts.size==1 })
+            f.start();f.work("First request");assertTrue(waitFor { f.jobPosts.size==1 })
             val requestId=f.jobPosts.single().getString("request_id")
             f.jobs=JSONArray().put(json("job_id" to "job-1","request_id" to requestId,"stored_session_id" to "stored","runtime_session_id" to "runtime",
                 "status" to "uncertain","error_code" to "native_turn_pending_confirmation","will_continue" to true))
-            f.receive(geminiFinal("Next request"));delay(1400)
+            f.work("Next request");delay(1400)
             assertEquals("A still-live watch must not receive an unlinked second prompt",1,f.prompts().size)
             f.jobs=JSONArray().put(json("job_id" to "job-1","request_id" to requestId,"stored_session_id" to "stored","runtime_session_id" to "runtime","status" to "done","result" to "First result."))
             assertTrue("The follow-up may start after the watch settles",waitFor { f.prompts().size==2 })
@@ -1175,42 +987,15 @@ class NativeSpeechBackendTest {
     @Test(timeout = 10000) fun rowBoundLinkageAllowsAnIndependentFollowupDuringAnOlderUnconfirmedWatch() = runBlocking {
         val f=Fixture()
         try {
-            f.rowBound=true;f.start();f.receive(geminiFinal("First request"));assertTrue(waitFor { f.jobPosts.size==1 })
+            f.rowBound=true;f.start();f.work("First request");assertTrue(waitFor { f.jobPosts.size==1 })
             val requestId=f.jobPosts.single().getString("request_id")
             f.jobs=JSONArray().put(json("job_id" to "job-1","request_id" to requestId,"stored_session_id" to "stored","runtime_session_id" to "runtime",
                 "status" to "uncertain","error_code" to "native_turn_pending_confirmation","will_continue" to true))
-            f.receive(geminiFinal("Next request"))
+            f.work("Next request")
             assertTrue("Row-bound linkage must not strand a distinct prompt",waitFor { f.jobPosts.size==2 })
             assertEquals(2,f.prompts().size)
             assertNotEquals(f.jobPosts.first().getLong("user_row_id"),f.jobPosts.last().getLong("user_row_id"))
         } finally { f.close() }
-    }
-
-    @Test(timeout = 8000) fun microphoneProviderHasNoToolRouteOrAutomaticOpenAiReply() = runBlocking {
-        for(provider in listOf("gemini","openai")) {
-            val f=Fixture(provider)
-            try {
-                f.start()
-                val input=f.providerFrames.first { frame ->
-                    val instruction=frame.optJSONObject("setup")?.optJSONObject("systemInstruction")?.optJSONArray("parts")?.optJSONObject(0)?.optString("text")
-                        ?: frame.optJSONObject("session")?.optString("instructions").orEmpty()
-                    instruction.startsWith("Transcribe")
-                }
-                if(provider=="gemini") assertFalse(input.getJSONObject("setup").has("tools"))
-                else {
-                    val session=input.getJSONObject("session")
-                    assertEquals(0,session.getJSONArray("tools").length());assertEquals("none",session.getString("tool_choice"))
-                    assertFalse(session.getJSONObject("audio").getJSONObject("input").getJSONObject("turn_detection").getBoolean("create_response"))
-                }
-            } finally { f.close() }
-        }
-    }
-
-    @Test fun finalItemLedgerRejectsOverflowInsteadOfForgettingReplayIdentity() {
-        val ledger=VoiceFinalItems()
-        repeat(512) { i -> assertNotNull(ledger.accept(json("text" to "request", "final" to true, "item_id" to "item-$i"),false)) }
-        assertTrue(runCatching { ledger.accept(json("text" to "request", "final" to true, "item_id" to "overflow"),false) }.exceptionOrNull() is VoiceInputLimit)
-        assertNull(ledger.accept(json("text" to "request", "final" to true, "item_id" to "item-0"),false))
     }
 
     @Test(timeout = 8000) fun fullLegacyJobTableRefusesBeforeImageStagingOrNativeMutation() = runBlocking {
@@ -1220,12 +1005,12 @@ class NativeSpeechBackendTest {
             f.jobs=JSONArray().apply { repeat(64) { put(json("job_id" to "old-$it","status" to "done","runtime_session_id" to "runtime")) } }
             f.start();f.voice.setVisualState("camera","starting")
             assertTrue(f.voice.image(byteArrayOf(0xff.toByte(),0xd8.toByte(),0xff.toByte()),{ true }))
-            f.receive(geminiFinal("Check this"))
-            assertTrue(waitFor { f.prompts().isNotEmpty() || f.events.any { it.optString("message").contains("work limit") } })
+            f.work("Check this")
+            assertTrue(waitFor { f.prompts().isNotEmpty() || f.answered("not_sent") })
             assertEquals("A full legacy call must refuse before prompt.submit",0,f.prompts().size)
             assertTrue("A refused turn must not stage image bytes",f.nativeFrames.none { it.optString("method") in setOf("file.attach","image.attach_bytes") })
             assertTrue(f.jobPosts.isEmpty())
-            assertTrue(f.events.any { it.optString("message").contains("new call") })
+            assertTrue("The model is told the call reached its work limit", f.responses().any { it.optString("reason") == "job_capacity" })
         } finally { f.close() }
     }
 
@@ -1234,7 +1019,7 @@ class NativeSpeechBackendTest {
         try {
             f.rowBound=true;f.canonicalAlsoRow=true
             f.jobs=JSONArray().apply { repeat(64) { put(json("job_id" to "old-$it","status" to "done","runtime_session_id" to "stored")) } }
-            f.start();f.receive(geminiFinal("Check this"))
+            f.start();f.work("Check this")
             assertTrue("Canonical admission uses its actual admission receipt",waitFor { f.prompts().size==1 })
             @Suppress("UNCHECKED_CAST")
             val receipts=DirectVoice::class.java.getDeclaredField("toolReceipts").apply { isAccessible=true }.get(f.voice) as Map<String,JSONObject>
@@ -1250,7 +1035,7 @@ class NativeSpeechBackendTest {
         try {
             f.start();f.voice.setVisualState("camera","starting")
             assertTrue(f.voice.image(byteArrayOf(0xff.toByte(),0xd8.toByte(),0xff.toByte()),{ true }))
-            f.receive(geminiFinal("What is visible?"))
+            f.work("What is visible?")
             assertTrue(waitFor { f.nativeSockets.size==1 })
             delay(1800)
             assertTrue("Before gateway.ready neither resume, image nor prompt may be sent",f.nativeFrames.none { it.optString("method") in setOf("session.resume","file.attach","image.attach_bytes","prompt.submit") })
@@ -1267,8 +1052,8 @@ class NativeSpeechBackendTest {
         try {
             f.start();f.voice.setVisualState("camera","starting")
             assertTrue(f.voice.image(byteArrayOf(0xff.toByte(),0xd8.toByte(),0xff.toByte()),{ true }))
-            f.receive(geminiFinal("What is visible?"))
-            val settled=withTimeoutOrNull(6500) { while(f.prompts().isEmpty() && f.events.none { it.optString("message").contains("not sent") }) delay(10);true }==true
+            f.work("What is visible?")
+            val settled=withTimeoutOrNull(6500) { while(f.prompts().isEmpty() && !f.answered("not_sent")) delay(10);true }==true
             assertTrue("An unknown ready state must end with an honest refusal",settled)
             assertTrue("No resume, image staging or prompt.submit is safe without gateway.ready",f.nativeFrames.none { it.optString("method") in setOf("session.resume","file.attach","image.attach_bytes","prompt.submit") })
         } finally { f.close() }
@@ -1279,13 +1064,13 @@ class NativeSpeechBackendTest {
         try {
             f.start();f.voice.setVisualState("camera","starting")
             assertTrue(f.voice.image(byteArrayOf(0xff.toByte(),0xd8.toByte(),0xff.toByte()),{ true }))
-            f.receive(geminiFinal("First request"))
+            f.work("First request")
             assertTrue(waitFor { f.nativeSockets.size==1 })
             delay(100)
             val (oldSocket,oldListener)=f.nativeSockets[0]
             oldListener.onFailure(oldSocket,java.io.IOException("Fixture disconnect"),null)
             f.gatewayReady(0,true)
-            f.receive(geminiFinal("Second request"))
+            f.work("Second request")
             assertTrue(waitFor { f.nativeSockets.size>=2 })
             delay(1800)
             assertTrue("An old socket's ready event must not authorize a replacement",f.nativeFrames.none { it.optString("method") in setOf("session.resume","file.attach","image.attach_bytes","prompt.submit") })
@@ -1293,127 +1078,6 @@ class NativeSpeechBackendTest {
             assertTrue(waitFor { f.prompts().size==1 })
             assertEquals("Second request",f.prompts().single().getJSONObject("params").getString("text"))
             assertTrue(f.prompts().single().getJSONObject("params").has("attachments"))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 12000) fun unflaggedGeminiFragmentsWaitForAnExplicitFinalTranscription() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start()
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Delete"))))
-            assertFalse("The first unflagged fragment must not submit",waitFor { f.prompts().isNotEmpty() })
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to " all drafts"))))
-            assertFalse("The second unflagged fragment is still not a final turn",waitFor { f.prompts().isNotEmpty() })
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "", "finished" to true))))
-            assertTrue("A transcription-final boundary must submit the full turn",waitFor { f.prompts().size==1 })
-            assertEquals("Delete all drafts",f.prompts().single().getJSONObject("params").getString("text"))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 12000) fun modelTurnCompleteQuarantinesUnsegmentedLateInput() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start()
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Delete"))))
-            f.receive(json("serverContent" to json("turnComplete" to true)))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to " all drafts"))))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "", "finished" to true))))
-            assertFalse("An unowned late fragment must never be combined into a guessed request",waitFor { f.prompts().isNotEmpty() })
-            assertTrue(f.events.any { it.optString("message").contains("not sent") })
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 12000) fun closedGeminiSegmentWithMatchingEchoSubmitsOnlyTheFullInputOnce() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start()
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Review "))))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "my notes"))))
-            assertFalse("Unflagged fragments are not committed",waitFor { f.prompts().isNotEmpty() })
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Review my notes"))))
-            f.receive(json("serverContent" to json("generationComplete" to true)))
-            assertTrue(waitFor { f.prompts().size==1 })
-            assertEquals("Review my notes",f.prompts().single().getJSONObject("params").getString("text"))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Review my notes"),"turnComplete" to true)))
-            delay(200);assertEquals(1,f.prompts().size)
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 10000) fun geminiEchoCanArriveBeforeInputButNeedsClosedActivityAndCompletedOutput() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start();f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Check the calendar"))))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Check the calendar"))))
-            assertFalse(waitFor { f.prompts().isNotEmpty() })
-            f.receive(json("serverContent" to json("generationComplete" to true)))
-            assertTrue(waitFor { f.prompts().size==1 })
-            assertEquals("Check the calendar",f.prompts().single().getJSONObject("params").getString("text"))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 10000) fun mismatchedGeminiEchoNeverSubmitsPartialOrAlteredNumbers() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start();f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Pay 1.5"))))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Pay 15"),"generationComplete" to true)))
-            assertFalse("A mismatch cannot become a native request",waitFor { f.prompts().isNotEmpty() })
-            assertTrue(waitFor { f.events.any { it.optString("message").contains("not sent") } })
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 10000) fun newGeminiActivityBeforeCompletionNeverCombinesTwoUtterances() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start();f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Delete"))))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to " all drafts"))))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Delete all drafts"),"turnComplete" to true)))
-            assertFalse("Ambiguous overlapped utterances must not mutate Hermes",waitFor { f.prompts().isNotEmpty() })
-            assertTrue(f.events.any { it.optString("message").contains("not sent") })
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 10000) fun lateGeminiInputAfterSubmissionCannotCreateAnotherTurn() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start();f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Open calendar"))))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Open calendar"),"generationComplete" to true)))
-            assertTrue(waitFor { f.prompts().size==1 })
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to " and send an invite"))))
-            delay(500);assertEquals("Late unscoped data is not a second user turn",1,f.prompts().size)
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 10000) fun explicitFinalAndLaterMatchingEchoCannotSubmitTheSameGeminiSegmentTwice() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start();f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(geminiFinal("Review notes"));assertTrue(waitFor { f.prompts().size==1 })
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Review notes"),"generationComplete" to true)))
-            delay(500);assertEquals(1,f.prompts().size)
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 10000) fun unsegmentedGeminiOutputNeverAuthorizesARequest() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start()
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Delete all drafts"))))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Delete all drafts"),"turnComplete" to true)))
-            assertFalse("A model turn boundary without an owned closed segment is insufficient",waitFor { f.prompts().isNotEmpty() })
-            assertTrue(f.events.any { it.optString("message").contains("not sent") })
         } finally { f.close() }
     }
 
@@ -1434,202 +1098,11 @@ class NativeSpeechBackendTest {
         checkNativeSpeech("Verified reply.", "Verified reply and extra words.", false)
     }
 
-    @Test(timeout = 10000) fun geminiInputCanArriveAfterTheClosedSegmentGenerationCompletes() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start();f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Check notes"))))
-            f.receive(json("serverContent" to json("generationComplete" to true)))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Check notes"))))
-            assertTrue("The independently delivered input must reach Hermes once",waitFor { f.prompts().size==1 })
-            assertEquals("Check notes",f.prompts().single().getJSONObject("params").getString("text"))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 12000) fun temporaryGeminiHttpFailureRetriesSpeechWithoutRepeatingNativeWork() = runBlocking {
-        val f = Fixture(authority = true)
-        try {
-            f.start(); f.receive(geminiFinal("Check this")); assertTrue(waitFor { f.prompts().size == 1 })
-            f.admission = json("status" to "terminal", "outcome" to "completed", "admission_id" to "admission-1", "ref" to json("session_id" to "stored"), "result" to json("final_response" to "Verified reply."))
-            assertTrue(withTimeoutOrNull(6000) { while(f.renderRequestCount("Verified reply.") == 0) delay(10); true } == true)
-            val old = f.tts.requests.last(); old.respond(JSONObject(), 503)
-            assertTrue(waitFor { f.renderRequestCount("Verified reply.") == 2 })
-            old.respond(SpeechHttpFixture.pcm()); assertTrue(f.audio.isEmpty())
-            f.tts.respond(); assertTrue(waitFor { f.audio.size == 1 })
-            assertEquals("An isolated speech retry must not repeat native work", 1, f.prompts().size)
-        } finally { f.close() }
-    }
-
     @Test(timeout = 8000) fun aNonemptyMismatchedRenderDoesNotRetryOrPlay() = runBlocking {
         val f = RenderFixture()
         try {
             f.start(); f.receive(renderPcm()); f.receive(renderTranscript(text = "A different answer.")); f.receive(renderDone()); f.closeSocket()
             assertTrue(waitFor { f.warned() }); assertTrue(f.audio.isEmpty()); assertEquals(1, f.requestCount("Verified reply."))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 10000) fun unflaggedFragmentAfterStandaloneFinalCannotBecomeAnotherNativeTurn() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start();f.receive(geminiFinal("Review notes"));assertTrue(waitFor { f.prompts().size==1 })
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to " and delete them"))))
-            f.receive(geminiFinal(""))
-            assertFalse("Late unsegmented text is not a second request",waitFor { f.prompts().size>1 })
-            assertTrue(f.events.any { it.optString("message").contains("not sent") })
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 10000) fun freshGeminiActivityAfterStandaloneFinalCanStartANewSegment() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start();f.receive(geminiFinal("Review notes"));assertTrue(waitFor { f.prompts().size==1 })
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("serverContent" to json("interrupted" to true,"turnComplete" to true)))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Open calendar"))))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Open calendar"),"generationComplete" to true)))
-            assertTrue(waitFor { f.prompts().size==2 })
-            assertEquals("Open calendar",f.prompts().last().getJSONObject("params").getString("text"))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 10000) fun matchingGeminiGenerationCompletesBeforePlaybackTurnEnds() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start();f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Check calendar"))))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Check calendar"))))
-            f.receive(json("serverContent" to json("generationComplete" to true)))
-            assertTrue("A matching completed generation must not wait for provider playback",waitFor { f.prompts().size==1 })
-            assertEquals("Check calendar",f.prompts().single().getJSONObject("params").getString("text"))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 15000) fun oldInterruptedTurnCompleteCannotFinalizeTheNextGeminiSegment() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start();f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "First request"))))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "First request"),"generationComplete" to true)))
-            assertTrue(waitFor { f.prompts().size==1 })
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("serverContent" to json("interrupted" to true)))
-            f.receive(json("serverContent" to json("turnComplete" to true)))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Second request"))))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Second request"))))
-            assertFalse("An older interrupted turnComplete is not this segment's completion",waitFor { f.prompts().size>1 })
-            f.receive(json("serverContent" to json("generationComplete" to true)))
-            assertTrue(waitFor { f.prompts().size==2 })
-            assertEquals("Second request",f.prompts().last().getJSONObject("params").getString("text"))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 8000) fun interruptedGeminiTurnCompleteAloneNeverAdmitsMatchingSpeech() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start();f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Delete drafts"))))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Delete drafts"))))
-            f.receive(json("serverContent" to json("interrupted" to true,"turnComplete" to true)))
-            assertFalse("Interrupted playback completion cannot finalize a speech request",waitFor { f.prompts().isNotEmpty() })
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 15000) fun explicitGeminiFinalDoesNotBlockTheNextActivityOnOldPlayback() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start();f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(geminiFinal("First request"));assertTrue(waitFor { f.prompts().size==1 })
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("serverContent" to json("interrupted" to true,"turnComplete" to true)))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Second request"))))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Second request"))))
-            assertFalse("The old turnComplete does not complete the new segment",waitFor { f.prompts().size>1 })
-            f.receive(json("serverContent" to json("generationComplete" to true)))
-            assertTrue(waitFor { f.prompts().size==2 })
-            assertEquals("Second request",f.prompts().last().getJSONObject("params").getString("text"))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 15000) fun standaloneFinalDoesNotLetOldTurnCompleteAuthorizeNextSpeech() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start();f.receive(geminiFinal("First request"));assertTrue(waitFor { f.prompts().size==1 })
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("serverContent" to json("interrupted" to true,"turnComplete" to true)))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Second request"))))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Second request"))))
-            assertFalse("Playback completion cannot authorize the second turn",waitFor { f.prompts().size>1 })
-            f.receive(json("serverContent" to json("generationComplete" to true)))
-            assertTrue(waitFor { f.prompts().size==2 })
-            assertEquals("Second request",f.prompts().last().getJSONObject("params").getString("text"))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 15000) fun oldGenerationCompleteAfterExplicitFinalCannotCompleteNewSegment() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start();f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(geminiFinal("First request"));assertTrue(waitFor { f.prompts().size==1 })
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("serverContent" to json("generationComplete" to true,"turnComplete" to true)))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Second request"))))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Second request"))))
-            assertFalse("The prior generation cannot authorize the new segment",waitFor { f.prompts().size>1 })
-            f.receive(json("serverContent" to json("generationComplete" to true)))
-            assertTrue(waitFor { f.prompts().size==2 })
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 18000) fun playbackBeforeLateInputDoesNotStrandTwoFollowingGeminiSegments() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start();f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "First request"))))
-            f.receive(json("serverContent" to json("generationComplete" to true)))
-            f.receive(json("serverContent" to json("turnComplete" to true)))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "First request"))))
-            assertTrue("The late first input must commit once",waitFor { f.prompts().size==1 })
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Second request"))))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Second request"),"generationComplete" to true)))
-            assertTrue("The second segment must commit once",waitFor { f.prompts().size==2 })
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("serverContent" to json("interrupted" to true,"turnComplete" to true)))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Third request"))))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Third request"))))
-            assertFalse("The prior playback tail cannot finish the third segment",waitFor { f.prompts().size>2 })
-            f.receive(json("serverContent" to json("generationComplete" to true)))
-            assertTrue("The third segment must commit after its own generation",waitFor { f.prompts().size==3 })
-            assertEquals("Third request",f.prompts().last().getJSONObject("params").getString("text"))
-        } finally { f.close() }
-    }
-
-    @Test(timeout = 12000) fun generationCompleteDuringAnActiveGeminiSegmentCannotAuthorizeItsLaterEcho() = runBlocking {
-        val f=Fixture()
-        try {
-            f.start();f.receive(json("voiceActivity" to json("type" to "ACTIVITY_START")))
-            f.receive(json("serverContent" to json("generationComplete" to true)))
-            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Delete drafts"))))
-            f.receive(json("voiceActivity" to json("type" to "ACTIVITY_END")))
-            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Delete drafts"))))
-            assertFalse("A completion during active speech cannot authorize its later transcript",waitFor { f.prompts().isNotEmpty() })
-            f.receive(json("serverContent" to json("generationComplete" to true)))
-            assertTrue("The closed segment's own generation may be admitted",waitFor { f.prompts().size==1 })
-            assertEquals("Delete drafts",f.prompts().single().getJSONObject("params").getString("text"))
         } finally { f.close() }
     }
 
@@ -1643,6 +1116,96 @@ class NativeSpeechBackendTest {
                 method.invoke(f.voice, json("id" to "cancel-old", "name" to "hermes_cancel", "args" to json("job_id" to "old")), 0L, continuation)
             }
             assertTrue("An old job must never interrupt a newer voice or chat turn", f.nativeFrames.none { it.optString("method") == "session.interrupt" })
+        } finally { f.close() }
+    }
+
+    @Test(timeout = 8000) fun aFinalOwnerTranscriptSubmitsNothingToHermes() = runBlocking {
+        for (provider in listOf("gemini", "openai")) {
+            val f = Fixture(provider)
+            try {
+                f.start()
+                f.receive(if (provider == "gemini") geminiFinal("What is in my calendar?") else openAiFinal("item-1", "What is in my calendar?"))
+                delay(300)
+                assertTrue("$provider: the owner's words stay with the live model", f.prompts().isEmpty())
+                assertTrue(f.jobPosts.isEmpty())
+                assertTrue("$provider: the call card still shows them", f.events.any { it.optString("role") == "user" && it.optString("text") == "What is in my calendar?" })
+                assertTrue("$provider: a normal turn shows no verification warning", f.events.none { it.optString("type") == "warning" })
+            } finally { f.close() }
+        }
+    }
+
+    @Test(timeout = 8000) fun theLiveModelsOwnAnswerIsCaptionedAndPlayed() = runBlocking {
+        val f = Fixture()
+        try {
+            f.start()
+            f.receive(geminiFinal("What is in my calendar?"))
+            f.receive(json("serverContent" to json("outputTranscription" to json("text" to "Your calendar is empty."))))
+            f.receive(json("serverContent" to json("modelTurn" to json("parts" to JSONArray().put(json("inlineData" to json("mimeType" to "audio/pcm;rate=24000", "data" to "AAE=")))))))
+            f.receive(json("serverContent" to json("generationComplete" to true, "turnComplete" to true)))
+            assertTrue("The model's own audio plays", waitFor { f.audio.size == 1 })
+            assertTrue(waitFor { f.events.any { it.optString("type") == "turn_complete" } })
+            assertTrue(f.events.any { it.optString("role") == "assistant" && it.optString("text").contains("calendar is empty") })
+            assertTrue("Answering never goes through Hermes", f.prompts().isEmpty())
+        } finally { f.close() }
+    }
+
+    @Test(timeout = 12000) fun aReplayedToolCallIdAfterReconnectRunsOnce() = runBlocking {
+        val f = Fixture("openai")
+        try {
+            f.start()
+            f.work("Check that", id = "call-1")
+            assertTrue("The first call reaches Hermes", waitFor { f.prompts().size == 1 })
+            val (socket, listener) = f.inputSockets.first()
+            listener.onFailure(socket, java.io.IOException("fixture disconnect"), null)
+            assertTrue("Provider must reconnect", waitFor { f.inputSockets.size >= 2 })
+            assertTrue("Provider must be admitted after reconnect", waitFor { f.events.count { it.optString("state") == "listening" } >= 2 })
+            f.work("Check that", id = "call-1")
+            delay(300)
+            assertEquals("A replayed call id never runs twice", 1, f.prompts().size)
+        } finally { f.close() }
+    }
+
+    @Test(timeout = 12000) fun aVerifiedNativeResultIsToldToTheLiveModelAndNeverRenderedByThePhone() = runBlocking {
+        val f = Fixture(authority = true)
+        try {
+            f.start(); f.work("Check this")
+            assertTrue(waitFor { f.prompts().size == 1 })
+            f.admission = json("status" to "terminal", "outcome" to "completed", "admission_id" to "admission-1", "ref" to json("session_id" to "stored"), "result" to json("final_response" to "Hermes verified it."))
+            assertTrue("The result reaches the live model as a turn", withTimeoutOrNull(6000) { while (f.told("Hermes verified it.") == 0) delay(10); true } == true)
+            delay(200)
+            assertEquals("It is told once", 1, f.told("Hermes verified it."))
+            assertTrue("The phone renders no speech of its own", f.audio.isEmpty())
+        } finally { f.close() }
+    }
+
+    @Test(timeout = 18000) fun pendingUncertaintyCanRecoverToAVerifiedNativeReply() = runBlocking {
+        val f = Fixture()
+        try {
+            f.start(); f.work("Check the long task")
+            assertTrue(waitFor { f.jobPosts.size == 1 })
+            val requestId = f.jobPosts.single().getString("request_id")
+            f.jobs = JSONArray().put(json("job_id" to "job-1", "request_id" to requestId, "stored_session_id" to "stored", "runtime_session_id" to "runtime",
+                "status" to "uncertain", "error_code" to "native_turn_pending_confirmation", "will_continue" to true))
+            val pendingText = "Your request is still pending; its outcome is not yet confirmed."
+            assertTrue(withTimeoutOrNull(6000) { while (f.told(pendingText) == 0) delay(10); true } == true)
+            f.jobs = JSONArray().put(json("job_id" to "job-1", "request_id" to requestId, "stored_session_id" to "stored", "runtime_session_id" to "runtime",
+                "status" to "done", "result" to "A verified final reply."))
+            assertTrue("A later verified result is still told to the model", withTimeoutOrNull(6000) { while (f.told("A verified final reply.") == 0) delay(10); true } == true)
+        } finally { f.close() }
+    }
+
+    @Test(timeout = 8000) fun cancellingAnActiveJobInterruptsItsRuntimeOnceAndAnswersTheModel() = runBlocking {
+        val f = Fixture()
+        try {
+            f.start()
+            f.jobs = JSONArray().put(json("job_id" to "new", "status" to "watching", "runtime_session_id" to "runtime"))
+            f.call("hermes_cancel", json("job_id" to "new"), "cancel-1")
+            assertTrue(waitFor { f.nativeFrames.any { it.optString("method") == "session.interrupt" } })
+            f.call("hermes_cancel", json("job_id" to "new"), "cancel-1")
+            assertTrue("The model gets the outcome", waitFor { f.providerFrames.any { it.optJSONObject("toolResponse")?.toString()?.contains("cancel-1") == true } })
+            delay(200)
+            assertEquals("A replayed call never interrupts twice", 1, f.nativeFrames.count { it.optString("method") == "session.interrupt" })
+            assertEquals("runtime", f.nativeFrames.single { it.optString("method") == "session.interrupt" }.getJSONObject("params").getString("session_id"))
         } finally { f.close() }
     }
 }

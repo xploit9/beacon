@@ -2,6 +2,7 @@ package dev.hermes.android
 
 import dev.hermes.android.data.*
 import dev.hermes.android.ui.NativeSkillsState
+import dev.hermes.android.ui.withSkillEnabled
 import dev.hermes.android.core.*
 import androidx.lifecycle.SavedStateHandle
 import org.json.JSONObject
@@ -129,22 +130,24 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         _server.value = NativeServerState(requestedActionId = saved["server-update:$host:id"] ?: "", requestedAt = saved["server-update:$host:at"] ?: "")
     }
 
-    private fun skillsRequest(write: Boolean = false, block: suspend (NativeSkills) -> NativeSkillsState) {
+    /** [optimistic] shows the expected result at once; [undo] puts the old state back if the request fails (the error text is shown either way). */
+    private fun skillsRequest(write: Boolean = false, optimistic: ((NativeSkillsState) -> NativeSkillsState)? = null, undo: ((NativeSkillsState) -> NativeSkillsState)? = null, toggling: String? = null, block: suspend (NativeSkills) -> NativeSkillsState) {
         val active = client() ?: return
         bind()
         val revision = bindingRevision
-        if (_skills.value.saving) return
+        if (_skills.value.saving || _skills.value.toggling != null) return
         skillJob?.cancel()
-        _skills.update { it.copy(loading = !write, saving = write, error = null, notice = null) }
+        // A switch saves without the screen-wide "Saving" state, so the list neither locks nor shifts.
+        _skills.update { it.copy(loading = !write, saving = write && toggling == null, toggling = toggling, error = null, notice = null).let { started -> optimistic?.invoke(started) ?: started } }
         skillJob = jobs.launch {
             val c = active.detached()
             try {
                 authorizeProfile(active, c.scope.profile)
                 if (!current(active, revision)) return@launch
                 val result = block(NativeSkills(c))
-                if (current(active, revision)) { _skills.value = result.copy(loading = false, saving = false); draftChanged() }
+                if (current(active, revision)) { _skills.value = result.copy(loading = false, saving = false, toggling = null); draftChanged() }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (current(active, revision)) { _skills.update { it.copy(loading = false, saving = false, error = appErrorText(e)) }; profileFailure(e) } }
+            catch (e: Exception) { if (current(active, revision)) { _skills.update { (undo?.invoke(it) ?: it).copy(loading = false, saving = false, toggling = null, error = appErrorText(e)) }; profileFailure(e) } }
             finally { c.closeNative() }
         }
     }
@@ -177,15 +180,18 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
     fun skillDraft(value: String) { _skills.update { it.copy(draft = value) }; draftChanged() }
     fun skillEdit(editing: Boolean) { if (!_skills.value.saving && (!editing || !_skills.value.loading && _skills.value.content != null)) { _skills.update { it.copy(editing = editing, draft = if (editing) it.content?.content.orEmpty() else "", error = null) }; draftChanged() } }
     fun closeSkill() { if (!_skills.value.saving) { skillJob?.cancel(); _skills.update { it.copy(selected = null, content = null, editing = false, draft = "", loading = false, error = null) }; draftChanged() } }
+    /** The switch moves at once. Hermes confirms in the background (toggle reads the list back to check it, and that list is the refresh); a failure puts the switch back. */
     fun toggleSkill(skill: NativeSkill, enabled: Boolean) {
       val active = client() ?: return
       bind()
       val revision = bindingRevision
-      skillsRequest(true) { api ->
+      val was = _skills.value.skills.firstOrNull { it.name == skill.name }?.enabled ?: skill.enabled
+      skillsRequest(true, optimistic = { it.withSkillEnabled(skill.name, enabled) }, undo = { it.withSkillEnabled(skill.name, was) }, toggling = skill.name) { api ->
         api.toggle(skill.name, enabled)
-        val list = api.list()
+        val list = api.snapshot?.let(::parseNativeSkills) ?: api.list()
         if (current(active, revision)) keepSkills(active.scope, api)
-        _skills.value.copy(skills = list, selected = list.firstOrNull { it.name == _skills.value.selected?.name }, notice = "Saved. New chats use this change.")
+        // The switch already shows the change; no notice pushes the list down.
+        _skills.value.copy(skills = list, selected = list.firstOrNull { it.name == _skills.value.selected?.name })
       }
     }
     fun saveSkill() {

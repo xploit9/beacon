@@ -69,18 +69,27 @@ def _number(value):
         return None
 
 
+def prefix_range(*prefixes):
+    """A WHERE term and its arguments that match every meta key starting with one of the prefixes. Unlike LIKE and
+    substr(), a key range reads only those rows of the primary-key index."""
+    return ("(" + " OR ".join("(key>=? AND key<?)" for _ in prefixes) + ")",
+            [bound for prefix in prefixes for bound in (prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1))])
+
+
 def prune_meta(conn, now):
     # A caller reads its clock before it waits for the write lock, so a marker a faster request just committed can
     # be dated after that stale reading; only a marker ahead of the live clock is corrupt.
     horizon = max(now, time.time())
-    for key, value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'email-evidence:%' OR key LIKE 'source-evidence:%' OR key LIKE 'mail-evidence:%' ORDER BY key LIMIT ?", (PRUNE_BATCH,)).fetchall():
+    where, bounds = prefix_range("email-evidence:", "source-evidence:", "mail-evidence:")
+    for key, value in conn.execute("SELECT key,value FROM meta WHERE " + where + " ORDER BY key LIMIT ?", (*bounds, PRUNE_BATCH)).fetchall():
         try:
             observed = json.loads(value).get("observed_at")
         except (AttributeError, TypeError, ValueError):
             observed = None
         if type(observed) not in (int, float) or not math.isfinite(observed) or now - observed > EVIDENCE_TTL:
             conn.execute("DELETE FROM meta WHERE key=?", (key,))
-    for key, value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'proactive-alert:%' OR key LIKE 'proactive-call:%' OR key LIKE 'proactive-email-notice:%' OR key LIKE 'proactive-email-rule:%' OR key LIKE 'mail-notified:%' ORDER BY key LIMIT ?", (PRUNE_BATCH,)).fetchall():
+    where, bounds = prefix_range("proactive-alert:", "proactive-call:", "proactive-email-notice:", "proactive-email-rule:", "mail-notified:")
+    for key, value in conn.execute("SELECT key,value FROM meta WHERE " + where + " ORDER BY key LIMIT ?", (*bounds, PRUNE_BATCH)).fetchall():
         created = _number(value)
         if key.startswith("proactive-email-rule:"):
             try:
@@ -94,7 +103,8 @@ def prune_meta(conn, now):
         retention = CALL_WINDOW if key.startswith("proactive-call:") else ALERT_RETENTION
         if created is None or created > horizon or now - created > retention:
             conn.execute("DELETE FROM meta WHERE key=?", (key,))
-    for key, value in conn.execute("SELECT key,value FROM meta WHERE key LIKE 'completion:%'").fetchall():
+    where, bounds = prefix_range("completion:")
+    for key, value in conn.execute("SELECT key,value FROM meta WHERE " + where, bounds).fetchall():
         created = _number(value)
         if created is None:
             if value == b"notified":
@@ -124,6 +134,9 @@ def completion(mobile, native, cfg, profile, session_id, turn_id=None, completed
         if conn.execute("SELECT COUNT(*) FROM notices").fetchone()[0] >= 10000:
             raise ValueError("Notification capacity reached")
         conn.execute("INSERT INTO meta VALUES(?,?)", (key, str(now).encode()))
+        # The owner is on a call in this conversation: the reply is spoken and shown there, so it is not also an alert.
+        if kind != "task_result" and mobile.call_open_on(conn, owner, profile, session_id):
+            return
         conn.execute("INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,job_id) VALUES(?,?,?,?,?,?,?,?)",
                      (uuid.uuid4().hex, owner, profile, kind, session_id, now, now + 86400,
                       job_id if isinstance(job_id, str) and mobile.ID.fullmatch(job_id) else ""))
@@ -386,9 +399,9 @@ def event_notice(mobile, native, cfg, profile, session_id, args, now):
             if conn.execute("SELECT 1 FROM meta WHERE key=?", (dedupe,)).fetchone():
                 return dict(DUPLICATE_ALERT)
             prefix = f"proactive-call:{owner}:{profile}:"
+            where, bounds = prefix_range(prefix)
             count = sum((_number(row[0]) or 0) > now.timestamp() - CALL_WINDOW
-                        for row in conn.execute("SELECT value FROM meta WHERE substr(key,1,?)=?",
-                                                (len(prefix), prefix)))
+                        for row in conn.execute("SELECT value FROM meta WHERE " + where, bounds))
             callbacks_ready = cfg.get("callback_tool_enabled") is True and cfg.get("scheduled_callbacks_enabled") is True
             if callbacks_ready and count < CALL_LIMIT:
                 # The event's own reason leads (call history shows it first); the rule follows.

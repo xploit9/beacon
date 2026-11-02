@@ -28,20 +28,19 @@ HISTORY_RETENTION_DAYS = (0,30,90,365)
 HISTORY_RETENTION_EVENTS_PER_BATCH = 1000
 HISTORY_RETENTION_CALLS_PER_BATCH = 100
 MAX_DEVICES = 32
+DEVICE_SEEN_SECONDS = 60
 DEVICE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 
 
 class DeviceLimitError(ValueError):
     pass
 
-def _yaml_settings():
-    from copy import deepcopy
-    path=home()/'config.yaml'
-    try:
-        from utils import load_yaml_file_readonly
-        if not path.is_file() or path.stat().st_size>1024*1024: return None
-        cfg=load_yaml_file_readonly(path)
-    except Exception: return None  # Native YAML engines differ; unreadable authority always fails closed.
+# config path -> (file signature, plugin settings). The YAML is parsed again only when the file changed.
+_YAML_CACHE={}
+# A write can share the timestamp of the one before it; a file touched this recently is never trusted to the cache.
+_YAML_RACY_NS=250_000_000
+
+def _plugin_settings(cfg):
     if not isinstance(cfg,dict): return None
     plugins=cfg.get('plugins')
     if not isinstance(plugins,dict): return None
@@ -54,7 +53,26 @@ def _yaml_settings():
     if not isinstance(entry,dict): return None
     if 'settings' not in entry or entry['settings'] is None: return {}
     value=entry['settings']
-    return deepcopy(value) if isinstance(value,dict) else None
+    return value if isinstance(value,dict) else None
+
+def _yaml_settings():
+    from copy import deepcopy
+    path=home()/'config.yaml'
+    try:
+        from utils import load_yaml_file_readonly
+        if not path.is_file(): return None
+        info=path.stat()
+        if info.st_size>1024*1024: return None
+        signature=(info.st_mtime_ns,info.st_size,info.st_ino)
+        held=_YAML_CACHE.get(str(path))
+        if held and held[0]==signature: return deepcopy(held[1])
+        cfg=load_yaml_file_readonly(path)
+    except Exception: return None  # Native YAML engines differ; unreadable authority always fails closed.
+    value=_plugin_settings(cfg)
+    if time.time_ns()-info.st_mtime_ns>_YAML_RACY_NS:
+        if len(_YAML_CACHE)>=8: _YAML_CACHE.clear()
+        _YAML_CACHE[str(path)]=(signature,deepcopy(value))
+    return deepcopy(value)
 
 def _valid_owner_identity(owner,provider):
     return all(isinstance(value,str) and value.strip() and len(value)<=256 and not any(ord(c)<32 or ord(c)==127 for c in value)
@@ -175,7 +193,7 @@ def protect(path):
     import ctypes
     from ctypes import wintypes
     if _OWNER_SID is None:
-        _OWNER_SID = subprocess.check_output(['whoami', '/user', '/fo', 'csv', '/nh'], text=True,
+        _OWNER_SID = subprocess.check_output(['whoami', '/user', '/fo', 'csv', '/nh'], text=True, timeout=15,
                                   creationflags=subprocess.CREATE_NO_WINDOW).strip().split(',')[-1].strip('"')
     sid=_OWNER_SID
     if not re.fullmatch(r'S-1-[0-9-]+', sid):
@@ -219,6 +237,13 @@ def _initialize_schema(conn):
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS owned_voice_calls ON calls(owner,profile,conversation,created DESC)')
     conn.execute('CREATE INDEX IF NOT EXISTS owned_call_log ON call_log(owner,profile,created DESC)')
+    # Backing indexes for the hot filters below; they upgrade an existing database in place.
+    conn.execute('CREATE INDEX IF NOT EXISTS notices_owner_profile ON notices(owner,profile,seq)')
+    conn.execute('CREATE INDEX IF NOT EXISTS notices_expires ON notices(expires)')
+    conn.execute('CREATE INDEX IF NOT EXISTS notices_call_id ON notices(call_id)')
+    conn.execute('CREATE INDEX IF NOT EXISTS jobs_call_id ON jobs(call_id)')
+    conn.execute('CREATE INDEX IF NOT EXISTS jobs_owner_profile_status ON jobs(owner,profile,status)')
+    conn.execute('CREATE INDEX IF NOT EXISTS call_log_call_id ON call_log(call_id)')
     conn.execute('CREATE INDEX IF NOT EXISTS owned_beacon_devices ON beacon_devices(owner,profile,removed,last_seen DESC)')
     conn.execute("CREATE INDEX IF NOT EXISTS transcript_versions ON timeline(call_id,json_extract(payload,'$.type'),json_extract(payload,'$.role'),json_extract(payload,'$.turn_id'),json_extract(payload,'$.final'),json_extract(payload,'$.at_ms'))")
     call_columns={r[1] for r in conn.execute('PRAGMA table_info(calls)')}
@@ -226,6 +251,8 @@ def _initialize_schema(conn):
     if 'callback_context' not in call_columns: conn.execute("ALTER TABLE calls ADD COLUMN callback_context TEXT NOT NULL DEFAULT '{}'")
     if 'ended' not in call_columns: conn.execute('ALTER TABLE calls ADD COLUMN ended REAL')
     if 'seen' not in call_columns: conn.execute('ALTER TABLE calls ADD COLUMN seen REAL')
+    # Only unfinished calls are ever counted or swept, so the index holds just those rows.
+    conn.execute('CREATE INDEX IF NOT EXISTS open_calls ON calls(owner,COALESCE(seen,created)) WHERE closed=0')
     columns={r[1] for r in conn.execute('PRAGMA table_info(jobs)')}
     for name in ('result','error'):
         if name not in columns: conn.execute('ALTER TABLE jobs ADD COLUMN '+name+" TEXT DEFAULT ''")
@@ -237,6 +264,7 @@ def _initialize_schema(conn):
     call_log_columns={r[1] for r in conn.execute('PRAGMA table_info(call_log)')}
     if 'email_notice_id' not in call_log_columns: conn.execute("ALTER TABLE call_log ADD COLUMN email_notice_id TEXT DEFAULT ''")
     if 'feedback_verdict' not in call_log_columns: conn.execute('ALTER TABLE call_log ADD COLUMN feedback_verdict TEXT')
+    conn.execute('CREATE INDEX IF NOT EXISTS call_log_email_notice ON call_log(email_notice_id)')
     if 'release_version' not in notice_columns: conn.execute('ALTER TABLE notices ADD COLUMN release_version INTEGER NOT NULL DEFAULT 0')
     if 'reason' not in notice_columns: conn.execute("ALTER TABLE notices ADD COLUMN reason TEXT DEFAULT ''")
     if 'job_id' not in notice_columns: conn.execute("ALTER TABLE notices ADD COLUMN job_id TEXT DEFAULT ''")
@@ -268,13 +296,34 @@ def _initialize_schema(conn):
     deferred_columns={r[1] for r in conn.execute('PRAGMA table_info(deferred)')}
     if 'reason' not in deferred_columns: conn.execute("ALTER TABLE deferred ADD COLUMN reason TEXT DEFAULT ''")
 
-def _connect():
+class _Connection(sqlite3.Connection):
+    """sqlite3's own `with` only commits; closing here as well keeps `with connect() as conn` from leaking the handle."""
+    def __exit__(self, *exc):
+        try: return super().__exit__(*exc)
+        finally: self.close()
+
+_ROOT_READY={}
+
+def _protected_root():
     root = home() / 'plugin-data' / 'beacon'
+    # protect() walks the path and its parents; once it passed, one stat tells whether the folder is still the same one.
+    try:
+        info = root.stat()
+        if _ROOT_READY.get(str(root)) == (info.st_dev, info.st_ino): return root
+    except OSError: pass
     protect(root)
+    info = root.stat()
+    _ROOT_READY[str(root)] = (info.st_dev, info.st_ino)
+    return root
+
+def _connect(thread_safe=False):
+    root = _protected_root()
     database = root / 'mobile.sqlite'
-    conn = sqlite3.connect(database, timeout=15)
+    conn = sqlite3.connect(database, timeout=15, factory=_Connection, check_same_thread=not thread_safe)
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA foreign_keys=ON')
+    # WAL is on, so NORMAL only drops the per-commit fsync; a crash can lose the last commit but never corrupts.
+    conn.execute('PRAGMA synchronous=NORMAL')
     try:
         info=database.stat()
         schema_key=(str(database.resolve()),info.st_dev,info.st_ino)
@@ -287,8 +336,9 @@ def _connect():
         raise
     return conn
 
-def connect():
-    with LOCK: return _connect()
+def connect(thread_safe=False):
+    """A new connection; `thread_safe` lets a caller that never overlaps its own calls (a long poll) use it from several worker threads."""
+    with LOCK: return _connect(thread_safe)
 
 
 def read_plugin_version(path):
@@ -413,13 +463,15 @@ def touch_device(owner, provider, profile, device_id, update_seen=True, require=
         return
     now = time.time()
     with LOCK, connect() as conn:
-        row = conn.execute('SELECT owner,provider,removed FROM beacon_devices WHERE id=?', (device_id,)).fetchone()
+        row = conn.execute('SELECT owner,provider,removed,last_seen FROM beacon_devices WHERE id=?', (device_id,)).fetchone()
         if not row or row['owner'] != owner or row['provider'] != provider:
             if require: raise LookupError('device_required')
             return
         if row['removed']:
             raise LookupError('device_removed')
-        if update_seen: conn.execute('UPDATE beacon_devices SET last_seen=? WHERE id=? AND removed=0', (now, device_id))
+        # "Last seen" shows minutes, so a phone polling every second writes it once a minute, not on every request.
+        if update_seen and not 0 <= now - row['last_seen'] < DEVICE_SEEN_SECONDS:
+            conn.execute('UPDATE beacon_devices SET last_seen=? WHERE id=? AND removed=0', (now, device_id))
 
 HELD_POST_SECONDS=86400
 MAX_HELD_POSTS=200
@@ -555,6 +607,11 @@ STALE_CALL_SECONDS=300
 def active_calls(conn,owner):
     return conn.execute('SELECT COUNT(*) FROM calls WHERE owner=? AND closed=0 AND COALESCE(seen,created)>=?',(owner,time.time()-STALE_CALL_SECONDS)).fetchone()[0]
 
+def call_open_on(conn,owner,profile,conversation):
+    """A live call (not stale) on this conversation: its replies are heard and shown in the call, so they raise no alert."""
+    return conn.execute('SELECT 1 FROM calls WHERE owner=? AND closed=0 AND profile=? AND conversation=? AND COALESCE(seen,created)>=? LIMIT 1',
+                        (owner,profile,conversation,time.time()-STALE_CALL_SECONDS)).fetchone() is not None
+
 def prune_notices(conn):
     now=time.time()
     conn.execute("UPDATE calls SET closed=1,ended=COALESCE(ended,seen,created),status='failed' WHERE closed=0 AND COALESCE(seen,created)<?",(now-STALE_CALL_SECONDS,))
@@ -662,12 +719,13 @@ def events(call_id,owner,body):
         clean.append((row['event_id'],hashlib.sha256(raw.encode()).hexdigest(),raw))
     with LOCK,connect() as conn:
         owned(conn,call_id,owner,writable=True)
-        existing_ids={r[0] for r in conn.execute('SELECT event_id FROM timeline WHERE call_id=?',(call_id,))}
-        if len(existing_ids|{r[0] for r in clean})>20000: raise ValueError('Timeline limit exceeded')
+        # One lookup for the batch's own ids (not one per event); the cap needs only the stored count.
+        known={r[0]:r[1] for r in conn.execute('SELECT event_id,digest FROM timeline WHERE call_id=? AND event_id IN (%s)'%','.join('?'*len(clean)),(call_id,*(r[0] for r in clean)))}
+        stored=conn.execute('SELECT COUNT(*) FROM timeline WHERE call_id=?',(call_id,)).fetchone()[0]
+        if stored+len({r[0] for r in clean}-known.keys())>20000: raise ValueError('Timeline limit exceeded')
         for eid,digest,raw in clean:
-            old=conn.execute('SELECT digest FROM timeline WHERE call_id=? AND event_id=?',(call_id,eid)).fetchone()
-            if old and old[0]!=digest: raise ValueError('Conflicting duplicate event')
-            conn.execute('INSERT OR IGNORE INTO timeline VALUES(?,?,?,?)',(call_id,eid,digest,raw))
+            if known.setdefault(eid,digest)!=digest: raise ValueError('Conflicting duplicate event')
+        conn.executemany('INSERT OR IGNORE INTO timeline VALUES(?,?,?,?)',[(call_id,eid,digest,raw) for eid,digest,raw in clean])
     return {'stored':True,'count':len(clean),'recording_status':'disabled','transcript_status':'syncing'}
 
 def finalize(call_id,owner,body):
@@ -771,9 +829,14 @@ def voice_history(owner,profile,stored,limit=200,text_budget=1024*1024,call_id=N
                     CASE role WHEN 'user' THEN 0 ELSE 1 END,first_at DESC,first_ordinal DESC,display_id DESC LIMIT ?""",(call['id'],limit+1)).fetchall()
             numeric_turns=bool(groups) and all(str(group['turn'] or '').isdigit() for group in groups)
             role_order=lambda group: 0 if group['role']=='user' else 1
-            for group in groups:
+            # Payloads come 32 at a time and the interrupted turns once per call, not one query per group.
+            payloads={};interrupted_turns=None
+            for position,group in enumerate(groups):
                 if len(output)>=limit: truncated=True;break
-                event=json.loads(conn.execute('SELECT payload FROM timeline WHERE rowid=?',(group['version_row'],)).fetchone()[0])
+                if group['version_row'] not in payloads:
+                    chunk=[g['version_row'] for g in groups[position:position+32]]
+                    payloads.update(conn.execute('SELECT rowid,payload FROM timeline WHERE rowid IN (%s)'%','.join('?'*len(chunk)),chunk).fetchall())
+                event=json.loads(payloads.pop(group['version_row']))
                 is_final=bool(event.get('final'));text=event['text']+('' if is_final else ' [unfinalized transcript]')
                 encoded=text.encode('utf-8')
                 if len(encoded)>remaining:
@@ -786,7 +849,9 @@ def voice_history(owner,profile,stored,limit=200,text_budget=1024*1024,call_id=N
                 remaining-=len(text.encode('utf-8'))
                 interrupted=bool(event.get('interrupted'))
                 if group['role']=='assistant' and not interrupted:
-                    interrupted=bool(conn.execute("SELECT 1 FROM timeline WHERE call_id=? AND json_extract(payload,'$.type')='interruption' AND json_extract(payload,'$.turn_id') IS ? LIMIT 1",(call['id'],group['turn'])).fetchone())
+                    if interrupted_turns is None:
+                        interrupted_turns={r[0] for r in conn.execute("SELECT DISTINCT json_extract(payload,'$.turn_id') FROM timeline WHERE call_id=? AND json_extract(payload,'$.type')='interruption'",(call['id'],))}
+                    interrupted=group['turn'] in interrupted_turns
                 turn_order=int(group['turn']) if numeric_turns else group['first_at'] or 0
                 output.append({'call_id':call['id'],'event_id':group['display_id'],'session_id':stored,'turn_id':str(group['turn'] or ''),'role':group['role'],'text':text,'final':is_final,'interrupted':interrupted,'at_ms':event['at_ms'],'created_at':call['created']+(group['first_at'] or 0)/1000,'_order':(call['created'],0 if numeric_turns else 1,turn_order,role_order(group),group['first_at'] or 0,group['first_ordinal'],group['display_id'],call['id'])})
                 if remaining<=0: truncated=True;break

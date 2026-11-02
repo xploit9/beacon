@@ -151,14 +151,14 @@ class LaneR8KWideLayoutTest {
         }
         fun assertDrawer(fontScaleValue: Float, panelTag: String) {
             if (fontScaleValue > 1f) {
-                // At large text Bots moves under More; Chats stays on the drawer switch.
+                // At large text Bots moves under More, where it still switches Bot Mode on and off.
                 compose.onNodeWithTag("navigation-more").assertExists()
                 compose.onAllNodesWithTag("navigation-bots").assertCountEquals(0)
             } else compose.onNodeWithTag("navigation-bots").assertTextEquals("Bots")
             compose.onNodeWithTag("history-view-all").assertTextEquals("All")
             compose.onNodeWithTag("history-view-pinned").assertTextEquals("Pinned")
             compose.onNodeWithTag("history-threads").assertTextEquals("Threads")
-            val labels = if (fontScaleValue > 1f) listOf("Chats", "All", "Pinned", "Threads") else listOf("Bots", "Chats", "All", "Pinned", "Threads")
+            val labels = if (fontScaleValue > 1f) listOf("All", "Pinned", "Threads") else listOf("Bots", "All", "Pinned", "Threads")
             labels.forEach(::assertSingleUnclippedLine)
             compose.onNodeWithTag(panelTag).assertIsDisplayed()
             val panelWidth = widthDp(panelTag)

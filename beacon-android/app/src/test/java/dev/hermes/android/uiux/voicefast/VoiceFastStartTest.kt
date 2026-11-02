@@ -8,7 +8,6 @@ import dev.hermes.android.data.defaultVoiceModel
 import dev.hermes.android.data.defaultVoiceName
 import dev.hermes.android.voice.DirectVoice
 import dev.hermes.android.voice.CALL_HERMES_NO_ANSWER
-import dev.hermes.android.voice.SpeechHttpFixture
 import kotlinx.coroutines.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Protocol
@@ -28,8 +27,7 @@ import java.util.concurrent.atomic.AtomicInteger
 class VoiceFastStartTest {
     private val credentials = VoiceSessionCredentials("gemini", "fixture-provider-key", defaultVoiceModel("gemini"), defaultVoiceName("gemini"), "balanced")
 
-    private inner class Call(private val holdSetup: Boolean = false, failContext: Boolean = false,
-        val tts: SpeechHttpFixture = SpeechHttpFixture()) {
+    private inner class Call(private val holdSetup: Boolean = false, failContext: Boolean = false) {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val events = CopyOnWriteArrayList<JSONObject>()
         val audio = CopyOnWriteArrayList<ByteArray>()
@@ -67,7 +65,7 @@ class VoiceFastStartTest {
         init {
             // The clock stands still one second after the tap, so every diagnostic must read 1000 ms.
             voice = DirectVoice(client, "call", "stored", scope, { bytes -> audio += bytes; voice.played(bytes.size) }, { events += it }, { failure.complete(it) },
-                credentials = credentials, providerSocketFactory = provider, providerCallFactory = tts, clock = { 51_000L }, tappedAt = 50_000L)
+                credentials = credentials, providerSocketFactory = provider, clock = { 51_000L }, tappedAt = 50_000L)
         }
         fun receive(frame: JSONObject) { val (socket, listener) = inputs.last(); listener.onMessage(socket, frame.toString()) }
         fun states() = events.filter { it.optString("type") == "state" }.map { it.getString("state") }
@@ -90,7 +88,6 @@ class VoiceFastStartTest {
             assertEquals("The socket opened beside the context read", 1, c.inputs.size)
             assertTrue(c.states().isEmpty())
             assertFalse(c.voice.pcm(ByteArray(640)) { true })
-            assertTrue(c.tts.requests.isEmpty())
         } finally { c.close() }
     }
 }

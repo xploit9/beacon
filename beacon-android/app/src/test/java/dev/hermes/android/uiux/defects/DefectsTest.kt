@@ -45,7 +45,8 @@ class DefectsTest {
     @Test fun thePhoneSettingsWriteTheSameTwoSaveNotices() {
         // NativePhoneSettings (outside the UI package) writes the notices; if its words drift, the success pill would silently turn into a warning row.
         val source = File(GapsAssets.appDir, "src/main/java/dev/hermes/android/NativePhoneSettings.kt").readText()
-        assertTrue(source.contains("notice = \"$SkillsSavedNotice\""))
+        // A skill switch shows its own change; only saved instructions add a notice above the list.
+        assertFalse(source.contains("notice = \"$SkillsSavedNotice\""))
         assertTrue(source.contains("notice = \"$SkillInstructionsSavedNotice\""))
     }
 

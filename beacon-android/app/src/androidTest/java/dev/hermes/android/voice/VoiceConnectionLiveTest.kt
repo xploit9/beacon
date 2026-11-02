@@ -33,7 +33,8 @@ import java.io.File
 class VoiceConnectionLiveTest {
     @get:Rule val rule = createAndroidComposeRule<BeaconActivity>()
 
-    private suspend fun checkNativeReply(app: BeaconApplication, client: BeaconClient, call: String): JSONObject {
+    /** The live model answers a spoken question itself: no Hermes job is started for it, and the reply time is measured. */
+    private suspend fun checkDirectReply(app: BeaconApplication, client: BeaconClient, call: String): JSONObject {
         val service = requireNotNull(app.calls.service)
         service.mute(true)
         val direct = BeaconCallService::class.java.getDeclaredField("directVoice").apply { isAccessible = true }.get(service) as DirectVoice
@@ -65,25 +66,31 @@ class VoiceConnectionLiveTest {
                 input[index * 2] = source[at]; input[index * 2 + 1] = source[at + 1]
             }
             source.fill(0)
-            try { stream(ByteArray(19200)); stream(input); stream(ByteArray(70400)) } finally { input.fill(0) }
+            // Counted before speaking: the live model can answer during the trailing silence, before the stream ends.
+            val repliesBefore = app.calls.state.value.transcripts.count { it.role == "assistant" }
+            var spoken = 0L
+            fun answer() = app.calls.state.value.transcripts.filter { it.role == "assistant" }.drop(repliesBefore).joinToString(" ") { it.text }
+            // The first reply is timed as it appears, even while the trailing silence is still being streamed.
+            val firstReplyAt = java.util.concurrent.atomic.AtomicLong(0)
+            val watcher = kotlinx.coroutines.CoroutineScope(Dispatchers.Default).launch {
+                while (firstReplyAt.get() == 0L) { if (spoken > 0 && answer().isNotBlank()) firstReplyAt.set(android.os.SystemClock.elapsedRealtime()); delay(50) }
+            }
+            try { stream(ByteArray(19200)); stream(input); spoken = android.os.SystemClock.elapsedRealtime(); stream(ByteArray(70400)) } finally { input.fill(0) }
             val queue = DirectVoice::class.java.getDeclaredField("microphone").apply { isAccessible = true }.get(direct) as kotlinx.coroutines.channels.Channel<*>
             @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
             suspend fun drained() = withTimeout(5000) { while (!queue.isEmpty) delay(10) }
             drained(); check(direct.send(GeminiWire.endAudio()))
-            await { jobs().length() == 1 }
-            val ownerText = app.calls.state.value.transcripts.filter { it.role == "user" && it.final }.joinToString(" ") { it.text }
-            assertTrue(Regex("(?i)\\b(?:two|2)\\b").containsMatchIn(ownerText) && Regex("(?i)\\b(?:three|3)\\b").containsMatchIn(ownerText))
-            var result = ""
-            await {
-                val all = jobs(); assertEquals("A readout must never replay native work", 1, all.length())
-                val job = all.getJSONObject(0)
-                check(job.optString("status") !in setOf("failed", "cancelled"))
-                if (job.optString("status") in setOf("done", "completed")) result = job.getString("result")
-                result.isNotBlank()
-            }
-            assertTrue("The native arithmetic result must be relevant", Regex("(?i)\\b(?:five|5)\\b").containsMatchIn(result))
-            await { app.calls.state.value.transcripts.filter { it.role == "assistant" && it.final }.joinToString(" ") { it.text }.contains(result) }
-            return JSONObject().put("native_jobs", jobs().length()).put("native_result_presented", true).put("synthetic_input", true)
+            await { firstReplyAt.get() > 0 }
+            watcher.cancel()
+            val firstReplyMs = firstReplyAt.get() - spoken
+            await { Regex("(?i)\\b(?:five|5)\\b").containsMatchIn(answer()) }
+            val answerMs = android.os.SystemClock.elapsedRealtime() - spoken
+            // The live model finishes transcribing the owner's turn just after it starts to answer.
+            fun ownerText() = app.calls.state.value.transcripts.filter { it.role == "user" && it.final }.joinToString(" ") { it.text }
+            await { Regex("(?i)\\b(?:two|2)\\b").containsMatchIn(ownerText()) && Regex("(?i)\\b(?:three|3)\\b").containsMatchIn(ownerText()) }
+            // The owner's words are never relayed to the Hermes text chat as a job: the live model talks.
+            assertEquals("A spoken question starts no Hermes job", 0, jobs().length())
+            return JSONObject().put("native_jobs", 0).put("first_reply_ms", firstReplyMs).put("answer_ms", answerMs).put("synthetic_input", true)
         } finally {
             withContext(NonCancellable + Dispatchers.IO) {
                 http.dispatcher.cancelAll(); http.connectionPool.evictAll(); http.dispatcher.executorService.shutdown()
@@ -198,10 +205,10 @@ class VoiceConnectionLiveTest {
                 assertTrue("The greeting is the live model's audio, after its setup: $sample", sample.getLong("first_model_audio_ms") >= setup)
                 assertTrue("Nothing is heard before the provider answered setup: $sample", firstHeard < 0 || firstHeard - started >= setup)
                 val context = client.nativeCallContext(call)
-                assertEquals("hermes", context.getString("backend"))
+                assertTrue(context.getString("backend") in setOf("hermes", "direct"))
                 assertEquals(client.auth.profile, context.getString("profile"))
                 assertEquals(session, context.getString("selected_session_id"))
-                if (provider == "gemini" && index == 0) sample.put("native_reply", checkNativeReply(app, client, call))
+                if (provider == "gemini" && index == 0) sample.put("direct_reply", checkDirectReply(app, client, call))
                 app.calls.hangup()
                 await { !app.calls.state.value.active && app.calls.service == null }
                 client.nativeRequest("/api/plugins/beacon/mobile/calls/$call", "DELETE")

@@ -17,11 +17,37 @@ import org.junit.Test
 import java.io.File
 import java.util.concurrent.ConcurrentLinkedQueue
 
-/** Real speech, native row receipts and presented replies; no replacement client or retained audio. */
+/** Real speech answered by the live model itself, Hermes tools and jobs only when it needs them, and presented replies; no replacement client or retained audio. */
 class VoiceLookupLiveTest {
     @get:Rule val rule=createAndroidComposeRule<BeaconActivity>()
-    @Test(timeout=360_000) fun grokUsesNativeHermesBackend() = exercise("grok")
-    @Test(timeout=360_000) fun geminiUsesNativeHermesBackend() = exercise("gemini")
+    private val LookupPhrases=mapOf(
+        "ordinary" to "Without using any tools, what is two plus three?",
+        "tools" to "Please use your normal skill tools to name just one available skill without changing anything.",
+        "memory" to "Please use your normal memory tools to recall my preferred name without saving or changing anything.")
+    /** One phrase as PCM16 at [rate], spoken by Gemini's speech model with the key saved on this test phone. */
+    private suspend fun spoken(phrase:String,rate:Int):ByteArray {
+        val app=ApplicationProvider.getApplicationContext<BeaconApplication>()
+        val credentials=requireNotNull(VoiceKeyStore(app).session("gemini")) { "A Gemini key on the test phone is required to speak the fixture" }
+        val http=okhttp3.OkHttpClient.Builder().cookieJar(okhttp3.CookieJar.NO_COOKIES).followRedirects(false).followSslRedirects(false)
+            .callTimeout(30,java.util.concurrent.TimeUnit.SECONDS).build()
+        try {
+            val source=withContext(Dispatchers.IO) {
+                http.newCall(GeminiSpeech.request(credentials,phrase)).execute().use { response ->
+                    check(response.isSuccessful) { "Fixture speech failed: ${response.code}" }
+                    val value=requireNotNull(response.body).bytes();check(value.size<=GeminiSpeech.MAX_JSON_BYTES)
+                    GeminiSpeech.pcm(JSONObject(value.toString(Charsets.UTF_8)))
+                }
+            }
+            // Gemini speaks at 24 kHz; the call listens at [rate].
+            val samples=source.size/2;val count=(samples.toLong()*rate/GeminiWire.OUTPUT_RATE).toInt()
+            val output=ByteArray(count*2)
+            for(index in 0 until count) { val at=(index.toLong()*GeminiWire.OUTPUT_RATE/rate).toInt()*2;output[index*2]=source[at];output[index*2+1]=source[at+1] }
+            source.fill(0)
+            return output
+        } finally { withContext(NonCancellable+Dispatchers.IO) { http.dispatcher.cancelAll();http.connectionPool.evictAll();http.dispatcher.executorService.shutdown() } }
+    }
+    @Test(timeout=360_000) fun grokAnswersDirectlyAndUsesHermesTools() = exercise("grok")
+    @Test(timeout=360_000) fun geminiAnswersDirectlyAndUsesHermesTools() = exercise("gemini")
 
     private fun exercise(provider:String)=runBlocking<Unit> {
         val args=InstrumentationRegistry.getArguments()
@@ -67,7 +93,7 @@ class VoiceLookupLiveTest {
             call=app.calls.state.value.callId
             assertEquals(provider,app.calls.state.value.voiceProvider)
             val context=client.nativeCallContext(call)
-            assertEquals("hermes",context.getString("backend"))
+            assertTrue(context.getString("backend") in setOf("hermes","direct"))
             assertEquals(client.auth.profile,context.getString("profile"))
             assertEquals(session,context.getString("selected_session_id"))
             val service=requireNotNull(app.calls.service)
@@ -140,13 +166,15 @@ class VoiceLookupLiveTest {
             for((kind,purpose) in listOf("ordinary" to "brief arithmetic question","tools" to "read-only skill listing","memory" to "read-only preferred-name recall")) {
                 phases.put("phase",kind+"_input").put(kind+"_fixture_purpose",purpose)
                 val prior=jobs().map { it.getString("job_id") }.toSet()
+                val priorReceipts=app.calls.state.value.toolReceipts.map { it.requestId }.toSet()
                 val priorUsers=app.calls.state.value.transcripts.filter { it.role=="user"&&it.final }.map { it.eventId }.toSet()
                 val priorAssistant=app.calls.state.value.transcripts.filter { it.role=="assistant"&&it.final }.map { it.eventId }.toSet()
+                // The owner's words are synthesized for the test with the phone's own Gemini key (a staged file still wins).
                 val file=File(app.filesDir,"voice-lookup-$provider-$kind.pcm")
-                val fixture=try {
-                    check(file.isFile&&file.length() in 2L..(rate*2L*60)&&file.length()%2L==0L) { "A bounded synthetic PCM16 fixture is required" }
+                val fixture=if(file.isFile) try {
+                    check(file.length() in 2L..(rate*2L*60)&&file.length()%2L==0L) { "A bounded synthetic PCM16 fixture is required" }
                     file.readBytes()
-                } finally { if(file.exists()) check(file.delete()) }
+                } finally { check(file.delete()) } else spoken(LookupPhrases.getValue(kind),rate)
                 try {
                     stream(ByteArray(rate*2*600/1000));stream(fixture);stream(ByteArray(rate*2*2200/1000))
                     if(provider=="gemini") {
@@ -158,39 +186,32 @@ class VoiceLookupLiveTest {
                     }
                 }
                 finally { fixture.fill(0) }
-                phases.put("phase",kind+"_native_admission")
-                var job:JSONObject?=null
-                await { job=jobs().firstOrNull { it.getString("job_id") !in prior };job!=null }
-                val accepted=app.calls.state.value.transcripts.lastOrNull { it.role=="user"&&it.final&&it.eventId !in priorUsers }
-                assertNotNull("A native voice job must follow accepted owner speech",accepted)
+                phases.put("phase",kind+"_direct_answer")
+                var accepted:CallTranscript?=null
+                await { accepted=app.calls.state.value.transcripts.lastOrNull { it.role=="user"&&it.eventId !in priorUsers&&it.text.isNotBlank() };accepted!=null }
                 val cues=when(kind) {
                     "ordinary" -> listOf(Regex("(?i)\\b(?:two|2)\\b"),Regex("(?i)\\b(?:three|3)\\b"))
                     "tools" -> listOf(Regex("(?i)\\bskills?\\b"))
                     else -> listOf(Regex("(?i)\\b(?:memory|remember)\\b"),Regex("(?i)\\bname\\b"))
                 }
                 assertTrue("Speech keeps the fixture purpose",cues.all { it.containsMatchIn(accepted!!.text) })
-                assertEquals(session,job!!.getString("stored_session_id"))
-                assertTrue(job!!.getString("runtime_session_id").isNotBlank())
-                assertTrue(job!!.getLong("user_row_id")>0)
-                val id=job!!.getString("job_id")
-                phases.put("phase",kind+"_native_completion")
-                await {
-                    job=jobs().first { it.getString("job_id")==id }
-                    val state=job!!.getString("status")
-                    check(state !in setOf("failed","cancelled")&&!(state=="uncertain"&&!job!!.optBoolean("will_continue"))) {
-                        "Native voice result is $state (${job!!.optString("error_code")})"
-                    }
-                    state in setOf("done","completed")
+                phases.put(kind+"_asr_shown",true)
+                await(60_000) { app.calls.state.value.transcripts.any { it.role=="assistant"&&it.final&&it.eventId !in priorAssistant&&it.text.isNotBlank() } }
+                val started=jobs().filter { it.getString("job_id") !in prior }
+                val tools=app.calls.state.value.toolReceipts.filter { it.requestId !in priorReceipts }
+                if(kind=="ordinary") assertTrue("A plain question is answered by the live model itself, without Hermes",started.isEmpty()&&tools.isEmpty())
+                else if(kind=="memory") {
+                    // The owner's name is already in the call brief: a recall from it is the instant answer, a tool the fallback.
+                    val name=context.optString("owner_first_name")
+                    val reply=app.calls.state.value.transcripts.filter { it.role=="assistant"&&it.final&&it.eventId !in priorAssistant }.joinToString(" ") { it.text }
+                    assertTrue("The preferred name is recalled from the brief or a Hermes tool",(name.isNotBlank()&&reply.contains(name,true))||started.isNotEmpty()||tools.isNotEmpty())
                 }
-                val result=job!!.getString("result")
-                assertTrue(result.isNotBlank())
-                phases.put(kind+"_native_completed",true).put(kind+"_accepted_asr_before_job",true)
-                phases.put("phase",kind+"_spoken_reply")
-                await(45_000) {
-                    val spoken=app.calls.state.value.transcripts.filter { it.role=="assistant"&&it.final&&it.eventId !in priorAssistant }.joinToString(" ") { it.text }
-                    normalizeVoiceText(spoken).contains(normalizeVoiceText(result))
+                else assertTrue("A Hermes tool or job backs the answer",started.isNotEmpty()||tools.isNotEmpty())
+                started.forEach { job ->
+                    assertEquals(session,job.getString("stored_session_id"));completed+=job
+                    check(job.getString("status") !in setOf("failed","cancelled")) { "Hermes job is ${job.getString("status")}" }
                 }
-                phases.put(kind+"_spoken",true);completed+=job!!
+                phases.put(kind+"_answered",true).put(kind+"_hermes_jobs",started.size).put(kind+"_hermes_tools",tools.size)
                 drainSpeech()
             }
             app.calls.hangup();await { !app.calls.state.value.active&&app.calls.service==null }

@@ -9,7 +9,7 @@ import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
 
 data class NativeMediaBytes(val bytes: ByteArray, val mime: String = "")
-/** This client has no owner cookies, CSRF, profile headers, authentication or cache. */
+/** This client has no owner cookies, CSRF, profile headers, authentication or HTTP cache; the preview keeps a fetched file in the app's scoped in-memory MediaCache instead. */
 internal fun isPublicExternalMediaAddress(address: InetAddress): Boolean {
     if (address is Inet6Address) {
         val bytes = address.address

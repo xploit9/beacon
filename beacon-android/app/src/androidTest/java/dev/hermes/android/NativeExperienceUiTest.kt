@@ -1262,7 +1262,7 @@ class NativeExperienceUiTest {
             compose.onNodeWithTag("bot-row-coder").performClick()
         }
         compose.runOnIdle { vm.composer(TextFieldValue("Normal chat draft")); vm.toggleSessions(true) }
-        // While history search has text the destinations and the Chats | Bots switch fold away, so tiles are read and Bot Mode entered with the search closed.
+        // While history search has text the destinations fold away, so tiles are read and Bot Mode entered with the search closed.
         val normalTiles = navigationTiles.associateWith { compose.onNodeWithTag("navigation-${it.lowercase()}").getUnclippedBoundsInRoot() }
         toggle()
         await { vm.ui.value.botModeEnabled && !vm.ui.value.botModeSwitching && vm.botMode.state.value.bots.size == 2 }
@@ -1273,10 +1273,10 @@ class NativeExperienceUiTest {
             assertEquals("Menu row changed for $name", (normalTiles.getValue(name).top - normalTiles.getValue("Skills").top).value, (botTiles.getValue(name).top - botTiles.getValue("Skills").top).value, 0.5f)
         }
         receipts += "Normal and Bot Mode tile widths, left alignment and relative rows match."
-        compose.onNodeWithTag("navigation-bot-mode-home").assertIsSelected()
-        // The chosen Bots segment is the state; no "On" text stretches a tile.
+        // The Bots tile is the one switch: it shows Bot Mode as selected, and no "On" text stretches a tile.
+        compose.onNodeWithTag("navigation-bots").assertIsSelected()
         compose.onNodeWithText("On").assertDoesNotExist()
-        compose.onNodeWithTag("navigation-leave-bot-mode").assertTextContains("Chats")
+        compose.onNodeWithTag("navigation-mode-chats").assertDoesNotExist()
         compose.onNodeWithTag("bot-mode-sidebar").performScrollToNode(hasTestTag("bot-row-coder"))
         compose.onNodeWithTag("bot-row-coder").assertTextContains("Code profile")
         compose.onNodeWithText("Search conversations").assertDoesNotExist()
@@ -1291,14 +1291,12 @@ class NativeExperienceUiTest {
         compose.runOnIdle { vm.toggleSessions(true) }; coder()
         await { vm.botMode.state.value.activeBot?.profile == "coder" }
         compose.runOnIdle { vm.composer(TextFieldValue("Coder bot draft")); vm.toggleSessions(true) }
-        compose.onNodeWithTag("bot-mode-sidebar").performScrollToNode(hasTestTag("navigation-leave-bot-mode"))
-        compose.onNodeWithTag("navigation-leave-bot-mode").performClick()
+        toggle()
         await { !vm.ui.value.botModeEnabled && !vm.ui.value.botModeSwitching }
         assertEquals("default", vm.ui.value.profile)
         assertEquals("chat-a", vm.chat.value.sessionId)
         assertEquals("Normal chat draft", vm.composer.value.text)
-        compose.onNodeWithTag("navigation-mode-chats").assertIsSelected()
-        compose.onNodeWithTag("navigation-mode-bots").assertIsNotSelected()
+        compose.onNodeWithTag("navigation-bots").assertIsNotSelected()
         // History search folds the destinations away, so it is typed here, after leaving Bot Mode.
         compose.onNodeWithTag("history-search-toggle").performClick()
         compose.onNodeWithText("Search conversations").performTextInput("Travel")

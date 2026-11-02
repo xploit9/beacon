@@ -12,8 +12,6 @@ import dev.hermes.android.voice.CALL_SIGN_IN_EXPIRED
 import dev.hermes.android.voice.DirectVoice
 import dev.hermes.android.voice.LiveSession
 import dev.hermes.android.voice.NativeCallTranscriptSync
-import dev.hermes.android.voice.NativeSpeechRenderer
-import dev.hermes.android.voice.SpeechHttpFixture
 import dev.hermes.android.voice.callFailureText
 import dev.hermes.android.voice.contextMatches
 import dev.hermes.android.voice.liveInstruction
@@ -100,11 +98,10 @@ class VoiceConnectTest {
         val events = CopyOnWriteArrayList<JSONObject>()
         val audio = CopyOnWriteArrayList<ByteArray>()
         val failure = CompletableDeferred<String>()
-        val tts = SpeechHttpFixture()
         lateinit var voice: DirectVoice
         init {
             voice = DirectVoice(client, if (admission == null) "call" else "", "stored", scope, { bytes -> audio += bytes; voice.played(bytes.size) },
-                { events += it }, { failure.complete(it) }, gemini, providerSocketFactory = provider, providerCallFactory = tts, clock = now, tappedAt = 50_000L,
+                { events += it }, { failure.complete(it) }, gemini, providerSocketFactory = provider, clock = now, tappedAt = 50_000L,
                 warm = warm, prefetched = prefetched, admission = admission, streamsMicrophone = streamsMicrophone)
         }
         fun states() = events.filter { it.optString("type") == "state" }.map { it.getString("state") }
@@ -128,12 +125,9 @@ class VoiceConnectTest {
         for (gone in listOf("GreetingCache", "EarlyGreeting", "OpeningPrefetch", "TrackGreetingOutput", "callGrantGreeting", "openingRenderMs", "MODE_STATIC"))
             assertTrue("$gone must not exist", sources.none { (_, text) -> text.contains(gone) })
         assertFalse("No greeting audio is stored on the phone", sources.values.any { it.contains("\"voice-greetings\"") && !it.contains("deleteRecursively") })
-        // The renderer reads Hermes' verified replies only: it has no greeting entry point.
-        assertTrue(NativeSpeechRenderer::class.java.declaredMethods.none { it.name == "say" && it.parameterCount != 1 })
-        assertTrue(NativeSpeechRenderer::class.java.declaredMethods.none { it.name in setOf("prefetchedAudio", "adopt") })
     }
 
-    @Test(timeout = 10000) fun theFirstAudioIsTheLiveModelsGreetingAfterSetupAndNothingIsRendered() = runBlocking {
+    @Test(timeout = 10000) fun theFirstAudioIsTheLiveModelsGreetingAfterSetup() = runBlocking {
         val c = Call()
         try {
             c.voice.start()
@@ -151,7 +145,6 @@ class VoiceConnectTest {
             c.provider.receive(greetingWords("مساء الخير يا مايا"))
             c.provider.receive(greetingDone())
             assertTrue(waitFor { c.events.any { it.optString("type") == "transcript" && it.optString("text") == "مساء الخير يا مايا" } })
-            assertTrue("No speech render exists for the greeting", c.tts.requests.isEmpty())
             assertTrue(waitFor { c.stage("first_model_audio").isNotEmpty() })
             val setup = c.at("provider_setup_ok")
             val heard = c.at("first_model_audio")
@@ -335,15 +328,18 @@ class VoiceConnectTest {
         } finally { scope.cancel() }
     }
 
-    @Test fun theLiveSetupAsksForOneGreetingInTheOwnersLanguageAndOtherwiseOnlyTranscribes() {
-        val instruction = liveInstruction(context)
-        assertTrue(instruction.startsWith("Transcribe the owner's speech."))
+    @Test fun theLiveSetupGreetsOnceInTheOwnersLanguageAndOtherwiseAnswersWithHermesTools() {
+        val instruction = liveInstruction(context, gemini.personalityInstruction, gemini.model)
         assertTrue(instruction.contains("\"Maya\"") && instruction.contains("in Arabic") && instruction.contains("one short, warm greeting"))
+        assertTrue("The session answers the owner itself", instruction.contains("You answer the owner yourself, in your own voice"))
         assertTrue(liveInstruction(json("profile" to "default")).contains("without using any name"))
         val callback = liveInstruction(json("callback" to json("reason" to "the flight check")))
-        assertTrue(callback.contains("callback the owner asked for") && callback.contains("\"the flight check\""))
+        assertTrue(callback.contains("callback the owner asked for") && callback.contains("the flight check"))
+        assertFalse("The callback reason is data, not the trusted opening", callback.substringAfter("Trusted natural opening guidance:\n").substringBefore('\n').contains("the flight check"))
         val setup = liveSetup(gemini, context).getJSONObject("setup")
-        assertFalse("The transcription session has no tools", setup.has("tools"))
+        val tools = setup.getJSONArray("tools").getJSONObject(0).getJSONArray("functionDeclarations")
+        val names = (0 until tools.length()).map { tools.getJSONObject(it).getString("name") }
+        assertTrue("The warm session already carries Hermes' tools", names.containsAll(listOf("discover_tools", "invoke_tool", "tool_status", "hermes_work", "get_visual_state")))
         assertEquals(instruction, setup.getJSONObject("systemInstruction").getJSONArray("parts").getJSONObject(0).getString("text"))
         // 1 November 2026 14:05 UTC is 18:05 in Dubai.
         assertTrue(liveStartCue(context, 1793541900000L).contains("Sunday 18:05"))

@@ -187,7 +187,8 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
     }
     suspend fun nativeCallContext(callId: String, ownerName: String = ""): JSONObject = kotlinx.coroutines.withTimeout(20_000) {
         val path = "/api/plugins/beacon/mobile/calls/$callId/context"
-        val params = mapOf("owner_name" to ownerName, "backend" to "hermes")
+        // The live model answers the owner itself (the direct brief: persona, memory, this chat, tools), and Beacon hands the call to Hermes memory when it ends.
+        val params = mapOf("owner_name" to ownerName)
         try { nativeRequest(path, params = params) }
         catch (error: ApiFailure) {
             if (error.status !in setOf(429, 502, 503, 504)) throw error

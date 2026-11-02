@@ -149,14 +149,16 @@ internal enum class BeaconMotionMode { Pulse, Ripple }
     Icon(painterResource(R.drawable.ic_beacon), contentDescription, modifier.size(size), tint = MaterialTheme.colorScheme.primary)
 }
 
+private val StillBeaconPhase = object : State<Float> { override val value = 0f }
+
 @Composable internal fun BeaconSignal(mode: BeaconMotionMode, modifier: Modifier = Modifier, size: androidx.compose.ui.unit.Dp = 24.dp, trigger: Any? = Unit) {
     val motionEnabled = rememberNativeMotionEnabled()
-    val phase = if (motionEnabled && mode != BeaconMotionMode.Ripple) {
+    // The pulse is read only while drawing, so each frame redraws the canvas instead of recomposing the signal.
+    val phase: State<Float> = if (motionEnabled && mode != BeaconMotionMode.Ripple) {
         val transition = rememberInfiniteTransition(label = "beacon-${mode.name}")
         val spec: InfiniteRepeatableSpec<Float> = infiniteRepeatable(tween(2200, easing = FastOutSlowInEasing), RepeatMode.Reverse)
-        val value by transition.animateFloat(0f, 1f, spec, label = "beacon-phase-${mode.name}")
-        value
-    } else 0f
+        transition.animateFloat(0f, 1f, spec, label = "beacon-phase-${mode.name}")
+    } else StillBeaconPhase
     val ripple = remember { Animatable(0f) }
     LaunchedEffect(mode, trigger, motionEnabled) {
         if (mode == BeaconMotionMode.Ripple && motionEnabled) {
@@ -172,9 +174,10 @@ internal enum class BeaconMotionMode { Pulse, Ripple }
         val stroke = (canvasSize.minDimension * .055f).coerceAtLeast(1.dp.toPx())
         when (mode) {
             BeaconMotionMode.Pulse -> {
-                drawCircle(color.copy(alpha = .12f + .12f * phase), radius * (1.05f + .2f * phase), center)
+                val pulse = phase.value
+                drawCircle(color.copy(alpha = .12f + .12f * pulse), radius * (1.05f + .2f * pulse), center)
                 drawCircle(color.copy(alpha = .62f), radius * .72f, center, style = Stroke(stroke))
-                drawCircle(color.copy(alpha = .95f), radius * (.16f + .05f * phase), center)
+                drawCircle(color.copy(alpha = .95f), radius * (.16f + .05f * pulse), center)
             }
             BeaconMotionMode.Ripple -> {
                 val progress = if (motionEnabled) ripple.value else 1f

@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shlex
 import sys
+import time
 
 ROOT=Path(__file__).resolve().parent
 def _stale(module):
@@ -108,20 +109,32 @@ def _owned_proactive_run(owner,profile,session_id):
         return False
 
 
+_RECENT_VERIFIED={}
+_VERIFY_REUSE_SECONDS=1.0
+
+def _verify_owned(owner,provider,profile,session_id):
+    """The pre_llm_call hooks of one turn run back to back on the same chat: a passed ownership check is reused for a
+    second instead of asked again. A refusal is never kept."""
+    key=(owner,provider,profile,session_id);now=time.monotonic()
+    if _RECENT_VERIFIED.get(key,0)>now: return
+    native.verify(owner,provider,profile,session_id)
+    if len(_RECENT_VERIFIED)>=64: _RECENT_VERIFIED.clear()
+    _RECENT_VERIFIED[key]=now+_VERIFY_REUSE_SECONDS
+
 def native_live_context(session_id=None,**kwargs):
     """Inject the profile's live capabilities only into its owned chat or Proactive run."""
+    # Only the owner and provider are read here, and they do not depend on the profile: one settings read per hook.
     cfg=mobile.settings()
     try:
         if not session_id: return None
         profile=current_profile(cfg)
-        cfg=mobile.settings(profile)
         owner,provider=cfg.get('owner_id'),cfg.get('owner_provider')
         if not owner or not provider: return None
     except (LookupError,ValueError,RuntimeError):
         return None
     job_scope=False
     try:
-        native.verify(owner,provider,profile,session_id)
+        _verify_owned(owner,provider,profile,session_id)
     except (LookupError,ValueError,RuntimeError):
         if not _owned_proactive_run(owner,profile,session_id): return None
         row=_cron_row(profile,session_id)
@@ -234,11 +247,10 @@ def native_voice_context(session_id=None, conversation_history=None, **kwargs):
         if not session_id:
             return None
         profile = current_profile(cfg)
-        cfg = mobile.settings(profile)
         owner, provider = cfg.get('owner_id'), cfg.get('owner_provider')
         if not owner or not provider:
             return None
-        native.verify(owner, provider, profile, session_id)
+        _verify_owned(owner, provider, profile, session_id)
     except (LookupError, ValueError, RuntimeError):
         return None
     try:

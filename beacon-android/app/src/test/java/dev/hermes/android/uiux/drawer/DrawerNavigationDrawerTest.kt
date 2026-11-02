@@ -1,11 +1,7 @@
 package dev.hermes.android.uiux.drawer
 
 import dev.hermes.android.core.Release
-import dev.hermes.android.ui.DrawerMode
-import dev.hermes.android.ui.DrawerModeAction
 import dev.hermes.android.ui.NavigationStrings
-import dev.hermes.android.ui.drawerModeAction
-import dev.hermes.android.ui.drawerModeTag
 import dev.hermes.android.ui.drawerUpdateReady
 import dev.hermes.android.ui.navigationColumns
 import dev.hermes.android.ui.navigationCompact
@@ -26,25 +22,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DrawerNavigationDrawerTest {
-    @Test fun theChatsAndBotsSwitchEntersLeavesAndReturnsHome() {
-        assertEquals(DrawerModeAction.EnterBots, drawerModeAction(botMode = false, tapped = DrawerMode.Bots))
-        assertEquals(DrawerModeAction.LeaveBots, drawerModeAction(botMode = true, tapped = DrawerMode.Chats))
-        // The segment already chosen: Bots opens the Bot Mode home (the old home button), Chats does nothing.
-        assertEquals(DrawerModeAction.OpenBotHome, drawerModeAction(botMode = true, tapped = DrawerMode.Bots))
-        assertEquals(DrawerModeAction.None, drawerModeAction(botMode = false, tapped = DrawerMode.Chats))
-    }
-
-    @Test fun eachSegmentKeepsTheTagOfTheControlItReplaced() {
-        assertEquals("navigation-leave-bot-mode", drawerModeTag(botMode = true, mode = DrawerMode.Chats))
-        assertEquals("navigation-bot-mode-home", drawerModeTag(botMode = true, mode = DrawerMode.Bots))
-        assertEquals("navigation-mode-chats", drawerModeTag(botMode = false, mode = DrawerMode.Chats))
-        assertEquals("navigation-mode-bots", drawerModeTag(botMode = false, mode = DrawerMode.Bots))
-        val tags = listOf(true, false).flatMap { bot -> DrawerMode.entries.map { drawerModeTag(bot, it) } }
-        assertEquals("Every tag is its own", tags.size, tags.toSet().size)
-    }
-
-    @Test fun theBotsTileIsADestinationNotASwitch() {
-        // Same eight destinations and routes as before; the tile now reads "Bots" like the segment.
+    @Test fun theBotsTileKeepsItsPlaceAndLabel() {
+        // Same eight tiles and routes as before; Bots is also the one switch for Bot Mode.
         assertEquals(listOf("Skills", "Memory", "Cron", "Files", "Projects", "Bots", "Kanban", "Settings"), navigationTiles)
         assertEquals("Bots", navigationLabel("Bots"))
         assertEquals("Schedules", navigationLabel("Cron"))

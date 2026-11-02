@@ -16,7 +16,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.withFrameNanos
+import androidx.compose.animation.core.withInfiniteAnimationFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawWithCache
@@ -120,9 +120,10 @@ fun MorphingSphere(
     )
     if (motionMode == SphereMotionMode.Procedural) {
         LaunchedEffect(motionMode) {
-            var lastNanos = withFrameNanos { it }
+            // An infinite animation, like rememberInfiniteTransition: UI tests can idle while the sphere turns.
+            var lastNanos = withInfiniteAnimationFrameNanos { it }
             while (true) {
-                val now = withFrameNanos { it }
+                val now = withInfiniteAnimationFrameNanos { it }
                 val dtSec = (now - lastNanos).coerceAtLeast(0L) / 1_000_000_000f
                 lastNanos = now
                 animatedTime.floatValue = advanceSphereTime(animatedTime.floatValue, dtSec * SPHERE_TIME_UNITS_PER_SEC)

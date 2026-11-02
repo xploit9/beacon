@@ -78,9 +78,10 @@ def large(harness, monkeypatch, tmp_path):
     # Neither route may run discovery: each of these would be a full plugin, MCP or memory-provider scan.
     def forbidden(*args, **kwargs): raise AssertionError('discovery on the call path')
     monkeypatch.setattr(voice, 'tool_catalogue', forbidden)
-    monkeypatch.setattr(voice, 'personality', forbidden)
-    monkeypatch.setattr(voice, 'builtin_memory', forbidden)
-    monkeypatch.setattr(voice, 'history', forbidden)
+    # The direct brief reads the profile's persona and curated memory (change-checked files) and, before the tap, this chat.
+    monkeypatch.setattr(voice, 'personality', lambda root: 'Calm and brief.')
+    monkeypatch.setattr(voice, 'builtin_memory', lambda root, cfg: 'Likes short answers.')
+    monkeypatch.setattr(voice, 'history', lambda *args: [{'role': 'user', 'content': 'Typed just before the call'}])
     monkeypatch.setattr(voice, 'load_recall_provider', forbidden)
     monkeypatch.setattr(voice, 'provider_tool_schemas', forbidden)
     (root / 'memories').mkdir(exist_ok=True)
@@ -105,7 +106,10 @@ def test_the_session_context_needs_no_call_and_carries_no_call_bound_fields(larg
     response, _ = _context(client)
     assert response.status_code == 200, response.text
     value = response.json()
-    assert value['backend'] == 'hermes' and value['profile'] == 'default' and value['selected_session_id'] == 'native-stored'
+    assert value['backend'] == 'direct' and value['profile'] == 'default' and value['selected_session_id'] == 'native-stored'
+    # The live model answers itself: it gets the persona, memory and this chat, and finds tools when it needs them.
+    assert 'Profile personality:\nCalm and brief.' in value['system_instruction'] and value['context']['memory'] == 'Likes short answers.'
+    assert value['context']['history'] == [{'role': 'user', 'content': 'Typed just before the call'}] and value['tool_catalogue'] == ''
     assert value['owner_first_name'] == 'Maya' and value['zone'] == '+00:00'
     assert value['callback'] == {} and value['reason'] == '' and 'callback_reason' not in value['context']
     with api.mobile.connect() as conn:
@@ -219,3 +223,20 @@ def test_a_new_chat_not_yet_saved_is_read_from_the_owners_open_draft(large):
     assert response.json()['selected_session_id'] == 'native-draft' and response.json()['callback'] == {}
     assert _context(client, 'native-foreign')[0].status_code == 404, "another owner's draft stays private"
     assert _context(client, 'native-ended')[0].status_code == 404, 'a closed draft is not a call entry'
+
+
+def test_a_call_entry_warms_the_tools_and_a_ready_list_reaches_the_call_without_waiting(large, monkeypatch):
+    api, client, store, _ = large
+    voice = api.voice_context
+    warmed = []
+    monkeypatch.setattr(voice, 'prefetch_tools', lambda profile: warmed.append(profile) or True)
+    first, _ = _context(client)
+    assert first.status_code == 200 and warmed == ['default'], 'the call entry starts the background warm'
+    assert first.json()['tool_catalogue'] == '', 'nothing is waited for before the list exists'
+    # Once the background prefetch has a list, the next brief carries it, so the first tool needs no discovery round trip.
+    voice.SESSION_CONTEXTS.clear()
+    monkeypatch.setitem(voice.TOOLS_READY, 'default', (voice._clock(), 'File: Read a local file'))
+    second, elapsed = _context(client)
+    assert second.json()['tool_catalogue'] == 'File: Read a local file' and elapsed < 1000
+    monkeypatch.setitem(voice.TOOLS_READY, 'default', (voice._clock() - voice.TOOLS_READY_SECONDS - 1, 'Old list'))
+    assert voice.ready_tools('default') == '', 'a list too old to trust is not named'

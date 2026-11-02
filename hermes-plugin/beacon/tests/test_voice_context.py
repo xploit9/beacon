@@ -10,7 +10,7 @@ from test_mobile import harness, reserve
 
 
 @pytest.mark.parametrize('native_backend', [True, False])
-def test_native_startup_skips_external_secret_resolution_and_reuses_bound_clock(harness, monkeypatch, native_backend):
+def test_every_call_start_skips_external_secret_resolution_and_reuses_bound_clock(harness, monkeypatch, native_backend):
     api, client, _, root, _ = harness
     call_id = reserve(client)
     voice = api.voice_context
@@ -42,8 +42,9 @@ def test_native_startup_skips_external_secret_resolution_and_reuses_bound_clock(
     monkeypatch.setattr(voice, 'builtin_memory', lambda *args: '')
     monkeypatch.setattr(voice, 'owner_name_in_memory', lambda *args: 'Maya')
     result = voice.context('owner', 'basic', 'work', 'native-stored', call_id, native_backend=native_backend)
-    assert scopes == [({'profile_home': str(root)}, not native_backend)]
-    assert clocks == ['bound' if native_backend else 'profile']
+    # Both briefs read only files and Beacon's own database, so neither resolves profile secrets or asks the proactive clock.
+    assert scopes == [({'profile_home': str(root)}, False)]
+    assert clocks == ['bound']
     assert active == []
     assert result['profile'] == 'work' and result['selected_session_id'] == 'native-stored'
     assert result['greeting'].startswith('Good evening, Maya.')
@@ -111,19 +112,20 @@ def test_admission_defers_optional_discovery_and_keeps_authoritative_context(har
     call_id = reserve(client)
     voice = api.voice_context
     verified = []
-    monkeypatch.setattr(voice, 'scoped', lambda profile, fn: fn(root))
+    monkeypatch.setattr(voice, 'scoped', lambda profile, fn, **kwargs: fn(root))
     monkeypatch.setattr(voice, 'config', lambda root: {'memory': {'provider': 'hindsight'}})
     monkeypatch.setattr(voice, 'personality', lambda root: 'Owned personality')
     monkeypatch.setattr(voice, 'builtin_memory', lambda root, cfg: 'Owned curated memory')
     monkeypatch.setattr(voice, 'history', lambda *args: verified.append(args) or [{'role': 'user', 'content': 'Owned history'}])
     monkeypatch.setattr(voice, 'external_provider', lambda *args: pytest.fail('Admission must not scan live agents'))
     monkeypatch.setitem(sys.modules, 'tools.web_tools', SimpleNamespace(_ensure_web_plugins_loaded=lambda: pytest.fail('Admission must not load search plugins')))
+    monkeypatch.setattr(voice, 'tool_catalogue', lambda *args: pytest.fail('Admission must not run tool discovery'))
     result = voice.context('owner', 'basic', 'default', 'native-stored', call_id)
-    assert verified == [('owner', 'basic', 'default', 'native-stored')]
+    # The call start reads no chat history (the warm context before the tap does) and no tool list (discover_tools does).
+    assert verified == [] and result['context']['history'] == [] and result['tool_catalogue'] == ''
     assert result['profile'] == 'default' and result['selected_session_id'] == 'native-stored'
     assert result['context']['personality'] == 'Owned personality'
     assert result['context']['memory'] == 'Owned curated memory'
-    assert result['context']['history'][0]['content'] == 'Owned history'
     assert result['capabilities']['skills'] and result['capabilities']['memory_recall'] and result['capabilities']['web_search']
     assert result['configured_memory_provider'] == 'hindsight'
     assert result['capability_details']['web_search'] == {'available': None, 'reason': 'verify_on_use'}
@@ -134,8 +136,10 @@ def test_unowned_history_blocks_profile_reads(harness, monkeypatch):
     api, client, _, _, _ = harness
     call_id = reserve(client)
     voice = api.voice_context
-    monkeypatch.setattr(voice, 'history', lambda *args: (_ for _ in ()).throw(LookupError('Not owned')))
-    monkeypatch.setattr(voice, 'scoped', lambda *args: pytest.fail('Unowned call cannot read profile'))
+    # The ownership check comes first, before any history or profile read.
+    monkeypatch.setattr(voice.native, 'verify', lambda *args: (_ for _ in ()).throw(LookupError('Not owned')))
+    monkeypatch.setattr(voice, 'history', lambda *args: pytest.fail('Unowned call cannot read history'))
+    monkeypatch.setattr(voice, 'scoped', lambda *args, **kwargs: pytest.fail('Unowned call cannot read profile'))
     with pytest.raises(LookupError):
         voice.context('other', 'basic', 'default', 'native-stored', call_id)
 
@@ -148,7 +152,7 @@ def test_callback_reason_is_untrusted_reference_data_and_greeting_uses_name(harn
         conn.execute('UPDATE calls SET callback_context=? WHERE id=?',
                      (json.dumps({'reason': reason, 'job_id': ''}), call_id))
     voice = api.voice_context
-    monkeypatch.setattr(voice, 'scoped', lambda profile, fn: fn(root))
+    monkeypatch.setattr(voice, 'scoped', lambda profile, fn, **kwargs: fn(root))
     monkeypatch.setattr(voice, 'config', lambda root: {})
     monkeypatch.setattr(voice, 'personality', lambda root: '')
     monkeypatch.setattr(voice, 'builtin_memory', lambda root, cfg: '')
@@ -165,7 +169,7 @@ def test_search_source_urls_fit_the_android_evidence_limit(harness, monkeypatch)
     api, _, _, root, _ = harness
     voice = api.voice_context
     long_url = 'https://example.test/' + 'x' * 2100
-    monkeypatch.setattr(voice, 'scoped', lambda profile, fn: fn(root))
+    monkeypatch.setattr(voice, 'scoped', lambda profile, fn, **kwargs: fn(root))
     monkeypatch.setitem(sys.modules, 'tools.web_tools', SimpleNamespace(web_search_tool=lambda query, limit: {
         'success': True, 'data': {'web': [{'url': long_url, 'title': 'Example', 'description': 'A source'}]}
     }))
@@ -181,7 +185,7 @@ def test_recall_uses_only_the_matching_initialized_provider(harness, monkeypatch
     matching = SimpleNamespace(prefetch=lambda query, session_id: calls.append((query, session_id)) or 'Verified existing memory')
     manager = object()
     monkeypatch.setattr(voice.native, 'verify', lambda *args: None)
-    monkeypatch.setattr(voice, 'scoped', lambda profile, fn: fn(root))
+    monkeypatch.setattr(voice, 'scoped', lambda profile, fn, **kwargs: fn(root))
     monkeypatch.setattr(voice, 'config', lambda root: {'memory': {'provider': 'mnemosyne-bridge'}})
     monkeypatch.setattr(voice, 'external_provider', lambda *args: ((manager, matching), 'mnemosyne-bridge'))
     monkeypatch.setitem(sys.modules, 'agent.memory_manager', SimpleNamespace(sanitize_context=lambda text: text))
@@ -209,7 +213,7 @@ def test_recall_trusts_the_providers_own_status_not_its_name_or_wording(harness,
     if count == 'raise': matching.recall_status = broken_status
     elif count is not None: matching.recall_status = lambda: SimpleNamespace(count=count)
     monkeypatch.setattr(voice.native, 'verify', lambda *args: None)
-    monkeypatch.setattr(voice, 'scoped', lambda profile, fn: fn(root))
+    monkeypatch.setattr(voice, 'scoped', lambda profile, fn, **kwargs: fn(root))
     monkeypatch.setattr(voice, 'config', lambda root: {'memory': {'provider': 'acme-memory'}})
     monkeypatch.setattr(voice, 'external_provider', lambda *args: ((object(), matching), 'acme-memory'))
     monkeypatch.setitem(sys.modules, 'agent.memory_manager', SimpleNamespace(sanitize_context=lambda value: value))
@@ -227,9 +231,10 @@ def test_instruction_carries_the_owners_local_time(harness, monkeypatch):
     voice = api.voice_context
     from datetime import datetime
     from zoneinfo import ZoneInfo
-    monkeypatch.setitem(sys.modules, 'beacon_proactive', SimpleNamespace(
-        profile_now=lambda profile: datetime(2026, 10, 20, 16, 15, tzinfo=ZoneInfo('Europe/Lisbon'))))
-    monkeypatch.setattr(voice, 'scoped', lambda profile, fn: fn(root))
+    # The profile's own clock, bound by its runtime scope.
+    monkeypatch.setitem(sys.modules, 'hermes_time', SimpleNamespace(
+        now=lambda: datetime(2026, 10, 20, 16, 15, tzinfo=ZoneInfo('Europe/Lisbon'))))
+    monkeypatch.setattr(voice, 'scoped', lambda profile, fn, **kwargs: fn(root))
     monkeypatch.setattr(voice, 'config', lambda root: {})
     monkeypatch.setattr(voice, 'personality', lambda root: '')
     monkeypatch.setattr(voice, 'builtin_memory', lambda root, cfg: '')
@@ -254,7 +259,7 @@ def test_greeting_uses_first_name_and_the_profile_clock(harness):
         'Hi, Maya. What can I do for you?'
 
 
-def test_context_includes_the_compact_tool_catalogue_and_personal_opening(harness, monkeypatch):
+def test_context_leaves_tools_to_discovery_and_keeps_the_personal_opening(harness, monkeypatch):
     import inspect
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -263,10 +268,10 @@ def test_context_includes_the_compact_tool_catalogue_and_personal_opening(harnes
     voice = api.voice_context
     call_id = api.mobile.reserve('owner', 'default', 'native-stored')['call_id']
     assert 'display_name' in inspect.signature(voice.context).parameters
-    monkeypatch.setitem(sys.modules, 'beacon_proactive', SimpleNamespace(
-        profile_now=lambda profile: datetime(2026, 10, 20, 18, 15, tzinfo=ZoneInfo('Asia/Dubai'))))
-    monkeypatch.setattr(voice, 'tool_catalogue', lambda profile: 'read_file: Read a local file', raising=False)
-    monkeypatch.setattr(voice, 'scoped', lambda profile, fn: fn(root))
+    monkeypatch.setitem(sys.modules, 'hermes_time', SimpleNamespace(
+        now=lambda: datetime(2026, 10, 20, 18, 15, tzinfo=ZoneInfo('Asia/Dubai'))))
+    monkeypatch.setattr(voice, 'tool_catalogue', lambda *args: pytest.fail('A call start runs no tool discovery'), raising=False)
+    monkeypatch.setattr(voice, 'scoped', lambda profile, fn, **kwargs: fn(root))
     monkeypatch.setattr(voice, 'config', lambda root: {})
     monkeypatch.setattr(voice, 'personality', lambda root: '')
     monkeypatch.setattr(voice, 'builtin_memory', lambda root, cfg: '')
@@ -275,7 +280,8 @@ def test_context_includes_the_compact_tool_catalogue_and_personal_opening(harnes
     result = voice.context('owner', 'basic', 'default', 'native-stored', call_id, display_name='Maya Example')
 
     assert result['greeting'] == 'Good evening, Maya. What can I do for you?'
-    assert result['tool_catalogue'] == 'read_file: Read a local file'
+    # The live model finds tools with discover_tools when a request needs one; the connect never waits for an MCP scan.
+    assert result['tool_catalogue'] == ''
 
 
 def test_tool_catalogue_starts_background_warm_before_reading_cache(harness, monkeypatch):
@@ -294,7 +300,7 @@ def test_context_leaves_the_name_to_the_phone_and_keeps_profile_personality(harn
     api, _, _, root, _ = harness
     call_id=api.mobile.reserve('owner','default','native-stored')['call_id']
     voice=api.voice_context
-    monkeypatch.setattr(voice,'scoped',lambda profile,fn:fn(root))
+    monkeypatch.setattr(voice,'scoped',lambda profile,fn,**kwargs:fn(root))
     monkeypatch.setattr(voice,'config',lambda root:{})
     monkeypatch.setattr(voice,'personality',lambda root:'Profile-owned SOUL personality')
     monkeypatch.setattr(voice,'builtin_memory',lambda root,cfg:'')
@@ -314,7 +320,7 @@ def test_get_context_returns_the_clean_owner_first_name(harness,monkeypatch):
     api,client,_,root,_=harness
     call_id=reserve(client)
     voice=api.voice_context
-    monkeypatch.setattr(voice,'scoped',lambda profile,fn:fn(root))
+    monkeypatch.setattr(voice,'scoped',lambda profile,fn,**kwargs:fn(root))
     monkeypatch.setattr(voice,'config',lambda root:{})
     monkeypatch.setattr(voice,'personality',lambda root:'')
     monkeypatch.setattr(voice,'builtin_memory',lambda root,cfg:'')

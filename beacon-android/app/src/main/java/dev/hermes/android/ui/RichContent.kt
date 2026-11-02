@@ -27,6 +27,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
@@ -82,7 +83,11 @@ internal val LocalMarkdownCut = compositionLocalOf<() -> Unit> { {} }
 @Composable fun Markdown(source: String, vm: BeaconViewModel, origin: Scope? = vm.authenticatedScope(), snapshots: Map<String, String> = emptyMap(), documentKey: String = "", interactive: Boolean = true) {
     val checklist = checklistReading(vm, origin, documentKey, source, interactive)
     val scopeKey = origin?.key ?: vm.client?.scope?.key.orEmpty()
-    val parsed by produceState<PreparedContent<Node>?>(null, source, scopeKey) { value = PreparedContent(scopeKey, source, withContext(Dispatchers.Default) { parseNativeMarkdown(source) }) }
+    // A row that scrolls back in finds its parse in the cache and draws at full height on its first frame.
+    val parsed by produceState<PreparedContent<Node>?>(MediaCache.markdown.get(source)?.let { PreparedContent(scopeKey, source, it) }, source, scopeKey) {
+        val node = MediaCache.markdown.get(source) ?: withContext(Dispatchers.Default) { parseNativeMarkdown(source) }.also { MediaCache.markdown.put(source, it) }
+        value = PreparedContent(scopeKey, source, node)
+    }
     // Retain the same message's rendered prefix while streaming text is parsed; avoid a zero-height frame.
     val document = parsed?.forGrowingText(scopeKey, source)
     CompositionLocalProvider(LocalChecklist provides checklist) { SelectionContainer { Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) { document?.children()?.forEach { block -> MarkdownBlock(block, vm, origin, snapshots) } } } }
@@ -283,8 +288,8 @@ internal fun Modifier.scrollEdgeFade(state: androidx.compose.foundation.ScrollSt
 }
 internal fun structuredTreeDefault(ready: Boolean, preference: String, lines: Int, threshold: Int): Boolean = ready && (preference == "on" || preference == "auto" && lines >= threshold)
 internal fun imagePanOffset(scale: Float, offset: androidx.compose.ui.geometry.Offset, pan: androidx.compose.ui.geometry.Offset): androidx.compose.ui.geometry.Offset = if (scale <= 1f) androidx.compose.ui.geometry.Offset.Zero else offset + pan
-/** In a message the image is inline; a tap opens it full screen, where [fullScreen] fills the window with the same zoom. */
-@Composable fun ZoomImage(bitmap: Bitmap, description: String, fullScreen: Boolean = false) {
+/** In a message the image is inline; a tap opens it full screen, where [fullScreen] fills the window with the same zoom. [sharper], when given, decodes the picture at full size once it is opened full screen (the inline one is decoded for its box only). */
+@Composable fun ZoomImage(bitmap: Bitmap, description: String, fullScreen: Boolean = false, sharper: (suspend () -> Bitmap?)? = null) {
     var scale by remember(bitmap) { mutableFloatStateOf(1f) }
     var offset by remember(bitmap) { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
     var viewing by remember(bitmap) { mutableStateOf(false) }
@@ -302,7 +307,8 @@ internal fun imagePanOffset(scale: Float, offset: androidx.compose.ui.geometry.O
     if (viewing) Dialog(onDismissRequest = { viewing = false }, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
         Surface(Modifier.fillMaxSize(), color = Color.Black.copy(alpha = .94f)) {
             Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
-                ZoomImage(bitmap, description, fullScreen = true)
+                val shown by produceState(bitmap, bitmap, sharper) { value = bitmap; sharper?.invoke()?.let { value = it } }
+                ZoomImage(shown, description, fullScreen = true)
                 IconButton(onClick = { viewing = false }, Modifier.align(androidx.compose.ui.Alignment.TopEnd)) { Icon(Icons.Rounded.Close, uiText("Close"), tint = Color.White) }
             }
         }
@@ -312,19 +318,28 @@ internal fun imagePanOffset(scale: Float, offset: androidx.compose.ui.geometry.O
     var open by remember(attachment, origin?.key) { mutableStateOf(false) }
     val name = attachment.string("name", attachment.string("filename", uiText("Attachment")))
     OutlinedButton(onClick = { open = !open }) { Icon(Icons.Rounded.AttachFile, null); Text(name, Modifier.padding(start = 8.dp)) }
-    if (open) { if (origin != null) NativeReferencePreview(vm, resolveAttachmentReference(attachment, origin, snapshots), name, origin) else Text(uiText("No authorized file reference was supplied by the server"), color = MaterialTheme.colorScheme.error) }
+    if (open) { if (origin != null) NativeReferencePreview(vm, resolveAttachmentReference(attachment, origin, snapshots), name, origin, knownAspect(attachment.optInt("width"), attachment.optInt("height"))) else Text(uiText("No authorized file reference was supplied by the server"), color = MaterialTheme.colorScheme.error) }
 }
 @Composable fun MediaPreview(vm: BeaconViewModel, path: String, name: String = path, endpoint: String = "/api/file/raw", origin: Scope? = vm.authenticatedScope()) {
     if (origin != null) NativeReferencePreview(vm, NativeReference.LocalMedia(path, origin.session, null, endpoint), name, origin)
 }
-@Composable private fun NativeReferencePreview(vm: BeaconViewModel, reference: NativeReference, name: String, origin: Scope) {
+/** A cached copy of a file, but only where fetching it would be allowed: a private file needs its signed-in profile. */
+private fun cachedMedia(key: MediaKey, reference: NativeReference, signedIn: Boolean): NativeMediaBytes? =
+    if (reference is NativeReference.ExternalMedia || signedIn && (reference is NativeReference.LocalMedia || reference is NativeReference.HistoryImage)) MediaCache.payloads.get(key) else null
+private fun referenceFilename(reference: NativeReference, name: String): String = when (reference) { is NativeReference.LocalMedia -> reference.path; is NativeReference.ExternalMedia -> reference.url.pathSegments.lastOrNull().orEmpty(); else -> name }
+/** [aspect] is the picture's width / height when the message says it; the placeholder reserves that shape while the file loads. */
+@Composable private fun NativeReferencePreview(vm: BeaconViewModel, reference: NativeReference, name: String, origin: Scope, aspect: Float? = null) {
     val active = vm.client
     val resultClient = active.takeIf { reference is NativeReference.LocalMedia || reference is NativeReference.HistoryImage }
     val client = remember(origin.key, active) { active?.takeIf { it.scope == origin.copy(session = "") }?.detached() }
     var error by remember(reference, origin.key, resultClient) { mutableStateOf("") }
     var retry by remember(reference, origin.key, resultClient) { mutableIntStateOf(0) }
-    val loaded by produceState<PreparedContent<NativeMediaBytes>?>(null, reference, origin.key, resultClient, retry) {
-        value = null; error = ""
+    val cacheKey = remember(origin.key, reference) { MediaKey(origin.key, reference) }
+    val cached = remember(cacheKey, client != null) { cachedMedia(cacheKey, reference, client != null) }
+    val loaded by produceState<PreparedContent<NativeMediaBytes>?>(cached?.let { PreparedContent(origin.key, reference, it, resultClient) }, reference, origin.key, resultClient, retry) {
+        error = ""
+        cachedMedia(cacheKey, reference, client != null)?.let { hit -> value = PreparedContent(origin.key, reference, hit, resultClient); return@produceState }
+        value = null
         try { val payload = when (reference) {
             is NativeReference.LocalMedia -> { require(client != null) { "Sign in to the originating profile to preview this file" }; NativeMediaBytes(client.bytes(reference.endpoint, reference.query())) }
             is NativeReference.HistoryImage -> { require(client != null) { "Sign in to the originating profile to preview this image" }; client.historyImage(reference) }
@@ -332,31 +347,56 @@ internal fun imagePanOffset(scale: Float, offset: androidx.compose.ui.geometry.O
             is NativeReference.ExternalMedia -> externalMediaBytes(reference)
             is NativeReference.Unsupported -> kotlin.error(reference.reason)
             else -> kotlin.error("This reference opens a conversation or workspace rather than a media preview")
-        }; value = PreparedContent(origin.key, reference, payload, resultClient) } catch (e: Throwable) { if (e is CancellationException) throw e; error = e.message ?: "Preview unavailable" }
+        }; if (reference !is NativeReference.DataImage) MediaCache.payloads.put(cacheKey, payload, payload.bytes.size.toLong()); value = PreparedContent(origin.key, reference, payload, resultClient) } catch (e: Throwable) { if (e is CancellationException) throw e; error = e.message ?: "Preview unavailable" }
     }
     if (error.isNotBlank()) { Text(uiText(error), color = MaterialTheme.colorScheme.error); if (reference !is NativeReference.Unsupported) TextButton(onClick = { retry++ }) { Text(uiText("Retry preview")) }; Disclosure(uiText("Reference"), when (reference) { is NativeReference.Unsupported -> reference.source; is NativeReference.LocalMedia -> reference.path; is NativeReference.DataImage -> reference.source; is NativeReference.ExternalMedia -> reference.url.toString(); else -> name }); return }
-    val payload = loaded?.forContext(origin.key, reference, resultClient) ?: run { LinearProgressIndicator(); return }
+    val filename = referenceFilename(reference, name)
+    val payload = loaded?.forContext(origin.key, reference, resultClient) ?: run { MediaPlaceholder(placeholderShape(mediaKindOf(filename), aspect)); return }
     val data = payload.bytes
-    val filename = when (reference) { is NativeReference.LocalMedia -> reference.path; is NativeReference.ExternalMedia -> reference.url.pathSegments.lastOrNull().orEmpty(); else -> name }
     val extension = when (payload.mime.lowercase(java.util.Locale.ROOT)) { "image/svg+xml" -> "svg"; "image/gif" -> "gif"; "application/pdf" -> "pdf"; else -> filename.substringBefore('?').substringBefore('#').substringAfterLast('.', "").lowercase(java.util.Locale.ROOT) }
     when {
-        extension == "svg" -> SvgPreview(data, name, origin.key)
-        extension == "gif" -> AnimatedPreview(data, name, !rememberNativeMotionEnabled(), origin.key)
-        extension == "pdf" || data.take(5).toByteArray().toString(Charsets.US_ASCII) == "%PDF-" -> PdfPreview(vm, data, origin.key, reference)
+        extension == "svg" -> SvgPreview(data, name, origin.key, aspect)
+        extension == "gif" -> AnimatedPreview(data, name, !rememberNativeMotionEnabled(), origin.key, aspect)
+        extension == "pdf" || data.take(5).toByteArray().toString(Charsets.US_ASCII) == "%PDF-" -> PdfPreview(vm, data, origin.key, reference, aspect)
         payload.mime.startsWith("video/") || extension in setOf("mp4", "webm", "mkv", "mov") -> LocalMedia(vm, data, extension.ifBlank { "media" }, true, origin.key)
         payload.mime.startsWith("audio/") || extension in setOf("mp3", "wav", "m4a", "ogg", "flac", "aac") -> LocalMedia(vm, data, extension.ifBlank { "media" }, false, origin.key)
-        else -> { val rendered by produceState<PreparedContent<DecodedBitmap>?>(null, data, origin.key) { value = null; value = PreparedContent(origin.key, data, DecodedBitmap(withContext(Dispatchers.Default) { boundedBitmap(data) })) }; val result = rendered?.forContext(origin.key, data); if (result == null) LinearProgressIndicator() else result.bitmap?.let { ZoomImage(it, name) } ?: SelectionContainer { Text("$name · ${uiText("This media type could not be decoded by Android")}", style = MaterialTheme.typography.bodyMedium) } }
+        else -> BitmapPreview(data, name, origin.key, reference, aspect)
     }
 }
-@Composable private fun AnimatedPreview(data: ByteArray, name: String, reducedMotion: Boolean, scopeKey: String) {
+/** A picture decoded for the box it is drawn in (the column's width, at most [InlineImageMaxHeightDp] high), not for a fixed 1440 px; full screen decodes it at full size once opened. */
+@Composable private fun BitmapPreview(data: ByteArray, name: String, scopeKey: String, reference: NativeReference, aspect: Float?) {
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val maxHeight = with(LocalDensity.current) { InlineImageMaxHeightDp.dp.roundToPx() }
+        val width = if (constraints.hasBoundedWidth) constraints.maxWidth else 0
+        val key = MediaKey(scopeKey, reference, width)
+        val fullKey = MediaKey(scopeKey, reference, 0)
+        val rendered by produceState<PreparedContent<DecodedBitmap>?>(MediaCache.picture(key, data)?.let { PreparedContent(scopeKey, data, DecodedBitmap(it)) }, data, scopeKey, key) {
+            val hit = MediaCache.picture(key, data)
+            if (hit != null) { value = PreparedContent(scopeKey, data, DecodedBitmap(hit)); return@produceState }
+            value = null
+            val bitmap = withContext(Dispatchers.Default) { boundedBitmap(data, width, maxHeight) }
+            if (bitmap != null) MediaCache.putPicture(key, data, bitmap)
+            value = PreparedContent(scopeKey, data, DecodedBitmap(bitmap))
+        }
+        val full = remember(data, scopeKey, key) { suspend { MediaCache.picture(fullKey, data) ?: withContext(Dispatchers.Default) { sharperBitmap(data, width, maxHeight) }?.also { MediaCache.putPicture(fullKey, data, it) } } }
+        val result = rendered?.forContext(scopeKey, data)
+        if (result == null) MediaPlaceholder(placeholderShape(MediaKind.Image, aspect)) else result.bitmap?.let { ZoomImage(it, name, sharper = full) } ?: SelectionContainer { Text("$name · ${uiText("This media type could not be decoded by Android")}", style = MaterialTheme.typography.bodyMedium) }
+    }
+}
+/** The loading state of a preview, reserving the shape it will fill so nothing around it jumps when it arrives. */
+@Composable private fun MediaPlaceholder(shape: PlaceholderShape) {
+    Box((if (shape.fixedHeightDp != null) Modifier.fillMaxWidth().height(shape.fixedHeightDp.dp) else Modifier.fillMaxWidth().heightIn(max = InlineImageMaxHeightDp.dp).aspectRatio(shape.aspect))
+        .clip(androidx.compose.foundation.shape.RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.onSurface.copy(alpha = .05f)).testTag("media-placeholder"), contentAlignment = androidx.compose.ui.Alignment.Center) { LinearProgressIndicator() }
+}
+@Composable private fun AnimatedPreview(data: ByteArray, name: String, reducedMotion: Boolean, scopeKey: String, aspect: Float? = null) {
     var error by remember(data, scopeKey) { mutableStateOf("") }
     val decoded by produceState<PreparedContent<Drawable>?>(null, data, scopeKey) { value = null; try { value = PreparedContent(scopeKey, data, withContext(Dispatchers.Default) { ImageDecoder.decodeDrawable(ImageDecoder.createSource(ByteBuffer.wrap(data))) { decoder, info, _ -> val scale = minOf(1f, 2048f / info.size.width, 2048f / info.size.height); decoder.setTargetSize((info.size.width * scale).toInt().coerceAtLeast(1), (info.size.height * scale).toInt().coerceAtLeast(1)) } }) } catch (e: Throwable) { if (e is CancellationException) throw e; error = "Animated image could not be decoded" } }
     val drawable = decoded?.forContext(scopeKey, data)
     if (error.isNotBlank()) Text(uiText(error), color = MaterialTheme.colorScheme.error)
-    else if (drawable == null) LinearProgressIndicator()
+    else if (drawable == null) MediaPlaceholder(placeholderShape(MediaKind.Image, aspect))
     drawable?.let { image -> AndroidView(factory = { ImageView(it).apply { scaleType = ImageView.ScaleType.FIT_CENTER; adjustViewBounds = true; contentDescription = name } }, update = { it.contentDescription = name; if (it.drawable !== image) (it.drawable as? AnimatedImageDrawable)?.stop(); it.setImageDrawable(image); (image as? AnimatedImageDrawable)?.let { animation -> if (reducedMotion) animation.stop() else animation.start() } }, onRelease = { (it.drawable as? AnimatedImageDrawable)?.stop() }, modifier = Modifier.fillMaxWidth().heightIn(min = 80.dp, max = 440.dp)) }
 }
-@Composable private fun SvgPreview(data: ByteArray, name: String, scopeKey: String) {
+@Composable private fun SvgPreview(data: ByteArray, name: String, scopeKey: String, aspect: Float? = null) {
     var error by remember(data, scopeKey) { mutableStateOf("") }
     val rendered by produceState<PreparedContent<Bitmap>?>(null, data, scopeKey) {
         value = null
@@ -377,7 +417,7 @@ internal fun imagePanOffset(scale: Float, offset: androidx.compose.ui.geometry.O
         }; value = PreparedContent(scopeKey, data, bitmap) } catch (e: Throwable) { if (e is CancellationException) throw e; error = e.message ?: "SVG preview failed" }
     }
     val bitmap = rendered?.forContext(scopeKey, data)
-    if (error.isNotBlank()) { Text(uiText(error), color = MaterialTheme.colorScheme.error); Disclosure(uiText("SVG source"), data.take(2 * 1024 * 1024).toByteArray().toString(Charsets.UTF_8)) } else if (bitmap == null) LinearProgressIndicator() else ZoomImage(bitmap!!, name)
+    if (error.isNotBlank()) { Text(uiText(error), color = MaterialTheme.colorScheme.error); Disclosure(uiText("SVG source"), data.take(2 * 1024 * 1024).toByteArray().toString(Charsets.UTF_8)) } else if (bitmap == null) MediaPlaceholder(placeholderShape(MediaKind.Image, aspect)) else ZoomImage(bitmap!!, name)
 }
 @Composable private fun JsonTree(value: Any, label: String = "", depth: Int = 0) {
     if (depth > 12) { Text(uiText("Nested value · view source for more")); return }
@@ -390,7 +430,7 @@ internal fun imagePanOffset(scale: Float, offset: androidx.compose.ui.geometry.O
 }
 private data class DecodedBitmap(val bitmap: Bitmap?)
 private data class PdfPage(val bitmap: Bitmap, val count: Int, val index: Int)
-@Composable private fun PdfPreview(vm: BeaconViewModel, data: ByteArray, scopeKey: String, reference: NativeReference) {
+@Composable private fun PdfPreview(vm: BeaconViewModel, data: ByteArray, scopeKey: String, reference: NativeReference, aspect: Float? = null) {
     var page by rememberSaveable(scopeKey, reference) { mutableIntStateOf(0) }
     val contentKey = data to page
     var error by remember(contentKey, scopeKey) { mutableStateOf("") }
@@ -408,7 +448,7 @@ private data class PdfPage(val bitmap: Bitmap, val count: Int, val index: Int)
     val result = rendered?.forContext(scopeKey, contentKey)
     Column {
         if (error.isNotBlank()) SelectionContainer { Text(uiText(error), color = MaterialTheme.colorScheme.error) }
-        else if (result == null) LinearProgressIndicator()
+        else if (result == null) MediaPlaceholder(placeholderShape(MediaKind.Pdf, aspect))
         result?.let { current ->
             ZoomImage(current.bitmap, "${uiText("PDF page")} ${current.index + 1}")
             val previousLabel = uiText("Previous PDF page")
@@ -436,7 +476,7 @@ private data class PdfPage(val bitmap: Bitmap, val count: Int, val index: Int)
         } catch (e: Throwable) { created?.delete(); if (e is CancellationException) throw e; fileError = e.message ?: "Media preview could not be prepared" }
     }
     if (fileError.isNotBlank()) { SelectionContainer { Text(uiText(fileError), color = MaterialTheme.colorScheme.error) }; return }
-    val playable = produced?.forContext(scopeKey, contentKey) ?: run { LinearProgressIndicator(); return }
+    val playable = produced?.forContext(scopeKey, contentKey) ?: run { MediaPlaceholder(placeholderShape(if (video) MediaKind.Video else MediaKind.Audio)); return }
     var player by remember(playable) { mutableStateOf<MediaPlayer?>(null) }
     var videoView by remember(playable) { mutableStateOf<VideoView?>(null) }
     var videoControls by remember(playable) { mutableStateOf<android.widget.MediaController?>(null) }
@@ -459,4 +499,8 @@ private data class PdfPage(val bitmap: Bitmap, val count: Int, val index: Int)
     else Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) { FilledIconButton(onClick = { runCatching { if (playing) player?.pause() else player?.start(); playing = !playing }.onFailure { mediaError = it.message.orEmpty() } }, enabled = duration > 0 && !call.active && mediaError.isBlank()) { Icon(if (playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, uiText(if (playing) "Pause audio" else "Play audio")) }; Slider(position, { position = it; player?.seekTo(it.toInt()) }, valueRange = 0f..duration.coerceAtLeast(1).toFloat(), modifier = Modifier.weight(1f), enabled = duration > 0 && !call.active && mediaError.isBlank()); Text("${(position / 1000).toInt()}s", style = MaterialTheme.typography.bodySmall) }
 }
 
-private fun boundedBitmap(data: ByteArray): Bitmap? { val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }; BitmapFactory.decodeByteArray(data, 0, data.size, bounds); if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null; val sample = generateSequence(1) { it * 2 }.first { bounds.outWidth / it <= 1440 && bounds.outHeight / it <= 1440 }; return BitmapFactory.decodeByteArray(data, 0, data.size, BitmapFactory.Options().apply { inSampleSize = sample }) }
+private fun bitmapBounds(data: ByteArray): Pair<Int, Int>? { val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }; BitmapFactory.decodeByteArray(data, 0, data.size, bounds); return if (bounds.outWidth <= 0 || bounds.outHeight <= 0) null else bounds.outWidth to bounds.outHeight }
+/** Decoded for a [targetWidth]x[targetHeight] box (0 = none: only the 1440 px cap applies). */
+private fun boundedBitmap(data: ByteArray, targetWidth: Int = 0, targetHeight: Int = 0): Bitmap? { val (width, height) = bitmapBounds(data) ?: return null; return BitmapFactory.decodeByteArray(data, 0, data.size, BitmapFactory.Options().apply { inSampleSize = imageSampleSize(width, height, targetWidth, targetHeight) }) }
+/** The full-size decode of a picture that was decoded smaller for its box; null when the box already got the full size. */
+private fun sharperBitmap(data: ByteArray, targetWidth: Int, targetHeight: Int): Bitmap? { val (width, height) = bitmapBounds(data) ?: return null; return if (imageSampleSize(width, height, targetWidth, targetHeight) == imageSampleSize(width, height)) null else boundedBitmap(data) }

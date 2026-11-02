@@ -120,15 +120,21 @@ private fun hubCompatibilityTag(name: String): String? = when (name) {
 @Composable private fun SettingsGroup(title: String, names: List<String>, summaries: Map<String, SettingsRowSummary>, modifier: Modifier = Modifier, selectedPage: String? = null, onOpen: (String) -> Unit) {
     SettingsSection(if (title.isBlank()) "" else uiText(title), modifier, testTag = "settings-group:$title") { SettingsRows(names, summaries, selectedPage, onOpen) }
 }
+/** The routes whose row matches [query]. [shown] is each route's label, description and keywords as the phone shows them, in [routes] order; a blank query lists nothing. */
+internal fun settingsSearchResults(routes: List<String>, shown: List<Triple<String, String, String>>, query: String): List<String> =
+    if (query.isBlank() || shown.size != routes.size) emptyList() else routes.filterIndexed { index, route -> settingsRowMatches(route, shown[index].first, shown[index].second, shown[index].third, query) }
+
 /**
  * Stateless Settings overview: current values at a glance, one tap to the focused page. [onOpen] receives the exact
  * `BeaconViewModel.more` argument, [summaries] maps a row name to its localized value and pill (absent = the row's description).
  */
 @Composable internal fun SettingsOverview(summaries: Map<String, SettingsRowSummary>, onOpen: (String) -> Unit, category: String = "", selectedPage: String? = null) {
     var query by rememberSaveable(category) { mutableStateOf("") }
-    val matches = settingsSearchRoutes.filter { route ->
-        settingsRowMatches(route, uiText(settingsLabel(route)), uiText(settingsDescriptions[route].orEmpty()), settingsKeywordsOf(route).takeIf(String::isNotBlank)?.let { uiText(it) }.orEmpty(), query)
+    // Only a search needs the matches, and they are worked out once per query and language, not on every recomposition of the overview.
+    val shown = if (query.isBlank()) emptyList() else settingsSearchRoutes.map { route ->
+        Triple(uiText(settingsLabel(route)), uiText(settingsDescriptions[route].orEmpty()), settingsKeywordsOf(route).takeIf(String::isNotBlank)?.let { uiText(it) }.orEmpty())
     }
+    val matches = remember(query, shown) { settingsSearchResults(settingsSearchRoutes, shown, query) }
     val focus = LocalFocusManager.current
     SettingsList(testTag = "settings-overview") {
         item {

@@ -36,23 +36,90 @@ class DirectVoiceStartupTest {
         assertTrue(outcomeUnknownAtCallEnd(json("function_name" to "hermes_work", "status" to "submitting_native")))
     }
 
-    @Test(timeout=8000) fun providerFunctionCallsCannotSubmitNativeWork() = runBlocking {
+    private fun gatewayClient(paths: MutableList<String>, tickets: AtomicInteger, posts: MutableList<String> = java.util.concurrent.CopyOnWriteArrayList()): BeaconClient =
+        BeaconClient(AuthContext("https://voice-fixture.invalid", emptyList(), "owner", "default", backend = "hermes-dashboard"), null) { builder ->
+            builder.addInterceptor { chain ->
+                val path = chain.request().url.encodedPath
+                paths += path
+                if (chain.request().method == "POST") posts += path
+                if (path.endsWith("/ws-ticket")) tickets.incrementAndGet()
+                val body = when {
+                    path.endsWith("/context") -> json("profile" to "default", "selected_session_id" to "stored")
+                    path.endsWith("/tools") -> json("tools" to JSONArray().put(json("name" to "get_weather", "tool_id" to "a".repeat(64), "description" to "Weather")))
+                    else -> json("jobs" to JSONArray())
+                }
+                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
+                    .body(body.toString().toResponseBody("application/json".toMediaType())).build()
+            }
+        }
+
+    @Test(timeout=8000) fun aModelToolCallRunsThroughTheGatewayAndGetsAToolResponse() = runBlocking {
         val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
         val started=CompletableDeferred<Pair<WebSocket,WebSocketListener>>()
         val events=java.util.concurrent.CopyOnWriteArrayList<JSONObject>()
         val frames=java.util.concurrent.CopyOnWriteArrayList<JSONObject>()
-        val tickets=AtomicInteger();val client=client("stored",nativeAdmission={tickets.incrementAndGet()})
-        val factory=providerFactory(true,onSetup={ socket,listener,frame ->
-            val instruction=frame.getJSONObject("setup").getJSONObject("systemInstruction").getJSONArray("parts").getJSONObject(0).getString("text")
-            if(instruction.startsWith("Transcribe")) started.complete(socket to listener)
-        },onFrame={ frames+=it })
+        val paths=java.util.concurrent.CopyOnWriteArrayList<String>();val tickets=AtomicInteger()
+        val client=gatewayClient(paths,tickets)
+        val factory=providerFactory(true,onSetup={ socket,listener,_ -> started.complete(socket to listener) },onFrame={ frames+=it })
         val voice=DirectVoice(client,"call","stored",scope,{}, { events+=it }, {},credentials=credentials(),providerSocketFactory=factory)
         try {
             voice.start(); val (socket,listener)=withTimeout(3000) { started.await() }
             withTimeout(3000) { while(events.none { it.optString("state")=="listening" }) delay(5) }
-            listener.onMessage(socket,json("toolCall" to json("functionCalls" to JSONArray().put(json("id" to "invented", "name" to "hermes_work", "args" to json("text" to "Do something"))))).toString())
+            listener.onMessage(socket,json("toolCall" to json("functionCalls" to JSONArray().put(json("id" to "find-1","name" to "discover_tools","args" to json("query" to "weather"))))).toString())
+            withTimeout(3000) { while(frames.none { it.has("toolResponse") }) delay(5) }
+            val response=frames.first { it.has("toolResponse") }.getJSONObject("toolResponse").getJSONArray("functionResponses").getJSONObject(0)
+            assertEquals("find-1",response.getString("id"));assertEquals("discover_tools",response.getString("name"))
+            assertEquals("get_weather",response.getJSONObject("response").getJSONArray("tools").getJSONObject(0).getString("name"))
+            assertTrue(paths.contains("/api/plugins/beacon/mobile/calls/call/tools"))
+            assertEquals("A lookup opens no Hermes work",0,tickets.get())
+            assertTrue(events.any { it.optString("type")=="tool_receipt"&&it.optString("tool_name")=="discover_tools"&&it.optString("status")=="running" })
+        } finally { voice.close();scope.cancel();client.closeNative() }
+    }
+
+    @Test(timeout=8000) fun aFunctionTheCallDoesNotOfferIsRefusedWithoutRunningAnything() = runBlocking {
+        val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
+        val started=CompletableDeferred<Pair<WebSocket,WebSocketListener>>()
+        val events=java.util.concurrent.CopyOnWriteArrayList<JSONObject>()
+        val frames=java.util.concurrent.CopyOnWriteArrayList<JSONObject>()
+        val paths=java.util.concurrent.CopyOnWriteArrayList<String>();val tickets=AtomicInteger()
+        val client=gatewayClient(paths,tickets)
+        val factory=providerFactory(true,onSetup={ socket,listener,_ -> started.complete(socket to listener) },onFrame={ frames+=it })
+        val voice=DirectVoice(client,"call","stored",scope,{}, { events+=it }, {},credentials=credentials(),providerSocketFactory=factory)
+        try {
+            voice.start(); val (socket,listener)=withTimeout(3000) { started.await() }
+            withTimeout(3000) { while(events.none { it.optString("state")=="listening" }) delay(5) }
+            listener.onMessage(socket,json("toolCall" to json("functionCalls" to JSONArray().put(json("id" to "invented","name" to "delete_everything","args" to json())))).toString())
+            withTimeout(3000) { while(frames.none { it.has("toolResponse") }) delay(5) }
+            val response=frames.first { it.has("toolResponse") }.getJSONObject("toolResponse").getJSONArray("functionResponses").getJSONObject(0).getJSONObject("response")
+            assertEquals("unsupported",response.getString("status"))
+            assertEquals(0,tickets.get());assertTrue(paths.none { it.contains("/tools") })
+        } finally { voice.close();scope.cancel();client.closeNative() }
+    }
+
+    @Test(timeout=8000) fun aFinalOwnerTranscriptIsNotRelayedToHermesAndTheModelAnswersAloud() = runBlocking {
+        val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
+        val started=CompletableDeferred<Pair<WebSocket,WebSocketListener>>()
+        val events=java.util.concurrent.CopyOnWriteArrayList<JSONObject>()
+        val audio=java.util.concurrent.CopyOnWriteArrayList<ByteArray>()
+        val paths=java.util.concurrent.CopyOnWriteArrayList<String>();val posts=java.util.concurrent.CopyOnWriteArrayList<String>();val tickets=AtomicInteger()
+        val client=gatewayClient(paths,tickets,posts)
+        val factory=providerFactory(true,onSetup={ socket,listener,_ -> started.complete(socket to listener) })
+        val voice=DirectVoice(client,"call","stored",scope,{ audio+=it }, { events+=it }, {},credentials=credentials(),providerSocketFactory=factory)
+        try {
+            voice.start(); val (socket,listener)=withTimeout(3000) { started.await() }
+            withTimeout(3000) { while(events.none { it.optString("state")=="listening" }) delay(5) }
+            // The greeting turn ends, then the owner speaks and the live model answers in its own voice.
+            listener.onMessage(socket,json("serverContent" to json("turnComplete" to true)).toString())
+            listener.onMessage(socket,json("serverContent" to json("inputTranscription" to json("text" to "What is two plus three?","finished" to true))).toString())
+            listener.onMessage(socket,json("serverContent" to json("outputTranscription" to json("text" to "Five."),"modelTurn" to json("parts" to JSONArray().put(json("inlineData" to json("mimeType" to "audio/pcm;rate=24000","data" to "AAE=")))))).toString())
+            listener.onMessage(socket,json("serverContent" to json("generationComplete" to true,"turnComplete" to true)).toString())
+            withTimeout(3000) { while(audio.isEmpty()||events.none { it.optString("type")=="turn_complete" }) delay(5) }
             delay(150)
-            assertEquals(0,tickets.get());assertFalse(frames.any { it.has("toolResponse") })
+            assertEquals("The model's own answer reaches the speaker",1,audio.size)
+            assertTrue("The owner's words and the answer reach the call card",events.any { it.optString("role")=="user"&&it.optString("text")=="What is two plus three?" }&&events.any { it.optString("role")=="assistant"&&it.optString("text")=="Five." })
+            assertEquals("No Hermes work or native session is opened",0,tickets.get())
+            assertTrue("Nothing is posted to the call's jobs",posts.none { it.contains("/jobs") })
+            assertTrue("A normal turn shows no verification warning",events.none { it.optString("type")=="warning" })
         } finally { voice.close();scope.cancel();client.closeNative() }
     }
 
@@ -64,8 +131,7 @@ class DirectVoiceStartupTest {
         val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
         val client=client("stored",contextRead={ if(contexts.incrementAndGet()==2) throw java.io.IOException("Network handover") })
         val factory=providerFactory(true,onSetup={ socket,listener,frame ->
-            val instruction=frame.getJSONObject("setup").getJSONObject("systemInstruction").getJSONArray("parts").getJSONObject(0).getString("text")
-            if(instruction.startsWith("Transcribe") && asrConnections.incrementAndGet()==1) listener.onFailure(socket,java.io.IOException("Network handover"),null)
+            if(asrConnections.incrementAndGet()==1) listener.onFailure(socket,java.io.IOException("Network handover"),null)
         },onRequest={ sockets.incrementAndGet() })
         val voice=DirectVoice(client,"call","stored",scope,{}, {
             if(it.optString("state")=="listening") { admittedOn+=sockets.get();if(sockets.get()==3) reconnected.complete(Unit) }
@@ -138,7 +204,7 @@ class DirectVoiceStartupTest {
             val receipts=DirectVoice::class.java.getDeclaredField("toolReceipts").apply { isAccessible=true }.get(voice) as Map<String,JSONObject>
             val response=receipts.getValue("updating-native")
             assertEquals("not_sent",response.getString("status"));assertEquals("hermes_updating",response.getString("error_code"))
-            assertTrue(events.any { it.optString("message").contains("updating") })
+            assertTrue("The model is told why and when to try again",response.getString("message").contains("updating"))
         } finally { voice.close();scope.cancel();client.closeNative() }
     }
 
@@ -231,9 +297,11 @@ class DirectVoiceStartupTest {
                 assertEquals("voice-live",prompts.single().getString("surface"))
                 assertEquals("Use this profile's configured tools and memory",prompts.single().getString("text"))
                 call("different-chat","hermes_work",json("text" to "Fixture","separate" to true))
-                call("legacy-router","discover_tools",json("query" to "mail"))
-                assertEquals(1,prompts.size)
-                assertFalse(paths.any { it.endsWith("/memory")||it.endsWith("/search")||it.contains("/tools") })
+                assertEquals("Extra arguments never reach a second chat",1,prompts.size)
+                call("lookup","discover_tools",json("query" to "mail"))
+                assertEquals("A lookup submits no prompt",1,prompts.size)
+                assertTrue("Tools are found through the call's own gateway",paths.contains("/api/plugins/beacon/mobile/calls/call/tools"))
+                assertFalse(paths.any { it.endsWith("/memory")||it.endsWith("/search") })
             } finally { voice.close();scope.cancel();client.closeNative() }
         }
     }
@@ -441,4 +509,16 @@ class DirectVoiceStartupTest {
                     .message("Fixture").body(body.toString().toResponseBody("application/json".toMediaType())).build()
             }
         }
+
+    @Test fun noRelayVerificationOrPerUtteranceHandOffRemainsInTheCall() {
+        val root = listOf("src/main/java/dev/hermes/android/voice", "app/src/main/java/dev/hermes/android/voice", "beacon-android/app/src/main/java/dev/hermes/android/voice")
+            .map { java.io.File(it) }.first { it.isDirectory }
+        val sources = root.walk().filter { it.isFile && it.extension == "kt" }.associate { it.name to it.readText() }
+        for (gone in listOf("Speech could not be verified", "Speech could not be confirmed", "VoiceFinalItems", "codecDrain", "lastNativeReply"))
+            assertTrue("$gone must not exist", sources.none { (_, text) -> text.contains(gone) })
+        // A final owner transcript is a caption, never a Hermes request.
+        assertFalse(sources.getValue("DirectVoice.kt").contains("Your request is still pending."))
+        assertTrue(callToolHint("hermes_callback", json("subscribed" to true)).contains("call back"))
+        assertEquals("", callToolHint("discover_tools", json("tools" to JSONArray())))
+    }
 }

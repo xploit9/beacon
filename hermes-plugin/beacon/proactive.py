@@ -643,7 +643,8 @@ def _job_definition_matches(job, spec):
 def _managed_ids(mobile, owner, profile):
     prefix = _key(owner, profile, "job:")
     with mobile.connect() as conn:
-        rows = conn.execute("SELECT key,value FROM meta WHERE substr(key,1,?)=?", (len(prefix), prefix)).fetchall()
+        # A key range reads just the prefix's rows of the primary-key index; substr() scans every row.
+        rows = conn.execute("SELECT key,value FROM meta WHERE key>=? AND key<?", (prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1))).fetchall()
     return {row["key"][len(prefix):]: row["value"].decode("utf-8") if isinstance(row["value"], bytes) else str(row["value"])
             for row in rows}
 
@@ -876,7 +877,7 @@ def pause_managed_jobs(mobile):
     """Native unload cleanup; include orphaned profiles recorded in Beacon's own metadata."""
     prefix = 'beacon:proactive:'
     with mobile.connect() as conn:
-        keys = conn.execute('SELECT key FROM meta WHERE substr(key,1,?)=?', (len(prefix), prefix)).fetchall()
+        keys = conn.execute('SELECT key FROM meta WHERE key>=? AND key<?', (prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1))).fetchall()
     scopes = {tuple(row['key'][len(prefix):].partition(':job:')[0].rsplit(':', 1))
               for row in keys if ':job:' in row['key'][len(prefix):]}
     call, _, mutate, _ = _cron_helpers()

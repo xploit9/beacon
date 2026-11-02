@@ -85,6 +85,8 @@ internal data class BackgroundActivitySummary(
     val available: Boolean = true,
 ) {
     val active get() = agents > 0 || processes > 0 || cronJobs > 0 || watches > 0
+    /** Work running right now; an enabled watch on its own only waits for its next look. */
+    val working get() = agents > 0 || processes > 0 || cronJobs > 0
 }
 
 /** The background line's fixed texts, which reach uiText through [backgroundActivityStatus]. Each count sits inside its own template as {0}. */

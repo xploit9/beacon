@@ -36,6 +36,8 @@ data class NativeSkillsState(
     val selected: NativeSkill? = null, val content: NativeSkillContent? = null,
     val draft: String = "", val editing: Boolean = false, val loading: Boolean = false,
     val saving: Boolean = false, val error: String? = null, val notice: String? = null,
+    /** The skill whose switch is being saved: it changes at once, and only the switches wait for it. */
+    val toggling: String? = null,
 )
 
 /** The two notices a successful save puts in [NativeSkillsState.notice] (NativePhoneSettings writes them). Any other notice is a warning from the server and never reads as success. */
@@ -43,9 +45,17 @@ internal const val SkillsSavedNotice = "Saved. New chats use this change."
 internal const val SkillInstructionsSavedNotice = "Instructions saved. New chats use this change."
 internal fun skillNoticeIsSuccess(notice: String): Boolean = notice == SkillsSavedNotice || notice == SkillInstructionsSavedNotice
 
+/** The state with one skill switched on or off right away, before Hermes confirms; the open skill follows. Calling it again with the old value is the rollback. */
+internal fun NativeSkillsState.withSkillEnabled(name: String, enabled: Boolean): NativeSkillsState =
+    copy(skills = skills.map { if (it.name == name) it.copy(enabled = enabled) else it }, selected = selected?.let { if (it.name == name) it.copy(enabled = enabled) else it })
+
 /** "apple-notes" reads "Apple Notes": skills are stored under slugs, people read names. */
+/** Words that read as letters keep their capitals ("Autonomous AI Agents", "MCP Servers"). */
+private val SkillNameAcronyms = setOf("ai", "api", "mcp", "pdf", "url", "sql", "ui", "ux", "llm", "csv", "json", "html", "css", "ocr", "tts", "seo", "sms", "id")
 internal fun skillDisplayName(name: String): String =
-    name.split('-', '_').filter(String::isNotBlank).joinToString(" ") { it.replaceFirstChar(Char::titlecase) }.ifBlank { name }
+    name.split('-', '_').filter(String::isNotBlank).joinToString(" ") { word ->
+        if (word.lowercase() in SkillNameAcronyms) word.uppercase() else word.replaceFirstChar(Char::titlecase)
+    }.ifBlank { name }
 
 /** The filter ids are "all", "on" (enabled) and "setup" (needs setup); a search matches the name as stored, as shown, the description and the category. */
 internal fun skillMatches(skill: NativeSkill, filter: String, search: String): Boolean =
@@ -122,7 +132,7 @@ private fun LazyListScope.skillList(
             SettingsSection(title = when { category == null -> ""; category.isBlank() -> uiText("Other"); else -> skillDisplayName(category) }) {
                 skills.forEachIndexed { index, skill ->
                     if (index > 0) SettingsDivider()
-                    SkillRow(skill, busy, enableLabel, { onOpen(skill) }) { onToggle(skill, it) }
+                    SkillRow(skill, busy, state.toggling != null, enableLabel, { onOpen(skill) }) { onToggle(skill, it) }
                 }
             }
         }
@@ -130,8 +140,8 @@ private fun LazyListScope.skillList(
 }
 
 /** A skill: its name, one line of description and, when it can't work yet, a "Needs setup" pill. The row opens it; the switch is its own target. */
-@Composable private fun SkillRow(skill: NativeSkill, busy: Boolean, enableLabel: String, onOpen: () -> Unit, onToggle: (Boolean) -> Unit) {
-    Row(Modifier.fillMaxWidth().heightIn(min = 72.dp).clickable(enabled = !busy, role = Role.Button, onClick = onOpen).padding(start = 16.dp, top = 12.dp, end = 8.dp, bottom = 12.dp).testTag("skill-row-${skill.name}"),
+@Composable private fun SkillRow(skill: NativeSkill, busy: Boolean, switchSaving: Boolean, enableLabel: String, onOpen: () -> Unit, onToggle: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth().heightIn(min = 72.dp).clickable(enabled = !busy, role = Role.Button, onClick = onOpen).padding(start = 16.dp, top = 12.dp, end = 16.dp, bottom = 12.dp).testTag("skill-row-${skill.name}"),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
         SettingsIconTile(SkillsIcon)
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -140,7 +150,7 @@ private fun LazyListScope.skillList(
             if (skill.requirements.isNotEmpty()) SettingsStatusPill(SettingsStatus.Attention, uiText("Needs setup"))
             else if (skill.essential) SettingsStatusPill(SettingsStatus.Off, uiText("Always on"))
         }
-        Switch(checked = skill.enabled, onCheckedChange = onToggle, enabled = !busy && !skill.essential, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "$enableLabel ${skill.name}" })
+        Switch(checked = skill.enabled, onCheckedChange = onToggle, enabled = !busy && !switchSaving && !skill.essential, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "$enableLabel ${skill.name}" })
     }
 }
 
@@ -156,7 +166,7 @@ private fun LazyListScope.skillDetail(
     }
     item(key = "enabled") { SettingsSection {
         SettingsSwitchRow(uiText("Enabled"), skill.enabled, { onToggle(skill, it) }, Modifier.semantics { contentDescription = "$enableLabel ${skill.name}" }, icon = Icons.Rounded.PowerSettingsNew,
-            summary = if (skill.essential) uiText("Always on") else "", enabled = !busy && !skill.essential, testTag = "skill-enabled")
+            summary = if (skill.essential) uiText("Always on") else "", enabled = !busy && state.toggling == null && !skill.essential, testTag = "skill-enabled")
     } }
     if (!ready) item(key = "needs") { SettingsSection(title = uiText("Needs"), testTag = "skill-needs") {
         skill.requirements.forEachIndexed { index, requirement ->

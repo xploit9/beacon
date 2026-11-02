@@ -327,7 +327,7 @@ class CallController(private val app: BeaconApplication) {
             spec = call
             // Ended while it was being set up: nothing starts, and the admission is released once it lands (unless the hangup took it).
             if (generation != epoch.get()) { if (spec === call) { spec = null; warm?.close(); background.launch { release(call) } }; return }
-            _state.update { it.copy(voiceProvider = voiceSettings.provider, visionAvailable = true).let { call -> grant?.let { g -> call.copy(conversationScope = frozen.scope.session(g.getString("conversation_id")), callId = g.getString("call_id")) } ?: call }.withOverlayPermission(android.provider.Settings.canDrawOverlays(app)) }
+            _state.update { it.copy(voiceProvider = voiceSettings.provider, visionAvailable = voiceSettings.provider == "gemini").let { call -> grant?.let { g -> call.copy(conversationScope = frozen.scope.session(g.getString("conversation_id")), callId = g.getString("call_id")) } ?: call }.withOverlayPermission(android.provider.Settings.canDrawOverlays(app)) }
             ContextCompat.startForegroundService(app, Intent(app, BeaconCallService::class.java).setAction(BeaconCallService.START))
             started = true
         } catch (e: Throwable) {
@@ -560,7 +560,8 @@ class BeaconCallService : Service() {
                 val direct=DirectVoice(spec.client,spec.grant.optString("call_id"),spec.conversation.ifBlank { spec.grant.getString("conversation_id") },scope,{bytes ->
                     if(!held&&!closed.get()) { if(!audio.enqueue(bytes)&&!closed.get()) { audio.interrupt();app.calls.updateFrom(this@BeaconCallService) { it.copy(error="Playback queue overflow; current speech was interrupted") } } }
                 },::directEvent,::failure,voiceSettings,ownerName=ownerName,ownerFence=closed,ownerActive={ !closed.get() },
-                    clock=android.os.SystemClock::elapsedRealtime,tappedAt=spec.tappedAt,warm=spec.warm,prefetched=spec.context,admission=spec.admission,callback=spec.incoming,streamsMicrophone=true)
+                    clock=android.os.SystemClock::elapsedRealtime,tappedAt=spec.tappedAt,warm=spec.warm,prefetched=spec.context,admission=spec.admission,callback=spec.incoming,streamsMicrophone=true,
+                    recentSpeech={ app.calls.state.value.transcripts.takeLast(10).joinToString("\n") { "${it.role}: ${it.text}" }.takeLast(6000) })
                 directVoice=direct;direct.start()
             } catch(e:Exception) { if(!closed.get()) failure("Native audio initialization failed") }
             }

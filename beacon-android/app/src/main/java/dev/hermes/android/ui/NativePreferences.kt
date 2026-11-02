@@ -38,7 +38,10 @@ internal fun assistantName(value: String, name: String): String =
     val name = LocalAssistantName.current
     return assistantName(uiText(value), name)
 }
-@Composable fun uiText(value: String): String {
-    val dictionary = LocalUiStrings.current
+/** English and a catalog still loading share the empty dictionary: nothing to look up, so skip the normalizing (it runs ~200 times per frame). */
+internal fun translateUi(dictionary: JSONObject, value: String): String {
+    if (dictionary === NoStrings) return value
     return dictionary.optString(normalized(value)).ifBlank { dictionary.optString(normalized(nativeAliases[value] ?: value)).ifBlank { value } }
 }
+internal val EmptyUiStrings: JSONObject get() = NoStrings
+@Composable fun uiText(value: String): String = translateUi(LocalUiStrings.current, value)

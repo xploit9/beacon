@@ -25,6 +25,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
@@ -82,22 +83,6 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
 /** The tile names the drawer shows through uiText ("Cron" reads Schedules). */
 internal val NavigationStrings = navigationTiles.map(::navigationLabel)
 
-/** The two worlds the drawer switches between: the owner's chats, or Bot Mode with its bots and shared spaces. */
-internal enum class DrawerMode { Chats, Bots }
-internal enum class DrawerModeAction { None, EnterBots, LeaveBots, OpenBotHome }
-
-/** What a tap on [tapped] does: leave or enter Bot Mode, or (already in it) go to its home. Chats while in Chats does nothing. */
-internal fun drawerModeAction(botMode: Boolean, tapped: DrawerMode): DrawerModeAction = when (tapped) {
-    DrawerMode.Chats -> if (botMode) DrawerModeAction.LeaveBots else DrawerModeAction.None
-    DrawerMode.Bots -> if (botMode) DrawerModeAction.OpenBotHome else DrawerModeAction.EnterBots
-}
-
-/** Each segment keeps the tag of the control it replaced: Leave Bot Mode and the Bot Mode home button. */
-internal fun drawerModeTag(botMode: Boolean, mode: DrawerMode): String = when (mode) {
-    DrawerMode.Chats -> if (botMode) "navigation-leave-bot-mode" else "navigation-mode-chats"
-    DrawerMode.Bots -> if (botMode) "navigation-bot-mode-home" else "navigation-mode-bots"
-}
-
 /** An update waits for the owner: a newer app, or a Hermes plugin that can update, or a download that needs install permission. */
 internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported && when (state.phase) {
     UpdatePhase.NeedsPermission -> true
@@ -119,17 +104,9 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
     var naming by rememberSaveable { mutableStateOf(false) }
     var moreOpen by rememberSaveable { mutableStateOf(false) }
     if (naming) NewThreadDialog(vm, onDismiss = { naming = false })
-    val openMode: (DrawerMode) -> Unit = { mode ->
-        when (drawerModeAction(ui.botModeEnabled, mode)) {
-            DrawerModeAction.EnterBots, DrawerModeAction.LeaveBots -> { vm.toggleBotMode() }
-            DrawerModeAction.OpenBotHome -> vm.showBotMode()
-            DrawerModeAction.None -> {}
-        }
-    }
-    // A destination tile opens its page; Bots is the tile that enters Bot Mode, or goes to its home once inside.
-    val openTile: (String) -> Unit = { name -> if (name == "Bots") openMode(DrawerMode.Bots) else vm.navigate(name) }
+    // Bots is the one switch for Bot Mode: a tap turns it on, and off again (navigate("Bots") toggles).
+    val openTile: (String) -> Unit = vm::navigate
     Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        DrawerModeSwitch(ui.botModeEnabled, ui.botModeSwitching, openMode)
         if (!ui.botModeEnabled) {
             Box(Modifier.fillMaxWidth()) {
                 var pillWidth by remember { mutableStateOf(0.dp) }
@@ -177,7 +154,7 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         row.forEach { name ->
                             val route = navigationRoute(name)
-                            NavigationTile(name, active = ui.tab == route.tab && ui.morePage == route.page, enabled = name != "Bots" || !ui.botModeSwitching,
+                            NavigationTile(name, active = if (name == "Bots") ui.botModeEnabled else ui.tab == route.tab && ui.morePage == route.page, enabled = name != "Bots" || !ui.botModeSwitching,
                                 updateReady = name == "Settings" && updateReady, onClick = { openTile(name) }, modifier = Modifier.weight(1f))
                         }
                     }
@@ -185,33 +162,9 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
                 if (overflow.isNotEmpty()) NavigationMoreTile(onClick = { moreOpen = true })
             }
             if (moreOpen && overflow.isNotEmpty()) NavigationMoreSheet(
-                names = overflow, isActive = { name -> navigationRoute(name).let { ui.tab == it.tab && ui.morePage == it.page } }, updateReady = updateReady,
+                names = overflow, isActive = { name -> if (name == "Bots") ui.botModeEnabled else navigationRoute(name).let { ui.tab == it.tab && ui.morePage == it.page } }, updateReady = updateReady,
                 onPick = { name -> moreOpen = false; openTile(name) }, onDismiss = { moreOpen = false },
             )
-        }
-    }
-}
-
-/** Chats | Bots, always the first thing in the drawer: the two worlds are one switch, not a tile. */
-@Composable internal fun DrawerModeSwitch(botMode: Boolean, switching: Boolean, onTap: (DrawerMode) -> Unit, modifier: Modifier = Modifier) {
-    val modes = DrawerMode.entries
-    SingleChoiceSegmentedButtonRow(modifier.fillMaxWidth()) {
-        modes.forEachIndexed { index, mode ->
-            val chosen = (mode == DrawerMode.Bots) == botMode
-            SegmentedButton(
-                selected = chosen,
-                onClick = { onTap(mode) },
-                shape = SegmentedButtonDefaults.itemShape(index, modes.size),
-                enabled = !switching,
-                modifier = Modifier.heightIn(min = 48.dp).testTag(drawerModeTag(botMode, mode)),
-                icon = {
-                    SegmentedButtonDefaults.Icon(
-                        active = chosen,
-                        activeContent = { Icon(Icons.Rounded.Check, null, Modifier.size(SegmentedButtonDefaults.IconSize)) },
-                        inactiveContent = { Icon(if (mode == DrawerMode.Bots) Icons.Rounded.SmartToy else Icons.Rounded.ChatBubbleOutline, null, Modifier.size(SegmentedButtonDefaults.IconSize)) },
-                    )
-                },
-            ) { Text(uiText(if (mode == DrawerMode.Bots) "Bots" else "Chats"), maxLines = 1, overflow = TextOverflow.Ellipsis) }
         }
     }
 }
@@ -299,9 +252,10 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
 ) {
     DropdownMenu(expanded = expanded, onDismissRequest = onDismiss, modifier = (if (width > 0.dp) Modifier.width(width) else Modifier).testTag("navigation-profile-menu")) {
         when {
-            catalog == null || catalog.optBoolean("_loading") -> MenuRow(Modifier.testTag("navigation-profile-loading")) {
-                CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
-                Text(uiText("Loading profiles…"), Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
+            catalog == null || catalog.optBoolean("_loading") -> {
+                val loading = uiText("Loading profiles…")
+                // Skeleton rows the shape of the profile rows, so the menu does not resize when the list arrives.
+                Box(Modifier.fillMaxWidth().widthIn(min = 200.dp).testTag("navigation-profile-loading").semantics { contentDescription = loading }) { SettingsSkeletonRows(2) }
             }
             catalog.string("_error").isNotBlank() -> MenuRow(Modifier.clickable(role = Role.Button, onClick = onRetry).testTag("navigation-profile-retry")) {
                 Icon(Icons.Rounded.Refresh, null, Modifier.size(24.dp))

@@ -668,6 +668,17 @@ def cached_config(root):
     return copy.deepcopy(_cached_read('config',config,root,(root/'config.yaml',),lambda: config(root)))
 
 
+def cached_personality(root):
+    """personality(root), read again only when SOUL.md changes."""
+    return _cached_read('personality',personality,root,(root/'SOUL.md',),lambda: personality(root))
+
+
+def cached_builtin_memory(root,cfg):
+    """builtin_memory(root,cfg), read again only when the memory files or config.yaml change."""
+    return _cached_read('memory',builtin_memory,root,(root/'config.yaml',root/'memories'/'MEMORY.md',root/'memories'/'USER.md'),
+                        lambda: builtin_memory(root,cfg))
+
+
 def cached_owner_name(root,cfg):
     """owner_name_in_memory(root,cfg), read again only when USER.md or config.yaml changes."""
     return _cached_read('owner-name',owner_name_in_memory,root,(root/'config.yaml',root/'memories'/'USER.md'),
@@ -710,7 +721,8 @@ def session_context(owner,provider,profile,stored,display_name='',owner_name='')
         hit=SESSION_CONTEXTS.get(key)
         if hit is not None and started<hit[0]: return json.loads(hit[1])
     # A new chat is read before its first message saves it: the call entry shows as soon as the chat opens.
-    value=context(owner,provider,profile,stored,'',display_name,owner_name,native_backend=True,verify=_verify_saved_or_draft)
+    # Built before the tap, so it also carries this chat's latest messages: a call picks up where the typing left off.
+    value=context(owner,provider,profile,stored,'',display_name,owner_name,verify=_verify_saved_or_draft,with_history=True)
     value['callback']={}
     value['context'].pop('callback_reason',None);value['context'].pop('callback_result',None)
     with SESSION_CONTEXTS_LOCK:
@@ -752,22 +764,54 @@ def tool_catalogue(profile, wait=None):
         return ''
 
 
-def context(owner,provider,profile,stored,call_id,display_name='',owner_name='',native_backend=False,verify=None):
-    # history verifies ownership before any profile data is loaded.
-    if native_backend:
-        (verify or native.verify)(owner,provider,profile,stored)
-        messages=[]
-    else:
-        messages=history(owner,provider,profile,stored)
-    catalogue='' if native_backend else tool_catalogue(profile)
+# The profile's call tool list, built in the background before any call (prefetch_tools) and read by the call start without waiting.
+TOOLS_READY={}
+TOOLS_READY_SECONDS=900
+TOOLS_WARMING=set()
+TOOLS_LOCK=threading.Lock()
+
+
+def prefetch_tools(profile):
+    """Starts warming this profile's call tools in the background and returns at once, so a call's first tool runs without a scan."""
+    module=sys.modules.get('beacon_gateway_tools')
+    if not module: return False
+    with TOOLS_LOCK:
+        if profile in TOOLS_WARMING: return False
+        TOOLS_WARMING.add(profile)
+    def build():
+        try:
+            text=module.Gateway(mobile,scoped).prefetch(profile)
+            with TOOLS_LOCK: TOOLS_READY[profile]=(_clock(),text)
+        except Exception: pass
+        finally:
+            with TOOLS_LOCK: TOOLS_WARMING.discard(profile)
+    try: threading.Thread(target=build,name='beacon-voice-tools',daemon=True).start()
+    except Exception:
+        with TOOLS_LOCK: TOOLS_WARMING.discard(profile)
+        return False
+    return True
+
+
+def ready_tools(profile):
+    """The compact tool list a background prefetch already built, or ''; never scans or waits."""
+    with TOOLS_LOCK: hit=TOOLS_READY.get(profile)
+    return hit[1] if hit and _clock()-hit[0]<TOOLS_READY_SECONDS else ''
+
+
+def context(owner,provider,profile,stored,call_id,display_name='',owner_name='',native_backend=False,verify=None,with_history=False):
+    # Ownership is verified before any profile data is loaded. A call start runs no tool discovery: it names the tools a
+    # background prefetch already found, and the live model finds others with discover_tools. Only the warm context reads the chat.
+    owned=(verify or native.verify)(owner,provider,profile,stored)
+    messages=history(owner,provider,profile,stored) if with_history and not native_backend and owned!={} else []
+    catalogue='' if native_backend else ready_tools(profile)
     def load(root):
-        # The native path runs on every call start: its profile reads come from the change-checked cache.
-        cfg=cached_config(root) if native_backend else config(root);details={}
-        try: soul='' if native_backend else personality(root)
+        # Every call start reads the profile through the change-checked cache.
+        cfg=cached_config(root);details={}
+        try: soul='' if native_backend else cached_personality(root)
         except Exception: soul='';details['personality']='unavailable'
-        try: memory='' if native_backend else builtin_memory(root,cfg)
+        try: memory='' if native_backend else cached_builtin_memory(root,cfg)
         except Exception: memory='';details['memory']='unavailable'
-        try: remembered=cached_owner_name(root,cfg) if native_backend else owner_name_in_memory(root,cfg)
+        try: remembered=cached_owner_name(root,cfg)
         except Exception: remembered=''
         section=cfg.get('memory')
         name=str(section.get('provider') or '') if isinstance(section,dict) else ''
@@ -795,7 +839,7 @@ def context(owner,provider,profile,stored,call_id,display_name='',owner_name='',
         if soul: instruction+='\n\nProfile personality:\n'+soul
         if language: instruction+='\nPreferred spoken language: '+language
         # Native setup reads metadata under the existing profile scope; no provider secrets are needed.
-        clock,zone=profile_clock(profile,bound=True) if native_backend else profile_clock(profile)
+        clock,zone=profile_clock(profile,bound=True)
         if clock: instruction+='\nCurrent local time for the owner: '+clock
         greeting_name=opening_name(display_name,owner_name,remembered)
         first_name=_owner_first_name(greeting_name)
@@ -808,7 +852,8 @@ def context(owner,provider,profile,stored,call_id,display_name='',owner_name='',
                 'configured_memory_provider':name if external_memory_configured(cfg) else 'builtin' if memory else None,
                 'capabilities':{'profile_context':True} if native_backend else {'web_search':True,'memory_recall':bool(memory or external_memory_configured(cfg)),'skills':True,'profile_context':True},
                 'capability_details':{'web_search':search,'memory_recall':{'available':None if external_memory_configured(cfg) else bool(memory),'provider':name if external_memory_configured(cfg) else 'builtin' if memory else None,'reason':'verify_on_use' if external_memory_configured(cfg) else None if memory else 'native_memory_unavailable'},**details}}
-    return scoped(profile,load,hydrate_secrets=False) if native_backend else scoped(profile,load)
+    # Only files and this plugin's database are read, so no profile secrets are resolved for it.
+    return scoped(profile,load,hydrate_secrets=False)
 
 def search(profile,query):
     def run(root):

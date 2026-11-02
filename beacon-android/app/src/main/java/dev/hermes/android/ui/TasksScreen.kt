@@ -352,7 +352,7 @@ internal fun scheduleCardClock(schedule: JSONObject?, display: String, hermesZon
 }
 /** One run per line, each opening the conversation it made. */
 @Composable private fun RunHistory(vm: BeaconViewModel, job: JSONObject, history: JSONObject?) {
-    if (history == null) LinearProgressIndicator(Modifier.fillMaxWidth())
+    if (history == null) SettingsSkeletonRows(2)
     else if (history.has("_error")) Text(uiText("Run history isn't available. Check your network, then retry."), color = MaterialTheme.colorScheme.error)
     else if (history.rows("runs").isEmpty()) Text(uiText("No recorded runs yet."))
     else history.rows("runs").forEach { run ->

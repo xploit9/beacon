@@ -47,13 +47,17 @@ class NativeFlowTest {
         source.eraseColor(android.graphics.Color.RED)
         val bytes = java.io.ByteArrayOutputStream()
         try { assertTrue(source.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, bytes)) } finally { source.recycle() }
-        val decoder = Class.forName("dev.hermes.android.ui.RichContentKt").getDeclaredMethod("boundedBitmap", ByteArray::class.java).apply { isAccessible = true }
-        val decoded = requireNotNull(decoder.invoke(null, bytes.toByteArray()) as? android.graphics.Bitmap)
+        // boundedBitmap(data, targetWidth, targetHeight): 0 x 0 is the cap alone, a box decodes no larger than it needs.
+        val decoder = Class.forName("dev.hermes.android.ui.RichContentKt")
+            .getDeclaredMethod("boundedBitmap", ByteArray::class.java, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType).apply { isAccessible = true }
+        val decoded = requireNotNull(decoder.invoke(null, bytes.toByteArray(), 0, 0) as? android.graphics.Bitmap)
         try {
             assertTrue(decoded.width in 1..1440 && decoded.height in 1..1440)
             assertEquals(android.graphics.Color.RED, decoded.getPixel(0, 0))
         } finally { decoded.recycle() }
-        assertNull(decoder.invoke(null, byteArrayOf()))
+        val fitted = requireNotNull(decoder.invoke(null, bytes.toByteArray(), 440, 440) as? android.graphics.Bitmap)
+        try { assertTrue("a 440 px box decodes smaller than the cap: ${fitted.width}", fitted.width in 440..1080) } finally { fitted.recycle() }
+        assertNull(decoder.invoke(null, byteArrayOf(), 0, 0))
     }
 
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()

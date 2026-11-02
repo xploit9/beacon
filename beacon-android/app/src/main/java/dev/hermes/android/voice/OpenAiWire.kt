@@ -61,7 +61,7 @@ internal class OpenAiWire {
                     .put("input", JSONObject()
                         .put("format", JSONObject().put("type", "audio/pcm").put("rate", 24000))
                         .put("transcription", JSONObject().put("model", "gpt-4o-transcribe"))
-                        .put("turn_detection", JSONObject().put("type", "semantic_vad").put("create_response", false)))
+                        .put("turn_detection", JSONObject().put("type", "semantic_vad")))
                     .put("output", JSONObject()
                         .put("format", JSONObject().put("type", "audio/pcm").put("rate", 24000))
                         .put("voice", voice)))

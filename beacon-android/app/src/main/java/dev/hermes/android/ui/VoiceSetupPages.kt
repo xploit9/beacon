@@ -16,7 +16,6 @@ import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Key
-import androidx.compose.material.icons.rounded.RecordVoiceOver
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -41,7 +40,6 @@ import dev.hermes.android.data.VoiceKeyStore
 import dev.hermes.android.data.VoicePreferences
 import dev.hermes.android.data.defaultVoiceModel
 import dev.hermes.android.data.ownerNameOf
-import dev.hermes.android.voice.GeminiSpeech
 import dev.hermes.android.voice.GeminiWire
 import dev.hermes.android.voice.GrokWire
 import dev.hermes.android.voice.OpenAiWire
@@ -504,11 +502,6 @@ internal fun voiceChoicesPage(
                         }, selection.model, { model -> pick(selection.copy(model = model)) }, collapsedCount = 4,
                             moreLabel = uiText("More models ({0})").replace("{0}", "$hiddenModels"), moreTestTag = "voice-more-models", expanded = moreModels, onExpand = { moreModels = true })
                     } else SettingsValueRow(uiText("Model"), icon = Icons.Rounded.GraphicEq, value = voiceModelDisplayName(selection.model), testTag = "voice-model-single")
-                    // The 1.1.21 disclosure: with Gemini the chosen Live model listens and a dedicated speech model says the replies.
-                    if (provider == "gemini") {
-                        SettingsDivider()
-                        SettingsValueRow(uiText("Spoken replies"), icon = Icons.Rounded.RecordVoiceOver, value = voiceModelDisplayName(GeminiSpeech.MODEL), testTag = "voice-spoken-replies")
-                    }
                 }
                 if (onOwnerNameChange != null) SettingsSection {
                     SettingsTextFieldRow(assistantText("What should Beacon call you?"), ownerDraft, { ownerDraft = ownerNameDraft(it); onOwnerNameChange(ownerNameOf(ownerDraft)) },

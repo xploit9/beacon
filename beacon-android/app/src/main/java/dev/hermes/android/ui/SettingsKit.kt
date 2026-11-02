@@ -325,8 +325,9 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Text(label, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium, color = labelColor, maxLines = 2, overflow = TextOverflow.Ellipsis)
         val pill = status != null && statusLabel.isNotBlank()
-        if (value.isNotBlank() || pill) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (value.isNotBlank()) Text(value, Modifier.weight(1f, fill = false).kitTag(valueTestTag), style = MaterialTheme.typography.bodyMedium,
+        // The pill moves under the value when both do not fit on one line, so large text never splits a short value around it.
+        if (value.isNotBlank() || pill) FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp), itemVerticalAlignment = Alignment.CenterVertically) {
+            if (value.isNotBlank()) Text(value, Modifier.kitTag(valueTestTag), style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = valueMaxLines, overflow = valueOverflow)
             if (pill) SettingsStatusPill(status, statusLabel)
         }

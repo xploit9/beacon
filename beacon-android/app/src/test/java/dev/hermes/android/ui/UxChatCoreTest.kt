@@ -3,6 +3,7 @@ package dev.hermes.android.ui
 import dev.hermes.android.tasks.scheduleTime
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.Locale
@@ -72,5 +73,13 @@ class UxChatCoreTest {
         // The menu draws Delete last, apart from the daily groups, whichever group lists it.
         assertEquals(listOf("Delete conversation"), conversationMenuGroups(conversationActionGroups.values.toList()).destructive)
         assertTrue(conversationMenuGroups(conversationActionGroups.values.toList()).daily.flatten().none { it in destructiveConversationActions })
+    }
+
+    @Test fun anEnabledWatchAloneShowsActivityWithoutASpinner() {
+        // A watch that is only switched on waits for its next look: the strip shows it, but nothing spins all day.
+        val watching = BackgroundActivitySummary(watches = 1)
+        assertTrue(watching.active); assertFalse(watching.working)
+        for (running in listOf(BackgroundActivitySummary(agents = 1, watches = 1), BackgroundActivitySummary(processes = 1), BackgroundActivitySummary(cronJobs = 1)))
+            assertTrue(running.working)
     }
 }

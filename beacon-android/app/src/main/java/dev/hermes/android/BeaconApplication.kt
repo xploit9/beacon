@@ -27,6 +27,8 @@ class BeaconApplication : Application() {
     var firebaseConfigured = false; private set
     override fun onCreate() {
         super.onCreate()
+        // Test builds log main-thread disk and network IO to logcat while developing; it is never fatal.
+        if (BuildConfig.DEBUG) android.os.StrictMode.setThreadPolicy(android.os.StrictMode.ThreadPolicy.Builder().detectDiskReads().detectDiskWrites().detectNetwork().penaltyLog().build())
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             getSystemService(NotificationManager::class.java)?.let { manager ->
                 notificationChannelIdsToDelete(

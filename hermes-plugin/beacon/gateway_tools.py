@@ -26,6 +26,9 @@ MAX_CALL_ALLOWANCES = 32
 MAX_ALLOWANCES = 1024
 DEADLINE = 90
 CATALOG_TTL = 15
+# An older list is still served at once (and refreshed behind it) for this long, so a call never waits for a scan; the cache
+# key already changes with Hermes' config, MCP config and tool registry, so an added or removed server is never missed.
+CATALOG_STALE_TTL = 600
 BOOT = uuid.uuid4().hex
 POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix='beacon-mcp')
 SLOTS = threading.BoundedSemaphore(4)
@@ -568,8 +571,11 @@ class Gateway:
         with CATALOG_LOCK:
             cached=CATALOG_CACHE.get(key)
             if cached and now-cached[0]<CATALOG_TTL: return cached[1]
-            if cached: CATALOG_CACHE.pop(key,None)
-        return None
+            if not cached or now-cached[0]>=CATALOG_STALE_TTL:
+                CATALOG_CACHE.pop(key,None)
+                return None
+        self.warm_catalogue(profile)
+        return cached[1]
 
     def _store_catalog(self, profile, rows):
         key=self._catalog_key(profile)
@@ -577,7 +583,7 @@ class Gateway:
         now=time.monotonic()
         with CATALOG_LOCK:
             for old,(created,_) in list(CATALOG_CACHE.items()):
-                if now-created>=CATALOG_TTL: CATALOG_CACHE.pop(old,None)
+                if now-created>=CATALOG_STALE_TTL: CATALOG_CACHE.pop(old,None)
             if key not in CATALOG_CACHE and len(CATALOG_CACHE)>=16:
                 CATALOG_CACHE.pop(next(iter(CATALOG_CACHE)))
             CATALOG_CACHE[key]=(now,rows)
@@ -603,12 +609,13 @@ class Gateway:
         with CATALOG_LOCK:
             cached=CATALOG_CACHE.get(key)
             if cached and now-cached[0]<CATALOG_TTL: return False
-            CATALOG_CACHE.pop(key,None)
+            # A stale list stays served until the refresh replaces it.
+            if not cached or now-cached[0]>=CATALOG_STALE_TTL: CATALOG_CACHE.pop(key,None)
             if key in CATALOG_WARMING: return False
             CATALOG_WARMING.add(key)
 
         def refresh():
-            try: self.catalog(profile)
+            try: self._store_catalog(profile,self._call_tools(self.scoped(profile,lambda _:self.backend.catalog())))
             except Exception: pass
             finally:
                 with CATALOG_LOCK: CATALOG_WARMING.discard(key)
@@ -620,6 +627,25 @@ class Gateway:
             return False
         with CATALOG_LOCK: CATALOG_FIRST_WARM.setdefault(profile,thread)
         return True
+
+    def prefetch(self, profile):
+        """Warms the call tool list in the calling (background) thread and returns its compact form. After a restart the first
+        MCP scan takes seconds; doing it here, before any call, is what lets a call's first tool run at once."""
+        key=self._catalog_key(profile)
+        if key is None: return ''
+        now=time.monotonic()
+        with CATALOG_LOCK:
+            cached=CATALOG_CACHE.get(key)
+            mine=not (cached and now-cached[0]<CATALOG_TTL) and key not in CATALOG_WARMING
+            if mine:
+                CATALOG_WARMING.add(key)
+                # discover() waits for the first scan of this process; this thread is that scan when it runs first.
+                CATALOG_FIRST_WARM.setdefault(profile,threading.current_thread())
+        if mine:
+            try: self._store_catalog(profile,self._call_tools(self.scoped(profile,lambda _:self.backend.catalog())))
+            finally:
+                with CATALOG_LOCK: CATALOG_WARMING.discard(key)
+        return self.compact_catalogue(profile)
 
     def compact_catalogue(self, profile):
         groups={}

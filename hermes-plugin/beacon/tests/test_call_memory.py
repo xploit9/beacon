@@ -55,7 +55,7 @@ def memory_env(harness, monkeypatch):
     server._profile_home = lambda profile: None if profile == 'default' else root / profile
     server._hermes_home = root
     server._session_auth_user_id = lambda record: record.get('auth_user_id')
-    monkeypatch.setattr(voice, 'scoped', lambda profile, fn: fn(root))
+    monkeypatch.setattr(voice, 'scoped', lambda profile,fn,**kwargs: fn(root))
     monkeypatch.setattr(voice, 'CALL_MEMORY', {})
     monkeypatch.setattr(voice, 'PROVIDER_SCHEMAS', {})
     return api, client, voice, server, root

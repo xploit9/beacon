@@ -75,6 +75,8 @@ class CatalogPresentationTest {
         assertEquals("Hermes Agent", skillDisplayName("hermes_agent"))
         assertEquals("Inbox", skillDisplayName("inbox"))
         assertEquals("-", skillDisplayName("-"))
+        assertEquals("Autonomous AI Agents", skillDisplayName("autonomous-ai-agents"))
+        assertEquals("MCP Servers", skillDisplayName("mcp_servers"))
     }
 
     @Test fun filtersAndSearchSelectSkills() {

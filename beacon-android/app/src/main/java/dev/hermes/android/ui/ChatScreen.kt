@@ -278,6 +278,22 @@ internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> =
     .mapNotNull { row -> row.string("tool_name").takeIf { it.matches(toolNamePattern) }?.let { row.string("id") to humanToolName(it, " result").replaceFirstChar(Char::titlecase) } }
     .toMap()
 
+
+/** (own message, width) of the placeholder bubbles a chat shows while its first read is still on the way. */
+internal val ChatSkeletonBubbles = listOf(false to .62f, true to .44f, false to .78f, true to .36f, false to .54f)
+
+/** A chat opened with nothing cached yet: message-shaped bars in the settings skeleton's look, in place of a bare spinner. */
+@Composable internal fun ChatSkeleton(modifier: Modifier = Modifier) {
+    val bar = MaterialTheme.colorScheme.onSurface
+    Column(modifier.padding(horizontal = 12.dp, vertical = 12.dp).testTag("chat-skeleton").clearAndSetSemantics {}, verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        ChatSkeletonBubbles.forEach { (own, width) ->
+            Box(Modifier.fillMaxWidth(), contentAlignment = if (own) Alignment.CenterEnd else Alignment.CenterStart) {
+                Box(Modifier.fillMaxWidth(width).height(if (width > .6f) 64.dp else 44.dp).clip(RoundedCornerShape(18.dp)).background(bar.copy(alpha = if (own) .05f else .08f)))
+            }
+        }
+    }
+}
+
 /** The History source filter only offers a choice: two or more sources, or a hidden one that must stay listed to be shown again. */
 internal fun historySourceFilterShown(sources: List<String>, hidden: Set<String>): Boolean = sources.size > 1 || hidden.isNotEmpty()
 
@@ -324,15 +340,30 @@ internal fun historySourceFilterShown(sources: List<String>, hidden: Set<String>
     val searching = searchFocused || search.isNotBlank()
     LaunchedEffect(allProfiles, ui.origin, ui.owner) { if (allProfiles) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     LaunchedEffect(search, archived, view, hidden, order, allProfiles) { kotlinx.coroutines.delay(250); vm.refreshSessions(search, archived, force = false, threads = view == HistoryView.Threads, allProfiles = allProfiles) }
-    // One scroll owner keeps destinations, search, projects and history reachable with the IME.
-    LazyColumn(modifier.background(MaterialTheme.colorScheme.surfaceContainer), contentPadding = PaddingValues(bottom = 16.dp)) {
-        if (!searching) item("destinations") { beforeHistory() }
-        val loaded = ui.sessions.filter {
+    // The rows are worked out once per input, not on every recomposition of the list.
+    val loaded = remember(ui.sessions, archived, allProfiles, ui.profile, view, hidden) {
+        ui.sessions.filter {
             it.optBoolean("archived") == archived && (allProfiles || it.string("profile", ui.profile) == ui.profile) &&
                 (view == HistoryView.Threads || it.string("source") !in hidden)
         }
+    }
+    val scopeKey = vm.client?.scope?.key
+    val searchData = data["history:search"]
+    val matches = remember(searchData, search, scopeKey, archived, view, allProfiles, hidden, order) {
+        searchData?.takeIf {
+            it.string("query") == search && it.string("scope_key") == scopeKey && it.optBoolean("archived") == archived &&
+                it.optBoolean("threads") == (view == HistoryView.Threads) && it.optBoolean("all_profiles") == allProfiles &&
+                it.string("hidden_sources") == hidden.sorted().joinToString(",") && it.string("order") == order.key
+        }?.rows("sessions")
+    }
+    val rows = remember(loaded, search, matches, view, order, ui.profile, preferences.assistantProfile, ui.assistantSessionId) {
+        historyRows(historySearchRows(loaded, search, matches, ui.profile), view, order, ui.profile, preferences.assistantProfile, ui.assistantSessionId)
+    }
+    // One scroll owner keeps destinations, search, projects and history reachable with the IME.
+    LazyColumn(modifier.background(MaterialTheme.colorScheme.surfaceContainer), contentPadding = PaddingValues(bottom = 16.dp)) {
+        if (!searching) item("destinations", contentType = "destinations") { beforeHistory() }
         // Beacon is the always-there agent: a presence card above History, not a row among the chats. Its tab keeps its conversation.
-        if (view != HistoryView.Threads && !archived && (search.isBlank() || assistantTitle.contains(search.trim(), ignoreCase = true))) item("beacon-row") {
+        if (view != HistoryView.Threads && !archived && (search.isBlank() || assistantTitle.contains(search.trim(), ignoreCase = true))) item("beacon-row", contentType = "beacon") {
             val assistantRow = loaded.firstOrNull { ui.assistantSessionId.isNotBlank() && sessionRowId(it) == ui.assistantSessionId && it.string("profile", ui.profile) == preferences.assistantProfile }
             val glance = glances.rows["${preferences.assistantProfile}:${ui.assistantSessionId}"]
             val activity = assistantRow?.let(::rowActivityMillis) ?: 0L
@@ -352,7 +383,7 @@ internal fun historySourceFilterShown(sources: List<String>, hidden: Set<String>
             )
         }
         // The search icon opens the field; once it is open the field itself is the header, so the icon is not shown twice.
-        if (!searching) item("history-header") {
+        if (!searching) item("history-header", contentType = "header") {
             Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(uiText("History"), Modifier.weight(1f).semantics { heading() }, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 IconButton(
@@ -366,7 +397,7 @@ internal fun historySourceFilterShown(sources: List<String>, hidden: Set<String>
                 ) { Icon(Icons.Rounded.Search, uiText("Search conversations")) }
             }
         }
-        stickyHeader("history-search") {
+        stickyHeader("history-search", contentType = "search") {
             AnimatedVisibility(
                 visible = searchExpanded || search.isNotBlank(),
                 enter = if (motionEnabled) expandVertically() + fadeIn(tween(180)) else EnterTransition.None,
@@ -390,7 +421,7 @@ internal fun historySourceFilterShown(sources: List<String>, hidden: Set<String>
                 )
             }
         }
-        item("history-filters") {
+        item("history-filters", contentType = "filters") {
             val filtered = allProfiles || archived || hidden.isNotEmpty() || order != HistoryOrder.Recent
             Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 SingleChoiceSegmentedButtonRow(Modifier.weight(1f)) {
@@ -456,27 +487,20 @@ internal fun historySourceFilterShown(sources: List<String>, hidden: Set<String>
         unreadable.forEach { profile -> item("history-unreadable:$profile") {
             Text(uiText("Couldn't load conversations") + ": " + profileDisplayName(profile, profileRows), Modifier.padding(horizontal = 16.dp, vertical = 8.dp).testTag("history-unreadable:$profile"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         } }
-        val matches = data["history:search"]?.takeIf {
-            it.string("query") == search && it.string("scope_key") == vm.client?.scope?.key && it.optBoolean("archived") == archived &&
-                it.optBoolean("threads") == (view == HistoryView.Threads) && it.optBoolean("all_profiles") == allProfiles &&
-                it.string("hidden_sources") == hidden.sorted().joinToString(",") && it.string("order") == order.key
-        }?.rows("sessions")
-        val searched = historySearchRows(loaded, search, matches, ui.profile)
-        val rows = historyRows(searched, view, order, ui.profile, preferences.assistantProfile, ui.assistantSessionId)
         // A failed read is not "no conversations". New thread lives once, in the drawer above.
         if (rows.isEmpty() && (ui.historyLoading || unreadable.isEmpty())) item("empty-history") {
             // An empty list is only "empty" once the fetch has answered.
             if (search.isNotBlank()) Box(Modifier.testTag("history-no-matches").semantics(mergeDescendants = true) {}) {
                 EmptyState(uiText("No matching chats"), uiText("Try another search."), Icons.Rounded.SearchOff)
             }
-            else if (ui.historyLoading) ListItem(headlineContent = { Text(uiText("Loading conversations…")) }, leadingContent = { CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) }, colors = ListItemDefaults.colors(containerColor = Color.Transparent), modifier = Modifier.testTag("history-loading"))
+            else if (ui.historyLoading) Box(Modifier.testTag("history-loading")) { SettingsSkeletonRows(4) }
             else when (view) {
                 HistoryView.Threads -> EmptyState(uiText("No threads yet"), uiText("Start a named thread for a topic you will come back to."), action = uiText("New thread"), onAction = { naming = true })
                 HistoryView.Pinned -> EmptyState(uiText("No pinned conversations"), uiText("Pin a conversation from its actions to keep it here."))
                 HistoryView.All -> EmptyState(uiText("No conversations here"), uiText("Start a conversation or try another search."), action = uiText("New conversation"), onAction = { vm.toggleSessions(false); vm.newChat() })
             }
         }
-        items(rows, key = { "session:" + historyRowKey(it, ui.profile) }) { row ->
+        items(rows, key = { "session:" + historyRowKey(it, ui.profile) }, contentType = { "session" }) { row ->
             val id = sessionRowId(row)
             val rowProfile = row.string("profile", ui.profile)
             val rowKey = historyRowKey(row, ui.profile)
@@ -798,7 +822,9 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     val questionId = chat.clarification?.let { it.string("clarify_id", it.string("id")) }.orEmpty()
     var questionAnswers by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId, questionId,
         stateSaver = androidx.compose.runtime.saveable.mapSaver<Map<String, String>>(save = { it }, restore = { saved -> saved.mapValues { it.value as String } })) { mutableStateOf(emptyMap<String, String>()) }
-    val matchingCallGroups = remember(callTranscriptGroups, search) { callTranscriptGroupsMatchingSearch(callTranscriptGroups, search) }
+    // Matches are worked out once typing pauses (a long transcript is scanned per keystroke otherwise); emptying the box clears them at once.
+    val findQuery = search
+    val matchingCallGroups = remember(callTranscriptGroups, findQuery) { callTranscriptGroupsMatchingSearch(callTranscriptGroups, findQuery) }
     val matchingCallIds = remember(matchingCallGroups) { matchingCallGroups.mapTo(mutableSetOf()) { it.callId } }
     // Find keeps the whole transcript: matches are highlighted and stepped through, never filtered.
     val visibleMessages = remember(messages, foldedToolResults, callIdByMessageId, firstCallMessageIdByCallId) {
@@ -808,11 +834,11 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
         }.let(::mergeToolOnlyRuns)
     }
     // Ids of the rows that match, oldest first; a call card matches through any of its lines.
-    val findMatches = remember(visibleMessages, search, foldedToolResults, callIdByMessageId, matchingCallIds) {
-        if (search.isBlank()) emptyList() else visibleMessages.map { it.value }.filter { message ->
+    val findMatches = remember(visibleMessages, findQuery, foldedToolResults, callIdByMessageId, matchingCallIds) {
+        if (findQuery.isBlank()) emptyList() else visibleMessages.map { it.value }.filter { message ->
             val callId = callIdByMessageId[message.id]
             if (callId != null) callId in matchingCallIds
-            else message.text.contains(search, true) || message.tools.any { tool -> foldedToolResults.byCallId[toolCallResultId(tool)]?.content?.contains(search, true) == true }
+            else message.text.contains(findQuery, true) || message.tools.any { tool -> foldedToolResults.byCallId[toolCallResultId(tool)]?.content?.contains(findQuery, true) == true }
         }.map { it.id }
     }
     val findMatchSet = remember(findMatches) { findMatches.toSet() }
@@ -868,10 +894,10 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
         if (sphereState == dev.hermes.android.ui.sphere.SphereState.Thinking && rawSphereState == dev.hermes.android.ui.sphere.SphereState.Streaming) delay(1_500L)
         sphereState = rawSphereState
     }
-    val sphereIntensity by animateFloatAsState(if (sphereStreaming) .7f else 0f, if (sphereMotionEnabled) tween(if (sphereStreaming) 1_000 else 2_000) else snap(), label = "chatSphereIntensity")
+    // The animated values stay States here and are read inside ChatSphere, so a sphere frame recomposes the sphere, not the whole conversation.
+    val sphereIntensity = animateFloatAsState(if (sphereStreaming) .7f else 0f, if (sphereMotionEnabled) tween(if (sphereStreaming) 1_000 else 2_000) else snap(), label = "chatSphereIntensity")
     val activeSphereTool = sphereStreaming && chat.liveTools.any { toolOutcomeOf(it, streaming = true) == ToolOutcome.Running }
-    val sphereToolCallBurst by animateFloatAsState(if (activeSphereTool) 1f else 0f, if (sphereMotionEnabled) tween(if (activeSphereTool) 200 else 1_200) else snap(), label = "chatSphereToolBurst")
-    val avatarState = dev.hermes.android.ui.sphere.AvatarRenderState(sphereState, sphereIntensity, sphereToolCallBurst, paused = !sphereMotionEnabled)
+    val sphereToolCallBurst = animateFloatAsState(if (activeSphereTool) 1f else 0f, if (sphereMotionEnabled) tween(if (activeSphereTool) 200 else 1_200) else snap(), label = "chatSphereToolBurst")
     var showCallHistory by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(false) }
     var showCallHistorySheet by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf(false) }
     var callHistoryTargetSession by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf("") }
@@ -1044,13 +1070,11 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                 // Without an error the conversation is only switching (answering a call does this), so it says Opening, not unavailable.
                 EmptyState(assistantText(if (ui.beaconError.isBlank()) "Opening Beacon’s conversation" else "Beacon’s conversation is unavailable"), uiText(ui.beaconError).ifBlank { uiText("Your chats and drafts are saved.") }, action = if (ui.beaconOpening) "" else assistantText("Retry Beacon"), onAction = { vm.openBeacon() })
             } else if (chat.sessionId.isBlank()) Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
-                Box(Modifier.widthIn(max = 280.dp).fillMaxWidth(.9f).aspectRatio(1f).clipToBounds().testTag("chat-sphere-empty")) { ChatSphere(Modifier.fillMaxSize(), avatarState) }
+                Box(Modifier.widthIn(max = 280.dp).fillMaxWidth(.9f).aspectRatio(1f).clipToBounds().testTag("chat-sphere-empty")) { ChatSphere(Modifier.fillMaxSize(), sphereState, sphereIntensity, sphereToolCallBurst, !sphereMotionEnabled) }
                 EmptyState(uiText(if (ui.newChatOpening) "Opening your conversation" else "Make room for a thought"), if (ui.newChatError.isNotBlank()) ui.newChatError else uiText(if (ui.newChatOpening) "Keep typing. Your draft stays here while the conversation opens." else "Ask, explore or turn an idea into working progress."), icon = null, action = if (ui.newChatError.isNotBlank() && !ui.newChatOpening) uiText("Retry") else "", onAction = { vm.retryInitialChat() }, centered = true)
                 if (!ui.newChatOpening && ui.newChatError.isBlank()) StarterPrompts { vm.composer(TextFieldValue(it, TextRange(it.length))) }
             }
-            else if (!chat.projectionReady) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
-            }
+            else if (!chat.projectionReady) ChatSkeleton(Modifier.weight(1f).fillMaxWidth())
             else Column(Modifier.weight(1f).fillMaxWidth()) {
                 if (taskResult.isNotBlank()) Card(
                     Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp).testTag("task-result-card"),
@@ -1091,19 +1115,20 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                     val latestShown = ready && !follow && list.canScrollForward
                     val transcriptBottom by animateDpAsState(if (latestShown) 72.dp else 12.dp, if (motionEnabled) tween(200) else snap(), label = "transcript-bottom")
                     LazyColumn(Modifier.fillMaxSize().nestedScroll(ownerScroll).testTag("conversation-transcript"), state = list, contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 12.dp, bottom = transcriptBottom)) {
-                    if (missingPluginShown) item("missing-beacon-plugin") {
+                    if (missingPluginShown) item("missing-beacon-plugin", contentType = "missing-plugin") {
                         MissingBeaconPluginState(Modifier.testTag("beacon-plugin-missing"), compact = true)
                     }
-                    if (chat.messages.isEmpty() && chat.streamId.isBlank() && !chatSendInFlight(chat)) item("empty-state") {
+                    if (chat.messages.isEmpty() && chat.streamId.isBlank() && !chatSendInFlight(chat)) item("empty-state", contentType = "empty") {
                         // A saved chat whose rows are all hidden is not a new one: it gets no first-run welcome.
                         if (savedConversation(chatState.messages.size, chat.raw.optInt("message_count"), openRowMessageCount)) EmptyState(uiText("Nothing to show here yet"), "", Icons.Rounded.ChatBubbleOutline, centered = true)
                         else Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-                            Box(Modifier.widthIn(max = 280.dp).fillMaxWidth(.9f).aspectRatio(1f).clipToBounds().testTag("chat-sphere-empty")) { ChatSphere(Modifier.fillMaxSize(), avatarState) }
+                            Box(Modifier.widthIn(max = 280.dp).fillMaxWidth(.9f).aspectRatio(1f).clipToBounds().testTag("chat-sphere-empty")) { ChatSphere(Modifier.fillMaxSize(), sphereState, sphereIntensity, sphereToolCallBurst, !sphereMotionEnabled) }
                             EmptyState(uiText("Where shall we begin?"), if (beacon) assistantText("Beacon keeps the same context across text, calls and completed tasks.") else uiText("Your work starts here. Choose a model and send your first message."), icon = null, centered = true)
                             StarterPrompts { vm.composer(TextFieldValue(it, TextRange(it.length))) }
                         }
                     }
-                    items(visibleMessages, key = { (_, message) -> callGroupByFirstMessageId[message.id]?.let { "call:${it.callId}" } ?: message.id }) { (index, message) ->
+                    items(visibleMessages, key = { (_, message) -> callGroupByFirstMessageId[message.id]?.let { "call:${it.callId}" } ?: message.id },
+                        contentType = { (_, message) -> if (callGroupByFirstMessageId.containsKey(message.id)) "call" else if (alertsByMessageId.containsKey(message.id)) "alert" else message.role }) { (index, message) ->
                         dayStarts[message.id]?.let { DateChip(uiText(it)) }
                         val group = callGroupByFirstMessageId[message.id]
                         val alert = alertsByMessageId[message.id]
@@ -1118,7 +1143,7 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                                 onChoose = { sendAlertFeedback(alert.noticeId, it) })
                         } else MessageRow(vm, message, transcriptIndex[message.id] ?: index, groups[message.id] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax, toolResultsByCallId = foldedToolResults.byCallId, resultTitle = toolResultTitles[message.id].orEmpty(), confirmedLocalId = chat.queued.firstOrNull { it.state == "sent" && it.rowId == message.id }?.id, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }, find = if (findHit == FindHit.None) "" else search, findHit = findHit)
                     }
-                    if (liveShown) item("live") {
+                    if (liveShown) item("live", contentType = "live") {
                         // Same bubble and spacing as the stored reply, so replacing this row does not move the text.
                         val liveGroup = groups[LIVE_REPLY_ID] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true)
                         Column(Modifier.fillMaxWidth().padding(top = if (liveGroup.startsRun) 10.dp else 3.dp).testTag("live-reply"), verticalArrangement = Arrangement.spacedBy(3.dp)) {
@@ -1131,10 +1156,10 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                             Box(Modifier.widthIn(max = bubbleMax)) { MessageActivity(chat.liveReasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), chat.liveTools, "", streaming = true, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }, vm = vm, scope = vm.authenticatedScope()?.session(chat.sessionId)) }
                         }
                     }
-                    items(chat.queued.filter { queued -> queued.rowId.isBlank() || chat.messages.none { it.id == queued.rowId } }, key = { "queued:${it.id}" }) { queued ->
+                    items(chat.queued.filter { queued -> queued.rowId.isBlank() || chat.messages.none { it.id == queued.rowId } }, key = { "queued:${it.id}" }, contentType = { "queued" }) { queued ->
                         QueuedMessageRow(vm, queued, bubbleMax, canDismiss = chat.uncertain != queued.id)
                     }
-                    chat.approval?.let { p -> item("approval:${p.string("approval_id", p.string("id"))}") {
+                    chat.approval?.let { p -> item("approval:${p.string("approval_id", p.string("id"))}", contentType = "approval") {
                         val exactBeaconAction = p.string("approval_id").startsWith("beacon-cf:")
                         Glass(Modifier.padding(top = 10.dp)) { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             Text(uiText("Approval needed"), style = MaterialTheme.typography.titleMedium)
@@ -1148,8 +1173,8 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                             }
                         } }
                     } }
-                    chat.clarification?.let { p -> item("clarify:$questionId") { Box(Modifier.padding(top = 10.dp)) { Clarification(vm, p, promptScope, questionAnswers) { id, value -> questionAnswers = questionAnswers + (id to value) } } } }
-                    if (chatSendInFlight(chat)) item("sending") { SendingMessage(composerDraft.text, groups[SENDING_MESSAGE_ID] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax) }
+                    chat.clarification?.let { p -> item("clarify:$questionId", contentType = "clarify") { Box(Modifier.padding(top = 10.dp)) { Clarification(vm, p, promptScope, questionAnswers) { id, value -> questionAnswers = questionAnswers + (id to value) } } } }
+                    if (chatSendInFlight(chat)) item("sending", contentType = "sending") { SendingMessage(composerDraft.text, groups[SENDING_MESSAGE_ID] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax) }
                     // Offline, the top banner already says the chat is saved; the transcript does not repeat it.
                     else if (transcriptStatusShown(chat.status, chat.streamId.isNotBlank(), ui.connected)) item { Text(uiText(chat.status), Modifier.padding(top = 10.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     }
@@ -1797,7 +1822,7 @@ internal fun findRanges(text: String, query: String): List<IntRange> {
     val stopped = stoppedMessageMarker(message.role, message.text, message.interrupted)
     val post = channelPost(message.displayKind, message.role, history.text)
     val displayText = post?.body ?: history.text
-    val presentation = chatPresentation(message.role, displayText, JSONObject().put("name", resultTitle), tools = message.tools)
+    val presentation = remember(message.role, displayText, resultTitle, message.tools) { chatPresentation(message.role, displayText, JSONObject().put("name", resultTitle), tools = message.tools) }
     val reading by vm.readingAloud.collectAsStateWithLifecycle()
     val haptic = LocalHapticFeedback.current
     var actions by remember(message.id) { mutableStateOf(false) }
@@ -2377,8 +2402,9 @@ private fun resendLocalForm(vm: BeaconViewModel, id: String) = ActionForm("Resen
         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .28f),
     ) {
         Row(Modifier.padding(horizontal = 10.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
-            if (activity.active) CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 1.5.dp)
-            else Icon(Icons.Rounded.Info, null, Modifier.size(15.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            // A spinner only while something really runs: a watch that is merely on would otherwise spin all day.
+            if (activity.working) CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 1.5.dp)
+            else Icon(Icons.Rounded.Visibility, null, Modifier.size(15.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.width(8.dp))
             Text(title, style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
             Spacer(Modifier.width(8.dp))
@@ -2407,7 +2433,7 @@ private fun resendLocalForm(vm: BeaconViewModel, id: String) = ActionForm("Resen
                 if (activity.agents > 0) ActivityRow(uiText(if (activity.agents == 1) "1 background agent" else "{0} background agents").replace("{0}", "${activity.agents}"), uiText("Running"), true)
                 if (activity.processes > 0) ActivityRow(uiText(if (activity.processes == 1) "1 background process" else "{0} background processes").replace("{0}", "${activity.processes}"), uiText("Running"), true)
                 if (activity.cronJobs > 0) ActivityRow(uiText(if (activity.cronJobs == 1) "1 schedule running" else "{0} schedules running").replace("{0}", "${activity.cronJobs}"), uiText("Running"), true)
-                if (activity.watches > 0) ActivityRow(uiText(if (activity.watches == 1) "1 active watch" else "{0} active watches").replace("{0}", "${activity.watches}"), uiText("Watching"), true)
+                if (activity.watches > 0) ActivityRow(uiText(if (activity.watches == 1) "1 active watch" else "{0} active watches").replace("{0}", "${activity.watches}"), uiText("Watching"), false, Icons.Rounded.Visibility)
                 if (!activity.available) Text(uiText("More background work may be active."), Modifier.padding(horizontal = 20.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
@@ -2418,9 +2444,9 @@ private fun resendLocalForm(vm: BeaconViewModel, id: String) = ActionForm("Resen
     Text("$label · $count", Modifier.padding(horizontal = 20.dp, vertical = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
 }
 
-@Composable private fun ActivityRow(title: String, detail: String, spinning: Boolean) {
+@Composable private fun ActivityRow(title: String, detail: String, spinning: Boolean, icon: androidx.compose.ui.graphics.vector.ImageVector = Icons.Rounded.Build) {
     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(horizontal = 20.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(30.dp), contentAlignment = Alignment.Center) { if (spinning) CircularProgressIndicator(Modifier.size(17.dp), strokeWidth = 2.dp) else Icon(Icons.Rounded.Build, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant) }
+        Box(Modifier.size(30.dp), contentAlignment = Alignment.Center) { if (spinning) CircularProgressIndicator(Modifier.size(17.dp), strokeWidth = 2.dp) else Icon(icon, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant) }
         Column(Modifier.weight(1f).padding(start = 10.dp)) {
             Text(title.replaceFirstChar(Char::titlecase), style = MaterialTheme.typography.bodyMedium, maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
             Text(detail, style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
@@ -2579,7 +2605,9 @@ internal fun attachmentPreparationLabel(name: String, status: String, error: Str
 internal fun composerUsesVoice(text: String, readyAttachments: Int, preparingAttachments: Int): Boolean =
     text.isBlank() && readyAttachments == 0 && preparingAttachments == 0
 
-@Composable private fun ChatSphere(modifier: Modifier, state: dev.hermes.android.ui.sphere.AvatarRenderState) {
+@Composable private fun ChatSphere(modifier: Modifier, sphere: dev.hermes.android.ui.sphere.SphereState, intensity: State<Float>, toolCallBurst: State<Float>, paused: Boolean) {
+    // The two animated values are read here, in the sphere's own scope.
+    val state = dev.hermes.android.ui.sphere.AvatarRenderState(sphere, intensity.value, toolCallBurst.value, paused)
     dev.hermes.android.ui.sphere.MorphingSphere(
         modifier = modifier,
         state = state.state,
