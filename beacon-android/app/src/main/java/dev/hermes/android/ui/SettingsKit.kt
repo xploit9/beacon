@@ -37,6 +37,7 @@ import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
@@ -172,6 +173,20 @@ private fun Modifier.kitTag(tag: String): Modifier = if (tag.isBlank()) this els
     }
 }
 
+/**
+ * The one search field of every page and sheet: a pill with a leading search icon, the [placeholder] while empty and a clear button
+ * once something is typed. [testTag] sits on the field itself; Search on the keyboard closes it.
+ */
+@Composable internal fun SettingsSearchField(value: String, onValueChange: (String) -> Unit, placeholder: String, modifier: Modifier = Modifier, testTag: String = "") {
+    val focus = LocalFocusManager.current
+    OutlinedTextField(value, onValueChange, modifier.fillMaxWidth().heightIn(min = SettingsKit.TouchMin).kitTag(testTag), singleLine = true,
+        placeholder = { Text(placeholder, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+        leadingIcon = { Icon(Icons.Rounded.Search, null) },
+        trailingIcon = if (value.isEmpty()) null else ({ SettingsIconButton(Icons.Rounded.Close, uiText("Clear search"), { onValueChange("") }) }),
+        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search), keyboardActions = KeyboardActions(onSearch = { focus.clearFocus() }),
+        shape = CircleShape)
+}
+
 @Composable internal fun SettingsDivider() {
     HorizontalDivider(Modifier.padding(start = SettingsKit.DividerStart, end = 16.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f))
 }
@@ -293,7 +308,8 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
                         when {
                             painter != null -> Icon(painter, null, Modifier.size(32.dp), tint = Color.Unspecified)
                             icon != null -> Icon(icon, null, Modifier.size(24.dp), tint = ink)
-                            shown != null -> SettingsStatusGlyph(shown, 28.dp, ink, signal = shown != SettingsStatus.Error && shown != SettingsStatus.Off)
+                            // The state's own glyph (check, alert, error) in its colour; the beacon's resting dot read as an empty tile. Working still moves.
+                            shown != null -> SettingsStatusGlyph(shown, 28.dp, ink, signal = false)
                         }
                     }
                 }
@@ -612,7 +628,7 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
         val check: @Composable () -> Unit = { if (selected) Icon(Icons.Rounded.CheckCircle, null, Modifier.size(18.dp), tint = scheme.primary) }
         val text: @Composable ColumnScope.() -> Unit = {
             Text(option.label, style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            if (option.detail.isNotBlank()) Text(option.detail, style = MaterialTheme.typography.bodySmall, color = scheme.onSurfaceVariant, maxLines = if (grid) 2 else 1, overflow = TextOverflow.Ellipsis)
+            if (option.detail.isNotBlank()) Text(option.detail, style = MaterialTheme.typography.bodySmall, color = scheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
             if (option.badge.isNotBlank()) SettingsBadge(option.badge, Modifier.padding(top = 4.dp))
         }
         if (grid) Box(Modifier.alpha(if (enabled) 1f else .38f)) {
@@ -661,7 +677,7 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
                 Icon(Icons.Rounded.Check, null, Modifier.size(12.dp), tint = scheme.onPrimary)
             }
         }
-        Text(swatch.label, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center)
+        Text(swatch.label, style = MaterialTheme.typography.labelMedium, maxLines = 2, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center)
     }
 }
 

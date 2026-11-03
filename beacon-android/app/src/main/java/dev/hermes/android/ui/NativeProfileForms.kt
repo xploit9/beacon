@@ -28,11 +28,14 @@ private val noCapitals = KeyboardOptions(capitalization = KeyboardCapitalization
     LaunchedEffect(admin.completed) { if (admin.completed > opened) onDone() }
 }
 
-/** New profile: a name checked the way Hermes checks it, what to start from (empty or a copy of [profiles], each an id and its label), and an optional role. */
-@Composable internal fun NewProfileDialog(profiles: List<Pair<String, String>>, admin: NativeProfileAdminState, onCreate: (name: String, copyFrom: String, role: String) -> Unit, onDismiss: () -> Unit) {
-    var name by rememberSaveable { mutableStateOf("") }
+/** New profile: a name checked the way Hermes checks it, what to start from (empty or a copy of [profiles], each an id and its label), and an optional role. Bot Mode's suggested roles open it with [initialName] and [initialRole] filled in. */
+@Composable internal fun NewProfileDialog(
+    profiles: List<Pair<String, String>>, admin: NativeProfileAdminState, onCreate: (name: String, copyFrom: String, role: String) -> Unit, onDismiss: () -> Unit,
+    initialName: String = "", initialRole: String = "",
+) {
+    var name by rememberSaveable { mutableStateOf(initialName) }
     var from by rememberSaveable { mutableStateOf("") }
-    var role by rememberSaveable { mutableStateOf("") }
+    var role by rememberSaveable { mutableStateOf(initialRole) }
     var choosing by remember { mutableStateOf(false) }
     val problem = profileNameProblem(name, profiles.map { it.first })
     val shown = problem?.takeIf { name.isNotBlank() }

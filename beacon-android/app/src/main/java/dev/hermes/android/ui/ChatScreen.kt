@@ -53,6 +53,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -293,6 +294,9 @@ internal val ChatSkeletonBubbles = listOf(false to .62f, true to .44f, false to 
         }
     }
 }
+
+/** Beacon's conversation is opening and nothing is wrong: the chat shows its skeleton and an idle composer rather than a text page. An error or a stalled open keeps its own page with Retry. */
+internal fun beaconOpeningSkeletonShown(beacon: Boolean, ready: Boolean, opening: Boolean, error: String): Boolean = beacon && !ready && opening && error.isBlank()
 
 /** The History source filter only offers a choice: two or more sources, or a hidden one that must stay listed to be shown again. */
 internal fun historySourceFilterShown(sources: List<String>, hidden: Set<String>): Boolean = sources.size > 1 || hidden.isNotEmpty()
@@ -684,6 +688,7 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     val side by vm.side.collectAsStateWithLifecycle()
     val settings = LocalBeaconSettings.current
     val ready = !beacon || vm.isBeaconConversation()
+    val beaconOpeningShown = beaconOpeningSkeletonShown(beacon, ready, ui.beaconOpening, ui.beaconError)
     val proactiveScope = (vm.pcScope() ?: Scope(ui.origin, ui.owner, ui.profile)).copy(profile = preferences.assistantProfile, session = "")
     val proactiveKey = proactiveSettingsKey(proactiveScope)
     val proactive = profileDefaults[proactiveKey]
@@ -743,23 +748,15 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
         }.toMap()
     }
     val scope = rememberCoroutineScope()
-    var alertsSending by remember(chat.sessionId) { mutableStateOf(emptySet<String>()) }
-    fun sendAlertFeedback(noticeId: String, verdict: String) {
-        if (noticeId in alertsSending || verdict !in setOf("important", "not_important")) return
-        val source = vm.client ?: return
-        val client = try { source.forAuthorizedProfile(ui.profile) } catch (_: Throwable) { vm.notice("Couldn't send feedback. Try again."); return }
-        alertsSending = alertsSending + noticeId
-        scope.launch {
-            try {
-                client.call("$PROACTIVE_SETTINGS_PATH/feedback", mapOf("profile" to ui.profile), method = "POST", data = json("notice_id" to noticeId, "verdict" to verdict))
-                vm.alertChosen(taskResultScope, noticeId, verdict)
-            } catch (error: Throwable) {
-                if (error is CancellationException) throw error
-                if (isMissingBeaconPluginRoute(error)) vm.storeData(proactiveKey, JSONObject().put("_pluginUpdateRequired", true))
-                else vm.notice(proactiveErrorMessage(error, "Couldn't send feedback. Try again."))
-            } finally { client.closeNative(); alertsSending = alertsSending - noticeId }
-        }
-    }
+    // A tap on Important or Not important opens the rule sheet for that alert; the choice is sent from there.
+    var emailRule by remember(chat.sessionId) { mutableStateOf<EmailRuleRequest?>(null) }
+    EmailRuleSheetHost(
+        emailRule,
+        fetch = { request -> fetchEmailRuleSuggestion(vm.client ?: throw IllegalStateException("Reconnect first."), ui.profile, request) },
+        send = { request, rule -> sendEmailChoice(vm.client ?: throw IllegalStateException("Reconnect first."), ui.profile, request, rule) },
+        onChosen = { request -> vm.alertChosen(taskResultScope, request.noticeId, request.verdict); emailRule = null },
+        onDismiss = { emailRule = null },
+    )
     LaunchedEffect(promptSignature, promptText, promptMemory) {
         if (pluginStatus == "available" && promptSignature.isNotBlank() && promptText.isBlank() && promptMemory?.let { it.first != promptSignature } == true)
             proactiveContext.preferences.edit { it[proactivePromptDismissedKey] = json("state" to promptSignature, "dismissed" to "").toString() }
@@ -1066,9 +1063,11 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
             // Focus only while the field (and its requester) is composed; a hidden panel or rotation must not request focus.
             if (canonical && showSearch) LaunchedEffect(chat.sessionId) { searchFocusRequester.requestFocus() }
             if (canonical && showSearch) FindBar(search, { search = it }, onClose = { showSearch = false; search = "" }, focusRequester = searchFocusRequester)
-            if (beacon && !ready) Box(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
-                // Without an error the conversation is only switching (answering a call does this), so it says Opening, not unavailable.
-                EmptyState(assistantText(if (ui.beaconError.isBlank()) "Opening Beacon’s conversation" else "Beacon’s conversation is unavailable"), uiText(ui.beaconError).ifBlank { uiText("Your chats and drafts are saved.") }, action = if (ui.beaconOpening) "" else assistantText("Retry Beacon"), onAction = { vm.openBeacon() })
+            // While the conversation opens (answering a call does this too) the chat shows its skeleton, with the composer below in place.
+            if (beaconOpeningShown) ChatSkeleton(Modifier.weight(1f).fillMaxWidth())
+            else if (beacon && !ready) Box(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
+                // Not opening, so it is either unavailable (with its error) or waiting for a retry.
+                EmptyState(assistantText(if (ui.beaconError.isBlank()) "Opening Beacon’s conversation" else "Beacon’s conversation is unavailable"), uiText(ui.beaconError), action = if (ui.beaconOpening) "" else assistantText("Retry Beacon"), onAction = { vm.openBeacon() })
             } else if (chat.sessionId.isBlank()) Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
                 Box(Modifier.widthIn(max = 280.dp).fillMaxWidth(.9f).aspectRatio(1f).clipToBounds().testTag("chat-sphere-empty")) { ChatSphere(Modifier.fillMaxSize(), sphereState, sphereIntensity, sphereToolCallBurst, !sphereMotionEnabled) }
                 EmptyState(uiText(if (ui.newChatOpening) "Opening your conversation" else "Make room for a thought"), if (ui.newChatError.isNotBlank()) ui.newChatError else uiText(if (ui.newChatOpening) "Keep typing. Your draft stays here while the conversation opens." else "Ask, explore or turn an idea into working progress."), icon = null, action = if (ui.newChatError.isNotBlank() && !ui.newChatOpening) uiText("Retry") else "", onAction = { vm.retryInitialChat() }, centered = true)
@@ -1139,8 +1138,8 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                                 assistantName = LocalAssistantName.current, modifier = Modifier.fillMaxWidth().padding(top = 10.dp).findOutline(findHit, RoundedCornerShape(20.dp)), searchQuery = search)
                         } else if (alert != null) {
                             AlertRow(alert, groups[message.id] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax, vm, taskResultScope,
-                                canChoose = pluginStatus == "available" && ui.connected && vm.client != null && alert.noticeId !in alertsSending && alert.expiresAt > System.currentTimeMillis() / 1000,
-                                onChoose = { sendAlertFeedback(alert.noticeId, it) })
+                                canChoose = pluginStatus == "available" && ui.connected && vm.client != null && alert.expiresAt > System.currentTimeMillis() / 1000,
+                                onChoose = { emailRule = EmailRuleRequest(alert.noticeId, it) })
                         } else MessageRow(vm, message, transcriptIndex[message.id] ?: index, groups[message.id] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax, toolResultsByCallId = foldedToolResults.byCallId, resultTitle = toolResultTitles[message.id].orEmpty(), confirmedLocalId = chat.queued.firstOrNull { it.state == "sent" && it.rowId == message.id }?.id, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }, find = if (findHit == FindHit.None) "" else search, findHit = findHit)
                     }
                     if (liveShown) item("live", contentType = "live") {
@@ -1307,9 +1306,9 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                 onOlder = { if (findMatches.isNotEmpty()) findPosition = (findPosition + 1).coerceAtMost(findMatches.size - 1) },
                 onNewer = { findPosition = (findPosition - 1).coerceAtLeast(0) })
         }
-        if (ready && !activeHere && !finding) Column(Modifier.fillMaxWidth().onSizeChanged { onComposerHeight(it.height) }) {
-            if (!shortWindow) Box(Modifier.fillMaxWidth().widthIn(max = 840.dp).align(Alignment.CenterHorizontally)) { ChatActivityStrip(backgroundActivity) { activitySheet = true } }
-            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { Composer(vm, activeHere, !call.active, callThisChat, composerDetails, { composerDetails = it }) }
+        if ((ready || beaconOpeningShown) && !activeHere && !finding) Column(Modifier.fillMaxWidth().onSizeChanged { onComposerHeight(it.height) }) {
+            if (!shortWindow && ready) Box(Modifier.fillMaxWidth().widthIn(max = 840.dp).align(Alignment.CenterHorizontally)) { ChatActivityStrip(backgroundActivity) { activitySheet = true } }
+            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { Composer(vm, activeHere, !call.active, callThisChat, composerDetails, { composerDetails = it }, opening = !ready) }
         }
     }
     }
@@ -1338,20 +1337,25 @@ internal fun acceptsInitialConversationEdit(
 ): Boolean = sameClient && newChatOpening && !callActive && inputScope?.session.isNullOrBlank() &&
     ownerScope != null && currentScope?.copy(session = "") == ownerScope
 
-@Composable private fun Composer(vm: BeaconViewModel, callActive: Boolean, callAvailable: Boolean, onCall: () -> Unit, details: Boolean, onDetails: (Boolean) -> Unit) {
+/** [opening]: Beacon's conversation is still opening, so the composer holds its place but is idle and shows nothing of the chat that was open before. */
+@Composable private fun Composer(vm: BeaconViewModel, callActive: Boolean, callAvailable: Boolean, onCall: () -> Unit, details: Boolean, onDetails: (Boolean) -> Unit, opening: Boolean = false) {
     val ui by vm.ui.collectAsStateWithLifecycle()
-    val chat by vm.chat.collectAsStateWithLifecycle()
-    val draft by vm.composer.collectAsStateWithLifecycle()
+    val liveChat by vm.chat.collectAsStateWithLifecycle()
+    val chat = if (opening) ChatState() else liveChat
+    val liveDraft by vm.composer.collectAsStateWithLifecycle()
+    val draft = if (opening) TextFieldValue() else liveDraft
     val preferences by vm.preferences.collectAsStateWithLifecycle()
     val busyOverride by vm.busySendOverride.collectAsStateWithLifecycle()
     val busyAction = busyOverride ?: preferences.busySendAction
     val settings = LocalBeaconSettings.current
     val readOnly = chat.raw.optBoolean("read_only") || chat.raw.optBoolean("is_read_only")
     val canonical = chat.sessionId.isNotBlank()
-    val editable = (chat.projectionReady || ui.newChatOpening) && (canonical || vm.canComposeInitialChat())
-    val files by vm.attachments.collectAsStateWithLifecycle()
+    val editable = !opening && (chat.projectionReady || ui.newChatOpening) && (canonical || vm.canComposeInitialChat())
+    val liveFiles by vm.attachments.collectAsStateWithLifecycle()
+    val files = if (opening) emptyList<JSONObject>() else liveFiles
     val data by vm.data.collectAsStateWithLifecycle()
-    val preparing by vm.attachmentPreparation.collectAsStateWithLifecycle()
+    val livePreparing by vm.attachmentPreparation.collectAsStateWithLifecycle()
+    val preparing = if (opening) emptyList<JSONObject>() else livePreparing
     val context = LocalContext.current
     val inputClient = vm.client
     val inputScope = vm.authenticatedScope()
@@ -1466,7 +1470,7 @@ internal fun acceptsInitialConversationEdit(
     val effort = chat.raw.string("reasoning_effort", chat.raw.string("reasoning"))
     val sessionEffort = chat.sessionReasoningEffort
     val followsProfile = chat.raw.string("model").isBlank() || effort.isBlank() && sessionEffort.isBlank()
-    val defaults = data["profile-defaults"]?.takeIf { followsProfile && it.string("profile") == ui.profile && it.string("scope_key") == vm.client?.scope?.key && it.string("session_id") == chat.sessionId && recordError(it).isBlank() }
+    val defaults = data["profile-defaults"]?.takeIf { !opening && followsProfile && it.string("profile") == ui.profile && it.string("scope_key") == vm.client?.scope?.key && it.string("session_id") == chat.sessionId && recordError(it).isBlank() }
     LaunchedEffect(ui.origin, ui.owner, ui.profile, chat.sessionId, chat.projectionReady, ui.connected, followsProfile) {
         if (followsProfile && ui.connected && (chat.sessionId.isBlank() || chat.projectionReady)) vm.load("profile-defaults", "/api/profile/defaults", if (chat.sessionId.isBlank()) emptyMap() else mapOf("session_id" to chat.sessionId))
     }
@@ -1598,7 +1602,7 @@ internal fun acceptsInitialConversationEdit(
                             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                             if (intent.resolveActivity(context.packageManager) != null) vm.client?.let { dictationRequest = it to vm.authenticatedScope(); dictation.launch(intent) }
                             else vm.notice("Set up a speech recognition service in Android to use dictation.")
-                        }, enabled = !callActive && !readOnly, modifier = Modifier.testTag("composer-dictate")) { Icon(Icons.Rounded.Mic, uiText("Dictate message")) }
+                        }, enabled = !opening && !callActive && !readOnly, modifier = Modifier.testTag("composer-dictate")) { Icon(Icons.Rounded.Mic, uiText("Dictate message")) }
                         if (voiceAction && streaming) {
                             // The trailing slot morphs to Stop, so the bar never widens during a turn.
                             OutlinedIconButton(onClick = { vm.cancel() }, shape = CircleShape, border = BorderStroke(1.dp, MaterialTheme.colorScheme.error), modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("message-stop")) { Icon(Icons.Rounded.Stop, uiText("Stop"), Modifier.size(composerActionIconSize), tint = MaterialTheme.colorScheme.error) }
@@ -1656,9 +1660,12 @@ private const val SENDING_MESSAGE_ID = "sending-message"
         modifier.widthIn(max = bubbleMax),
         shape = bubbleShape(own, group.joinedTop, group.tail),
         color = if (own) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerLow,
-        border = findBorder(findHit) ?: if (own) null else BorderStroke(.5.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f)),
+        border = findBorder(findHit) ?: if (own) null else assistantBubbleBorder(MaterialTheme.colorScheme.background.luminance() < .5f, MaterialTheme.colorScheme.outlineVariant),
     ) { Column(Modifier.padding(start = 12.dp, end = 12.dp, top = 7.dp, bottom = 5.dp), content = content) }
 }
+
+/** The assistant bubble's edge: a full 1 dp outline in a dark theme, where its surface is almost the background; a hairline in a light one. */
+internal fun assistantBubbleBorder(dark: Boolean, outline: Color): BorderStroke = if (dark) BorderStroke(1.dp, outline) else BorderStroke(.5.dp, outline.copy(alpha = .6f))
 
 /** Where a row stands in an open find: not a match, a match, or the match the find bar is on. */
 internal enum class FindHit { None, Match, Current }
@@ -1755,7 +1762,7 @@ internal fun findRanges(text: String, query: String): List<IntRange> {
             }
             BubbleText(alert.text, vm, scope, interactive = false)
             if (alert.verdict.isNotBlank()) Text(
-                uiText(if (alert.verdict == "important") "Important" else "Not important") + " · " + assistantText("Thanks — Beacon will remember."),
+                uiText(if (alert.verdict == "important") "Important" else "Not important"),
                 Modifier.padding(top = 4.dp).testTag("alert-verdict:${alert.noticeId}"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             ) else if (alert.expiresAt > System.currentTimeMillis() / 1000) Row(Modifier.padding(top = 2.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 TextButton(onClick = { onChoose("important") }, enabled = canChoose, modifier = Modifier.testTag("alert-important:${alert.noticeId}")) { Text(uiText("Important")) }

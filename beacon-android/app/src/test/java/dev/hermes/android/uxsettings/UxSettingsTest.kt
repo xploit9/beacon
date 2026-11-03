@@ -58,7 +58,7 @@ class UxSettingsTest {
     @Test fun keepConnectedBeingOffIsTheOwnersChoiceAndOnItsOwnLeavesHealthHealthy() {
         // The wizard starts with Keep connected off and this server has no push sender: the plain, healthy setup.
         val owner = health(answer(pushReady = false, pushReason = "no_sender"), keep = false)
-        assertEquals("Turn on Keep connected", owner.notifications.text)
+        assertEquals("Keep connected is off", owner.notifications.text)
         assertEquals(SettingsStatus.Off, owner.notifications.status)
         assertEquals(SettingsStatus.Ok, owner.overall)
         assertEquals("Healthy", owner.overallText)
@@ -121,7 +121,7 @@ class UxSettingsTest {
                 when (line.status) {
                     SettingsStatus.Ok, SettingsStatus.Working -> assertEquals("${line.text} asks nothing", HealthTarget.None, line.target)
                     SettingsStatus.Attention, SettingsStatus.Error -> assertNotEquals("${line.text} is in trouble and must lead somewhere", HealthTarget.None, line.target)
-                    SettingsStatus.Off -> assertEquals("Only Keep connected is Off", "Turn on Keep connected", line.text)
+                    SettingsStatus.Off -> assertEquals("Only Keep connected is Off", "Keep connected is off", line.text)
                 }
             }
         }
@@ -225,8 +225,8 @@ class UxSettingsTest {
         // The hub row still tells the state, so Keep connected stays in its summary.
         val on = settingsSummary("Notifications & Keep connected", SettingsSnapshot(keepConnectedEnabled = true)).single()
         val off = settingsSummary("Notifications & Keep connected", SettingsSnapshot(keepConnectedEnabled = false)).single()
-        assertEquals("Keep connected on" to SettingsStatus.Ok, on.text to on.status)
-        assertEquals("Keep connected off" to SettingsStatus.Off, off.text to off.status)
+        assertEquals("Keep connected is on" to SettingsStatus.Ok, on.text to on.status)
+        assertEquals("Keep connected is off" to SettingsStatus.Off, off.text to off.status)
         // And search finds the row by the old title, its words and the new title.
         val route = "Notifications & Keep connected"
         for (query in listOf("keep connected", "Keep connected", "notifications", "delivery", "alerts")) {

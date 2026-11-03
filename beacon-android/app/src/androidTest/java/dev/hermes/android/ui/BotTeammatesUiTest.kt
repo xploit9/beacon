@@ -94,8 +94,8 @@ class BotTeammatesUiTest {
             }
         }
         compose.onNodeWithTag("space-row:r1").assertTextContains("Review team").assertTextContains("Coder: Plan the review").assertTextContains("10:42")
-        // Three bots show; more become a "+N" chip.
-        compose.onNodeWithText("+2").assertIsDisplayed()
+        // A group row has two places for avatars, the width of one bot row's avatar: one bot shows, and the rest become a "+N" chip.
+        compose.onNodeWithText("+3").assertIsDisplayed()
         compose.onNodeWithTag("space-row:r1").performTouchInput { longClick() }
         compose.onNodeWithTag("space-action-open").assertIsDisplayed()
         compose.onNodeWithTag("space-action-rename").assertIsEnabled()

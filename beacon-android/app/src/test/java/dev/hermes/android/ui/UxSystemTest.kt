@@ -44,11 +44,13 @@ class UxSystemTest {
 
     @Test fun callToolTextsKeepTheNameOutsideTheTranslatedWords() {
         val service = CallToolReceipt("request-1", "mcp__gmail__search", "running")
-        assertEquals("Checking {0}…", service.activityTemplate())
-        assertEquals("Using {0}…", service.statusTemplate())
+        // One verb for the tool card, the overlay's tool line and the status: a service is "Using", never "Checking" (a tool may write).
+        assertEquals("Using {0}…", service.activityTemplate())
+        assertEquals(service.activityTemplate(), service.statusTemplate())
         assertEquals("Gmail", service.activitySubject())
-        assertEquals("Checking Gmail…", service.activityLabel())
+        assertEquals("Using Gmail…", service.activityLabel())
         assertEquals("Using Gmail…", service.statusLabel())
+        assertEquals(service.activityLabel(), service.statusLabel())
         val file = CallToolReceipt("request-2", "write_file", "ready")
         val other = CallToolReceipt("request-3", "send_email", "running")
         assertEquals("Using Send email…", other.statusLabel())

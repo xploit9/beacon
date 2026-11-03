@@ -688,6 +688,8 @@ internal fun receivePush(context: Context, data: Map<String, String>, localActio
         val event = data["event_id"].orEmpty()
         if (!validOpaque(source) || !validOpaque(event) || !validOpaque(data["conversation_ref"].orEmpty()) || !app.push.permitsIncoming(source)) return null
         val nativeKind = data["kind"].orEmpty()
+        // Hermes is asking to use this phone's calendar, alarms, contacts, calls or messages: the phone reads the request and asks its owner.
+        if (nativeKind == "phone_request") { dev.hermes.android.phone.HermesPhoneRequests.onPush(context, source); return null }
         val activity = data["activity_ref"].orEmpty()
         fun fetchPreview(kind: String): PreviewRequest? {
             if (deferPreview) return PreviewRequest(source, event, data["conversation_ref"].orEmpty(), kind)

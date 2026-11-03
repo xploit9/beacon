@@ -1304,8 +1304,10 @@ def test_registered_native_completion_and_callback_tools_are_real(harness):
     ctx=SimpleNamespace(register_tool=lambda **kwargs:tools.append(kwargs),register_hook=lambda name,handler:hooks.append((name,handler)))
     plugin.register(ctx)
     assert {name for name,handler in hooks}=={'on_session_end','pre_llm_call','post_tool_call','pre_tool_call'}
+    # The phone-access tools are registered here too, each in the beacon-phone toolset (test_phone_requests covers them).
     assert {tool['name'] for tool in tools}=={'beacon_call_user','beacon_create_proactive_request',
-                                            'beacon_event_notice','beacon_events_checked','beacon_email_notice','beacon_email_checked'}
+                                            'beacon_event_notice','beacon_events_checked','beacon_email_notice','beacon_email_checked',
+                                            *plugin.phone_tools.NAMES}
     assert all(callable(handler) for name,handler in hooks)
 
 

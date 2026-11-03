@@ -1251,6 +1251,48 @@ class NativeExperienceUiTest {
         receipts += "A held background room refresh preserves roster coordinates; polling pauses with Activity stop and resumes on return."
     }
 
+    @Test fun botModeDrawerLeadsWithNewBotAndNewSpaceStartsFromASuggestedRoleAndLeavesByTheSwitch() = withFixture { vm, _ ->
+        compose.runOnIdle { vm.toggleSessions(true) }
+        val newChat = compose.onNodeWithTag("navigation-new-chat").getUnclippedBoundsInRoot()
+        compose.onNodeWithTag("navigation-menu").performScrollToNode(hasTestTag("navigation-bots"))
+        compose.onNodeWithTag("navigation-bots").performClick()
+        await { vm.ui.value.botModeEnabled && !vm.ui.value.botModeSwitching && vm.botMode.state.value.bots.size == 2 && !vm.botMode.state.value.loading }
+        // The two buttons are the size of New chat and New thread, and sit above the bots.
+        val newBot = compose.onNodeWithTag("bot-mode-sidebar-new-bot").assertIsDisplayed().assertHeightIsAtLeast(48.dp).getUnclippedBoundsInRoot()
+        val newSpace = compose.onNodeWithTag("bot-mode-sidebar-new-chat").assertIsDisplayed().assertHeightIsAtLeast(48.dp).getUnclippedBoundsInRoot()
+        assertEquals((newChat.right - newChat.left).value, (newBot.right - newBot.left).value, 0.5f)
+        assertEquals((newChat.bottom - newChat.top).value, (newBot.bottom - newBot.top).value, 0.5f)
+        assertEquals(newBot.top.value, newSpace.top.value, 0.5f)
+        assertTrue(newSpace.bottom <= compose.onNodeWithTag("bot-row-default").getUnclippedBoundsInRoot().top)
+        for (name in navigationTiles - "Bots") compose.onAllNodesWithTag("navigation-${name.lowercase()}").assertCountEquals(0)
+        compose.onAllNodesWithTag("navigation-more").assertCountEquals(0)
+        compose.onNodeWithTag("navigation-bots").assertIsSelected().assertHeightIsAtLeast(48.dp)
+        // A suggested role opens New bot with its name and role filled in; New bot alone opens it empty.
+        compose.onNodeWithTag("bot-mode-sidebar").performScrollToNode(hasTestTag("bot-mode-suggested-role:researcher"))
+        // The Bot Mode home behind the drawer offers the same starters; this test taps the drawer's one.
+        compose.onNode(hasTestTag("bot-mode-suggested-role:researcher") and hasAnyAncestor(hasTestTag("bot-mode-sidebar"))).performClick()
+        compose.onNodeWithTag("new-profile-name").assertTextContains("researcher")
+        compose.onNodeWithTag("new-profile-role").assertTextContains("Finds sources and sums them up.")
+        compose.onNodeWithTag("new-profile-create").assertIsEnabled()
+        compose.onNodeWithText("Cancel").performClick()
+        compose.onAllNodesWithTag("new-profile-name").assertCountEquals(0)
+        compose.onNodeWithTag("bot-mode-sidebar").performScrollToNode(hasTestTag("bot-mode-sidebar-new-bot"))
+        compose.onNodeWithTag("bot-mode-sidebar-new-bot").performClick()
+        compose.onNodeWithTag("new-profile-name").assertIsDisplayed()
+        compose.onNodeWithTag("new-profile-create").assertIsNotEnabled()
+        compose.onNodeWithText("Cancel").performClick()
+        capture("bot-mode-drawer-top")
+        // One tap on the switch leaves Bot Mode and the normal drawer is back.
+        compose.onNodeWithTag("navigation-bots").performClick()
+        await { !vm.ui.value.botModeEnabled && !vm.ui.value.botModeSwitching }
+        compose.onNodeWithTag("navigation-new-chat").assertIsDisplayed()
+        compose.onNodeWithTag("navigation-new-thread").assertIsDisplayed()
+        for (name in navigationTiles) compose.onNodeWithTag("navigation-${name.lowercase()}").assertExists()
+        compose.onAllNodesWithTag("bot-mode-sidebar-new-bot").assertCountEquals(0)
+        compose.onNodeWithTag("navigation-bots").assertIsNotSelected()
+        receipts += "Bot Mode's drawer leads with New bot and New space, a suggested role fills New bot, and the switch restores the normal drawer."
+    }
+
     @Test fun botModeToggleRestoresProfileChatDraftAndHistory() = withFixture { vm, fixture ->
         showProfileDisplayNames(vm, fixture)
         fun toggle() {
@@ -1266,14 +1308,13 @@ class NativeExperienceUiTest {
         val normalTiles = navigationTiles.associateWith { compose.onNodeWithTag("navigation-${it.lowercase()}").getUnclippedBoundsInRoot() }
         toggle()
         await { vm.ui.value.botModeEnabled && !vm.ui.value.botModeSwitching && vm.botMode.state.value.bots.size == 2 }
-        val botTiles = navigationTiles.associateWith { compose.onNodeWithTag("navigation-${it.lowercase()}").getUnclippedBoundsInRoot() }
-        for (name in navigationTiles) {
-            assertEquals("Menu tile width changed for $name", (normalTiles.getValue(name).right - normalTiles.getValue(name).left).value, (botTiles.getValue(name).right - botTiles.getValue(name).left).value, 0.5f)
-            assertEquals("Menu tile alignment changed for $name", normalTiles.getValue(name).left.value, botTiles.getValue(name).left.value, 0.5f)
-            assertEquals("Menu row changed for $name", (normalTiles.getValue(name).top - normalTiles.getValue("Skills").top).value, (botTiles.getValue(name).top - botTiles.getValue("Skills").top).value, 0.5f)
-        }
-        receipts += "Normal and Bot Mode tile widths, left alignment and relative rows match."
-        // The Bots tile is the one switch: it shows Bot Mode as selected, and no "On" text stretches a tile.
+        // Bot Mode has no tile grid: New bot and New space lead the drawer, and the Bot Mode switch is the one control left.
+        for (name in navigationTiles - "Bots") compose.onAllNodesWithTag("navigation-${name.lowercase()}").assertCountEquals(0)
+        compose.onAllNodesWithTag("navigation-more").assertCountEquals(0)
+        compose.onNodeWithTag("bot-mode-sidebar-new-bot").assertIsDisplayed()
+        compose.onNodeWithTag("bot-mode-sidebar-new-chat").assertIsDisplayed()
+        receipts += "Bot Mode's drawer leads with New bot and New space and shows no tile grid."
+        // The switch shows Bot Mode as selected, and no "On" text stretches it.
         compose.onNodeWithTag("navigation-bots").assertIsSelected()
         compose.onNodeWithText("On").assertDoesNotExist()
         compose.onNodeWithTag("navigation-mode-chats").assertDoesNotExist()
@@ -1297,6 +1338,12 @@ class NativeExperienceUiTest {
         assertEquals("chat-a", vm.chat.value.sessionId)
         assertEquals("Normal chat draft", vm.composer.value.text)
         compose.onNodeWithTag("navigation-bots").assertIsNotSelected()
+        // Leaving Bot Mode brings the tile grid back at the widths it had before.
+        for (name in navigationTiles) {
+            val bounds = compose.onNodeWithTag("navigation-${name.lowercase()}").getUnclippedBoundsInRoot()
+            assertEquals("Menu tile width changed for $name", (normalTiles.getValue(name).right - normalTiles.getValue(name).left).value, (bounds.right - bounds.left).value, 0.5f)
+        }
+        receipts += "Leaving Bot Mode restores the normal drawer's tile grid at its original widths."
         // History search folds the destinations away, so it is typed here, after leaving Bot Mode.
         compose.onNodeWithTag("history-search-toggle").performClick()
         compose.onNodeWithText("Search conversations").performTextInput("Travel")
@@ -2672,7 +2719,7 @@ class NativeExperienceUiTest {
         await { compose.onAllNodes(hasText(localProviderLabel) and hasAnyAncestor(hasTestTag("settings-row:Beacon")), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
         await { compose.onAllNodes(hasText(localKeyStatus) and hasAnyAncestor(hasTestTag("settings-row:Beacon")), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
         val keepConnectedEnabled = dev.hermes.android.push.KeepConnectedService.isEnabled(app)
-        val keepConnectedSummary = if (keepConnectedEnabled) "Keep connected on" else "Keep connected off"
+        val keepConnectedSummary = if (keepConnectedEnabled) "Keep connected is on" else "Keep connected is off"
         val keepConnectedStatus = if (keepConnectedEnabled) "Keep connected is on" else "Keep connected is off"
         await { compose.onAllNodes(hasText(keepConnectedSummary) and hasAnyAncestor(hasTestTag("settings-row:Notifications")), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
         capture("settings")
@@ -4064,7 +4111,7 @@ class NativeExperienceUiTest {
         compose.onNodeWithContentDescription("Refresh").performClick()
         compose.runOnIdle { vm.more("Session checkpoints") }
         await { !vm.phoneSettings.server.value.loading }
-        compose.onNodeWithText("No session checkpoints are stored for this profile.").assertExists()
+        compose.onNodeWithText("No backups yet.").assertExists()
         compose.runOnIdle { vm.more("Server updates") }
         await { vm.phoneSettings.server.value.update != null && !vm.phoneSettings.server.value.loading }
         compose.onNodeWithText("Check now").performClick()

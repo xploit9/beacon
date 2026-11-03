@@ -22,6 +22,7 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.window.DialogWindowProvider
 import androidx.core.view.WindowCompat
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.graphics.Brush
@@ -32,9 +33,12 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.input.*
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
@@ -466,6 +470,13 @@ internal fun bubbleShape(own: Boolean, joinedTop: Boolean, tail: Boolean): Round
     else RoundedCornerShape(topStart = top, topEnd = round, bottomEnd = round, bottomStart = bottom)
 }
 
+/**
+ * A list row's text keeps its own reading order (a Latin name in an Arabic row stays left to right) but sits against the start edge of the
+ * layout, beside the avatar: right in an Arabic layout, left otherwise, whatever script the text is in.
+ */
+@Composable internal fun TextStyle.rowStart(): TextStyle =
+    contentDirection().copy(textAlign = if (LocalLayoutDirection.current == LayoutDirection.Rtl) TextAlign.Right else TextAlign.Left)
+
 /** One Telegram-style row of the chat list. The caller adds the click, tag and long-press through [modifier]. */
 @Composable internal fun ChatListRow(
     id: String,
@@ -490,13 +501,13 @@ internal fun bubbleShape(own: Boolean, joinedTop: Boolean, tail: Boolean): Round
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                Text(plainTitle(title), Modifier.weight(1f), style = MaterialTheme.typography.titleMedium.copy(fontWeight = if (unread) FontWeight.Bold else FontWeight.Medium).contentDirection(), maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                Text(plainTitle(title), Modifier.weight(1f), style = MaterialTheme.typography.titleMedium.copy(fontWeight = if (unread) FontWeight.Bold else FontWeight.Medium).rowStart(), maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                 if (pinned) Icon(Icons.Rounded.PushPin, uiText("Pinned"), Modifier.padding(start = 6.dp).size(14.dp), tint = scheme.onSurfaceVariant)
                 else if (thread) ThreadSpoolGlyph(Modifier.padding(start = 6.dp).size(14.dp), tint = scheme.onSurfaceVariant)
-                if (time.isNotBlank()) Text(time, Modifier.padding(start = 6.dp), style = nativeMetadataStyle(), color = if (unread) scheme.primary else scheme.onSurfaceVariant, maxLines = 1)
+                if (time.isNotBlank()) Text(time, Modifier.padding(start = 8.dp), style = nativeMetadataStyle(), color = if (unread) scheme.primary else scheme.onSurfaceVariant, maxLines = 1)
             }
             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                Text(preview, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium.contentDirection(), color = scheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                Text(preview, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium.rowStart(), color = scheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                 if (streaming) CircularProgressIndicator(Modifier.padding(start = 8.dp).size(14.dp), strokeWidth = 2.dp)
                 else if (unread) Box(Modifier.padding(start = 8.dp).size(10.dp).clip(CircleShape).background(scheme.primary).testTag("unread-dot"))
             }

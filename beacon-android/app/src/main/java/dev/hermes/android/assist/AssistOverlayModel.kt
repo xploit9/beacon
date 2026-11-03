@@ -2,6 +2,7 @@ package dev.hermes.android.assist
 
 import dev.hermes.android.ChatState
 import dev.hermes.android.ui.BeaconDustMood
+import dev.hermes.android.ui.presenceState
 import dev.hermes.android.ui.sphere.SphereState
 import dev.hermes.android.voice.CALL_DROPPED
 import dev.hermes.android.voice.CALL_HERMES_NO_ANSWER
@@ -9,6 +10,9 @@ import dev.hermes.android.voice.CALL_MIC_FAILED
 import dev.hermes.android.voice.CALL_SIGN_IN_EXPIRED
 import dev.hermes.android.voice.CALL_VOICE_NO_ANSWER
 import dev.hermes.android.voice.CALL_VOICE_STOPPED
+import dev.hermes.android.voice.CallState
+import dev.hermes.android.voice.CallToolApproval
+import dev.hermes.android.voice.CallTranscript
 import kotlinx.coroutines.delay
 
 /**
@@ -16,14 +20,20 @@ import kotlinx.coroutines.delay
  * feeds it events; the overlay only draws it. Nothing here touches Android, so every rule is checked on the JVM.
  */
 
-/** The overlay's main surface: the pill alone, a written answer above it, or a live call. */
+/**
+ * The overlay's main surface: the pill alone, a written answer above it, or a live conversation. The pill, the text box, stays in
+ * all three; live, its orb shows the conversation and the captions sit above it. There is no surface of its own for a call.
+ */
 internal enum class OverlaySurface { Pill, Answer, Live }
 
 /** The window's own life: rising in, open, falling away. */
 internal enum class OverlayPhase { Summoning, Open, Dismissing, Hidden }
 
-/** One short line the overlay shows instead of failing quietly. Each has one action, if any. */
-internal enum class OverlayLine { Microphone, VoiceKey, SignIn, NotHeard, NoRecognizer, NotSent, CallFailed, Waiting }
+/**
+ * One short line the overlay shows instead of failing quietly. Each has one action, if any. [Unlock] is the locked phone's: the side
+ * button asks for the unlock first, and until it succeeds this is all the overlay says (see [startNeedsUnlock]).
+ */
+internal enum class OverlayLine { Microphone, VoiceKey, SignIn, NotHeard, NoRecognizer, NotSent, CallFailed, Waiting, Unlock }
 
 /**
  * Why a call didn't start or dropped, for the six reasons the call service words itself ([full] is its constant in DirectVoice.kt).
@@ -74,8 +84,11 @@ internal data class AssistOverlayState(
 )
 
 internal sealed interface OverlayEvent {
-    /** The assist gesture (or an unlock that brings the same answer back). [fresh] clears the last question. */
-    data class Show(val fresh: Boolean, val callActive: Boolean) : OverlayEvent
+    /**
+     * The assist gesture (or an unlock that brings the same answer back). [fresh] clears the last question. [locked] is the lock
+     * screen read when it shows: a fresh show on a locked phone with no conversation running starts nothing and says to unlock first.
+     */
+    data class Show(val fresh: Boolean, val callActive: Boolean, val locked: Boolean = false) : OverlayEvent
     data object Summoned : OverlayEvent
     data object DictationStarted : OverlayEvent
     data class Heard(val text: String) : OverlayEvent
@@ -101,6 +114,12 @@ internal fun reduce(state: AssistOverlayState, event: OverlayEvent): AssistOverl
             phase = OverlayPhase.Summoning, shows = state.shows + 1,
             // A call that is running is what the owner comes back to; otherwise the last answer, or the bare pill.
             surface = if (event.callActive) OverlaySurface.Live else base.cardOrPill(),
+            // Locked, a fresh show starts nothing and says so; an unlock line left from an earlier show is gone once the phone is unlocked.
+            line = when {
+                event.fresh && startNeedsUnlock(event.locked, event.callActive) -> OverlayLine.Unlock
+                base.line == OverlayLine.Unlock -> null
+                else -> base.line
+            },
         )
     }
     OverlayEvent.Summoned -> if (state.phase == OverlayPhase.Summoning) state.copy(phase = OverlayPhase.Open) else state
@@ -131,7 +150,8 @@ internal fun reduce(state: AssistOverlayState, event: OverlayEvent): AssistOverl
     is OverlayEvent.CallFailed -> state.copy(line = OverlayLine.CallFailed, callFailure = event.reason, dictating = false)
     OverlayEvent.CloseCard -> if (state.surface == OverlaySurface.Answer) state.copy(surface = OverlaySurface.Pill, ask = null, line = null) else state.copy(line = null)
     OverlayEvent.Dismiss -> if (state.phase == OverlayPhase.Hidden) state else state.copy(phase = OverlayPhase.Dismissing, dictating = false, heard = "")
-    OverlayEvent.Hidden -> state.copy(phase = OverlayPhase.Hidden, dictating = false, heard = "")
+    // A closed overlay holds no conversation: the dust falls away with its captions still up, and once it is gone nothing is live.
+    OverlayEvent.Hidden -> state.copy(phase = OverlayPhase.Hidden, dictating = false, heard = "", surface = if (state.surface == OverlaySurface.Live) state.cardOrPill() else state.surface)
 }
 
 /** The answer card when an answered (or still answering) question is held; the bare pill when there is none, or it never left. */
@@ -179,6 +199,26 @@ internal suspend fun holdWhileIdle(now: () -> Long, lastInteraction: () -> Long,
 
 // --- the lock screen ---
 
+/*
+ * The lock-screen rule, one rule for everything the overlay and its conversations show or do:
+ *  - One live read. The text gates (the owner's words, the typed question and an unsent one in the text box, the tool line, a written
+ *    answer, the approval card) all read [overlayLocked]: what the lock broadcasts last said, or the lock screen right now
+ *    (deviceLockedNow), whichever says locked. None reads the broadcasts alone.
+ *  - The overlay never starts a conversation on a locked phone. The side button on the lock screen asks for the unlock first
+ *    ([startNeedsUnlock]): until it succeeds nothing is heard or said, no microphone opens, no dictation, no typed text is sent, and
+ *    no voice session is warmed or connected. The one line, "Unlock your phone first." with Unlock, is all the overlay shows; the
+ *    unlock (AssistUnlockActivity, "talk") brings the overlay back as a fresh start, the same as an unlocked gesture.
+ *  - A conversation is TRUSTED when it started on an unlocked phone, or the phone has been unlocked at any time since (a live read at
+ *    its start, the unlock broadcast, or a read when a tool runs: voice/CallTrust.kt). That stays as defense in depth: one that somehow
+ *    starts locked is told nothing private (no memory, history or profile in its brief) and every tool, Hermes' and the phone's,
+ *    answers "Unlock your phone first." without reading anything.
+ *  - Once trusted it stays trusted for that conversation, even if the screen locks again (a call in a pocket keeps working). An
+ *    approval still needs the unlocked screen to tap, as before.
+ */
+
+/** The lock state every private surface of the overlay reads: the lock broadcasts' last word, or the lock screen right now. */
+internal fun overlayLocked(cached: Boolean, keyguardNow: Boolean): Boolean = cached || keyguardNow
+
 /**
  * Whether a written answer may show. Locked, every answer waits for an unlock: questions go into the assistant's ongoing chat,
  * which carries its history and memory, so no rule about the reply can tell a private answer from a plain one.
@@ -199,12 +239,52 @@ internal fun answerBody(locked: Boolean, ask: OverlayAsk): AnswerBody = when {
     else -> AnswerBody.Empty
 }
 
-/** Everything the overlay can do. Talking and asking work locked; anything that opens the app or a settings screen unlocks first. */
-internal enum class OverlayAction { Ask, Dictate, Live, Mute, EndCall, Type, CloseCard, Dismiss, AttachScreen, OpenInBeacon, OpenCall, ContinueChat, OpenWaiting, Reveal, Settings }
+/**
+ * The question line the answer card draws. The question is the owner's own typed words, as private as the reply: locked, none of it is
+ * drawn (the state keeps it, so the card comes back whole after the unlock) and the unlock row is all the card says.
+ */
+internal fun answerQuestion(locked: Boolean, ask: OverlayAsk): String = if (locked) "" else ask.question
+
+/**
+ * Everything the overlay can do. Locked, asking, dictating and starting the conversation wait for the unlock (a conversation that
+ * already runs carries on, ending it and closing always work), and so does anything that opens the app or a settings screen.
+ */
+internal enum class OverlayAction { Ask, Dictate, Live, EndCall, Type, CloseCard, Dismiss, AttachScreen, OpenInBeacon, ContinueChat, OpenWaiting, Reveal, Settings }
 
 internal fun needsUnlock(action: OverlayAction, locked: Boolean): Boolean = locked && action in setOf(
-    OverlayAction.OpenInBeacon, OverlayAction.OpenCall, OverlayAction.ContinueChat, OverlayAction.OpenWaiting, OverlayAction.Reveal, OverlayAction.Settings,
+    OverlayAction.Ask, OverlayAction.Dictate, OverlayAction.Live,
+    OverlayAction.OpenInBeacon, OverlayAction.ContinueChat, OverlayAction.OpenWaiting, OverlayAction.Reveal, OverlayAction.Settings,
 )
+
+/**
+ * Whether starting the conversation waits for the unlock: the phone is [locked] and no conversation runs. One that runs was started
+ * unlocked, so it is trusted and the overlay joins it, as before.
+ */
+internal fun startNeedsUnlock(locked: Boolean, callActive: Boolean): Boolean = needsUnlock(OverlayAction.Live, locked) && !callActive
+
+/**
+ * Whether the text box is inert: locked with no conversation running, nothing is typed, sent or dictated, and its orb only asks for
+ * the unlock. A running conversation takes typed turns locked too (it is trusted).
+ */
+internal fun pillInert(locked: Boolean, live: Boolean): Boolean = locked && !live
+
+/** What the first frame of a show leads to. */
+internal enum class FirstFrame {
+    /** Locked, a fresh show: no app model, no warming, no start; the unlock is asked for, once. */
+    AskUnlock,
+    /** Locked and nothing to start (a re-show): nothing is loaded or warmed either. */
+    Hold,
+    /** Unlocked, or joining a conversation that runs: the app's model loads and the call session warms. */
+    Warm,
+    /** Warm, and a fresh show starts the conversation. */
+    WarmAndTalk,
+}
+
+internal fun firstFrame(locked: Boolean, callActive: Boolean, talks: Boolean): FirstFrame = when {
+    startNeedsUnlock(locked, callActive) -> if (talks) FirstFrame.AskUnlock else FirstFrame.Hold
+    talks -> FirstFrame.WarmAndTalk
+    else -> FirstFrame.Warm
+}
 
 /** A suggestion above the pill. Talking live is the orb in the pill, so it has no chip of its own. */
 internal sealed interface AssistChip {
@@ -252,7 +332,7 @@ internal fun fitChips(chips: List<AssistChip>, room: Int, gap: Int, continueMin:
 // --- one short line instead of a silent failure ---
 
 /** The one thing a line offers to do about it, if anything. */
-internal enum class LineAction { Allow, Open, SignIn, TryAgain, CallAgain, OpenWaiting }
+internal enum class LineAction { Allow, Open, SignIn, TryAgain, CallAgain, OpenWaiting, Unlock }
 
 /** An expired sign-in can't be fixed by calling again: its action opens Beacon (unlocked first) to sign in. */
 internal fun lineAction(line: OverlayLine, reason: CallReason? = null): LineAction? = when (line) {
@@ -261,6 +341,8 @@ internal fun lineAction(line: OverlayLine, reason: CallReason? = null): LineActi
     OverlayLine.NotSent -> LineAction.TryAgain
     OverlayLine.CallFailed -> if (reason == CallReason.SignInExpired) LineAction.SignIn else LineAction.CallAgain
     OverlayLine.Waiting -> LineAction.OpenWaiting
+    // Asks Android for the unlock again; the overlay stays, and the unlock brings it back as a fresh start.
+    OverlayLine.Unlock -> LineAction.Unlock
     OverlayLine.NotHeard, OverlayLine.NoRecognizer -> null
 }
 
@@ -311,41 +393,56 @@ internal const val GROUND_LEAD_DP = 24
 /** How much of the theme's background lies under the surfaces: all of it in light and .98 in dark, so no app shows between them. */
 internal fun groundAlpha(dark: Boolean): Float = if (dark) .98f else 1f
 
-// --- the first summon's "Talk live" hint ---
+// --- the live conversation ---
 
-/** Where a show's one-time "Talk live" hint stands. The chip row waits for [Over], so the two never share the same stretch of screen. */
-internal enum class HintStage { Unknown, Playing, Over }
+/** What starting the conversation does now: join one that runs, ask for what is missing first, or start. */
+internal enum class LiveStart { Join, SignIn, Microphone, Start }
 
-internal fun chipsMayRise(stage: HintStage): Boolean = stage == HintStage.Over
-
-/** How long the hint takes to fade away; the chips begin their rise once it has. */
-internal const val TALK_HINT_FADE_MILLIS = 240
-
-/**
- * One show's hint, in order: it is read whether it was shown before ([seen], off the main thread); a hint seen already lets the chips
- * rise. Otherwise it waits for the pill to form, is marked seen as it appears, shows for [holdMillis], fades for [fadeMillis], and only
- * then are the chips let go. A show that closes first keeps the hint for the next one.
- */
-internal suspend fun playTalkHint(
-    seen: suspend () -> Boolean,
-    markSeen: () -> Unit,
-    state: () -> AssistOverlayState,
-    stage: (HintStage) -> Unit,
-    visible: (Boolean) -> Unit,
-    holdMillis: Long,
-    fadeMillis: Long,
-) {
-    if (seen()) { stage(HintStage.Over); return }
-    while (state().phase == OverlayPhase.Summoning) delay(16)
-    val now = state()
-    if (now.phase != OverlayPhase.Open || now.surface != OverlaySurface.Pill) { stage(HintStage.Over); return }
-    markSeen()
-    stage(HintStage.Playing)
-    try { visible(true); delay(holdMillis) } finally { visible(false) }
-    delay(fadeMillis)
-    stage(HintStage.Over)
+/** A conversation that runs is joined; otherwise being signed in (or still restoring) and the microphone come before a start, so no start is a dead end. */
+internal fun liveStart(callActive: Boolean, signedIn: Boolean, micGranted: Boolean): LiveStart = when {
+    callActive -> LiveStart.Join
+    !signedIn -> LiveStart.SignIn
+    !micGranted -> LiveStart.Microphone
+    else -> LiveStart.Start
 }
 
-/** The capsule's left edge: its end on the pill's end, which is the right edge left to right and the left edge right to left. */
-internal fun hintLeft(pillLeft: Float, pillRight: Float, width: Float, rtl: Boolean): Float =
-    if (rtl) pillLeft else (pillRight - width).coerceAtLeast(0f)
+/** Whether a show starts the conversation by itself once its first frame is drawn: every fresh one. A re-show (an unlock bringing the same answer back) keeps what was on screen. */
+internal fun talksOnShow(reshow: Boolean): Boolean = !reshow
+
+/** One live caption: [owner] says whose words, the owner's or the assistant's. */
+internal data class Caption(val owner: Boolean, val text: String)
+
+/** The last two lines above the text box: the owner's words, then the assistant's reply; typed turns are the owner's too. */
+internal fun liveCaptions(transcripts: List<CallTranscript>, typed: List<String>): List<Caption> =
+    (transcripts.filter { it.text.isNotBlank() }.map { Caption(it.role == "user", it.text.trim()) } + typed.map { Caption(true, it) }).takeLast(2)
+
+/** What the orb in the text box shows: a tap to talk, then the conversation's own state; a tap on it while live ends the conversation. */
+internal enum class OrbFace { Talk, Connecting, Listening, Speaking, Working }
+
+internal fun orbFace(live: Boolean, call: CallState): OrbFace = when {
+    !live -> OrbFace.Talk
+    !call.active -> OrbFace.Connecting
+    else -> when (presenceState(call)) {
+        SphereState.Thinking -> OrbFace.Working
+        SphereState.Speaking, SphereState.Streaming -> OrbFace.Speaking
+        else -> if (call.state == "connecting") OrbFace.Connecting else OrbFace.Listening
+    }
+}
+
+/**
+ * The approval the live conversation waits on, when it belongs to the account the overlay is signed in to: the same rule the app's own
+ * screen uses before it asks. Null for none, another account's, or a call that is not running.
+ */
+internal fun waitingApproval(call: CallState, authenticated: Boolean, origin: String, owner: String, profile: String): CallToolApproval? =
+    call.toolApprovals.firstOrNull()?.takeIf {
+        authenticated && call.active && call.conversationScope?.let { s -> s.owner == owner && s.profile == profile && s.origin == origin } == true
+    }
+
+/** How the overlay shows [waitingApproval]: the whole card, or locked only that something waits (no details) with a way to say no. */
+internal enum class ApprovalShow { None, Card, Locked }
+
+internal fun approvalShow(live: Boolean, approval: CallToolApproval?, locked: Boolean): ApprovalShow = when {
+    !live || approval == null -> ApprovalShow.None
+    locked -> ApprovalShow.Locked
+    else -> ApprovalShow.Card
+}

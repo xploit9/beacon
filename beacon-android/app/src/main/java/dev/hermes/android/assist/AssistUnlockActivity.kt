@@ -8,8 +8,9 @@ import android.os.Build
 import android.os.Bundle
 
 /**
- * The overlay asks the phone to unlock before anything private opens. It draws nothing: it sits over the lock screen only long
- * enough to ask Android for the unlock, then does what the overlay asked and leaves. Cancelling the unlock does nothing.
+ * The overlay asks the phone to unlock before anything private opens, or before it talks. It draws nothing: it sits over the lock
+ * screen only long enough to ask Android for the unlock, then does what the overlay asked and leaves. Cancelling the unlock does
+ * nothing: the overlay is still up with its "Unlock your phone first." line and Unlock to ask again.
  * Not exported, so only the overlay can start it.
  */
 class AssistUnlockActivity : Activity() {
@@ -33,6 +34,8 @@ class AssistUnlockActivity : Activity() {
         val then = intent.getStringExtra(EXTRA_THEN)
         when (then) {
             THEN_REVEAL -> BeaconVoiceInteractionService.reshow()
+            // A fresh show, the same as an unlocked gesture: the conversation starts at once, as a trusted one.
+            THEN_TALK -> BeaconVoiceInteractionService.show()
             THEN_PERMISSIONS -> openBeaconPermissions(this)
             else -> assistTargetOf(then, intent.getStringExtra(EXTRA_ASSIST_SESSION), intent.getStringExtra(EXTRA_ASSIST_PROFILE))?.let { openBeacon(this, it) }
         }
@@ -42,6 +45,7 @@ class AssistUnlockActivity : Activity() {
     companion object {
         private const val EXTRA_THEN = "dev.hermes.android.extra.ASSIST_THEN"
         private const val THEN_REVEAL = "reveal"
+        private const val THEN_TALK = "talk"
         private const val THEN_PERMISSIONS = "permissions"
 
         /** Unlock, then open the app for [target]; the token is issued only after the unlock, so a slow PIN never expires it. */
@@ -51,6 +55,9 @@ class AssistUnlockActivity : Activity() {
 
         /** Unlock, then bring the overlay back with the answer it held. */
         internal fun reveal(context: Context) = start(context, THEN_REVEAL) {}
+
+        /** Unlock, then bring the overlay back as a fresh start that talks at once; the overlay that asked stays up meanwhile. */
+        internal fun talk(context: Context) = start(context, THEN_TALK) {}
 
         /** Unlock, then open Beacon's permissions. */
         internal fun permissions(context: Context) = start(context, THEN_PERMISSIONS) {}

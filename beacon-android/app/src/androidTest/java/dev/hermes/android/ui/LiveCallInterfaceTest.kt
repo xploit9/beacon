@@ -246,14 +246,15 @@ class LiveCallInterfaceTest {
         assertEquals(listOf("deny", "approve"), decisions)
     }
 
-    @Test fun automaticToolReceiptShowsItsQuietApprovalCaptionWithoutAnApprovalDialog() {
+    @Test fun automaticToolReceiptShowsOnlyTheToolNameWithoutACaptionOrAnApprovalDialog() {
         val receipt = requireNotNull(CallToolReceipt.from(org.json.JSONObject()
             .put("request_id", "request-1").put("tool_name", "mcp__gmail__search_messages")
             .put("status", "running").put("approved_by", "chat_yolo")))
         rule.runOnUiThread { rule.activity.setContent { MaterialTheme { CallToolChip(receipt) } } }
 
-        rule.onNodeWithText("Checking Gmail…").assertIsDisplayed()
-        rule.onNodeWithText("Approvals skipped in this chat").assertIsDisplayed()
+        rule.onNodeWithText("Using Gmail…").assertIsDisplayed()
+        rule.onNodeWithText("Approvals skipped in this chat").assertDoesNotExist()
+        rule.onNodeWithTag("beacon-tool-approval-caption").assertDoesNotExist()
         rule.onNodeWithText("Allow this action?").assertDoesNotExist()
     }
 

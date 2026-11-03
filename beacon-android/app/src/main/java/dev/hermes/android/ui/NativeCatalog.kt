@@ -24,6 +24,7 @@ import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
@@ -75,9 +76,11 @@ internal fun pinSelectedModel(models: List<JSONObject>, selectedId: String, inCu
     val reasoningPending = reasoningSaving || "$scopeKey|/api/reasoning" in pending
     var toolsMcp by rememberSaveable(kind, chat.sessionId) { mutableStateOf(false) }
     val assistant = LocalAssistantName.current
+    // A few reasoning levels take their own height; the long model and tool lists keep the tall sheet.
+    val wrapsContent = kind == "Reasoning"
     Dialog(vm::closeCatalog, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Surface(Modifier.widthIn(max = if (kind == "Toolsets") 560.dp else 900.dp).fillMaxWidth().fillMaxHeight(if (kind == "Toolsets") .8f else .92f).padding(12.dp), shape = MaterialTheme.shapes.extraLarge, color = MaterialTheme.colorScheme.surface.copy(alpha = 1f)) {
-            Column(Modifier.fillMaxSize()) {
+        Surface(Modifier.testTag("catalog-sheet").widthIn(max = if (kind == "Toolsets") 560.dp else 900.dp).fillMaxWidth().then(if (wrapsContent) Modifier else Modifier.fillMaxHeight(if (kind == "Toolsets") .8f else .92f)).padding(12.dp), shape = MaterialTheme.shapes.extraLarge, color = MaterialTheme.colorScheme.surface.copy(alpha = 1f)) {
+            Column(if (wrapsContent) Modifier.fillMaxWidth() else Modifier.fillMaxSize()) {
                 // Toolsets belong to the profile, not to this chat, so the chat's title is not shown under them. The Beacon conversation is named for the assistant, not for its Hermes session title.
                 Header(uiText(if (kind == "Toolsets") "Tools" else kind), if (kind == "Toolsets") "" else if (vm.isBeaconConversation()) assistant else chat.title, actions = {
                     if (kind == "Reasoning" || kind == "Model & provider") IconButton(
@@ -102,7 +105,7 @@ internal fun pinSelectedModel(models: List<JSONObject>, selectedId: String, inCu
                         val value = data["picker:reasoning"]
                         val options = value?.optJSONArray("options")?.strings().orEmpty()
                         var level by remember(value?.toString()) { mutableStateOf(value?.string("value").orEmpty().takeIf { it in options }.orEmpty()) }
-                        Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             if (value == null || "picker:reasoning" in refreshing) ReasoningSkeleton()
                             else if (recordError(value).isNotBlank()) SettingsSection { SettingsErrorRow(uiText("Couldn't load reasoning"), { vm.openCatalog("Reasoning") }, uiText("Retry")) }
                             else if (options.isNotEmpty()) {
@@ -161,7 +164,7 @@ internal fun pinSelectedModel(models: List<JSONObject>, selectedId: String, inCu
     val currentGroup = catalogGroups.firstOrNull { it.string("provider_id") == currentProvider }
     val currentTitle = currentGroup?.let { g -> (g.rows("models") + g.rows("extra_models")).firstOrNull { it.string("id") == chatModel }?.string("label") }?.takeIf { it.isNotBlank() } ?: chatModel
     val currentProviderLabel = currentGroup?.let { shortProviderLabel(it.string("provider", it.string("label", it.string("provider_id")))) } ?: chatProvider
-    OutlinedTextField(query, { query = it }, label = { Text(uiText("Search model or provider")) }, leadingIcon = { Icon(Icons.Rounded.Search, null) }, singleLine = true, modifier = Modifier.fillMaxWidth().padding(start = 16.dp, top = 4.dp, end = 16.dp))
+    SettingsSearchField(query, { query = it }, uiText("Search model or provider"), Modifier.padding(start = 16.dp, top = 4.dp, end = 16.dp), testTag = "models-search")
     SettingsList(Modifier.weight(1f), refreshing = (modelPending && modelSaving.isBlank()) || (!loading && "picker:models" in refreshing)) {
         if (query.isBlank()) item(key = "current") {
             CurrentModelCard(
@@ -399,7 +402,7 @@ internal fun formatTokenCount(value: Long, locale: Locale = Locale.getDefault())
     val error = recordError(catalog)
     val commands = remember(catalog, query) { mobileSlashCommands(catalog?.rows("commands").orEmpty()).filter { query.isBlank() || (it.string("name") + it.string("description")).contains(query, true) } }
     SettingsList(refreshing = catalog != null && "slash:catalog" in refreshing, testTag = "commands-page") {
-        item { OutlinedTextField(query, onQuery, label = { Text(uiText("Search commands")) }, leadingIcon = { Icon(Icons.Rounded.Search, null) }, singleLine = true, modifier = Modifier.fillMaxWidth()) }
+        item { SettingsSearchField(query, onQuery, uiText("Search commands"), testTag = "commands-search") }
         if (error.isNotBlank()) item { SettingsSection { SettingsErrorRow(uiText(error), { vm.loadSlashCatalog(force = true) }, uiText("Retry")) } }
         when {
             catalog == null -> item { SettingsSection { SettingsSkeletonRows(4) } }
@@ -470,7 +473,9 @@ internal fun isBuiltInCommand(name: String): Boolean = slashCommandText(name, ""
                 } }
                 val extra = usage.keys().asSequence().filter { !it.startsWith('_') && it != "error" && it !in figures.consumed && usage.opt(it).let { v -> v != null && v != JSONObject.NULL && v.toString().isNotBlank() } }.toList()
                 if (extra.isNotEmpty()) item { SettingsSection(testTag = "usage-details") {
-                    SettingsActionRow(uiText("Details"), { details = !details }, icon = Icons.Rounded.Info)
+                    val stateText = uiText(if (details) "Expanded" else "Collapsed")
+                    SettingsNavRow(uiText("Details"), { details = !details }, Modifier.semantics { stateDescription = stateText }, icon = Icons.Rounded.Info,
+                        minHeight = SettingsKit.RowMinHeight, trailingIcon = if (details) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, testTag = "usage-details-toggle")
                     if (details) Box(Modifier.fillMaxWidth().padding(16.dp)) { StructuredRead(JSONObject(usage, extra.toTypedArray())) }
                 } }
                 // A failed refresh keeps the figures already read; its error sits under them.

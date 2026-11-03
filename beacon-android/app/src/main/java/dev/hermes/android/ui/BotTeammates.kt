@@ -6,14 +6,17 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.Groups
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -21,9 +24,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
@@ -33,8 +39,15 @@ import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.core.rows
 import dev.hermes.android.core.string
 import dev.hermes.android.data.BotModeBot
+import dev.hermes.android.data.BotModeMember
 import dev.hermes.android.data.BotModeSpace
+import dev.hermes.android.data.NativeBotModeState
 import dev.hermes.android.data.botModeChosen
+import dev.hermes.android.tasks.scheduleEnded
+import dev.hermes.android.tasks.scheduleIsCallback
+import dev.hermes.android.tasks.scheduleNameOnly
+import dev.hermes.android.tasks.schedulePaused
+import dev.hermes.android.tasks.scheduleTitle
 import org.json.JSONObject
 
 // Bot Mode as a team of teammates, after Grok Bot (docs.x.ai/grok-bot): each bot is a person with its own chat, "New chat" picks two to
@@ -65,6 +78,128 @@ internal fun newChatName(bots: List<NewChatBot>, selected: Set<String>, using: S
 
 internal data class NewChatBot(val profile: String, val name: String)
 
+/** The bots Hermes reports as answering in the open space, by profile ([typing] names members; a member id may be the profile itself). */
+internal fun botsReplying(typing: List<String>, roster: List<BotModeMember>): Set<String> =
+    typing.map { id -> roster.firstOrNull { it.id == id }?.profile ?: roster.firstOrNull { it.profile == id }?.profile ?: id }.toSet()
+
+/** How many of [spaces] each bot is in. */
+internal fun botSpaceCounts(spaces: List<BotModeSpace>): Map<String, Int> = spaces.flatMap { it.members.distinct() }.groupingBy { it }.eachCount()
+
+/** A bot row's status: typing now, else the shared spaces it is in ([spacesText] is the translated "Spaces: {0}"), else nothing. */
+internal fun botStatus(replying: Boolean, spaces: Int, typingText: String, spacesText: String): String =
+    if (replying) typingText else if (spaces > 0) spacesText.replace("{0}", "$spaces") else ""
+
+/**
+ * What each bot row says on its right, for the drawer and the home screen alike: typing now (in the open space), else the shared spaces
+ * it is in. The spaces list is cut at the recent ones, so with more behind it a count would be too low and is left out.
+ */
+@Composable internal fun rememberBotStatus(state: NativeBotModeState): (String) -> String {
+    val replying = botsReplying(state.typing, state.roster)
+    val inSpaces = remember(state.spaces, state.moreSpaces) { if (state.moreSpaces) emptyMap() else botSpaceCounts(state.spaces) }
+    val typingText = uiText("Typing…")
+    val spacesText = uiText("Spaces: {0}")
+    return { profile -> botStatus(profile in replying, inSpaces[profile] ?: 0, typingText, spacesText) }
+}
+
+/** One scheduled run for "Up next": whose it is ([profile]), what it is called and when it runs next ([nextRunAt], Hermes' own timestamp). */
+internal class UpNextRun(val id: String, val title: String, val profile: String, val nextRunAt: String, val at: java.time.Instant)
+
+/** How many runs the home screen lists; the full list is on the Schedules screen. */
+internal const val UP_NEXT_LIMIT = 3
+
+/**
+ * The soonest runs among [jobs] (Hermes' schedules as the Schedules screen reads them): running ones only, so nothing paused, finished or
+ * without a next time, no callback (a one-time call-back the assistant set up, not a bot's routine) and none of the jobs the Beacon plugin
+ * keeps in shape itself (the check-ups, watching email, the nightly memory), which are read from their markers and never from their names.
+ * A job that names its own `profile` belongs to that bot; any other belongs to [defaultProfile], the profile the list was read for.
+ */
+internal fun upNextRuns(jobs: List<JSONObject>, defaultProfile: String, untitled: String, limit: Int = UP_NEXT_LIMIT): List<UpNextRun> =
+    jobs.mapNotNull { job ->
+        if (scheduleIsCallback(job) || scheduleNameOnly(job) || schedulePaused(job) || scheduleEnded(job)) return@mapNotNull null
+        val next = job.string("next_run_at")
+        val at = runCatching { java.time.OffsetDateTime.parse(next).toInstant() }.getOrNull() ?: return@mapNotNull null
+        UpNextRun(job.string("id"), scheduleTitle(job, untitled, ""), job.string("profile").ifBlank { defaultProfile }, next, at)
+    }.sortedBy { it.at }.take(limit)
+
+/** A one-tap start for a new bot: a profile [id] (lowercase, as Hermes names profiles), its [name] and the one-line [role] it gets. */
+internal class SuggestedRole(val id: String, val name: String, val role: String)
+
+/** Below this many bots the drawer suggests roles to start from. */
+internal const val SUGGESTED_ROLES_BELOW = 4
+
+/** Four generic roles, one job each; the ids stay as written, the name and the role are in the owner's language. */
+@Composable internal fun suggestedRoleCatalog(): List<SuggestedRole> = listOf(
+    SuggestedRole("researcher", uiText("Researcher"), uiText("Finds sources and sums them up.")),
+    SuggestedRole("planner", uiText("Planner"), uiText("Turns goals into clear next steps.")),
+    SuggestedRole("writer", uiText("Writer"), uiText("Drafts and polishes your text.")),
+    SuggestedRole("inbox-helper", uiText("Inbox helper"), uiText("Sorts messages and drafts replies.")),
+)
+
+/** The roles worth offering: only while the team is small, and never one whose id is already a profile ([taken]). */
+internal fun suggestedRolesOffered(catalog: List<SuggestedRole>, taken: Collection<String>, bots: Int): List<SuggestedRole> =
+    if (bots >= SUGGESTED_ROLES_BELOW) emptyList() else catalog.filter { it.id !in taken }
+
+/** "Suggested roles": a chip per role, in the drawer and on the home screen alike; a tap opens New bot with that name and role filled in. */
+@Composable internal fun SuggestedRolesRow(roles: List<SuggestedRole>, onPick: (String) -> Unit) {
+    val scheme = MaterialTheme.colorScheme
+    Column(Modifier.fillMaxWidth().testTag("bot-mode-suggested-roles")) {
+        RosterHeader(uiText("Suggested roles"))
+        FlowRow(Modifier.fillMaxWidth().padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            roles.forEach { starter ->
+                Surface(
+                    onClick = { onPick(starter.id) }, shape = CircleShape, color = scheme.surface, border = BorderStroke(1.dp, scheme.outlineVariant),
+                    modifier = Modifier.heightIn(min = 48.dp).semantics { role = Role.Button }.testTag("bot-mode-suggested-role:${starter.id}"),
+                ) {
+                    Row(Modifier.padding(start = 12.dp, end = 16.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Icon(Icons.Rounded.Add, null, Modifier.size(18.dp))
+                        Text(starter.name, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * A scheduled run in "Up next": the bot's avatar and the schedule's name on the full width, then the bot's name with when it runs next
+ * ([whenText], in the phone's clock) beside it, so a long name is not cut by the time. A tap opens Schedules ([onOpen]).
+ */
+@Composable internal fun UpNextRow(title: String, bot: String, profile: String, whenText: String, tag: String, onOpen: () -> Unit) {
+    val scheme = MaterialTheme.colorScheme
+    Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable(onClickLabel = uiText("Schedules"), role = Role.Button, onClick = onOpen).semantics(mergeDescendants = true) {}
+        .padding(horizontal = 12.dp, vertical = 8.dp).testTag(tag), verticalAlignment = Alignment.CenterVertically) {
+        ChatAvatar(bot, profile, size = 40.dp)
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(title, Modifier.fillMaxWidth(), style = MaterialTheme.typography.titleMedium.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.Medium).rowStart(), maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(bot, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium.rowStart(), color = scheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(whenText, Modifier.padding(start = 8.dp), style = nativeMetadataStyle(), color = scheme.primary, maxLines = 1)
+            }
+        }
+    }
+}
+
+/**
+ * New bot (filled) and New space (tonal) side by side, one size and shape; at large text they stack full width so neither wraps.
+ * The drawer's top buttons look the same, so the two places read as one pattern.
+ */
+@Composable internal fun BotModeActions(onNewBot: () -> Unit, onNewSpace: () -> Unit, newBotTag: String, newSpaceTag: String, modifier: Modifier = Modifier, enabled: Boolean = true) {
+    val shape = RoundedCornerShape(14.dp)
+    val newBot: @Composable (Modifier) -> Unit = { at ->
+        Button(onClick = onNewBot, modifier = at.heightIn(min = 48.dp).testTag(newBotTag), shape = shape, enabled = enabled) {
+            Icon(Icons.Rounded.Add, null); Spacer(Modifier.width(8.dp)); Text(uiText("New bot"), maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+    }
+    val newSpace: @Composable (Modifier) -> Unit = { at ->
+        FilledTonalButton(onClick = onNewSpace, modifier = at.heightIn(min = 48.dp).testTag(newSpaceTag), shape = shape, enabled = enabled) {
+            Icon(Icons.Rounded.Groups, null); Spacer(Modifier.width(8.dp)); Text(uiText("New space"), maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+    }
+    if (isLargeText(LocalDensity.current.fontScale)) Column(modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) { newBot(Modifier.fillMaxWidth()); newSpace(Modifier.fillMaxWidth()) }
+    else Row(modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { newBot(Modifier.weight(1f)); newSpace(Modifier.weight(1f)) }
+}
+
 /** One entry of a row's long-press menu. */
 internal class RowAction(val label: String, val tag: String, val danger: Boolean = false, val divider: Boolean = false, val enabled: Boolean = true, val onClick: () -> Unit)
 
@@ -77,14 +212,23 @@ internal class RowAction(val label: String, val tag: String, val danger: Boolean
     }
 }
 
-/** A bot as a chat-list row: its avatar in the colour it has in the group chat, its name and its role. A long press opens [actions]. */
-@Composable internal fun TeammateRow(name: String, profile: String, role: String, isOpen: Boolean, actions: List<RowAction>, tag: String, onOpen: () -> Unit) {
+/** An icon button at the end of a row, with the [label] a screen reader says. */
+internal class RowQuick(val icon: ImageVector, val label: String, val tag: String, val onClick: () -> Unit)
+
+/**
+ * A bot as a chat-list row: its avatar in the colour it has in the group chat, its name and its role, and on the right its [status] (blank for none).
+ * A tap opens its chat; a long press opens [actions]; [quick] adds one more button at the end of the row.
+ */
+@Composable internal fun TeammateRow(name: String, profile: String, role: String, isOpen: Boolean, actions: List<RowAction>, tag: String, status: String = "", quick: RowQuick? = null, onOpen: () -> Unit) {
     var menu by remember { mutableStateOf(false) }
     Box {
-        ChatListRow(
-            id = profile, title = name, preview = role, time = "", selected = isOpen,
-            modifier = Modifier.semantics { selected = isOpen }.combinedClickable(onLongClickLabel = uiText("Bot actions"), onLongClick = { menu = true }, onClick = onOpen).testTag(tag),
-        )
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            ChatListRow(
+                id = profile, title = name, preview = role, time = status, selected = isOpen,
+                modifier = Modifier.weight(1f).semantics { selected = isOpen }.combinedClickable(onLongClickLabel = uiText("Bot actions"), onLongClick = { menu = true }, onClick = onOpen).testTag(tag),
+            )
+            quick?.let { IconButton(onClick = it.onClick, modifier = Modifier.size(48.dp).testTag(it.tag)) { Icon(it.icon, it.label) } }
+        }
         RowMenu(menu, { menu = false }, actions, "$tag-menu")
     }
 }
@@ -100,39 +244,53 @@ internal class RowAction(val label: String, val tag: String, val danger: Boolean
                 .padding(horizontal = 12.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            GroupAvatars(members)
+            GroupAvatars(members, size = GroupRowAvatarSize, slots = 2)
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(name, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.Medium).contentDirection(), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    if (time.isNotBlank()) Text(time, Modifier.padding(start = 6.dp), style = nativeMetadataStyle(), color = scheme.onSurfaceVariant, maxLines = 1)
+                    Text(name, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.Medium).rowStart(), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    if (time.isNotBlank()) Text(time, Modifier.padding(start = 8.dp), style = nativeMetadataStyle(), color = scheme.onSurfaceVariant, maxLines = 1)
                 }
-                Text(preview, style = MaterialTheme.typography.bodyMedium.contentDirection(), color = scheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(preview, Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyMedium.rowStart(), color = scheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
         RowMenu(menu, { menu = false }, actions, "$tag-menu")
     }
 }
 
-/** Three bots' avatars (title and profile each), overlapping; with more, two avatars and "+N". The width is fixed so the names of all rows line up. */
-@Composable internal fun GroupAvatars(members: List<Pair<String, String>>, modifier: Modifier = Modifier, size: Dp = 32.dp) {
+/** How far an avatar reaches over the one before it, as a share of its size. */
+private const val GROUP_AVATAR_OVERLAP = .3f
+
+/** The width of [slots] overlapping avatars of size 1: the first whole, each next one adds what is not covered. Two are 1.7, three 2.4. */
+internal fun groupAvatarsWidth(slots: Int): Float = 1f + (1f - GROUP_AVATAR_OVERLAP) * (slots - 1)
+
+/** How many of [count] members get an avatar of their own when [slots] places are offered: all of them, or one less than the places when the last place is the "+N". */
+internal fun groupAvatarsShown(count: Int, slots: Int): Int = if (count > slots) slots - 1 else count
+
+/** The size of a group row's avatars: two of them take exactly the 48 dp a bot row's avatar takes, so the names of both line up. */
+private val GroupRowAvatarSize = 48.dp / groupAvatarsWidth(2)
+
+/**
+ * A group's bots' avatars (title and profile each), overlapping, in [slots] places: one avatar each, or with more bots than places the first
+ * ones and "+N" in the last. The width is fixed, so the names of all rows line up.
+ */
+@Composable internal fun GroupAvatars(members: List<Pair<String, String>>, modifier: Modifier = Modifier, size: Dp = 32.dp, slots: Int = 3) {
     val ring = MaterialTheme.colorScheme.surface
-    val shown = if (members.size > 3) members.take(2) else members
-    Box(modifier.width(size * 2.4f)) {
-        Row(Modifier.wrapContentWidth(Alignment.Start, unbounded = true).testTag("group-avatars"), horizontalArrangement = Arrangement.spacedBy(-(size * .3f)), verticalAlignment = Alignment.CenterVertically) {
+    val shown = members.take(groupAvatarsShown(members.size, slots))
+    Box(modifier.width(size * groupAvatarsWidth(slots))) {
+        Row(Modifier.wrapContentWidth(Alignment.Start, unbounded = true).testTag("group-avatars"), horizontalArrangement = Arrangement.spacedBy(-(size * GROUP_AVATAR_OVERLAP)), verticalAlignment = Alignment.CenterVertically) {
             shown.forEach { (title, profile) -> ChatAvatar(title, profile, Modifier.border(2.dp, ring, CircleShape), size = size) }
-            if (members.size > 3) Box(Modifier.size(size).clip(CircleShape).background(MaterialTheme.colorScheme.surfaceVariant).border(2.dp, ring, CircleShape), contentAlignment = Alignment.Center) {
-                Text("+${members.size - 2}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (members.size > shown.size) Box(Modifier.size(size).clip(CircleShape).background(MaterialTheme.colorScheme.surfaceVariant).border(2.dp, ring, CircleShape), contentAlignment = Alignment.Center) {
+                Text("+${members.size - shown.size}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
 }
 
-/** A roster section title with an optional action on its right. */
-@Composable internal fun RosterHeader(title: String, action: String = "", tag: String = "", end: @Composable RowScope.() -> Unit = {}, onAction: () -> Unit = {}) {
+/** A roster section title with an optional control ([end], such as a refresh) on its right. */
+@Composable internal fun RosterHeader(title: String, end: @Composable RowScope.() -> Unit = {}) {
     Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 12.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
         Text(title, Modifier.weight(1f).semantics { heading() }, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        if (action.isNotBlank()) TextButton(onClick = onAction, modifier = Modifier.heightIn(min = 48.dp).testTag(tag)) { Icon(Icons.Rounded.Add, null, Modifier.size(18.dp)); Spacer(Modifier.width(4.dp)); Text(action) }
         end()
     }
 }
@@ -157,6 +315,10 @@ internal class RowAction(val label: String, val tag: String, val danger: Boolean
 @Composable internal fun botActions(vm: BeaconViewModel, bot: BotModeBot, deletable: Boolean, dialog: MutableState<String>): List<RowAction> = botMenu(deletable,
     open = { vm.openBot(bot) }, group = { vm.botMode.startNewChat(bot.profile); dialog.value = "newChat:" }, role = { dialog.value = "role:${bot.profile}" },
     settings = { vm.profileAdmin.openInSettings(bot.profile); vm.more("Profiles") }, delete = { dialog.value = "deleteBot:${bot.profile}" })
+
+/** The home screen's one button on a bot's row: start a shared space with this bot already picked (the long-press menu's "Start a group with…"). */
+@Composable internal fun botGroupQuick(vm: BeaconViewModel, bot: BotModeBot, name: String, tag: String, dialog: MutableState<String>): RowQuick =
+    RowQuick(Icons.Rounded.Groups, "${uiText("Start a group with…").trimEnd('…', ' ')} $name", tag) { vm.botMode.startNewChat(bot.profile); dialog.value = "newChat:" }
 
 @Composable internal fun spaceActions(vm: BeaconViewModel, space: BotModeSpace, canRename: Boolean, canDelete: Boolean, dialog: MutableState<String>): List<RowAction> = spaceMenu(canRename, canDelete,
     open = { vm.openBotSpace(space.id) }, rename = { dialog.value = "renameSpace:${space.id}" }, members = { dialog.value = "members:${space.id}" }, delete = { dialog.value = "deleteSpace:${space.id}" })
@@ -224,8 +386,10 @@ internal class RowAction(val label: String, val tag: String, val danger: Boolean
             onStart = { name -> vm.showBotMode(); controller.createSpace(name) },
             onNewBot = { controller.cancelNewChat(); dialog.value = "newBot:" },
             onDismiss = { controller.cancelNewChat(); close() })
+        // "newBot:researcher" starts from a suggested role; "newBot:" from nothing.
         "newBot" -> NewProfileDialog(profileRows.map { it.string("name") to profileDisplayName(it.string("name"), profileRows) }, admin,
-            onCreate = { name, from, role -> vm.profileAdmin.create(name, from, role, profileRows.map { it.string("name") }) }, onDismiss = close)
+            onCreate = { name, from, role -> vm.profileAdmin.create(name, from, role, profileRows.map { it.string("name") }) }, onDismiss = close,
+            initialName = id, initialRole = suggestedRoleCatalog().firstOrNull { it.id == id }?.role.orEmpty())
         "role" -> EditRoleDialog(id, state.bots.firstOrNull { it.profile == id }?.description.orEmpty(), admin, onSave = { vm.profileAdmin.setRole(id, it) }, onDismiss = close)
         "deleteBot" -> {
             val deletable = vm.canDeleteProfile(id)

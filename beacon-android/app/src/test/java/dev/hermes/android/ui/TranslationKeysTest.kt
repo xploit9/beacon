@@ -114,6 +114,8 @@ class TranslationKeysTest {
             SettingsSnapshot(connected = true, profile = "work", sendKey = "enter", showThinking = true, theme = "dark", installedVersion = "1.0.0", voiceProviderId = "gemini", voiceKeySaved = true, keepConnectedEnabled = true),
             SettingsSnapshot(sendKey = "ctrl_enter", showThinking = false, theme = "light", updateReady = true, voiceProviderId = "gemini", voiceKeySaved = false, keepConnectedEnabled = false),
             SettingsSnapshot(sendKey = "shift+enter", theme = "system", updateName = "1.1.0", installedVersion = "1.0.0"),
+            SettingsSnapshot(phoneAccess = emptyList()),
+            SettingsSnapshot(phoneAccess = listOf("Calendar & reminders", "Alarms & timers", "Contacts", "Phone calls", "Messages")),
         )
         return snapshots.flatMap { snapshot -> settingsSearchRoutes.flatMap { route -> settingsSummary(route, snapshot) } }.filter { it.translate }.map { it.text }.distinct()
     }
@@ -168,7 +170,7 @@ class TranslationKeysTest {
             "HistoryStrings" to HistoryStrings, "KanbanStrings" to KanbanStrings, "SettingsStrings" to SettingsStrings, "settingsSummary" to settingsSummaryTexts(),
             "ScheduleStateStrings" to ScheduleStateStrings, "ApprovalStrings" to ApprovalStrings, "NavigationStrings" to NavigationStrings,
             "UpdateFailureStrings" to UpdateFailureStrings, "PluginRowStrings" to PluginRowStrings, "CallToolStrings" to CallToolStrings, "CallStrings" to CallStrings, "CallFailureStrings" to CallFailureStrings,
-            "ErrorStrings" to ErrorStrings, "DeliveryNameStrings" to DeliveryNameStrings, "ScheduleBuilderStrings" to ScheduleBuilderStrings, "HistoryRetentionStrings" to HistoryRetentionStrings, "VoiceStyleStrings" to VoiceStyleStrings,
+            "PhoneAccessStrings" to (PhoneAccessStrings + PhoneAccessLabels), "ErrorStrings" to ErrorStrings, "DeliveryNameStrings" to DeliveryNameStrings, "ScheduleBuilderStrings" to ScheduleBuilderStrings, "HistoryRetentionStrings" to HistoryRetentionStrings, "VoiceStyleStrings" to VoiceStyleStrings,
         )
         lists.forEach { (name, texts) -> assertTrue("$name is empty, so nothing is checked.", texts.isNotEmpty()) }
         val missing = untranslated(lists.flatMap { (name, texts) -> texts.map { it to name } })

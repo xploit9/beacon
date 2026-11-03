@@ -2,8 +2,10 @@ package dev.hermes.android.uiux.gaps
 
 import androidx.activity.ComponentActivity
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.unit.dp
 import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.core.json
 import dev.hermes.android.ui.NativeAdministration
@@ -112,6 +114,15 @@ class SessionUsagePageGapsUiTest {
         }
         compose.onNodeWithText("Details").performClick()
         compose.onNodeWithText("Provider note").assertDoesNotExist()
+    }
+
+    @Test fun theDetailsRowHasAChevronThatTurnsWithItsState() = withClientlessVm(compose) { vm ->
+        show(vm)
+        serve(vm, figures.apply { put("provider_note", "kept on the server") })
+        val state = { text: String -> SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, text) }
+        compose.onNodeWithTag("usage-details-toggle").assertHeightIsAtLeast(48.dp).assert(state("Collapsed"))
+        compose.onNodeWithTag("usage-details-toggle").performClick().assert(state("Expanded"))
+        compose.onNodeWithTag("usage-details-toggle").performClick().assert(state("Collapsed"))
     }
 
     @Test fun thereIsNoDetailsRowWhenEveryKeyWasUsed() = withClientlessVm(compose) { vm ->

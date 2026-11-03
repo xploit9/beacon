@@ -57,24 +57,28 @@ class CallPresentationTest {
         assertEquals(0 to 24,clampBubblePosition(-100,-100,64,64,400,800,24,32))
         assertEquals(336 to 704,clampBubblePosition(2000,2000,64,64,400,800,24,32))
     }
-    @Test fun automaticApprovalReceiptKeepsItsOutcomeAndShowsTheQuietPolicyCaption() {
+    @Test fun automaticApprovalReceiptKeepsItsOutcomeAndTheToolHasOneWording() {
         val receipt = requireNotNull(CallToolReceipt.from(json(
             "request_id" to "request-1", "tool_name" to "mcp__gmail__search_messages", "status" to "running", "approved_by" to "chat_yolo",
         )))
 
-        assertEquals("Checking Gmail…", receipt.activityLabel())
-        assertEquals("Approvals skipped in this chat", receipt.approvalCaption())
+        assertEquals("chat_yolo", receipt.approvedBy)
+        // The tool card and the status line say the same thing, so a tool reads "Using Gmail…" wherever it is named.
+        assertEquals("Using Gmail…", receipt.activityLabel())
+        assertEquals(receipt.activityLabel(), receipt.statusLabel())
         assertEquals("Using Gmail…", callStatusLabel(call.copy(toolReceipts = listOf(receipt))))
+        // Where the tool has a line of its own, the status is the state alone.
+        assertEquals("Listening", callStatusLabel(call.copy(toolReceipts = listOf(receipt)), withTool = false))
+        assertEquals("Thinking", callStatusLabel(call.copy(state = "thinking", toolReceipts = listOf(receipt)), withTool = false))
         assertEquals("Muted", callStatusLabel(call.copy(muted = true)))
     }
 
-    @Test fun fileToolReceiptHasAReadableActivityLabelAndOwnerApprovalHasNoAutomaticCaption() {
+    @Test fun fileToolReceiptHasAReadableActivityLabel() {
         val receipt = requireNotNull(CallToolReceipt.from(json(
             "request_id" to "request-2", "tool_name" to "write_file", "status" to "ready", "approved_by" to "owner",
         )))
 
         assertEquals("Writing a file…", receipt.activityLabel())
-        assertNull(receipt.approvalCaption())
         assertNull(CallToolReceipt.from(json("request_id" to "request-3", "tool_name" to "send_email", "status" to "needs_approval"))?.activityLabel())
     }
 
@@ -87,9 +91,7 @@ class CallPresentationTest {
         )))
 
         assertEquals("Gmail action failed", failed.chipLabel())
-        assertEquals("Allowed automatically", failed.approvalCaption())
         assertEquals("File write outcome unclear", uncertain.chipLabel())
-        assertEquals("Allowed for this call", uncertain.approvalCaption())
     }
 
     @Test fun approvedReceiptsNeverProduceAnOwnerApprovalPrompt() {
@@ -102,19 +104,12 @@ class CallPresentationTest {
         assertNull(callProposalNeedingOwnerApproval(json("status" to "running", "proposal" to proposal)))
     }
 
-    @Test fun eachAutomaticApprovalSourceGetsItsShortCallCaption() {
-        val captions = mapOf(
-            "chat_yolo" to "Approvals skipped in this chat",
-            "profile_off" to "Approvals off",
-            "smart" to "Allowed automatically",
-            "memory" to "Allowed automatically",
-            "call_allowance" to "Allowed for this call",
-        )
-        captions.forEach { (approvedBy, caption) ->
+    @Test fun eachAutomaticApprovalSourceKeepsItsOutcomeOnTheReceipt() {
+        listOf("chat_yolo", "profile_off", "smart", "memory", "call_allowance").forEach { approvedBy ->
             val receipt = requireNotNull(CallToolReceipt.from(json(
                 "request_id" to approvedBy, "tool_name" to "read_file", "status" to "completed", "approved_by" to approvedBy,
             )))
-            assertEquals(caption, receipt.approvalCaption())
+            assertEquals(approvedBy, receipt.approvedBy)
         }
     }
 

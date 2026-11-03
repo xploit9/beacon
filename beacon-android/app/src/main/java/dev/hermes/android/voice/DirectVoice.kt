@@ -174,7 +174,11 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
     /** The call streams the phone's microphone: it is connected only once that stream reaches the session. */
     private val streamsMicrophone:Boolean=false,
     /** What was said so far in this call; a replacement session without a resumption handle starts from it. */
-    private val recentSpeech:()->String={ "" }) {
+    private val recentSpeech:()->String={ "" },
+    /** Runs the phone tools (calendar, alarms, contacts, calls, messages) on this phone; null in tests and sessions without them. */
+    private val phone:PhoneVoiceBridge?=null,
+    /** Whether this conversation may read or do anything private: not until the phone has been unlocked since it started ([CallTrust]). */
+    private val trust:CallTrust=CallTrust.open()) {
     // One call clock: every diagnostic's elapsed_ms counts from the owner's tap when the service supplies it.
     private val origin=tappedAt.takeIf { it>0 }?:clock()
     private fun elapsedMs()=clock()-origin
@@ -597,7 +601,7 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                 val grok=if(provider=="grok") GrokWire() else null
                 val openAi=if(provider=="openai") OpenAiWire() else null
                 // The first attempt takes the session opened before the tap; a session that died meanwhile is never reused.
-                val adopted=warm?.takeIf { !warmUsed&&!greeted&&!it.dead }
+                val adopted=warm?.takeIf { !warmUsed&&!greeted&&!it.dead&&trust.trusted() }
                 if(!warmUsed) { warmUsed=true;if(adopted==null) warm?.close() }
                 // A Gemini session continues from its resumption handle; any other replacement starts from what was said so far.
                 val resumption=resume.takeIf { provider=="gemini" }
@@ -685,7 +689,7 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                 val setupSender=if(adopted!=null) null else launch {
                     opened.await()
                     if(load.result.await()!=null) return@launch
-                    if(voiceProviderCurrent(generation,epoch.get(),stopped,ended.isCompleted)&&!sendFrames(ws,liveSetup(credentials,context,resumption,recentSpeech()).toString())) { ended.complete(Unit);ws.cancel() }
+                    if(voiceProviderCurrent(generation,epoch.get(),stopped,ended.isCompleted)&&!sendFrames(ws,liveSetup(credentials,callBrief(context,trust.trusted()),resumption,recentSpeech()).toString())) { ended.complete(Unit);ws.cancel() }
                 }
                 var fatal=false
                 fun admit():Boolean = synchronized(socketFence) {
@@ -865,6 +869,8 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
     suspend fun decideTool(requestId:String,proposalId:String,decision:String) {
         check(!stopped) { "Call ended" }
         require(decision in setOf("approve", "approve_call", "deny")) { "Invalid tool approval decision" }
+        // A phone request is answered by its own card; Hermes never sees it.
+        if(phone?.owns(requestId)==true) { phone.decide(requestId,proposalId,decision);return }
         val proposal=gatewayReceipts.decision(requestId,proposalId)
         val receipt=try { withTimeoutOrNull(20000) { gatewayRequests.withPermit { check(callOwned()) { "Call authority changed" };gateway().decide(requestId,proposalId,decision) } } ?: throw java.io.IOException("Tool decision timed out") }
         catch(error:CancellationException) { throw error }
@@ -879,12 +885,17 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
             socket?.close(1002,"Invalid function identifier")
             return
         }
-        if(name !in DIRECT_CALL_TOOLS) {
+        val phoneTool=phone!=null&&PhoneVoiceTools.handles(name)
+        if(name !in DIRECT_CALL_TOOLS&&!phoneTool) {
             toolResponse(id,name,JSONObject().put("status","unsupported").put("message","Unknown function; no work was submitted."))
             return
         }
+        // A conversation that started on a locked phone and has not been unlocked since may talk, but nothing private is read or done:
+        // every Hermes tool answers at once, before admission or any request (the phone's own tools are held back in PhoneVoiceBridge).
+        if(!trust.trusted()&&name in DIRECT_CALL_TOOLS) { toolResponse(id,name,lockedToolResult());return }
         // Every Hermes action belongs to the admitted call; none runs before Hermes admitted it.
-        if(name!="get_visual_state") try { admittedCall() } catch(_:CallAdmissionFailed) {
+        // Phone tools run on this phone and never reach Hermes, so they do not wait for its admission.
+        if(name!="get_visual_state"&&!phoneTool) try { admittedCall() } catch(_:CallAdmissionFailed) {
             toolResponse(id,name,JSONObject().put("status","not_sent").put("message","That request was not sent: Hermes did not admit this call. Tell the owner to try again."));return
         }
         val requestId=java.util.UUID.nameUUIDFromBytes((callId+":"+id).toByteArray(Charsets.UTF_8)).toString()
@@ -944,6 +955,9 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                 gatewayReceipts.receipt(requestId)!!
                 }
                 }
+            } else if(phoneTool) {
+                require(!call.has("args")||call.opt("args") is JSONObject)
+                checkNotNull(phone).call(requestId,name,call.optJSONObject("args")?:JSONObject(),event)
             } else if(name in setOf("hermes_search","hermes_memory","hermes_skills","hermes_context")) {
                 require(!call.has("args")||call.opt("args") is JSONObject)
                 val read=GeminiWire.nativeRead(name,call.optJSONObject("args")?:JSONObject())
@@ -1062,7 +1076,7 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                     toolReceipts.values.count(::outcomeUnknownAtCallEnd))
             }
         }
-        epoch.incrementAndGet();ready=false;visual.clear()
+        epoch.incrementAndGet();ready=false;visual.clear();phone?.close()
         synchronized(greetingLock) { greetingOpen=false;heldGreeting.clear() }
         if(!warmUsed) { warmUsed=true;warm?.close() }
         // Stop local reads/idle waits; accepted native writes still settle their receipt once.

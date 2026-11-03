@@ -6,9 +6,6 @@ import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyListScope
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.CallSplit
@@ -25,9 +22,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -66,6 +61,7 @@ private fun settingsIcon(name: String): ImageVector = when (name) {
     "Appearance" -> Icons.Rounded.Palette
     "Chat", "Settings" -> Icons.Rounded.ChatBubbleOutline
     "Notifications & Keep connected", "Notifications" -> Icons.Rounded.NotificationsNone
+    "Phone access" -> Icons.Rounded.PhoneAndroid
     "App updates" -> Icons.Rounded.SystemUpdate
     "Server" -> Icons.Rounded.SettingsSuggest
     "Health" -> Icons.Rounded.MonitorHeart
@@ -135,14 +131,8 @@ internal fun settingsSearchResults(routes: List<String>, shown: List<Triple<Stri
         Triple(uiText(settingsLabel(route)), uiText(settingsDescriptions[route].orEmpty()), settingsKeywordsOf(route).takeIf(String::isNotBlank)?.let { uiText(it) }.orEmpty())
     }
     val matches = remember(query, shown) { settingsSearchResults(settingsSearchRoutes, shown, query) }
-    val focus = LocalFocusManager.current
     SettingsList(testTag = "settings-overview") {
-        item {
-            OutlinedTextField(query, { query = it }, singleLine = true, placeholder = { Text(uiText("Search settings")) }, leadingIcon = { Icon(Icons.Rounded.Search, null) },
-                trailingIcon = { if (query.isNotEmpty()) IconButton(onClick = { query = "" }) { Icon(Icons.Rounded.Close, uiText("Clear search")) } },
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search), keyboardActions = KeyboardActions(onSearch = { focus.clearFocus() }),
-                shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth().testTag("settings-search"))
-        }
+        item { SettingsSearchField(query, { query = it }, uiText("Search settings"), testTag = "settings-search") }
         if (query.isNotBlank()) {
             item {
                 SettingsSection(testTag = "settings-results") {
@@ -230,6 +220,9 @@ internal fun pluginActionWord(plugin: PluginRow): String = when {
     val tools = data["native-tools"].loadedRecord()?.rows("items")
     val mcp = data["native-mcp"].loadedRecord()?.rows("servers")
     val checkpointSize = if (server.checkpointBytes > 0) Formatter.formatShortFileSize(context, server.checkpointBytes) else ""
+    // Read again whenever Phone access changes a choice (also on a wide screen, where its page stays beside this list) and when the page changes.
+    val phoneChanges by phoneAccessChanged.collectAsStateWithLifecycle()
+    val phoneAccess = remember(context, ui.morePage, phoneChanges) { phoneAccessOn(context) }
     // The Connection page's own verdict decides the row too, so the two never disagree.
     val verdict = connectionVerdict(ui.connected, ui.loading || ui.restoringSession, ui.authenticated, ui.origin.isNotBlank())
     val snapshot = SettingsSnapshot(
@@ -246,7 +239,7 @@ internal fun pluginActionWord(plugin: PluginRow): String = when {
         toolsOn = tools?.count { it.optBoolean("enabled") }, mcpServers = mcp?.size,
         serverOverall = server.overall,
         serverUpdateAvailable = server.update?.optBoolean("update_available"),
-        checkpointSize = checkpointSize,
+        checkpointSize = checkpointSize, phoneAccess = phoneAccess,
     ).withLoaded(data["profile-settings"])
     val summaries = localizedSettingsSummaries(snapshot)
     SettingsOverview(summaries, { vm.more(it) }, category, selectedPage)
@@ -331,6 +324,7 @@ internal fun pluginActionWord(plugin: PluginRow): String = when {
             SettingsHome(vm, page.removePrefix("category:"))
         }
         page == "Settings" -> NativeChatPreferences(vm)
+        page == "Phone access" -> PhoneAccessSettings(vm)
         page in setOf("Appearance", "Assistant", "Connection", "Beacon", "Notifications", "App updates", "Licenses") -> Column(Modifier.fillMaxSize()) {
             // Fixed route names only reach this branch; Skills/Bots are handled above and keep their own headers.
             Header(uiText(settingsLabel(page)), back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current)

@@ -57,7 +57,7 @@ def test_alerts_list_this_chat_newest_first_with_source_and_expiry(harness):
     assert body["session_id"] == CHAT and body["profile"] == "default" and body["next"] == ""
 
 
-def test_alert_verdict_is_read_back_from_the_saved_feedback(harness):
+def test_alert_verdict_is_read_back_from_the_alerts_own_choice(harness):
     api, client, _, _, _ = harness
     now = time.time()
     first, second = "a" * 32, "b" * 32
@@ -70,12 +70,17 @@ def test_alert_verdict_is_read_back_from_the_saved_feedback(harness):
     assert verdicts() == {first: "", second: ""}
     assert client.post(FEEDBACK, json={"notice_id": first, "verdict": "important"}).status_code == 200
     assert verdicts() == {first: "important", second: ""}
-    # A new choice replaces the old one, and taking the note out of what Beacon learned opens the alert again.
+    # The choice stands, marks this alert alone and saves nothing: no rule and no learned note.
     assert client.post(FEEDBACK, json={"notice_id": first, "verdict": "not_important"}).status_code == 200
-    assert verdicts()[first] == "not_important"
-    note = api.proactive.learned_notes(api.mobile, "owner", "default")[0]
-    assert client.request("DELETE", "/api/plugins/beacon/mobile/proactive/learned", json={"note": note}).status_code == 200
-    assert verdicts() == {first: "", second: ""}
+    assert verdicts() == {first: "important", second: ""}
+    assert api.proactive.learned_notes(api.mobile, "owner", "default") == []
+    assert api.proactive.list_requests(api.mobile, "owner", "default") == []
+    # A rating from before ratings became rules still reads back until the owner clears it.
+    old = 'Beacon importance: email: Not important: "Billing / Invoice 4471 overdue"'
+    api.proactive._store_learned(api.mobile, "owner", "default", [old])
+    assert verdicts() == {first: "important", second: "not_important"}
+    assert client.request("DELETE", "/api/plugins/beacon/mobile/proactive/learned", json={"note": old}).status_code == 200
+    assert verdicts() == {first: "important", second: ""}
 
 
 def test_alerts_are_paged_and_bounded(harness):

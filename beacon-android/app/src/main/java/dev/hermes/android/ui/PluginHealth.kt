@@ -29,7 +29,10 @@ internal const val PLUGIN_HEALTH_PATH = "/api/plugins/beacon/mobile/health"
 internal enum class HealthTarget { None, Notifications, VoiceCalls, AppUpdates, CheckNow }
 
 /** One row's verdict. [text] is the English word the row shows through uiText; [target] is where a tap on the row goes. */
-internal data class HealthLine(val status: SettingsStatus, val text: String, val target: HealthTarget = HealthTarget.None)
+internal data class HealthLine(val status: SettingsStatus, val text: String, val target: HealthTarget = HealthTarget.None) {
+    /** A row that is fine, switched off on purpose or at work asks nothing of the owner. */
+    val needsAttention: Boolean get() = status == SettingsStatus.Attention || status == SettingsStatus.Error
+}
 
 /** What the Beacon plugin section says. A row the plugin could not observe is null and not shown. */
 internal data class PluginHealth(val version: String, val dashboard: HealthLine?, val gateway: HealthLine?, val calls: HealthLine, val notifications: HealthLine) {
@@ -53,7 +56,7 @@ internal data class PluginHealth(val version: String, val dashboard: HealthLine?
 internal val PluginHealthStrings = listOf(
     "Beacon plugin", "Health", "Version", "Hermes dashboard", "Hermes gateway", "Calls", "Notifications", "Check now", "Checking…", "Retry", "Can't reach Hermes",
     "Healthy", "Needs attention", "Not working", "Up to date", "Needs restart", "Running", "Working", "Stopped", "Ready", "Add key",
-    "Slow to start", "Hermes is updating", "Hermes is busy", "Hermes took too long", "Not ready", "Keep connected is on", "Turn on Keep connected", "Not set up",
+    "Slow to start", "Hermes is updating", "Hermes is busy", "Hermes took too long", "Not ready", "Keep connected is on", "Keep connected is off", "Not set up",
     "The Beacon plugin isn't installed", "Update Beacon on your Hermes", "Hermes answered in {0} ms",
 )
 
@@ -97,7 +100,7 @@ internal fun pluginHealthOf(answer: JSONObject?, keepConnected: Boolean, voiceKe
         push.flag("ready") == true -> HealthLine(SettingsStatus.Ok, "Ready")
         keepConnected -> HealthLine(SettingsStatus.Ok, "Keep connected is on")
         push.optString("reason") == "no_phone" -> HealthLine(SettingsStatus.Attention, "Not set up", HealthTarget.Notifications)
-        else -> HealthLine(SettingsStatus.Off, "Turn on Keep connected", HealthTarget.Notifications)
+        else -> HealthLine(SettingsStatus.Off, "Keep connected is off", HealthTarget.Notifications)
     }
     return PluginHealth(version, dashboard, gateway, callsLine, notifications)
 }
@@ -123,8 +126,9 @@ internal fun pluginHealthOf(answer: JSONObject?, keepConnected: Boolean, voiceKe
     SettingsValueRow(uiText("Health"), icon = Icons.Rounded.MonitorHeart, status = health.overall, statusLabel = uiText(health.overallText), testTag = "plugin-health-status")
     SettingsDivider()
     SettingsValueRow(uiText("Version"), icon = Icons.Rounded.Tag, value = health.version, testTag = "plugin-health-version")
-    health.dashboard?.let { SettingsDivider(); HealthRow(uiText("Hermes dashboard"), Icons.Rounded.Dashboard, it, "plugin-health-dashboard", onOpen) }
-    health.gateway?.let { SettingsDivider(); HealthRow(uiText("Hermes gateway"), Icons.Rounded.Router, it, "plugin-health-gateway", onOpen) }
+    // The dashboard and the gateway only appear when one of them needs the owner; "Healthy" above already says they are fine.
+    health.dashboard?.takeIf { it.needsAttention }?.let { SettingsDivider(); HealthRow(uiText("Hermes dashboard"), Icons.Rounded.Dashboard, it, "plugin-health-dashboard", onOpen) }
+    health.gateway?.takeIf { it.needsAttention }?.let { SettingsDivider(); HealthRow(uiText("Hermes gateway"), Icons.Rounded.Router, it, "plugin-health-gateway", onOpen) }
     SettingsDivider()
     HealthRow(uiText("Calls"), Icons.Rounded.Call, health.calls, "plugin-health-calls", onOpen)
     SettingsDivider()

@@ -140,8 +140,8 @@ class PluginHealthLiveTest {
                     assertTrue(mergedText("plugin-health-version").contains(installed))
                     // Each row reads what the plugin reported (the words are the mapping's, in the phone's language, here English).
                     assertTrue(mergedText("plugin-health-calls").contains(expected.calls.text))
-                    expected.dashboard?.let { assertTrue(mergedText("plugin-health-dashboard").contains(it.text)) }
-                    expected.gateway?.let { assertTrue(mergedText("plugin-health-gateway").contains(it.text)) }
+                    expected.dashboard?.takeIf { it.needsAttention }?.let { assertTrue(mergedText("plugin-health-dashboard").contains(it.text)) }
+                    expected.gateway?.takeIf { it.needsAttention }?.let { assertTrue(mergedText("plugin-health-gateway").contains(it.text)) }
                     assertTrue(mergedText("plugin-health-status").contains(expected.overallText))
                 }
                 compose.onNodeWithTag("plugin-health-check").performClick()

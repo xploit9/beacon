@@ -26,7 +26,7 @@ import org.json.JSONObject
 import java.net.URLEncoder
 
 /** What a tool group or MCP server shows under its name in place of its description. */
-internal enum class ToolPillKind { TestFailed, Tested, FromPlugin, SetupNeeded }
+internal enum class ToolPillKind { TestFailed, Tested, FromPlugin, SetupNeeded, NotTested }
 internal data class ToolPill(val kind: ToolPillKind, val status: SettingsStatus, val count: Int = 0)
 
 /**
@@ -41,7 +41,15 @@ internal fun toolRowPill(mcp: Boolean, managedByPlugin: Boolean, configured: Boo
     else -> null
 }
 
+/** What sits next to an MCP server's Test button, from the test result already loaded: a failure, the tools a passed test found, or that none has run. */
+internal fun mcpTestPill(testedTools: Int?, testFailed: Boolean): ToolPill = when {
+    testFailed -> ToolPill(ToolPillKind.TestFailed, SettingsStatus.Error)
+    testedTools != null -> ToolPill(ToolPillKind.Tested, SettingsStatus.Ok, testedTools)
+    else -> ToolPill(ToolPillKind.NotTested, SettingsStatus.Off)
+}
+
 @Composable private fun toolPillText(pill: ToolPill, plugin: String): String = when (pill.kind) {
+    ToolPillKind.NotTested -> uiText("Not tested")
     ToolPillKind.TestFailed -> uiText("Test failed")
     ToolPillKind.Tested -> if (pill.count == 1) uiText("1 tool") else uiText("{0} tools").replace("{0}", "${pill.count}")
     ToolPillKind.FromPlugin -> uiText("From {0}").replace("{0}", plugin)
@@ -101,8 +109,7 @@ internal fun toolRowPill(mcp: Boolean, managedByPlugin: Boolean, configured: Boo
     SettingsList(refreshing = loading && record != null, testTag = if (mcp) "mcp-settings" else "tool-settings") {
         item(key = "search") {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                OutlinedTextField(search, { search = it }, Modifier.weight(1f), label = { Text(uiText(if (mcp) "Search MCP servers" else "Search tools")) },
-                    leadingIcon = { Icon(Icons.Rounded.Search, null) }, singleLine = true)
+                SettingsSearchField(search, { search = it }, uiText(if (mcp) "Search MCP servers" else "Search tools"), Modifier.weight(1f), testTag = "tools-search")
                 SettingsIconButton(Icons.Rounded.Refresh, uiText(if (mcp) "Refresh MCP servers" else "Refresh tools"), { refresh() }, Modifier.testTag("tools-refresh"), enabled = idle)
             }
         }
@@ -141,6 +148,15 @@ internal fun toolRowPill(mcp: Boolean, managedByPlugin: Boolean, configured: Boo
     }
 }
 
+private val ToolIdentifierList = Regex("^[a-z0-9_]+(, [a-z0-9_]+)*$")
+
+/**
+ * The line under a tool group's name: its description, except when that is only a list of function names ("web_search, web_extract"),
+ * which means nothing to a reader and which "View tools" already shows (so it holds back only while [hasToolList]).
+ */
+internal fun toolRowSummary(description: String, hasToolList: Boolean): String =
+    if (hasToolList && ToolIdentifierList.matches(description.trim())) "" else description
+
 /** One tool group or server: its switch with a state pill, then Test and View tools under the name. */
 @Composable private fun ToolRow(
     row: JSONObject, mcp: Boolean, saving: Boolean, enabled: Boolean, idle: Boolean, testedTools: Int?, testFailed: Boolean,
@@ -148,16 +164,21 @@ internal fun toolRowPill(mcp: Boolean, managedByPlugin: Boolean, configured: Boo
 ) {
     val name = row.string("name")
     val managedByPlugin = row.string("source") == "plugin"
-    val pill = toolRowPill(mcp, managedByPlugin, row.optBoolean("configured"), testedTools, testFailed)
+    // An MCP server's test result sits next to Test; under the name stays only what describes the server itself (one a plugin manages).
+    val pill = toolRowPill(mcp, managedByPlugin, row.optBoolean("configured"), testedTools.takeIf { !mcp }, testFailed && !mcp)
+    val testPill = if (mcp) mcpTestPill(testedTools, testFailed) else null
     val motion = rememberNativeMotionEnabled()
     Column(Modifier.fillMaxWidth().animateContentSize(tween(if (motion) 200 else 0))) {
         SettingsSwitchRow(row.string("label", name), row.optBoolean("enabled"), onToggle, icon = if (mcp) Icons.Rounded.Hub else Icons.Rounded.Build,
-            summary = row.string("description"), status = pill?.status, statusLabel = pill?.let { toolPillText(it, row.string("plugin")) }.orEmpty(),
+            summary = if (mcp) row.string("description") else toolRowSummary(row.string("description"), tools.isNotEmpty()), status = pill?.status, statusLabel = pill?.let { toolPillText(it, row.string("plugin")) }.orEmpty(),
             enabled = enabled && !managedByPlugin, busy = saving, testTag = "tool-row:$name")
-        if (mcp || tools.isNotEmpty()) Row(Modifier.fillMaxWidth().padding(start = SettingsKit.DividerStart - 12.dp, end = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+        // Wrapping, so Test, its result and View tools stay whole at large text instead of pushing each other off the row.
+        if (mcp || tools.isNotEmpty()) FlowRow(Modifier.fillMaxWidth().padding(start = SettingsKit.DividerStart - 12.dp, end = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp), itemVerticalAlignment = Alignment.CenterVertically) {
             if (mcp) {
                 val testLabel = uiText("Test")
                 TextButton(onClick = onTest, enabled = idle, modifier = Modifier.heightIn(min = SettingsKit.TouchMin).testTag("tool-test:$name").semantics { contentDescription = "$testLabel $name" }) { Text(testLabel) }
+                testPill?.let { SettingsStatusPill(it.status, toolPillText(it, ""), testTag = "tool-test-result:$name") }
             }
             if (tools.isNotEmpty()) {
                 val stateText = uiText(if (expanded) "Expanded" else "Collapsed")

@@ -56,6 +56,34 @@ class ProactiveSettingsTest {
         assertTrue(proactiveLearnedNotes(json()).isEmpty())
     }
 
+    @Test fun aSuggestionReadsAsTheSenderThenTheSubjectThenHermesOwnWords() {
+        val from = "Sent by {0}"
+        val about = "About {0}"
+        assertEquals("Sent by Daniel Reyes", EmailRuleSuggestion("Daniel Reyes", "Client moved the review", "x").text(from, about))
+        assertEquals("About Weekly deals", EmailRuleSuggestion(topic = "Weekly deals", rule = "x").text(from, about))
+        assertEquals("Hermes words", EmailRuleSuggestion(rule = "Hermes words").text(from, about))
+        assertEquals("", EmailRuleSuggestion().text(from, about))
+        // The words come in the app's language: the template is the translated one, the name is data.
+        assertEquals("من داني", EmailRuleSuggestion("داني").text("من {0}", "بخصوص {0}"))
+        assertEquals(EmailRuleSuggestion("Daniel Reyes", "Review", "Sent by Daniel Reyes"),
+            EmailRuleSuggestion.from(json("sender" to " Daniel Reyes ", "topic" to "Review", "rule" to "Sent by Daniel Reyes", "source" to "email")))
+        assertEquals(EmailRuleSuggestion(), EmailRuleSuggestion.from(json()))
+    }
+
+    @Test fun earlierRatingsProposalKeepsKnownVerdictsAndSourcesAndAtMostFiveRules() {
+        fun row(verdict: String, source: String, sender: String) = json("verdict" to verdict, "source" to source, "sender" to sender, "topic" to "", "rule" to "Sent by $sender")
+        val rows = JSONArray(listOf(
+            row("important", "email", "A"), row("not_important", "email", "B"), row("maybe", "email", "C"), row("important", "", "D"),
+            row("important", "github", "E"), row("not_important", "email", "F"), row("important", "email", "G"), row("important", "email", "H"),
+        ))
+        val proposal = proactiveLearnedProposal(json("learned_proposal" to rows))
+        assertEquals(listOf("A", "B", "E", "F", "G"), proposal.map { it.suggestion.sender })
+        assertEquals(listOf("important", "not_important", "important", "not_important", "important"), proposal.map { it.verdict })
+        assertEquals("github", proposal[2].source)
+        assertTrue(proactiveLearnedProposal(json()).isEmpty())
+        assertTrue(importanceActions == setOf("important", "not_important"))
+    }
+
     @Test fun sourceLabelsIgnoreInvalidEntriesAndPreserveCatalogueOrder() {
         assertEquals(listOf("Gmail", "Calendar", "GitHub"), proactiveSources(json(
             "sources" to JSONArray(listOf("Gmail", " Calendar ", "GitHub", "Gmail", "", "  ", 12, JSONObject.NULL)),

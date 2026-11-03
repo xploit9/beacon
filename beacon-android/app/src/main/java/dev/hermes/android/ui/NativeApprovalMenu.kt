@@ -207,6 +207,9 @@ internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: S
                     optionIcons = mapOf("manual" to Icons.Rounded.FrontHand, "smart" to Icons.Rounded.AutoMode),
                     optionTestTags = ProfileApprovalChoices.associateWith { "profile-approval-$it" },
                     enabled = active != null && !loading && !busy && !failed, style = ChoiceStyle.Segmented)
+                // One line on what each does: Manual asks every time; Auto lets what Hermes judges safe through and still asks for the rest.
+                Text(uiText("Manual asks every time. Auto lets safe actions through."), Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp).testTag("profile-approvals-caption"),
+                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }

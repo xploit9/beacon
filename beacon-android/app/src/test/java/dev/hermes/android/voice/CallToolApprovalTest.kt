@@ -68,8 +68,18 @@ class CallToolApprovalTest {
             val huge = callToolApprovalSummary(CallToolApproval("request", "p".repeat(32), "terminal", JSONObject().put(key, "y".repeat(1500)).toString()))
             assertEquals(1000, huge.preview.length); assertTrue(huge.preview.endsWith("…"))
         }
-        val note = callToolApprovalSummary(CallToolApproval("request", "p".repeat(32), "write_file", JSONObject().put("content", "z".repeat(300)).toString()))
-        assertEquals(160, note.preview.length); assertTrue(note.preview.endsWith("…"))
+    }
+
+    /** A note or message is shown nearly whole, like a command: up to 1000 characters, and only text beyond that ends with an ellipsis. */
+    @Test fun aNoteOrMessagePreviewIsShownUpToAThousandCharacters() {
+        assertEquals(1000, APPROVAL_PREVIEW_MAX)
+        for (key in listOf("content", "text", "body")) {
+            fun preview(length: Int) = callToolApprovalSummary(CallToolApproval("request", "p".repeat(32), "write_file", JSONObject().put(key, "z".repeat(length)).toString())).preview
+            assertEquals("z".repeat(300), preview(300))
+            assertEquals("z".repeat(1000), preview(1000))
+            assertEquals("z".repeat(999) + "…", preview(1001))
+            assertEquals(1000, preview(5000).length)
+        }
     }
 
     @Test fun approvalSummaryShowsAllRecipientKindsBeforeOtherFields() {
@@ -128,14 +138,26 @@ class CallToolApprovalTest {
         assertEquals("ls", JSONObject(CallToolApproval.from(forbidden).arguments).getString("command"))
     }
 
-    @Test fun summaryFieldsCutAtOneHundredCharactersEndWithAnEllipsis() {
-        val recipients = (1..12).joinToString(", ") { "person$it@example.invalid" }
+    @Test fun summaryFieldsCutAtFourHundredCharactersEndWithAnEllipsis() {
+        assertEquals(400, APPROVAL_FIELD_MAX)
+        val recipients = (1..40).joinToString(", ") { "person$it" + "@" + "example.invalid" }
         val summary = callToolApprovalSummary(CallToolApproval("request", "p".repeat(32), "send_email", JSONObject()
-            .put("to", recipients).put("cc", "y".repeat(101)).put("subject", "s".repeat(100)).toString()))
+            .put("to", recipients).put("cc", "y".repeat(401)).put("subject", "s".repeat(400)).toString()))
         val (to, cc, subject) = summary.fields.split(" · ").map { it.substringAfter(": ") }
-        assertEquals(100, to.length); assertTrue(to.endsWith("…")); assertEquals(recipients.take(99), to.dropLast(1))
-        assertEquals("y".repeat(99) + "…", cc)
-        assertEquals("s".repeat(100), subject)
+        assertEquals(400, to.length); assertTrue(to.endsWith("…")); assertEquals(recipients.take(399), to.dropLast(1))
+        assertEquals("y".repeat(399) + "…", cc)
+        assertEquals("s".repeat(400), subject)
+    }
+
+    /** A dozen recipients are a normal message: nothing of them is cut, and a list reads as the owner writes it, not as JSON. */
+    @Test fun aListOfRecipientsShowsWholeAndReadsAsAList() {
+        val recipients = (1..12).joinToString(", ") { "person$it" + "@" + "example.invalid" }
+        val plain = callToolApprovalSummary(CallToolApproval("request", "p".repeat(32), "send_email", JSONObject().put("to", recipients).toString()))
+        assertEquals("to: $recipients", plain.fields)
+        val list = callToolApprovalSummary(CallToolApproval("request", "p".repeat(32), "send_email", JSONObject()
+            .put("to", org.json.JSONArray((1..12).map { "person$it" + "@" + "example.invalid" })).toString()))
+        assertEquals("to: $recipients", list.fields)
+        assertFalse(list.fields.contains("[") || list.fields.contains("\""))
     }
 
     @Test fun fileWriteSummaryShowsActionShortTargetAndContentPreview() {

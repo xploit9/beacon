@@ -46,8 +46,8 @@ class SettingsHubTest {
         assertEquals(SettingsRowSummary("Gemini Live", SettingsStatus.Ok, "Key saved"), row("Voice & calls", voice))
         assertEquals(SettingsRowSummary("Grok", SettingsStatus.Attention, "Add key"), row("Voice & calls", SettingsSnapshot(voiceProviderId = "grok", voiceKeySaved = false)))
         assertEquals(SettingsRowSummary(), row("Voice & calls", SettingsSnapshot(voiceProviderId = "gemini")))
-        assertEquals(SettingsRowSummary("", SettingsStatus.Ok, "Keep connected on"), row("Notifications & Keep connected", SettingsSnapshot(keepConnectedEnabled = true)))
-        assertEquals(SettingsRowSummary("", SettingsStatus.Off, "Keep connected off"), row("Notifications & Keep connected", SettingsSnapshot(keepConnectedEnabled = false)))
+        assertEquals(SettingsRowSummary("", SettingsStatus.Ok, "Keep connected is on"), row("Notifications & Keep connected", SettingsSnapshot(keepConnectedEnabled = true)))
+        assertEquals(SettingsRowSummary("", SettingsStatus.Off, "Keep connected is off"), row("Notifications & Keep connected", SettingsSnapshot(keepConnectedEnabled = false)))
         assertEquals(SettingsRowSummary("", SettingsStatus.Ok, "Healthy"), row("Health", SettingsSnapshot(serverHealthy = true)))
         assertEquals(SettingsRowSummary("", SettingsStatus.Attention, "Needs attention"), row("Health", SettingsSnapshot(serverHealthy = false)))
         assertEquals(SettingsRowSummary("", SettingsStatus.Attention, "Update available"), row("Server updates", SettingsSnapshot(serverUpdateAvailable = true)))
@@ -87,6 +87,24 @@ class SettingsHubTest {
         val summary = settingsRowSummary(settingsSummary("Connection", SettingsSnapshot(connected = false, account = "Connected", profile = "Offline"))) { "T:$it" }
         assertEquals("Connected · Offline", summary.value)
         assertEquals("T:Offline", summary.statusLabel)
+    }
+
+    @Test fun phoneAccessSaysOffWhenNothingIsOnAndNamesWhatIsOnOtherwise() {
+        // Nothing switched on is a known state, with the same Off pill the other rows use for theirs.
+        assertEquals(SettingsRowSummary("", SettingsStatus.Off, "Off"), row("Phone access", SettingsSnapshot(phoneAccess = emptyList())))
+        // Otherwise the enabled ones, in the page's own order, and no pill.
+        assertEquals(SettingsRowSummary("Contacts · Messages"), row("Phone access", SettingsSnapshot(phoneAccess = listOf("Contacts", "Messages"))))
+        assertEquals(SettingsRowSummary("Alarms & timers"), row("Phone access", SettingsSnapshot(phoneAccess = listOf("Alarms & timers"))))
+        // Not read yet is not "off": the row keeps its description.
+        assertEquals(SettingsRowSummary(), row("Phone access", SettingsSnapshot(phoneAccess = null)))
+    }
+
+    @Test fun theOffPillAndTheCapabilityNamesAreTranslated() {
+        assertTrue("Off" in settingsPillWords && "Off" in SettingsStrings)
+        val translated = settingsRowSummary(settingsSummary("Phone access", SettingsSnapshot(phoneAccess = emptyList()))) { if (it == "Off") "Spento" else it }
+        assertEquals("Spento", translated.statusLabel)
+        val named = settingsRowSummary(settingsSummary("Phone access", SettingsSnapshot(phoneAccess = listOf("Contacts", "Phone calls")))) { "T:$it" }
+        assertEquals("T:Contacts · T:Phone calls", named.value)
     }
 
     @Test fun everyPillIsAShortWord() {

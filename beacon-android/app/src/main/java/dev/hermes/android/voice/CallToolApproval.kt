@@ -1,9 +1,15 @@
 package dev.hermes.android.voice
 
+import dev.hermes.android.phone.PhoneTools
 import org.json.JSONObject
 import org.json.JSONArray
 
-data class CallToolApproval(val requestId: String, val proposalId: String, val toolName: String, val arguments: String, val busy: Boolean = false, val error: String = "", val allowCall: Boolean = true) {
+/** What a phone request's card says, already in the phone's language: the headline, who or where, more detail lines and a notes or message preview. */
+data class PhoneApprovalText(val action: String, val target: String = "", val details: String = "", val preview: String = "",
+    /** Seconds the card counts down before it places the call by itself; 0 means the owner must tap. Only a call can have one. */ val countdown: Int = 0,
+    /** When the card was made on the phone's elapsed clock; a card never stamped, or one that waited too long to be drawn, does not count down. */ val askedAt: Long = 0)
+
+data class CallToolApproval(val requestId: String, val proposalId: String, val toolName: String, val arguments: String, val busy: Boolean = false, val error: String = "", val allowCall: Boolean = true, val phone: PhoneApprovalText? = null) {
     companion object {
         fun from(value: JSONObject): CallToolApproval {
             val request = value.getString("request_id")
@@ -13,14 +19,50 @@ data class CallToolApproval(val requestId: String, val proposalId: String, val t
             require(request.matches(Regex("[A-Za-z0-9_-]{1,160}")) && proposal.matches(Regex("[A-Za-z0-9_-]{32,80}")))
             require(name.isNotBlank() && name.length <= 200 && arguments.toByteArray(Charsets.UTF_8).size <= 65536)
             // Older plugins omit the field and keep offering the call-long allowance; any present value other than true withholds it.
-            return CallToolApproval(request, proposal, name, arguments, allowCall = !value.has("allow_call") || value.opt("allow_call") == true)
+            // Only this phone's own tools carry a card; a Hermes proposal never can, whatever its fields say.
+            val card = if (name in PhoneTools.names) value.optJSONObject("phone_card")?.let {
+                // The notes or message arrive whole (up to the phone tools' own bounds): a card must not hide what will be written.
+                PhoneApprovalText(it.optString("action").take(300), it.optString("target").take(100), it.optString("details").take(1200), it.optString("preview").take(1000),
+                    if (name == "phone_call") it.optInt("countdown").coerceIn(0, 5) else 0, it.optLong("asked_at"))
+            }?.takeIf { it.action.isNotBlank() } else null
+            return CallToolApproval(request, proposal, name, arguments, allowCall = !value.has("allow_call") || value.opt("allow_call") == true, phone = card)
         }
     }
 }
 
+/**
+ * Which approvals have a card really on screen, counted per request id (the app's dialog and the overlay can each show one). The
+ * call posts a notification for every approval that has none, so an approval is never left with no card and no notification.
+ */
+internal class ApprovalCardsOnScreen {
+    private val counts = HashMap<String, Int>()
+
+    @Synchronized fun shown(requestId: String): Boolean = (counts[requestId] ?: 0) > 0
+
+    /** A card of [requestId] arrived ([on]) or left. True when the request went from having no card on screen to having one, or back. */
+    @Synchronized fun set(requestId: String, on: Boolean): Boolean {
+        val before = counts[requestId] ?: 0
+        val after = (before + if (on) 1 else -1).coerceAtLeast(0)
+        if (after == 0) counts.remove(requestId) else counts[requestId] = after
+        return (before > 0) != (after > 0)
+    }
+}
+
+/**
+ * The approval a notification should ask about: the first one still waiting that has no card on screen. Null when the card on screen
+ * is the approval (the app shows its first one) or nothing waits, so no notification stands beside a card and none is missing without one.
+ */
+internal fun approvalNeedingNotification(approvals: List<CallToolApproval>, cardShown: (String) -> Boolean): CallToolApproval? {
+    val first = approvals.firstOrNull() ?: return null
+    if (cardShown(first.requestId)) return null
+    return approvals.firstOrNull { !it.busy && !cardShown(it.requestId) }
+}
+
 /** Pending work shares the gateway's 64-request bound; only cosmetic recent receipts may be clipped. */
 internal fun pendingCallToolApprovals(current: List<CallToolApproval>, event: JSONObject): List<CallToolApproval> = when (event.optString("type")) {
-    "tool_approval" -> CallToolApproval.from(event).let { approval -> current.filterNot { it.requestId == approval.requestId } + approval }
+    "tool_approval" -> CallToolApproval.from(event).let { approval ->
+        if (current.any { it.requestId == approval.requestId }) current.map { if (it.requestId == approval.requestId) approval else it } else current + approval
+    }
     "tool_receipt" -> if (callProposalNeedingOwnerApproval(event) == null) current.filterNot { it.requestId == event.optString("request_id") } else current
     else -> current
 }
@@ -34,6 +76,8 @@ internal data class CallApprovalSummary(
 )
 
 internal fun callToolApprovalSummary(approval: CallToolApproval): CallApprovalSummary {
+    // A phone request shows exactly what will run: the headline, who or where, the details and the notes or message.
+    approval.phone?.let { return CallApprovalSummary(it.action, it.target, it.preview, "", it.details) }
     val arguments = runCatching { JSONObject(approval.arguments) }.getOrDefault(JSONObject())
     val name = approval.toolName.substringAfterLast("__").lowercase()
     val words = name.replace('_', ' ').split(' ').filter(String::isNotBlank)
@@ -52,20 +96,27 @@ internal fun callToolApprovalSummary(approval: CallToolApproval): CallApprovalSu
     val target = listOf(fileName, folder).filter(String::isNotBlank).joinToString(" · ")
     val previewKey = listOf("command", "cmd", "code", "content", "text", "body").firstOrNull { arguments.optString(it).isNotBlank() }
     val previewText = previewKey?.let { arguments.optString(it) }?.trim()?.replace(Regex("\\s+"), " ").orEmpty()
-    // A command is shown nearly whole and a clipped preview always says so, so nothing hides behind "Always allow".
-    val previewLimit = if (previewKey in setOf("command", "cmd", "code")) 1000 else 160
-    val preview = previewText.clipWithEllipsis(previewLimit)
+    // A command, a note or a message is shown nearly whole and a clipped preview always says so, so nothing hides behind "Always allow".
+    val preview = previewText.clipWithEllipsis(APPROVAL_PREVIEW_MAX)
     val service = approval.toolName.takeIf { it.startsWith("mcp__") }
         ?.removePrefix("mcp__")?.substringBefore("__")?.split('_')
         ?.joinToString(" ") { it.replaceFirstChar { char -> char.titlecase() } }.orEmpty()
     val fields = listOf("to", "cc", "bcc", "subject", "query", "title", "name", "filename", "url")
         .mapNotNull { key ->
-            val value = arguments.opt(key).takeIf { it is String || it is Number || it is Boolean || it is JSONArray }?.toString()
-                ?.takeIf(String::isNotBlank)?.clipWithEllipsis(100) ?: return@mapNotNull null
+            val value = arguments.opt(key).takeIf { it is String || it is Number || it is Boolean || it is JSONArray }
+                // A list (several recipients) reads as the owner would write it, not as JSON.
+                ?.let { if (it is JSONArray) (0 until it.length()).map { index -> it.opt(index).toString() }.filter(String::isNotBlank).joinToString(", ") else it.toString() }
+                ?.takeIf(String::isNotBlank)?.clipWithEllipsis(APPROVAL_FIELD_MAX) ?: return@mapNotNull null
             "$key: $value"
         }.joinToString(" · ")
     return CallApprovalSummary(action, target, preview, service, fields)
 }
+
+/** The longest preview of a command, note or message an approval shows; only text beyond it is cut, and the cut says so. */
+internal const val APPROVAL_PREVIEW_MAX = 1000
+
+/** The longest a field of an approval (a subject, a list of recipients) shows before it ends with an ellipsis. */
+internal const val APPROVAL_FIELD_MAX = 400
 
 private fun String.clipWithEllipsis(limit: Int) = if (length > limit) take(limit - 1) + "…" else this
 
@@ -124,26 +175,21 @@ data class CallToolReceipt(
     }
 }
 
-internal fun CallToolReceipt.approvalCaption(): String? = when (approvedBy) {
-    "chat_yolo" -> "Approvals skipped in this chat"
-    "profile_off" -> "Approvals off"
-    "smart", "memory" -> "Allowed automatically"
-    "call_allowance" -> "Allowed for this call"
-    else -> null
-}
-
 private fun CallToolReceipt.service(): String? = toolName.takeIf { it.startsWith("mcp__") }?.removePrefix("mcp__")?.substringBefore("__")
     ?.split('_')?.joinToString(" ") { it.replaceFirstChar { char -> char.titlecase() } }?.takeIf(String::isNotBlank)
 
 /** What the activity names: the service for an MCP tool, else the tool. It is the {0} of [activityTemplate]. */
 internal fun CallToolReceipt.activitySubject(): String = service() ?: toolName.substringAfterLast("__").lowercase().replace('_', ' ').replaceFirstChar { it.titlecase() }
 
-/** The activity with its subject left as {0}, so uiText can translate the wording and the subject goes in after. */
+/**
+ * The activity with its subject left as {0}, so uiText can translate the wording and the subject goes in after. The card, the overlay's
+ * tool line and the call status all read this one wording: a service is "Using", never "Checking", because the tool may write as well as read.
+ */
 internal fun CallToolReceipt.activityTemplate(): String? {
     if (status !in setOf("ready", "running")) return null
     val tool = toolName.substringAfterLast("__").lowercase()
     return when {
-        service() != null -> "Checking {0}…"
+        service() != null -> "Using {0}…"
         tool in setOf("write_file", "create_file") -> "Writing a file…"
         tool in setOf("edit_file", "patch_file") -> "Updating a file…"
         tool in setOf("read_file", "list_directory") -> "Reading files…"
@@ -153,15 +199,14 @@ internal fun CallToolReceipt.activityTemplate(): String? {
 
 internal fun CallToolReceipt.activityLabel(): String? = activityTemplate()?.replace("{0}", activitySubject())
 
-/** [activityTemplate] as the call status line says it: a service is "Using", not "Checking". */
-internal fun CallToolReceipt.statusTemplate(): String? = activityTemplate()?.let { if (it == "Checking {0}…") "Using {0}…" else it }
+/** The same wording as [activityTemplate]: the status line and the tool card never differ in their verb. */
+internal fun CallToolReceipt.statusTemplate(): String? = activityTemplate()
 
 internal fun CallToolReceipt.statusLabel(): String? = statusTemplate()?.replace("{0}", activitySubject())
 
 /** The receipt texts that reach uiText whole or as templates; the tool chip's "<tool> complete" forms are built from the tool's own name. */
 internal val CallToolStrings = listOf(
-    "Checking {0}…", "Using {0}…", "Writing a file…", "Updating a file…", "Reading files…",
-    "Approvals skipped in this chat", "Approvals off", "Allowed automatically", "Allowed for this call",
+    "Using {0}…", "Writing a file…", "Updating a file…", "Reading files…",
     "Needs approval", "Completion not confirmed", "Action denied", "Approval expired", "Action cancelled",
 )
 

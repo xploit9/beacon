@@ -58,14 +58,15 @@ class PluginHealthUiTest {
 
     private fun health(json: JSONObject = answer(), keepConnected: Boolean = false): PluginHealth = requireNotNull(pluginHealthOf(json, keepConnected, voiceKeySaved = true))
 
-    @Test fun aHealthySectionShowsEveryRowAndCheckNowReportsTheRoundTrip() {
+    @Test fun aHealthySectionShowsOnlyWhatTheOwnerCanActOnAndCheckNowReportsTheRoundTrip() {
         var checks = 0
         var trip by mutableStateOf<Long?>(null)
         compose.showPage { SettingsSection("Beacon plugin") { PluginHealthRows(health(), trip, false) { checks++; trip = 84 } } }
         compose.onNodeWithTag("plugin-health-status").assertIsDisplayed().assertTextContains("Healthy")
         compose.onNodeWithTag("plugin-health-version").assertTextContains("1.1.23")
-        compose.onNodeWithTag("plugin-health-dashboard").assertTextContains("Up to date")
-        compose.onNodeWithTag("plugin-health-gateway").assertTextContains("Running")
+        // "Healthy" already says the dashboard and the gateway are fine, so their rows stay out of sight.
+        compose.onNodeWithTag("plugin-health-dashboard").assertDoesNotExist()
+        compose.onNodeWithTag("plugin-health-gateway").assertDoesNotExist()
         compose.onNodeWithTag("plugin-health-calls").assertTextContains("Ready")
         compose.onNodeWithTag("plugin-health-notifications").assertTextContains("Ready")
         compose.onNodeWithText("Hermes answered in 84 ms").assertDoesNotExist()
@@ -81,13 +82,21 @@ class PluginHealthUiTest {
         compose.onNodeWithTag("plugin-health-dashboard").assertTextContains("Needs restart")
         compose.onNodeWithTag("plugin-health-gateway").assertTextContains("Stopped")
         compose.onNodeWithTag("plugin-health-calls").assertTextContains("Hermes took too long")
-        compose.onNodeWithTag("plugin-health-notifications").assertTextContains("Turn on Keep connected")
+        compose.onNodeWithTag("plugin-health-notifications").assertTextContains("Keep connected is off")
+    }
+
+    @Test fun aRowAppearsOnlyWhileItNeedsAttention() {
+        compose.showPage { SettingsSection("Beacon plugin") { PluginHealthRows(health(answer(dashboardCurrent = false)), null, false) {} } }
+        compose.onNodeWithTag("plugin-health-dashboard").assertIsDisplayed().assertTextContains("Needs restart")
+        compose.onNodeWithTag("plugin-health-gateway").assertDoesNotExist()
+        compose.onNodeWithTag("plugin-health-status").assertTextContains("Needs attention")
     }
 
     @Test fun keepConnectedStandsInForPushAndABusyGatewayIsInProgressNotAFault() {
         compose.showPage { SettingsSection("Beacon plugin") { PluginHealthRows(health(answer(gatewayBusy = true, pushReady = false), keepConnected = true), null, false) {} } }
         compose.onNodeWithTag("plugin-health-notifications").assertTextContains("Keep connected is on")
-        compose.onNodeWithTag("plugin-health-gateway").assertTextContains("Working")
+        // A gateway at work is neither a fault nor a success, so it has no row of its own.
+        compose.onNodeWithTag("plugin-health-gateway").assertDoesNotExist()
         compose.onNodeWithTag("plugin-health-status").assertTextContains("Healthy")
     }
 
@@ -121,7 +130,7 @@ class PluginHealthUiTest {
         val opened = mutableListOf<HealthTarget>()
         compose.showPage { SettingsSection("Beacon plugin") { PluginHealthRows(health(answer(pushReady = false)), null, false, { opened += it }) {} } }
         compose.onNodeWithTag("plugin-health-status").assertTextContains("Healthy")
-        compose.onNodeWithTag("plugin-health-notifications").assertTextContains("Turn on Keep connected").performClick()
+        compose.onNodeWithTag("plugin-health-notifications").assertTextContains("Keep connected is off").performClick()
         compose.runOnIdle { assertEquals(listOf(HealthTarget.Notifications), opened) }
     }
 
@@ -183,7 +192,7 @@ class PluginHealthUiTest {
             if (name == "ar-dark") compose.waitUntil(5_000) { compose.onAllNodesWithText("لوحة تحكم Hermes").fetchSemanticsNodes().isNotEmpty() }
             compose.waitForIdle()
             for (tag in listOf("plugin-health-dashboard", "plugin-health-calls", "plugin-health-notifications")) compose.onNodeWithTag(tag).assertHasClickAction().assertHeightIsAtLeast(48.dp)
-            compose.onNodeWithTag("plugin-health-gateway").assertHasNoClickAction()
+            compose.onNodeWithTag("plugin-health-gateway").assertDoesNotExist()
             Thread.sleep(800)
             compose.waitForIdle()
             val image = requireNotNull(InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot())
@@ -194,9 +203,9 @@ class PluginHealthUiTest {
         File(compose.activity.filesDir, "plugin-health/synthetic.json").writeText(saved.toString(2), Charsets.UTF_8)
     }
 
-    @Test fun theBusyGatewayShowsWorkingNotACheckMark() {
+    @Test fun theBusyGatewayIsNeitherAFaultNorACheckMark() {
         compose.showPage { SettingsSection("Beacon plugin") { PluginHealthRows(health(answer(gatewayBusy = true)), null, false) {} } }
-        compose.onNodeWithTag("plugin-health-gateway").assertTextContains("Working").assertHasNoClickAction()
+        compose.onNodeWithTag("plugin-health-gateway").assertDoesNotExist()
         compose.onNodeWithTag("plugin-health-status").assertTextContains("Healthy")
     }
 
@@ -205,7 +214,8 @@ class PluginHealthUiTest {
             val density = LocalDensity.current
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl, LocalDensity provides Density(density.density, fontScale = 1.6f)) {
                 NativeLocalization("ar") {
-                    dev.hermes.android.BeaconTheme(dark = false) { SettingsSection("Beacon plugin") { PluginHealthRows(health(), 84, false) {} } }
+                    // The dashboard and the gateway rows only show when they need the owner, so this answer needs both.
+                    dev.hermes.android.BeaconTheme(dark = false) { SettingsSection("Beacon plugin") { PluginHealthRows(health(answer(dashboardCurrent = false, gatewayRunning = false)), 84, false) {} } }
                 }
             }
         }

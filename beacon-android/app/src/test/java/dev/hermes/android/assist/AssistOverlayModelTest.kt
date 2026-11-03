@@ -15,8 +15,6 @@ import dev.hermes.android.voice.CALL_VOICE_STOPPED
 import dev.hermes.android.voice.CallFailureStrings
 import androidx.compose.ui.geometry.Rect
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.currentTime
@@ -53,7 +51,7 @@ class AssistOverlayModelTest {
         assertEquals(OverlayPhase.Dismissing, reduce(leaving, OverlayEvent.Summoned).phase)
     }
 
-    @Test fun aRunningCallOpensStraightIntoTheLiveBand() {
+    @Test fun aRunningCallOpensStraightIntoTheLiveConversation() {
         assertEquals(OverlaySurface.Live, shown(callActive = true).surface)
         val asked = reduce(open(), OverlayEvent.Asked("Weather?", false, "s1"))
         // A call started elsewhere while an answer shows takes over; when it ends the answer is back.
@@ -299,9 +297,31 @@ class AssistOverlayModelTest {
         assertEquals("You asked about the weather.", back.ask.answer)
     }
 
-    @Test fun talkingAndAskingWorkLockedButOpeningAnythingUnlocksFirst() {
-        val free = listOf(OverlayAction.Ask, OverlayAction.Dictate, OverlayAction.Live, OverlayAction.Mute, OverlayAction.EndCall, OverlayAction.Type, OverlayAction.CloseCard, OverlayAction.Dismiss, OverlayAction.AttachScreen)
-        val gated = listOf(OverlayAction.OpenInBeacon, OverlayAction.OpenCall, OverlayAction.ContinueChat, OverlayAction.OpenWaiting, OverlayAction.Reveal, OverlayAction.Settings)
+    /** Strix vuln-0005: the card drew the owner's own question over the lock screen while only the reply waited for the unlock. */
+    @Test fun lockedTheOwnersQuestionIsHiddenLikeTheReply() {
+        val question = "What did the clinic say about my biopsy results?"
+        val done = OverlayAsk(question, answer = "Clear. No further tests until March.", streaming = false)
+        assertEquals("", answerQuestion(locked = true, ask = done))
+        assertEquals("a reply still streaming hides it too", "", answerQuestion(locked = true, ask = done.copy(answer = "", streaming = true)))
+        assertEquals(question, answerQuestion(locked = false, ask = done))
+        // The phone locks with the card up: the state keeps the question (it is what comes back after the unlock); the draw drops it.
+        val answered = reduce(reduce(reduce(open(), OverlayEvent.Asked(question, false, "s1")), OverlayEvent.Progress(done.answer, streaming = false)), OverlayEvent.DictationStopped)
+        assertEquals(OverlaySurface.Answer, answered.surface)
+        assertEquals(question, answered.ask?.question)
+        assertEquals("", answerQuestion(locked = true, ask = answered.ask!!))
+        // Hide, lock, show again: the card returns with its question held, and it is drawn only once the phone is unlocked.
+        val reshown = reduce(reduce(answered, OverlayEvent.Hidden), OverlayEvent.Show(fresh = false, callActive = false, locked = true))
+        assertEquals(OverlaySurface.Answer, reshown.surface)
+        assertEquals("", answerQuestion(locked = true, ask = reshown.ask!!))
+        assertEquals(question, answerQuestion(locked = false, ask = reshown.ask))
+    }
+
+    @Test fun lockedNothingIsAskedHeardOrStartedAndOpeningAnythingUnlocksFirst() {
+        // On a locked phone the side button asks for the unlock first (Lane LK): asking, dictating and starting wait for it, as does
+        // everything that opens the app or a settings screen. Ending a conversation, closing and dismissing never do.
+        val free = listOf(OverlayAction.EndCall, OverlayAction.Type, OverlayAction.CloseCard, OverlayAction.Dismiss, OverlayAction.AttachScreen)
+        val gated = listOf(OverlayAction.Ask, OverlayAction.Dictate, OverlayAction.Live,
+            OverlayAction.OpenInBeacon, OverlayAction.ContinueChat, OverlayAction.OpenWaiting, OverlayAction.Reveal, OverlayAction.Settings)
         assertEquals(OverlayAction.entries.toSet(), (free + gated).toSet())
         free.forEach { assertFalse("$it must work locked", needsUnlock(it, locked = true)) }
         gated.forEach { assertTrue("$it must unlock first", needsUnlock(it, locked = true)) }
@@ -532,95 +552,5 @@ class AssistOverlayModelTest {
         val overlay = source("AssistOverlay.kt")
         assertTrue(overlay.contains("stack.top - GROUND_LEAD_DP.dp.toPx()"))
         assertTrue(overlay.contains("background.copy(alpha = groundAlpha(dark) * appear)"))
-    }
-
-    // --- N-4: the first summon's hint and the chips ---
-
-    @OptIn(ExperimentalCoroutinesApi::class)
-    @Test fun theChipsRiseOnlyAfterTheFirstSummonsHintHasFadedAway() = runTest {
-        val log = mutableListOf<String>()
-        var state = shown()
-        var stage = HintStage.Unknown
-        launch { delay(100); state = reduce(state, OverlayEvent.Summoned) }
-        val job = launch {
-            playTalkHint(
-                seen = { log += "$currentTime read"; false }, markSeen = { log += "$currentTime marked" }, state = { state },
-                stage = { stage = it; log += "$currentTime stage $it" }, visible = { log += "$currentTime hint $it" },
-                holdMillis = 1_500, fadeMillis = TALK_HINT_FADE_MILLIS.toLong(),
-            )
-        }
-        // The pill is still forming: the hint waits, and the chips are held.
-        advanceTimeBy(90); runCurrent()
-        assertEquals(listOf("0 read"), log)
-        assertFalse(chipsMayRise(stage))
-        // It appears once the pill is open, and is marked seen as it does; the chips are held while it shows.
-        advanceTimeBy(200); runCurrent()
-        assertEquals(listOf("read", "marked", "stage Playing", "hint true"), log.map { it.substringAfter(' ') })
-        assertFalse(chipsMayRise(stage))
-        val shownAt = log.last().substringBefore(' ').toLong()
-        // Still held for the whole hold, and through the fade after it.
-        advanceTimeBy(shownAt + 1_499 - currentTime); runCurrent()
-        assertEquals(HintStage.Playing, stage)
-        advanceTimeBy(2); runCurrent()
-        assertEquals("hint false", log.last().substringAfter(' '))
-        assertEquals(1_500L, log.last().substringBefore(' ').toLong() - shownAt)
-        assertFalse("The chips wait while the hint fades", chipsMayRise(stage))
-        val hiddenAt = log.last().substringBefore(' ').toLong()
-        advanceTimeBy(hiddenAt + TALK_HINT_FADE_MILLIS - 1 - currentTime); runCurrent()
-        assertFalse(chipsMayRise(stage))
-        advanceTimeBy(2); runCurrent()
-        assertEquals("stage Over", log.last().substringAfter(' '))
-        assertEquals(TALK_HINT_FADE_MILLIS.toLong(), log.last().substringBefore(' ').toLong() - hiddenAt)
-        assertTrue(chipsMayRise(stage))
-        assertFalse(job.isActive)
-    }
-
-    @OptIn(ExperimentalCoroutinesApi::class)
-    @Test fun aHintSeenBeforeNeverHoldsTheChipsAndAClosedShowKeepsItForTheNext() = runTest {
-        suspend fun play(seen: Boolean, state: AssistOverlayState): List<String> {
-            val log = mutableListOf<String>()
-            playTalkHint(
-                seen = { seen }, markSeen = { log += "marked" }, state = { state }, stage = { log += "stage $it" }, visible = { log += "hint $it" },
-                holdMillis = 1_500, fadeMillis = 240,
-            )
-            return log
-        }
-        // Seen already: the chips rise at once, nothing is shown, nothing is marked.
-        assertEquals(listOf("stage Over"), play(seen = true, state = open()))
-        // The show closed while the pill formed, or the answer card is up instead of the pill: the hint keeps for the next show.
-        assertEquals(listOf("stage Over"), play(seen = false, state = reduce(shown(), OverlayEvent.Dismiss)))
-        assertEquals(listOf("stage Over"), play(seen = false, state = reduce(open(), OverlayEvent.Asked("Hi", false, "s1"))))
-        assertEquals(listOf("stage Over"), play(seen = false, state = open(callActive = true)))
-        // Cancelled while it shows (the overlay hid): the hint comes down, and the next show starts over.
-        val log = mutableListOf<String>()
-        val job: Job = launch {
-            playTalkHint(seen = { false }, markSeen = { log += "marked" }, state = { open() }, stage = { log += "stage $it" }, visible = { log += "hint $it" }, holdMillis = 1_500, fadeMillis = 240)
-        }
-        runCurrent(); advanceTimeBy(500)
-        job.cancel(); runCurrent()
-        assertEquals(listOf("marked", "stage Playing", "hint true", "hint false"), log)
-    }
-
-    @Test fun theHintsEndSitsOnThePillsEndAndMirrorsInRightToLeft() {
-        // Pill 42..1038 px wide, a 240 px capsule: its end is the pill's end (right edge in LTR, left edge in RTL), 16 dp from the screen.
-        val ltr = hintLeft(42f, 1038f, 240f, rtl = false)
-        assertEquals(1038f, ltr + 240f)
-        val rtl = hintLeft(42f, 1038f, 240f, rtl = true)
-        assertEquals(42f, rtl)
-        // The orb sits at the pill's end, 6 dp padding plus half its 48 dp from it; the pointer falls on it inside the capsule.
-        val dp = 2.625f
-        val orbLtr = 1038f - 30 * dp
-        val orbRtl = 42f + 30 * dp
-        assertTrue((orbLtr - ltr) in 0f..240f)
-        assertTrue((orbRtl - rtl) in 0f..240f)
-        assertEquals(240f - 30 * dp, orbLtr - ltr, .01f)
-        assertEquals(30 * dp, orbRtl - rtl, .01f)
-        // A capsule wider than the room left of the pill's end stays on the screen.
-        assertEquals(0f, hintLeft(42f, 100f, 240f, rtl = false))
-        // The overlay places it with that rule and holds the chips by the stage, and the tag sits on the glass for the tests.
-        val overlay = source("AssistOverlay.kt")
-        assertTrue(overlay.contains("hintLeft(bar.left, bar.right, bubble.width.toFloat(), rtl)"))
-        assertTrue(overlay.contains("val held = !chipsMayRise(c.hint)"))
-        assertTrue(overlay.contains("if (held) return@LaunchedEffect"))
     }
 }

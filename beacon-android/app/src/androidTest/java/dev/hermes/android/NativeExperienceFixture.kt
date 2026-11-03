@@ -70,6 +70,11 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
     val proactiveRequests = ConcurrentHashMap<String, CopyOnWriteArrayList<JSONObject>>()
     val proactiveLearned = ConcurrentHashMap<String, CopyOnWriteArrayList<String>>()
     val proactiveFeedbacks = CopyOnWriteArrayList<JSONObject>()
+    /** The rules Hermes proposes from earlier ratings (`learned_proposal`), and what the app sent when the owner turned them into rules. */
+    val proactiveProposal = ConcurrentHashMap<String, CopyOnWriteArrayList<JSONObject>>()
+    val proactiveLearnedRuleBodies = CopyOnWriteArrayList<JSONObject>()
+    /** The suggestion Hermes builds for an alert, by notice id; an alert without one gets a sender-based default. */
+    val proactiveSuggestions = ConcurrentHashMap<String, JSONObject>()
     val voices = ConcurrentHashMap(mapOf("gemini" to "Kore", "grok" to "ara"))
     val personalities = ConcurrentHashMap(mapOf("gemini" to "balanced", "grok" to "balanced"))
     @Volatile var roomName = "Shared workspace"
@@ -491,6 +496,7 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
         "health" to (proactiveHealth[profile] ?: json("state" to "unknown")).copy(),
         "rules" to JSONArray(proactiveRequests[profile]?.map { it.copy() } ?: emptyList<JSONObject>()),
         "learned" to JSONArray(proactiveLearned[profile]?.toList() ?: emptyList<String>()),
+        "learned_proposal" to JSONArray(proactiveProposal[profile]?.map { it.copy() } ?: emptyList<JSONObject>()),
         "jobs" to JSONArray(),
     )
     private fun http(path: String, method: String, body: JSONObject, profile: String, directory: String, archived: Boolean = false, url: HttpUrl? = null): Pair<Int, JSONObject> {
@@ -532,8 +538,23 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
         path == "/api/plugins/beacon/mobile/proactive/feedback" && method == "POST" -> {
             if (proactiveFeedbackStatusCode != 200) return proactiveFeedbackStatusCode to json("detail" to "Feedback unavailable")
             require(body.has("notice_id") && !body.has("topic") && body.getString("verdict") in setOf("important", "not_important"))
+            // Like the plugin, a rule that cannot be saved leaves the alert unmarked.
+            if (body.has("rule") && proactiveRequests[profile].orEmpty().size >= 20) return 400 to json("detail" to "Proactive request limit reached")
             proactiveFeedbacks += body.copy()
+            // "Save rule": the words the owner reviewed become one importance rule, in the same list as every other rule.
+            if (body.has("rule")) {
+                val requests = proactiveRequests.computeIfAbsent(profile) { CopyOnWriteArrayList() }
+                requests += json("id" to "request-${java.util.UUID.randomUUID()}", "text" to body.getString("rule"), "action" to body.getString("verdict"),
+                    "signal" to "email", "night" to false, "enabled" to true, "created_at" to 1792400000)
+            }
             200 to json("ok" to true)
+        }
+        path == "/api/plugins/beacon/mobile/proactive/suggestion" && method == "GET" -> {
+            val noticeId = url?.queryParameter("notice_id").orEmpty()
+            val verdict = url?.queryParameter("verdict").orEmpty()
+            require(noticeId.isNotBlank() && verdict in setOf("important", "not_important"))
+            200 to (proactiveSuggestions[noticeId]?.copy()?.put("verdict", verdict)
+                ?: json("verdict" to verdict, "source" to "email", "sender" to "Daniel Reyes", "topic" to "Client moved the review", "rule" to "Sent by Daniel Reyes"))
         }
         path == "/api/plugins/beacon/mobile/proactive/requests" && method == "POST" -> {
             val requestText = body.getString("text")
@@ -556,14 +577,32 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
             else {
                 if (body.has("enabled")) request.put("enabled", body.getBoolean("enabled"))
                 if (body.has("night")) request.put("night", body.getBoolean("night"))
+                if (body.has("text")) { require(request.string("action") in setOf("important", "not_important") && body.getString("text").isNotBlank()); request.put("text", body.getString("text")) }
                 if (body.has("action")) { require(body.getString("action") in setOf("notify", "call")); request.put("action", body.getString("action")) }
                 200 to request.copy()
             }
         }
         path == "/api/plugins/beacon/mobile/proactive/learned" && method == "DELETE" -> {
             val notes = proactiveLearned.computeIfAbsent(profile) { CopyOnWriteArrayList() }
-            notes.remove(body.getString("note"))
+            if (body.optBoolean("all")) { notes.clear(); proactiveProposal[profile]?.clear() } else notes.remove(body.getString("note"))
             200 to json("ok" to true)
+        }
+        path == "/api/plugins/beacon/mobile/proactive/learned/rules" && method == "POST" -> {
+            val rules = body.getJSONArray("rules")
+            require(rules.length() in 0..5)
+            // Like the plugin, a list that would pass twenty rules saves none of them.
+            if (proactiveRequests[profile].orEmpty().size + rules.length() > 20) return 400 to json("detail" to "Proactive request limit reached")
+            proactiveLearnedRuleBodies += body.copy()
+            val requests = proactiveRequests.computeIfAbsent(profile) { CopyOnWriteArrayList() }
+            for (index in 0 until rules.length()) {
+                val rule = rules.getJSONObject(index)
+                require(rule.getString("verdict") in setOf("important", "not_important") && rule.getString("rule").isNotBlank())
+                requests += json("id" to "request-${java.util.UUID.randomUUID()}", "text" to rule.getString("rule"), "action" to rule.getString("verdict"),
+                    "signal" to rule.getString("source"), "night" to false, "enabled" to true, "created_at" to 1792400000)
+            }
+            proactiveLearned[profile]?.clear()
+            proactiveProposal[profile]?.clear()
+            200 to json("ok" to true, "saved" to rules.length())
         }
         path == "/api/plugins/beacon/mobile/calls" -> if (callHistoryRouteMissing) 404 to json("detail" to "Unknown route") else 200 to callHistoryResponse.copy()
         path == "/api/plugins/beacon/mobile/notifications/events" -> {

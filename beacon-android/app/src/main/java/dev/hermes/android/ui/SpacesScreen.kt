@@ -97,10 +97,6 @@ internal fun fileTrailFolds(trail: List<FileCrumb>): List<TrailFold> = when {
 internal fun chooseTrailFold(folds: List<TrailFold>, widths: List<Int>, available: Int): TrailFold =
     folds.zip(widths).firstOrNull { (_, width) -> width <= available }?.first ?: folds.last()
 
-/** The server named by its address ("hermes.local"), without scheme, port or path; blank when the address holds no host. */
-internal fun serverHostLabel(origin: String): String =
-    runCatching { java.net.URI(origin.trim()).host }.getOrNull().orEmpty().ifBlank { origin.trim().substringAfter("://").substringBefore('/').substringBefore(':') }
-
 /** Where Files opens: the folder last browsed on this account, else the main folder of the first project that has one. */
 internal fun initialFilesFolder(saved: String, projects: JSONObject?): String {
     if (saved.isNotBlank()) return saved
@@ -172,7 +168,7 @@ internal fun fileModifiedMillis(row: JSONObject): Long {
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val wide = maxWidth >= 720.dp * LocalDensity.current.fontScale.coerceAtLeast(1f)
         Column(Modifier.widthIn(max = 720.dp).fillMaxWidth().fillMaxHeight().align(Alignment.TopCenter).testTag("files-content")) {
-            if (wide || editor.path.isBlank() || editor.scope?.copy(session = "") != scope) Header(uiText("Files"), serverHostLabel(ui.origin).ifBlank { uiText("Hermes") }, menu = LocalOpenNavigationMenu.current) {
+            if (wide || editor.path.isBlank() || editor.scope?.copy(session = "") != scope) Header(uiText("Files"), menu = LocalOpenNavigationMenu.current) {
                 IconButton(onClick = refresh) { Icon(Icons.Rounded.Refresh, uiText("Refresh files")) }
                 Box {
                     IconButton(onClick = { menu = true }, modifier = Modifier.testTag("files-menu")) { Icon(Icons.Rounded.MoreVert, uiText("File actions")) }
@@ -245,7 +241,7 @@ internal fun fileModifiedMillis(row: JSONObject): Long {
  * The folder trail on one line. The fullest fold that the measured row fits is shown: Home folds into the "…" menu before a level
  * is dropped, so a deep path reads "… › Documents › Atelier relaunch" from the leading edge. It scrolls, with a fade, only when even the last level does not fit.
  */
-@Composable private fun FileTrailRow(trail: List<FileCrumb>, onOpen: (String) -> Unit) {
+@Composable internal fun FileTrailRow(trail: List<FileCrumb>, onOpen: (String) -> Unit) {
     val folds = remember(trail) { fileTrailFolds(trail) }
     val scroll = rememberScrollState()
     SubcomposeLayout(Modifier.fillMaxWidth()) { constraints ->
@@ -275,7 +271,8 @@ internal fun fileModifiedMillis(row: JSONObject): Long {
             var fullPath by remember { mutableStateOf(false) }
             val fullPathLabel = uiText("Show full path")
             Box {
-                FilterChip(selected = false, onClick = { fullPath = true }, label = { Text("…") }, modifier = Modifier.semantics { contentDescription = fullPathLabel }.tagged("files-crumb-more"))
+                // Once Home folds into the menu this chip is the trail's root, so it reads as the home icon; a fold of middle levels only keeps the ellipsis.
+                FilterChip(selected = false, onClick = { fullPath = true }, label = { if (view.homeInMenu) Icon(Icons.Rounded.Home, null, Modifier.size(18.dp)) else Text("…") }, modifier = Modifier.semantics { contentDescription = fullPathLabel }.tagged("files-crumb-more"))
                 DropdownMenu(fullPath, { fullPath = false }) {
                     if (view.homeInMenu) DropdownMenuItem({ Text(uiText("Home")) }, { fullPath = false; onOpen("") }, Modifier.testTag("files-crumb-home-menu"), leadingIcon = { Icon(Icons.Rounded.Home, null) })
                     view.menu.forEach { crumb ->

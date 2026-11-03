@@ -508,6 +508,8 @@ class NativeApprovalMenuUiTest {
         content = { ProfileApprovalSettings(it) }, prepare = { _, fixture -> fixture.sessions.getValue("chat-a").getJSONObject("info").put("yolo", true) },
     ) { vm, fixture ->
         await { vm.data.value["profile:approvals"] != null }
+        // One line says what each segment does.
+        compose.onNodeWithTag("profile-approvals-caption").assertIsDisplayed().assert(hasText("Manual asks every time. Auto lets safe actions through."))
         compose.onNodeWithTag("profile-approval-smart").performClick()
         await { fixture.approvalMode == "smart" && vm.data.value["profile:approvals"]?.string("value") == "smart" }
         compose.onNodeWithTag("profile-approval-smart").assert(isSelected())

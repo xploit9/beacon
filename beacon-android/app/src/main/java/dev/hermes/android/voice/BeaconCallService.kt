@@ -103,7 +103,11 @@ internal fun cameraStopRequested(event: JSONObject): Boolean = event.string("typ
  */
 internal class CallSpec(val client: BeaconClient, val admission: Deferred<JSONObject>, val incoming: Boolean = false, val credentials: VoiceSessionCredentials? = null,
     val tappedAt: Long = 0, val warm: LiveSession? = null, val context: JSONObject? = null, val conversation: String = "",
-    val early: MutableList<JSONObject> = java.util.Collections.synchronizedList(mutableListOf())) {
+    val early: MutableList<JSONObject> = java.util.Collections.synchronizedList(mutableListOf()),
+    /** Where this conversation's phone requests come from: the assistant overlay when it started the call, else the call itself. */
+    val phoneOrigin: dev.hermes.android.phone.PhoneOrigin = dev.hermes.android.phone.PhoneOrigin.LiveCall,
+    /** Whether the phone was unlocked when the call started, or since; until then no tool runs and the brief holds nothing private. Held back unless a start says otherwise. */
+    val trust: CallTrust = CallTrust { true }) {
     constructor(client: BeaconClient, grant: JSONObject) : this(client, CompletableDeferred(grant))
     val grant: JSONObject get() = if (admission.isCompleted && !admission.isCancelled) runCatching { admission.getCompleted() }.getOrElse { JSONObject() } else JSONObject()
 }
@@ -151,6 +155,8 @@ internal fun phoneKeyAnswerBody(provider:String):JSONObject {
 }
 
 class CallController(private val app: BeaconApplication) {
+    // Every live session, warm or not, declares the phone tools that are switched on in Phone access.
+    init { PhoneVoiceTools.attach(app) }
     private val _state = MutableStateFlow(CallState())
     val state = _state.asStateFlow()
     @Volatile internal var spec: CallSpec? = null
@@ -162,6 +168,13 @@ class CallController(private val app: BeaconApplication) {
             // Sign-out, another owner or profile: the warm session belongs to the old account and closes.
             if(account) prewarm.changed()
         }
+    private val approvalCards = ApprovalCardsOnScreen()
+    /**
+     * An approval's card reports here when it is really on screen (drawn on a started screen) and when it leaves or its screen stops.
+     * An approval shows as that card, or as a notification when no card of it is on screen.
+     */
+    fun approvalCardShown(requestId: String, shown: Boolean) { if (approvalCards.set(requestId, shown)) service?.refreshToolNotification() }
+    internal fun approvalCardOnScreen(requestId: String) = approvalCards.shown(requestId)
     fun minimize(expectedId: String) { if(state.value.callId==expectedId) service?.minimize(expectedId) }
     fun resumeWindow() { service?.restoreWindow() }
     fun refreshOverlayPermission() { _state.update { it.withOverlayPermission(android.provider.Settings.canDrawOverlays(app)) } }
@@ -211,12 +224,12 @@ class CallController(private val app: BeaconApplication) {
             .put("provider", provider).put("attempt", 0).apply { warm?.let { put("warm", it) } }
         pending.add(value); stageLog.add(value)
     }
-    suspend fun start(client: BeaconClient, conversationId: String? = null) {
+    suspend fun start(client: BeaconClient, conversationId: String? = null, phoneOrigin: dev.hermes.android.phone.PhoneOrigin = dev.hermes.android.phone.PhoneOrigin.LiveCall) {
         val tappedAt=android.os.SystemClock.elapsedRealtime()
         check(!switching.get()) { "Wait for the voice model switch to finish" }
         val keyStore=VoiceKeyStore(app)
         val credentials=withContext(Dispatchers.IO) { keyStore.session() }?:throw MissingVoiceKeyException(keyStore.settings().provider)
-        start(client, null, conversationId,credentials,tappedAt)
+        start(client, null, conversationId,credentials,tappedAt,phoneOrigin)
     }
     suspend fun switchToGemini(expectedId:String):String {
         val before=state.value
@@ -229,9 +242,10 @@ class CallController(private val app: BeaconApplication) {
             val client=previous.clientForHandoff(expectedId)
             check(uiVisible&&ownerScope==client.scope) { "Open this call before switching" }
             val generation=epoch.incrementAndGet()
+            val phoneOrigin=spec?.phoneOrigin ?: dev.hermes.android.phone.PhoneOrigin.LiveCall
             previous.hangup()
             awaitCallTeardown(previous.destroyed) { epoch.get()==generation&&uiVisible&&ownerScope==client.scope }
-            start(client,null,before.conversationScope.session,credentials)
+            start(client,null,before.conversationScope.session,credentials,phoneOrigin=phoneOrigin)
             replacement=state.value.callId
             withTimeout(45000) {
                 state.first {
@@ -259,7 +273,7 @@ class CallController(private val app: BeaconApplication) {
         } finally { app.push.retryInvitation(source, event) }
     }
     private suspend fun start(client: BeaconClient, incoming: IncomingCall?, conversationId: String? = null, voiceSettings:VoiceSessionCredentials,
-        tappedAt: Long = android.os.SystemClock.elapsedRealtime()) {
+        tappedAt: Long = android.os.SystemClock.elapsedRealtime(), phoneOrigin: dev.hermes.android.phone.PhoneOrigin = dev.hermes.android.phone.PhoneOrigin.LiveCall) {
         fun refuse(template: String): Nothing = throw CallStartRefused(callText(app, template))
         // The last call's camera, screen or microphone release is unconfirmed: nothing new starts until it is.
         if (_state.value.audioStopPending) refuse(CALL_MIC_STILL_ON)
@@ -267,6 +281,8 @@ class CallController(private val app: BeaconApplication) {
         if (_state.value.active) refuse(CALL_ALREADY_ON)
         if (ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) refuse(CALL_ALLOW_MIC)
         if (!starting.compareAndSet(false, true)) refuse(CALL_STILL_CONNECTING)
+        // The lock screen as this conversation finds it, read now: started on a locked phone it is told nothing private until the phone is unlocked.
+        val trust = CallTrust.forPhone(app)
         val generation = epoch.get()
         val frozen = client.detached()
         var grant: JSONObject? = null
@@ -284,7 +300,8 @@ class CallController(private val app: BeaconApplication) {
             val target = conversationId?.takeIf { incoming == null && it.isNotBlank() }?.let { frozen.scope.session(it) }
             // The conversation's context and a live session set up with it are ready before the tap when a call entry was on screen:
             // the live model is asked to greet now, while Hermes admits the call and the service, Telecom and microphone start.
-            val prefetched = target?.let { prewarm.context(it, ownerName) }
+            // The context and the live session read before the tap carry the owner's memory: a locked start takes neither.
+            val prefetched = if (trust.trusted()) target?.let { prewarm.context(it, ownerName) } else null
             warm = if (target != null && prefetched != null) prewarm.claim(target, voiceSettings) else null
             // The Call button's touch-down usually sent it already.
             warm?.takeIf { !it.cueRequested }?.let { it.startTurn(liveStartCue(it.context)) }
@@ -323,7 +340,7 @@ class CallController(private val app: BeaconApplication) {
                 }
                 CompletableDeferred(grant)
             }
-            val call = CallSpec(frozen, admission, incoming != null, voiceSettings, tappedAt, warm, prefetched, target?.session.orEmpty(), early)
+            val call = CallSpec(frozen, admission, incoming != null, voiceSettings, tappedAt, warm, prefetched, target?.session.orEmpty(), early, phoneOrigin, trust)
             spec = call
             // Ended while it was being set up: nothing starts, and the admission is released once it lands (unless the hangup took it).
             if (generation != epoch.get()) { if (spec === call) { spec = null; warm?.close(); background.launch { release(call) } }; return }
@@ -557,11 +574,13 @@ class BeaconCallService : Service() {
                     app.calls.updateFrom(this@BeaconCallService) { it.copy(error=reason) };camera(false);stopScreen()
                     directVoice?.setVisualState(source,"failed",reason)
                 },{ stopScreen() })
+                spec.trust.watch(applicationContext)
                 val direct=DirectVoice(spec.client,spec.grant.optString("call_id"),spec.conversation.ifBlank { spec.grant.getString("conversation_id") },scope,{bytes ->
                     if(!held&&!closed.get()) { if(!audio.enqueue(bytes)&&!closed.get()) { audio.interrupt();app.calls.updateFrom(this@BeaconCallService) { it.copy(error="Playback queue overflow; current speech was interrupted") } } }
                 },::directEvent,::failure,voiceSettings,ownerName=ownerName,ownerFence=closed,ownerActive={ !closed.get() },
                     clock=android.os.SystemClock::elapsedRealtime,tappedAt=spec.tappedAt,warm=spec.warm,prefetched=spec.context,admission=spec.admission,callback=spec.incoming,streamsMicrophone=true,
-                    recentSpeech={ app.calls.state.value.transcripts.takeLast(10).joinToString("\n") { "${it.role}: ${it.text}" }.takeLast(6000) })
+                    recentSpeech={ app.calls.state.value.transcripts.takeLast(10).joinToString("\n") { "${it.role}: ${it.text}" }.takeLast(6000) },
+                    phone=PhoneVoiceBridge(applicationContext,spec.phoneOrigin,trust=spec.trust),trust=spec.trust)
                 directVoice=direct;direct.start()
             } catch(e:Exception) { if(!closed.get()) failure("Native audio initialization failed") }
             }
@@ -647,14 +666,16 @@ class BeaconCallService : Service() {
         val pending=spec ?: return
         val state=app.calls.state.value
         fun visibleOrUnlockedNotification()=if(fromNotification) !getSystemService(KeyguardManager::class.java).isDeviceLocked else app.calls.uiVisible
-        if(decision !in setOf("approve", "approve_call", "deny")||closed.get()||!visibleOrUnlockedNotification()||app.calls.ownerScope?.let { it.sameAccount(pending.client.scope)&&it.profile==pending.client.scope.profile }!=true) return
+        // Saying no to a phone request needs no screen: leaving the card is itself a no.
+        val phoneNo=decision=="deny"&&state.toolApprovals.any { it.requestId==requestId&&it.proposalId==proposalId&&it.phone!=null }
+        if(decision !in setOf("approve", "approve_call", "deny")||closed.get()||(!phoneNo&&!visibleOrUnlockedNotification())||app.calls.ownerScope?.let { it.sameAccount(pending.client.scope)&&it.profile==pending.client.scope.profile }!=true) return
         if(!app.auth.read(pending.client.scope.origin).authorizesPushSource(pending.client.scope)) return
         if(state.toolApprovals.none { it.requestId==requestId&&it.proposalId==proposalId&&!it.busy }) return
         app.calls.updateFrom(this) { it.copy(toolApprovals=it.toolApprovals.map { p -> if(p.requestId==requestId) p.copy(busy=true,error="") else p }) }
         updateToolNotification()
         scope.launch {
             try {
-                check(!closed.get()&&spec===pending&&app.calls.service===this@BeaconCallService&&visibleOrUnlockedNotification())
+                check(!closed.get()&&spec===pending&&app.calls.service===this@BeaconCallService&&(phoneNo||visibleOrUnlockedNotification()))
                 check(app.calls.ownerScope?.let { it.sameAccount(pending.client.scope)&&it.profile==pending.client.scope.profile }==true)
                 check(app.auth.read(pending.client.scope.origin).authorizesPushSource(pending.client.scope))
                 checkNotNull(directVoice).decideTool(requestId,proposalId,decision)
@@ -837,6 +858,7 @@ class BeaconCallService : Service() {
         var endDisposition=endingGemini?.close()?:DirectCallEnd()
         // A live session the call never took closes with it; no call audio is retained.
         spec?.warm?.close()
+        spec?.trust?.close(applicationContext)
         scope.launch(Dispatchers.Main.immediate) { overlay?.close();overlay=null }
         CoroutineScope(SupervisorJob()+Dispatchers.IO).launch {
             var captureReleased=false
@@ -930,14 +952,20 @@ class BeaconCallService : Service() {
     private fun openCallIntent(id:String):PendingIntent = PendingIntent.getActivity(this,21,
         Intent(this,BeaconActivity::class.java).putExtra(EXTRA_CALL_ID,id).setData(Uri.Builder().scheme("beacon-call").authority(packageName).appendPath(id).appendPath("open").build())
             .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+    internal fun refreshToolNotification() = updateToolNotification()
+
     private fun updateToolNotification() {
         val state=app.calls.state.value
         val manager=getSystemService(NotificationManager::class.java)
-        val request=state.toolApprovals.firstOrNull { !it.busy }
+        // The card on screen (the call screen or the assistant overlay) is the approval; a notification beside it would be a second window.
+        // An approval with no card on screen, whatever else is in front, gets the notification.
+        val request=approvalNeedingNotification(state.toolApprovals,app.calls::approvalCardOnScreen)
         if(closed.get()||!state.active||request==null) { manager.cancel(TOOL_NOTIFICATION);return }
         dev.hermes.android.push.ensureActivityChannels(manager)
         val channel=dev.hermes.android.push.promptNotificationChannel(manager)
-        val details="${request.toolName}\n${request.arguments}"
+        // A phone request reads as its card; its tools that open another app can only be approved on the call screen, in front.
+        val details=request.phone?.let { listOf(it.action,it.target,it.details,it.preview).filter(String::isNotBlank).joinToString("\n") } ?: "${request.toolName}\n${request.arguments}"
+        val needsScreen=dev.hermes.android.phone.PhoneTools.launchesApp(request.toolName)
         val open=openCallIntent(state.callId)
         val builder=NotificationCompat.Builder(this,channel).setSmallIcon(R.drawable.ic_beacon_notification)
             .setContentTitle("Beacon needs permission").setContentText(dev.hermes.android.push.boundedNotificationText(details,640,preserveWhitespace=true))
@@ -954,7 +982,7 @@ class BeaconCallService : Service() {
             builder.addAction(NotificationCompat.Action.Builder(0,if(approved) "Allow once" else "Deny",PendingIntent.getService(this,0,intent,PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)).setAuthenticationRequired(true).build())
         }
         // A shortened command must be reviewed in full before it can be approved.
-        if(details.length<=640) answer(true) else builder.addAction(0,"Review request",open)
+        if(details.length<=640&&!needsScreen) answer(true) else builder.addAction(0,"Review request",open)
         answer(false)
         try { manager.notify(TOOL_NOTIFICATION,builder.build()) } catch (_: SecurityException) { }
     }

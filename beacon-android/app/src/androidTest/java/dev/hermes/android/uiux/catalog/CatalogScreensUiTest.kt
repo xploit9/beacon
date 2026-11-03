@@ -59,7 +59,7 @@ class CatalogScreensUiTest {
         compose.onNodeWithTag("skill-row-apple-notes").assertExists()
         compose.onNodeWithTag("skill-row-work-inbox").assertDoesNotExist()
         compose.onNodeWithTag("skills-filter-all").performClick()
-        compose.onNode(hasSetTextAction() and hasText("Search skills")).performTextReplacement("work inbox")
+        compose.onNode(hasSetTextAction() and hasTestTag("skills-search")).performTextReplacement("work inbox")
         compose.onNodeWithTag("skill-row-work-inbox").assertExists()
         compose.onNodeWithTag("skill-row-apple-notes").assertDoesNotExist()
         compose.onNode(hasSetTextAction() and hasText("work inbox")).performTextReplacement("nothing like it")

@@ -4,13 +4,12 @@ import dev.hermes.android.ui.FileCrumb
 import dev.hermes.android.ui.fileBreadcrumbs
 import dev.hermes.android.ui.fileModifiedMillis
 import dev.hermes.android.ui.initialFilesFolder
-import dev.hermes.android.ui.serverHostLabel
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
-/** Files: the folder trail, the server name, where it opens and the modified time. Synthetic paths only. */
+/** Files: the folder trail, where it opens and the modified time. Synthetic paths only. */
 class ModulesFilesTest {
     @Test fun aWindowsPathBecomesADriveThenOneChipPerFolder() {
         assertEquals(
@@ -33,13 +32,6 @@ class ModulesFilesTest {
     @Test fun noPathHasNoTrail() {
         assertEquals(emptyList<FileCrumb>(), fileBreadcrumbs(""))
         assertEquals(emptyList<FileCrumb>(), fileBreadcrumbs("   "))
-    }
-
-    @Test fun theServerIsNamedByItsHostOnly() {
-        assertEquals("hermes.example.com", serverHostLabel("https://hermes.example.com:9119/dashboard"))
-        assertEquals("100.64.0.1", serverHostLabel("http://100.64.0.1:9119"))
-        assertEquals("hermes.example.com", serverHostLabel("hermes.example.com:8080"))
-        assertEquals("", serverHostLabel(""))
     }
 
     private fun project(id: String, vararg folders: Pair<String, Boolean>, archived: Boolean = false) = JSONObject().put("id", id).put("archived", archived)

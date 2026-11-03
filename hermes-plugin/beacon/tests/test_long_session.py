@@ -37,7 +37,9 @@ def test_nightly_memory_upkeep_corrects_stale_capabilities_and_preserves_owner_f
 
     assert "missing capability" in prompt
     assert "stale tool/account state" in prompt
-    assert "source-specific importance" in prompt
+    # The owner's importance rules replace per-email memory notes, so the upkeep removes the old lines and writes none.
+    assert "remove notes that start with 'beacon importance: '" in prompt
+    assert "importance rules replace them" in prompt
     assert "never save transcripts" in prompt
 
 
@@ -308,7 +310,10 @@ def test_live_snapshot_shows_watch_health_and_learned_count(harness, monkeypatch
     monkeypatch.setattr(api.proactive, "_setup_complete", lambda *args: True)
     monkeypatch.setattr(api.proactive, "health", lambda *args: {
         "state": "ok", "checked_at": 1700000000, "message": "Read complete"})
-    monkeypatch.setattr(api.proactive, "learned_notes", lambda *args: ["important", "not important"])
+    # Rules, not marked emails: two importance rules count; a disabled one and a delivery rule do not.
+    monkeypatch.setattr(api.proactive, "list_requests", lambda *args: [
+        {"action": "important", "enabled": True}, {"action": "not_important", "enabled": True},
+        {"action": "important", "enabled": False}, {"action": "notify", "enabled": True}])
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles",
                         SimpleNamespace(_profile_scope=lambda profile: nullcontext()))
     from tools.registry import registry
@@ -317,4 +322,4 @@ def test_live_snapshot_shows_watch_health_and_learned_count(harness, monkeypatch
     context = live.snapshot(api.mobile, "owner", "default", api.proactive)
 
     assert "Proactive connected sources: ok" in context
-    assert "2 alerts the owner marked" in context
+    assert "2 email importance rules" in context

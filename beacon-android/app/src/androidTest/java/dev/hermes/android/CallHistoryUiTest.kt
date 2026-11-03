@@ -130,18 +130,22 @@ class CallHistoryUiTest {
             for (redial in 1..3) compose.onNodeWithTag("call-history-row:call-history-redial-$redial").assertExists()
             compose.onNodeWithTag("call-history-group:call-history-redial-3").performClick()
             compose.onAllNodesWithTag("call-history-row:call-history-redial-2").assertCountEquals(0)
+            // A tap opens the rule sheet; "Just this email" marks the call alone, and a refused save leaves the sheet open with its message.
             fixture.proactiveFeedbackStatusCode = 503
             compose.onNodeWithTag("call-history-feedback-not-important:$callId").performClick()
+            compose.waitUntil(5_000) { compose.onAllNodesWithTag("email-rule-just-this").fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithTag("email-rule-just-this").performClick()
             compose.waitUntil(5_000) { compose.onAllNodesWithText("Couldn't save your choice. Try again.").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithTag("call-history-feedback-not-important:$callId").assertExists()
             fixture.proactiveFeedbackStatusCode = 200
-            compose.onNodeWithTag("call-history-feedback-not-important:$callId").performClick()
+            compose.onNodeWithTag("email-rule-just-this").performClick()
             compose.waitUntil(5_000) {
-                fixture.proactiveFeedbacks.size == 1 && compose.onAllNodesWithText("Thanks — Beacon will remember.").fetchSemanticsNodes().isNotEmpty()
+                fixture.proactiveFeedbacks.size == 1 && compose.onAllNodesWithTag("call-history-feedback-sent:$callId").fetchSemanticsNodes().isNotEmpty()
             }
             val feedback = fixture.proactiveFeedbacks.single()
             assertEquals("email-notice-42", feedback.string("notice_id"))
             assertEquals("not_important", feedback.string("verdict"))
+            assertFalse(feedback.has("rule"))
             compose.onNodeWithTag("call-history-feedback-not-important:$callId").assertDoesNotExist()
             compose.onNodeWithTag("call-history-row:$callId").performClick()
             compose.waitUntil(5_000) { compose.onAllNodesWithText("Transcript from completed call").fetchSemanticsNodes().isNotEmpty() }

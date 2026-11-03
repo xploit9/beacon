@@ -29,7 +29,7 @@ def _stale(module):
     seen=getattr(module,'_beacon_mtime',None)
     try: return seen is not None and seen!=Path(module.__file__).stat().st_mtime_ns
     except (OSError,TypeError): return True
-_MODULE_NAMES=('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_tools','gateway_api','bot_mode_api','observers','callbacks','callback_api','call_history_api','proactive','compat','health_api')
+_MODULE_NAMES=('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_tools','gateway_api','bot_mode_api','observers','callbacks','callback_api','call_history_api','proactive','compat','health_api','phone_tools')
 # Only purge the siblings loaded here; other plugin entry points may still serve live work.
 if any(_stale(sys.modules.get('beacon_'+name)) for name in _MODULE_NAMES):
     for name in _MODULE_NAMES: sys.modules.pop('beacon_'+name,None)
@@ -43,6 +43,7 @@ mobile=sys.modules['beacon_mobile'];native=sys.modules['beacon_native'];voice_co
 activity=sys.modules['beacon_activity']
 voice_models=sys.modules['beacon_voice_models']
 proactive=sys.modules['beacon_proactive']
+phone_tools=sys.modules['beacon_phone_tools']
 # The version this dashboard process imported; /mobile/plugin/version reports it as `running`.
 _read_plugin_version=mobile.read_plugin_version
 _RUNNING_PLUGIN_VERSION=_read_plugin_version(ROOT/'plugin.yaml')
@@ -694,6 +695,49 @@ def _install_checkup_task(profile):
             matches[0]=renamed
         return {'job':matches[0],'existing':True}
     return {'job':_create_cron_job_sync(CronJobCreate(name=name,schedule='every 1m',prompt='Owner-requested check-ups: 3–4 random opportunities in the profile local 10:00–22:00 window; missed/busy opportunities skipped.',deliver='local',script='beacon-checkups.py',no_agent=True),profile),'existing':False}
+# Phone access: Hermes asks, this phone approves. Only a linked phone of the owner may list, decide or answer a request.
+def phone_device(request,owner,provider,profile):
+    try: mobile.touch_device(owner,provider,profile,request.headers.get('x-beacon-device-id'),True,True)
+    except LookupError as exc: raise HTTPException(403,str(exc)) from None
+    return request.headers['x-beacon-device-id']
+def phone_request_id(value):
+    if not isinstance(value,str) or not re.fullmatch(r'[0-9a-f]{32}',value): raise HTTPException(404,'Phone request not found')
+    return value
+@router.put('/mobile/phone/state')
+async def phone_state(request:Request):
+    value=await body(request,4096)
+    owner,provider,_,_=await identity_async(request,owner_only=True)
+    device=await asyncio.to_thread(phone_device,request,owner,provider,None)
+    try: state=phone_tools.clean_state(value)
+    except ValueError: raise HTTPException(400,'Invalid phone state') from None
+    await asyncio.to_thread(mobile.phone_state_put,owner,device,state)
+    return JSONResponse({'stored':True},headers={'Cache-Control':'no-store'})
+@router.get('/mobile/phone/requests')
+async def phone_requests(request:Request):
+    owner,provider,profile,_=await identity_async(request)
+    device=await asyncio.to_thread(phone_device,request,owner,provider,profile)
+    rows=await asyncio.to_thread(mobile.phone_requests_open,owner,profile,device)
+    return JSONResponse({'requests':rows},headers={'Cache-Control':'no-store'})
+@router.post('/mobile/phone/requests/{request_id}/decision')
+async def phone_decision(request_id:str,request:Request):
+    value=await body(request,256)
+    if set(value)!={'approved'} or type(value['approved']) is not bool: raise HTTPException(400,'Invalid phone decision')
+    owner,provider,profile,_=await identity_async(request)
+    device=await asyncio.to_thread(phone_device,request,owner,provider,profile)
+    try: await asyncio.to_thread(mobile.phone_request_decide,owner,profile,phone_request_id(request_id),value['approved'],device)
+    except LookupError: raise HTTPException(404,'Phone request not found') from None
+    except ValueError as exc: raise HTTPException(409,'expired' if str(exc)=='expired' else 'settled') from None
+    return JSONResponse({'approved':value['approved']},headers={'Cache-Control':'no-store'})
+@router.post('/mobile/phone/requests/{request_id}/result')
+async def phone_result(request_id:str,request:Request):
+    value=await body(request,mobile.PHONE_RESULT_BYTES+1024)
+    if set(value)!={'result'} or not isinstance(value['result'],dict): raise HTTPException(400,'Invalid phone result')
+    owner,provider,profile,_=await identity_async(request)
+    device=await asyncio.to_thread(phone_device,request,owner,provider,profile)
+    try: await asyncio.to_thread(mobile.phone_request_finish,owner,profile,phone_request_id(request_id),device,value['result'])
+    except LookupError: raise HTTPException(404,'Phone request not found') from None
+    except ValueError as exc: raise HTTPException(409 if str(exc)=='settled' else 400,'settled' if str(exc)=='settled' else 'Invalid phone result') from None
+    return JSONResponse({'stored':True},headers={'Cache-Control':'no-store'})
 @router.get('/mobile/notifications/targets')
 async def targets(request:Request):
     owner,_,profile,_=await identity_async(request)
@@ -848,6 +892,7 @@ def _notices_after(owner,profile,after):
 def notice_preview(kind):
     if kind=='test': return 'Beacon notification test','Synthetic test. Seeing this notification confirms arrival on this phone.'
     if kind=='approval': return 'Approval needed','Open Beacon to review the request.'
+    if kind=='phone_request': return 'Phone request','Open Beacon to review the request.'
     if kind=='clarify': return 'Question for you','Answer here or open Beacon.'
     if kind=='working': return 'Beacon working','Hermes is working on your chat.'
     if kind=='activity_end': return 'Activity ended','Open Beacon to review your session.'
@@ -1130,6 +1175,9 @@ async def start_watcher():
                         if time.monotonic()>=_tools_next.get(profile_key,0):
                             _tools_next[profile_key]=time.monotonic()+TOOLS_REFRESH_SECONDS
                             voice_context.prefetch_tools(profile)
+                # Phone requests belong to no profile's watch: their private text goes once nobody can answer them.
+                try: await asyncio.to_thread(mobile.phone_requests_sweep)
+                except Exception: pass
             except Exception:
                 pass
             await asyncio.sleep(3)
@@ -1390,11 +1438,21 @@ async def proactive_enabled(request:Request):
 
 @router.post('/mobile/proactive/feedback')
 async def proactive_feedback(request:Request):
-    value=await body(request,1024)
-    if set(value)!={'notice_id','verdict'} or value['verdict'] not in ('important','not_important'):
-        raise HTTPException(400,'Expected notice_id and verdict important or not_important')
+    # Alone, the choice marks this alert only; with the owner's reviewed `rule` words it also saves one importance rule.
+    value=await body(request,2048)
+    if not {'notice_id','verdict'}<=set(value) or set(value)-{'notice_id','verdict','rule'} or value['verdict'] not in ('important','not_important'):
+        raise HTTPException(400,'Expected notice_id and verdict important or not_important, with an optional rule')
+    if 'rule' in value and (not isinstance(value['rule'],str) or len(value['rule'])>300):
+        raise HTTPException(400,'The rule must be up to 300 characters')
     owner,_,profile,_=await identity_async(request)
-    return await feature(proactive.add_email_feedback,mobile,owner,profile,value['notice_id'],value['verdict'],timeout=15,value_error_status=400,lookup_message='This item is no longer available.')
+    return await feature(proactive.add_email_feedback,mobile,owner,profile,value['notice_id'],value['verdict'],value.get('rule'),timeout=30,value_error_status=400,lookup_message='This item is no longer available.')
+
+@router.get('/mobile/proactive/suggestion')
+async def proactive_suggestion(notice_id:str,verdict:str,request:Request):
+    # One editable rule for the alert the owner is rating, built from its quoted words.
+    owner,_,profile,_=await identity_async(request)
+    result=await feature(proactive.importance_suggestion,mobile,owner,profile,notice_id,verdict,timeout=8,value_error_status=400,lookup_message='This item is no longer available.')
+    return JSONResponse(result,headers={'Cache-Control':'no-store'})
 
 @router.get('/mobile/proactive/alerts')
 async def proactive_alerts(session_id:str,request:Request,before:int=0,limit:int=50):
@@ -1407,9 +1465,19 @@ async def proactive_alerts(session_id:str,request:Request,before:int=0,limit:int
 @router.delete('/mobile/proactive/learned')
 async def proactive_learned_delete(request:Request):
     value=await body(request,2048)
-    if set(value)!={'note'}: raise HTTPException(400,'Expected one learned note')
+    if set(value)=={'all'} and value['all'] is True: note=True
+    elif set(value)=={'note'}: note=value['note']
+    else: raise HTTPException(400,'Expected one earlier rating, or all')
     owner,_,profile,_=await identity_async(request)
-    return await feature(proactive.delete_learned,mobile,owner,profile,value['note'],timeout=12,value_error_status=400,lookup_message='This item is no longer available.')
+    return await feature(proactive.delete_learned,mobile,owner,profile,note,timeout=12,value_error_status=400,lookup_message='This item is no longer available.')
+
+@router.post('/mobile/proactive/learned/rules')
+async def proactive_learned_rules(request:Request):
+    # The rules the owner reviewed from their earlier ratings; the ratings go once these are saved.
+    value=await body(request,4096)
+    if set(value)!={'rules'}: raise HTTPException(400,'Expected the reviewed rules')
+    owner,_,profile,_=await identity_async(request)
+    return await feature(proactive.convert_learned,mobile,owner,profile,value['rules'],timeout=30,value_error_status=400,lookup_message='This item is no longer available.')
 
 @router.post('/mobile/proactive/requests')
 async def proactive_request_create(request:Request):
@@ -1426,7 +1494,7 @@ async def proactive_request_create(request:Request):
 @router.patch('/mobile/proactive/requests/{request_id}')
 async def proactive_request_patch(request_id:str,request:Request):
     value=await body(request,2048)
-    if not value or set(value)-{'enabled','action','night'}: raise HTTPException(400,'Invalid Proactive request fields')
+    if not value or set(value)-{'enabled','action','night','text'}: raise HTTPException(400,'Invalid Proactive request fields')
     owner,_,profile,_=await identity_async(request)
     return await feature(proactive.patch_request,mobile,owner,profile,request_id,value,timeout=30,value_error_status=400,lookup_message='This item is no longer available.')
 

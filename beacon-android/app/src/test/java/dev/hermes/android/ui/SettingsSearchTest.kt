@@ -52,7 +52,7 @@ class SettingsSearchTest {
     }
     @Test fun everyDestinationAndSearchAliasStaysSearchableInOrder() {
         assertEquals(
-            listOf("Connection", "Assistant", "Voice & calls", "Notifications & Keep connected", "Chat", "Profiles & model", "Skills", "Memory", "Tools & MCP", "Server", "Appearance", "App updates", "About & licenses",
+            listOf("Connection", "Assistant", "Voice & calls", "Phone access", "Notifications & Keep connected", "Chat", "Profiles & model", "Skills", "Memory", "Tools & MCP", "Server", "Appearance", "App updates", "About & licenses",
                 "Profiles", "Providers & models", "Tools & commands", "MCP servers", "Health", "Logs", "Server updates", "Session checkpoints", "Devices"),
             settingsSearchRoutes,
         )
@@ -66,12 +66,12 @@ class SettingsSearchTest {
         assertEquals("Devices is a search shortcut to Connection", "Connection", settingsRoute("Devices"))
         assertEquals(settingsSearchRoutes.size - 1, settingsSearchRoutes.map(::settingsRoute).toSet().size)
         // Description-only words still find the row whose label does not contain them.
-        assertTrue(settingsSearchMatches(settingsLabel("Session checkpoints"), settingsDescriptions.getValue("Session checkpoints"), "recovery"))
+        assertTrue(settingsSearchMatches(settingsLabel("Session checkpoints"), settingsDescriptions.getValue("Session checkpoints"), "versions"))
         assertTrue(settingsSearchMatches(settingsLabel("Chat"), settingsDescriptions.getValue("Chat"), "sending"))
     }
     @Test fun rowsOpenTheIncumbentRouteArguments() {
         assertEquals(
-            listOf("Connection", "Assistant", "Beacon", "Notifications", "Settings", "category:Profiles & model", "Skills", "Memory", "category:Tools & MCP", "category:Server", "Appearance", "App updates", "Licenses"),
+            listOf("Connection", "Assistant", "Beacon", "Phone access", "Notifications", "Settings", "category:Profiles & model", "Skills", "Memory", "category:Tools & MCP", "category:Server", "Appearance", "App updates", "Licenses"),
             settingsHubRoutes.map(::settingsRoute),
         )
         assertEquals("Sections in Relay's order with the assistant up front", listOf("", "Assistant", "Hermes", "App"), settingsHubSections.keys.toList())
@@ -139,8 +139,8 @@ class SettingsSearchTest {
         assertEquals("Update available · 0.4.15", summary("App updates", known.copy(updateName = "0.4.15")))
         assertEquals("Update ready to install · 0.4.15", summary("App updates", known.copy(updateName = "0.4.15", updateReady = true)))
         assertEquals("Gemini Live · Key saved", summary("Voice & calls", known))
-        assertEquals("Keep connected on", summary("Notifications & Keep connected", known))
-        assertEquals("Keep connected off", summary("Notifications & Keep connected", known.copy(keepConnectedEnabled = false)))
+        assertEquals("Keep connected is on", summary("Notifications & Keep connected", known))
+        assertEquals("Keep connected is off", summary("Notifications & Keep connected", known.copy(keepConnectedEnabled = false)))
         assertEquals("Graphite", summary("Appearance", SettingsSnapshot(theme = "sepia", colorStyle = "graphite")))
         assertEquals("Enter to send", summary("Chat", SettingsSnapshot(sendKey = "enter")))
         assertEquals("", summary("Chat", SettingsSnapshot(sendKey = "shift_enter")))

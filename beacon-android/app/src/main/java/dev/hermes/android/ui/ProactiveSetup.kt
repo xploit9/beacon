@@ -24,6 +24,7 @@ import dev.hermes.android.data.AppPreferences
 import dev.hermes.android.data.ApiFailure
 import dev.hermes.android.data.BeaconClient
 import dev.hermes.android.isMissingBeaconPluginRoute
+import dev.hermes.android.phone.isolateBidi
 import org.json.JSONObject
 import kotlinx.coroutines.CancellationException
 import java.time.Instant
@@ -171,7 +172,8 @@ internal fun proactiveClockLabel(value: String, pattern: String, locale: Locale 
         )
     }
     val time = proactiveClockLabel(value, nativeClockPattern(Locale.getDefault(), is24Hour))
-    SettingsNavRow(label, { open = true }, icon = icon, value = time, enabled = enabled, testTag = "proactive-time-$tagLabel")
+    // Isolated, so "10:00 PM" keeps its order beside a right-to-left label instead of being reordered by it.
+    SettingsNavRow(label, { open = true }, icon = icon, value = isolateBidi(time), enabled = enabled, testTag = "proactive-time-$tagLabel")
     if (open) AlertDialog(
         onDismissRequest = { open = false },
         title = { Text(label) },
@@ -191,7 +193,7 @@ internal fun openProactiveRuleForm(vm: BeaconViewModel, profile: String, explana
         "Add a rule", "", listOf(
             Field("text", "Your rule", FieldType.MULTILINE, required = true),
             Field("signal", "Source", FieldType.CHOICE, options = listOf("anything") + sources,
-                optionLabels = mapOf("anything" to "Anything")),
+                optionLabels = mapOf("anything" to "Anything") + sources.associateWith { ruleSourceWords(it) ?: it }),
             Field("action", "When it matches", FieldType.CHOICE, options = listOf("notify", "call"), optionLabels = mapOf("notify" to "Notify", "call" to "Call")),
             Field("night", "Even at night", FieldType.BOOLEAN),
         ),

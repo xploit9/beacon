@@ -11,6 +11,7 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.test.core.app.ApplicationProvider
 import dev.hermes.android.core.json
 import dev.hermes.android.data.NativeCheckpoint
+import dev.hermes.android.data.NativeComponent
 import dev.hermes.android.data.NativeServerState
 import dev.hermes.android.ui.NativeServerSettings
 import org.junit.Assert.*
@@ -64,6 +65,33 @@ class ServerPagesGapsUiTest {
         compose.onNodeWithTag("server-components").assertDoesNotExist()
     }
 
+    // Health: one status per row
+
+    private val hermes = NativeServerState(overall = "ok", version = "0.14.2", gatewayState = "running", activeAgents = 1)
+    private fun parts(gateway: NativeComponent, storage: NativeComponent = NativeComponent("storage", "ok", "")) =
+        listOf(gateway, NativeComponent("dashboard", "ok", ""), storage, NativeComponent("platforms", "ok", "1 / 1 connected"))
+
+    @Test fun aHealthyHermesSaysItsGatewayOnceAndKeepsOnlyThePlatformsRow() {
+        show({ "Health" }, { hermes.copy(components = parts(NativeComponent("gateway", "ok", "running"))) }, Calls())
+        compose.onAllNodesWithText("Running").assertCountEquals(1)
+        for (internal in listOf("gateway", "dashboard", "storage")) compose.onNodeWithTag("server-component-$internal").assertDoesNotExist()
+        compose.onNodeWithTag("server-component-platforms").assertIsDisplayed()
+    }
+
+    @Test fun aGatewayThatNeedsAttentionGetsItsRowAndTheTileDropsIt() {
+        show({ "Health" }, { hermes.copy(overall = "degraded", gatewayState = "starting", components = parts(NativeComponent("gateway", "degraded", "starting"))) }, Calls())
+        compose.onNodeWithTag("server-component-gateway").assertIsDisplayed().assertTextContains("Starting").assertTextContains("Needs attention")
+        compose.onAllNodesWithText("Starting").assertCountEquals(1)
+        compose.onAllNodesWithText("Gateway").assertCountEquals(1)
+        compose.onNodeWithTag("server-component-dashboard").assertIsDisplayed()
+    }
+
+    @Test fun aHealthyRowShownBesideAFailingOneSaysHealthyOnlyNotRunningToo() {
+        show({ "Health" }, { hermes.copy(overall = "degraded", components = parts(NativeComponent("gateway", "ok", "running"), NativeComponent("storage", "error", ""))) }, Calls())
+        compose.onNodeWithTag("server-component-gateway").assertIsDisplayed().assertTextContains("Healthy").assert(hasText("Running", substring = true).not())
+        compose.onAllNodesWithText("Running").assertCountEquals(0)
+    }
+
     @Test fun logChipsNameTheFileAndTheSearchFieldReportsTyping() {
         val calls = Calls()
         var state by mutableStateOf(NativeServerState(logFile = "errors", logs = listOf("one line")))
@@ -72,7 +100,7 @@ class ServerPagesGapsUiTest {
         compose.onNodeWithText("Errors").assertIsSelected()
         compose.onNodeWithText("Gateway").assertIsNotSelected().performClick()
         compose.runOnIdle { assertEquals(listOf("gateway"), calls.files) }
-        compose.onNode(hasSetTextAction() and hasText("Search log entries")).performTextInput("timeout")
+        compose.onNode(hasSetTextAction() and hasTestTag("server-log-search")).performTextInput("timeout")
         compose.runOnIdle { assertEquals("timeout", calls.searches.last()); assertEquals("Opening the page read the lines already", 0, calls.check) }
         // Typing narrows the lines: once it pauses, the page asks to read them again, once.
         compose.waitUntil(5_000) { calls.check == 1 }
@@ -151,7 +179,7 @@ class ServerPagesGapsUiTest {
         compose.onNodeWithTag("server-checkpoint-metrics").assertIsDisplayed()
         compose.onNodeWithTag("server-checkpoint-synthetic-session").assertIsDisplayed().assertTextContains("synthetic-session")
         compose.runOnIdle { state = NativeServerState() }
-        compose.onNodeWithText("No session checkpoints are stored for this profile.").assertIsDisplayed()
+        compose.onNodeWithText("No backups yet.").assertIsDisplayed()
         compose.runOnIdle { state = NativeServerState(loading = true) }
         compose.onNodeWithTag("settings-skeleton").assertIsDisplayed()
         compose.onNodeWithTag("server-checkpoint-metrics").assertDoesNotExist()

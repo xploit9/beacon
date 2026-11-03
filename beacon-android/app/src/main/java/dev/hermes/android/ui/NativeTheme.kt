@@ -12,8 +12,10 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
@@ -72,8 +74,15 @@ internal fun beaconEmbers(width: Float, height: Float, spacing: Float, maxRadius
     }
 }
 
-/** Times, durations and step details: small type with even-width digits so columns of numbers line up. */
-@Composable fun nativeMetadataStyle(): TextStyle = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum", fontWeight = FontWeight.Medium, letterSpacing = .2.sp)
+/** Small Arabic text is hard to read at labelSmall's 11 sp, so small text in a right-to-left layout is 12.5 sp. */
+internal val RtlMetadataSize = 12.5.sp
+
+/** Times, durations and step details: small type with even-width digits so columns of numbers line up; a little larger in a right-to-left layout. */
+@Composable fun nativeMetadataStyle(): TextStyle {
+    val small = MaterialTheme.typography.labelSmall
+    val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
+    return small.copy(fontSize = if (rtl) RtlMetadataSize else small.fontSize, fontFeatureSettings = "tnum", fontWeight = FontWeight.Medium, letterSpacing = .2.sp)
+}
 
 /** Motion follows the phone's "Remove animations" setting and stops while the screen is not started. */
 internal fun nativeMotionAllowed(systemAnimationsEnabled: Boolean, lifecycleStarted: Boolean): Boolean =

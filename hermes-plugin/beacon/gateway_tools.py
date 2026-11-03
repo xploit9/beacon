@@ -11,6 +11,7 @@ import secrets
 import sys
 import threading
 import time
+import unicodedata
 import uuid
 from contextlib import closing, contextmanager
 
@@ -19,7 +20,15 @@ from fastapi import HTTPException
 MAX_ARGUMENTS = 16384
 MAX_RESULT = 24576
 MAX_TOOLS = 12
-MAX_CATALOGUE_BYTES = 3072
+MAX_CATALOGUE_BYTES = 4096
+# The search result's own short map of every tool source, so an empty or narrow search still shows what exists.
+MAX_SOURCES_BYTES = 2048
+# What a server says about a tool is cut here: strings per value, nesting per schema, and the tool's name in a search result.
+MAX_SCHEMA_TEXT = 1200
+MAX_SCHEMA_DEPTH = 48
+MAX_TOOL_NAME = 200
+# A call's tool search waits this long at most for this process's first MCP scan, then answers with what is ready.
+FIRST_SCAN_WAIT = 2.0
 # Eight active calls at 128 receipts each; old closed or expired receipts make room.
 MAX_RECEIPTS = 1024
 MAX_CALL_ALLOWANCES = 32
@@ -42,17 +51,21 @@ NATIVE_READ_ONLY_ACTIONS = {'cronjob_manage': frozenset({'list'}), 'process_mana
 INLINE_TOOLS = frozenset({'memory','session_search'})
 CALL_EXCLUDED_TOOLS = frozenset({'manage_connections','manage_catalog','setup_mcp',
                                  'connector_search','connector_describe'})
+# A live call uses the phone tools through the app itself, which shows the owner each card; Hermes' phone_* tools wait for an answer
+# for up to two minutes and are not for a call.
+PHONE_TOOLS = frozenset({'phone_calendars','phone_calendar_list','phone_contacts_search','phone_calendar_create','phone_calendar_update',
+                         'phone_calendar_delete','phone_reminder_create','phone_alarm_set','phone_timer_set','phone_call','phone_message_draft'})
 NATIVE_EXCLUDED_TOOLS = frozenset({'clarify','delegate_task','todo_list',
                                    'beacon_create_proactive_request','beacon_event_notice','beacon_events_checked',
-                                   'beacon_email_notice','beacon_email_checked'}) | CALL_EXCLUDED_TOOLS
-NATIVE_EXCLUDED_TOOLSETS = frozenset({'browser','connectors','beacon-interactive','beacon-mailbox'})
-QUERY_FILLER = set('a an the my me please could can you i would like want get read list find look pull show to for of in on and from up most latest recent current last today now one two three four five six ten tool tools'.split())
+                                   'beacon_email_notice','beacon_email_checked'}) | CALL_EXCLUDED_TOOLS | PHONE_TOOLS
+NATIVE_EXCLUDED_TOOLSETS = frozenset({'browser','connectors','beacon-interactive','beacon-mailbox','beacon-phone'})
+QUERY_FILLER = set('a an the my me please could can you i would like want get read list find look pull show to for of in on and from up most latest recent current last today now one two three four five six ten tool tools use using do have access able'.split())
 QUERY_ALIASES = {
     'email': {'email', 'mail', 'gmail', 'inbox', 'outlook'},
     'mail': {'email', 'mail', 'gmail', 'inbox', 'outlook'},
     'check': {'search', 'list'},
     'pull': {'search', 'list'},
-    'web': {'web', 'internet', 'website', 'browser', 'scrapling'},
+    'web': {'web', 'internet', 'website', 'browser', 'page'},
     'search': {'search', 'find', 'lookup', 'query'},
     'get': {'get', 'read', 'retrieve', 'fetch', 'list'},
     'remember': {'remember', 'memory', 'save', 'note'},
@@ -71,7 +84,7 @@ def query_words(text):
 
 
 def discovery_rank(tool, words, query):
-    name = tool['name'] + ' ' + tool.get('_raw', '')
+    name = ' '.join(str(tool.get(key) or '') for key in ('name', '_raw', '_server', '_toolset'))
     named, described = query_words(name), query_words(tool['description'])
     coverage = weight = 0
     for word in words:
@@ -85,9 +98,8 @@ def discovery_rank(tool, words, query):
     writing = bool(intent & {'send','draft','create','delete','remove','modify','update','write'})
     if not writing and tool['read_only']:
         weight += 2
-        if intent & {'email','mail','gmail','inbox'}:
-            if named & {'search','list'}: weight += 2
-            if named & {'message','thread','inbox'}: weight += 1
+        # Asking for "my latest X" starts with a search or a list, whatever X is.
+        if named & {'search','list'}: weight += 2
     return (int(query.casefold() in (tool['name'].casefold(), tool.get('_raw', '').casefold())), coverage, weight)
 
 
@@ -96,7 +108,8 @@ def encoded(value):
 
 
 def digest(value):
-    return hashlib.sha256(encoded(value).encode()).hexdigest()
+    # A server's metadata may carry a lone surrogate; hashing must not fail on it.
+    return hashlib.sha256(encoded(value).encode('utf-8', 'surrogatepass')).hexdigest()
 
 
 def outcome(value, read_only, depth=0, own=False):
@@ -129,6 +142,40 @@ def outcome(value, read_only, depth=0, own=False):
 def safe(value, limit):
     from agent.redact import redact_sensitive_text
     return redact_sensitive_text(str(value), force=True, redact_url_credentials=True)[:limit]
+
+
+_ESCAPE_SEQUENCE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+
+
+def display_line(value, limit):
+    """Untrusted metadata (a tool's description or a server's name) as one plain line for a model: escape sequences, control
+    characters and line or paragraph separators become spaces, format characters (bidi overrides, zero-width joiners, byte-order
+    marks) and lone surrogates are dropped, and the result is bounded."""
+    text = _ESCAPE_SEQUENCE.sub('', str(value))
+    text = ''.join(' ' if unicodedata.category(char) in ('Cc', 'Zl', 'Zp') else '' if unicodedata.category(char) in ('Cf', 'Cs') else char
+                   for char in text)
+    return ' '.join(text.split())[:limit]
+
+
+def plain_line(value, limit):
+    """The same after the secret redaction, which reads the text as written and again once escape sequences and invisible
+    characters are gone: a secret a server split with a zero-width character is whole again by then, and still never shown."""
+    return display_line(safe(display_line(safe(value, limit * 4), limit * 4), limit * 4), limit)
+
+
+def plain_schema(node, depth=0):
+    """A copy of a tool's parameter schema in which every key and every string the model reads (a description, a property name,
+    an enum value, a default) is one plain line, and nesting stops at MAX_SCHEMA_DEPTH: a node deeper than that is cut to an empty
+    one, so no schema a server sends can break the walk."""
+    if isinstance(node, str):
+        return display_line(node, MAX_SCHEMA_TEXT)
+    if isinstance(node, dict):
+        if depth >= MAX_SCHEMA_DEPTH: return {}
+        return {display_line(key, MAX_SCHEMA_TEXT): plain_schema(child, depth + 1) for key, child in node.items()}
+    if isinstance(node, list):
+        if depth >= MAX_SCHEMA_DEPTH: return []
+        return [plain_schema(child, depth + 1) for child in node]
+    return node
 
 
 def coerce(schema, value):
@@ -231,7 +278,8 @@ WRITE_WORDS = frozenset({
     'categorize','report','unmark','untrash','unarchive','unlabel','unmute','unsnooze','unblock',
     'empty','reschedule','revoke','trigger','install','edit','enable','disable','pause','resume','schedule',
     'message','ping','alert','comment','escalate','triage','process','truncate','rotate','suspend','terminate',
-    'drop','rebuild','reindex','kill','restart','reboot','rollback','revert','resend','ban'})
+    'drop','rebuild','reindex','kill','restart','reboot','rollback','revert','resend','ban',
+    'charge','withdraw','deposit','debit','deploy','promote','enqueue','launch','spawn'})
 # 'and', 'or' and 'then' chain a second action; they are not WRITE_WORDS because a read action may say "list or search".
 UNSAFE_NAME_WORDS = WRITE_WORDS | frozenset({
     'exec','sql','call','invoke','eval','shell','command','script','http','request',
@@ -254,25 +302,64 @@ def name_words(text):
     return re.findall(r'[a-z0-9]+', re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', text or '').casefold())
 
 
+# What an ordinary word adds to an action word: comments, installed, deployments, attachments, important, connectors, transferable.
+WORD_ENDINGS = frozenset({'s','es','d','ed','r','rs','er','ers','or','ors','ing','ly','ion','ions','ation','ations','ment','ments',
+                          'ant','ants','ance','ee','ees','ive','al','ory','able','ible','ability'})
+# Ordinary words that begin with an action word without being one (execution, delivery, callback, start, bookmark, postgres).
+ORDINARY_WORDS = frozenset({
+    'start','starts','started','starting','starter','startup','execution','executions','executor','executors','executable','executables',
+    'evaluate','evaluates','evaluated','evaluating','evaluation','evaluations','evaluator','evaluators','delivery','deliveries',
+    'deliverable','deliverables','deliverability','connectivity','cancellation','cancellations','synchronization','callback','callbacks',
+    'bookmark','bookmarks','bookshelf','bookshelves','blockchain','posture','postures','postal','postcode','postgres','postgresql',
+    'market','markets','marketing','marketplace','markdown','dropbox','dropdown','dropdowns','changelog','changelogs',
+    'changeset','changesets','closest','sharepoint'})
+# A server chooses its tool names, so a write verb glued to the word after it (wipedb, deleteall) or hidden in a name written without
+# separators (getaccountsresetpassword) must not read as one long harmless word. Shorter action words are not looked for inside a word.
+GLUED_MIN = 4
+# 'and', 'or' and 'then' chain a second action; an action value such as "list or search" is still a read.
+CHAIN_NAME_WORDS = frozenset({'and','or','then'})
+ACTION_VALUE_WORDS = UNSAFE_NAME_WORDS - CHAIN_NAME_WORDS
+
+
+def glued_action(words, vocabulary):
+    """Whether a word of [words] hides an action word of [vocabulary]: it starts with one and goes on with something that no action word
+    plus an ordinary ending explains (wipedb, but not comments, installed or enrolled), or it starts with a read verb and holds a real
+    action anywhere after it (getaccountsresetpassword)."""
+    verbs = [verb for verb in vocabulary if len(verb) >= GLUED_MIN]
+    actions = [verb for verb in ACTION_NAME_WORDS if len(verb) >= GLUED_MIN]
+    for word in words:
+        if word in vocabulary or word in READ_NAME_WORDS or word in ORDINARY_WORDS: continue
+        rests = [word[len(verb):] for verb in verbs if word.startswith(verb)]
+        if rests and not any(rest in WORD_ENDINGS for rest in rests): return True
+        lead = next((read for read in READ_NAME_WORDS if word.startswith(read)), None)
+        if lead and any(verb in word[len(lead):] for verb in actions): return True
+    return False
+
+
 def name_writes(raw):
     """A tool name that carries a write. After a leading read verb only a real action counts: get_pull_request reads,
-    get_and_delete_x and get_or_call_user write ('and', 'or' and 'then' chain a second action)."""
+    get_and_delete_x and get_or_call_user write ('and', 'or' and 'then' chain a second action). A write verb glued to another
+    word writes too (search_wipedb)."""
     words=name_words(raw)
-    return bool(set(words)&(ACTION_NAME_WORDS if words and words[0] in READ_NAME_WORDS else UNSAFE_NAME_WORDS))
+    vocabulary=ACTION_NAME_WORDS if words and words[0] in READ_NAME_WORDS else UNSAFE_NAME_WORDS
+    return bool(set(words)&vocabulary) or glued_action(words,vocabulary)
 
 
 def mcp_reads_by_name(raw, trust):
     """A read-only annotation is the server's own claim: it releases the owner's approval only for a name with no write
     action, and on an untrusted server only for a name that also says it reads, with every noun counted as a write."""
     if trust!='untrusted': return not name_writes(raw)
-    words=set(name_words(raw))
-    return not words&UNSAFE_NAME_WORDS and bool(words&READ_NAME_WORDS)
+    words=name_words(raw)
+    return not set(words)&UNSAFE_NAME_WORDS and bool(set(words)&READ_NAME_WORDS) and not glued_action(words,UNSAFE_NAME_WORDS)
 
 
 def writes_by_action(arguments):
     """An action or operation argument that names a write makes the call a write, whatever the tool is annotated."""
     given={str(key).casefold():value for key,value in arguments.items()}
-    return any(isinstance(given.get(field),str) and bool(set(name_words(given[field]))&WRITE_WORDS) for field in ('action','operation'))
+    for field in ('action','operation'):
+        words=name_words(given[field]) if isinstance(given.get(field),str) else []
+        if set(words)&ACTION_VALUE_WORDS or glued_action(words,ACTION_VALUE_WORDS): return True
+    return False
 
 
 def _hermes_read_only(name):
@@ -312,7 +399,7 @@ def native_catalog():
         read_only=_hermes_read_only(name)
         row={'tool_id':digest(['hermes-native',registry.current_scope_key(),registry._generation,
                                config_digest,name,toolset,schema,read_only]),
-             'name':name,'description':safe(function.get('description',''),1200),
+             'name':name,'description':plain_line(function.get('description',''),1200),
              'parameters':schema,'read_only':read_only,'_kind':'hermes','_raw':name,
              '_toolset':toolset,'_enabled_tools':enabled_tools}
         if name in INLINE_TOOLS: row['_inline']=name
@@ -329,7 +416,7 @@ def native_catalog():
             parameters=json.loads(encoded(provided.get('parameters') or {'type':'object','properties':{}}))
             output.append({'tool_id':digest(['hermes-memory-provider',registry.current_scope_key(),registry._generation,
                                              config_digest,name,parameters]),
-                           'name':name,'description':safe(provided.get('description',''),1200),
+                           'name':name,'description':plain_line(provided.get('description',''),1200),
                            'parameters':parameters,'read_only':False,'_kind':'hermes','_raw':name,
                            '_toolset':'memory','_inline':'provider','_enabled_tools':enabled_tools})
     return output
@@ -348,6 +435,65 @@ def tool_read_only(tool, arguments):
     if tool.get('_kind')!='hermes': return False
     name=tool.get('_raw')
     return arguments.get('action') in NATIVE_READ_ONLY_ACTIONS.get(name,())
+
+
+def tool_words(tool):
+    raw=str(tool.get('_raw') or tool.get('name') or '')
+    return [word for word in re.split(r'[^0-9A-Za-z]+',raw.casefold()) if word]
+
+
+def source_label(name, clean=safe):
+    """A source's name as a short line of words. The secret redaction runs on the name as written: once it is reduced to words, a
+    URL with credentials or a key with its separators no longer matches anything."""
+    return ' '.join(word for word in re.split(r'[^0-9A-Za-z]+', clean(display_line(name, 400), 400)) if word)[:80]
+
+
+def source_lines(rows, per_group, clean=safe):
+    """One line per tool source: each MCP server under its own name, and Hermes for its own tools. Tools that share leading
+    words form a group, shown with its size and up to [per_group] names. Labels come only from the user's own servers and
+    tools, never from guessing a service, so every source (browser, mail, notes, anything) is named for what it is."""
+    sources={}
+    for tool in rows:
+        if not isinstance(tool,dict): continue
+        words=tool_words(tool)
+        if not words: continue
+        server=tool.get('_server')
+        source=str(server) if server else 'Hermes'
+        key=words[0] if server else (plain_line(tool.get('_toolset') or '',80) or words[0])
+        sources.setdefault(source,{}).setdefault(key,[]).append(words)
+    lines=[]
+    for source in sorted(sources,key=lambda name:(name!='Hermes',name.casefold())):
+        label=source_label(source,clean) or 'Hermes'
+        parts=[];loose=[]
+        for key,names in sorted(sources[source].items(),key=lambda item:(-len(item[1]),item[0])):
+            names=sorted(names)
+            if len(names)==1:
+                loose.append(' '.join(names[0]));continue
+            shortest=min(len(name) for name in names)
+            prefix=0
+            # Hermes' own groups are its toolsets ("file", "web"), named as Hermes names them; an MCP group is named by its shared words.
+            while source!='Hermes' and prefix<shortest-1 and len({tuple(name[:prefix+1]) for name in names})==1: prefix+=1
+            title=' '.join(names[0][:prefix]) if prefix else key
+            shown=[' '.join(name[prefix:]) for name in names[:per_group]]
+            parts.append(f'{title} ({len(names)})'+(': '+', '.join(shown) if shown else ''))
+        if loose:
+            room=max(per_group,1)*2
+            parts.append(', '.join(loose[:room])+(' and more' if len(loose)>room else ''))
+        lines.append(label+': '+'; '.join(parts))
+    return lines
+
+
+def fitted_sources(rows, budget, clean=safe):
+    """The source lines with as many names as fit in [budget] bytes; every source keeps its line while there is room."""
+    for per_group in (6,4,3,2,1,0):
+        text='\n'.join(source_lines(rows,per_group,clean))
+        if len(text.encode('utf-8'))<=budget: return text
+    kept=[];size=0
+    for line in source_lines(rows,0,clean):
+        count=len(line.encode('utf-8'))+1
+        if size+count>budget: break
+        kept.append(line);size+=count
+    return '\n'.join(kept)
 
 
 class NativeMcp:
@@ -403,6 +549,12 @@ class NativeMcp:
         except Exception:
             return None
 
+    def configured_servers(self):
+        """The enabled MCP servers in this profile's config, by name only (no connection details)."""
+        from tools.mcp_tool_config import _load_mcp_config
+        from tools.mcp_tool_common import mcp_server_enabled
+        return sorted(str(name) for name,cfg in (_load_mcp_config() or {}).items() if isinstance(cfg,dict) and mcp_server_enabled(cfg))
+
     def catalog(self, discover=True):
         from tools import mcp_tool as core
         from tools.mcp_tool_config import _load_mcp_config
@@ -433,7 +585,11 @@ class NativeMcp:
                 if not _same_server_route(live, cfg, cross_profile=False): continue
             elif cached != cfg:
                 continue
-            schema = json.loads(encoded(entry.schema.get('parameters', {})))
+            try: schema = json.loads(encoded(plain_schema(entry.schema.get('parameters', {}))))
+            except (TypeError, ValueError):
+                # A schema that cannot be held (a NaN, a loop) leaves only its own tool out; the rest of the catalogue stays.
+                logger.warning('A tool schema could not be read; the tool is left out: %r', str(entry.name)[:80])
+                continue
             generic_http=raw.replace('-', '_').endswith('make_request')
             properties=schema.get('properties',{})
             method=properties.get('method') if isinstance(properties,dict) else None
@@ -452,7 +608,7 @@ class NativeMcp:
             tool_timeout=float(closure.get('tool_timeout') or 60)
             version = digest([registry.current_scope_key(), server, raw, cfg, schema, readonly])
             output.append({'tool_id':version, 'name':entry.name,
-                           'description':safe(entry.schema.get('description', ''), 1200),
+                           'description':plain_line(entry.schema.get('description', ''), 1200),
                            'parameters':schema, 'read_only':readonly,
                            '_timeout':tool_timeout,
                            '_server':server, '_raw':raw,
@@ -648,37 +804,31 @@ class Gateway:
         return self.compact_catalogue(profile)
 
     def compact_catalogue(self, profile):
-        groups={}
-        for tool in sorted(self.catalog(profile,discover=False),key=lambda item:str(item.get('name',''))):
-            if not tool.get('read_only'): continue
-            source=tool.get('_server') or tool.get('_toolset') or 'Hermes'
-            source=' '.join(str(source).split())[:80]
-            corpus=' '.join(str(tool.get(key) or '') for key in ('name','_raw','description')).casefold()
-            if 'google_workspace' in corpus or 'google workspace' in corpus: label='Google Workspace'
-            elif 'gmail' in corpus or 'email' in corpus or 'mail' in corpus: label='Gmail'
-            else: label=re.sub(r'[_-]+',' ',source).title()
-            description=safe(tool.get('description',''),1200)
-            description=re.sub(r'\s+',' ',''.join(c for c in description if c.isprintable())).strip()
-            if not description:
-                description=re.sub(r'[_-]+',' ',str(tool.get('_raw') or tool.get('name') or '')).strip()
-            rows=groups.setdefault(source,[label,[]])[1]
-            if description and description not in rows and len(rows)<3:
-                rows.append(description[:72])
-        lines=[];size=0
-        for label,rows in sorted(groups.values(),key=lambda value:value[0].casefold()):
-            if not rows: continue
-            line=label+': '+'; '.join(rows)
-            line_bytes=len(line.encode('utf-8'))+1
-            if size+line_bytes>MAX_CATALOGUE_BYTES: break
-            lines.append(line);size+=line_bytes
-        return '\n'.join(lines)
+        """The call's map of every tool source this profile has (read and write tools alike), within MAX_CATALOGUE_BYTES."""
+        # The same redaction as discover()'s sources map: this text is what the voice model's instruction carries.
+        return self.sanitize(fitted_sources(self.catalog(profile,discover=False),MAX_CATALOGUE_BYTES,self.sanitize),MAX_CATALOGUE_BYTES)
+
+    def _starting(self, profile, rows):
+        """MCP servers in this profile's config that have no tools yet while this process is still scanning: they are starting
+        up, not missing. Empty when nothing is scanning, so a server that failed to start is never reported as on its way."""
+        names=getattr(self.backend,'configured_servers',None)
+        if not callable(names): return []
+        first=CATALOG_FIRST_WARM.get(profile)
+        with CATALOG_LOCK: scanning=any(isinstance(key,tuple) and key[:1]==(profile,) for key in CATALOG_WARMING)
+        if not (scanning or (first is not None and first.is_alive())): return []
+        try: configured=self.scoped(profile,lambda _:names())
+        except Exception: return []
+        present={str(tool.get('_server')) for tool in rows if isinstance(tool,dict) and tool.get('_server')}
+        labels=[source_label(name,self.sanitize) for name in configured if str(name) not in present]
+        return [label for label in (self.sanitize(label,80) for label in labels) if label]
 
     def discover(self, profile, query=''):
         if not isinstance(query, str) or len(query)>240: raise HTTPException(400, 'Invalid tool query')
         self.warm_catalogue(profile)
-        # Right after a restart MCP tools are still being discovered; wait once (bounded) so mail tools are not missed.
+        # Right after a restart MCP servers are still starting. Wait briefly for a quick scan, then answer with what is ready;
+        # servers still starting are named in the answer, so the call asks again instead of waiting out its deadline.
         first=CATALOG_FIRST_WARM.get(profile)
-        if first is not None and first is not threading.current_thread(): first.join(30)
+        if first is not None and first is not threading.current_thread(): first.join(FIRST_SCAN_WAIT)
         words = set(re.findall(r'[^\W_]+', query.casefold())) - QUERY_FILLER
         words = {word for word in words if not word.isdecimal()}
         rows = self.catalog(profile,discover=False)
@@ -687,7 +837,9 @@ class Gateway:
         selected = [tool for score,tool in sorted(ranked, key=lambda row:row[0], reverse=True) if score[1]] if words else rows
         result, size = [], 0
         for tool in selected:
-            public = {k:v for k,v in tool.items() if not k.startswith('_')}
+            public = plain_schema({k:v for k,v in tool.items() if not k.startswith('_')})
+            # The name is the one string the model is told to use as it stands: redacted and bounded like a description.
+            if isinstance(tool.get('name'),str): public['name'] = plain_line(tool['name'],MAX_TOOL_NAME)
             # Schema output is also untrusted and bounded; never leak connection config.
             text = self.sanitize(encoded(public), MAX_RESULT)
             if text != encoded(public):
@@ -697,7 +849,13 @@ class Gateway:
             if count>MAX_RESULT or size+count>MAX_RESULT: continue
             result.append(public); size += count
             if len(result)==MAX_TOOLS: break
-        return {'tools':result, 'total_matches':len(selected), 'truncated':len(result)<len(selected)}
+        answer={'tools':result, 'total_matches':len(selected), 'truncated':len(result)<len(selected)}
+        # Every answer carries the map of all sources, so a narrow or empty search still shows what else exists.
+        sources=self.sanitize(fitted_sources(rows,MAX_SOURCES_BYTES,self.sanitize),MAX_SOURCES_BYTES)
+        if sources: answer['sources']=sources
+        starting=self._starting(profile,rows)
+        if starting: answer['still_starting']=starting
+        return answer
 
     def _row(self, conn, scope, request):
         return conn.execute('SELECT * FROM tool_receipts WHERE owner=? AND provider=? AND profile=? AND call_id=? AND request_id=?', (*scope,request)).fetchone()
@@ -767,7 +925,9 @@ class Gateway:
         session_id=session_id or scope[3]
         approved_by=None if read_only else self._approval_source(scope,tool,arguments,session_id)
         needs_approval=not read_only and approved_by is None
-        result={'request_id':request,'tool_id':tool['tool_id'],'tool_name':tool['name'],
+        # The name is shown to the model and on the approval card as plain text; the real one still runs the tool.
+        shown_name=plain_line(tool['name'],MAX_TOOL_NAME)
+        result={'request_id':request,'tool_id':tool['tool_id'],'tool_name':shown_name,
                 'status':'needs_approval' if needs_approval else 'ready','approved_by':approved_by,
                 '_arguments':arguments,'_read_only':read_only,'_session_id':session_id,
                 '_expires':time.time()+120}
@@ -781,7 +941,7 @@ class Gateway:
                     raise ValueError('Approval arguments were changed by redaction')
             except (ValueError,TypeError):
                 raise HTTPException(400,'These arguments cannot be shown accurately for approval; remove sensitive values') from None
-            result['proposal']={'id':secrets.token_urlsafe(32),'tool_name':tool['name'],'arguments':displayed,
+            result['proposal']={'id':secrets.token_urlsafe(32),'tool_name':shown_name,'arguments':displayed,
                                 **({'allow_call':False} if tool.get('_kind')=='hermes' else {})}
         with self.db() as conn:
             previous=self._row(conn,scope,request)

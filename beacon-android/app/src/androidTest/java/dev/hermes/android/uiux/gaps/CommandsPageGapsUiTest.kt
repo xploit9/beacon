@@ -27,7 +27,8 @@ class CommandsPageGapsUiTest {
         compose.waitForIdle()
     }
     private fun serve(vm: BeaconViewModel, payload: org.json.JSONObject) = compose.runOnIdle { vm.storeData(key, payload) }
-    private fun search() = compose.onNode(hasSetTextAction() and hasText("Search commands"))
+    // The field is found by its tag: its placeholder is gone once something is typed.
+    private fun search() = compose.onNode(hasSetTextAction() and hasTestTag("commands-search"))
 
     @Test fun theFirstReadShowsPlaceholderRowsNotAnEmptyOrFailedPage() = withClientlessVm(compose) { vm ->
         show(vm)

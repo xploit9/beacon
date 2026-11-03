@@ -33,6 +33,7 @@ import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -41,9 +42,10 @@ import java.io.File
 /**
  * Lanes assist-overlay, ux-overlay and ux2-overlay: Beacon's own assistant overlay on the emulator, end to end. It makes Beacon the phone's
  * assistant for the run (cmd role, test only), opens the overlay over the home screen, over another app and over the lock screen,
- * asks in writing, listens, starts a live call without the app coming to the front, checks that a locked answer waits behind the
- * lock row and that the chips fit whole, that the first summon's "Talk live" hint ends on the pill's end (mirrored in Arabic) with the
- * chips held until it has faded, that a failed send goes back to the pill and a failed call shows its short reason, and takes the
+ * asks in writing, listens, starts the live conversation at once (the side button talks, with no tap and no other window: the text box stays and the captions sit above it),
+ * ends it with the orb and by closing, checks that over the lock screen the side button asks for the unlock first (one line, nothing started,
+ * nothing sent, then the unlock brings the conversation) and that the chips fit whole, that a failed send
+ * goes back to the pill and a failed call shows its short reason, and takes the
  * review screenshots in four looks (dark, light, Arabic right to left in dark, 1.3x text in light). Everything it changes on the phone (assistant, recognizer, lock screen, dark mode, text size, app language)
  * is put back in `finally`.
  *
@@ -280,47 +282,21 @@ class AssistOverlayDeviceTest {
     }
 
     /**
-     * The first summon's hint: the capsule's end sits on the pill's end (its right edge, or its left in Arabic, 16 dp from the screen)
-     * with the pointer over the orb, and the chips are still held while it shows. The numbers are read the moment it appears, since it
-     * stays for 1.5 s; the still is taken a moment later, once it has faded in.
+     * The side button talks at once: waits for the conversation to start by itself, checks it is the overlay's alone (the app's call
+     * window held away, the app not in front, the text box still there, no band and no "Open call"), then ends it with the orb so the
+     * written-answer flows that follow run on the bare pill.
      */
-    private fun assertHintAligned(look: Look, shot: String) {
-        waitFor("the talk hint in ${look.name}", 6_000) { hasTag("assist-talk-hint") }
-        val stage = controller().hint
-        val (hint, pill, orb) = boundsOf("assist-talk-hint", "assist-pill", "assist-live")
-        val width = main { requireNotNull(session()?.window?.window?.decorView).width }
-        Thread.sleep(250)
-        capture(shot, settle = 0)
-        val density = app.resources.displayMetrics.density
-        timings.put("hint_${look.name}", JSONObject().put("hint", JSONArray(hint.toList())).put("pill", JSONArray(pill.toList())).put("orb", JSONArray(orb.toList()))
-            .put("screen_width", width).put("stage", stage.name))
-        assertEquals("The chips wait while the hint shows in ${look.name}", HintStage.Playing, stage)
-        val gap = if (look.arabic) hint[0] - pill[0] else pill[1] - hint[1]
-        assertTrue("The hint's end sits on the pill's end in ${look.name}: hint=${hint.toList()} pill=${pill.toList()}", kotlin.math.abs(gap) <= 2f)
-        val margin = if (look.arabic) pill[0] else width - pill[1]
-        assertTrue("The pill's end is 16 dp from the screen in ${look.name}: $margin px", kotlin.math.abs(margin - 16 * density) <= 3f)
-        val orbCentre = (orb[0] + orb[1]) / 2f
-        assertTrue("The pointer falls over the orb in ${look.name}: orb at $orbCentre inside ${hint.toList()}", orbCentre >= hint[0] && orbCentre <= hint[1])
+    private fun endAutoLive() {
+        waitFor("the conversation to start by itself", 30_000) { controller().state.surface == OverlaySurface.Live || controller().state.line != null }
+        if (controller().state.surface != OverlaySurface.Live) return
+        assertTrue("The overlay holds the app's call window away while it shows", app.calls.uiVisible)
+        assertFalse("The conversation must not bring the app to the front", beaconInFront())
+        assertTrue("The text box stays during the conversation", hasTag("assist-pill") && hasTag("assist-field") && hasTag("assist-live"))
+        assertFalse("No band of its own", hasTag("assist-live-band"))
+        assertFalse("No Open call panel", hasTag("assist-live-open"))
+        main { controller().endCall() }
+        waitFor("the conversation to end", 45_000) { controller().state.surface != OverlaySurface.Live && !app.calls.state.value.active }
     }
-
-    /** Locked, the finished answer waits behind the lock row: the row shows, and not a word of the answer does. */
-    private fun assertLockedAnswerHidden(look: Look) {
-        val ask = requireNotNull(controller().state.ask)
-        // The controller's state changes a frame before the semantics tree does, so the lock row is waited for (and how long it took is
-        // recorded); at no poll in that time may any of the answer's text be on screen.
-        val started = SystemClock.uptimeMillis()
-        val atOnce = hasTag("assist-unlock-to-see")
-        waitFor("the lock row in ${look.name}: ${overlayState()}", 8_000) {
-            assertFalse("A locked answer never shows its text in ${look.name}", hasTag("assist-answer-text"))
-            hasTag("assist-unlock-to-see")
-        }
-        timings.put("lock_row_at_once_${look.name}", atOnce).put("lock_row_wait_ms_${look.name}", SystemClock.uptimeMillis() - started)
-        assertTrue("A locked answer shows the lock row in ${look.name}", hasTag("assist-unlock-to-see"))
-        assertFalse("A locked answer never shows its text in ${look.name}", hasTag("assist-answer-text"))
-        val words = ask.answer.trim().take(24)
-        assertTrue("The answer's words show locked in ${look.name}", words.isBlank() || shownTexts().none { it.contains(words) })
-    }
-
     /** Non-intrusive, always runs: Android can find the assistant service, its session and the pass-through recognizer. */
     @Test fun androidSeesBeaconAsAnAssistantWithARecognizer() {
         val pm = app.packageManager
@@ -356,27 +332,19 @@ class AssistOverlayDeviceTest {
         val night = shell("cmd uimode night")
         val fontScale = shell("settings get system font_scale")
         appLocales = Regex("""\[(.*)]""").find(shell("cmd locale get-app-locales $pkg"))?.groupValues?.get(1).orEmpty().trim()
-        val hints = app.getSharedPreferences(AssistOverlayController.HINTS, Context.MODE_PRIVATE)
-        val hintSeen = hints.getBoolean(AssistOverlayController.TALK_HINT_SEEN, false)
         try {
             shell("cmd role add-role-holder android.app.role.ASSISTANT $pkg")
             waitFor("Beacon to become the assistant", 20_000) { shell("settings get secure voice_interaction_service") == assistant }
             assertEquals(PhoneAssistantState.Active, phoneAssistantState(app))
 
-            // 1. Over the home screen: the cold first show says once what the orb is for, then the overlay's own pill and chips.
-            hints.edit().remove(AssistOverlayController.TALK_HINT_SEEN).commit()
+            // 1. Over the home screen: the cold first show opens the pill and starts the conversation after its first frame.
             wear(looks[0])
             shell("input keyevent KEYCODE_HOME")
             Thread.sleep(1_500)
             timings.put("cold_first_frame_ms", summon())
             assertFalse("The overlay must not bring the app to the front", beaconInFront())
-            val hinted = runCatching { waitFor("the talk hint", 6_000) { hasTag("assist-talk-hint") } }.isSuccess
-            timings.put("talk_hint_shown", hinted)
-            assertTrue("The first summon shows the hint", hinted)
-            assertHintAligned(looks[0], "00-talk-hint-dark")
-            // The chips rise after the hint has faded, never under it.
-            waitFor("the hint to fade", 6_000) { controller().hint == HintStage.Over && !hasTag("assist-talk-hint") }
-            assertTrue("The talk hint is shown once, then remembered", hints.getBoolean(AssistOverlayController.TALK_HINT_SEEN, false) || !hinted)
+            assertFalse("The first summon shows no hint any more", hasTag("assist-talk-hint"))
+            endAutoLive()
             waitFor("the assistant chat to open in the overlay", 90_000) {
                 val vm = controller().vm
                 vm != null && vm.ui.value.authenticated && vm.chat.value.sessionId.isNotBlank() && vm.isBeaconConversation()
@@ -404,31 +372,14 @@ class AssistOverlayDeviceTest {
             warmShows += warm
             dismissWithBack()
 
-            // 2b. The first summon's hint in the other three looks, over Settings: end on the pill's end, mirrored in Arabic.
-            for (look in looks.drop(1)) {
-                hints.edit().remove(AssistOverlayController.TALK_HINT_SEEN).commit()
-                wear(look)
-                Thread.sleep(1_500)
-                summon()
-                if (look.arabic) assertEquals("ar", controller().locale.language)
-                assertHintAligned(look, "00-talk-hint-${look.name}")
-                waitFor("the hint to fade", 6_000) { controller().hint == HintStage.Over && !hasTag("assist-talk-hint") }
-                dismissWithBack()
-            }
-            // Remembered: the next summon shows no hint and lets the chips rise at once.
             wear(looks[0])
             Thread.sleep(1_500)
-            summon()
-            Thread.sleep(600)
-            assertFalse("The hint shows once", hasTag("assist-talk-hint"))
-            assertEquals(HintStage.Over, controller().hint)
-            dismissWithBack()
-
             // 3. Over an app in every look: the bare pill and its chips, a written answer, a send that failed, a call that didn't start.
             for (look in looks) {
                 wear(look)
                 summon()
                 if (look.arabic) assertEquals("ar", controller().locale.language)
+                endAutoLive()
                 assertChipsFit(look)
                 capture("app-idle-${look.name}")
                 askAndWait("Without using any tools, reply in one short sentence: say hello.")
@@ -469,6 +420,7 @@ class AssistOverlayDeviceTest {
 
             // 4. The mic: dictation listens here and answers in writing.
             summon()
+            endAutoLive()
             main { controller().dictate() }
             waitFor("dictation to start", 5_000) { controller().state.dictating || controller().state.line != null }
             if (controller().state.dictating) { capture("07-listening"); frames("listening", 2_000) }
@@ -476,42 +428,61 @@ class AssistOverlayDeviceTest {
             main { if (controller().state.dictating) controller().dictate() }
             Thread.sleep(1_000)
 
-            // 5. A live call from the pill: it reaches connecting or live while the app stays in the background; stills in every look.
-            main { controller().clearLine(); controller().startLive() }
-            waitFor("the live call to start", 45_000) { app.calls.state.value.active && app.calls.state.value.state != "idle" }
+            // 5. The side button talks at once, in the overlay alone: the conversation starts by itself (no tap), the app stays in the
+            // background, the text box stays with the captions above it, and there is no band, no Open call and no call screen.
+            summon()
+            waitFor("the live conversation to start", 45_000) { app.calls.state.value.active && app.calls.state.value.state != "idle" }
             assertEquals(OverlaySurface.Live, controller().state.surface)
-            assertFalse("A call from the overlay must not open the app", beaconInFront())
+            assertFalse("A conversation from the overlay must not open the app", beaconInFront())
+            assertTrue("The overlay holds the app's call window away", app.calls.uiVisible)
+            assertTrue("The text box stays during the conversation", hasTag("assist-pill") && hasTag("assist-field") && hasTag("assist-live"))
+            assertFalse("No band of its own", hasTag("assist-live-band"))
+            assertFalse("No Open call panel", hasTag("assist-live-open"))
             timings.put("call_state", app.calls.state.value.state)
             capture("app-live-dark")
             val spoke = runCatching { waitFor("the assistant to speak", 25_000) { presenceState(app.calls.state.value) == SphereState.Speaking } }.isSuccess
             timings.put("speaking_seen", spoke)
             if (spoke) { capture("09-speaking"); frames("speaking", 2_000) }
-            // After the greeting, so measuring never hides it: the band's frames, then typing mid-call. The keyboard control opens
-            // the typing row; the still shows both, then the row closes again.
+            // After the greeting, so measuring never hides it: the live frames, then a typed turn from the text box, whose words show
+            // in the captions directly above it.
             frames("live")
-            if (app.calls.state.value.active && clickTag("assist-live-type")) {
-                Thread.sleep(800); capture("08b-live-typing"); timings.put("typing_still", true)
-                main { controller().draft = TextFieldValue() }
-                clickTag("assist-live-type"); Thread.sleep(500)
+            if (app.calls.state.value.active) {
+                main { controller().draft = TextFieldValue("Say OK."); controller().ask() }
+                runCatching { waitFor("the typed turn in the captions", 10_000) { hasTag("assist-captions") } }
+                val captioned = hasTag("assist-captions")
+                timings.put("typing_still", captioned)
+                if (captioned) {
+                    val (captions, pill) = boundsOf("assist-captions", "assist-pill")
+                    assertTrue("The captions sit above the text box: ${captions.toList()} over ${pill.toList()}", captions[3] <= pill[2] + 1f)
+                    capture("08b-live-typing")
+                }
             } else timings.put("typing_still", false)
+            // Each look needs the overlay opened again (the language is read on a summon), and closing ends the conversation.
             for (look in looks.drop(1)) {
                 if (!app.calls.state.value.active) break
-                if (look.arabic) dismissWithBack()
+                dismissWithBack()
+                waitFor("the conversation to end with the overlay", 45_000) { !app.calls.state.value.active }
                 wear(look)
-                // The language is read on a summon; a running call opens straight into the live band.
-                if (look.arabic) { summon(); assertEquals(OverlaySurface.Live, controller().state.surface) }
-                // A new text size restarts the app beneath; the still waits for it to draw again.
+                summon()
+                if (look.arabic) assertEquals("ar", controller().locale.language)
+                waitFor("the live conversation in ${look.name}", 45_000) { app.calls.state.value.active && controller().state.surface == OverlaySurface.Live }
                 Thread.sleep(1_500)
                 capture("app-live-${look.name}")
-                if (look.arabic) { dismissWithBack(); wear(looks[0]); summon() }
             }
             assertFalse(beaconInFront())
-            main { controller().endCall() }
-            waitFor("the call to end", 45_000) { !app.calls.state.value.active }
+            // The orb is the one control: a tap on it ends the conversation and the pill is the talk button again.
+            assertTrue("The orb ends the conversation", clickTag("assist-live"))
+            waitFor("the conversation to end with the orb", 45_000) { !app.calls.state.value.active && controller().state.surface != OverlaySurface.Live }
+            // A tap to talk starts it again; closing the overlay then ends it, so nothing keeps listening hidden.
+            assertTrue("The orb talks again", clickTag("assist-live"))
+            waitFor("the conversation to start again", 45_000) { app.calls.state.value.active }
             dismissWithBack()
+            waitFor("the conversation to end with the overlay", 45_000) { !app.calls.state.value.active }
+            assertFalse("Nothing holds the app's call window once the overlay is closed", app.calls.uiVisible)
             wear(looks[0])
-
-            // 6. Over the lock screen in every look: the bare pill, then a written answer that waits behind the lock row.
+            // 6. Over the lock screen in every look: the side button asks for the unlock first (owner decision, 3 Nov). The one line
+            // "Unlock your phone first." with Unlock is all the overlay shows; nothing is heard or said, no conversation starts, no
+            // microphone opens, no chip, no mic, no send, and a question typed anyway goes nowhere.
             shell("locksettings set-disabled false")
             shell("input keyevent KEYCODE_SLEEP"); Thread.sleep(1_500); shell("input keyevent KEYCODE_WAKEUP")
             val keyguard = requireNotNull(app.getSystemService(KeyguardManager::class.java))
@@ -520,38 +491,55 @@ class AssistOverlayDeviceTest {
             for (look in looks) {
                 wear(look)
                 // The lock screen sleeps ten seconds after it wakes, and the system hides the overlay with the screen. The open overlay
-                // holds the screen for half a minute after the last interaction, so each look wakes the phone afresh, pauses 15 s (past
-                // the phone's own timeout) with the overlay still open, and asks inside the half minute; the frame measurement waits
-                // until the answer holds the screen on.
+                // holds the screen for half a minute after the last interaction, so each look wakes the phone afresh.
                 shell("input keyevent KEYCODE_SLEEP"); Thread.sleep(1_000)
                 shell("input keyevent KEYCODE_WAKEUP"); Thread.sleep(500)
                 summon()
                 assertTrue("The overlay knows it is over the lock screen", controller().locked)
                 assertTrue(keyguard.isKeyguardLocked)
-                capture("lock-idle-${look.name}")
-                // A pause to think over on the lock screen: still open, screen still on, nothing touched for 15 s.
-                Thread.sleep(15_000)
-                assertTrue("The overlay is still open after a 15 s pause on the lock screen in ${look.name}: ${overlayState()}",
-                    controller().state.phase == OverlayPhase.Open && power.isInteractive && keyguard.isKeyguardLocked && hasTag("assist-pill"))
-                capture("lock-idle-15s-${look.name}")
-                assertTrue("The lock screen is still on, with the overlay open, when the question is asked in ${look.name}: ${overlayState()}",
-                    power.isInteractive && controller().state.phase == OverlayPhase.Open)
-                askAndWait("Without using any tools, reply in one short sentence: what colour is the sky on a clear day?")
-                assertTrue("Still locked while answering", keyguard.isKeyguardLocked)
-                // The lock screen sleeps ten seconds after the last touch; the overlay holds it on while it answers.
-                assertTrue("The screen stayed on over the lock screen", requireNotNull(app.getSystemService(android.os.PowerManager::class.java)).isInteractive)
-                assertTrue(controller().state.phase == OverlayPhase.Open)
-                assertLockedAnswerHidden(look)
-                capture("lock-answer-${look.name}")
-                // Measured with the answer up, which keeps the screen on for the measurement.
+                waitFor("the unlock line in ${look.name}: ${overlayState()}", 8_000) { controller().state.line == OverlayLine.Unlock && hasTag("assist-line") }
+                waitForText("the unlock line", shownIn(look, "Unlock your phone first."))
+                waitForText("its Unlock action", shownIn(look, "Unlock"))
+                // Nothing starts by itself, however long it waits: no conversation, no call, no microphone, no written answer.
+                Thread.sleep(4_000)
+                assertEquals("Still the unlock line in ${look.name}: ${overlayState()}", OverlayLine.Unlock, controller().state.line)
+                assertEquals(OverlaySurface.Pill, controller().state.surface)
+                assertFalse("No conversation starts on a locked phone in ${look.name}", app.calls.state.value.active)
+                assertFalse(controller().state.dictating)
+                assertNull(controller().state.ask)
+                assertFalse("No chip over the lock screen", hasTag("assist-chip-0"))
+                assertFalse("No mic over the lock screen", hasTag("assist-mic"))
+                assertFalse("No send over the lock screen", hasTag("assist-send"))
+                // A question typed anyway goes nowhere.
+                main { controller().draft = TextFieldValue("Hello"); controller().ask() }
+                Thread.sleep(700)
+                assertNull("A typed question is not sent locked in ${look.name}", controller().state.ask)
+                assertEquals(OverlaySurface.Pill, controller().state.surface)
+                main { controller().draft = TextFieldValue() }
+                assertTrue("The screen stays on over the lock screen while the line waits", power.isInteractive && controller().state.phase == OverlayPhase.Open)
+                capture("lock-unlock-first-${look.name}")
                 if (look.name == "dark") frames("locked")
                 dismissWithBack()
             }
+            // The unlock brings the conversation: Unlock asks Android (no PIN here, so it succeeds at once), the overlay comes back as a
+            // fresh start and the conversation starts on its own, as it does on an unlocked phone.
+            wear(looks[0])
+            shell("input keyevent KEYCODE_SLEEP"); Thread.sleep(1_000)
+            shell("input keyevent KEYCODE_WAKEUP"); Thread.sleep(500)
+            summon()
+            waitFor("the unlock line before the unlock", 8_000) { controller().state.line == OverlayLine.Unlock && hasTag("assist-line-action") }
+            assertTrue("Unlock asks Android for the unlock", clickTag("assist-line-action"))
+            waitFor("the phone to unlock", 20_000) { !keyguard.isKeyguardLocked }
+            waitFor("the conversation after the unlock: ${overlayState()}", 60_000) { app.calls.state.value.active && controller().state.surface == OverlaySurface.Live }
+            assertNull("The line is gone once the phone is unlocked", controller().state.line)
+            assertFalse("Unlocked, the overlay no longer reads as locked", controller().locked)
+            capture("unlock-then-talk")
+            dismissWithBack()
+            waitFor("the conversation to end with the overlay", 45_000) { !app.calls.state.value.active }
             shell("wm dismiss-keyguard")
         } finally {
             runCatching { app.calls.hangup() }
             runCatching { session()?.let { s -> main { s.hide() } } }
-            hints.edit().putBoolean(AssistOverlayController.TALK_HINT_SEEN, hintSeen).commit()
             shell("settings put system font_scale $fontScale")
             restoreAppLocale()
             shell(if (night.contains("yes")) "cmd uimode night yes" else if (night.contains("no")) "cmd uimode night no" else "cmd uimode night auto")

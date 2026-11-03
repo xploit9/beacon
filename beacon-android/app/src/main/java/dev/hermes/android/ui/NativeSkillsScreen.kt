@@ -11,7 +11,6 @@ import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Key
 import androidx.compose.material.icons.rounded.PowerSettingsNew
-import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.SearchOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -108,7 +107,7 @@ private fun LazyListScope.skillList(
     item(key = "counts") { SettingsSection(testTag = "skills-counts") {
         SettingsMetricRow(listOf(uiText("Installed") to "${all.size}", uiText("Enabled") to "${all.count { it.enabled }}", uiText("Need setup") to "${all.count { it.requirements.isNotEmpty() }}"))
     } }
-    item(key = "search") { OutlinedTextField(value = state.search, onValueChange = onSearch, label = { Text(uiText("Search skills")) }, leadingIcon = { Icon(Icons.Rounded.Search, null) }, singleLine = true, modifier = Modifier.fillMaxWidth()) }
+    item(key = "search") { SettingsSearchField(state.search, onSearch, uiText("Search skills"), testTag = "skills-search") }
     item(key = "filter") {
         val ids = listOf("all", "on", "setup")
         val labels = listOf(uiText("All"), uiText("Enabled"), uiText("Needs setup"))
@@ -139,14 +138,18 @@ private fun LazyListScope.skillList(
     }
 }
 
-/** A skill: its name, one line of description and, when it can't work yet, a "Needs setup" pill. The row opens it; the switch is its own target. */
+/** Past 1.15x text a skill's description takes two lines, so the meaning is not cut to a few words; below it, one line. */
+internal fun skillDescriptionLines(fontScale: Float): Int = if (fontScale > 1.15f) 2 else 1
+
+/** A skill: its name, its description (one line, two at large text) and, when it can't work yet, a "Needs setup" pill. The row opens it; the switch is its own target. */
 @Composable private fun SkillRow(skill: NativeSkill, busy: Boolean, switchSaving: Boolean, enableLabel: String, onOpen: () -> Unit, onToggle: (Boolean) -> Unit) {
+    val descriptionLines = skillDescriptionLines(LocalDensity.current.fontScale)
     Row(Modifier.fillMaxWidth().heightIn(min = 72.dp).clickable(enabled = !busy, role = Role.Button, onClick = onOpen).padding(start = 16.dp, top = 12.dp, end = 16.dp, bottom = 12.dp).testTag("skill-row-${skill.name}"),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
         SettingsIconTile(SkillsIcon)
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(skillDisplayName(skill.name), style = MaterialTheme.typography.bodyLarge.contentDirection(), fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(skill.description.ifBlank { uiText("No description") }, style = MaterialTheme.typography.bodyMedium.contentDirection(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(skill.description.ifBlank { uiText("No description") }, style = MaterialTheme.typography.bodyMedium.contentDirection(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = descriptionLines, overflow = TextOverflow.Ellipsis)
             if (skill.requirements.isNotEmpty()) SettingsStatusPill(SettingsStatus.Attention, uiText("Needs setup"))
             else if (skill.essential) SettingsStatusPill(SettingsStatus.Off, uiText("Always on"))
         }

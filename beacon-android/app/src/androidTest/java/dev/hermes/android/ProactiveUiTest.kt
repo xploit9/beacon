@@ -75,8 +75,11 @@ class ProactiveUiTest {
         compose.onNodeWithText("Cancel").performClick()
         compose.onNodeWithTag("proactive-time-Quiet hours end").performScrollTo().assertTextContains("Quiet until")
         compose.onNodeWithText("Run a brief now").assertDoesNotExist()
-        compose.onNodeWithTag("assistant-settings").performScrollToNode(hasText("What Beacon learned"))
-        compose.onNodeWithText("What Beacon learned").assertExists()
+        // Importance lives in the rules list; with no earlier ratings there is no card for them.
+        compose.onNodeWithTag("assistant-settings").performScrollToNode(hasText("Your rules"))
+        compose.onNodeWithText("Your rules").assertExists()
+        compose.onNodeWithText("Earlier ratings").assertDoesNotExist()
+        compose.onNodeWithText("What Beacon learned").assertDoesNotExist()
     }
 
     @Test fun v4SettingsSaveRulesAndKeepEveryRequestOnTheAssistantProfile() = withFixture { vm, fixture ->
@@ -155,23 +158,134 @@ class ProactiveUiTest {
         assertEquals("notify", fixture.proactiveDelivery["coder"])
     }
 
-    @Test fun learnedEmailNotesCanBeRemovedAndShowTheTeachingHintWhenEmpty() = withFixture { vm, fixture ->
+    // Importance rules sit in the one rules list beside the delivery rules: a verdict instead of Notify / Call, with edit, switch and delete.
+    @Test fun importanceRulesSitInTheOneRulesListWithEditSwitchAndDelete() = withFixture { vm, fixture ->
         fixture.proactiveEnabled["coder"] = true
-        fixture.proactiveLearned["coder"] = CopyOnWriteArrayList(listOf("Client moved the review"))
+        fixture.proactiveRequests["coder"] = CopyOnWriteArrayList(listOf(
+            json("id" to "rule-call", "text" to "Call when the client moves a review", "action" to "call", "signal" to null, "night" to false, "enabled" to true, "created_at" to 1),
+            json("id" to "rule-imp", "text" to "Sent by Acme Promotions", "action" to "not_important", "signal" to "email", "night" to false, "enabled" to true, "created_at" to 2),
+        ))
+        compose.runOnIdle { vm.more("Assistant") }
+        await { vm.data.value[proactiveKey(fixture)]?.optJSONArray("rules")?.length() == 2 }
+
+        compose.onNodeWithTag("assistant-settings").performScrollToNode(hasTestTag("proactive-rule-rule-imp"))
+        badgeShows("proactive-rule-kind-rule-imp", "Not important")
+        // The source reads as a word, not as the id Hermes sends.
+        badgeShows("proactive-rule-source-rule-imp", "Email")
+        compose.onNodeWithTag("proactive-rule-text-rule-imp").assertTextContains("Sent by Acme Promotions")
+        compose.onAllNodesWithTag("proactive-rule-night-rule-imp").assertCountEquals(0)
+        compose.onNodeWithTag("proactive-rule-night-rule-call").performScrollTo().assertExists()
+
+        // Edit the words; the verdict stays.
+        compose.onNodeWithTag("proactive-rule-edit-rule-imp").performScrollTo().performClick()
+        compose.onNodeWithTag("proactive-rule-edit-save").assertIsNotEnabled()
+        compose.onNodeWithTag("proactive-rule-edit-field").performTextReplacement("Sent by Acme")
+        compose.onNodeWithTag("proactive-rule-edit-save").assertIsEnabled().performClick()
+        await { fixture.proactiveRequests["coder"]?.firstOrNull { it.string("id") == "rule-imp" }?.string("text") == "Sent by Acme" }
+        val patch = fixture.requests.last { it.string("path") == "$PROACTIVE_SETTINGS_PATH/requests/rule-imp" && it.string("method") == "PATCH" }
+        assertEquals(setOf("text"), patch.getJSONObject("body").keys().asSequence().toSet())
+        await { compose.onAllNodesWithText("Sent by Acme").fetchSemanticsNodes().isNotEmpty() }
+        badgeShows("proactive-rule-kind-rule-imp", "Not important")
+
+        // The switch and delete work like every other rule's.
+        compose.onNodeWithTag("proactive-rule-enabled-rule-imp").performScrollTo().performClick()
+        await { fixture.proactiveRequests["coder"]?.firstOrNull { it.string("id") == "rule-imp" }?.optBoolean("enabled") == false }
+        compose.onNodeWithTag("proactive-rule-delete-rule-imp").performScrollTo().performClick()
+        compose.onNodeWithTag("proactive-rule-delete-confirm").performClick()
+        await { fixture.proactiveRequests["coder"]?.none { it.string("id") == "rule-imp" } == true }
+        compose.onAllNodesWithTag("proactive-rule-rule-imp").assertCountEquals(0)
+        compose.onNodeWithTag("proactive-rule-rule-call").performScrollTo().assertExists()
+    }
+
+    // Ratings from before importance became rules show once. Turn into rules lets the owner review and change what is proposed.
+    @Test fun earlierRatingsTurnIntoReviewedRulesAndTheCardIsGone() = withFixture { vm, fixture ->
+        fixture.proactiveEnabled["coder"] = true
+        fixture.proactiveLearned["coder"] = CopyOnWriteArrayList(listOf(
+            "Beacon importance: email: Important: \"Daniel Reyes / Client moved the review\"",
+            "Beacon importance: email: Not important: \"Acme Promotions / Weekly deals\"",
+        ))
+        fixture.proactiveProposal["coder"] = CopyOnWriteArrayList(listOf(
+            json("verdict" to "important", "source" to "email", "sender" to "Daniel Reyes", "topic" to "Client moved the review", "rule" to "Sent by Daniel Reyes"),
+            json("verdict" to "not_important", "source" to "email", "sender" to "Acme Promotions", "topic" to "Weekly deals", "rule" to "Sent by Acme Promotions"),
+        ))
+        compose.runOnIdle { vm.more("Assistant") }
+        await { vm.data.value[proactiveKey(fixture)]?.optJSONArray("learned_proposal")?.length() == 2 }
+
+        compose.onNodeWithTag("assistant-settings").performScrollToNode(hasText("Earlier ratings"))
+        compose.onNodeWithText("Earlier ratings").assertExists()
+        compose.onNodeWithText("What Beacon learned").assertDoesNotExist()
+        compose.onNodeWithTag("proactive-earlier-convert").performScrollTo().performClick()
+        await { compose.onAllNodesWithTag("earlier-rules-sheet").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("earlier-rule-text-0").assertTextContains("Sent by Daniel Reyes")
+        badgeShows("earlier-rule-kind-0", "Important")
+        compose.onNodeWithTag("earlier-rule-text-1").assertTextContains("Sent by Acme Promotions")
+        badgeShows("earlier-rule-kind-1", "Not important")
+
+        // The owner drops the second, rewords the first and saves.
+        compose.onNodeWithTag("earlier-rule-remove-1").performClick()
+        compose.onAllNodesWithTag("earlier-rule-text-1").assertCountEquals(0)
+        compose.onNodeWithTag("earlier-rule-text-0").performTextReplacement("Sent by Daniel Reyes (clients)")
+        compose.onNodeWithTag("earlier-rules-save").performClick()
+        await { fixture.proactiveLearnedRuleBodies.size == 1 && vm.data.value[proactiveKey(fixture)]?.optJSONArray("learned")?.length() == 0 }
+        val request = fixture.requests.last { it.string("path") == "$PROACTIVE_SETTINGS_PATH/learned/rules" && it.string("method") == "POST" }
+        assertEquals("coder", request.string("profile"))
+        val rules = request.getJSONObject("body").getJSONArray("rules")
+        assertEquals(1, rules.length())
+        assertEquals("important", rules.getJSONObject(0).string("verdict"))
+        assertEquals("email", rules.getJSONObject(0).string("source"))
+        assertEquals("Sent by Daniel Reyes (clients)", rules.getJSONObject(0).string("rule"))
+
+        // The card and the sheet are gone for good, and the rule is in the rules list.
+        await { compose.onAllNodesWithTag("earlier-rules-sheet").fetchSemanticsNodes().isEmpty() }
+        compose.onAllNodesWithText("Earlier ratings").assertCountEquals(0)
+        compose.onNodeWithTag("assistant-settings").performScrollToNode(hasText("Sent by Daniel Reyes (clients)"))
+        compose.onNodeWithText("Sent by Daniel Reyes (clients)").assertExists()
+    }
+
+    // The same cap as saving one rule from an alert: a full list says so, and the sheet stays with what the owner reviewed.
+    @Test fun turningEarlierRatingsIntoRulesWithAFullRulesListSaysItIsFull() = withFixture { vm, fixture ->
+        fixture.proactiveEnabled["coder"] = true
+        fixture.proactiveRequests["coder"] = CopyOnWriteArrayList((1..20).map {
+            json("id" to "rule-$it", "text" to "Call about item $it", "action" to "call", "signal" to null, "night" to false, "enabled" to true, "created_at" to it)
+        })
+        fixture.proactiveLearned["coder"] = CopyOnWriteArrayList(listOf("Beacon importance: email: Important: \"Daniel Reyes / Client moved the review\""))
+        fixture.proactiveProposal["coder"] = CopyOnWriteArrayList(listOf(
+            json("verdict" to "important", "source" to "email", "sender" to "Daniel Reyes", "topic" to "Client moved the review", "rule" to "Sent by Daniel Reyes"),
+        ))
+        compose.runOnIdle { vm.more("Assistant") }
+        await { vm.data.value[proactiveKey(fixture)]?.optJSONArray("learned_proposal")?.length() == 1 }
+
+        compose.onNodeWithTag("assistant-settings").performScrollToNode(hasText("Earlier ratings"))
+        compose.onNodeWithTag("proactive-earlier-convert").performScrollTo().performClick()
+        await { compose.onAllNodesWithTag("earlier-rules-sheet").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("earlier-rules-save").performClick()
+        await { compose.onAllNodesWithTag("earlier-rules-error").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("earlier-rules-error").assertTextEquals("Rules are full. Delete one first.")
+        // Nothing was saved, and the owner's review is still there.
+        assertTrue(fixture.proactiveLearnedRuleBodies.isEmpty())
+        compose.onNodeWithTag("earlier-rule-text-0").assertTextContains("Sent by Daniel Reyes")
+    }
+
+    @Test fun clearingEarlierRatingsRemovesTheCardWithoutMakingRules() = withFixture { vm, fixture ->
+        fixture.proactiveEnabled["coder"] = true
+        // A rating in no known wording gives no proposal, so Clear is the only action.
+        fixture.proactiveLearned["coder"] = CopyOnWriteArrayList(listOf("Client decisions matter."))
         compose.runOnIdle { vm.more("Assistant") }
         await { vm.data.value[proactiveKey(fixture)]?.optJSONArray("learned")?.length() == 1 }
 
-        compose.onNodeWithTag("assistant-settings").performScrollToNode(hasText("What Beacon learned"))
-        compose.onNodeWithText("What Beacon learned").assertExists()
-        compose.onNodeWithText("Client moved the review").performScrollTo().assertExists()
-        compose.onNodeWithTag("proactive-learned-remove-0").performScrollTo().performClick()
-        compose.onNodeWithTag("proactive-learned-remove-confirm").performClick()
+        compose.onNodeWithTag("assistant-settings").performScrollToNode(hasText("Earlier ratings"))
+        compose.onAllNodesWithTag("proactive-earlier-convert").assertCountEquals(0)
+        // The row says what it clears, not just Clear.
+        compose.onNodeWithTag("proactive-earlier-clear").performScrollTo().assertTextContains("Clear earlier ratings")
+        compose.onNodeWithTag("proactive-earlier-clear").performClick()
+        compose.onNodeWithTag("proactive-earlier-clear-confirm").performClick()
         await { fixture.proactiveLearned["coder"]?.isEmpty() == true && vm.data.value[proactiveKey(fixture)]?.optJSONArray("learned")?.length() == 0 }
-        val removal = fixture.requests.last { it.string("path") == "$PROACTIVE_SETTINGS_PATH/learned" && it.string("method") == "DELETE" }
-        assertEquals("coder", removal.string("profile"))
-        assertEquals("Client moved the review", removal.getJSONObject("body").string("note"))
-        compose.onNodeWithTag("proactive-learned-empty").assertExists()
-        compose.onNodeWithText("Rate alerts to teach Beacon").assertExists()
+        val clear = fixture.requests.last { it.string("path") == "$PROACTIVE_SETTINGS_PATH/learned" && it.string("method") == "DELETE" }
+        assertEquals("coder", clear.string("profile"))
+        assertTrue(clear.getJSONObject("body").getBoolean("all"))
+        assertFalse(clear.getJSONObject("body").has("note"))
+        compose.onAllNodesWithText("Earlier ratings").assertCountEquals(0)
+        assertTrue(fixture.proactiveRequests["coder"].isNullOrEmpty())
     }
 
     @Test fun missingPluginShowsUpdateHelpAndOtherFailuresShowDetailAndRetry() = withFixture { vm, fixture ->
@@ -203,6 +317,9 @@ class ProactiveUiTest {
         compose.onNodeWithText("What needs you").assertExists()
         assertFalse(fixture.proactiveEnabled["coder"] == true)
     }
+
+    /** A badge's tag sits on its surface; the words are in its child. */
+    private fun badgeShows(tag: String, text: String) = compose.onNode(hasTestTag(tag) and hasAnyDescendant(hasText(text))).assertExists()
 
     private fun alertJson(noticeId: String, text: String, ageSeconds: Long = 60, expiresInSeconds: Long = 3600, verdict: String = "") = json(
         "notice_id" to noticeId, "text" to text, "source" to "Email", "created_at" to System.currentTimeMillis() / 1000 - ageSeconds,
@@ -244,7 +361,13 @@ class ProactiveUiTest {
             compose.onNodeWithText(reason).assertExists()
             compose.onAllNodesWithTag("task-result-card").assertCountEquals(0)
             compose.onNodeWithTag("alert-important:$noticeId").assertExists()
+            // The tap opens the rule sheet with the suggested rule; "Just this email" marks only this alert.
             compose.onNodeWithTag("alert-not-important:$noticeId").performClick()
+            await { compose.onAllNodesWithTag("email-rule-sheet").fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithTag("email-rule-title").assertTextEquals("Mark as not important")
+            await { runCatching { compose.onNodeWithTag("email-rule-text").assertTextContains("Sent by Daniel Reyes") }.isSuccess }
+            assertTrue(fixture.proactiveFeedbacks.isEmpty())
+            compose.onNodeWithTag("email-rule-just-this").performClick()
             await { fixture.proactiveFeedbacks.isNotEmpty() }
             val request = fixture.requests.last { it.string("path") == "$PROACTIVE_SETTINGS_PATH/feedback" }
             assertEquals(fixture.scope.profile, request.string("profile"))
@@ -344,6 +467,56 @@ class ProactiveUiTest {
         compose.onAllNodesWithTag("alert-important:expired-email-notice").assertCountEquals(0)
         compose.onAllNodesWithTag("alert-not-important:expired-email-notice").assertCountEquals(0)
         assertTrue(fixture.proactiveFeedbacks.isEmpty())
+    }
+
+    // "Save rule" sends the words the owner left in the sheet, and the rule appears in the one rules list.
+    @Test fun savingAnAlertRuleSendsTheEditedWordsAndTheAlertShowsItsChoice() = withFixture { vm, fixture ->
+        val noticeId = "rule-email-notice"
+        saveAlerts(fixture.scope.session("chat-a"), alertJson(noticeId, "Daniel Reyes / Client moved the review"))
+        fixture.proactiveSuggestions[noticeId] = json("source" to "email", "sender" to "Daniel Reyes", "topic" to "Client moved the review", "rule" to "Sent by Daniel Reyes")
+        compose.runOnIdle { vm.selectSession("chat-a") }
+        await { compose.onAllNodesWithTag("alert-message:$noticeId").fetchSemanticsNodes().isNotEmpty() && vm.ui.value.connected }
+
+        compose.onNodeWithTag("alert-important:$noticeId").performClick()
+        await { runCatching { compose.onNodeWithTag("email-rule-text").assertTextContains("Sent by Daniel Reyes") }.isSuccess }
+        compose.onNodeWithTag("email-rule-title").assertTextEquals("Mark as important")
+        compose.onNodeWithTag("email-rule-text").performTextReplacement("Sent by Daniel Reyes and his team")
+        compose.onNodeWithTag("email-rule-save").performClick()
+        await { fixture.proactiveFeedbacks.size == 1 && compose.onAllNodesWithTag("alert-verdict:$noticeId").fetchSemanticsNodes().isNotEmpty() }
+
+        val sent = fixture.proactiveFeedbacks.single()
+        assertEquals(setOf("notice_id", "verdict", "rule"), sent.keys().asSequence().toSet())
+        assertEquals(noticeId, sent.string("notice_id"))
+        assertEquals("important", sent.string("verdict"))
+        assertEquals("Sent by Daniel Reyes and his team", sent.string("rule"))
+        compose.onAllNodesWithTag("email-rule-sheet").assertCountEquals(0)
+        compose.onAllNodesWithTag("alert-important:$noticeId").assertCountEquals(0)
+        val saved = fixture.proactiveRequests[fixture.scope.profile].orEmpty().single()
+        assertEquals("important", saved.string("action"))
+        assertEquals("email", saved.string("signal"))
+        assertEquals("Sent by Daniel Reyes and his team", saved.string("text"))
+    }
+
+    // A full rules list refuses "Save rule" and the sheet says so; "Just this email" still marks the alert.
+    @Test fun aFullRulesListKeepsTheSheetOpenAndJustThisEmailStillWorks() = withFixture { vm, fixture ->
+        val noticeId = "full-list-notice"
+        saveAlerts(fixture.scope.session("chat-a"), alertJson(noticeId, "Daniel Reyes / Client moved the review"))
+        fixture.proactiveRequests[fixture.scope.profile] = CopyOnWriteArrayList((1..20).map {
+            json("id" to "rule-$it", "text" to "Rule $it", "action" to "notify", "signal" to null, "night" to false, "enabled" to true, "created_at" to it)
+        })
+        compose.runOnIdle { vm.selectSession("chat-a") }
+        await { compose.onAllNodesWithTag("alert-message:$noticeId").fetchSemanticsNodes().isNotEmpty() && vm.ui.value.connected }
+
+        compose.onNodeWithTag("alert-important:$noticeId").performClick()
+        await { runCatching { compose.onNodeWithTag("email-rule-text").assertTextContains("Sent by Daniel Reyes") }.isSuccess }
+        compose.onNodeWithTag("email-rule-save").performClick()
+        await { compose.onAllNodesWithTag("email-rule-error").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("email-rule-error").assertTextContains("Rules are full. Delete one first.")
+        assertEquals(20, fixture.proactiveRequests[fixture.scope.profile].orEmpty().size)
+        compose.onAllNodesWithTag("alert-verdict:$noticeId").assertCountEquals(0)
+        compose.onNodeWithTag("email-rule-just-this").performClick()
+        await { compose.onAllNodesWithTag("alert-verdict:$noticeId").fetchSemanticsNodes().isNotEmpty() }
+        assertEquals(20, fixture.proactiveRequests[fixture.scope.profile].orEmpty().size)
     }
 
     // Was: dismissing the alert card. Alerts have no dismiss, so this checks that each one is its own message and keeps its own choice.

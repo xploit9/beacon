@@ -17,7 +17,7 @@ import java.time.Instant
 import java.time.ZoneId
 import java.util.Locale
 
-/** UX-38: every time on a schedule card is in the phone's zone; Hermes' zone is a second line only when it differs. */
+/** UX-38: every time on a schedule card is in the phone's zone; Hermes' time of day is a second line ("8:00 AM in Lisbon") only when it differs. */
 class ScheduleClockTest {
     // The JVM has no best-pattern lookup, so the clock falls back to h:mm a and the day to "d MMM".
     private val twelveHour = ScheduleFormat(false, Locale.US, { it }, dayPattern = "d MMM")
@@ -31,7 +31,7 @@ class ScheduleClockTest {
     @Test fun aDailyTimeReadsInThePhonesZoneAndKeepsHermesTimeOnASecondLine() {
         val card = cron("0 8 * * *", lisbon, "Asia/Dubai", winter)
         assertEquals("Every day at 12:00 PM", card.description)
-        assertEquals("Every day at 8:00 AM", card.inHermesClock)
+        assertEquals("8:00 AM", card.inHermesClock)
         assertEquals(ZoneId.of("Asia/Dubai"), card.zone)
         assertFalse(card.zoneNamed)
         assertEquals("Lisbon", card.zoneLabel)
@@ -62,7 +62,7 @@ class ScheduleClockTest {
     @Test fun aWindowThatStaysInTheDayMovesAsAWhole() {
         val card = cron("*/15 7-21 * * *", lisbon, "Europe/Madrid", winter)
         assertEquals("Every 15 minutes, 8:00 AM–11:00 PM", card.description)
-        assertEquals("Every 15 minutes, 7:00 AM–10:00 PM", card.inHermesClock)
+        assertEquals("7:00 AM–10:00 PM", card.inHermesClock)
         assertFalse(card.zoneNamed)
     }
 
@@ -85,7 +85,7 @@ class ScheduleClockTest {
         val noon = cron("0 9 * * 1-5", lisbon, "Asia/Dubai", winter)
         assertFalse(noon.zoneNamed)
         assertEquals("Weekdays at 1:00 PM", noon.description)
-        assertEquals("Weekdays at 9:00 AM", noon.inHermesClock)
+        assertEquals("9:00 AM", noon.inHermesClock)
         // A day of the month is a day rule too.
         assertTrue(cron("0 23 15 * *", lisbon, "Asia/Dubai", winter).zoneNamed)
         assertEquals("Every month on day 15 at 9:00 AM", cron("0 8 15 * *", lisbon, "Europe/Madrid", winter).description)
@@ -94,7 +94,7 @@ class ScheduleClockTest {
     @Test fun aDailyTimeMayCrossMidnightBecauseNoDayDependsOnIt() {
         val card = cron("0 22 * * *", lisbon, "Asia/Dubai", winter)
         assertEquals("Every day at 2:00 AM", card.description)
-        assertEquals("Every day at 10:00 PM", card.inHermesClock)
+        assertEquals("10:00 PM", card.inHermesClock)
         assertFalse(card.zoneNamed)
     }
 
@@ -114,17 +114,28 @@ class ScheduleClockTest {
     @Test fun aOneTimeScheduleMovesWhetherOrNotItsStampCarriesAnOffset() {
         val withOffset = scheduleCardClock(json("kind" to "once", "run_at" to "2026-10-28T19:01:00+04:00"), "", "Asia/Dubai", ZoneId.of(lisbon), Instant.parse("2026-10-28T15:01:00Z"), twelveHour)
         assertEquals("Once · 28 Oct, 3:01 PM", withOffset.description)
-        assertEquals("Once · 28 Oct, 7:01 PM", withOffset.inHermesClock)
+        assertEquals("7:01 PM", withOffset.inHermesClock)
         // No offset: the stamp is Hermes' own wall clock.
         val bare = scheduleCardClock(json("kind" to "once", "run_at" to "2026-10-28T19:01:00"), "", "Asia/Dubai", ZoneId.of(lisbon), Instant.parse("2026-10-28T15:01:00Z"), twelveHour)
         assertEquals("Once · 28 Oct, 3:01 PM", bare.description)
+    }
+
+    @Test fun theSecondLineIsOnlyTheTimeOfDayNotAWholeSecondRule() {
+        // "Every day at 12:00 PM" on the first line, "8:00 AM in Lisbon" on the second: the rule is not said twice.
+        val card = cron("0 8 * * *", lisbon, "Asia/Dubai", winter)
+        assertEquals("8:00 AM in Lisbon", scheduleZoneNamed(card.inHermesClock.orEmpty(), card.zoneLabel, "{0} in {1}"))
+        // Several times of day, and a window kept to its own minutes.
+        assertEquals("9:00 AM, 5:00 PM", cron("0 9,17 * * *", lisbon, "Asia/Dubai", winter).inHermesClock)
+        assertEquals("7:30 AM–9:30 PM", cron("30 7-21 * * *", lisbon, "Europe/Madrid", winter).inHermesClock)
+        // A day rule keeps its day on the first line only.
+        assertEquals("9:00 AM", cron("0 9 15 * *", lisbon, "Asia/Dubai", winter).inHermesClock)
     }
 
     @Test fun aScheduleHermesOnlyDescribedInWordsStillMoves() {
         // No structured schedule: the display text is a shape the builder knows.
         val card = scheduleCardClock(null, "0 8 * * *", lisbon, ZoneId.of("Asia/Dubai"), winter, twelveHour)
         assertEquals("Every day at 12:00 PM", card.description)
-        assertEquals("Every day at 8:00 AM", card.inHermesClock)
+        assertEquals("8:00 AM", card.inHermesClock)
         // Words the builder cannot read have no clock to move.
         val custom = scheduleCardClock(null, "twice a week", lisbon, ZoneId.of("Asia/Dubai"), winter, twelveHour)
         assertEquals("twice a week", custom.description)

@@ -1,3 +1,4 @@
+@file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 package dev.hermes.android.ui
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
@@ -54,8 +55,8 @@ internal val ScheduleStateStrings = listOf("Paused", "Completed", "Running", "Fa
 }
 /**
  * One schedule card's times, all in one clock. [zone] is the clock Next and Last are written in: the phone's, or Hermes' when the rule
- * cannot move to the phone's clock without changing its meaning ([zoneNamed]). [inHermesClock] is the rule in Hermes' clock, kept for a
- * second line only when it reads differently from [description].
+ * cannot move to the phone's clock without changing its meaning ([zoneNamed]). [inHermesClock] is only the time of day in Hermes' clock
+ * ("8:00 AM"; the card adds "in Lisbon"), kept for a second line only when the rule reads differently from [description].
  */
 internal class ScheduleCardClock(val description: String, val inHermesClock: String?, val zone: java.time.ZoneId, val zoneLabel: String, val zoneNamed: Boolean)
 
@@ -174,8 +175,35 @@ private fun moveCronToPhoneClock(expr: String, hermes: java.time.ZoneId, phone: 
     return PhoneClock.Moved(json("kind" to "cron", "expr" to rewritten))
 }
 
+/** Just the times of day [rule] fires at in [hermes]' clock: "8:00 AM", "9:00 AM, 5:00 PM" or the window "7:00 AM–10:00 PM"; null when it names none. */
+private fun scheduleClockOnly(rule: JSONObject, hermes: java.time.ZoneId, f: ScheduleFormat): String? = when (rule.string("kind")) {
+    "once" -> rule.string("run_at").let { runAt ->
+        (runCatching { java.time.OffsetDateTime.parse(runAt).atZoneSameInstant(hermes).toLocalTime() }.getOrNull()
+            ?: runCatching { java.time.LocalDateTime.parse(runAt.take(19)).toLocalTime() }.getOrNull())?.let { f.clock(it.hour, it.minute) }
+    }
+    "cron" -> cronClockOnly(rule.string("expr", rule.string("expression")), f)
+    else -> null
+}
+
+private fun cronClockOnly(expr: String, f: ScheduleFormat): String? {
+    val p = expr.trim().split(Regex("\\s+")).takeIf { it.size == 5 } ?: return null
+    val minutes = cronNumbers(p[0], 0, 59) ?: return null
+    val hours = cronNumbers(p[1], 0, 23) ?: return null
+    // A few fixed times a day, as the describer words them.
+    if (plainCronNumbers.matches(p[0]) && plainCronNumbers.matches(p[1]) && (minutes.size == 1 || hours.size == 1) && minutes.size * hours.size <= 6)
+        return hours.flatMap { h -> minutes.map { m -> f.clock(h, m) } }.joinToString(", ")
+    if (hours.size == 24) return null
+    // A window: several minutes an hour read from the first hour to the end of the last; one minute from its first run to its last.
+    if (minutes.size == 1) return "${f.clock(hours.first(), minutes[0])}–${f.clock(hours.last(), minutes[0])}"
+    val runs = hours.fold(mutableListOf<IntRange>()) { runs, h ->
+        if (runs.isNotEmpty() && runs.last().last + 1 == h) runs[runs.lastIndex] = runs.last().first..h else runs.add(h..h)
+        runs
+    }
+    return runs.joinToString(", ") { "${f.clock(it.first, 0)}–${f.clock(it.last + 1, 0)}" }
+}
+
 /**
- * A schedule card's rule and clock (UX-38): every time on the card in the phone's zone, Hermes' zone only on a second line and only when it
+ * A schedule card's rule and clock (UX-38): every time on the card in the phone's zone, Hermes' time of day only on a second line and only when it
  * differs, and a rule that cannot be converted kept whole in Hermes' zone, named. A blank or unknown [hermesZoneId] (no plugin) changes nothing.
  */
 internal fun scheduleCardClock(schedule: JSONObject?, display: String, hermesZoneId: String, phone: java.time.ZoneId, reference: java.time.Instant, f: ScheduleFormat = ScheduleFormat(), zoneName: (String) -> String = ::scheduleZoneCity): ScheduleCardClock {
@@ -187,7 +215,7 @@ internal fun scheduleCardClock(schedule: JSONObject?, display: String, hermesZon
     return when (val moved = moveToPhoneClock(rule, hermes, phone, reference)) {
         PhoneClock.Same -> ScheduleCardClock(own, null, phone, city, false)
         PhoneClock.Fixed -> ScheduleCardClock(own, null, hermes, city, true)
-        is PhoneClock.Moved -> describeSchedule(moved.schedule, "", phone.id, f).let { mine -> ScheduleCardClock(mine, own.takeIf { it != mine }, phone, city, false) }
+        is PhoneClock.Moved -> describeSchedule(moved.schedule, "", phone.id, f).let { mine -> ScheduleCardClock(mine, if (own != mine) rule?.let { scheduleClockOnly(it, hermes, f) } else null, phone, city, false) }
     }
 }
 
@@ -217,7 +245,30 @@ internal fun scheduleCardClock(schedule: JSONObject?, display: String, hermesZon
         ScheduleChip.Completed -> "Completed"
         ScheduleChip.Unconfirmed -> "Execution unconfirmed"
     })
-    SettingsStatusPill(status, word, modifier.testTag("schedule-status:${job.string("id")}"))
+    val reason = if (chip == ScheduleChip.Failed) scheduleFailureReason(job) else ""
+    if (reason.isBlank()) SettingsStatusPill(status, word, modifier.testTag("schedule-status:${job.string("id")}"))
+    else FlowRow(modifier, horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp), itemVerticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+        SettingsStatusPill(status, word, Modifier.testTag("schedule-status:${job.string("id")}"))
+        Text(reason, Modifier.testTag("schedule-failure:${job.string("id")}"), style = MaterialTheme.typography.bodySmall.contentDirection(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+/** A bracketed code, a snake_case identifier or a quoted id: words for the logs, not for the owner. */
+private val technicalReason = Regex("""^\[[^\]]*\]|\b[a-z]+_[a-z_]+\b|'[^'\s]+'|"[^"\s]+"""")
+
+/** The longest reason a failed schedule's chip shows. */
+internal const val FAILURE_REASON_MAX = 60
+
+/**
+ * Why a failed schedule failed, short and in Hermes' own words: the first line of its last error. Blank when it did not fail, when Hermes gave no
+ * reason, or when the failure is a delivery one (the card already shows that error under the schedule).
+ */
+internal fun scheduleFailureReason(job: JSONObject): String {
+    if (scheduleState(job) != "Failed" || job.string("last_status") == "delivery_failed") return ""
+    val line = job.string("last_error").lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() }.orEmpty()
+    // "[blocked_config] delivery platform 'phone' is ..." is for the logs: a bracketed code, snake_case or a quoted id leaves only the Failed chip.
+    if (technicalReason.containsMatchIn(line)) return ""
+    return if (line.length > FAILURE_REASON_MAX) line.take(FAILURE_REASON_MAX - 1).trimEnd() + "…" else line
 }
 
 /** Edit, run history, pause or resume, and delete (last, in red) behind one overflow button; each does what its icon button used to. */

@@ -17,6 +17,7 @@ import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -79,7 +80,7 @@ class SettingsHubUiTest {
         showHub(signedIn)
         row("settings-connection").assertTextContains("maya · Personal").assertTextContains("Connected")
         row("settings-row:Beacon").assertTextContains("Gemini Live").assertTextContains("Key saved")
-        row("settings-row:Notifications").assertTextContains("Keep connected on")
+        row("settings-row:Notifications").assertTextContains("Keep connected is on")
         row("settings-row:App updates").assertTextContains("1.1.22")
         for (section in listOf("Assistant", "Hermes", "App")) compose.onNodeWithTag("settings-group:$section").assertExists()
     }
@@ -101,6 +102,19 @@ class SettingsHubUiTest {
         row("settings-row:Appearance").assertTextContains("Theme and colors")
         row("settings-row:Notifications").assertTextContains("Alerts and calls")
         row("settings-row:Beacon").assertTextContains("Voice and provider")
+    }
+
+    @Test fun phoneAccessSaysOffUntilSomethingIsOnThenNamesWhatIsOn() {
+        val state = showHub(signedIn.copy(phoneAccess = emptyList()))
+        row("settings-row:Phone access").assertTextContains("Off")
+        compose.runOnIdle { state.value = signedIn.copy(phoneAccess = listOf("Contacts", "Messages")) }
+        row("settings-row:Phone access").assertTextContains("Contacts · Messages")
+        compose.onAllNodesWithText("Off").assertCountEquals(0)
+    }
+
+    @Test fun phoneAccessKeepsItsDescriptionUntilTheSwitchesAreRead() {
+        showHub(signedIn)
+        row("settings-row:Phone access").assertTextContains("Calendar, contacts and calls")
     }
 
     @Test fun searchingAnOldDescriptionWordStillFindsItsRow() {

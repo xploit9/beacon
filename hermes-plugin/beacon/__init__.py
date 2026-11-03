@@ -13,7 +13,7 @@ def _stale(module):
     seen=getattr(module,'_beacon_mtime',None)
     try: return seen is not None and seen!=Path(module.__file__).stat().st_mtime_ns
     except (OSError,TypeError): return True
-_MODULE_NAMES=('mobile','native','observers','proactive','phone_delivery','live_context')
+_MODULE_NAMES=('mobile','native','observers','proactive','phone_delivery','live_context','phone_tools')
 # Only purge the siblings loaded here; dashboard-only modules may still serve live routes.
 if any(_stale(sys.modules.get('beacon_'+name)) for name in _MODULE_NAMES):
     for name in _MODULE_NAMES: sys.modules.pop('beacon_'+name,None)
@@ -25,7 +25,7 @@ for name in _MODULE_NAMES:
         sys.modules[key]=module;spec.loader.exec_module(module)
 mobile=sys.modules['beacon_mobile'];native=sys.modules['beacon_native'];observers=sys.modules['beacon_observers']
 proactive=sys.modules['beacon_proactive'];phone_delivery=sys.modules['beacon_phone_delivery']
-live_context=sys.modules['beacon_live_context']
+live_context=sys.modules['beacon_live_context'];phone_tools=sys.modules['beacon_phone_tools']
 
 def _cron_fallback_allowed(cfg,row):
     if row.get('source')!='cron' or cfg.get('scheduled_callbacks_enabled') is not True: return False
@@ -295,10 +295,11 @@ _MAIL_NAME_WORDS={
     'time','google','googlecalendar','gcal','microsoft','ms','graph','office','workspace','exchange','imap','proton',
     'fastmail','icloud','zoho','yahoo'}
 _BLOCKED_PROACTIVE_TOOLSETS={'delegation','code_execution','computer_use','kanban','cronjob'}
-# web_extract/web_fetch could carry another email's content out in a URL an injected email asks for.
+# web_extract/web_fetch could carry another email's content out in a URL an injected email asks for; the phone tools would
+# let an injected email read or change the owner's phone.
 _BLOCKED_PROACTIVE_TOOLS={'delegate_task','execute_code','computer_use','kanban','cronjob_manage',
                           'beacon_call_user','browser_click','browser_type','browser_press',
-                          'browser_cdp','browser_exec','web_extract','web_fetch'}
+                          'browser_cdp','browser_exec','web_extract','web_fetch'}|set(phone_tools.NAMES)
 # Read commands only: the subcommand words before the first option say what runs.
 _HIMALAYA_READS={('envelope','list'),('envelope','search'),('folder','list'),('mailbox','list')}
 _GWS_READ_OPTIONS={'--params','--format','--page-all','--page-limit','--page-delay'}
@@ -596,11 +597,8 @@ def _watch_tool_guard(tool_name,args,profile):
     # The native tool can select another profile explicitly or through a profile/session link.
     if tool_name=='session_search' and (args.get('profile') not in (None,'') or '/' in str(args.get('session_id') or '')):
         return {'action':'block','message':'Proactive watches only search conversations in their current profile.'}
-    argument_words=set()
-    for field in ('action','operation'):
-        value=args.get(field)
-        if isinstance(value,str): argument_words.update(_tool_words(value))
-    if argument_words&_gateway_tools().WRITE_WORDS:
+    # The call gateway's own test of an action or operation argument, so the two cannot drift apart.
+    if _gateway_tools().writes_by_action(args):
         return {'action':'block','message':_READ_ONLY_MESSAGE}
     schema=None
     try:
@@ -711,5 +709,6 @@ def register(ctx):
     # Cleanup runs before the guard is removed because native registrations unwind in reverse order.
     if callable(getattr(ctx,'on_unload',None)): ctx.on_unload(pause_proactive_jobs)
     phone_delivery.register(ctx)
+    phone_tools.register(ctx)
     _record_gateway_plugin_version()
     _restart_stale_dashboard()

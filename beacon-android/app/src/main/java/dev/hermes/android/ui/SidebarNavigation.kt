@@ -8,6 +8,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -106,8 +107,14 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
     if (naming) NewThreadDialog(vm, onDismiss = { naming = false })
     // Bots is the one switch for Bot Mode: a tap turns it on, and off again (navigate("Bots") toggles).
     val openTile: (String) -> Unit = vm::navigate
+    val botMode = ui.botModeEnabled
+    // New bot and New space open the roster's own dialogs; outside the Bot Mode drawer this row hosts them itself.
+    val hostedDialog = LocalBotModeDialog.current
+    val ownDialog = rememberSaveable { mutableStateOf("") }
+    val botDialog = hostedDialog ?: ownDialog
+    if (botMode && hostedDialog == null) BotModeDialogs(vm, ownDialog)
     Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        if (!ui.botModeEnabled) {
+        if (!botMode) {
             Box(Modifier.fillMaxWidth()) {
                 var pillWidth by remember { mutableStateOf(0.dp) }
                 val density = LocalDensity.current
@@ -129,23 +136,24 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
                     onManage = { profilesOpen = false; vm.more("Profiles") },
                 )
             }
-            // At large text the two buttons stack full width, so "New thread" never wraps beside "New chat".
-            val stacked = isLargeText(LocalDensity.current.fontScale)
-            val newChat: @Composable (Modifier) -> Unit = { modifier ->
-                Button(onClick = { vm.tab("Chat"); vm.newChat() }, modifier = modifier.heightIn(min = 48.dp).testTag("navigation-new-chat"), shape = RoundedCornerShape(14.dp), enabled = !ui.newChatOpening) {
-                    Icon(Icons.Rounded.Add, null); Spacer(Modifier.width(8.dp)); Text(uiText(if (ui.newChatOpening) "Opening chat…" else "New chat"), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
-            }
-            val newThread: @Composable (Modifier) -> Unit = { modifier ->
-                FilledTonalButton(onClick = { naming = true }, modifier = modifier.heightIn(min = 48.dp).testTag("navigation-new-thread"), shape = RoundedCornerShape(14.dp), enabled = !ui.newChatOpening) {
-                    Icon(Icons.Rounded.Forum, null); Spacer(Modifier.width(8.dp)); Text(uiText("New thread"), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
-            }
-            if (stacked) Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) { newChat(Modifier.fillMaxWidth()); newThread(Modifier.fillMaxWidth()) }
-            else Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { newChat(Modifier.weight(1f)); newThread(Modifier.weight(1f)) }
         }
+        // The two buttons at the top: New chat and New thread, or New bot and New space in Bot Mode. At large text they stack
+        // full width, so the second never wraps beside the first.
+        val stacked = isLargeText(LocalDensity.current.fontScale)
+        val primary: @Composable (Modifier) -> Unit = { modifier ->
+            if (botMode) DrawerAction(uiText("New bot"), Icons.Rounded.Add, "bot-mode-sidebar-new-bot", modifier, primary = true, enabled = !ui.botModeSwitching) { botDialog.value = "newBot:" }
+            else DrawerAction(uiText(if (ui.newChatOpening) "Opening chat…" else "New chat"), Icons.Rounded.Add, "navigation-new-chat", modifier, primary = true, enabled = !ui.newChatOpening) { vm.tab("Chat"); vm.newChat() }
+        }
+        val secondary: @Composable (Modifier) -> Unit = { modifier ->
+            if (botMode) DrawerAction(uiText("New space"), Icons.Rounded.Groups, "bot-mode-sidebar-new-chat", modifier, primary = false, enabled = !ui.botModeSwitching) { vm.botMode.startNewChat(); botDialog.value = "newChat:" }
+            else DrawerAction(uiText("New thread"), Icons.Rounded.Forum, "navigation-new-thread", modifier, primary = false, enabled = !ui.newChatOpening) { naming = true }
+        }
+        if (stacked) Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) { primary(Modifier.fillMaxWidth()); secondary(Modifier.fillMaxWidth()) }
+        else Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { primary(Modifier.weight(1f)); secondary(Modifier.weight(1f)) }
         if (updateReady) UpdateReadyChip(onClick = vm::openAppUpdates)
-        BoxWithConstraints(Modifier.fillMaxWidth()) {
+        // Bot Mode has no tile grid: the one control left is the switch that leaves it.
+        if (botMode) BotModeSwitchRow(enabled = !ui.botModeSwitching) { openTile("Bots") }
+        else BoxWithConstraints(Modifier.fillMaxWidth()) {
             val fontScale = LocalDensity.current.fontScale
             val columns = navigationColumns(maxWidth.value, fontScale)
             val overflow = navigationMore(fontScale)
@@ -166,6 +174,35 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
                 onPick = { name -> moreOpen = false; openTile(name) }, onDismiss = { moreOpen = false },
             )
         }
+    }
+}
+
+/** One of the two buttons at the top of the drawer: the filled [primary] one, or the tonal one beside it. Both keep one size and shape in every mode. */
+@Composable private fun DrawerAction(label: String, icon: ImageVector, tag: String, modifier: Modifier, primary: Boolean, enabled: Boolean, onClick: () -> Unit) {
+    val content: @Composable RowScope.() -> Unit = {
+        Icon(icon, null); Spacer(Modifier.width(8.dp)); Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+    val at = modifier.heightIn(min = 48.dp).testTag(tag)
+    if (primary) Button(onClick = onClick, modifier = at, shape = RoundedCornerShape(14.dp), enabled = enabled, content = content)
+    else FilledTonalButton(onClick = onClick, modifier = at, shape = RoundedCornerShape(14.dp), enabled = enabled, content = content)
+}
+
+/**
+ * Bot Mode's one control in the drawer, in place of the tile grid: a switch that is on, and a tap turns it off. It keeps the Bots tile's
+ * tag and "selected" state, so the one place that switches Bot Mode reads the same on and off.
+ */
+@Composable private fun BotModeSwitchRow(enabled: Boolean, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(12.dp)
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = 56.dp).clip(shape).background(MaterialTheme.colorScheme.secondaryContainer)
+            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, shape)
+            .toggleable(value = true, enabled = enabled, role = Role.Switch, onValueChange = { onClick() })
+            .semantics { selected = true }.padding(horizontal = 16.dp).testTag("navigation-bots"),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Icon(navigationIcon("Bots"), null, Modifier.size(20.dp))
+        Text(uiText("Bot Mode"), Modifier.weight(1f), style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Switch(checked = true, onCheckedChange = null, enabled = enabled)
     }
 }
 

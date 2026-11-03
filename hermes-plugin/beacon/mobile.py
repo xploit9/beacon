@@ -229,6 +229,9 @@ def _initialize_schema(conn):
     CREATE TABLE IF NOT EXISTS notice_deliveries(event TEXT REFERENCES notices(id) ON DELETE CASCADE,target TEXT REFERENCES targets(id) ON DELETE CASCADE,accepted REAL DEFAULT 0,attempts INTEGER DEFAULT 0,next_attempt REAL DEFAULT 0,last_error TEXT DEFAULT '',PRIMARY KEY(event,target));
     CREATE TABLE IF NOT EXISTS tool_receipts(owner TEXT,provider TEXT,profile TEXT,call_id TEXT,request_id TEXT,signature TEXT NOT NULL,payload TEXT NOT NULL,updated REAL NOT NULL,PRIMARY KEY(owner,provider,profile,call_id,request_id));
     CREATE TABLE IF NOT EXISTS call_tool_allowances(owner TEXT,provider TEXT,profile TEXT,call_id TEXT,tool_id TEXT,tool_name TEXT,created REAL NOT NULL,PRIMARY KEY(owner,provider,profile,call_id,tool_name));
+    CREATE TABLE IF NOT EXISTS phone_requests(id TEXT PRIMARY KEY,owner TEXT NOT NULL,profile TEXT NOT NULL,session TEXT NOT NULL DEFAULT '',tool TEXT NOT NULL,args TEXT NOT NULL,created REAL NOT NULL,expires REAL NOT NULL,status TEXT NOT NULL DEFAULT 'pending',result TEXT NOT NULL DEFAULT '',device TEXT NOT NULL DEFAULT '');
+    CREATE INDEX IF NOT EXISTS phone_requests_owner ON phone_requests(owner,profile,status,expires);
+    CREATE TABLE IF NOT EXISTS phone_state(owner TEXT NOT NULL,device TEXT NOT NULL,updated REAL NOT NULL,state TEXT NOT NULL,PRIMARY KEY(owner,device));
     CREATE TRIGGER IF NOT EXISTS close_call_tool_allowances AFTER UPDATE OF closed,status ON calls
       WHEN NEW.closed=1 OR NEW.status IN ('saved','partial','failed')
       BEGIN DELETE FROM call_tool_allowances WHERE call_id=NEW.id AND owner=NEW.owner AND profile=NEW.profile; END;
@@ -782,6 +785,158 @@ def invitation(owner,profile,conversation,reason=None,*,deduplicate=False,conn=N
         if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: raise RuntimeError('Notification outbox capacity reached')
         conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason) VALUES(?,?,?,?,?,?,?,?)',(nid,owner,profile,'incoming_call',ident(conversation),time.time(),time.time()+120,reason))
     return nid
+
+
+# Phone access. A Hermes tool call becomes a request the owner's phone approves; the phone claims it once, runs it and posts the result.
+PHONE_REQUEST_SECONDS=120
+PHONE_OPEN_LIMIT=8
+PHONE_PER_MINUTE=20
+PHONE_KEEP_SECONDS=3600
+# Past this age no tool is still waiting for a request's answer, so whatever text the request held is dropped.
+PHONE_SETTLE_SECONDS=300
+PHONE_RESULT_BYTES=16384
+PHONE_STATE_BYTES=2048
+
+def phone_state_put(owner,device,state):
+    """A linked phone's own report of what it lets Hermes use; only that phone's latest report counts."""
+    if not isinstance(owner,str) or not owner or not isinstance(device,str) or not DEVICE_ID.fullmatch(device) or not isinstance(state,dict):
+        raise ValueError('Invalid phone state')
+    raw=json.dumps(state,separators=(',',':'),sort_keys=True)
+    if len(raw)>PHONE_STATE_BYTES: raise ValueError('Invalid phone state')
+    with LOCK,connect() as conn:
+        conn.execute('INSERT OR REPLACE INTO phone_state(owner,device,updated,state) VALUES(?,?,?,?)',(owner,device,time.time(),raw))
+        # A removed phone's report leaves with it.
+        conn.execute('DELETE FROM phone_state WHERE owner=? AND device NOT IN (SELECT id FROM beacon_devices WHERE owner=? AND removed=0)',(owner,owner))
+
+def phone_state(owner):
+    """What the owner's linked phones allow Hermes to use: any phone with access on counts; reads ask first unless every such phone says not to."""
+    with connect() as conn:
+        rows=conn.execute('SELECT s.state FROM phone_state s JOIN beacon_devices d ON d.id=s.device AND d.owner=s.owner AND d.removed=0 WHERE s.owner=?',(owner,)).fetchall()
+    access=False;ask=False;tools=set()
+    for row in rows:
+        try: value=json.loads(row[0])
+        except (TypeError,ValueError): continue
+        if not isinstance(value,dict) or value.get('hermes_access') is not True: continue
+        access=True;ask=ask or value.get('ask_reads') is not False
+        if isinstance(value.get('tools'),list): tools.update(name for name in value['tools'] if isinstance(name,str))
+    return {'hermes_access':access,'ask_reads':ask if access else True,'tools':tools if access else set()}
+
+def _phone_expire(conn,now):
+    """Settles what nobody can answer any more and drops its private text (calendar notes, message bodies, contact answers), so the
+    text never outlives the request even when the tool that waited for it has gone."""
+    conn.execute("UPDATE phone_requests SET status='expired',args='{}',result='' WHERE (status='pending' AND expires<=?) OR (status='approved' AND created<?)",
+                 (now,now-PHONE_SETTLE_SECONDS))
+    conn.execute("UPDATE phone_requests SET args='{}',result='' WHERE status IN ('done','denied','expired') AND created<? AND (args!='{}' OR result!='')",
+                 (now-PHONE_SETTLE_SECONDS,))
+    conn.execute('DELETE FROM phone_requests WHERE created<?',(now-PHONE_KEEP_SECONDS,))
+
+def phone_requests_sweep():
+    """The dashboard watcher's pass, so a request is cleaned up even when no phone asks about the queue."""
+    with LOCK,connect() as conn: _phone_expire(conn,time.time())
+
+def phone_request_create(owner,profile,session,tool,args):
+    """Queues one tool call for the phone and raises its notice (same id), which reaches the phone like any other. Returns the id."""
+    raw=json.dumps(args,separators=(',',':'),sort_keys=True)
+    if not isinstance(tool,str) or not ID.fullmatch(tool) or len(raw)>8192: raise ValueError('Invalid phone request')
+    request_id=uuid.uuid4().hex;now=time.time()
+    with LOCK,connect() as conn:
+        _phone_expire(conn,now)
+        if conn.execute("SELECT COUNT(*) FROM phone_requests WHERE owner=? AND profile=? AND status IN ('pending','approved') AND expires>?",(owner,profile,now)).fetchone()[0]>=PHONE_OPEN_LIMIT:
+            raise RuntimeError('Too many phone requests are waiting')
+        # A runaway agent cannot bury the owner in cards: denied and expired requests count too.
+        if conn.execute('SELECT COUNT(*) FROM phone_requests WHERE owner=? AND profile=? AND created>?',(owner,profile,now-60)).fetchone()[0]>=PHONE_PER_MINUTE:
+            raise RuntimeError('Too many phone requests')
+        if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: raise RuntimeError('Notification outbox capacity reached')
+        conn.execute('INSERT INTO phone_requests(id,owner,profile,session,tool,args,created,expires) VALUES(?,?,?,?,?,?,?,?)',
+                     (request_id,owner,profile,str(session or '')[:256],tool,raw,now,now+PHONE_REQUEST_SECONDS))
+        conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires) VALUES(?,?,?,?,?,?,?)',
+                     (request_id,owner,profile,'phone_request','phone-'+request_id,now,now+PHONE_REQUEST_SECONDS))
+    return request_id
+
+def _phone_allows(conn,owner,device):
+    """The tools this one phone reported it lets Hermes use; none for a phone that reported access off or nothing."""
+    row=conn.execute('SELECT s.state FROM phone_state s JOIN beacon_devices d ON d.id=s.device AND d.owner=s.owner AND d.removed=0 WHERE s.owner=? AND s.device=?',(owner,device)).fetchone()
+    try: value=json.loads(row[0]) if row else {}
+    except (TypeError,ValueError): value={}
+    if not isinstance(value,dict) or value.get('hermes_access') is not True or not isinstance(value.get('tools'),list): return set()
+    return {name for name in value['tools'] if isinstance(name,str)}
+
+def phone_requests_open(owner,profile,device):
+    """The requests this phone may still decide on this profile: only those for tools this phone reported it allows, so a phone
+    that has them off never answers (or takes) a request meant for the owner's other phone."""
+    now=time.time()
+    with LOCK,connect() as conn:
+        _phone_expire(conn,now)
+        allowed=_phone_allows(conn,owner,device)
+        rows=conn.execute("SELECT id,tool,args,created,expires FROM phone_requests WHERE owner=? AND profile=? AND status='pending' AND expires>? ORDER BY created LIMIT ?",
+                          (owner,profile,now,PHONE_OPEN_LIMIT)).fetchall()
+        shown=[]
+        for r in rows:
+            if r['tool'] not in allowed: continue
+            try:
+                args=json.loads(r['args'])
+                json.dumps(args,ensure_ascii=False).encode('utf-8')  # what the reply will do: half an emoji cannot be sent
+            except (ValueError,RecursionError):
+                # A request that cannot be shown is over: one bad row never fails the list for the others.
+                _phone_withdraw(conn,owner,profile,r['id'])
+                continue
+            shown.append({'id':r['id'],'tool':r['tool'],'args':args,'created_at':int(r['created']),'expires_at':int(r['expires']),
+                          'expires_in_seconds':max(0,int(r['expires']-now))})
+    return shown
+
+def phone_request_decide(owner,profile,request_id,approved,device):
+    """The phone's tap: approving claims the request for that phone (once), denying ends it. An expired, settled or foreign request changes nothing."""
+    now=time.time()
+    with LOCK,connect() as conn:
+        _phone_expire(conn,now)
+        row=conn.execute('SELECT status,tool FROM phone_requests WHERE id=? AND owner=? AND profile=?',(ident(request_id),owner,profile)).fetchone()
+        # A phone that has not reported the tool as allowed never sees the request, so it cannot take it either.
+        if not row or row['tool'] not in _phone_allows(conn,owner,device): raise LookupError('Phone request not found')
+        if row['status']=='expired': raise ValueError('expired')
+        if approved: changed=conn.execute("UPDATE phone_requests SET status='approved',device=? WHERE id=? AND status='pending'",(device,request_id)).rowcount
+        else: changed=conn.execute("UPDATE phone_requests SET status='denied',device=?,args='{}' WHERE id=? AND status='pending'",(device,request_id)).rowcount
+        if not changed: raise ValueError('settled')
+        conn.execute("UPDATE notices SET state='answered' WHERE id=? AND owner=? AND profile=?",(request_id,owner,profile))
+
+def phone_request_finish(owner,profile,request_id,device,result):
+    """The result of a request this phone claimed; recorded once, even when it lands after the tool stopped waiting."""
+    raw=json.dumps(result,separators=(',',':'))
+    if not isinstance(result,dict) or len(raw)>PHONE_RESULT_BYTES: raise ValueError('Invalid phone result')
+    with LOCK,connect() as conn:
+        changed=conn.execute("UPDATE phone_requests SET status='done',result=?,args='{}' WHERE id=? AND owner=? AND profile=? AND status='approved' AND device=?",
+                             (raw,ident(request_id),owner,profile,device)).rowcount
+        if not changed:
+            if not conn.execute('SELECT 1 FROM phone_requests WHERE id=? AND owner=? AND profile=?',(request_id,owner,profile)).fetchone():
+                raise LookupError('Phone request not found')
+            raise ValueError('settled')
+
+def phone_request_get(owner,profile,request_id):
+    """{'status','result'} of one request; a pending one past its time reads as expired. None when it is not this owner's."""
+    with connect() as conn:
+        row=conn.execute('SELECT status,result,expires FROM phone_requests WHERE id=? AND owner=? AND profile=?',(ident(request_id),owner,profile)).fetchone()
+    if not row: return None
+    status='expired' if row['status']=='pending' and row['expires']<=time.time() else row['status']
+    return {'status':status,'result':json.loads(row['result']) if row['result'] else None}
+
+def _phone_withdraw(conn,owner,profile,request_id):
+    row=conn.execute('SELECT status FROM phone_requests WHERE id=? AND owner=? AND profile=?',(request_id,owner,profile)).fetchone()
+    if not row: return None
+    if row['status'] in ('pending','approved'):
+        conn.execute("UPDATE phone_requests SET status='expired',args='{}',result='' WHERE id=?",(request_id,))
+        conn.execute("UPDATE notices SET state='expired' WHERE id=? AND owner=? AND profile=? AND state='pending'",(request_id,owner,profile))
+    return row['status']
+
+def phone_request_withdraw(owner,profile,request_id):
+    """The tool stopped waiting. A request still open ends, so the phone never shows, runs or reports it late; what its status was
+    is returned ('pending', 'approved', 'done', 'denied', 'expired', or None when it is not this owner's)."""
+    with LOCK,connect() as conn: return _phone_withdraw(conn,owner,profile,ident(request_id))
+
+def phone_request_scrub(owner,profile,request_id):
+    """The tool has what it needed or gave up: the arguments and the phone's answer (calendar text, contact numbers) are not kept,
+    and a request still open ends here, so a late tap cannot run it."""
+    with LOCK,connect() as conn:
+        _phone_withdraw(conn,owner,profile,ident(request_id))
+        conn.execute("UPDATE phone_requests SET args='{}',result='' WHERE id=? AND owner=? AND profile=?",(request_id,owner,profile))
 
 
 def reference_key():

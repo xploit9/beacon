@@ -45,6 +45,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import dev.hermes.android.core.string
+import dev.hermes.android.data.NativeComponent
 import dev.hermes.android.data.NativeServerState
 import kotlinx.coroutines.delay
 
@@ -189,6 +190,9 @@ private fun copyServerText(context: Context, text: String) {
     }
 }
 
+/** The Session checkpoints page holds the earlier versions of changed files, and is named for that. */
+internal fun serverCheckpointPage(page: String): Boolean = page == "Session checkpoints" || page == "Rollback checkpoints"
+
 private fun LazyListScope.serverHealth(context: Context, state: NativeServerState) {
     item {
         val status = serverHealthStatus(state.overall, state.loading)
@@ -201,23 +205,26 @@ private fun LazyListScope.serverHealth(context: Context, state: NativeServerStat
         val line = if (state.version.isBlank()) uiText("Hermes server") else uiText("Hermes {0}").replace("{0}", state.version)
         SettingsStatusHero(status, title, line = line, testTag = "server-health-hero")
     }
+    val components = serverComponentsShown(state.components)
     if (serverHasCache("Health", state)) item {
         SettingsSection(testTag = "server-health-metrics") {
-            SettingsMetricRow(listOf(
-                uiText("Gateway") to if (state.gatewayState.isBlank()) uiText("Not reported") else serverStateText(state.gatewayState),
+            // One status per row: the Gateway's state is in the tile or in its row below, never in both.
+            val gateway = if (state.gatewayState.isBlank()) uiText("Not reported") else serverStateText(state.gatewayState)
+            SettingsMetricRow(listOfNotNull(
+                (uiText("Gateway") to gateway).takeIf { serverGatewayMetricShown(components) },
                 uiText("Active agents") to "${state.activeAgents}",
             ))
         }
     }
-    if (state.components.isNotEmpty()) item {
+    if (components.isNotEmpty()) item {
         SettingsSection(title = uiText("Components"), testTag = "server-components") {
-            state.components.forEachIndexed { index, component ->
+            components.forEachIndexed { index, component ->
                 if (index > 0) SettingsDivider()
                 val status = serverComponentStatus(component.status)
                 SettingsValueRow(
                     label = serverComponentName(component.name),
                     icon = serverComponentIcon(component.name),
-                    value = serverComponentDetail(component.detail),
+                    value = if (serverComponentDetailShown(component.detail, status)) serverComponentDetail(component.detail) else "",
                     status = status,
                     statusLabel = serverComponentLabel(status, component.status),
                     testTag = "server-component-${component.name}",
@@ -226,6 +233,27 @@ private fun LazyListScope.serverHealth(context: Context, state: NativeServerStat
         }
     }
 }
+
+/** Hermes' own parts, which are healthy far more often than not; their rows say nothing new while they are. */
+private val internalComponents = setOf("gateway", "dashboard", "storage", "agent")
+
+/**
+ * The component rows worth showing: the gateway, dashboard, storage and agent rows only when one of them needs attention (the hero already says
+ * "healthy"); a row about the outside world (platforms, anything unknown) always stays.
+ */
+internal fun serverComponentsShown(components: List<NativeComponent>): List<NativeComponent> {
+    fun internal(component: NativeComponent) = component.name.trim().lowercase() in internalComponents
+    return if (components.any { internal(it) && serverComponentStatus(it.status) != SettingsStatus.Ok }) components else components.filterNot { internal(it) }
+}
+
+/** The top tile says the Gateway's state only when no Gateway row below does. */
+internal fun serverGatewayMetricShown(shown: List<NativeComponent>): Boolean = shown.none { it.name.trim().equals("gateway", ignoreCase = true) }
+
+private val serverStateWords = setOf("running", "stopped", "starting")
+
+/** A row says its state once: a healthy row's chip already says it, so "Running" beside "Healthy" is left out. Any other detail stays. */
+internal fun serverComponentDetailShown(detail: String, status: SettingsStatus): Boolean =
+    detail.isNotBlank() && !(status == SettingsStatus.Ok && detail.trim().lowercase() in serverStateWords)
 
 /** Code and log text stays left to right whatever the layout direction: a command or timestamp must not reorder. */
 internal fun TextStyle.codeDirection(): TextStyle = copy(textDirection = TextDirection.Ltr, textAlign = TextAlign.Left)
@@ -296,9 +324,7 @@ private fun LazyListScope.serverLogs(state: NativeServerState, onLogFile: (Strin
             delay(LogSearchPauseMillis)
             onReload()
         }
-        SettingsSection(testTag = "server-log-search") {
-            SettingsTextFieldRow(uiText("Search log entries"), state.logSearch, onLogSearch, icon = Icons.Rounded.Search)
-        }
+        SettingsSearchField(state.logSearch, onLogSearch, uiText("Search log entries"), testTag = "server-log-search")
     }
     item {
         SettingsSection(testTag = "server-log-lines") {
@@ -417,7 +443,7 @@ private fun LazyListScope.serverCheckpoints(context: Context, state: NativeServe
                         testTag = "server-checkpoint-${checkpoint.session}")
                 }
                 state.loading -> SettingsSkeletonRows(3)
-                else -> SettingsEmpty(uiText("No session checkpoints are stored for this profile."), Icons.Rounded.Restore)
+                else -> SettingsEmpty(uiText("No backups yet."), Icons.Rounded.Restore)
             }
         }
     }

@@ -144,7 +144,7 @@ class NativePhoneAuditTest {
             waitFor { vm.phoneSettings.server.value.update != null && !vm.phoneSettings.server.value.loading }
             assertEquals("", vm.phoneSettings.server.value.error)
             capture("server-updates")
-            compose.onNodeWithContentDescription("Back").performClick(); click("Session checkpoints")
+            compose.onNodeWithContentDescription("Back").performClick(); click("File backups")
             waitFor { !vm.phoneSettings.server.value.loading }
             assertEquals("", vm.phoneSettings.server.value.error)
             steps.add("Health, log search, update check/status, checkpoint reads")

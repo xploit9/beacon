@@ -69,12 +69,19 @@ class VisualTourDeviceTest {
             compose.waitUntil(30_000) { vm.preferences.value.theme == theme }
         }
         var index = 0
+        /** Turns Bot Mode [on] or off with the Bots switch and waits until the switch has finished. */
+        fun botMode(on: Boolean) {
+            compose.runOnIdle { if (vm.ui.value.botModeEnabled != on) vm.navigate("Bots") }
+            compose.waitUntil(30_000) { vm.ui.value.botModeEnabled == on && !vm.ui.value.botModeSwitching }
+        }
         fun screen(name: String, open: BeaconViewModel.() -> Unit) {
             compose.runOnIdle { vm.open() }
             // Never capture a case in the wrong theme: fail instead (the light case was once captured dark).
             args.getString("tourTheme")?.let { theme -> check(vm.preferences.value.theme == theme) { "Theme drifted to ${vm.preferences.value.theme} before $name" } }
             capture(++index, name)
         }
+        // Every case starts outside Bot Mode (an earlier case may have left it on), so Chat and the drawer compare across cases.
+        botMode(false)
         screen("Chat") { tab("Chat") }
         screen("Drawer") { toggleSessions(true) }
         screen("Model picker") { toggleSessions(false); tab("Chat"); openCatalog("Model & provider") }
@@ -84,10 +91,15 @@ class VisualTourDeviceTest {
         for (name in settingsSearchRoutes) screen(name) { more(settingsRoute(name)) }
         screen("Commands") { more("Commands") }
         screen("Session usage") { more("Session usage") }
-        screen("Bot Mode") { more("Bots") }
         screen("Schedules") { tab("Tasks") }
         screen("Files") { tab("Spaces") }
         screen("Projects") { tab("Projects") }
         screen("Kanban") { tab("Kanban") }
+        // Bot Mode last: switching it on changes what the drawer and tabs show, so nothing captured after it is affected.
+        screen("Bot Mode") { more("Bots") }
+        // The Bots tile is the Bot Mode switch: turned on, the drawer shows Bot Mode's own top (New bot, New space, the switch).
+        botMode(true)
+        screen("Bot Mode drawer") { toggleSessions(true) }
+        botMode(false)
     }
 }

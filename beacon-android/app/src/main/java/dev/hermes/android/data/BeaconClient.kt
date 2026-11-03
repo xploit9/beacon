@@ -185,6 +185,15 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         if (method == "DELETE" && deviceId != null && path == "/api/plugins/beacon/devices/$deviceId") NativeDeviceRemoval.removed(scope)
         return result
     }
+    // Phone access: Hermes asks this phone to use its calendar, alarms, contacts, calls or messages, and the phone decides.
+    private fun phoneRequestPath(id: String): String {
+        require(id.matches(Regex("[0-9a-f]{32}"))) { "Invalid phone request" }
+        return "/api/plugins/beacon/mobile/phone/requests/$id"
+    }
+    internal suspend fun phoneRequests(): JSONObject = nativeRequest("/api/plugins/beacon/mobile/phone/requests")
+    internal suspend fun phoneDecision(id: String, approved: Boolean): JSONObject = nativeRequest(phoneRequestPath(id) + "/decision", "POST", json("approved" to approved))
+    internal suspend fun phoneResult(id: String, result: JSONObject): JSONObject = nativeRequest(phoneRequestPath(id) + "/result", "POST", json("result" to result))
+    internal suspend fun phoneState(state: JSONObject): JSONObject = nativeRequest("/api/plugins/beacon/mobile/phone/state", "PUT", state)
     suspend fun nativeCallContext(callId: String, ownerName: String = ""): JSONObject = kotlinx.coroutines.withTimeout(20_000) {
         val path = "/api/plugins/beacon/mobile/calls/$callId/context"
         // The live model answers the owner itself (the direct brief: persona, memory, this chat, tools), and Beacon hands the call to Hermes memory when it ends.

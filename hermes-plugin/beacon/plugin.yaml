@@ -1,10 +1,10 @@
 name: beacon
 manifest_version: 1
-version: 1.1.24
+version: 1.1.25
 description: Native Beacon Android calls, text conversations and callbacks
 kind: standalone
 platforms: [windows, linux, macos]
 hooks: [on_session_end, pre_llm_call, post_tool_call, pre_tool_call]
 provides_hooks: [on_session_end, pre_llm_call, post_tool_call, pre_tool_call]
-provides_tools: [beacon_call_user, beacon_create_proactive_request, beacon_event_notice, beacon_events_checked, beacon_email_notice, beacon_email_checked]
+provides_tools: [beacon_call_user, beacon_create_proactive_request, beacon_event_notice, beacon_events_checked, beacon_email_notice, beacon_email_checked, phone_calendars, phone_calendar_list, phone_contacts_search, phone_calendar_create, phone_calendar_update, phone_calendar_delete, phone_reminder_create, phone_alarm_set, phone_timer_set, phone_call, phone_message_draft]
 python_dependencies: []

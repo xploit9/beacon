@@ -109,7 +109,7 @@ class PluginHealthTest {
         assertEquals("Ready" to SettingsStatus.Ok, notifications(true, "", false).let { it.text to it.status })
         assertEquals("Keep connected is on" to SettingsStatus.Ok, notifications(false, "no_sender", true).let { it.text to it.status })
         // Keep connected off is the owner's choice: the hint shows, but the row is Off, not Attention.
-        assertEquals("Turn on Keep connected" to SettingsStatus.Off, notifications(false, "no_sender", false).let { it.text to it.status })
+        assertEquals("Keep connected is off" to SettingsStatus.Off, notifications(false, "no_sender", false).let { it.text to it.status })
         assertEquals("Not set up" to SettingsStatus.Attention, notifications(false, "no_phone", false).let { it.text to it.status })
         assertEquals("Keep connected is on", notifications(false, "no_phone", true).text)
     }

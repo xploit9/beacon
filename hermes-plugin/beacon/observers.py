@@ -15,9 +15,14 @@ PRUNE_BATCH = 256
 MAX_EVIDENCE_HASHES = 1024
 CLAIM_FIELDS = {"id", "message_id", "messageid", "thread_id", "threadid", "event_id", "eventid", "task_id", "taskid",
                 "url", "uri", "link", "web_url", "subject", "title", "name", "summary"}
-_TEXT_IDENTIFIER = re.compile(r"""(?i)^\s*(?:[-*]\s*)?(?:message[_ -]?id|thread[_ -]?id|event[_ -]?id|\bid\b)\s*[:=]\s*[\"'<]?([A-Za-z0-9._:-]{1,256})[\"'>]?\s*$""")
 _TEXT_BODY_START = re.compile(r"(?i)^\s*(?:(?:message|email)\s+)?(?:body|content)\s*:")
-_TEXT_BODY_FIELDS = frozenset({'body','message_body','email_body','body_text','plain_body','html_body','raw_body'})
+# A header line of a rendered message ("Subject: ...", "Message-ID: ..."), and a bare line that is shaped like an identifier.
+_TEXT_HEADER = re.compile(r"""(?i)^\s*(?:[-*]\s*)?(?:subject|title|name|summary|url|uri|link|web[_ ]url|id|(?:message|thread|event|task)[_ -]?id)\s*[:=]\s*(\S.{0,254})$""")
+_TEXT_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@<>=+/~-]{3,127}")
+_TEXT_BODY_FIELDS = frozenset({'body','message_body','email_body','body_text','plain_body','html_body','raw_body',
+                               'snippet','preview','body_preview','plain_text','text_body','html','plain'})
+# One run (session) can raise this many alerts; a message that fools the id check still cannot flood the owner.
+ALERTS_PER_RUN = 10
 
 
 # An email seen again in a later run is normal; the plain message keeps a watch run from reporting it as a failure.
@@ -42,8 +47,18 @@ def normalize_callback_text(value, limit=240):
     return value
 
 
+# Letters from other scripts that read as Latin ones; case folding and decomposition leave them alone.
+_LOOKALIKES = str.maketrans({
+    **dict(zip("асеіјѕԁԍһӏкмнортухѵѡԛԝ", "aceijsdghlkmhoptyxvwqw")),
+    **dict(zip("αεικνορτυχγωη", "aeikvoptuxywn")),
+    **dict(zip("ɑɡɩȷɪʜʟɴʀꜱʏᴀʙᴄᴅᴇɢᴋᴍᴏᴘᴛᴜᴠᴡᴢıøđłħŧɨʉ", "agijihlnrsyabcdegkmoptuvwzioldhtiu")),
+})
+
+
 def _squashed(value):
-    return re.sub(r"[\W_]+", "", value.casefold())
+    # Decompose and drop accents, then map look-alike letters onto Latin, so one swapped letter cannot hide a phrase.
+    plain = "".join(char for char in unicodedata.normalize("NFKD", value) if not unicodedata.combining(char))
+    return re.sub(r"[\W_]+", "", plain.casefold().translate(_LOOKALIKES))
 
 
 def check_instruction_markers(value):
@@ -161,19 +176,31 @@ def _claims(value, depth=0, budget=None, text_ids=False):
         if isinstance(parsed, (dict, list)):
             return _claims(parsed, depth + 1, budget, text_ids)
         output = set()
+        started = False
         for line in value.splitlines()[:80]:
-            if text_ids and _TEXT_BODY_START.match(line): break
+            if text_ids:
+                # A rendered message: the header block names the message, the prose after its blank line (or body label) is
+                # attacker-written text, and only header lines and id-shaped tokens can be claimed.
+                text = line.strip()
+                if _TEXT_BODY_START.match(line) or started and not text: break
+                started = started or bool(text)
+                if header:=_TEXT_HEADER.match(line):
+                    value_text = header.group(1).strip()
+                    output.update((_digest(text), _digest(value_text), _digest(value_text.strip("\"'<>"))))
+                    output.update(_digest(url) for url in re.findall(r"https?://[^\s<>\"']+", value_text)[:8])
+                elif _TEXT_TOKEN.fullmatch(text):
+                    output.add(_digest(text))
+                continue
             line = line.strip()
             if 2 <= len(line) <= 256:
                 output.add(_digest(line))
             output.update(_digest(url) for url in re.findall(r"https?://[^\s<>\"']+", line)[:8])
-            if text_ids and (match:=_TEXT_IDENTIFIER.fullmatch(line)):
-                output.add(_digest(match.group(1)))
         return output
     if isinstance(value, dict):
         output = set()
         for key, child in list(value.items())[:100]:
-            if text_ids and key.casefold() in _TEXT_BODY_FIELDS:
+            # A field named for message prose holds attacker-written text whichever server returned it.
+            if isinstance(key, str) and key.casefold() in _TEXT_BODY_FIELDS:
                 continue
             if isinstance(child, str) and key.casefold() in CLAIM_FIELDS and 1 <= len(child.strip()) <= 256:
                 output.add(_digest(child))
@@ -185,6 +212,40 @@ def _claims(value, depth=0, budget=None, text_ids=False):
             output.update(_claims(child, depth + 1, budget, text_ids))
         return output
     return set()
+
+
+# The opening lines of a message as a server renders it: two different ones (From, Subject, Message-ID, ...) before the first blank
+# line, among at most the 80 lines a result is read for.
+_MESSAGE_HEADER = re.compile(r"(?i)\s*(?P<key>from|to|cc|bcc|reply-to|subject|date|message[_ -]?id|in-reply-to)\s*:")
+
+
+def _rendered_message(value, depth=0, budget=None):
+    """Whether a tool result holds a rendered message (a header block, then its body), whatever the server is called. The prose
+    after the header block is written by the sender, so it must never count as the message's items."""
+    budget = [0] if budget is None else budget
+    budget[0] += 1
+    if depth > 5 or budget[0] > 512:
+        return False
+    if isinstance(value, str):
+        if len(value) > 65536:
+            return False
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            return _rendered_message(parsed, depth + 1, budget)
+        keys = set()
+        for line in value.splitlines()[:80]:
+            if not line.strip():
+                if keys:
+                    break
+                continue
+            if header := _MESSAGE_HEADER.match(line):
+                keys.add(re.sub(r"[_ -]", "", header["key"].casefold()))
+        return len(keys) >= 2
+    children = list(value.values())[:100] if isinstance(value, dict) else value[:100] if isinstance(value, list) else []
+    return any(_rendered_message(child, depth + 1, budget) for child in children)
 
 
 def _source_error(value, depth=0, budget=None):
@@ -269,7 +330,9 @@ def source_observed(mobile, cfg, profile, session_id, tool_name, result, status)
             return False
     except (ImportError, LookupError, RuntimeError, ValueError):
         return False
-    text_ids = any(token in tool_name.casefold() for token in ("gmail", "google_workspace", "himalaya", "email", "mail"))
+    # A rendered message is told by its own shape; a mail-looking tool name only adds to that, so a server called anything is covered.
+    text_ids = (tool_name == "terminal" or any(token in tool_name.casefold() for token in ("gmail", "google_workspace", "himalaya", "email", "mail"))
+                or _rendered_message(result))
     claims = sorted(_claims(result, text_ids=text_ids))[:128]
     if not claims:
         return False
@@ -279,9 +342,11 @@ def source_observed(mobile, cfg, profile, session_id, tool_name, result, status)
         prune_meta(conn, now)
         previous = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         reads = []
+        alerts = 0
         if previous:
             try:
                 old = json.loads(previous[0])
+                alerts = old.get("alerts") if type(old.get("alerts")) is int else 0
                 # Older aggregate hashes mix sources; only individually attributed reads can survive an upgrade.
                 reads = [read for read in old.get("reads", [])
                          if type(read.get("observed_at")) in (int, float)
@@ -292,7 +357,7 @@ def source_observed(mobile, cfg, profile, session_id, tool_name, result, status)
                       "item_hashes": claims, "observed_at": now})
         while len(reads) > 64 or sum(len(read.get("item_hashes", [])) for read in reads) > MAX_EVIDENCE_HASHES:
             reads.pop(0)
-        record = {"reads": reads, "observed_at": now}
+        record = {"reads": reads, "observed_at": now, "alerts": alerts}
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
                      (key, json.dumps(record, separators=(",", ":")).encode()))
     return True
@@ -308,7 +373,87 @@ def _inside_quiet(now, setup):
     return first <= minute < last if first < last else minute >= first or minute < last
 
 
-def _notice(mobile, owner, profile, conversation, reason, alert_key, now, email_alert=False, source="email", *, conn=None):
+def _words(value):
+    """Comparable words: case, accents and look-alike letters folded, punctuation dropped."""
+    plain = "".join(char for char in unicodedata.normalize("NFKD", value) if not unicodedata.combining(char))
+    return re.findall(r"\w+", plain.casefold().translate(_LOOKALIKES))
+
+
+def _holds(words, phrase):
+    return bool(phrase) and any(words[start:start + len(phrase)] == phrase for start in range(len(words) - len(phrase) + 1))
+
+
+# The common ways to tell an assistant to drop what it was told: one of these verbs and one of these objects together, in any order, in
+# the words of a rule. INSTRUCTION_MARKERS holds exact phrases; this catches the same order given in other words.
+OVERRIDE_VERBS = frozenset({"ignore", "disregard", "forget", "override", "overrule", "bypass", "circumvent", "disable", "neglect",
+                            "skip", "stop", "drop", "discard"})
+OVERRIDE_OBJECTS = frozenset({"rule", "rules", "instruction", "instructions", "prompt", "prompts", "policy", "policies",
+                              "guideline", "guidelines", "guidance", "directive", "directives"})
+NEGATIONS = frozenset({"not", "never", "t", "dont"})
+
+
+def check_override_phrase(value):
+    """ValueError for rule text that tells the assistant to drop its rules or instructions ("Ignore not important rules"), in the
+    words a deny-list of exact phrases cannot hold. A name or subject that only shares a word (Skip The Dishes) is left alone."""
+    words = set(_words(value))
+    orders = words & OVERRIDE_VERBS or ({"follow", "obey"} & words if words & NEGATIONS else set())
+    if orders and words & OVERRIDE_OBJECTS:
+        raise ValueError("Instruction-like text cannot be saved as a rule")
+
+
+def _rule_matches(text, sender, topic, whole):
+    """Whether an importance rule's words describe this alert. A rule is built from an alert's own sender ("Sent by ...") or
+    subject ("About ..."); wording the owner changed still matches when it names the alert's sender or subject."""
+    rule = _words(text)
+    kind = "sender" if rule[:2] == ["sent", "by"] else "topic" if rule[:1] == ["about"] else ""
+    rule = rule[2:] if kind == "sender" else rule[1:] if kind else rule
+    if kind == "sender": return _holds(sender, rule)
+    if kind == "topic": return _holds(topic, rule)
+    return _holds(whole, rule) or _holds(rule, sender) or _holds(rule, topic)
+
+
+def _muted(rules, labels, reason):
+    """The owner's enabled importance rules against one alert: the more specific rule wins (one limited to this source beats one for
+    any source) and Not important wins a tie. True when the alert is one the owner said not to be told about. [labels] are the names
+    the alert's own source goes by: a rule limited to any of them applies, so a mailbox saved as "gmail" is not heard again as "email"."""
+    from beacon_proactive import source_name
+    sender_text, slash, topic_text = reason.partition(" / ")
+    if not slash: sender_text, topic_text = "", reason
+    sender, topic, whole = _words(sender_text), _words(topic_text), _words(reason)
+    best = {}
+    for row in rules:
+        if not isinstance(row, dict) or row.get("enabled") is not True or row.get("action") not in ("important", "not_important"):
+            continue
+        signal = row.get("signal")
+        try:
+            if signal is not None and source_name(signal) not in labels: continue
+        except ValueError:
+            continue
+        if _rule_matches(str(row.get("text", "")), sender, topic, whole):
+            best[row["action"]] = max(best.get(row["action"], -1), int(signal is not None))
+    return "not_important" in best and best["not_important"] >= best.get("important", -1)
+
+
+def _take_run_slot(conn, owner, profile, session_id):
+    """One alert of this run's allowance, counted on the run's own evidence record so it lasts as long as the evidence does;
+    ValueError once the run has raised ALERTS_PER_RUN of them."""
+    key = _evidence_key(owner, profile, session_id)
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    try:
+        record = json.loads(row[0]) if row else None
+    except (TypeError, ValueError):
+        record = None
+    if not isinstance(record, dict):
+        return
+    used = record.get("alerts")
+    used = used if type(used) is int and used >= 0 else 0
+    if used >= ALERTS_PER_RUN:
+        raise ValueError("Too many alerts in this run; the owner already has the important ones")
+    record["alerts"] = used + 1
+    conn.execute("UPDATE meta SET value=? WHERE key=?", (json.dumps(record, separators=(",", ":")).encode(), key))
+
+
+def _notice(mobile, owner, profile, conversation, reason, alert_key, now, email_alert=False, source="email", *, conn=None, run_session=None):
     from contextlib import nullcontext
     with mobile.LOCK, (mobile.connect() if conn is None else nullcontext(conn)) as conn:
         prune_meta(conn, now.timestamp())
@@ -317,6 +462,8 @@ def _notice(mobile, owner, profile, conversation, reason, alert_key, now, email_
         mobile.prune_notices(conn)
         if conn.execute("SELECT COUNT(*) FROM notices").fetchone()[0] >= 10000:
             raise ValueError("Notification capacity reached")
+        if run_session:
+            _take_run_slot(conn, owner, profile, run_session)
         event = uuid.uuid4().hex
         conn.execute("INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason) VALUES(?,?,?,?,?,?,?,?)",
                      (event, owner, profile, "task_result", conversation, now.timestamp(),
@@ -338,7 +485,7 @@ def email_notice(mobile, native, cfg, profile, session_id, args, now):
 
 
 def event_notice(mobile, native, cfg, profile, session_id, args, now):
-    from beacon_proactive import EMAIL_RULE_PREFIX, _setup, _setup_complete, enabled, list_requests, source_name
+    from beacon_proactive import EMAIL_RULE_PREFIX, _setup, _setup_complete, _without_links, enabled, list_requests, source_name
 
     owner, provider = cfg.get("owner_id"), cfg.get("owner_provider")
     if not owner or not provider or not _profile_allowed(cfg,profile) or not session_id:
@@ -349,16 +496,23 @@ def event_notice(mobile, native, cfg, profile, session_id, args, now):
     request_id, item_id, reason = args.get("request_id"), args.get("item_id"), args.get("reason")
     if request_id is not None and (not isinstance(request_id, str) or not mobile.ID.fullmatch(request_id)):
         raise ValueError("Invalid Proactive rule id")
-    if not isinstance(item_id, str) or not 1 <= len(item_id.strip()) <= 256:
+    if not isinstance(item_id, str) or not 1 <= len(item_id.strip()) <= 256 or any(c < " " or c == "\x7f" for c in item_id):
         raise ValueError("A source-returned item id, title, or URL is required")
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("A brief reason is required")
-    reason = reason_text(reason)
+    # The words of an alert come from mail: any link, address or number to dial in them is dropped before the alert is stored,
+    # shown in the chat or spoken to the model on a call, the same as for what the watch learns from it.
+    reason = _without_links(reason_text(reason))
+    if not reason.strip(". "):
+        raise ValueError("A brief reason is required")
     setup = _setup(mobile, owner, profile)
     if not enabled(mobile, owner, profile) or not _setup_complete(mobile, owner, profile):
         raise ValueError("Proactive is not enabled")
-    request = next((row for row in list_requests(mobile, owner, profile)
-                    if row.get("id") == request_id and row.get("enabled") is True), None) if request_id else None
+    # A "Not important" rule only silences alerts; it can never be the reason for one.
+    rules = list_requests(mobile, owner, profile)
+    request = next((row for row in rules
+                    if row.get("id") == request_id and row.get("enabled") is True and row.get("action") != "not_important"),
+                   None) if request_id else None
     if request_id and not request:
         raise ValueError("No enabled source rule matches this alert")
     evidence_key = _evidence_key(owner, profile, session_id)
@@ -379,6 +533,13 @@ def event_notice(mobile, native, cfg, profile, session_id, args, now):
             and not any(source_name(request["signal"]) in read.get("sources", [])
                         for read in matched)):
         raise ValueError("No enabled source rule matches this alert")
+    # The owner's saved Not important rules are enforced here, not left to the watch prompt: whatever the model decided,
+    # no notice or call is created for an alert they said not to be told about.
+    # The labels the reads that proved this alert carry: the claimed one, and the mailbox's others (email and gmail, its server's name).
+    labels = {source, *(label for read in matched if isinstance(read.get("sources"), list)
+                        for label in read["sources"] if isinstance(label, str))}
+    if _muted(rules, labels, reason):
+        return {"status": "quiet", "message": "The owner marked this kind of alert as not important; nothing was sent."}
 
     stored = cfg.get("scheduled_callback_conversation_id")
     if not isinstance(stored, str) or not stored.strip():
@@ -404,6 +565,7 @@ def event_notice(mobile, native, cfg, profile, session_id, args, now):
                         for row in conn.execute("SELECT value FROM meta WHERE " + where, bounds))
             callbacks_ready = cfg.get("callback_tool_enabled") is True and cfg.get("scheduled_callbacks_enabled") is True
             if callbacks_ready and count < CALL_LIMIT:
+                _take_run_slot(conn, owner, profile, session_id)
                 # The event's own reason leads (call history shows it first); the rule follows.
                 rule_note = f" Rule: {request['text'][:100]}" if request else ""
                 lead = reason.strip() if not rule_note or reason.strip()[-1:] in ".!?" else reason.strip() + "."
@@ -425,5 +587,6 @@ def event_notice(mobile, native, cfg, profile, session_id, args, now):
                 conn.execute("UPDATE call_log SET email_notice_id=? WHERE id=? AND owner=? AND profile=?",
                              (event, event, owner, profile))
                 return {"status": "pending", "event_id": event, "conversation_id": stored}
-            return _notice(mobile, owner, profile, stored, reason.strip(), dedupe, now, email_alert=True, source=source, conn=conn)
-    return _notice(mobile, owner, profile, stored, reason.strip(), dedupe, now, email_alert=True, source=source)
+            return _notice(mobile, owner, profile, stored, reason.strip(), dedupe, now, email_alert=True, source=source, conn=conn,
+                           run_session=session_id)
+    return _notice(mobile, owner, profile, stored, reason.strip(), dedupe, now, email_alert=True, source=source, run_session=session_id)

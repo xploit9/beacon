@@ -122,7 +122,12 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
 }
 
 /** One rule: what the owner wrote with its own switch, then how it reaches them (Notify or Call), its source, night and delete. */
-@Composable private fun ProactiveRuleBlock(rule: JSONObject, enabled: Boolean, onUpdate: (JSONObject) -> Unit, onDelete: () -> Unit) {
+@Composable private fun ProactiveRuleBlock(rule: JSONObject, enabled: Boolean, onUpdate: (JSONObject) -> Unit, onDelete: () -> Unit, callsOff: Boolean = false) {
+    // An Important / Not important rule has a verdict instead of a delivery: it is shown, edited and deleted from the same list.
+    if (rule.string("action") in importanceActions) {
+        ImportanceRuleBlock(rule, enabled, onUpdate, onDelete)
+        return
+    }
     val id = rule.string("id")
     val text = rule.string("text")
     val on = rule.optBoolean("enabled")
@@ -131,14 +136,16 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
     Column(Modifier.fillMaxWidth().testTag("proactive-rule-$id").padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             Text(text, Modifier.weight(1f).testTag("proactive-rule-text-$id"), style = MaterialTheme.typography.bodyLarge,
-                color = if (on) scheme.onSurface else scheme.onSurfaceVariant, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                color = if (on) scheme.onSurface else scheme.onSurfaceVariant, maxLines = RULE_TEXT_LINES, overflow = TextOverflow.Ellipsis)
             Switch(on, { onUpdate(json("enabled" to it)) }, enabled = enabled, modifier = Modifier.testTag("proactive-rule-enabled-$id").semantics { contentDescription = text })
         }
         SegmentedChoice("When it matches", rule.string("action", "notify"), listOf("notify", "call"), listOf(uiText("Notify"), uiText("Call")), { onUpdate(json("action" to it)) },
             enabled = enabled, icons = mapOf("notify" to Icons.Rounded.Notifications, "call" to Icons.Rounded.Call))
+        // A rule that calls, on a Hermes that cannot place calls, says so on its own row: it will notify instead.
+        if (callsOff && rule.string("action") == "call") SettingsStatusPill(SettingsStatus.Attention, uiText("Calls off on this Hermes"), testTag = "proactive-rule-calls-off-$id")
         Row(verticalAlignment = Alignment.CenterVertically) {
             Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                SettingsBadge((rule.opt("signal") as? String)?.takeIf(String::isNotBlank) ?: uiText("Anything"), Modifier.weight(1f, fill = false), testTag = "proactive-rule-source-$id")
+                SettingsBadge(ruleSourceLabel(rule.opt("signal") as? String), Modifier.weight(1f, fill = false), testTag = "proactive-rule-source-$id")
                 FilterChip(night, { onUpdate(json("night" to !night)) }, label = { Text(uiText("At night"), maxLines = 1) }, enabled = enabled,
                     leadingIcon = { Icon(Icons.Rounded.Bedtime, null, Modifier.size(FilterChipDefaults.IconSize)) }, modifier = Modifier.testTag("proactive-rule-night-$id"))
             }
@@ -173,12 +180,16 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
     var proactiveQuietStart by remember(proactiveVersion) { mutableStateOf(proactive?.string("quiet_start").orEmpty().ifBlank { "22:00" }) }
     var proactiveQuietEnd by remember(proactiveVersion) { mutableStateOf(proactive?.string("quiet_end").orEmpty().ifBlank { "07:00" }) }
     var ruleToDelete by remember(profile) { mutableStateOf<Pair<String, String>?>(null) }
-    var noteToRemove by remember(profile) { mutableStateOf<String?>(null) }
+    var earlierSheet by remember(profile) { mutableStateOf(false) }
+    var earlierError by remember(profile) { mutableStateOf("") }
+    var confirmClear by remember(profile) { mutableStateOf(false) }
     // Words the callbacks below show are translated here, where uiText can run.
     val loadFailed = uiText("Couldn't load Proactive settings. Try again.")
     val updateFailed = uiText("Couldn't update Proactive settings. Try again.")
     val ruleFailed = uiText("Couldn't update the rule. Try again.")
-    val noteFailed = uiText("Couldn't remove this preference. Try again.")
+    val noteFailed = uiText("Couldn't clear earlier ratings. Try again.")
+    val earlierFailed = uiText("Couldn't save the rule. Try again.")
+    val earlierFull = uiText("Rules are full. Delete one first.")
     val ruleExplanation = assistantText("Tell Beacon what needs your attention.")
     fun reportProactiveError(error: Throwable, fallback: String) {
         if (isMissingBeaconPluginRoute(error)) vm.storeData(proactiveKey, JSONObject().put("_pluginUpdateRequired", true))
@@ -267,18 +278,39 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
             sources = proactive?.let(::proactiveSources).orEmpty(),
         )
     }
-    fun removeLearnedNote(note: String) {
+    /** The earlier ratings go (Clear); the list does not come back, so the card leaves with the next status. */
+    fun clearEarlierRatings() {
         if (savingProactive) return
         val source = vm.client ?: return
         val client = try { source.forAuthorizedProfile(profile) } catch (_: Throwable) { vm.notice(noteFailed); return }
         savingProactive = true
         scope.launch {
             try {
-                client.call("$PROACTIVE_SETTINGS_PATH/learned", mapOf("profile" to profile), method = "DELETE", data = json("note" to note))
+                client.call("$PROACTIVE_SETTINGS_PATH/learned", mapOf("profile" to profile), method = "DELETE", data = json("all" to true))
                 if (vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile) proactiveRefresh++
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
                 reportProactiveError(error, noteFailed)
+            } finally { client.closeNative(); savingProactive = false }
+        }
+    }
+    /** The rules the owner reviewed are saved together, and the earlier ratings go with them. */
+    fun convertEarlierRatings(drafts: List<EarlierRuleDraft>) {
+        if (savingProactive) return
+        val source = vm.client ?: return
+        val client = try { source.forAuthorizedProfile(profile) } catch (_: Throwable) { earlierError = earlierFailed; return }
+        savingProactive = true
+        earlierError = ""
+        scope.launch {
+            try {
+                client.call("$PROACTIVE_SETTINGS_PATH/learned/rules", mapOf("profile" to profile), method = "POST",
+                    data = json("rules" to org.json.JSONArray(drafts.map { json("verdict" to it.verdict, "rule" to it.text, "source" to it.source) })))
+                earlierSheet = false
+                if (vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile) proactiveRefresh++
+            } catch (error: Throwable) {
+                if (error is CancellationException) throw error
+                if (isMissingBeaconPluginRoute(error)) vm.storeData(proactiveKey, JSONObject().put("_pluginUpdateRequired", true))
+                else earlierError = if (ruleLimitReached(error)) earlierFull else earlierFailed
             } finally { client.closeNative(); savingProactive = false }
         }
     }
@@ -396,26 +428,23 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
                 rules.forEachIndexed { index, rule ->
                     if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f))
                     val id = rule.string("id")
-                    ProactiveRuleBlock(rule, controlsEnabled, onUpdate = { updateProactiveRule(id, "PATCH", it) }, onDelete = { ruleToDelete = id to rule.string("text") })
+                    ProactiveRuleBlock(rule, controlsEnabled, onUpdate = { updateProactiveRule(id, "PATCH", it) }, onDelete = { ruleToDelete = id to rule.string("text") }, callsOff = !callbacksAvailable)
                 }
                 SettingsDivider()
                 SettingsActionRow(uiText("Add a rule"), ::addProactiveRule, icon = Icons.Rounded.Add, value = if (rules.size >= 20) uiText("Delete one to add another") else "",
                     enabled = controlsEnabled && rules.size < 20, testTag = "proactive-add-rule")
             }
         }
-        if (proactiveLoaded && proactiveEnabled) item {
-            val learned = proactiveLearnedNotes(proactive)
-            SettingsSection(assistantText("What Beacon learned")) {
-                if (learned.isEmpty()) SettingsEmpty(assistantText("Rate alerts to teach Beacon"), Icons.Rounded.Lightbulb, Modifier.testTag("proactive-learned-empty"))
-                learned.forEachIndexed { index, note ->
-                    if (index > 0) SettingsDivider()
-                    Row(Modifier.fillMaxWidth().heightIn(min = SettingsKit.RowMinHeight).padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                        SettingsIconTile(Icons.Rounded.Lightbulb)
-                        Text(note, Modifier.weight(1f).testTag("proactive-learned-$index"), style = MaterialTheme.typography.bodyLarge)
-                        SettingsIconButton(Icons.Rounded.Close, uiText("Remove note"), { noteToRemove = note }, Modifier.testTag("proactive-learned-remove-$index"), enabled = controlsEnabled)
-                    }
+        // Ratings from before importance became rules show once; after Turn into rules or Clear the card is gone for good.
+        if (proactiveLoaded && proactiveEnabled && proactiveLearnedNotes(proactive).isNotEmpty()) item {
+            val proposal = proactiveLearnedProposal(proactive)
+            SettingsSection(uiText("Earlier ratings")) {
+                if (proposal.isNotEmpty()) {
+                    SettingsActionRow(uiText("Turn into rules"), { earlierError = ""; earlierSheet = true }, icon = Icons.AutoMirrored.Rounded.Rule,
+                        enabled = controlsEnabled, testTag = "proactive-earlier-convert")
+                    SettingsDivider()
                 }
+                SettingsActionRow(uiText("Clear earlier ratings"), { confirmClear = true }, icon = Icons.Rounded.Close, enabled = controlsEnabled, testTag = "proactive-earlier-clear")
             }
         }
         // Without the plugin there is nothing to schedule; the section above already offers the install.
@@ -437,9 +466,13 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
         SettingsConfirmDialog(uiText("Delete this rule?"), text, uiText("Delete"), { ruleToDelete = null; updateProactiveRule(id, "DELETE") }, { ruleToDelete = null },
             confirmTestTag = "proactive-rule-delete-confirm")
     }
-    noteToRemove?.let { note ->
-        SettingsConfirmDialog(uiText("Remove this note?"), note, uiText("Remove"), { noteToRemove = null; removeLearnedNote(note) }, { noteToRemove = null },
-            confirmTestTag = "proactive-learned-remove-confirm")
+    if (confirmClear) {
+        SettingsConfirmDialog(uiText("Clear earlier ratings?"), "", uiText("Clear"), { confirmClear = false; clearEarlierRatings() }, { confirmClear = false },
+            confirmTestTag = "proactive-earlier-clear-confirm")
+    }
+    if (earlierSheet) {
+        val proposal = proactive?.let(::proactiveLearnedProposal).orEmpty()
+        if (proposal.isNotEmpty()) EarlierRulesSheet(proposal, busy = savingProactive, error = earlierError, onSave = { convertEarlierRatings(it) }, onDismiss = { earlierSheet = false })
     }
 }
 

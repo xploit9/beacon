@@ -71,7 +71,9 @@ import dev.hermes.android.BeaconViewModel
     val callBlocksUpdate = uiText("End the current call before updating Hermes.")
     LaunchedEffect(page, ui.origin, ui.owner, ui.profile, ui.connected, vm.client) { vm.phoneSettings.bind(); vm.phoneSettings.loadServer(page) }
     Column(Modifier.fillMaxSize()) {
-        Header(uiText(settingsLabel(page)), back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current, actions = {
+        // The checkpoints page is named for what it holds: the earlier versions of changed files.
+        val backups = serverCheckpointPage(page)
+        Header(if (backups) uiText("File backups") else uiText(settingsLabel(page)), if (backups) uiText("Earlier versions of changed files") else "", back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current, actions = {
             SettingsIconButton(Icons.Rounded.Refresh, uiText(if (page == "Server updates") "Refresh update status" else "Refresh"), { vm.phoneSettings.loadServer(page) }, enabled = !state.loading)
         })
         NativeServerSettings(page, state, { vm.phoneSettings.loadServer(page, force = true) },

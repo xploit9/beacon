@@ -128,6 +128,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.testTag
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
@@ -141,6 +142,7 @@ import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.data.AppPreferences
 import dev.hermes.android.data.currentAssistantName
 import dev.hermes.android.preferences
+import dev.hermes.android.ui.ApprovalCardOnScreen
 import dev.hermes.android.ui.BeaconDust
 import dev.hermes.android.ui.LocalAssistantName
 import dev.hermes.android.ui.Markdown
@@ -148,13 +150,15 @@ import dev.hermes.android.ui.NativeLocalization
 import dev.hermes.android.ui.VoicePresence
 import dev.hermes.android.ui.assistantText
 import dev.hermes.android.ui.beaconGold
-import dev.hermes.android.ui.callStatusText
 import dev.hermes.android.ui.nativeLanguageFor
 import dev.hermes.android.ui.presenceState
 import dev.hermes.android.ui.rememberBeaconClock
+import dev.hermes.android.ui.rememberKeyguardLocked
 import dev.hermes.android.ui.rememberNativeMotionEnabled
 import dev.hermes.android.ui.uiText
-import dev.hermes.android.voice.CallState
+import dev.hermes.android.voice.activitySubject
+import dev.hermes.android.voice.statusLabel
+import dev.hermes.android.voice.statusTemplate
 import dev.hermes.android.voice.voiceAmplitude
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.map
@@ -177,8 +181,8 @@ import kotlin.math.sin
     }
 }
 
-private val Gold = Color(0xFFE8A63A)
-private val GoldBright = Color(0xFFFFD27A)
+internal val Gold = Color(0xFFE8A63A)
+internal val GoldBright = Color(0xFFFFD27A)
 private val GoldDeep = Color(0xFFB9700F)
 /** The ink on a gold pearl. */
 private val OnGold = Color(0xFF2E1C00)
@@ -221,6 +225,12 @@ private val OnGold = Color(0xFF2E1C00)
     // Hiding leaves the flag alone (a hidden window keeps nothing on), so a warm show finds it already set.
     LaunchedEffect(awake) { if (awake || state.phase != OverlayPhase.Hidden) c.keepScreenOn(awake) }
     val live = state.surface == OverlaySurface.Live
+    // Locked, the conversation's words, the tool in use and the approval's details stay off the window. One value decides all of them: the
+    // controller's flag follows the broadcasts and the lock screen is read now as well, so a lock that came up between two broadcasts is not missed.
+    val keyguardLocked = rememberKeyguardLocked()
+    val phoneLocked = overlayLocked(c.locked, keyguardLocked())
+    // Locked with no conversation running, the text box is inert: nothing to type, send or dictate, and its orb only asks for the unlock.
+    val pillLocked = pillInert(phoneLocked, live)
     // The chips start rising a frame after the overlay shows (they are clear for their first 200 ms), so the first frame after
     // the gesture composes as little as it can.
     var chipShows by remember { androidx.compose.runtime.mutableIntStateOf(state.shows) }
@@ -231,11 +241,12 @@ private val OnGold = Color(0xFF2E1C00)
     Box(Modifier.fillMaxSize().semantics { this.paneTitle = paneTitle }.testTag("assist-overlay")
         // Watches every touch before the controls see it (it consumes nothing), for the idle hold.
         .pointerInput(Unit) { awaitPointerEventScope { while (true) { awaitPointerEvent(PointerEventPass.Initial); lastTouch[0] = SystemClock.uptimeMillis() } } }) {
-        // The app beneath stays as it is; tapping anywhere outside Beacon's glass closes the overlay. The lower part of the screen
+        // The app beneath stays as it is; tapping anywhere outside Beacon's glass closes the overlay, unless a conversation is live (see
+        // outsideTap: Back, a swipe down and the orb still end it). The lower part of the screen
         // deepens toward the theme's background under the dust (BeaconDust's scrim), and from GROUND_LEAD_DP above the topmost surface
         // down it is the theme's background itself (all of it in light, .98 in dark), so nothing of the app shows between the chips,
         // the line, the card and the pill. The dust is drawn above it.
-        Box(Modifier.fillMaxSize().pointerInput(Unit) { detectTapGestures { c.dismiss() } }.drawBehind {
+        Box(Modifier.fillMaxSize().pointerInput(Unit) { detectTapGestures { c.outsideTap() } }.drawBehind {
             if (stack.height <= 0f) return@drawBehind
             val edge = (stack.top - GROUND_LEAD_DP.dp.toPx()).coerceAtLeast(0f)
             val ramp = 56.dp.toPx()
@@ -243,12 +254,14 @@ private val OnGold = Color(0xFF2E1C00)
             drawRect(Brush.verticalGradient(listOf(ground.copy(alpha = 0f), ground), edge - ramp, edge), Offset(0f, edge - ramp), Size(size.width, ramp))
             drawRect(ground, Offset(0f, edge), Size(size.width, size.height - edge))
         })
-        // In a live call the voice is the band's own dust; otherwise the aurora follows the dictation or the reply.
-        BeaconDust(mood, pill, mic, if (live) ({ call.voiceAmplitude() }) else c::dustLevel, Modifier.fillMaxSize(), motion,
-            crown = stack, presence = !live, scrim = { background.copy(alpha = (if (dark) .94f else .92f) * appear) }, onFrame = c::drawn)
+        // Live, the voice is the conversation's own; otherwise the aurora follows the dictation or the reply. The dust keeps its crown
+        // above whatever shows over the text box, and listening dust streams to the orb, which is the conversation's one control.
+        BeaconDust(mood, pill, if (live && orb != Rect.Zero) orb.center else mic, if (live) ({ call.voiceAmplitude() }) else c::dustLevel, Modifier.fillMaxSize(), motion,
+            crown = stack, scrim = { background.copy(alpha = (if (dark) .94f else .92f) * appear) }, onFrame = c::drawn)
         Column(
             Modifier.align(Alignment.BottomCenter).fillMaxWidth()
-                .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom))
+                // The top inset too: with the card, the captions and the text box at their tallest the stack reaches the top of a short screen, and stays under the bar.
+                .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Vertical))
                 .padding(start = 16.dp, end = 16.dp, bottom = 12.dp)
                 .onGloballyPositioned { stack = it.boundsInRoot() }
                 // The glass condenses out of the dust: it rises a little and settles to full size as the swarm reaches its outline.
@@ -256,65 +269,38 @@ private val OnGold = Color(0xFF2E1C00)
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             val vm = c.vm
-            when (state.surface) {
-                OverlaySurface.Answer -> state.ask?.let { AnswerCard(c, it, vm, clock, motion) }
-                OverlaySurface.Live -> Unit
-                OverlaySurface.Pill -> Unit
+            if (state.surface == OverlaySurface.Answer) state.ask?.let {
+                AnswerCard(it, vm, clock, motion, phoneLocked, c::closeCard, c::reveal) { c.open(AssistTarget(AssistPurpose.OpenAssistant)) }
             }
             state.line?.let { LineRow(c, it, state.callFailure) }
-            if (live) LiveBand(c, call, motion, dark, clock)
-            else {
+            if (live) {
+                // The conversation's words, tool activity and any approval it waits on sit right above the text box: no band, no call
+                // screen, no window of the app.
+                val ui = vm?.ui?.collectAsState()?.value
+                val approval = if (ui != null) waitingApproval(call, ui.authenticated, ui.origin, ui.owner, ui.profile) else null
+                val captions = remember(call.transcripts, c.typedTurns) { liveCaptions(call.transcripts, c.typedTurns) }
+                val tool = call.toolReceipts.lastOrNull { it.statusLabel() != null }
+                val activity = tool?.statusTemplate()?.let { uiText(it).replace("{0}", tool.activitySubject()) }
+                val show = approvalShow(live, approval, phoneLocked)
+                // Only a card that is really drawn counts as the approval; locked, the call posts its notification instead.
+                if (approval != null) ApprovalCardOnScreen(approval.requestId, c.app.calls::approvalCardShown, shown = show == ApprovalShow.Card)
+                LiveAbovePill(captions, activity, approval, show, { decision -> approval?.let { c.decide(it, decision) } }, phoneLocked = phoneLocked)
+            } else {
                 // The chips join a frame after the show (they are clear for their first 200 ms anyway), so fitting them never
-                // costs the first frame.
-                if (vm != null && chipShows == state.shows) Chips(c, vm, chipShows, motion, field) else Spacer(Modifier.height(0.dp))
-                Pill(c, state, field, motion, clock, onBounds = { pill = it }, onMic = { mic = it }, onOrb = { orb = it })
+                // costs the first frame. While the unlock line waits, it is the only thing the overlay shows.
+                if (vm != null && chipShows == state.shows && state.line != OverlayLine.Unlock) Chips(c, vm, chipShows, motion, field, phoneLocked) else Spacer(Modifier.height(0.dp))
             }
+            val face = orbFace(live, call)
+            // The text box says the state only; the tool in use is the line above it.
+            val status = if (live) (if (!call.active) uiText("Connecting") else uiText(liveStatusLabel(call, phoneLocked))) else ""
+            val screenAvailable = c.screen != null && !live
+            Pill(PillInput(
+                state = state, draft = { c.draft }, onDraft = { c.draft = it }, screen = screenAvailable, screenAttached = c.screenAttached && screenAvailable, onAttach = c::attach,
+                heardLevel = { c.heardLevel }, face = face, status = status, voice = { call.voiceAmplitude() },
+                onSend = { question -> c.ask(screenQuestion = question) }, onDictate = c::dictate, onOrb = { if (live) c.endCall() else c.startLive() },
+                locked = pillLocked,
+            ), field, motion, clock, onBounds = { pill = it }, onMic = { mic = it }, onOrb = { orb = it })
         }
-        val hint by animateFloatAsState(if (c.talkHint && !live && !leaving) 1f else 0f, if (motion) tween(TALK_HINT_FADE_MILLIS) else snap(), label = "Talk hint")
-        if (c.talkHint || hint > 0f) TalkHint({ pill }, { orb }, { hint })
-    }
-}
-
-/**
- * "Talk live" in a small glass capsule above the orb, pointing at it: the first summon on a phone says what the orb is for. The
- * capsule's end sits on the pill's end (its right edge, or its left in right-to-left), so the pointer falls over the orb.
- */
-@Composable private fun TalkHint(pill: () -> Rect, orb: () -> Rect, shown: () -> Float) {
-    val glass = LocalGlass.current
-    val fill = glass?.bottom ?: MaterialTheme.colorScheme.surfaceContainerHigh
-    val edge = (glass?.rimLo ?: Gold).copy(alpha = .7f)
-    // Where the orb's centre falls along the capsule, worked out where the capsule is placed and read where its pointer is drawn.
-    val aim = remember { FloatArray(1) }
-    // The wrapper only places the capsule; the capsule is its own layout node, so its bounds are the glass itself.
-    Box(Modifier.layout { measurable, constraints ->
-        val bubble = measurable.measure(Constraints())
-        val rtl = layoutDirection == LayoutDirection.Rtl
-        layout(constraints.maxWidth, constraints.maxHeight) {
-            val at = orb()
-            val bar = pill()
-            val x = hintLeft(bar.left, bar.right, bubble.width.toFloat(), rtl).roundToInt()
-            aim[0] = at.center.x - x
-            if (at.width > 0f && bar.width > 0f) bubble.place(x, (at.top - bubble.height - 2.dp.roundToPx()).roundToInt())
-        }
-    }) {
-        Text(uiText("Talk live"), Modifier
-            .graphicsLayer { alpha = shown(); translationY = (1f - shown()) * 6.dp.toPx() }
-            .drawBehind {
-                val half = 7.dp.toPx()
-                val tip = 7.dp.toPx()
-                val cx = aim[0].coerceIn(16.dp.toPx() + half, size.width - 16.dp.toPx() - half)
-                val base = size.height - tip
-                val caret = androidx.compose.ui.graphics.Path().apply { moveTo(cx - half, base - 1f); lineTo(cx, size.height); lineTo(cx + half, base - 1f); close() }
-                drawPath(caret, fill)
-                drawLine(edge, Offset(cx - half, base), Offset(cx, size.height), 1.2.dp.toPx())
-                drawLine(edge, Offset(cx + half, base), Offset(cx, size.height), 1.2.dp.toPx())
-            }
-            .padding(bottom = 7.dp)
-            .glass(RoundedCornerShape(16.dp), solid = true, rim = { .7f }, halo = .45f, panel = false)
-            // The orb itself is "Talk to Beacon" for TalkBack; the capsule only shows it.
-            .clearAndSetSemantics { testTag = "assist-talk-hint" }
-            .padding(horizontal = 12.dp, vertical = 8.dp),
-            style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurface)
     }
 }
 
@@ -348,7 +334,7 @@ private val LocalGlass = androidx.compose.runtime.staticCompositionLocalOf<Glass
  * strength of the outer glow. A panel takes the taps that land on it ([panel]), so only the dim around it closes the overlay; a
  * button's face leaves them to its button.
  */
-@Composable private fun Modifier.glass(shape: Shape, solid: Boolean = false, rim: () -> Float = { .45f }, turn: () -> Float = { -.6f }, halo: Float = 0f, panel: Boolean = true): Modifier {
+@Composable internal fun Modifier.glass(shape: Shape, solid: Boolean = false, rim: () -> Float = { .45f }, turn: () -> Float = { -.6f }, halo: Float = 0f, panel: Boolean = true): Modifier {
     val style = LocalGlass.current ?: return this
     val fill = if (solid) 1f else .95f
     return drawWithCache {
@@ -380,56 +366,97 @@ private val LocalGlass = androidx.compose.runtime.staticCompositionLocalOf<Glass
 }
 
 /** The owner's and the agent's own words read in their own direction, whatever the interface language. */
-private val ContentDirection = androidx.compose.ui.text.TextStyle(textDirection = androidx.compose.ui.text.style.TextDirection.Content)
+internal val ContentDirection = androidx.compose.ui.text.TextStyle(textDirection = androidx.compose.ui.text.style.TextDirection.Content)
 
 // --- the pill ---
 
-@Composable private fun Pill(c: AssistOverlayController, state: AssistOverlayState, field: FocusRequester, motion: Boolean, clock: FloatState, onBounds: (Rect) -> Unit, onMic: (Offset) -> Unit, onOrb: (Rect) -> Unit) {
+/**
+ * What the text box shows and does, apart from the controller: the overlay passes its controller's, a Compose test its own. [face] is
+ * the orb's (a tap to talk, or the conversation's state), [status] the words for it, [voice] the conversation's voice level (read
+ * while drawing) and [onOrb] a tap on it: talk, or, live, end the conversation. [onSend] gets the question an attached screen asks.
+ * [locked] is the locked phone's text box (see [pillInert]): nothing to type, send or dictate, no hint, and the orb only asks for the unlock.
+ */
+internal class PillInput(
+    val state: AssistOverlayState,
+    val draft: () -> TextFieldValue,
+    val onDraft: (TextFieldValue) -> Unit,
+    val screen: Boolean,
+    val screenAttached: Boolean,
+    val onAttach: () -> Unit,
+    val heardLevel: () -> Float,
+    val face: OrbFace,
+    val status: String,
+    val voice: () -> Float,
+    val onSend: (String) -> Unit,
+    val onDictate: () -> Unit,
+    val onOrb: () -> Unit,
+    val locked: Boolean = false,
+)
+
+/**
+ * The text box. It stays through a live conversation: typing then sends a typed turn, the mic (dictation would compete with the
+ * conversation's own microphone) and the screen's + give way, and the orb shows the conversation and ends it.
+ */
+@Composable internal fun Pill(p: PillInput, field: FocusRequester, motion: Boolean, clock: FloatState, onBounds: (Rect) -> Unit = {}, onMic: (Offset) -> Unit = {}, onOrb: (Rect) -> Unit = {}) {
     val scheme = MaterialTheme.colorScheme
+    val state = p.state
+    val live = p.face != OrbFace.Talk
     val screenQuestion = uiText("What's on my screen?")
-    val canSend = c.draft.text.isNotBlank() || (c.screenAttached && c.screen != null)
+    val typeHint = uiText("Type a message")
+    // Locked (no conversation running), a question typed but not sent is not drawn: the controller keeps it for the unlock, the box shows none of it.
+    val draft = if (p.locked) TextFieldValue() else p.draft()
+    // Locked, nothing is sent from the text box, whatever it holds.
+    val canSend = !p.locked && (draft.text.isNotBlank() || (p.screenAttached && p.screen))
     val dictating = state.dictating
-    // The rim flares as the dust condenses into it, warms while it listens or works, and rests at a slow breath.
+    val unlockFirst = uiText("Unlock your phone first.")
+    // The rim flares as the dust condenses into it, warms while it listens, talks or works, and rests at a slow breath.
     val rest by animateFloatAsState(when {
         state.phase == OverlayPhase.Summoning -> 1f
         dictating -> .8f
+        p.face == OrbFace.Speaking -> .8f
+        p.face == OrbFace.Listening || p.face == OrbFace.Working -> .65f
         state.ask?.streaming == true -> .65f
         else -> .42f
     }, if (motion) tween(360) else snap(), label = "Pill rim")
-    val rim = { (rest * (.86f + .14f * sin(clock.floatValue * 1.7f)) + if (dictating) .45f * c.heardLevel else 0f).coerceIn(0f, 1f) }
+    val rim = { (rest * (.86f + .14f * sin(clock.floatValue * 1.7f)) + if (dictating) .45f * p.heardLevel() else if (live) .35f * p.voice() else 0f).coerceIn(0f, 1f) }
     Row(
         // The tag is outermost, so its bounds are the whole pill (the 16 dp inset from the screen included), not what is inside its padding.
         Modifier.fillMaxWidth().heightIn(min = 64.dp).testTag("assist-pill").onGloballyPositioned { onBounds(it.boundsInRoot()) }
             .glass(CircleShape, rim = rim, turn = { -.9f + .45f * clock.floatValue }, halo = .55f).padding(horizontal = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        if (c.screen != null) {
-            IconButton(c::attach, Modifier.testTag("assist-attach")) {
-                Icon(if (c.screenAttached) Icons.Rounded.CheckCircle else Icons.Rounded.Add,
-                    if (c.screenAttached) uiText("Screen attached") else uiText("Attach screen"), tint = if (c.screenAttached) Gold else scheme.onSurfaceVariant)
+        if (p.screen) {
+            IconButton(p.onAttach, Modifier.testTag("assist-attach")) {
+                Icon(if (p.screenAttached) Icons.Rounded.CheckCircle else Icons.Rounded.Add,
+                    if (p.screenAttached) uiText("Screen attached") else uiText("Attach screen"), tint = if (p.screenAttached) Gold else scheme.onSurfaceVariant)
             }
         } else Spacer(Modifier.width(14.dp))
         Box(Modifier.weight(1f).padding(vertical = 10.dp), contentAlignment = Alignment.CenterStart) {
             val hint = when {
+                // Locked, the line above says it; the box is blank and nothing can be typed in it.
+                p.locked -> ""
                 dictating -> state.heard.ifBlank { uiText("Listening") }
-                c.screenAttached && c.screen != null -> screenQuestion
+                // Live, the words say what the conversation is doing; the box can still be typed in, and TalkBack hears that (see below).
+                live -> p.status.ifBlank { typeHint }
+                p.screenAttached && p.screen -> screenQuestion
                 else -> assistantText("Ask Beacon")
             }
             BasicTextField(
-                c.draft, { c.draft = it }, Modifier.fillMaxWidth().focusRequester(field).testTag("assist-field").semantics { contentDescription = hint },
+                draft, p.onDraft, Modifier.fillMaxWidth().focusRequester(field).testTag("assist-field").semantics { contentDescription = if (p.locked) unlockFirst else if (live) typeHint else hint },
+                enabled = !p.locked,
                 textStyle = MaterialTheme.typography.bodyLarge.copy(color = scheme.onSurface).merge(ContentDirection), cursorBrush = SolidColor(Gold), maxLines = 4,
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send), keyboardActions = KeyboardActions(onSend = { c.ask(screenQuestion = screenQuestion) }),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send), keyboardActions = KeyboardActions(onSend = { p.onSend(screenQuestion) }),
             )
-            if (c.draft.text.isEmpty()) Text(hint, color = if (dictating && state.heard.isNotBlank()) scheme.onSurface else scheme.onSurfaceVariant,
+            if (draft.text.isEmpty() && hint.isNotEmpty()) Text(hint, color = if (dictating && state.heard.isNotBlank()) scheme.onSurface else scheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodyLarge, maxLines = 2, overflow = TextOverflow.Ellipsis)
         }
-        if (canSend) IconButton({ c.ask(screenQuestion = screenQuestion) }, Modifier.testTag("assist-send")) {
+        if (canSend) IconButton({ p.onSend(screenQuestion) }, Modifier.testTag("assist-send")) {
             Pearl(36.dp) { Icon(Icons.Rounded.ArrowUpward, uiText("Send"), tint = OnGold) }
-        } else IconButton(c::dictate, Modifier.onGloballyPositioned { onMic(it.boundsInRoot().center) }.testTag("assist-mic")) {
+        } else if (!live && !p.locked) IconButton(p.onDictate, Modifier.onGloballyPositioned { onMic(it.boundsInRoot().center) }.testTag("assist-mic")) {
             // Listening, a gold ring round the mic swells with the voice.
             Box(Modifier.size(40.dp).drawBehind {
                 if (!dictating) return@drawBehind
-                val level = c.heardLevel.coerceIn(0f, 1f)
+                val level = p.heardLevel().coerceIn(0f, 1f)
                 drawCircle(Gold.copy(alpha = .16f + .14f * level), 15.dp.toPx())
                 drawCircle(GoldBright.copy(alpha = .5f + .4f * level), (13f + 6f * level).dp.toPx(), style = Stroke(1.5.dp.toPx()))
             }, contentAlignment = Alignment.Center) {
@@ -437,8 +464,15 @@ private val ContentDirection = androidx.compose.ui.text.TextStyle(textDirection 
                     tint = if (dictating) Gold else scheme.onSurface)
             }
         }
-        IconButton(c::startLive, Modifier.onGloballyPositioned { onOrb(it.boundsInRoot()) }.testTag("assist-live")) {
-            DustCore(clock, 38.dp) { Icon(Icons.Rounded.GraphicEq, assistantText("Talk to Beacon"), Modifier.size(20.dp), tint = Color(0xFFFFF3D6)) }
+        // The orb: a tap to talk; during the conversation it shows listening, speaking or working, and a tap on it ends the conversation.
+        IconButton(p.onOrb, Modifier.onGloballyPositioned { onOrb(it.boundsInRoot()) }.testTag("assist-live")
+            .semantics { if (live) stateDescription = p.status }) {
+            LiveOrb(p.face, clock, p.voice, motion) {
+                DustCore(clock, 38.dp) {
+                    if (live) Icon(Icons.Rounded.Stop, uiText("End call"), Modifier.size(18.dp), tint = Color(0xFFFFF3D6))
+                    else Icon(Icons.Rounded.GraphicEq, assistantText("Talk to Beacon"), Modifier.size(20.dp), tint = Color(0xFFFFF3D6))
+                }
+            }
         }
     }
 }
@@ -487,13 +521,13 @@ private val ContentDirection = androidx.compose.ui.text.TextStyle(textDirection 
 private val ChipInset = 16.dp
 private val ChipPadding = 14.dp
 
-@Composable private fun Chips(c: AssistOverlayController, vm: BeaconViewModel, shows: Int, motion: Boolean, field: FocusRequester) {
+@Composable private fun Chips(c: AssistOverlayController, vm: BeaconViewModel, shows: Int, motion: Boolean, field: FocusRequester, locked: Boolean) {
     val ui by vm.ui.collectAsState()
     val chat by vm.chat.collectAsState()
     val assistantChat = chat.sessionId.isNotBlank() && vm.isBeaconConversation()
     val waiting = if (assistantChat && (chat.approval != null || chat.clarification != null)) AssistChip.Waiting(approval = chat.approval != null) else null
     val last = remember(ui.sessions, chat.sessionId, ui.profile) { lastChat(ui.sessions, if (assistantChat) chat.sessionId else "", ui.profile) }
-    val chips = assistChips(c.screen != null, c.locked, last, waiting)
+    val chips = assistChips(c.screen != null, locked, last, waiting)
     if (chips.isEmpty()) return
     val labels = chips.map { chipLabel(it) }
     val style = MaterialTheme.typography.labelLarge
@@ -501,8 +535,6 @@ private val ChipPadding = 14.dp
     val density = LocalDensity.current
     val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
     val scroll = rememberScrollState()
-    // On the summon that shows the one-time "Talk live" hint the chips wait for it to fade; any other summon lets them rise at once.
-    val held = !chipsMayRise(c.hint)
     // The row reaches the screen's edges, its chips inset like the pill. At rest every chip fits whole (fitChips); should one ever
     // reach past an edge, the row scrolls and fades there instead of cutting it.
     BoxWithConstraints(Modifier.bleed(ChipInset).fillMaxWidth()) {
@@ -519,7 +551,7 @@ private val ChipPadding = 14.dp
         Row(Modifier.fillMaxWidth().edgeFade(scroll, rtl).pointerInput(Unit) { detectTapGestures { } }.horizontalScroll(scroll)
             .padding(horizontal = ChipInset, vertical = 4.dp).testTag("assist-chips"), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             fitted.forEachIndexed { index, (chip, width) ->
-                Chip(c, chip, labels[chips.indexOf(chip)], index, shows, motion, held, field, Modifier.widthIn(max = with(density) { width.toDp() }))
+                Chip(c, chip, labels[chips.indexOf(chip)], index, shows, motion, field, Modifier.widthIn(max = with(density) { width.toDp() }))
             }
         }
     }
@@ -531,11 +563,10 @@ private val ChipPadding = 14.dp
     is AssistChip.Continue -> uiText("Continue: {0}").replace("{0}", chip.title)
 }
 
-@Composable private fun Chip(c: AssistOverlayController, chip: AssistChip, label: String, index: Int, shows: Int, motion: Boolean, held: Boolean, field: FocusRequester, modifier: Modifier) {
-    // The chips rise in one after another once the pill has formed, and once the first summon's hint has faded.
-    val rise = remember(shows, chip) { Animatable(if (motion || held) 0f else 1f) }
-    LaunchedEffect(shows, chip, motion, held) {
-        if (held) return@LaunchedEffect
+@Composable private fun Chip(c: AssistOverlayController, chip: AssistChip, label: String, index: Int, shows: Int, motion: Boolean, field: FocusRequester, modifier: Modifier) {
+    // The chips rise in one after another once the pill has formed.
+    val rise = remember(shows, chip) { Animatable(if (motion) 0f else 1f) }
+    LaunchedEffect(shows, chip, motion) {
         if (motion) { delay(200L + index * 70L); rise.animateTo(1f, tween(220)) } else rise.snapTo(1f)
     }
     // Pressed, a chip lifts a little toward the finger and its rim brightens.
@@ -553,7 +584,7 @@ private val ChipPadding = 14.dp
             translationY = (1f - rise.value) * 12.dp.toPx() - lift * 3.dp.toPx()
             scaleX = 1f + .03f * lift; scaleY = 1f + .03f * lift
         }.heightIn(min = 48.dp).glass(RoundedCornerShape(24.dp), rim = { .36f + .55f * lift }, halo = .5f * lift)
-            .clickable(press, LocalIndication.current, enabled = !held) {
+            .clickable(press, LocalIndication.current) {
                 when (chip) {
                     is AssistChip.Waiting -> c.open(AssistTarget(AssistPurpose.OpenAssistant), OverlayAction.OpenWaiting)
                     AssistChip.AboutScreen -> { c.screenAttached = true; runCatching { field.requestFocus() } }
@@ -588,7 +619,11 @@ private fun Modifier.edgeFade(scroll: ScrollState, rtl: Boolean) = graphicsLayer
 
 // --- the written answer ---
 
-@Composable private fun AnswerCard(c: AssistOverlayController, ask: OverlayAsk, vm: BeaconViewModel?, clock: FloatState, motion: Boolean) {
+/**
+ * The written answer. Stateless, so the overlay and a Compose test run the same card: [onClose] puts it away, [onReveal] asks for the
+ * unlock behind a locked answer, [onOpen] opens the chat. [locked] hides the owner's question like the reply (see [answerQuestion]).
+ */
+@Composable internal fun AnswerCard(ask: OverlayAsk, vm: BeaconViewModel?, clock: FloatState, motion: Boolean, locked: Boolean, onClose: () -> Unit, onReveal: () -> Unit, onOpen: () -> Unit) {
     val scheme = MaterialTheme.colorScheme
     val density = LocalDensity.current
     val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
@@ -608,7 +643,7 @@ private fun Modifier.edgeFade(scroll: ScrollState, rtl: Boolean) = graphicsLayer
         Modifier.fillMaxWidth().offset { IntOffset(0, drag.roundToInt()) }
             // Swiping the card down puts it away and leaves the pill.
             .draggable(rememberDraggableState { drag = (drag + it).coerceAtLeast(0f) }, Orientation.Vertical,
-                onDragStopped = { if (drag > with(density) { 96.dp.toPx() }) c.closeCard(); drag = 0f })
+                onDragStopped = { if (drag > with(density) { 96.dp.toPx() }) onClose(); drag = 0f })
             .heightIn(max = maxHeight).glass(shape, solid = true, rim = { .4f + .4f * shimmer }, halo = .3f)
             .drawWithContent {
                 drawContent()
@@ -631,17 +666,20 @@ private fun Modifier.edgeFade(scroll: ScrollState, rtl: Boolean) = graphicsLayer
             .padding(start = 20.dp, end = 6.dp, top = 8.dp, bottom = 8.dp).testTag("assist-answer"),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(ask.question, Modifier.weight(1f).padding(vertical = 8.dp), style = MaterialTheme.typography.labelLarge.merge(ContentDirection), color = scheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            IconButton(c::closeCard, Modifier.testTag("assist-answer-close")) { Icon(Icons.Rounded.Close, uiText("Close"), tint = scheme.onSurfaceVariant) }
+            // Locked, the owner's question is not composed at all (no text for the screen or a service to read); the close keeps its place.
+            val question = answerQuestion(locked, ask)
+            if (question.isNotEmpty()) Text(question, Modifier.weight(1f).padding(vertical = 8.dp).testTag("assist-answer-question"), style = MaterialTheme.typography.labelLarge.merge(ContentDirection), color = scheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            else Spacer(Modifier.weight(1f))
+            IconButton(onClose, Modifier.testTag("assist-answer-close")) { Icon(Icons.Rounded.Close, uiText("Close"), tint = scheme.onSurfaceVariant) }
         }
-        val body = answerBody(c.locked, ask)
+        val body = answerBody(locked, ask)
         when (body) {
             // Locked, the reply never shows a word before an unlock; the unlock brings the overlay back with it.
             AnswerBody.Locked -> Row(Modifier.padding(end = 6.dp, bottom = 4.dp).testTag("assist-unlock-to-see"), verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Rounded.Lock, null, Modifier.size(20.dp), tint = Gold)
                 Text(uiText("Unlock to see your answer"), Modifier.weight(1f).padding(start = 12.dp).semantics { liveRegion = LiveRegionMode.Polite },
                     style = MaterialTheme.typography.bodyLarge, color = scheme.onSurface)
-                TextButton(c::reveal, Modifier.heightIn(min = 48.dp).testTag("assist-unlock")) { Text(uiText("Unlock")) }
+                TextButton(onReveal, Modifier.heightIn(min = 48.dp).testTag("assist-unlock")) { Text(uiText("Unlock")) }
             }
             AnswerBody.Thinking -> Text(uiText("Thinking…"), Modifier.padding(bottom = 10.dp).semantics { liveRegion = LiveRegionMode.Polite }
                 // A slow gold light passes over the word while Beacon thinks.
@@ -666,7 +704,7 @@ private fun Modifier.edgeFade(scroll: ScrollState, rtl: Boolean) = graphicsLayer
             }
             AnswerBody.Empty -> Unit
         }
-        if (body == AnswerBody.Text && !ask.streaming) TextButton({ c.open(AssistTarget(AssistPurpose.OpenAssistant)) }, Modifier.heightIn(min = 48.dp).testTag("assist-open")) {
+        if (body == AnswerBody.Text && !ask.streaming) TextButton(onOpen, Modifier.heightIn(min = 48.dp).testTag("assist-open")) {
             Icon(Icons.AutoMirrored.Rounded.OpenInNew, null, Modifier.size(18.dp))
             Spacer(Modifier.width(8.dp))
             Text(uiText("Open in Beacon"))
@@ -677,6 +715,22 @@ private fun Modifier.edgeFade(scroll: ScrollState, rtl: Boolean) = graphicsLayer
 // --- one short line instead of a silent failure ---
 
 @Composable private fun LineRow(c: AssistOverlayController, line: OverlayLine, callFailure: CallReason?) {
+    val onAction: () -> Unit = when (lineAction(line, callFailure)) {
+        // Asks Android for the unlock again; the overlay stays, and the unlock brings it back as a fresh start.
+        LineAction.Unlock -> c::unlock
+        LineAction.Allow -> c::openPermissions
+        // Both open Beacon; locked, the phone unlocks first (needsUnlock). SignIn lands on the sign-in the app shows.
+        LineAction.Open, LineAction.SignIn -> { { c.open(AssistTarget(AssistPurpose.OpenAssistant)) } }
+        LineAction.OpenWaiting -> { { c.open(AssistTarget(AssistPurpose.OpenAssistant), OverlayAction.OpenWaiting) } }
+        LineAction.TryAgain -> c::retry
+        LineAction.CallAgain -> c::startLive
+        null -> { {} }
+    }
+    LineRowBody(line, callFailure, onAction, c::clearLine)
+}
+
+/** The line itself, without the controller: its words, its one action ([onAction]) and, except for the unlock line, its close ([onClear]). */
+@Composable internal fun LineRowBody(line: OverlayLine, callFailure: CallReason?, onAction: () -> Unit, onClear: () -> Unit) {
     val text = when (line) {
         OverlayLine.Microphone -> uiText("Allow the microphone to talk")
         OverlayLine.VoiceKey -> uiText("Add a voice key in Beacon")
@@ -695,9 +749,11 @@ private fun Modifier.edgeFade(scroll: ScrollState, rtl: Boolean) = graphicsLayer
             null -> uiText("Couldn't start the call")
         }
         OverlayLine.Waiting -> uiText("Waiting for you in Beacon")
+        OverlayLine.Unlock -> uiText("Unlock your phone first.")
     }
     val action = lineAction(line, callFailure)
     val label = when (action) {
+        LineAction.Unlock -> uiText("Unlock")
         LineAction.Allow -> uiText("Allow")
         LineAction.Open, LineAction.OpenWaiting -> uiText("Open")
         LineAction.SignIn -> uiText("Sign in")
@@ -705,108 +761,12 @@ private fun Modifier.edgeFade(scroll: ScrollState, rtl: Boolean) = graphicsLayer
         LineAction.CallAgain -> uiText("Call again")
         null -> null
     }
-    val onAction: () -> Unit = when (action) {
-        LineAction.Allow -> c::openPermissions
-        // Both open Beacon; locked, the phone unlocks first (needsUnlock). SignIn lands on the sign-in the app shows.
-        LineAction.Open, LineAction.SignIn -> { { c.open(AssistTarget(AssistPurpose.OpenAssistant)) } }
-        LineAction.OpenWaiting -> { { c.open(AssistTarget(AssistPurpose.OpenAssistant), OverlayAction.OpenWaiting) } }
-        LineAction.TryAgain -> c::retry
-        LineAction.CallAgain -> c::startLive
-        null -> { {} }
-    }
     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).glass(RoundedCornerShape(24.dp), solid = true, halo = .2f).padding(start = 16.dp).semantics { liveRegion = LiveRegionMode.Polite }.testTag("assist-line"),
         verticalAlignment = Alignment.CenterVertically) {
         Text(text, Modifier.weight(1f).padding(vertical = 6.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
         label?.let { TextButton(onAction, Modifier.heightIn(min = 48.dp).testTag("assist-line-action")) { Text(it) } }
-        IconButton(c::clearLine) { Icon(Icons.Rounded.Close, uiText("Close"), Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant) }
-    }
-}
-
-// --- the live conversation ---
-
-@Composable private fun LiveBand(c: AssistOverlayController, call: CallState, motion: Boolean, dark: Boolean, clock: FloatState) {
-    val scheme = MaterialTheme.colorScheme
-    var typing by remember { mutableStateOf(false) }
-    val captions = remember(call.transcripts, c.typedTurns) {
-        (call.transcripts.filter { it.text.isNotBlank() }.map { (it.role == "user") to it.text.trim() } + c.typedTurns.map { true to it }).takeLast(2)
-    }
-    val voice = call.voiceAmplitude()
-    Box(Modifier.fillMaxWidth()
-        .glass(RoundedCornerShape(32.dp), solid = true, rim = { (.42f * (.86f + .14f * sin(clock.floatValue * 1.4f)) + .5f * voice).coerceIn(0f, 1f) }, turn = { -.9f + .35f * clock.floatValue }, halo = .5f)
-        .testTag("assist-live-band")) {
-        Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            // Two short lines of live captions, the owner's in a quieter colour; the top corner keeps room for Open call.
-            Column(Modifier.fillMaxWidth().padding(start = 8.dp, end = 44.dp).semantics { liveRegion = LiveRegionMode.Polite }.testTag("assist-captions")) {
-                captions.forEach { (owner, text) ->
-                    Text(text, style = MaterialTheme.typography.bodyMedium.merge(ContentDirection), color = if (owner) scheme.onSurfaceVariant else scheme.onSurface, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
-            }
-            // The same dust as the call screen in the app, so the overlay and the app are one presence; here it is Beacon gold in
-            // every state, in a square so the swarm stays round, over a soft gold bloom that warms with the voice so even a quiet
-            // swarm reads against the card.
-            VoicePresence(call, Modifier.align(Alignment.CenterHorizontally).size(180.dp).drawBehind {
-                drawCircle(Brush.radialGradient(listOf(Gold.copy(alpha = (if (dark) .16f else .24f) + .2f * voice), Color.Transparent), center, size.minDimension / 2f))
-            }.beaconGold(dark), motion)
-            Text(if (call.active) callStatusText(call) else uiText("Connecting"), Modifier.fillMaxWidth().testTag("assist-live-status"),
-                style = MaterialTheme.typography.labelLarge, color = scheme.onSurfaceVariant, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
-            if (typing && LIVE_TYPING) {
-                // Typing mid-call: the same glass capsule as the pill, focused at once, with the gold send pearl.
-                val typed = remember { FocusRequester() }
-                LaunchedEffect(Unit) { runCatching { typed.requestFocus() } }
-                val hint = uiText("Type a message")
-                Row(Modifier.fillMaxWidth().heightIn(min = 52.dp).glass(CircleShape, rim = { .55f }, turn = { -.9f + .45f * clock.floatValue }, halo = .3f)
-                    .padding(start = 18.dp, end = 4.dp).testTag("assist-live-typing"), verticalAlignment = Alignment.CenterVertically) {
-                    Box(Modifier.weight(1f).padding(vertical = 10.dp), contentAlignment = Alignment.CenterStart) {
-                        BasicTextField(c.draft, { c.draft = it }, Modifier.fillMaxWidth().focusRequester(typed).semantics { contentDescription = hint },
-                            textStyle = MaterialTheme.typography.bodyLarge.copy(color = scheme.onSurface).merge(ContentDirection), cursorBrush = SolidColor(Gold), maxLines = 3,
-                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send), keyboardActions = KeyboardActions(onSend = { c.ask() }))
-                        if (c.draft.text.isEmpty()) Text(hint, color = scheme.onSurfaceVariant, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    }
-                    IconButton({ c.ask() }) { Pearl(34.dp) { Icon(Icons.Rounded.ArrowUpward, uiText("Send"), tint = OnGold) } }
-                }
-            }
-            // Mute, End call and Keyboard in three equal places, so End call sits in the middle.
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                    LiveToggle(if (call.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic, uiText("Microphone"), if (call.muted) uiText("Muted") else uiText("Unmuted"),
-                        "assist-live-mute", checked = call.muted, enabled = call.active) { c.mute() }
-                }
-                Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { EndCall(c::endCall) }
-                Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                    if (LIVE_TYPING) LiveToggle(Icons.Rounded.Keyboard, uiText("Type a message"), if (typing) uiText("Shown") else uiText("Hidden"),
-                        "assist-live-type", checked = typing, enabled = call.active, lit = typing) { typing = !typing }
-                }
-            }
-        }
-        IconButton({ c.open(AssistTarget(AssistPurpose.ShowCall), OverlayAction.OpenCall) }, Modifier.align(Alignment.TopEnd).padding(top = 4.dp, end = 6.dp).size(48.dp).testTag("assist-live-open")) {
-            Icon(Icons.AutoMirrored.Rounded.OpenInNew, uiText("Open call"), Modifier.size(20.dp), tint = scheme.onSurfaceVariant)
-        }
-    }
-}
-
-/**
- * A round call control in glass that stays on or off. TalkBack hears its fixed [label], that it is a switch, and its [state] in
- * words; [lit] lights its rim and icon gold (the keyboard while typing).
- */
-@Composable private fun LiveToggle(icon: ImageVector, label: String, state: String, tag: String, checked: Boolean, enabled: Boolean, lit: Boolean = false, onToggle: () -> Unit) {
-    val scheme = MaterialTheme.colorScheme
-    Box(Modifier.size(56.dp)
-        .toggleable(checked, remember { MutableInteractionSource() }, ripple(bounded = false, radius = 28.dp), enabled = enabled, role = Role.Switch) { onToggle() }
-        .semantics { contentDescription = label; stateDescription = state }.testTag(tag), contentAlignment = Alignment.Center) {
-        Box(Modifier.size(48.dp).glass(CircleShape, rim = { if (lit) .9f else .3f }, halo = if (lit) .35f else 0f, panel = false), contentAlignment = Alignment.Center) {
-            Icon(icon, null, tint = (if (lit) Gold else scheme.onSurface).copy(alpha = if (enabled) 1f else .38f))
-        }
-    }
-}
-
-/** End call: the one red control, round, in the middle. */
-@Composable private fun EndCall(onClick: () -> Unit) {
-    val red = Color(0xFFC62F2A)
-    IconButton(onClick, Modifier.size(56.dp).testTag("assist-live-end")) {
-        Box(Modifier.size(48.dp).clip(CircleShape).drawBehind {
-            drawCircle(Brush.radialGradient(listOf(red.copy(red = (red.red + .12f).coerceAtMost(1f)), red), center + Offset(-size.width * .15f, -size.height * .2f), size.minDimension * .75f))
-        }, contentAlignment = Alignment.Center) {
-            Icon(Icons.Rounded.CallEnd, uiText("End call"), tint = Color.White)
-        }
+        // The unlock line is not closed: the phone is still locked, so Back or a tap outside closes the overlay, and the action asks again.
+        if (line == OverlayLine.Unlock) Spacer(Modifier.width(8.dp))
+        else IconButton(onClear) { Icon(Icons.Rounded.Close, uiText("Close"), Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant) }
     }
 }

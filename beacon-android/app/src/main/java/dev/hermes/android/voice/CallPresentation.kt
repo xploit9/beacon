@@ -18,8 +18,12 @@ internal fun CallState.chipLabel(): String = when {
     muted -> "Muted"
     else -> "Listen"
 }
-internal fun callStatusLabel(call: CallState): String {
-    val toolStatus = call.toolReceipts.lastOrNull { it.statusLabel() != null }?.statusLabel()
+/**
+ * The call's state in words. [withTool] puts the tool in use first ("Using Gmail…"); the call screen leaves it to the tool card and the
+ * overlay to its tool line, so the header and the text box say only the state.
+ */
+internal fun callStatusLabel(call: CallState, withTool: Boolean = true): String {
+    val toolStatus = if (withTool) call.toolReceipts.lastOrNull { it.statusLabel() != null }?.statusLabel() else null
     return when {
         call.held -> "Call on hold"
         call.state == "connecting" || call.state == "reconnecting" -> "Connecting"

@@ -1,12 +1,10 @@
 package dev.hermes.android.assist
 
 import android.Manifest
-import android.app.KeyguardManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.os.Bundle
@@ -26,9 +24,11 @@ import dev.hermes.android.VoiceCallRequest
 import dev.hermes.android.data.MissingVoiceKeyException
 import dev.hermes.android.data.NativeDeviceRemoval
 import dev.hermes.android.data.VoiceKeyStore
+import dev.hermes.android.phone.deviceLockedNow
 import dev.hermes.android.push.serviceText
 import dev.hermes.android.ui.voiceKeyConfiguredOnIo
 import dev.hermes.android.updates.PluginInstallHub
+import dev.hermes.android.voice.CallToolApproval
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -36,6 +36,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -57,6 +58,9 @@ internal fun overlayLocale(context: android.content.Context): java.util.Locale {
     return context.resources.configuration.locales[0] ?: java.util.Locale.getDefault()
 }
 
+/** Whether a tap on the dim outside the glass closes the overlay: not while a conversation is live, whose own controls end it. */
+internal fun outsideTapCloses(surface: OverlaySurface): Boolean = surface != OverlaySurface.Live
+
 internal class AssistOverlayController(private val session: BeaconAssistSession) {
     val app get() = session.app
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -77,22 +81,27 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
     var locale by mutableStateOf(overlayLocale(session.context)); private set
     /** Typed turns sent into the live call, shown in its captions as the owner's words. */
     var typedTurns by mutableStateOf(emptyList<String>()); private set
-    /** "Talk live" above the orb: shown for a moment on the first summon on this phone, then never again. */
-    var talkHint by mutableStateOf(false); private set
-    /** Where this show's hint stands: the chip row rises only once it is over, so the chips never come up under the hint. */
-    var hint by mutableStateOf(HintStage.Unknown); private set
-    /** The overlay's own small preferences, loaded off the main thread the first time and read from memory after. */
-    private var hints: SharedPreferences? = null
     private var replyBeat = 0L
     private var shownAt = 0L
     private var awaitingFrame = false
+    /** A fresh show talks as soon as its first frame is drawn (see [talksOnShow]); a re-show keeps what was on screen. */
+    private var talkOnFrame = false
     private var asking: Job? = null
     private var asked: Pair<Set<String>, String>? = null
-    private var liveWanted = false
+    /** The conversation this overlay asks for and runs: asked for, running here, or cancelled while it was starting. */
+    private val live = AssistLiveBook()
     private var heldCallWindow = false
-    private var hinting: Job? = null
-    /** An unlock while the overlay shows over the lock screen shows what it held at once. */
-    private val unlocked = object : BroadcastReceiver() { override fun onReceive(context: Context, intent: Intent) { locked = false } }
+    /**
+     * Keeps [locked] true to the lock screen while the overlay shows: the screen turning off counts as locked at once (the lock screen
+     * follows it, but a read right then can still say unlocked); turning on and an unlock read it again, so an unlock over the lock
+     * screen shows what the overlay held at once.
+     */
+    private val lockWatch = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            locked = intent.action == Intent.ACTION_SCREEN_OFF || keyguardLocked()
+            if (locked) lockedWhileOpen() else unlockedWhileWaiting()
+        }
+    }
     private var listening = false
     private val dictation = AssistDictation(session.context, ::dictationEvent)
 
@@ -104,53 +113,73 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
     fun shown(args: Bundle?) {
         shownAt = SystemClock.uptimeMillis()
         awaitingFrame = true
-        locked = session.context.getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == true
-        if (locked && !listening) listening = runCatching {
-            ContextCompat.registerReceiver(session.context, unlocked, IntentFilter(Intent.ACTION_USER_PRESENT), ContextCompat.RECEIVER_NOT_EXPORTED)
+        locked = keyguardLocked()
+        if (!listening) listening = runCatching {
+            val actions = IntentFilter(Intent.ACTION_SCREEN_OFF).apply { addAction(Intent.ACTION_SCREEN_ON); addAction(Intent.ACTION_USER_PRESENT) }
+            ContextCompat.registerReceiver(session.context, lockWatch, actions, ContextCompat.RECEIVER_NOT_EXPORTED)
         }.isSuccess
         refreshLocale()
-        // A new show starts its hint over; a hint seen before (once the preferences are loaded) lets the chips rise as ever.
-        hinting?.cancel()
-        talkHint = false
-        hint = if (hints?.getBoolean(TALK_HINT_SEEN, false) == true) HintStage.Over else HintStage.Unknown
         val reveal = args?.getBoolean(EXTRA_RESHOW) == true
         if (!reveal) { screen = null; screenAttached = false; draft = TextFieldValue(); typedTurns = emptyList() }
-        state = reduce(state, OverlayEvent.Show(fresh = !reveal, callActive = app.calls.state.value.active))
+        talkOnFrame = talksOnShow(reshow = reveal)
+        live.shown()
+        // The lock is read now (not only the cached flag): a fresh show on a locked phone starts nothing and says to unlock first.
+        state = reduce(state, OverlayEvent.Show(fresh = !reveal, callActive = app.calls.state.value.active, locked = overlayLocked(locked, keyguardLocked())))
         holdCallWindow()
     }
 
-    /** Every drawn dust frame; the first after a show is timed, then the app's view model is made. */
+    /**
+     * Every drawn dust frame; the first after a show is timed, then, unlocked, the app's view model is made and, for a fresh show, the
+     * live conversation starts (startLive asks for what is missing, a microphone or a sign-in, instead of failing quietly). Locked,
+     * the first frame loads, warms and starts nothing: it asks for the unlock (see [settle]).
+     */
     fun drawn() {
         if (!awaitingFrame) return
         awaitingFrame = false
         firstFrames += SystemClock.uptimeMillis() - shownAt
         session.tick()
-        // Posted, so the first frame never waits for the view model or for warming the call session.
-        android.os.Handler(android.os.Looper.getMainLooper()).post {
-            if (state.phase != OverlayPhase.Hidden) { ensureVm().foreground(true); assistPrewarm(true); offerTalkHint() }
+        // Posted, so the first frame never waits for the view model, for warming the call session or for starting the conversation.
+        android.os.Handler(android.os.Looper.getMainLooper()).post { settle() }
+    }
+
+    /** What the first frame leads to: see [firstFrame]. The lock is read live, so a lock that came up since the show is not missed. */
+    private fun settle() {
+        if (state.phase == OverlayPhase.Hidden) return
+        val talks = talkOnFrame && state.phase != OverlayPhase.Dismissing
+        when (firstFrame(overlayLocked(locked, keyguardLocked()), app.calls.state.value.active, talks)) {
+            FirstFrame.AskUnlock -> { talkOnFrame = false; unlockFirst() }
+            FirstFrame.Hold -> Unit
+            FirstFrame.Warm -> warm()
+            FirstFrame.WarmAndTalk -> { talkOnFrame = false; warm(); startLive() }
         }
+    }
+
+    private fun warm() { ensureVm().foreground(true); assistPrewarm(true) }
+
+    /**
+     * The phone locked (or its screen went off) with the overlay open. A conversation that runs was started unlocked, so it is trusted
+     * and carries on; one still being asked for stops here, and whatever is idle waits for the unlock: nothing is heard or started locked.
+     */
+    private fun lockedWhileOpen() {
+        if (state.phase == OverlayPhase.Hidden || state.phase == OverlayPhase.Dismissing || app.calls.state.value.active) return
+        dictation.cancel()
+        heardLevel = 0f
+        state = reduce(state, OverlayEvent.DictationStopped)
+        if (live.wanted) endCall()
+        // A written answer carries its own unlock row; the bare pill gets the line.
+        if (state.surface == OverlaySurface.Pill) state = reduce(state, OverlayEvent.Line(OverlayLine.Unlock))
     }
 
     /**
-     * Once per phone, the first time the pill shows: "Talk live" above the orb for a moment, and the chips rise after it has faded
-     * (playTalkHint holds the order). Whether it was shown before is read off the main thread.
+     * The phone unlocked while the unlock line waits and the unlock's own return has not come: the conversation starts as the unlocked
+     * gesture's does. If that return does come, a start already on its way is not asked for twice (see [startLive]).
      */
-    private fun offerTalkHint() {
-        hinting?.cancel()
-        hinting = scope.launch {
-            playTalkHint(
-                seen = { hintPreferences().getBoolean(TALK_HINT_SEEN, false) },
-                markSeen = { hints?.edit()?.putBoolean(TALK_HINT_SEEN, true)?.apply() },
-                state = { state }, stage = { hint = it }, visible = { talkHint = it },
-                holdMillis = TALK_HINT_MILLIS, fadeMillis = if (motionEnabled()) TALK_HINT_FADE_MILLIS.toLong() else 0L,
-            )
-        }
+    private fun unlockedWhileWaiting() {
+        if (state.line != OverlayLine.Unlock || state.phase == OverlayPhase.Hidden || state.phase == OverlayPhase.Dismissing) return
+        state = reduce(state, OverlayEvent.Line(null))
+        talkOnFrame = true
+        if (!awaitingFrame) settle()
     }
-
-    /** The overlay's preferences; the first read loads the file on the IO thread (getAll waits for it), later reads are in memory. */
-    private suspend fun hintPreferences(): SharedPreferences = hints ?: withContext(Dispatchers.IO) {
-        app.getSharedPreferences(HINTS, Context.MODE_PRIVATE).also { it.all }
-    }.also { hints = it }
 
     fun summoned() { state = reduce(state, OverlayEvent.Summoned) }
 
@@ -162,7 +191,9 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
 
     fun hidden() {
         dictation.cancel()
-        hinting?.cancel()
+        // Whatever closes the overlay ends the conversation it started, before the window is let go (which would float the call).
+        closeLive()
+        talkOnFrame = false
         stopListening()
         heardLevel = 0f
         state = reduce(state, OverlayEvent.Hidden)
@@ -173,28 +204,40 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
     }
 
     fun destroyed() {
+        closeLive()
         if (state.phase != OverlayPhase.Hidden) { assistPrewarm(false); releaseCallWindow() }
         dictation.cancel()
         stopListening()
         scope.cancel()
     }
 
-    /** Closes with the dust falling away; reduced motion closes at once. */
+    /** Closes with the dust falling away; reduced motion closes at once. Nothing keeps listening from the first moment of it. */
     fun dismiss() {
         if (state.phase == OverlayPhase.Hidden || state.phase == OverlayPhase.Dismissing) return
         dictation.cancel()
+        talkOnFrame = false
+        closeLive()
         state = reduce(state, OverlayEvent.Dismiss)
         if (!motionEnabled()) { session.hide(); return }
         scope.launch { delay(dev.hermes.android.ui.BEACON_DUST_DISMISS_MILLIS.toLong()); if (state.phase == OverlayPhase.Dismissing) session.hide() }
     }
+
+    /**
+     * A tap on the dim around Beacon's glass: it closes the overlay, except while a conversation is live ([outsideTapCloses]). A stray
+     * tap beside the glass then does nothing; Back, a swipe down and the orb still end the conversation and close the overlay.
+     */
+    fun outsideTap() { if (outsideTapCloses(state.surface)) dismiss() }
 
     fun closeCard() { state = reduce(state, OverlayEvent.CloseCard); if (state.ask == null) { asking?.cancel(); asked = null } }
 
     fun clearLine() { state = reduce(state, OverlayEvent.Line(null)) }
 
     private fun stopListening() {
-        if (listening) { listening = false; runCatching { session.context.unregisterReceiver(unlocked) } }
+        if (listening) { listening = false; runCatching { session.context.unregisterReceiver(lockWatch) } }
     }
+
+    /** The lock screen is up right now: the one live read of every private surface of the overlay (see [overlayLocked]). */
+    private fun keyguardLocked() = deviceLockedNow(session.context)
 
     fun motionEnabled() = android.provider.Settings.Global.getFloat(session.context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f) > 0f
 
@@ -221,15 +264,20 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
             app.calls.state.collect { call ->
                 when {
                     call.active -> {
-                        liveWanted = false
+                        // Closed while it was starting: it ends the moment it exists, so nothing listens with no overlay on screen.
+                        if (live.callActive(call.startedAt) == LiveActive.HangUp) { app.calls.hangup(); return@collect }
                         if (state.surface != OverlaySurface.Live && state.phase != OverlayPhase.Hidden) state = reduce(state, OverlayEvent.LiveStarted)
                     }
-                    // A call asked for here is still starting; any other end of a call gives the band back.
-                    state.surface == OverlaySurface.Live && !liveWanted -> {
-                        state = reduce(state, OverlayEvent.LiveEnded)
-                        typedTurns = emptyList()
-                        // The call service words its reason in the phone's language (serviceText), so that wording is recognised too.
-                        if (call.failureReason.isNotBlank()) state = reduce(state, OverlayEvent.CallFailed(callReason(call.failureReason) { listOf(serviceText(app, it)) }))
+                    // A call asked for here is still starting; any other end of a call gives the pill its orb back. A closing overlay
+                    // keeps its captions until the dust has fallen away (the reducer lets go of the live surface when it is hidden).
+                    !live.wanted -> {
+                        live.callEnded()
+                        if (state.surface == OverlaySurface.Live && state.phase != OverlayPhase.Dismissing && state.phase != OverlayPhase.Hidden) {
+                            state = reduce(state, OverlayEvent.LiveEnded)
+                            typedTurns = emptyList()
+                            // The call service words its reason in the phone's language (serviceText), so that wording is recognised too.
+                            if (call.failureReason.isNotBlank()) state = reduce(state, OverlayEvent.CallFailed(callReason(call.failureReason) { listOf(serviceText(app, it)) }))
+                        }
                     }
                 }
             }
@@ -254,9 +302,12 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
      * is what an attached screen asks on its own, in the owner's language.
      */
     fun ask(text: String = draft.text, screenQuestion: String = SCREEN_QUESTION) {
+        // The screen only goes to a written question; a typed turn into the conversation is the words alone.
+        if (state.surface == OverlaySurface.Live) { text.trim().takeIf { it.isNotEmpty() }?.let(::typeIntoCall); return }
+        // Locked, nothing is sent: the text box is inert, and words typed or dictated before the lock came up go nowhere.
+        if (needsUnlock(OverlayAction.Ask, overlayLocked(locked, keyguardLocked()))) return
         val question = text.trim().ifEmpty { if (screenAttached) screenQuestion else "" }
         if (question.isEmpty()) return
-        if (state.surface == OverlaySurface.Live) { typeIntoCall(question); return }
         val model = ensureVm()
         if (!signedIn(model)) { state = reduce(state, OverlayEvent.Line(OverlayLine.SignIn)); return }
         session.tick()
@@ -341,6 +392,8 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
 
     fun dictate() {
         if (state.dictating) { dictation.stop(); return }
+        // Locked, nothing is heard: no microphone question, no recognizer.
+        if (needsUnlock(OverlayAction.Dictate, overlayLocked(locked, keyguardLocked()))) return
         if (!granted()) { state = reduce(state, OverlayEvent.Line(OverlayLine.Microphone)); return }
         ensureVm()
         if (!dictation.start()) { state = reduce(state, OverlayEvent.Line(OverlayLine.NoRecognizer)); return }
@@ -369,44 +422,106 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
         }
     }
 
-    // --- the live call ---
+    // --- the live conversation ---
 
-    /** Starts a voice conversation here, through the same request the chat's call button makes. */
+    /**
+     * Starts a voice conversation here, through the same request the chat's call button makes. A missing sign-in or microphone is
+     * a line with its one action instead (see [liveStart]), so no start is a dead end.
+     */
     fun startLive() {
-        if (app.calls.state.value.active) { state = reduce(state, OverlayEvent.LiveStarted); return }
         dictation.cancel()
+        // Locked with no conversation running, nothing starts: no app model, no sign-in or microphone question, only the unlock. A
+        // conversation that runs was started unlocked and is joined below.
+        if (startNeedsUnlock(overlayLocked(locked, keyguardLocked()), app.calls.state.value.active)) { unlockFirst(); return }
         val model = ensureVm()
-        if (!signedIn(model)) { state = reduce(state, OverlayEvent.Line(OverlayLine.SignIn)); return }
-        if (!granted()) { state = reduce(state, OverlayEvent.Line(OverlayLine.Microphone)); return }
-        session.tick()
-        liveWanted = true
-        state = reduce(state, OverlayEvent.LiveStarted)
-        model.callBeacon()
-        // The chat may take a moment to open; if the call never starts, the band gives way again.
-        scope.launch { delay(25_000); if (liveWanted && !app.calls.state.value.active) { liveWanted = false; state = reduce(reduce(state, OverlayEvent.LiveEnded), OverlayEvent.Line(OverlayLine.CallFailed)) } }
+        when (liveStart(app.calls.state.value.active, signedIn(model), granted())) {
+            LiveStart.Join -> state = reduce(state, OverlayEvent.LiveStarted)
+            LiveStart.SignIn -> state = reduce(state, OverlayEvent.Line(OverlayLine.SignIn))
+            LiveStart.Microphone -> state = reduce(state, OverlayEvent.Line(OverlayLine.Microphone))
+            LiveStart.Start -> {
+                // Already on its way (an unlock seen here, then the unlock's own fresh show): not asked for twice.
+                if (live.wanted) { state = reduce(state, OverlayEvent.LiveStarted); return }
+                session.tick()
+                live.requested()
+                state = reduce(state, OverlayEvent.LiveStarted)
+                scope.launch {
+                    // A session that is still restoring (the first show after the app's process started) is waited for: the chat's call
+                    // entry gives up on a signed-out chat. If it ends up signed out, the line says so.
+                    val ui = withTimeoutOrNull(RESTORE_WAIT_MILLIS) { model.ui.first { !it.restoringSession } }
+                    if (!live.wanted) return@launch
+                    if (ui == null || !ui.authenticated || ui.setupWizard) { endWanted(OverlayLine.SignIn); return@launch }
+                    // The phone may have locked while the sign-in was restored: nothing is heard, the unlock comes first.
+                    if (overlayLocked(locked, keyguardLocked())) { endWanted(OverlayLine.Unlock); return@launch }
+                    model.callBeacon()
+                }
+                // The chat may take a moment to open; if the conversation never starts, the pill gets its orb back with a line.
+                scope.launch { delay(25_000); if (live.wanted && !app.calls.state.value.active) { live.gaveUp(); state = reduce(reduce(state, OverlayEvent.LiveEnded), OverlayEvent.Line(OverlayLine.CallFailed)) } }
+            }
+        }
     }
 
     private fun startRequestedCall(model: BeaconViewModel, request: VoiceCallRequest) {
         model.consumeVoiceCallRequest(request)
+        // Closed, or ended with the orb, while the chat opened: nothing starts.
+        if (!live.wanted) return
         val active = model.client
         if (active == null || active.scope != request.scope || model.chat.value.sessionId != request.conversationId) { endWanted(OverlayLine.CallFailed); return }
         scope.launch {
             if (!voiceKeyConfiguredOnIo { VoiceKeyStore(app) }) { endWanted(OverlayLine.VoiceKey); return@launch }
-            try { model.stopReadAloud(); app.calls.start(active.detached(), request.conversationId) }
+            if (!live.wanted) return@launch
+            // The last gate before the call exists: locked by now, nothing starts and the unlock comes first.
+            if (overlayLocked(locked, keyguardLocked())) { endWanted(OverlayLine.Unlock); return@launch }
+            // From here the start is in flight: a close that comes before it returns must end the call it produces (see AssistLiveBook).
+            live.launched(System.currentTimeMillis())
+            var returned = false
+            try { model.stopReadAloud(); app.calls.start(active.detached(), request.conversationId, dev.hermes.android.phone.PhoneOrigin.Overlay); returned = true }
             catch (error: CancellationException) { throw error }
             catch (error: MissingVoiceKeyException) { endWanted(OverlayLine.VoiceKey) }
             catch (error: Exception) { endWanted(OverlayLine.CallFailed) }
+            finally {
+                val call = app.calls.state.value
+                if (live.settled(returned, call.active, call.startedAt)) app.calls.hangup()
+            }
         }
     }
 
     private fun endWanted(line: OverlayLine) {
-        liveWanted = false
+        if (!live.gaveUp()) return
         state = reduce(reduce(state, OverlayEvent.LiveEnded), OverlayEvent.Line(line))
     }
 
-    fun mute() = app.calls.mute()
+    /**
+     * Locked: the overlay says to unlock first and asks Android for it. Nothing is heard, said, warmed or connected until the unlock
+     * succeeds, and then the overlay comes back as a fresh start.
+     */
+    private fun unlockFirst() {
+        dictation.cancel()
+        heardLevel = 0f
+        state = reduce(state, OverlayEvent.Line(OverlayLine.Unlock))
+        unlock()
+    }
 
-    fun endCall() { liveWanted = false; app.calls.hangup() }
+    /**
+     * "Unlock": asks Android for the unlock (through [AssistUnlockActivity], "talk"). The overlay stays up meanwhile; a cancelled or
+     * failed unlock leaves it as it is, with the line and this action to ask again.
+     */
+    fun unlock() { AssistUnlockActivity.talk(app) }
+
+    /** The orb during the conversation: ends it. A call that runs hangs up; one still starting ends the moment it exists. */
+    fun endCall() {
+        if (live.end()) state = reduce(state, OverlayEvent.LiveEnded)
+        app.calls.hangup()
+    }
+
+    /** Closing the overlay ends a conversation it started, so nothing keeps listening hidden; a call the app is on carries on there. */
+    private fun closeLive() { if (live.closing()) endCall() }
+
+    /** The owner's answer to the approval the conversation waits on, from its card in the overlay. Locked, only no can be said. */
+    fun decide(approval: CallToolApproval, decision: String) {
+        // Read live as well: the phone may have locked since the card was drawn, whatever the last broadcast said.
+        if (decision != "deny" && overlayLocked(locked, keyguardLocked())) return
+        app.calls.decideTool(app.calls.state.value.callId, approval.requestId, approval.proposalId, decision)
+    }
 
     private fun typeIntoCall(text: String) {
         val call = app.calls.state.value
@@ -416,8 +531,8 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
     }
 
     /**
-     * The overlay is the call's screen while it shows, so a call started here does not also float a bubble over it. When it closes
-     * the app learns the call is in the background again, which brings back the usual bubble and notification.
+     * The overlay is the conversation's one surface while it shows, so the app's own call window (the floating bubble, the call
+     * screen) is kept away: the app is told its call screen is visible. When the overlay closes the app learns it is in the background again.
      */
     private fun holdCallWindow() {
         if (!app.calls.uiVisible) { heldCallWindow = true; app.calls.uiVisible = true }
@@ -431,7 +546,7 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
 
     /** Opens the app for [target]; locked, the phone unlocks first. The overlay steps aside either way. */
     fun open(target: AssistTarget, action: OverlayAction = OverlayAction.OpenInBeacon) {
-        if (needsUnlock(action, locked)) AssistUnlockActivity.open(app, target) else openBeacon(app, target)
+        if (needsUnlock(action, overlayLocked(locked, keyguardLocked()))) AssistUnlockActivity.open(app, target) else openBeacon(app, target)
         session.hide()
     }
 
@@ -443,7 +558,7 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
 
     /** The microphone screen; locked, after an unlock. */
     fun openPermissions() {
-        if (needsUnlock(OverlayAction.Settings, locked)) AssistUnlockActivity.permissions(app) else openBeaconPermissions(app)
+        if (needsUnlock(OverlayAction.Settings, overlayLocked(locked, keyguardLocked()))) AssistUnlockActivity.permissions(app) else openBeaconPermissions(app)
         session.hide()
     }
 
@@ -452,9 +567,7 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
     internal companion object {
         /** The question a bare attached screen asks. */
         const val SCREEN_QUESTION = "What's on my screen?"
-        /** The overlay's own small preferences, apart from the app's. */
-        const val HINTS = "assist-overlay"
-        const val TALK_HINT_SEEN = "talk_hint_seen"
-        const val TALK_HINT_MILLIS = 1_500L
+        /** How long a start waits for the sign-in to be restored before it says to sign in. */
+        const val RESTORE_WAIT_MILLIS = 15_000L
     }
 }

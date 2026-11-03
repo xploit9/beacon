@@ -34,7 +34,8 @@ class ToolsMcpGapsUiTest {
         compose.waitForIdle()
     }
     private fun serve(vm: BeaconViewModel, mcp: Boolean, payload: JSONObject) = compose.runOnIdle { vm.storeData(key(mcp), payload) }
-    private fun search(mcp: Boolean) = compose.onNode(hasSetTextAction() and hasText(if (mcp) "Search MCP servers" else "Search tools"))
+    // The field is found by its tag: its placeholder is gone once something is typed.
+    @Suppress("UNUSED_PARAMETER") private fun search(mcp: Boolean) = compose.onNode(hasSetTextAction() and hasTestTag("tools-search"))
 
     // The same behaviour on both pages
 
@@ -123,6 +124,29 @@ class ToolsMcpGapsUiTest {
     }
     @Test fun toolsRefreshReadsAgainAndWaitsWhileAReadRuns() = refreshing(false)
     @Test fun mcpRefreshReadsAgainAndWaitsWhileAReadRuns() = refreshing(true)
+
+    // An MCP server's test result sits next to Test, from the result already loaded
+
+    @Test fun anMcpServerSaysNotTestedUntilItIsTestedThenCountsItsToolsNextToTest() = withClientlessVm(compose) { vm ->
+        show(vm, true)
+        serve(vm, true, rows(true, "alpha"))
+        compose.onNodeWithTag("tool-test-result:alpha").assertIsDisplayed().assertTextContains("Not tested")
+        compose.runOnIdle { vm.storeData("mcp-test:alpha", json("ok" to true, "tools" to JSONArray().put(json("name" to "one")).put(json("name" to "two")))) }
+        compose.onNodeWithTag("tool-test-result:alpha").assertTextContains("2 tools")
+        compose.onNodeWithTag("tool-row:alpha").assert(hasText("2 tools", substring = true).not())
+        compose.onNodeWithTag("tool-test:alpha").assertIsDisplayed()
+    }
+
+    @Test fun aToolGroupHasNoTestResultChipAndNoIdentifierSubtitle() = withClientlessVm(compose) { vm ->
+        show(vm, false)
+        serve(vm, false, json("items" to JSONArray()
+            .put(json("name" to "web", "label" to "Web research", "description" to "web_search, web_extract", "enabled" to true, "configured" to true, "tools" to JSONArray(listOf("web_search", "web_extract"))))
+            .put(json("name" to "files", "label" to "File operations", "description" to "Read and change files", "enabled" to true, "configured" to true, "tools" to JSONArray(listOf("read_file"))))))
+        compose.onNodeWithTag("tool-test-result:web").assertDoesNotExist()
+        compose.onNodeWithText("web_search, web_extract").assertDoesNotExist()
+        compose.onNodeWithText("Read and change files").assertIsDisplayed()
+        compose.onNodeWithTag("tool-expand:web").assertTextContains("View tools · 2")
+    }
 
     // The chat's Tools sheet hosts the same two pages
 

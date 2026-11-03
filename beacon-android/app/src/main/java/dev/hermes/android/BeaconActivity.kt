@@ -71,6 +71,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.assist.ACTION_ASSIST_CALL
 import dev.hermes.android.assist.AssistGestures
 import dev.hermes.android.assist.AssistLaunchEffect
+import dev.hermes.android.assist.ContentDirection
 import dev.hermes.android.assist.EXTRA_ASSIST_TOKEN
 import dev.hermes.android.assist.assistFresh
 import dev.hermes.android.data.NativeAuth
@@ -177,6 +178,7 @@ class BeaconActivity : ComponentActivity() {
             CompositionLocalProvider(LocalBeaconSettings provides (data["profile-settings"] ?: emptySettings), LocalAssistantName provides preferences.assistantName) { NativeLocalization(nativeLanguageFor(LocalConfiguration.current.locales[0])) { BeaconTheme(dark, preferences.skin) { NativeWindowLayout(this@BeaconActivity) {
                 BeaconRoot(model, externalConnectionLinkOrigin) { externalConnectionLinkOrigin = null }
                 IncomingCallSheet(model, permissionSource.isNotBlank(), answer)
+                HermesPhoneApprovalHost(if (ui.authenticated) model.client else null)
                 CallBubbleAskHost(call)
                 // With the client, a plugin restart that waited for Hermes to go idle is retried whenever Beacon is in front.
                 dev.hermes.android.updates.AppUpdateHost(model.app.updates, model.client, ui.bootstrap.optJSONObject("optional_features")?.optString("plugin") == "absent")
@@ -559,6 +561,7 @@ internal fun incomingReasonFromHistory(history: org.json.JSONObject, event: Stri
     form?.let { NativeForm(vm, it) }
     val approval=call.toolApprovals.firstOrNull()?.takeIf { ui.authenticated && call.active && call.conversationScope?.let { s -> s.owner==ui.owner&&s.profile==ui.profile&&s.origin==ui.origin }==true }
     if(approval!=null&&form==null) {
+        ApprovalCardOnScreen(approval.requestId, vm.app.calls::approvalCardShown)
         CallToolApprovalDialog(approval, onDecision = { decision ->
             vm.app.calls.decideTool(call.callId,approval.requestId,approval.proposalId,decision)
         })
@@ -581,6 +584,8 @@ internal fun incomingReasonFromHistory(history: org.json.JSONObject, event: Stri
 
 @Composable
 internal fun CallToolApprovalDialog(approval: CallToolApproval, onDecision: (String) -> Unit) {
+    // A call the owner asked for in a live call counts down on its own card instead of waiting for a tap.
+    if ((approval.phone?.countdown ?: 0) > 0) { PhoneCallCountdownDialog(approval, onDecision); return }
     var details by rememberSaveable(approval.requestId) { mutableStateOf(false) }
     val summary = remember(approval.toolName, approval.arguments) { callToolApprovalSummary(approval) }
     AlertDialog(
@@ -588,21 +593,19 @@ internal fun CallToolApprovalDialog(approval: CallToolApproval, onDecision: (Str
         icon = { Icon(Icons.Rounded.VerifiedUser, null) },
         title = { Text(uiText("Allow this action?")) },
         text = {
-            Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text(summary.action, style = MaterialTheme.typography.titleMedium)
+            val scroll = rememberScrollState()
+            // A fade at the bottom shows while there is more to read; the answers stay in the dialog's own button column.
+            Column(Modifier.heightIn(max = 420.dp).verticalScrollFade(scroll).verticalScroll(scroll), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(summary.action, style = MaterialTheme.typography.titleMedium.merge(ContentDirection))
                 if (summary.service.isNotBlank()) Text(summary.service, style = MaterialTheme.typography.bodySmall)
                 if (summary.target.isNotBlank()) Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(uiText("Target"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(summary.target, style = MaterialTheme.typography.bodyLarge)
+                    Text(summary.target, style = MaterialTheme.typography.bodyLarge.merge(ContentDirection))
                 }
-                if (summary.fields.isNotBlank()) Text(summary.fields, style = MaterialTheme.typography.bodyMedium)
-                if (summary.preview.isNotBlank()) Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text(uiText("Content preview"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Surface(shape = MaterialTheme.shapes.medium, color = MaterialTheme.colorScheme.surfaceContainerLow) {
-                        Text(summary.preview, Modifier.fillMaxWidth().padding(12.dp), style = MaterialTheme.typography.bodyMedium)
-                    }
+                if (summary.fields.isNotBlank()) Text(summary.fields, style = MaterialTheme.typography.bodyMedium.merge(ContentDirection))
+                if (summary.preview.isNotBlank()) Surface(shape = MaterialTheme.shapes.medium, color = MaterialTheme.colorScheme.surfaceContainerLow) {
+                    Text(summary.preview, Modifier.fillMaxWidth().padding(12.dp).testTag("beacon-tool-approval-preview"), style = MaterialTheme.typography.bodyMedium.merge(ContentDirection))
                 }
-                Text(assistantText("Review the details before Beacon runs this action."))
                 TextButton(onClick = { details = !details }, modifier = Modifier.heightIn(min = 48.dp).testTag("beacon-tool-approval-details-toggle")) {
                     Text(if (details) uiText("Hide details") else uiText("Details"))
                 }

@@ -3,6 +3,7 @@ package dev.hermes.android.uiux.gaps
 import androidx.activity.ComponentActivity
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.unit.height
 import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.core.json
 import dev.hermes.android.ui.NativeAdministration
@@ -95,7 +96,7 @@ class ProvidersModelsGapsUiTest {
         compose.onNodeWithText("No matching models").assertIsDisplayed()
         compose.onNodeWithText("Clear search").assertDoesNotExist()
         compose.onNodeWithTag("model-current").assertIsDisplayed()
-        compose.onNode(hasSetTextAction() and hasText("Search model or provider")).performTextReplacement("zzz")
+        compose.onNode(hasSetTextAction() and hasTestTag("models-search")).performTextReplacement("zzz")
         compose.onNodeWithText("No matching models").assertIsDisplayed()
         compose.onNodeWithTag("model-current").assertDoesNotExist()
         compose.onNodeWithText("Clear search").performClick()
@@ -203,6 +204,26 @@ class ProvidersModelsGapsUiTest {
         compose.onNodeWithTag("reasoning-skeleton").assertDoesNotExist()
         for (level in listOf("low", "medium", "high")) compose.onNodeWithTag("reasoning-level:$level").assertIsDisplayed()
         compose.onNodeWithTag("reasoning-level:medium").assertIsSelected()
+    }
+
+    /** The sheet's height in dp and the screen's, to see whether it wraps its content or fills the screen. */
+    private fun sheetAndScreenHeights(): Pair<Float, Float> {
+        val metrics = compose.activity.resources.displayMetrics
+        return compose.onNodeWithTag("catalog-sheet").getUnclippedBoundsInRoot().height.value to metrics.heightPixels / metrics.density
+    }
+
+    @Test fun theReasoningSheetWrapsItsLevelsInsteadOfFillingTheScreen() = withClientlessVm(compose) { vm ->
+        openSheet(vm, kind = "Reasoning")
+        compose.runOnIdle { vm.storeData("picker:reasoning", reasoning) }
+        compose.onNodeWithTag("reasoning-level:high").assertIsDisplayed()
+        val (sheet, screen) = sheetAndScreenHeights()
+        assertTrue("The reasoning sheet is $sheet dp of a $screen dp screen: it holds three levels, so it must not fill it", sheet < screen * .7f)
+    }
+
+    @Test fun theModelSheetStaysTallForItsLongList() = withClientlessVm(compose) { vm ->
+        openSheet(vm)
+        val (sheet, screen) = sheetAndScreenHeights()
+        assertTrue("The model sheet is $sheet dp of a $screen dp screen: a long list keeps the tall sheet", sheet > screen * .8f)
     }
 
     @Test fun theReasoningSheetNamesAFailureAndAnEmptyAnswer() = withClientlessVm(compose) { vm ->

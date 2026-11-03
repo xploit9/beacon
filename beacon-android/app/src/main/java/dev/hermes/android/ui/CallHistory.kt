@@ -199,30 +199,31 @@ internal fun CallHistorySheet(vm: BeaconViewModel, onOpenCall: (conversationId: 
         }
     }
 
-    fun sendFeedback(call: CallHistoryEntry, verdict: String) {
+    // A tap on Important or Not important opens the rule sheet for that call; the choice is sent from there.
+    var emailRule by remember(activeClient, requestScope) { mutableStateOf<EmailRuleRequest?>(null) }
+    fun chooseEmail(call: CallHistoryEntry, verdict: String) {
         val noticeId = call.emailNoticeId ?: return
-        if (feedback[noticeId] == "sending" || feedback[noticeId] == "saved") return
-        val feedbackClient = client ?: return
-        val scope = requestScope ?: return
-        if (vm.client !== activeClient || vm.authenticatedScope()?.copy(session = "") != scope) return
-        feedback = feedback + (noticeId to "sending")
-        coroutineScope.launch {
-            val saved = try {
-                if (vm.client !== activeClient || vm.authenticatedScope()?.copy(session = "") != scope) false
-                else {
-                    feedbackClient.nativeRequest(EMAIL_FEEDBACK_PATH, "POST", JSONObject().put("notice_id", noticeId).put("verdict", verdict))
-                    vm.client === activeClient && vm.authenticatedScope()?.copy(session = "") == scope
-                }
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (_: Exception) {
-                false
-            }
-            feedback = if (vm.client === activeClient && vm.authenticatedScope()?.copy(session = "") == scope) {
-                feedback + (noticeId to if (saved) "saved" else "failed")
-            } else feedback - noticeId
-        }
+        if (feedback[noticeId] == "saved") return
+        emailRule = EmailRuleRequest(noticeId, verdict)
     }
+    fun sameScope() = vm.client === activeClient && vm.authenticatedScope()?.copy(session = "") == requestScope
+    EmailRuleSheetHost(
+        emailRule,
+        fetch = { request ->
+            val feedbackClient = client?.takeIf { sameScope() } ?: throw IllegalStateException("Reconnect first.")
+            feedbackClient.nativeRequest("$PROACTIVE_SETTINGS_PATH/suggestion", "GET", null, mapOf("notice_id" to request.noticeId, "verdict" to request.verdict))
+        },
+        send = { request, rule ->
+            val feedbackClient = client?.takeIf { sameScope() } ?: throw IllegalStateException("Reconnect first.")
+            feedbackClient.nativeRequest(EMAIL_FEEDBACK_PATH, "POST", JSONObject().put("notice_id", request.noticeId).put("verdict", request.verdict).apply { if (rule != null) put("rule", rule) })
+            check(sameScope()) { "Reconnect first." }
+        },
+        onChosen = { request ->
+            if (sameScope()) feedback = feedback + (request.noticeId to "saved")
+            emailRule = null
+        },
+        onDismiss = { emailRule = null },
+    )
 
     LaunchedEffect(activeClient, requestScope) { load() }
     LaunchedEffect(list, calls.size, next, loading, error) {
@@ -267,7 +268,7 @@ internal fun CallHistorySheet(vm: BeaconViewModel, onOpenCall: (conversationId: 
                             is CallHistoryItem.Single -> {
                                 val call = item.call
                                 dayStarts[call.id]?.let { DayDivider(uiText(it)) }
-                                CallHistoryRow(call, titleLine(call), call.emailNoticeId?.let { feedback[it] }, { sendFeedback(call, it) }) { onOpenCall(call.conversationId, call.id) }
+                                CallHistoryRow(call, titleLine(call), call.emailNoticeId?.let { feedback[it] }, { chooseEmail(call, it) }) { onOpenCall(call.conversationId, call.id) }
                             }
                             is CallHistoryItem.Attempts -> {
                                 dayStarts[item.calls.first().id]?.let { DayDivider(uiText(it)) }
@@ -323,12 +324,11 @@ private fun CallHistoryRow(call: CallHistoryEntry, firstUserLine: String?, feedb
         CallRowContent(call, title, callDetails(call), Modifier.clickable(role = Role.Button, onClick = onOpen).testTag("call-history-row:${call.id}"))
         if (call.emailNoticeId != null) {
             if (feedbackStatus == "saved") {
-                Text(assistantText("Thanks — Beacon will remember."), Modifier.padding(start = 52.dp).testTag("call-history-feedback-sent:${call.id}"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(uiText("Saved"), Modifier.padding(start = 52.dp).testTag("call-history-feedback-sent:${call.id}"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
-                if (feedbackStatus == "failed") Text(uiText("Couldn't save your choice. Try again."), Modifier.padding(start = 52.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                    TextButton(onClick = { onFeedback("important") }, enabled = feedbackStatus != "sending", modifier = Modifier.testTag("call-history-feedback-important:${call.id}")) { Text(uiText("Important")) }
-                    TextButton(onClick = { onFeedback("not_important") }, enabled = feedbackStatus != "sending", modifier = Modifier.testTag("call-history-feedback-not-important:${call.id}")) { Text(uiText("Not important")) }
+                    TextButton(onClick = { onFeedback("important") }, modifier = Modifier.testTag("call-history-feedback-important:${call.id}")) { Text(uiText("Important")) }
+                    TextButton(onClick = { onFeedback("not_important") }, modifier = Modifier.testTag("call-history-feedback-not-important:${call.id}")) { Text(uiText("Not important")) }
                 }
             }
         }

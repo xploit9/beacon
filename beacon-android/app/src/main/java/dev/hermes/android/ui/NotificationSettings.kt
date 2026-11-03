@@ -100,7 +100,8 @@ private sealed interface TestResult {
 private const val PUSH_STATUS_PATH = "/api/plugins/beacon/mobile/notifications/status"
 private const val PUSH_TEST_PATH = "/api/plugins/beacon/mobile/notifications/test"
 
-@Composable private fun agoText(now: Long, at: Long): String {
+/** How long ago [at] was, in the one wording the whole app uses ("5 min ago", "2 h ago"), in the phone's language. */
+@Composable internal fun agoText(now: Long, at: Long): String {
     val (kind, count) = deliveryAgo(now, at)
     return when (kind) {
         Ago.Never -> uiText("Never")
@@ -289,7 +290,7 @@ private const val PUSH_TEST_PATH = "/api/plugins/beacon/mobile/notifications/tes
         }
     }
     val pushStatus = data["push-status"]
-    // Reaching Hermes for the status is itself a sign of life, for "Heard from Hermes".
+    // Reaching Hermes for the status is itself a sign of life, for "Last contact".
     LaunchedEffect(pushStatus) { if (pushStatus != null && !pushStatus.has("_error")) { DeliveryLog.markHeard(context); heardAt = DeliveryLog.heardAt(context) } }
     val serverReady = pushStatus?.optBoolean("android_configured") == true
     val registered = target != null && pushStatus?.rows("targets")?.any { it.string("target_id") == target && it.string("kind") == "fcm" && !it.optBoolean("revoked") } == true
@@ -439,7 +440,7 @@ private const val PUSH_TEST_PATH = "/api/plugins/beacon/mobile/notifications/tes
                     stop = explainingStop(stop, keepConnectedEnabled, keepConnectedStatus, now)?.let { if (it == "Force-stopped") uiText("Force-stopped") else uiText("Stopped by Android") },
                 )
                 SettingsDivider()
-                SettingsMetricRow(listOf(uiText("Last alert") to agoText(now, lastAlertAt), uiText("Heard from Hermes") to agoText(now, heardAt)), Modifier.testTag("notification-last-seen"))
+                SettingsMetricRow(listOf(uiText("Last alert") to agoText(now, lastAlertAt), uiText("Last contact") to agoText(now, heardAt)), Modifier.testTag("notification-last-seen"))
                 if (firebase) {
                     SettingsDivider()
                     SettingsActionRow(uiText("Send a test"), ::sendTest, icon = Icons.AutoMirrored.Rounded.Send, enabled = testReady && !busy, busy = testing, busyLabel = uiText("Sending…"), testTag = "notification-test")

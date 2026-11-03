@@ -7,6 +7,7 @@ internal fun settingsLabel(route: String): String = when (route) {
     "Notifications", "Notifications & Keep connected" -> "Notifications"
     "Licenses" -> "About & licenses"
     "Tools & commands" -> "Tools"
+    "Session checkpoints" -> "File backups"
     else -> route
 }
 
@@ -22,8 +23,10 @@ private val settingsSearchKeywords = mapOf(
     "Devices" to "Manage linked phones",
     "Appearance" to "Theme and color style dark light",
     "Memory" to "What Hermes knows about you",
+    "Phone access" to "Calendar reminders alarms timers contacts calls messages text SMS permissions Hermes activity",
     "App updates" to "Install the latest Beacon version",
     "Profiles" to "Profile defaults and behavior",
+    "File backups" to "Session checkpoints",
 )
 private fun searchTermsMatch(text: String, query: String): Boolean =
     query.splitToSequence(searchWhitespace).filter(String::isNotBlank).all { text.contains(it, ignoreCase = true) }
@@ -61,6 +64,7 @@ internal val settingsDescriptions = mapOf(
     "Chat" to ChatDescription,
     "Voice & calls" to VoiceDescription,
     "Notifications & Keep connected" to NotificationsDescription,
+    "Phone access" to "Calendar, contacts and calls",
     "Appearance" to "Theme and colors",
     "Profiles & model" to "Profiles and models",
     "Tools & MCP" to "Tool groups and MCP servers",
@@ -75,13 +79,13 @@ internal val settingsDescriptions = mapOf(
     "Skills" to "Installed skills", "Memory" to "Notes Hermes keeps",
     "MCP servers" to "Services Hermes can use",
     "Health" to "Check the dashboard and agent", "Logs" to "Recent server activity",
-    "Server updates" to "Check and update Hermes", "Session checkpoints" to "Saved file recovery points", "Licenses" to LicensesDescription,
+    "Server updates" to "Check and update Hermes", "Session checkpoints" to "Earlier file versions", "Licenses" to LicensesDescription,
 )
 
 /** Hub sections in Relay's order (connection first, then Hermes, then the app), with the assistant's own section up front. */
 internal val settingsHubSections = linkedMapOf(
     "" to listOf("Connection"),
-    "Assistant" to listOf("Assistant", "Voice & calls", "Notifications & Keep connected"),
+    "Assistant" to listOf("Assistant", "Voice & calls", "Phone access", "Notifications & Keep connected"),
     "Hermes" to listOf("Chat", "Profiles & model", "Skills", "Memory", "Tools & MCP", "Server"),
     "App" to listOf("Appearance", "App updates", "About & licenses"),
 )
@@ -113,8 +117,8 @@ internal fun normalizeSettingsPage(page: String): String = when (page) {
 internal val settingsThemeLabels = mapOf("system" to "System", "dark" to "Dark", "light" to "Light")
 
 /** The short pill words of the hub rows, which reach uiText through a summary part rather than a literal. */
-internal val settingsPillWords = listOf("Connected", "Offline", "Sign in", "Key saved", "Add key", "Keep connected on", "Keep connected off", "Update ready", "Update available",
-    "Update the Beacon plugin", "Restart Hermes", "Restart dashboard", "Healthy", "Needs attention", "Failed", "Reconnecting…", "{0} on", "{0} servers", "1 server", "{0} profiles")
+internal val settingsPillWords = listOf("Connected", "Offline", "Sign in", "Key saved", "Add key", "Keep connected is on", "Keep connected is off", "Update ready", "Update available",
+    "Update the Beacon plugin", "Restart Hermes", "Restart dashboard", "Healthy", "Needs attention", "Failed", "Reconnecting…", "{0} on", "{0} servers", "1 server", "{0} profiles", "Off")
 
 /**
  * The fixed texts that reach uiText through variables and so are checked by the translation test: the hub's row names and descriptions, section and
@@ -146,6 +150,7 @@ internal data class SettingsSnapshot(
     /** "Update the Beacon plugin", "Restart Hermes" or "Restart dashboard" while the update screen has a pending plugin step, else blank. */ val pluginAction: String = "",
     val profileCount: Int? = null, val skillsOn: Int? = null, val toolsOn: Int? = null, val mcpServers: Int? = null,
     val serverHealthy: Boolean? = null, /** Hermes' own overall word ("ok", "degraded", …); wins over [serverHealthy] and maps like the Health page. */ val serverOverall: String = "", val serverUpdateAvailable: Boolean? = null, val checkpointSize: String = "",
+    /** The Phone access switches that are on and usable, by their English names; empty is a known "none", null is unread. */ val phoneAccess: List<String>? = null,
 )
 /**
  * Mirrors the composer's key handling (`ChatScreen.kt` `onPreviewKeyEvent`): it recognises `ctrl_enter`/`ctrl+enter` and
@@ -226,8 +231,10 @@ internal fun settingsSummary(route: String, s: SettingsSnapshot): List<SettingsS
                     if (keySaved) SettingsSummaryPart("Key saved", status = SettingsStatus.Ok) else attention("Add key"))
             }
         }.orEmpty()
+        // Nothing on is a state of its own (Off); otherwise the row names what is on, as its neighbours name their own state.
+        "Phone access" -> s.phoneAccess?.let { on -> if (on.isEmpty()) listOf(SettingsSummaryPart("Off", status = SettingsStatus.Off)) else on.map { SettingsSummaryPart(it) } }.orEmpty()
         "Notifications & Keep connected" -> s.keepConnectedEnabled?.let {
-            listOf(SettingsSummaryPart(if (it) "Keep connected on" else "Keep connected off", status = if (it) SettingsStatus.Ok else SettingsStatus.Off))
+            listOf(SettingsSummaryPart(if (it) "Keep connected is on" else "Keep connected is off", status = if (it) SettingsStatus.Ok else SettingsStatus.Off))
         }.orEmpty()
         "Skills" -> listOfNotNull(count("{0} on", s.skillsOn))
         "Tools & commands" -> listOfNotNull(count("{0} on", s.toolsOn))

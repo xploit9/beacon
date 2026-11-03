@@ -162,8 +162,10 @@ def test_a_read_only_tool_naming_a_write_in_its_action_still_needs_approval(gate
         return api.invoke(SCOPE,{'request_id':request,'tool_id':'a'*64,'arguments':{'query':'weather',**extra}})
     call('r1',action='list')
     assert settled(api,'r1')['status']=='completed'
+    # Strix 76b2ce6 vuln-0002: any word of the write vocabulary counts, not only the narrower list the arguments used to check.
     for index,extra in enumerate(({'action':'delete'},{'action':'sendEmail'},{'Operation':'purge_all'},
-                                  {'action':'list','Operation':'update'})):
+                                  {'action':'list','Operation':'update'},{'action':'deploy'},{'action':'destroy'},{'Operation':'charge'},
+                                  {'action':'grant'},{'action':'deleteall'})):
         assert call(f'w{index}',**extra)['status']=='needs_approval'
     assert len(backend.calls)==1
 
@@ -198,6 +200,17 @@ def test_a_read_only_tool_naming_a_write_in_its_action_still_needs_approval(gate
     ('get_message','full',True,True),
     ('get_process','full',True,True),
     ('get_message','untrusted',True,False),
+    # Strix 76b2ce6 vuln-0002: a write verb glued to another word, or one the lists lacked, no longer reads as a read; real reads stay.
+    ('search_wipedb','full',True,False),
+    ('search_wipedb','untrusted',True,False),
+    ('list_deleteall','full',True,False),
+    ('getaccountsresetpassword','full',True,False),
+    ('search_charge_card','full',True,False),
+    ('search_charge_card','untrusted',True,False),
+    ('get_attachment','full',True,True),
+    ('list_connections','full',True,True),
+    ('list_deployments','full',True,True),
+    ('get_transcript','untrusted',True,True),
 ],ids=lambda value:str(value))
 def test_a_servers_read_only_annotation_needs_a_name_that_agrees(gateway,monkeypatch,raw,trust,annotated,expected):
     api,backend,_=gateway
@@ -821,9 +834,9 @@ def test_public_web_discovery_ranks_web_tools_above_mail_web_links(gateway):
     backend.catalog=lambda discover=True:[
         tool('search_gmail_messages','Search Gmail messages and return web interface links'),
         tool('search_contacts','Search contacts with web profile links'),
-        tool('scrapling_fetch','Fetch a public web page with search engine referer support'),
+        tool('fetch_web_page','Fetch a public web page with search engine referer support'),
     ]
-    assert api.discover('profile','web search')['tools'][0]['name']=='scrapling_fetch'
+    assert api.discover('profile','web search')['tools'][0]['name']=='fetch_web_page'
 
 
 def test_discovery_preserves_inflected_description_matches(gateway):
@@ -849,6 +862,10 @@ def test_native_tools_are_discovered_for_the_api_profile_and_exclusions_are_appl
         ('hindsight_retain','memory'),
         ('manage_connections','connectors'),('manage_catalog','connectors'),('setup_mcp','connectors'),
         ('mcp-weather','mcp-weather'),('metadata_read','custom'),
+        ('phone_calendars','beacon-phone'),('phone_calendar_list','beacon-phone'),('phone_contacts_search','beacon-phone'),
+        ('phone_calendar_create','beacon-phone'),('phone_calendar_update','beacon-phone'),('phone_calendar_delete','beacon-phone'),
+        ('phone_reminder_create','beacon-phone'),('phone_alarm_set','beacon-phone'),('phone_timer_set','beacon-phone'),
+        ('phone_call','beacon-phone'),('phone_message_draft','beacon-phone'),
     ]
     entries={name:SimpleNamespace(name=name,toolset=toolset,schema={'description':f'{name} purpose'},
                                  read_only=True if name=='metadata_read' else None)
@@ -860,7 +877,7 @@ def test_native_tools_are_discovered_for_the_api_profile_and_exclusions_are_appl
     config={'agent':{'disabled_toolsets':['video']}}
     seen={}
     enabled={'file','web','vision','session_search','memory','todo','video','clarify','delegation','browser',
-             'beacon-interactive','beacon-mailbox','connectors','mcp-weather','custom'}
+             'beacon-interactive','beacon-mailbox','connectors','mcp-weather','custom','beacon-phone'}
     def platform_tools(received,platform):
         assert received is config and platform=='api_server'
         return enabled
@@ -892,6 +909,8 @@ def test_native_tools_are_discovered_for_the_api_profile_and_exclusions_are_appl
     assert not {'todo_list','clarify','delegate_task','browser_click','beacon_create_proactive_request',
                 'beacon_email_notice','beacon_event_notice','beacon_events_checked',
                 'mcp-weather','video_analyze','manage_connections','manage_catalog','setup_mcp'} & set(catalog)
+    # The phone tools reach a call through the app, which shows the owner each card; Hermes' copies never appear in the call's catalogue.
+    assert not {name for name,_ in names if name.startswith('phone_')} & set(catalog)
     assert catalog['read_file']['read_only'] and catalog['web_search']['read_only']
     assert not catalog['web_extract']['read_only'] and not catalog['vision_analyze']['read_only']
     assert not catalog['metadata_read']['read_only']
@@ -948,15 +967,15 @@ def test_warmed_catalogue_is_off_request_path_and_summarizes_each_source_once(tm
         begin=time.perf_counter()
         while_warming=api.compact_catalogue(profile)
         assert (time.perf_counter()-begin)<0.5
-        assert 'Read a local file' in while_warming
+        assert 'read file' in while_warming
     finally:
         release.set()
     assert finished.wait(1)
 
     summary=api.compact_catalogue(profile)
-    assert len(summary.splitlines())==2
-    assert 'Gmail' in summary and 'Search Gmail messages' in summary and 'Get Gmail message threads' in summary
-    assert 'Memory: Recall relevant Hindsight memories' in summary
+    # One line per source, each named by the source itself (Hermes, then each MCP server), never by a guessed service.
+    assert summary.splitlines()==['Hermes: hindsight recall',
+                                  'tool gateway meeting: google workspace (2): get gmail thread, search gmail']
     assert calls==[True,False]
 
 
@@ -1163,8 +1182,8 @@ def test_voice_tool_catalogue_is_bounded_live_and_uncached(tmp_path):
     backend=Backend();api=g.Gateway(Mobile(tmp_path/'catalog.sqlite'),lambda profile,fn:fn(tmp_path),backend)
     first=api.compact_catalogue('profile')
     again=api.compact_catalogue('profile')
-    assert first==again and len(first.encode('utf-8'))<=3072
-    assert 'File:' in first and backend.calls==2 and backend.discover==[False,False]
+    assert first==again and len(first.encode('utf-8'))<=g.MAX_CATALOGUE_BYTES
+    assert first.startswith('Hermes: file (100): tool 000') and backend.calls==2 and backend.discover==[False,False]
     api.compact_catalogue('profile')
     api.compact_catalogue('other-profile')
     assert backend.calls==4 and backend.discover==[False]*4
@@ -1270,6 +1289,13 @@ def test_a_call_leaves_out_the_tools_that_need_an_agent_turn():
     assert not {'memory','session_search'}&g.NATIVE_EXCLUDED_TOOLS
 
 
+def test_a_call_leaves_out_every_phone_tool_hermes_has():
+    phone_spec=importlib.util.spec_from_file_location('beacon_phone_tools_test',ROOT/'phone_tools.py')
+    phone_tools=importlib.util.module_from_spec(phone_spec);phone_spec.loader.exec_module(phone_tools)
+    assert len(phone_tools.NAMES)==11 and set(phone_tools.NAMES)<=g.NATIVE_EXCLUDED_TOOLS
+    assert phone_tools.TOOLSET in g.NATIVE_EXCLUDED_TOOLSETS
+
+
 def test_inline_tools_run_through_the_call_memory_with_the_calls_authority(tmp_path,monkeypatch):
     seen=[];session={}
     monkeypatch.setitem(sys.modules,'gateway',SimpleNamespace(session_context=SimpleNamespace(
@@ -1327,7 +1353,7 @@ def test_a_stale_tool_list_is_served_at_once_and_refreshed_behind_it(tmp_path,mo
             return rows
 
     api=g.Gateway(Mobile(tmp_path/'stale.sqlite'),lambda name,fn,**kwargs:fn(tmp_path),Backend())
-    assert api.prefetch('stale-profile')=='File: Read a local file'
+    assert api.prefetch('stale-profile')=='Hermes: read file'
     assert scans==[True]
     key=('stale-profile','stale-cache')
     with g.CATALOG_LOCK: created,cached=g.CATALOG_CACHE[key]; g.CATALOG_CACHE[key]=(created-g.CATALOG_TTL-1,cached)
@@ -1358,3 +1384,50 @@ def test_prefetch_is_the_first_scan_discover_waits_for(tmp_path):
     assert api.warm_catalogue('first-profile') is False, 'a running prefetch is not scanned twice'
     release.set();worker.join(2)
     assert not worker.is_alive()
+
+
+def test_call_overview_names_every_source_and_its_write_tools(tmp_path):
+    rows=[{'name':'mcp__acme_browser__page_navigate','_raw':'page-navigate','_server':'acme_browser','description':'Open a page','read_only':False},
+          {'name':'mcp__acme_browser__page_click','_raw':'page-click','_server':'acme_browser','description':'Click on a page','read_only':False},
+          {'name':'mcp__acme_suite__notes_search','_raw':'notes_search','_server':'acme_suite','description':'Search notes','read_only':True},
+          {'name':'read_file','_toolset':'file','_kind':'hermes','description':'Read a file','read_only':True}]
+
+    class Backend:
+        def cache_key(self): return 'overview'
+        def catalog(self,discover=True): return rows
+
+    api=g.Gateway(Mobile(tmp_path/'overview.sqlite'),lambda name,fn,**kwargs:fn(tmp_path),Backend())
+    # Write tools are listed too (the browser's click and navigate), each source under its own name.
+    assert api.compact_catalogue('overview-'+str(time.time_ns())).splitlines()==[
+        'Hermes: read file', 'acme browser: page (2): click, navigate', 'acme suite: notes search']
+
+
+def test_a_call_search_never_waits_out_a_slow_first_scan(tmp_path):
+    profile='slow-'+str(time.time_ns());started=threading.Event();release=threading.Event()
+    ready={'name':'read_file','_toolset':'file','_kind':'hermes','description':'Read a local file','read_only':True,
+           'tool_id':'f'*64,'parameters':{'type':'object','properties':{}}}
+    late={'name':'mcp__acme_browser__page_navigate','_raw':'page-navigate','_server':'acme_browser',
+          'description':'Open a web page','read_only':False,'tool_id':'b'*64,'parameters':{'type':'object','properties':{}}}
+
+    class Backend:
+        def cache_key(self): return 'slow-scan'
+        def configured_servers(self): return ['acme_browser']
+        def catalog(self,discover=True):
+            if discover: started.set();release.wait(10)
+            return [ready,late] if release.is_set() else [ready]
+
+    api=g.Gateway(Mobile(tmp_path/'slow.sqlite'),lambda name,fn,**kwargs:fn(tmp_path),Backend())
+    worker=threading.Thread(target=api.prefetch,args=(profile,));worker.start()
+    try:
+        assert started.wait(1)
+        begin=time.perf_counter()
+        answer=api.discover(profile,'open a web page')
+        assert time.perf_counter()-begin<g.FIRST_SCAN_WAIT+1, 'answers well inside the app deadline'
+        assert answer['tools']==[]
+        assert answer['still_starting']==['acme browser'], 'the server still starting is named, not hidden'
+        assert answer['sources']=='Hermes: read file', 'and the map of what is ready comes with it'
+    finally:
+        release.set();worker.join(2)
+    found=api.discover(profile,'open a web page')
+    assert found['tools'][0]['name']==late['name'] and 'still_starting' not in found
+    assert 'acme browser: page navigate' in found['sources']

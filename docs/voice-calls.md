@@ -7,6 +7,9 @@ A call talks to your own Hermes profile. The voice model answers you itself, str
 - The assistant can use the tools your profile has: connected servers, files, web search and skills.
 - Looking something up runs at once. Anything that changes something asks you on the phone first, unless your chat or profile approvals say otherwise. Hermes' own tools ask every time; a connected server's tool can be allowed for the rest of the call. Memory is the exception, as in Hermes (below).
 - A few tools stay out of calls, because they do not fit a call. Longer work goes to Hermes with `hermes_work`.
+- The assistant starts each call knowing every source of tools your profile has, each under its own name (a connected server, or Hermes for its own tools), so it never guesses what you have. It searches for the exact tool when it needs one, and searches before saying it cannot do something.
+- The tools are the ones Hermes gives Beacon chats (its API platform tool set). A Hermes tool you turned on for that platform reaches calls too; one it leaves out, such as computer use by default, is not in calls either.
+- Right after Hermes starts, connected servers take a moment to come up. A search answers at once with what is ready and names the servers still starting, so the assistant asks again instead of waiting.
   - `clarify` asks in a chat prompt. On a call the assistant asks out loud.
   - `delegate_task` starts helpers inside a running Hermes agent. `hermes_work` hands the task to a full run instead.
   - `todo_list` keeps its list inside one running agent turn, so it would be lost when the call ends.

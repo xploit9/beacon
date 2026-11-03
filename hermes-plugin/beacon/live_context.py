@@ -4,6 +4,7 @@ import math
 import re
 import threading
 import time
+import unicodedata
 
 
 MAX_CONTEXT_CHARS = 600
@@ -17,15 +18,28 @@ _SENT = {}
 _LOCK = threading.Lock()
 
 
+_ESCAPE_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _plain(text):
+    """One plain line, by the same rule as the voice catalogue's display_line: escape sequences go, control characters and line
+    separators become spaces, format characters (bidi overrides, zero-width characters) and lone surrogates are dropped."""
+    text = _ESCAPE_SEQUENCE.sub("", text)
+    text = "".join(" " if unicodedata.category(char) in ("Cc", "Zl", "Zp") else "" if unicodedata.category(char) in ("Cf", "Cs") else char
+                   for char in text)
+    return " ".join(text.split())
+
+
 def _label(value):
     if not isinstance(value, str):
         return None
-    value = " ".join(value.split())
+    # Plain first: the redaction must see the text the model would read, not one an invisible character has split.
+    value = _plain(value)
     if not value:
         return None
     from agent.redact import redact_sensitive_text
     value = redact_sensitive_text(value[:120], force=True, redact_url_credentials=True)
-    return " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", value).split())[:60] or None
+    return _plain(value)[:60].strip() or None
 
 
 def _time_label(value):
@@ -65,8 +79,9 @@ def _build_snapshot(mobile, owner, profile, proactive, job_scope=False):
         health = proactive.health(mobile, owner, profile, setup)
         checked = _time_label(health.get("checked_at"))
         detail = f"{health['state']}" + (f"; last checked {checked}" if checked else "")
-        notes = proactive.learned_notes(mobile, owner, profile)
-        items.append(f"Proactive connected sources: {detail}; {len(notes)} alerts the owner marked")
+        rules = [row for row in proactive.list_requests(mobile, owner, profile)
+                 if row.get("enabled") is True and row.get("action") in proactive.IMPORTANCE_ACTIONS]
+        items.append(f"Proactive connected sources: {detail}; {len(rules)} email importance rules")
 
     from hermes_cli.web_server_profiles import _profile_scope
     from tools.registry import registry

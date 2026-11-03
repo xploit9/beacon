@@ -9,6 +9,7 @@ import re
 from urllib.parse import urlsplit
 import sys
 import time
+import unicodedata
 
 native=sys.modules['beacon_native']
 mobile=sys.modules['beacon_mobile']
@@ -20,6 +21,14 @@ def clip(value,limit):
 def private_text(value,limit):
     from agent.redact import redact_sensitive_text
     return clip(redact_sensitive_text(clip(value,limit),force=True,redact_url_credentials=True),limit)
+
+def plain_line(value,limit):
+    """Untrusted metadata (a skill's name, description or setup note) as one plain line for the model: redacted, escape sequences gone,
+    control characters and line separators turned into spaces, format (bidi, zero-width) characters and lone surrogates dropped,
+    then redacted again on the plain text, so a secret an invisible character split is caught once it is whole."""
+    text=re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',private_text(value,limit*4))
+    text=''.join(' ' if unicodedata.category(char) in ('Cc','Zl','Zp') else '' if unicodedata.category(char) in ('Cf','Cs') else char for char in text)
+    return ' '.join(private_text(text,limit*4).split())[:limit]
 
 def scoped(profile,fn,*,hydrate_secrets=True):
     from tui_gateway import server
@@ -505,7 +514,7 @@ def skills(profile, query='', name='', scope=None):
             return len(terms.intersection(re.findall(r'\w+', (row['name'] + ' ' + row['description']).lower())))
         matching = [row for row in rows if row['enabled'] and (not terms or score(row))]
         matching.sort(key=lambda row: (-score(row), row['name']))
-        offered = [{'name': private_text(row['name'], 160), 'description': private_text(row['description'], 1200), 'readiness': row['readiness'], 'requirements': [private_text(note, 300) for note in row['requirements'][:12]]} for row in matching[:30]]
+        offered = [{'name': plain_line(row['name'], 160), 'description': plain_line(row['description'], 1200), 'readiness': row['readiness'], 'requirements': [plain_line(note, 300) for note in row['requirements'][:12]]} for row in matching[:30]]
         summary = '\n'.join(row['name'] + ': ' + row['description'] + ('; setup: ' + '; '.join(row['requirements']) if row['requirements'] else '') for row in offered)
         return {'summary': private_text(summary, 12000), 'sources': [{'title': 'Enabled Hermes skills', 'ref': 'native-skills:' + profile}],
                 'items': offered, 'truncated': len(matching) > len(offered) or len(summary) > 12000, 'observed_at': int(time.time())}
