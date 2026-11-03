@@ -17,7 +17,7 @@ import time
 from urllib.parse import urlsplit
 import uuid
 from fastapi import APIRouter,HTTPException,Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 # Hermes loads this file by path rather than as a package. Load private sibling modules
 # under stable plugin-specific names so the native tool and dashboard share durable state.
 ROOT=Path(__file__).resolve().parent.parent
@@ -823,6 +823,13 @@ async def remove_target_id(target_id:str,request:Request):
             conn.execute('DELETE FROM targets WHERE id=? AND owner=? AND profile=?',(target_id,owner,profile))
     await asyncio.to_thread(revoke)
     return {'revoked':True,'target_id':target_id}
+@router.get('/mobile/release')
+async def relayed_release(request:Request):
+    """GitHub's own latest-release document as Hermes last read it; the phone checks it exactly as it checks GitHub's answer."""
+    await identity_async(request)
+    document=await asyncio.to_thread(mobile.latest_release_document)
+    if document is None: raise HTTPException(404,'No release read yet')
+    return Response(document,media_type='application/json')
 @router.get('/mobile/notifications/events')
 async def notices(request:Request,after:int=0,wait:float=0):
     owner,provider,profile,_=await identity_async(request)
@@ -1150,9 +1157,11 @@ def _warm_profile(owner,profile):
         _jobs_warming.discard(key)
 _tools_next={}
 TOOLS_REFRESH_SECONDS=300
+_release_next=0.0
 async def start_watcher():
     global _watch_task
     async def loop():
+        global _release_next
         while True:
             try:
                 cfg=mobile.settings()
@@ -1178,6 +1187,11 @@ async def start_watcher():
                         if time.monotonic()>=_tools_next.get(profile_key,0):
                             _tools_next[profile_key]=time.monotonic()+TOOLS_REFRESH_SECONDS
                             voice_context.prefetch_tools(profile)
+                    # A new Beacon release reaches the owner's phones within minutes, even when a phone's own GitHub check is late or refused.
+                    if profiles and time.monotonic()>=_release_next:
+                        _release_next=time.monotonic()+mobile.RELEASE_CHECK_SECONDS
+                        try: await asyncio.to_thread(mobile.check_release,cfg['owner_id'],profiles[0])
+                        except Exception: pass
                 # Phone requests belong to no profile's watch: their private text goes once nobody can answer them.
                 try: await asyncio.to_thread(mobile.phone_requests_sweep)
                 except Exception: pass

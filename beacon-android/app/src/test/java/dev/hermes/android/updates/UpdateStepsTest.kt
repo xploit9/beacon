@@ -163,6 +163,15 @@ class UpdateStepsTest {
         assertEquals(StepNote.DashboardManual, PluginRow(PluginStatus.DashboardRestart).text)
     }
 
+    // Owner, 3 Nov: a dashboard on an older plugin may still refuse while Hermes is busy; the gateway, restarted with the new plugin,
+    // restarts it anyway, so the phone waits for that and the update ends as one version instead of "Hermes is busy".
+    @Test fun aBusyRefusalFromAnOlderDashboardEndsUpdatedOnceTheGatewayRestartsIt() {
+        val endpoint = Fake(listOf(versions("1.1.22", "1.1.23", "1.1.23"), versions("1.1.23")), dashboard = DashboardRestartResult.Waiting)
+        val result = run(endpoint)
+        assertEquals(PluginStatus.Updated, result.row.status)
+        assertTrue(result.steps.all { it.state == StepState.Done })
+    }
+
     @Test fun theDashboardStepShowsWhileItReconnects() {
         val endpoint = Fake(listOf(versions("1.1.22", "1.1.23", "1.1.23"), versions("1.1.23")), reconnecting = listOf(true, true, false))
         val result = run(endpoint)

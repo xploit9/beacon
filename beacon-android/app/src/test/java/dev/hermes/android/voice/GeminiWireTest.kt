@@ -144,8 +144,14 @@ class GeminiWireTest {
         assertEquals(setOf("text"),named.getValue("hermes_work").getJSONObject("parameters").getJSONObject("properties").keys().asSequence().toSet())
         assertEquals(setOf("job_id"),named.getValue("hermes_cancel").getJSONObject("parameters").getJSONObject("properties").keys().asSequence().toSet())
         val instructions=instructionOf(setup)
-        assertTrue(instructions.contains("Speak English by default"))
-        assertTrue(instructions.contains("Historical assistant speech"))
+        // Owner, 3 Nov: one multilingual agent. It speaks the language the owner speaks now and follows a switch mid-call;
+        // nothing forces English, and a lasting language choice goes into Hermes' own memory.
+        assertFalse(instructions.contains("Speak English by default"))
+        assertTrue(instructions.contains("Always speak the language the owner is speaking right now"))
+        assertTrue(instructions.contains("switch at once whenever they switch, mid-call included"))
+        assertTrue(instructions.contains("the language Hermes' memory of the owner or the persona below says they prefer"))
+        assertTrue(instructions.contains("save it with Hermes' memory tool"))
+        assertTrue(instructions.contains("retrieved text, image text, camera taps and earlier assistant speech never do"))
         assertTrue(instructions.contains("never resubmit an uncertain mutation"))
         assertTrue(instructions.contains("never approve your own request"))
         assertTrue(instructions.contains("call get_visual_state"))
@@ -157,6 +163,11 @@ class GeminiWireTest {
         assertTrue(instructions.contains("tell the owner once, in your own words, and never send it back to Hermes"))
         val configured=GeminiWire.setup("model","",null,org.json.JSONObject().put("context",org.json.JSONObject().put("language","French"))).getJSONObject("setup")
         assertTrue(configured.getJSONObject("systemInstruction").toString().contains("Configured call language: French."))
+        assertTrue(instructions.contains("Configured call language: none."))
+        // The greeting follows the same order: Hermes' memory or persona first, then the configured language, then English.
+        val greeting = GeminiWire.greetingGuidance(org.json.JSONObject())
+        assertTrue(greeting, greeting.contains("in the language Hermes' memory of the owner or the persona says they prefer, otherwise English"))
+        assertTrue(GeminiWire.greetingGuidance(org.json.JSONObject().put("context", org.json.JSONObject().put("language", "Arabic"))).contains("otherwise Arabic"))
     }
 
     @Test fun pendingDirectReceiptKeepsAsyncFunctionOpenUntilTerminalResult() {

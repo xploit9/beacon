@@ -354,6 +354,63 @@ def read_plugin_version(path):
     except Exception: return ''
 
 
+# ---- Beacon releases ---------------------------------------------------------------------------------------------
+# Owner, 3 Nov: a published release reaches the owner's phone as a notice, every time. Hermes is always on and has one stable
+# address, so it asks GitHub (an unchanged answer is a free 304) and tells the phones over Keep connected; each phone then checks the
+# release itself (metadata, size, checksum, signer and version, all from GitHub) and posts the update notice.
+RELEASE_LATEST='https://api.github.com/repos/xploit9/beacon/releases/latest'
+RELEASE_CHECK_SECONDS=300
+RELEASE_DOCUMENT_LIMIT=262144
+RELEASE_NOTICE_SECONDS=7*86400
+
+def _fetch_latest_release(etag):
+    """GitHub's latest Beacon release: (status, etag, body); a 304 when nothing was published since [etag]."""
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+    headers={'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'Beacon-Hermes-plugin'}
+    if etag: headers['If-None-Match']=etag
+    try:
+        with urlopen(Request(RELEASE_LATEST,headers=headers),timeout=10) as response:
+            return response.status,response.headers.get('ETag'),response.read(RELEASE_DOCUMENT_LIMIT+1)
+    except HTTPError as error:
+        return error.code,None,b''
+
+def _meta_text(conn,key):
+    row=conn.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
+    value=row[0] if row else None
+    return value.decode('utf-8','replace') if isinstance(value,bytes) else value
+
+def check_release(owner,profile,fetch=None):
+    """Asks GitHub for Beacon's latest release; one it has not announced yet becomes one app_update notice for [owner]'s phones.
+    Returns the version announced, or '' (nothing new, a draft, an unreadable answer or no network). Never raises."""
+    try:
+        with connect() as conn: etag=_meta_text(conn,'release-etag')
+        status,fresh,body=(fetch or _fetch_latest_release)(etag)
+        if status!=200 or not body or len(body)>RELEASE_DOCUMENT_LIMIT: return ''
+        document=json.loads(body)
+        if not isinstance(document,dict): return ''
+        tag=document.get('tag_name')
+        if document.get('draft') or document.get('prerelease') or not isinstance(tag,str) or not re.fullmatch(r'v?\d{1,4}(\.\d{1,4}){1,3}',tag): return ''
+        version=tag.removeprefix('v');now=time.time()
+        with LOCK,connect() as conn:
+            conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',('release-etag',str(fresh or '')[:200]))
+            conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',('release-document',body))
+            if _meta_text(conn,'release-announced')==version: return ''
+            conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',('release-announced',version))
+            # Keep connected carries it; the Firebase path has nothing to add for an update.
+            conn.execute("INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,push) VALUES(?,?,?,?,?,?,?,'none')",
+                         (uuid.uuid4().hex,owner,profile,'app_update','release-'+version.replace('.','-'),now,now+RELEASE_NOTICE_SECONDS))
+        return version
+    except (OSError,ValueError,TypeError,sqlite3.Error):
+        return ''
+
+def latest_release_document():
+    """GitHub's own latest-release document as Hermes last read it (bytes), or None before the first good answer."""
+    with connect() as conn:
+        row=conn.execute('SELECT value FROM meta WHERE key=?',('release-document',)).fetchone()
+    return bytes(row[0]) if row and row[0] else None
+
+
 GATEWAY_VERSION_KEY='gateway_plugin_version'
 
 def record_gateway_plugin_version(version,pid=None,at=None):

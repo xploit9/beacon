@@ -50,12 +50,11 @@ def test_a_call_in_progress_refuses_the_restart_before_anything_is_recorded(harn
     assert not seen['begin'] and not seen['handed'] and not module.status_path(home).exists()
 
 
-def test_a_hermes_that_is_working_is_not_restarted_and_says_why(harness, restarter):
+def test_a_hermes_that_is_working_is_restarted_anyway_when_the_owner_asks(harness, restarter):
     _, client, _, _, _ = harness
     _, seen, _ = restarter
     seen['busy'] = True
-    assert client.post(BASE, json={}).json() == {'restart_started': False, 'restart_error_code': 'live_sessions'}
-    assert not seen['handed']
+    assert client.post(BASE, json={}).json()['restart_started'] is True
 
 
 def test_a_hermes_that_is_updating_itself_is_not_restarted_under_its_own_update(harness, restarter, monkeypatch):

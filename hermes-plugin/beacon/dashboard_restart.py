@@ -21,7 +21,6 @@ import uuid
 ROOT = Path(__file__).resolve().parent
 STATUS_NAME = 'dashboard-restart.json'
 FLUSH_GRACE = 0.75       # the response that started the restart is on its way out
-BUSY_WAIT = 120          # Hermes working on a reply: wait this long for it to finish
 STOP_GRACE = 10          # polite stop before a forced one
 SUPERVISOR_WAIT = 20     # a supervisor gets this long to bring a new listener up
 VERIFY_WAIT = 60         # a new dashboard gets this long to answer with Beacon
@@ -226,19 +225,6 @@ class Host:
         installer = _installer()
         return installer._route_status(f'http://127.0.0.1:{port}{installer.PROBE_ROUTE}?profile={profile}') == 200
 
-    def busy(self, port):
-        return hermes_busy(port)
-
-
-def hermes_busy(port) -> bool:
-    """Hermes is working on a reply or task (the dashboard's own status); a status that cannot be read is not 'busy'."""
-    from urllib.request import urlopen
-    try:
-        with urlopen(f'http://127.0.0.1:{port}/api/status', timeout=3) as response:
-            status = json.loads(response.read(65536))
-        return bool(status.get('gateway_busy', int(status.get('active_agents') or 0) > 0))
-    except (OSError, ValueError, TypeError, AttributeError):
-        return False
 
 
 # ---- the restart ---------------------------------------------------------------------------------------------------
@@ -311,8 +297,7 @@ def run(spec, host=None):
 def _run(spec, host, note):
     note(state='running', step='waiting', helper=os.getpid())
     host.sleep(FLUSH_GRACE + float(spec.get('delay', 0)))
-    if wait_for(host, lambda: not host.busy(spec['port']), BUSY_WAIT) is None:
-        return note(state='failed', error='live_sessions', finished=time.time())
+    # Owner, 3 Nov: the owner asked for this restart, so it goes on at once, whatever Hermes is doing.
     chain = find_chain(host, spec)
     if not chain:
         return note(state='failed', error='foreign', finished=time.time())
@@ -375,9 +360,6 @@ def begin(home, port, profile, host=None, helper=None):
     if in_flight(current, host):
         return {'restart_started': False, 'restart_error_code': 'in_progress', 'restart_id': current.get('id', '')}, None
     port = int(port or command_port(me['command']))
-    # Like the gateway restart, a Hermes that is working on a reply is not restarted: the phone asks again once it is idle.
-    if host.busy(port):
-        return {'restart_started': False, 'restart_error_code': 'live_sessions'}, None
     spec = {'id': uuid.uuid4().hex, 'pid': me['pid'], 'created': me['created'], 'home': str(home), 'port': port,
             'profile': profile, 'status': str(path)}
     write_status(path, id=spec['id'], state='running', step='waiting', mode='', error='', pid=0, helper=0, started=time.time(), finished=0)

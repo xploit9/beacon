@@ -31,6 +31,7 @@ class PhoneToolsDeviceTest {
     private val approved = PhoneDecision(true)
     private var calendarId = -1L
     private var contactId = -1L
+    private var rawContactId = -1L
     private val before = PhoneCapability.entries.associateWith { PhoneAccess.switchedOn(context, it) }
     private val account = "beacon-phone-test"
 
@@ -44,8 +45,10 @@ class PhoneToolsDeviceTest {
 
     @After fun tearDown() {
         if (calendarId > 0) resolver.delete(syncAdapter(CalendarContract.Calendars.CONTENT_URI), "${CalendarContract.Calendars._ID} = ?", arrayOf(calendarId.toString()))
-        if (contactId > 0) withShell("android.permission.WRITE_CONTACTS") {
-            resolver.delete(syncAdapter(ContactsContract.RawContacts.CONTENT_URI), "${ContactsContract.RawContacts.CONTACT_ID} = ?", arrayOf(contactId.toString()))
+        // Exactly the contact this test made, removed for good (a sync-adapter delete; no account filter, as it has no account).
+        if (rawContactId > 0) withShell("android.permission.WRITE_CONTACTS") {
+            val raw = ContactsContract.RawContacts.CONTENT_URI.buildUpon().appendQueryParameter(ContactsContract.CALLER_IS_SYNCADAPTER, "true").build()
+            resolver.delete(raw, "${ContactsContract.RawContacts._ID} = ?", arrayOf(rawContactId.toString()))
         }
         before.forEach { (capability, on) -> PhoneAccess.setSwitchedOn(context, capability, on) }
     }
@@ -218,8 +221,9 @@ class PhoneToolsDeviceTest {
             batch += ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI).withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, 0)
                 .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE)
                 .withValue(ContactsContract.CommonDataKinds.Phone.NUMBER, number).withValue(ContactsContract.CommonDataKinds.Phone.TYPE, ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE).build()
-            resolver.applyBatch(ContactsContract.AUTHORITY, batch)
-            resolver.query(ContactsContract.Contacts.CONTENT_URI, arrayOf(ContactsContract.Contacts._ID), "${ContactsContract.Contacts.DISPLAY_NAME} = ?", arrayOf(name), null)?.use { if (it.moveToFirst()) { contactId = it.getLong(0); made = true } }
+            rawContactId = resolver.applyBatch(ContactsContract.AUTHORITY, batch)[0].uri?.let(ContentUris::parseId) ?: -1L
+            if (rawContactId > 0) resolver.query(ContentUris.withAppendedId(ContactsContract.RawContacts.CONTENT_URI, rawContactId), arrayOf(ContactsContract.RawContacts.CONTACT_ID), null, null, null)
+                ?.use { if (it.moveToFirst()) { contactId = it.getLong(0); made = contactId > 0 } }
         }
         assumeTrue("The test contact could not be created on this device", made)
     }

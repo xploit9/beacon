@@ -678,6 +678,11 @@ class KeepConnectedService : Service() {
                 signedInProfile = { client?.auth?.profile.orEmpty() },
                 onEvent = { profile, event ->
                     if (event.optString("kind") == "incoming_call") deliverIncomingCall(app, origin, owner, profile, nativeProvider, event)
+                    // Hermes saw a new Beacon release: this phone checks the release Hermes read and posts the update notice at once.
+                    else if (event.optString("kind") == "app_update") serviceScope.launch {
+                        val document = runCatching { requireNotNull(client).nativeGetForProfile(RELEASE_ROUTE, profile, authorizedProfiles, maxBytes = 262_144) }.getOrNull()
+                        runCatching { app.updates.releaseAnnounced(document) }
+                    }
                     else if (app.push.bindKeepConnectedSource(Scope(origin, owner, profile, nativeProvider = nativeProvider), event.optString("source_ref"))) {
                         val data = keepConnectedPushData(event)
                         receivePush(this, data)
@@ -786,6 +791,8 @@ class KeepConnectedService : Service() {
         const val KEY_OWNER = "owner"
         const val KEY_NATIVE_PROVIDER = "native_provider"
         const val KEY_STATUS = "status"
+        // The release document Hermes read from GitHub, for an app_update event.
+        const val RELEASE_ROUTE = "/api/plugins/beacon/mobile/release"
         const val KEY_REASON = "reason"
         private const val KEY_STOP_TOKEN = "stop_token"
         const val STATUS_OFF = "off"

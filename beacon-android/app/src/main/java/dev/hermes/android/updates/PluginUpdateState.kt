@@ -100,6 +100,13 @@ internal fun pluginStatusFor(versions: PluginVersions, target: String, restartDo
 }
 
 /**
+ * Owner, 3 Nov: the app and the plugin are one version. The app goes on only when the plugin runs the release's version (or is past it),
+ * or when this Hermes has no plugin to match ([PluginStatus.Hidden]); a plugin that did not update or still waits for a restart holds it back.
+ */
+internal fun pluginAllowsApp(row: PluginRow): Boolean =
+    row.status in setOf(PluginStatus.Hidden, PluginStatus.UpToDate, PluginStatus.Updated, PluginStatus.Newer)
+
+/**
  * A dashboard that is still old after a restart of its own failed is not one that cannot restart itself: the phone offers that restart again
  * ([PluginStatus.DashboardFailed]) instead of sending the owner to the computer. [failed] is the phone's memory of that failure.
  */
@@ -199,7 +206,11 @@ private suspend fun restartDashboardStep(endpoint: PluginEndpoint, installed: St
         DashboardRestartResult.Unsupported -> awaitGatewayLedRestart(endpoint, target, steps, pause)?.let { now ->
             steps.done(UpdateStep.PluginDashboard); steps.complete(); row(PluginStatus.Updated, now.installed)
         } ?: run { steps.fail(UpdateStep.PluginDashboard, StepNote.DashboardManual); row(PluginStatus.DashboardRestart) }
-        DashboardRestartResult.Waiting -> { steps.hold(UpdateStep.PluginDashboard, StepNote.Busy); row(PluginStatus.Waiting) }
+        // A dashboard on a plugin from before 1.1.27 still refuses while Hermes is busy; the gateway, just restarted with the new plugin,
+        // restarts it whatever Hermes is doing (owner, 3 Nov), so the phone waits for that instead of waiting for Hermes to be idle.
+        DashboardRestartResult.Waiting -> awaitGatewayLedRestart(endpoint, target, steps, pause)?.let { now ->
+            steps.done(UpdateStep.PluginDashboard); steps.complete(); row(PluginStatus.Updated, now.installed)
+        } ?: run { steps.hold(UpdateStep.PluginDashboard, StepNote.Busy); row(PluginStatus.Waiting) }
         DashboardRestartResult.Call -> { steps.fail(UpdateStep.PluginDashboard, StepNote.Call); row(PluginStatus.Busy) }
         DashboardRestartResult.Failed -> { steps.fail(UpdateStep.PluginDashboard, StepNote.DashboardFailed); row(PluginStatus.DashboardFailed) }
         DashboardRestartResult.Completed -> {

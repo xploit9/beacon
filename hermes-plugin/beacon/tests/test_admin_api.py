@@ -79,9 +79,35 @@ def test_a_restart_hermes_cannot_start_still_answers_503_without_a_code(harness,
     assert response.json() == {'detail': 'Hermes could not start the gateway restart'}
 
 
-def test_native_plugin_restart_delegates_without_forcing_or_patching_native(monkeypatch):
+def test_native_plugin_restart_is_hermes_own_forced_restart(monkeypatch):
+    # Owner, 3 Nov: a restart asked for from the phone happens even while Hermes is busy. Hermes' own force path
+    # (`hermes gateway restart --interrupt`, the one POST /api/gateway/restart?interrupt=true uses) does it; nothing native is patched.
     from types import SimpleNamespace
     calls = []
+
+    def spawn(profile=None, *, interrupt=False):
+        calls.append((profile, interrupt))
+        return SimpleNamespace(pid=4321), False
+    monkeypatch.setitem(sys.modules, 'hermes_cli.web_server', SimpleNamespace(_spawn_gateway_restart=spawn))
+    monkeypatch.setitem(sys.modules, 'hermes_cli.web_server_gateway', SimpleNamespace(
+        _restart_gateway_after=lambda profile, **kwargs: pytest.fail('The forced path is used when Hermes has it')))
+    assert api.native_plugin_restart('work') == {'restart_started': True, 'restart_action': 'gateway-restart', 'restart_pid': 4321}
+    assert calls == [('work', True)]
+
+
+def test_native_plugin_restart_reports_a_failed_forced_spawn(monkeypatch):
+    from types import SimpleNamespace
+
+    def spawn(profile=None, *, interrupt=False):
+        raise RuntimeError('gateway restart already in progress for another profile')
+    monkeypatch.setitem(sys.modules, 'hermes_cli.web_server', SimpleNamespace(_spawn_gateway_restart=spawn))
+    assert api.native_plugin_restart('work') == {'restart_started': False, 'restart_error': 'gateway restart already in progress for another profile'}
+
+
+def test_native_plugin_restart_on_a_hermes_without_the_force_path_restarts_as_before(monkeypatch):
+    from types import SimpleNamespace
+    calls = []
+    monkeypatch.setitem(sys.modules, 'hermes_cli.web_server', SimpleNamespace(_spawn_gateway_restart=lambda profile=None: pytest.fail('No interrupt here')))
     monkeypatch.setitem(sys.modules, 'hermes_cli.web_server_gateway', SimpleNamespace(
         _restart_gateway_after=lambda profile, **kwargs: calls.append((profile, kwargs)) or {'restart_started': False}))
     assert api.native_plugin_restart('work') == {'restart_started': False}

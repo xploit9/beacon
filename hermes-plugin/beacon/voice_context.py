@@ -837,7 +837,8 @@ def context(owner,provider,profile,stored,call_id,display_name='',owner_name='',
                 if job:
                     callback.update(job_id=job['id'],reason=private_text(job['title'],120),result=private_text(job['result'],6000))
         voice=cfg.get('voice') if isinstance(cfg.get('voice'),dict) else {}
-        language=str(voice.get('language') or mobile.settings().get('language') or 'English')[:80]
+        # Owner, 3 Nov: no language is forced. Unset, the call speaks whatever the owner speaks and greets in the one Hermes' memory names.
+        language=str(voice.get('language') or mobile.settings().get('language') or '')[:80]
         history_text='\n'.join(m['role']+': '+m['content'] for m in messages)[-7000:]
         voice={'events':[]} if native_backend else mobile.voice_history(owner,profile,stored,limit=40,text_budget=16000)
         voice_text=private_text('\n'.join(row['role']+': '+row['text'] for row in voice['events']),5000)

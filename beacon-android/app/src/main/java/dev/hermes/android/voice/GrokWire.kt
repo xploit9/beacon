@@ -17,6 +17,8 @@ internal class GrokWire(private val providerName: String = "Grok") {
     private val pendingDelivered=mutableMapOf<String,String>()
     private var responding=false
     private var responsePending=false
+    // The calls of the latest response still without an output: xAI answers parallel calls once every output is in.
+    private val awaiting=linkedSetOf<String>()
 
     companion object {
         fun endpoint(value:String):String {
@@ -52,11 +54,11 @@ internal class GrokWire(private val providerName: String = "Grok") {
                 for (i in 0 until rows.length()) {
                     val row = rows.optJSONObject(i) ?: continue
                     val id = row.optString("id")
-                    if (id.startsWith("grok-voice") && safeCatalogValue(id)) add(id)
+                    if (id.startsWith("grok-voice") && "transcribe" !in id && safeCatalogValue(id)) add(id)
                     val aliases = row.optJSONArray("aliases") ?: continue
                     for (j in 0 until aliases.length()) {
                         val alias = aliases.optString(j)
-                        if (alias.startsWith("grok-voice") && safeCatalogValue(alias)) add(alias)
+                        if (alias.startsWith("grok-voice") && "transcribe" !in alias && safeCatalogValue(alias)) add(alias)
                     }
                 }
             }.distinct()
@@ -115,7 +117,7 @@ internal class GrokWire(private val providerName: String = "Grok") {
                 if((pendingDelivered[id]?:delivered[id])==receipt) continue
                 result+=if(id in calls&&id !in delivered&&id !in pendingDelivered) JSONObject().put("type","conversation.item.create").put("item",JSONObject().put("type","function_call_output").put("call_id",id).put("output",receipt))
                     else text("Verified tool receipt update for ${row.getString("name")} (call $id): $receipt")
-                calls.remove(id)
+                calls.remove(id);awaiting.remove(id)
                 val status=row.getJSONObject("response").optString("status")
                 if(!directToolIsReadOnly(row.optString("name"))&&status in setOf("ready","running","needs_approval","uncertain","waiting_for_idle","submitting","submitting_native","submitted","accepted","accepted_unlinked","submission_unconfirmed")) {
                     pendingDelivered[id]=receipt;delivered.remove(id)
@@ -135,7 +137,7 @@ internal class GrokWire(private val providerName: String = "Grok") {
         }
         if(result.isNotEmpty()&&continueTurn) {
             responsePending=true
-            if(!responding) { responding=true;responsePending=false;result+=JSONObject().put("type","response.create") }
+            if(!responding&&awaiting.isEmpty()) { responding=true;responsePending=false;result+=JSONObject().put("type","response.create") }
         }
         return result
     }
@@ -147,7 +149,8 @@ internal class GrokWire(private val providerName: String = "Grok") {
         when(frame.optString("type")) {
             "session.updated" -> return JSONObject().put("setupComplete",JSONObject())
             "response.created" -> { responding=true;return null }
-            "input_audio_buffer.speech_started" -> content.put("interrupted",true)
+            // The owner speaking starts a new turn, so no reply waits on an older call any more.
+            "input_audio_buffer.speech_started" -> { awaiting.clear();content.put("interrupted",true) }
             "response.output_audio.delta","response.audio.delta" -> content.put("modelTurn",JSONObject().put("parts",JSONArray().put(JSONObject().put("inlineData",JSONObject().put("mimeType","audio/pcm;rate=24000").put("data",frame.getString("delta"))))))
             "conversation.item.input_audio_transcription.completed" -> {
                 val item=frame.getString("item_id");require(item.isNotBlank()&&item.length<=200)
@@ -225,12 +228,12 @@ internal class GrokWire(private val providerName: String = "Grok") {
         require(arguments.isNotBlank()&&arguments.length<=20000)
         val args=JSONObject(arguments)
         if(!emittedCalls.add(id)) return null
-        calls[id]=name
+        calls[id]=name;awaiting+=id
         if(calls.size>128) {
             val oldestRead=calls.entries.firstOrNull { directToolIsReadOnly(it.value) }?.key
             // This is protocol matching only; DirectVoice retains mutation authority and receipts.
             val remove=oldestRead?:calls.keys.first()
-            calls.remove(remove);emittedCalls.remove(remove)
+            calls.remove(remove);emittedCalls.remove(remove);awaiting.remove(remove)
         }
         if(emittedCalls.size>128) emittedCalls.remove(emittedCalls.first())
         frame.optString("item_id").takeIf(String::isNotBlank)?.let(argumentDeltas::remove)
@@ -243,7 +246,7 @@ internal class GrokWire(private val providerName: String = "Grok") {
         if(outputTranscriptItems.size>128) outputTranscriptItems.remove(outputTranscriptItems.first())
         return fresh
     }
-    @Synchronized fun continueResponse():JSONObject? = if(responsePending&&!responding) {
+    @Synchronized fun continueResponse():JSONObject? = if(responsePending&&!responding&&awaiting.isEmpty()) {
         responsePending=false;responding=true;JSONObject().put("type","response.create")
     } else null
 }

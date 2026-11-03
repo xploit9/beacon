@@ -10,7 +10,7 @@ class BeaconIdentityTest {
     @Test fun activeNotificationIdsRemainStable() {
         assertEquals("xara-calls", BeaconCallService.CHANNEL)
         assertEquals("xara-incoming-call-v2", BeaconMessagingService.INCOMING_CHANNEL)
-        assertEquals("hermes-updates", UpdateManager.CHANNEL)
+        assertEquals("hermes-updates-v2", UpdateManager.CHANNEL)
         assertEquals("hermes.call.HANGUP", BeaconCallService.HANGUP)
     }
 }

@@ -278,25 +278,20 @@ def test_a_dashboard_that_will_not_stop_is_reported_and_nothing_is_launched(scen
     assert not spawned(host) and host.listeners(PORT) == [spec['pid']]
 
 
-def test_the_helper_waits_for_hermes_to_finish_working_before_it_stops_anything(scene):
-    host, spec, who = scene
-    host.is_busy = lambda: host.clock < 30
-    result = finish(host, spec)
-    assert result['state'] == 'completed'
-    assert host.events[0][0] == 'stop' and host.clock >= 30
-
-
-def test_a_hermes_that_stays_busy_is_not_restarted(scene):
+def test_a_hermes_that_stays_busy_is_restarted_anyway(scene):
+    # Owner, 3 Nov: the restart the owner asked for happens; a Hermes that stays busy (or a stuck agent count) never holds it back.
     host, spec, _ = scene
     host.is_busy = lambda: True
     result = finish(host, spec)
-    assert (result['state'], result['error']) == ('failed', 'live_sessions')
-    assert not host.events and host.listeners(PORT) == [spec['pid']]
+    assert result['state'] == 'completed'
+    assert host.events[0][0] == 'stop'
+    # It never asked whether Hermes was busy: nothing waits on Hermes' work.
+    assert not hasattr(dr, 'BUSY_WAIT') and not hasattr(dr, 'BUSY_GRACE')
 
 
 def test_the_helper_never_raises(scene, monkeypatch):
     host, spec, _ = scene
-    monkeypatch.setattr(host, 'busy', lambda port: 1 / 0)
+    monkeypatch.setattr(host, 'info', lambda pid: 1 / 0)
     result = finish(host, spec)
     assert (result['state'], result['error']) == ('failed', 'failed')
 
@@ -371,13 +366,12 @@ def test_begin_records_the_restart_but_stops_nothing(scene, tmp_path):
     assert given['created'] == host.rows[os.getpid()]['created']
 
 
-def test_begin_refuses_while_hermes_is_busy_and_while_a_restart_runs(scene, tmp_path):
+def test_begin_starts_while_hermes_is_busy_and_refuses_only_while_a_restart_runs(scene, tmp_path):
     host, _, _ = scene
     host.add('python.exe', COMMAND, pid=os.getpid())
     host.is_busy = lambda: True
-    assert dr.begin(tmp_path, PORT, 'default', host=host)[0] == {'restart_started': False, 'restart_error_code': 'live_sessions'}
-    host.is_busy = lambda: False
     payload, _ = dr.begin(tmp_path, PORT, 'default', host=host)
+    assert payload['restart_started'] is True
     again, start = dr.begin(tmp_path, PORT, 'default', host=host)
     assert start is None and again == {'restart_started': False, 'restart_error_code': 'in_progress', 'restart_id': payload['restart_id']}
     dr.write_status(dr.status_path(tmp_path), state='failed')

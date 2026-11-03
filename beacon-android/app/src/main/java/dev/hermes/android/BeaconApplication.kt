@@ -75,7 +75,9 @@ private val CURRENT_NOTIFICATION_CHANNEL_IDS = setOf(
     "hermes-prompts-v2",
     "xara-incoming-call-v2",
     "xara-calls",
+    // The quiet first update category stays until UpdateManager has carried an "off" over to its replacement and removed it.
     "hermes-updates",
+    "hermes-updates-v2",
     "beacon_keep_connected",
     "beacon_sign_in",
 )

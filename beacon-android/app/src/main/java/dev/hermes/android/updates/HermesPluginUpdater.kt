@@ -57,7 +57,9 @@ internal class HermesPluginUpdater(private val client: BeaconClient, private val
             val pid = response.optInt("restart_pid")
             if (response.opt("restart_started") != true || pid <= 0) {
                 return@run when (response.optString("restart_error_code")) {
-                    "live_sessions" -> RestartResult.Waiting
+                    // A plugin from before 1.1.27 still refuses while Hermes is busy. Owner, 3 Nov: an update asked for from the phone restarts
+                    // Hermes whatever it is doing, so Hermes' own forced restart (the one its dashboard's Restart uses) goes ahead instead.
+                    "live_sessions" -> forcedRestart(remember)
                     "owner_call" -> RestartResult.Call
                     // The same pid as the restart before: that one is not new, so wait on it instead of reporting a failure.
                     "stale" -> if (pid > 0 || last.pid > 0) pendingOn(pid.takeIf { it > 0 } ?: last.pid, last, remember) else RestartResult.Pending
@@ -70,6 +72,16 @@ internal class HermesPluginUpdater(private val client: BeaconClient, private val
         }
     } catch (error: CancellationException) { throw error }
     catch (_: Exception) { RestartResult.Failed }
+
+    /** Hermes' `POST /api/gateway/restart`: `gateway restart --interrupt`, which live sessions never refuse; polled like any other restart. */
+    private suspend fun forcedRestart(remember: (RestartMemo) -> Unit): RestartResult {
+        val response = client.nativeRequest(GATEWAY_RESTART, "POST", JSONObject())
+        val pid = response.optInt("pid")
+        if (response.opt("ok") != true || pid <= 0) return RestartResult.Failed
+        val memo = RestartMemo(pid, clock())
+        remember(memo)
+        return pendingOn(pid, memo, remember, alreadyKnown = true)
+    }
 
     private suspend fun pendingOn(pid: Int, memo: RestartMemo, remember: (RestartMemo) -> Unit, alreadyKnown: Boolean = false): RestartResult {
         val known = if (alreadyKnown) memo else RestartMemo(pid, if (memo.pid == pid) memo.at else clock()).also(remember)
@@ -121,6 +133,7 @@ internal class HermesPluginUpdater(private val client: BeaconClient, private val
     }
 
     private companion object {
+        const val GATEWAY_RESTART = "/api/gateway/restart"
         const val DASHBOARD_RESTART = "/api/plugins/beacon/admin/dashboard/restart"
         const val DASHBOARD_STATUS = "/api/plugins/beacon/admin/dashboard/restart/status"
         const val DASHBOARD_POLLS = 150

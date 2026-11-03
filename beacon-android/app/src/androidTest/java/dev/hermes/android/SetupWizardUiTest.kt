@@ -677,6 +677,9 @@ class SetupWizardUiTest {
             compose.onNodeWithText("Step 3 of 4").assertIsDisplayed()
             val providerBar = setupBarPosition()
             compose.onNodeWithTag("voice-model-gemini").assertIsSelected()
+            // Owner, 3 Nov: OpenAI is shown as coming soon and cannot be chosen.
+            compose.onNodeWithTag("voice-model-openai").assertIsNotEnabled().assertIsNotSelected()
+            compose.onNodeWithText("Coming soon").assertIsDisplayed()
             compose.onNodeWithTag("voice-model-grok").performClick()
             compose.onNodeWithTag("voice-model-grok").assertIsSelected()
             compose.onNodeWithTag("setup-voice-continue").performClick()

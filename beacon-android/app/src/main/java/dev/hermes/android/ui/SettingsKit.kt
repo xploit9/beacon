@@ -581,7 +581,8 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
     }
 }
 
-@Immutable internal data class SettingsOption(val id: String, val label: String, val detail: String = "", val icon: ImageVector? = null, val badge: String = "", val testTag: String = "")
+/** [enabled] false draws one choice dimmed and not selectable (a "Coming soon" one), whatever the rest do. */
+@Immutable internal data class SettingsOption(val id: String, val label: String, val detail: String = "", val icon: ImageVector? = null, val badge: String = "", val testTag: String = "", val enabled: Boolean = true)
 
 /**
  * Choices worth seeing side by side (voices, personality, models): selectable cards, [columns] per row. A collapsed list shows
@@ -605,7 +606,7 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
         Column(Modifier.selectableGroup(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             shown.chunked(perRow).forEach { row ->
                 Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    row.forEach { option -> SettingsOptionCard(option, option.id == selected, enabled, grid = perRow > 1, Modifier.weight(1f).fillMaxHeight()) { if (option.id != selected) onSelect(option.id) } }
+                    row.forEach { option -> SettingsOptionCard(option, option.id == selected, enabled && option.enabled, grid = perRow > 1, Modifier.weight(1f).fillMaxHeight()) { if (option.id != selected) onSelect(option.id) } }
                     repeat(perRow - row.size) { Spacer(Modifier.weight(1f)) }
                 }
             }

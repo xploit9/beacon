@@ -56,7 +56,7 @@ class RestartHonestyTest {
     }
 
     @Test(timeout = 5000) fun everyRefusalReasonSurvivesInsteadOfCollapsingIntoFalse() {
-        val expected = mapOf("live_sessions" to RestartResult.Waiting, "owner_call" to RestartResult.Call, "failed" to RestartResult.Failed, "" to RestartResult.Failed, "other" to RestartResult.Failed)
+        val expected = mapOf("owner_call" to RestartResult.Call, "failed" to RestartResult.Failed, "" to RestartResult.Failed, "other" to RestartResult.Failed)
         expected.forEach { (code, result) ->
             val calls = mutableListOf<String>()
             val body = if (code.isEmpty()) """{"restart_started":false}""" else """{"restart_started":false,"restart_error_code":"$code"}"""
@@ -108,20 +108,48 @@ class RestartHonestyTest {
         withClient(calls, { path, _ ->
             when (path) {
                 status -> Answer(200, """{"pid":55,"failed":true}""")
-                restart -> Answer(200, """{"restart_started":false,"restart_error_code":"live_sessions"}""")
+                restart -> Answer(200, """{"restart_started":false,"restart_error_code":"failed"}""")
                 else -> error(path)
             }
-        }) { assertEquals(RestartResult.Waiting, it.restart(RestartMemo(55, now - 1_000), remembered::add)) }
+        }) { assertEquals(RestartResult.Failed, it.restart(RestartMemo(55, now - 1_000), remembered::add)) }
         assertEquals(listOf(RestartMemo()), remembered)
         assertEquals(listOf("GET $status?pid=55", "POST $restart"), calls)
     }
 
     @Test(timeout = 5000) fun anOldPidIsHistoryNotARestartInFlight() {
         val calls = mutableListOf<String>()
-        withClient(calls, { path, _ -> if (path == restart) Answer(200, """{"restart_started":false,"restart_error_code":"live_sessions"}""") else error(path) }) {
-            assertEquals(RestartResult.Waiting, it.restart(RestartMemo(55, now - RestartMemo.RESTART_MEMORY_MS - 1)))
+        withClient(calls, { path, _ -> if (path == restart) Answer(200, """{"restart_started":false,"restart_error_code":"failed"}""") else error(path) }) {
+            assertEquals(RestartResult.Failed, it.restart(RestartMemo(55, now - RestartMemo.RESTART_MEMORY_MS - 1)))
         }
         assertEquals(listOf("POST $restart"), calls)
+    }
+
+    // Owner, 3 Nov: an update asked for from the phone restarts Hermes whatever it is doing. A plugin from before 1.1.27 still answers
+    // "busy", so the phone asks Hermes for its own forced restart and waits on that one like any other.
+    @Test(timeout = 8000) fun aBusyRefusalGoesToHermesOwnForcedRestart() {
+        val calls = mutableListOf<String>()
+        val remembered = mutableListOf<RestartMemo>()
+        withClient(calls, { path, _ ->
+            when (path) {
+                restart -> Answer(200, """{"restart_started":false,"restart_error_code":"live_sessions"}""")
+                "/api/gateway/restart" -> Answer(200, """{"ok":true,"pid":909,"name":"gateway-restart"}""")
+                status -> Answer(200, """{"pid":909,"completed":true}""")
+                "/api/status" -> Answer(200, """{"gateway_running":true,"gateway_state":"running"}""")
+                else -> error(path)
+            }
+        }) { assertEquals(RestartResult.Completed, it.restart(RestartMemo(), remembered::add)) }
+        assertEquals(listOf("POST $restart", "POST /api/gateway/restart"), calls.filter { it.startsWith("POST") })
+        assertEquals(listOf(RestartMemo(909, now), RestartMemo(909, now, completed = true)), remembered)
+    }
+
+    @Test(timeout = 5000) fun aForcedRestartHermesDidNotStartIsAFailureNotAWait() {
+        withClient(mutableListOf(), { path, _ ->
+            when (path) {
+                restart -> Answer(200, """{"restart_started":false,"restart_error_code":"live_sessions"}""")
+                "/api/gateway/restart" -> Answer(500, """{"detail":"Failed to restart gateway"}""")
+                else -> error(path)
+            }
+        }) { assertEquals(RestartResult.Failed, it.restart()) }
     }
 
     @Test(timeout = 8000) fun aStalePidMeansTheEarlierRestartIsTheOneToWaitFor() {

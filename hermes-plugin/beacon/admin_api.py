@@ -168,8 +168,19 @@ def restart_error_code(result):
 
 
 def native_plugin_restart(profile):
-    from hermes_cli.web_server_gateway import _restart_gateway_after
-    return _restart_gateway_after(profile, what='Beacon plugin update', label='Beacon plugin update')
+    """The owner asked for this restart from the phone, so it is Hermes' own forced one (`gateway restart --interrupt`, as
+    POST /api/gateway/restart?interrupt=true): a busy Hermes never holds a plugin update back. A Hermes without it restarts as before."""
+    import inspect
+    from hermes_cli import web_server
+    spawn = getattr(web_server, '_spawn_gateway_restart', None)
+    if spawn is None or 'interrupt' not in inspect.signature(spawn).parameters:
+        from hermes_cli.web_server_gateway import _restart_gateway_after
+        return _restart_gateway_after(profile, what='Beacon plugin update', label='Beacon plugin update')
+    try:
+        proc, _ = spawn(profile, interrupt=True)
+    except Exception as error:  # Hermes says why, the same way its own restart does
+        return {'restart_started': False, 'restart_error': str(error)}
+    return {'restart_started': True, 'restart_action': 'gateway-restart', 'restart_pid': proc.pid}
 
 
 async def native_plugin_restart_status():

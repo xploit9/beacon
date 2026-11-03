@@ -23,6 +23,7 @@ internal fun olderThanSeen(seenCode: Long, release: Release): Boolean = seenCode
 
 internal const val UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60_000L
 internal const val UPDATE_OFFER_REFRESH_MS = 30 * 60_000L
+internal const val UPDATE_LIVE_REFRESH_MS = 5 * 60_000L
 private const val UPDATE_RETRY_MS = 15 * 60_000L
 
 /** A check is due every [window] (6 hours); a failed attempt waits 15 minutes. A manual check is always due. */
@@ -32,11 +33,20 @@ internal fun updateCheckDue(lastCheck: Long, now: Long, force: Boolean, lastAtte
 }
 
 /**
- * Opening the update screen on an offer refreshes it after 30 minutes, and so does every check while Keep connected is live (its
- * foreground connection keeps the process alive, and the stored ETag makes a repeat check free); the rest keep the 6-hour schedule.
+ * While Keep connected is live a check is due every 5 minutes, so a new release reaches the phone within minutes (its foreground
+ * connection keeps the process alive, and the stored ETag makes an unchanged answer a free 304). Opening the update screen on an offer
+ * refreshes it after 30 minutes; the rest keep the 6-hour schedule.
  */
-internal fun checkWindow(offered: Boolean, onUpdateScreen: Boolean, keepConnected: Boolean = false): Long =
-    if (keepConnected || offered && onUpdateScreen) UPDATE_OFFER_REFRESH_MS else UPDATE_CHECK_INTERVAL_MS
+internal fun checkWindow(offered: Boolean, onUpdateScreen: Boolean, keepConnected: Boolean = false): Long = when {
+    keepConnected -> UPDATE_LIVE_REFRESH_MS
+    offered && onUpdateScreen -> UPDATE_OFFER_REFRESH_MS
+    else -> UPDATE_CHECK_INTERVAL_MS
+}
+
+/** The update notice pops up like Beacon's alerts; an update category the owner had turned off stays off. */
+internal fun updateChannelImportance(previous: Int?): Int =
+    if (previous == android.app.NotificationManager.IMPORTANCE_NONE) android.app.NotificationManager.IMPORTANCE_NONE
+    else android.app.NotificationManager.IMPORTANCE_HIGH
 
 /** Keep connected is on and its last answer from Hermes is fresh; both are read from its public state, never changed here. */
 internal fun keepConnectedLive(enabled: Boolean, status: String): Boolean = enabled && status == KeepConnectedService.STATUS_CONNECTED

@@ -5355,7 +5355,9 @@
     "no backups yet.": "Ancora nessun backup.",
     "not tested": "Non testato",
     "email": "Email",
-    "earlier file versions": "Versioni precedenti dei file"
+    "earlier file versions": "Versioni precedenti dei file",
+    "the beacon plugin didn't update, so the app didn't either.": "Il plugin Beacon non si è aggiornato, quindi nemmeno l'app.",
+    "coming soon": "Prossimamente"
   },
   "ja": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "選択した Live モデルが音声を聞き取ります。応答の読み上げには、同じキーと声で Gemini 3.8 Flash-Lite TTS を使用します。",
@@ -8914,7 +8916,9 @@
     "no backups yet.": "バックアップはまだありません。",
     "not tested": "未テスト",
     "email": "メール",
-    "earlier file versions": "以前のファイルのバージョン"
+    "earlier file versions": "以前のファイルのバージョン",
+    "the beacon plugin didn't update, so the app didn't either.": "Beacon プラグインが更新されなかったため、アプリも更新されませんでした。",
+    "coming soon": "近日公開"
   },
   "ru": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "Выбранная модель Live распознаёт речь. Для озвучивания ответов используется Gemini 3.8 Flash-Lite TTS с тем же ключом и голосом.",
@@ -12473,7 +12477,9 @@
     "no backups yet.": "Резервных копий пока нет.",
     "not tested": "Не проверен",
     "email": "Почта",
-    "earlier file versions": "Прежние версии файлов"
+    "earlier file versions": "Прежние версии файлов",
+    "the beacon plugin didn't update, so the app didn't either.": "Плагин Beacon не обновился, поэтому приложение тоже не обновилось.",
+    "coming soon": "Скоро"
   },
   "es": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "El modelo Live seleccionado escucha. Las respuestas habladas usan Gemini 3.8 Flash-Lite TTS con la misma clave y voz.",
@@ -15996,7 +16002,9 @@
     "no backups yet.": "Aún no hay copias de seguridad.",
     "not tested": "Sin probar",
     "email": "Correo",
-    "earlier file versions": "Versiones anteriores de archivos"
+    "earlier file versions": "Versiones anteriores de archivos",
+    "the beacon plugin didn't update, so the app didn't either.": "El plugin de Beacon no se actualizó, así que la app tampoco.",
+    "coming soon": "Próximamente"
   },
   "de": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "Das ausgewählte Live-Modell hört zu. Gesprochene Antworten verwenden Gemini 3.8 Flash-Lite TTS mit demselben Schlüssel und derselben Stimme.",
@@ -19509,7 +19517,9 @@
     "no backups yet.": "Noch keine Sicherungen.",
     "not tested": "Nicht getestet",
     "email": "E-Mail",
-    "earlier file versions": "Frühere Dateiversionen"
+    "earlier file versions": "Frühere Dateiversionen",
+    "the beacon plugin didn't update, so the app didn't either.": "Das Beacon-Plugin wurde nicht aktualisiert, deshalb auch die App nicht.",
+    "coming soon": "Demnächst"
   },
   "zh": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "所选 Live 模型负责听取语音。回复由 Gemini 3.8 Flash-Lite TTS 朗读，使用相同的密钥和声音。",
@@ -23022,7 +23032,9 @@
     "no backups yet.": "还没有备份。",
     "not tested": "未测试",
     "email": "邮件",
-    "earlier file versions": "文件的早期版本"
+    "earlier file versions": "文件的早期版本",
+    "the beacon plugin didn't update, so the app didn't either.": "Beacon 插件未更新，因此应用也未更新。",
+    "coming soon": "即将推出"
   },
   "zh-Hant": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "所選 Live 模型負責聆聽語音。回覆由 Gemini 3.8 Flash-Lite TTS 朗讀，使用相同的金鑰和聲音。",
@@ -26581,7 +26593,9 @@
     "no backups yet.": "尚無備份。",
     "not tested": "未測試",
     "email": "郵件",
-    "earlier file versions": "檔案的較早版本"
+    "earlier file versions": "檔案的較早版本",
+    "the beacon plugin didn't update, so the app didn't either.": "Beacon 外掛未更新，因此 App 也未更新。",
+    "coming soon": "即將推出"
   },
   "pt": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "O modelo Live selecionado escuta. As respostas faladas usam Gemini 3.8 Flash-Lite TTS com a mesma chave e voz.",
@@ -29999,7 +30013,9 @@
     "no backups yet.": "Ainda não há backups.",
     "not tested": "Não testado",
     "email": "E-mail",
-    "earlier file versions": "Versões anteriores dos arquivos"
+    "earlier file versions": "Versões anteriores dos arquivos",
+    "the beacon plugin didn't update, so the app didn't either.": "O plugin do Beacon não foi atualizado, por isso o app também não.",
+    "coming soon": "Em breve"
   },
   "ko": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "선택한 Live 모델이 음성을 듣습니다. 응답 읽기에는 같은 키와 음성으로 Gemini 3.8 Flash-Lite TTS를 사용합니다.",
@@ -33558,7 +33574,9 @@
     "no backups yet.": "아직 백업이 없습니다.",
     "not tested": "테스트 안 됨",
     "email": "이메일",
-    "earlier file versions": "이전 파일 버전"
+    "earlier file versions": "이전 파일 버전",
+    "the beacon plugin didn't update, so the app didn't either.": "Beacon 플러그인이 업데이트되지 않아 앱도 업데이트되지 않았습니다.",
+    "coming soon": "출시 예정"
   },
   "fr": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "Le modèle Live sélectionné écoute. Les réponses vocales utilisent Gemini 3.8 Flash-Lite TTS avec la même clé et la même voix.",
@@ -37117,7 +37135,9 @@
     "no backups yet.": "Aucune sauvegarde pour l'instant.",
     "not tested": "Non testé",
     "email": "E-mail",
-    "earlier file versions": "Versions antérieures des fichiers"
+    "earlier file versions": "Versions antérieures des fichiers",
+    "the beacon plugin didn't update, so the app didn't either.": "Le plugin Beacon ne s'est pas mis à jour, donc l'application non plus.",
+    "coming soon": "Bientôt"
   },
   "cs": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "Vybraný model Live poslouchá. Mluvené odpovědi používají Gemini 3.8 Flash-Lite TTS se stejným klíčem a hlasem.",
@@ -40676,7 +40696,9 @@
     "no backups yet.": "Zatím žádné zálohy.",
     "not tested": "Netestováno",
     "email": "E-mail",
-    "earlier file versions": "Starší verze souborů"
+    "earlier file versions": "Starší verze souborů",
+    "the beacon plugin didn't update, so the app didn't either.": "Plugin Beacon se neaktualizoval, takže ani aplikace ne.",
+    "coming soon": "Již brzy"
   },
   "tr": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "Seçilen Live modeli dinler. Sesli yanıtlar, aynı anahtar ve sesle Gemini 3.8 Flash-Lite TTS kullanır.",
@@ -44235,7 +44257,9 @@
     "no backups yet.": "Henüz yedek yok.",
     "not tested": "Test edilmedi",
     "email": "E-posta",
-    "earlier file versions": "Dosyaların önceki sürümleri"
+    "earlier file versions": "Dosyaların önceki sürümleri",
+    "the beacon plugin didn't update, so the app didn't either.": "Beacon eklentisi güncellenmedi, bu yüzden uygulama da güncellenmedi.",
+    "coming soon": "Yakında"
   },
   "pl": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "Wybrany model Live słucha. Odpowiedzi głosowe korzystają z Gemini 3.8 Flash-Lite TTS z tym samym kluczem i głosem.",
@@ -47794,7 +47818,9 @@
     "no backups yet.": "Nie ma jeszcze kopii zapasowych.",
     "not tested": "Nie przetestowano",
     "email": "E-mail",
-    "earlier file versions": "Wcześniejsze wersje plików"
+    "earlier file versions": "Wcześniejsze wersje plików",
+    "the beacon plugin didn't update, so the app didn't either.": "Wtyczka Beacon się nie zaktualizowała, więc aplikacja też nie.",
+    "coming soon": "Wkrótce"
   },
   "vi": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "Mô hình Live đã chọn đảm nhiệm việc nghe. Câu trả lời được đọc bằng Gemini 3.8 Flash-Lite TTS với cùng khóa và giọng nói.",
@@ -51353,7 +51379,9 @@
     "no backups yet.": "Chưa có bản sao lưu nào.",
     "not tested": "Chưa kiểm tra",
     "email": "Email",
-    "earlier file versions": "Các phiên bản tệp trước đây"
+    "earlier file versions": "Các phiên bản tệp trước đây",
+    "the beacon plugin didn't update, so the app didn't either.": "Plugin Beacon chưa được cập nhật nên ứng dụng cũng chưa được cập nhật.",
+    "coming soon": "Sắp ra mắt"
   },
   "ar": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "يتولى نموذج Live المحدد الاستماع. تستخدم الردود المنطوقة Gemini 3.8 Flash-Lite TTS بالمفتاح والصوت نفسيهما.",
@@ -53526,6 +53554,8 @@
     "no backups yet.": "لا توجد نسخ احتياطية بعد.",
     "not tested": "لم يُختبر",
     "email": "البريد الإلكتروني",
-    "earlier file versions": "إصدارات سابقة من الملفات"
+    "earlier file versions": "إصدارات سابقة من الملفات",
+    "the beacon plugin didn't update, so the app didn't either.": "لم تُحدَّث إضافة Beacon، لذلك لم يُحدَّث التطبيق أيضًا.",
+    "coming soon": "قريبًا"
   }
 }

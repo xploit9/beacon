@@ -80,6 +80,13 @@ def test_hermes_still_words_its_live_session_refusal_the_way_the_restart_code_re
     assert "'restart_error'" in hermes.joinpath('hermes_cli', 'web_server_gateway.py').read_text(encoding='utf-8-sig').replace('"', "'")
 
 
+def test_hermes_still_offers_its_forced_gateway_restart(hermes):
+    # admin_api.native_plugin_restart forces the owner's restart through _spawn_gateway_restart(profile, interrupt=True).
+    server = hermes.joinpath('hermes_cli', 'web_server.py').read_text(encoding='utf-8-sig')
+    assert re.search(r'def _spawn_gateway_restart\(profile[^)]*\*, interrupt: bool = False\)', server)
+    assert '"--interrupt"' in server
+
+
 def test_hermes_still_launches_its_gateway_as_gateway_run(hermes):
     # __init__._is_gateway_process records the gateway's plugin version only for a process launched as `gateway run`.
     main = hermes.joinpath('hermes_cli', 'main.py').read_text(encoding='utf-8-sig')

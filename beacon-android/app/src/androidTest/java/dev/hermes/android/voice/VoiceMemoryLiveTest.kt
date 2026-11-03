@@ -434,4 +434,77 @@ class VoiceMemoryLiveTest {
             }
         } }
     }
+
+    /**
+     * Owner, 3 Nov: one multilingual agent. On one live Gemini call the owner speaks Arabic and is answered in Arabic, then switches
+     * to English mid-call and is answered in English: nothing forces a language. Synthetic speech; no memory is touched.
+     */
+    @Test(timeout = 600_000) fun geminiFollowsTheOwnersLanguageMidCall() = runBlocking<Unit> {
+        val args = InstrumentationRegistry.getArguments()
+        assumeTrue(args.getString("beaconLiveService") == "1")
+        assumeTrue(args.getString("beaconNoHostAudio") == "1")
+        require(android.os.Build.FINGERPRINT.contains("generic") || android.os.Build.MODEL.contains("sdk"))
+        val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
+        require(app.packageName.endsWith(".debug") && !app.calls.state.value.active)
+        require(app.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) { "The microphone grant is required (device-test.py --grant-mic)" }
+        val voiceStore = VoiceKeyStore(app)
+        require(voiceStore.hasKey(PROVIDER)) { "The Gemini key saved on the test phone is required to speak the fixture" }
+        val arabicScript = Regex("[\\u0600-\\u06FF]")
+        val latinWord = Regex("(?i)\\b[a-z]{2,}\\b")
+        lateinit var vm: BeaconViewModel
+        rule.runOnIdle { vm = ViewModelProvider(rule.activity)[BeaconViewModel::class.java] }
+        val run = MemoryRun(app, vm)
+        val previousVoice = voiceStore.settings()
+        val arabic = spoken(app, "مرحبا، كيف حالك اليوم؟")
+        val english = spoken(app, "Thanks. Tell me one short fun fact about the moon.")
+        try {
+            voiceStore.setSelection(voiceStore.settings(PROVIDER))
+            eventually({ "the app to connect to the demo Hermes" }) { vm.ui.value.connected && vm.client != null && !vm.ui.value.restoringSession }
+            run.connected = requireNotNull(vm.client).detached()
+            require(android.net.Uri.parse(run.client.auth.origin).port == 8446) { "This test runs only against the isolated demo Hermes" }
+            openChat(run, "Voice language")
+            rule.onNodeWithTag("chat-call-beacon").performClick()
+            eventually({ "the call to start (error: ${app.calls.state.value.failureReason} ${app.calls.state.value.error})" }, 45_000) {
+                app.calls.state.value.let { it.active && it.state in setOf("thinking", "listening", "speaking") }
+            }
+            run.calls += app.calls.state.value.callId
+            assertEquals(PROVIDER, app.calls.state.value.voiceProvider)
+            val service = requireNotNull(app.calls.service)
+            service.mute(true)
+            val pcm = read(BeaconCallService::class.java, service, "pcm") as NativePcm
+            val direct = read(BeaconCallService::class.java, service, "directVoice") as DirectVoice
+            withTimeoutOrNull(35_000) { while (app.calls.state.value.transcripts.none { it.role == "assistant" && it.final } && app.calls.state.value.error.isBlank()) delay(100) }
+            drainSpeech(pcm)
+            suspend fun turn(label: String, fixture: ByteArray, heard: Regex): String {
+                val before = app.calls.state.value.transcripts.map { it.eventId }.toSet()
+                fun fresh(role: String) = app.calls.state.value.transcripts.filter { it.role == role && it.eventId !in before && it.text.isNotBlank() }
+                stream(direct, ByteArray(RATE * 2 * 600 / 1000)); stream(direct, fixture)
+                stream(direct, ByteArray(RATE * 2 * 2200 / 1000)); endSpeech(direct)
+                eventually({ "the $label speech to be heard (heard: \"${fresh("user").joinToString(" ") { it.text }}\")" }, 60_000) {
+                    heard.containsMatchIn(fresh("user").filter { it.final }.joinToString(" ") { it.text })
+                }
+                eventually({ "an answer to the $label speech" }) { fresh("assistant").any { it.final } }
+                drainSpeech(pcm); delay(1_000)
+                return fresh("assistant").joinToString(" ") { it.text }
+            }
+            run.phase = "arabic"
+            val inArabic = turn("Arabic", arabic, arabicScript)
+            assertTrue("Spoken to in Arabic, the agent answered in Arabic (it said: \"${inArabic.take(300)}\")", arabicScript.containsMatchIn(inArabic))
+            run.passed.put("answers_in_arabic", true)
+            run.phase = "english"
+            val inEnglish = turn("English", english, latinWord)
+            assertTrue("After the owner switched to English mid-call, the agent answered in English (it said: \"${inEnglish.take(300)}\")",
+                latinWord.findAll(inEnglish).count() >= 4 && !arabicScript.containsMatchIn(inEnglish))
+            run.passed.put("follows_switch_to_english", true)
+            run.phase = "done"
+        } finally { withContext(NonCancellable) {
+            arabic.fill(0); english.fill(0)
+            runCatching { app.calls.hangup(); withTimeoutOrNull(60_000) { while (app.calls.service != null) delay(100) } }
+            runCatching { voiceStore.setSelection(previousVoice) }
+            run.calls.toList().forEach { call -> runCatching { run.client.nativeRequest("$CALLS_PATH/$call", "DELETE") } }
+            run.chats.toList().forEach { chat -> runCatching { run.client.nativeRpc("session.set_hidden", json("session_id" to chat, "hidden" to true)) } }
+            runCatching { run.connected?.closeNative() }
+            InstrumentationRegistry.getInstrumentation().sendStatus(2, Bundle().apply { putString("beacon_voice_language", run.passed.put("phase", run.phase).toString()) })
+        } }
+    }
 }

@@ -330,7 +330,7 @@ class VoiceConnectTest {
 
     @Test fun theLiveSetupGreetsOnceInTheOwnersLanguageAndOtherwiseAnswersWithHermesTools() {
         val instruction = liveInstruction(context, gemini.personalityInstruction, gemini.model)
-        assertTrue(instruction.contains("\"Maya\"") && instruction.contains("in Arabic") && instruction.contains("one short, warm greeting"))
+        assertTrue(instruction.contains("\"Maya\"") && instruction.contains("otherwise Arabic") && instruction.contains("one short, warm greeting"))
         assertTrue("The session answers the owner itself", instruction.contains("You answer the owner yourself, in your own voice"))
         assertTrue(liveInstruction(json("profile" to "default")).contains("without using any name"))
         val callback = liveInstruction(json("callback" to json("reason" to "the flight check")))

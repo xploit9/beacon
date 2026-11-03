@@ -75,7 +75,7 @@ class UpdateMigrationDeviceTest {
         var etag = "\"v1\""
         private val sha get() = digest.ifBlank { sha256(apk) }
         private fun assetUrl(file: String) = "https://github.com/xploit9/beacon/releases/download/v$name/$file"
-        private fun announcement() = JSONObject().put("tag_name", "v$name").put("draft", false).put("prerelease", false).put("body", "## What's new\n- Calmer updates")
+        fun announcement() = JSONObject().put("tag_name", "v$name").put("draft", false).put("prerelease", false).put("body", "## What's new\n- Calmer updates")
             .put("published_at", "2026-10-24T09:00:00Z").put("assets", JSONArray(listOf(
                 JSONObject().put("name", "Beacon-$name.json").put("browser_download_url", assetUrl("Beacon-$name.json")).put("size", 10).put("state", "uploaded"),
                 JSONObject().put("name", "Beacon-$name.apk").put("browser_download_url", assetUrl("Beacon-$name.apk")).put("size", apk.size).put("state", "uploaded"))))
@@ -101,7 +101,8 @@ class UpdateMigrationDeviceTest {
     private fun dueAgain() = assertTrue(prefs.edit().remove("last_check").remove("last_attempt").commit())
     private fun notifications(): NotificationManager = target.getSystemService(NotificationManager::class.java).also {
         check(it.areNotificationsEnabled()) { "Enable notifications for the isolated debug test installation" }
-        it.createNotificationChannel(NotificationChannel(UpdateManager.CHANNEL, "Beacon app updates", NotificationManager.IMPORTANCE_DEFAULT))
+        // The category as the app makes it: an update notice pops up (a lower importance here would also lower the app's own category).
+        it.createNotificationChannel(NotificationChannel(UpdateManager.CHANNEL, "Beacon app updates", dev.hermes.android.updates.updateChannelImportance(null)))
     }
     private fun posted(manager: NotificationManager) = manager.activeNotifications.any { it.id == 4202 && it.tag == null }
 
@@ -159,6 +160,8 @@ class UpdateMigrationDeviceTest {
             assertTrue(offered.checkedAt > 0)
             assertEquals(installedCode + 1, prefs.getLong("notified_version", 0))
             assertTrue(posted(system))
+            // A background check's notice goes to the update category that pops up, not to the quiet one it replaced.
+            assertEquals(UpdateManager.CHANNEL, system.activeNotifications.single { it.id == 4202 && it.tag == null }.notification.channelId)
             // The same release again: GitHub says 304, nothing more is posted, and nothing was downloaded.
             system.cancel(4202)
             dueAgain()
@@ -171,6 +174,41 @@ class UpdateMigrationDeviceTest {
             assertFalse(prefs.contains("pending_file"))
             assertEquals(sessions, sessionsBefore)
             assertEquals(0, installerOpened.get())
+        } finally { system.cancel(4202) }
+    }
+
+    // Owner, 3 Nov: a published release always reaches the phone. The release Hermes read from GitHub and announced over Keep connected
+    // posts the update notice at once, without this phone asking GitHub's API (a shared mobile address can be refused there); its
+    // metadata still comes from GitHub and is checked like GitHub's own answer.
+    @Test fun aReleaseHermesAnnouncesIsNotifiedAtOnceWithoutAskingGitHubsApi() = runBlocking {
+        val system = notifications()
+        check(system.activeNotifications.none { it.id == 4202 && it.tag == null }) { "An existing update notification must not be replaced by the test" }
+        val github = FakeGitHub()
+        val manager = manager(github)
+        try {
+            manager.releaseAnnounced(github.announcement())
+            assertEquals(0, github.requests("/releases/latest"))
+            assertEquals(1, github.requests(".json"))
+            assertEquals(0, github.requests(".apk"))
+            assertEquals(installedCode + 1, manager.state.value.release?.version)
+            assertTrue(posted(system))
+            assertEquals(UpdateManager.CHANNEL, system.activeNotifications.single { it.id == 4202 && it.tag == null }.notification.channelId)
+        } finally { system.cancel(4202) }
+    }
+
+    @Test fun anAnnouncementWithoutAUsableReleaseAsksGitHubAtOnce() = runBlocking {
+        val system = notifications()
+        check(system.activeNotifications.none { it.id == 4202 && it.tag == null }) { "An existing update notification must not be replaced by the test" }
+        val github = FakeGitHub()
+        val manager = manager(github)
+        try {
+            // A Hermes too old to relay the release, or a document that does not verify: the phone's own check runs now, not in hours.
+            manager.releaseAnnounced(null)
+            assertEquals(1, github.requests("/releases/latest"))
+            assertTrue(posted(system))
+            system.cancel(4202)
+            manager.releaseAnnounced(JSONObject().put("tag_name", "v99.0.0"))
+            assertEquals(2, github.requests("/releases/latest"))
         } finally { system.cancel(4202) }
     }
 

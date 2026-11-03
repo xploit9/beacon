@@ -181,4 +181,34 @@ class GrokWireTest {
         assertTrue(setup.getString("instructions").contains("never approve your own request"))
     }
 
+    // xAI's Voice Agent API (Grok Voice 3.0, 14 Oct 2026): with parallel calls, response.create waits until every function_call_output
+    // of that response is in, so the reply is built from all of the results.
+    @Test fun parallelCallsAreAnsweredOnceEveryResultIsIn() {
+        val wire=GrokWire()
+        fun call(id:String)=JSONObject().put("type","response.function_call_arguments.done").put("call_id",id).put("name","invoke_tool").put("arguments",JSONObject().put("tool_id","opaque").toString())
+        wire.inbound(call("call-a"));wire.inbound(call("call-b"))
+        wire.inbound(JSONObject().put("type","response.done").put("response",JSONObject().put("status","completed")))
+        val first=wire.outbound(GeminiWire.tool("call-a","invoke_tool",JSONObject().put("status","completed").put("result","one")))
+        assertEquals(listOf("conversation.item.create"),first.map { it.getString("type") })
+        assertNull("call-b has no result yet",wire.continueResponse())
+        val second=wire.outbound(GeminiWire.tool("call-b","invoke_tool",JSONObject().put("status","completed").put("result","two")))
+        assertEquals(listOf("conversation.item.create","response.create"),second.map { it.getString("type") })
+    }
+
+    @Test fun theOwnerSpeakingNeverLeavesTheReplyWaitingOnAnOlderCall() {
+        val wire=GrokWire()
+        fun call(id:String)=JSONObject().put("type","response.function_call_arguments.done").put("call_id",id).put("name","invoke_tool").put("arguments",JSONObject().put("tool_id","opaque").toString())
+        wire.inbound(call("call-a"));wire.inbound(call("call-b"))
+        wire.inbound(JSONObject().put("type","response.done").put("response",JSONObject().put("status","completed")))
+        wire.inbound(JSONObject().put("type","input_audio_buffer.speech_started"))
+        val rows=wire.outbound(GeminiWire.tool("call-a","invoke_tool",JSONObject().put("status","completed").put("result","one")))
+        assertEquals("response.create",rows.last().getString("type"))
+    }
+
+    @Test fun transcriptionModelsAreNeverOfferedAsVoices() {
+        val listed=JSONObject().put("data",org.json.JSONArray()
+            .put(JSONObject().put("id","grok-voice-3.0").put("aliases",org.json.JSONArray().put("grok-voice-latest")))
+            .put(JSONObject().put("id","grok-voice-transcribe-2.0")))
+        assertEquals(listOf("grok-voice-3.0","grok-voice-latest"),GrokWire.models(listed))
+    }
 }

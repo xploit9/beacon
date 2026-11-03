@@ -75,7 +75,8 @@ The voice is Grok; the caller's side is synthetic speech. Screens and videos com
 - **Projects.** Add a chat to a project from its menu. It works in the project's folder and shows the project at the top.
 - **Tools at hand.** Tools, under More in a chat's menu, opens your tools and MCP servers, the same controls as Settings.
 - **Approvals per chat.** Each chat follows your profile's approval mode, or skips approvals for that chat only.
-- **Voice calls.** Talk with Gemini Live, Grok or OpenAI Realtime. Calls use the tools and memory of your Hermes profile,
+- **Voice calls.** Talk with Gemini Live or Grok, in any language; switch languages mid-call and Beacon follows (OpenAI Realtime is
+  coming soon). Calls use the tools and memory of your Hermes profile,
   and can save new memories like a chat ([how calls use tools and memory](docs/voice-calls.md)). A ball of drifting
   dust shows the call: blue while Beacon listens, amber while it thinks, green while it speaks, and it swirls and
   scatters while someone talks. Call text is saved; audio is not kept.

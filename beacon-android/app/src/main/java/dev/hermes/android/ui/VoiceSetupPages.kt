@@ -74,6 +74,9 @@ internal val voiceProviders = listOf(
 
 internal fun voiceProviderInfo(provider: String): VoiceProviderInfo = voiceProviders.firstOrNull { it.id == provider } ?: voiceProviders.first()
 
+/** Owner, 3 Nov: shown as "Coming soon" and not selectable on the provider page. */
+internal val voiceProvidersComingSoon = setOf("openai")
+
 /** The catalog read for each provider, kept in memory so the choices open already filled and refresh behind it. */
 internal object VoiceCatalogCache {
     private val catalogs = ConcurrentHashMap<String, VoiceCatalog>()
@@ -197,7 +200,8 @@ internal fun voiceProviderPage(
 ): SetupPage {
     val context = LocalContext.current.applicationContext
     val store = remember(context) { VoiceKeyStore(context) }
-    var selected by remember { mutableStateOf(store.settings().provider) }
+    // A provider that is coming soon is never what Continue goes on with.
+    var selected by remember { mutableStateOf(store.settings().provider.takeIf { it !in voiceProvidersComingSoon } ?: voiceProviders.first().id) }
     var saved by remember { mutableStateOf<Set<String>>(emptySet()) }
     var busy by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("") }
@@ -221,8 +225,11 @@ internal fun voiceProviderPage(
         }
     }
     val keySaved = uiText("Key saved")
+    val comingSoon = uiText("Coming soon")
     val options = voiceProviders.map { info ->
-        SettingsOption(info.id, info.name, voiceProviderNote(info.id), Icons.Rounded.GraphicEq, badge = if (info.id in saved) keySaved else "", testTag = "voice-model-${info.id}")
+        val ready = info.id !in voiceProvidersComingSoon
+        SettingsOption(info.id, info.name, voiceProviderNote(info.id), Icons.Rounded.GraphicEq, badge = if (!ready) comingSoon else if (info.id in saved) keySaved else "",
+            testTag = "voice-model-${info.id}", enabled = ready)
     }
     return SetupPage(
         content = {

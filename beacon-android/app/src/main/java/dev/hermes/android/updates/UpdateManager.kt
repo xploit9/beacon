@@ -52,6 +52,7 @@ internal enum class UpdateFailure(val text: String, val retriesCheck: Boolean = 
     Verification("The update didn't pass verification."),
     Install("Android couldn't install the update. Try again."),
     Call("End your call before updating Beacon."),
+    Plugin("The Beacon plugin didn't update, so the app didn't either."),
 }
 
 /** Every failure text the update screen shows through uiText. */
@@ -86,7 +87,8 @@ internal data class AppUpdateUi(
 /**
  * Beacon updates itself from the public GitHub latest release, with no Hermes and no sign-in. A newer release posts one
  * notification; nothing downloads or installs until the user taps Update. When this phone is signed in to a Hermes that runs
- * the Beacon plugin, the same tap updates the plugin first through Hermes' own updater; a plugin that cannot update never blocks the app.
+ * the Beacon plugin, the same tap updates the plugin first through Hermes' own updater, and the app installs only once the plugin runs the
+ * release's version: the two are always one version.
  */
 class UpdateManager internal constructor(private val app: BeaconApplication, private val releases: GitHubReleases, private val selfUpdates: Boolean) {
     // Debug, preview and candidate builds never check, notify or install.
@@ -164,7 +166,14 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     private fun callActive() = app.calls.state.value.active || app.calls.state.value.state == "ending" ||
         app.calls.service != null || app.calls.spec != null || app.push.incoming.value != null
     private fun onScreen() = beaconVisible(ActivityManager.RunningAppProcessInfo().also(ActivityManager::getMyMemoryState).importance)
-    private fun ensureChannel() = notifications.createNotificationChannel(NotificationChannel(CHANNEL, "Beacon app updates", NotificationManager.IMPORTANCE_DEFAULT))
+    private fun ensureChannel() {
+        if (notifications.getNotificationChannel(CHANNEL) != null) return
+        // The first update category was quiet, so a ready update could sit unseen; Android keeps a category's importance, so the
+        // one that pops up is new. An owner who had turned update notices off keeps them off.
+        val previous = notifications.getNotificationChannel(LEGACY_CHANNEL)?.importance
+        notifications.createNotificationChannel(NotificationChannel(CHANNEL, "Beacon app updates", updateChannelImportance(previous)))
+        notifications.deleteNotificationChannel(LEGACY_CHANNEL)
+    }
 
     /** Called at launch and after a restart; Android defers the periodic job in Doze and while offline. */
     fun schedule(checkNow: Boolean = true) {
@@ -179,10 +188,10 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
 
     /** The periodic job. */
     suspend fun backgroundCheck() { if (selfUpdates) runCheck(force = false, visible = false, window = checkWindow(offered = false, onUpdateScreen = false, keepConnected = keepConnectedOn())) }
-    /** Keep connected's public state, read only: its connection also calls [backgroundCheck] every minute, so a live one checks every 30 minutes. */
+    /** Keep connected's public state, read only: its connection also calls [backgroundCheck] every minute, so a live one checks every 5 minutes. */
     private fun keepConnectedOn() = runCatching { keepConnectedLive(KeepConnectedService.isEnabled(app), KeepConnectedService.status(app)) }.getOrDefault(false)
     /**
-     * Beacon came to the foreground; checks only when the last check is older than 6 hours (30 minutes while Keep connected is live).
+     * Beacon came to the foreground; checks only when the last check is older than 6 hours (5 minutes while Keep connected is live).
      * An offer already on screen stays put while it refreshes behind it, and on the update screen ([onUpdateScreen]) that refresh is due after 30 minutes.
      */
     internal fun checkIfDue(onUpdateScreen: Boolean = false) {
@@ -190,6 +199,25 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
         val offered = _state.value.phase == UpdatePhase.Available
         scope.launch { runCheck(force = false, visible = !offered, window = checkWindow(offered, onUpdateScreen, keepConnectedOn())) }
     }
+    /**
+     * Hermes saw a new Beacon release on GitHub and said so over Keep connected (owner, 3 Nov: a published release always reaches the
+     * phone). The [document] it relays is checked like GitHub's own answer, so the notice comes at once even when this phone's own GitHub
+     * check is late or refused; without a usable document the phone asks GitHub itself, at once.
+     */
+    suspend fun releaseAnnounced(document: org.json.JSONObject?) {
+        if (!selfUpdates) return
+        val relayed = try { document?.let { releases.relayed(it) }?.let(::vet) }
+            catch (error: CancellationException) { throw error }
+            catch (_: Exception) { null }
+        val release = relayed?.takeIf { it.version > updater.installedVersion() } ?: return runCheck(force = true, visible = false)
+        val now = System.currentTimeMillis()
+        checking.withLock {
+            synchronized(lock) { prefs.edit().putString("release", release.encode()).putLong("last_check", now).commit() }
+            publish { copy(latest = release, release = release, checkedAt = now) }
+        }
+        notifyRelease(release)
+    }
+
     /** "Check for updates": always asks GitHub. */
     internal fun checkNow() { if (selfUpdates) scope.launch { runCheck(force = true, visible = true) } }
 
@@ -386,11 +414,9 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     }
 
     private suspend fun runWaitingRestart(client: BeaconClient) {
+        // Owner, 3 Nov: the restart belongs to an update the owner asked for, so it goes ahead whatever Hermes is doing.
         if (callActive()) return
-        val idle = try { hermesIdle(gatewayStatusOf(client.nativeRequest("/api/status"))) }
-        catch (error: CancellationException) { throw error }
-        catch (_: Exception) { false }
-        if (idle) pluginStep(client, accept = false)
+        pluginStep(client, accept = false)
     }
 
     /**
@@ -465,6 +491,8 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
                 publish { this }
                 if (restartPending(client) || _state.value.plugin.status in setOf(PluginStatus.Available, PluginStatus.Restart, PluginStatus.Waiting, PluginStatus.RestartFailed,
                         PluginStatus.DashboardFailed)) pluginStep(client, accept = false)
+                // One release is one version: the app installs only once the plugin runs the release's version; the plugin row says why not.
+                if (release != null && !pluginAllowsApp(_state.value.plugin)) { appSteps.clear(); return fail(UpdateFailure.Plugin) }
             }
             if (release == null) { publish { copy(phase = UpdatePhase.Idle) }; return }
             val retained = pendingFor(release)
@@ -485,7 +513,7 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
         }
     }
 
-    /** Hermes' own updater; whatever it answers lands on the plugin row, and the app update goes on. Hermes carries on if the phone stops watching. */
+    /** Hermes' own updater; whatever it answers lands on the plugin row, and the app goes on only when that row matches the release. Hermes carries on if the phone stops watching. */
     private suspend fun pluginStep(client: BeaconClient, accept: Boolean) {
         val target = _state.value.latest?.pluginVersion.orEmpty()
         val restartOnly = restartPending(client)
@@ -624,7 +652,8 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
 
     companion object {
         const val EXTRA_TOKEN = "update_token"
-        const val CHANNEL = "hermes-updates"
+        const val CHANNEL = "hermes-updates-v2"
+        private const val LEGACY_CHANNEL = "hermes-updates"
         const val ACTION_INSTALL_RESULT = "dev.hermes.android.updates.INSTALL_RESULT"
         private const val JOB_ID = 4202
         private const val NOTIFICATION_ID = 4202

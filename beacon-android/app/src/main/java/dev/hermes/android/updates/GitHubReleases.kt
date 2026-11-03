@@ -83,6 +83,12 @@ internal class GitHubReleases(
         }
     }
 
+    /**
+     * GitHub's latest-release document as the owner's Hermes read and passed it on: read exactly like GitHub's own answer, so its
+     * metadata and APK still come from GitHub's hosts and pass every check below. Null for a draft, a prerelease or no Beacon assets.
+     */
+    suspend fun relayed(json: JSONObject): Release? = release(json)
+
     private suspend fun release(json: JSONObject): Release? {
         if (json.optBoolean("draft") || json.optBoolean("prerelease")) return null
         val assets = json.optJSONArray("assets")?.let { rows -> (0 until rows.length()).mapNotNull { rows.optJSONObject(it) } }.orEmpty()

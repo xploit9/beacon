@@ -80,21 +80,29 @@ class UpdatePolicyTest {
         assertTrue(updateCheckDue(1_000, now, true, lastAttempt = now))
     }
 
-    @Test fun aLiveKeepConnectedChecksEveryThirtyMinutesAndEverythingElseKeepsTheSixHourSchedule() {
+    @Test fun aLiveKeepConnectedChecksEveryFiveMinutesAndEverythingElseKeepsItsSchedule() {
         val minute = 60_000L
         val hour = 60 * minute
         assertEquals(6 * hour, checkWindow(offered = false, onUpdateScreen = false))
         assertEquals(6 * hour, checkWindow(offered = true, onUpdateScreen = false))
         assertEquals(30 * minute, checkWindow(offered = true, onUpdateScreen = true))
-        assertEquals(30 * minute, checkWindow(offered = false, onUpdateScreen = false, keepConnected = true))
-        assertEquals(30 * minute, checkWindow(offered = true, onUpdateScreen = true, keepConnected = true))
+        // Owner, 3 Nov: a release published while the phone is connected must reach it within minutes, not half an hour.
+        assertEquals(5 * minute, checkWindow(offered = false, onUpdateScreen = false, keepConnected = true))
+        assertEquals(5 * minute, checkWindow(offered = true, onUpdateScreen = true, keepConnected = true))
         val window = checkWindow(offered = false, onUpdateScreen = false, keepConnected = true)
-        // Keep connected asks every minute; the 30-minute window makes only one of those a request, and a failed attempt still waits 15 minutes.
-        assertFalse(updateCheckDue(1_000, 1_000 + 30 * minute - 1, false, window = window))
-        assertTrue(updateCheckDue(1_000, 1_000 + 30 * minute, false, window = window))
-        assertFalse(updateCheckDue(1_000, 1_000 + 30 * minute, false, lastAttempt = 1_000 + 30 * minute - 14 * minute, window = window))
+        // Keep connected asks every minute; the 5-minute window makes only one of those a request, and a failed attempt still waits 15 minutes.
+        assertFalse(updateCheckDue(1_000, 1_000 + 5 * minute - 1, false, window = window))
+        assertTrue(updateCheckDue(1_000, 1_000 + 5 * minute, false, window = window))
+        assertFalse(updateCheckDue(1_000, 1_000 + 5 * minute, false, lastAttempt = 1_000 + 5 * minute - 4 * minute, window = window))
         // Without Keep connected the same moment is not yet due.
-        assertFalse(updateCheckDue(1_000, 1_000 + 30 * minute, false, window = checkWindow(false, false)))
+        assertFalse(updateCheckDue(1_000, 1_000 + 5 * minute, false, window = checkWindow(false, false)))
+    }
+
+    @Test fun theUpdateNoticePopsUpUnlessTheOwnerHadTurnedUpdatesOff() {
+        assertEquals(android.app.NotificationManager.IMPORTANCE_HIGH, updateChannelImportance(null))
+        assertEquals(android.app.NotificationManager.IMPORTANCE_HIGH, updateChannelImportance(android.app.NotificationManager.IMPORTANCE_DEFAULT))
+        assertEquals(android.app.NotificationManager.IMPORTANCE_HIGH, updateChannelImportance(android.app.NotificationManager.IMPORTANCE_LOW))
+        assertEquals(android.app.NotificationManager.IMPORTANCE_NONE, updateChannelImportance(android.app.NotificationManager.IMPORTANCE_NONE))
     }
 
     @Test fun keepConnectedCountsOnlyWhenEnabledAndConnected() {

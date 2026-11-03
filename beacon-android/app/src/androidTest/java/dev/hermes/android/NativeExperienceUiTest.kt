@@ -2765,7 +2765,9 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Send a test notification").assertDoesNotExist()
         compose.onNodeWithText("Proactive calls").assertDoesNotExist()
         val notifications = app.getSystemService(android.app.NotificationManager::class.java)
-        listOf("hermes-messages-v2", "hermes-tasks-v2", "hermes-approvals", "hermes-updates").forEach { assertNotNull("Advertised notification category exists: $it", notifications.getNotificationChannel(it)) }
+        listOf("hermes-messages-v2", "hermes-tasks-v2", "hermes-approvals", "hermes-updates-v2").forEach { assertNotNull("Advertised notification category exists: $it", notifications.getNotificationChannel(it)) }
+        // The quiet first version of the update category is gone; its replacement pops up (UpdatePolicyTest pins the importance it is made with).
+        assertNull(notifications.getNotificationChannel("hermes-updates"))
         assertTrue(fixture.requests.none { it.string("path") == "/api/mobile/proactive" })
         receipts += "Local chat preferences are reachable; Keep connected state leads Notifications, Firebase-only controls stay hidden in this build, and no proactive calls are scheduled."
         capture("notification-categories")
