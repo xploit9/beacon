@@ -14,7 +14,6 @@ import androidx.compose.ui.test.assertHeightIsAtLeast
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
-import androidx.compose.ui.test.assertIsOn
 import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.getUnclippedBoundsInRoot
@@ -64,14 +63,14 @@ import org.junit.Rule
 import org.junit.Test
 
 /**
- * The Bot Mode drawer on its own: New bot and New space at the top, no tile grid, one switch to leave, the bots with a real status,
+ * The Bot Mode drawer on its own: New bot and New space at the top, the same tiles as the normal drawer (Bots shows on and leaves), the bots with a real status,
  * and suggested roles. The roster is set directly, so nothing here talks to Hermes. Leaving by the switch is in NativeExperienceUiTest,
  * where a Hermes fixture answers the toggle.
  */
 class BotModeDrawerUiTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
 
-    private val tiles = listOf("skills", "memory", "cron", "files", "projects", "kanban", "settings", "more")
+    private val tiles = listOf("skills", "memory", "cron", "files", "projects", "kanban", "settings")
     private val twoBots = listOf(BotModeBot("default", "Default", "Your main assistant"), BotModeBot("coder", "Coder", "Reviews code"))
     private val oneSpace = listOf(BotModeSpace("room-1", "Review room", listOf("default", "coder"), updatedAt = 1_700_000_000L, last = BotModePreview("coder", "Looks good to me")))
 
@@ -138,7 +137,7 @@ class BotModeDrawerUiTest {
         }
     }
 
-    @Test fun newBotAndNewSpaceLeadTheDrawerAndNoTileGridPadsIt() = withDrawer { _ ->
+    @Test fun newBotAndNewSpaceLeadTheDrawerAndTheTilesStay() = withDrawer { _ ->
         val newBot = compose.onNodeWithTag("bot-mode-sidebar-new-bot").assertIsDisplayed().assertIsEnabled().assertHeightIsAtLeast(48.dp).assertTextContains("New bot").getUnclippedBoundsInRoot()
         val newSpace = compose.onNodeWithTag("bot-mode-sidebar-new-chat").assertIsDisplayed().assertIsEnabled().assertHeightIsAtLeast(48.dp).assertTextContains("New space").getUnclippedBoundsInRoot()
         // Side by side at normal text, New bot first, one size; both above the first bot.
@@ -146,12 +145,15 @@ class BotModeDrawerUiTest {
         assertEquals(newBot.top.value, newSpace.top.value, 0.5f)
         assertEquals(newBot.width.value, newSpace.width.value, 1f)
         assertTrue("The buttons sit above the bots", newSpace.bottom <= bounds("bot-row-default").top)
-        tiles.forEach { compose.onAllNodesWithTag("navigation-$it").assertCountEquals(0) }
-        // The profile pill and the chat buttons belong to the normal drawer.
-        listOf("navigation-profile", "navigation-new-chat", "navigation-new-thread").forEach { compose.onAllNodesWithTag(it).assertCountEquals(0) }
-        // One compact, clearly-on control leaves Bot Mode.
-        compose.onNodeWithTag("navigation-bots").assertIsDisplayed().assertIsSelected().assertIsOn().assertHeightIsAtLeast(48.dp).assertTextContains("Bot Mode")
-        assertTrue("The switch sits under the buttons", bounds("navigation-bots").top >= newSpace.bottom)
+        // The same tiles as the normal drawer, under the buttons.
+        tiles.forEach { compose.onNodeWithTag("navigation-$it").assertExists() }
+        assertTrue("The tiles sit under the buttons", bounds("navigation-skills").top >= newSpace.bottom)
+        // One layout in both modes: the profile pill stays, and New bot and New space take the chat buttons' place.
+        compose.onNodeWithTag("navigation-profile").assertExists()
+        listOf("navigation-new-chat", "navigation-new-thread").forEach { compose.onAllNodesWithTag(it).assertCountEquals(0) }
+        // The Bots tile shows Bot Mode is on; a tap on it leaves.
+        compose.onNodeWithTag("navigation-bots").assertIsDisplayed().assertIsSelected().assertHeightIsAtLeast(48.dp).assertTextContains("Bots")
+        assertTrue("The bots follow the tiles", bounds("navigation-bots").bottom <= bounds("bot-row-default").top)
     }
 
     @Test fun theRosterHeadersNoLongerCarryNewBotOrNewSpace() = withDrawer { _ ->
@@ -159,7 +161,8 @@ class BotModeDrawerUiTest {
         compose.onAllNodesWithTag("bot-mode-sidebar-new-chat").assertCountEquals(1)
         compose.onAllNodesWithText("New bot").assertCountEquals(1)
         compose.onAllNodesWithText("New space").assertCountEquals(1)
-        compose.onNodeWithText("Bots").assertIsDisplayed()
+        // "Bots" is the tile and the roster's own heading.
+        compose.onAllNodesWithText("Bots").assertCountEquals(2)
         compose.onNodeWithText("Shared spaces").assertIsDisplayed()
     }
 
@@ -238,12 +241,12 @@ class BotModeDrawerUiTest {
         assertTrue("New space is under New bot ($newBot, $newSpace)", newBot.bottom <= newSpace.top)
         assertEquals(newBot.left.value, newSpace.left.value, 0.5f)
         assertEquals(newBot.width.value, newSpace.width.value, 0.5f)
-        val switch = compose.onNodeWithTag("navigation-bots").assertIsDisplayed().assertHeightIsAtLeast(48.dp).getUnclippedBoundsInRoot()
-        assertTrue("The switch is under New space", newSpace.bottom <= switch.top)
-        listOf("New bot", "New space", "Bot Mode").forEach(::assertSingleUnclippedLine)
+        // At large text the grid keeps its four main tiles and More, as in the normal drawer.
+        listOf("cron", "files", "projects", "settings", "more").forEach { compose.onNodeWithTag("navigation-$it").assertExists() }
+        assertTrue("The tiles are under New space", newSpace.bottom <= bounds("navigation-cron").top)
+        listOf("New bot", "New space").forEach(::assertSingleUnclippedLine)
         compose.onNodeWithTag("bot-mode-sidebar").performScrollToNode(hasTestTag("bot-mode-suggested-roles"))
         listOf("Researcher", "Planner", "Writer", "Inbox helper").forEach(::assertSingleUnclippedLine)
-        tiles.forEach { compose.onAllNodesWithTag("navigation-$it").assertCountEquals(0) }
     }
 
     @Test fun arabicRunsRightToLeftWithNewBotFirstAtTheStart() = withDrawer(language = "ar", rtl = true) { _ ->
@@ -253,7 +256,7 @@ class BotModeDrawerUiTest {
         // The start is the right: New bot is the right-hand button, and the buttons keep one size and do not overlap.
         assertTrue("New bot is right of New space ($newBot, $newSpace)", newBot.left >= newSpace.right)
         assertEquals(newBot.width.value, newSpace.width.value, 1f)
-        compose.onNodeWithTag("navigation-bots").assertTextContains("وضع الروبوتات").assertHeightIsAtLeast(48.dp)
+        compose.onNodeWithTag("navigation-bots").assertIsSelected().assertHeightIsAtLeast(48.dp)
         compose.onNodeWithTag("bot-mode-sidebar").performScrollToNode(hasTestTag("bot-mode-suggested-roles"))
         // The first suggested role starts at the right edge and the next follows it to the left.
         val first = bounds("bot-mode-suggested-role:researcher")

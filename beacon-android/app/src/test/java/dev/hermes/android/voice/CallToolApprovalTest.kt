@@ -193,4 +193,21 @@ class CallToolApprovalTest {
         assertEquals("The call is busy. Try again shortly.", callToolApprovalErrorMessage("Tool request capacity reached"))
         assertEquals("This request is still finishing. Wait and check it again.", callToolApprovalErrorMessage("Tool lookup still settling; inspect the same request identity"))
     }
+
+    // Strix final1126: a card headline or target too long for the card ends in an ellipsis, so the owner sees there is more.
+    @Test fun aCardHeadlineOrTargetTooLongForTheCardShowsThatItWasCut() {
+        val card = JSONObject().put("action", "Add '" + "T".repeat(200) + "' Tue 4 Nov 3:00 PM to " + "Calendar ".repeat(20))
+            .put("target", "C".repeat(150)).put("details", "").put("preview", "")
+        val value = JSONObject().put("request_id", "r1").put("proposal_id", "p".repeat(32)).put("tool_name", "phone_calendar_create")
+            .put("arguments", JSONObject()).put("phone_card", card)
+        val phone = CallToolApproval.from(value).phone!!
+        assertEquals(300, phone.action.length)
+        assertTrue(phone.action, phone.action.endsWith("…"))
+        assertEquals(100, phone.target.length)
+        assertTrue(phone.target.endsWith("…"))
+        // A headline that fits is drawn whole, with no mark.
+        val short = CallToolApproval.from(JSONObject(value.toString()).put("phone_card", JSONObject(card.toString()).put("action", "Add 'Dentist' to Personal").put("target", "Personal"))).phone!!
+        assertEquals("Add 'Dentist' to Personal", short.action)
+        assertEquals("Personal", short.target)
+    }
 }

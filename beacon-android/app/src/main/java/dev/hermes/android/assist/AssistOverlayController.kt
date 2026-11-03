@@ -187,7 +187,7 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
 
     fun keepScreenOn(on: Boolean) = session.keepScreenOn(on)
 
-    fun screenshot(bitmap: Bitmap?) { if (!locked) screen = bitmap }
+    fun screenshot(bitmap: Bitmap?) { if (!overlayLocked(locked, keyguardLocked())) screen = bitmap }
 
     fun hidden() {
         dictation.cancel()

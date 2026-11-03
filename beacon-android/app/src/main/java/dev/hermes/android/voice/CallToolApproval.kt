@@ -22,11 +22,14 @@ data class CallToolApproval(val requestId: String, val proposalId: String, val t
             // Only this phone's own tools carry a card; a Hermes proposal never can, whatever its fields say.
             val card = if (name in PhoneTools.names) value.optJSONObject("phone_card")?.let {
                 // The notes or message arrive whole (up to the phone tools' own bounds): a card must not hide what will be written.
-                PhoneApprovalText(it.optString("action").take(300), it.optString("target").take(100), it.optString("details").take(1200), it.optString("preview").take(1000),
+                PhoneApprovalText(clipped(it.optString("action"), 300), clipped(it.optString("target"), 100), it.optString("details").take(1200), it.optString("preview").take(1000),
                     if (name == "phone_call") it.optInt("countdown").coerceIn(0, 5) else 0, it.optLong("asked_at"))
             }?.takeIf { it.action.isNotBlank() } else null
             return CallToolApproval(request, proposal, name, arguments, allowCall = !value.has("allow_call") || value.opt("allow_call") == true, phone = card)
         }
+
+        /** [text] within [limit] characters; a cut one ends in an ellipsis, so the card never hides that there is more. */
+        private fun clipped(text: String, limit: Int) = if (text.length <= limit) text else text.take(limit - 1) + "…"
     }
 }
 

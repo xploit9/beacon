@@ -9,7 +9,7 @@ A call talks to your own Hermes profile. The voice model answers you itself, str
 - A few tools stay out of calls, because they do not fit a call. Longer work goes to Hermes with `hermes_work`.
 - The assistant starts each call knowing every source of tools your profile has, each under its own name (a connected server, or Hermes for its own tools), so it never guesses what you have. It searches for the exact tool when it needs one, and searches before saying it cannot do something.
 - The tools are the ones Hermes gives Beacon chats (its API platform tool set). A Hermes tool you turned on for that platform reaches calls too; one it leaves out, such as computer use by default, is not in calls either.
-- Right after Hermes starts, connected servers take a moment to come up. A search answers at once with what is ready and names the servers still starting, so the assistant asks again instead of waiting.
+- A search finds every tool Hermes already knows from earlier connections at once, even right after Hermes starts, because it reads the tool lists Hermes keeps on disk (`cache/mcp_schema_cache.json`) and starts no server. A server starts only when one of its tools is used, and only that server. A server Hermes has never connected, or whose settings changed, connects in the background: a search answers at once with what is ready and names that server as still starting, so the assistant asks again instead of waiting.
   - `clarify` asks in a chat prompt. On a call the assistant asks out loud.
   - `delegate_task` starts helpers inside a running Hermes agent. `hermes_work` hands the task to a full run instead.
   - `todo_list` keeps its list inside one running agent turn, so it would be lost when the call ends.
@@ -25,6 +25,7 @@ A call talks to your own Hermes profile. The voice model answers you itself, str
 
 ## During and after a call
 
+- Calls start on the speaker unless a headset or Bluetooth is connected.
 - Replies in the chat you are calling from are not sent as notifications while the call is on; you hear and see them in the call.
 - The finished exchanges are given to your memory provider like chat turns, once per call and never twice. A reply you interrupted or that never finished is left out. No audio is kept.
 - Nothing is passed on when the call failed, when your profile has no memory provider, or when you turned off Hermes' memory tools for the API platform.

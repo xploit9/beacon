@@ -257,13 +257,13 @@ class CallAdmissionFailureTest {
         suspend fun begin(conversationId: String? = "synthetic-chat") = withContext(Dispatchers.Main.immediate) {
             // Exercise the reservation/start catch without consulting the owner's VoiceKeyStore.
             suspendCoroutineUninterceptedOrReturn<Unit> { continuation ->
-                // start(client, incoming, conversationId, voiceSettings, tappedAt, continuation)
-                val method = CallController::class.java.declaredMethods.single { it.name == "start" && it.parameterTypes.size == 6 }
+                // start(client, incoming, conversationId, voiceSettings, tappedAt, phoneOrigin, continuation)
+                val method = CallController::class.java.declaredMethods.single { it.name == "start" && it.parameterTypes.size == 7 }
                 method.isAccessible = true
                 try {
                     method.invoke(app.calls, client, null, conversationId,
                         VoiceSessionCredentials("gemini", "synthetic-unused-provider-key", "synthetic-model", "synthetic-voice", "balanced"),
-                        android.os.SystemClock.elapsedRealtime(), continuation)
+                        android.os.SystemClock.elapsedRealtime(), dev.hermes.android.phone.PhoneOrigin.LiveCall, continuation)
                 } catch (error: InvocationTargetException) { throw error.targetException }
             }
         }

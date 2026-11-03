@@ -301,9 +301,22 @@ def _tool_sources(tool_name):
             names.append(toolset.removeprefix("mcp-"))
     except (ImportError, AttributeError, KeyError):
         pass
-    # Match the existing compact catalogue's mail/Workspace labels as well as native source ids.
-    words = set(re.findall(r"[a-z0-9]+", tool_name.casefold()))
-    if words & {"mail", "email", "gmail", "gmai", "outlook", "himalaya"} or tool_name == "terminal":
+    # Match the existing compact catalogue's mail/Workspace labels as well as native source ids. The mail aliases say
+    # "this read is that mailbox under another name", so a read earns them only when the tool itself is a mail tool or
+    # a server named for a mail provider. A tool that names another source (a calendar, contacts or drive tool on the
+    # same "outlook" server) is that other source, never mail: otherwise an email-scoped Not important rule would
+    # silence that other source's alerts, so the owner is never told.
+    mail_words = {"mail", "email", "gmail", "gmai", "outlook", "himalaya"}
+    other_sources = {"calendar", "calendars", "event", "events", "invite", "invites", "contact", "contacts",
+                     "address", "addresses", "drive", "file", "files", "folder", "folders", "doc", "docs",
+                     "document", "documents", "sheet", "sheets", "slide", "slides", "task", "tasks", "todo",
+                     "todos", "reminder", "reminders", "note", "notes", "chat", "chats", "channel", "channels",
+                     "issue", "issues", "ticket", "tickets", "pull", "repo", "repos", "repository", "commit",
+                     "commits", "build", "builds", "device", "devices", "phone", "sms"}
+    server, _, tool_part = tool_name.partition("__")[2].partition("__") if tool_name.startswith("mcp__") else ("", "", "")
+    tool_words = set(re.findall(r"[a-z0-9]+", (tool_part or tool_name).casefold()))
+    if tool_name == "terminal" or (not tool_words & other_sources and (
+            tool_words & mail_words or set(re.findall(r"[a-z0-9]+", server.casefold())) & mail_words)):
         names.extend(("email", "gmail"))
     if "google_workspace" in tool_name.casefold():
         names.append("Google Workspace")

@@ -809,8 +809,10 @@ async def target(request:Request):
 @router.delete('/mobile/notifications/targets')
 async def remove_target(request:Request):
     value=await body(request,1024);owner,_,profile,_=await identity_async(request)
+    target=value.get('id',value.get('device_id'))
+    if not isinstance(target,str) or not mobile.ID.fullmatch(target): raise HTTPException(400,'Choose a registered phone')
     def revoke():
-        with mobile.LOCK,mobile.connect() as conn: conn.execute('DELETE FROM targets WHERE id=? AND owner=? AND profile=?',(value.get('id',value.get('device_id')),owner,profile))
+        with mobile.LOCK,mobile.connect() as conn: conn.execute('DELETE FROM targets WHERE id=? AND owner=? AND profile=?',(target,owner,profile))
     await asyncio.to_thread(revoke)
     return {'revoked':True}
 @router.delete('/mobile/notifications/targets/{target_id}')
@@ -932,9 +934,10 @@ async def notice_detail(event_id:str,request:Request):
         return found,notice_wire(dict(found),owner)
     row,result=await asyncio.to_thread(load)
     if row['kind']=='completion' and row['conversation']:
-        # The notification shows what the reply says; Android's lock-screen setting still hides it when locked.
+        # The notification shows what the reply says; Android's lock-screen setting still hides it when locked. The chat is read
+        # under the profile the notice was stored for (the query above already requires it to be the selected one).
         try:
-            snapshot=await feature(native.conversation_snapshot,owner,provider,profile,row['conversation'],timeout=6)
+            snapshot=await feature(native.conversation_snapshot,owner,provider,row['profile'],row['conversation'],timeout=6)
             reply=reply_preview(snapshot.get('messages') or [])
             if reply: result['preview']={'title':str(snapshot.get('title') or 'Reply ready')[:120],'body':reply}
         except Exception as exc:  # the generic text stays

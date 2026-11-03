@@ -1264,8 +1264,8 @@ class NativeExperienceUiTest {
         assertEquals((newChat.bottom - newChat.top).value, (newBot.bottom - newBot.top).value, 0.5f)
         assertEquals(newBot.top.value, newSpace.top.value, 0.5f)
         assertTrue(newSpace.bottom <= compose.onNodeWithTag("bot-row-default").getUnclippedBoundsInRoot().top)
-        for (name in navigationTiles - "Bots") compose.onAllNodesWithTag("navigation-${name.lowercase()}").assertCountEquals(0)
-        compose.onAllNodesWithTag("navigation-more").assertCountEquals(0)
+        // Bot Mode keeps the same tiles as the normal drawer; Bots shows on.
+        for (name in navigationTiles) compose.onNodeWithTag("navigation-${name.lowercase()}").assertExists()
         compose.onNodeWithTag("navigation-bots").assertIsSelected().assertHeightIsAtLeast(48.dp)
         // A suggested role opens New bot with its name and role filled in; New bot alone opens it empty.
         compose.onNodeWithTag("bot-mode-sidebar").performScrollToNode(hasTestTag("bot-mode-suggested-role:researcher"))
@@ -1282,7 +1282,7 @@ class NativeExperienceUiTest {
         compose.onNodeWithTag("new-profile-create").assertIsNotEnabled()
         compose.onNodeWithText("Cancel").performClick()
         capture("bot-mode-drawer-top")
-        // One tap on the switch leaves Bot Mode and the normal drawer is back.
+        // One tap on the Bots tile leaves Bot Mode and the normal drawer is back.
         compose.onNodeWithTag("navigation-bots").performClick()
         await { !vm.ui.value.botModeEnabled && !vm.ui.value.botModeSwitching }
         compose.onNodeWithTag("navigation-new-chat").assertIsDisplayed()
@@ -1308,12 +1308,11 @@ class NativeExperienceUiTest {
         val normalTiles = navigationTiles.associateWith { compose.onNodeWithTag("navigation-${it.lowercase()}").getUnclippedBoundsInRoot() }
         toggle()
         await { vm.ui.value.botModeEnabled && !vm.ui.value.botModeSwitching && vm.botMode.state.value.bots.size == 2 }
-        // Bot Mode has no tile grid: New bot and New space lead the drawer, and the Bot Mode switch is the one control left.
-        for (name in navigationTiles - "Bots") compose.onAllNodesWithTag("navigation-${name.lowercase()}").assertCountEquals(0)
-        compose.onAllNodesWithTag("navigation-more").assertCountEquals(0)
+        // Bot Mode keeps the tiles exactly where they were: New bot and New space take the place of New chat and New thread.
+        for ((name, before) in normalTiles) assertEquals("$name moved when Bot Mode opened", before, compose.onNodeWithTag("navigation-${name.lowercase()}").getUnclippedBoundsInRoot())
         compose.onNodeWithTag("bot-mode-sidebar-new-bot").assertIsDisplayed()
         compose.onNodeWithTag("bot-mode-sidebar-new-chat").assertIsDisplayed()
-        receipts += "Bot Mode's drawer leads with New bot and New space and shows no tile grid."
+        receipts += "Bot Mode's drawer leads with New bot and New space and keeps every tile in place."
         // The switch shows Bot Mode as selected, and no "On" text stretches it.
         compose.onNodeWithTag("navigation-bots").assertIsSelected()
         compose.onNodeWithText("On").assertDoesNotExist()

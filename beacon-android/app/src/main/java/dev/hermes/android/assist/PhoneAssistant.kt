@@ -102,7 +102,8 @@ internal fun openAssistantSettings(context: Context): Boolean {
         }
         handled()
         when (assistAction(step, target.purpose)) {
-            AssistAction.StartCall -> vm.callBeacon()
+            // A phone that locked while the app got ready asks for the unlock first; the call starts only unlocked.
+            AssistAction.StartCall -> if (dev.hermes.android.phone.deviceLockedNow(context)) AssistUnlockActivity.open(context, target) else vm.callBeacon()
             AssistAction.ShowCall -> vm.openCurrentCall()
             AssistAction.OpenAssistant -> vm.navigate("Beacon")
             AssistAction.OpenChat -> {

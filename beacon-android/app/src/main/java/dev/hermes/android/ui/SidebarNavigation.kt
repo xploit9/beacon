@@ -114,7 +114,8 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
     val botDialog = hostedDialog ?: ownDialog
     if (botMode && hostedDialog == null) BotModeDialogs(vm, ownDialog)
     Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        if (!botMode) {
+        // The drawer keeps one layout in both modes, so switching Bot Mode never moves the tiles.
+        run {
             Box(Modifier.fillMaxWidth()) {
                 var pillWidth by remember { mutableStateOf(0.dp) }
                 val density = LocalDensity.current
@@ -151,9 +152,8 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
         if (stacked) Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) { primary(Modifier.fillMaxWidth()); secondary(Modifier.fillMaxWidth()) }
         else Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { primary(Modifier.weight(1f)); secondary(Modifier.weight(1f)) }
         if (updateReady) UpdateReadyChip(onClick = vm::openAppUpdates)
-        // Bot Mode has no tile grid: the one control left is the switch that leaves it.
-        if (botMode) BotModeSwitchRow(enabled = !ui.botModeSwitching) { openTile("Bots") }
-        else BoxWithConstraints(Modifier.fillMaxWidth()) {
+        // The same tiles in both modes; in Bot Mode the Bots tile shows on, and a tap on it leaves Bot Mode.
+        BoxWithConstraints(Modifier.fillMaxWidth()) {
             val fontScale = LocalDensity.current.fontScale
             val columns = navigationColumns(maxWidth.value, fontScale)
             val overflow = navigationMore(fontScale)
@@ -185,25 +185,6 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
     val at = modifier.heightIn(min = 48.dp).testTag(tag)
     if (primary) Button(onClick = onClick, modifier = at, shape = RoundedCornerShape(14.dp), enabled = enabled, content = content)
     else FilledTonalButton(onClick = onClick, modifier = at, shape = RoundedCornerShape(14.dp), enabled = enabled, content = content)
-}
-
-/**
- * Bot Mode's one control in the drawer, in place of the tile grid: a switch that is on, and a tap turns it off. It keeps the Bots tile's
- * tag and "selected" state, so the one place that switches Bot Mode reads the same on and off.
- */
-@Composable private fun BotModeSwitchRow(enabled: Boolean, onClick: () -> Unit) {
-    val shape = RoundedCornerShape(12.dp)
-    Row(
-        Modifier.fillMaxWidth().heightIn(min = 56.dp).clip(shape).background(MaterialTheme.colorScheme.secondaryContainer)
-            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, shape)
-            .toggleable(value = true, enabled = enabled, role = Role.Switch, onValueChange = { onClick() })
-            .semantics { selected = true }.padding(horizontal = 16.dp).testTag("navigation-bots"),
-        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Icon(navigationIcon("Bots"), null, Modifier.size(20.dp))
-        Text(uiText("Bot Mode"), Modifier.weight(1f), style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        Switch(checked = true, onCheckedChange = null, enabled = enabled)
-    }
 }
 
 /** One line under the drawer's top controls: an update waits, and a tap opens App updates, where the install is one more tap. */

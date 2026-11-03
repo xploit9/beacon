@@ -428,6 +428,8 @@ class BeaconCallService : Service() {
     @Volatile private var cameraCaptureAttempted = false
     private var control: CallControlScope? = null
     private var endpoints = emptyList<CallEndpointCompat>()
+    // One call per service: the speaker is asked for once, then the owner and Android decide the route.
+    private val startingRoute = StartingRoute()
     @Volatile private var muted = false
     @Volatile private var held = false
     @Volatile private var cameraRequested = false
@@ -518,15 +520,17 @@ class BeaconCallService : Service() {
                 val attributes = CallAttributesCompat(displayName = dev.hermes.android.data.currentAssistantName, address = Uri.parse("hermes:beacon"), direction = if (pending.incoming) CallAttributesCompat.DIRECTION_INCOMING else CallAttributesCompat.DIRECTION_OUTGOING, callType = CallAttributesCompat.CALL_TYPE_AUDIO_CALL)
                 manager.addCall(attributes, onAnswer = { _ -> hold(false) }, onDisconnect = { _ -> hangup() }, onSetActive = { hold(false) }, onSetInactive = { hold(true) }) {
                     control = this
-                    launch { availableEndpoints.collect { values -> endpoints = values; app.calls.updateFrom(this@BeaconCallService) { it.copy(routes = values.map { e -> AudioRoute(e.identifier.toString(), e.name.toString()) }) } } }
-                    launch { currentCallEndpoint.collect { endpoint -> app.calls.updateFrom(this@BeaconCallService) { it.copy(route = endpoint.identifier.toString()) } } }
+                    // A failed switch leaves the call on the route it has, without a message.
+                    fun startRoute(endpoint: CallEndpointCompat?) { if (endpoint != null && !closed.get()) launch { requestEndpointChange(endpoint) } }
+                    launch { availableEndpoints.collect { values -> endpoints = values; app.calls.updateFrom(this@BeaconCallService) { it.copy(routes = values.map { e -> AudioRoute(e.identifier.toString(), e.name.toString()) }) }; startRoute(startingRoute.available(values)) } }
+                    launch { currentCallEndpoint.collect { endpoint -> startingRoute.current(endpoint); app.calls.updateFrom(this@BeaconCallService) { it.copy(route = endpoint.identifier.toString()) } } }
                     launch { isMuted.collect { value -> mute(value) } }
                     launch {
                         try {
                             if (!closed.get()) {
                                 val result = if (pending.incoming) answer(CallAttributesCompat.CALL_TYPE_AUDIO_CALL) else setActive()
                                 if (result is CallControlResult.Error) failure("Android could not activate the call: $result")
-                                else if (!closed.get() && app.calls.service === this@BeaconCallService) openTransport(pending)
+                                else if (!closed.get() && app.calls.service === this@BeaconCallService) { startRoute(startingRoute.active()); openTransport(pending) }
                             }
                             ended.await()
                         } finally {
@@ -840,7 +844,7 @@ class BeaconCallService : Service() {
         if(!intent.enabled) directVoice?.send(GeminiWire.endAudio())
         app.calls.updateFrom(this) { it.copy(muted=intent.muted,held=intent.held,userSpeaking=false) }
     }
-    fun route(id: String) { val endpoint = endpoints.find { it.identifier.toString() == id } ?: return; scope.launch { val result = control?.requestEndpointChange(endpoint); if (result is CallControlResult.Error) app.calls.updateFrom(this@BeaconCallService) { it.copy(error = "Audio route could not change: $result") } } }
+    fun route(id: String) { val endpoint = endpoints.find { it.identifier.toString() == id } ?: return; startingRoute.chosenByOwner(); scope.launch { val result = control?.requestEndpointChange(endpoint); if (result is CallControlResult.Error) app.calls.updateFrom(this@BeaconCallService) { it.copy(error = "Audio route could not change: $result") } } }
     // Services have no Compose strings: the reason comes from the same catalog, in the phone's language.
     private fun failure(message: String) { endCall(dev.hermes.android.push.serviceText(this, message), failedConnection = true) }
     fun hangup() { endCall(null) }

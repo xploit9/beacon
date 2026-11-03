@@ -34,17 +34,30 @@ MAX_RECEIPTS = 1024
 MAX_CALL_ALLOWANCES = 32
 MAX_ALLOWANCES = 1024
 DEADLINE = 90
+# A list built while some server still waits for its first live scan is rebuilt after this long.
 CATALOG_TTL = 15
 # An older list is still served at once (and refreshed behind it) for this long, so a call never waits for a scan; the cache
-# key already changes with Hermes' config, MCP config and tool registry, so an added or removed server is never missed.
+# key already changes with Hermes' config, MCP config and schema cache file, so an added or removed server is never missed.
+# A list with nothing left to scan is current for this whole time: nothing a rescan could find changes the key first.
 CATALOG_STALE_TTL = 600
 BOOT = uuid.uuid4().hex
 POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix='beacon-mcp')
 SLOTS = threading.BoundedSemaphore(4)
 CATALOG_LOCK = threading.RLock()
 CATALOG_CACHE = {}
+CATALOG_SETTLED = set()  # keys whose stored list left no MCP server to scan live
 CATALOG_WARMING = set()
 CATALOG_FIRST_WARM = {}  # profile -> this process's first warm-up, which runs MCP discovery
+# Hermes keeps each MCP server's tool list on disk (tools/mcp_schema_cache.py) and registers a server from it without starting it.
+# The call's tool list starts from that file, so it is complete the moment the dashboard starts; only a server Hermes has no usable
+# entry for is scanned live. All of it is per profile scope (the profile's own home holds the file).
+MCP_CACHE_LOCK = threading.RLock()
+MCP_CACHE_FILES = {}  # scope -> (file signature, parsed file, entry digests)
+MCP_REGISTERED = {}   # (scope, server) -> (config fingerprint, entry digest, tools registered)
+MCP_REFRESHED = set() # (scope, server, entry digest) whose out-of-date list has had its refresh started
+MCP_SCANNING = set()  # scopes with a live scan running
+# A cache file larger than this is not read: Hermes' own is a few hundred kilobytes for hundreds of tools.
+MAX_SCHEMA_CACHE_BYTES = 32 * 1024 * 1024
 NATIVE_READ_ONLY = frozenset({'read_file','search_files','web_search','skills_list','skill_view','session_search'})
 NATIVE_READ_ONLY_ACTIONS = {'cronjob_manage': frozenset({'list'}), 'process_manage': frozenset({'list'})}
 # Hermes runs these in its agent loop, where their state lives; voice_context gives a call the same state.
@@ -397,7 +410,8 @@ def native_catalog():
         # A call searches its own profile's history only, like the app's History.
         if name=='session_search' and isinstance(schema.get('properties'),dict): schema['properties'].pop('profile',None)
         read_only=_hermes_read_only(name)
-        row={'tool_id':digest(['hermes-native',registry.current_scope_key(),registry._generation,
+        # No registry generation in the id: an MCP server registering in the background must not change the id of read_file.
+        row={'tool_id':digest(['hermes-native',registry.current_scope_key(),
                                config_digest,name,toolset,schema,read_only]),
              'name':name,'description':plain_line(function.get('description',''),1200),
              'parameters':schema,'read_only':read_only,'_kind':'hermes','_raw':name,
@@ -414,7 +428,7 @@ def native_catalog():
             name=provided['name']
             if name in taken: continue
             parameters=json.loads(encoded(provided.get('parameters') or {'type':'object','properties':{}}))
-            output.append({'tool_id':digest(['hermes-memory-provider',registry.current_scope_key(),registry._generation,
+            output.append({'tool_id':digest(['hermes-memory-provider',registry.current_scope_key(),
                                              config_digest,name,parameters]),
                            'name':name,'description':plain_line(provided.get('description',''),1200),
                            'parameters':parameters,'read_only':False,'_kind':'hermes','_raw':name,
@@ -488,16 +502,82 @@ def fitted_sources(rows, budget, clean=safe):
     for per_group in (6,4,3,2,1,0):
         text='\n'.join(source_lines(rows,per_group,clean))
         if len(text.encode('utf-8'))<=budget: return text
-    kept=[];size=0
-    for line in source_lines(rows,0,clean):
-        count=len(line.encode('utf-8'))+1
-        if size+count>budget: break
-        kept.append(line);size+=count
-    return '\n'.join(kept)
+    # Still too long: every source keeps a line. The shortest take what they need and the rest share what is left, each cut
+    # at a word, so one server with a huge name list can never hide the sources after it.
+    lines=source_lines(rows,0,clean)
+    out=[None]*len(lines);room=budget;left=len(lines)
+    for index in sorted(range(len(lines)),key=lambda i:len(lines[i].encode('utf-8'))):
+        out[index]=clipped_line(lines[index],max(room//left-1,0))
+        room-=len(out[index].encode('utf-8'))+1;left-=1
+    return '\n'.join(line for line in out if line)
+
+
+def clipped_line(line, limit):
+    """[line] within [limit] UTF-8 bytes, cut after the last whole word and marked with an ellipsis when it was cut."""
+    if len(line.encode('utf-8'))<=limit: return line
+    cut=line.encode('utf-8')[:max(limit-4,0)].decode('utf-8',errors='ignore')
+    cut=cut[:cut.rfind(' ')] if ' ' in cut else cut
+    return (cut.rstrip(' ,;:')+' …') if cut else ''
+
+
+def seconds(value, default):
+    """A configured number of seconds; anything that is not a positive finite number is the default."""
+    try: number=float(value)
+    except (TypeError, ValueError): return float(default)
+    return number if 0<number<float('inf') else float(default)
+
+
+def hermes_schema_cache():
+    """Hermes' own persisted MCP tool lists and its lazy registration from them, as (cache path, config fingerprint, forget, register)
+    functions; None when this Hermes lacks any of them, and the tool list then comes from live discovery alone, as it always did.
+    These are private Hermes names: compat.py and the contract test read them from Hermes' source so a release that moves one is named."""
+    try:
+        from tools.mcp_schema_cache import _cache_path, config_fingerprint
+        from tools.mcp_tool_discovery import _forget_lazy_server
+        from tools.mcp_tool_registration import _register_from_cache_sync
+    except Exception:
+        return None
+    return _cache_path,config_fingerprint,_forget_lazy_server,_register_from_cache_sync
+
+
+def schema_file_signature():
+    """The schema cache file's modification time and size, or None when there is no file yet."""
+    parts=hermes_schema_cache()
+    if parts is None: return None
+    try: info=parts[0]().stat()
+    except Exception: return None
+    return (info.st_mtime_ns,info.st_size)
+
+
+def schema_file(scope, path):
+    """The parsed schema cache file and a dict for its entries' digests, read again only when the file's signature changed. A missing,
+    oversized or unreadable file is an empty cache: every server is then scanned live."""
+    try: info=path.stat()
+    except Exception: signature=None
+    else: signature=(info.st_mtime_ns,info.st_size)
+    held=MCP_CACHE_FILES.get(scope)
+    if held is not None and held[0]==signature: return held[1],held[2]
+    data={}
+    if signature is not None and signature[1]<=MAX_SCHEMA_CACHE_BYTES:
+        try:
+            parsed=json.loads(path.read_text(encoding='utf-8-sig'))
+            if isinstance(parsed,dict): data=parsed
+        except (OSError,ValueError):
+            data={}
+    MCP_CACHE_FILES[scope]=(signature,data,{})
+    return data,MCP_CACHE_FILES[scope][2]
+
+
+def schema_entry_expired(entry):
+    """Whether a cache entry is past the ttl its server gave with the list (Hermes itself then reconnects instead of using it)."""
+    ttl,written=entry.get('ttl_ms'),entry.get('written_at')
+    return (type(ttl) in (int,float) and type(written) in (int,float)) and (time.time()-written)*1000.0>=float(ttl)
 
 
 class NativeMcp:
     """Direct MCP and Hermes registry tool catalog and dispatch for the active profile."""
+    _seen = threading.local()  # what this thread's last catalog() found, read once by settled()
+
     def scoped_metadata(self, profile, fn):
         from tui_gateway import server
         root=server._profile_home(profile)
@@ -540,12 +620,16 @@ class NativeMcp:
         return None
 
     def cache_key(self):
+        """What the tool list depends on: this profile, its config and MCP config, and Hermes' schema cache file (Hermes rewrites it
+        itself when a server connects or its tools change, so its modification time is the only signal needed). Without a usable
+        schema cache the list follows the tool registry instead, as it always did."""
         try:
             from hermes_cli.config import load_config_readonly
             from tools.mcp_tool_config import _load_mcp_config
             from tools.registry import registry
-            return (registry.current_scope_key(),registry._generation,
-                    digest(load_config_readonly()),digest(_load_mcp_config()))
+            usable=hermes_schema_cache() is not None
+            return (registry.current_scope_key(),digest(load_config_readonly()),digest(_load_mcp_config()),
+                    schema_file_signature() if usable else ('registry',registry._generation))
         except Exception:
             return None
 
@@ -554,6 +638,96 @@ class NativeMcp:
         from tools.mcp_tool_config import _load_mcp_config
         from tools.mcp_tool_common import mcp_server_enabled
         return sorted(str(name) for name,cfg in (_load_mcp_config() or {}).items() if isinstance(cfg,dict) and mcp_server_enabled(cfg))
+
+    def _register(self, config=None):
+        """Registers every enabled MCP server that Hermes' schema cache describes, as its config now is, through Hermes' own lazy path:
+        its tools are listed at once and no process starts until one of them is used. Returns (servers that need a live scan, servers
+        whose cached list is out of date and should be refreshed), or None when this Hermes has no usable schema cache. Cheap when
+        nothing changed: one stat of the cache file, then a look at each server. [config] is the MCP config the caller already loaded."""
+        parts=hermes_schema_cache()
+        if parts is None: return None
+        cache_path,fingerprint_of,forget,register=parts
+        try:
+            from tools import mcp_tool as core
+            from tools.mcp_tool_config import _load_mcp_config
+            from tools.mcp_tool_common import mcp_server_enabled
+            from tools.mcp_tool_scope import _resolve_server_key
+            from tools.registry import registry
+            scope=registry.current_scope_key()
+            servers={str(name):cfg for name,cfg in ((_load_mcp_config() if config is None else config) or {}).items()
+                     if isinstance(cfg,dict) and mcp_server_enabled(cfg)}
+            path=cache_path()
+        except Exception:
+            return None
+        pending=[];stale=[];toolsets=None
+        with MCP_CACHE_LOCK:
+            data,digests=schema_file(scope,path)
+            for name,cfg in servers.items():
+                try:
+                    key=_resolve_server_key(name)
+                    with core._lock:
+                        live=key in core._servers
+                        lazy=core._lazy_server_configs.get(key)
+                    if live: continue  # connected in this process: its tools are the live ones
+                    entry=data.get(name)
+                    fingerprint=fingerprint_of(cfg)
+                    # An entry written for another config is not this server's list: it is scanned live, never served from it.
+                    if not (isinstance(entry,dict) and entry.get('fingerprint')==fingerprint and isinstance(entry.get('tools'),list)):
+                        if lazy is not None: forget(key)
+                        MCP_REGISTERED.pop((scope,name),None)
+                        pending.append(name);continue
+                    if name not in digests: digests[name]=digest(entry)
+                    held=MCP_REGISTERED.get((scope,name))
+                    if held is not None and held[2] and toolsets is None: toolsets={item.toolset for item in registry.get_all_entries()}
+                    # Registered as this entry and config say, and its tools are still in the registry (a scoped discovery can drop them).
+                    here=held is not None and held[:2]==(fingerprint,digests[name]) and (
+                        held[2]==0 or lazy==cfg and f'mcp-{name}' in toolsets)
+                    if not here:
+                        # A changed entry replaces what was registered, tools it no longer lists included.
+                        if lazy is not None: forget(key)
+                        registered=register(name,cfg,entry)
+                        MCP_REGISTERED[(scope,name)]=(fingerprint,digests[name],len(registered))
+                    if schema_entry_expired(entry) and (scope,name,digests[name]) not in MCP_REFRESHED:
+                        stale.append((name,digests[name]))
+                except Exception:
+                    logger.warning('An MCP server could not be listed from Hermes\' schema cache; it is scanned live: %r',name[:80])
+                    MCP_REGISTERED.pop((scope,name),None)
+                    pending.append(name)
+        # An out-of-date list keeps serving; its server is connected once, off this path, so Hermes rewrites the entry.
+        if stale: self._refresh(stale)
+        return pending,stale
+
+    def pending_servers(self):
+        """The enabled MCP servers that still need a live scan (no usable cache entry); None when Hermes has no usable schema cache."""
+        state=self._register()
+        return None if state is None else list(state[0])
+
+    def settled(self):
+        """Whether the list this thread's last catalog() built was complete without any live scan left to do: Hermes' cache covered every
+        enabled MCP server. Read once, and only ever from that call, so a list built any other way is never called settled."""
+        found=getattr(self._seen,'settled',False)
+        self._seen.settled=False
+        return found
+
+    def _refresh(self, stale):
+        """Connects each server whose cached list is out of date, one at a time and off the call path: Hermes rewrites its entry
+        when the server answers. The cached list keeps serving until then."""
+        try:
+            from tools.mcp_tool_discovery import _ensure_lazy_server_connected
+            from tools.registry import registry
+            scope=registry.current_scope_key()
+        except Exception:
+            return
+        with MCP_CACHE_LOCK:
+            names=[name for name,entry_digest in stale if (scope,name,entry_digest) not in MCP_REFRESHED]
+            MCP_REFRESHED.update((scope,name,entry_digest) for name,entry_digest in stale)
+        if not names: return
+        def run():
+            for name in names:
+                try: _ensure_lazy_server_connected(name)
+                except Exception: logger.warning('An out-of-date MCP tool list could not be refreshed: %r',name[:80])
+        try: threading.Thread(target=contextvars.copy_context().run,args=(run,),name='beacon-mcp-refresh',daemon=True).start()
+        except Exception: pass
 
     def catalog(self, discover=True):
         from tools import mcp_tool as core
@@ -565,38 +739,60 @@ class NativeMcp:
         from tools.mcp_tool_handlers import _tool_is_read_only
         from tools.registry import registry
         # Native discovery loads only operator config; the caller supplies no connection address.
-        if discover: discover_mcp_tools()
         config = _load_mcp_config()
+        # The cached lists come first, with or without discovery: they cost one stat and start nothing.
+        state=self._register(config)
+        if discover:
+            if state is None: discover_mcp_tools()
+            else:
+                pending=state[0]
+                scope=registry.current_scope_key()
+                with MCP_CACHE_LOCK:
+                    scanning=scope in MCP_SCANNING
+                    if pending and not scanning: MCP_SCANNING.add(scope)
+                if pending and not scanning:
+                    # Only the servers Hermes has no list for; a server registered from its cache is skipped by discovery itself.
+                    try: discover_mcp_tools(allowed_mcp_names=pending)
+                    finally:
+                        with MCP_CACHE_LOCK: MCP_SCANNING.discard(scope)
+                    state=self._register(config)
+        self._seen.settled=state is not None and not state[0]
         output = []
-        for entry in registry.get_all_entries():
-            if not entry.toolset.startswith('mcp-'):
-                continue
+        served = {}  # server -> (its tool filter, whether it is not connected yet), or None when this process does not serve it as configured
+        def mcp_row(entry):
+            if not str(getattr(entry, 'toolset', '') or '').startswith('mcp-'):
+                return None
             closure = inspect.getclosurevars(entry.handler).nonlocals
             server, raw = closure.get('server_name'), closure.get('tool_name')
             cfg = config.get(server)
-            if not server or not raw or not cfg or not mcp_server_enabled(cfg):
-                continue  # generated resources/prompts are not native tools/call handles
-            if not _make_tool_filter(server, cfg)(raw):
-                continue
-            key = _resolve_server_key(server)
-            live = core._servers.get(key)
-            cached = core._lazy_server_configs.get(key)
-            if live is not None:
-                if not _same_server_route(live, cfg, cross_profile=False): continue
-            elif cached != cfg:
-                continue
-            try: schema = json.loads(encoded(plain_schema(entry.schema.get('parameters', {}))))
-            except (TypeError, ValueError):
+            if not isinstance(server, str) or not isinstance(raw, str) or not server or not raw or not cfg:
+                return None  # generated resources/prompts are not native tools/call handles
+            if server not in served:
+                served[server] = None
+                if mcp_server_enabled(cfg):
+                    key = _resolve_server_key(server)
+                    live = core._servers.get(key)
+                    cached = core._lazy_server_configs.get(key)
+                    if (_same_server_route(live, cfg, cross_profile=False) if live is not None else cached == cfg):
+                        served[server] = (_make_tool_filter(server, cfg), live is None)
+            if served[server] is None or not served[server][0](raw):
+                return None
+            try:
+                parameters = entry.schema.get('parameters', {}) if isinstance(entry.schema, dict) else None
+                if not isinstance(parameters, dict): raise TypeError('The tool schema is not an object')
+                schema = json.loads(encoded(plain_schema(parameters)))
+                if not isinstance(schema, dict): raise TypeError('The tool schema is not an object')
+            except (TypeError, ValueError, AttributeError):
                 # A schema that cannot be held (a NaN, a loop) leaves only its own tool out; the rest of the catalogue stays.
                 logger.warning('A tool schema could not be read; the tool is left out: %r', str(entry.name)[:80])
-                continue
+                return None
             generic_http=raw.replace('-', '_').endswith('make_request')
             properties=schema.get('properties',{})
             method=properties.get('method') if isinstance(properties,dict) else None
             method_read_only=bool(readonly_methods(schema))
             if generic_http:
                 # Native recovery trusts the provider's erroneous read-only hint; prohibit writes.
-                if not isinstance(method,dict): continue
+                if not isinstance(method,dict): return None
                 method['enum']=['GET']
                 method['default']='GET'
                 method_read_only=True
@@ -605,14 +801,25 @@ class NativeMcp:
             trust=_normalize_server_trust(cfg.get('trust'))
             readonly = (_tool_is_read_only(server, raw) and mcp_reads_by_name(raw, trust) and not generic_http
                         and not (has_method and not method_read_only))
-            tool_timeout=float(closure.get('tool_timeout') or 60)
+            tool_timeout=seconds(closure.get('tool_timeout'),60)
             version = digest([registry.current_scope_key(), server, raw, cfg, schema, readonly])
-            output.append({'tool_id':version, 'name':entry.name,
-                           'description':plain_line(entry.schema.get('description', ''), 1200),
-                           'parameters':schema, 'read_only':readonly,
-                           '_timeout':tool_timeout,
-                           '_server':server, '_raw':raw,
-                           '_trust':trust})
+            row={'tool_id':version, 'name':entry.name,
+                 'description':plain_line(entry.schema.get('description', '') if isinstance(entry.schema.get('description', ''), str) else '', 1200),
+                 'parameters':schema, 'read_only':readonly,
+                 '_timeout':tool_timeout,
+                 '_server':server, '_raw':raw,
+                 '_trust':trust}
+            # A server Hermes has not started yet connects inside the first call to one of its tools, within that call's deadline.
+            if served[server][1]: row['_connect_timeout']=seconds(cfg.get('connect_timeout'),getattr(core,'_DEFAULT_CONNECT_TIMEOUT',60))
+            return row
+        for entry in registry.get_all_entries():
+            # Every field of a tool is its server's own: one with a name, schema or timeout of an unexpected type leaves only
+            # itself out, never the profile's whole list.
+            try: row = mcp_row(entry)
+            except Exception:
+                logger.warning('A tool could not be read; the tool is left out: %r', str(getattr(entry, 'name', ''))[:80])
+                continue
+            if row is not None: output.append(row)
         output.extend(native_catalog())
         return output
 
@@ -720,20 +927,27 @@ class Gateway:
         except Exception: return None
         return (profile,value) if value is not None else None
 
+    @staticmethod
+    def _fresh_for(key):
+        """How long a stored list is current without a rescan. A list with nothing left to scan lasts: its key already follows the
+        config, the MCP config and Hermes' schema cache file, so there is nothing a periodic rescan would find."""
+        return CATALOG_STALE_TTL if key in CATALOG_SETTLED else CATALOG_TTL
+
     def _cached_catalog(self, profile):
         key=self._catalog_key(profile)
         if key is None: return None
         now=time.monotonic()
         with CATALOG_LOCK:
             cached=CATALOG_CACHE.get(key)
-            if cached and now-cached[0]<CATALOG_TTL: return cached[1]
+            if cached and now-cached[0]<self._fresh_for(key): return cached[1]
             if not cached or now-cached[0]>=CATALOG_STALE_TTL:
                 CATALOG_CACHE.pop(key,None)
+                CATALOG_SETTLED.discard(key)
                 return None
         self.warm_catalogue(profile)
         return cached[1]
 
-    def _store_catalog(self, profile, rows):
+    def _store_catalog(self, profile, rows, settled=False):
         key=self._catalog_key(profile)
         if key is None: return
         now=time.monotonic()
@@ -743,6 +957,18 @@ class Gateway:
             if key not in CATALOG_CACHE and len(CATALOG_CACHE)>=16:
                 CATALOG_CACHE.pop(next(iter(CATALOG_CACHE)))
             CATALOG_CACHE[key]=(now,rows)
+            if settled: CATALOG_SETTLED.add(key)
+            else: CATALOG_SETTLED.discard(key)
+            CATALOG_SETTLED.intersection_update(CATALOG_CACHE)
+
+    def _build(self, profile, discover=True):
+        """The profile's tool list (with a live scan of the servers Hermes has no list for when [discover]) and whether nothing is left to scan."""
+        def run(_):
+            rows=self.backend.catalog() if discover else self.backend.catalog(discover=False)
+            settled=getattr(self.backend,'settled',None)
+            return rows,bool(settled()) if callable(settled) else False
+        rows,settled=self.scoped(profile,run)
+        return self._call_tools(rows),settled
 
     @staticmethod
     def _call_tools(rows):
@@ -753,9 +979,9 @@ class Gateway:
     def catalog(self, profile, discover=True):
         cached=self._cached_catalog(profile)
         if cached is not None: return self._call_tools(cached)
-        rows=self.scoped(profile,lambda _:self.backend.catalog() if discover else self.backend.catalog(discover=False))
-        rows=self._call_tools(rows)
-        if discover: self._store_catalog(profile,rows)
+        rows,settled=self._build(profile,discover)
+        # A list that is complete without any scan is as good as a scanned one, so the next look finds it stored.
+        if discover or settled: self._store_catalog(profile,rows,settled)
         return rows
 
     def warm_catalogue(self, profile):
@@ -764,14 +990,14 @@ class Gateway:
         now=time.monotonic()
         with CATALOG_LOCK:
             cached=CATALOG_CACHE.get(key)
-            if cached and now-cached[0]<CATALOG_TTL: return False
+            if cached and now-cached[0]<self._fresh_for(key): return False
             # A stale list stays served until the refresh replaces it.
-            if not cached or now-cached[0]>=CATALOG_STALE_TTL: CATALOG_CACHE.pop(key,None)
+            if not cached or now-cached[0]>=CATALOG_STALE_TTL: CATALOG_CACHE.pop(key,None);CATALOG_SETTLED.discard(key)
             if key in CATALOG_WARMING: return False
             CATALOG_WARMING.add(key)
 
         def refresh():
-            try: self._store_catalog(profile,self._call_tools(self.scoped(profile,lambda _:self.backend.catalog())))
+            try: self._store_catalog(profile,*self._build(profile))
             except Exception: pass
             finally:
                 with CATALOG_LOCK: CATALOG_WARMING.discard(key)
@@ -792,13 +1018,13 @@ class Gateway:
         now=time.monotonic()
         with CATALOG_LOCK:
             cached=CATALOG_CACHE.get(key)
-            mine=not (cached and now-cached[0]<CATALOG_TTL) and key not in CATALOG_WARMING
+            mine=not (cached and now-cached[0]<self._fresh_for(key)) and key not in CATALOG_WARMING
             if mine:
                 CATALOG_WARMING.add(key)
                 # discover() waits for the first scan of this process; this thread is that scan when it runs first.
                 CATALOG_FIRST_WARM.setdefault(profile,threading.current_thread())
         if mine:
-            try: self._store_catalog(profile,self._call_tools(self.scoped(profile,lambda _:self.backend.catalog())))
+            try: self._store_catalog(profile,*self._build(profile))
             finally:
                 with CATALOG_LOCK: CATALOG_WARMING.discard(key)
         return self.compact_catalogue(profile)
@@ -810,25 +1036,41 @@ class Gateway:
 
     def _starting(self, profile, rows):
         """MCP servers in this profile's config that have no tools yet while this process is still scanning: they are starting
-        up, not missing. Empty when nothing is scanning, so a server that failed to start is never reported as on its way."""
+        up, not missing. Only a server Hermes has no cached list for scans live, so only such a server is named. Empty when nothing
+        is scanning, so a server that failed to start is never reported as on its way."""
         names=getattr(self.backend,'configured_servers',None)
-        if not callable(names): return []
+        pending=getattr(self.backend,'pending_servers',None)
+        if not callable(names) and not callable(pending): return []
         first=CATALOG_FIRST_WARM.get(profile)
         with CATALOG_LOCK: scanning=any(isinstance(key,tuple) and key[:1]==(profile,) for key in CATALOG_WARMING)
         if not (scanning or (first is not None and first.is_alive())): return []
-        try: configured=self.scoped(profile,lambda _:names())
+        def listed(_):
+            scan=pending() if callable(pending) else None
+            return scan if scan is not None else names() if callable(names) else []
+        try: configured=self.scoped(profile,listed)
         except Exception: return []
         present={str(tool.get('_server')) for tool in rows if isinstance(tool,dict) and tool.get('_server')}
         labels=[source_label(name,self.sanitize) for name in configured if str(name) not in present]
         return [label for label in (self.sanitize(label,80) for label in labels) if label]
 
+    def _pending(self, profile):
+        """The MCP servers that still need their first live scan (an empty list when the cache covers every one), or None when the
+        backend cannot tell, which waits for the first scan as it always did."""
+        pending=getattr(self.backend,'pending_servers',None)
+        if not callable(pending): return None
+        try: return self.scoped(profile,lambda _:pending())
+        except Exception: return None
+
     def discover(self, profile, query=''):
         if not isinstance(query, str) or len(query)>240: raise HTTPException(400, 'Invalid tool query')
-        self.warm_catalogue(profile)
-        # Right after a restart MCP servers are still starting. Wait briefly for a quick scan, then answer with what is ready;
-        # servers still starting are named in the answer, so the call asks again instead of waiting out its deadline.
-        first=CATALOG_FIRST_WARM.get(profile)
-        if first is not None and first is not threading.current_thread(): first.join(FIRST_SCAN_WAIT)
+        # Hermes' schema cache lists every server it has connected before, so that list is complete without any scan (asking registers it).
+        # Only a server with no cached list is scanned live: wait briefly for a quick scan, then answer with what is ready; servers
+        # still starting are named in the answer, so the call asks again instead of waiting out its deadline.
+        pending=self._pending(profile)
+        if pending!=[]:
+            self.warm_catalogue(profile)
+            first=CATALOG_FIRST_WARM.get(profile)
+            if first is not None and first is not threading.current_thread(): first.join(FIRST_SCAN_WAIT)
         words = set(re.findall(r'[^\W_]+', query.casefold())) - QUERY_FILLER
         words = {word for word in words if not word.isdecimal()}
         rows = self.catalog(profile,discover=False)
@@ -932,7 +1174,7 @@ class Gateway:
                 '_arguments':arguments,'_read_only':read_only,'_session_id':session_id,
                 '_expires':time.time()+120}
         if '_timeout' in tool:
-            result['_deadline_seconds']=max(DEADLINE,float(tool['_timeout'])+30)
+            result['_deadline_seconds']=max(DEADLINE,float(tool['_timeout'])+float(tool.get('_connect_timeout') or 0)+30)
         if needs_approval:
             serialized=encoded(arguments)
             try:
