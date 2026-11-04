@@ -534,6 +534,12 @@ def _stored_watch_sources(mobile, owner, profile):
             and isinstance(row.get("native"), list) and isinstance(row.get("servers"), list)] if isinstance(rows, list) else []
 
 
+def watch_servers(mobile, owner, profile):
+    """The MCP servers the owner chose for the watch, or None when none is chosen and the watch reads every source."""
+    chosen = _stored_watch_sources(mobile, owner, profile)
+    return None if not chosen else {str(server) for row in chosen for server in row["servers"]}
+
+
 def watch_toolsets(mobile, owner, profile):
     """The toolsets the watch job is limited to, or None when the owner chose no sources and the watch reads every one."""
     chosen = _stored_watch_sources(mobile, owner, profile)

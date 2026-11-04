@@ -1,10 +1,13 @@
 """Authenticated call-bound direct Hermes and MCP endpoints."""
 import asyncio
 import importlib.util
+import logging
 from pathlib import Path
 import sys
 import threading
 from fastapi import APIRouter, HTTPException, Request
+
+logger=logging.getLogger(__name__)
 
 key='beacon_gateway_tools'
 if key not in sys.modules:
@@ -30,13 +33,17 @@ def build_router(call, body, scoped, mobile, refuse_while_updating=_never_updati
     async def bounded(fn,*args):
         # Disconnects must not cancel a mutation receipt or replay its execution.
         if not admissions.acquire(blocking=False): raise HTTPException(429,'Tool request capacity reached')
+        worker=None
         def run():
+            nonlocal worker
+            worker=threading.current_thread()
             try: return fn(*args)
             finally: admissions.release()
         task=asyncio.create_task(asyncio.to_thread(run))
         task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
         try: return await asyncio.wait_for(asyncio.shield(task),15)
         except asyncio.TimeoutError:
+            logger.warning('Beacon call %s timed out; worker_stack=%s',fn.__name__,sys.modules[key].worker_stack(worker))
             raise HTTPException(504,'Tool lookup still settling; inspect the same request identity') from None
 
     @router.get('/mobile/calls/{call_id}/tools')

@@ -194,3 +194,80 @@ def test_a_native_tool_named_after_health_never_reads_in_a_watch(watch_guard, mo
         assert plugin.native_proactive_read_only_guard(tool_name=name, args={}, session_id="watch-run") == blocked, name
     # Control: the native branch is live, so the blocks above come from the name rule.
     assert plugin.native_proactive_read_only_guard(tool_name="skill_view", args={}, session_id="watch-run") is None
+
+
+# Owner, 4 Nov 2026 ("Read tools of my sources"): the watch was refused list_resources on every server, its Jira and Notion
+# searches, the list of connected apps and memory recall.
+def test_a_picked_trusted_servers_unannotated_read_runs_in_a_watch(watch_guard, monkeypatch):
+    plugin, _ = watch_guard
+    blocked = {"action": "block", "message": plugin._READ_ONLY_MESSAGE}
+    _serve({"list_issues": None, "delete_issue": None, "list_builds": False})
+    monkeypatch.setattr(plugin.proactive, "watch_servers", lambda *args: None)  # nothing picked: every source
+    assert _guard(plugin, "list_issues") is None
+    assert _guard(plugin, "delete_issue") == blocked
+    assert _guard(plugin, "list_builds") == blocked  # the server itself says it is not read-only
+    assert _guard(plugin, "list_issues", {"url": "https://example.com/x"}) == blocked
+    monkeypatch.setattr(plugin.proactive, "watch_servers", lambda *args: {"other"})
+    assert _guard(plugin, "list_issues") == blocked  # a server the owner did not pick
+    monkeypatch.setattr(plugin.proactive, "watch_servers", lambda *args: {"api"})
+    assert _guard(plugin, "list_issues") is None
+    _mcp_trust(monkeypatch, api="untrusted")
+    assert _guard(plugin, "list_issues") == blocked  # an untrusted server's names may lie
+
+
+def test_hermes_read_utilities_run_in_a_watch_on_a_picked_server(watch_guard, monkeypatch):
+    plugin, _ = watch_guard
+    blocked = {"action": "block", "message": plugin._READ_ONLY_MESSAGE}
+    sys.modules["tools.mcp_tool"]._mcp_tool_server_names.update(
+        {"mcp__api__" + name: "api" for name in ("list_resources", "list_prompts", "subscribe_event", "get_prompt")})
+    monkeypatch.setattr(plugin.proactive, "watch_servers", lambda *args: None)
+    assert _guard(plugin, "list_resources") is None and _guard(plugin, "list_prompts") is None
+    assert _guard(plugin, "subscribe_event", {"name": "new_mail"}) == blocked
+    assert _guard(plugin, "get_prompt", {"name": "summary"}) == blocked
+    _mcp_trust(monkeypatch, api="untrusted")
+    assert _guard(plugin, "list_resources") is None  # Hermes names its utilities itself
+    monkeypatch.setattr(plugin.proactive, "watch_servers", lambda *args: {"other"})
+    assert _guard(plugin, "list_resources") == blocked
+
+
+def test_a_connector_batch_passes_to_its_own_calls_and_nothing_else_does(watch_guard, monkeypatch):
+    plugin, _ = watch_guard
+    blocked = {"action": "block", "message": plugin._READ_ONLY_MESSAGE}
+
+    def entries(args):
+        calls = args.get("calls")
+        return (calls, None) if isinstance(calls, list) and calls else ([], "tool_call needs calls")
+
+    monkeypatch.setitem(sys.modules, "tools.tool_search", SimpleNamespace(
+        normalize_tool_call_entries=entries, is_connector_name=lambda name: isinstance(name, str) and name.startswith("connectors__")))
+    # Hermes keeps connector calls out of its registry.
+    monkeypatch.setitem(sys.modules, "tools.registry", SimpleNamespace(registry=SimpleNamespace(
+        get_toolset_for_tool=lambda name: None if name.startswith("connectors__") else "mcp-api", get_schema=lambda name: None)))
+
+    def guard(name, args):
+        return plugin.native_proactive_read_only_guard(tool_name=name, args=args, session_id="watch-run")
+
+    jira = {"name": "connectors__jira__SEARCH_ISSUES", "arguments": {"jql": "assignee = currentUser()"}}
+    notion = {"name": "connectors__notion__SEARCH_NOTION_PAGE", "arguments": {"query": "plan"}}
+    assert guard("tool_call", {"calls": [jira, notion]}) is None
+    # Hermes then puts each call through the guard by its own name.
+    assert guard(jira["name"], jira["arguments"]) is None and guard(notion["name"], notion["arguments"]) is None
+    assert guard("connectors__gmail__GMAIL_SEND_EMAIL", {"body": "hi"}) == blocked
+    assert guard("tool_call", {"calls": [jira, {"name": "write_file", "arguments": {}}]}) == blocked
+    assert guard("tool_call", {"name": "write_file"}) == blocked
+    assert guard("tool_call", {"calls": [{"name": "connectors__web__FETCH", "arguments": {"url": "https://example.com"}}]}) == blocked
+    # A Hermes without connectors cannot read the batch, so it stays blocked.
+    monkeypatch.setitem(sys.modules, "tools.tool_search", None)
+    assert guard("tool_call", {"calls": [jira]}) == blocked
+
+
+def test_listing_connected_apps_reads_and_changing_them_does_not(watch_guard):
+    plugin, _ = watch_guard
+    blocked = {"action": "block", "message": plugin._READ_ONLY_MESSAGE}
+
+    def guard(args):
+        return plugin.native_proactive_read_only_guard(tool_name="manage_connections", args=args, session_id="watch-run")
+
+    assert guard({}) is None and guard({"action": " Status "}) is None
+    for action in ("connect", "reconnect", "rename", "display", "install", "enable", "authorize"):
+        assert guard({"action": action, "connectors": ["gmail"]}) == blocked, action

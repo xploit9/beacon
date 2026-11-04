@@ -24,7 +24,8 @@ class VoiceLookupLiveTest {
         "ordinary" to "Without using any tools, what is two plus three?",
         "tools" to "Please use your normal skill tools to name just one available skill without changing anything.",
         "memory" to "Please use your normal memory tools to recall my preferred name without saving or changing anything.",
-        "callback" to "Please call me back in one hour about the garden plan.")
+        "callback" to "Please call me back in one hour about the garden plan.",
+        "discover" to "Please use discover tools to find a tool that can read a file, and tell me its name.")
     /** One phrase as PCM16 at [rate], spoken by Gemini's speech model with the key saved on this test phone. */
     private suspend fun spoken(phrase:String,rate:Int):ByteArray {
         val app=ApplicationProvider.getApplicationContext<BeaconApplication>()
@@ -51,6 +52,8 @@ class VoiceLookupLiveTest {
     @Test(timeout=360_000) fun geminiAnswersDirectlyAndUsesHermesTools() = exercise("gemini")
     /** Owner, 4 Nov 2026: a callback can be asked for any time, with no Hermes work behind it. */
     @Test(timeout=360_000) fun geminiSchedulesACallbackWhenAsked() = exercise("gemini", listOf("callback"))
+    /** Owner, 4 Nov 2026: "now she cannot see the tools" - the call finds Hermes' tools by searching for them. */
+    @Test(timeout=360_000) fun geminiFindsHermesToolsBySearching() = exercise("gemini", listOf("discover"))
 
     private fun exercise(provider:String,kinds:List<String> = listOf("ordinary","tools","memory"))=runBlocking<Unit> {
         val args=InstrumentationRegistry.getArguments()
@@ -171,7 +174,7 @@ class VoiceLookupLiveTest {
                 }
             }
             for((kind,purpose) in listOf("ordinary" to "brief arithmetic question","tools" to "read-only skill listing","memory" to "read-only preferred-name recall",
-                    "callback" to "a callback in an hour").filter { it.first in kinds }) {
+                    "callback" to "a callback in an hour","discover" to "a tool search").filter { it.first in kinds }) {
                 phases.put("phase",kind+"_input").put(kind+"_fixture_purpose",purpose)
                 val prior=jobs().map { it.getString("job_id") }.toSet()
                 val priorReceipts=app.calls.state.value.toolReceipts.map { it.requestId }.toSet()
@@ -202,6 +205,7 @@ class VoiceLookupLiveTest {
                     "ordinary" -> listOf(Regex("(?i)\\b(?:two|2)\\b"),Regex("(?i)\\b(?:three|3)\\b"))
                     "tools" -> listOf(Regex("(?i)\\bskills?\\b"))
                     "callback" -> listOf(Regex("(?i)\\bcall\\b"),Regex("(?i)\\bhour\\b"))
+                    "discover" -> listOf(Regex("(?i)\\btools?\\b"),Regex("(?i)\\bfile\\b"))
                     else -> listOf(Regex("(?i)\\b(?:memory|remember)\\b"),Regex("(?i)\\bname\\b"))
                 }
                 assertTrue("Speech keeps the fixture purpose",cues.all { it.containsMatchIn(accepted!!.text) })
@@ -215,6 +219,12 @@ class VoiceLookupLiveTest {
                     val name=context.optString("owner_first_name")
                     val reply=app.calls.state.value.transcripts.filter { it.role=="assistant"&&it.final&&it.eventId !in priorAssistant }.joinToString(" ") { it.text }
                     assertTrue("The preferred name is recalled from the brief or a Hermes tool",(name.isNotBlank()&&reply.contains(name,true))||started.isNotEmpty()||tools.isNotEmpty())
+                }
+                else if(kind=="discover") {
+                    // The search is the call's own lookup, so its receipt is in the call's state, not in Hermes' tool runs.
+                    withTimeoutOrNull(30_000) { await { app.calls.state.value.toolReceipts.any { it.toolName=="discover_tools"&&it.status=="completed" } } }
+                    phases.put("discover_receipts",app.calls.state.value.toolReceipts.filter { it.toolName=="discover_tools" }.joinToString { it.status })
+                    assertTrue("The tool search completes",app.calls.state.value.toolReceipts.any { it.toolName=="discover_tools"&&it.status=="completed" })
                 }
                 else if(kind=="callback") {
                     withTimeoutOrNull(30_000) { await { (callbackSchedules()-priorCallbacks).isNotEmpty() } }
@@ -262,7 +272,7 @@ class VoiceLookupLiveTest {
                 val events=DirectVoice::class.java.getDeclaredField("nativeEvents").apply { isAccessible=true }.get(direct) as? Job
                 phases.put("native_event_collector_active",events?.isActive==true)
             }
-            val removed=listOf("ordinary","tools","memory","callback").map { kind -> File(app.filesDir,"voice-lookup-$provider-$kind.pcm").let { !it.exists()||it.delete() } }.all { it }
+            val removed=listOf("ordinary","tools","memory","callback","discover").map { kind -> File(app.filesDir,"voice-lookup-$provider-$kind.pcm").let { !it.exists()||it.delete() } }.all { it }
             phases.put("fixtures_removed",removed).put("completed_jobs",completed.size)
             app.calls.hangup();withTimeoutOrNull(60_000) { while(app.calls.service!=null) delay(100) }
             runCatching { voiceStore.setSelection(previous) }

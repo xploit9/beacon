@@ -502,7 +502,8 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
     assert allowed is None and outside is None and skills_list is None
     assert memory_read is None and web_read is None
     # Provider memory tools are not read-only by name; only the native memory tool's read actions are allowed.
-    assert hindsight_reads == [blocked] * 4 and hindsight_writes == [blocked] * 3
+    # A memory provider's read by name runs (owner, 4 Nov 2026); reflect is no read word, and writes stay blocked.
+    assert hindsight_reads == [None, blocked, None, None] and hindsight_writes == [blocked] * 3
     assert email_notice_url is None and email_checked_url is None
     assert event_notice_url is None and events_checked is None
     mcp_tool._mcp_tool_server_names.update({"mcp__github__get_issue": "github", "mcp__github__create_issue": "github"})

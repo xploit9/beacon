@@ -29,6 +29,8 @@ MAX_SCHEMA_DEPTH = 48
 MAX_TOOL_NAME = 200
 # A call's tool search waits this long at most for this process's first MCP scan, then answers with what is ready.
 FIRST_SCAN_WAIT = 2.0
+# Hermes metadata can wait on configuration locks even when its tool list is already known.
+DISCOVER_LIST_WAIT = 8.0
 # Eight active calls at 128 receipts each; old closed or expired receipts make room.
 MAX_RECEIPTS = 1024
 MAX_CALL_ALLOWANCES = 32
@@ -48,6 +50,8 @@ CATALOG_CACHE = {}
 CATALOG_SETTLED = set()  # keys whose stored list left no MCP server to scan live
 CATALOG_WARMING = set()
 CATALOG_FIRST_WARM = {}  # profile -> this process's first warm-up, which runs MCP discovery
+LAST_CATALOG = {}  # profile -> the last list returned, without another Hermes config/cache-key lookup
+DISCOVER_LOOKUPS = {}  # profile -> (daemon thread, future); a blocked lookup is never duplicated
 # Hermes keeps each MCP server's tool list on disk (tools/mcp_schema_cache.py) and registers a server from it without starting it.
 # The call's tool list starts from that file, so it is complete the moment the dashboard starts; only a server Hermes has no usable
 # entry for is scanned live. All of it is per profile scope (the profile's own home holds the file).
@@ -84,6 +88,16 @@ QUERY_ALIASES = {
     'remember': {'remember', 'memory', 'save', 'note'},
 }
 logger = logging.getLogger(__name__)
+
+
+def worker_stack(thread):
+    """Bounded locations only: never frame locals, source text, arguments or directory paths."""
+    frame=sys._current_frames().get(thread.ident) if thread is not None and thread.ident is not None else None
+    locations=[]
+    while frame is not None and len(locations)<12:
+        locations.append(f'{Path(frame.f_code.co_filename).name}:{frame.f_lineno} {frame.f_code.co_name}')
+        frame=frame.f_back
+    return ' <- '.join(locations) or 'not running'
 
 
 def query_words(text):
@@ -983,10 +997,12 @@ class Gateway:
 
     def catalog(self, profile, discover=True):
         cached=self._cached_catalog(profile)
-        if cached is not None: return self._call_tools(cached)
-        rows,settled=self._build(profile,discover)
-        # A list that is complete without any scan is as good as a scanned one, so the next look finds it stored.
-        if discover or settled: self._store_catalog(profile,rows,settled)
+        if cached is not None: rows=self._call_tools(cached)
+        else:
+            rows,settled=self._build(profile,discover)
+            # A list that is complete without any scan is as good as a scanned one, so the next look finds it stored.
+            if discover or settled: self._store_catalog(profile,rows,settled)
+        with CATALOG_LOCK: LAST_CATALOG[profile]=rows
         return rows
 
     def warm_catalogue(self, profile):
@@ -1066,8 +1082,7 @@ class Gateway:
         try: return self.scoped(profile,lambda _:pending())
         except Exception: return None
 
-    def discover(self, profile, query=''):
-        if not isinstance(query, str) or len(query)>240: raise HTTPException(400, 'Invalid tool query')
+    def _discover_catalog(self, profile):
         # Hermes' schema cache lists every server it has connected before, so that list is complete without any scan (asking registers it).
         # Only a server with no cached list is scanned live: wait briefly for a quick scan, then answer with what is ready; servers
         # still starting are named in the answer, so the call asks again instead of waiting out its deadline.
@@ -1076,9 +1091,36 @@ class Gateway:
             self.warm_catalogue(profile)
             first=CATALOG_FIRST_WARM.get(profile)
             if first is not None and first is not threading.current_thread(): first.join(FIRST_SCAN_WAIT)
+        rows=self.catalog(profile,discover=False)
+        return rows,self._starting(profile,rows)
+
+    def discover(self, profile, query=''):
+        if not isinstance(query, str) or len(query)>240: raise HTTPException(400, 'Invalid tool query')
+        with CATALOG_LOCK:
+            lookup=DISCOVER_LOOKUPS.get(profile)
+            if lookup is None or not lookup[0].is_alive():
+                future=concurrent.futures.Future()
+                def run():
+                    try: future.set_result(self._discover_catalog(profile))
+                    except BaseException as error: future.set_exception(error)
+                thread=threading.Thread(target=contextvars.copy_context().run,args=(run,),name='beacon-tool-lookup',daemon=True)
+                lookup=(thread,future)
+                DISCOVER_LOOKUPS[profile]=lookup
+                try: thread.start()
+                except Exception:
+                    DISCOVER_LOOKUPS.pop(profile,None)
+                    raise
+        thread,future=lookup
+        thread.join(DISCOVER_LIST_WAIT)
+        if future.done(): rows,starting=future.result()
+        else:
+            with CATALOG_LOCK: rows=LAST_CATALOG.get(profile)
+            if rows is None: rows,starting=future.result()
+            else:
+                starting=[]
+                logger.warning('Beacon call discover using last tool list after metadata wait; worker_stack=%s',worker_stack(thread))
         words = set(re.findall(r'[^\W_]+', query.casefold())) - QUERY_FILLER
         words = {word for word in words if not word.isdecimal()}
-        rows = self.catalog(profile,discover=False)
         # Task details ("latest five emails") need not occur verbatim in a tool's schema.
         ranked = [(discovery_rank(tool, words, query), tool) for tool in rows] if words else []
         selected = [tool for score,tool in sorted(ranked, key=lambda row:row[0], reverse=True) if score[1]] if words else rows
@@ -1100,7 +1142,6 @@ class Gateway:
         # Every answer carries the map of all sources, so a narrow or empty search still shows what else exists.
         sources=self.sanitize(fitted_sources(rows,MAX_SOURCES_BYTES,self.sanitize),MAX_SOURCES_BYTES)
         if sources: answer['sources']=sources
-        starting=self._starting(profile,rows)
         if starting: answer['still_starting']=starting
         return answer
 

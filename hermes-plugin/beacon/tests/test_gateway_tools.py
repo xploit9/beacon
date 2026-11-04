@@ -1467,3 +1467,129 @@ def test_an_unknown_approval_choice_is_refused(gateway):
             api.invoke(SCOPE,{'request_id':'r9','tool_id':'a'*64,'arguments':{'query':'weather'},'approval':bad})
         assert error.value.status_code==400
     assert backend.calls==[]
+
+
+@pytest.mark.parametrize('blocked_part',['pending','key','catalog'])
+def test_discover_uses_last_profile_list_when_hermes_metadata_stalls(tmp_path,monkeypatch,caplog,blocked_part):
+    profile='stalled-'+blocked_part+'-'+str(time.time_ns())
+    backend=Backend();api=g.Gateway(Mobile(tmp_path/'stalled.sqlite'),lambda p,fn:fn(tmp_path),backend)
+    api.catalog(profile,discover=False)
+    release=threading.Event();entered=threading.Event();lookups=[];starting=[]
+    def blocked(*args,**kwargs):
+        lookups.append(threading.current_thread());entered.set();release.wait(2)
+        return backend_rows
+    backend_rows=backend.catalog()
+    if blocked_part=='pending': monkeypatch.setattr(backend,'pending_servers',blocked,raising=False)
+    elif blocked_part=='key': monkeypatch.setattr(backend,'cache_key',blocked,raising=False)
+    else: monkeypatch.setattr(backend,'catalog',blocked)
+    monkeypatch.setattr(api,'_starting',lambda *args:starting.append(True) or [])
+    monkeypatch.setattr(g,'DISCOVER_LIST_WAIT',.04,raising=False)
+    try:
+        begin=time.monotonic()
+        answer=api.discover(profile,'search private-query-marker')
+        assert time.monotonic()-begin<.4, 'a Hermes metadata lock must not hold a tool search until its deadline'
+        assert entered.is_set() and answer['tools'][0]['name']=='configured_search'
+        assert not starting and 'still_starting' not in answer
+        again=api.discover(profile,'search')
+        assert again['tools']==answer['tools'] and len(lookups)==1, 'reuse the blocked lookup instead of adding threads'
+        assert lookups[0].daemon
+        assert 'worker_stack=' in caplog.text and 'private-query-marker' not in caplog.text
+    finally:
+        release.set()
+        for worker in lookups:
+            if worker is not threading.current_thread(): worker.join(2)
+
+
+def test_discover_lookup_preserves_context_and_never_borrows_another_profiles_rows(tmp_path,monkeypatch):
+    import contextvars
+    current=contextvars.ContextVar('lookup-profile')
+    release=threading.Event();workers=[]
+    class ScopedBackend(Backend):
+        def catalog(self,discover=True):
+            rows=super().catalog(discover)
+            rows[0]['name']=current.get()+'_search'
+            return rows
+    backend=ScopedBackend();api=g.Gateway(Mobile(tmp_path/'profiles.sqlite'),lambda p,fn:fn(tmp_path),backend)
+    profiles=['first-'+str(time.time_ns()),'second-'+str(time.time_ns())]
+    for profile in profiles:
+        token=current.set(profile)
+        try: assert api.discover(profile,'search')['tools'][0]['name']==profile+'_search'
+        finally: current.reset(token)
+    def blocked(profile):
+        workers.append(threading.current_thread());release.wait(2);return []
+    monkeypatch.setattr(api,'_pending',blocked)
+    monkeypatch.setattr(g,'DISCOVER_LIST_WAIT',.04,raising=False)
+    token=current.set(profiles[0])
+    try:
+        assert api.discover(profiles[0],'search')['tools'][0]['name']==profiles[0]+'_search'
+    finally:
+        release.set();current.reset(token)
+        for worker in workers:
+            if worker is not threading.current_thread(): worker.join(2)
+
+
+def test_discover_without_a_last_list_waits_and_propagates_lookup_errors(tmp_path,monkeypatch):
+    profile='cold-wait-'+str(time.time_ns());release=threading.Event();entered=threading.Event();finished=threading.Event()
+    api=g.Gateway(Mobile(tmp_path/'cold.sqlite'),lambda p,fn:fn(tmp_path),Backend())
+    def blocked(profile): entered.set();release.wait(2);return []
+    monkeypatch.setattr(api,'_pending',blocked)
+    monkeypatch.setattr(g,'DISCOVER_LIST_WAIT',.04,raising=False)
+    result=[]
+    def discover():
+        try: result.append(api.discover(profile,'search'))
+        finally: finished.set()
+    worker=threading.Thread(target=discover);worker.start()
+    try:
+        assert entered.wait(1) and not finished.wait(.12), 'a cold lookup cannot invent an empty or foreign list'
+    finally: release.set();worker.join(2)
+    assert finished.is_set() and result[0]['tools'][0]['name']=='configured_search'
+    def failed(*args,**kwargs): raise HTTPException(409,'Synthetic lookup failure')
+    monkeypatch.setattr(api,'catalog',failed)
+    with pytest.raises(HTTPException) as error: api.discover(profile,'search')
+    assert error.value.status_code==409
+
+
+def test_worker_stack_has_only_bounded_frame_locations_without_private_values():
+    release=threading.Event();entered=threading.Event()
+    namespace={'release':release,'entered':entered}
+    exec(compile('def hold():\n private_value="frame-secret-marker"\n entered.set()\n release.wait(2)\n',
+                 '/private-directory-marker/lookup_fixture.py','exec'),namespace)
+    worker=threading.Thread(target=namespace['hold'],daemon=True);worker.start()
+    try:
+        assert entered.wait(1)
+        stack=g.worker_stack(worker)
+        assert 'lookup_fixture.py:4 hold' in stack and len(stack.split(' <- '))<=12
+        assert 'frame-secret-marker' not in stack and 'private-directory-marker' not in stack
+    finally: release.set();worker.join(2)
+
+
+def test_router_timeout_logs_worker_locations_and_holds_admission_until_worker_finishes(tmp_path,monkeypatch,caplog):
+    import asyncio
+    release=threading.Event()
+    class StalledGateway:
+        def __init__(self,*args): pass
+        def discover(self,*args):
+            private_value='request-secret-marker'
+            release.wait(2)
+            return {'tools':[]}
+    monkeypatch.setitem(sys.modules,'beacon_gateway_tools',SimpleNamespace(Gateway=StalledGateway,worker_stack=getattr(g,'worker_stack',lambda thread:'missing')))
+    spec=importlib.util.spec_from_file_location('beacon_gateway_timeout_test',ROOT/'gateway_api.py')
+    api=importlib.util.module_from_spec(spec);spec.loader.exec_module(api)
+    original=asyncio.wait_for
+    async def short_wait(task,timeout): return await original(task,.04)
+    monkeypatch.setattr(api.asyncio,'wait_for',short_wait)
+    async def call(*args,**kwargs): return 'owner','password',{'profile':'profile','conversation':'synthetic'},{}
+    router=api.build_router(call,lambda *args:{},lambda p,fn:fn(tmp_path),Mobile(tmp_path/'timeout.sqlite'))
+    endpoint=next(route.endpoint for route in router.routes if route.path.endswith('/tools'))
+    async def exercise():
+        try:
+            errors=await asyncio.gather(*(endpoint('synthetic',None,'request-secret-marker') for _ in range(4)),return_exceptions=True)
+            assert all(isinstance(error,HTTPException) and error.status_code==504 for error in errors)
+            with pytest.raises(HTTPException) as error: await endpoint('synthetic',None,'')
+            assert error.value.status_code==429, 'a timeout does not release a still-running worker slot'
+            assert 'discover' in caplog.text and 'worker_stack=' in caplog.text
+            assert 'request-secret-marker' not in caplog.text
+        finally: release.set()
+        await asyncio.sleep(.08)
+        assert await endpoint('synthetic',None,'')=={'tools':[]}
+    asyncio.run(exercise())

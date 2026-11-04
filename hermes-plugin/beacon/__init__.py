@@ -387,6 +387,51 @@ def _mcp_read_only(tool_name,profile):
     # add such verbs to WRITE_WORDS.
     return hint is True and (_named_read_only(raw_name) or _health_name(raw_name)) and _gateway_tools().mcp_reads_by_name(raw_name,trust)
 
+def _watched_source_read(tool_name,profile):
+    """Owner, 4 Nov 2026: a trusted server the owner picked for the watch (every server while none is picked) vouches for its
+    tools whose names only read without the server's own hint, and any picked server for Hermes' read utilities. A server that says the tool is not read-only,
+    an untrusted server and a server the owner did not pick keep the strict rule above; links, recipients and write actions in
+    the arguments are refused before this."""
+    entry=_mcp_tool_entry(tool_name,profile)
+    if entry:
+        raw_name,hint,server_name,trust=entry
+        if hint is False or trust=='untrusted' or not _named_read_only(raw_name): return False
+    else:
+        server_name=_mcp_utility_read(tool_name)
+        if not server_name: return False
+    try:
+        owner=mobile.settings().get('owner_id')
+        servers=proactive.watch_servers(mobile,owner,profile) if owner else set()
+    except Exception:
+        return False
+    return servers is None or server_name in servers
+
+# Hermes generates these for every MCP server (tools/mcp_tool_schema.py) and names them itself, so a server cannot lie about
+# them; they only list or read. get_prompt and the event subscriptions are not among them.
+_MCP_UTILITY_READS=('list_resources','read_resource','list_prompts','list_event_types')
+
+def _mcp_utility_read(tool_name):
+    """The server whose read utility this is, or None."""
+    try:
+        from tools import mcp_tool
+        from tools.mcp_tool_schema import mcp_prefixed_tool_name
+        server_name=mcp_tool._mcp_tool_server_names.get(tool_name)
+        if isinstance(server_name,str) and server_name and any(mcp_prefixed_tool_name(server_name,name)==tool_name for name in _MCP_UTILITY_READS):
+            return server_name
+    except Exception:
+        pass
+    return None
+
+def _connector_batch(args):
+    """A tool_call that Hermes runs as a batch of connector calls only, each of which passes this guard on its own; anything
+    Hermes cannot read as one (or an older Hermes without connectors) is not."""
+    try:
+        from tools.tool_search import is_connector_name, normalize_tool_call_entries
+        entries,error=normalize_tool_call_entries(args)
+    except Exception:
+        return False
+    return not error and bool(entries) and all(isinstance(entry,dict) and is_connector_name(entry.get('name')) for entry in entries)
+
 def _reads_by_method(args,schema):
     return _gateway_tools().reads_by_method(args,schema)
 
@@ -593,7 +638,14 @@ def _watch_tool_guard(tool_name,args,profile):
         return {'action':'block','message':_READ_ONLY_MESSAGE}
     if tool_name in _BLOCKED_PROACTIVE_TOOLS:
         return {'action':'block','message':_READ_ONLY_MESSAGE}
+    if tool_name=='tool_call':
+        # Hermes unwraps a single deferred tool before this guard sees it, but runs a connector batch (Jira, Notion) as one
+        # tool_call and puts each of its calls through this guard by its own name (tools/connectors/dispatch.py).
+        return None if _connector_batch(args) else {'action':'block','message':_READ_ONLY_MESSAGE}
     args=args if isinstance(args,dict) else {}
+    # Listing the owner's connected apps reads; every other connection action changes them.
+    if tool_name=='manage_connections' and str(args.get('action') or 'status').strip().lower()=='status':
+        return None
     # The native tool can select another profile explicitly or through a profile/session link.
     if tool_name=='session_search' and (args.get('profile') not in (None,'') or '/' in str(args.get('session_id') or '')):
         return {'action':'block','message':'Proactive watches only search conversations in their current profile.'}
@@ -614,10 +666,14 @@ def _watch_tool_guard(tool_name,args,profile):
         return {'action':'block','message':_READ_ONLY_MESSAGE}
     if toolset.startswith('mcp-') or tool_name.startswith('mcp__'):
         if _mcp_read_only(tool_name,profile) and _reads_by_method(args,schema): return None
+        if _watched_source_read(tool_name,profile) and _reads_by_method(args,schema): return None
         return {'action':'block','message':_READ_ONLY_MESSAGE}
     if toolset=='memory':
         # Only the native memory tool's own action says what it does; provider tools in this toolset are never vouched for by an argument.
         if tool_name=='memory' and args.get('action') in {'read','search','get','list','query'}: return None
+        # A memory provider's tool that only reads by name (mnemosyne_recall, *_search_*) tells the watch what matters to the
+        # owner and changes nothing (owner, 4 Nov 2026); reflect, retain and the rest stay blocked.
+        if tool_name!='memory' and (_named_read_only(tool_name) or 'recall' in _tool_words(tool_name)) and not _gateway_tools().name_writes(tool_name): return None
         return {'action':'block','message':_READ_ONLY_MESSAGE}
     # Deny by default: any other tool runs only when its own name clearly reads (skill_view, session_search,
     # read_file); a read-sounding action argument never vouches for the tool's other arguments.
